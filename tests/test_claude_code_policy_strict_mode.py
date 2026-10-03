@@ -23,6 +23,7 @@ from ccs.adapters.claude_code.policy import (
     DEFAULT_TRACKED_PATTERNS,
     STRICT_MODE_PATH_WARN_THRESHOLD,
     TrackedArtifactPolicy,
+    globs_intersect,
 )
 
 
@@ -204,6 +205,88 @@ def test_a_strict_pattern_with_no_tracked_cover_is_not_covering(root: Path) -> N
     assert policy.strict_patterns_covering("notes/*.txt") == ()
     assert policy.strict_patterns_covering("notes/**") == ("**",)
     assert policy.strict_patterns_covering("docs/**") == ("**",)
+
+
+@pytest.mark.parametrize("negated", [False, True])
+def test_a_class_range_too_wide_to_expand_errs_toward_covering(
+    root: Path, negated: bool
+) -> None:
+    """A class range wider than the expand limit is approximated so the class
+    accepts more, never less, in both polarities: an untrack of a path the
+    strict class matches is refused, never answered as a silent untrack."""
+    bang = "!" if negated else ""
+    # [0-\u0300] holds '5'; [!a-\u0300] does too (5 sorts below 'a').
+    strict = f"data/[{bang}{'a' if negated else '0'}-\u0300].json"
+    (root / ".coherence" / "tracked.yaml").write_text("- data/*\n")
+    (root / ".coherence" / "strict_mode.yaml").write_text(f"- '{strict}'\n")
+    (root / ".coherence" / "ignored.yaml").write_text("- data/5.json\n")
+    policy = TrackedArtifactPolicy.load(root)
+    assert policy.is_strict_mode("data/5.json")
+
+    assert globs_intersect("data/5.json", strict)
+    assert policy.strict_patterns_covering("data/5.json") == (strict,)
+    assert policy.ignored_patterns_overridden_by_strict() == ("data/5.json",)
+
+
+_STAR_HEAVY = "**/" + "/".join(f"*{c}*" for c in "abcdefgh")
+
+
+def test_a_search_over_its_state_budget_answers_intersects() -> None:
+    """The product search is exponential in a star-heavy glob's segments; a
+    bounded search stops and errs toward "intersects" (the refusal side)."""
+    assert not globs_intersect("**/*a*/*b*/*c*", "src/**/*.py", "**/plan.md")
+    assert globs_intersect(_STAR_HEAVY, "src/**/*.py", "**/plan.md", max_states=50)
+
+
+def test_a_star_heavy_untrack_entry_is_decided_within_the_budget(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """strict_patterns_covering shares one state budget across the call, so a
+    star-heavy entry is decided well inside the /policy/untrack deadline
+    (unbounded, this case explored the whole state space against every
+    default tracked pattern: tens of seconds). Strict patterns left undecided
+    when the budget runs out count as covered."""
+    import time
+
+    from ccs.adapters.claude_code import policy as policy_module
+
+    (root / ".coherence" / "tracked.yaml").write_text("- src/**/*.py\n")
+    (root / ".coherence" / "strict_mode.yaml").write_text(
+        "- 'docs/**/*.txt'\n- 'src/**/*.py'\n"
+    )
+    policy = TrackedArtifactPolicy.load(root)
+
+    started = time.monotonic()
+    covering = policy.strict_patterns_covering(_STAR_HEAVY)
+    assert time.monotonic() - started < 2.0
+    assert "src/**/*.py" in covering
+
+    monkeypatch.setattr(policy_module, "GLOB_INTERSECT_STATE_BUDGET", 1)
+    assert policy.strict_patterns_covering(_STAR_HEAVY) == (
+        "docs/**/*.txt", "src/**/*.py",
+    )
+
+
+def test_a_hot_reload_skips_the_spawn_time_override_diagnostic(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ignored-over-strict warning is a spawn-time diagnostic; a
+    /policy/track or /policy/untrack reload does not recompute it."""
+    (root / ".coherence" / "tracked.yaml").write_text("- data/**\n")
+    (root / ".coherence" / "strict_mode.yaml").write_text("- data/**\n")
+    (root / ".coherence" / "ignored.yaml").write_text("- '**'\n")
+    live = TrackedArtifactPolicy.load(root)
+    calls: list[int] = []
+    monkeypatch.setattr(
+        TrackedArtifactPolicy,
+        "ignored_patterns_overridden_by_strict",
+        lambda self: calls.append(1) or (),
+    )
+
+    reloaded = live.reloaded()
+
+    assert calls == []
+    assert reloaded.is_strict_mode("data/a.txt")
 
 
 def test_reload_never_narrows_strict_enforcement(root: Path) -> None:

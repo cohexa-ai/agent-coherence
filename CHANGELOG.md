@@ -374,23 +374,27 @@ Alpha — APIs may change before `v1.0`.
     "strict_patterns"}], "rejected": [...], "error": <text>}`, and the whole
     request writes nothing. Overlap is decided on the glob languages, so a
     literal path, the strict glob itself, and a broader or differently spelled
-    glob are all caught. The CLI exits 3 on it. **Changed behaviour of a
-    shipped verb:** to untrack a strict path, remove its entry from
+    glob are all caught; where the decision is approximate (a class range too
+    wide to expand, or a star-heavy glob whose overlap search exceeds a fixed
+    state budget) it errs toward refusing. The CLI exits 3 on it. **Changed
+    behaviour of a shipped verb:** to untrack a strict path, remove its entry from
     `.coherence/strict_mode.yaml` and restart the coordinator.
   - Strict wins over ignore in `TrackedArtifactPolicy.is_tracked`: an ignored
     pattern no longer untracks a path that is tracked and matches a strict
     pattern (previously ignore won, and a strict path in `ignored.yaml` was
-    neither tracked nor strict). The load logs each overridden ignore entry.
-    Non-strict paths are unchanged: ignore still wins there.
+    neither tracked nor strict). The spawn-time load logs each overridden
+    ignore entry; hot reloads do not recompute it. Non-strict paths are unchanged: ignore still wins there.
   - The hot reload behind `/policy/track` and `/policy/untrack`
     (`TrackedArtifactPolicy.reloaded()`) keeps every strict and user-added
     pattern the live policy carries while strict patterns are live, so a
     hand-edited YAML followed by a track cannot end enforcement mid-run.
     Without strict patterns the reload reads the files verbatim, as before.
   - The Node coordinator's `/policy/untrack` and policy evaluator are not
-    changed here; the new corpus fixture
-    (`strict_mode/15-policy-untrack-of-a-strict-path-is-refused`) is scoped to
-    the Python coordinator until the plugin follows.
+    changed here; the new corpus fixtures
+    (`strict_mode/15-policy-untrack-of-a-strict-path-is-refused` and
+    `strict_mode/16-pre-edit-strict-path-under-an-ignore-pattern-stays-strict`)
+    are scoped to the Python coordinator and are the parity targets for the
+    plugin follow-up.
 
 - **A Bash or Grep command denied in strict mode no longer counts as a read.**
   When `pre-bash` or `pre-grep` finds a stale tracked file, it re-grants the

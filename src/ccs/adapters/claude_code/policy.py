@@ -167,20 +167,7 @@ class TrackedArtifactPolicy:
         ``.coherence/ignored.yaml`` opt-out + ``.coherence/strict_mode.yaml``
         v0.2 opt-in (KTD-O). All YAML files are optional. Patterns failing
         the path-traversal guard are rejected with WARNING."""
-        root = Path(coordinator_root).resolve()
-        rejected: list[tuple[str, str]] = []
-
-        added = _load_yaml_patterns(root / ".coherence" / "tracked.yaml", rejected)
-        ignored = _load_yaml_patterns(root / ".coherence" / "ignored.yaml", rejected)
-        strict = _load_yaml_patterns(root / ".coherence" / "strict_mode.yaml", rejected)
-        policy = cls(
-            coordinator_root=root,
-            tracked_patterns=DEFAULT_TRACKED_PATTERNS,
-            ignored_patterns=tuple(ignored),
-            user_added_patterns=tuple(added),
-            strict_mode_paths=tuple(strict),
-            rejected_patterns=tuple(rejected),
-        )
+        policy = cls._read(coordinator_root)
         overridden = policy.ignored_patterns_overridden_by_strict()
         if overridden:
             logger.warning(
@@ -191,6 +178,25 @@ class TrackedArtifactPolicy:
                 ", ".join(overridden),
             )
         return policy
+
+    @classmethod
+    def _read(cls, coordinator_root: Path | str) -> "TrackedArtifactPolicy":
+        """Read the policy files without :meth:`load`'s strict-override
+        diagnostic, which hot reloads (:meth:`reloaded`) skip."""
+        root = Path(coordinator_root).resolve()
+        rejected: list[tuple[str, str]] = []
+
+        added = _load_yaml_patterns(root / ".coherence" / "tracked.yaml", rejected)
+        ignored = _load_yaml_patterns(root / ".coherence" / "ignored.yaml", rejected)
+        strict = _load_yaml_patterns(root / ".coherence" / "strict_mode.yaml", rejected)
+        return cls(
+            coordinator_root=root,
+            tracked_patterns=DEFAULT_TRACKED_PATTERNS,
+            ignored_patterns=tuple(ignored),
+            user_added_patterns=tuple(added),
+            strict_mode_paths=tuple(strict),
+            rejected_patterns=tuple(rejected),
+        )
 
     def _matches_tracked(self, normalized: str) -> bool:
         # PERF-2 / finding #16: pass pre-compiled cache so _glob_match skips
@@ -261,21 +267,33 @@ class TrackedArtifactPolicy:
         caught: ``data/**`` and ``**`` both cover a strict ``data/*.json``;
         ``notes/**`` covers nothing when no tracked pattern reaches
         ``notes/``. Character classes are matched approximately, erring
-        toward "covers" (a refusal, never a silent untrack). Empty when no
-        strict path is covered, which is always the case with no strict
-        patterns."""
+        toward "covers" (a refusal, never a silent untrack), and so is a
+        search that exceeds :data:`GLOB_INTERSECT_STATE_BUDGET` states, shared
+        across the whole call: the strict pattern being decided and every one
+        not yet decided then count as covered. Empty when no strict path is
+        covered, which is always the case with no strict patterns."""
         if not self.strict_mode_paths:
             return ()
-        tracked = (*self.tracked_patterns, *self.user_added_patterns)
-        return tuple(
-            s for s in self.strict_mode_paths
-            if any(globs_intersect(pattern, s, t) for t in tracked)
-        )
+        tracked = tuple(dict.fromkeys((*self.user_added_patterns, *self.tracked_patterns)))
+        budget = _StateBudget(GLOB_INTERSECT_STATE_BUDGET)
+        covering: list[str] = []
+        for index, strict in enumerate(self.strict_mode_paths):
+            try:
+                if _globs_intersect((pattern, strict), budget) and any(
+                    _globs_intersect((pattern, strict, t), budget) for t in tracked
+                ):
+                    covering.append(strict)
+            except _BudgetExhausted:
+                covering.extend(self.strict_mode_paths[index:])
+                break
+        return tuple(covering)
 
     def ignored_patterns_overridden_by_strict(self) -> tuple[str, ...]:
         """Ignored patterns that cover a strict path, which strict therefore
-        overrides (:meth:`is_tracked`). Logged once at :meth:`load` so an
-        operator learns that the ignore entry does not untrack those paths."""
+        overrides (:meth:`is_tracked`). Logged once at :meth:`load` (spawn),
+        not on hot reloads, so an operator learns that the ignore entry does
+        not untrack those paths. Bounded like :meth:`strict_patterns_covering`,
+        so a pathological entry may be reported as overridden when it is not."""
         return tuple(p for p in self.ignored_patterns if self.strict_patterns_covering(p))
 
     def reloaded(self) -> "TrackedArtifactPolicy":
@@ -290,7 +308,7 @@ class TrackedArtifactPolicy:
         untrack cannot end enforcement mid-run. Additions on disk still take
         effect. Without strict patterns a reload reads the files verbatim, as
         before."""
-        fresh = TrackedArtifactPolicy.load(self.coordinator_root)
+        fresh = TrackedArtifactPolicy._read(self.coordinator_root)
         if not self.strict_mode_paths:
             return fresh
         return TrackedArtifactPolicy(
@@ -441,19 +459,29 @@ def _glob_tokens(pattern: str) -> list[tuple]:
             if negated:
                 body = body[1:]
             members: set[str] = set()
+            too_wide = False
             k = 0
             while k < len(body):
                 if k + 2 < len(body) and body[k + 1] == "-":
                     lo, hi = body[k], body[k + 2]
                     if ord(hi) - ord(lo) <= _RANGE_EXPAND_LIMIT:
                         members.update(chr(o) for o in range(ord(lo), ord(hi) + 1))
-                    else:  # too wide to expand: keep the ends (approximate)
+                    else:
+                        too_wide = True
+                        # Negated: excluding only the ends excludes too little,
+                        # so the class accepts more than it does (approximate
+                        # toward "intersects").
                         members.update((lo, hi))
                     k += 3
                 else:
                     members.add(body[k])
                     k += 1
-            tokens.append((_CLASS, negated, frozenset(members)))
+            if too_wide and not negated:
+                # A positive class with a range too wide to expand accepts any
+                # one character here — again more than it does, never less.
+                tokens.append((_ANY_ONE,))
+            else:
+                tokens.append((_CLASS, negated, frozenset(members)))
         else:
             tokens.append((_LIT, c))
     return tokens
@@ -493,14 +521,47 @@ def _advance(states: frozenset[int], tokens: list[tuple], ch: str | None) -> fro
     return _closure(frozenset(nxt), tokens)
 
 
-def globs_intersect(*patterns: str) -> bool:
+GLOB_INTERSECT_STATE_BUDGET: int = 2000
+"""How many product states one :meth:`TrackedArtifactPolicy.strict_patterns_covering`
+call may explore before it stops deciding and answers "covers". Ordinary
+globs settle in a few dozen states; a star-heavy entry can need exponentially
+many, and the check runs inside the ``/policy/untrack`` handler's deadline."""
+
+
+class _BudgetExhausted(Exception):
+    pass
+
+
+class _StateBudget:
+    __slots__ = ("remaining",)
+
+    def __init__(self, states: int) -> None:
+        self.remaining = states
+
+    def spend(self) -> None:
+        self.remaining -= 1
+        if self.remaining < 0:
+            raise _BudgetExhausted
+
+
+def globs_intersect(*patterns: str, max_states: int | None = None) -> bool:
     """True when some non-empty path matches every one of ``patterns`` under
     this module's matching rules (:func:`matches_any`).
 
-    A product of the patterns' automata searched breadth-first over an
-    alphabet of every character the patterns name, ``/``, and one stand-in for
-    every other character. Exact for ``*``, ``**`` and ``?``; a class range
-    wider than 512 code points is approximated by its ends."""
+    A product of the patterns' automata searched over an alphabet of every
+    character the patterns name, ``/``, and one stand-in for every other
+    character. Exact for ``*``, ``**`` and ``?``; a class range wider than 512
+    code points is approximated so the class accepts more, never less.
+    Every approximation errs toward True, and so does ``max_states``: a search
+    that visits more product states than that stops and answers True."""
+    budget = _StateBudget(max_states) if max_states is not None else None
+    try:
+        return _globs_intersect(patterns, budget)
+    except _BudgetExhausted:
+        return True
+
+
+def _globs_intersect(patterns: Sequence[str], budget: _StateBudget | None) -> bool:
     token_lists = [_glob_tokens(p) for p in patterns]
     alphabet: set[str | None] = {"/", None}
     for tokens in token_lists:
@@ -521,6 +582,8 @@ def globs_intersect(*patterns: str) -> bool:
             if all(len(t) in s for s, t in zip(nxt, token_lists)):
                 return True
             if nxt not in seen:
+                if budget is not None:
+                    budget.spend()
                 seen.add(nxt)
                 frontier.append(nxt)
     return False
