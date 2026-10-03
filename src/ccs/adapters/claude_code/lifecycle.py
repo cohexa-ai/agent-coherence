@@ -776,6 +776,34 @@ def _start_background_threads(entry: _SpawnedEntry, cfg: LifecycleConfig) -> Non
         idle_thread.start()
 
 
+def _report_sweep_reclaims(
+    coordinator: CoordinatorHTTPServer,
+    reclaims: list[tuple[UUID, UUID, str]],
+    now_tick: int,
+) -> None:
+    """Count and log each reclaim the sweep landed (#195). Best-effort per
+    entry: a failure for one never skips the rest, and never raises."""
+    for artifact_id, agent_id, trigger in reclaims:
+        try:
+            coordinator.record_sweep_reclaim(trigger)
+        except Exception:  # noqa: BLE001 — observability, best-effort
+            logger.exception("sweep reclaim counter update failed")
+        try:
+            artifact = coordinator.registry.get_artifact(artifact_id)
+            label = artifact.name if artifact is not None else str(artifact_id)
+        except Exception:  # noqa: BLE001 — a log label, best-effort
+            label = str(artifact_id)
+        # The agent id is the non-reversible uuid5 /status already publishes
+        # (R6): no session id, no session name, in the log line either.
+        logger.warning(
+            "sweep reclaimed grant: trigger=%s tick=%d agent_id=%s artifact=%s",
+            trigger,
+            now_tick,
+            agent_id,
+            label,
+        )
+
+
 def _sweep_stable_grants(
     coordinator: CoordinatorHTTPServer, cfg: LifecycleConfig, now_tick: int
 ) -> int:
@@ -799,7 +827,8 @@ def _sweep_stable_grants(
     holder. (The detached ``agent-coherence-coordinator`` child sends stderr
     to /dev/null, so there the counter and ``/status`` are the surface.)
     The observability step is best-effort: a failure there is logged and never
-    costs the tick its remaining passes.
+    costs the tick its remaining passes. It runs in a ``finally``, so reclaims
+    that landed before a mid-walk exception are still counted and logged.
 
     Returns the reclaimed count, as ``enforce_stable_grant_timeouts`` does.
     """
@@ -822,28 +851,20 @@ def _sweep_stable_grants(
             preempted_at_unix_ts=time.time(),
         )
 
-    reclaimed = coordinator.service.enforce_stable_grant_timeouts(
-        current_tick=now_tick,
-        heartbeat_timeout_ticks=cfg.grant_heartbeat_timeout_sec,
-        max_hold_ticks=cfg.grant_max_hold_sec,
-        on_reclaim=_on_reclaim,
-    )
-    for artifact_id, agent_id, trigger in reclaims:
-        coordinator.record_sweep_reclaim(trigger)
-        try:
-            artifact = coordinator.registry.get_artifact(artifact_id)
-            label = artifact.name if artifact is not None else str(artifact_id)
-        except Exception:  # noqa: BLE001 — a log label, best-effort
-            label = str(artifact_id)
-        # The agent id is the non-reversible uuid5 /status already publishes
-        # (R6): no session id, no session name, in the log line either.
-        logger.warning(
-            "sweep reclaimed grant: trigger=%s tick=%d agent_id=%s artifact=%s",
-            trigger,
-            now_tick,
-            agent_id,
-            label,
+    # try/finally: the walk commits each pair on its own, so a later pair
+    # raising (a store error mid-walk) leaves the earlier reclaims durable.
+    # They are counted and logged on the way out all the same; otherwise the
+    # tick reads as quiet in exactly the case an operator most needs it not
+    # to. The exception still propagates to the caller unchanged.
+    try:
+        reclaimed = coordinator.service.enforce_stable_grant_timeouts(
+            current_tick=now_tick,
+            heartbeat_timeout_ticks=cfg.grant_heartbeat_timeout_sec,
+            max_hold_ticks=cfg.grant_max_hold_sec,
+            on_reclaim=_on_reclaim,
         )
+    finally:
+        _report_sweep_reclaims(coordinator, reclaims, now_tick)
     return reclaimed
 
 

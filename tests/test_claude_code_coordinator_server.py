@@ -9919,3 +9919,104 @@ def test_status_full_tier_lists_a_reclaimed_agent_the_restarted_coordinator_neve
     # Below the operator tier nothing changes: a row with no held grant and
     # no name is not added there.
     assert minimal["sessions"] == []
+
+
+def test_sweep_counts_and_logs_reclaims_that_landed_before_a_mid_walk_error(
+    coordinator, client: _Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The walk commits each pair on its own. When a later pair raises, the
+    reclaims already durable must still be counted and logged: a store error
+    mid-walk must not read as a quiet tick."""
+    for name, path in (("walk-a-195", "plan.md"), ("walk-b-195", "task.md")):
+        assert client.post("/hooks/pre-edit", {"session_id": _sid(name), "path": path})[0] == 200
+
+    real = coordinator.service._validate_single_writer
+    calls = {"n": 0}
+
+    def _flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("registry hiccup")
+        return real(*args, **kwargs)
+
+    coordinator.service._validate_single_writer = _flaky
+    try:
+        with caplog.at_level(logging.WARNING, logger="ccs.adapters.claude_code.lifecycle"):
+            with pytest.raises(RuntimeError, match="registry hiccup"):
+                _sweep(coordinator, int(time.time()) + 999_999)
+    finally:
+        coordinator.service._validate_single_writer = real
+
+    payload = _operator_status(client)
+    landed = sum(len(row["reclaimed"]) for row in payload["sessions"])
+    # Both pairs are durably reclaimed: the first before the error, the second
+    # by the very pass whose post-write check raised.
+    assert landed == 2
+    assert payload["sweep_reclaims_total"] == landed
+    logged = [r for r in caplog.records if "sweep reclaimed grant" in r.getMessage()]
+    assert len(logged) == landed
+
+
+def test_status_never_reports_a_pair_both_held_and_reclaimed(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The slot read is a second registry call after ``status_snapshot``. A
+    reclaim landing between the two must read as the grant the snapshot saw,
+    never as a held state and a reclaim in one row."""
+    sid = _sid("race-195")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    payload = _operator_status(client)
+    [artifact] = [a for a in payload["tracked_artifacts"] if a["path"] == "plan.md"]
+    agent_id = session_to_agent_id(sid)
+
+    monkeypatch.setattr(
+        coordinator.registry,
+        "invalid_reclamations",
+        lambda: {uuid.UUID(artifact["id"]): {agent_id: ("reclaim_heartbeat", int(time.time()))}},
+    )
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {"plan.md": "EXCLUSIVE"}
+    assert row["reclaimed"] == {}
+
+
+def test_status_drops_an_unnamed_reclaim_only_row_once_the_reclaim_is_old(
+    tmp_path: Path,
+) -> None:
+    """A dead session's slot never clears (it never acquires again), so the
+    unnamed reclaim-only row is bounded by the reclaim's age: a crashed
+    session does not stay in the operator table for ever."""
+    from ccs.adapters.claude_code import coordinator_server as cs
+
+    sid = _sid("stale-195")
+    first = _restart_on(tmp_path, "stale-before")
+    try:
+        secret = load_secret(first.coordinator_root)
+        assert secret is not None
+        _Client("127.0.0.1", first.port, secret).post(
+            "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"}
+        )
+        assert _sweep(first, int(time.time()) + 999_999) == 1
+    finally:
+        first.shutdown()
+
+    second = _restart_on(tmp_path, "stale-after")
+    try:
+        secret = load_secret(second.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", second.port, secret)
+        real = second.registry.invalid_reclamations
+        old_tick = int(time.time()) - cs._RECLAIM_ONLY_ROW_MAX_AGE_SEC - 60
+
+        def _aged() -> dict:
+            return {
+                artifact_id: {agent: (trigger, old_tick) for agent, (trigger, _) in slots.items()}
+                for artifact_id, slots in real().items()
+            }
+
+        second.registry.invalid_reclamations = _aged
+        payload = _operator_status(client)
+    finally:
+        second.shutdown()
+
+    agent = str(session_to_agent_id(sid))
+    assert [row for row in payload["sessions"] if row["agent_id"] == agent] == []

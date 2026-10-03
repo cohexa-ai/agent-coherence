@@ -3322,7 +3322,11 @@ class CoordinatorService:
                     content_hash=None,
                 )
                 self.registry.record_last_reclamation(agent_id, artifact_id, trigger, current_tick)
-                self._validate_single_writer(artifact_id)
+                # The callback fires once the reclaim is durable and BEFORE the
+                # single-writer check: a check that raises still leaves this
+                # pair reclaimed (each pair commits on its own), and a reclaim
+                # the registry records must not go without its notice, count
+                # or log line (#195).
                 if on_reclaim is not None:
                     # Best-effort: a notice-recording failure must not stop the sweep
                     # (the reclamation itself already landed in the registry).
@@ -3333,6 +3337,7 @@ class CoordinatorService:
                             "on_reclaim callback raised for agent=%s artifact=%s trigger=%s",
                             agent_id, artifact_id, trigger,
                         )
+                self._validate_single_writer(artifact_id)
                 reclaimed += 1
 
         return reclaimed

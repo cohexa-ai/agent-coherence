@@ -74,7 +74,10 @@ Alpha — APIs may change before `v1.0`.
     the original trigger and tick, because the cause describes the session's
     last write grant there, not its most recent exit. The cause survives a
     coordinator restart, so after one a reclaimed session gets a row (with a
-    null name) even if it has not sent a request since. `tick` is wall-clock
+    null name) even if it has not sent a request since. That row lasts 24
+    hours from the reclaim: the cause is never cleared for a session that
+    crashed (it never takes a write grant again), and without a bound every
+    crashed session would stay in the table for good. `tick` is wall-clock
     seconds. The map is in the operator tier only, like the writer attribution
     above; the `minimal` tier is unchanged.
   - The counter block (every tier, including `?detail=metrics`) adds
@@ -84,7 +87,8 @@ Alpha — APIs may change before `v1.0`.
   - The sweep logs one WARNING line per reclaim (trigger, tick, agent id,
     path). The sweep used to discard the reclaimed count, so a tick that pulled
     a live grant logged nothing. The line names the agent id, never the session
-    id.
+    id. A reclaim is counted and logged even when a later pair in the
+    same pass raises.
   - New registry read `invalid_reclamations()` on both backends (in-memory and
     SQLite). It is one batched query, so `/status` stays free of per-pair
     reads.

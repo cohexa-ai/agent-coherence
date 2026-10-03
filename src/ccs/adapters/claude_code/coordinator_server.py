@@ -205,6 +205,16 @@ SWEEP_RECLAMATION_PREEMPTER_ID: UUID = uuid5(
 #: ``timeout`` is in ``RECLAIM_TRIGGERS`` too but records no reclamation slot.
 _SWEEP_RECLAIM_TRIGGERS: tuple[str, ...] = ("reclaim_heartbeat", "reclaim_max_hold")
 
+#: #195: how long a reclaim keeps an otherwise-empty, unnamed agent listed in
+#: ``/status?detail=full`` ``sessions[]``. The slot itself is durable and
+#: clears only on that agent's next M/E acquire, and the commonest heartbeat
+#: reclaim is a dead session that never acquires again, so without a bound
+#: every crashed session would add a row that no restart and no operator
+#: action removes. Past this age (the slot's tick is wall-clock seconds over
+#: the HTTP transport) the row is dropped; a named session, or one that still
+#: holds a grant, keeps its row and its ``reclaimed`` map regardless.
+_RECLAIM_ONLY_ROW_MAX_AGE_SEC: int = 24 * 60 * 60
+
 MAX_POLICY_PATHS_PER_REQUEST = 20
 """Cap on the number of paths /policy/track and /policy/untrack accept
 in one request body (security-lens P1)."""
@@ -5451,7 +5461,10 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     reclaimed and it has held none since": a later read grant that a peer
     invalidates returns the path to ``reclaimed`` with the original
     trigger/tick. ``tick`` is the sweep's tick basis, wall-clock seconds over
-    the HTTP transport. The key is absent below the operator tier.
+    the HTTP transport. The key is absent below the operator tier. An agent
+    that is unnamed, holds nothing and is listed only for a reclaim gets a row
+    only while its newest reclaim is younger than
+    ``_RECLAIM_ONLY_ROW_MAX_AGE_SEC`` (24h), so dead sessions do not pile up.
 
       Fields may be ADDED in minor versions (additive change is
       non-breaking for dashboards using selective key access).
@@ -5614,8 +5627,17 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # is exactly the one a supervisor must not mistake for a clean finish.
     # ``reclaimed_by_agent`` is empty below that tier, so those rows are
     # unchanged.
+    # The reclaim-only rows are bounded by the age of the agent's newest
+    # reclaim (``_RECLAIM_ONLY_ROW_MAX_AGE_SEC``) so dead sessions do not
+    # accumulate in the table for ever.
+    reclaim_row_cutoff = monotonic_seconds() - _RECLAIM_ONLY_ROW_MAX_AGE_SEC
+    recent_reclaim_only = {
+        agent_id
+        for agent_id, paths in reclaimed_by_agent.items()
+        if max(slot["tick"] for slot in paths.values()) >= reclaim_row_cutoff
+    }
     for agent_id in sorted(
-        (states_by_agent.keys() | reclaimed_by_agent.keys()) - named_ids, key=str
+        (states_by_agent.keys() | recent_reclaim_only) - named_ids, key=str
     ):
         sessions.append(_row(agent_id, None))
 
