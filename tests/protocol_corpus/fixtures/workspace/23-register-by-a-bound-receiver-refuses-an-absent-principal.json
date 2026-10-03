@@ -1,0 +1,95 @@
+{
+  "name": "workspace-restore-register-by-a-bound-receiver-refuses-an-absent-principal",
+  "description": "/workspace/restore/register is require-class. Setup as 12, then the receiver B CLAIMS its principal; B's registration without the principal is refused with the typed absent reason before any version moves or the checkpoint is claimed, so a caller without B's principal cannot register a restore as B's. Twin of 24.",
+  "setup": {
+    "tracked": [
+      "docs/**"
+    ],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n",
+      "docs/spec.md": "# coherence corpus fixture  \n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "33333333-3333-4333-8333-333333333333",
+          "path": "docs/plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit-cas",
+        "body": {
+          "session_id": "33333333-3333-4333-8333-333333333333",
+          "path": "docs/plan.md",
+          "content_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "expected_version": 1
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/workspace/checkpoint",
+        "body": {
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "name": "before-refactor",
+          "window_min": 100.0,
+          "window_max": 101.0,
+          "members": [
+            {
+              "member_path": "docs/plan.md",
+              "native_token": null,
+              "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "captured_at": 100.0,
+              "restore_tier": "restorable-unpinned"
+            },
+            {
+              "member_path": "docs/spec.md",
+              "native_token": null,
+              "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "captured_at": 100.0,
+              "restore_tier": "restorable-unpinned"
+            }
+          ],
+          "receiver_session_id": "22222222-2222-4222-8222-222222222222"
+        },
+        "capture": {
+          "checkpoint": "checkpoint_id"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "22222222-2222-4222-8222-222222222222",
+          "mint_nonce": "corpus-mint-nonce-a"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/workspace/restore/register",
+    "body": {
+      "session_id": "22222222-2222-4222-8222-222222222222",
+      "checkpoint_id": "${checkpoint}",
+      "writes": [
+        {
+          "member_path": "docs/plan.md",
+          "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": "missing Coherence-Caller-Principal header: this route requires the caller principal that POST /principal/claim bound to the session_id it names (caller_principal_absent)",
+      "reason": "caller_principal_absent"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

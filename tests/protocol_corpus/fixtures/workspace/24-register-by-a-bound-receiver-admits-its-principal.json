@@ -1,0 +1,111 @@
+{
+  "name": "workspace-restore-register-by-a-bound-receiver-admits-its-principal",
+  "description": "Twin of 23: the bound receiver B presents its principal and the registration commits exactly as 12's unbound receiver does (version 3, peer C invalidated, the call made the claim).",
+  "setup": {
+    "tracked": [
+      "docs/**"
+    ],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n",
+      "docs/spec.md": "# coherence corpus fixture  \n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "33333333-3333-4333-8333-333333333333",
+          "path": "docs/plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit-cas",
+        "body": {
+          "session_id": "33333333-3333-4333-8333-333333333333",
+          "path": "docs/plan.md",
+          "content_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "expected_version": 1
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/workspace/checkpoint",
+        "body": {
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "name": "before-refactor",
+          "window_min": 100.0,
+          "window_max": 101.0,
+          "members": [
+            {
+              "member_path": "docs/plan.md",
+              "native_token": null,
+              "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "captured_at": 100.0,
+              "restore_tier": "restorable-unpinned"
+            },
+            {
+              "member_path": "docs/spec.md",
+              "native_token": null,
+              "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "captured_at": 100.0,
+              "restore_tier": "restorable-unpinned"
+            }
+          ],
+          "receiver_session_id": "22222222-2222-4222-8222-222222222222"
+        },
+        "capture": {
+          "checkpoint": "checkpoint_id"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "22222222-2222-4222-8222-222222222222",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal": "principal"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/workspace/restore/register",
+    "body": {
+      "session_id": "22222222-2222-4222-8222-222222222222",
+      "checkpoint_id": "${checkpoint}",
+      "writes": [
+        {
+          "member_path": "docs/plan.md",
+          "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "checkpoint_id": "<UUID>",
+      "status": "committed",
+      "detail": "registered 1 written file member(s) via one all-or-nothing commit_all (hash-only; peers invalidated atomically, signals returned for broadcast-after-commit)",
+      "versions": {
+        "docs/plan.md": 3
+      },
+      "skipped": [],
+      "refused": {},
+      "invalidated": 1,
+      "retry_of_own_registration": false,
+      "coordinator_epoch": "<MINTED>"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

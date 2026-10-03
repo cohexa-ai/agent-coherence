@@ -55,7 +55,7 @@ pytestmark = pytest.mark.protocol_corpus
 
 # Frozen counts, per directory: a misspelled or emptied directory loads as
 # nothing and a parametrize over nothing reports green.
-_EXPECTED_COUNTS = {"session": 13, "workspace": 20, "admin": 3}
+_EXPECTED_COUNTS = {"session": 13, "workspace": 24, "admin": 3}
 
 # Frozen duplicates of the code under test (tests/CLAUDE.md house rule): the
 # derived controller ids of the fixtures' session ids, uuid5(NAMESPACE_URL,
@@ -129,18 +129,38 @@ def test_fixture_directories_are_actually_loaded() -> None:
         )
 
 
+def _python_asserted_routes(paths) -> set[tuple[str, str]]:
+    asserted: set[tuple[str, str]] = set()
+    for path in paths:
+        raw = json.loads(Path(path).read_text())
+        if BACKEND_PYTHON not in (raw.get("backends") or [BACKEND_PYTHON, BACKEND_NODE]):
+            continue
+        request = raw["request"]
+        asserted.add((request.get("method", "POST").upper(), request["path"].split("?")[0]))
+    return asserted
+
+
+def test_route_coverage_ignores_a_node_only_row() -> None:
+    """The admin route's Node 404 row alone must not count as asserting it."""
+    node_only = [p for p in (FIXTURES_ROOT / "admin").glob("*.json")
+                 if json.loads(p.read_text()).get("backends") == [BACKEND_NODE]]
+    assert node_only, "admin/ lost its Node 404 row; this control checks nothing"
+    assert ("POST", "/admin/prepare-for-migration") not in _python_asserted_routes(node_only)
+    assert ("POST", "/admin/prepare-for-migration") in _python_asserted_routes(
+        (FIXTURES_ROOT / "admin").glob("*.json")
+    )
+
+
 def test_every_registered_route_is_the_request_under_test_somewhere() -> None:
     """#193's finding was a list of routes the corpus never asserted. This
     keeps it from regrowing: every ``(method, path)`` the Python dispatcher
     registers must be the MAIN request of at least one fixture in some
-    directory — a preflight does not count, its body is never asserted."""
+    directory — a preflight does not count, its body is never asserted. Only a
+    row that RUNS on Python counts: a Node-only "the sibling answers 404" row
+    asserts nothing about the Python response."""
     from ccs.adapters.claude_code.coordinator_server import _ROUTES
 
-    asserted: set[tuple[str, str]] = set()
-    for path in FIXTURES_ROOT.glob("*/*.json"):
-        request = json.loads(path.read_text())["request"]
-        asserted.add((request.get("method", "POST").upper(), request["path"].split("?")[0]))
-    missing = sorted(set(_ROUTES) - asserted)
+    missing = sorted(set(_ROUTES) - _python_asserted_routes(FIXTURES_ROOT.glob("*/*.json")))
     assert not missing, (
         f"routes no fixture makes the request under test: {missing}. Add a "
         f"row asserting each one's response body."
@@ -205,6 +225,16 @@ def test_minted_fields_are_scrubbed_by_name_and_stay_asserted_present() -> None:
     assert normalize_response(heartbeat) != normalize_response(
         {**heartbeat, "coordinator_epoch": "ec5390065a2a4af8887cb2badfa790c5"}
     )
+
+    # Only a minted VALUE scrubs: a null, empty or non-string token/epoch is
+    # compared literally, so a begin that minted nothing fails the diff.
+    for broken in (None, "", 0, {"x": 1}):
+        assert normalize_response(begin) != normalize_response(
+            {**begin, "session_token": broken}
+        ), f"session_token={broken!r} matched a minted token"
+        assert normalize_response(begin) != normalize_response(
+            {**begin, "coordinator_epoch": broken}
+        ), f"coordinator_epoch={broken!r} matched a minted epoch"
 
     # A preserve_identity declaration cannot un-scrub a minted value.
     assert normalize_response(

@@ -218,12 +218,19 @@ Alpha — APIs may change before `v1.0`.
   refused`, `/session/heartbeat` carries no `coordinator_epoch`, and the #191
   registration refusals (`not_a_checkpoint_member`, `fingerprint_mismatch`,
   `not_the_receiver`, `already_registered`) and the same controller's
-  idempotent retry. The session, workspace and admin rows run on the Python
+  idempotent retry. Rows for a session that has claimed a caller principal
+  pin `/workspace/checkpoint` and `/workspace/restore/register`: without the
+  `Coherence-Caller-Principal` header the request is refused 400
+  `caller_principal_absent`; with it the request succeeds as for an unbound
+  session. The session, workspace and admin rows run on the Python
   coordinator only, which is the only one that serves those routes; the
   post-edit-cas and untrack rows run on both. A new check fails when a route is
-  registered that no fixture asserts. The harness now scrubs `session_token` and
-  `coordinator_epoch` by name to `<MINTED>`, so fixtures no longer opt out of
-  them one by one, and a `preserve_identity` declaration is checked at every
+  registered that no fixture running on Python asserts (a Node-only 404 row
+  does not count). The harness now scrubs `session_token` and
+  `coordinator_epoch` by name to `<MINTED>` when the value is a non-empty
+  string (a null, empty or non-string value is compared literally, so a
+  response that minted nothing fails), so fixtures no longer opt out of them
+  one by one, and a `preserve_identity` declaration is checked at every
   occurrence of a repeated key rather than only the last.
 
 ### Changed

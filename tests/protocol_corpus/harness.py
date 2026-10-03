@@ -350,8 +350,11 @@ def normalize_response(
         # subtree (and smuggle a timestamp through with it).
         # A minted value is never comparable either (it differs on every run),
         # so it too outranks the opt-in; ``_validate_preserve_identity`` refuses
-        # a declaration over one at load.
-        if key in _MINTED_KEYS:
+        # a declaration over one at load. Only a non-empty STRING scrubs: a
+        # null / "" / non-string under a minted key was not minted, so it falls
+        # through and is compared literally (an expected ``<MINTED>`` then
+        # fails against it).
+        if key in _MINTED_KEYS and isinstance(v, str) and v:
             return MINTED_SENTINEL
         if key in preserve_identity and isinstance(v, str):
             return v
