@@ -1428,22 +1428,22 @@ class ArtifactRegistry:
 
     def claim_checkpoint_registration(
         self, checkpoint_id: str, controller: UUID
-    ) -> UUID:
+    ) -> tuple[UUID, bool]:
         """First-claim-wins registration claim (#191) — read + set in one lock
-        hold, so two concurrent claimants cannot both win. Returns the
-        ``registered_by`` holding after the call; raises ``KeyError`` for an
-        unknown checkpoint. Parity with
+        hold, so two concurrent claimants cannot both win. Returns ``(holder,
+        newly_claimed)`` decided inside that lock hold; raises ``KeyError``
+        for an unknown checkpoint. Parity with
         :meth:`SqliteArtifactRegistry.claim_checkpoint_registration`."""
         with self._lock:
             record = self._checkpoints.get(checkpoint_id)
             if record is None:
                 raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
             if record.registered_by is not None:
-                return record.registered_by
+                return record.registered_by, False
             self._checkpoints[checkpoint_id] = replace(
                 record, registered_by=controller
             )
-            return controller
+            return controller, True
 
     def list_checkpoints(self) -> list[CheckpointRecord]:
         """Return every checkpoint header, ordered by ``(created_at,

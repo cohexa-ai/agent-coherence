@@ -2978,7 +2978,10 @@ def test_delete_only_restore_records_only_never_calls_commit_all() -> None:
     assert reg.status == WORKSPACE_REGISTRATION_EMPTY
     assert reg.deleted_recorded == ("s3://ghost.json",)
     assert service.commit_all_calls == 0
-    assert service.register_calls == 0  # the empty write-set never leaves the seam
+    # The empty write-set still reaches the service once (#191: it claims the
+    # checkpoint), which answers empty without calling commit_all.
+    assert service.register_calls == 1
+    assert registry.get_checkpoint(checkpoint_id).registered_by == OWNER
     (stored,) = registry.get_checkpoint_members(checkpoint_id)
     assert stored.deleted_at_restore is not None
     record = registry.get_checkpoint(checkpoint_id)
@@ -3008,7 +3011,7 @@ def test_all_converged_empty_restore_concludes_with_empty_registration() -> None
     assert reg.status == WORKSPACE_REGISTRATION_EMPTY
     assert reg.registered == {} and reg.deleted_recorded == ()
     assert service.commit_all_calls == 0
-    assert service.register_calls == 0
+    assert service.register_calls == 1  # the claim (#191); commit_all never ran
     record = registry.get_checkpoint(checkpoint_id)
     assert record is not None and record.restore_status == RESTORE_STATUS_CONCLUDED
 
@@ -3454,6 +3457,31 @@ def test_restore_of_a_checkpoint_another_owner_registered_is_refused() -> None:
     assert again.registration.status is WORKSPACE_REGISTRATION_PRIOR_RUN
 
 
+def test_restore_with_nothing_to_register_still_claims_the_checkpoint() -> None:
+    """#191: a restore whose write-set is empty (every member converged)
+    claims the checkpoint all the same — another owner's restore is refused
+    ``already_registered`` instead of getting the first run's concluded
+    report, whether or not the first run had bytes to write."""
+    registry, service = _probe_service()
+    files = _FakeFileStore()
+    files.put("notes/plan.md", b"plan text", 7)
+    resolver = _FakeResolver()
+    resolver.keep("notes/plan.md", 7, b"plan text")
+    taker = _versioner(service, resolver=resolver)
+    taker.add_file_member(files, "notes/plan.md")
+    checkpoint_id = taker.checkpoint("calm").record.checkpoint_id
+
+    first = _restorer_for(service, files, resolver).restore(checkpoint_id)
+    assert first.registration.status == WORKSPACE_REGISTRATION_EMPTY
+    assert registry.get_checkpoint(checkpoint_id).registered_by == OWNER
+
+    with pytest.raises(CheckpointRegistrationRefused) as excinfo:
+        _restorer_owned_by(service, files, resolver, uuid.uuid4()).restore(
+            checkpoint_id
+        )
+    assert excinfo.value.reason is CHECKPOINT_ALREADY_REGISTERED_REASON
+
+
 def test_registration_claimed_mid_restore_concludes_refused() -> None:
     """#191 race: a concurrent controller claims the checkpoint between this
     restore's pre-flight and its registration. The service's atomic claim
@@ -3806,6 +3834,68 @@ def test_route_checkpoint_receiver_binds_the_registration(client) -> None:
     assert status == 200 and body["ok"] is True
     status, listing = client("GET", "/workspace/checkpoints")
     assert listing["checkpoints"][0]["registered_by"] == cp["receiver"]
+
+
+def test_route_restore_progress_is_gated_like_the_registration(client) -> None:
+    """#191 over HTTP: a session the receiver binding excludes cannot write
+    the restore's progress — conclude the checkpoint, or record a member
+    restored/deleted (delete legs register over ``/restore/member``) — which
+    would otherwise turn the receiver's restore into a no-op. Once a session
+    registered, a rival is refused ``already_registered`` there too."""
+    receiver_sid, rival_sid = str(uuid.uuid4()), str(uuid.uuid4())
+    checkpoint_id = _route_checkpoint(client, receiver_session_id=receiver_sid)
+    member = {
+        "checkpoint_id": checkpoint_id,
+        "member_path": "notes/plan.md",
+        "restore_outcome": "restored",
+        "deleted_at_restore": 5.0,
+    }
+    conclude = {"checkpoint_id": checkpoint_id, "status": "concluded"}
+
+    for route, payload in (
+        ("/workspace/restore/member", member),
+        ("/workspace/restore/status", conclude),
+    ):
+        status, body = client("POST", route, {"session_id": rival_sid, **payload})
+        assert status == 200 and body["ok"] is False, (route, body)
+        assert body["reason"] == "not_the_receiver"
+        assert body["member_paths"] == []
+
+    status, listing = client("GET", "/workspace/checkpoints")
+    (cp,) = listing["checkpoints"]
+    assert cp["restore_status"] == "none"
+    assert cp["registered_by"] is None
+    (row,) = cp["members"]
+    assert row["restore_outcome"] is None
+
+    # The receiver drives it, then a rival of the registrant is refused.
+    write = {"member_path": "notes/plan.md", "fingerprint": sha256_hex(b"plan text")}
+    status, body = client(
+        "POST",
+        "/workspace/restore/register",
+        {"session_id": receiver_sid, "checkpoint_id": checkpoint_id,
+         "writes": [write]},
+    )
+    assert status == 200 and body["ok"] is True, body
+    status, body = client(
+        "POST", "/workspace/restore/status", {"session_id": receiver_sid, **conclude}
+    )
+    assert status == 200 and body["ok"] is True, body
+
+    unbound = _route_checkpoint(client)
+    status, body = client(
+        "POST",
+        "/workspace/restore/register",
+        {"session_id": receiver_sid, "checkpoint_id": unbound, "writes": [write]},
+    )
+    assert status == 200 and body["ok"] is True, body
+    status, body = client(
+        "POST",
+        "/workspace/restore/member",
+        {"session_id": rival_sid, **member, "checkpoint_id": unbound},
+    )
+    assert status == 200 and body["ok"] is False
+    assert body["reason"] == "already_registered"
 
 
 def test_route_checkpoint_receiver_session_id_is_shape_checked(client) -> None:

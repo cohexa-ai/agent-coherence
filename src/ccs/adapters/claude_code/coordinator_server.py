@@ -5110,6 +5110,12 @@ timed-out registration must read as FAILURE (the ``_OCC_DEGRADED_RESPONSE``
 posture — it is a version-bumping commit path), never as success."""
 
 
+def _restore_controller_refused_response(exc: CheckpointRegistrationRefused) -> dict:
+    """The typed #191 refusal envelope shared by the restore routes:
+    ``{ok: false, reason, detail, member_paths}``."""
+    return {**_typed_reason_response(exc), "member_paths": list(exc.member_paths)}
+
+
 def _validate_checkpoint_id(checkpoint_id: Any) -> str | None:
     """Boundary shape check for a wire checkpoint id (reason, or None if ok)."""
     if not isinstance(checkpoint_id, str) or not checkpoint_id.strip():
@@ -5135,6 +5141,12 @@ def _handle_workspace_restore_status(
     durable metadata with no version bump — it lands durably or fails typed.
     An unknown checkpoint answers ``{ok: false, reason: "checkpoint_unknown",
     detail}`` — the register route's stable token, matched by identity.
+
+    Who may write it (#191): the controller derived from ``session_id``, as
+    on the register route. A checkpoint naming another receiver answers
+    ``{ok: false, reason: "not_the_receiver", detail, member_paths: []}``;
+    one another controller registered answers ``already_registered``. No
+    claim is made here.
     """
     body = req._read_json()
     if body is None:
@@ -5155,16 +5167,24 @@ def _handle_workspace_restore_status(
         return
     if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
         return
+    # #191: the same controller the register route derives, gated the same way.
+    controller = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
     def work() -> dict:
         try:
             coordinator.service.set_workspace_checkpoint_restore_status(
-                checkpoint_id, status, updated_at=float(now), abort=abort
+                checkpoint_id,
+                status,
+                updated_at=float(now),
+                abort=abort,
+                controller=controller,
             )
         except KeyError as exc:
             # Unknown checkpoint — the register route's stable token, not prose.
             return _unknown_checkpoint_response(exc)
+        except CheckpointRegistrationRefused as exc:
+            return _restore_controller_refused_response(exc)
         except ValueError as exc:
             return {"ok": False, "reason": str(exc)}
         return {
@@ -5198,6 +5218,9 @@ def _handle_workspace_restore_member(
     never through ``commit_all`` (which has no delete semantics). An unknown
     (checkpoint, member) pair answers ``{ok: false, reason:
     "checkpoint_unknown", detail}`` — the stable token, prose in ``detail``.
+    Gated like ``/workspace/restore/status`` (#191): ``not_the_receiver`` /
+    ``already_registered`` for a controller the checkpoint excludes, so the
+    delete half of a registration has the same gate as the commit half.
     """
     body = req._read_json()
     if body is None:
@@ -5238,6 +5261,8 @@ def _handle_workspace_restore_member(
         return
     if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
         return
+    # #191: the same controller the register route derives, gated the same way.
+    controller = _session_owner_from_request(coordinator, session_id)
 
     def work() -> dict:
         try:
@@ -5249,11 +5274,14 @@ def _handle_workspace_restore_member(
                     float(deleted_at_restore) if deleted_at_restore is not None else None
                 ),
                 abort=abort,
+                controller=controller,
             )
         except KeyError as exc:
             # Unknown (checkpoint, member) pair — same stable token as the
             # register route's unknown-checkpoint class; "detail" says which.
             return _unknown_checkpoint_response(exc)
+        except CheckpointRegistrationRefused as exc:
+            return _restore_controller_refused_response(exc)
         except ValueError as exc:
             return {"ok": False, "reason": str(exc)}
         return {
@@ -5381,10 +5409,7 @@ def _handle_workspace_restore_register(
         except CheckpointUnknown as exc:
             return {"ok": False, "reason": exc.reason}
         except CheckpointRegistrationRefused as exc:
-            return {
-                **_typed_reason_response(exc),
-                "member_paths": list(exc.member_paths),
-            }
+            return _restore_controller_refused_response(exc)
         except ValueError as exc:
             return {"ok": False, "reason": str(exc)}
         except OccCallerTransientError:

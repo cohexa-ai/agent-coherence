@@ -2680,6 +2680,7 @@ class CoordinatorService:
         *,
         updated_at: float,
         abort: threading.Event | None = None,
+        controller: UUID | None = None,
     ) -> None:
         """Update the checkpoint-level restore status (durable, crash-visible).
 
@@ -2690,6 +2691,15 @@ class CoordinatorService:
         ``abort`` threads into :meth:`registry.abort_guard` (the A6 lesson:
         every mutating path threads it). Raises ``KeyError`` for an unknown
         checkpoint.
+
+        ``controller`` (#191) is the caller restoring the checkpoint. When
+        given, the write is refused exactly as a registration by that
+        controller would be — :class:`CheckpointRegistrationRefused` with
+        ``not_the_receiver`` or ``already_registered`` — so the controller a
+        receiver binding or a registration claim excludes cannot drive the
+        restore's progress either (conclude it, say). It makes no claim. The
+        HTTP route always passes it; ``None`` is the trusted in-process
+        caller, whose versioner runs the same check in its pre-flight.
         """
         if status not in RESTORE_STATUSES:
             raise ValueError(
@@ -2697,6 +2707,8 @@ class CoordinatorService:
                 f"{sorted(RESTORE_STATUSES)} (fail-closed — an unknown status "
                 "would orphan crash-resume, which matches by identity)"
             )
+        if controller is not None:
+            self._require_restore_controller(checkpoint_id, controller)
         with self.registry.abort_guard(abort):
             self.registry.set_checkpoint_restore_status(
                 checkpoint_id, status, updated_at=updated_at
@@ -2710,6 +2722,7 @@ class CoordinatorService:
         restore_outcome: str | None,
         deleted_at_restore: float | None = None,
         abort: threading.Event | None = None,
+        controller: UUID | None = None,
     ) -> None:
         """Record one member's durable restore progress (both columns written).
 
@@ -2721,6 +2734,13 @@ class CoordinatorService:
         non-terminal member look terminal. ``abort`` threads into
         :meth:`registry.abort_guard`. Raises ``KeyError`` for an unknown
         (checkpoint, member) pair.
+
+        ``controller`` (#191): as on
+        :meth:`set_workspace_checkpoint_restore_status` — when given, a
+        controller excluded by the receiver binding or by another
+        controller's registration claim is refused before the write. Delete
+        legs register here, so this is the delete half of the registration
+        gate.
         """
         if restore_outcome is not None and restore_outcome not in RESTORE_MEMBER_OUTCOMES:
             raise ValueError(
@@ -2728,6 +2748,8 @@ class CoordinatorService:
                 f"vocabulary is {sorted(RESTORE_MEMBER_OUTCOMES)} (fail-closed "
                 "— crash-resume classifies terminality by identity against it)"
             )
+        if controller is not None:
+            self._require_restore_controller(checkpoint_id, controller)
         with self.registry.abort_guard(abort):
             self.registry.set_checkpoint_member_restore(
                 checkpoint_id,
@@ -3047,14 +3069,7 @@ class CoordinatorService:
         fails closed at the registry lock instead of claiming late.
         """
         checkpoint_id = record.checkpoint_id
-        if record.receiver is not None and record.receiver != controller:
-            raise CheckpointRegistrationRefused(
-                checkpoint_id, CHECKPOINT_NOT_THE_RECEIVER_REASON
-            )
-        if record.registered_by is not None and record.registered_by != controller:
-            raise CheckpointRegistrationRefused(
-                checkpoint_id, CHECKPOINT_ALREADY_REGISTERED_REASON
-            )
+        _refuse_excluded_controller(record, controller)
         members = {
             row.member_path: row
             for row in self.registry.get_checkpoint_members(checkpoint_id)
@@ -3082,7 +3097,7 @@ class CoordinatorService:
                 member_paths=mismatched,
             )
         with self.registry.abort_guard(abort):
-            holder = self.registry.claim_checkpoint_registration(
+            holder, newly_claimed = self.registry.claim_checkpoint_registration(
                 checkpoint_id, controller
             )
         if holder != controller:
@@ -3090,7 +3105,22 @@ class CoordinatorService:
             raise CheckpointRegistrationRefused(
                 checkpoint_id, CHECKPOINT_ALREADY_REGISTERED_REASON
             )
-        return record.registered_by == controller
+        # From the atomic claim, not the header read above: a concurrent
+        # retry by this same controller may have claimed in between.
+        return not newly_claimed
+
+    def _require_restore_controller(
+        self, checkpoint_id: str, controller: UUID
+    ) -> None:
+        """The #191 controller gate for the restore progress writes: the two
+        controller refusals of :meth:`register_workspace_restore`, read from
+        the header, with no claim made. ``KeyError`` for an unknown
+        checkpoint (the progress writes' existing unknown-checkpoint
+        signal)."""
+        record = self.registry.get_checkpoint(checkpoint_id)
+        if record is None:
+            raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
+        _refuse_excluded_controller(record, controller)
 
     def _resolve_workspace_member_artifact(
         self, member_path: str, fingerprint: str
@@ -3462,6 +3492,21 @@ class CoordinatorService:
         if artifact is None:
             raise CoherenceError(f"artifact_not_found artifact={artifact_id}")
         return artifact
+
+
+def _refuse_excluded_controller(record: CheckpointRecord, controller: UUID) -> None:
+    """Raise the #191 controller refusal ``controller`` gets for ``record``:
+    ``not_the_receiver`` when the checkpoint names another receiver,
+    ``already_registered`` when another controller claimed it. The owner is
+    never compared (it is provenance)."""
+    if record.receiver is not None and record.receiver != controller:
+        raise CheckpointRegistrationRefused(
+            record.checkpoint_id, CHECKPOINT_NOT_THE_RECEIVER_REASON
+        )
+    if record.registered_by is not None and record.registered_by != controller:
+        raise CheckpointRegistrationRefused(
+            record.checkpoint_id, CHECKPOINT_ALREADY_REGISTERED_REASON
+        )
 
 
 def _invalidation_transient_for_state(state: MESIState) -> TransientState | None:

@@ -709,7 +709,10 @@ def test_concurrent_claim_loser_refused_before_resolution(
     checkpoint_id = _mint_checkpoint(service)
     stale_header = registry.get_checkpoint(checkpoint_id)
     winner = uuid4()
-    assert registry.claim_checkpoint_registration(checkpoint_id, winner) == winner
+    assert registry.claim_checkpoint_registration(checkpoint_id, winner) == (
+        winner,
+        True,
+    )
     # The loser read the header before the winner's claim landed.
     monkeypatch.setattr(registry, "get_checkpoint", lambda _cid: stale_header)
     ids_before = set(registry.artifact_ids())
@@ -737,6 +740,108 @@ def test_abort_event_fails_the_claim_closed(service, registry) -> None:
     assert registry.get_checkpoint(checkpoint_id).registered_by is None
 
 
+@pytest.mark.parametrize(
+    "write",
+    [("secrets/other.md", FP_NEW), ("notes/plan.md", FP_OLD)],
+    ids=["non_member", "fingerprint_mismatch"],
+)
+def test_already_registered_precedes_membership(service, registry, write) -> None:
+    """Step 2 before step 3: once another controller holds the claim, an
+    intruder learns only ``already_registered`` — its write-set (a stranger
+    path, or a member at a foreign fingerprint) is not evaluated for it."""
+    checkpoint_id = _mint_checkpoint(service)
+    _register(service, checkpoint_id, OWNER, ("notes/plan.md", FP_NEW))
+
+    exc = _refusal(service, checkpoint_id, uuid4(), write)
+
+    assert exc.reason is CHECKPOINT_ALREADY_REGISTERED_REASON
+    assert exc.member_paths == ()
+
+
+def test_concurrent_own_retry_reports_retry_from_the_claim(
+    service, registry, monkeypatch
+) -> None:
+    """Two concurrent registers by ONE controller: both read the header
+    unclaimed, the other call claims first. The second is a retry of its own
+    registration and must say so — the flag comes from the atomic claim, not
+    from the header it read before claiming."""
+    checkpoint_id = _mint_checkpoint(service)
+    real_get = registry.get_checkpoint
+
+    def _read_then_overlap(cid):
+        record = real_get(cid)
+        registry.claim_checkpoint_registration(cid, OWNER)
+        return record
+
+    monkeypatch.setattr(registry, "get_checkpoint", _read_then_overlap)
+    result = _register(service, checkpoint_id, OWNER, ("notes/plan.md", FP_NEW))
+
+    assert result.retry_of_own_registration is True
+
+
+# ---------------------------------------------------------------------------
+# #191 — the restore progress writes are gated like the registration
+# ---------------------------------------------------------------------------
+
+
+def _progress_writes(service, checkpoint_id: str, controller):
+    """The two progress writes a restore makes, each by ``controller``."""
+    return (
+        lambda: service.set_workspace_checkpoint_restore_status(
+            checkpoint_id, "concluded", updated_at=5.0, controller=controller
+        ),
+        lambda: service.set_workspace_checkpoint_member_restore(
+            checkpoint_id,
+            "notes/plan.md",
+            restore_outcome="restored",
+            deleted_at_restore=5.0,
+            controller=controller,
+        ),
+    )
+
+
+def test_non_receiver_cannot_drive_restore_progress(service, registry) -> None:
+    """A controller the receiver binding excludes cannot conclude the
+    checkpoint or record member outcomes (deletes register here) — which
+    would turn the receiver's own restore into a no-op."""
+    receiver = uuid4()
+    checkpoint_id = _mint_checkpoint(service, receiver=receiver)
+    for write in _progress_writes(service, checkpoint_id, uuid4()):
+        with pytest.raises(CheckpointRegistrationRefused) as excinfo:
+            write()
+        assert excinfo.value.reason is CHECKPOINT_NOT_THE_RECEIVER_REASON
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record.restore_status == "none"
+    assert record.registered_by is None
+    (member,) = registry.get_checkpoint_members(checkpoint_id)
+    assert member.restore_outcome is None and member.deleted_at_restore is None
+
+    for write in _progress_writes(service, checkpoint_id, receiver):
+        write()
+    assert registry.get_checkpoint(checkpoint_id).restore_status == "concluded"
+    # A progress write makes no claim.
+    assert registry.get_checkpoint(checkpoint_id).registered_by is None
+
+
+def test_rival_of_the_registrant_cannot_drive_restore_progress(
+    service, registry
+) -> None:
+    checkpoint_id = _mint_checkpoint(service)
+    _register(service, checkpoint_id, OWNER)
+    for write in _progress_writes(service, checkpoint_id, uuid4()):
+        with pytest.raises(CheckpointRegistrationRefused) as excinfo:
+            write()
+        assert excinfo.value.reason is CHECKPOINT_ALREADY_REGISTERED_REASON
+    for write in _progress_writes(service, checkpoint_id, OWNER):
+        write()
+
+
+def test_progress_controller_gate_unknown_checkpoint_is_keyerror(service) -> None:
+    for write in _progress_writes(service, "no-such-checkpoint", OWNER):
+        with pytest.raises(KeyError):
+            write()
+
+
 # ---------------------------------------------------------------------------
 # #191 — the registry claim primitive (parity across both backends)
 # ---------------------------------------------------------------------------
@@ -745,9 +850,18 @@ def test_abort_event_fails_the_claim_closed(service, registry) -> None:
 def test_registry_claim_first_wins_and_never_rebinds(service, registry) -> None:
     checkpoint_id = _mint_checkpoint(service)
     first, second = uuid4(), uuid4()
-    assert registry.claim_checkpoint_registration(checkpoint_id, first) == first
-    assert registry.claim_checkpoint_registration(checkpoint_id, second) == first
-    assert registry.claim_checkpoint_registration(checkpoint_id, first) == first
+    assert registry.claim_checkpoint_registration(checkpoint_id, first) == (
+        first,
+        True,
+    )
+    assert registry.claim_checkpoint_registration(checkpoint_id, second) == (
+        first,
+        False,
+    )
+    assert registry.claim_checkpoint_registration(checkpoint_id, first) == (
+        first,
+        False,
+    )
     assert registry.get_checkpoint(checkpoint_id).registered_by == first
     (listed,) = registry.list_checkpoints()
     assert listed.registered_by == first

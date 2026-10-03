@@ -384,16 +384,17 @@ class RegistryBase(Protocol):
 
     def claim_checkpoint_registration(
         self, checkpoint_id: str, controller: UUID
-    ) -> UUID:
+    ) -> tuple[UUID, bool]:
         """Claim the restore registration of ``checkpoint_id`` for
         ``controller``, first claim wins (#191).
 
         One atomic compare-and-set: when the header's ``registered_by`` is
         unset it becomes ``controller``; when it is set it is left alone.
-        Returns the ``registered_by`` that holds AFTER the call, so the caller
-        tells "I hold the claim" (the return equals ``controller``) from
-        "another controller does" without a second read that could race.
-        Raises ``KeyError`` for an unknown checkpoint."""
+        Returns ``(holder, newly_claimed)``: the ``registered_by`` that holds
+        AFTER the call, and whether THIS call set it. Both come from inside
+        the atomic step, so the caller tells "I just claimed it", "I already
+        held it" and "another controller does" without a second read that
+        could race. Raises ``KeyError`` for an unknown checkpoint."""
         ...
 
     @property

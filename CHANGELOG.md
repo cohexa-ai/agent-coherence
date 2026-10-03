@@ -231,7 +231,16 @@ Alpha — APIs may change before `v1.0`.
   error that said the restore path owner-validates against it now says so).
   `WorkspaceVersioner.restore` refuses a checkpoint bound to another receiver
   or registered by another owner with `CheckpointRegistrationRefused` before it
-  writes anything, and the CLI exits `2` on it. `GET /workspace/checkpoints`
+  writes anything, and the CLI exits `2` on it; a restore with nothing to
+  register still makes one `register_workspace_restore` call with an empty
+  write-set, so it claims the checkpoint too. `POST /workspace/restore/status`
+  and `POST /workspace/restore/member` (and the matching service methods, given
+  a `controller`) refuse an excluded session with the same `not_the_receiver` /
+  `already_registered` reasons, so no other session can conclude a checkpoint
+  or record its members ahead of its receiver. The registry's
+  `claim_checkpoint_registration` returns `(holder, newly_claimed)`, and
+  `retry_of_own_registration` is derived from it, so a concurrent retry by the
+  same controller is reported as a retry. `GET /workspace/checkpoints`
   shows `receiver` and `registered_by`. A client that registered a write-set
   outside the manifest, or a fingerprint other than the captured one, now gets
   `ok: false`. See the guide's

@@ -1869,8 +1869,9 @@ class WorkspaceVersioner:
           design — no coordinator artifact identity is ever forced);
         - delete legs → ``deleted_recorded`` (their durable
           ``deleted_at_restore`` record IS the registration);
-        - empty commit write-set → typed EMPTY, the service is never called
-          and ``commit_all`` therefore never runs.
+        - empty commit write-set → still ONE ``register_workspace_restore``
+          call (#191: registering nothing claims the checkpoint all the
+          same), answered typed EMPTY; ``commit_all`` never runs.
 
         Bounded re-drive (the leg-budget twin): a HELD batch whose reasons are
         all retry-eligible (``version_mismatch`` — a live registered writer
@@ -1915,17 +1916,11 @@ class WorkspaceVersioner:
                 substrate_registered=tuple(substrate_registered),
                 deleted_recorded=tuple(deleted_recorded),
             )
-        if not writes:
-            return RestoreRegistration(
-                status=WORKSPACE_REGISTRATION_EMPTY,
-                detail=(
-                    "no written file members: the commit write-set is empty — "
-                    "commit_all was never called (deletes are manifest-side "
-                    "records; S3 members are substrate-registered by design)"
-                ),
-                substrate_registered=tuple(substrate_registered),
-                deleted_recorded=tuple(deleted_recorded),
-            )
+        # An empty write-set still goes to the service (#191): registering
+        # nothing claims the checkpoint all the same, so another owner's
+        # restore of it is refused already_registered whether or not this run
+        # had bytes to write. The service answers empty_write_set without
+        # calling commit_all.
         return self._drive_registration(
             store,
             checkpoint_id,

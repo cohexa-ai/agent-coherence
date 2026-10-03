@@ -2958,11 +2958,12 @@ class SqliteArtifactRegistry:
 
     def claim_checkpoint_registration(
         self, checkpoint_id: str, controller: UUID
-    ) -> UUID:
+    ) -> tuple[UUID, bool]:
         """First-claim-wins registration claim (#191): read + conditional set
         in ONE ``BEGIN IMMEDIATE``, so two concurrent claimants (in this
-        process or another) cannot both win. Returns the ``registered_by``
-        holding after the call; raises ``KeyError`` for an unknown checkpoint.
+        process or another) cannot both win. Returns ``(holder, newly_claimed)``
+        decided inside that transaction; raises ``KeyError`` for an unknown
+        checkpoint.
         Parity with :meth:`ArtifactRegistry.claim_checkpoint_registration`."""
         self._guard_writable()
         with self._lock:
@@ -2977,14 +2978,14 @@ class SqliteArtifactRegistry:
                     raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
                 if row[0] is not None:
                     self._conn.execute("COMMIT")
-                    return UUID(hex=row[0])
+                    return UUID(hex=row[0]), False
                 self._conn.execute(
                     "UPDATE workspace_checkpoints SET registered_by = ? "
                     "WHERE checkpoint_id = ? AND registered_by IS NULL",
                     (controller.hex, checkpoint_id),
                 )
                 self._conn.execute("COMMIT")
-                return controller
+                return controller, True
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
