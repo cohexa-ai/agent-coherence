@@ -612,11 +612,24 @@ detached. When the sets cannot be read at all, because the coordinator is older
 and publishes only counts, or is the Node coordinator, the volume fails closed
 the same way and says that enforcement could not be confirmed.
 `vol.managed_glob_enforcement()` returns the same three-way answer. The
-comparison is literal and taken once, at attach: a coordinator that ignores the
-paths under a broader pattern, or a path untracked after attach with the untrack
-command, is not detected, and such paths answer every operation as untracked. A
-fleet with mixed globs is still unsupported; it now refuses instead of running
-unguarded.
+comparison is literal and taken once, at attach, and the coordinator keeps the
+answer true while it runs. A strict path stays enforced for the coordinator's
+lifetime:
+
+- the untrack command (`POST /policy/untrack`) refuses an entry, a path or a
+  glob, that covers a path the coordinator holds in strict mode. It answers
+  HTTP 409 with `reason: "untrack_strict_path"`, names the strict pattern for
+  each refused entry under `refused`, and writes nothing; the CLI exits 3;
+- an ignored pattern never takes a strict path off the tracked set, whether it
+  was in `.coherence/ignored.yaml` at spawn or added later, and however broadly
+  it is spelled (`**`): strict wins over ignore, and the coordinator logs the
+  overridden ignore entry at load. For every non-strict path ignore still wins;
+- the reload behind the track and untrack commands never drops a strict or
+  tracked pattern, even one removed from the YAML on disk by hand.
+
+To stop enforcing a strict path, remove its entry from
+`.coherence/strict_mode.yaml` and restart the coordinator. A fleet with mixed
+globs is still unsupported; it refuses instead of running unguarded.
 
 ```python
 from ccs.adapters.coherent_volume import CoherentVolume

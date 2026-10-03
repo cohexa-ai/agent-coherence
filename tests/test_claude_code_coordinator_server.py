@@ -679,6 +679,115 @@ def test_policy_untrack_persists_to_ignored_yaml(coordinator, client: _Client) -
     assert not coordinator.policy.is_tracked("docs/brainstorms/draft.md")
 
 
+@pytest.fixture
+def strict_coordinator(tmp_path: Path):
+    """A live coordinator whose policy holds ``data/**`` tracked and strict."""
+    (tmp_path / ".coherence").mkdir()
+    (tmp_path / ".coherence" / "tracked.yaml").write_text("- data/**\n")
+    (tmp_path / ".coherence" / "strict_mode.yaml").write_text("- data/*.json\n")
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
+    server.serve_in_thread()
+    time.sleep(0.05)
+    try:
+        yield server
+    finally:
+        server.shutdown()
+
+
+@pytest.fixture
+def strict_client(strict_coordinator) -> _Client:
+    secret = load_secret(strict_coordinator.coordinator_root)
+    assert secret is not None
+    return _Client("127.0.0.1", strict_coordinator.port, secret)
+
+
+@pytest.mark.parametrize("entry", ["data/a.json", "data/*.json", "data/**", "**", "*.json"])
+def test_policy_untrack_refuses_an_entry_covering_a_strict_path(
+    strict_coordinator, strict_client: _Client, entry: str
+) -> None:
+    """#261: an untrack entry — a literal path, the strict glob itself, a
+    broader glob, or one spelled differently — that covers a path the live
+    policy holds in strict mode is refused with the typed reason, naming the
+    strict pattern, and the whole request writes nothing (the valid
+    non-strict entry beside it included). The path stays strict."""
+    s, b = strict_client.post("/policy/untrack", {"paths": [entry, "data/notes.txt", "/abs"]})
+    assert s == 409, b
+    assert b["ok"] is False
+    assert b["reason"] == "untrack_strict_path"
+    assert b["refused"] == [{"path": entry, "strict_patterns": ["data/*.json"]}]
+    assert [r["path"] for r in b["rejected"]] == ["/abs"]
+    assert "untrack_strict_path" in b["error"] and "restart" in b["error"]
+    assert not (strict_coordinator.coordinator_root / ".coherence" / "ignored.yaml").exists()
+    assert strict_coordinator.policy.is_strict_mode("data/a.json")
+    assert strict_coordinator.policy.is_tracked("data/notes.txt")
+
+
+def test_policy_untrack_of_a_non_strict_path_round_trips_on_a_strict_coordinator(
+    strict_coordinator, strict_client: _Client
+) -> None:
+    """Control: an entry that covers no strict path untracks as before, and
+    tracking it again restores it; the strict path is untouched throughout."""
+    s, b = strict_client.post("/policy/untrack", {"paths": ["data/*.txt"]})
+    assert s == 200 and b == {"ok": True, "removed": ["data/*.txt"], "rejected": []}
+    assert not strict_coordinator.policy.is_tracked("data/notes.txt")
+    assert strict_coordinator.policy.is_strict_mode("data/a.json")
+    s, b = strict_client.post("/policy/track", {"paths": ["data/keep.txt"]})
+    assert s == 200 and b["added"] == ["data/keep.txt"]
+    # Ignore still wins over track for a non-strict path (unchanged semantics).
+    assert not strict_coordinator.policy.is_tracked("data/keep.txt")
+    assert strict_coordinator.policy.is_strict_mode("data/a.json")
+
+
+def test_a_reload_after_a_hand_edit_keeps_the_strict_path_enforced(
+    strict_coordinator, strict_client: _Client
+) -> None:
+    """The hot reload behind /policy/track and /policy/untrack never narrows
+    strict enforcement: removing the strict and tracked entries from disk and
+    then running any track leaves the strict path tracked and strict until a
+    restart."""
+    root = strict_coordinator.coordinator_root
+    (root / ".coherence" / "strict_mode.yaml").write_text("")
+    (root / ".coherence" / "tracked.yaml").write_text("")
+    s, _ = strict_client.post("/policy/track", {"paths": ["runbook.md"]})
+    assert s == 200
+    assert strict_coordinator.policy.is_strict_mode("data/a.json")
+    assert strict_coordinator.policy.is_tracked("runbook.md")
+
+
+def test_a_stale_cas_on_a_strict_path_ignored_at_spawn_conflicts(tmp_path: Path) -> None:
+    """The broader-ignore case on the wire: ``ignored.yaml`` carries ``**``
+    when the coordinator starts. Strict wins over ignore, so the strict path
+    is not answered on the untracked fast path: a post-edit-cas at
+    expected_version 0 over a newer commit is a version_mismatch, not an
+    accepted overwrite."""
+    (tmp_path / ".coherence").mkdir()
+    (tmp_path / ".coherence" / "tracked.yaml").write_text("- data/**\n")
+    (tmp_path / ".coherence" / "strict_mode.yaml").write_text("- data/**\n")
+    (tmp_path / ".coherence" / "ignored.yaml").write_text("- '**'\n")
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
+    server.serve_in_thread()
+    time.sleep(0.05)
+    try:
+        client = _Client("127.0.0.1", server.port, load_secret(tmp_path))
+        writer = _sid("ign-writer")
+        v = _occ_seed_shared(client, writer, "data/x.json", _hash("ign-v1"))
+        assert v >= 1, "the strict path is version-tracked despite the ignore"
+        s, b = client.post("/hooks/post-edit-cas", {
+            "session_id": writer, "path": "data/x.json", "success": True,
+            "content_hash": _hash("ign-v2"), "expected_version": v,
+        })
+        assert s == 200 and b == {"ok": True, "version": v + 1}, b
+        peer = _sid("ign-peer")
+        s, b = client.post("/hooks/post-edit-cas", {
+            "session_id": peer, "path": "data/x.json", "success": True,
+            "content_hash": _hash("ign-stale"), "expected_version": 0,
+        })
+        assert s == 200 and b.get("ok") is False, b
+        assert _artifact_version(server, "data/x.json") == v + 1
+    finally:
+        server.shutdown()
+
+
 # ----------------------------------------------------------------------
 # /status
 # ----------------------------------------------------------------------

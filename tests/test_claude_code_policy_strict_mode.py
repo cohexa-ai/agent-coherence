@@ -121,9 +121,12 @@ def test_strict_mode_with_tracked_yaml_opt_in(root: Path) -> None:
     assert policy.is_strict_mode("src/important/payment.py")
 
 
-def test_strict_mode_blocked_by_ignored_yaml(root: Path) -> None:
-    """ignored.yaml wins over both tracked.yaml AND strict_mode.yaml. A path
-    ignored via ignored.yaml is not tracked, therefore not strict-mode."""
+def test_strict_mode_wins_over_ignored_yaml(root: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A strict path stays tracked and strict even when ignored.yaml names it
+    (#261). Before, ignore won: the path dropped to the untracked fast path,
+    where a read reports version 0 and a CAS commit is accepted at any expected
+    version, so a leftover ignored.yaml silently disarmed strict mode. The
+    load names the overridden ignore entry once."""
     (root / ".coherence" / "tracked.yaml").write_text(
         "- src/special/secret.py\n"
     )
@@ -133,11 +136,103 @@ def test_strict_mode_blocked_by_ignored_yaml(root: Path) -> None:
     (root / ".coherence" / "strict_mode.yaml").write_text(
         "- src/special/secret.py\n"
     )
+    with caplog.at_level(logging.WARNING, logger="ccs.adapters.claude_code.policy"):
+        policy = TrackedArtifactPolicy.load(root)
+
+    assert policy.is_tracked("src/special/secret.py")
+    assert policy.is_strict_mode("src/special/secret.py")
+    assert policy.ignored_patterns_overridden_by_strict() == ("src/special/secret.py",)
+    assert any("strict wins" in r.getMessage() for r in caplog.records)
+
+
+def test_a_broader_ignore_pattern_does_not_untrack_a_strict_path(root: Path) -> None:
+    """The issue's second case: an ignore pattern that covers the strict glob
+    under another spelling (``**``) takes non-strict paths off the tracked set
+    as before, but never a strict one."""
+    (root / ".coherence" / "tracked.yaml").write_text("- data/**\n")
+    (root / ".coherence" / "strict_mode.yaml").write_text("- data/**\n")
+    (root / ".coherence" / "ignored.yaml").write_text("- '**'\n")
     policy = TrackedArtifactPolicy.load(root)
 
-    assert not policy.is_tracked("src/special/secret.py")
-    # Ignored → not tracked → not strict-mode.
-    assert not policy.is_strict_mode("src/special/secret.py")
+    assert policy.is_tracked("data/a.txt") and policy.is_strict_mode("data/a.txt")
+    # Non-strict tracked paths: ignore still wins, unchanged.
+    assert not policy.is_tracked("CLAUDE.md")
+    assert not policy.is_tracked("docs/plans/x.md")
+
+
+def test_ignore_still_wins_for_tracked_non_strict_paths(root: Path) -> None:
+    """Control: with strict patterns live, an ignore on a non-strict tracked
+    path untracks it as it always did."""
+    (root / ".coherence" / "strict_mode.yaml").write_text("- CLAUDE.md\n")
+    (root / ".coherence" / "ignored.yaml").write_text("- docs/plans/**/*.md\n")
+    policy = TrackedArtifactPolicy.load(root)
+
+    assert not policy.is_tracked("docs/plans/x.md")
+    assert policy.ignored_patterns_overridden_by_strict() == ()
+
+
+@pytest.mark.parametrize(
+    ("entry", "covering"),
+    [
+        ("data/**", ("data/*.json",)),            # the issue's glob untrack
+        ("data/a.json", ("data/*.json",)),        # a literal strict path
+        ("**", ("data/*.json",)),                 # a broader pattern
+        ("*.json", ("data/*.json",)),             # fnmatch '*' crosses '/'
+        ("data/a.txt", ()),                       # tracked, not strict
+        ("data/*.txt", ()),                       # disjoint glob
+        ("notes/**", ()),                         # strict-free and untracked
+    ],
+)
+def test_strict_patterns_covering_decides_on_the_glob_languages(
+    root: Path, entry: str, covering: tuple[str, ...]
+) -> None:
+    (root / ".coherence" / "tracked.yaml").write_text("- data/**\n")
+    (root / ".coherence" / "strict_mode.yaml").write_text("- data/*.json\n")
+    policy = TrackedArtifactPolicy.load(root)
+
+    assert policy.strict_patterns_covering(entry) == covering
+
+
+def test_a_strict_pattern_with_no_tracked_cover_is_not_covering(root: Path) -> None:
+    """Strict mode is an intersection: a strict glob that reaches no tracked
+    path puts nothing in strict mode, so untracking under it is not refused."""
+    (root / ".coherence" / "strict_mode.yaml").write_text("- '**'\n")
+    policy = TrackedArtifactPolicy.load(root)
+
+    # notes/*.txt reaches no default tracked pattern (notes/** would: the
+    # default **/plan.md matches notes/plan.md).
+    assert policy.strict_patterns_covering("notes/*.txt") == ()
+    assert policy.strict_patterns_covering("notes/**") == ("**",)
+    assert policy.strict_patterns_covering("docs/**") == ("**",)
+
+
+def test_reload_never_narrows_strict_enforcement(root: Path) -> None:
+    """A hot reload (track / untrack) keeps every strict and user-added
+    pattern the live policy carries, so hand-removing one from disk cannot end
+    enforcement mid-run; additions on disk still take effect."""
+    (root / ".coherence" / "tracked.yaml").write_text("- data/**\n")
+    (root / ".coherence" / "strict_mode.yaml").write_text("- data/**\n")
+    live = TrackedArtifactPolicy.load(root)
+    (root / ".coherence" / "tracked.yaml").write_text("- extra/**\n")
+    (root / ".coherence" / "strict_mode.yaml").write_text("- extra/**\n")
+
+    reloaded = live.reloaded()
+
+    assert reloaded.is_strict_mode("data/a.txt"), "a strict path stayed enforced"
+    assert reloaded.is_strict_mode("extra/b.txt"), "an addition on disk took effect"
+    assert reloaded.user_added_patterns == ("data/**", "extra/**")
+    assert reloaded.strict_mode_paths == ("data/**", "extra/**")
+
+
+def test_reload_without_strict_patterns_reads_the_files_verbatim(root: Path) -> None:
+    (root / ".coherence" / "tracked.yaml").write_text("- data/**\n")
+    live = TrackedArtifactPolicy.load(root)
+    (root / ".coherence" / "tracked.yaml").write_text("- extra/**\n")
+
+    reloaded = live.reloaded()
+
+    assert reloaded.user_added_patterns == ("extra/**",)
+    assert not reloaded.is_tracked("data/a.txt")
 
 
 def test_strict_mode_for_path_with_invalid_normalization(root: Path) -> None:

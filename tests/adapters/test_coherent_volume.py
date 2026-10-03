@@ -1052,12 +1052,13 @@ def test_a_managed_glob_the_coordinator_carries_in_only_one_set_is_not_enforced(
 def test_a_managed_glob_the_coordinator_ignores_is_not_enforced(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
-    """The coordinator enforces a path only when it is tracked, strict, and
-    matches no ignored pattern, and its hooks answer an ignored path as
-    untracked: a read reports version 0 and a CAS commit is accepted at any
-    expected version. A volume whose managed glob the coordinator's policy
-    ignores is therefore refused at attach, by name, like one it does not
-    track.
+    """A coordinator that predates #261 enforces a path only when it is
+    tracked, strict, and matches no ignored pattern, and answers an ignored
+    path as untracked: a read reports version 0 and a CAS commit is accepted at
+    any expected version. The volume cannot tell which coordinator it attached
+    to, so a managed glob the policy literally ignores is still refused at
+    attach, by name, like one it does not track (a current coordinator would
+    enforce it — strict wins over ignore — so the refusal is conservative).
 
     Prevents the attach check confirming a glob the coordinator ignores: with
     ``ignored.yaml`` carrying the glob before the spawn, the check answered
@@ -1072,6 +1073,93 @@ def test_a_managed_glob_the_coordinator_ignores_is_not_enforced(
         message = str(raised.value)
         assert "does not enforce strict mode for managed glob(s) data/**" in message, message
         assert "ignored" in message, message
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def _untrack_refusal(vol: CoherentVolume, paths: list[str]) -> tuple[int, dict]:
+    """POST /policy/untrack expecting the typed strict refusal; the status and
+    the decoded body."""
+    import urllib.error
+
+    from ccs.cli._coherence_client import http_status_from_error
+
+    with pytest.raises(urllib.error.HTTPError) as raised:
+        coherent_volume_module._coordinator_post(vol._endpoint, "/policy/untrack", {"paths": paths})
+    return raised.value.code, http_status_from_error(raised.value) or {}
+
+
+@pytest.mark.parametrize("untrack", ["data/**", "data/shared.txt", "**"])
+def test_untracking_a_managed_path_after_attach_is_refused_and_a_stale_cas_still_conflicts(
+    tmp_path: Path, fast_cfg: LifecycleConfig, untrack: str
+) -> None:
+    """The #261 reproduction: both volumes attach confirmed, the managed glob
+    (or a path under it, or a broader pattern) is untracked through
+    ``/policy/untrack``, and a peer's ``write_cas_at(expected_version=0)``
+    lands over a newer write with nothing raised — the untrack had put the
+    path on the untracked fast path, where a CAS commit is accepted at any
+    expected version.
+
+    The coordinator now refuses the untrack with the typed reason, naming the
+    strict pattern, and writes nothing; the path stays enforced, so the stale
+    CAS raises CasVersionConflict and the newer bytes survive."""
+    target = _seed(tmp_path, content=b"v1")
+    vol, peer = _pair(tmp_path, fast_cfg)
+    try:
+        assert vol.managed_glob_enforcement().confirmed and peer.managed_glob_enforcement().confirmed
+        status, body = _untrack_refusal(vol, [untrack])
+        assert status == 409, body
+        assert body["ok"] is False and body["reason"] == "untrack_strict_path", body
+        assert body["refused"] == [{"path": untrack, "strict_patterns": ["data/**"]}], body
+        assert not (tmp_path / ".coherence" / "ignored.yaml").exists(), "nothing was written"
+
+        vol.write("data/shared.txt", b"newer")
+        _data, version = vol.read_with_version("data/shared.txt")
+        assert version >= 1, "the path is still version-tracked"
+        with pytest.raises(CasVersionConflict):
+            peer.write_cas_at("data/shared.txt", 0, b"stale")
+        assert target.read_bytes() == b"newer", "the newer write survived"
+        assert vol.managed_glob_enforcement().confirmed, "still enforced after the attempt"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_broader_ignore_pattern_at_spawn_does_not_unguard_a_managed_path(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The issue's second case: an ``ignored.yaml`` that covers the managed
+    glob under another spelling (``**``) passes the volume's literal attach
+    check. Before #261 the coordinator then answered every hook for the path as
+    untracked and a stale CAS landed; strict now wins over ignore on the
+    coordinator, so the path stays enforced and the stale CAS conflicts."""
+    target = _seed(tmp_path, content=b"v1")
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True)
+    CoherentVolume._merge_yaml_list(coherence_dir / "ignored.yaml", ("**",))
+    vol, peer = _pair(tmp_path, fast_cfg)
+    try:
+        assert vol.is_attached and not vol.is_degraded
+        vol.write("data/shared.txt", b"newer")
+        with pytest.raises(CasVersionConflict):
+            peer.write_cas_at("data/shared.txt", 0, b"stale")
+        assert target.read_bytes() == b"newer"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_untracking_an_unmanaged_path_on_a_strict_coordinator_still_works(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """Control: the refusal is keyed on the strict set only. A path the
+    coordinator tracks but does not hold in strict mode untracks as before."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        answer = coherent_volume_module._coordinator_post(
+            vol._endpoint, "/policy/untrack", {"paths": ["docs/plans/**"]}
+        )
+        assert answer == {"ok": True, "removed": ["docs/plans/**"], "rejected": []}, answer
+        assert vol.managed_glob_enforcement().confirmed
     finally:
         stop_coordinator(tmp_path)
 
@@ -5662,15 +5750,14 @@ def _tracked_version(vol: CoherentVolume, rel: str) -> int | None:
     return None
 
 
-# Where the refused write goes: a path the coordinator tracks, one it does not
-# track, and one the VOLUME manages but the coordinator is told to ignore AFTER
-# the attach (the attach check sees the policy the coordinator started with; the
-# untrack command reloads it) — so nothing the volume holds says whether the
-# coordinator tracks a path.
+# Where the refused write goes: a path the coordinator tracks and one it does
+# not. (A third arm, a managed path the coordinator was told to ignore after the
+# attach, is gone: /policy/untrack now refuses a strict path and strict wins
+# over ignore, #261. The message still states both cases, because a volume may
+# attach to a coordinator that predates that.)
 _REFUSED_WRITE_PATHS = {
-    "tracked": ("data/shared.txt", None),
-    "untracked": ("notes/free.txt", None),
-    "managed-but-ignored": ("data/shared.txt", "data/**"),
+    "tracked": "data/shared.txt",
+    "untracked": "notes/free.txt",
 }
 
 # What the refused write puts, against what the file and the volume already
@@ -5699,8 +5786,8 @@ def test_every_clause_of_an_unrecorded_write_holds_wherever_the_write_went(
     whether the coordinator tracks the path — it took EXCLUSIVE and
     invalidated every peer holding a copy — or does not, when it took no
     grant and invalidated nobody. The volume cannot tell which (its managed
-    globs do not decide it: an ignored path is managed here and untracked
-    there), so the message states both cases, and each is observed where it
+    globs do not decide it: on a coordinator that predates #261 an ignored
+    path is managed here and untracked there), so the message states both cases, and each is observed where it
     applies. The disk clause says whether THIS call wrote the file, and each
     arm counts the disk writes it made (see ``_REFUSED_WRITE_BYTES``).
 
@@ -5711,20 +5798,13 @@ def test_every_clause_of_an_unrecorded_write_holds_wherever_the_write_went(
     freely."""
     from ccs.core.exceptions import CallerPrincipalRefused
 
-    rel, ignored = _REFUSED_WRITE_PATHS[where]
+    rel = _REFUSED_WRITE_PATHS[where]
     data, expected_disk_writes = _REFUSED_WRITE_BYTES[rewrite]
     target = _seed(tmp_path, rel=rel, content=b"v1")
     on_stale_write = "allow" if rewrite == "committed-over-foreign" else "raise"
     vol = CoherentVolume(tmp_path, managed=("data/**",), on_stale_write=on_stale_write, config=fast_cfg)
     peer = CoherentVolume(tmp_path, managed=("data/**",), on_stale_write="allow", config=fast_cfg)
     try:
-        if ignored is not None:
-            # Ignored after the attach: the coordinator reloads its policy and
-            # untracks the managed path, and neither volume sees that.
-            untracked = coherent_volume_module._coordinator_post(
-                vol._endpoint, "/policy/untrack", {"paths": [ignored]}
-            )
-            assert untracked.get("ok") is True and untracked.get("removed") == [ignored], untracked
         vol.read(rel)
         if rewrite in ("same-bytes", "committed-over-foreign"):
             vol.write(rel, b"v2")  # recorded: the refused write below writes these bytes again
