@@ -527,7 +527,14 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
                 "(name unknown — redacted below the operator tier, "
                 "or a grant predating this coordinator)"
             )
-            per_artifact = s.get("states", {})
+            per_artifact = dict(s.get("states", {}))
+            # #195: the operator tier names the paths this session lost to the
+            # coordinator sweep. They are not held grants, so they render in
+            # the same column under their own label rather than as a state.
+            for path, cause in (s.get("reclaimed") or {}).items():
+                per_artifact[path] = (
+                    f"reclaimed ({cause.get('trigger', '?')} at tick {cause.get('tick', '?')})"
+                )
             print(f"  {sid[:8]}  {name}")
             if not per_artifact:
                 print("    (no held grants)")
@@ -561,6 +568,7 @@ def _render_counter_block(payload: dict[str, Any]) -> None:
             "watchdog_queue_overflows_total",
             "handler_concurrency_overflows_total",
             "cold_start_duration_ms",
+            "sweep_reclaims_total",
         ) if k in payload
     ]
     if not has_endpoint_counters and not keys_present:

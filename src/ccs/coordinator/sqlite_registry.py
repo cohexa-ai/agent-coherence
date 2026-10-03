@@ -3549,6 +3549,26 @@ class SqliteArtifactRegistry:
             return None
         return (row[0], row[1])
 
+    def invalid_reclamations(self) -> dict[UUID, dict[UUID, ReclamationSlot]]:
+        """Reclamation slots of the pairs that are INVALID right now (#195).
+
+        See the Protocol docstring. One SELECT, so the state predicate and the
+        slot are read from the same row; a slot whose artifact row is gone is
+        dropped the same way ``status_snapshot`` drops orphans (the join)."""
+        out: dict[UUID, dict[UUID, ReclamationSlot]] = {}
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT s.artifact_id, s.agent_id, s.last_reclaim_trigger, s.last_reclaim_tick
+                FROM agent_states AS s JOIN artifacts AS a ON a.id = s.artifact_id
+                WHERE s.state = ? AND s.last_reclaim_trigger IS NOT NULL
+                """,
+                (MESIState.INVALID.name,),
+            ).fetchall()
+        for artifact_hex, agent_hex, trigger, tick in rows:
+            out.setdefault(UUID(hex=artifact_hex), {})[UUID(hex=agent_hex)] = (trigger, tick)
+        return out
+
     def granted_at_tick(self, agent_id: UUID, artifact_id: UUID) -> int | None:
         """Return the tick at which agent acquired its current M/E grant on artifact, if any."""
         with self._lock:

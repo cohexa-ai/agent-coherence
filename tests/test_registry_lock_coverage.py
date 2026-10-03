@@ -278,7 +278,7 @@ INMEM_SURFACE = frozenset({
     "get_owner_generation", "get_read_generation", "get_session_cut",
     "get_session_meta", "get_state_map", "get_transient_map",
     "get_transient_tick", "get_version_record", "granted_at_tick",
-    "has_artifact", "instance_id", "last_heartbeat_tick",
+    "has_artifact", "instance_id", "invalid_reclamations", "last_heartbeat_tick",
     "last_observed_version_for", "list_checkpoints",
     "record_detection_tick", "record_detection_uncoverable",
     "record_foreign_write", "record_heartbeat",

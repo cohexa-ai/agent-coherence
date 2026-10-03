@@ -408,6 +408,24 @@ class RegistryBase(Protocol):
     ) -> ReclamationSlot | None:
         ...
 
+    def invalid_reclamations(self) -> dict[UUID, dict[UUID, ReclamationSlot]]:
+        """Return ``{artifact_id: {agent_id: (trigger, tick)}}`` for every pair
+        that is INVALID right now AND carries a recorded reclamation slot (#195).
+
+        One batched read for ``/status``, so the reclaim cause is observable by
+        a process other than the reclaimed session without a per-pair
+        ``get_last_reclamation`` call (the PERF-1 N+1 ``status_snapshot``
+        removed). The slot is cleared only when the pair next acquires M/E, so
+        what it states is "this pair's most recent WRITE grant ended in a sweep
+        reclaim, and it has held none since". A pair that re-read to SHARED
+        keeps the slot (the checkpoint-restore diagnostic) but is not INVALID,
+        so it is excluded while SHARED; if a peer later invalidates that read,
+        the pair is INVALID again and reported with the ORIGINAL reclaim's
+        trigger and tick -- still true of its last write grant, though the most
+        recent exit was the peer's. Artifacts with no qualifying pair are
+        absent. Non-mutating."""
+        ...
+
     def get_owner_generation(self, artifact_id: UUID) -> int:
         ...
 

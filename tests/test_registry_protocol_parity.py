@@ -79,6 +79,7 @@ BASE_METHODS = frozenset(
         "get_version_record",
         "granted_at_tick",
         "has_artifact",
+        "invalid_reclamations",
         "last_heartbeat_tick",
         "last_observed_version_for",
         "list_checkpoints",

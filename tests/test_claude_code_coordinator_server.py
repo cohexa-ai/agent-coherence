@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
@@ -9727,3 +9728,194 @@ def test_session_start_shows_a_bound_peers_notices_without_draining_them(
 
     harm = _CALLER_PRINCIPAL_POSTURE[("POST", "/hooks/session-start")].harm
     assert "without draining them" in harm and "compact-pending" in harm, harm
+
+
+# ======================================================================
+# #195 — the sweep's reclaim cause is observable by someone other than
+# the reclaimed session
+# ======================================================================
+#
+# Every exit from M/E lands the ex-holder in INVALID, which ``states`` omits,
+# so a release and a sweep reclaim used to produce the same /status body. The
+# cause was recorded (``agent_states.last_reclaim_trigger`` / ``_tick``) with
+# no reader outside the victim's own commit and post-edit. These drive the
+# REAL sweep pass the coordinator's loop runs (``_sweep_stable_grants``), so
+# the notice, the counter and the log line are all the shipped wiring.
+
+
+def _reclaiming_cfg():
+    from ccs.adapters.claude_code.lifecycle import LifecycleConfig
+
+    return LifecycleConfig(grant_heartbeat_timeout_sec=1, grant_max_hold_sec=999_999_999)
+
+
+def _sweep(coordinator, now_tick: int) -> int:
+    from ccs.adapters.claude_code.lifecycle import _sweep_stable_grants
+
+    return _sweep_stable_grants(coordinator, _reclaiming_cfg(), now_tick)
+
+
+def _row_for(payload: dict, sid: str) -> dict:
+    [row] = [s for s in payload["sessions"] if s["agent_id"] == str(session_to_agent_id(sid))]
+    return row
+
+
+def test_status_full_tier_names_a_sweep_reclaim(
+    coordinator, client: _Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    sid = _sid("reclaim-195")
+    assert client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})[0] == 200
+    assert _row_for(_operator_status(client), sid)["states"] == {"plan.md": "EXCLUSIVE"}
+
+    now_tick = int(time.time()) + 999_999
+    with caplog.at_level(logging.WARNING, logger="ccs.adapters.claude_code.lifecycle"):
+        assert _sweep(coordinator, now_tick) == 1
+
+    row = _row_for(_operator_status(client), sid)
+    # ``states`` keeps its meaning: held grants only. The cause is a sibling.
+    assert row["states"] == {}
+    assert row["reclaimed"] == {"plan.md": {"trigger": "reclaim_heartbeat", "tick": now_tick}}
+
+    # The log line: one per reclaim, naming trigger, tick, agent id and path,
+    # and never the raw session id (#198 / R6).
+    [record] = [r for r in caplog.records if "sweep reclaimed grant" in r.getMessage()]
+    message = record.getMessage()
+    assert record.levelno == logging.WARNING
+    assert "trigger=reclaim_heartbeat" in message
+    assert f"tick={now_tick}" in message
+    assert str(session_to_agent_id(sid)) in message
+    assert "plan.md" in message
+    assert sid not in message
+
+
+def test_status_full_tier_does_not_report_a_voluntary_release_as_a_reclaim(
+    coordinator, client: _Client
+) -> None:
+    sid = _sid("release-195")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    assert client.post("/hooks/session-stop", {"session_id": sid})[0] == 200
+    # Nothing for the sweep to pull: the release already left INVALID.
+    assert _sweep(coordinator, int(time.time()) + 999_999) == 0
+
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {}
+    assert row["reclaimed"] == {}
+    _, metrics = client.get("/status?detail=metrics")
+    assert metrics["sweep_reclaims_total"] == 0
+
+
+def test_status_full_tier_does_not_report_a_peer_preemption_as_a_reclaim(
+    coordinator, client: _Client
+) -> None:
+    victim, peer = _sid("victim-195"), _sid("peer-195")
+    client.post("/hooks/pre-edit", {"session_id": victim, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": peer, "path": "plan.md"})
+    payload = _operator_status(client)
+    assert _row_for(payload, victim) == {
+        "agent_name": _row_for(payload, victim)["agent_name"],
+        "agent_id": str(session_to_agent_id(victim)),
+        "states": {},
+        "reclaimed": {},
+    }
+    assert _row_for(payload, peer)["states"] == {"plan.md": "EXCLUSIVE"}
+
+
+def test_reclaim_cause_is_operator_tier_only(coordinator, client: _Client) -> None:
+    sid = _sid("tier-195")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    _sweep(coordinator, int(time.time()) + 999_999)
+
+    _, minimal = client.get("/status")
+    assert minimal["detail"] == "minimal"
+    for row in minimal["sessions"]:
+        assert "reclaimed" not in row
+        assert row["agent_name"] is None
+    # The counter rides every tier (it names no session and no path).
+    assert minimal["sweep_reclaims_total"] == 1
+    _, metrics = client.get("/status?detail=metrics")
+    assert "sessions" not in metrics
+
+
+def test_metrics_tier_counts_sweep_reclaims_by_trigger(coordinator, client: _Client) -> None:
+    from ccs.adapters.claude_code.lifecycle import LifecycleConfig, _sweep_stable_grants
+
+    _, before = client.get("/status?detail=metrics")
+    assert before["sweep_reclaims_total"] == 0
+    assert before["sweep_reclaims_by_trigger"] == {"reclaim_heartbeat": 0, "reclaim_max_hold": 0}
+
+    client.post("/hooks/pre-edit", {"session_id": _sid("hb-195"), "path": "plan.md"})
+    _sweep(coordinator, int(time.time()) + 999_999)
+
+    # Max-hold: a fresh heartbeat, a grant older than the ceiling.
+    client.post("/hooks/pre-edit", {"session_id": _sid("mh-195"), "path": "plan.md"})
+    now_tick = int(time.time()) + 10
+    cfg = LifecycleConfig(grant_heartbeat_timeout_sec=999_999, grant_max_hold_sec=1)
+    assert _sweep_stable_grants(coordinator, cfg, now_tick) == 1
+
+    _, after = client.get("/status?detail=metrics")
+    assert after["sweep_reclaims_total"] == 2
+    assert after["sweep_reclaims_by_trigger"] == {"reclaim_heartbeat": 1, "reclaim_max_hold": 1}
+    row = _row_for(_operator_status(client), _sid("mh-195"))
+    assert row["reclaimed"] == {"plan.md": {"trigger": "reclaim_max_hold", "tick": now_tick}}
+
+
+def test_reclaimed_path_returns_to_states_on_a_reread_and_clears_on_reacquire(
+    coordinator, client: _Client
+) -> None:
+    """The slot is the registry's: a SHARED re-read keeps it but moves the
+    path back into ``states`` (never both maps at once); a fresh M/E acquire
+    clears it."""
+    sid, peer = _sid("reread-195"), _sid("reread-peer-195")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    _sweep(coordinator, int(time.time()) + 999_999)
+    # A peer read first, so the re-read is granted SHARED rather than E.
+    client.post("/hooks/pre-read", {"session_id": peer, "path": "plan.md", "content_hash": _hash("x")})
+    client.post("/hooks/pre-read", {"session_id": sid, "path": "plan.md", "content_hash": _hash("x")})
+
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {"plan.md": "SHARED"}
+    assert row["reclaimed"] == {}
+
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    client.post("/hooks/session-stop", {"session_id": sid})
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {}
+    assert row["reclaimed"] == {}, "a re-acquire clears the slot; the later exit was a release"
+
+
+def test_status_full_tier_lists_a_reclaimed_agent_the_restarted_coordinator_never_named(
+    tmp_path: Path,
+) -> None:
+    """The reclaim slot is durable and the name map is not: after a restart a
+    reclaimed session that has not spoken since still gets a row (null name),
+    because it is exactly the one a supervisor must not read as finished."""
+    sid = _sid("restart-195")
+    first = _restart_on(tmp_path, "reclaim-before")
+    try:
+        secret = load_secret(first.coordinator_root)
+        assert secret is not None
+        _Client("127.0.0.1", first.port, secret).post(
+            "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"}
+        )
+        now_tick = int(time.time()) + 999_999
+        assert _sweep(first, now_tick) == 1
+    finally:
+        first.shutdown()
+
+    second = _restart_on(tmp_path, "reclaim-after")
+    try:
+        secret = load_secret(second.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", second.port, secret)
+        payload = _operator_status(client)
+        _, minimal = client.get("/status")
+    finally:
+        second.shutdown()
+
+    row = _row_for(payload, sid)
+    assert row["agent_name"] is None
+    assert row["states"] == {}
+    assert row["reclaimed"] == {"plan.md": {"trigger": "reclaim_heartbeat", "tick": now_tick}}
+    # Below the operator tier nothing changes: a row with no held grant and
+    # no name is not added there.
+    assert minimal["sessions"] == []

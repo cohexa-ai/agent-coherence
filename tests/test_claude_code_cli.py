@@ -1000,3 +1000,42 @@ def test_render_table_marks_a_holder_with_no_known_name(
     assert "4c9625da" in out
     assert "docs/plan.md" in out and "EXCLUSIVE" in out
     assert "No active sessions." not in out
+
+
+def test_render_table_names_a_sweep_reclaim_beside_held_states(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#195: the operator tier's ``reclaimed`` map renders under the session,
+    labelled as a reclaim with its trigger and tick — not as a held state, and
+    not as the "no held grants" line a clean release prints."""
+    monkeypatch.setenv("COLUMNS", "120")
+    payload = {
+        "tracked_artifacts": [{"path": "docs/plan.md", "version": 2}],
+        "sessions": [
+            {
+                "agent_name": "claude-session-x",
+                "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
+                "states": {"docs/spec.md": "SHARED"},
+                "reclaimed": {
+                    "docs/plan.md": {"trigger": "reclaim_heartbeat", "tick": 1789558656}
+                },
+            },
+            {
+                "agent_name": "claude-session-y",
+                "agent_id": "5c9625da-356c-527f-b5d7-027f181f7748",
+                "states": {},
+                "reclaimed": {},
+            },
+        ],
+        "policy_summary": {},
+        "coordinator_pid": 0,
+        "sweep_reclaims_total": 1,
+    }
+    coherence_status._render_table(payload)
+    out = capsys.readouterr().out
+
+    assert "reclaimed (reclaim_heartbeat at tick 1789558656)" in out
+    assert "docs/spec.md" in out and "SHARED" in out
+    # The released session (y) still reads as holding nothing.
+    assert out.count("(no held grants)") == 1
+    assert "sweep_reclaims_total" in out

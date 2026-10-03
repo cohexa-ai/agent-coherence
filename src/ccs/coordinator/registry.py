@@ -1592,6 +1592,19 @@ class ArtifactRegistry:
                 return None
             return record.last_reclamation_by_agent.get(agent_id)
 
+    def invalid_reclamations(self) -> dict[UUID, dict[UUID, ReclamationSlot]]:
+        """Reclamation slots of the pairs that are INVALID right now (#195).
+
+        See the Protocol docstring; one lock hold, so the state and the slot
+        of each pair are read together."""
+        out: dict[UUID, dict[UUID, ReclamationSlot]] = {}
+        with self._lock:
+            for artifact_id, record in self._records.items():
+                for agent_id, slot in record.last_reclamation_by_agent.items():
+                    if record.state_by_agent.get(agent_id) == MESIState.INVALID:
+                        out.setdefault(artifact_id, {})[agent_id] = slot
+        return out
+
     def granted_at_tick(self, agent_id: UUID, artifact_id: UUID) -> int | None:
         """Return the tick at which agent acquired its current M/E grant on artifact, if any."""
         with self._lock:

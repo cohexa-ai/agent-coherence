@@ -198,6 +198,13 @@ SWEEP_RECLAMATION_PREEMPTER_ID: UUID = uuid5(
     NAMESPACE_URL, "ccs-coordinator-sweep:stable-grant-reclamation"
 )
 
+#: #195: the triggers the STABLE-grant sweep reclaims under
+#: (``CoordinatorService.enforce_stable_grant_timeouts``). The keys of the
+#: ``sweep_reclaims_by_trigger`` counter and the values ``/status?detail=full``
+#: reports under ``sessions[].reclaimed[path].trigger``. The transient sweep's
+#: ``timeout`` is in ``RECLAIM_TRIGGERS`` too but records no reclamation slot.
+_SWEEP_RECLAIM_TRIGGERS: tuple[str, ...] = ("reclaim_heartbeat", "reclaim_max_hold")
+
 MAX_POLICY_PATHS_PER_REQUEST = 20
 """Cap on the number of paths /policy/track and /policy/untrack accept
 in one request body (security-lens P1)."""
@@ -1040,6 +1047,20 @@ class CoordinatorHTTPServer:
         # ``effect_fence_total``; the ratio is what tells an operator whether
         # their agents are gating on state the coordinator can confirm.
         self._effect_fence_holds_total: int = 0
+        # sweep_reclaims_total / sweep_reclaims_by_trigger (#195): how many M/E
+        # grants the stable-grant sweep pulled, and why. Answers "did the sweep
+        # pull anything" without the operator tier, and without being the
+        # reclaimed session (the only reader of the cause until #195). Bumped by
+        # the sweep loop (lifecycle._sweep_stable_grants) once per reclaim, AFTER
+        # the registry hold is released. Process-local like every counter here:
+        # it resets on respawn, so the durable answer for one pair is the
+        # registry slot the operator tier reads, not this count. Keys are the
+        # stable sweep's two triggers, seeded at 0 so a dashboard sees a stable
+        # shape before the first reclaim.
+        self._sweep_reclaims_total: int = 0
+        self._sweep_reclaims_by_trigger: dict[str, int] = {
+            trigger: 0 for trigger in _SWEEP_RECLAIM_TRIGGERS
+        }
         # caller_principal_absent_total: requests admitted without a caller
         # principal — on an accept-class route, or on a require-class route for
         # an identity nobody claimed (plan U6 / KTD4). A LOCAL diagnostic an
@@ -1445,6 +1466,19 @@ class CoordinatorHTTPServer:
         :meth:`increment_strict_mode_denial`."""
         self._effect_fence_holds_total += 1
 
+    def record_sweep_reclaim(self, trigger: str) -> None:
+        """#195: count one stable-grant reclaim by its trigger
+        (``reclaim_heartbeat`` / ``reclaim_max_hold``). Called by the sweep
+        loop after ``enforce_stable_grant_timeouts`` returns, never from inside
+        its per-pair registry hold. A trigger outside the seeded pair is still
+        counted (in the total and under its own key) rather than dropped: a
+        reclaim the counter cannot name is still a reclaim."""
+        with self._reliability_counter_lock:
+            self._sweep_reclaims_total += 1
+            self._sweep_reclaims_by_trigger[trigger] = (
+                self._sweep_reclaims_by_trigger.get(trigger, 0) + 1
+            )
+
     def increment_caller_principal_absent(self) -> None:
         """Bumped when a route ADMITS a request that names an identity but
         presents no caller principal (plan U6): any accept-class route, and a
@@ -1569,6 +1603,8 @@ class CoordinatorHTTPServer:
             "fresh_shared_hash_mismatch_total": self._fresh_shared_hash_mismatch_total,
             "shared_foreign_lag_suppressed_total": self._shared_foreign_lag_suppressed_total,
             "effect_fence_holds_total": self._effect_fence_holds_total,
+            "sweep_reclaims_total": self._sweep_reclaims_total,
+            "sweep_reclaims_by_trigger": dict(self._sweep_reclaims_by_trigger),
             "caller_principal_absent_total": self._caller_principal_absent_total,
             "caller_principal_refused_total": self._caller_principal_refused_total,
             "auth_401_total": self._auth_401_total,
@@ -5397,7 +5433,25 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
       ``handler_concurrency_overflows_total``,
       ``in_flight_drain_timed_out``, ``cold_start_duration_ms``,
       ``endpoint_counters``, ``intra_task_acquire_release_total``,
-      ``stale_warning_emitted_total``, ``stale_warning_reread_total``.
+      ``stale_warning_emitted_total``, ``stale_warning_reread_total``,
+      ``sweep_reclaims_total``, ``sweep_reclaims_by_trigger`` (#195).
+
+    #195 — reclaim cause at the operator tier: every ``sessions[]`` row at
+    ``detail=full`` carries ``reclaimed``, a map SIBLING to ``states``:
+    ``{path: {"trigger": "reclaim_heartbeat" | "reclaim_max_hold", "tick": int}}``
+    for each artifact this agent is INVALID on because the stable-grant sweep
+    pulled its grant (the registry's ``last_reclaim_trigger`` /
+    ``last_reclaim_tick`` slot). ``states`` keeps its meaning — held grants
+    only, INVALID omitted — so a consumer that never reads ``reclaimed`` sees
+    exactly today's body. A voluntary release, a peer preemption and a commit
+    record no slot and leave ``reclaimed`` empty; re-acquiring M/E clears the
+    slot, and a re-read to SHARED moves the path back into ``states`` and out
+    of ``reclaimed``. The slot clears only on the next M/E acquire, so an
+    entry means "this session's most recent write grant on this path was
+    reclaimed and it has held none since": a later read grant that a peer
+    invalidates returns the path to ``reclaimed`` with the original
+    trigger/tick. ``tick`` is the sweep's tick basis, wall-clock seconds over
+    the HTTP transport. The key is absent below the operator tier.
 
       Fields may be ADDED in minor versions (additive change is
       non-breaking for dashboards using selective key access).
@@ -5496,6 +5550,35 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
                 continue
             states_by_agent.setdefault(agent_id, {})[meta["name"]] = state.name
 
+    # #195: the reclaim cause, operator tier only (the same disclosure call as
+    # #199's writer attribution: it says which session lost which path, and
+    # when). A SIBLING map, never folded into ``states``: ``states`` is "what
+    # this session holds", and every consumer that reads it (the status CLI,
+    # Arbiter's poller, the corpus) keeps that answer byte-for-byte.
+    #
+    # The slot read is a second registry call, so it is filtered against THIS
+    # snapshot: a path is reported reclaimed only where the snapshot above
+    # also has the pair INVALID. A reclaim that lands between the two reads
+    # therefore shows as the grant it was in the snapshot, never as both a
+    # held state and a reclaim in one row; a re-acquire in between clears the
+    # slot and reads as a release — the only tear left, and the conservative
+    # one. One batched read, not ``get_last_reclamation`` per INVALID pair:
+    # nothing GCs ``agent_states``, so that would be the N+1 PERF-1 removed.
+    reclaimed_by_agent: dict[UUID, dict[str, dict[str, Any]]] = {}
+    if detail == "full":
+        for artifact_id, slots in coordinator.registry.invalid_reclamations().items():
+            meta = artifact_by_id.get(artifact_id)
+            if meta is None:
+                continue
+            snap_states = state_by_artifact[artifact_id]
+            for agent_id, (trigger, tick) in slots.items():
+                if snap_states.get(agent_id) != MESIState.INVALID:
+                    continue
+                reclaimed_by_agent.setdefault(agent_id, {})[meta["name"]] = {
+                    "trigger": trigger,
+                    "tick": tick,
+                }
+
     # R6: ``agent_name`` renders the raw session id verbatim
     # (``session_to_agent_name`` → ``claude-session-<sid>``, and the SB-25
     # subagent form carries it too), so every tier that listed a session row
@@ -5509,23 +5592,32 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     name_visible = detail == "full"
     sessions: list[dict] = []
     named_ids: set[UUID] = set()
-    for agent_id, name in named_agents:
-        named_ids.add(agent_id)
-        sessions.append({
-            "agent_name": name if name_visible else None,
+    def _row(agent_id: UUID, name: str | None) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "agent_name": name,
             "agent_id": str(agent_id),
             "states": states_by_agent.get(agent_id, {}),
-        })
+        }
+        if detail == "full":
+            row["reclaimed"] = reclaimed_by_agent.get(agent_id, {})
+        return row
+
+    for agent_id, name in named_agents:
+        named_ids.add(agent_id)
+        sessions.append(_row(agent_id, name if name_visible else None))
     # ``agent_name`` is null rather than a guess: ``session_to_agent_id`` is a
     # uuid5 of the session id, so the session id is NOT recoverable from the
     # row. An entry keyed on the raw agent id is the honest answer, and it is
     # strictly more than the empty list these holders used to render as.
-    for agent_id in sorted(states_by_agent.keys() - named_ids, key=str):
-        sessions.append({
-            "agent_name": None,
-            "agent_id": str(agent_id),
-            "states": states_by_agent[agent_id],
-        })
+    # #195: at the operator tier an agent whose ONLY entry is a reclaim gets a
+    # row too — a reclaimed session that never re-registered after a restart
+    # is exactly the one a supervisor must not mistake for a clean finish.
+    # ``reclaimed_by_agent`` is empty below that tier, so those rows are
+    # unchanged.
+    for agent_id in sorted(
+        (states_by_agent.keys() | reclaimed_by_agent.keys()) - named_ids, key=str
+    ):
+        sessions.append(_row(agent_id, None))
 
     # The pattern lists are workspace-relative paths and globs. Publishing
     # them at the minimal/metrics tiers would expose the operator's directory

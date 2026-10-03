@@ -56,6 +56,44 @@ Alpha — APIs may change before `v1.0`.
   close. It is **not implemented**; `pre-edit` still grants EXCLUSIVE to
   whoever asks.
 
+- **A sweep reclaim is now visible to someone other than the reclaimed
+  session (#195).** A session whose grant the coordinator sweep pulled (stale
+  heartbeat or max-hold ceiling) used to look exactly like one that released
+  voluntarily: both vanish from `/status` `states`. The cause was recorded in
+  the registry but only the reclaimed session itself could read it, at its next
+  commit or post-edit. Now:
+  - `GET /status?detail=full` gives every `sessions[]` row a `reclaimed` map
+    beside `states`: `{path: {"trigger": "reclaim_heartbeat" |
+    "reclaim_max_hold", "tick": <int>}}` for each path the session is INVALID
+    on because the sweep reclaimed its last write grant there. `states` is
+    unchanged (held grants only), so existing readers see the same body. A
+    release, a peer preemption or a commit leaves `reclaimed` empty. The cause
+    is cleared when the session takes a write grant on that path again. A
+    session that later re-reads the path shows it under `states` as `SHARED`;
+    if a peer invalidates that read, the path goes back to `reclaimed` with
+    the original trigger and tick, because the cause describes the session's
+    last write grant there, not its most recent exit. The cause survives a
+    coordinator restart, so after one a reclaimed session gets a row (with a
+    null name) even if it has not sent a request since. `tick` is wall-clock
+    seconds. The map is in the operator tier only, like the writer attribution
+    above; the `minimal` tier is unchanged.
+  - The counter block (every tier, including `?detail=metrics`) adds
+    `sweep_reclaims_total` and `sweep_reclaims_by_trigger`
+    (`reclaim_heartbeat`, `reclaim_max_hold`). They are process-local like
+    the other counters and reset when the coordinator restarts.
+  - The sweep logs one WARNING line per reclaim (trigger, tick, agent id,
+    path). The sweep used to discard the reclaimed count, so a tick that pulled
+    a live grant logged nothing. The line names the agent id, never the session
+    id.
+  - New registry read `invalid_reclamations()` on both backends (in-memory and
+    SQLite). It is one batched query, so `/status` stays free of per-pair
+    reads.
+  - `agent-coherence-status` prints reclaimed paths under each session,
+    labelled with trigger and tick, plus the new counter.
+
+  The plugin's Node coordinator runs no grant sweep and answers
+  `detail=full` with `501`, so it has nothing to report here.
+
 - **`GET /status?detail=full` now says who last wrote each tracked
   artifact (#199 §2).** Every `tracked_artifacts` entry at the operator tier
   carries `last_writer_agent_id` (the committing agent's UUID, joinable against

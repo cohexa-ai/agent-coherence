@@ -47,6 +47,7 @@ EXPECTED_LOCAL_FIXTURES: dict[str, tuple[str, ...] | None] = {
 EXPECTED_SHARED_CONSUMERS: frozenset[str] = frozenset({
     "coordinator/test_caller_principal.py",
     "test_conflict_instrumentation.py",
+    "test_invalid_reclamations.py",
 })
 
 SHARED_PARAM_IDS: tuple[str, ...] = ("memory", "sqlite")

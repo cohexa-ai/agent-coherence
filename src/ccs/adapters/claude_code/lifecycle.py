@@ -36,6 +36,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import UUID
 
 from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
 
@@ -775,6 +776,77 @@ def _start_background_threads(entry: _SpawnedEntry, cfg: LifecycleConfig) -> Non
         idle_thread.start()
 
 
+def _sweep_stable_grants(
+    coordinator: CoordinatorHTTPServer, cfg: LifecycleConfig, now_tick: int
+) -> int:
+    """One stable-grant sweep pass, with its reclaims made observable (#195).
+
+    ADV-004: each reclaim records a preemption notice for the victim under
+    ``SWEEP_RECLAMATION_PREEMPTER_ID``, so its eventual post-edit gets the
+    "reclaimed by coordinator sweep" error instead of a bare CoherenceError.
+
+    #195: each reclaim is also logged and counted
+    (``sweep_reclaims_total`` / ``sweep_reclaims_by_trigger``), so a tick that
+    pulled a live grant no longer reads as a quiet tick. Both happen AFTER
+    ``enforce_stable_grant_timeouts`` returns: its ``on_reclaim`` runs inside
+    the per-pair registry hold (KTD7 — no blocking on other threads), so the
+    callback only records the notice and appends to a local list; the log
+    handler's lock and the counter lock are taken outside the hold. WARNING,
+    not INFO: the coordinator configures no logging, and Python's last-resort
+    handler emits WARNING and above only, so an INFO line (like the
+    reaped/evicted ones beside this) is dropped even by a host that keeps the
+    coordinator's stderr; and a reclaim pulls a grant from a possibly live
+    holder. (The detached ``agent-coherence-coordinator`` child sends stderr
+    to /dev/null, so there the counter and ``/status`` are the surface.)
+    The observability step is best-effort: a failure there is logged and never
+    costs the tick its remaining passes.
+
+    Returns the reclaimed count, as ``enforce_stable_grant_timeouts`` does.
+    """
+    from ccs.adapters.claude_code.coordinator_server import (
+        SWEEP_RECLAMATION_PREEMPTER_ID,
+    )
+
+    reclaims: list[tuple[UUID, UUID, str]] = []
+
+    def _on_reclaim(artifact_id: UUID, agent_id: UUID, trigger: str) -> None:
+        # Append FIRST: a notice-write failure below is caught and logged by
+        # the service, and must not lose the reclaim from the count.
+        reclaims.append((artifact_id, agent_id, trigger))
+        # Float wall-clock time (the notice timestamp is operator-visible via
+        # the F4 prose) rather than the integer sweep tick.
+        coordinator.registry.record_preemption_notice(
+            victim_agent_id=agent_id,
+            artifact_id=artifact_id,
+            preempter_agent_id=SWEEP_RECLAMATION_PREEMPTER_ID,
+            preempted_at_unix_ts=time.time(),
+        )
+
+    reclaimed = coordinator.service.enforce_stable_grant_timeouts(
+        current_tick=now_tick,
+        heartbeat_timeout_ticks=cfg.grant_heartbeat_timeout_sec,
+        max_hold_ticks=cfg.grant_max_hold_sec,
+        on_reclaim=_on_reclaim,
+    )
+    for artifact_id, agent_id, trigger in reclaims:
+        coordinator.record_sweep_reclaim(trigger)
+        try:
+            artifact = coordinator.registry.get_artifact(artifact_id)
+            label = artifact.name if artifact is not None else str(artifact_id)
+        except Exception:  # noqa: BLE001 — a log label, best-effort
+            label = str(artifact_id)
+        # The agent id is the non-reversible uuid5 /status already publishes
+        # (R6): no session id, no session name, in the log line either.
+        logger.warning(
+            "sweep reclaimed grant: trigger=%s tick=%d agent_id=%s artifact=%s",
+            trigger,
+            now_tick,
+            agent_id,
+            label,
+        )
+    return reclaimed
+
+
 def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
     """Periodic sweep: transient → stable grant → notice eviction.
 
@@ -787,13 +859,12 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
     enriched "reclaimed by coordinator sweep" error instead of a
     generic CoherenceError with no context. The sentinel preempter
     UUID is ``SWEEP_RECLAMATION_PREEMPTER_ID`` (imported lazily to
-    avoid an import cycle at module load).
+    avoid an import cycle at module load). See :func:`_sweep_stable_grants`.
     """
     # Lazy import — coordinator_server imports lifecycle's
     # CoordinatorHTTPServer; importing back at module load would cycle.
     from ccs.adapters.claude_code.coordinator_server import (
         _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC,
-        SWEEP_RECLAMATION_PREEMPTER_ID,
         monotonic_seconds,
     )
     from ccs.adapters.claude_code.foreign_write_detector import run_detection_pass
@@ -816,17 +887,6 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
     # tick is the only evidence it left.
     detection_tick_clock: dict[str, float] = {}
 
-    def _record_reclamation_notice(artifact_id, agent_id, trigger) -> None:
-        """Per-reclamation callback wired into service.enforce_stable_grant_timeouts.
-        Uses float wall-clock time (the notice timestamp is operator-visible
-        via the F4 prose) rather than the integer sweep tick."""
-        coordinator.registry.record_preemption_notice(
-            victim_agent_id=agent_id,
-            artifact_id=artifact_id,
-            preempter_agent_id=SWEEP_RECLAMATION_PREEMPTER_ID,
-            preempted_at_unix_ts=time.time(),
-        )
-
     while not coordinator.shutting_down:
         time.sleep(cfg.sweep_interval_sec)
         if coordinator.shutting_down:
@@ -847,12 +907,7 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
                 current_tick=now_tick,
                 timeout_ticks=cfg.transient_timeout_sec,
             )
-            coordinator.service.enforce_stable_grant_timeouts(
-                current_tick=now_tick,
-                heartbeat_timeout_ticks=cfg.grant_heartbeat_timeout_sec,
-                max_hold_ticks=cfg.grant_max_hold_sec,
-                on_reclaim=_record_reclamation_notice,
-            )
+            _sweep_stable_grants(coordinator, cfg, now_tick)
             # SB-17 / TX-1 Unit 5 / R4: the session-liveness sweep — a SEPARATE
             # axis from the grant sweep above (a snapshot session holds no MESI
             # grant, so the grant sweep can never see it). Reaps a session whose

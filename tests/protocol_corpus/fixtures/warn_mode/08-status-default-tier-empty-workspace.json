@@ -41,6 +41,11 @@
       "stale_warning_reread_total": 0,
       "strict_mode_denials_total": 0,
       "strict_mode_routed_around_via_bash_total": 0,
+      "sweep_reclaims_by_trigger": {
+        "reclaim_heartbeat": 0,
+        "reclaim_max_hold": 0
+      },
+      "sweep_reclaims_total": 0,
       "audit_log_mode_drift_total": 0,
       "tracked_artifacts": "<IGNORED>",
       "watchdog_late_aborts_total": 0,
