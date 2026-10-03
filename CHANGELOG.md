@@ -209,6 +209,23 @@ Alpha — APIs may change before `v1.0`.
   stopped writing, a bounded `conflict` (never a clobber) when it is still writing.
   Offline, deterministic, no keys: `python -m examples.session_handoff.main`.
 
+- **The protocol corpus asserts every coordinator route (#193).** Fixtures now
+  make each `/session/*` route, the five `/workspace/*` routes,
+  `/admin/prepare-for-migration`, `/hooks/post-edit-cas` and `/policy/untrack`
+  the request under test, so a client in another language can check the shapes
+  a status code does not tell it. Among them: a refused `/session/read` is HTTP
+  200, a restore registration whose commit is held is `ok: true` with `status:
+  refused`, `/session/heartbeat` carries no `coordinator_epoch`, and the #191
+  registration refusals (`not_a_checkpoint_member`, `fingerprint_mismatch`,
+  `not_the_receiver`, `already_registered`) and the same controller's
+  idempotent retry. The session, workspace and admin rows run on the Python
+  coordinator only, which is the only one that serves those routes; the
+  post-edit-cas and untrack rows run on both. A new check fails when a route is
+  registered that no fixture asserts. The harness now scrubs `session_token` and
+  `coordinator_epoch` by name to `<MINTED>`, so fixtures no longer opt out of
+  them one by one, and a `preserve_identity` declaration is checked at every
+  occurrence of a repeated key rather than only the last.
+
 ### Changed
 
 - **A restore registration is checked against its checkpoint, and the first

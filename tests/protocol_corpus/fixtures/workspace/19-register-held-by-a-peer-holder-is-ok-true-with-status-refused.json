@@ -1,0 +1,97 @@
+{
+  "name": "workspace-restore-register-held-by-a-peer-holder-is-ok-true-with-status-refused",
+  "description": "A registration that passes every #191 gate but whose commit_all is HELD answers `ok: true` with `status: refused` and the per-member typed reason under `refused` -- here `other_holder`, because peer C wrote docs/plan.md on the pessimistic path and still holds it. `ok: true` means the registration was ADJUDICATED, not that it landed: a client must branch on `status`. Nothing mutated (versions empty); the claim B made is kept, so B can re-drive and nobody else can take the checkpoint over.",
+  "setup": {
+    "tracked": [
+      "docs/**"
+    ],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n",
+      "docs/spec.md": "# coherence corpus fixture  \n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "33333333-3333-4333-8333-333333333333",
+          "path": "docs/plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "33333333-3333-4333-8333-333333333333",
+          "path": "docs/plan.md",
+          "success": true,
+          "content_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/workspace/checkpoint",
+        "body": {
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "name": "before-refactor",
+          "window_min": 100.0,
+          "window_max": 101.0,
+          "members": [
+            {
+              "member_path": "docs/plan.md",
+              "native_token": null,
+              "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "captured_at": 100.0,
+              "restore_tier": "restorable-unpinned"
+            },
+            {
+              "member_path": "docs/spec.md",
+              "native_token": null,
+              "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "captured_at": 100.0,
+              "restore_tier": "restorable-unpinned"
+            }
+          ],
+          "receiver_session_id": "22222222-2222-4222-8222-222222222222"
+        },
+        "capture": {
+          "checkpoint": "checkpoint_id"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/workspace/restore/register",
+    "body": {
+      "session_id": "22222222-2222-4222-8222-222222222222",
+      "checkpoint_id": "${checkpoint}",
+      "writes": [
+        {
+          "member_path": "docs/plan.md",
+          "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "checkpoint_id": "<UUID>",
+      "status": "refused",
+      "detail": "commit_all HELD the registration batch (all-or-nothing: no member registered); per-member typed reasons attached",
+      "versions": {},
+      "skipped": [],
+      "refused": {
+        "docs/plan.md": "other_holder"
+      },
+      "invalidated": 0,
+      "retry_of_own_registration": false,
+      "coordinator_epoch": "<MINTED>"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

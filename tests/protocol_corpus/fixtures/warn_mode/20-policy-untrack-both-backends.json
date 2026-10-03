@@ -1,0 +1,35 @@
+{
+  "name": "policy-untrack-both-backends",
+  "description": "/policy/untrack as the request under test (#193): the path joins ignored.yaml and is reported under `removed`, with an empty `rejected`. The path is deliberately one no strict_mode.yaml names, so the row does not depend on how untrack treats a strict path (#261).",
+  "setup": {
+    "tracked": [
+      "docs/**"
+    ],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/policy/untrack",
+    "body": {
+      "paths": [
+        "docs/plan.md"
+      ]
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "removed": [
+        "docs/plan.md"
+      ],
+      "rejected": []
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

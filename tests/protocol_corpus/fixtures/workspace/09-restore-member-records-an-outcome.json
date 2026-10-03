@@ -1,0 +1,68 @@
+{
+  "name": "workspace-restore-member-records-an-outcome",
+  "description": "The receiver records one member's terminal outcome. Echoes the member path and outcome.",
+  "setup": {
+    "tracked": [
+      "docs/**"
+    ],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n",
+      "docs/spec.md": "# coherence corpus fixture  \n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/workspace/checkpoint",
+        "body": {
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "name": "before-refactor",
+          "window_min": 100.0,
+          "window_max": 101.0,
+          "members": [
+            {
+              "member_path": "docs/plan.md",
+              "native_token": null,
+              "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "captured_at": 100.0,
+              "restore_tier": "restorable-unpinned"
+            },
+            {
+              "member_path": "docs/spec.md",
+              "native_token": null,
+              "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "captured_at": 100.0,
+              "restore_tier": "restorable-unpinned"
+            }
+          ],
+          "receiver_session_id": "22222222-2222-4222-8222-222222222222"
+        },
+        "capture": {
+          "checkpoint": "checkpoint_id"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/workspace/restore/member",
+    "body": {
+      "session_id": "22222222-2222-4222-8222-222222222222",
+      "checkpoint_id": "${checkpoint}",
+      "member_path": "docs/plan.md",
+      "restore_outcome": "restored"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "checkpoint_id": "<UUID>",
+      "member_path": "docs/plan.md",
+      "restore_outcome": "restored",
+      "coordinator_epoch": "<MINTED>"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

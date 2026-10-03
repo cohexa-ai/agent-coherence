@@ -1,0 +1,25 @@
+{
+  "name": "admin-python-prepare-for-migration-accepts-and-schedules-shutdown",
+  "description": "With the operator header the route answers at once -- before the drain runs -- with `draining: true` and the two deadlines, then drains, releases orphan M/E grants and shuts the coordinator down in the background. Safe to run as a fixture: the workspace is empty, so the drain has nothing to release, and coordinator shutdown is idempotent, so the harness tearing it down concurrently is a no-op for whichever call is second.",
+  "setup": {},
+  "request": {
+    "method": "POST",
+    "path": "/admin/prepare-for-migration",
+    "body": {},
+    "headers": {
+      "Coherence-Local-Operator": "true"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "draining": true,
+      "drain_timeout_ms": 5000,
+      "shutdown_scheduled_in_ms": 5100
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

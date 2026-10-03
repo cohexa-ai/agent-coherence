@@ -51,6 +51,11 @@ the harness could not carry before and which are described in full at
   ``<UUID>``. The scrub stays the default everywhere else: it is what lets one
   fixture set run against two implementations that mint different ids.
 
+A value the coordinator mints and a client only echoes (``session_token``,
+``coordinator_epoch``) is scrubbed BY NAME to ``MINTED_SENTINEL`` (#193): the
+key stays in the diff, its per-run value does not, and ``preserve_identity``
+cannot un-hide it.
+
 A principal is subject to R5 and is NOT expressible in an expectation: it
 normalizes to ``PRINCIPAL_SENTINEL``, ``preserve_identity`` cannot un-hide it,
 and ``build_fixture`` refuses a fixture whose expected body carries one.
@@ -124,6 +129,13 @@ IGNORED_SENTINEL = "<IGNORED>"
 #: principal field would be indistinguishable from any other identifier and
 #: ``_validate_expected_body`` could not refuse one.
 PRINCIPAL_SENTINEL = "<PRINCIPAL>"
+#: A value the coordinator MINTS per run and a client only ever echoes back:
+#: a snapshot ``session_token`` and the per-boot ``coordinator_epoch``. Its own
+#: sentinel, not ``UUID_SENTINEL``: neither value is UUID-shaped (a 43-char
+#: URL-safe base64 token; a 32-char undashed hex epoch), so ``_UUID_RE`` never
+#: touched them, and naming the class keeps "this field is present and was
+#: minted" distinguishable from "this field is an identity" in an expected body.
+MINTED_SENTINEL = "<MINTED>"
 _PID_SENTINEL = "<PID>"
 _UPTIME_SENTINEL = "<UPTIME>"
 _PORT_SENTINEL = "<PORT>"
@@ -186,6 +198,23 @@ _PRINCIPAL_KEYS: frozenset[str] = frozenset({
     "principal",
     "caller_principal",
     "principal_id",
+})
+
+# Minted-per-run fields (#193 ask 2). Before these were listed, every fixture
+# asserting a /session/* or /workspace/* response needed a per-fixture
+# ``ignore_keys`` entry for each — a hole the fixture had to open by hand, and
+# one ``ignore_keys`` widens to ANY value, absent included as ``<IGNORED>``.
+# Scrubbing by name keeps the KEY compared: a response that drops
+# ``coordinator_epoch`` (``/session/heartbeat`` never carries one) still
+# differs from one that carries it.
+_MINTED_KEYS: frozenset[str] = frozenset({
+    # Server-minted snapshot-session capability (``/session/begin``); 32
+    # random bytes, URL-safe base64. Echoed by the client, never inspected.
+    "session_token",
+    # Per-coordinator-boot epoch (32-char hex) on every session and workspace
+    # response except the heartbeat; a client compares it for CHANGE, so its
+    # value is never portable across runs or runtimes.
+    "coordinator_epoch",
 })
 
 # Content-hash fields. SHA-256 hex is deterministic for identical bytes, so we
@@ -319,6 +348,11 @@ def normalize_response(
         # The identity opt-in: a declared key's STRING value survives verbatim.
         # Non-string values fall through so a declaration cannot freeze a
         # subtree (and smuggle a timestamp through with it).
+        # A minted value is never comparable either (it differs on every run),
+        # so it too outranks the opt-in; ``_validate_preserve_identity`` refuses
+        # a declaration over one at load.
+        if key in _MINTED_KEYS:
+            return MINTED_SENTINEL
         if key in preserve_identity and isinstance(v, str):
             return v
         # Key-driven normalization fires regardless of value type so we don't
@@ -518,14 +552,30 @@ def _validate_preserve_identity(
     ignore_keys: frozenset[str],
     body: Any,
 ) -> None:
-    """Refuse a declaration that cannot do anything.
+    """Refuse a declaration the comparison would quietly override.
 
-    Four shapes that read as protection and are not: a key ``ignore_keys``
-    discards first, a principal key (R5 outranks the opt-in), a key the
-    fixture's expected body never carries, and a key whose asserted value is
-    already a sentinel — preserving a sentinel preserves nothing. Each one
-    would leave a fixture looking like it pinned an identity while the
-    comparison it produces is the scrubbed one."""
+    Refused: a key ``ignore_keys`` discards first; a principal key (R5 outranks
+    the opt-in); a minted key (``_MINTED_KEYS`` outrank it too — the value
+    differs per run); a key the fixture's expected body never carries; a key
+    with no non-sentinel STRING occurrence; and a key with ANY occurrence whose
+    asserted value is a sentinel. Each would leave a fixture looking like it
+    pinned an identity while the comparison it produces is the scrubbed one.
+
+    Every occurrence is checked, not the last one: a key repeated across rows
+    (``receiver`` per checkpoint, ``agent_id`` per session) whose first row
+    asserts ``<UUID>`` and whose last asserts an identity is refused, where a
+    dict built over the walk would have kept only the last and accepted it. A
+    non-string occurrence (``null`` for a checkpoint that names no receiver) is
+    admitted beside a string one: the opt-in does not apply to it, and the
+    default compares ``null`` literally anyway.
+
+    One shape is ACCEPTED although it does nothing: a declared key whose every
+    value the default scrub leaves unchanged (an undashed hex id, which
+    ``_UUID_RE`` never matches). Declared, it states the contract for the field;
+    deleted, the comparison is the same bytes — it is verbatim either way, so
+    the declaration cannot turn a failing comparison into a passing one, which
+    is the class of fixture this check exists to refuse.
+    ``harness_identity/02`` is that case and its description says so."""
     both = sorted(preserve_identity & ignore_keys)
     if both:
         raise FixtureContractError(
@@ -539,8 +589,20 @@ def _validate_preserve_identity(
             f"{name}: {principals} name a principal field. R5 outranks the "
             f"identity opt-in — a principal is never comparable."
         )
-    asserted = {key: value for key, value in _iter_keyed(body)}
-    sentinels = {UUID_SENTINEL, PRINCIPAL_SENTINEL, IGNORED_SENTINEL, _TS_SENTINEL}
+    minted = sorted(preserve_identity & _MINTED_KEYS)
+    if minted:
+        raise FixtureContractError(
+            f"{name}: {minted} name a minted field. Its value differs on every "
+            f"run, so it always normalizes to {MINTED_SENTINEL!r} — there is no "
+            f"identity to preserve."
+        )
+    asserted: dict[str, list[Any]] = {}
+    for key, value in _iter_keyed(body):
+        asserted.setdefault(key, []).append(value)
+    sentinels = {
+        UUID_SENTINEL, PRINCIPAL_SENTINEL, IGNORED_SENTINEL, _TS_SENTINEL,
+        MINTED_SENTINEL,
+    }
     for key in sorted(preserve_identity):
         if key not in asserted:
             raise FixtureContractError(
@@ -548,17 +610,20 @@ def _validate_preserve_identity(
                 f"fixture's expected body does not carry. A declaration over a "
                 f"key nothing asserts preserves nothing."
             )
-        value = asserted[key]
-        if not isinstance(value, str):
+        values = asserted[key]
+        pinned = [v for v in values if isinstance(v, str)]
+        if not pinned:
             raise FixtureContractError(
                 f"{name}: preserve_identity names {key!r}, whose asserted "
-                f"value is {value!r}. The opt-in applies to string values only."
+                f"values are {values!r}. The opt-in applies to string values only."
             )
-        if value in sentinels:
+        hidden = [v for v in pinned if v in sentinels]
+        if hidden:
             raise FixtureContractError(
-                f"{name}: preserve_identity names {key!r}, whose asserted "
-                f"value is the sentinel {value!r}. Preserving a sentinel "
-                f"preserves nothing — pin the identity itself."
+                f"{name}: preserve_identity names {key!r}, and "
+                f"{len(hidden)} of its {len(values)} asserted occurrence(s) is "
+                f"the sentinel {hidden[0]!r}. Preserving a sentinel preserves "
+                f"nothing — pin the identity itself."
             )
 
 
