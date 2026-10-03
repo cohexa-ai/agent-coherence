@@ -643,6 +643,17 @@ child gets a session of its own. The fresh attempt travels in the request's
 `agent_id` field, so the volume needs a coordinator that reads it: this package's
 from 0.13.0, or the Claude Code plugin's from 0.3.0.
 
+To name the attempt to something else — a registry that joins the coordinator's
+`/status` `sessions[].agent_id` against its writers, for example — read
+`vol.agent_id`: the identity the coordinator keys the volume's next request on,
+in the same string form `/status` reports. `vol.incarnation` is the per-attempt
+part of it, the value every request carries in its `agent_id` field. Both change
+only when an attempt starts (`reacquire()`, `write_cas_at`, `atomic_publish`, a
+`write_cas` that retries or first releases its own `write()` grant, and a forked
+child) and are stable in between, so read them after the operation whose
+attempt you are reporting. `vol.root` is the workspace root as the volume
+resolved it at construction (absolute, symlinks followed); it never changes.
+
 ### Concurrent writers: `write_cas`
 
 Plain `write()` denies the *sequential* stale view. For **concurrent** same-key

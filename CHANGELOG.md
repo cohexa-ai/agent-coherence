@@ -209,6 +209,20 @@ Alpha — APIs may change before `v1.0`.
   stopped writing, a bounded `conflict` (never a clobber) when it is still writing.
   Offline, deterministic, no keys: `python -m examples.session_handoff.main`.
 
+- **`CoherentVolume.incarnation`, `.agent_id` and `.root`: read-only accessors
+  for the attempt identity and the resolved root.** Since `session_id` became
+  stable for the volume's lifetime, the coordinator keys a volume's grants on
+  the session folded with a per-attempt incarnation, which was readable only as
+  the private `_incarnation`; the resolved root only as `_root`. `incarnation`
+  is the value the next request carries in its `agent_id` field; `agent_id` is
+  `str(session_to_agent_id(session_id, incarnation))`, the exact string `/status`
+  reports in `sessions[].agent_id` for this volume's rows; `root` is the path
+  resolved at construction. `incarnation` and `agent_id` change when an attempt
+  starts (`reacquire()`, `write_cas_at`, `atomic_publish`, a `write_cas` retry or
+  its rotation off its own `write()` grant, a forked child) and are stable in
+  between; `root` never changes. The private attributes are unchanged
+  ([#262](https://github.com/Cohexa-ai/agent-coherence/issues/262)).
+
 ### Changed
 
 - **Requests naming a session that has claimed a principal must present it on
