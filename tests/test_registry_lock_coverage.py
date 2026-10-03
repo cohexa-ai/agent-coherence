@@ -266,7 +266,7 @@ EXEMPT_MEMBERS = frozenset({
 INMEM_SURFACE = frozenset({
     "abort_guard", "adjust_checkpoint_pin_refcount", "all_session_meta",
     "artifact_ids", "bind_caller_principal", "capture_version_vector",
-    "clear_agent_transient",
+    "claim_checkpoint_registration", "clear_agent_transient",
     "commit_all", "commit_cas", "conflict_outcome_totals", "coordinator_epoch",
     "artifacts_with_detection_edge", "clear_detection_edges",
     "close_detection_run", "create_checkpoint", "detection_runs",

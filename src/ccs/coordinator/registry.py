@@ -1390,7 +1390,15 @@ class ArtifactRegistry:
             raise ValueError(
                 "create_checkpoint requires an owner: a checkpoint manifest "
                 "without owner metadata is unrepresentable (fail-closed; the "
-                "restore path owner-validates against it)"
+                "owner is provenance — who took it — and the restore "
+                "registration's authorization reads the optional receiver "
+                "instead)"
+            )
+        if checkpoint.registered_by is not None:
+            raise ValueError(
+                "create_checkpoint: a new manifest cannot arrive already "
+                "registered — the registration claim is made only through "
+                "claim_checkpoint_registration"
             )
         with self._lock:
             if checkpoint.checkpoint_id in self._checkpoints:
@@ -1417,6 +1425,25 @@ class ArtifactRegistry:
         """Return the checkpoint header, or ``None`` when unknown."""
         with self._lock:
             return self._checkpoints.get(checkpoint_id)
+
+    def claim_checkpoint_registration(
+        self, checkpoint_id: str, controller: UUID
+    ) -> UUID:
+        """First-claim-wins registration claim (#191) — read + set in one lock
+        hold, so two concurrent claimants cannot both win. Returns the
+        ``registered_by`` holding after the call; raises ``KeyError`` for an
+        unknown checkpoint. Parity with
+        :meth:`SqliteArtifactRegistry.claim_checkpoint_registration`."""
+        with self._lock:
+            record = self._checkpoints.get(checkpoint_id)
+            if record is None:
+                raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
+            if record.registered_by is not None:
+                return record.registered_by
+            self._checkpoints[checkpoint_id] = replace(
+                record, registered_by=controller
+            )
+            return controller
 
     def list_checkpoints(self) -> list[CheckpointRecord]:
         """Return every checkpoint header, ordered by ``(created_at,

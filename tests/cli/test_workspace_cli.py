@@ -34,7 +34,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -93,7 +93,9 @@ def _checkpoint_id(capsys, root: Path) -> str:
     return json.loads(out)["checkpoints"][0]["checkpoint_id"]
 
 
-def _fabricate_checkpoint(root: Path, member: CheckpointMember) -> str:
+def _fabricate_checkpoint(
+    root: Path, member: CheckpointMember, *, receiver: UUID | None = None
+) -> str:
     """Persist a manifest row the CLI cannot mint itself (an S3-shaped member)
     directly through the CLI's own registry, so ``status``/``restore`` render
     real durable state rather than a mock."""
@@ -108,6 +110,7 @@ def _fabricate_checkpoint(root: Path, member: CheckpointMember) -> str:
             members=[member],
             window_min=1.0,
             window_max=2.0,
+            receiver=receiver,
         )
         return record.checkpoint_id
     finally:
@@ -1678,3 +1681,36 @@ def test_guide_does_not_revert_to_the_over_claim(guide_text: str, wording: str) 
     assert _normalized(wording) not in guide_text, (
         f"docs/guide.md reverted to the over-claiming wording: {wording!r}"
     )
+
+
+# --- #191: a checkpoint bound to another receiver ------------------------------
+
+
+def test_restore_of_a_checkpoint_bound_to_another_receiver_is_refused(
+    tmp_path: Path, capsys
+) -> None:
+    """The CLI owns one controller per workspace root, so a checkpoint naming a
+    different receiver (created through another path) is a typed exit-2
+    refusal before the restore writes anything — never a stuck in_progress."""
+    ckpt = _fabricate_checkpoint(
+        tmp_path,
+        CheckpointMember(
+            member_path="effects/notify",
+            artifact_id=None,
+            native_token=None,
+            fingerprint=None,
+            captured_at=1.0,
+            arbitration_tier=ArbitrationTier.NO_ARBITER.value,
+            restore_tier=RestoreTier.FORWARD_ONLY.value,
+        ),
+        receiver=uuid4(),
+    )
+    rc, out, err = _run(capsys, "restore", ckpt, "--json", "--root", str(tmp_path))
+    assert rc == 2
+    envelope = json.loads(out)
+    assert envelope["kind"] == "error"
+    assert envelope["reason"] == "not_the_receiver"
+    assert "not_the_receiver" in err
+    rc, out, _ = _run(capsys, "status", ckpt, "--json", "--root", str(tmp_path))
+    assert rc == 0
+    assert json.loads(out)["checkpoint"]["restore_status"] == "none"

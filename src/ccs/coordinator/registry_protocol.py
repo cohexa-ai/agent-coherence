@@ -158,6 +158,21 @@ class CheckpointRecord:
     (durable because restore is crash-resumable); the vocabulary is the service
     layer's — the registry stores the string. ``pin_refcount`` is the Unit-6 GC
     pin bookkeeping (never negative; adjusted only through the registry).
+
+    ``owner`` is PROVENANCE, not authorization (#191): who took the checkpoint.
+    The restore registration never compares a controller with it, because the
+    checkpoint is the join point between two writers and the one restoring it
+    is routinely not the one that took it. Authorization reads the two fields
+    below instead (schema v9):
+
+    - ``receiver`` — the one controller allowed to register a restore of this
+      checkpoint, named at creation; ``None`` (the default) admits any
+      controller, which is the behaviour before #191;
+    - ``registered_by`` — the controller whose registration claimed this
+      checkpoint first, set once through
+      :meth:`RegistryBase.claim_checkpoint_registration` and never rebound. A
+      later registration by another controller is refused
+      ``already_registered``; a retry by this one is not.
     """
 
     checkpoint_id: str
@@ -170,6 +185,8 @@ class CheckpointRecord:
     restore_status: str = "none"
     restore_updated_at: float | None = None
     pin_refcount: int = 0
+    receiver: UUID | None = None
+    registered_by: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -360,7 +377,23 @@ class RegistryBase(Protocol):
         INCLUDED, same transaction) plus every member row — atomically: all rows
         land or none do. Raises ``ValueError`` on an absent owner (fail-closed:
         an ownerless manifest is never persisted), on a duplicate
-        ``checkpoint_id``, and on duplicate member paths within the manifest."""
+        ``checkpoint_id``, on duplicate member paths within the manifest, and on
+        a header that arrives already ``registered_by`` someone (a registration
+        claim is only ever made through :meth:`claim_checkpoint_registration`)."""
+        ...
+
+    def claim_checkpoint_registration(
+        self, checkpoint_id: str, controller: UUID
+    ) -> UUID:
+        """Claim the restore registration of ``checkpoint_id`` for
+        ``controller``, first claim wins (#191).
+
+        One atomic compare-and-set: when the header's ``registered_by`` is
+        unset it becomes ``controller``; when it is set it is left alone.
+        Returns the ``registered_by`` that holds AFTER the call, so the caller
+        tells "I hold the claim" (the return equals ``controller``) from
+        "another controller does" without a second read that could race.
+        Raises ``KeyError`` for an unknown checkpoint."""
         ...
 
     @property

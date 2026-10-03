@@ -211,6 +211,40 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **A restore registration is checked against its checkpoint, and the first
+  controller to register a checkpoint claims it (#191).** `POST
+  /workspace/restore/register` (and `register_workspace_restore` in-process)
+  used `checkpoint_id` only to prove the manifest existed: a write-set naming
+  paths the checkpoint does not describe, or a member at a fingerprint the
+  caller chose, committed forward with peer invalidations, and a second
+  controller registering the same checkpoint got a success-shaped
+  `empty_write_set`. Now each refusal is typed, lands before anything is
+  resolved or minted, and changes nothing: `not_a_checkpoint_member` and
+  `fingerprint_mismatch` (with the offending `member_paths`),
+  `not_the_receiver`, and `already_registered`, which names no one. A retry by
+  the controller that registered stays idempotent and answers
+  `retry_of_own_registration: true`. A checkpoint can name a **receiver** — the
+  only controller allowed to register it — through
+  `WorkspaceVersioner.checkpoint(name, receiver=...)` or `receiver_session_id`
+  on `POST /workspace/checkpoint`; without one any controller may, as before.
+  The owner stays provenance and is never compared (the `create_checkpoint`
+  error that said the restore path owner-validates against it now says so).
+  `WorkspaceVersioner.restore` refuses a checkpoint bound to another receiver
+  or registered by another owner with `CheckpointRegistrationRefused` before it
+  writes anything, and the CLI exits `2` on it. `GET /workspace/checkpoints`
+  shows `receiver` and `registered_by`. A client that registered a write-set
+  outside the manifest, or a fingerprint other than the captured one, now gets
+  `ok: false`. See the guide's
+  [Who may restore a checkpoint](docs/guide.md#who-may-restore-a-checkpoint-and-what-its-registration-accepts).
+
+- **Registry schema version 9 (forward-only).** `workspace_checkpoints` gains
+  two nullable columns, `receiver` and `registered_by`, for #191. Existing
+  checkpoints migrate with neither set — no receiver, not yet registered — so
+  the first registration after the upgrade claims them. The migration runs on
+  first open and there is no down step: once a workspace's `state.db` (or the
+  CLI's `workspace.db`) is at version 9, an older release refuses it. The
+  v7→v8 step now stamps its own literal version.
+
 - **Requests naming a session that has claimed a principal must present it on
   the routes that can change another writer's work.** `pre-edit`,
   `session-stop`, `post-edit`, `post-edit-cas`, `effect-fence` and the four

@@ -103,6 +103,7 @@ from ccs.core.exceptions import (
     RESTORE_STATUS_CONCLUDED,
     WORKSPACE_REGISTRATION_REFUSED,
     CasVersionConflict,
+    CheckpointRegistrationRefused,
     CheckpointUnknown,
     CoherenceError,
     CommitUnconfirmed,
@@ -1290,7 +1291,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             args, exit_code=2, reason=exc.reason, message=str(exc), exc=exc
         )
         return 2
-    except CheckpointUnknown as exc:
+    except (CheckpointUnknown, CheckpointRegistrationRefused) as exc:
+        # CheckpointRegistrationRefused (#191): the checkpoint names another
+        # receiver, or another controller registered it — refused before the
+        # restore wrote anything. The CLI uses one owner per workspace root,
+        # so only a checkpoint created through another path can reach this.
         err(f"{_PROG}: refused ({exc.reason}): {exc}")
         _emit_error_envelope(
             args, exit_code=2, reason=exc.reason, message=str(exc), exc=exc

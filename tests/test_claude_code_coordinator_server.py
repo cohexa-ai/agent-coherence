@@ -9727,3 +9727,62 @@ def test_session_start_shows_a_bound_peers_notices_without_draining_them(
 
     harm = _CALLER_PRINCIPAL_POSTURE[("POST", "/hooks/session-start")].harm
     assert "without draining them" in harm and "compact-pending" in harm, harm
+
+
+# ----------------------------------------------------------------------
+# #191 — the checkpoint receiver binding composes with the caller principal
+# ----------------------------------------------------------------------
+
+
+def test_checkpoint_receiver_binding_holds_as_far_as_the_principal(
+    client: _Client,
+) -> None:
+    """A checkpoint naming ``receiver_session_id`` admits only that session's
+    registration, and once the receiver session has claimed a principal a
+    register naming it must present it — a copied request naming the
+    receiver without the principal is refused before the handler, so the
+    receiver binding is exactly as strong as the require-class check."""
+    owner_sid, receiver_sid = _sid("191-owner"), _sid("191-receiver")
+    fingerprint = _hash("191-captured")
+    receiver_principal = _explicit_claim(client, receiver_sid)
+    status, body = client.post(
+        "/workspace/checkpoint",
+        {
+            "session_id": owner_sid,
+            "name": "handoff",
+            "window_min": 1.0,
+            "window_max": 1.0,
+            "members": [
+                {"member_path": "plan.md", "native_token": "v1",
+                 "fingerprint": fingerprint, "captured_at": 1.0}
+            ],
+            "receiver_session_id": receiver_sid,
+        },
+    )
+    assert status == 200 and body["ok"] is True, body
+    register = {
+        "checkpoint_id": body["checkpoint_id"],
+        "writes": [{"member_path": "plan.md", "fingerprint": fingerprint}],
+    }
+
+    # The owner's own session is not the receiver.
+    status, body = client.post(
+        "/workspace/restore/register", {"session_id": owner_sid, **register}
+    )
+    assert status == 200 and body["ok"] is False
+    assert body["reason"] == "not_the_receiver"
+
+    # Naming the receiver without its principal: refused at the gate.
+    status, body = client.post(
+        "/workspace/restore/register", {"session_id": receiver_sid, **register}
+    )
+    assert status == 400
+    assert body["reason"] == "caller_principal_absent"
+
+    status, body = client.post(
+        "/workspace/restore/register",
+        {"session_id": receiver_sid, **register},
+        principal=receiver_principal,
+    )
+    assert status == 200 and body["ok"] is True, body
+    assert body["retry_of_own_registration"] is False

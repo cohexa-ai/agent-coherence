@@ -199,7 +199,15 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Final, Mapping, Protocol, Sequence, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Final,
+    Mapping,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 from uuid import UUID
 
 from ccs.adapters.coherent_object import (
@@ -214,6 +222,8 @@ from ccs.adapters.substrate import CasConflict, ReconcileVerdict
 from ccs.coordinator.registry_protocol import CheckpointMember, CheckpointRecord
 from ccs.core.clock import monotonic_seconds
 from ccs.core.exceptions import (
+    CHECKPOINT_ALREADY_REGISTERED_REASON,
+    CHECKPOINT_NOT_THE_RECEIVER_REASON,
     PIN_STATE_HELD,
     PIN_STATE_RELEASED,
     PIN_STATE_UNAVAILABLE,
@@ -244,6 +254,7 @@ from ccs.core.exceptions import (
     WORKSPACE_REGISTRATION_REFUSED,
     CasRetriesExhausted,
     CasVersionConflict,
+    CheckpointRegistrationRefused,
     CheckpointUnknown,
     CoherenceError,
     CommitUnconfirmed,
@@ -419,6 +430,9 @@ class CheckpointPersistence(Protocol):
 
     ONE call registers the whole manifest (header + owner + members) in one
     transaction via the Unit-2 registry API and returns the minted header.
+    A checkpoint taken with a ``receiver`` (#191) passes it as one more
+    keyword, ``receiver=``; one without passes nothing, so a seam that
+    predates the keyword keeps serving receiver-less checkpoints.
     """
 
     def create_workspace_checkpoint(
@@ -948,9 +962,17 @@ class WorkspaceVersioner:
 
     # --- the capture ----------------------------------------------------------
 
-    def checkpoint(self, name: str, *, pin: bool = True) -> WorkspaceCheckpoint:
+    def checkpoint(
+        self, name: str, *, pin: bool = True, receiver: UUID | None = None
+    ) -> WorkspaceCheckpoint:
         """Capture a named checkpoint: cut → verify → persist (one registration)
         → pin (the Unit-6 GC pin legs, on by default).
+
+        ``receiver`` (#191, optional) names the one controller allowed to
+        register a restore of this checkpoint — another versioner's ``owner``
+        when the checkpoint is a handoff. ``None`` (the default) lets any
+        controller restore it, as before; this versioner's ``owner`` is
+        recorded as provenance either way and authorizes nothing.
 
         ``pin=True`` (the fail-closed default) runs the pin legs right after
         the manifest persists — module docstring, "Pins": an S3 hold lands
@@ -983,7 +1005,7 @@ class WorkspaceVersioner:
             pin_store = self._require_pin_store_for_checkpoint() if pin else None
             rows = self._capture_all(name)
             rows = self._verify_window(rows)
-            result = self._persist(name, rows)
+            result = self._persist(name, rows, receiver=receiver)
             if pin_store is None:
                 return result
             checkpoint_id = result.record.checkpoint_id
@@ -1251,9 +1273,18 @@ class WorkspaceVersioner:
 
     # --- persist (one registration) -------------------------------------------
 
-    def _persist(self, name: str, rows: list[CheckpointMember]) -> WorkspaceCheckpoint:
+    def _persist(
+        self,
+        name: str,
+        rows: list[CheckpointMember],
+        *,
+        receiver: UUID | None = None,
+    ) -> WorkspaceCheckpoint:
         window_min = min(row.captured_at for row in rows)
         window_max = max(row.captured_at for row in rows)
+        # Passed only when set, so a persist seam predating #191 keeps working
+        # for every checkpoint that names no receiver.
+        extra: dict[str, Any] = {} if receiver is None else {"receiver": receiver}
         try:
             record = self._service.create_workspace_checkpoint(
                 name=name,
@@ -1262,6 +1293,7 @@ class WorkspaceVersioner:
                 window_min=window_min,
                 window_max=window_max,
                 issued_at_tick=int(self._clock()),
+                **extra,
             )
         except Exception as exc:
             raise CheckpointPersistFailed(
@@ -1693,7 +1725,11 @@ class WorkspaceVersioner:
         including the Unit-5 ``registration`` answer — is returned AND durably
         mirrored. Per-member failures are ABSORBED into the report — the only
         raises are pre-flight, before any status write: the typed
-        :class:`~ccs.core.exceptions.CheckpointUnknown` for an unknown id,
+        :class:`~ccs.core.exceptions.CheckpointUnknown` for an unknown id, the
+        typed :class:`~ccs.core.exceptions.CheckpointRegistrationRefused`
+        (#191) when the checkpoint names a receiver that is not this
+        versioner's ``owner`` (``not_the_receiver``) or another controller
+        already registered it (``already_registered``),
         ``TypeError`` for a service that lacks the restore surface, and
         ``ValueError`` for missing member bindings / a missing file resolver
         (caller misconfiguration must never mint an ``in_progress`` record it
@@ -1744,6 +1780,7 @@ class WorkspaceVersioner:
         record = store.get_workspace_checkpoint(checkpoint_id)
         if record is None:
             raise CheckpointUnknown(checkpoint_id)
+        self._require_registrable_by_owner(record)
         rows = store.get_workspace_checkpoint_members(checkpoint_id)
         self._require_known_restore_state(record, rows)
         if record.restore_status == RESTORE_STATUS_CONCLUDED:
@@ -1935,6 +1972,20 @@ class WorkspaceVersioner:
                 # The controller was invalidated mid-flight (a peer's commit
                 # left it mid-transient): retry-eligible, budget-bounded.
                 continue
+            except CheckpointRegistrationRefused as exc:
+                # #191, past the pre-flight: a concurrent controller claimed
+                # the checkpoint first, or the write-set disagrees with the
+                # manifest. Terminal — re-driving cannot change either — and
+                # nothing was registered. The restore still CONCLUDES.
+                paths = exc.member_paths or tuple(w.member_path for w in writes)
+                return RestoreRegistration(
+                    status=WORKSPACE_REGISTRATION_REFUSED,
+                    detail=f"{exc} — not retried",
+                    substrate_registered=substrate_registered,
+                    deleted_recorded=deleted_recorded,
+                    refused={path: exc.reason for path in paths},
+                    attempts=budget.attempts,
+                )
             if result.status in (
                 WORKSPACE_REGISTRATION_COMMITTED,
                 WORKSPACE_REGISTRATION_EMPTY,
@@ -1973,6 +2024,29 @@ class WorkspaceVersioner:
             # version_mismatch / other_holder: re-drive from fresh comparands.
 
     # --- restore pre-flight (fail-fast, before any status write) --------------
+
+    def _require_registrable_by_owner(self, record: CheckpointRecord) -> None:
+        """Refuse a restore this versioner's registration could never land
+        (#191) — BEFORE any status write or member leg, so a refused restore
+        writes no bytes.
+
+        The two controller refusals of
+        ``CoordinatorService.register_workspace_restore``, read from the
+        header: the checkpoint names a receiver that is not this versioner's
+        ``owner`` (``not_the_receiver``), or another controller already
+        registered it (``already_registered``, naming nobody). A concurrent
+        restore that claims the checkpoint between this read and this run's
+        registration is caught by the service's atomic claim instead, and
+        concludes ``refused`` (see :meth:`_drive_registration`).
+        """
+        if record.receiver is not None and record.receiver != self._owner:
+            raise CheckpointRegistrationRefused(
+                record.checkpoint_id, CHECKPOINT_NOT_THE_RECEIVER_REASON
+            )
+        if record.registered_by is not None and record.registered_by != self._owner:
+            raise CheckpointRegistrationRefused(
+                record.checkpoint_id, CHECKPOINT_ALREADY_REGISTERED_REASON
+            )
 
     def _require_restore_store(self) -> CheckpointRestoreStore:
         if not isinstance(self._service, CheckpointRestoreStore):

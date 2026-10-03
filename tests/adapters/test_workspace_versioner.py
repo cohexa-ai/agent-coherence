@@ -27,6 +27,7 @@ Covers, per the unit's test scenarios:
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
@@ -53,6 +54,8 @@ from ccs.adapters.workspace import (
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.service import CoordinatorService
 from ccs.core.exceptions import (
+    CHECKPOINT_ALREADY_REGISTERED_REASON,
+    CHECKPOINT_NOT_THE_RECEIVER_REASON,
     CHECKPOINT_UNKNOWN_REASON,
     PIN_STATE_HELD,
     PIN_STATE_RELEASED,
@@ -82,6 +85,7 @@ from ccs.core.exceptions import (
     WORKSPACE_REGISTRATION_PRIOR_RUN,
     WORKSPACE_REGISTRATION_REFUSED,
     CasVersionConflict,
+    CheckpointRegistrationRefused,
     CheckpointUnknown,
     CommitUnconfirmed,
     OccCallerTransientError,
@@ -3371,6 +3375,119 @@ def test_registration_budget_exhaustion_under_sustained_contention() -> None:
     assert (service.commit_all_calls, service.register_calls) == calls_before
 
 
+def _restorer_owned_by(
+    service: Any, files: _FakeFileStore, resolver: _FakeResolver, owner: uuid.UUID
+) -> WorkspaceVersioner:
+    restorer = WorkspaceVersioner(
+        service=service, owner=owner, clock=_TickClock(), file_resolver=resolver
+    )
+    restorer.add_file_member(files, "notes/plan.md")
+    return restorer
+
+
+def test_restore_by_non_receiver_refused_before_any_write() -> None:
+    """#191: a checkpoint taken with a ``receiver`` restores only through a
+    versioner owned by that receiver. Any other versioner — the one that took
+    it included — is refused typed in pre-flight: no status write, no leg, no
+    bytes, no claim."""
+    registry, service = _probe_service()
+    receiver = uuid.uuid4()
+    files = _FakeFileStore()
+    files.put("notes/plan.md", b"plan text", 7)
+    resolver = _FakeResolver()
+    resolver.keep("notes/plan.md", 7, b"plan text")
+    taker = _versioner(service, resolver=resolver)
+    taker.add_file_member(files, "notes/plan.md")
+    checkpoint = taker.checkpoint("handoff", receiver=receiver)
+    assert checkpoint.record.receiver == receiver
+    assert checkpoint.record.owner == OWNER
+    checkpoint_id = checkpoint.record.checkpoint_id
+    files.put("notes/plan.md", b"edited", 9)
+
+    for stranger in (OWNER, uuid.uuid4()):
+        with pytest.raises(CheckpointRegistrationRefused) as excinfo:
+            _restorer_owned_by(service, files, resolver, stranger).restore(
+                checkpoint_id
+            )
+        assert excinfo.value.reason is CHECKPOINT_NOT_THE_RECEIVER_REASON
+    assert service.status_writes == []
+    assert service.register_calls == 0
+    assert files.read_with_version("notes/plan.md")[0] == b"edited"
+    assert registry.get_checkpoint(checkpoint_id).registered_by is None
+
+    report = _restorer_owned_by(service, files, resolver, receiver).restore(
+        checkpoint_id
+    )
+    assert report.status == RESTORE_STATUS_CONCLUDED
+    assert report.registration is not None
+    assert report.registration.status in (
+        WORKSPACE_REGISTRATION_COMMITTED,
+        WORKSPACE_REGISTRATION_EMPTY,
+    )
+    assert registry.get_checkpoint(checkpoint_id).registered_by == receiver
+
+
+def test_restore_of_a_checkpoint_another_owner_registered_is_refused() -> None:
+    """#191, the versioner's half of ``already_registered``: once one owner's
+    restore registered a checkpoint, another owner's restore is refused in
+    pre-flight — it never re-drives the legs and never reads the first run's
+    registration as its own ``registered_by_prior_run``. The first owner's
+    re-restore still rebuilds its report."""
+    registry, service = _probe_service()
+    service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=sha256_hex(b"old-body")
+    )
+    checkpoint_id, files, resolver = _checkpoint_diverged_file(service)
+    first = _restorer_for(service, files, resolver).restore(checkpoint_id)
+    assert first.registration.status is WORKSPACE_REGISTRATION_COMMITTED
+    assert registry.get_checkpoint(checkpoint_id).registered_by == OWNER
+    writes_before = list(service.status_writes)
+
+    with pytest.raises(CheckpointRegistrationRefused) as excinfo:
+        _restorer_owned_by(service, files, resolver, uuid.uuid4()).restore(
+            checkpoint_id
+        )
+    assert excinfo.value.reason is CHECKPOINT_ALREADY_REGISTERED_REASON
+    assert service.status_writes == writes_before
+
+    again = _restorer_for(service, files, resolver).restore(checkpoint_id)
+    assert again.registration.status is WORKSPACE_REGISTRATION_PRIOR_RUN
+
+
+def test_registration_claimed_mid_restore_concludes_refused() -> None:
+    """#191 race: a concurrent controller claims the checkpoint between this
+    restore's pre-flight and its registration. The service's atomic claim
+    refuses it ``already_registered``; the restore still CONCLUDES, with the
+    registration ``refused`` (terminal, not retried) and nothing committed."""
+    registry, service = _probe_service()
+    art = service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=sha256_hex(b"old-body")
+    )
+    checkpoint_id, files, resolver = _checkpoint_diverged_file(service)
+    rival = uuid.uuid4()
+    real_register = service.register_workspace_restore
+
+    def _rival_claims_first(**kwargs: Any) -> Any:
+        registry.claim_checkpoint_registration(checkpoint_id, rival)
+        return real_register(**kwargs)
+
+    service.register_workspace_restore = _rival_claims_first  # type: ignore[method-assign]
+    report = _restorer_for(service, files, resolver).restore(checkpoint_id)
+
+    assert report.status == RESTORE_STATUS_CONCLUDED
+    reg = report.registration
+    assert reg is not None
+    assert reg.status is WORKSPACE_REGISTRATION_REFUSED
+    assert reg.refused == {"notes/plan.md": CHECKPOINT_ALREADY_REGISTERED_REASON}
+    assert service.register_calls == 1  # terminal: never re-driven
+    assert service.commit_all_calls == 0
+    assert registry.get_artifact(art.id).version == 1
+    assert service.status_writes == [
+        RESTORE_STATUS_IN_PROGRESS,
+        RESTORE_STATUS_CONCLUDED,
+    ]
+
+
 def test_registration_transient_invalidation_retries_and_lands() -> None:
     """FIX-5b: OccCallerTransientError raised by the registration call (a
     peer's commit left the controller mid-transient) is retry-eligible — the
@@ -3407,27 +3524,32 @@ def test_registration_transient_invalidation_retries_and_lands() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _route_checkpoint(client, *, member_path: str = "notes/plan.md") -> str:
+def _route_checkpoint(
+    client,
+    *,
+    member_path: str = "notes/plan.md",
+    fingerprint: str | None = None,
+    receiver_session_id: str | None = None,
+) -> str:
     sid = str(uuid.uuid4())
-    status, body = client(
-        "POST",
-        "/workspace/checkpoint",
-        {
-            "session_id": sid,
-            "name": "route-restore-cp",
-            "window_min": 100.0,
-            "window_max": 100.0,
-            "members": [
-                _member_wire(
-                    member_path,
-                    native_token="7",
-                    fingerprint=sha256_hex(b"plan text"),
-                    arbitration_tier="no-arbiter",
-                    restore_tier="restorable-unpinned",
-                )
-            ],
-        },
-    )
+    payload: dict[str, Any] = {
+        "session_id": sid,
+        "name": "route-restore-cp",
+        "window_min": 100.0,
+        "window_max": 100.0,
+        "members": [
+            _member_wire(
+                member_path,
+                native_token="7",
+                fingerprint=fingerprint or sha256_hex(b"plan text"),
+                arbitration_tier="no-arbiter",
+                restore_tier="restorable-unpinned",
+            )
+        ],
+    }
+    if receiver_session_id is not None:
+        payload["receiver_session_id"] = receiver_session_id
+    status, body = client("POST", "/workspace/checkpoint", payload)
     assert status == 200 and body["ok"] is True
     return body["checkpoint_id"]
 
@@ -3510,7 +3632,10 @@ def test_route_restore_progress_validation_fails_closed(client) -> None:
 def test_route_restore_register_first_observation_then_commit(client) -> None:
     """Over HTTP against the sqlite-backed coordinator: the first registration
     of an unknown path mints hash-only via resolve_or_register (skipped —
-    empty_write_set), and a later differing fingerprint COMMITS forward."""
+    empty_write_set), a retry says it is one, a fingerprint the manifest did
+    not capture is refused (#191 — it used to commit forward), and a SECOND
+    checkpoint that captured the member at another fingerprint COMMITS it
+    forward."""
     sid = str(uuid.uuid4())
     checkpoint_id = _route_checkpoint(client)
     fp_one = sha256_hex(b"plan text")
@@ -3538,8 +3663,11 @@ def test_route_restore_register_first_observation_then_commit(client) -> None:
     assert status == 200 and body["ok"] is True
     assert body["status"] == "empty_write_set"
     assert body["skipped"] == ["notes/plan.md"]
+    # The empty call above already claimed the checkpoint for this session.
+    assert body["retry_of_own_registration"] is True
 
-    # A differing fingerprint commits FORWARD (v1 -> v2), all-or-nothing.
+    # A fingerprint this checkpoint did not capture: refused typed, nothing
+    # bumped (pre-#191 this committed v1 -> v2 at the caller's hash).
     status, body = client(
         "POST",
         "/workspace/restore/register",
@@ -3549,10 +3677,152 @@ def test_route_restore_register_first_observation_then_commit(client) -> None:
             "writes": [{"member_path": "notes/plan.md", "fingerprint": fp_two}],
         },
     )
+    assert status == 200 and body["ok"] is False
+    assert body["reason"] == "fingerprint_mismatch"
+    assert body["member_paths"] == ["notes/plan.md"]
+
+    # A second checkpoint that captured the member at fp_two commits it
+    # FORWARD (v1 -> v2), all-or-nothing.
+    second = _route_checkpoint(client, fingerprint=fp_two)
+    status, body = client(
+        "POST",
+        "/workspace/restore/register",
+        {
+            "session_id": sid,
+            "checkpoint_id": second,
+            "writes": [{"member_path": "notes/plan.md", "fingerprint": fp_two}],
+        },
+    )
     assert status == 200 and body["ok"] is True
     assert body["status"] == "committed"
     assert body["versions"] == {"notes/plan.md": 2}
     assert body["refused"] == {}
+    assert body["retry_of_own_registration"] is False
+
+
+def test_route_restore_register_refuses_non_member_and_mints_nothing(
+    client, coordinator
+) -> None:
+    """#191 membership half over HTTP: a path the checkpoint does not
+    describe is refused with a typed reason, and the coordinator — which never
+    saw the path — holds no artifact for it afterwards."""
+    sid = str(uuid.uuid4())
+    checkpoint_id = _route_checkpoint(client)
+    status, body = client(
+        "POST",
+        "/workspace/restore/register",
+        {
+            "session_id": sid,
+            "checkpoint_id": checkpoint_id,
+            "writes": [
+                {"member_path": "secrets/other.md", "fingerprint": sha256_hex(b"x")}
+            ],
+        },
+    )
+    assert status == 200 and body["ok"] is False
+    assert body["reason"] == "not_a_checkpoint_member"
+    assert body["member_paths"] == ["secrets/other.md"]
+    assert "detail" in body
+    assert coordinator.registry.lookup_artifact_id_by_name("secrets/other.md") is None
+    status, listing = client("GET", "/workspace/checkpoints")
+    (cp,) = listing["checkpoints"]
+    assert cp["registered_by"] is None
+
+
+def test_route_restore_register_second_session_refused(client, coordinator) -> None:
+    """#191 / plan B7 over HTTP: a second session registering a checkpoint
+    another session already registered is refused ``already_registered``
+    (it used to get a success-shaped ``empty_write_set``), and the refusal
+    names neither session; the first session's retry is told it is a retry."""
+    from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
+
+    first_sid, second_sid = str(uuid.uuid4()), str(uuid.uuid4())
+    checkpoint_id = _route_checkpoint(client)
+    write = {"member_path": "notes/plan.md", "fingerprint": sha256_hex(b"plan text")}
+
+    def register(sid: str) -> dict:
+        status, body = client(
+            "POST",
+            "/workspace/restore/register",
+            {"session_id": sid, "checkpoint_id": checkpoint_id, "writes": [write]},
+        )
+        assert status == 200
+        return body
+
+    first = register(first_sid)
+    assert first["ok"] is True and first["retry_of_own_registration"] is False
+
+    second = register(second_sid)
+    assert second["ok"] is False
+    assert second["reason"] == "already_registered"
+    assert second["member_paths"] == []
+    first_agent = str(session_to_agent_id(first_sid))
+    for leaked in (first_sid, first_agent, second_sid):
+        assert leaked not in json.dumps(second)
+
+    again = register(first_sid)
+    assert again["ok"] is True
+    assert again["status"] == "empty_write_set"
+    assert again["retry_of_own_registration"] is True
+
+    status, listing = client("GET", "/workspace/checkpoints")
+    (cp,) = listing["checkpoints"]
+    assert cp["registered_by"] == first_agent
+    assert cp["receiver"] is None
+
+
+def test_route_checkpoint_receiver_binds_the_registration(client) -> None:
+    """#191 owner half over HTTP: ``receiver_session_id`` at creation names
+    the one session allowed to register; the creating session and any other
+    are refused ``not_the_receiver`` and claim nothing."""
+    from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
+
+    receiver_sid = str(uuid.uuid4())
+    checkpoint_id = _route_checkpoint(client, receiver_session_id=receiver_sid)
+    write = {"member_path": "notes/plan.md", "fingerprint": sha256_hex(b"plan text")}
+
+    status, listing = client("GET", "/workspace/checkpoints")
+    (cp,) = listing["checkpoints"]
+    assert cp["receiver"] == str(session_to_agent_id(receiver_sid))
+    assert cp["owner"] != cp["receiver"]
+
+    status, body = client(
+        "POST",
+        "/workspace/restore/register",
+        {"session_id": str(uuid.uuid4()), "checkpoint_id": checkpoint_id,
+         "writes": [write]},
+    )
+    assert status == 200 and body["ok"] is False
+    assert body["reason"] == "not_the_receiver"
+    status, listing = client("GET", "/workspace/checkpoints")
+    assert listing["checkpoints"][0]["registered_by"] is None
+
+    status, body = client(
+        "POST",
+        "/workspace/restore/register",
+        {"session_id": receiver_sid, "checkpoint_id": checkpoint_id,
+         "writes": [write]},
+    )
+    assert status == 200 and body["ok"] is True
+    status, listing = client("GET", "/workspace/checkpoints")
+    assert listing["checkpoints"][0]["registered_by"] == cp["receiver"]
+
+
+def test_route_checkpoint_receiver_session_id_is_shape_checked(client) -> None:
+    status, body = client(
+        "POST",
+        "/workspace/checkpoint",
+        {
+            "session_id": str(uuid.uuid4()),
+            "name": "cp",
+            "window_min": 1.0,
+            "window_max": 1.0,
+            "members": [_member_wire("a.txt")],
+            "receiver_session_id": "not a session id",
+        },
+    )
+    assert status == 400
+    assert "receiver_session_id" in body["error"]
 
 
 def test_route_restore_register_boundary_validation(client) -> None:

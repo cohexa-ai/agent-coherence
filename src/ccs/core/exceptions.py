@@ -1278,8 +1278,9 @@ WORKSPACE_REGISTRATION_STATUSES: frozenset[str] = frozenset(
 )
 
 # Pre-flight restore refusal: the checkpoint id names no persisted manifest.
-# The ONLY typed restore exception — a restore that starts always CONCLUDES
-# with a report (failures are per-member absorbing outcomes, never raises).
+# One of the two typed restore pre-flight exceptions (the other is
+# ``CheckpointRegistrationRefused`` below) — a restore that starts always
+# CONCLUDES with a report (failures are per-member absorbing outcomes).
 CHECKPOINT_UNKNOWN_REASON = "checkpoint_unknown"
 
 
@@ -1300,6 +1301,91 @@ class CheckpointUnknown(CoherenceError):
             "nothing was restored (list checkpoints and retry with a known id)"
         )
         self.checkpoint_id = checkpoint_id
+
+
+# Restore-REGISTRATION pre-flight refusals (#191). Each is a typed reason a
+# client branches on by identity, never by parsing prose; every one is raised
+# BEFORE any artifact is resolved or minted and before ``commit_all`` runs, so
+# a refused registration changes nothing.
+#
+# - ``not_a_checkpoint_member`` — a write names a path the checkpoint's
+#   manifest does not describe (the stale-id case: a write-set registered
+#   against a checkpoint from another round);
+# - ``fingerprint_mismatch`` — the path IS a member, but the write's
+#   fingerprint is not the one the manifest captured for it (a restore
+#   registers the captured bytes, never a caller-chosen hash);
+# - ``not_the_receiver`` — the checkpoint named a receiver at creation and the
+#   registering controller is not it;
+# - ``already_registered`` — another controller already registered this
+#   checkpoint. The refusal names nobody: the caller learns only that it was
+#   not first. A retry by the controller that DID register is not refused; its
+#   result carries ``retry_of_own_registration=True`` instead.
+CHECKPOINT_NOT_A_MEMBER_REASON = "not_a_checkpoint_member"
+CHECKPOINT_FINGERPRINT_MISMATCH_REASON = "fingerprint_mismatch"
+CHECKPOINT_NOT_THE_RECEIVER_REASON = "not_the_receiver"
+CHECKPOINT_ALREADY_REGISTERED_REASON = "already_registered"
+CHECKPOINT_REGISTRATION_REFUSAL_REASONS: frozenset[str] = frozenset(
+    {
+        CHECKPOINT_NOT_A_MEMBER_REASON,
+        CHECKPOINT_FINGERPRINT_MISMATCH_REASON,
+        CHECKPOINT_NOT_THE_RECEIVER_REASON,
+        CHECKPOINT_ALREADY_REGISTERED_REASON,
+    }
+)
+
+
+class CheckpointRegistrationRefused(CoherenceError):
+    """A restore registration refused before anything was resolved (#191).
+
+    ``reason`` is one of :data:`CHECKPOINT_REGISTRATION_REFUSAL_REASONS`,
+    matched by identity (the typed-signal-not-substring house rule): the
+    instance carries the module constant itself, never an equal copy.
+    ``member_paths`` names the offending writes for the two membership reasons
+    (the caller's own paths, nothing it did not send) and is empty for the two
+    controller reasons. Neither controller reason names another controller.
+
+    Raised by ``CoordinatorService.register_workspace_restore`` and, for the
+    two controller reasons, by ``WorkspaceVersioner.restore`` as a pre-flight
+    refusal before any status write or member leg.
+    """
+
+    def __init__(
+        self,
+        checkpoint_id: str,
+        reason: str,
+        *,
+        member_paths: "tuple[str, ...]" = (),
+    ) -> None:
+        canonical = {r: r for r in CHECKPOINT_REGISTRATION_REFUSAL_REASONS}
+        if reason not in canonical:
+            raise ValueError(
+                f"unknown checkpoint registration refusal reason {reason!r}"
+            )
+        reason = canonical[reason]
+        paths = list(member_paths)
+        detail = {
+            CHECKPOINT_NOT_A_MEMBER_REASON: (
+                "the write-set names paths the checkpoint's manifest does not "
+                f"describe: {paths!r}"
+            ),
+            CHECKPOINT_FINGERPRINT_MISMATCH_REASON: (
+                "the write-set's fingerprints differ from the ones the manifest "
+                f"captured for: {paths!r}"
+            ),
+            CHECKPOINT_NOT_THE_RECEIVER_REASON: (
+                "the checkpoint names a receiver and this controller is not it"
+            ),
+            CHECKPOINT_ALREADY_REGISTERED_REASON: (
+                "another controller already registered this checkpoint"
+            ),
+        }[reason]
+        super().__init__(
+            f"restore registration of checkpoint {checkpoint_id!r} refused "
+            f"({reason}): {detail} — nothing was registered"
+        )
+        self.checkpoint_id = checkpoint_id
+        self.reason = reason
+        self.member_paths = tuple(member_paths)
 
 
 class WatchdogAbandoned(RuntimeError):

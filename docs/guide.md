@@ -970,6 +970,23 @@ Nothing was added to the substrate wire for this: the values ride the read each 
 
 Each member's leg rides its own backend's arbitration: S3 legs are a native conditional write (`If-Match` — the substrate arbitrates a racing foreign writer); file legs are a version-checked write whose foreign-edit signal is **detection only** (`no-arbiter`) — a foreign edit racing a file restore is detected and reported as a typed conflict, never presented as substrate arbitration. Restore progress is durable, so a restore interrupted mid-way resumes idempotently: already-terminal members are skipped, and a member whose live state already matches concludes `converged` without a second write.
 
+### Who may restore a checkpoint, and what its registration accepts
+
+After the member legs, a restore *registers* its written file members with the coordinator (`POST /workspace/restore/register`, or `CoordinatorService.register_workspace_restore` in-process): each member's artifact moves forward to the captured fingerprint and peers holding it are invalidated. That step is checked before it resolves or mints anything, and every refusal carries a typed `reason`:
+
+| `reason` | When |
+|---|---|
+| `not_a_checkpoint_member` | a write names a path the checkpoint does not describe — typically a checkpoint id from an earlier round. `member_paths` names them |
+| `fingerprint_mismatch` | the path is a member, but the write's fingerprint is not the one captured for it. A restore registers the captured bytes only |
+| `not_the_receiver` | the checkpoint names a receiver and this controller is not it |
+| `already_registered` | another controller registered this checkpoint first. The refusal does not say who |
+
+**The owner is provenance, not permission.** A checkpoint records who took it (`owner`), and nothing checks a restore against that: the point of a checkpoint is often that someone else restores it. To restrict who may, name a **receiver** when you take it — `WorkspaceVersioner.checkpoint(name, receiver=<their owner id>)`, or `receiver_session_id` on `POST /workspace/checkpoint`. Without one, any controller may register it, as before.
+
+**The first registration claims the checkpoint.** Once a controller registers a checkpoint, a registration by any other controller is refused `already_registered`, while the same controller's retries stay idempotent and come back with `retry_of_own_registration: true` — so "I registered this" and "someone else did" never look alike. The claim is kept even when the registration's commit is refused (a live holder, a fenced controller), so the same controller re-drives and no one takes the checkpoint over mid-retry. `GET /workspace/checkpoints` shows `receiver` and `registered_by` per checkpoint. In-process, `WorkspaceVersioner.restore` checks both before it writes anything and raises `CheckpointRegistrationRefused`; a rival claiming the checkpoint while a restore is already running is caught at registration instead, and that restore concludes with its registration `refused`.
+
+**How far this holds.** Over HTTP the controller is derived from the request's `session_id`, so the receiver binding is as strong as that identity: when the receiver's session has claimed a [caller principal](#caller-principal), a register naming it must present that principal; when it has not, anyone holding the workspace secret can name it. In-process, the controller is whatever the caller passes. This separates writers that follow the protocol; it is not a security boundary.
+
 ### The honesty model: restore tiers and pin states
 
 Every member carries a **restore tier**, derived from what its backend can actually promise — never asserted:
@@ -1007,7 +1024,7 @@ Exit codes:
 |---|---|
 | `0` | the verb succeeded (restore: concluded with no member in `conflict` / `target_lost` / `held_unconfirmed`) — never a claim that nothing was overwritten: a restore that put a member back over content committed after the capture also exits `0`, and says so per member in the report |
 | `1` | not in a git repository, or a validation error (no members, a `..` traversal in a member argument), or a typed contention error |
-| `2` | a typed refusal: a non-UTF-8 member, an unknown checkpoint id, a persist failure, or a member path that fails containment at access time — a workspace escape, a symlink component, a hardlinked regular file with a co-owner outside the root, a non-regular file (FIFO, socket, device), or a `.coherence/**` self-target |
+| `2` | a typed refusal: a non-UTF-8 member, an unknown checkpoint id, a checkpoint bound to another receiver or already registered by another controller, a persist failure, or a member path that fails containment at access time — a workspace escape, a symlink component, a hardlinked regular file with a co-owner outside the root, a non-regular file (FIFO, socket, device), or a `.coherence/**` self-target |
 | `3` | the restore **concluded**, but at least one member ended in `conflict` / `target_lost` / `held_unconfirmed`, or the restore registration was refused — the per-member report on stdout is the truth; the exit code just tells you to read it |
 | `4` | opt-in, and only with `restore --exit-nonzero-on-discarded-content`: the restore concluded clean by the codes above, but at least one member's write discarded content the checkpoint did not hold, or the run holds no record of what that member's write overwrote. Without the flag the same run exits `0`, and both producers of `3` take precedence over it. It is evaluated after the engine returns, so it reports the writes and never prevents one |
 

@@ -195,6 +195,14 @@ class WorkspaceRegistrationResult:
     the idempotency filter that makes crash-resumed registration exactly-once
     — a re-run of an already-landed registration re-answers without a second
     version bump.
+
+    ``retry_of_own_registration`` (#191) is ``True`` when this controller had
+    already claimed the checkpoint's registration before this call — the call
+    is a retry of its OWN registration, so an ``empty_write_set`` with
+    ``skipped`` members reads "I registered this", never "someone else did".
+    A registration claimed by a DIFFERENT controller never reaches a result:
+    it is refused ``already_registered`` (:class:`~ccs.core.exceptions.
+    CheckpointRegistrationRefused`).
     """
 
     checkpoint_id: str
@@ -204,6 +212,7 @@ class WorkspaceRegistrationResult:
     skipped: tuple[str, ...] = ()
     signals: tuple["InvalidationSignal", ...] = ()
     refused: Mapping[str, ConflictDetail] = field(default_factory=dict)
+    retry_of_own_registration: bool = False
 
 
 @dataclass(frozen=True)

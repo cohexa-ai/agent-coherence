@@ -22,6 +22,10 @@ from ccs.core.exceptions import (
     CALLER_PRINCIPAL_ABSENT_REASON,
     CALLER_PRINCIPAL_CLAIMED_REASON,
     CALLER_PRINCIPAL_FOREIGN_REASON,
+    CHECKPOINT_ALREADY_REGISTERED_REASON,
+    CHECKPOINT_FINGERPRINT_MISMATCH_REASON,
+    CHECKPOINT_NOT_A_MEMBER_REASON,
+    CHECKPOINT_NOT_THE_RECEIVER_REASON,
     CURRENT_VERSION_REASON,
     EPOCH_MISMATCH_REASON,
     FUTURE_VERSION_REASON,
@@ -41,6 +45,7 @@ from ccs.core.exceptions import (
     WORKSPACE_REGISTRATION_EMPTY,
     WORKSPACE_REGISTRATION_REFUSED,
     CallerPrincipalRefused,
+    CheckpointRegistrationRefused,
     CheckpointUnknown,
     CoherenceError,
     OccCallerTransientError,
@@ -2582,6 +2587,7 @@ class CoordinatorService:
         window_max: float,
         issued_at_tick: int = 0,
         abort: threading.Event | None = None,
+        receiver: UUID | None = None,
     ) -> CheckpointRecord:
         """Persist ONE workspace-checkpoint manifest (WV plan Unit 3 / R1–R2).
 
@@ -2606,6 +2612,12 @@ class CoordinatorService:
         watchdog-timed-out ``/workspace/checkpoint`` request fails closed at
         the registry write lock instead of landing a manifest AFTER the client
         already received the degraded ``checkpoint_unconfirmed`` response.
+
+        ``receiver`` (#191, optional) names the ONE controller allowed to
+        register a restore of this checkpoint
+        (:meth:`register_workspace_restore` refuses any other
+        ``not_the_receiver``). ``None`` admits any controller. ``owner`` is
+        provenance only and authorizes nothing.
         """
         if not isinstance(name, str) or not name.strip():
             raise ValueError("create_workspace_checkpoint requires a non-empty name")
@@ -2633,6 +2645,7 @@ class CoordinatorService:
             created_at_tick=issued_at_tick,
             window_min=float(window_min),
             window_max=float(window_max),
+            receiver=receiver,
         )
         with self.registry.abort_guard(abort):
             self.registry.create_checkpoint(record, member_rows)
@@ -2860,12 +2873,45 @@ class CoordinatorService:
         bounded. ``abort`` threads into ``commit_all`` → ``abort_guard`` (the
         A6 lesson: every mutating path threads it).
 
+        **Who may register, and against what (#191).** Before anything is
+        resolved, minted or committed, in this order:
+
+        1. ``not_the_receiver`` — the checkpoint named a ``receiver`` at
+           creation and ``controller`` is not it. ``owner`` is never compared:
+           it is provenance, and the controller restoring a checkpoint is
+           routinely not the one that took it.
+        2. ``already_registered`` — another controller's registration already
+           claimed this checkpoint (the header's ``registered_by``). The
+           refusal names nobody.
+        3. ``not_a_checkpoint_member`` / ``fingerprint_mismatch`` — every write
+           must name a member of the manifest AND carry that member's captured
+           fingerprint. Checked before resolution on purpose: resolution mints
+           an artifact on first observation, so a refused path the coordinator
+           never saw must not get one.
+        4. The CLAIM — :meth:`RegistryBase.claim_checkpoint_registration`,
+           atomic first-claim-wins. A loser of a concurrent race (both passed
+           step 2) is refused ``already_registered`` here, still before any
+           resolution. The claim is sticky: a registration that then HELDs
+           (``refused``) or raises keeps it, so the same controller re-drives
+           and nobody else can take the checkpoint over mid-retry.
+
+        A controller that already held the claim gets its result with
+        ``retry_of_own_registration=True`` — "I registered this" is always
+        distinguishable from "someone else did" (which never reaches a
+        result). Over HTTP the controller is derived from the request's
+        ``session_id`` and, when that session claimed a caller principal,
+        checked against it (the route is require-class); in-process the
+        caller passes it and is trusted, like every in-process caller.
+
         Raises:
             CheckpointUnknown: ``checkpoint_id`` names no persisted manifest.
+            CheckpointRegistrationRefused: one of the four typed reasons above
+                (``reason`` matched by identity); nothing resolved or minted.
             ValueError: blank/duplicate member paths or a blank fingerprint
                 (caller bugs, refused before any resolution).
         """
-        if self.registry.get_checkpoint(checkpoint_id) is None:
+        record = self.registry.get_checkpoint(checkpoint_id)
+        if record is None:
             raise CheckpointUnknown(checkpoint_id)
         entries = list(writes)
         seen: set[str] = set()
@@ -2883,6 +2929,9 @@ class CoordinatorService:
                     f"{write.member_path!r} in the write-set"
                 )
             seen.add(write.member_path)
+        retry_of_own = self._claim_workspace_registration(
+            record, controller, entries, abort=abort
+        )
         if not entries:
             return WorkspaceRegistrationResult(
                 checkpoint_id=checkpoint_id,
@@ -2891,6 +2940,7 @@ class CoordinatorService:
                     "empty write-set: no written file members to register — "
                     "commit_all was never called (it raises on an empty set)"
                 ),
+                retry_of_own_registration=retry_of_own,
             )
 
         skipped: list[str] = []
@@ -2929,6 +2979,7 @@ class CoordinatorService:
                     "fingerprint — commit_all was never called"
                 ),
                 skipped=tuple(skipped),
+                retry_of_own_registration=retry_of_own,
             )
 
         out = self.commit_all(
@@ -2953,6 +3004,7 @@ class CoordinatorService:
                     path_by_artifact[art_id]: conflict
                     for art_id, conflict in out.per_artifact.items()
                 },
+                retry_of_own_registration=retry_of_own,
             )
         result, signals = out
         versions: dict[str, int] = {}
@@ -2973,7 +3025,72 @@ class CoordinatorService:
             versions=versions,
             skipped=tuple(skipped),
             signals=tuple(signals),
+            retry_of_own_registration=retry_of_own,
         )
+
+    def _claim_workspace_registration(
+        self,
+        record: CheckpointRecord,
+        controller: UUID,
+        entries: "Sequence[WorkspaceRestoreWrite]",
+        *,
+        abort: threading.Event | None = None,
+    ) -> bool:
+        """The #191 pre-resolution gate of :meth:`register_workspace_restore`:
+        receiver, prior claim, membership + fingerprint, then the atomic claim.
+
+        Returns ``True`` when ``controller`` already held the claim before this
+        call (a retry of its own registration), ``False`` when this call made
+        the claim. Raises :class:`CheckpointRegistrationRefused` on any of the
+        four refusals; nothing is resolved, minted or committed then. The claim is a durable
+        write, so it threads ``abort`` (A6): a watchdog-abandoned request
+        fails closed at the registry lock instead of claiming late.
+        """
+        checkpoint_id = record.checkpoint_id
+        if record.receiver is not None and record.receiver != controller:
+            raise CheckpointRegistrationRefused(
+                checkpoint_id, CHECKPOINT_NOT_THE_RECEIVER_REASON
+            )
+        if record.registered_by is not None and record.registered_by != controller:
+            raise CheckpointRegistrationRefused(
+                checkpoint_id, CHECKPOINT_ALREADY_REGISTERED_REASON
+            )
+        members = {
+            row.member_path: row
+            for row in self.registry.get_checkpoint_members(checkpoint_id)
+        }
+        strangers = tuple(
+            write.member_path for write in entries if write.member_path not in members
+        )
+        if strangers:
+            raise CheckpointRegistrationRefused(
+                checkpoint_id,
+                CHECKPOINT_NOT_A_MEMBER_REASON,
+                member_paths=strangers,
+            )
+        # A member captured absent (or forward-only) has no fingerprint, so no
+        # write can match it: a restore registers captured bytes only.
+        mismatched = tuple(
+            write.member_path
+            for write in entries
+            if members[write.member_path].fingerprint != write.fingerprint
+        )
+        if mismatched:
+            raise CheckpointRegistrationRefused(
+                checkpoint_id,
+                CHECKPOINT_FINGERPRINT_MISMATCH_REASON,
+                member_paths=mismatched,
+            )
+        with self.registry.abort_guard(abort):
+            holder = self.registry.claim_checkpoint_registration(
+                checkpoint_id, controller
+            )
+        if holder != controller:
+            # Lost a concurrent race after the pre-check above passed.
+            raise CheckpointRegistrationRefused(
+                checkpoint_id, CHECKPOINT_ALREADY_REGISTERED_REASON
+            )
+        return record.registered_by == controller
 
     def _resolve_workspace_member_artifact(
         self, member_path: str, fingerprint: str
