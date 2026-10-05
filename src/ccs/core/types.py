@@ -598,3 +598,98 @@ class FenceComparands:
     grant_did_not_stand: bool
     content_claim_present: bool
 
+
+
+# ---------------------------------------------------------------------------
+# Targeted grant handoff (#185, unit U2): the transfer record's status
+# vocabulary and the two typed outcomes the handoff answers with.
+# ---------------------------------------------------------------------------
+#
+# The status a transfer record carries (R25). Wire-stable constants matched by
+# identity (add, never rename). A status is a LABEL, not liveness: a record is
+# live while the artifact's version still equals the version at transfer and
+# the status is neither declined nor withdrawn, whatever else it says (R10).
+#
+# - ``pending`` -- the transfer landed; the successor has not acted.
+# - ``completed`` -- the successor acquired, won a compare-and-swap, or accepted.
+#   Completion alone never lifts the giver's fence.
+# - ``declined`` -- the successor declined; the fence is off.
+# - ``withdrawn`` -- the giver withdrew; the fence is off.
+# - ``overtaken`` -- a third session acquired or won a compare-and-swap; the
+#   record names it as the counterparty.
+# - ``superseded`` -- the giver transferred the path again. No stored row
+#   carries it: the replacing record's cause records the supersession, and a
+#   re-sent superseded transfer answers this status.
+TRANSFER_STATUS_PENDING = "pending"
+TRANSFER_STATUS_COMPLETED = "completed"
+TRANSFER_STATUS_DECLINED = "declined"
+TRANSFER_STATUS_WITHDRAWN = "withdrawn"
+TRANSFER_STATUS_OVERTAKEN = "overtaken"
+TRANSFER_STATUS_SUPERSEDED = "superseded"
+TRANSFER_STATUSES: frozenset[str] = frozenset(
+    {
+        TRANSFER_STATUS_PENDING,
+        TRANSFER_STATUS_COMPLETED,
+        TRANSFER_STATUS_DECLINED,
+        TRANSFER_STATUS_WITHDRAWN,
+        TRANSFER_STATUS_OVERTAKEN,
+        TRANSFER_STATUS_SUPERSEDED,
+    }
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class TransferGrantOutcome:
+    """One grant's answer to a transfer (R3): transferred, or refused with its
+    reason. A multi-path transfer answers one of these per path, and its
+    top-level result is success only when every grant transferred.
+
+    ``kw_only`` because ``giver`` and ``successor`` are two ids of one type side
+    by side: a positional swap reports the giver as the successor, which is the
+    handoff pointed the wrong way.
+
+    - ``transferred`` -- the grant was handed off (or a re-send found its live
+      record, R6). ``reason`` is ``None`` then; otherwise it is the typed
+      refusal reason (see
+      :data:`ccs.core.exceptions.HANDOFF_TRANSFER_REFUSAL_REASONS`), and the
+      grant was left exactly as it was (R4).
+    - ``giver`` / ``successor`` -- session-level ids: the normalised pair of a
+      transferred grant, or the pending pair a ``handoff_in_flight`` refusal
+      names (R26). ``None`` where the answer names no record.
+    - ``version_at_transfer`` -- the artifact version the handoff is fenced on.
+    - ``hold_shape`` -- the grant given up: EXCLUSIVE, MODIFIED or SHARED.
+    - ``status`` -- the record's status (one of :data:`TRANSFER_STATUSES`) where
+      the answer reports one: a fresh or re-sent transfer, and the
+      ``handoff_ended`` refusal (R6).
+    """
+
+    artifact_id: UUID
+    transferred: bool
+    reason: str | None = None
+    giver: UUID | None = None
+    successor: UUID | None = None
+    version_at_transfer: int | None = None
+    hold_shape: MESIState | None = None
+    status: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class CasHandoffOutcome:
+    """What a compare-and-swap win did to a live handoff of its path (R21, R24,
+    R32): the successor's win marks it ``completed``; a third session's win
+    marks it ``overtaken`` with that session as ``counterparty``. Reported
+    beside the win, never instead of it -- the win's answer does not change.
+
+    ``status`` is :data:`TRANSFER_STATUS_COMPLETED` or
+    :data:`TRANSFER_STATUS_OVERTAKEN`. ``giver`` and ``successor`` are the
+    record's session-level ids (``kw_only`` for the same swap hazard as
+    :class:`TransferGrantOutcome`), ``version_at_transfer`` the version the win
+    was taken at.
+    """
+
+    artifact_id: UUID
+    status: str
+    giver: UUID
+    successor: UUID
+    version_at_transfer: int
+    counterparty: UUID | None = None

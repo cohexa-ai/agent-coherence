@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from uuid import UUID
+
 # Wire-stable reason string for the retry-eligible OCC precondition where a peer
 # invalidated the caller in the window BETWEEN its fresh read and its CAS. Defined
 # ONCE here so the coordinator server's response mapping
@@ -390,6 +392,137 @@ once it holds the right principal. ``caller_principal_claimed`` is not one of
 these: it answers a mint claim, in an HTTP 200 ``{ok: false}`` body."""
 
 # ---------------------------------------------------------------------------
+# targeted grant handoff vocabulary (#185, unit U2)
+# ---------------------------------------------------------------------------
+#
+# A session done with a path hands it to a named successor (a transfer); the
+# giver is then fenced on that path while the handoff record is live (the
+# artifact's version still equals the version at transfer and the record was
+# neither declined nor withdrawn). Wire-stable and ADDITIVE: every value below
+# is matched by ``reason == CONSTANT`` or by membership, never by a substring of
+# a message (the typed-signal-not-substring house rule); add, never rename.
+# Disjoint from :data:`HOLD_REASONS`: none of these invites the reacquire a hold
+# does, and the giver's refusal must never be retried.
+GIVER_FENCED_REASON = "handed_off"
+"""The committer handed this path off and the handoff is still live, so its
+write is refused on every write route -- the pessimistic acquire and commit,
+the compare-and-swap commit and the batch commit. The refusal names the
+successor and the version at transfer. It ends when the successor writes the
+path, when the successor declines, or when the giver withdraws on its user's or
+host's instruction; a retry, a reacquire or a re-read never ends it. Carried by
+:class:`GiverFenced`."""
+
+# Per-grant transfer refusals. A refused grant is left exactly as it was.
+HANDOFF_SELF_REASON = "handoff_to_self"
+"""The named successor is the caller's own session-level identity, directly or
+through a composite (the caller's own subagent) that normalises to it. A
+handoff is between sessions."""
+
+HANDOFF_SUCCESSOR_UNKNOWN_REASON = "handoff_successor_unknown"
+"""The successor id is well formed but names no identity the coordinator knows:
+no bound principal, no registered session, no grant row, or a composite the
+live name map no longer holds (it is lost on a coordinator restart)."""
+
+HANDOFF_SUCCESSOR_MALFORMED_REASON = "handoff_successor_malformed"
+"""The successor id is not a well-formed agent id."""
+
+HANDOFF_NOT_HELD_REASON = "handoff_not_held"
+"""The presented identity holds no claim on the path (no EXCLUSIVE or MODIFIED
+grant and no standing SHARED read). Wins over a foreign write holder. Also the
+answer to a re-sent transfer once the artifact's version has moved past the
+version at transfer."""
+
+HANDOFF_VERSION_UNCONFIRMED_REASON = "handoff_version_unconfirmed"
+"""The path has no confirmed version (unconfirmed, or zero), so there is no
+version at transfer to fence on. A definite refusal: nothing was written. Not
+to be confused with :data:`HANDOFF_TRANSFER_UNCONFIRMED_REASON`, which says the
+transfer's own outcome is unknown."""
+
+HANDOFF_IN_FLIGHT_REASON = "handoff_in_flight"
+"""Another session's handoff of this path is live. The refusal names that
+pending giver and successor and, in static text, what ends it: the successor
+declines, the giver withdraws, or any session writes the path. Only the giver of
+a live handoff may transfer the path again (which supersedes its record)."""
+
+HANDOFF_OTHER_HOLDER_REASON = "handoff_other_holder"
+"""Another session holds this path EXCLUSIVE or MODIFIED, so the caller's claim
+is not the write authority to hand on (R5). When the caller also holds nothing
+on the path, :data:`HANDOFF_NOT_HELD_REASON` is answered instead: the not-held
+reason wins. Its own value, not the compare-and-swap route's ``other_holder``,
+so a client can tell a refused grant of a transfer from a refused write by
+membership in :data:`HANDOFF_TRANSFER_REFUSAL_REASONS`."""
+
+HANDOFF_ENDED_REASON = "handoff_ended"
+"""A re-sent transfer (same giver, successor, path and version) whose record has
+ended at an unmoved version: declined, withdrawn, or superseded by the giver's
+later transfer of the path. The refusal carries that status; nothing is
+written."""
+
+# Accept and decline (the successor's verbs) and withdraw (the giver's verb).
+HANDOFF_NOT_SUCCESSOR_REASON = "handoff_not_successor"
+"""An accept or decline by a session that is not the live record's successor.
+The refusal carries the record's status."""
+
+HANDOFF_NOT_GIVER_REASON = "handoff_not_giver"
+"""A withdraw by a session that is not the live record's giver. The refusal
+carries the record's status."""
+
+HANDOFF_NOT_LIVE_REASON = "handoff_not_live"
+"""An accept, decline or withdraw with no live record to act on: the record was
+declined or withdrawn, or the artifact's version moved past the version at
+transfer. The refusal carries the record's status."""
+
+# One fail-closed degraded answer per verb: the coordinator could not confirm
+# the outcome in time (a watchdog timeout). The outcome is UNKNOWN -- it may
+# still land -- so a client never reads one of these as a refusal that changed
+# nothing, nor as a success.
+HANDOFF_TRANSFER_UNCONFIRMED_REASON = "handoff_transfer_unconfirmed"
+HANDOFF_ACCEPT_UNCONFIRMED_REASON = "handoff_accept_unconfirmed"
+HANDOFF_DECLINE_UNCONFIRMED_REASON = "handoff_decline_unconfirmed"
+HANDOFF_WITHDRAW_UNCONFIRMED_REASON = "handoff_withdraw_unconfirmed"
+
+HANDOFF_TRANSFER_REFUSAL_REASONS: frozenset[str] = frozenset(
+    {
+        HANDOFF_SELF_REASON,
+        HANDOFF_SUCCESSOR_UNKNOWN_REASON,
+        HANDOFF_SUCCESSOR_MALFORMED_REASON,
+        HANDOFF_NOT_HELD_REASON,
+        HANDOFF_VERSION_UNCONFIRMED_REASON,
+        HANDOFF_IN_FLIGHT_REASON,
+        HANDOFF_OTHER_HOLDER_REASON,
+        HANDOFF_ENDED_REASON,
+    }
+)
+"""The handoff-specific reasons a refused grant of a transfer carries in its
+per-grant answer."""
+
+HANDOFF_UNCONFIRMED_REASONS: frozenset[str] = frozenset(
+    {
+        HANDOFF_TRANSFER_UNCONFIRMED_REASON,
+        HANDOFF_ACCEPT_UNCONFIRMED_REASON,
+        HANDOFF_DECLINE_UNCONFIRMED_REASON,
+        HANDOFF_WITHDRAW_UNCONFIRMED_REASON,
+    }
+)
+"""The four degraded answers, one per verb: the outcome is unknown. A client
+raises on these and returns every other handoff refusal as a typed value."""
+
+HANDOFF_REASONS: frozenset[str] = (
+    frozenset(
+        {
+            GIVER_FENCED_REASON,
+            HANDOFF_NOT_SUCCESSOR_REASON,
+            HANDOFF_NOT_GIVER_REASON,
+            HANDOFF_NOT_LIVE_REASON,
+        }
+    )
+    | HANDOFF_TRANSFER_REFUSAL_REASONS
+    | HANDOFF_UNCONFIRMED_REASONS
+)
+"""Every wire reason the handoff adds -- the closed set a consumer, and the
+protocol corpus's coverage check, matches against."""
+
+# ---------------------------------------------------------------------------
 # MCP-C deny vocabulary (stale-write-guard-fs, 2026-06-18 plan, Unit 1)
 # ---------------------------------------------------------------------------
 #
@@ -511,6 +644,44 @@ class CallerPrincipalRefused(CoherenceError):
         super().__init__(message)
         self.reason = reason
         self.settled = settled
+
+
+class GiverFenced(CoherenceError):
+    """The committer handed this path off, and the handoff is still live: its
+    write is refused, on the pessimistic route and the compare-and-swap route
+    alike, and nothing landed.
+
+    A terminal, never retried: no reacquire, re-read or re-merge ends the fence,
+    because it is keyed on the giver's session-level identity, which a fresh
+    incarnation keeps. It ends when the successor writes the path, when the
+    successor declines, or when the giver withdraws on its user's or host's
+    instruction -- so the giver stops and reports to its user or host.
+
+    Carries :data:`GIVER_FENCED_REASON` on the class, so a consumer classifies it
+    by type or ``.reason``, never by the message, plus ``successor`` (the
+    session-level id the path was handed to) and ``version_at_transfer``.
+    ``artifact_id`` names what was refused: the artifact id in process, a path
+    on a client. ``successor`` is the id as the raise site has it -- a ``UUID``
+    in process, the wire string on a client -- and the constructor never
+    parses it, because an exception constructor must not raise.
+    """
+
+    reason = GIVER_FENCED_REASON
+
+    def __init__(
+        self, artifact_id: object, successor: UUID | str, version_at_transfer: int
+    ) -> None:
+        super().__init__(
+            f"{GIVER_FENCED_REASON} artifact={artifact_id} successor={successor} "
+            f"version_at_transfer={version_at_transfer} (no write landed: this was "
+            "handed off to the successor at that version. The fence ends when the "
+            "successor writes it, when the successor declines, or when the giver "
+            "withdraws on its user's or host's instruction; stop and report, a "
+            "retry cannot clear it)"
+        )
+        self.artifact_id = artifact_id
+        self.successor = successor
+        self.version_at_transfer = version_at_transfer
 
 
 class CoherenceDegradedWarning(UserWarning):

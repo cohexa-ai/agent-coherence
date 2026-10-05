@@ -215,8 +215,9 @@ class CheckpointMember:
 # carrying one of these bumps the artifact's owner_generation (the
 # read-generation fence), because the claim was revoked WITHOUT a version move,
 # which version-CAS cannot see. EPOCH_BUMP_TRIGGERS immediately below is the
-# full bump set -- it adds the voluntary "invalidate" release, which ends a
-# claim at an unchanged version the same way. The peer-invalidation triggers
+# full bump set -- it adds the voluntary "invalidate" release and the
+# HANDOFF_TRIGGER, which each end a claim at an unchanged version the same way
+# without being a reclaim. The peer-invalidation triggers
 # never bump, for different reasons each: "commit" moves the version, so
 # version-CAS already catches a stale write; "write" (a peer's pessimistic
 # acquire) moves NOTHING, and is kept out anyway -- see the note under
@@ -224,6 +225,13 @@ class CheckpointMember:
 RECLAIM_TRIGGERS: frozenset[str] = frozenset(
     {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
 )
+# HANDOFF_TRIGGER: the trigger a transfer moves its giver INVALID under (the
+# targeted grant handoff, #185). Its own value, distinct from "invalidate", so
+# the state log records a deliberate handoff as a handoff rather than as a
+# release, and deliberately NOT a RECLAIM_TRIGGER: a handoff is the holder's own
+# act, never an eviction. Wire-stable: renaming it without EPOCH_BUMP_TRIGGERS
+# leaves the bump keyed on a string nothing emits.
+HANDOFF_TRIGGER: str = "handoff"
 # EPOCH_BUMP_TRIGGERS: the triggers whose M/E -> INVALID transition MOVES the
 # ownership epoch. The rule is not "the sweep did it" but "a write-claim was
 # revoked WITHOUT the version moving" -- the one condition version-CAS is
@@ -234,6 +242,13 @@ RECLAIM_TRIGGERS: frozenset[str] = frozenset(
 # already INVALID, so the sweep has no M/E grant left to reclaim and the epoch
 # never moves at all -- the identical end-state a sweep reclaim fences was
 # silently admitted (NoSilentRevoke, formal/tla/Fencing.tla).
+#
+# HANDOFF_TRIGGER joins for the same reason: a giver that hands a path off from
+# EXCLUSIVE or MODIFIED ends its write claim at an unchanged version exactly as
+# a release does, so its late commit must meet the fence. Because the bump keys
+# on leaving M/E, a giver handing off a standing SHARED read never moves the
+# epoch -- it revoked no write claim, and a bump there would fence every
+# bystander that read the path as though a writer had been reclaimed.
 #
 # The peer-invalidation triggers ("write" / "commit") stay OUT, unchanged.
 # "commit" moves the version, so version-CAS already arbitrates a stale write.
@@ -249,7 +264,9 @@ RECLAIM_TRIGGERS: frozenset[str] = frozenset(
 # arbitrate -- is HELD by the effect gate's standing-grant re-check
 # (adapters.effect_gate.check_fence: a stale-status re-validate read HOLDs
 # even with the (version, generation) pair unchanged).
-EPOCH_BUMP_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS | frozenset({"invalidate"})
+EPOCH_BUMP_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS | frozenset(
+    {"invalidate", HANDOFF_TRIGGER}
+)
 # CLAIM_CAPTURE_TRIGGERS: triggers under which a transition MAY be a genuine
 # content read for read-generation capture (the E/M-acquire capture is keyed
 # on the state transition, not the trigger). Membership is necessary, not
