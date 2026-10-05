@@ -948,3 +948,56 @@ def test_a_degraded_mint_reads_as_failure_and_carries_no_principal(
     assert status == 200
     assert body == {"ok": False, "degraded": True, "reason": "claim_unconfirmed"}
     assert body["reason"] not in HOLD_REASONS
+
+
+# ----------------------------------------------------------------------
+# Targeted grant handoff routes (#185, U5)
+# ----------------------------------------------------------------------
+
+from ccs.adapters.claude_code.coordinator_server import (  # noqa: E402
+    _MIGRATION_REJECTED_ROUTES,
+)
+
+#: FROZEN duplicate of the four handoff routes and their attempt counters.
+_HANDOFF_ROUTE_COUNTERS = {
+    "/handoff/transfer": "handoff_transfer_total",
+    "/handoff/accept": "handoff_accept_total",
+    "/handoff/decline": "handoff_decline_total",
+    "/handoff/withdraw": "handoff_withdraw_total",
+}
+
+
+@pytest.mark.parametrize("route", sorted(_HANDOFF_ROUTE_COUNTERS))
+def test_handoff_route_is_registered_counted_and_served_during_a_drain(
+    route: str, coordinator, client: _Client
+) -> None:
+    """Each handoff verb is registered in the central table (so the bearer and
+    Host seam applies), is counted in BOTH counter registrations -- the
+    increment helper silently ignores a name missing from the counter dict,
+    so the bump itself is asserted -- and keeps serving during a migration
+    drain: a transfer initiates no write, and its epoch move is the
+    release-class bump the drain performs itself (R37)."""
+    counter = _HANDOFF_ROUTE_COUNTERS[route]
+    assert ("POST", route) in _ROUTES
+    assert _ENDPOINT_COUNTER_NAMES[("POST", route)] == counter
+    assert ("POST", route) not in _MIGRATION_REJECTED_ROUTES
+    before = coordinator.endpoint_counters_snapshot()[counter]
+    coordinator._migration_draining = True
+    try:
+        status, body = client.post(route, {"session_id": _sid("handoff-drain")})
+    finally:
+        coordinator._migration_draining = False
+    assert status == 400, (status, body)  # the handler answered: not the drain's 503
+    assert coordinator.endpoint_counters_snapshot()[counter] == before + 1
+
+
+@pytest.mark.parametrize("route", sorted(_HANDOFF_ROUTE_COUNTERS))
+def test_handoff_route_without_bearer_is_401(coordinator, route: str) -> None:
+    url = f"http://127.0.0.1:{coordinator.port}{route}"
+    req = urlrequest.Request(
+        url, data=b"{}", method="POST",
+        headers={"Host": "127.0.0.1", "Content-Type": "application/json"},
+    )
+    with pytest.raises(urlerror.HTTPError) as err:
+        urlrequest.urlopen(req, timeout=5)
+    assert err.value.code == 401

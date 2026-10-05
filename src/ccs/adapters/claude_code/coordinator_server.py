@@ -18,6 +18,9 @@ shared-secret Bearer auth + Host-header check (KTD-12):
 - ``POST /policy/untrack``      — Unit 6 CLI hot-add to ignored.yaml
 - ``GET  /status``              — Unit 6 status CLI
 - ``POST /principal/claim``     — caller-principal mint (plan U4; Python-only)
+- ``POST /handoff/transfer``    — hand claims to a named successor (#185;
+  Python-only, like ``/handoff/accept``, ``/handoff/decline`` and
+  ``/handoff/withdraw``)
 
 Every route that names an acting identity (``session_id``) has a caller-
 principal posture in :data:`_CALLER_PRINCIPAL_POSTURE` (plan U6): require-class
@@ -74,7 +77,7 @@ from ccs.adapters.claude_code.auth import (
 )
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
-from ccs.coordinator.registry_protocol import CheckpointMember
+from ccs.coordinator.registry_protocol import CheckpointMember, TransferRecord
 from ccs.coordinator.service import (
     CallerPrincipalUncached,
     CoordinatorService,
@@ -86,7 +89,17 @@ from ccs.core.exceptions import (
     CALLER_PRINCIPAL_ABSENT_REASON,
     CALLER_PRINCIPAL_FOREIGN_REASON,
     CHECKPOINT_UNKNOWN_REASON,
+    GIVER_FENCED_REASON,
     HANDLER_FAILURE_REASON_PREFIX,
+    HANDOFF_ACCEPT_UNCONFIRMED_REASON,
+    HANDOFF_DECLINE_UNCONFIRMED_REASON,
+    HANDOFF_IN_FLIGHT_REASON,
+    HANDOFF_NOT_HELD_REASON,
+    HANDOFF_NOT_LIVE_REASON,
+    HANDOFF_SUCCESSOR_MALFORMED_REASON,
+    HANDOFF_SUCCESSOR_UNKNOWN_REASON,
+    HANDOFF_TRANSFER_UNCONFIRMED_REASON,
+    HANDOFF_WITHDRAW_UNCONFIRMED_REASON,
     HOLD_REASONS,
     HOLD_VERSION_UNCONFIRMED,
     OCC_CALLER_TRANSIENT_REASON,
@@ -97,6 +110,7 @@ from ccs.core.exceptions import (
     CallerPrincipalRefused,
     CheckpointUnknown,
     CoherenceError,
+    GiverFenced,
     OccCallerTransientError,
     SessionInvalidated,
     StaleReadGeneration,
@@ -110,6 +124,8 @@ from ccs.core.fence import (
 from ccs.core.states import MESIState
 from ccs.core.substrate import ArbitrationTier, RestoreTier
 from ccs.core.types import (
+    TRANSFER_STATUS_COMPLETED,
+    TRANSFER_STATUS_OVERTAKEN,
     Artifact,
     ConflictDetail,
     DataPlaneDeferredRead,
@@ -118,6 +134,8 @@ from ccs.core.types import (
     SessionCommitRejection,
     SessionReadRejection,
     SnapshotSession,
+    TransferGrantOutcome,
+    TransferVerbOutcome,
     VersionedContent,
     VersionedReadRejection,
     WorkspaceRestoreWrite,
@@ -278,13 +296,17 @@ def session_to_agent_id(session_id: str, subagent_id: str | None = None) -> UUID
     return uuid5(NAMESPACE_URL, f"ccs-agent:claude-session-{session_id}")
 
 
+_AGENT_NAME_PREFIX = "claude-session-"
+_SUBAGENT_NAME_INFIX = ":subagent-"
+
+
 def session_to_agent_name(session_id: str, subagent_id: str | None = None) -> str:
     """Human-readable agent name for state_log and status display. SB-25:
     a subagent identity renders as ``claude-session-<sid>:subagent-<aid>``
     so /status keeps the parent linkage visible."""
     if subagent_id:
-        return f"claude-session-{session_id}:subagent-{subagent_id}"
-    return f"claude-session-{session_id}"
+        return f"{_AGENT_NAME_PREFIX}{session_id}{_SUBAGENT_NAME_INFIX}{subagent_id}"
+    return f"{_AGENT_NAME_PREFIX}{session_id}"
 
 
 def caller_principal_identity(session_id: str) -> UUID:
@@ -467,7 +489,14 @@ _CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
         "caller cannot assert; an absent principal admits nothing more")),
     ("POST", "/session/commit"): RoutePrincipalPosture(_ACCEPT, (
         "writes attribution, but only through a server-minted session token "
-        "bound to its owner; an absent principal admits nothing more")),
+        "bound to its owner, and /session/begin, which mints one for the "
+        "session it names, is accept-class too. Accepted behaviour for an "
+        "absent principal: a request that presents no principal and names a "
+        "bound session commits as that session, so against a live handoff of "
+        "the path it is fenced as that session when it is a live record's "
+        "giver, completes the record as that session when it is the record's "
+        "successor, and is stored as the counterparty of an overtake "
+        "otherwise")),
     ("POST", "/session/commit_all"): RoutePrincipalPosture(_ACCEPT, (
         "as /session/commit, over a write-set")),
     ("POST", "/session/heartbeat"): RoutePrincipalPosture(_ACCEPT, (
@@ -496,6 +525,26 @@ _CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
     ("POST", "/principal/claim"): RoutePrincipalPosture(PrincipalPosture.MINT, (
         "issues principals; requiring one would be circular, and its gate is "
         "the mint nonce (first claim wins, a retry must present the same nonce)")),
+    # -- the four grant-handoff verbs (#185) ---------------------------------
+    ("POST", "/handoff/transfer"): RoutePrincipalPosture(_REQUIRE, (
+        "hands the claims the named identity presents to a successor and "
+        "records the named session as the giver, fenced from writing those "
+        "paths until the handoff ends: a caller without a claimed session's "
+        "principal could give away that session's claim and leave it unable "
+        "to write the path")),
+    ("POST", "/handoff/accept"): RoutePrincipalPosture(_REQUIRE, (
+        "marks a live handoff to the named session completed: a caller "
+        "without the successor's principal could accept a handoff in its "
+        "name")),
+    ("POST", "/handoff/decline"): RoutePrincipalPosture(_REQUIRE, (
+        "ends a live handoff to the named session and lifts its giver's "
+        "fence: a caller without the successor's principal could refuse a "
+        "handoff in its name and reopen the path to the giver")),
+    ("POST", "/handoff/withdraw"): RoutePrincipalPosture(_REQUIRE, (
+        "ends the named session's live handoff and lifts its fence: a caller "
+        "without the giver's principal could withdraw the handoff, so the "
+        "giver's late write would land where its successor was told to "
+        "write")),
 }
 """Route -> caller-principal posture, over EVERY route that reads a
 ``session_id`` and no other. The require-class harm is what an absent
@@ -730,6 +779,31 @@ def has_subagent_id_field(body: dict) -> bool:
     degrading to parent attribution there is benign."""
     raw = _raw_subagent_id_value(body)
     return raw is not None and raw != ""
+
+
+_MALFORMED_SUBAGENT_ERROR = "agent_id must be 1-64 chars of [A-Za-z0-9_-]"
+"""The 400 ``error`` for a present-but-malformed subagent id on a route that
+refuses one rather than reading it as the parent (session-stop, the transfer)
+-- the effect fence's wording, so a client sees one phrase for one fault."""
+
+_AGENT_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32}",
+    re.IGNORECASE,
+)
+"""The two spellings the coordinator publishes an agent id in: the hyphenated
+form ``/status`` lists (``str(uuid)``) and the 32-hex form a stale summary
+names a writer by (``uuid.hex``). Matched with ``fullmatch``; nothing else
+``uuid.UUID`` would parse (braces, a ``urn:uuid:`` prefix) is accepted."""
+
+
+def parse_agent_id(value: Any) -> UUID | None:
+    """A successor id named on the wire, as a UUID; ``None`` when it is not a
+    well-formed agent id in one of the two published spellings
+    (:data:`_AGENT_ID_RE`). A transfer refuses every grant of a request whose
+    successor is ``None`` here (``handoff_successor_malformed``, R2)."""
+    if not isinstance(value, str) or _AGENT_ID_RE.fullmatch(value) is None:
+        return None
+    return UUID(value)
 
 
 def validate_session_id(
@@ -982,6 +1056,11 @@ class CoordinatorHTTPServer:
             # Same rule as effect_fence_total above: registered in
             # _ENDPOINT_COUNTER_NAMES too, or the mint is counted nowhere.
             "principal_claim_total": 0,
+            # The four grant-handoff verbs (#185), on the same rule.
+            "handoff_transfer_total": 0,
+            "handoff_accept_total": 0,
+            "handoff_decline_total": 0,
+            "handoff_withdraw_total": 0,
         }
         self._endpoint_counters_lock = threading.Lock()
 
@@ -1302,6 +1381,32 @@ class CoordinatorHTTPServer:
                     session_id, subagent_id
                 )
         return agent_id
+
+    def session_identity_for(self, agent_id: UUID) -> UUID | None:
+        """The session-level identity of ``agent_id`` while the live name map
+        holds it -- itself for a session-level id, its session's for a
+        subagent's or a volume incarnation's composite -- else ``None``.
+
+        How a transfer normalises a successor named by a composite id (#185
+        R2, KTD7). Read back from the display name :meth:`register_session`
+        wrote (:func:`session_to_agent_name`'s scheme, the SB-25 source of
+        truth :meth:`agents_for_session` also reads), and kept only when that
+        name re-derives ``agent_id``, so a name written any other way never
+        resolves. Process-local like the map: after a restart a composite id
+        is unknown here even while it still holds a grant row, and a
+        session-level id stays known only through its principal binding. The
+        session id itself never leaves this method."""
+        name = self.agent_name_for(agent_id)
+        if name is None or not name.startswith(_AGENT_NAME_PREFIX):
+            return None
+        session_id, _, subagent_id = name[len(_AGENT_NAME_PREFIX):].partition(
+            _SUBAGENT_NAME_INFIX
+        )
+        if validate_session_id(session_id) is not None:
+            return None
+        if session_to_agent_id(session_id, subagent_id or None) != agent_id:
+            return None
+        return caller_principal_identity(session_id)
 
     def agent_names_snapshot(self) -> list[tuple[UUID, str]]:
         """R10 (Unit 6): return a stable list snapshot of (agent_id, name)
@@ -2086,6 +2191,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
+    caller = caller_principal_identity(session_id)
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -2413,6 +2519,10 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                         additional_context=notice_text,
                     ),
                 }
+        # #185 R29: the structured handoff key, on every arm (a strict deny
+        # included -- it is a top-level key, never inside the deny's bytes),
+        # and only while the path has a transfer record.
+        result = _attach_handoff_key(coordinator, result, path=path, caller=caller)
         # SB-10 U4 (KTD6): the deferred re-grounding seam sits AFTER the
         # deny decision inside work() — a strict deny returns untouched and
         # keeps the flag pending — and AFTER the notice drain above, so
@@ -2892,6 +3002,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
+    caller = caller_principal_identity(session_id)
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -2972,8 +3083,16 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         holder_id, holder_ts = _exclusive_holder(coordinator, artifact_id, exclude_agent=agent_id)
 
         # Acquire EXCLUSIVE — this invalidates peers (KTD-1 single-writer).
+        # ``caller`` is the session-level identity (#185 KTD1): the giver of a
+        # live handoff is refused whichever subagent or incarnation it sends.
         try:
-            coordinator.service.write(agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=now, abort=abort)
+            coordinator.service.write(
+                agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=now,
+                abort=abort, caller=caller,
+            )
+        except GiverFenced as exc:
+            # Ahead of the generic arm, which would answer the refusal as prose.
+            return _giver_fenced_body(exc)
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
 
@@ -3029,9 +3148,11 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # inside work(); notices are already merged into the result's
         # additionalContext, so the re-grounding block always lands last.
         # The abort token rides along so a timed-out request never
-        # consumes the compact-pending flag.
+        # consumes the compact-pending flag. #185 R29: the handoff key is a
+        # top-level key, attached on every arm while a record exists.
+        result = _attach_handoff_key(coordinator, work(), path=path, caller=caller)
         return _deliver_pending_reground(
-            coordinator, session_id, body, work(), abort=abort
+            coordinator, session_id, body, result, abort=abort
         )
 
     # On watchdog timeout this route ADMITS. _PRE_EDIT_DEGRADED_RESPONSE is
@@ -3091,6 +3212,7 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
 
     # Records the display name for /status; the attributed id is agent_id above.
     coordinator.register_session(session_id, read_subagent_id(body))
+    caller = caller_principal_identity(session_id)
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -3104,6 +3226,13 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
             # Tool failure path — release the EXCLUSIVE grant without bumping version.
             artifact = coordinator.registry.get_artifact(artifact_id)
             if artifact is not None:
+                # #185 R8: the giver of a live handoff reporting a failed edit
+                # holds nothing here -- its grant went to the successor -- so
+                # this is not a clean release. Read BEFORE any release, and
+                # change nothing: never a release, never a withdraw (R35).
+                handed = coordinator.service.live_handoff_given_by(artifact_id, caller)
+                if handed is not None:
+                    return _handed_off_release(path, handed)
                 try:
                     coordinator.service.invalidate(
                         agent_id=agent_id,
@@ -3114,10 +3243,12 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
                         abort=abort,
                     )
                 except CoherenceError as exc:
-                    return {"ok": False, "reason": str(exc)}
+                    # Still held: not a clean success, so it answers per grant.
+                    return {"ok": False, "reason": str(exc), "grants": [_held_grant(path, exc)]}
             return {"ok": True, "released": True}
 
-        # Success path — commit and bump version.
+        # Success path — commit and bump version. ``caller`` is the session-
+        # level identity the giver fence keys on (#185 KTD1).
         try:
             coordinator.service.commit(
                 agent_id=agent_id,
@@ -3126,7 +3257,12 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
                 issued_at_tick=now,
                 content_hash=content_hash,
                 abort=abort,
+                caller=caller,
             )
+        except GiverFenced as exc:
+            # Ahead of the generic arm, which would read a preemption notice
+            # into it and answer the refusal as prose.
+            return _giver_fenced_body(exc)
         except StaleReadGeneration:
             # Read-generation fence: a sweep reclaimed this committer in the race
             # window between its grant and this commit. Surface the STABLE machine
@@ -3184,12 +3320,18 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
         coordinator.increment_intra_task_acquire_release()
         return {"ok": True}
 
+    def work_with_handoff() -> dict:
+        # #185 R29: the handoff key on every arm while the path has a record.
+        return _attach_handoff_key(coordinator, work(), path=path, caller=caller)
+
     # AC-05: post-edit's wire contract is {ok: bool}; ok-shape degraded
     # envelope keeps clients reading result.get("ok") safe on timeout.
     # A6: abort threaded into invalidate/commit so a late post-edit aborts at
     # the registry lock instead of landing a phantom version bump/invalidation.
     abort = threading.Event()
-    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
+    _run_or_degrade(
+        req, coordinator, work_with_handoff, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort
+    )
 
 
 def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -3272,6 +3414,7 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
 
     # Records the display name for /status; the attributed id is agent_id above.
     coordinator.register_session(session_id, read_subagent_id(body))
+    caller = caller_principal_identity(session_id)
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -3284,7 +3427,9 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
 
         # OCC commit — version-checked CAS. Does NOT take EXCLUSIVE: the
         # caller is S (from pre-read) or I (preempted); commit_cas rejects an
-        # M/E caller (D4) by raising CoherenceError.
+        # M/E caller (D4) by raising CoherenceError. ``caller`` is the
+        # session-level identity (#185 KTD1): a giver's re-minted incarnation
+        # is refused, and a successor's completes the record, not overtakes it.
         try:
             result = coordinator.service.commit_cas(
                 agent_id=agent_id,
@@ -3293,7 +3438,11 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
                 content_hash=content_hash,
                 issued_at_tick=now,
                 abort=abort,
+                caller=caller,
             )
+        except GiverFenced as exc:
+            # Ahead of the generic arm, which would answer the refusal as prose.
+            return _giver_fenced_body(exc)
         except OccCallerTransientError:
             # Retry-eligible (AC2): a peer invalidated the caller between its
             # read and this CAS. Surface a STABLE machine reason decoupled from
@@ -3330,6 +3479,18 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
         coordinator.increment_intra_task_acquire_release()
         return {"ok": True, "version": updated.version}
 
+    def work_with_handoff() -> dict:
+        # #185 R29: the handoff key on every arm while the path has a record;
+        # a WIN's carries the outcome it gave that record (R21, R24). commit_cas
+        # does not return it, so it is read back: the win moved the version, so
+        # the record it labelled is never relabelled and the read is stable.
+        result = work()
+        won = result.get("ok") is True and "version" in result
+        return _attach_handoff_key(
+            coordinator, result, path=path, caller=caller,
+            won_at=expected_version if won else None,
+        )
+
     # Fail-closed: the OCC commit degrades to a body that reads as FAILURE.
     # A timed-out commit_cas whose future the watchdog does NOT cancel may
     # still run to completion later. A6: the abort token (below) makes the
@@ -3345,7 +3506,9 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
     # mistake a degraded CAS for success — hence _OCC_DEGRADED_RESPONSE
     # ({ok: false, …}), never _OK_DEGRADED_RESPONSE.
     abort = threading.Event()
-    _run_or_degrade(req, coordinator, work, degraded_response=_OCC_DEGRADED_RESPONSE, abort=abort)
+    _run_or_degrade(
+        req, coordinator, work_with_handoff, degraded_response=_OCC_DEGRADED_RESPONSE, abort=abort
+    )
 
 
 def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -3358,19 +3521,26 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     if sid_err:
         req._json(400, {"error": sid_err[1]})
         return
-    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
-        return
 
     subagent_id = read_subagent_id(body)
     # P1 subagent-stop safety: session-stop RELEASES grants, so a malformed
     # agent_id must NOT silently degrade to the parent identity — that would
     # release the PARENT's live grants. Absent agent_id = a legitimate parent
     # Stop (release the parent's own grants, unchanged). Present-but-invalid =
-    # refuse (no-op), since the caller intended a scoped subagent release the
-    # server can't resolve. The read paths (where degrading to parent
-    # attribution is benign) deliberately do NOT carry this guard.
+    # refuse, since the caller intended a scoped subagent release the server
+    # can't resolve. The read paths (where degrading to parent attribution is
+    # benign) deliberately do NOT carry this guard.
+    #
+    # #185 R8: REFUSED (HTTP 400, the effect fence's answer to the same field,
+    # before the principal gate as there), never ``{ok: true,
+    # released_artifacts: []}`` -- that body reads as a release that found
+    # nothing to release, so a client dropping its record on the answer would
+    # forget a grant the coordinator still holds. Python-only: the Node
+    # backend still answers the empty success.
     if subagent_id is None and has_subagent_id_field(body):
-        req._json(200, {"ok": True, "released_artifacts": []})
+        req._json(400, {"error": _MALFORMED_SUBAGENT_ERROR})
+        return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, subagent_id)) is None:
         return
 
     # SB-10 U4 (R2): the deferred re-grounding flag lives at most one
@@ -3392,6 +3562,10 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
             agent_id, {MESIState.EXCLUSIVE, MESIState.MODIFIED}
         )
         released: list[str] = []
+        # One entry per grant asked for, in acquisition order: answered only
+        # when a grant is still held (#185 R8). A stop never withdraws or
+        # declines a handoff (R35): it releases EXCLUSIVE/MODIFIED rows alone.
+        grants: list[dict] = []
         for artifact_id in held:
             artifact = coordinator.registry.get_artifact(artifact_id)
             if artifact is None:
@@ -3405,9 +3579,12 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
                     issued_at_tick=now,
                     abort=abort,
                 )
-                released.append(artifact.name)
             except CoherenceError as exc:
                 logger.warning("session-stop release failed for %s: %s", artifact_id, exc)
+                grants.append(_held_grant(artifact.name, exc))
+                continue
+            released.append(artifact.name)
+            grants.append(_released_grant(artifact.name))
 
         # F1 (P0): pop any pending preemption notices for the ending session.
         # The phpmac canonical case: X was preempted, but X's next action was
@@ -3440,7 +3617,13 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
                 "preempted_at_iso": _iso_utc(ts),
             })
 
-        response: dict = {"ok": True, "released_artifacts": released}
+        # A clean release keeps today's bytes, which the Node backend mirrors
+        # (corpus warn_mode/18); only a stop that left a grant held answers
+        # top-level false with the per-grant list (#185 R8).
+        clean = len(released) == len(grants)
+        response: dict = {"ok": clean, "released_artifacts": released}
+        if not clean:
+            response["grants"] = grants
         if notices_payload:
             response["notices"] = notices_payload
             # Render prose for stream-json consumers / human inspection.
@@ -4434,6 +4617,10 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
                 session_token, artifact_id, content, caller=caller, issued_at_tick=now,
                 abort=abort,
             )
+        except GiverFenced as exc:
+            # The session owner is the caller identity the fence keys on
+            # (#185 KTD1); ahead of the generic arm, which answers prose.
+            return _giver_fenced_body(exc)
         except SessionInvalidated as exc:
             _session_audit.append_session_invalidate(
                 coordinator.coordinator_root,
@@ -4571,6 +4758,10 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
                 session_token, writes_map, caller=caller, issued_at_tick=now,
                 abort=abort,
             )
+        except GiverFenced as exc:
+            # One handed-off member refuses the whole batch (#185 KTD1); the
+            # body names which, ahead of the generic arm's prose.
+            return _giver_fenced_body(exc, path=path_by_id.get(exc.artifact_id))
         except SessionInvalidated as exc:
             _session_audit.append_session_invalidate(
                 coordinator.coordinator_root,
@@ -4740,6 +4931,512 @@ def _handle_principal_claim(req: _RequestProtocol, coordinator: CoordinatorHTTPS
     abort = threading.Event()
     _run_or_degrade(
         req, coordinator, work, degraded_response=_PRINCIPAL_CLAIM_DEGRADED_RESPONSE, abort=abort
+    )
+
+
+# ----------------------------------------------------------------------
+# Targeted grant handoff (#185, U5)
+# ----------------------------------------------------------------------
+#
+# A session done with a path hands it to a named successor: the four verbs
+# below, and what a handoff changes on the routes that already exist -- the
+# giver's typed refusal on every write route, the per-grant answer of a
+# release that is not a clean success, and the structured ``handoff`` key on
+# the pre-read, pre-edit, post-edit and compare-and-swap bodies while a record
+# exists. The service decides everything (U4); these helpers only render it.
+#
+# PYTHON-ONLY, like the effect fence and the mint: the Node backend answers
+# the four routes 404, and every body it mirrors stays byte-identical whenever
+# no transfer record exists (R29, R30). A clean release keeps today's bytes.
+#
+# Identity: the giver, the successor and the record are SESSION-level agent
+# ids -- ``caller_principal_identity(session_id)`` -- while the grant given up
+# is the one the presented composite holds (KTD7). Every route that reaches a
+# write path passes that session-level identity to the service as ``caller``.
+#
+# Every id below is rendered ``str(uuid)``, the hyphenated spelling ``/status``
+# lists agent ids in. A successor may be NAMED in either published spelling
+# (:func:`parse_agent_id`).
+
+MAX_TRANSFER_GRANTS = MAX_SESSION_READ_SET_PATHS
+"""Cap on the grants one transfer names: the snapshot read-set's and the batch
+publish's bound, for the same defense-in-depth reason."""
+
+#: The caller's role in a record, as the ``handoff`` key's ``role`` says it.
+#: Wire values: add, never rename.
+_HANDOFF_ROLE_GIVER = "giver"
+_HANDOFF_ROLE_SUCCESSOR = "successor"
+_HANDOFF_ROLE_BYSTANDER = "bystander"
+
+#: Why a grant a release answer reports is no longer held (R8). Wire values:
+#: add, never rename. ``release`` is this request's own release, recorded under
+#: the ``invalidate`` trigger as before; ``handoff`` is a grant its holder
+#: handed to a successor earlier, which this request did not touch.
+_GRANT_CAUSE_RELEASE = "release"
+_GRANT_CAUSE_HANDOFF = "handoff"
+
+_HANDOFF_IN_FLIGHT_DETAIL = (
+    "another session's handoff of this path is live; it ends when its "
+    "successor declines, its giver withdraws, or any session writes the path"
+)
+"""Static text beside a ``handoff_in_flight`` refusal, which also names the
+pending giver and successor (R26). No id, path or timestamp: byte-stable."""
+
+_HANDOFF_TRANSFER_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": HANDOFF_TRANSFER_UNCONFIRMED_REASON,
+}
+"""What ``/handoff/transfer`` answers when the watchdog cuts it short, whether
+its caller-principal gate or its work body timed out: failed and UNCONFIRMED,
+never a success (R7). It names no grant: the transfer is all-or-nothing and
+checks the watchdog abort once, when its registry hold is won, so a body cut
+short while waiting lands nothing and one cut short inside the hold lands
+every admitted path -- every grant is equally unconfirmed either way, and one
+static body is what the gate's table can hold (KTD4)."""
+
+_HANDOFF_ACCEPT_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": HANDOFF_ACCEPT_UNCONFIRMED_REASON,
+}
+"""``/handoff/accept`` cut short by the watchdog: failed and unconfirmed (AE24).
+A late body aborts at the registry lock, so the record is left as it was."""
+
+_HANDOFF_DECLINE_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": HANDOFF_DECLINE_UNCONFIRMED_REASON,
+}
+"""``/handoff/decline`` cut short by the watchdog: failed and unconfirmed."""
+
+_HANDOFF_WITHDRAW_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": HANDOFF_WITHDRAW_UNCONFIRMED_REASON,
+}
+"""``/handoff/withdraw`` cut short by the watchdog: failed and unconfirmed."""
+
+
+def _giver_fenced_body(exc: GiverFenced, *, path: str | None = None) -> dict:
+    """A fenced giver's refusal on a write route (#185 R10): the typed reason
+    with the successor and the version at transfer as top-level fields, so a
+    client classifies it by ``reason`` and never by prose. ``path`` names the
+    refused member of a multi-member write.
+
+    No ``hookSpecificOutput`` and no prose in this slice: the hook client's
+    deny envelope is U7's, and it will sit beside this same top-level reason
+    (KTD5)."""
+    body: dict = {"ok": False, "reason": GIVER_FENCED_REASON}
+    if path is not None:
+        body["path"] = path
+    body["successor"] = str(exc.successor)
+    body["version_at_transfer"] = exc.version_at_transfer
+    return body
+
+
+def _handoff_projection(record: TransferRecord, *, live: bool, caller: UUID) -> dict:
+    """The ``handoff`` key: ``record`` projected for ``caller``'s role (R29).
+
+    The successor reads its provenance (who handed it the path, at which
+    version, from which hold shape), a bystander the pair it is writing past,
+    the giver its outcome. Session-level agent ids only -- no session id, no
+    composite, no timestamp (KTD9) -- so the corpus can pin it. ``live`` is the
+    registry's liveness (KTD10): a record whose version moved, or that was
+    declined or withdrawn, is reported until the sweep evicts it, so the
+    giver's next touch learns how it ended."""
+    if caller == record.giver:
+        role = _HANDOFF_ROLE_GIVER
+    elif caller == record.successor:
+        role = _HANDOFF_ROLE_SUCCESSOR
+    else:
+        role = _HANDOFF_ROLE_BYSTANDER
+    projection: dict = {
+        "role": role,
+        "giver": str(record.giver),
+        "successor": str(record.successor),
+        "version_at_transfer": record.version_at_transfer,
+        "hold_shape": record.hold_shape.name,
+        "status": record.status,
+        "live": live,
+    }
+    if record.counterparty is not None:
+        projection["counterparty"] = str(record.counterparty)
+    return projection
+
+
+def _win_outcome(record: TransferRecord, *, caller: UUID, won_at: int) -> str | None:
+    """What a compare-and-swap win at ``won_at`` did to ``record``: completed
+    (the successor's win) or overtaken (anyone else's), or ``None`` when the
+    win labelled nothing -- the record was not live when it was admitted, or
+    the label write failed, or a later transfer has since replaced it.
+
+    The service labels only a record live at admission, whose version at
+    transfer is the win's expected version, and the win then moved the
+    version, so nothing relabels that record afterwards (KTD2): the label read
+    back here is the one the win wrote, when it names this caller."""
+    if record.version_at_transfer != won_at:
+        return None
+    if record.status == TRANSFER_STATUS_COMPLETED and caller == record.successor:
+        return TRANSFER_STATUS_COMPLETED
+    if record.status == TRANSFER_STATUS_OVERTAKEN and record.counterparty == caller:
+        return TRANSFER_STATUS_OVERTAKEN
+    return None
+
+
+def _attach_handoff_key(
+    coordinator: CoordinatorHTTPServer,
+    result: dict,
+    *,
+    path: str,
+    caller: UUID,
+    won_at: int | None = None,
+) -> dict:
+    """``result`` with the ``handoff`` key added while ``path`` has a transfer
+    record, else ``result`` itself, unchanged (R29: byte-identical whenever no
+    record exists). ``won_at`` is a compare-and-swap win's expected version;
+    the key then also carries the win's ``outcome`` when it labelled the
+    record.
+
+    A read only -- nothing is granted, popped or marked -- so it may ride the
+    safety-path reads too. The key is top-level: it never enters a
+    ``hookSpecificOutput``, so a strict deny's bytes are unchanged."""
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    if artifact_id is None:
+        return result
+    read = coordinator.registry.get_transfer_record(artifact_id)
+    if read is None:
+        return result
+    record, live = read
+    projection = _handoff_projection(record, live=live, caller=caller)
+    if won_at is not None:
+        outcome = _win_outcome(record, caller=caller, won_at=won_at)
+        if outcome is not None:
+            projection["outcome"] = outcome
+    return {**result, "handoff": projection}
+
+
+def _released_grant(path: str) -> dict:
+    """A release answer's entry for a grant this request released (R8)."""
+    return {"path": path, "held": False, "cause": _GRANT_CAUSE_RELEASE}
+
+
+def _held_grant(path: str, exc: CoherenceError) -> dict:
+    """A release answer's entry for a grant still held, with why: the typed
+    reason (and the prose as ``detail``) when the error carries one, the
+    error's text otherwise -- the release routes' existing reason."""
+    fields = _typed_reason_response(exc)
+    del fields["ok"]
+    return {"path": path, "held": True, **fields}
+
+
+def _handed_off_grant(path: str, record: TransferRecord) -> dict:
+    """A release answer's entry for a grant its holder handed off (R8): not
+    held, handed to the successor at the version at transfer."""
+    return {
+        "path": path,
+        "held": False,
+        "cause": _GRANT_CAUSE_HANDOFF,
+        "successor": str(record.successor),
+        "version_at_transfer": record.version_at_transfer,
+    }
+
+
+def _handed_off_release(path: str, record: TransferRecord) -> dict:
+    """The giver's failed-edit report on its live record (R8): not a clean
+    success. The typed giver reason and the per-grant entry, and nothing
+    changed -- no release, and never a withdraw (R35)."""
+    return {
+        "ok": False,
+        "reason": GIVER_FENCED_REASON,
+        "successor": str(record.successor),
+        "version_at_transfer": record.version_at_transfer,
+        "grants": [_handed_off_grant(path, record)],
+    }
+
+
+def _refused_transfer_grant(path: str, reason: str) -> dict:
+    return {"path": path, "transferred": False, "reason": reason}
+
+
+def _transfer_grant_entry(path: str, outcome: TransferGrantOutcome) -> dict:
+    """One grant of a transfer answer (R3), from the service's outcome: the
+    normalised session-level ids, the version at transfer and the hold shape
+    given up for a transferred grant; the typed reason, and whatever the
+    refusal names (the pending pair, an ended record's status), otherwise."""
+    entry: dict = {"path": path, "transferred": outcome.transferred}
+    if outcome.reason is not None:
+        entry["reason"] = outcome.reason
+    if outcome.giver is not None:
+        entry["giver"] = str(outcome.giver)
+    if outcome.successor is not None:
+        entry["successor"] = str(outcome.successor)
+    if outcome.version_at_transfer is not None:
+        entry["version_at_transfer"] = outcome.version_at_transfer
+    if outcome.hold_shape is not None:
+        entry["hold_shape"] = outcome.hold_shape.name
+    if outcome.status is not None:
+        entry["status"] = outcome.status
+    if outcome.reason == HANDOFF_IN_FLIGHT_REASON:
+        entry["detail"] = _HANDOFF_IN_FLIGHT_DETAIL
+    return entry
+
+
+def _transfer_answer(entries: list[dict]) -> dict:
+    """The transfer's answer: success only when every named grant transferred
+    (R3), with one entry per grant in request order."""
+    return {"ok": all(entry["transferred"] for entry in entries), "grants": entries}
+
+
+def _parse_transfer_grants(grants: Any) -> "list[tuple[str, str | None]] | str":
+    """The transfer's ``grants`` as ``(path, subagent id or None)`` pairs, or
+    the 400 ``error`` naming what is wrong.
+
+    A grant's ``agent_id`` names the incarnation (a subagent component) that
+    holds the claim on that path, so a client presents a DIFFERENT composite
+    per path (KTD7); absent, the request's own ``agent_id`` applies. A
+    malformed one is refused rather than read as the parent: the parent's
+    grant is not the one the caller asked to give away."""
+    if not isinstance(grants, list) or not grants:
+        return "grants must be a non-empty list of {path, agent_id}"
+    if len(grants) > MAX_TRANSFER_GRANTS:
+        return f"grants exceeds {MAX_TRANSFER_GRANTS} paths"
+    parsed: list[tuple[str, str | None]] = []
+    for item in grants:
+        if not isinstance(item, dict):
+            return "each grant must be a {path, agent_id} object"
+        path = item.get("path", "")
+        path_err = validate_path(path)
+        if path_err:
+            return path_err
+        subagent = read_subagent_id(item)
+        if subagent is None and has_subagent_id_field(item):
+            return _MALFORMED_SUBAGENT_ERROR
+        parsed.append((path, subagent))
+    # A duplicate path would collapse in the artifact-keyed request.
+    if len({path for path, _ in parsed}) != len(parsed):
+        return "grants contains duplicate paths"
+    return parsed
+
+
+def _handle_handoff_transfer(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /handoff/transfer — hand claims to a named successor (#185).
+
+    Request::
+
+        {"session_id": "<uuid>",            # the giver's session
+         "agent_id": "<subagent id>",       # optional: the default holder
+         "successor": "<agent id>",         # hyphenated or 32-hex
+         "grants": [{"path": "<repo-relative path>",
+                     "agent_id": "<subagent id>"},   # optional, per path
+                    ...]}
+
+    Each grant gives up the claim the composite
+    ``session_to_agent_id(session_id, <grant agent_id or request agent_id>)``
+    holds on its path -- a volume names, per path, the incarnation that holds
+    its claim there (KTD7). The giver recorded and fenced is the SESSION.
+
+    The successor is named by a coordinator-published agent id (R2). A
+    composite the live name map holds is normalised to its session; an id the
+    map does not hold is known only when a principal is bound to it (it is
+    then a session-level id); anything else -- a composite the map lost on a
+    restart, even one still holding a grant row -- is refused as unknown, and
+    is never handed to the service, whose grant-row arm (for library callers
+    with no name map) would count it known.
+
+    Responses, HTTP 200 for every protocol outcome::
+
+        {"ok": <every grant transferred>,
+         "grants": [{"path", "transferred": true, "giver", "successor",
+                     "version_at_transfer", "hold_shape", "status"} |
+                    {"path", "transferred": false, "reason", ...}, ...]}
+
+    in request order (R3); a refused grant is left exactly as it was (R4). A
+    malformed successor refuses every grant (``handoff_successor_malformed``),
+    an unknown one likewise (``handoff_successor_unknown``); a path the
+    coordinator has never seen is not held. HTTP 400 for a request whose
+    session, grant set or subagent id cannot be read; the principal gate's 400
+    as on every require-class route; the watchdog's
+    :data:`_HANDOFF_TRANSFER_DEGRADED_RESPONSE`.
+
+    Stays OUT of ``_MIGRATION_REJECTED_ROUTES``: a transfer initiates no
+    write, and the epoch move it makes is the release-class bump the drain
+    performs itself (R37)."""
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    grants = _parse_transfer_grants(body.get("grants"))
+    if isinstance(grants, str):
+        req._json(400, {"error": grants})
+        return
+    if body.get("successor") is None:
+        req._json(400, {"error": "missing successor"})
+        return
+    default_subagent = read_subagent_id(body)
+    if default_subagent is None and has_subagent_id_field(body):
+        req._json(400, {"error": _MALFORMED_SUBAGENT_ERROR})
+        return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, default_subagent)) is None:
+        return
+    coordinator.register_session(session_id, default_subagent)
+
+    successor = parse_agent_id(body["successor"])
+    if successor is None:
+        # R2: refused per grant inside a 200, never a 400 and never a plain
+        # release -- the stated exception to the malformed-optional rule.
+        req._json(200, _transfer_answer([
+            _refused_transfer_grant(path, HANDOFF_SUCCESSOR_MALFORMED_REASON)
+            for path, _ in grants
+        ]))
+        return
+    giver = caller_principal_identity(session_id)
+    named_session = coordinator.session_identity_for(successor)
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        resolved = named_session
+        if resolved is None and coordinator.service.is_caller_principal_bound(successor):
+            resolved = successor
+        if resolved is None:
+            return _transfer_answer([
+                _refused_transfer_grant(path, HANDOFF_SUCCESSOR_UNKNOWN_REASON)
+                for path, _ in grants
+            ])
+        entries: dict[str, dict] = {}
+        holders: dict[UUID, UUID] = {}
+        path_by_id: dict[UUID, str] = {}
+        for path, subagent in grants:
+            artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+            if artifact_id is None:
+                entries[path] = _refused_transfer_grant(path, HANDOFF_NOT_HELD_REASON)
+                continue
+            holders[artifact_id] = session_to_agent_id(session_id, subagent or default_subagent)
+            path_by_id[artifact_id] = path
+        if holders:
+            # One registry hold decides and applies every path (KTD2); the
+            # abort is checked once, when the hold is won (R7, AE18).
+            for outcome in coordinator.service.transfer(
+                giver=giver,
+                successor=resolved,
+                holders=holders,
+                successor_known=True,
+                issued_at_tick=now,
+                abort=abort,
+            ):
+                path = path_by_id[outcome.artifact_id]
+                entries[path] = _transfer_grant_entry(path, outcome)
+        return _transfer_answer([entries[path] for path, _ in grants])
+
+    abort = threading.Event()
+    _run_or_degrade(
+        req, coordinator, work, degraded_response=_HANDOFF_TRANSFER_DEGRADED_RESPONSE, abort=abort
+    )
+
+
+def _verb_body(outcome: TransferVerbOutcome) -> dict:
+    """An accept's, decline's or withdraw's answer: ``ok``, and the typed
+    reason, the record's status and its counterparty where there are any."""
+    body: dict = {"ok": outcome.ok}
+    if outcome.reason is not None:
+        body["reason"] = outcome.reason
+    if outcome.status is not None:
+        body["status"] = outcome.status
+    if outcome.counterparty is not None:
+        body["counterparty"] = str(outcome.counterparty)
+    return body
+
+
+def _settle_handoff(
+    req: _RequestProtocol,
+    coordinator: CoordinatorHTTPServer,
+    body: dict,
+    session_id: Any,
+    *,
+    settle: Callable[..., TransferVerbOutcome],
+    degraded_response: dict,
+) -> None:
+    """The shared body of accept, decline and withdraw: validate, admit,
+    register, then run ``settle`` (the service verb) for the path's record as
+    the SESSION-level identity -- the parties to a handoff are sessions, so a
+    subagent of the successor accepts for it (R20, KTD1).
+
+    Request: ``{session_id, path}`` (an ``agent_id`` is read for the principal
+    gate only). Responses: ``{ok, status?, counterparty?}``, or ``{ok: false,
+    reason, status?}`` naming the typed refusal; a path with no record, or one
+    the coordinator has never seen, answers ``handoff_not_live`` with no
+    status; the watchdog answers ``degraded_response``. Out of the migration
+    set like the transfer: none of the three initiates a write."""
+    path = body.get("path", "")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    path_err = validate_path(path)
+    if path_err:
+        msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
+        req._json(400, {"error": msg})
+        return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
+    coordinator.register_session(session_id, read_subagent_id(body))
+    caller = caller_principal_identity(session_id)
+
+    def work() -> dict:
+        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        if artifact_id is None:
+            return {"ok": False, "reason": HANDOFF_NOT_LIVE_REASON}
+        return _verb_body(settle(artifact_id=artifact_id, caller=caller, abort=abort))
+
+    abort = threading.Event()
+    _run_or_degrade(req, coordinator, work, degraded_response=degraded_response, abort=abort)
+
+
+def _handle_handoff_accept(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /handoff/accept — the successor accepts a live handoff without
+    writing (R20): a pending record becomes completed and the giver's fence
+    stands; an overtaken one is answered as it stands. See
+    :func:`_settle_handoff`."""
+    body = req._read_json()
+    if body is None:
+        return
+    _settle_handoff(
+        req, coordinator, body, body.get("session_id"),
+        settle=coordinator.service.accept_transfer,
+        degraded_response=_HANDOFF_ACCEPT_DEGRADED_RESPONSE,
+    )
+
+
+def _handle_handoff_decline(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /handoff/decline — the successor declines a live handoff (R20):
+    the record ends declined and the giver's fence lifts at once. See
+    :func:`_settle_handoff`."""
+    body = req._read_json()
+    if body is None:
+        return
+    _settle_handoff(
+        req, coordinator, body, body.get("session_id"),
+        settle=coordinator.service.decline_transfer,
+        degraded_response=_HANDOFF_DECLINE_DEGRADED_RESPONSE,
+    )
+
+
+def _handle_handoff_withdraw(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /handoff/withdraw — the giver withdraws its live handoff (R16):
+    the record ends withdrawn and the fence lifts. Nothing else withdraws: a
+    session stop and a failed edit never do (R35). See
+    :func:`_settle_handoff`."""
+    body = req._read_json()
+    if body is None:
+        return
+    _settle_handoff(
+        req, coordinator, body, body.get("session_id"),
+        settle=coordinator.service.withdraw_transfer,
+        degraded_response=_HANDOFF_WITHDRAW_DEGRADED_RESPONSE,
     )
 
 
@@ -5336,6 +6033,12 @@ def _handle_workspace_restore_register(
             # Retry-eligible: the controller is mid-transient (a peer's commit
             # invalidated it between read and CAS). Byte-stable reason.
             return {"ok": False, "reason": OCC_CALLER_TRANSIENT_REASON}
+        except GiverFenced as exc:
+            # The controller is the session-level identity, so a giver's
+            # registration of a path it handed off is refused (#185 KTD1);
+            # ahead of the generic arm, which would answer it as prose.
+            fenced = coordinator.registry.get_artifact(exc.artifact_id)
+            return _giver_fenced_body(exc, path=fenced.name if fenced else None)
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
         return {
@@ -5780,6 +6483,15 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     # Python-only: the sibling Node coordinator answers 404 here; U6 declares
     # that asymmetry with a corpus fixture rather than leaving it silent.
     ("POST", "/principal/claim"): _handle_principal_claim,
+    # #185 — the four grant-handoff verbs, require-class. Registered HERE so
+    # they ride the one dispatcher seam. Out of _MIGRATION_REJECTED_ROUTES: a
+    # transfer initiates no write, and its epoch move is the release-class
+    # bump the drain performs itself (R37); accept, decline and withdraw only
+    # relabel a record. Python-only: the Node backend answers them 404.
+    ("POST", "/handoff/transfer"): _handle_handoff_transfer,
+    ("POST", "/handoff/accept"): _handle_handoff_accept,
+    ("POST", "/handoff/decline"): _handle_handoff_decline,
+    ("POST", "/handoff/withdraw"): _handle_handoff_withdraw,
     # WV plan Unit 3 — workspace-checkpoint endpoints. Registered HERE so they
     # ride the central verify_bearer + verify_host seam like every route. The
     # POST threads a watchdog abort Event into the service's abort_guard (the
@@ -5848,6 +6560,10 @@ _ENDPOINT_COUNTER_NAMES: dict[tuple[str, str], str] = {
     ("POST", "/policy/untrack"): "policy_untrack_total",
     ("GET", "/status"): "status_total",
     ("POST", "/principal/claim"): "principal_claim_total",
+    ("POST", "/handoff/transfer"): "handoff_transfer_total",
+    ("POST", "/handoff/accept"): "handoff_accept_total",
+    ("POST", "/handoff/decline"): "handoff_decline_total",
+    ("POST", "/handoff/withdraw"): "handoff_withdraw_total",
     # /admin/prepare-for-migration intentionally not counted — it
     # initiates shutdown, so counting it would never be observable via
     # subsequent /status calls (coordinator is already down).
@@ -5973,6 +6689,10 @@ _CALLER_GATE_DEGRADED_RESPONSE: dict[tuple[str, str], dict] = {
     ("POST", "/workspace/restore/status"): _RESTORE_PROGRESS_DEGRADED_RESPONSE,
     ("POST", "/workspace/restore/member"): _RESTORE_PROGRESS_DEGRADED_RESPONSE,
     ("POST", "/workspace/restore/register"): _RESTORE_REGISTER_DEGRADED_RESPONSE,
+    ("POST", "/handoff/transfer"): _HANDOFF_TRANSFER_DEGRADED_RESPONSE,
+    ("POST", "/handoff/accept"): _HANDOFF_ACCEPT_DEGRADED_RESPONSE,
+    ("POST", "/handoff/decline"): _HANDOFF_DECLINE_DEGRADED_RESPONSE,
+    ("POST", "/handoff/withdraw"): _HANDOFF_WITHDRAW_DEGRADED_RESPONSE,
 }
 """What a route answers when its caller-principal gate cannot decide within the
 handler watchdog: exactly what its handler passes ``_run_or_degrade`` for a
