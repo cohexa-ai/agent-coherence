@@ -693,3 +693,26 @@ class CasHandoffOutcome:
     successor: UUID
     version_at_transfer: int
     counterparty: UUID | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class TransferVerbOutcome:
+    """The answer to an accept, a decline or a withdraw of a path's handoff
+    (R16, R20).
+
+    - ``ok`` -- the verb was taken. An accept of a record a bystander overtook is
+      taken but changes nothing, so it answers ``ok`` with the ``overtaken``
+      status and its ``counterparty``; a client tells it from a completion by
+      ``status``.
+    - ``reason`` -- ``None`` when ``ok``; otherwise the typed refusal
+      (``handoff_not_successor``, ``handoff_not_giver`` or ``handoff_not_live``,
+      see :data:`ccs.core.exceptions.HANDOFF_REASONS`), and nothing changed.
+    - ``status`` / ``counterparty`` -- the record's label after the verb, or
+      the label a refusal carries. ``None`` when the path has no record at all.
+    """
+
+    artifact_id: UUID
+    ok: bool
+    reason: str | None = None
+    status: str | None = None
+    counterparty: UUID | None = None

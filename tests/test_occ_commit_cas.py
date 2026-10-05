@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import threading
 import time
 import uuid
@@ -49,7 +50,7 @@ from ccs.agent.runtime import AgentRuntime
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
-from ccs.core.exceptions import CasRetriesExhausted
+from ccs.core.exceptions import CasRetriesExhausted, GiverFenced
 from ccs.core.hashing import compute_content_hash
 from ccs.core.states import MESIState
 from ccs.core.types import Artifact, ConflictDetail, FetchRequest
@@ -396,6 +397,92 @@ def test_r12_retry_exhaustion_surfaces_typed_terminal_no_silent_drop() -> None:
     # The protagonist's last attempted content is not the persisted writer.
     last_writer_content = f"prot-v{final.version}"
     assert runtime.content(artifact.id) != last_writer_content
+
+
+# ----------------------------------------------------------------------
+# A handed-off giver racing its successor, through the service (#185, U4)
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_a_handed_off_giver_racing_its_successor_never_wins(db_path: Path, backend: str) -> None:
+    """KTD1 under contention, through the service's ``commit_cas`` -- the race
+    arms above call the registry directly, which has no giver fence. A giver
+    that handed its standing read to a successor, and the successor, fire at
+    the transfer version from a barrier, each with a FIXED stale buffer and a
+    fresh incarnation carrying its session-level identity. Exactly one write
+    lands and it is the successor's: the giver is refused with the giver reason
+    when it runs first, or meets the version mismatch once the successor's win
+    ended the record. Fails if the giver can ever win, which is the lost
+    update the handoff exists to close."""
+    reg = ArtifactRegistry() if backend == "memory" else SqliteArtifactRegistry(db_path)
+    try:
+        svc = CoordinatorService(reg)
+        art = svc.register_artifact(name="plan.md", content="v1")
+        giver, giver_read, successor = uuid4(), uuid4(), uuid4()
+        reg.set_agent_state(art.id, giver_read, MESIState.SHARED, trigger="fetch", tick=1)
+        (handed,) = svc.transfer(
+            giver=giver, successor=successor, holders={art.id: giver_read}, successor_known=True
+        )
+        assert handed.transferred
+
+        results: dict[UUID, object] = {}
+        barrier = threading.Barrier(2)
+        overlap_seen = threading.Event()
+        in_flight = {"n": 0}
+        in_flight_lock = threading.Lock()
+
+        def attempt(session: UUID) -> None:
+            content_hash = hashlib.sha256(session.bytes).hexdigest()
+            barrier.wait()
+            with in_flight_lock:
+                in_flight["n"] += 1
+                if in_flight["n"] > 1:
+                    overlap_seen.set()
+            try:
+                results[session] = svc.commit_cas(
+                    agent_id=uuid4(),
+                    artifact_id=art.id,
+                    expected_version=1,
+                    content_hash=content_hash,
+                    caller=session,
+                )
+            except GiverFenced as exc:
+                results[session] = exc
+            finally:
+                with in_flight_lock:
+                    in_flight["n"] -= 1
+
+        previous = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            threads = [threading.Thread(target=attempt, args=(s,)) for s in (giver, successor)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            sys.setswitchinterval(previous)
+
+        if not overlap_seen.is_set():
+            warnings.warn(
+                "giver-vs-successor round did not observe overlapping in-flight "
+                "writers; the runner may have serialized threads. The correctness "
+                "property is still asserted.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        won, lost = results[successor], results[giver]
+        assert isinstance(won, tuple) and won[0].version == 2, won
+        assert isinstance(lost, GiverFenced) or lost == ConflictDetail("version_mismatch", 2), lost
+        persisted = reg.get_artifact(art.id)
+        assert persisted.version == 2
+        assert persisted.content_hash == hashlib.sha256(successor.bytes).hexdigest()
+        record, live = reg.get_transfer_record(art.id)
+        assert (record.status, live) == ("completed", False)
+    finally:
+        if isinstance(reg, SqliteArtifactRegistry):
+            reg.close()
 
 
 # ----------------------------------------------------------------------
