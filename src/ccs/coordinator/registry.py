@@ -36,6 +36,7 @@ from ccs.core.types import (
     ConflictDetail,
     MultiCommitConflict,
     MultiCommitResult,
+    TransferGrantOutcome,
     VersionedReadRejection,
 )
 
@@ -46,14 +47,22 @@ from .registry_protocol import (
     CLAIM_CAPTURE_TRIGGERS,
     EPOCH_BUMP_TRIGGERS,
     FOREIGN_WRITE_OUTCOMES,
+    HANDOFF_TRIGGER,
     RECLAIM_TRIGGERS,  # noqa: F401 — re-exported; see the parity test
+    TRANSFER_STORED_STATUSES,
     CaptureResult,
     CasResult,
     CheckpointMember,
     CheckpointRecord,
     DetectionRun,
     ReclamationSlot,
+    TransferDecision,
+    TransferPathView,
+    TransferRecord,
+    TransferRequest,
     UncoverableRun,
+    decide_transfer_grant,
+    transfer_record_live,
 )
 from .retention import RetentionPolicy, collectible_versions
 
@@ -111,6 +120,12 @@ class ArtifactRecord:
     # computed from. Mirrors the sqlite agent_states.last_observed_version
     # column (nullable INTEGER, schema v6).
     last_observed_version_by_agent: dict[UUID, int] = field(default_factory=dict)
+    # The grant handoff's transfer record (#185, KTD2): at most one per
+    # artifact, held on the slot so dropping the slot drops it -- the in-memory
+    # mirror of the sqlite row's cascade on artifact deletion. A stored label,
+    # never liveness: liveness is read against ``artifact.version``
+    # (``ArtifactRegistry._transfer_read``).
+    transfer: TransferRecord | None = None
 
 
 class ArtifactRegistry:
@@ -623,9 +638,10 @@ class ArtifactRegistry:
                 # Read-generation fence: revoking this M/E grant WITHOUT moving the
                 # version bumps the artifact's ownership epoch, atomically (GIL)
                 # with the INVALID transition, so a commit by the ex-holder (or any
-                # pre-revocation holder) fails the generation check. Both the sweep
-                # reclaims and the voluntary release ("invalidate") qualify — see
-                # EPOCH_BUMP_TRIGGERS. The peer invalidations ("write" /
+                # pre-revocation holder) fails the generation check. The sweep
+                # reclaims, the voluntary release ("invalidate") and the handoff
+                # (HANDOFF_TRIGGER, a giver ending its write claim) all qualify —
+                # see EPOCH_BUMP_TRIGGERS. The peer invalidations ("write" /
                 # "commit") do not -- a "commit" moves the version and a
                 # "write" preemption is fenced by grant-state at the effect
                 # gate and by the M/E state check at commit, never by the
@@ -1365,6 +1381,182 @@ class ArtifactRegistry:
         with self._lock:
             bound = self._caller_principals.get(identity)
         return bound[0] if bound is not None else None
+
+    # ------------------------------------------------------------------
+    # Transfer records (targeted grant handoff #185, U3; KTD2, KTD10)
+    # ------------------------------------------------------------------
+
+    def transfer_grants(
+        self,
+        request: TransferRequest,
+        *,
+        tick: int = 0,
+        now_unix: float | None = None,
+    ) -> list[TransferGrantOutcome]:
+        """The composite transfer; see :meth:`RegistryBase.transfer_grants`.
+
+        One ``_lock`` hold covers the decisions and the apply. It STAGES: every
+        path is decided first, every state-log entry is emitted next (rolling
+        ``_seq`` back on a raise), and only then is anything mutated -- so a
+        callback raise leaves the registry exactly as it was, the in-memory
+        twin of the sqlite ROLLBACK (the ``commit_cas`` discipline)."""
+        now = time.time() if now_unix is None else now_unix
+        with self._lock:
+            known = self._successor_known(request)
+            staged = [
+                (view, decide_transfer_grant(request, view, successor_known=known, now_unix=now))
+                for view in (
+                    self._transfer_view(artifact_id, holder)
+                    for artifact_id, holder in request.holders.items()
+                )
+            ]
+            emitted_here = 0
+            try:
+                for view, decision in staged:
+                    if decision.move_holder:
+                        emitted_here += self._emit_handoff_move(view, tick=tick)
+            except Exception:
+                self._seq -= emitted_here
+                raise
+            for view, decision in staged:
+                self._apply_transfer(view, decision)
+            return [decision.outcome for _view, decision in staged]
+
+    def get_transfer_record(
+        self, artifact_id: UUID
+    ) -> tuple[TransferRecord, bool] | None:
+        """The record and its liveness, read under one ``_lock`` hold."""
+        with self._lock:
+            slot = self._records.get(artifact_id)
+            return self._transfer_read(slot) if slot is not None else None
+
+    def set_transfer_status(
+        self,
+        artifact_id: UUID,
+        status: str,
+        *,
+        counterparty: UUID | None = None,
+        now_unix: float | None = None,
+    ) -> None:
+        """Write the label unconditionally; see
+        :meth:`RegistryBase.set_transfer_status`."""
+        if status not in TRANSFER_STORED_STATUSES:
+            raise ValueError(
+                f"transfer status {status!r} cannot be stored; expected one of "
+                f"{sorted(TRANSFER_STORED_STATUSES)}"
+            )
+        now = time.time() if now_unix is None else now_unix
+        with self._lock:
+            slot = self._records.get(artifact_id)
+            if slot is None or slot.transfer is None:
+                raise KeyError(f"no transfer record for artifact {artifact_id}")
+            slot.transfer = replace(
+                slot.transfer, status=status, counterparty=counterparty, updated_at=now
+            )
+
+    def evict_transfer_records(
+        self, *, max_age_sec: float, now_unix: float | None = None
+    ) -> int:
+        """Drop not-live records older than ``max_age_sec``. In memory the age
+        runs from the record's ``updated_at`` alone: the slot keeps no
+        wall-clock stamp of the artifact's last update (the sqlite registry
+        also weighs that one)."""
+        now = time.time() if now_unix is None else now_unix
+        cutoff = now - max_age_sec
+        with self._lock:
+            evicted = 0
+            for slot in self._records.values():
+                read = self._transfer_read(slot)
+                if read is None:
+                    continue
+                record, live = read
+                if not live and record.updated_at < cutoff:
+                    slot.transfer = None
+                    evicted += 1
+            return evicted
+
+    def _transfer_read(self, slot: ArtifactRecord) -> tuple[TransferRecord, bool] | None:
+        """THE in-memory liveness helper (KTD10): the slot's record judged
+        against the slot's own artifact version. Every reader of liveness here
+        -- the read, the composite transfer, the eviction -- goes through it.
+        Caller holds ``_lock``."""
+        if slot.transfer is None:
+            return None
+        return slot.transfer, transfer_record_live(slot.transfer, slot.artifact.version)
+
+    def _transfer_view(self, artifact_id: UUID, holder: UUID) -> TransferPathView:
+        """One path's facts for the decision. Caller holds ``_lock``."""
+        slot = self._records.get(artifact_id)
+        if slot is None:
+            return TransferPathView(
+                artifact_id=artifact_id,
+                holder=holder,
+                current_version=None,
+                record=None,
+                live=False,
+                holder_state=None,
+                other_write_holder=False,
+            )
+        read = self._transfer_read(slot)
+        return TransferPathView(
+            artifact_id=artifact_id,
+            holder=holder,
+            current_version=slot.artifact.version,
+            record=read[0] if read is not None else None,
+            live=read[1] if read is not None else False,
+            holder_state=slot.state_by_agent.get(holder),
+            other_write_holder=any(
+                agent_id != holder and state in _M_OR_E_STATES
+                for agent_id, state in slot.state_by_agent.items()
+            ),
+        )
+
+    def _successor_known(self, request: TransferRequest) -> bool:
+        """R2's registry arms: the caller resolved it, it has a bound
+        principal, or it holds a grant row on some artifact (the library
+        caller's arm -- a row in any state means the coordinator has seen the
+        identity). Caller holds ``_lock``."""
+        return (
+            request.successor_known
+            or request.successor in self._caller_principals
+            or any(
+                request.successor in slot.state_by_agent
+                for slot in self._records.values()
+            )
+        )
+
+    def _emit_handoff_move(self, view: TransferPathView, *, tick: int) -> int:
+        """Emit the state-log entry for one path's INVALID move, before it is
+        applied. Returns the ``_seq`` reservations made (0 or 1)."""
+        slot = self._records[view.artifact_id]
+        return self._emit_state_log(
+            artifact_id=view.artifact_id,
+            agent_id=view.holder,
+            from_state=view.holder_state if view.holder_state is not None else MESIState.INVALID,
+            to_state=MESIState.INVALID,
+            trigger=HANDOFF_TRIGGER,
+            tick=tick,
+            version=slot.artifact.version,
+            content_hash=None,
+        )
+
+    def _apply_transfer(self, view: TransferPathView, decision: TransferDecision) -> None:
+        """Apply one decided path (cannot fail: dict writes only). The INVALID
+        move reproduces :meth:`set_agent_state`'s leaving-M/E bookkeeping: the
+        grant tick is dropped, and the epoch moves because the handoff trigger
+        is in ``EPOCH_BUMP_TRIGGERS`` -- keyed on the set, as at that site, so
+        the two can never disagree about which handoffs bump."""
+        if decision.write is None:
+            return
+        slot = self._records[view.artifact_id]
+        slot.transfer = decision.write
+        if not decision.move_holder:
+            return
+        slot.state_by_agent[view.holder] = MESIState.INVALID
+        if view.holder_state in _M_OR_E_STATES:
+            slot.granted_at_tick_by_agent.pop(view.holder, None)
+            if HANDOFF_TRIGGER in EPOCH_BUMP_TRIGGERS:
+                slot.owner_generation += 1
 
     # ------------------------------------------------------------------
     # Workspace-checkpoint manifest store (WV plan Unit 2 / R1, R9)

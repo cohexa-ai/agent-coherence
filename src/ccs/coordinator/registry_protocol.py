@@ -49,14 +49,29 @@ from typing import (
 )
 from uuid import UUID
 
+from ccs.core.exceptions import (
+    HANDOFF_ENDED_REASON,
+    HANDOFF_IN_FLIGHT_REASON,
+    HANDOFF_NOT_HELD_REASON,
+    HANDOFF_OTHER_HOLDER_REASON,
+    HANDOFF_SELF_REASON,
+    HANDOFF_SUCCESSOR_UNKNOWN_REASON,
+    HANDOFF_VERSION_UNCONFIRMED_REASON,
+)
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import (
+    TRANSFER_STATUS_DECLINED,
+    TRANSFER_STATUS_PENDING,
+    TRANSFER_STATUS_SUPERSEDED,
+    TRANSFER_STATUS_WITHDRAWN,
+    TRANSFER_STATUSES,
     Artifact,
     CasCorruption,
     CommitAllEntry,
     ConflictDetail,
     MultiCommitConflict,
     MultiCommitResult,
+    TransferGrantOutcome,
     VersionedReadRejection,
 )
 
@@ -279,6 +294,358 @@ EPOCH_BUMP_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS | frozenset(
 CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
 
 
+# ---------------------------------------------------------------------------
+# The transfer record (targeted grant handoff, #185 U3; R25, KTD2, KTD10)
+# ---------------------------------------------------------------------------
+#
+# One record per artifact, kept by both registries and exposed through four
+# base members: ``transfer_grants`` (the composite transfer), the read
+# ``get_transfer_record``, the status write ``set_transfer_status`` and the
+# eviction ``evict_transfer_records``. The decision order and the liveness
+# predicate below are shared by both registries, which share no base class:
+# each gathers a path's facts in its own critical section (one lock hold, or one
+# ``BEGIN IMMEDIATE``) and decides with the same function, so the two backends
+# cannot answer one request differently.
+
+# Why a record exists, as a closed vocabulary (stored; add, never rename). A
+# plain transfer is a ``handoff``; the giver's re-transfer of its own live
+# record is a ``supersession``, and that record also names the successor it
+# superseded, so a late re-send of the superseded tuple is recognised (AE20)
+# rather than read as a fresh supersession. The cause is its own column, never
+# an id encoded into a string, so a later cause (#195's reclaim causes) adds a
+# value without re-parsing the stored ones.
+TRANSFER_CAUSE_HANDOFF = "handoff"
+TRANSFER_CAUSE_SUPERSESSION = "supersession"
+TRANSFER_CAUSES: frozenset[str] = frozenset(
+    {TRANSFER_CAUSE_HANDOFF, TRANSFER_CAUSE_SUPERSESSION}
+)
+
+# The statuses that end a record whatever its version (R10). Every other label
+# leaves a record live while the artifact's version equals the version at
+# transfer -- an overtaken record included.
+TRANSFER_ENDED_STATUSES: frozenset[str] = frozenset(
+    {TRANSFER_STATUS_DECLINED, TRANSFER_STATUS_WITHDRAWN}
+)
+
+# The statuses a stored record may carry. ``superseded`` never persists: the
+# replacing record's cause carries it, and a stored superseded row would read as
+# live (it is neither declined nor withdrawn) and fence its giver for nothing.
+TRANSFER_STORED_STATUSES: frozenset[str] = TRANSFER_STATUSES - {
+    TRANSFER_STATUS_SUPERSEDED
+}
+
+# A claim the presented composite can hand on: a write grant or a standing read.
+_HELD_STATES: frozenset[MESIState] = frozenset(
+    {MESIState.EXCLUSIVE, MESIState.MODIFIED, MESIState.SHARED}
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class TransferRecord:
+    """One path's transfer record (R25), as both registries store and return it.
+
+    ``kw_only`` because four fields are ids of one type side by side; a
+    positional swap would record the handoff pointed the wrong way.
+
+    - ``giver`` -- the caller's session-level identity: what the fence keys on,
+      so a re-minted incarnation or a subagent of the same session is fenced
+      alike (R11).
+    - ``holder`` -- the composite that held the claim and moved INVALID.
+    - ``successor`` -- the successor's session-level identity.
+    - ``version_at_transfer`` -- the artifact version the handoff is fenced on.
+    - ``hold_shape`` -- the grant given up: EXCLUSIVE, MODIFIED or SHARED.
+    - ``cause`` -- one of :data:`TRANSFER_CAUSES`; ``superseded_successor`` is
+      set exactly when the cause is a supersession.
+    - ``status`` -- one of :data:`TRANSFER_STORED_STATUSES`. A label, not
+      liveness: the read answers liveness beside the record (KTD10).
+    - ``counterparty`` -- the bystander an overtaken label names.
+    - ``created_at`` / ``updated_at`` -- wall-clock unix seconds, since the
+      coordinator's ticks reset on a restart.
+    """
+
+    artifact_id: UUID
+    giver: UUID
+    holder: UUID
+    successor: UUID
+    version_at_transfer: int
+    hold_shape: MESIState
+    cause: str
+    superseded_successor: UUID | None
+    status: str
+    counterparty: UUID | None
+    created_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True, kw_only=True)
+class TransferRequest:
+    """One transfer request, as :meth:`RegistryBase.transfer_grants` decides it.
+
+    - ``giver`` -- the caller's session-level identity. The registry never
+      derives it: the route passes the identity it derived from the session id,
+      a library caller its own agent id.
+    - ``successor`` -- the successor's session-level identity, already
+      normalised by the caller (the registry never resolves a composite).
+    - ``holders`` -- artifact id to the composite presented as holding the
+      claim on that path (KTD7: a volume presents the incarnation that holds
+      its read or write there). Keyed by artifact, so a path is decided once.
+    - ``successor_known`` -- whether the caller already resolved the successor
+      through a name map the registry cannot see (the HTTP route's live map).
+      The registry also counts a bound principal and a grant row as known (R2).
+    """
+
+    giver: UUID
+    successor: UUID
+    holders: Mapping[UUID, UUID]
+    successor_known: bool = False
+
+
+def transfer_record_live(record: TransferRecord, current_version: int) -> bool:
+    """R10's liveness, the one predicate both registries read it from (KTD10).
+
+    Live while the artifact's version still equals the version at transfer and
+    the record was neither declined nor withdrawn, whatever its label otherwise
+    says. The version leg is what a status-only reading misses: a version can
+    move with no status write (a crash, or a failed label write, between a win
+    and its completion), and such a record must read as not live everywhere at
+    once. Each registry supplies ``current_version`` from inside the same hold
+    or transaction that read the record."""
+    return (
+        current_version == record.version_at_transfer
+        and record.status not in TRANSFER_ENDED_STATUSES
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class TransferPathView:
+    """What one path looks like to the composite transfer, read by a registry
+    inside the hold or transaction that will also apply the decision.
+
+    ``current_version`` is None when the artifact is absent; ``record`` and
+    ``live`` come from the registry's liveness helper; ``holder_state`` is the
+    presented composite's grant (None when it has no row);
+    ``other_write_holder`` is whether any OTHER agent holds the path EXCLUSIVE
+    or MODIFIED."""
+
+    artifact_id: UUID
+    holder: UUID
+    current_version: int | None
+    record: TransferRecord | None
+    live: bool
+    holder_state: MESIState | None
+    other_write_holder: bool
+
+
+@dataclass(frozen=True)
+class TransferDecision:
+    """One path's decision: the per-grant answer, the record to store (None:
+    nothing is written), and whether the presented composite moves INVALID
+    under the handoff trigger (a supersession writes the record alone)."""
+
+    outcome: TransferGrantOutcome
+    write: TransferRecord | None = None
+    move_holder: bool = False
+
+
+def decide_transfer_grant(
+    request: TransferRequest,
+    view: TransferPathView,
+    *,
+    successor_known: bool,
+    now_unix: float,
+) -> TransferDecision:
+    """Decide one path of a transfer in KTD2's order. Pure: it reads the view
+    and writes nothing, so a registry decides EVERY path before it applies any.
+
+    First the path's record is matched against the caller as giver:
+
+    - (a) live, same successor: answered transferred with the record's status;
+      nothing moves (R6).
+    - (b) live, the successor this record's supersession replaced: refused as
+      ended with the superseded status, so a late re-send never supersedes back.
+    - (c) live, any other successor: supersedes. The stored holder stands in for
+      the hold check only; the foreign write-holder, self and unknown refusals
+      still run, and a refused supersession changes nothing (R4, R26).
+    - (d) ended by decline or withdraw, same successor, unmoved version: refused
+      as ended with that status.
+    - (e) any other record naming the caller is treated as absent.
+
+    Then, with no record naming the caller, the ordinary checks run on the
+    presented composite, in order: hold, unconfirmed version, foreign write
+    holder (not held already won), another giver's live record, self, unknown.
+    """
+    record = view.record
+    if record is not None and record.giver == request.giver:
+        decided = _decide_on_own_record(
+            request, view, record, successor_known=successor_known, now_unix=now_unix
+        )
+        if decided is not None:
+            return decided
+        record = None  # arm (e)
+    return _decide_ordinary(
+        request, view, record, successor_known=successor_known, now_unix=now_unix
+    )
+
+
+def _decide_on_own_record(
+    request: TransferRequest,
+    view: TransferPathView,
+    record: TransferRecord,
+    *,
+    successor_known: bool,
+    now_unix: float,
+) -> TransferDecision | None:
+    """Arms (a) to (d); None is arm (e)."""
+    if view.live:
+        if record.successor == request.successor:
+            return TransferDecision(_transferred(record))
+        if record.superseded_successor == request.successor:
+            return TransferDecision(
+                _ended(record, successor=request.successor, status=TRANSFER_STATUS_SUPERSEDED)
+            )
+        return _supersede(request, view, record, successor_known=successor_known, now_unix=now_unix)
+    if (
+        record.status in TRANSFER_ENDED_STATUSES
+        and record.successor == request.successor
+        and view.current_version == record.version_at_transfer
+    ):
+        return TransferDecision(
+            _ended(record, successor=record.successor, status=record.status)
+        )
+    return None
+
+
+def _supersede(
+    request: TransferRequest,
+    view: TransferPathView,
+    record: TransferRecord,
+    *,
+    successor_known: bool,
+    now_unix: float,
+) -> TransferDecision:
+    """Arm (c). No INVALID move: the stored holder's row moved at the first
+    transfer, and the hold shape and version at transfer carry over."""
+    refusal = _write_holder_refusal(view) or _successor_refusal(
+        request, view, successor_known
+    )
+    if refusal is not None:
+        return TransferDecision(refusal)
+    write = TransferRecord(
+        artifact_id=view.artifact_id,
+        giver=request.giver,
+        holder=record.holder,
+        successor=request.successor,
+        version_at_transfer=record.version_at_transfer,
+        hold_shape=record.hold_shape,
+        cause=TRANSFER_CAUSE_SUPERSESSION,
+        superseded_successor=record.successor,
+        status=TRANSFER_STATUS_PENDING,
+        counterparty=None,
+        created_at=now_unix,
+        updated_at=now_unix,
+    )
+    return TransferDecision(_transferred(write), write=write)
+
+
+def _decide_ordinary(
+    request: TransferRequest,
+    view: TransferPathView,
+    record: TransferRecord | None,
+    *,
+    successor_known: bool,
+    now_unix: float,
+) -> TransferDecision:
+    """The checks on the presented composite, then a plain handoff with the
+    INVALID move; an ended record on the path is replaced (KTD10)."""
+    holder_state, version = view.holder_state, view.current_version
+    if holder_state is None or holder_state not in _HELD_STATES:
+        return TransferDecision(_refused(view, HANDOFF_NOT_HELD_REASON))
+    if version is None or version < 1:
+        return TransferDecision(_refused(view, HANDOFF_VERSION_UNCONFIRMED_REASON))
+    refusal = _write_holder_refusal(view)
+    if refusal is None and record is not None and view.live:
+        refusal = _refused(
+            view, HANDOFF_IN_FLIGHT_REASON, giver=record.giver, successor=record.successor
+        )
+    refusal = refusal or _successor_refusal(request, view, successor_known)
+    if refusal is not None:
+        return TransferDecision(refusal)
+    write = TransferRecord(
+        artifact_id=view.artifact_id,
+        giver=request.giver,
+        holder=view.holder,
+        successor=request.successor,
+        version_at_transfer=version,
+        hold_shape=holder_state,
+        cause=TRANSFER_CAUSE_HANDOFF,
+        superseded_successor=None,
+        status=TRANSFER_STATUS_PENDING,
+        counterparty=None,
+        created_at=now_unix,
+        updated_at=now_unix,
+    )
+    return TransferDecision(_transferred(write), write=write, move_holder=True)
+
+
+def _write_holder_refusal(view: TransferPathView) -> TransferGrantOutcome | None:
+    if view.other_write_holder:
+        return _refused(view, HANDOFF_OTHER_HOLDER_REASON)
+    return None
+
+
+def _successor_refusal(
+    request: TransferRequest, view: TransferPathView, successor_known: bool
+) -> TransferGrantOutcome | None:
+    """Self, then unknown. Self compares session-level identities only: the
+    caller normalised both, and the registry never derives one."""
+    if request.successor == request.giver:
+        return _refused(view, HANDOFF_SELF_REASON)
+    if not successor_known:
+        return _refused(view, HANDOFF_SUCCESSOR_UNKNOWN_REASON)
+    return None
+
+
+def _refused(
+    view: TransferPathView,
+    reason: str,
+    *,
+    giver: UUID | None = None,
+    successor: UUID | None = None,
+) -> TransferGrantOutcome:
+    return TransferGrantOutcome(
+        artifact_id=view.artifact_id,
+        transferred=False,
+        reason=reason,
+        giver=giver,
+        successor=successor,
+    )
+
+
+def _transferred(record: TransferRecord) -> TransferGrantOutcome:
+    return TransferGrantOutcome(
+        artifact_id=record.artifact_id,
+        transferred=True,
+        giver=record.giver,
+        successor=record.successor,
+        version_at_transfer=record.version_at_transfer,
+        hold_shape=record.hold_shape,
+        status=record.status,
+    )
+
+
+def _ended(record: TransferRecord, *, successor: UUID, status: str) -> TransferGrantOutcome:
+    return TransferGrantOutcome(
+        artifact_id=record.artifact_id,
+        transferred=False,
+        reason=HANDOFF_ENDED_REASON,
+        giver=record.giver,
+        successor=successor,
+        version_at_transfer=record.version_at_transfer,
+        hold_shape=record.hold_shape,
+        status=status,
+    )
+
+
 @runtime_checkable
 class RegistryBase(Protocol):
     """The registry contract the service layer (:class:`CoordinatorService`)
@@ -380,6 +747,18 @@ class RegistryBase(Protocol):
         ``checkpoint_id``, and on duplicate member paths within the manifest."""
         ...
 
+    def evict_transfer_records(
+        self, *, max_age_sec: float, now_unix: float | None = None
+    ) -> int:
+        """Delete every transfer record that is NOT live and older than
+        ``max_age_sec``, and return how many went. Liveness is the read's
+        (:func:`transfer_record_live`), so a live record is never evicted
+        whatever its age (KTD10). The age runs from the record's
+        ``updated_at`` -- on sqlite from the later of that and the artifact's
+        own last update, so a version-move ending survives until the giver's
+        next touch can report it. ``now_unix`` defaults to the wall clock."""
+        ...
+
     @property
     def coordinator_epoch(self) -> str:
         """Fence token identifying this coordinator incarnation. A ``@property``
@@ -438,6 +817,17 @@ class RegistryBase(Protocol):
         ...
 
     def get_state_map(self, artifact_id: UUID) -> dict[UUID, MESIState]:
+        ...
+
+    def get_transfer_record(
+        self, artifact_id: UUID
+    ) -> "tuple[TransferRecord, bool] | None":
+        """Return the artifact's transfer record together with whether it is
+        live, or None when the path has no record. Both halves come from ONE
+        read under the registry lock (sqlite: one SELECT joining the
+        artifact's version), so a concurrent version move cannot tear them:
+        this is the one place the service reads liveness from (KTD10). A
+        plain read, so it serves a read-only open too."""
         ...
 
     def get_transient_map(self, artifact_id: UUID) -> dict[UUID, TransientState]:
@@ -591,6 +981,43 @@ class RegistryBase(Protocol):
         last_writer: Optional[UUID] = None,
         fence_agent_id: Optional[UUID] = None,
     ) -> None:
+        ...
+
+    def set_transfer_status(
+        self,
+        artifact_id: UUID,
+        status: str,
+        *,
+        counterparty: UUID | None = None,
+        now_unix: float | None = None,
+    ) -> None:
+        """Write a record's label: ``status``, ``counterparty`` (None clears
+        it) and ``updated_at``, all three. Unconditional -- it never checks
+        liveness, because a win's label is written after the version already
+        moved; the service decides from the record it read under the same
+        hold (KTD2). Raises ``ValueError`` for a status outside
+        :data:`TRANSFER_STORED_STATUSES` (``superseded`` included) and
+        ``KeyError`` when the path has no record; either way nothing is
+        written."""
+        ...
+
+    def transfer_grants(
+        self,
+        request: TransferRequest,
+        *,
+        tick: int = 0,
+        now_unix: float | None = None,
+    ) -> list[TransferGrantOutcome]:
+        """The composite transfer (KTD2): decide every path of ``request`` with
+        :func:`decide_transfer_grant`, then apply the admitted subset -- the
+        record upsert, and for a plain handoff the presented composite's
+        INVALID move under ``HANDOFF_TRIGGER`` (moving ``owner_generation``
+        when it leaves EXCLUSIVE or MODIFIED) with one state-log entry per
+        path -- all inside ONE lock hold and ONE transaction. A refused path is
+        left untouched while the admitted ones commit; any raise mid-apply
+        rolls every path back. Returns one outcome per path, in request
+        order. The registry never derives an identity: the giver and the
+        successor arrive session-level, the holders as presented."""
         ...
 
     def valid_holders(self, artifact_id: UUID) -> list[UUID]:
