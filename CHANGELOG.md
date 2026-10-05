@@ -8,6 +8,71 @@ Alpha — APIs may change before `v1.0`.
 
 ### Added
 
+- **Targeted grant handoff: a session can hand a path to a named successor
+  (#185).** Until now a session done with a file could only release its claim,
+  and the coordinator could not tell a deliberate handoff from an abandoned
+  claim. `POST /handoff/transfer` hands one or more paths — each held as a
+  write grant or a standing read — to one successor session, and the
+  coordinator keeps one transfer record per path: the giver, the successor, the
+  version at transfer, the hold shape given up and a status (`pending`,
+  `completed`, `overtaken`, `declined` or `withdrawn`; a re-send of a transfer
+  the giver has since replaced answers `superseded`). The answer is per grant,
+  in request order, and `ok` only when every grant transferred; a refused grant
+  is left exactly as it was, and an exact re-send moves nothing. The successor
+  accepts or declines with `POST /handoff/accept` or `/handoff/decline`, and
+  the giver withdraws with `POST /handoff/withdraw`. The giver's claim moves to
+  INVALID under a new state-log trigger, `handoff`, which moves the ownership
+  epoch for a write grant as a release does, moves nothing for a standing
+  read, and is not a reclaim. A handoff reserves nothing: other sessions keep
+  reading, acquiring and committing, and an acquire or optimistic commit by
+  anyone but the successor marks the record `overtaken`. Name the successor by
+  its session-level agent id; a subagent's or a per-attempt id is accepted only
+  while the coordinator process still holds it in its name map, so not after a
+  restart. All four routes require the caller principal of a session that has
+  claimed one, answer a watchdog timeout with a fail-closed `ok: false` and a
+  `handoff_*_unconfirmed` reason, and are served by the Python coordinator
+  only: the Claude Code plugin's Node coordinator answers them `404`. The
+  bundled clients do not call them. `/status` counts each route among its
+  endpoint counters. See the guide's
+  [Targeted grant handoff](docs/guide.md#targeted-grant-handoff) section.
+
+- **The giver of a live handoff cannot write the path it handed off (#185).**
+  While the record is live — the path's version unchanged since the transfer,
+  and the handoff neither declined nor withdrawn — `pre-edit`, `post-edit`,
+  `post-edit-cas`, `/session/commit`, `/session/commit_all` and
+  `/workspace/restore/register` answer the giver's session
+  `{"ok": false, "reason": "handed_off"}` with the `successor` and the
+  `version_at_transfer`, and grant or commit nothing. The fence is keyed on the
+  session, so a subagent or a fresh attempt of the giver is refused alike, and
+  no retry, re-read or reacquire clears it. It lifts when any session's commit
+  moves the version, when the successor declines, or when the giver withdraws
+  — never on a timer, and not on the successor's accept or acquire. A path
+  with no record answers exactly as before. The Claude Code hook client relays
+  the `pre-edit` answer as it is, with no deny, so the fence by itself does not
+  keep a hook session's edit from landing on disk; only its grant and commit
+  are refused.
+
+- **Read, edit and status answers show a path's handoff (#185).** While a path
+  has a transfer record, the `pre-read`, `pre-edit`, `post-edit` and
+  `post-edit-cas` answers carry a top-level `handoff` key projected for the
+  caller's `role` (`giver`, `successor` or `bystander`), with the record's
+  status, whether it is still live, and the `counterparty` of an overtake; a
+  compare-and-swap win that labelled the record adds whether it `completed` or
+  `overtaken` it. `GET /status` carries the same fields, without the role, in
+  each such `tracked_artifacts` entry on the default and operator tiers, and
+  the operator tier adds the record's creation time. Every id in the key is a
+  session-level agent id, never a session name or id. With no record every
+  answer is byte-for-byte unchanged, and the metrics tier never carries a
+  record.
+
+- **`transfer_record_evict_max_age_sec`: ended handoff records are evicted
+  (#185).** A new `LifecycleConfig` field, 86400 seconds by default. The
+  coordinator's sweep removes a transfer record once it is no longer live and
+  neither it nor its path has been updated for that long, so a giver left idle
+  overnight still learns how its handoff ended. A live record is never
+  removed. A giver idle past eviction learns only what any out-of-date writer
+  does, such as a `version_mismatch` on its next compare-and-swap.
+
 - **A caller principal: the coordinator can check which session a request is
   from.** The coordinator authenticates the workspace, not the caller — the
   session a request acts as is a body field — so a copied request, a stale
@@ -210,6 +275,31 @@ Alpha — APIs may change before `v1.0`.
   Offline, deterministic, no keys: `python -m examples.session_handoff.main`.
 
 ### Changed
+
+- **A release that is not a clean success now answers per grant (#185).** A
+  `session-stop` that left a grant held answered `ok: true` and only logged
+  the failure, so a client dropping its record on that answer forgot a grant
+  the coordinator still held. It now answers `ok: false` with
+  `released_artifacts` and a `grants` list naming each grant, in the order it
+  was acquired, as released (`"held": false, "cause": "release"`) or still held
+  (`"held": true` with its `reason`). A failed-edit `post-edit` whose release
+  is refused adds the same `grants` list to its existing `ok: false` answer. A
+  failed-edit report from the giver of a live handoff answers `ok: false` with
+  `reason: "handed_off"` and the grant reported handed to the successor, and
+  changes nothing: it neither releases nor withdraws. A clean release answers
+  exactly as before. The Node coordinator's answers are unchanged.
+
+- **`session-stop` refuses a malformed subagent id with HTTP `400` (#185).** A
+  present but malformed `agent_id` answered `{"ok": true, "released_artifacts":
+  []}`, which reads as a release that found nothing to release. It is now
+  `400 {"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"}`, before the
+  caller-principal check. The Node coordinator still answers the empty
+  success.
+
+- **Registry schema version 9 (forward-only).** Transfer records get their own
+  table. As with earlier steps, the migration runs on first open, from version
+  8 or any earlier version, and there is no down step: once a workspace's
+  `state.db` is at version 9, an older release refuses it.
 
 - **Requests naming a session that has claimed a principal must present it on
   the routes that can change another writer's work.** `pre-edit`,
