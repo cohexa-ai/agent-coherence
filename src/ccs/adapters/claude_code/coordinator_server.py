@@ -5035,24 +5035,15 @@ def _giver_fenced_body(exc: GiverFenced, *, path: str | None = None) -> dict:
     return body
 
 
-def _handoff_projection(record: TransferRecord, *, live: bool, caller: UUID) -> dict:
-    """The ``handoff`` key: ``record`` projected for ``caller``'s role (R29).
-
-    The successor reads its provenance (who handed it the path, at which
-    version, from which hold shape), a bystander the pair it is writing past,
-    the giver its outcome. Session-level agent ids only -- no session id, no
-    composite, no timestamp (KTD9) -- so the corpus can pin it. ``live`` is the
-    registry's liveness (KTD10): a record whose version moved, or that was
-    declined or withdrawn, is reported until the sweep evicts it, so the
-    giver's next touch learns how it ended."""
-    if caller == record.giver:
-        role = _HANDOFF_ROLE_GIVER
-    elif caller == record.successor:
-        role = _HANDOFF_ROLE_SUCCESSOR
-    else:
-        role = _HANDOFF_ROLE_BYSTANDER
-    projection: dict = {
-        "role": role,
+def _handoff_record_fields(record: TransferRecord, *, live: bool) -> dict:
+    """The caller-independent half of the ``handoff`` key: who handed the path
+    to whom, at which version, from which hold shape, how the record stands,
+    and the bystander an overtaken label names. Session-level agent ids only
+    -- no session id, no composite, no timestamp (KTD9) -- so the corpus can
+    pin it. ``live`` is the registry's liveness (KTD10): a record whose
+    version moved, or that was declined or withdrawn, is reported until the
+    sweep evicts it, so the giver's next touch learns how it ended."""
+    fields: dict = {
         "giver": str(record.giver),
         "successor": str(record.successor),
         "version_at_transfer": record.version_at_transfer,
@@ -5061,7 +5052,37 @@ def _handoff_projection(record: TransferRecord, *, live: bool, caller: UUID) -> 
         "live": live,
     }
     if record.counterparty is not None:
-        projection["counterparty"] = str(record.counterparty)
+        fields["counterparty"] = str(record.counterparty)
+    return fields
+
+
+def _handoff_projection(record: TransferRecord, *, live: bool, caller: UUID) -> dict:
+    """The ``handoff`` key: ``record`` projected for ``caller``'s role (R29).
+
+    The successor reads its provenance (who handed it the path, at which
+    version, from which hold shape), a bystander the pair it is writing past,
+    the giver its outcome -- the role first, then the record's fields."""
+    if caller == record.giver:
+        role = _HANDOFF_ROLE_GIVER
+    elif caller == record.successor:
+        role = _HANDOFF_ROLE_SUCCESSOR
+    else:
+        role = _HANDOFF_ROLE_BYSTANDER
+    return {"role": role, **_handoff_record_fields(record, live=live)}
+
+
+def _status_handoff_projection(
+    record: TransferRecord, *, live: bool, operator_tier: bool
+) -> dict:
+    """The ``handoff`` key on a ``/status`` entry (R27): the record's fields
+    with no ``role``, because ``/status`` has no caller to be a party to the
+    record -- it describes the workspace, and each party tells its own role by
+    its session-level id. The operator tier adds the record's created
+    wall-clock timestamp beside the entry's last-writer one; the default tier
+    carries ids only (KTD9)."""
+    projection = _handoff_record_fields(record, live=live)
+    if operator_tier:
+        projection["created_at_unix_ts"] = record.created_at
     return projection
 
 
@@ -6091,6 +6112,12 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     dispatcher; the header is a SECOND factor specifically for the
     elevated tier.
 
+    #185 R27: while a tracked artifact has a transfer record, its
+    ``tracked_artifacts`` entry carries a ``handoff`` key at the minimal and
+    full tiers, with session-level agent ids only; the full tier's key adds
+    the record's ``created_at_unix_ts``. An entry with no record, and the
+    metrics tier always, keep today's bytes.
+
     AC-07 — metrics-tier stability contract (operator-facing):
 
       Fields PRESENT in the metrics tier are stable within a major
@@ -6155,8 +6182,12 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
 
     # PERF-1: single batched snapshot — replaces 2N SELECTs (one
     # get_artifact + one get_state_map per artifact) with 2 SELECTs total
-    # held under one registry lock so the view is consistent.
-    artifact_by_id, state_by_artifact = coordinator.registry.status_snapshot()
+    # held under one registry lock so the view is consistent. #185 KTD9: the
+    # transfer rows ride the same hold as a third SELECT, so each record's
+    # liveness is judged against the version its entry shows.
+    artifact_by_id, state_by_artifact, transfer_by_artifact = (
+        coordinator.registry.status_snapshot(include_transfers=True)
+    )
     named_agents = coordinator.agent_names_snapshot()
 
     tracked: list[dict] = []
@@ -6183,6 +6214,14 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
             writer = meta.get("last_writer_id")
             entry["last_writer_agent_id"] = str(writer) if writer else None
             entry["last_writer_at_unix_ts"] = meta.get("updated_at") if writer else None
+        # #185 R27: the path's transfer record, only while one exists, so an
+        # entry with no record keeps today's bytes at every tier.
+        transfer = transfer_by_artifact.get(artifact_id)
+        if transfer is not None:
+            record, live = transfer
+            entry["handoff"] = _status_handoff_projection(
+                record, live=live, operator_tier=detail == "full"
+            )
         tracked.append(entry)
 
     # The HOLDER set comes from the registry; a NAME comes from the adapter.

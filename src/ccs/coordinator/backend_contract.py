@@ -675,7 +675,11 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         MemberClass.READ_ONLY,
         "sqlite_extended",
         "Batch read of the artifact + state maps for the /status surface, "
-        "optionally scoping the state half to named agents. Non-mutating.",
+        "optionally scoping the state half to named agents. A keyword-only "
+        "opt-in, off by default, adds each artifact's transfer record and its "
+        "liveness, read inside the same lock hold so a record is judged "
+        "against the version its row reports (#185 KTD9); only /status opts "
+        "in, and the default answer is unchanged. Non-mutating.",
     ),
     MemberContract(
         "record_foreign_write",

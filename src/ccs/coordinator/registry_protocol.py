@@ -1149,8 +1149,25 @@ class SqliteExtended(RegistryBase, Protocol):
         self,
         *,
         agent_ids: Iterable[UUID] | None = None,
-    ) -> tuple[
-        dict[UUID, dict[str, Any]],
-        dict[UUID, dict[UUID, MESIState]],
-    ]:
+        include_transfers: bool = False,
+    ) -> (
+        tuple[
+            dict[UUID, dict[str, Any]],
+            dict[UUID, dict[UUID, MESIState]],
+        ]
+        | tuple[
+            dict[UUID, dict[str, Any]],
+            dict[UUID, dict[UUID, MESIState]],
+            dict[UUID, tuple[TransferRecord, bool]],
+        ]
+    ):
+        """The artifact rows and the per-artifact state maps, read under ONE
+        lock hold; ``agent_ids`` scopes the state half to the named agents.
+
+        ``include_transfers`` (keyword-only, off by default) adds a third
+        element, ``{artifact_id: (record, live)}`` for every artifact that has
+        a transfer record, read inside the same hold and judged by the same
+        liveness helper :meth:`RegistryBase.get_transfer_record` uses (KTD10),
+        so ``/status`` renders each record beside the version it was judged
+        against. Without it the answer is the two-element tuple, unchanged."""
         ...

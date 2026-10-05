@@ -146,6 +146,12 @@ class LifecycleConfig:
     #: pause and come back, short enough to bound state on a dead session.
     notice_evict_max_age_sec: float = 1800.0
 
+    #: #185 KTD10 — transfer records that are no longer live (declined,
+    #: withdrawn, or past a version move) are evicted by the sweep once older
+    #: than this. One day: a giver left idle overnight still learns how its
+    #: handoff ended on its next touch. A live record is never evicted.
+    transfer_record_evict_max_age_sec: float = 86_400.0
+
     #: Loser's bounded retry when reading the port file. Bumped from 30 to
     #: 60 (G9) so a 30-process thundering herd with cold Python imports
     #: and SQLite WAL setup has time to settle before losers degrade.
@@ -776,11 +782,13 @@ def _start_background_threads(entry: _SpawnedEntry, cfg: LifecycleConfig) -> Non
 
 
 def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
-    """Periodic sweep: transient → stable grant → notice eviction.
+    """Periodic sweep: transient → stable grant → notice eviction →
+    transfer-record eviction.
 
     Order matters per R4: transient sweep first so the stable sweep does
-    not race entries that are mid-protocol. F2 notice eviction last —
-    it's a pure storage reclaim and doesn't interact with grants.
+    not race entries that are mid-protocol. F2 notice eviction and the
+    #185 transfer-record eviction last — both are pure storage reclaims
+    and don't interact with grants (a live record is never evicted).
 
     ADV-004: stable-grant reclamation records a preemption notice for
     the reclaimed victim so the victim's eventual post-edit gets an
@@ -880,13 +888,21 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
             )
             if evicted:
                 logger.info("sweep evicted %d stale preemption notice(s)", evicted)
+            # #185 KTD10: drop transfer records no longer live and older than
+            # the knob; the age runs from the later of the record's and its
+            # artifact's last update, so a version-move ending stays readable.
+            evicted_records = coordinator.registry.evict_transfer_records(
+                max_age_sec=cfg.transfer_record_evict_max_age_sec,
+            )
+            if evicted_records:
+                logger.info("sweep evicted %d ended transfer record(s)", evicted_records)
         except Exception as exc:
             # Sweep is best-effort — never crash the coordinator.
             logger.exception("sweep tick failed: %s", exc)
-        # Foreign-write detection: a fifth pass, deliberately OUTSIDE the try
-        # above rather than appended inside it. The four passes share one
+        # Foreign-write detection: a sixth pass, deliberately OUTSIDE the try
+        # above rather than appended inside it. The five passes share one
         # best-effort guard, so a detection failure inside it would cost the
-        # tick's reclamation work; and running detection only when all four
+        # tick's reclamation work; and running detection only when all five
         # succeeded would make the instrument's own liveness depend on theirs.
         # Two separate guards keep the failure domains apart in both
         # directions. ``run_detection_pass`` raises nothing by contract.
@@ -909,7 +925,7 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
             reported_faults=detection_reported_faults,
             tick_clock=detection_tick_clock,
             # Three sweep intervals of slack: one tick that arrives late
-            # because the four passes ahead of it ran long must not fragment a
+            # because the five passes ahead of it ran long must not fragment a
             # healthy run, but a stall long enough to hide a write must not be
             # read as continuously observed either.
             max_gap_sec=cfg.sweep_interval_sec * 3,

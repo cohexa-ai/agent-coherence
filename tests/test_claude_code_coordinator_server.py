@@ -10625,3 +10625,253 @@ def test_a_compare_and_swap_win_carries_its_handoff_outcome(
 
     read = _read(client, giver, "plan.md")
     assert read["handoff"] == _projection(giver, successor, "giver", status="completed", live=False)
+
+
+# ----------------------------------------------------------------------
+# The handoff key on /status (#185, U6)
+#
+# The default and operator tiers render each tracked artifact's transfer
+# record while one exists, read in the same registry hold as the artifact and
+# state rows (KTD9); the metrics tier and the session-start builder never see
+# it. The /status key is role-free -- the route has no caller to be a party to
+# the record -- so it is the per-path ``handoff`` key less its ``role``, plus
+# the record's created wall-clock timestamp on the operator tier only.
+# ----------------------------------------------------------------------
+
+_DEFAULT_ENTRY_KEYS = {"path", "version", "id"}
+_OPERATOR_ENTRY_KEYS = _DEFAULT_ENTRY_KEYS | {"last_writer_agent_id", "last_writer_at_unix_ts"}
+
+
+def _status_entry(body: dict, path: str) -> dict:
+    [entry] = [e for e in body["tracked_artifacts"] if e["path"] == path]
+    return entry
+
+
+def _status_handoff(
+    giver: _Session, successor: _Session, *, status: str = "pending", live: bool = True
+) -> dict:
+    """The ``handoff`` key a /status entry carries while a record exists (R27),
+    as a literal: session-level ids, no role, no session id, no timestamp."""
+    return {
+        "giver": giver.agent, "successor": successor.agent, "version_at_transfer": 1,
+        "hold_shape": "SHARED", "status": status, "live": live,
+    }
+
+
+def _keys_anywhere(value: Any) -> set[str]:
+    """Every dict key at any nesting depth of a JSON body."""
+    if isinstance(value, dict):
+        return set(value).union(*(_keys_anywhere(v) for v in value.values()))
+    if isinstance(value, list):
+        return set().union(*(_keys_anywhere(v) for v in value))
+    return set()
+
+
+def test_ae15_status_shows_a_handoff_on_the_default_and_operator_tiers_while_a_record_exists(
+    coordinator, client: _Client
+) -> None:
+    """AE15 / R27: with no record each entry has today's keys; while a record
+    exists the default and operator tiers both carry it on the handed path's
+    entry, with session-level agent ids and no session id, and the operator
+    tier adds the record's created timestamp beside the last-writer one. An
+    ended record is still shown -- a giver's next status read learns how it
+    ended -- and once evicted the entry is back to today's keys."""
+    giver, successor = _claimed(client), _claimed(client)
+    _read(client, giver, "plan.md", "inc-1")
+    _read(client, successor, "task.md")
+    tiers = _status_tiers(client)
+    for path in ("plan.md", "task.md"):
+        assert set(_status_entry(tiers["minimal"], path)) == _DEFAULT_ENTRY_KEYS
+        assert set(_status_entry(tiers["full"], path)) == _OPERATOR_ENTRY_KEYS
+
+    transferred_from = time.time()
+    answer = _transfer(client, giver, successor.agent, [{"path": "plan.md", "agent_id": "inc-1"}])
+    transferred_by = time.time()
+    assert answer == (200, {"ok": True, "grants": [_handed(giver, successor, "plan.md")]})
+
+    tiers = _status_tiers(client)
+    default = _status_entry(tiers["minimal"], "plan.md")
+    assert set(default) == _DEFAULT_ENTRY_KEYS | {"handoff"}
+    assert default["handoff"] == _status_handoff(giver, successor)
+    for sid in (giver.sid, successor.sid):
+        assert sid not in json.dumps(tiers["minimal"])
+
+    operator = _status_entry(tiers["full"], "plan.md")
+    assert set(operator) == _OPERATOR_ENTRY_KEYS | {"handoff"}
+    assert operator["last_writer_at_unix_ts"] is None
+    handoff = dict(operator["handoff"])
+    created = handoff.pop("created_at_unix_ts")
+    assert handoff == _status_handoff(giver, successor)
+    assert isinstance(created, float) and transferred_from <= created <= transferred_by
+    for sid in (giver.sid, successor.sid):
+        assert sid not in json.dumps(operator["handoff"])
+
+    assert set(_status_entry(tiers["minimal"], "task.md")) == _DEFAULT_ENTRY_KEYS
+    assert set(_status_entry(tiers["full"], "task.md")) == _OPERATOR_ENTRY_KEYS
+
+    assert _verb(client, _DECLINE, successor, "plan.md") == (200, {"ok": True, "status": "declined"})
+    _, minimal = client.get("/status")
+    assert _status_entry(minimal, "plan.md")["handoff"] == _status_handoff(
+        giver, successor, status="declined", live=False)
+
+    assert coordinator.registry.evict_transfer_records(
+        max_age_sec=0.0, now_unix=time.time() + 60.0) == 1
+    tiers = _status_tiers(client)
+    assert set(_status_entry(tiers["minimal"], "plan.md")) == _DEFAULT_ENTRY_KEYS
+    assert set(_status_entry(tiers["full"], "plan.md")) == _OPERATOR_ENTRY_KEYS
+
+
+def test_status_metrics_tier_carries_no_handoff_record_path_or_agent_id(
+    coordinator, client: _Client
+) -> None:
+    """R27, KTD9: the counters-only tier returns before the snapshot, so a live
+    record changes none of its keys (the handoff route counters are there with
+    or without one) and puts no record, path or agent id in it. Its values
+    move per request, so the comparison is of key sets, not bytes."""
+    giver, successor = _claimed(client), _claimed(client)
+    _read(client, giver, "plan.md", "inc-1")
+    _, without = client.get("/status?detail=metrics")
+    _hand_off(client, giver, successor, "plan.md")
+    status, with_record = client.get("/status?detail=metrics")
+
+    assert status == 200
+    assert set(with_record) == set(without)
+    assert set(with_record["endpoint_counters"]) == set(without["endpoint_counters"])
+    assert "handoff" not in _keys_anywhere(with_record)
+    text = json.dumps(with_record)
+    for leaked in (
+        "plan.md", giver.agent, successor.agent,
+        uuid.UUID(giver.agent).hex, uuid.UUID(successor.agent).hex, giver.sid, successor.sid,
+    ):
+        assert leaked not in text
+
+
+def test_status_operator_tier_without_its_header_is_refused_unchanged_with_a_live_record(
+    client: _Client,
+) -> None:
+    """R27: a live record does not open the operator tier -- the 403 answers
+    the same bytes as with no record, carrying nothing of it."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    assert client.get("/status?detail=full") == (403, {
+        "error": (
+            "detail=full requires the Coherence-Local-Operator: true opt-in "
+            "header in addition to the Bearer secret (R12)."
+        ),
+    })
+
+
+def test_status_reads_the_transfer_rows_inside_the_snapshot_lock_hold(
+    coordinator, client: _Client
+) -> None:
+    """KTD9: the transfer rows are read inside the ONE registry hold that reads
+    the artifact and agent-state rows. A per-artifact read outside that hold
+    lets a concurrent version move land between the two, so an entry would
+    pair one version with a liveness judged against another -- the one-lock
+    rule reopened at the status site."""
+    from tests.test_registry_lock_coverage import _TrackingRLock
+
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    registry = coordinator.registry
+    tracker = _TrackingRLock()
+    real_lock, real_conn = registry._lock, registry._conn
+
+    class _RecordingConnection:
+        """Records each statement into the tracker's event stream."""
+
+        def execute(self, sql: str, *args: Any) -> Any:
+            tracker.events.append(" ".join(sql.split()))
+            return real_conn.execute(sql, *args)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_conn, name)
+
+    registry._lock, registry._conn = tracker, _RecordingConnection()
+    try:
+        status, body = client.get("/status")
+    finally:
+        registry._lock, registry._conn = real_lock, real_conn
+    assert status == 200
+    assert _status_entry(body, "plan.md")["handoff"] == _status_handoff(giver, successor)
+
+    holds: list[list[str]] = []
+    unheld: list[str] = []
+    depth = 0
+    for event in tracker.events:
+        if event == "acquire":
+            if depth == 0:
+                holds.append([])
+            depth += 1
+        elif event == "release":
+            depth -= 1
+        elif depth == 0:
+            unheld.append(event)
+        else:
+            holds[-1].append(event)
+    assert not [sql for sql in unheld if "transfer_records" in sql]
+    transfer_holds = [hold for hold in holds if any("transfer_records" in sql for sql in hold)]
+    assert len(transfer_holds) == 1, transfer_holds
+    [hold] = transfer_holds
+    assert any("FROM artifacts" in sql and "transfer_records" not in sql for sql in hold), hold
+    assert any("FROM agent_states" in sql for sql in hold), hold
+
+
+def test_session_start_is_byte_identical_with_a_live_handoff_on_its_path(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """KTD9: the session-start builder keeps the default snapshot form, so the
+    successor's re-grounding over a path handed to it answers the bytes it
+    answered before the handoff, and the builder never asks for the transfer
+    rows -- an unseen read on a hook path that runs under the registry lock
+    twice per compaction (asserted on the argument, as the SB-10 scope is)."""
+    giver, successor = _claimed(client), _claimed(client)
+    _read(client, successor, "plan.md")
+    expected = (200, {"hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": "\n".join([
+            "Post-compaction re-grounding (agent-coherence):",
+            "At compaction you held SHARED on plan.md (v1) — re-acquire before writing.",
+            _SS_CLOSING,
+        ]),
+    }})
+    session_start = {"session_id": successor.sid}
+    assert client.post("/hooks/session-start", session_start, principal=successor.principal) == expected
+
+    _hand_off(client, giver, successor, "plan.md")
+    assert _record(coordinator, "plan.md")[1] is True
+    calls: list[dict] = []
+    real = coordinator.registry.status_snapshot
+
+    def recording(*args: Any, **kwargs: Any):
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator.registry, "status_snapshot", recording)
+    assert client.post("/hooks/session-start", session_start, principal=successor.principal) == expected
+    assert [set(kwargs) for kwargs in calls] == [{"agent_ids"}]
+
+
+def test_ae25_a_coordinator_wiring_a_state_log_records_the_transfer_under_the_handoff_trigger(
+    tmp_path: Path,
+) -> None:
+    """AE25 / R28: a caller that wires the in-process state log sees the
+    giver's INVALID move logged under ``handoff`` -- never ``invalidate``, the
+    trigger a release, a failed edit or a drain is recorded under."""
+    entries: list[dict] = []
+    server = CoordinatorHTTPServer(tmp_path, port=0, state_log=entries.append, instance_id="ae25")
+    server.serve_in_thread()
+    time.sleep(0.05)
+    try:
+        client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
+        giver, successor = _claimed(client), _claimed(client)
+        _read(client, giver, "plan.md", "inc-1")
+        logged = len(entries)
+        answer = _transfer(client, giver, successor.agent, [{"path": "plan.md", "agent_id": "inc-1"}])
+        assert answer == (200, {"ok": True, "grants": [_handed(giver, successor, "plan.md")]})
+        assert [
+            (e["agent_id"], e["from_state"], e["to_state"], e["trigger"])
+            for e in entries[logged:]
+        ] == [(str(giver.composite("inc-1")), "SHARED", "INVALID", "handoff")]
+    finally:
+        server.shutdown()
