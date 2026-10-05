@@ -332,7 +332,7 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "transfer_grants",
         MemberClass.INDEPENDENT,
         "base",
-        "The grant handoff's composite transfer (service transfer, #185 KTD2): "
+        "The grant handoff's composite transfer (service transfer, #185): "
         "decides every path of a request -- the giver's own record first, then "
         "the hold, version, write-holder, other-giver, self and unknown checks "
         "-- and applies the admitted subset (record upsert, the presented "
@@ -585,7 +585,7 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "(the version at transfer still equals the artifact's version and the "
         "record was neither declined nor withdrawn), both from one read: the "
         "single place the service's giver check, re-send answer and "
-        "completion/overtake decisions take liveness from (KTD10). "
+        "completion/overtake decisions take liveness from. "
         "Non-mutating; a lock-only select that serves a read-only open.",
     ),
     # ---- INDEPENDENT / READ_ONLY (sqlite_extended) ------------------------
@@ -678,7 +678,7 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "optionally scoping the state half to named agents. A keyword-only "
         "opt-in, off by default, adds each artifact's transfer record and its "
         "liveness, read inside the same lock hold so a record is judged "
-        "against the version its row reports (#185 KTD9); only /status opts "
+        "against the version its row reports (#185); only /status opts "
         "in, and the default answer is unchanged. Non-mutating.",
     ),
     MemberContract(

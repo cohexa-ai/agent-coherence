@@ -572,7 +572,7 @@ def test_session_stop_malformed_agent_id_does_not_release_parent(
     And it is REFUSED (HTTP 400, as the effect fence refuses the same field),
     never answered ``{ok: true, released_artifacts: []}``: that body reads as a
     release that found nothing to release, so a client dropping its record on
-    the answer would forget a grant the coordinator still holds (#185 R8)."""
+    the answer would forget a grant the coordinator still holds (#185)."""
     sid = _sid("A")
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})  # parent holds E
     artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
@@ -9789,7 +9789,7 @@ def test_session_start_shows_a_bound_peers_notices_without_draining_them(
 
 
 # ----------------------------------------------------------------------
-# Targeted grant handoff routes (#185, U5)
+# Targeted grant handoff routes (#185)
 #
 # The four require-class verbs -- transfer, accept, decline, withdraw -- and
 # what a handoff changes on the routes that already exist: the giver's typed
@@ -9807,7 +9807,8 @@ _WITHDRAW = "/handoff/withdraw"
 _HANDOFF_ROUTES = (_TRANSFER, _ACCEPT, _DECLINE, _WITHDRAW)
 
 #: FROZEN duplicates of the four static degraded bodies: one per verb, failed
-#: and unconfirmed, the transfer's naming no grant (R7, R37, KTD4).
+#: and unconfirmed, the transfer's naming no grant (every grant of an
+#: all-or-nothing transfer is equally unconfirmed).
 _HANDOFF_DEGRADED = {
     _TRANSFER: {"ok": False, "degraded": True, "reason": "handoff_transfer_unconfirmed"},
     _ACCEPT: {"ok": False, "degraded": True, "reason": "handoff_accept_unconfirmed"},
@@ -9877,7 +9878,7 @@ def _handed(
     giver: _Session, successor: _Session, path: str, *,
     version: int = 1, shape: str = "SHARED", status: str = "pending",
 ) -> dict:
-    """A transferred grant's per-grant entry, as a literal (R3)."""
+    """A transferred grant's per-grant entry, as a literal."""
     return {
         "path": path, "transferred": True, "giver": giver.agent,
         "successor": successor.agent, "version_at_transfer": version,
@@ -9889,7 +9890,7 @@ def _hand_off(
     client: _Client, giver: _Session, successor: _Session, path: str, subagent: str = "inc-1"
 ) -> None:
     """``giver`` reads ``path`` under the incarnation ``subagent`` and hands it to
-    ``successor``, presenting that incarnation (KTD7)."""
+    ``successor``, presenting that incarnation."""
     _read(client, giver, path, subagent)
     answer = _transfer(client, giver, successor.agent, [{"path": path, "agent_id": subagent}])
     assert answer == (200, {"ok": True, "grants": [_handed(giver, successor, path)]}), answer
@@ -9899,7 +9900,7 @@ def _projection(
     giver: _Session, successor: _Session, role: str, *,
     shape: str = "SHARED", status: str = "pending", live: bool = True, **extra: Any,
 ) -> dict:
-    """The ``handoff`` key a body carries while a record exists (R29), as a
+    """The ``handoff`` key a body carries while a record exists, as a
     literal: session-level ids only, no session id, no timestamp."""
     return {
         "role": role, "giver": giver.agent, "successor": successor.agent,
@@ -9969,7 +9970,7 @@ def test_transfer_refuses_a_request_it_cannot_read_and_changes_nothing(
 def test_transfer_answers_each_grant_with_the_normalised_session_level_ids(
     coordinator, client: _Client
 ) -> None:
-    """Covers AE9 (R2, R3, R4). One request, two grants: the held read is
+    """One request, two grants: the held read is
     transferred and reported with the SESSION-LEVEL giver and successor ids
     although the giver presented an incarnation and named the successor by
     the composite id of one of its subagents (in the 32-hex form a stale
@@ -9977,7 +9978,7 @@ def test_transfer_answers_each_grant_with_the_normalised_session_level_ids(
     held and left exactly as it was, so the top-level answer is false.
 
     Prevents a composite reaching the record (the fence keys on the
-    session-level id, R11) and a mixed answer reading as success."""
+    session-level id) and a mixed answer reading as success."""
     giver, successor = _claimed(client), _claimed(client)
     _read(client, giver, "plan.md", "inc-1")
     _read(client, successor, "spec.md", "worker")  # registers the successor's subagent
@@ -10005,7 +10006,7 @@ def test_transfer_answers_each_grant_with_the_normalised_session_level_ids(
 def test_transfer_presents_a_different_incarnation_per_path(
     coordinator, client: _Client
 ) -> None:
-    """KTD7: a client presents, per path, the incarnation that holds its claim
+    """A client presents, per path, the incarnation that holds its claim
     there; the request-level ``agent_id`` is the default for a grant that
     names none. Both grants transfer, and each incarnation's row is the one
     that moved INVALID."""
@@ -10028,7 +10029,7 @@ def test_transfer_presents_a_different_incarnation_per_path(
 def test_transfer_to_the_callers_own_session_is_refused_as_self(
     coordinator, client: _Client
 ) -> None:
-    """R2: a successor that normalises to the caller's own session -- its own
+    """A successor that normalises to the caller's own session -- its own
     subagent's composite, or its session-level id -- is refused as self, and
     the read is left as it was. A handoff is between sessions."""
     giver = _claimed(client)
@@ -10053,7 +10054,7 @@ def test_transfer_to_the_callers_own_session_is_refused_as_self(
 def test_a_malformed_successor_is_refused_for_every_grant_and_changes_nothing(
     named: Any, coordinator, client: _Client
 ) -> None:
-    """R2, R4: a successor id that is not a well-formed agent id refuses EVERY
+    """A successor id that is not a well-formed agent id refuses EVERY
     grant with its own typed reason, inside an HTTP 200 -- not a 400, and
     never a downgrade to a plain release (the stated exception to the
     malformed-optional-field rule)."""
@@ -10075,7 +10076,7 @@ def test_a_malformed_successor_is_refused_for_every_grant_and_changes_nothing(
 def test_a_successor_the_coordinator_never_saw_is_refused_as_unknown(
     coordinator, client: _Client
 ) -> None:
-    """R2: a well-formed id that is neither bound to a principal nor in the
+    """A well-formed id that is neither bound to a principal nor in the
     live name map is refused as unknown, and the read is left alone."""
     giver = _claimed(client)
     _read(client, giver, "plan.md", "inc-1")
@@ -10089,7 +10090,7 @@ def test_a_successor_the_coordinator_never_saw_is_refused_as_unknown(
 def test_a_composite_successor_is_known_only_while_the_name_map_holds_it(
     tmp_path: Path,
 ) -> None:
-    """R2, KTD7. A composite successor id -- here a volume incarnation's -- is
+    """A composite successor id -- here a volume incarnation's -- is
     accepted while the coordinator's live name map holds it, and normalised
     to its session. After a restart the map is empty, and the same id is
     refused as unknown EVEN THOUGH it still holds a SHARED row: on this
@@ -10129,7 +10130,7 @@ def test_a_composite_successor_is_known_only_while_the_name_map_holds_it(
 
 
 def test_a_refused_grant_carries_what_its_refusal_names(coordinator, client: _Client) -> None:
-    """R26, R6 rendered on the wire: a transfer of a path another session
+    """Refusals rendered on the wire: a transfer of a path another session
     handed off is refused naming the pending pair and, in static text with no
     id, what ends that handoff; a re-send of a handoff its successor declined
     is refused carrying the declined status. Nothing changes either time."""
@@ -10162,7 +10163,7 @@ def test_a_refused_grant_carries_what_its_refusal_names(coordinator, client: _Cl
 def test_a_name_the_registration_did_not_write_never_normalises_a_successor(
     tmp_path: Path,
 ) -> None:
-    """KTD7: a composite resolves to a session only through the display name
+    """A composite resolves to a session only through the display name
     ``register_session`` wrote for that very id. An id whose map entry carries
     another session's name (seeded straight into the map here) is not
     normalised to that session: the transfer refuses it as unknown instead of
@@ -10192,7 +10193,7 @@ def test_a_name_the_registration_did_not_write_never_normalises_a_successor(
 def test_accept_decline_and_withdraw_answer_their_typed_results(
     coordinator, client: _Client
 ) -> None:
-    """R16, R20 on the wire: the successor accepts or declines, the giver
+    """The three verbs on the wire: the successor accepts or declines, the giver
     withdraws, anyone else is refused with the typed reason carrying the
     record's status, a record that ended is refused as not live, and a path
     with no record at all answers not live with no status."""
@@ -10224,7 +10225,7 @@ def test_accept_decline_and_withdraw_answer_their_typed_results(
 def test_a_handoff_verb_cut_short_by_the_watchdog_answers_unconfirmed_and_lands_nothing(
     route: str, coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Covers AE18's first half and AE24 (R7, R37). With the registry lock held
+    """A watchdog that fires while a verb waits for the lock. With the registry lock held
     past the watchdog deadline, each verb answers its ONE static fail-closed
     body -- failed and unconfirmed, never a success, the transfer's naming no
     grant -- and once the lock frees, the abandoned body aborts at the
@@ -10268,10 +10269,10 @@ def test_a_handoff_verb_cut_short_by_the_watchdog_answers_unconfirmed_and_lands_
 
 
 def _giver_refusal(giver: _Session, successor: _Session, *, shape: str) -> dict:
-    """What a fenced giver's write answers in this slice: the typed reason with
-    the successor and the version at transfer as top-level fields, and the
-    ``handoff`` key -- no ``hookSpecificOutput`` and no prose (the deny
-    envelope is U7's)."""
+    """What a fenced giver's write answers: the typed reason with the
+    successor and the version at transfer as top-level fields, and the
+    ``handoff`` key -- no ``hookSpecificOutput`` and no prose (the hook
+    client's deny envelope comes with the hook-path handoff work)."""
     return {
         "ok": False, "reason": "handed_off", "successor": successor.agent,
         "version_at_transfer": 1,
@@ -10282,7 +10283,7 @@ def _giver_refusal(giver: _Session, successor: _Session, *, shape: str) -> dict:
 def test_a_fenced_givers_pre_edit_is_refused_with_the_typed_reason(
     coordinator, client: _Client
 ) -> None:
-    """R10, R11: the giver's pessimistic re-acquire, from a fresh incarnation,
+    """The giver's pessimistic re-acquire, from a fresh incarnation,
     is refused with the typed reason and takes no grant. Without its own arm
     ahead of the generic CoherenceError one, the refusal would be answered as
     the exception's prose."""
@@ -10299,7 +10300,7 @@ def test_a_fenced_givers_pre_edit_is_refused_with_the_typed_reason(
 def test_a_fenced_givers_post_edit_commit_is_refused_with_the_typed_reason(
     coordinator, client: _Client
 ) -> None:
-    """R10 on the pessimistic commit: a giver whose EXCLUSIVE grant was handed
+    """The giver fence on the pessimistic commit: a giver whose EXCLUSIVE grant was handed
     off reports its edit; the commit is refused with the typed reason and the
     version does not move. Fails if the post-edit success arm loses its giver
     arm (the refusal would be answered as prose) or the route stops passing
@@ -10322,7 +10323,7 @@ def test_a_fenced_givers_post_edit_commit_is_refused_with_the_typed_reason(
 def test_a_fenced_givers_compare_and_swap_from_a_fresh_incarnation_is_refused(
     coordinator, client: _Client
 ) -> None:
-    """Covers AE1 on the route (R10, R11): the giver read at v1 under one
+    """The measured lost update, on the route: the giver read at v1 under one
     incarnation and handed the path off; its compare-and-swap at v1 from a
     re-minted incarnation -- a row the registry has never seen, which the
     version check alone would admit -- is refused with the typed reason, and
@@ -10348,7 +10349,7 @@ def _begin(client: _Client, who: _Session, path: str, principal: str | None) -> 
 def test_a_fenced_givers_snapshot_commits_are_refused_with_the_typed_reason(
     coordinator, client: _Client
 ) -> None:
-    """R10 on the two snapshot-session routes, which already pass the session
+    """The giver fence on the two snapshot-session routes, which already pass the session
     owner as the caller identity: each needs its own arm ahead of the generic
     CoherenceError one, or the refusal is answered as prose. The batch names
     the member it refused."""
@@ -10376,7 +10377,7 @@ def test_a_fenced_givers_snapshot_commits_are_refused_with_the_typed_reason(
 def test_a_fenced_givers_restore_registration_is_refused_with_the_typed_reason(
     coordinator, client: _Client
 ) -> None:
-    """R10 on the restore registration, whose controller is the session-level
+    """The giver fence on the restore registration, whose controller is the session-level
     identity derived from the session id: a giver registering a restored
     member it handed off is refused like any other write -- the typed reason
     naming the member, not the generic arm's prose -- and nothing lands."""
@@ -10445,7 +10446,7 @@ def test_a_snapshot_commit_without_a_principal_acts_as_the_bound_session_it_name
 
 
 def test_a_clean_session_stop_answers_todays_exact_bytes(coordinator, client: _Client) -> None:
-    """Covers AE13's clean half (R8): a stop that releases every grant answers
+    """A stop that releases every grant answers
     the body the Node backend mirrors -- no per-grant list -- with the paths
     in the order they were acquired (corpus warn_mode/18)."""
     sid = _sid("clean-stop")
@@ -10458,7 +10459,7 @@ def test_a_clean_session_stop_answers_todays_exact_bytes(coordinator, client: _C
 def test_a_session_stop_that_keeps_a_grant_answers_per_grant(
     coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Covers AE13 (R8): when the second release fails, the stop answers
+    """When the second release fails, the stop answers
     top-level false with the first grant reported released (with its cause)
     and the second still held (with its reason), and the second grant really
     is still held. It used to answer ``ok: true`` with the failure only
@@ -10494,12 +10495,12 @@ def test_a_session_stop_that_keeps_a_grant_answers_per_grant(
 def test_a_givers_failed_edit_report_is_answered_handed_off_and_changes_nothing(
     tmp_path: Path,
 ) -> None:
-    """R8's last sentence: a post-edit reporting failure from the giver of a
+    """A post-edit reporting failure from the giver of a
     live record is not a clean success. It answers top-level false with the
     grant reported not held and handed to the successor at the transfer
     version, carries the typed reason, and changes nothing -- no release is
     issued (the state log records no ``invalidate``), the record is not
-    withdrawn (R35), and the version does not move."""
+    withdrawn, and the version does not move."""
     entries: list[dict] = []
     server = CoordinatorHTTPServer(
         tmp_path, port=0, instance_id="handoff-failed-edit", state_log=entries.append)
@@ -10538,7 +10539,7 @@ def test_a_givers_failed_edit_report_is_answered_handed_off_and_changes_nothing(
 def test_a_failed_edit_report_off_a_handoff_keeps_todays_bytes(
     coordinator, client: _Client
 ) -> None:
-    """R8: a failed-edit release that succeeds, on a path with no record, is
+    """A failed-edit release that succeeds, on a path with no record, is
     a clean success and answers today's exact body (corpus warn_mode/17)."""
     sid = _sid("clean-failed-edit")
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
@@ -10553,7 +10554,7 @@ def test_a_failed_edit_report_off_a_handoff_keeps_todays_bytes(
 def test_the_read_and_edit_bodies_carry_the_handoff_key_only_while_a_record_exists(
     coordinator, client: _Client
 ) -> None:
-    """R29: with no record the pre-read, pre-edit and post-edit bodies are
+    """With no record the pre-read, pre-edit and post-edit bodies are
     byte-identical to today; while a record exists each carries one
     ``handoff`` key projecting the record for the caller's role -- the
     successor sees its provenance, a bystander the pair it overtook, the
@@ -10595,7 +10596,7 @@ def test_the_read_and_edit_bodies_carry_the_handoff_key_only_while_a_record_exis
 def test_a_compare_and_swap_win_carries_its_handoff_outcome(
     coordinator, client: _Client
 ) -> None:
-    """R29, and the win outcome a volume returns (R32): with no record a win
+    """The win outcome a volume reads off a compare-and-swap answer: with no record a win
     answers today's bytes; the successor's win at the transfer version
     carries ``outcome: completed`` -- from a fresh incarnation too, because the
     route passes the session-level identity -- and a bystander's win on
@@ -10628,11 +10629,11 @@ def test_a_compare_and_swap_win_carries_its_handoff_outcome(
 
 
 # ----------------------------------------------------------------------
-# The handoff key on /status (#185, U6)
+# The handoff key on /status (#185)
 #
 # The default and operator tiers render each tracked artifact's transfer
 # record while one exists, read in the same registry hold as the artifact and
-# state rows (KTD9); the metrics tier and the session-start builder never see
+# state rows; the metrics tier and the session-start builder never see
 # it. The /status key is role-free -- the route has no caller to be a party to
 # the record -- so it is the per-path ``handoff`` key less its ``role``, plus
 # the record's created wall-clock timestamp on the operator tier only.
@@ -10650,7 +10651,7 @@ def _status_entry(body: dict, path: str) -> dict:
 def _status_handoff(
     giver: _Session, successor: _Session, *, status: str = "pending", live: bool = True
 ) -> dict:
-    """The ``handoff`` key a /status entry carries while a record exists (R27),
+    """The ``handoff`` key a /status entry carries while a record exists,
     as a literal: session-level ids, no role, no session id, no timestamp."""
     return {
         "giver": giver.agent, "successor": successor.agent, "version_at_transfer": 1,
@@ -10667,10 +10668,10 @@ def _keys_anywhere(value: Any) -> set[str]:
     return set()
 
 
-def test_ae15_status_shows_a_handoff_on_the_default_and_operator_tiers_while_a_record_exists(
+def test_status_shows_a_handoff_on_the_default_and_operator_tiers_while_a_record_exists(
     coordinator, client: _Client
 ) -> None:
-    """AE15 / R27: with no record each entry has today's keys; while a record
+    """With no record each entry has today's keys; while a record
     exists the default and operator tiers both carry it on the handed path's
     entry, with session-level agent ids and no session id, and the operator
     tier adds the record's created timestamp beside the last-writer one. An
@@ -10724,7 +10725,7 @@ def test_ae15_status_shows_a_handoff_on_the_default_and_operator_tiers_while_a_r
 def test_status_metrics_tier_carries_no_handoff_record_path_or_agent_id(
     coordinator, client: _Client
 ) -> None:
-    """R27, KTD9: the counters-only tier returns before the snapshot, so a live
+    """The counters-only tier returns before the snapshot, so a live
     record changes none of its keys (the handoff route counters are there with
     or without one) and puts no record, path or agent id in it. Its values
     move per request, so the comparison is of key sets, not bytes."""
@@ -10749,7 +10750,7 @@ def test_status_metrics_tier_carries_no_handoff_record_path_or_agent_id(
 def test_status_operator_tier_without_its_header_is_refused_unchanged_with_a_live_record(
     client: _Client,
 ) -> None:
-    """R27: a live record does not open the operator tier -- the 403 answers
+    """A live record does not open the operator tier -- the 403 answers
     the same bytes as with no record, carrying nothing of it."""
     giver, successor = _claimed(client), _claimed(client)
     _hand_off(client, giver, successor, "plan.md")
@@ -10764,7 +10765,7 @@ def test_status_operator_tier_without_its_header_is_refused_unchanged_with_a_liv
 def test_status_reads_the_transfer_rows_inside_the_snapshot_lock_hold(
     coordinator, client: _Client
 ) -> None:
-    """KTD9: the transfer rows are read inside the ONE registry hold that reads
+    """The transfer rows are read inside the ONE registry hold that reads
     the artifact and agent-state rows. A per-artifact read outside that hold
     lets a concurrent version move land between the two, so an entry would
     pair one version with a liveness judged against another -- the one-lock
@@ -10820,7 +10821,7 @@ def test_status_reads_the_transfer_rows_inside_the_snapshot_lock_hold(
 def test_session_start_is_byte_identical_with_a_live_handoff_on_its_path(
     coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """KTD9: the session-start builder keeps the default snapshot form, so the
+    """The session-start builder keeps the default snapshot form, so the
     successor's re-grounding over a path handed to it answers the bytes it
     answered before the handoff, and the builder never asks for the transfer
     rows -- an unseen read on a hook path that runs under the registry lock
@@ -10852,14 +10853,14 @@ def test_session_start_is_byte_identical_with_a_live_handoff_on_its_path(
     assert [set(kwargs) for kwargs in calls] == [{"agent_ids"}]
 
 
-def test_ae25_a_coordinator_wiring_a_state_log_records_the_transfer_under_the_handoff_trigger(
+def test_a_coordinator_wiring_a_state_log_records_the_transfer_under_the_handoff_trigger(
     tmp_path: Path,
 ) -> None:
-    """AE25 / R28: a caller that wires the in-process state log sees the
+    """A caller that wires the in-process state log sees the
     giver's INVALID move logged under ``handoff`` -- never ``invalidate``, the
     trigger a release, a failed edit or a drain is recorded under."""
     entries: list[dict] = []
-    server = CoordinatorHTTPServer(tmp_path, port=0, state_log=entries.append, instance_id="ae25")
+    server = CoordinatorHTTPServer(tmp_path, port=0, state_log=entries.append, instance_id="state-log")
     server.serve_in_thread()
     time.sleep(0.05)
     try:

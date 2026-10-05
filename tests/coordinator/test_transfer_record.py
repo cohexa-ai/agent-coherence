@@ -1,7 +1,7 @@
 # Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
-"""The transfer record: the registry half of the targeted grant handoff (#185, U3).
+"""The transfer record: the registry half of the targeted grant handoff (#185).
 
 A session done with a path hands it to a named successor. The registry keeps one
 transfer record per artifact and exposes four members: the composite transfer
@@ -21,10 +21,10 @@ Scenarios:
 - the giver's second transfer of a live record supersedes it, recording the
   superseded successor; a late re-send of the superseded tuple answers the
   superseded status and never supersedes back; another giver is refused naming
-  the pending pair (AE20);
+  the pending pair;
 - an exact re-send of a live record answers its current status with no row
   move; one ended by decline or withdraw at an unmoved version answers that
-  status; any other record naming the caller is treated as absent (R6);
+  status; any other record naming the caller is treated as absent;
 - the ordinary checks: not held (winning over a foreign write holder), an
   unconfirmed version, a foreign write holder, a live record by another giver,
   self, and an unknown successor;
@@ -32,8 +32,8 @@ Scenarios:
   admitted paths, and a raise mid-apply rolls every path back;
 - the INVALID move is logged under the handoff trigger and moves the epoch for
   a write shape only;
-- liveness follows the version and the ended statuses, never the label alone
-  (KTD10); eviction is its negation plus an age;
+- liveness follows the version and the ended statuses, never the label alone,
+  and is judged in one place per registry; eviction is its negation plus an age;
 - the record goes with its artifact, survives a reopen, serves a read-only
   handle, and lands as schema v9 on fresh and migrated stores alike.
 """
@@ -208,10 +208,11 @@ def test_get_answers_none_for_a_path_never_handed_off(registry) -> None:
 def test_a_write_shape_handoff_moves_the_epoch_and_a_read_shape_does_not(
     registry, shape: MESIState, bump: int
 ) -> None:
-    """KTD3 through the composite member: the INVALID move under the handoff
-    trigger revokes a write claim from EXCLUSIVE or MODIFIED, so the giver's
-    late commit at the unchanged version must meet the fence; from SHARED it
-    revoked nothing, and a bump would fence every bystander that read the path."""
+    """The handoff trigger joins the epoch-bump set, through the composite
+    member: the INVALID move under the handoff trigger revokes a write claim
+    from EXCLUSIVE or MODIFIED, so the giver's late commit at the unchanged
+    version must meet the fence; from SHARED it revoked nothing, and a bump
+    would fence every bystander that read the path."""
     art = _artifact(registry)
     giver, holder = uuid4(), uuid4()
     _hold(registry, art, holder, shape)
@@ -228,7 +229,7 @@ def test_a_write_shape_handoff_moves_the_epoch_and_a_read_shape_does_not(
 
 def test_the_invalid_move_is_logged_under_the_handoff_trigger(logged) -> None:
     """One state-log entry per admitted path, under ``handoff`` -- never
-    ``invalidate`` -- so the log tells a handoff from a release (R28)."""
+    ``invalidate`` -- so the log tells a handoff from a release."""
     registry, log = logged
     art = _artifact(registry, version=3)
     holder = uuid4()
@@ -245,7 +246,7 @@ def test_the_invalid_move_is_logged_under_the_handoff_trigger(logged) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Supersession and re-sends (R6, R26, AE20)
+# Supersession and re-sends
 # ---------------------------------------------------------------------------
 
 
@@ -290,7 +291,7 @@ def test_the_givers_second_transfer_supersedes_its_live_record(registry) -> None
 
 
 def test_a_late_resend_of_the_superseded_tuple_never_supersedes_back(registry) -> None:
-    """AE20: the giver's re-send of the tuple its later transfer superseded
+    """The giver's re-send of the tuple its later transfer superseded
     answers the superseded status and changes nothing. Fails if the re-send
     is read as a fresh supersession, which would hand the path back to the
     successor the giver already replaced."""
@@ -318,7 +319,7 @@ def test_a_late_resend_of_the_superseded_tuple_never_supersedes_back(registry) -
 def test_another_givers_transfer_of_a_live_path_is_refused_naming_the_pair(
     registry,
 ) -> None:
-    """AE20, R26: only the giver of a live handoff may transfer the path again.
+    """Only the giver of a live handoff may transfer the path again.
     Another session's transfer is refused naming the pending pair, its own grant
     stays as it was, and the live record is unchanged."""
     art = _artifact(registry)
@@ -342,7 +343,7 @@ def test_another_givers_transfer_of_a_live_path_is_refused_naming_the_pair(
 def test_an_exact_resend_of_a_live_record_answers_its_status_and_moves_nothing(
     registry, label: str
 ) -> None:
-    """R6: a lost answer re-sent finds the live record and answers transferred
+    """A lost answer re-sent finds the live record and answers transferred
     with its current label. Nothing moves -- a fresh read the giver's session
     took since the transfer stays SHARED, the epoch stays, and the record is
     not rewritten -- so a re-send can never undo the giver's own re-read."""
@@ -392,7 +393,7 @@ def test_an_exact_resend_with_no_intervening_read_is_still_answered_transferred(
 def test_an_exact_resend_after_decline_or_withdraw_answers_that_status(
     registry, ended: str
 ) -> None:
-    """R6, AE11: once the record ended at an unmoved version, the re-sent tuple
+    """Once the record ended at an unmoved version, the re-sent tuple
     is refused carrying that status and nothing is written."""
     art = _artifact(registry, version=3)
     giver, holder, successor = uuid4(), uuid4(), uuid4()
@@ -464,7 +465,7 @@ def test_a_giver_that_re_read_hands_the_path_on_again_after_a_withdraw(
 
 
 def test_a_resend_after_the_version_moved_answers_not_held(registry) -> None:
-    """R6's last clause: once the version moved the record is not live, so the
+    """Once the version moved the record is not live, so the
     re-sent tuple is decided by the hold check and the giver holds nothing."""
     art = _artifact(registry, version=3)
     giver, holder, successor = uuid4(), uuid4(), uuid4()
@@ -480,7 +481,7 @@ def test_a_resend_after_the_version_moved_answers_not_held(registry) -> None:
 
 
 # ---------------------------------------------------------------------------
-# A refused supersession leaves the live record unchanged (R4, R26)
+# A refused supersession leaves the live record unchanged
 # ---------------------------------------------------------------------------
 
 
@@ -530,12 +531,12 @@ def test_a_supersession_moves_no_row_and_logs_nothing(logged) -> None:
 
 
 # ---------------------------------------------------------------------------
-# The ordinary checks (R2, R5)
+# The ordinary checks: the hold, the version, a foreign write holder, the successor
 # ---------------------------------------------------------------------------
 
 
 def test_a_path_the_presented_composite_does_not_hold_is_refused(registry) -> None:
-    """R5: a composite with no grant on the path has nothing to hand on, and
+    """A composite with no grant on the path has nothing to hand on, and
     nothing is written for it."""
     art = _artifact(registry)
     (outcome,) = _transfer(registry, uuid4(), uuid4(), {art: uuid4()})
@@ -552,7 +553,7 @@ def test_an_unknown_artifact_is_refused_as_not_held(registry) -> None:
 
 
 def test_not_held_wins_over_a_foreign_write_holder(registry) -> None:
-    """R5's precedence: when both apply, the caller is told it holds nothing,
+    """The not-held reason's precedence: when both apply, the caller is told it holds nothing,
     not that someone else holds the path."""
     art = _artifact(registry)
     _hold(registry, art, uuid4(), MESIState.EXCLUSIVE)
@@ -561,7 +562,7 @@ def test_not_held_wins_over_a_foreign_write_holder(registry) -> None:
 
 
 def test_a_read_under_a_foreign_write_holder_is_refused(registry) -> None:
-    """R5: the caller's standing read is not the write authority to hand on
+    """The caller's standing read is not the write authority to hand on
     while another session holds the path EXCLUSIVE; its read is left alone."""
     art = _artifact(registry)
     holder, bystander = uuid4(), uuid4()
@@ -576,7 +577,7 @@ def test_a_read_under_a_foreign_write_holder_is_refused(registry) -> None:
 
 
 def test_an_unconfirmed_version_is_refused_and_writes_no_record(registry) -> None:
-    """AE10: with no confirmed version there is nothing to fence on."""
+    """With no confirmed version there is nothing to fence on."""
     art = _artifact(registry, version=0)
     holder = uuid4()
     _hold(registry, art, holder, MESIState.EXCLUSIVE)
@@ -589,7 +590,7 @@ def test_an_unconfirmed_version_is_refused_and_writes_no_record(registry) -> Non
 
 
 def test_a_transfer_to_the_callers_own_session_is_refused(registry) -> None:
-    """R2: a handoff is between sessions, so naming the caller's own
+    """A handoff is between sessions, so naming the caller's own
     session-level identity is refused and the read is left as it was."""
     art = _artifact(registry)
     giver, holder = uuid4(), uuid4()
@@ -604,7 +605,7 @@ def test_a_transfer_to_the_callers_own_session_is_refused(registry) -> None:
 def test_an_unresolved_successor_with_no_binding_or_grant_row_is_unknown(
     registry,
 ) -> None:
-    """R2: an id the caller could not resolve, with no bound principal and
+    """An id the caller could not resolve, with no bound principal and
     no grant row, is unknown -- never fenced on, never handed to."""
     art = _artifact(registry)
     holder = uuid4()
@@ -617,7 +618,7 @@ def test_an_unresolved_successor_with_no_binding_or_grant_row_is_unknown(
 
 
 def test_a_principal_binding_or_a_grant_row_makes_a_successor_known(registry) -> None:
-    """The member's own two arms of R2: a bound principal (a session-level
+    """The member's own two ways to know a successor: a bound principal (a session-level
     identity) and, for library callers with no name map, a grant row."""
     bound, with_row = uuid4(), uuid4()
     registry.bind_caller_principal(bound, "principal-for-the-test", "nonce-for-the-test")
@@ -635,14 +636,14 @@ def test_a_principal_binding_or_a_grant_row_makes_a_successor_known(registry) ->
 
 
 # ---------------------------------------------------------------------------
-# Multi-path: per-grant answers, all-or-nothing apply (R3, R4, R7)
+# Multi-path: per-grant answers, all-or-nothing apply
 # ---------------------------------------------------------------------------
 
 
 def test_a_mixed_request_commits_the_admitted_path_and_leaves_the_refused_one(
     registry,
 ) -> None:
-    """R3/R4: each grant is answered on its own; the admitted path's record and
+    """Each grant is answered on its own; the admitted path's record and
     INVALID move land while the refused path's grant is left exactly as it was."""
     held, contested = _artifact(registry, name="a.md"), _artifact(registry, name="b.md")
     giver, holder, successor = uuid4(), uuid4(), uuid4()
@@ -663,7 +664,7 @@ def test_a_mixed_request_commits_the_admitted_path_and_leaves_the_refused_one(
 
 
 def test_a_raise_mid_apply_rolls_every_path_back(logged) -> None:
-    """R7 all-or-nothing: the second path's state-log emit raises, and neither
+    """All-or-nothing: the second path's state-log emit raises, and neither
     path keeps a record, an INVALID move or an epoch bump. The sequence number
     the failed emits reserved is released, so the next entry leaves no gap."""
     registry, log = logged
@@ -690,7 +691,7 @@ def test_a_raise_mid_apply_rolls_every_path_back(logged) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Liveness (R10, KTD10) and the status write
+# Liveness and the status write
 # ---------------------------------------------------------------------------
 
 
@@ -725,7 +726,7 @@ def test_liveness_at_the_transfer_version_follows_the_ended_statuses(
 def test_a_record_whose_version_moved_is_not_live_whatever_its_label(
     registry, label: str
 ) -> None:
-    """KTD10: a version can move with no status write (a crash or a failed label
+    """A version can move with no status write (a crash or a failed label
     write after a win), and such a record must read as not live. Fails if
     liveness is read off the stored status alone."""
     art = _artifact(registry, version=3)
@@ -795,7 +796,7 @@ def test_the_status_write_on_a_path_with_no_record_raises(registry) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Eviction is the negation of liveness, plus an age (KTD10)
+# Eviction is the negation of liveness, plus an age
 # ---------------------------------------------------------------------------
 
 
@@ -822,7 +823,7 @@ def test_eviction_removes_an_ended_record_once_older_than_the_age(registry) -> N
 def test_eviction_never_removes_a_live_record_whatever_its_age(
     registry, label: str
 ) -> None:
-    """KTD10: no timer ever touches a live record -- removing one would lift
+    """No timer ever touches a live record -- removing one would lift
     the giver's fence without the successor, the giver or a write ending it."""
     art = _artifact(registry)
     holder = uuid4()
@@ -854,7 +855,7 @@ def test_eviction_removes_a_pending_record_whose_version_moved(registry) -> None
 def test_sqlite_eviction_ages_from_the_artifacts_last_update_when_later(
     tmp_path: Path,
 ) -> None:
-    """KTD10: a version-move ending is not evicted before the giver's next touch
+    """A version-move ending is not evicted before the giver's next touch
     can report it, so on sqlite the age runs from the later of the record's
     update and the artifact's. The move below stamps the artifact at the real
     clock while the record was written at t=1000."""
@@ -877,7 +878,7 @@ def test_sqlite_eviction_ages_from_the_artifacts_last_update_when_later(
 
 
 # ---------------------------------------------------------------------------
-# The record goes with its artifact (KTD2)
+# The record goes with its artifact
 # ---------------------------------------------------------------------------
 
 

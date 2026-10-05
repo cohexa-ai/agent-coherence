@@ -955,7 +955,7 @@ def test_a_degraded_mint_reads_as_failure_and_carries_no_principal(
 
 
 # ----------------------------------------------------------------------
-# Targeted grant handoff routes (#185, U5)
+# Targeted grant handoff routes (#185)
 # ----------------------------------------------------------------------
 
 from ccs.adapters.claude_code.coordinator_server import (  # noqa: E402
@@ -980,7 +980,7 @@ def test_handoff_route_is_registered_counted_and_served_during_a_drain(
     increment helper silently ignores a name missing from the counter dict,
     so the bump itself is asserted -- and keeps serving during a migration
     drain: a transfer initiates no write, and its epoch move is the
-    release-class bump the drain performs itself (R37)."""
+    release-class bump the drain performs itself."""
     counter = _HANDOFF_ROUTE_COUNTERS[route]
     assert ("POST", route) in _ROUTES
     assert _ENDPOINT_COUNTER_NAMES[("POST", route)] == counter
@@ -1008,7 +1008,7 @@ def test_handoff_route_without_bearer_is_401(coordinator, route: str) -> None:
 
 
 # ----------------------------------------------------------------------
-# Transfer-record eviction on the sweep (#185, U6, KTD10)
+# Transfer-record eviction on the sweep (#185)
 # ----------------------------------------------------------------------
 
 from ccs.adapters.claude_code import foreign_write_detector as _detector  # noqa: E402
@@ -1067,7 +1067,7 @@ def _handed_off(registry: SqliteArtifactRegistry, name: str) -> uuid.UUID:
 
 
 def test_the_transfer_record_eviction_knob_defaults_to_one_day() -> None:
-    """KTD10: an ended record outlives a writer left idle overnight, so its
+    """An ended record outlives a writer left idle overnight, so its
     next touch still learns how its handoff ended."""
     assert _lifecycle.LifecycleConfig().transfer_record_evict_max_age_sec == 86_400.0
 
@@ -1075,7 +1075,7 @@ def test_the_transfer_record_eviction_knob_defaults_to_one_day() -> None:
 def test_the_sweep_evicts_ended_transfer_records_older_than_its_knob_and_never_a_live_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """KTD10 on the sweep: a declined record, and a pending one whose version
+    """Eviction on the sweep: a declined record, and a pending one whose version
     moved with no label written, are kept while younger than the knob and
     evicted once older; a live record survives any knob, because removing it
     would lift the giver's fence with nobody having ended the handoff."""
@@ -1104,7 +1104,7 @@ def test_the_sweep_evicts_ended_transfer_records_older_than_its_knob_and_never_a
 def test_the_sweep_evicts_transfer_records_after_notices_under_the_same_guard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """KTD10: the eviction runs right after notice eviction with its own knob,
+    """The eviction runs right after notice eviction with its own knob,
     inside the best-effort guard the other passes share, so a failing eviction
     costs this tick nothing else and never takes the sweep down."""
     calls: list[tuple[str, float]] = []

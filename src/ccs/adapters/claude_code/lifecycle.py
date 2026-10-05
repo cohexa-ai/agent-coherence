@@ -146,7 +146,7 @@ class LifecycleConfig:
     #: pause and come back, short enough to bound state on a dead session.
     notice_evict_max_age_sec: float = 1800.0
 
-    #: #185 KTD10 — transfer records that are no longer live (declined,
+    #: #185 — transfer records that are no longer live (declined,
     #: withdrawn, or past a version move) are evicted by the sweep once older
     #: than this. One day: a giver left idle overnight still learns how its
     #: handoff ended on its next touch. A live record is never evicted.
@@ -888,7 +888,7 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
             )
             if evicted:
                 logger.info("sweep evicted %d stale preemption notice(s)", evicted)
-            # #185 KTD10: drop transfer records no longer live and older than
+            # #185: drop transfer records no longer live and older than
             # the knob; the age runs from the later of the record's and its
             # artifact's last update, so a version-move ending stays readable.
             evicted_records = coordinator.registry.evict_transfer_records(

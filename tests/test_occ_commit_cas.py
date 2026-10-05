@@ -400,13 +400,13 @@ def test_r12_retry_exhaustion_surfaces_typed_terminal_no_silent_drop() -> None:
 
 
 # ----------------------------------------------------------------------
-# A handed-off giver racing its successor, through the service (#185, U4)
+# A handed-off giver racing its successor, through the service (#185)
 # ----------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
 def test_a_handed_off_giver_racing_its_successor_never_wins(db_path: Path, backend: str) -> None:
-    """KTD1 under contention, through the service's ``commit_cas`` -- the race
+    """The giver fence under contention, through the service's ``commit_cas`` -- the race
     arms above call the registry directly, which has no giver fence. A giver
     that handed its standing read to a successor, and the successor, fire at
     the transfer version from a barrier, each with a FIXED stale buffer and a

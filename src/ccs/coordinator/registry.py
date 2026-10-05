@@ -120,7 +120,7 @@ class ArtifactRecord:
     # computed from. Mirrors the sqlite agent_states.last_observed_version
     # column (nullable INTEGER, schema v6).
     last_observed_version_by_agent: dict[UUID, int] = field(default_factory=dict)
-    # The grant handoff's transfer record (#185, KTD2): at most one per
+    # The grant handoff's transfer record (#185): at most one per
     # artifact, held on the slot so dropping the slot drops it -- the in-memory
     # mirror of the sqlite row's cascade on artifact deletion. A stored label,
     # never liveness: liveness is read against ``artifact.version``
@@ -1383,7 +1383,7 @@ class ArtifactRegistry:
         return bound[0] if bound is not None else None
 
     # ------------------------------------------------------------------
-    # Transfer records (targeted grant handoff #185, U3; KTD2, KTD10)
+    # Transfer records (targeted grant handoff #185)
     # ------------------------------------------------------------------
 
     def transfer_grants(
@@ -1476,7 +1476,7 @@ class ArtifactRegistry:
             return evicted
 
     def _transfer_read(self, slot: ArtifactRecord) -> tuple[TransferRecord, bool] | None:
-        """THE in-memory liveness helper (KTD10): the slot's record judged
+        """THE in-memory liveness helper: the slot's record judged
         against the slot's own artifact version. Every reader of liveness here
         -- the read, the composite transfer, the eviction -- goes through it.
         Caller holds ``_lock``."""
@@ -1512,10 +1512,10 @@ class ArtifactRegistry:
         )
 
     def _successor_known(self, request: TransferRequest) -> bool:
-        """R2's registry arms: the caller resolved it, it has a bound
-        principal, or it holds a grant row on some artifact (the library
-        caller's arm -- a row in any state means the coordinator has seen the
-        identity). Caller holds ``_lock``."""
+        """When the registry counts a successor as known: the caller
+        resolved it, it has a bound principal, or it holds a grant row on some
+        artifact (the library caller's arm -- a row in any state means the
+        coordinator has seen the identity). Caller holds ``_lock``."""
         return (
             request.successor_known
             or request.successor in self._caller_principals

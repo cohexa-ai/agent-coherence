@@ -343,7 +343,7 @@ def test_sqlite_extended_method_structure_matches_protocol(
 def test_status_snapshot_transfer_opt_in_is_keyword_only_and_off_by_default(
     sqlite_registry: SqliteArtifactRegistry,
 ) -> None:
-    """KTD9 (#185): the transfer rows ride the status snapshot as a keyword-only
+    """The transfer rows (#185) ride the status snapshot as a keyword-only
     opt-in that defaults off, so the session-start builder's default call keeps
     its two-element answer. Pinned as a literal on the Protocol and the
     implementation alike: the comparison above would pass a signature both

@@ -1,4 +1,4 @@
-"""The targeted-handoff vocabulary (Cohexa-ai/agent-coherence#185, unit U2).
+"""The targeted-handoff vocabulary (Cohexa-ai/agent-coherence#185).
 
 Every name pinned here is a WIRE value: a client, the MCP mapper and the
 protocol corpus branch on ``reason == CONSTANT`` / ``status == CONSTANT``, never
@@ -87,7 +87,7 @@ _REASON_LITERALS = [
 
 
 def test_every_handoff_reason_is_pinned_and_distinct() -> None:
-    """R2, R6, R10, R16, R20, R26: each reason is its own wire value. Two
+    """Each reason is its own wire value. Two
     constants sharing one would make, say, an unknown successor read as a
     malformed one, or an unconfirmed transfer read as a definite refusal that
     changed nothing."""
@@ -100,8 +100,8 @@ def test_every_handoff_reason_is_pinned_and_distinct() -> None:
 
 
 def test_transfer_refusals_and_unconfirmed_answers_are_separate_closed_sets() -> None:
-    """A per-grant transfer refusal changed nothing for that grant (R4); an
-    unconfirmed answer means the outcome is unknown (R7, R37). A client that
+    """A per-grant transfer refusal changed nothing for that grant; an
+    unconfirmed answer means the outcome is unknown. A client that
     reads one as the other either re-sends over a transfer that landed or
     treats a refused grant as handed off, so the two sets never overlap."""
     assert HANDOFF_TRANSFER_REFUSAL_REASONS == {
@@ -155,7 +155,7 @@ def test_handoff_reasons_collide_with_no_existing_reason_or_status() -> None:
 
 
 def test_giver_fenced_carries_its_reason_successor_and_version() -> None:
-    """KTD1, KTD8, R10, R14: the giver's refusal is one typed terminal whose
+    """The giver's refusal is one typed terminal whose
     class-level reason equals the wire constant, so a consumer classifies it by
     type or ``.reason`` and never by the message, and it carries the successor
     and the version at transfer the giver reports to its user or host."""
@@ -174,7 +174,7 @@ def test_giver_fenced_carries_its_reason_successor_and_version() -> None:
 
 
 def test_transfer_statuses_are_the_six_closed_values() -> None:
-    """R25: a record's status is exactly one of six values, a closed set the
+    """A record's status is exactly one of six values, a closed set the
     registries validate before a write and the corpus covers row by row."""
     for constant, literal in [
         (TRANSFER_STATUS_PENDING, "pending"),
@@ -192,7 +192,7 @@ def test_transfer_statuses_are_the_six_closed_values() -> None:
 
 
 def test_outcomes_are_frozen_and_name_giver_and_successor_by_keyword() -> None:
-    """R3, R32: the per-grant transfer outcome and the compare-and-swap handoff
+    """The per-grant transfer outcome and the compare-and-swap handoff
     outcome are values, never mutated after the answer is built. Their giver
     and successor are two ids of one type side by side; a positional swap
     would report the giver as the successor, so both are keyword-only."""

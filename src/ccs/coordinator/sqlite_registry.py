@@ -230,7 +230,7 @@ step and now stamps its own literal 7. FORWARD-ONLY: once a store opens at v8,
 an earlier build refuses it (an unrecognized ``user_version`` raises; there is
 no down step).
 
-**v8 -> v9** (targeted grant handoff, #185 U3) adds the ``transfer_records``
+**v8 -> v9** (targeted grant handoff, #185) adds the ``transfer_records``
 table: one row per artifact holding its current transfer record (giver,
 holding composite, successor, version at transfer, hold shape, cause, status,
 counterparty, wall-clock timestamps). Keyed on the artifact id with ``ON DELETE
@@ -476,7 +476,7 @@ CREATE TABLE caller_principals (
 )
 """
 
-# Transfer records (schema v9; targeted grant handoff #185, U3). One row per
+# Transfer records (schema v9; targeted grant handoff #185). One row per
 # artifact: the current handoff of that path. Keyed on the artifact id with ON
 # DELETE CASCADE (the ``pending_notices`` shape, not ``caller_principals``'), so
 # the library delete verb drops the record with the artifact, exactly as the
@@ -1371,7 +1371,7 @@ class SqliteArtifactRegistry:
             c.execute(_WORKSPACE_CHECKPOINTS_NAME_INDEX_DDL)
             # Caller-principal bindings (v8, caller-principal U4): same rule.
             c.execute(_CALLER_PRINCIPALS_DDL)
-            # Transfer records (v9, grant handoff U3): same rule — the fresh
+            # Transfer records (v9, grant handoff #185): same rule — the fresh
             # store and a migrated one must carry the identical table.
             c.execute(_TRANSFER_RECORDS_DDL)
             seed_epoch = uuid4().hex
@@ -1925,7 +1925,7 @@ class SqliteArtifactRegistry:
 
     def _migrate_v8_to_v9(self, instance_id: str | None) -> None:
         """Migrate a v8 db to v9 in ONE atomic transaction (targeted grant
-        handoff, #185 U3): create the ``transfer_records`` table, then stamp
+        handoff, #185): create the ``transfer_records`` table, then stamp
         ``user_version=9``. Caller holds lock. The FINAL step of the chain, so
         it stamps ``SCHEMA_USER_VERSION``.
 
@@ -2891,7 +2891,7 @@ class SqliteArtifactRegistry:
         return row[0] if row is not None else None
 
     # ------------------------------------------------------------------
-    # Transfer records (targeted grant handoff #185, U3; KTD2, KTD10)
+    # Transfer records (targeted grant handoff #185)
     # ------------------------------------------------------------------
 
     def transfer_grants(
@@ -2987,7 +2987,7 @@ class SqliteArtifactRegistry:
     ) -> int:
         """Delete not-live records older than ``max_age_sec``, aged from the
         later of the record's ``updated_at`` and the artifact's own last
-        update (KTD10): a version move stamps the artifact, so the ending it
+        update: a version move stamps the artifact, so the ending it
         caused survives the full age from the move, long enough for the
         giver's next touch to report it."""
         now = time.time() if now_unix is None else now_unix
@@ -3013,7 +3013,7 @@ class SqliteArtifactRegistry:
         return len(doomed)
 
     def _transfer_read(self, artifact_id: UUID) -> tuple[TransferRecord, bool] | None:
-        """THE sqlite liveness helper (KTD10): one SELECT joining the record to
+        """THE sqlite liveness helper: one SELECT joining the record to
         its artifact's version, judged by :func:`transfer_record_live`. The
         read, the composite transfer and the eviction all go through it (or
         its row converter). Caller holds the lock -- and, for a decision, the
@@ -3071,8 +3071,9 @@ class SqliteArtifactRegistry:
         )
 
     def _successor_known_in_txn(self, request: TransferRequest) -> bool:
-        """R2's registry arms: the caller resolved it, it has a bound principal,
-        or it holds a grant row on some artifact (the library caller's arm --
+        """When the registry counts a successor as known: the caller resolved
+        it, it has a bound principal, or it holds a grant row on some artifact
+        (the library caller's arm --
         a row in any state means the coordinator has seen the identity; the
         lookup rides ``idx_agent_states_agent``)."""
         if request.successor_known:
@@ -3570,7 +3571,7 @@ class SqliteArtifactRegistry:
         call on an artifact-heavy workspace stays O(all artifacts) however
         small the session is.
 
-        ``include_transfers`` (#185 KTD9) adds a THIRD element,
+        ``include_transfers`` (#185) adds a THIRD element,
         ``{artifact_id: (TransferRecord, live)}`` for every artifact that has
         a transfer record, read by a third query inside the same lock hold and
         judged by the one liveness helper, so each record's liveness matches

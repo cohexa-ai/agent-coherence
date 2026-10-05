@@ -1305,7 +1305,7 @@ class CoordinatorService:
         # had silently dropped it before this fix.
         #
         # ``caller`` -- the owner validated above -- rides along as the caller
-        # identity (KTD1) while ``committer_id`` stays the agent id: the giver
+        # identity while ``committer_id`` stays the agent id: the giver
         # fence and the completion/overtake label key on who the session
         # belongs to, never on the token-minted committer, and the
         # admit-on-absent read-generation path is unchanged.
@@ -2122,7 +2122,7 @@ class CoordinatorService:
         leaving a phantom EXCLUSIVE the agent never saw (and silently
         invalidating its peers).
 
-        ``caller`` is the caller's session-level identity (KTD1); ``None``
+        ``caller`` is the caller's session-level identity; ``None``
         compares ``agent_id`` itself, so a library agent is unchanged. The giver
         of a live handoff of the path is refused with :class:`GiverFenced`
         before anyone is invalidated; any other acquire on a live record labels
@@ -2142,7 +2142,7 @@ class CoordinatorService:
     ) -> list[InvalidationSignal]:
         artifact = self._require_artifact(artifact_id)
         identity = caller if caller is not None else agent_id
-        # Before the acquire (KTD1): a giver's re-acquire must never invalidate
+        # Before the acquire: a giver's re-acquire must never invalidate
         # the successor's read and then meet it as another holder.
         self._refuse_handed_off_giver(artifact_id, identity)
         admitted = self._live_transfer_record(artifact_id)
@@ -2204,7 +2204,7 @@ class CoordinatorService:
     ) -> tuple[Artifact, list[InvalidationSignal]]:
         """Commit modified content under the A6 abort guard (see _commit_impl).
 
-        ``caller`` is the caller's session-level identity (KTD1); ``None``
+        ``caller`` is the caller's session-level identity; ``None``
         compares ``agent_id`` itself."""
         with self.registry.abort_guard(abort):
             return self._commit_impl(
@@ -2232,7 +2232,7 @@ class CoordinatorService:
 
         Raises:
             GiverFenced: the caller handed this path off and the handoff is
-                still live (KTD1) -- checked first, so a giver whose grant was
+                still live -- checked first, so a giver whose grant was
                 handed off is never answered commit_not_allowed, nor shown a
                 reclaim it did not suffer.
             CoherenceError: the committer does not hold M/E (e.g. its grant was
@@ -2342,7 +2342,7 @@ class CoordinatorService:
     ) -> tuple[Artifact, list[InvalidationSignal]] | ConflictDetail:
         """Optimistic-concurrency commit under the A6 abort guard (see _commit_cas_impl).
 
-        ``caller`` is the caller's session-level identity (KTD1); ``None``
+        ``caller`` is the caller's session-level identity; ``None``
         compares ``agent_id`` itself, so a library agent is unchanged."""
         with self.registry.abort_guard(abort):
             return self._commit_cas_impl(
@@ -2389,7 +2389,7 @@ class CoordinatorService:
           holder is an *acquired* pessimistic writer and must use plain
           :meth:`commit` (rejected with a ``CoherenceError`` pointing there);
         - the caller must not be the giver of a live handoff of the path
-          (KTD1, :class:`GiverFenced`): ``caller`` is its session-level
+          (:class:`GiverFenced`): ``caller`` is its session-level
           identity, or ``agent_id`` itself when none is passed. A WIN on a
           record that was live when it was admitted then labels it completed
           (the successor) or overtaken (anyone else), best-effort.
@@ -2449,7 +2449,7 @@ class CoordinatorService:
                 f"(use commit() for an EXCLUSIVE/MODIFIED holder)"
             )
 
-        # Before the registry legs (KTD1): a giver's write is refused whatever
+        # Before the registry legs: a giver's write is refused whatever
         # version-CAS and the read-generation fence would have answered.
         identity = caller if caller is not None else agent_id
         self._refuse_handed_off_giver(artifact_id, identity)
@@ -2512,7 +2512,7 @@ class CoordinatorService:
         are RETURNED for the caller to publish to the event bus AFTER the commit
         (broadcast-after-commit — never mid-batch).
 
-        ``caller`` is the caller's session-level identity (KTD1); ``None``
+        ``caller`` is the caller's session-level identity; ``None``
         compares ``agent_id`` itself. A member the caller handed off under a live
         record refuses the whole batch with :class:`GiverFenced`; a WIN labels
         each member's live record completed or overtaken.
@@ -2644,7 +2644,8 @@ class CoordinatorService:
             )
             for artifact_id, (content, size_tokens) in writes.items()
         }
-        # The validated owner is the caller identity (KTD1), as in session_commit.
+        # The validated owner is the caller identity the giver fence keys on,
+        # as in session_commit.
         return self.commit_all(
             agent_id=committer_id,
             writes=batch,
@@ -3110,9 +3111,9 @@ class CoordinatorService:
         return False
 
     # ------------------------------------------------------------------
-    # Targeted grant handoff (#185, U4): transfer, accept, decline and
-    # withdraw; the giver fence every write path consults (KTD1); and the
-    # completion or overtake an admitted acquire or win records (KTD2).
+    # Targeted grant handoff (#185): transfer, accept, decline and
+    # withdraw; the giver fence every write path consults; and the
+    # completion or overtake an admitted acquire or win records.
     # ------------------------------------------------------------------
 
     def transfer(
@@ -3125,25 +3126,26 @@ class CoordinatorService:
         issued_at_tick: int = 0,
         abort: threading.Event | None = None,
     ) -> list[TransferGrantOutcome]:
-        """Hand each path in ``holders`` to ``successor`` (R1-R7, R9, R26).
+        """Hand each path in ``holders`` to ``successor``.
 
         ``giver`` is the caller's session-level identity -- what the record
         stores and the fence keys on. ``holders`` maps each artifact to the
-        composite presented as holding the claim there (KTD7): the grant given
+        composite presented as holding the claim there: the grant given
         up is the one that composite holds. ``successor`` arrives already
         normalised to a session-level identity, and ``successor_known`` says
         whether the caller resolved it through a name map this service cannot
-        see (R2).
+        see.
 
-        The registry's composite member decides every path in KTD2's order and
-        applies the admitted ones atomically; this method adds no decision of
-        its own. The abort is checked once, when the hold is won: an abort set
+        The registry's composite member decides every path in the order
+        :func:`~ccs.coordinator.registry_protocol.decide_transfer_grant`
+        documents and applies the admitted ones atomically; this method adds
+        no decision of its own. The abort is checked once, when the hold is won: an abort set
         while the request waits for the lock lands nothing
         (``WatchdogAbandoned``), and one set after the hold is taken lets every
-        admitted path land together (R7, AE18).
+        admitted path land together.
 
         Returns one :class:`TransferGrantOutcome` per path, in request order;
-        the request succeeded only if every grant transferred (R3).
+        the request succeeded only if every grant transferred.
 
         Raises:
             CoherenceError: ``holders`` names no path -- a request with nothing
@@ -3161,47 +3163,47 @@ class CoordinatorService:
         self, *, artifact_id: UUID, caller: UUID, abort: threading.Event | None = None
     ) -> TransferVerbOutcome:
         """The successor accepts the live handoff of ``artifact_id`` without
-        writing (R20). A pending record becomes completed; a completed one is
+        writing. A pending record becomes completed; a completed one is
         answered as it stands; an overtaken one is answered with its status and
         counterparty and keeps its label. Completion never lifts the giver's
-        fence (R10). ``caller`` is the session-level identity; with no live
-        record the answer is not live, and anyone but the successor is refused
-        as not the successor."""
+        fence: only a version move, a decline or a withdraw does. ``caller``
+        is the session-level identity; with no live record the answer is not
+        live, and anyone but the successor is refused as not the successor."""
         return self._settle_transfer(_ACCEPT, artifact_id=artifact_id, caller=caller, abort=abort)
 
     def decline_transfer(
         self, *, artifact_id: UUID, caller: UUID, abort: threading.Event | None = None
     ) -> TransferVerbOutcome:
-        """The successor declines the live handoff of ``artifact_id`` (R20),
+        """The successor declines the live handoff of ``artifact_id``,
         whatever its label: the record ends as declined and the giver's fence
-        lifts at once (R15). Refused as for :meth:`accept_transfer`."""
+        lifts at once. Refused as for :meth:`accept_transfer`."""
         return self._settle_transfer(_DECLINE, artifact_id=artifact_id, caller=caller, abort=abort)
 
     def withdraw_transfer(
         self, *, artifact_id: UUID, caller: UUID, abort: threading.Event | None = None
     ) -> TransferVerbOutcome:
-        """The giver withdraws its live handoff of ``artifact_id`` (R16),
+        """The giver withdraws its live handoff of ``artifact_id``,
         whatever its label: the record ends as withdrawn and the fence lifts.
         Anyone but the giver is refused as not the giver. Nothing else
-        withdraws: a session stop and a failed edit never call this (R35)."""
+        withdraws: a session stop and a failed edit never call this."""
         return self._settle_transfer(_WITHDRAW, artifact_id=artifact_id, caller=caller, abort=abort)
 
     def live_handoff_given_by(self, artifact_id: UUID, identity: UUID) -> TransferRecord | None:
-        """KTD1's giver predicate, the one read every write path consults: the
+        """The giver predicate, the one read every write path consults: the
         live transfer record of ``artifact_id`` whose giver is ``identity``, or
         ``None``.
 
         Present-record, like the read-generation fence's admit-on-absent: a path
         with NO record fences nobody, so a plain optimistic writer is never
-        refused (R12). ``identity`` is the session-level identity the route
+        refused. ``identity`` is the session-level identity the route
         passed, so a re-minted incarnation and a subagent of the giver are
-        fenced alike (R11). Liveness is the registry's (KTD10): a record whose
-        version moved, or that was declined or withdrawn, fences nobody (R15).
+        fenced alike. Liveness is the registry's: a record whose
+        version moved, or that was declined or withdrawn, fences nobody.
 
         Read-only. The write paths call it inside their abort-guard hold; a
         handler calls it to render the giver's pre-edit deny and its failed
         edit, which is answered not held and handed to the successor at the
-        transfer version and changes nothing (R8)."""
+        transfer version and changes nothing."""
         read = self.registry.get_transfer_record(artifact_id)
         if read is None:
             return None
@@ -3218,12 +3220,12 @@ class CoordinatorService:
     def _live_transfer_record(self, artifact_id: UUID) -> TransferRecord | None:
         """The path's record if it is live now. Read inside the write path's
         hold before its acquire or win, so it is the record that was live when
-        that write was admitted -- the only kind a write may label (KTD2)."""
+        that write was admitted -- the only kind a write may label."""
         read = self.registry.get_transfer_record(artifact_id)
         return read[0] if read is not None and read[1] else None
 
     def _label_live_transfer(self, admitted: TransferRecord | None, identity: UUID) -> None:
-        """Completion or overtake after an admitted acquire or win (R21, R24).
+        """Completion or overtake after an admitted acquire or win.
 
         ``admitted`` is the record that was live when the write was admitted
         (``None``: nothing to label -- an ended record is never relabelled).
@@ -3245,7 +3247,7 @@ class CoordinatorService:
             status, counterparty = TRANSFER_STATUS_OVERTAKEN, identity
         try:
             self.registry.set_transfer_status(admitted.artifact_id, status, counterparty=counterparty)
-        except Exception:  # noqa: BLE001 — any raise; the admitted write stands (KTD2)
+        except Exception:  # noqa: BLE001 — any raise; the admitted write stands
             logger.warning(
                 "handoff label %r not written for artifact %s after an admitted write; "
                 "the record now reads by its version",
@@ -3617,7 +3619,7 @@ class _TransferVerb:
         return None if caller == party else self.not_party_reason
 
 
-# R20: an accept turns only a pending record completed; a completed one is
+# An accept turns only a pending record completed; a completed one is
 # answered as it stands, and an overtaken one is never relabelled by an accept.
 _ACCEPT = _TransferVerb(
     "successor",

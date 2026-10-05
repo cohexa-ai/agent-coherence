@@ -392,7 +392,7 @@ once it holds the right principal. ``caller_principal_claimed`` is not one of
 these: it answers a mint claim, in an HTTP 200 ``{ok: false}`` body."""
 
 # ---------------------------------------------------------------------------
-# targeted grant handoff vocabulary (#185, unit U2)
+# targeted grant handoff vocabulary (#185)
 # ---------------------------------------------------------------------------
 #
 # A session done with a path hands it to a named successor (a transfer); the
@@ -446,7 +446,7 @@ a live handoff may transfer the path again (which supersedes its record)."""
 
 HANDOFF_OTHER_HOLDER_REASON = "handoff_other_holder"
 """Another session holds this path EXCLUSIVE or MODIFIED, so the caller's claim
-is not the write authority to hand on (R5). When the caller also holds nothing
+is not the write authority to hand on. When the caller also holds nothing
 on the path, :data:`HANDOFF_NOT_HELD_REASON` is answered instead: the not-held
 reason wins. Its own value, not the compare-and-swap route's ``other_holder``,
 so a client can tell a refused grant of a transfer from a refused write by

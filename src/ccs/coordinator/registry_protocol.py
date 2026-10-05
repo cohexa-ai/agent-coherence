@@ -295,7 +295,7 @@ CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
 
 
 # ---------------------------------------------------------------------------
-# The transfer record (targeted grant handoff, #185 U3; R25, KTD2, KTD10)
+# The transfer record (targeted grant handoff, #185)
 # ---------------------------------------------------------------------------
 #
 # One record per artifact, kept by both registries and exposed through four
@@ -310,7 +310,7 @@ CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
 # Why a record exists, as a closed vocabulary (stored; add, never rename). A
 # plain transfer is a ``handoff``; the giver's re-transfer of its own live
 # record is a ``supersession``, and that record also names the successor it
-# superseded, so a late re-send of the superseded tuple is recognised (AE20)
+# superseded, so a late re-send of the superseded tuple is recognised
 # rather than read as a fresh supersession. The cause is its own column, never
 # an id encoded into a string, so a later cause (#195's reclaim causes) adds a
 # value without re-parsing the stored ones.
@@ -320,7 +320,7 @@ TRANSFER_CAUSES: frozenset[str] = frozenset(
     {TRANSFER_CAUSE_HANDOFF, TRANSFER_CAUSE_SUPERSESSION}
 )
 
-# The statuses that end a record whatever its version (R10). Every other label
+# The statuses that end a record whatever its version. Every other label
 # leaves a record live while the artifact's version equals the version at
 # transfer -- an overtaken record included.
 TRANSFER_ENDED_STATUSES: frozenset[str] = frozenset(
@@ -342,14 +342,14 @@ _HELD_STATES: frozenset[MESIState] = frozenset(
 
 @dataclass(frozen=True, kw_only=True)
 class TransferRecord:
-    """One path's transfer record (R25), as both registries store and return it.
+    """One path's transfer record, as both registries store and return it.
 
     ``kw_only`` because four fields are ids of one type side by side; a
     positional swap would record the handoff pointed the wrong way.
 
     - ``giver`` -- the caller's session-level identity: what the fence keys on,
       so a re-minted incarnation or a subagent of the same session is fenced
-      alike (R11).
+      alike.
     - ``holder`` -- the composite that held the claim and moved INVALID.
     - ``successor`` -- the successor's session-level identity.
     - ``version_at_transfer`` -- the artifact version the handoff is fenced on.
@@ -357,7 +357,7 @@ class TransferRecord:
     - ``cause`` -- one of :data:`TRANSFER_CAUSES`; ``superseded_successor`` is
       set exactly when the cause is a supersession.
     - ``status`` -- one of :data:`TRANSFER_STORED_STATUSES`. A label, not
-      liveness: the read answers liveness beside the record (KTD10).
+      liveness: the read answers liveness beside the record.
     - ``counterparty`` -- the bystander an overtaken label names.
     - ``created_at`` / ``updated_at`` -- wall-clock unix seconds, since the
       coordinator's ticks reset on a restart.
@@ -387,11 +387,11 @@ class TransferRequest:
     - ``successor`` -- the successor's session-level identity, already
       normalised by the caller (the registry never resolves a composite).
     - ``holders`` -- artifact id to the composite presented as holding the
-      claim on that path (KTD7: a volume presents the incarnation that holds
+      claim on that path (a volume presents the incarnation that holds
       its read or write there). Keyed by artifact, so a path is decided once.
     - ``successor_known`` -- whether the caller already resolved the successor
       through a name map the registry cannot see (the HTTP route's live map).
-      The registry also counts a bound principal and a grant row as known (R2).
+      The registry also counts a bound principal and a grant row as known.
     """
 
     giver: UUID
@@ -401,7 +401,7 @@ class TransferRequest:
 
 
 def transfer_record_live(record: TransferRecord, current_version: int) -> bool:
-    """R10's liveness, the one predicate both registries read it from (KTD10).
+    """A record's liveness, the one predicate both registries read it from.
 
     Live while the artifact's version still equals the version at transfer and
     the record was neither declined nor withdrawn, whatever its label otherwise
@@ -454,18 +454,18 @@ def decide_transfer_grant(
     successor_known: bool,
     now_unix: float,
 ) -> TransferDecision:
-    """Decide one path of a transfer in KTD2's order. Pure: it reads the view
+    """Decide one path of a transfer in the order below. Pure: it reads the view
     and writes nothing, so a registry decides EVERY path before it applies any.
 
     First the path's record is matched against the caller as giver:
 
     - (a) live, same successor: answered transferred with the record's status;
-      nothing moves (R6).
+      nothing moves, so a re-send writes no second record.
     - (b) live, the successor this record's supersession replaced: refused as
       ended with the superseded status, so a late re-send never supersedes back.
     - (c) live, any other successor: supersedes. The stored holder stands in for
       the hold check only; the foreign write-holder, self and unknown refusals
-      still run, and a refused supersession changes nothing (R4, R26).
+      still run, and a refused supersession changes nothing.
     - (d) ended by decline or withdraw, same successor, unmoved version: refused
       as ended with that status.
     - (e) any other record naming the caller is treated as absent.
@@ -556,7 +556,7 @@ def _decide_ordinary(
     now_unix: float,
 ) -> TransferDecision:
     """The checks on the presented composite, then a plain handoff with the
-    INVALID move; an ended record on the path is replaced (KTD10)."""
+    INVALID move; an ended record on the path is replaced."""
     holder_state, version = view.holder_state, view.current_version
     if holder_state is None or holder_state not in _HELD_STATES:
         return TransferDecision(_refused(view, HANDOFF_NOT_HELD_REASON))
@@ -753,7 +753,7 @@ class RegistryBase(Protocol):
         """Delete every transfer record that is NOT live and older than
         ``max_age_sec``, and return how many went. Liveness is the read's
         (:func:`transfer_record_live`), so a live record is never evicted
-        whatever its age (KTD10). The age runs from the record's
+        whatever its age. The age runs from the record's
         ``updated_at`` -- on sqlite from the later of that and the artifact's
         own last update, so a version-move ending survives until the giver's
         next touch can report it. ``now_unix`` defaults to the wall clock."""
@@ -826,7 +826,7 @@ class RegistryBase(Protocol):
         live, or None when the path has no record. Both halves come from ONE
         read under the registry lock (sqlite: one SELECT joining the
         artifact's version), so a concurrent version move cannot tear them:
-        this is the one place the service reads liveness from (KTD10). A
+        this is the one place the service reads liveness from. A
         plain read, so it serves a read-only open too."""
         ...
 
@@ -995,7 +995,7 @@ class RegistryBase(Protocol):
         it) and ``updated_at``, all three. Unconditional -- it never checks
         liveness, because a win's label is written after the version already
         moved; the service decides from the record it read under the same
-        hold (KTD2). Raises ``ValueError`` for a status outside
+        hold. Raises ``ValueError`` for a status outside
         :data:`TRANSFER_STORED_STATUSES` (``superseded`` included) and
         ``KeyError`` when the path has no record; either way nothing is
         written."""
@@ -1008,7 +1008,7 @@ class RegistryBase(Protocol):
         tick: int = 0,
         now_unix: float | None = None,
     ) -> list[TransferGrantOutcome]:
-        """The composite transfer (KTD2): decide every path of ``request`` with
+        """The composite transfer: decide every path of ``request`` with
         :func:`decide_transfer_grant`, then apply the admitted subset -- the
         record upsert, and for a plain handoff the presented composite's
         INVALID move under ``HANDOFF_TRIGGER`` (moving ``owner_generation``
@@ -1167,7 +1167,7 @@ class SqliteExtended(RegistryBase, Protocol):
         ``include_transfers`` (keyword-only, off by default) adds a third
         element, ``{artifact_id: (record, live)}`` for every artifact that has
         a transfer record, read inside the same hold and judged by the same
-        liveness helper :meth:`RegistryBase.get_transfer_record` uses (KTD10),
+        liveness helper :meth:`RegistryBase.get_transfer_record` uses,
         so ``/status`` renders each record beside the version it was judged
         against. Without it the answer is the two-element tuple, unchanged."""
         ...
