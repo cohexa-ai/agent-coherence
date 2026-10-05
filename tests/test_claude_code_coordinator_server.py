@@ -528,13 +528,24 @@ def test_full_edit_cycle(coordinator, client: _Client) -> None:
 
 
 def test_failed_edit_releases_grant_without_bump(coordinator, client: _Client) -> None:
-    """KTD-1 release-on-failure: post-edit success:false releases E without bumping."""
-    client.post("/hooks/pre-read", {"session_id": _sid("A"), "path": "plan.md"})
-    client.post("/hooks/pre-edit", {"session_id": _sid("A"), "path": "plan.md"})
+    """KTD-1 release-on-failure: post-edit success:false releases E without bumping.
+
+    The grant check reads the agent the requests name — derived from the
+    same session id they post — and first asserts that agent HOLDS the
+    grant, so "no longer EXCLUSIVE" is measured against a grant that
+    existed. It used to read ``session_to_agent_id("A")``, an agent no
+    request touched, and the closing acquire by B succeeds whether or not
+    A released (a pre-edit preempts a holder): the test stayed green with
+    the release replaced by a no-op (#185)."""
+    sid = _sid("A")
+    agent_id = session_to_agent_id(sid)
+    client.post("/hooks/pre-read", {"session_id": sid, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
     artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    assert coordinator.registry.get_agent_state(artifact_id, agent_id) == MESIState.EXCLUSIVE
     version_before = coordinator.registry.get_artifact(artifact_id).version
     s, b = client.post("/hooks/post-edit",
-                        {"session_id": _sid("A"), "path": "plan.md",
+                        {"session_id": sid, "path": "plan.md",
                          "content_hash": _hash("ignored"), "success": False})
     assert s == 200
     assert b.get("released") is True
@@ -542,7 +553,6 @@ def test_failed_edit_releases_grant_without_bump(coordinator, client: _Client) -
     version_after = coordinator.registry.get_artifact(artifact_id).version
     assert version_after == version_before
     # Agent state is no longer EXCLUSIVE (some non-M/E state)
-    agent_id = session_to_agent_id("A")
     state = coordinator.registry.get_agent_state(artifact_id, agent_id)
     assert state not in (MESIState.EXCLUSIVE, MESIState.MODIFIED)
     # Another session can now acquire immediately
@@ -607,16 +617,27 @@ def test_collision_surfaces_via_additional_context(coordinator, client: _Client)
 
 
 def test_session_stop_releases_uncommitted_grants(coordinator, client: _Client) -> None:
-    """KTD-11: end-of-turn Stop releases any uncommitted EXCLUSIVE grants."""
-    client.post("/hooks/pre-edit", {"session_id": _sid("A"), "path": "plan.md"})
-    client.post("/hooks/pre-edit", {"session_id": _sid("A"), "path": "spec.md"})
+    """KTD-11: end-of-turn Stop releases any uncommitted EXCLUSIVE grants.
+
+    The grant check reads the agent the requests name — derived from the
+    same session id they post — and first asserts that agent HOLDS both
+    grants, so "no longer held" is measured against grants that existed. It
+    used to read ``session_to_agent_id("A")``, an agent no request touched,
+    whose state is absent whether or not the release ran: the test stayed
+    green with the release replaced by a no-op (#185)."""
+    sid = _sid("A")
+    agent_id = session_to_agent_id(sid)
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "spec.md"})
+    for path in ("plan.md", "spec.md"):
+        art_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        assert coordinator.registry.get_agent_state(art_id, agent_id) == MESIState.EXCLUSIVE
     # Stop fires
-    s, b = client.post("/hooks/session-stop", {"session_id": _sid("A")})
+    s, b = client.post("/hooks/session-stop", {"session_id": sid})
     assert s == 200 and b["ok"] is True
     released = set(b["released_artifacts"])
     assert released == {"plan.md", "spec.md"}
     # Neither artifact is held in M∪E by A anymore
-    agent_id = session_to_agent_id("A")
     for path in ("plan.md", "spec.md"):
         art_id = coordinator.registry.lookup_artifact_id_by_name(path)
         state = coordinator.registry.get_agent_state(art_id, agent_id)
