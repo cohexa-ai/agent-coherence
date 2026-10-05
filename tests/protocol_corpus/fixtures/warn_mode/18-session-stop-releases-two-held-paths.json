@@ -1,0 +1,64 @@
+{
+  "name": "session-stop-releases-two-held-paths",
+  "description": "KTD-11 end-of-turn release with grants held, pinned on both backends as they answer today: the session takes EXCLUSIVE on two tracked paths (preflight pre-edits, plan.md first, then CLAUDE.md), then stops; both grants are released and released_artifacts lists them in the order they were acquired, which is not name order -- both backends read the held grants with an unordered SELECT that walks the agent_states(agent_id) index, and a list compares element by element, so this row pins today's order too. This is the baseline the targeted grant handoff (#185) starts from: a stop that is not a clean success may later answer per grant, but this clean one must keep these bytes. The session claims a principal on Python (the claim is scoped, since Node answers 404) and presents it on the pre-edits and the stop, all require-class; Node issues none, so the harness omits the header there. The empty-list case is 05-session-stop-no-grants.",
+  "setup": {
+    "tracked": ["CLAUDE.md", "plan.md"],
+    "files": {
+      "CLAUDE.md": "# Project rules\n",
+      "plan.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "backends": ["python"],
+        "body": {
+          "session_id": "55555555-5555-4555-8555-555555555555",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "55555555-5555-4555-8555-555555555555",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "55555555-5555-4555-8555-555555555555",
+          "path": "CLAUDE.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/session-stop",
+    "body": {
+      "session_id": "55555555-5555-4555-8555-555555555555"
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_a}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "released_artifacts": ["plan.md", "CLAUDE.md"]
+    }
+  }
+}

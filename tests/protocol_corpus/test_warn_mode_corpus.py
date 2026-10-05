@@ -95,12 +95,14 @@ def test_warn_mode_fixture_response_matches_expected(
 
 
 def test_collection_loaded_fixtures() -> None:
-    """Self-test: at least one fixture is present so parametrize doesn't
-    silently no-op. Catches the failure mode where the fixtures directory
-    is empty or path-resolution is wrong."""
+    """Self-test: the fixtures are present so parametrize doesn't silently
+    no-op. Catches the failure mode where the fixtures directory is empty or
+    path-resolution is wrong, and — with the floor at the current count — a
+    row that goes missing, such as the release baselines (17, 18) the #185
+    grant handoff is measured against."""
     fixtures = _all_warn_mode_fixtures()
-    assert len(fixtures) >= 8, (
-        f"Expected ≥8 warn-mode fixtures, found {len(fixtures)}. "
+    assert len(fixtures) >= 18, (
+        f"Expected ≥18 warn-mode fixtures, found {len(fixtures)}. "
         f"Add coverage in tests/protocol_corpus/fixtures/warn_mode/."
     )
 
