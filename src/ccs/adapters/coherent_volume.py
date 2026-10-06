@@ -2359,6 +2359,15 @@ class CoherentVolume:
         # committed"), and never a TypeError from the substring test below.
         if not isinstance(reason, str):
             raise CommitUnconfirmed(_PUBLISH_UNCLASSIFIABLE_MESSAGE)
+        # The giver of a live handoff (#185): a member of this batch is a path
+        # this session handed off. The same typed terminal as the single-path
+        # writes, never the HELD conflict below, whose recovery (reacquire and
+        # rebuild) cannot clear the fence and would loop. Nothing was committed.
+        if reason == GIVER_FENCED_REASON:
+            fenced = commit.get("path")
+            raise self._giver_fenced(
+                commit, fenced if isinstance(fenced, str) else entries[0][1]
+            )
         # Non-WIN. A retry-eligible batch conflict (peer raced the window) is a
         # StaleView; a NON-retryable corruption reason must not masquerade as one
         # (mirror the size-1 CAS path, which raises CoherenceError on corruption).

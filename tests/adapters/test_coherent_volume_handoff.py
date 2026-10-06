@@ -162,6 +162,34 @@ def test_a_givers_cas_at_the_transfer_version_raises_the_giver_terminal(
         stop_coordinator(tmp_path)
 
 
+def test_a_givers_multi_file_publish_including_a_handed_path_raises_the_giver_terminal(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A hands plan.md to B, then publishes plan.md and other.md together.
+    The coordinator refuses the batch as handed off, and the volume raises the
+    same typed giver terminal as on its single-path writes, naming B and v1,
+    rather than the generic batch conflict, whose recovery (reacquire and
+    re-decide) never clears the fence and would loop. Nothing is written."""
+    target = _seed(tmp_path, _PLAN, b"plan v1")
+    other = _seed(tmp_path, _OTHER, b"other v1")
+    giver, successor = _volumes(tmp_path, fast_cfg, 2)
+    try:
+        assert giver.read_with_version(_PLAN) == (b"plan v1", 1)
+        assert giver.read_with_version(_OTHER) == (b"other v1", 1)
+        assert giver.transfer(_PLAN, successor=_agent(successor)).ok
+
+        with pytest.raises(GiverFenced) as raised:
+            giver.atomic_publish([(_PLAN, 1, b"late plan"), (_OTHER, 1, b"other v2")])
+
+        assert type(raised.value) is GiverFenced
+        assert raised.value.artifact_id == _PLAN
+        assert raised.value.successor == _agent(successor)
+        assert raised.value.version_at_transfer == 1
+        assert target.read_bytes() == b"plan v1"
+        assert other.read_bytes() == b"other v1"
+    finally:
+        stop_coordinator(tmp_path)
+
 def test_the_givers_pre_edit_raises_the_same_terminal_without_a_reacquire(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
