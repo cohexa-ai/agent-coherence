@@ -334,6 +334,19 @@ TRANSFER_STORED_STATUSES: frozenset[str] = TRANSFER_STATUSES - {
     TRANSFER_STATUS_SUPERSEDED
 }
 
+
+def require_storable_transfer_status(status: str) -> None:
+    """Raise ``ValueError`` for a status no stored record may carry (anything
+    outside :data:`TRANSFER_STORED_STATUSES`, ``superseded`` included). Both
+    registries' ``set_transfer_status`` call it before touching any state, so
+    the closed vocabulary is checked, and its refusal worded, in one place."""
+    if status not in TRANSFER_STORED_STATUSES:
+        raise ValueError(
+            f"transfer status {status!r} cannot be stored; expected one of "
+            f"{sorted(TRANSFER_STORED_STATUSES)}"
+        )
+
+
 # A claim the presented composite can hand on: a write grant or a standing read.
 _HELD_STATES: frozenset[MESIState] = frozenset(
     {MESIState.EXCLUSIVE, MESIState.MODIFIED, MESIState.SHARED}

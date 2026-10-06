@@ -133,7 +133,6 @@ from .registry_protocol import (
     FOREIGN_WRITE_OUTCOMES,
     HANDOFF_TRIGGER,
     RECLAIM_TRIGGERS,  # noqa: F401 — re-exported; see the parity test
-    TRANSFER_STORED_STATUSES,
     CaptureResult,
     CasResult,
     CheckpointMember,
@@ -146,6 +145,7 @@ from .registry_protocol import (
     TransferRequest,
     UncoverableRun,
     decide_transfer_grant,
+    require_storable_transfer_status,
     transfer_record_live,
 )
 from .retention import RetentionPolicy, collectible_versions
@@ -508,23 +508,18 @@ CREATE TABLE transfer_records (
 
 # The liveness join: a record's columns, then its artifact's version and last
 # update, read by ONE statement so the version a record is judged against is
-# the one that coexisted with it. ``_TRANSFER_READ_SQL`` serves one path (the
-# read, the composite transfer); ``_TRANSFER_READ_ALL_SQL`` every path (the
-# eviction, and the status snapshot's opt-in). Column order is
+# the one that coexisted with it. ``_TRANSFER_READ_ALL_SQL`` serves every path
+# (the eviction, and the status snapshot's opt-in); ``_TRANSFER_READ_SQL`` one
+# path (the read, the composite transfer), the same statement narrowed by its
+# WHERE, so the two can never disagree on the column order that is
 # ``_transfer_read_from_row``'s contract.
-_TRANSFER_READ_SQL = """
-SELECT t.artifact_id, t.giver, t.holder, t.successor, t.version_at_transfer,
-       t.hold_shape, t.cause, t.superseded_successor, t.status, t.counterparty,
-       t.created_at, t.updated_at, a.version, a.updated_at
-FROM transfer_records t JOIN artifacts a ON a.id = t.artifact_id
-WHERE t.artifact_id = ?
-"""
 _TRANSFER_READ_ALL_SQL = """
 SELECT t.artifact_id, t.giver, t.holder, t.successor, t.version_at_transfer,
        t.hold_shape, t.cause, t.superseded_successor, t.status, t.counterparty,
        t.created_at, t.updated_at, a.version, a.updated_at
 FROM transfer_records t JOIN artifacts a ON a.id = t.artifact_id
 """
+_TRANSFER_READ_SQL = _TRANSFER_READ_ALL_SQL + "WHERE t.artifact_id = ?\n"
 
 # The record upsert: insert, replace an ended record, or supersede a live one.
 _TRANSFER_UPSERT_SQL = """
@@ -2955,11 +2950,7 @@ class SqliteArtifactRegistry:
     ) -> None:
         """Write the label unconditionally; see
         :meth:`RegistryBase.set_transfer_status`."""
-        if status not in TRANSFER_STORED_STATUSES:
-            raise ValueError(
-                f"transfer status {status!r} cannot be stored; expected one of "
-                f"{sorted(TRANSFER_STORED_STATUSES)}"
-            )
+        require_storable_transfer_status(status)
         now = time.time() if now_unix is None else now_unix
         self._guard_writable()
         with self._lock:

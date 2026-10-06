@@ -60,7 +60,6 @@ from ccs.core.types import (
     TRANSFER_STATUS_SUPERSEDED,
     TRANSFER_STATUS_WITHDRAWN,
     TRANSFER_STATUSES,
-    CasHandoffOutcome,
     TransferGrantOutcome,
 )
 
@@ -191,11 +190,11 @@ def test_transfer_statuses_are_the_six_closed_values() -> None:
     assert len(TRANSFER_STATUSES) == 6
 
 
-def test_outcomes_are_frozen_and_name_giver_and_successor_by_keyword() -> None:
-    """The per-grant transfer outcome and the compare-and-swap handoff
-    outcome are values, never mutated after the answer is built. Their giver
-    and successor are two ids of one type side by side; a positional swap
-    would report the giver as the successor, so both are keyword-only."""
+def test_transfer_grant_outcome_is_frozen_and_names_giver_and_successor_by_keyword() -> None:
+    """The per-grant transfer outcome is a value, never mutated after the
+    answer is built. Its giver and successor are two ids of one type side by
+    side; a positional swap would report the giver as the successor, so it is
+    keyword-only."""
     giver, successor = uuid4(), uuid4()
     grant = TransferGrantOutcome(
         artifact_id=uuid4(),
@@ -210,16 +209,3 @@ def test_outcomes_are_frozen_and_name_giver_and_successor_by_keyword() -> None:
         grant.successor = giver  # type: ignore[misc]
     with pytest.raises(TypeError):
         TransferGrantOutcome(uuid4(), True)  # type: ignore[misc]
-
-    win = CasHandoffOutcome(
-        artifact_id=uuid4(),
-        status=TRANSFER_STATUS_OVERTAKEN,
-        giver=giver,
-        successor=successor,
-        version_at_transfer=3,
-        counterparty=uuid4(),
-    )
-    with pytest.raises(FrozenInstanceError):
-        win.status = TRANSFER_STATUS_COMPLETED  # type: ignore[misc]
-    with pytest.raises(TypeError):
-        CasHandoffOutcome(uuid4(), TRANSFER_STATUS_COMPLETED, giver, successor, 3)  # type: ignore[misc]

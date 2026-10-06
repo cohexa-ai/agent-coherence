@@ -674,28 +674,6 @@ class TransferGrantOutcome:
 
 
 @dataclass(frozen=True, kw_only=True)
-class CasHandoffOutcome:
-    """What a compare-and-swap win did to a live handoff of its path: the
-    successor's win marks it ``completed``; a third session's win
-    marks it ``overtaken`` with that session as ``counterparty``. Reported
-    beside the win, never instead of it -- the win's answer does not change.
-
-    ``status`` is :data:`TRANSFER_STATUS_COMPLETED` or
-    :data:`TRANSFER_STATUS_OVERTAKEN`. ``giver`` and ``successor`` are the
-    record's session-level ids (``kw_only`` for the same swap hazard as
-    :class:`TransferGrantOutcome`), ``version_at_transfer`` the version the win
-    was taken at.
-    """
-
-    artifact_id: UUID
-    status: str
-    giver: UUID
-    successor: UUID
-    version_at_transfer: int
-    counterparty: UUID | None = None
-
-
-@dataclass(frozen=True, kw_only=True)
 class TransferVerbOutcome:
     """The answer to an accept, a decline or a withdraw of a path's handoff.
 

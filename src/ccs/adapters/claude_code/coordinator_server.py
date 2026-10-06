@@ -5021,11 +5021,15 @@ _HANDOFF_WITHDRAW_DEGRADED_RESPONSE: dict = {
 """``/handoff/withdraw`` cut short by the watchdog: failed and unconfirmed."""
 
 
-def _giver_fenced_body(exc: GiverFenced, *, path: str | None = None) -> dict:
+def _giver_fenced_body(
+    fence: GiverFenced | TransferRecord, *, path: str | None = None
+) -> dict:
     """A fenced giver's refusal on a write route (#185): the typed reason
     with the successor and the version at transfer as top-level fields, so a
     client classifies it by ``reason`` and never by prose. ``path`` names the
-    refused member of a multi-member write.
+    refused member of a multi-member write. ``fence`` is the raised
+    :class:`GiverFenced`, or the live record a handler read the fence from:
+    both carry the two facts, so no handler builds an exception to carry them.
 
     No ``hookSpecificOutput`` and no prose yet: the hook client's deny
     envelope comes with the hook-path handoff work, as a byte-stable
@@ -5033,8 +5037,8 @@ def _giver_fenced_body(exc: GiverFenced, *, path: str | None = None) -> dict:
     body: dict = {"ok": False, "reason": GIVER_FENCED_REASON}
     if path is not None:
         body["path"] = path
-    body["successor"] = str(exc.successor)
-    body["version_at_transfer"] = exc.version_at_transfer
+    body["successor"] = str(fence.successor)
+    body["version_at_transfer"] = fence.version_at_transfer
     return body
 
 
@@ -5171,13 +5175,7 @@ def _handed_off_release(path: str, record: TransferRecord) -> dict:
     """The giver's failed-edit report on its live record: not a clean
     success. The typed giver reason and the per-grant entry, and nothing
     changed -- no release, and never a withdraw."""
-    return {
-        "ok": False,
-        "reason": GIVER_FENCED_REASON,
-        "successor": str(record.successor),
-        "version_at_transfer": record.version_at_transfer,
-        "grants": [_handed_off_grant(path, record)],
-    }
+    return {**_giver_fenced_body(record), "grants": [_handed_off_grant(path, record)]}
 
 
 def _refused_transfer_grant(path: str, reason: str) -> dict:

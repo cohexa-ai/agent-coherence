@@ -49,7 +49,6 @@ from .registry_protocol import (
     FOREIGN_WRITE_OUTCOMES,
     HANDOFF_TRIGGER,
     RECLAIM_TRIGGERS,  # noqa: F401 — re-exported; see the parity test
-    TRANSFER_STORED_STATUSES,
     CaptureResult,
     CasResult,
     CheckpointMember,
@@ -62,6 +61,7 @@ from .registry_protocol import (
     TransferRequest,
     UncoverableRun,
     decide_transfer_grant,
+    require_storable_transfer_status,
     transfer_record_live,
 )
 from .retention import RetentionPolicy, collectible_versions
@@ -1440,11 +1440,7 @@ class ArtifactRegistry:
     ) -> None:
         """Write the label unconditionally; see
         :meth:`RegistryBase.set_transfer_status`."""
-        if status not in TRANSFER_STORED_STATUSES:
-            raise ValueError(
-                f"transfer status {status!r} cannot be stored; expected one of "
-                f"{sorted(TRANSFER_STORED_STATUSES)}"
-            )
+        require_storable_transfer_status(status)
         now = time.time() if now_unix is None else now_unix
         with self._lock:
             slot = self._records.get(artifact_id)
