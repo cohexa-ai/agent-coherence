@@ -47,6 +47,7 @@ from ccs.adapters.claude_code.hook_payloads import (
     HANDOFF_EDIT_ON_DISK_SENTENCE,
     HANDOFF_GIVER_COMMIT_REFUSED_TEMPLATE,
     HANDOFF_GIVER_DENY_REASON_TEMPLATE,
+    HANDOFF_GIVER_READ_TEMPLATE,
     STRICT_MODE_DENY_REASON_TEMPLATE,
     TERMINAL_DENIAL_CLASSES,
     emit_allow,
@@ -1519,18 +1520,32 @@ def test_post_edit_handoff_arm_template_is_static() -> None:
     assert HANDOFF_EDIT_ON_DISK_SENTENCE in HANDOFF_GIVER_COMMIT_REFUSED_TEMPLATE
 
 
+def test_the_live_givers_read_prose_template_is_static() -> None:
+    """The prose a live giver's admitted read carries is under the deny's
+    placeholder lock: the path, the successor's short id and the version at
+    transfer only. A timestamp would rotate the bytes on every read and keep
+    the corpus from pinning them (R38)."""
+    actual = set(re.findall(r"\{([a-z_]+)\}", HANDOFF_GIVER_READ_TEMPLATE))
+    assert actual == {"path", "successor_short", "version_at_transfer"}, actual
+
+
 @pytest.mark.parametrize(
     "template",
-    [HANDOFF_GIVER_DENY_REASON_TEMPLATE, HANDOFF_GIVER_COMMIT_REFUSED_TEMPLATE],
-    ids=["pre_edit_deny", "post_edit_arm"],
+    [
+        HANDOFF_GIVER_DENY_REASON_TEMPLATE,
+        HANDOFF_GIVER_COMMIT_REFUSED_TEMPLATE,
+        HANDOFF_GIVER_READ_TEMPLATE,
+    ],
+    ids=["pre_edit_deny", "post_edit_arm", "pre_read_live_giver"],
 )
 def test_handoff_giver_prose_names_no_console_script_and_no_withdraw_invocation(
     template: str,
 ) -> None:
-    """KTD5 negative pin, beside the placeholder lock: the deny and the
-    post-edit arm name withdraw only as the giver's exit taken on its user's
-    or host's instruction. A console-script name, a route or a call spelling
-    in these bytes would hand the model the command that lifts its own fence."""
+    """KTD5 negative pin, beside the placeholder lock: the deny, the
+    post-edit arm and the live giver's read prose name withdraw only as the
+    giver's exit taken on its user's or host's instruction. A console-script
+    name, a route or a call spelling in these bytes would hand the model the
+    command that lifts its own fence."""
     present = [marker for marker in _NO_INVOCATION_MARKERS if marker in template]
     assert present == [], f"invocation markers in the giver prose: {present}"
     assert "on your user's or host's instruction" in template
@@ -1639,6 +1654,32 @@ def test_a_shell_read_after_the_givers_deny_counts_as_a_route_around(tmp_path: P
         after = running.server.counters_snapshot()["strict_mode_routed_around_via_bash_total"]
     assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
     assert after == before + 1
+
+
+def test_the_givers_strict_pre_read_deny_carries_no_handoff_prose(tmp_path: Path) -> None:
+    """R29: on a strict path the giver's read is the ordinary strict deny --
+    the transfer left its claim INVALID at an unmoved version, so the
+    grant-change template -- with nothing beside or inside it: no ``handoff``
+    key and no handoff prose, though the record is live. Fails if the live
+    giver's read prose, or the key, reaches a deny's bytes."""
+    with _Running(tmp_path / "ws", strict=True) as running:
+        _hand_off_notes(running.client)
+        status, body = running.client.post(
+            "/hooks/pre-read", {"session_id": _sid("G"), "path": _HANDOFF_PATH},
+        )
+    assert status == 200
+    assert set(body) == {"hookSpecificOutput", "status", "summary"}, body
+    assert body["hookSpecificOutput"] == {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": (
+            "Stale read denied: your grant on notes.md was revoked and no new "
+            "version was committed — notes.md is still at v1. Re-read notes.md "
+            "via the Read tool before proceeding. This denial is structural "
+            "(v0.2 strict mode); retrying the same operation will produce the "
+            "same denial."
+        ),
+    }
 
 
 # ----------------------------------------------------------------------

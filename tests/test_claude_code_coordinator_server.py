@@ -10674,11 +10674,12 @@ def test_a_compare_and_swap_win_carries_its_handoff_outcome(
 # --- the handoff prose on the hook envelopes (KTD6) ---------------------------
 #
 # Hook clients get the handoff as prose too: provenance, the read-first
-# warning, the bystander advisory and the giver's outcome through the
-# context-only PreToolUse envelope on admits, and the handoff arm through the
-# PostToolUse envelope on the giver's refused commit. Every expected sentence
-# is a hand-written literal; the short ids in it are the first eight characters
-# of the session-level ids the test computes from its own session ids.
+# warning, the bystander advisory, the live giver's statement on a read and
+# the giver's outcome through the context-only PreToolUse envelope on admits,
+# and the handoff arm through the PostToolUse envelope on the giver's refused
+# commit. Every expected sentence is a hand-written literal; the short ids in
+# it are the first eight characters of the session-level ids the test computes
+# from its own session ids.
 
 
 def _context(text: str) -> dict:
@@ -10717,6 +10718,19 @@ def _provenance(giver: _Session, path: str, *, version: int, shape: str) -> str:
 
 def _read_first(path: str, version: int) -> str:
     return f"⚠ You have not read {path} at v{version} or later; read it before editing."
+
+
+def _giver_fenced_read(successor: _Session, path: str, version: int = 1) -> str:
+    """The prose a live giver's admitted read carries, as a literal."""
+    s = successor.agent[:8]
+    return (
+        f"Handoff: you handed {path} to agent {s} at v{version}, so this session "
+        f"can no longer write it. The handoff ends when agent {s} writes {path}, "
+        f"when agent {s} declines it, or when you withdraw it on your user's or "
+        f"host's instruction. Until the handoff ends, do not change {path} by any "
+        f"route, a shell command included. Stop and report to your user that "
+        f"{path} was handed off."
+    )
 
 
 def _ended_unrecorded(path: str, version: int = 1) -> str:
@@ -10910,18 +10924,74 @@ def test_a_bystander_is_advised_and_its_commit_reports_overtaken_to_the_successo
     )
 
 
+def test_a_live_givers_read_says_it_handed_the_path_off_after_the_stale_warning(
+    coordinator, client: _Client
+) -> None:
+    """A Claude Code giver whose handoff is live reads the handed path. The
+    transfer left its claim INVALID, so the first read answers the generic
+    stale warning ending "Re-acquire before writing", and the read after it
+    is fresh -- measured to read as an all-clear for a shell write, or as a
+    cue to edit. Both carry the specific statement: the giver handed the
+    path off, may not change it by any route, and should stop and report. On
+    the stale read it follows the warning in the warning's own envelope, whose
+    allow decision is the warning's; on the fresh read it rides the
+    context-only envelope with no permission decision. Fails if a live
+    giver's read is silent about the handoff."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    expected = _giver_fenced_read(successor, "plan.md")
+
+    stale = _read(client, giver, "plan.md", "inc-1")
+    assert stale["status"] == "stale", stale
+    assert stale["handoff"] == _projection(giver, successor, "giver")
+    assert stale["hookSpecificOutput"]["permissionDecision"] == "allow", stale
+    warning, handoff = stale["hookSpecificOutput"]["additionalContext"].split("\n\n")
+    assert warning.endswith("Re-acquire before writing to plan.md."), warning
+    assert handoff == expected
+
+    assert _read(client, giver, "plan.md", "inc-1") == {
+        "status": "fresh", "version": 1,
+        "handoff": _projection(giver, successor, "giver"),
+        "hookSpecificOutput": _context(expected),
+    }
+
+
+@pytest.mark.parametrize("role", ["successor", "bystander"])
+def test_only_the_giver_is_told_on_a_read_that_it_handed_the_path_off(
+    coordinator, client: _Client, role: str
+) -> None:
+    """The live giver's statement is the giver's alone: while the record is
+    live the successor's reads carry its provenance and a bystander's the
+    advisory -- after the stale warning on the first read, alone on the fresh
+    one -- and neither is told it handed the path off. Fails if the
+    statement renders for every role."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    reader = successor if role == "successor" else bystander
+    expected = (
+        _provenance(giver, "plan.md", version=1, shape="SHARED")
+        if role == "successor" else _advisory(giver, successor, "plan.md")
+    )
+
+    first = _read(client, reader, "plan.md")
+    assert _last_block(first) == expected
+    assert "you handed" not in first["hookSpecificOutput"]["additionalContext"], first
+    assert _read(client, reader, "plan.md")["hookSpecificOutput"] == _context(expected)
+
+
 @pytest.mark.parametrize("ending", ["completed", "declined", "withdrawn"])
 def test_the_givers_next_touch_after_the_handoff_ended_reports_its_outcome(
     coordinator, client: _Client, ending: str
 ) -> None:
-    """R14. Once the record is no longer live, the giver's next touch
-    reports how its handoff ended -- and, the fence lifted, a pre-edit is an
-    admit that carries it too. While the record was live it said nothing on a
-    read: the deny and the refused commit are what speak to a live giver."""
+    """R14. While the record is live the giver's read says it handed the
+    path off; once the record is no longer live, the giver's next touch
+    reports how its handoff ended instead, and no longer says it may not
+    write -- and, the fence lifted, a pre-edit is an admit that carries the
+    outcome too. Fails if the live statement outlives the record."""
     giver, successor = _claimed(client), _claimed(client)
     _hand_off(client, giver, successor, "plan.md")
-    live_read = _read(client, giver, "plan.md", "inc-1")
-    assert "Handoff" not in json.dumps(live_read.get("hookSpecificOutput", {})), live_read
+    fenced = _giver_fenced_read(successor, "plan.md")
+    assert _last_block(_read(client, giver, "plan.md", "inc-1")) == fenced
 
     if ending == "completed":
         _read(client, successor, "plan.md")
@@ -10938,7 +11008,9 @@ def test_the_givers_next_touch_after_the_handoff_ended_reports_its_outcome(
         "withdrawn": "was withdrawn.",
     }[ending]
     expected = f"Handoff ended: your handoff of plan.md to agent {s} at v1 {outcome}"
-    assert _last_block(_read(client, giver, "plan.md", "inc-1")) == expected
+    ended_read = _read(client, giver, "plan.md", "inc-1")
+    assert _last_block(ended_read) == expected
+    assert fenced not in ended_read["hookSpecificOutput"]["additionalContext"], ended_read
     if ending != "completed":
         status, body = client.post(
             "/hooks/pre-edit", {"session_id": giver.sid, "path": "plan.md"},

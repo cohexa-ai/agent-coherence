@@ -287,6 +287,21 @@ HANDOFF_GIVER_DENY_REASON_TEMPLATE: str = (
 user's or host's instruction -- and tells the giver to stop and report, so the
 model has a next action that is not a retry."""
 
+HANDOFF_GIVER_READ_TEMPLATE: str = (
+    "Handoff: " + _HANDOFF_FENCED_CLAUSE + " "
+    + _HANDOFF_EXITS_SENTENCE + " "
+    + "Until the handoff ends, do not change {path} by any route, a shell "
+    + "command included. "
+    + _HANDOFF_STOP_SENTENCE
+)
+"""The live giver's admitted pre-read: context-only prose, appended after any
+stale warning or notice, so the generic "Re-acquire before writing" advice is
+followed by the specific statement that this session handed the path off. A
+read is not fenced and no hook stops a shell write: in a live measurement a
+giver took a silent re-read as an all-clear and appended to the file through
+the shell. The deny's fenced clause, exits and stop sentences, plus one
+sentence ruling out every route; same placeholders as the deny."""
+
 HANDOFF_EDIT_ON_DISK_SENTENCE: str = (
     "Your edit landed in your local worktree but was not given a version by "
     "the coordinator."
@@ -447,7 +462,10 @@ def handoff_context_text(
       (plus the read-before-editing sentence for an EXCLUSIVE hold, and the
       read-first warning when ``unread``), the overtaken sentence once a
       bystander took the path;
-    - giver: the outcome, once the record is no longer live;
+    - giver: while the record is live, that it handed the path off and may
+      not change it by any route -- reached on an admitted pre-read, since a
+      live giver's pre-edit is answered by its deny, which the seam leaves
+      untouched; the outcome once the record is no longer live;
     - bystander: the advisory naming giver and successor, while it is live.
 
     ``unread`` is the successor's acquire whose last observed version on the
@@ -461,7 +479,9 @@ def handoff_context_text(
             path=path, version_at_transfer=handoff["version_at_transfer"]
         )
     if handoff["role"] == HANDOFF_ROLE_GIVER:
-        return None if handoff["live"] else _giver_outcome(handoff, path)
+        if handoff["live"]:
+            return HANDOFF_GIVER_READ_TEMPLATE.format(**_handoff_fields(handoff, path))
+        return _giver_outcome(handoff, path)
     return _successor_context(handoff, path, unread=unread)
 
 
