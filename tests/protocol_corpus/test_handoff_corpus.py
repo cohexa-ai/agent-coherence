@@ -50,6 +50,7 @@ Marked ``protocol_corpus`` -- opt-in via ``pytest -m protocol_corpus``."""
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import NAMESPACE_URL, uuid5
@@ -76,7 +77,7 @@ from tests.protocol_corpus.harness import (
 pytestmark = pytest.mark.protocol_corpus
 
 _FIXTURE_DIR = "handoff"
-_EXPECTED_FIXTURE_COUNT = 38
+_EXPECTED_FIXTURE_COUNT = 39
 
 # Frozen expectations: deliberate duplicates of the code's vocabularies, per the
 # tests/CLAUDE.md house rule. A set derived from the code would move its own
@@ -162,6 +163,7 @@ _GIVER_ROUTE_FIXTURES: dict[str, str] = {
     "/hooks/pre-edit": "handoff-giver-pre-edit-is-denied-handed-off",
     "/hooks/post-edit-cas": "handoff-giver-compare-and-swap-is-refused-handed-off",
     "/hooks/post-edit": "handoff-giver-post-edit-commit-is-refused-with-the-handoff-arm",
+    "/hooks/pre-bash": "handoff-giver-shell-write-is-denied-handed-off",
 }
 
 # Each role's view of a record: the row, the role it is projected for, and
@@ -417,6 +419,39 @@ def test_the_givers_refusal_is_pinned_on_each_write_route() -> None:
     arm = _body(by_name[_GIVER_ROUTE_FIXTURES["/hooks/post-edit"]])["hookSpecificOutput"]
     assert arm["hookEventName"] == "PostToolUse" and "permissionDecision" not in arm
     assert _ON_DISK_SENTENCE in arm["additionalContext"]
+
+
+def test_the_givers_shell_write_row_is_python_only_and_names_a_shell_write() -> None:
+    """The shell-write row runs where a handoff exists, and its request is a
+    shell write that reads nothing -- so only the write check can answer it a
+    deny."""
+    fixture = _by_name()[_GIVER_ROUTE_FIXTURES["/hooks/pre-bash"]]
+    assert fixture.backends == (BACKEND_PYTHON,)
+    assert fixture.request["body"]["command"] == "echo '- gamma' >> plan.md"
+
+
+def test_the_givers_pre_edit_answers_the_shell_write_rows_body(tmp_path: Path) -> None:
+    """The shell-write row's setup with the giver's pre-edit on the handed-off
+    path instead of its shell write: the same expected body. Fails if the shell
+    route's deny drifts from the edit route's, even if the row were re-recorded
+    from a drifted shell route."""
+    fixture = _by_name()[_GIVER_ROUTE_FIXTURES["/hooks/pre-bash"]]
+    pre_edit = dataclasses.replace(fixture, request={
+        **fixture.request,
+        "path": "/hooks/pre-edit",
+        "body": {"session_id": fixture.request["body"]["session_id"], "path": "plan.md"},
+    })
+    status, body = run_scenario(
+        fixture=pre_edit, backend_id=BACKEND_PYTHON, workspace=tmp_path,
+        node_dist_path=_NODE_DIST_PATH,
+    )
+    assert status == fixture.expected["status"], body
+    assert body == normalize_response(
+        fixture.expected["body"],
+        ignore_keys=fixture.ignore_keys,
+        optional_keys=fixture.optional_keys,
+        preserve_identity=fixture.preserve_identity,
+    )
 
 
 def test_each_role_has_its_view_pinned() -> None:
