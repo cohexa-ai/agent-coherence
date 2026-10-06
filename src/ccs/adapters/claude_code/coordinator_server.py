@@ -3041,9 +3041,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         handed = coordinator.service.live_handoff_given_by(artifact_id, caller)
         if handed is not None:
             return _giver_deny_response(
-                coordinator,
-                GiverFenced(artifact_id, handed.successor, handed.version_at_transfer),
-                session_id=session_id, path=path, caller=caller,
+                coordinator, handed, session_id=session_id, path=path, caller=caller,
             )
         observed_before_acquire = coordinator.registry.last_observed_version_for(
             artifact_id, agent_id
@@ -3193,9 +3191,11 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # consumes the compact-pending flag. #185: while a record exists the
         # handoff key rides every arm but a deny (the giver's deny carries its
         # own), and an admit gets the handoff prose before the re-grounding
-        # block.
+        # block. work() runs first, on its own line: it is what sets
+        # ``observed_before_acquire``, which the attach then reads.
+        produced = work()
         result = _attach_hook_handoff(
-            coordinator, work(), path=path, caller=caller,
+            coordinator, produced, path=path, caller=caller,
             acquired=True, observed=observed_before_acquire,
         )
         return _deliver_pending_reground(
@@ -5084,7 +5084,8 @@ def _giver_fenced_body(
     The hook routes add their envelope beside it: the pre-edit deny
     (:func:`_giver_deny_response`) and the post-edit handoff arm
     (:func:`_giver_commit_refused_body`). The compare-and-swap and snapshot
-    routes answer it bare."""
+    routes answer it bare, and the giver's failed-edit report
+    (:func:`_handed_off_release`) adds its per-grant list."""
     body: dict = {"ok": False, "reason": GIVER_FENCED_REASON}
     if path is not None:
         body["path"] = path
@@ -5095,7 +5096,7 @@ def _giver_fenced_body(
 
 def _giver_deny_response(
     coordinator: CoordinatorHTTPServer,
-    exc: GiverFenced,
+    fence: GiverFenced | TransferRecord,
     *,
     session_id: str,
     path: str,
@@ -5114,12 +5115,12 @@ def _giver_deny_response(
     coordinator.increment_handoff_giver_denial()
     coordinator.record_strict_deny(session_id, path)
     body = {
-        **_giver_fenced_body(exc),
+        **_giver_fenced_body(fence),
         "hookSpecificOutput": _payloads.emit_handoff_giver_deny(
             source="pre_edit_handoff_giver_deny",
             path=path,
-            successor_id=str(exc.successor),
-            version_at_transfer=exc.version_at_transfer,
+            successor_id=str(fence.successor),
+            version_at_transfer=fence.version_at_transfer,
         ),
     }
     return _attach_handoff_key(coordinator, body, path=path, caller=caller)
