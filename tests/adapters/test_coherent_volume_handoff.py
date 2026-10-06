@@ -604,6 +604,48 @@ def test_an_unconfirmed_handoff_answer_raises_in_both_modes(
         stop_coordinator(tmp_path)
 
 
+#: Answers to accept, decline or withdraw that settle nothing: the
+#: coordinator's failure envelope, a refusal with no reason, no ``ok`` at all,
+#: and an ``ok`` that is not a boolean. Each verb may have landed.
+_UNCLASSIFIABLE_VERB_ANSWERS = [
+    {"ok": False, "reason": "internal: RuntimeError"},
+    {"ok": False},
+    {},
+    {"ok": "yes"},
+]
+
+
+@pytest.mark.parametrize("answer", _UNCLASSIFIABLE_VERB_ANSWERS)
+@pytest.mark.parametrize("verb", ["accept", "decline", "withdraw"])
+def test_a_verb_answer_that_is_not_a_typed_refusal_raises_unconfirmed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    verb: str, answer: dict,
+) -> None:
+    """Only the verbs' own typed refusals are a refusal that changed nothing.
+    Any other answer that is not ``ok: true`` -- the coordinator's failure
+    envelope, a refusal with no reason, an answer without ``ok`` -- does not
+    settle the outcome, and the verb may have landed: an accept may have
+    completed the handoff, a decline or withdraw ended it. Returned as a
+    refusal it would tell the caller nothing changed, so it raises the
+    unconfirmed terminal."""
+    _seed(tmp_path, _PLAN, b"plan v1")
+    volume = CoherentVolume(tmp_path, managed=_MANAGED, on_error="strict", config=fast_cfg)
+    try:
+        volume.read(_PLAN)
+        real_post = coherent_volume_module._coordinator_post
+
+        def unclassifiable(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            if path == f"/handoff/{verb}":
+                return dict(answer)
+            return real_post(endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", unclassifiable)
+        with pytest.raises(CommitUnconfirmed, match="no outcome this client can classify"):
+            getattr(volume, verb)(_PLAN)
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_a_transfer_whose_answer_is_lost_raises_in_degrade_mode(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

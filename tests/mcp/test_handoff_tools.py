@@ -22,6 +22,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+import ccs.adapters.coherent_volume as coherent_volume_module
 from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
@@ -48,6 +49,8 @@ OTHER = "data/other.md"
 #: terminal's wire reason and the recover verb the MCP surface gives it.
 _GIVER_REASON = "handed_off"
 _GIVER_RECOVER = "stop_and_report"
+#: FROZEN duplicate: the wire reason of an answer that does not settle an outcome.
+_UNCONFIRMED_REASON = "commit_unconfirmed"
 #: The recover verbs that would send a fenced giver back to try again: none of
 #: them can clear a fence keyed on the session.
 _LOOPING_RECOVERS = ("reacquire", "read_then_merge", "reacquire_and_reread", "wait_and_retry")
@@ -361,6 +364,39 @@ def test_the_transfer_tool_answers_per_grant_and_only_all_transferred_is_success
                 {"path": OTHER, "transferred": False, "reason": "handoff_not_held"},
             ],
         }
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("verb", "tool"), [("accept", _do_accept), ("decline", _do_decline), ("withdraw", _do_withdraw)]
+)
+def test_a_verb_tool_whose_answer_settles_nothing_is_the_unconfirmed_deny(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    verb: str, tool: object,
+) -> None:
+    """An answer the volume cannot classify (here the coordinator's failure
+    envelope) reaches the agent as the unconfirmed deny, which sends it to read
+    before acting again -- never as "refused ...; nothing changed", which would
+    be false if the verb landed."""
+    _seed(tmp_path, PLAN, b"plan v1")
+    config = _config(tmp_path)
+    volume = _vol(tmp_path, fast_cfg)
+    try:
+        _do_read(volume, config, PLAN)
+        real_post = coherent_volume_module._coordinator_post
+
+        def failure_envelope(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            if path == f"/handoff/{verb}":
+                return {"ok": False, "reason": "internal: RuntimeError"}
+            return real_post(endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", failure_envelope)
+        result = tool(volume, config, PLAN)  # type: ignore[operator]
+
+        assert result.isError is True
+        assert result.structuredContent["reason"] == _UNCONFIRMED_REASON
+        assert result.structuredContent["retryable"] is False
     finally:
         stop_coordinator(tmp_path)
 
