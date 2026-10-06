@@ -340,6 +340,23 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **Strict mode no longer lets a session write a file it was just refused a
+  read of.** A strict-mode deny of a Bash or Grep read re-grants the session's
+  SHARED read so that the retry the deny invites can run, and records no
+  observation, because the denied command never ran. The strict `pre-edit`
+  check looked only for an INVALID session, so that re-granted read also
+  admitted the session's next edit: a whole-file write from the copy it read
+  before a peer's commit then overwrote the commit, with nothing denied after
+  the shell read (#275). `pre-edit` on a strict path now also denies a SHARED
+  holder whose last observed version is older than the artifact's current one,
+  and the deny names that version; re-running the Bash command, or a `Read`,
+  records the current version and lifts it (after a Grep deny only a `Read`
+  does, because a Grep lists files rather than showing them). As everywhere
+  else, a read counts whole: a `head` or a line-limited `Read` is credited as
+  reading the current version. A session with no recorded observation is
+  still admitted like a first-time editor. Both coordinator backends; pinned by
+  strict-mode corpus fixtures 15 and 16.
+
 - **A `CoherentVolume` whose managed globs the coordinator does not enforce now
   fails closed instead of running unguarded.** An attaching volume adds no
   globs to a running coordinator's policy, so a volume that attached later with

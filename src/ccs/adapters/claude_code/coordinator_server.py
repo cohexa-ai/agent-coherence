@@ -2928,7 +2928,28 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # The original Unit 2 design — INVALID-only — is the right
             # gate for the Edit/Write surface: pre-edit strict-deny
             # fires after a session has been explicitly preempted.
-            editor_stale = editor_state == MESIState.INVALID
+            #
+            # A preempted session can also hold SHARED without having read
+            # the current version: a strict Bash / Grep deny re-arms SHARED
+            # so the retry it invites goes through, and records no
+            # observation because the command never ran (see
+            # ``_apply_bash_grep_regrants``). Admitting that grant lets a
+            # whole-file write from the copy read before the peer's commit
+            # overwrite the commit (#275), so it is stale too until a retried
+            # Bash command or a Read records the current version (a retried
+            # Grep records none: it never showed the file). A SHARED holder
+            # with no observation at all has acted on no version and is
+            # admitted like a first-time editor.
+            observed = (
+                coordinator.registry.last_observed_version_for(artifact_id, agent_id)
+                if editor_state == MESIState.SHARED else None
+            )
+            unobserved_shared = (
+                artifact is not None
+                and observed is not None
+                and observed < artifact.version
+            )
+            editor_stale = editor_state == MESIState.INVALID or unobserved_shared
             if artifact is not None and artifact.version > 0 and editor_stale:
                 last_writer_id = _last_writer_for(coordinator, artifact_id)
                 last_writer_ts = (
@@ -2937,7 +2958,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 summary: _payloads.StaleSummary = {
                     "path": path,
                     "current_version": artifact.version,
-                    "prior_version_seen_by_session": _prior_version_observed(
+                    "prior_version_seen_by_session": observed if unobserved_shared else _prior_version_observed(
                         coordinator, artifact_id, agent_id,
                         agent_state=editor_state,
                         current_version=artifact.version,
