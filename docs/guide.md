@@ -1643,9 +1643,13 @@ the other grants of the same request still transfer:
 
 Match on the whole value; the reasons may grow, and none is ever renamed.
 
-**Sending the same transfer again is safe.** A grant whose live record already
-names the same giver and successor answers `transferred: true` with the
-record's current status, and nothing moves. While its record is live, the giver
+**Sending the same transfer again is safe while its record is live.** A grant
+whose live record already names the same giver and successor answers
+`transferred: true` with the record's current status, and nothing moves. A
+request carries no version, so once the path's version has moved -- the
+successor or anyone else wrote it -- a re-send cannot be told from a new
+transfer: from a giver that holds a claim on the path again (a read registers
+one), it records a new handoff at the new version and fences the giver again. While its record is live, the giver
 naming a *different* successor for the path replaces the record: the new one is
 `pending` for the new successor, at the same version at transfer and hold
 shape. A late re-send naming the replaced successor answers `handoff_ended`
@@ -1664,8 +1668,10 @@ it is answered per grant, as above.
 **A timed-out transfer** answers
 `{"ok": false, "degraded": true, "reason": "handoff_transfer_unconfirmed"}`.
 The outcome is unknown: either nothing landed or every grant that would have
-transferred did. Send the same transfer again — a transfer that landed answers
-its record's status — or read the path's `handoff` key on `/status`.
+transferred did. Read the path's `handoff` key on `/status` first: a transfer
+that landed shows its record there, live or ended. Send the same transfer
+again only when it shows no handoff from you to that successor; while one is
+live, the re-send answers its status and moves nothing.
 
 ### Accept, decline and withdraw
 
