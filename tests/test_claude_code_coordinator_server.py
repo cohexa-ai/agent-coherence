@@ -10269,10 +10269,11 @@ def test_a_handoff_verb_cut_short_by_the_watchdog_answers_unconfirmed_and_lands_
 
 
 def _giver_refusal(giver: _Session, successor: _Session, *, shape: str) -> dict:
-    """What a fenced giver's write answers: the typed reason with the
-    successor and the version at transfer as top-level fields, and the
-    ``handoff`` key -- no ``hookSpecificOutput`` and no prose (the hook
-    client's deny envelope comes with the hook-path handoff work)."""
+    """What a fenced giver's write answers on the compare-and-swap route: the
+    typed reason with the successor and the version at transfer as top-level
+    fields, and the ``handoff`` key. The pre-edit and post-edit routes add
+    their hook envelope beside it (:func:`_giver_deny_envelope`,
+    :func:`_commit_arm_envelope`)."""
     return {
         "ok": False, "reason": "handed_off", "successor": successor.agent,
         "version_at_transfer": 1,
@@ -10280,20 +10281,58 @@ def _giver_refusal(giver: _Session, successor: _Session, *, shape: str) -> dict:
     }
 
 
+def _giver_deny_envelope(successor: _Session, path: str, version: int = 1) -> dict:
+    """The giver's pre-edit deny envelope, as a literal (KTD5)."""
+    s = successor.agent[:8]
+    return {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": (
+            f"Edit denied: you handed {path} to agent {s} at v{version}, so this "
+            f"session can no longer write it. The handoff ends when agent {s} "
+            f"writes {path}, when agent {s} declines it, or when you withdraw it "
+            f"on your user's or host's instruction. Stop and report to your user "
+            f"that {path} was handed off. This denial is structural; retrying "
+            f"the same operation will produce the same denial."
+        ),
+    }
+
+
+def _commit_arm_envelope(successor: _Session, path: str, version: int = 1) -> dict:
+    """The post-edit handoff arm in the post-tool context envelope, as a
+    literal (AE3, KTD6)."""
+    s = successor.agent[:8]
+    return {
+        "hookEventName": "PostToolUse",
+        "additionalContext": (
+            f"Commit refused: you handed {path} to agent {s} at v{version}, so "
+            f"this session can no longer write it. Your edit landed in your local "
+            f"worktree but was not given a version by the coordinator. The "
+            f"handoff ends when agent {s} writes {path}, when agent {s} declines "
+            f"it, or when you withdraw it on your user's or host's instruction. "
+            f"Stop and report to your user that {path} was handed off."
+        ),
+    }
+
+
 def test_a_fenced_givers_pre_edit_is_refused_with_the_typed_reason(
     coordinator, client: _Client
 ) -> None:
     """The giver's pessimistic re-acquire, from a fresh incarnation,
-    is refused with the typed reason and takes no grant. Without its own arm
-    ahead of the generic CoherenceError one, the refusal would be answered as
-    the exception's prose."""
+    is refused with the typed reason at the top level and the deny envelope
+    beside it, and takes no grant. Without its own arm ahead of the generic
+    CoherenceError one, the refusal would be answered as the exception's
+    prose; without the envelope the hook client would let the edit proceed."""
     giver, successor = _claimed(client), _claimed(client)
     _hand_off(client, giver, successor, "plan.md")
     answer = client.post(
         "/hooks/pre-edit", {"session_id": giver.sid, "agent_id": "inc-2", "path": "plan.md"},
         principal=giver.principal,
     )
-    assert answer == (200, _giver_refusal(giver, successor, shape="SHARED"))
+    assert answer == (200, {
+        **_giver_refusal(giver, successor, shape="SHARED"),
+        "hookSpecificOutput": _giver_deny_envelope(successor, "plan.md"),
+    })
     assert _state(coordinator, "plan.md", giver.composite("inc-2")) is None
 
 
@@ -10316,7 +10355,10 @@ def test_a_fenced_givers_post_edit_commit_is_refused_with_the_typed_reason(
         "content_hash": _hash("late-edit"),
     }, principal=giver.principal)
 
-    assert answer == (200, _giver_refusal(giver, successor, shape="EXCLUSIVE"))
+    assert answer == (200, {
+        **_giver_refusal(giver, successor, shape="EXCLUSIVE"),
+        "hookSpecificOutput": _commit_arm_envelope(successor, "plan.md"),
+    })
     assert _artifact_version(coordinator, "plan.md") == 1
 
 
@@ -10580,7 +10622,8 @@ def test_the_read_and_edit_bodies_carry_the_handoff_key_only_while_a_record_exis
         "/hooks/pre-edit", {"session_id": bystander.sid, "path": "plan.md"},
         principal=bystander.principal,
     ) == (200, {"ok": True, "handoff": _projection(
-        giver, successor, "bystander", status="overtaken", counterparty=bystander.agent)})
+        giver, successor, "bystander", status="overtaken", counterparty=bystander.agent),
+        "hookSpecificOutput": _context(_advisory(giver, successor, "plan.md"))})
     assert client.post("/hooks/post-edit", {
         "session_id": bystander.sid, "path": "plan.md", "success": True,
         "content_hash": _hash("plan-v2"),
@@ -10627,6 +10670,305 @@ def test_a_compare_and_swap_win_carries_its_handoff_outcome(
     read = _read(client, giver, "plan.md")
     assert read["handoff"] == _projection(giver, successor, "giver", status="completed", live=False)
 
+
+# --- the handoff prose on the hook envelopes (KTD6) ---------------------------
+#
+# Hook clients get the handoff as prose too: provenance, the read-first
+# warning, the bystander advisory and the giver's outcome through the
+# context-only PreToolUse envelope on admits, and the handoff arm through the
+# PostToolUse envelope on the giver's refused commit. Every expected sentence
+# is a hand-written literal; the short ids in it are the first eight characters
+# of the session-level ids the test computes from its own session ids.
+
+
+def _context(text: str) -> dict:
+    """A context-only PreToolUse envelope: prose, and no permission decision."""
+    return {"hookEventName": "PreToolUse", "additionalContext": text}
+
+
+def _last_block(body: dict) -> str:
+    """The last paragraph of an admit's additionalContext: where the handoff
+    prose lands, after any notice or stale warning."""
+    return body["hookSpecificOutput"]["additionalContext"].split("\n\n")[-1]
+
+
+def _advisory(giver: _Session, successor: _Session, path: str, version: int = 1) -> str:
+    return (
+        f"Handoff in progress: agent {giver.agent[:8]} handed {path} to agent "
+        f"{successor.agent[:8]} at v{version}. This session is not a party to it; "
+        f"its edits are admitted and are recorded as overtaking the handoff."
+    )
+
+
+def _provenance(giver: _Session, path: str, *, version: int, shape: str) -> str:
+    g = giver.agent[:8]
+    text = (
+        f"Handoff: agent {g} handed {path} to this session at v{version}; the "
+        f"hold it gave up was {shape}."
+    )
+    if shape == "EXCLUSIVE":
+        text += (
+            f" Agent {g} held an uncommitted write claim when it handed {path} "
+            f"on, so the file on disk may differ from v{version}; read {path} "
+            f"before editing it."
+        )
+    return text
+
+
+def _read_first(path: str, version: int) -> str:
+    return f"⚠ You have not read {path} at v{version} or later; read it before editing."
+
+
+def _ended_unrecorded(path: str, version: int = 1) -> str:
+    return (
+        f"Handoff ended: the handoff of {path} at v{version} was ended by a write "
+        f"at a later version whose writer was not recorded."
+    )
+
+
+def _cas(client: _Client, who: _Session, path: str, expected: int, label: str) -> dict:
+    status, answer = client.post("/hooks/post-edit-cas", {
+        "session_id": who.sid, "path": path, "content_hash": _hash(label),
+        "expected_version": expected,
+    }, principal=who.principal)
+    assert status == 200, answer
+    return answer
+
+
+def _hand_off_shape(client: _Client, giver: _Session, successor: _Session, shape: str) -> int:
+    """``giver`` takes ``plan.md`` in ``shape`` and hands it to ``successor``;
+    answers the version at transfer."""
+    if shape == "SHARED":
+        _read(client, giver, "plan.md")
+    else:
+        _pre_edit_with(client, giver.sid, giver.principal, "plan.md")
+    if shape == "MODIFIED":
+        status, body = client.post("/hooks/post-edit", {
+            "session_id": giver.sid, "path": "plan.md", "success": True,
+            "content_hash": _hash("plan-v2"),
+        }, principal=giver.principal)
+        assert body == {"ok": True}, body
+    version = 2 if shape == "MODIFIED" else 1
+    answer = _transfer(client, giver, successor.agent, [{"path": "plan.md"}])
+    assert answer == (200, {"ok": True, "grants": [
+        _handed(giver, successor, "plan.md", version=version, shape=shape)]}), answer
+    return version
+
+
+def test_the_handoff_prose_templates_are_static() -> None:
+    """The successor's and bystander's prose and the ended outcomes are
+    under the deny's placeholder rule: short agent ids, the path, the version
+    at transfer and the hold shape only -- no timestamp -- so the corpus can
+    pin their bytes (R38)."""
+    import re
+
+    from ccs.adapters.claude_code import hook_payloads as payloads
+
+    def placeholders(template: str) -> set[str]:
+        return set(re.findall(r"\{([a-z_]+)\}", template))
+
+    assert placeholders(payloads.HANDOFF_PROVENANCE_TEMPLATE) == {
+        "giver_short", "path", "version_at_transfer", "hold_shape"}
+    assert placeholders(payloads.HANDOFF_UNCOMMITTED_CLAIM_TEMPLATE) == {
+        "giver_short", "path", "version_at_transfer"}
+    assert placeholders(payloads.HANDOFF_READ_FIRST_TEMPLATE) == {"path", "version_at_transfer"}
+    assert placeholders(payloads.HANDOFF_OVERTAKEN_TEMPLATE) == {
+        "path", "giver_short", "version_at_transfer", "counterparty_short"}
+    assert placeholders(payloads.HANDOFF_BYSTANDER_ADVISORY_TEMPLATE) == {
+        "giver_short", "path", "successor_short", "version_at_transfer"}
+    assert placeholders(payloads.HANDOFF_ENDED_UNRECORDED_TEMPLATE) == {
+        "path", "version_at_transfer"}
+    for template in payloads.HANDOFF_GIVER_OUTCOME_TEMPLATES.values():
+        assert placeholders(template) <= {
+            "path", "successor_short", "version_at_transfer", "counterparty_short"}, template
+
+
+def test_the_givers_post_edit_refusal_renders_the_handoff_arm_in_the_post_tool_envelope(
+    coordinator, client: _Client
+) -> None:
+    """Covers AE3. A held ``plan.md`` EXCLUSIVE and handed it to B; A's
+    in-flight edit then reports success. The commit is refused with the typed
+    reason, and the handoff arm -- the three exits and the statement that the
+    edit is on disk without a version -- reaches the hook client through the
+    post-tool context envelope. It is not the preemption or reclaim arm: no
+    ``preempted`` or ``reclaimed`` flag, and no such wording. A second report
+    answers the same bytes."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off_shape(client, giver, successor, "EXCLUSIVE")
+    report = {
+        "session_id": giver.sid, "path": "plan.md", "success": True,
+        "content_hash": _hash("late-edit"),
+    }
+    first = client.post("/hooks/post-edit", report, principal=giver.principal)
+    second = client.post("/hooks/post-edit", report, principal=giver.principal)
+
+    assert first == (200, {
+        "ok": False, "reason": "handed_off", "successor": successor.agent,
+        "version_at_transfer": 1,
+        "hookSpecificOutput": _commit_arm_envelope(successor, "plan.md"),
+        "handoff": _projection(giver, successor, "giver", shape="EXCLUSIVE"),
+    })
+    assert second == first
+    arm = first[1]["hookSpecificOutput"]["additionalContext"]
+    assert "preempt" not in arm and "reclaim" not in arm, arm
+
+
+@pytest.mark.parametrize("shape", ["EXCLUSIVE", "MODIFIED", "SHARED"])
+def test_the_successors_provenance_reads_before_editing_only_for_an_exclusive_hold(
+    coordinator, client: _Client, shape: str
+) -> None:
+    """R17 and KTD6. The successor's reads carry its provenance -- by which
+    agent, at which version, from which hold shape -- in the context-only
+    envelope, after its stale warning on the first read and alone on the
+    next, byte for byte the same. The read-before-editing sentence rides the
+    EXCLUSIVE shape only: the giver may have written without committing.
+    MODIFIED committed what it wrote and SHARED never held a write claim."""
+    giver, successor = _claimed(client), _claimed(client)
+    version = _hand_off_shape(client, giver, successor, shape)
+    expected = _provenance(giver, "plan.md", version=version, shape=shape)
+
+    first = _read(client, successor, "plan.md")
+    assert first["hookSpecificOutput"]["permissionDecision"] == "allow", first
+    assert first["hookSpecificOutput"]["additionalContext"].endswith("\n\n" + expected), first
+    second = _read(client, successor, "plan.md")
+    assert second == {
+        "status": "fresh", "version": version,
+        "handoff": _projection(giver, successor, "successor", shape=shape)
+        | {"version_at_transfer": version},
+        "hookSpecificOutput": _context(expected),
+    }
+
+
+@pytest.mark.parametrize("observed", ["never", "at_transfer", "below_transfer"])
+def test_the_successors_pre_edit_is_admitted_with_provenance_and_a_read_first_warning(
+    coordinator, client: _Client, observed: str
+) -> None:
+    """Covers AE5 and R18. The successor's pre-edit is admitted -- never
+    denied -- and completes the handoff; its body carries the provenance in
+    the context-only envelope with no permission decision (nothing through
+    the allow emitter), plus the read-first warning exactly when the version
+    it last observed is absent or below the version at transfer."""
+    giver, successor = _claimed(client), _claimed(client)
+    if observed != "never":
+        _read(client, successor, "plan.md")
+    if observed == "below_transfer":
+        version = _hand_off_shape(client, giver, successor, "MODIFIED")
+        shape = "MODIFIED"
+    else:
+        version = _hand_off_shape(client, giver, successor, "EXCLUSIVE")
+        shape = "EXCLUSIVE"
+    expected = _provenance(giver, "plan.md", version=version, shape=shape)
+    if observed != "at_transfer":
+        expected += " " + _read_first("plan.md", version)
+
+    answer = client.post(
+        "/hooks/pre-edit", {"session_id": successor.sid, "path": "plan.md"},
+        principal=successor.principal,
+    )
+
+    assert answer == (200, {
+        "ok": True,
+        "handoff": _projection(giver, successor, "successor", shape=shape, status="completed")
+        | {"version_at_transfer": version},
+        "hookSpecificOutput": _context(expected),
+    })
+
+
+def test_a_bystander_is_advised_and_its_commit_reports_overtaken_to_the_successor(
+    coordinator, client: _Client
+) -> None:
+    """Covers AE8 (R23, R24). C's pre-edit on A's live handoff to B is
+    admitted with the advisory naming A and B; after C commits, B's next
+    read reports the handoff overtaken by C, and so does A's (its outcome)."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+
+    answer = client.post(
+        "/hooks/pre-edit", {"session_id": bystander.sid, "path": "plan.md"},
+        principal=bystander.principal,
+    )
+    assert answer == (200, {
+        "ok": True,
+        "handoff": _projection(
+            giver, successor, "bystander", status="overtaken", counterparty=bystander.agent),
+        "hookSpecificOutput": _context(_advisory(giver, successor, "plan.md")),
+    })
+    status, body = client.post("/hooks/post-edit", {
+        "session_id": bystander.sid, "path": "plan.md", "success": True,
+        "content_hash": _hash("plan-v2"),
+    }, principal=bystander.principal)
+    assert body["ok"] is True and "hookSpecificOutput" not in body, body
+
+    g, c = giver.agent[:8], bystander.agent[:8]
+    assert _last_block(_read(client, successor, "plan.md")) == (
+        f"Handoff overtaken: the handoff of plan.md to this session from agent {g} "
+        f"at v1 was overtaken by agent {c}."
+    )
+    assert _last_block(_read(client, giver, "plan.md", "inc-1")) == (
+        f"Handoff ended: your handoff of plan.md to agent {successor.agent[:8]} at v1 "
+        f"was overtaken by agent {c}."
+    )
+
+
+@pytest.mark.parametrize("ending", ["completed", "declined", "withdrawn"])
+def test_the_givers_next_touch_after_the_handoff_ended_reports_its_outcome(
+    coordinator, client: _Client, ending: str
+) -> None:
+    """R14. Once the record is no longer live, the giver's next touch
+    reports how its handoff ended -- and, the fence lifted, a pre-edit is an
+    admit that carries it too. While the record was live it said nothing on a
+    read: the deny and the refused commit are what speak to a live giver."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    live_read = _read(client, giver, "plan.md", "inc-1")
+    assert "Handoff" not in json.dumps(live_read.get("hookSpecificOutput", {})), live_read
+
+    if ending == "completed":
+        _read(client, successor, "plan.md")
+        assert _cas(client, successor, "plan.md", 1, "plan-v2")["ok"] is True
+    elif ending == "declined":
+        assert _verb(client, _DECLINE, successor, "plan.md")[1]["ok"] is True
+    else:
+        assert _verb(client, _WITHDRAW, giver, "plan.md")[1]["ok"] is True
+
+    s = successor.agent[:8]
+    outcome = {
+        "completed": f"was completed by agent {s}.",
+        "declined": f"was declined by agent {s}.",
+        "withdrawn": "was withdrawn.",
+    }[ending]
+    expected = f"Handoff ended: your handoff of plan.md to agent {s} at v1 {outcome}"
+    assert _last_block(_read(client, giver, "plan.md", "inc-1")) == expected
+    if ending != "completed":
+        status, body = client.post(
+            "/hooks/pre-edit", {"session_id": giver.sid, "path": "plan.md"},
+            principal=giver.principal,
+        )
+        assert body["ok"] is True and body["hookSpecificOutput"] == _context(expected), body
+
+
+def test_a_record_ended_by_an_unrecorded_writer_says_so_to_giver_and_successor(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """KTD6. The successor's win lands but its label write fails, so the
+    version moved while the record still says pending: it is no longer live,
+    and nothing recorded who ended it. Giver and successor are both told the
+    one static sentence for that case, not a completion nobody recorded."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _read(client, successor, "plan.md")
+
+    def failing_label_write(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("injected label-write failure")
+
+    monkeypatch.setattr(coordinator.registry, "set_transfer_status", failing_label_write)
+    assert _cas(client, successor, "plan.md", 1, "plan-v2")["version"] == 2
+    record, live = _record(coordinator, "plan.md")
+    assert (record.status, live) == ("pending", False)
+
+    assert _last_block(_read(client, giver, "plan.md", "inc-1")) == _ended_unrecorded("plan.md")
+    assert _read(client, successor, "plan.md")["hookSpecificOutput"] == _context(
+        _ended_unrecorded("plan.md"))
 
 # ----------------------------------------------------------------------
 # The handoff key on /status (#185)

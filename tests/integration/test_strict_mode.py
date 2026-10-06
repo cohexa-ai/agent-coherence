@@ -44,6 +44,9 @@ from ccs.adapters.claude_code.coordinator_server import (
     session_to_agent_id,
 )
 from ccs.adapters.claude_code.hook_payloads import (
+    HANDOFF_EDIT_ON_DISK_SENTENCE,
+    HANDOFF_GIVER_COMMIT_REFUSED_TEMPLATE,
+    HANDOFF_GIVER_DENY_REASON_TEMPLATE,
     STRICT_MODE_DENY_REASON_TEMPLATE,
     TERMINAL_DENIAL_CLASSES,
     emit_allow,
@@ -1403,3 +1406,296 @@ def test_crediting_a_held_read_never_restores_a_revoked_grant(
     )
     assert _mesi(strict_coordinator, "plan.md", "A") == MESIState.INVALID
     assert _observed(strict_coordinator, "plan.md", "A") == 1
+
+
+# ----------------------------------------------------------------------
+# The giver's pre-edit deny (#185, R13/R14/R38, KTD5)
+# ----------------------------------------------------------------------
+#
+# The third byte-stable deny template. It gets the strict template's three
+# pins -- placeholder lock, byte-stable across retries (and across strict and
+# warn mode, since it fires in both), no version pair on a deny -- plus a
+# negative pin: neither it nor the post-edit handoff arm may carry the way to
+# lift the fence. A deny whose text hands the model the command that ends it is
+# a self-bypass the measured retry loop would take.
+
+#: FROZEN: every console-script family this package installs (the planned
+#: handoff verbs are ``agent-coherence-transfer`` / ``-accept`` / ``-decline``
+#: / ``-withdraw``), the withdraw route, a call or tool spelling of the verb,
+#: and the shell syntax an invocation would need. Hand-written, never derived
+#: from the templates under test.
+_NO_INVOCATION_MARKERS: tuple[str, ...] = (
+    "agent-coherence",
+    "ccs-",
+    "stale-write-guard",
+    "/handoff",
+    "handoff_withdraw",
+    "withdraw_handoff",
+    "withdraw(",
+    "`",
+    "--",
+)
+
+_HANDOFF_PATH = "notes.md"
+
+
+def _handoff_policy(workspace: Path, *, strict: bool) -> None:
+    """``notes.md`` handed off, ``other.md`` the successor's registration
+    path; both tracked, ``notes.md`` strict when asked."""
+    _write_policy(
+        workspace,
+        tracked=[_HANDOFF_PATH, "other.md"],
+        strict=[_HANDOFF_PATH] if strict else [],
+    )
+
+
+class _Running:
+    """A coordinator on its own workspace, for comparing strict and warn mode
+    on the same path."""
+
+    def __init__(self, workspace: Path, *, strict: bool) -> None:
+        workspace.mkdir(parents=True, exist_ok=True)
+        _handoff_policy(workspace, strict=strict)
+        self.server = CoordinatorHTTPServer(
+            workspace, port=0, instance_id=f"handoff-{'strict' if strict else 'warn'}",
+        )
+        self.server.serve_in_thread()
+        time.sleep(0.05)
+        secret = load_secret(self.server.coordinator_root)
+        assert secret is not None
+        self.client = _Client("127.0.0.1", self.server.port, secret)
+
+    def __enter__(self) -> "_Running":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.server.shutdown()
+
+
+def _hand_off_notes(client: _Client) -> None:
+    """G reads notes.md (SHARED on v1) and hands it to S. S registers on
+    another path first, so the coordinator knows it without S observing
+    notes.md. No principal is claimed: the transfer is require-class, which
+    admits a session nobody claimed."""
+    client.post("/hooks/pre-read", {"session_id": _sid("S"), "path": "other.md"})
+    client.post("/hooks/pre-read", {"session_id": _sid("G"), "path": _HANDOFF_PATH})
+    status, answer = client.post("/handoff/transfer", {
+        "session_id": _sid("G"),
+        "successor": str(session_to_agent_id(_sid("S"))),
+        "grants": [{"path": _HANDOFF_PATH}],
+    })
+    assert status == 200 and answer["ok"] is True, answer
+
+
+def _expected_giver_deny_reason() -> str:
+    """The rendered deny, as a literal. The successor's short id is computed
+    from the session id this test supplies."""
+    s = session_to_agent_id(_sid("S")).hex[:8]
+    return (
+        f"Edit denied: you handed notes.md to agent {s} at v1, so this "
+        f"session can no longer write it. The handoff ends when agent {s} "
+        f"writes notes.md, when agent {s} declines it, or when you withdraw it "
+        f"on your user's or host's instruction. Stop and report to your user "
+        f"that notes.md was handed off. This denial is structural; retrying "
+        f"the same operation will produce the same denial."
+    )
+
+
+def test_handoff_giver_deny_reason_template_is_static() -> None:
+    """KTD5 placeholder lock, the strict template's first pin: only the path,
+    the successor's short id and the version at transfer. A timestamp or a
+    per-invocation field would rotate the bytes across retries, which the
+    Phase 0 measurement showed worsens the retry loop."""
+    actual = set(re.findall(r"\{([a-z_]+)\}", HANDOFF_GIVER_DENY_REASON_TEMPLATE))
+    assert actual == {"path", "successor_short", "version_at_transfer"}, actual
+
+
+def test_post_edit_handoff_arm_template_is_static() -> None:
+    """The post-edit handoff arm is under the same lock, and its
+    on-disk-without-a-version sentence carries no placeholder at all."""
+    actual = set(re.findall(r"\{([a-z_]+)\}", HANDOFF_GIVER_COMMIT_REFUSED_TEMPLATE))
+    assert actual == {"path", "successor_short", "version_at_transfer"}, actual
+    assert re.findall(r"\{[^}]*\}", HANDOFF_EDIT_ON_DISK_SENTENCE) == []
+    assert HANDOFF_EDIT_ON_DISK_SENTENCE in HANDOFF_GIVER_COMMIT_REFUSED_TEMPLATE
+
+
+@pytest.mark.parametrize(
+    "template",
+    [HANDOFF_GIVER_DENY_REASON_TEMPLATE, HANDOFF_GIVER_COMMIT_REFUSED_TEMPLATE],
+    ids=["pre_edit_deny", "post_edit_arm"],
+)
+def test_handoff_giver_prose_names_no_console_script_and_no_withdraw_invocation(
+    template: str,
+) -> None:
+    """KTD5 negative pin, beside the placeholder lock: the deny and the
+    post-edit arm name withdraw only as the giver's exit taken on its user's
+    or host's instruction. A console-script name, a route or a call spelling
+    in these bytes would hand the model the command that lifts its own fence."""
+    present = [marker for marker in _NO_INVOCATION_MARKERS if marker in template]
+    assert present == [], f"invocation markers in the giver prose: {present}"
+    assert "on your user's or host's instruction" in template
+
+
+def test_terminal_denial_classes_includes_the_handoff_giver_deny() -> None:
+    """The giver's deny class is terminal, beside the strict-mode one."""
+    assert "permissions_deny_handoff_giver" in TERMINAL_DENIAL_CLASSES
+
+
+@pytest.mark.parametrize("source", ALLOW_EMISSION_SOURCES)
+def test_emit_allow_refuses_the_handoff_giver_denial_class(source: str) -> None:
+    """KTD-U for the third template: no allow call site can convert the
+    giver's deny. Goes red if the class leaves the terminal set."""
+    with pytest.raises(AssertionError, match="TERMINAL_DENIAL_CLASSES"):
+        emit_allow(source=source, denial_class="permissions_deny_handoff_giver")
+
+
+def test_the_allow_emission_roster_is_unchanged_by_the_handoff_prose() -> None:
+    """The handoff provenance, warning, advisory and outcome ride the
+    context-only envelopes, never the allow emitter: the roster stays at the
+    seven sites it had before the handoff, so a new allow path for them would
+    have to change this count deliberately."""
+    assert len(ALLOW_EMISSION_SOURCES) == 7, ALLOW_EMISSION_SOURCES
+
+
+@pytest.mark.parametrize("strict", [True, False], ids=["strict", "warn"])
+def test_the_givers_pre_edit_is_denied_with_the_typed_reason_and_no_version_pair(
+    tmp_path: Path, strict: bool,
+) -> None:
+    """Covers AE4. The giver's pre-edit is denied inside the hook deny
+    envelope, with the typed reason at the top level beside it, in warn mode
+    as in strict mode -- so warn mode cannot re-take the path one turn later.
+    No version pair rides the deny even when the caller opts in. In strict
+    mode this fails if the strict stale branch runs first: the transfer left
+    the giver INVALID, so it would answer the strict template instead."""
+    with _Running(tmp_path / "ws", strict=strict) as running:
+        _hand_off_notes(running.client)
+        status, body = running.client.post("/hooks/pre-edit", {
+            "session_id": _sid("G"), "path": _HANDOFF_PATH, "want_owner_generation": True,
+        })
+    assert status == 200
+    assert body["ok"] is False and body["reason"] == "handed_off", body
+    assert body["successor"] == str(session_to_agent_id(_sid("S")))
+    assert body["version_at_transfer"] == 1
+    assert body["hookSpecificOutput"] == {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": _expected_giver_deny_reason(),
+    }
+    assert "owner_generation" not in body and "version" not in body, body
+
+
+def test_the_givers_deny_bytes_are_identical_across_retries_and_modes(tmp_path: Path) -> None:
+    """Covers AE4. The same reason bytes on a second attempt and in the other
+    mode: the template is static and fires ahead of the strict branch."""
+    reasons: list[str] = []
+    for strict in (False, True):
+        with _Running(tmp_path / ("strict" if strict else "warn"), strict=strict) as running:
+            _hand_off_notes(running.client)
+            for _ in range(2):
+                _, body = running.client.post(
+                    "/hooks/pre-edit", {"session_id": _sid("G"), "path": _HANDOFF_PATH},
+                )
+                reasons.append(body["hookSpecificOutput"]["permissionDecisionReason"])
+    assert reasons == [_expected_giver_deny_reason()] * 4, reasons
+
+
+def test_the_givers_deny_bumps_its_own_counter_only_and_writes_no_audit_line(
+    tmp_path: Path,
+) -> None:
+    """KTD5 bookkeeping, on a strict path where the strict branch would move
+    both other counters: each deny bumps the giver-deny counter once, the
+    strict-mode denial and stale-warning counters stay where they were, and
+    no audit line is written (the strict appender would mislabel it)."""
+    from ccs.adapters.claude_code.audit_log import _resolve_audit_log_path
+
+    with _Running(tmp_path / "ws", strict=True) as running:
+        _hand_off_notes(running.client)
+        before = running.server.counters_snapshot()
+        for _ in range(2):
+            running.client.post("/hooks/pre-edit", {"session_id": _sid("G"), "path": _HANDOFF_PATH})
+        after = running.server.counters_snapshot()
+        audit = _resolve_audit_log_path(running.server.coordinator_root)
+        assert (
+            after["handoff_giver_denials_total"] - before["handoff_giver_denials_total"],
+            after["strict_mode_denials_total"] - before["strict_mode_denials_total"],
+            after["stale_warning_emitted_total"] - before["stale_warning_emitted_total"],
+        ) == (2, 0, 0), (before, after)
+        assert not audit.exists(), audit.read_text()
+
+
+def test_a_shell_read_after_the_givers_deny_counts_as_a_route_around(tmp_path: Path) -> None:
+    """KTD5: the giver's deny is recorded in the route-around detector's map,
+    so a read-shaped shell command on the same path from the same session
+    within the window is counted as routing around it. The giver is INVALID
+    on the strict path after its transfer, so the shell read is strict-denied
+    and checks the map. Fails if the deny stops recording itself there."""
+    with _Running(tmp_path / "ws", strict=True) as running:
+        _hand_off_notes(running.client)
+        running.client.post("/hooks/pre-edit", {"session_id": _sid("G"), "path": _HANDOFF_PATH})
+        before = running.server.counters_snapshot()["strict_mode_routed_around_via_bash_total"]
+        _, body = running.client.post(
+            "/hooks/pre-bash", {"session_id": _sid("G"), "command": "cat notes.md"},
+        )
+        after = running.server.counters_snapshot()["strict_mode_routed_around_via_bash_total"]
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+    assert after == before + 1
+
+
+# ----------------------------------------------------------------------
+# A live record changes no strict deny and no shell body (#185, R29)
+# ----------------------------------------------------------------------
+#
+# The corpus rows below are replayed as recorded, then one transfer lands a
+# live record on the denied path -- B, which committed the write, hands its
+# claim to A, the very session the row's request comes from -- and the row's
+# own request must still answer the row's own bytes: no ``handoff`` key and no
+# prose inside or beside a strict deny, and pre-bash / pre-grep untouched.
+
+
+@pytest.mark.parametrize("row", [
+    "01-pre-read-strict-tracked-stale-denies.json",
+    "05-pre-edit-strict-tracked-stale-denies.json",
+    "06-pre-bash-strict-tracked-stale-denies.json",
+    "08-pre-grep-strict-tracked-stale-denies.json",
+])
+def test_a_strict_corpus_row_answers_its_bytes_with_a_live_record_on_its_path(
+    tmp_path: Path, row: str,
+) -> None:
+    """R29: a strict deny's bytes, and the pre-bash and pre-grep bodies, are
+    the corpus row's bytes while a live record names the denied session as
+    successor. Fails if the ``handoff`` key or any handoff prose is attached
+    to a strict deny, or if the shell routes start carrying either."""
+    from tests.protocol_corpus.harness import (
+        BACKEND_PYTHON,
+        apply_preflight_requests,
+        apply_setup,
+        coordinator_running,
+        execute_request,
+        load_fixtures,
+        normalize_response,
+    )
+
+    [fixture] = [f for f in load_fixtures("strict_mode") if f.path.name == row]
+    preflight = fixture.setup["preflight_requests"]
+    giver_sid = preflight[-1]["body"]["session_id"]
+    successor_sid = fixture.request["body"]["session_id"]
+    path = preflight[-1]["body"]["path"]
+    apply_setup(tmp_path, fixture.setup)
+    with coordinator_running(BACKEND_PYTHON, tmp_path) as backend:
+        apply_preflight_requests(backend, preflight)
+        status, answer = execute_request(backend, {"method": "POST", "path": "/handoff/transfer", "body": {
+            "session_id": giver_sid,
+            "successor": str(session_to_agent_id(successor_sid)),
+            "grants": [{"path": path}],
+        }})
+        assert status == 200 and answer["ok"] is True, answer
+        assert answer["grants"][0]["status"] == "pending", answer
+        status, body = execute_request(backend, fixture.request)
+
+    def normalized(value: dict) -> dict:
+        return normalize_response(
+            value, ignore_keys=fixture.ignore_keys, optional_keys=fixture.optional_keys,
+        )
+
+    assert status == fixture.expected["status"]
+    assert normalized(body) == normalized(fixture.expected["body"]), body

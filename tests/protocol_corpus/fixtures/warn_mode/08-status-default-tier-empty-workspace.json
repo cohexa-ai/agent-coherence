@@ -32,6 +32,7 @@
       "endpoint_counters": "<IGNORED>",
       "fresh_shared_hash_mismatch_total": 0,
       "handler_concurrency_overflows_total": 0,
+      "handoff_giver_denials_total": 0,
       "in_flight_drain_timed_out": false,
       "intra_task_acquire_release_total": 0,
       "policy_summary": "<IGNORED>",
@@ -49,6 +50,6 @@
       "watchdog_timeouts_total": 0
     }
   },
-  "_comment": "cold_start_duration_ms is emitted as 0.0 (float) by Python; the harness normalizer compares structural equality so int 0 vs float 0.0 are not equal. We accept the float here. If Node drifts cold_start to int, the corpus catches it. coordinator_version is ignored because it tracks the Python __version__ constant which bumps independently of the wire-shape contract. effect_fence_holds_total joined the envelope with the /hooks/effect-fence route; paired with the endpoint counter effect_fence_total it is the operator's hold RATE, so the corpus pins its PRESENCE at zero on a cold coordinator — a fixture that omitted it would have gone red the moment the counter shipped, which is exactly what it did. caller_principal_absent_total joined the envelope with the caller-principal route posture (plan U6): the count of requests admitted without a principal -- any accept-class request, or a require-class one naming a session nobody claimed (KTD15) -- a local diagnostic pinned here at zero on a cold coordinator for the same reason. caller_principal_refused_total joined beside it: the count of requests a route refused for their principal (absent on a claimed session, or foreign), pinned at zero for the same reason.",
+  "_comment": "cold_start_duration_ms is emitted as 0.0 (float) by Python; the harness normalizer compares structural equality so int 0 vs float 0.0 are not equal. We accept the float here. If Node drifts cold_start to int, the corpus catches it. coordinator_version is ignored because it tracks the Python __version__ constant which bumps independently of the wire-shape contract. effect_fence_holds_total joined the envelope with the /hooks/effect-fence route; paired with the endpoint counter effect_fence_total it is the operator's hold RATE, so the corpus pins its PRESENCE at zero on a cold coordinator — a fixture that omitted it would have gone red the moment the counter shipped, which is exactly what it did. caller_principal_absent_total joined the envelope with the caller-principal route posture (plan U6): the count of requests admitted without a principal -- any accept-class request, or a require-class one naming a session nobody claimed (KTD15) -- a local diagnostic pinned here at zero on a cold coordinator for the same reason. caller_principal_refused_total joined beside it: the count of requests a route refused for their principal (absent on a claimed session, or foreign), pinned at zero for the same reason. handoff_giver_denials_total joined the envelope with the giver's pre-edit deny (#185): the count of pre-edits denied to the giver of a live handoff, pinned at zero on a cold coordinator for the same reason.",
   "backends": ["python"]
 }

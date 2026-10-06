@@ -1140,6 +1140,10 @@ class CoordinatorHTTPServer:
         # denied as a foreign edit. Pairs with strict_mode_denials_total to let
         # an operator size the lag-window (5s) false-negative exposure.
         self._shared_foreign_lag_suppressed_total: int = 0
+        # handoff_giver_denials_total (#185): how often the giver of a live
+        # handoff was denied on pre-edit. Its own counter, not the strict-mode
+        # one: the deny is not a stale-view deny and fires in warn mode too.
+        self._handoff_giver_denials_total: int = 0
         # Per-(session, path) "recent strict-deny" memory for route-around
         # detection. Bounded by the registry's own (session, artifact)
         # cardinality at worst — same upper bound as _stale_warned_pairs.
@@ -1577,11 +1581,19 @@ class CoordinatorHTTPServer:
         :meth:`increment_strict_mode_denial`."""
         self._shared_foreign_lag_suppressed_total += 1
 
+    def increment_handoff_giver_denial(self) -> None:
+        """#185: bumped once per pre-edit deny of a live handoff's giver.
+        The strict-mode denial and stale-warning counters are not bumped
+        for it. Same GIL-atomicity contract as
+        :meth:`increment_strict_mode_denial`."""
+        self._handoff_giver_denials_total += 1
+
     def record_strict_deny(self, session_id: str, path: str) -> None:
         """v0.2 Unit 4 route-around tracker — store the (session, path)
         pair with monotonic timestamp so a subsequent pre-bash deny on
         the same pair within STRICT_DENY_ROUTE_AROUND_WINDOW_SEC can be
-        recognized as a route-around."""
+        recognized as a route-around. #185: the giver's pre-edit deny is
+        recorded here too, so a shell read routing around it is counted."""
         with self._recent_strict_denies_lock:
             self._recent_strict_denies[(session_id, path)] = time.monotonic()
 
@@ -1673,6 +1685,7 @@ class CoordinatorHTTPServer:
             "stale_warning_reread_total": self._stale_warning_reread_total,
             "fresh_shared_hash_mismatch_total": self._fresh_shared_hash_mismatch_total,
             "shared_foreign_lag_suppressed_total": self._shared_foreign_lag_suppressed_total,
+            "handoff_giver_denials_total": self._handoff_giver_denials_total,
             "effect_fence_holds_total": self._effect_fence_holds_total,
             "caller_principal_absent_total": self._caller_principal_absent_total,
             "caller_principal_refused_total": self._caller_principal_refused_total,
@@ -2519,10 +2532,11 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                         additional_context=notice_text,
                     ),
                 }
-        # #185: the structured handoff key, on every arm (a strict deny
-        # included -- it is a top-level key, never inside the deny's bytes),
-        # and only while the path has a transfer record.
-        result = _attach_handoff_key(coordinator, result, path=path, caller=caller)
+        # #185: only while the path has a transfer record, the structured
+        # handoff key on every arm but a strict deny (whose bytes stay the
+        # corpus's), and on an admit the handoff prose in the context-only
+        # envelope, after the notices.
+        result = _attach_hook_handoff(coordinator, result, path=path, caller=caller)
         # SB-10 U4 (KTD6): the deferred re-grounding seam sits AFTER the
         # deny decision inside work() — a strict deny returns untouched and
         # keeps the flag pending — and AFTER the notice drain above, so
@@ -3004,13 +3018,36 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     caller = caller_principal_identity(session_id)
     now = monotonic_seconds()
+    # #185 R18: the version this agent last observed on the path, read BEFORE
+    # the acquire (which records the current version as observed), so the
+    # successor's admit can warn when it never read the version it was handed.
+    observed_before_acquire: int | None = None
 
     def work() -> dict:
+        nonlocal observed_before_acquire
         coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
         # Seed the artifact row if this is the first Edit on a fresh path.
         artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
         if artifact_id is None:
             artifact_id = coordinator.registry.resolve_or_register(path, content_hash="")
+
+        # #185 R13 (KTD5): the giver of a live handoff is denied AHEAD of the
+        # strict-mode stale branch, and in warn mode too. The transfer left
+        # the giver's claim INVALID, so on a strict path the stale branch
+        # would otherwise answer first -- and in warn mode nothing would deny,
+        # letting the giver re-take the path one turn later. The service's
+        # one liveness member picks the envelope; this handler owns only the
+        # ordering.
+        handed = coordinator.service.live_handoff_given_by(artifact_id, caller)
+        if handed is not None:
+            return _giver_deny_response(
+                coordinator,
+                GiverFenced(artifact_id, handed.successor, handed.version_at_transfer),
+                session_id=session_id, path=path, caller=caller,
+            )
+        observed_before_acquire = coordinator.registry.last_observed_version_for(
+            artifact_id, agent_id
+        )
 
         # v0.2 KTD-O / KTD-P: strict-mode stale-edit deny branch. If the
         # artifact is opted into strict mode AND the editor's prior state
@@ -3093,7 +3130,11 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             )
         except GiverFenced as exc:
             # Ahead of the generic arm, which would answer the refusal as prose.
-            return _giver_fenced_body(exc)
+            # A transfer that landed between the check above and this acquire:
+            # the typed error maps to the same deny.
+            return _giver_deny_response(
+                coordinator, exc, session_id=session_id, path=path, caller=caller,
+            )
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
 
@@ -3149,9 +3190,14 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # inside work(); notices are already merged into the result's
         # additionalContext, so the re-grounding block always lands last.
         # The abort token rides along so a timed-out request never
-        # consumes the compact-pending flag. #185: the handoff key is a
-        # top-level key, attached on every arm while a record exists.
-        result = _attach_handoff_key(coordinator, work(), path=path, caller=caller)
+        # consumes the compact-pending flag. #185: while a record exists the
+        # handoff key rides every arm but a deny (the giver's deny carries its
+        # own), and an admit gets the handoff prose before the re-grounding
+        # block.
+        result = _attach_hook_handoff(
+            coordinator, work(), path=path, caller=caller,
+            acquired=True, observed=observed_before_acquire,
+        )
         return _deliver_pending_reground(
             coordinator, session_id, body, result, abort=abort
         )
@@ -3168,6 +3214,8 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # only: a late body that takes the strict-deny branch never reaches it,
     # so it completes and records a deny (counter, route-around marker,
     # audit line) for an edit the caller was already told to proceed with.
+    # The giver's deny (#185) is the same: a timed-out giver is admitted, its
+    # late body records the deny, and its commit is refused by the fence.
     abort = threading.Event()
     _run_or_degrade(
         req, coordinator, work_with_reground,
@@ -3262,8 +3310,10 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
             )
         except GiverFenced as exc:
             # Ahead of the generic arm, which would read a preemption notice
-            # into it and answer the refusal as prose.
-            return _giver_fenced_body(exc)
+            # into it and answer the refusal as prose. The giver's edit was
+            # in flight when the transfer landed: the handoff arm, never the
+            # preemption or reclaim one, reaches it in the post-tool envelope.
+            return _giver_commit_refused_body(exc, path=path)
         except StaleReadGeneration:
             # Read-generation fence: a sweep reclaimed this committer in the race
             # window between its grant and this commit. Surface the STABLE machine
@@ -4966,10 +5016,10 @@ MAX_TRANSFER_GRANTS = MAX_SESSION_READ_SET_PATHS
 publish's bound, for the same defense-in-depth reason."""
 
 #: The caller's role in a record, as the ``handoff`` key's ``role`` says it.
-#: Wire values: add, never rename.
-_HANDOFF_ROLE_GIVER = "giver"
-_HANDOFF_ROLE_SUCCESSOR = "successor"
-_HANDOFF_ROLE_BYSTANDER = "bystander"
+#: Wire values, defined once beside the prose that renders each role.
+_HANDOFF_ROLE_GIVER = _payloads.HANDOFF_ROLE_GIVER
+_HANDOFF_ROLE_SUCCESSOR = _payloads.HANDOFF_ROLE_SUCCESSOR
+_HANDOFF_ROLE_BYSTANDER = _payloads.HANDOFF_ROLE_BYSTANDER
 
 #: Why a grant a release answer reports is no longer held. Wire values:
 #: add, never rename. ``release`` is this request's own release, recorded under
@@ -5031,15 +5081,66 @@ def _giver_fenced_body(
     :class:`GiverFenced`, or the live record a handler read the fence from:
     both carry the two facts, so no handler builds an exception to carry them.
 
-    No ``hookSpecificOutput`` and no prose yet: the hook client's deny
-    envelope comes with the hook-path handoff work, as a byte-stable
-    template, and it will sit beside this same top-level reason."""
+    The hook routes add their envelope beside it: the pre-edit deny
+    (:func:`_giver_deny_response`) and the post-edit handoff arm
+    (:func:`_giver_commit_refused_body`). The compare-and-swap and snapshot
+    routes answer it bare."""
     body: dict = {"ok": False, "reason": GIVER_FENCED_REASON}
     if path is not None:
         body["path"] = path
     body["successor"] = str(fence.successor)
     body["version_at_transfer"] = fence.version_at_transfer
     return body
+
+
+def _giver_deny_response(
+    coordinator: CoordinatorHTTPServer,
+    exc: GiverFenced,
+    *,
+    session_id: str,
+    path: str,
+    caller: UUID,
+) -> dict:
+    """The giver's pre-edit deny (R13, KTD5): the typed reason at the top
+    level, the third byte-stable template in the deny envelope beside it, and
+    the path's ``handoff`` key -- a deny's body is fixed by its emitter, so
+    the key is attached here rather than by the route's wrapper.
+
+    Bookkeeping copied from the strict block, minus what does not fit: the
+    giver-deny counter only (this deny is neither a strict-mode nor a
+    stale-view deny, and it fires in warn mode), the route-around detector's
+    map so a shell read routing around it is counted, and no audit line (the
+    strict appender would label it a strict deny with a raw session id)."""
+    coordinator.increment_handoff_giver_denial()
+    coordinator.record_strict_deny(session_id, path)
+    body = {
+        **_giver_fenced_body(exc),
+        "hookSpecificOutput": _payloads.emit_handoff_giver_deny(
+            source="pre_edit_handoff_giver_deny",
+            path=path,
+            successor_id=str(exc.successor),
+            version_at_transfer=exc.version_at_transfer,
+        ),
+    }
+    return _attach_handoff_key(coordinator, body, path=path, caller=caller)
+
+
+def _giver_commit_refused_body(exc: GiverFenced, *, path: str) -> dict:
+    """The giver's post-edit refusal (AE3, KTD6): the typed reason, and the
+    handoff arm -- the three exits and the statement that the edit is on disk
+    without a version -- through the post-tool context envelope. Rendered
+    from the record the fence raised from, never from a notice row: notices
+    carry no cause and are overwritten newest-wins."""
+    return {
+        **_giver_fenced_body(exc),
+        "hookSpecificOutput": _payloads.emit_posttooluse_context(
+            additional_context=_payloads.handoff_commit_refused_text(
+                path=path,
+                successor_id=str(exc.successor),
+                version_at_transfer=exc.version_at_transfer,
+            ),
+        ),
+    }
 
 
 def _handoff_record_fields(record: TransferRecord, *, live: bool) -> dict:
@@ -5129,11 +5230,8 @@ def _attach_handoff_key(
 
     A read only -- nothing is granted, popped or marked -- so it may ride the
     safety-path reads too. The key is top-level: it never enters a
-    ``hookSpecificOutput``, so a strict deny's bytes are unchanged."""
-    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
-    if artifact_id is None:
-        return result
-    read = coordinator.registry.get_transfer_record(artifact_id)
+    ``hookSpecificOutput``."""
+    read = _read_handoff(coordinator, path)
     if read is None:
         return result
     record, live = read
@@ -5143,6 +5241,59 @@ def _attach_handoff_key(
         if outcome is not None:
             projection["outcome"] = outcome
     return {**result, "handoff": projection}
+
+
+def _read_handoff(
+    coordinator: CoordinatorHTTPServer, path: str
+) -> tuple[TransferRecord, bool] | None:
+    """``path``'s transfer record and its liveness, or ``None`` when the path
+    is unknown or has no record. A read only."""
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    if artifact_id is None:
+        return None
+    return coordinator.registry.get_transfer_record(artifact_id)
+
+
+def _is_deny(result: dict) -> bool:
+    """Does ``result`` carry a deny envelope (a strict deny or the giver's)?"""
+    hso = result.get("hookSpecificOutput")
+    return hso is not None and hso.get("permissionDecision") == "deny"
+
+
+def _attach_hook_handoff(
+    coordinator: CoordinatorHTTPServer,
+    result: dict,
+    *,
+    path: str,
+    caller: UUID,
+    acquired: bool = False,
+    observed: int | None = None,
+) -> dict:
+    """The pre-read and pre-edit seam for a handoff (R29, KTD6), from ONE
+    read of the record.
+
+    A deny is returned untouched: a strict deny keeps the corpus's bytes, and
+    the giver's deny carries its own key. Every other arm gets the
+    ``handoff`` key while the path has a record, and an admit also gets the
+    role's prose through the context-only envelope -- never the allow
+    emitter, which would widen a permission decision. ``acquired`` marks the
+    pre-edit's acquire, where ``observed`` (this agent's last observed
+    version before it) decides the successor's read-first warning (R18)."""
+    if _is_deny(result):
+        return result
+    read = _read_handoff(coordinator, path)
+    if read is None:
+        return result
+    record, live = read
+    projection = _handoff_projection(record, live=live, caller=caller)
+    result = {**result, "handoff": projection}
+    # The admit test the re-grounding attach uses: an allow envelope, or a
+    # bare admit body. A refusal body (``ok: false``) gets the key only.
+    if not _reground_qualifies(result):
+        return result
+    unread = acquired and (observed is None or observed < record.version_at_transfer)
+    text = _payloads.handoff_context_text(projection, path=path, unread=unread)
+    return result if text is None else _attach_pretooluse_context(result, text)
 
 
 def _released_grant(path: str) -> dict:
@@ -7243,6 +7394,14 @@ def _attach_reground(result: dict, text: str) -> dict:
     a CONTEXT-ONLY PreToolUse envelope. The deferred path rides the
     PreToolUse shape — never the SessionStart ``hookSpecificOutput``
     shape."""
+    return _attach_pretooluse_context(result, text)
+
+
+def _attach_pretooluse_context(result: dict, text: str) -> dict:
+    """Merge advisory prose into an admit response: appended after an
+    existing envelope's text, keeping its permission decision, or carried by
+    a CONTEXT-ONLY PreToolUse envelope on a bare admit body. The one merge
+    rule the deferred re-grounding and the handoff prose (#185) share."""
     hso = result.get("hookSpecificOutput")
     if hso is None:
         # WHY context-only rather than emit_allow: re-grounding is
