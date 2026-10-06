@@ -29,7 +29,11 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 from ccs.adapters.claude_code.lifecycle import stop_coordinator
-from ccs.adapters.coherent_volume import CoherentVolume
+from ccs.adapters.coherent_volume import (
+    CoherentVolume,
+    HandoffTransferResult,
+    HandoffVerbResult,
+)
 from ccs.adapters.effect_gate import check_fence
 from ccs.core.exceptions import HOLD_INPUT_VANISHED, CasVersionConflict, CoherenceError
 from ccs.mcp.deny import cas_exhausted_result, coordinator_unavailable_result, deny_result
@@ -69,6 +73,20 @@ Three guarantees, all single-host and fail-closed:
      re-decide.
      The verdict is true as of that call; the dispatch after it is still yours.
 
+HANDOFF between sessions: swg_transfer(paths, successor) hands this session's
+claim on each path (the write grant from swg_write, or the standing read from
+swg_read) to another session, the successor, named by the session_agent_id the
+successor's own swg_status reports.
+A transfer FENCES THE GIVER and DOES NOT RESERVE THE PATH: other sessions keep
+reading and writing it by the ordinary rules, and the handoff only labels what
+they do. While the handoff is live, this session's swg_write and swg_write_cas
+on the path are DENIED with reason=handed_off, retryable=false,
+recover=stop_and_report: stop and report to your user or host that the path
+was handed off. The successor sees the handoff in the handoff key of its
+swg_read and swg_status, and takes it with swg_accept or a write, or refuses it
+with swg_decline. swg_withdraw is taken only on the user's or host's explicit
+instruction, never as the recovery for a handed_off deny.
+
 OUT OF GUARANTEE (do not rely on this server for): writers on DIFFERENT hosts or
 across a synced/network mount; divergent-history reconciliation; semantic/content
 correctness; any server-enforced auto-merge. These are NOT detected in v1 — a
@@ -98,7 +116,10 @@ _READ_DESC = (
     "swg_write_cas; KEEP BOTH version and owner_generation and pass them to "
     "swg_gate before any irreversible external action you decide from this "
     "read (owner_generation=null means this coordinator does not report "
-    "generations, so swg_gate will hold). A "
+    "generations, so swg_gate will hold). When the path has a handoff record "
+    "the result also carries handoff: the record as it concerns this session "
+    "(role giver, successor or bystander, the two session_agent_ids, "
+    "version_at_transfer, hold_shape, status, live). A "
     "sticky-INVALID view returns fresh bytes but stays INVALID — use "
     "swg_reacquire to recover before writing. If the bytes on disk are not the "
     "content at the current version, the read is DENIED with reason=stale_view "
@@ -137,7 +158,13 @@ _REACQUIRE_DESC = (
 )
 _STATUS_DESC = (
     "Report coherence state: coordinator on|off|unknown (unknown is NOT off), "
-    "per-path enforced|not_registered, is_attached/is_degraded/session_id, "
+    "per-path enforced|not_registered (with handoff: the path's handoff record "
+    "-- giver, successor, version_at_transfer, hold_shape, status, live -- when "
+    "it has one), is_attached/is_degraded/session_id, session_agent_id (this "
+    "session's id as a handoff successor: the value another session passes to "
+    "swg_transfer to hand this session a path; it does not change when this "
+    "session reacquires, and it names this session as a successor only while "
+    "principal_claim is bound), "
     "principal_claim (this session's caller-principal state: bound; unsupported "
     "= the coordinator issues none; unconfirmed = the last claim's answer was "
     "lost and the next call claims again by itself; refused = the session is "
@@ -156,10 +183,57 @@ _WRITE_CAS_DESC = (
     "MERGE, then call swg_write_cas(path, expected_version, "
     "new_content). Stale-write-rejected: if a peer committed since your read, the "
     "CAS is a TYPED CONFLICT (reason=version_mismatch, current_version returned) "
-    "— NOT an auto-merge; re-read at current_version, re-merge, and retry. The "
+    "— NOT an auto-merge; re-read at current_version, re-merge, and retry. A "
+    "win on a path with a live handoff carries handoff: outcome=completed when "
+    "this session is its successor, overtaken (with counterparty) otherwise. The "
     "per-session conflict counter bounds only a COOPERATING agent (one session, "
     "stops on retryable=false); it is NOT livelock-proof against a fresh session "
     "or one that ignores retryable=false." + _SCOPE_CLAUSE
+)
+
+# Appended to each of the four handoff tools' descriptions: what a transfer
+# does to the giver and what it does not do to anyone else (R33).
+_HANDOFF_CLAUSE = (
+    " A transfer fences the giver and does not reserve the path: other sessions "
+    "keep reading and writing it by the ordinary rules, and the handoff only "
+    "labels what they do."
+)
+
+_TRANSFER_DESC = (
+    "Hand this session's claim on one or more paths -- the write grant from "
+    "swg_write, or the standing read from swg_read -- to another session, the "
+    "successor. Name the successor by the session_agent_id that the "
+    "successor's OWN swg_status reports. Answers one grant per path, in order: "
+    "transferred=true with the record (giver, successor, version_at_transfer, "
+    "hold_shape, status=pending), or transferred=false with a typed reason and "
+    "nothing changed (handoff_not_held: this session holds no claim on the "
+    "path; handoff_successor_unknown: the coordinator does not know that id; "
+    "handoff_in_flight: another session's handoff of the path is live). The "
+    "result is an error unless every grant transferred. While a handoff is "
+    "live this session's swg_write and swg_write_cas on its path are denied "
+    "with reason=handed_off." + _HANDOFF_CLAUSE + _SCOPE_CLAUSE
+)
+_ACCEPT_DESC = (
+    "As the successor, accept the live handoff of a path without writing it: "
+    "a pending handoff becomes completed (a write of the path completes it "
+    "too). The giver stays fenced until a write moves the version. Refused "
+    "with handoff_not_successor or handoff_not_live, as an error that changes "
+    "nothing." + _HANDOFF_CLAUSE + _SCOPE_CLAUSE
+)
+_DECLINE_DESC = (
+    "As the successor, decline the live handoff of a path: the handoff ends "
+    "and its giver's fence lifts. Refused with handoff_not_successor or "
+    "handoff_not_live, as an error that changes nothing."
+    + _HANDOFF_CLAUSE + _SCOPE_CLAUSE
+)
+_WITHDRAW_DESC = (
+    "As the giver, withdraw this session's live handoff of a path: the handoff "
+    "ends and this session's fence on the path lifts. Take it only on the "
+    "user's or host's explicit instruction. It is never the recovery for the "
+    "handed_off refusal: when a write of a path you handed off is refused, stop "
+    "and report to your user or host. Refused with handoff_not_giver or "
+    "handoff_not_live, as an error that changes nothing."
+    + _HANDOFF_CLAUSE + _SCOPE_CLAUSE
 )
 
 _REACQUIRE_NOTE = "write FROM these exact bytes — the server enforces version lineage, not content derivation"
@@ -264,15 +338,19 @@ def _do_read(volume: CoherentVolume, config: SessionConfig, path: str) -> CallTo
     # re-checks before an irreversible external action. ``null`` means the
     # coordinator could not confirm one (older daemon, deny, or degraded) — a
     # later swg_gate HOLDs on it rather than firing blind.
-    return _ok_result(
-        {
-            "content": text,
-            "version": version,
-            "owner_generation": owner_generation,
-            "encoding": "utf-8",
-        },
-        text,
-    )
+    structured = {
+        "content": text,
+        "version": version,
+        "owner_generation": owner_generation,
+        "encoding": "utf-8",
+    }
+    # The read's provenance (#185): the path's transfer record projected for
+    # this session, only when this read's answer carried one, so a read of a
+    # path with no record answers exactly what it did before.
+    handoff = volume.read_handoff(key)
+    if handoff is not None:
+        structured["handoff"] = handoff
+    return _ok_result(structured, text)
 
 
 def _do_gate(
@@ -414,7 +492,7 @@ def _do_write_cas(
     if not volume.is_attached:
         return coordinator_unavailable_result(f"coordinator unattached; refusing CAS of {key}")
     try:
-        volume.write_cas_at(key, expected_version, new_content.encode("utf-8"))
+        won = volume.write_cas_at(key, expected_version, new_content.encode("utf-8"))
     except CasVersionConflict as exc:
         # Bound a COOPERATING agent's retry loop: too many consecutive conflicts
         # on one path in this session → tell it to stop (retryable=false).
@@ -434,7 +512,132 @@ def _do_write_cas(
     except OSError as exc:  # disk/permission failure → fail closed, never escape to FastMCP
         return _client_error_result("io_error", "none", str(exc))
     conflicts.pop(key, None)  # a win resets the cooperating-agent conflict streak
-    return _ok_result({"ok": True, "path": key}, f"committed {key}")
+    structured: dict = {"ok": True, "path": key}
+    if won.handoff is not None:
+        # What the win did to a live handoff of the path (#185): completed it
+        # (this session is the successor) or overtook it (a bystander).
+        structured["handoff"] = _present(
+            {
+                "outcome": won.handoff.outcome,
+                "giver": won.handoff.giver,
+                "successor": won.handoff.successor,
+                "version_at_transfer": won.handoff.version_at_transfer,
+                "counterparty": won.handoff.counterparty,
+            }
+        )
+    return _ok_result(structured, f"committed {key}")
+
+
+def _present(fields: dict) -> dict:
+    """``fields`` without the ones the answer did not carry, so a result has
+    the shape of the coordinator's answer (a refused grant is ``{path,
+    transferred, reason}``)."""
+    return {key: value for key, value in fields.items() if value is not None}
+
+
+def _transfer_result(result: HandoffTransferResult) -> CallToolResult:
+    grants = [
+        _present(
+            {
+                "path": grant.path,
+                "transferred": grant.transferred,
+                "reason": grant.reason,
+                "giver": grant.giver,
+                "successor": grant.successor,
+                "version_at_transfer": grant.version_at_transfer,
+                "hold_shape": grant.hold_shape,
+                "status": grant.status,
+                "detail": grant.detail,
+            }
+        )
+        for grant in result.grants
+    ]
+    lines = [
+        f"{grant.path}: transferred to {grant.successor} at v{grant.version_at_transfer} "
+        f"({grant.status})"
+        if grant.transferred
+        else f"{grant.path}: not transferred ({grant.reason})"
+        for grant in result.grants
+    ]
+    # Not every grant moved: a non-ignorable error, so a partly refused
+    # transfer never reads as done.
+    return CallToolResult(
+        isError=not result.ok,
+        content=[TextContent(type="text", text="\n".join(lines))],
+        structuredContent={"ok": result.ok, "grants": grants},
+    )
+
+
+def _verb_result(verb: str, result: HandoffVerbResult) -> CallToolResult:
+    structured = _present(
+        {
+            "path": result.path,
+            "ok": result.ok,
+            "reason": result.reason,
+            "status": result.status,
+            "counterparty": result.counterparty,
+        }
+    )
+    if result.ok:
+        text = f"{verb} {result.path}: taken (status={result.status})"
+    else:
+        text = f"{verb} {result.path}: refused ({result.reason}); nothing changed"
+    return CallToolResult(
+        isError=not result.ok,
+        content=[TextContent(type="text", text=text)],
+        structuredContent=structured,
+    )
+
+
+def _do_transfer(
+    volume: CoherentVolume, config: SessionConfig, paths: list[str], successor: str
+) -> CallToolResult:
+    try:
+        keys = [validate_uri(path, root=config.root) for path in paths]
+    except UriValidationError as exc:
+        return _client_error_result("invalid_path", "fix_path", str(exc))
+    if not volume.is_attached:
+        return coordinator_unavailable_result(f"coordinator unattached; cannot transfer {', '.join(keys)}")
+    try:
+        result = volume.transfer(keys, successor=successor)
+    except CoherenceError as exc:
+        return deny_result(exc)
+    return _transfer_result(result)
+
+
+def _do_handoff_verb(
+    volume: CoherentVolume,
+    config: SessionConfig,
+    verb: str,
+    path: str,
+) -> CallToolResult:
+    """Accept, decline or withdraw ``path``'s handoff as this session. A refusal
+    is the volume's typed value; only an answer that does not settle the
+    outcome raises, and maps through the deny table like every terminal."""
+    try:
+        key = validate_uri(path, root=config.root)
+    except UriValidationError as exc:
+        return _client_error_result("invalid_path", "fix_path", str(exc))
+    if not volume.is_attached:
+        return coordinator_unavailable_result(f"coordinator unattached; cannot {verb} {key}")
+    act = {"accept": volume.accept, "decline": volume.decline, "withdraw": volume.withdraw}[verb]
+    try:
+        result = act(key)
+    except CoherenceError as exc:
+        return deny_result(exc)
+    return _verb_result(verb, result)
+
+
+def _do_accept(volume: CoherentVolume, config: SessionConfig, path: str) -> CallToolResult:
+    return _do_handoff_verb(volume, config, "accept", path)
+
+
+def _do_decline(volume: CoherentVolume, config: SessionConfig, path: str) -> CallToolResult:
+    return _do_handoff_verb(volume, config, "decline", path)
+
+
+def _do_withdraw(volume: CoherentVolume, config: SessionConfig, path: str) -> CallToolResult:
+    return _do_handoff_verb(volume, config, "withdraw", path)
 
 
 # --- registration ------------------------------------------------------------
@@ -448,7 +651,9 @@ def register_tools(server: FastMCP) -> None:
     """Register the sequential ``swg_*`` tools under the serialization lock.
 
     ``swg_write_cas`` is the concurrent regime; ``swg_gate`` is the
-    pull-based effect fence agents call before an irreversible dispatch.
+    pull-based effect fence agents call before an irreversible dispatch;
+    ``swg_transfer``/``swg_accept``/``swg_decline``/``swg_withdraw`` hand this
+    session's own claims to another session (#185).
     """
 
     @server.tool(
@@ -523,6 +728,50 @@ def register_tools(server: FastMCP) -> None:
         sctx = _server_context(ctx)
         async with sctx.lock:
             return _do_write_cas(sctx.volume, sctx.config, sctx.cas_conflicts, path, expected_version, new_content)
+
+    @server.tool(
+        name="swg_transfer",
+        description=_TRANSFER_DESC,
+        annotations=ToolAnnotations(readOnlyHint=False),
+        structured_output=False,
+    )
+    async def swg_transfer(paths: list[str], successor: str, ctx: Context) -> CallToolResult:
+        sctx = _server_context(ctx)
+        async with sctx.lock:
+            return _do_transfer(sctx.volume, sctx.config, paths, successor)
+
+    @server.tool(
+        name="swg_accept",
+        description=_ACCEPT_DESC,
+        annotations=ToolAnnotations(readOnlyHint=False),
+        structured_output=False,
+    )
+    async def swg_accept(path: str, ctx: Context) -> CallToolResult:
+        sctx = _server_context(ctx)
+        async with sctx.lock:
+            return _do_accept(sctx.volume, sctx.config, path)
+
+    @server.tool(
+        name="swg_decline",
+        description=_DECLINE_DESC,
+        annotations=ToolAnnotations(readOnlyHint=False),
+        structured_output=False,
+    )
+    async def swg_decline(path: str, ctx: Context) -> CallToolResult:
+        sctx = _server_context(ctx)
+        async with sctx.lock:
+            return _do_decline(sctx.volume, sctx.config, path)
+
+    @server.tool(
+        name="swg_withdraw",
+        description=_WITHDRAW_DESC,
+        annotations=ToolAnnotations(readOnlyHint=False),
+        structured_output=False,
+    )
+    async def swg_withdraw(path: str, ctx: Context) -> CallToolResult:
+        sctx = _server_context(ctx)
+        async with sctx.lock:
+            return _do_withdraw(sctx.volume, sctx.config, path)
 
 
 def build_server() -> FastMCP:

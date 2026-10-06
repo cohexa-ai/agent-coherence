@@ -221,6 +221,81 @@ def test_the_registered_status_description_names_the_principal_claim_and_counter
     assert "null" in description
 
 
+#: FROZEN duplicate of the four handoff tools' registered names (#185).
+_HANDOFF_TOOLS = ("swg_transfer", "swg_accept", "swg_decline", "swg_withdraw")
+
+
+def _registered_descriptions() -> dict[str, str]:
+    """Each tool's description as a client lists it from the built server."""
+    import asyncio
+
+    from ccs.mcp.server import build_server
+
+    return {
+        tool.name: tool.description or ""
+        for tool in asyncio.run(build_server().list_tools())
+    }
+
+
+def test_every_handoff_tool_and_the_instructions_say_a_transfer_fences_the_giver_and_reserves_nothing() -> None:
+    """R33. A model that reads only one handoff tool's description, or only the
+    server instructions, must learn both halves: a transfer fences the giver
+    (its own later writes are refused) and does not reserve the path (other
+    sessions keep writing it). Read as a reservation, a successor would wait
+    on a path a bystander can still overwrite."""
+    descriptions = _registered_descriptions()
+
+    for name in _HANDOFF_TOOLS:
+        text = descriptions[name].lower()
+        assert "fences the giver" in text, name
+        assert "does not reserve the path" in text, name
+        assert "single-host" in text, name
+    instructions = INSTRUCTIONS.lower()
+    assert "fences the giver" in instructions
+    assert "does not reserve the path" in instructions
+    assert "handed_off" in instructions and "stop_and_report" in instructions
+
+
+def test_the_transfer_tool_names_the_successor_by_the_id_its_own_status_tool_reports() -> None:
+    """R33, KTD7. The giver names the successor by the value the successor's
+    OWN status tool reports, and the status tool says that value names the
+    session as a successor only while its principal claim is bound (the
+    coordinator knows a session-level id through its principal binding)."""
+    descriptions = _registered_descriptions()
+
+    assert "session_agent_id" in descriptions["swg_transfer"]
+    assert "swg_status" in descriptions["swg_transfer"]
+    assert "session_agent_id" in descriptions["swg_status"]
+    assert "only while principal_claim is bound" in descriptions["swg_status"]
+
+
+def test_the_withdraw_tool_is_taken_only_on_instruction_and_is_never_the_givers_recovery() -> None:
+    """R33. The giver's withdraw lifts its own fence, so it is one call away from
+    a fenced giver. Its description says it is taken only on the user's or
+    host's explicit instruction and is never the recovery for the
+    ``handed_off`` refusal, beside the non-reservation statement; and, the
+    negative pin, it names no way back to writing: no recover verb, no
+    retry, no write tool to call after it."""
+    text = _registered_descriptions()["swg_withdraw"]
+
+    assert "only on the user's or host's explicit instruction" in text
+    assert "never the recovery for the handed_off refusal" in text
+    assert "does not reserve the path" in text
+    assert "recover=" not in text
+    assert "retry" not in text.lower()
+    assert "swg_write" not in text
+
+
+def test_the_read_and_cas_descriptions_name_the_handoff_key() -> None:
+    """R33. The read result carries the path's handoff record and a CAS win
+    what it did to a live handoff; the descriptions say so, so a model knows
+    the key it may find."""
+    descriptions = _registered_descriptions()
+
+    assert "handoff" in descriptions["swg_read"]
+    assert "handoff" in descriptions["swg_write_cas"]
+
+
 def test_instructions_state_forbidden_and_trust_boundary() -> None:
     text = INSTRUCTIONS.lower()
     assert "different hosts" in text

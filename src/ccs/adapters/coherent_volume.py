@@ -693,6 +693,12 @@ class CoherentVolume:
         # registered (_read_impl, _read_with_version), never on a verification,
         # denied, failed or unanswered read; a transferred path leaves it.
         self._read_incarnations: dict[str, str] = {}
+        # Per path, the ``handoff`` key the answer to this volume's latest read
+        # of it carried (#185): its transfer record, projected for this
+        # session. No entry when that answer carried none. Read through
+        # read_handoff(), which is how the MCP read tool relays a read's
+        # provenance without changing what the read calls return.
+        self._read_handoffs: dict[str, dict] = {}
 
         self._mint_identity()
         self._attach()
@@ -769,6 +775,7 @@ class CoherentVolume:
         self._new_principal_claim()
         self._grant_incarnations.clear()
         self._read_incarnations.clear()
+        self._read_handoffs.clear()
         self._endpoint = None
         self._needs_reattach = True
         self._last_committed_hash.clear()
@@ -1325,6 +1332,7 @@ class CoherentVolume:
         # after the refusal is overwritten. setdefault never replaces an earlier
         # observation, so the refused bytes cannot absolve an edit made after one.
         self._last_observed_hash.setdefault(rel, content_hash)
+        self._read_handoffs.pop(rel, None)  # this read's answer replaces it
         if self._endpoint is not None:
             reader = self._incarnation  # the incarnation this request names
             resp = self._post(
@@ -1335,6 +1343,7 @@ class CoherentVolume:
                     "content_hash": content_hash,
                 },
             )
+            self._note_read_handoff(rel, resp)
             # A stale / strict-deny response is expected and changes nothing here
             # (read returns current bytes; INVALID stays sticky). Two answers
             # are infra failures that take the unanswered-request seam: a
@@ -2526,6 +2535,31 @@ class CoherentVolume:
         results; raises like :meth:`transfer` when the outcome is not settled."""
         return self._settle_handoff("withdraw", path)
 
+    def read_handoff(self, path: str | os.PathLike[str]) -> dict | None:
+        """The ``handoff`` key the answer to this volume's latest read of
+        ``path`` carried: the path's transfer record projected for this
+        session (``role`` -- ``giver``, ``successor`` or ``bystander`` -- the
+        two parties' session-level agent ids, ``version_at_transfer``,
+        ``hold_shape``, ``status``, ``live``, and ``counterparty`` on an
+        overtaken record), as the coordinator sent it.
+
+        ``None`` when the path was never read, or that answer carried no key:
+        the path has no record, or the read was strict-denied, failed or went
+        unanswered. Every read call sets it, :meth:`read` and
+        :meth:`read_with_version` alike; it is what the MCP read tool relays
+        as the read's provenance."""
+        _abs_path, rel = self._to_relative(path)
+        handoff = self._read_handoffs.get(rel)
+        return dict(handoff) if handoff is not None else None
+
+    def _note_read_handoff(self, rel: str, resp: object) -> None:
+        """Keep the ``handoff`` key a pre-read answer carried for
+        :meth:`read_handoff`. The caller dropped the path's earlier one
+        before sending, so an answer without a key leaves none."""
+        handoff = resp.get("handoff") if isinstance(resp, dict) else None
+        if isinstance(handoff, dict):
+            self._read_handoffs[rel] = handoff
+
     def _settle_handoff(
         self, verb: Literal["accept", "decline", "withdraw"], path: str | os.PathLike[str]
     ) -> HandoffVerbResult:
@@ -3111,6 +3145,7 @@ class CoherentVolume:
         stale_status = False
         content_differs = False
         owner_generation: int | None = None
+        self._read_handoffs.pop(_rel, None)  # this read's answer replaces it
         if self._endpoint is not None:
             reader = self._incarnation  # the incarnation this request names
             resp = self._post(
@@ -3137,6 +3172,7 @@ class CoherentVolume:
                     "verify_only": not observe,
                 },
             )
+            self._note_read_handoff(_rel, resp)
             if isinstance(resp, dict):
                 if resp.get("degraded"):
                     self._fail_closed_or_degrade(

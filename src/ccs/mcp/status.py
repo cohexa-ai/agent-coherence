@@ -27,12 +27,24 @@ claims again with the same nonce by itself before it runs. The two
 ``/status`` document and, under the same SC5 rule as the three states, are
 ``None`` (never ``0``) when the coordinator is unreachable or does not report
 them.
+
+``session_agent_id`` is this session's session-level agent id: the value
+another session names as the successor when it hands this session a path
+(#185). It is derived from the volume's session id through the coordinator
+module's own function, never a second copy of the derivation string, so it is
+exactly the id the coordinator resolves; it does not change when the volume
+re-mints its incarnation, and the coordinator knows it as a successor only
+while this session's principal claim is bound. A tracked path with a transfer
+record carries it as ``handoff`` on its ``per_path`` entry, as the
+coordinator's default ``/status`` tier projects it; a path with none has no
+such key.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
 from ccs.adapters.claude_code.policy import matches_any
 
 if TYPE_CHECKING:
@@ -49,6 +61,7 @@ def build_status(volume: CoherentVolume, config: SessionConfig) -> dict:
         "is_attached": volume.is_attached,
         "is_degraded": volume.is_degraded,
         "session_id": volume.session_id,
+        "session_agent_id": str(session_to_agent_id(volume.session_id)),
         "principal_claim": volume.principal_claim_outcome,
         "caller_principal_absent_total": _counter(status_doc, "caller_principal_absent_total"),
         "caller_principal_refused_total": _counter(status_doc, "caller_principal_refused_total"),
@@ -92,7 +105,8 @@ def _counter(status_doc: dict | None, key: str) -> int | None:
 def _per_path(config: SessionConfig, status_doc: dict | None) -> dict:
     """Per tracked artifact: its version and whether it is ``enforced`` (matches
     this server's managed globs) or merely ``not_registered`` for strict
-    enforcement by this server."""
+    enforcement by this server, plus its transfer record as ``handoff`` when
+    the coordinator reports one."""
     per_path: dict[str, dict] = {}
     if not isinstance(status_doc, dict):
         return per_path
@@ -103,8 +117,12 @@ def _per_path(config: SessionConfig, status_doc: dict | None) -> dict:
         if not isinstance(path, str):
             continue
         enforced = matches_any(path, config.managed)
-        per_path[path] = {
+        entry = {
             "version": artifact.get("version"),
             "status": "enforced" if enforced else "not_registered",
         }
+        handoff = artifact.get("handoff")
+        if isinstance(handoff, dict):
+            entry["handoff"] = handoff
+        per_path[path] = entry
     return per_path

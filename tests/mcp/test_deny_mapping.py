@@ -23,6 +23,7 @@ from ccs.core.exceptions import (
     CoherenceError,
     CommitPreempted,
     CommitUnconfirmed,
+    GiverFenced,
     InternalConcurrencyError,
     StaleView,
     ViewWedged,
@@ -40,6 +41,11 @@ _PRINCIPAL_RECOVER = "restart_session"
 #: the recovery claim's answer was lost, and the next call claims again by
 #: itself — an existing verb from the CAS vocabulary, retryable.
 _PRINCIPAL_UNSETTLED_RECOVER = "wait_and_retry"
+#: FROZEN duplicates of the giver terminal (#185): its wire reason and the
+#: recover verb that means stop and report.
+_GIVER_REASON = "handed_off"
+_GIVER_RECOVER = "stop_and_report"
+_SUCCESSOR = "6b0f3c1e-4a5d-5b7e-9c2f-1d3e5a7b9c0d"
 
 
 def _principal_refusal(reason: str) -> CallerPrincipalRefused:
@@ -96,6 +102,7 @@ _TERMINALS = [
         False,
     ),
     (CasRetriesExhausted("data/x", 8, 3), "cas_exhausted", "stop", False),
+    (GiverFenced("data/x", _SUCCESSOR, 3), _GIVER_REASON, _GIVER_RECOVER, False),
     (
         InternalConcurrencyError("concurrent use detected"),
         "internal_concurrency_error",
@@ -384,3 +391,38 @@ def test_a_principal_refusal_subclass_does_not_inherit_the_mapping():
 
     sc = deny_result(_Narrower("caller_principal_foreign", "prose")).structuredContent
     assert sc["reason"] == "internal_error"
+
+
+def test_the_giver_terminal_is_a_typed_stop_that_says_report_and_never_withdraw():
+    """R34, KTD8. A session that handed a path off and writes it again gets the
+    giver terminal on both routes. Without its own row it fell to
+    ``internal_error`` / ``none``, the shape of a coordinator bug; read as a
+    stale view it sent the giver to reacquire, which cannot clear a fence keyed
+    on its session. It maps to its typed reason, ``retryable: false``, and a
+    recover verb that means stop and report -- neither reacquire nor
+    read-then-merge -- with the successor and the version at transfer as
+    values. The detail stays the exception's text verbatim (first text item);
+    the row adds fixed words telling the giver to report, and those words
+    never mention withdrawing: the MCP giver's withdraw tool is one call away,
+    and a refusal that names the act lifting it invites the agent to take it."""
+    exc = GiverFenced("data/plan.md", _SUCCESSOR, 7)
+
+    result = deny_result(exc)
+
+    sc = result.structuredContent
+    assert result.isError is True
+    assert sc["reason"] == _GIVER_REASON
+    assert sc["reason"] != "internal_error"
+    assert sc["retryable"] is False
+    assert sc["recover"] == _GIVER_RECOVER
+    assert sc["recover"] not in ("reacquire", "read_then_merge", "reacquire_and_reread")
+    assert sc["successor"] == _SUCCESSOR
+    assert sc["version_at_transfer"] == 7
+    assert sc["detail"] == str(exc)
+    assert result.content[0].text == str(exc)
+    words = sc["next_step"]
+    assert [item.text for item in result.content[1:]] == [words]
+    assert "report" in words.lower()
+    assert "stop" in words.lower()
+    assert "withdraw" not in words.lower()
+

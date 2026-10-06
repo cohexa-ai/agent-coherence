@@ -651,6 +651,55 @@ def test_a_restarted_writer_cannot_hand_on_a_live_handoff_until_its_write_overta
         stop_coordinator(tmp_path)
 
 
+# --- the handoff key a read received (R33) ----------------------------------
+
+
+def test_read_handoff_reports_the_key_the_latest_read_of_the_path_received(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """R33. The read calls return bytes and versions (public contracts), not the
+    ``handoff`` key their answers carry, so a caller that must relay a read's
+    provenance (the MCP read tool) asks ``read_handoff``: the key the answer to
+    this volume's latest read of the path carried, from either read call, or
+    ``None``. The successor's read reports the pending record projected for
+    it. Once a bystander's win moved the version, the successor's next read is
+    strict-denied, which carries no key, so it reports ``None`` rather than the
+    earlier answer; the bystander's own read reports the record it overtook. A
+    path never read reports ``None``, and so does a forked child, a new
+    session that read nothing."""
+    _seed(tmp_path, _PLAN, b"plan v1")
+    giver, successor, bystander = _volumes(tmp_path, fast_cfg, 3)
+    try:
+        giver.read(_PLAN)
+        assert giver.transfer(_PLAN, successor=_agent(successor)).ok
+        never_read = successor.read_handoff(_PLAN)
+
+        successor.read_with_version(_PLAN)
+        pending = successor.read_handoff(_PLAN)
+        bystander.write_cas_at(_PLAN, 1, b"plan v2 by a bystander")
+        successor.read(_PLAN)
+        after_denied_read = successor.read_handoff(_PLAN)
+        bystander.read(_PLAN)
+        overtaken = bystander.read_handoff(_PLAN)
+        bystander_id = _agent(bystander)  # before the fork re-mints the session
+        bystander._after_fork()  # simulate the child-side fork handler
+
+        assert never_read is None
+        assert pending == {
+            "role": "successor", "giver": _agent(giver), "successor": _agent(successor),
+            "version_at_transfer": 1, "hold_shape": "SHARED", "status": "pending", "live": True,
+        }
+        assert after_denied_read is None
+        assert overtaken == {
+            "role": "bystander", "giver": _agent(giver), "successor": _agent(successor),
+            "version_at_transfer": 1, "hold_shape": "SHARED", "status": "overtaken",
+            "live": False, "counterparty": bystander_id,
+        }
+        assert bystander.read_handoff(_PLAN) is None
+    finally:
+        stop_coordinator(tmp_path)
+
+
 # --- public names -----------------------------------------------------------
 
 

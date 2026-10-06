@@ -47,6 +47,7 @@ from ccs.core.exceptions import (
     CasVersionConflict,
     CommitPreempted,
     CommitUnconfirmed,
+    GiverFenced,
     InternalConcurrencyError,
     StaleView,
     ViewWedged,
@@ -56,11 +57,29 @@ from ccs.core.exceptions import (
 @dataclass(frozen=True)
 class _Terminal:
     """The wire shape for one deny terminal: a typed ``reason``, a ``recover``
-    verb the agent can act on, and whether a bare retry is safe."""
+    verb the agent can act on, and whether a bare retry is safe. ``next_step``
+    is fixed text for a terminal whose verb needs words beside the verbatim
+    detail; it is carried as ``next_step`` and as a second text item."""
 
     reason: str
     recover: str
     retryable: bool
+    next_step: str | None = None
+
+
+# The giver of a live handoff (#185) wrote a path it handed off. No reacquire,
+# re-read or re-merge clears the fence -- it is keyed on the session -- so the
+# verb is a stop, and the words say to report. They never name withdraw: the
+# MCP giver's own withdraw tool is one call away, and a refusal that names the
+# act that lifts it invites the agent to take it. Withdraw is the user's or
+# host's call, and its tool says so.
+GIVER_FENCED_RECOVER = "stop_and_report"
+GIVER_FENCED_NEXT_STEP = (
+    "Stop: this session handed this path off, so it can no longer write it, and "
+    "no retry, reacquire or re-read changes that. Do not write it by any other "
+    "route. Report to your user or host that the path was handed off to the "
+    "successor named here, at the version named here."
+)
 
 
 # Type A — matched by EXACT exception type (so a future subclass cannot silently
@@ -73,6 +92,10 @@ _TERMINALS: dict[type, _Terminal] = {
     CommitUnconfirmed: _Terminal(CommitUnconfirmed.reason, "read_then_retry", False),
     CasRetriesExhausted: _Terminal(CasRetriesExhausted.reason, "stop", False),
     InternalConcurrencyError: _Terminal(InternalConcurrencyError.reason, "none", False),
+    # Both write routes raise it (swg_write's pre-edit, swg_write_cas's commit).
+    GiverFenced: _Terminal(
+        GiverFenced.reason, GIVER_FENCED_RECOVER, False, GIVER_FENCED_NEXT_STEP
+    ),
 }
 
 # A CAS refusal is four different terminals wearing one exception type. The
@@ -134,13 +157,13 @@ def _result(terminal: _Terminal, detail: str, extra: dict | None = None) -> Call
         "retryable": terminal.retryable,
         "detail": detail,
     }
+    content = [TextContent(type="text", text=detail)]
+    if terminal.next_step is not None:
+        structured["next_step"] = terminal.next_step
+        content.append(TextContent(type="text", text=terminal.next_step))
     if extra:
         structured.update(extra)
-    return CallToolResult(
-        isError=True,
-        content=[TextContent(type="text", text=detail)],
-        structuredContent=structured,
-    )
+    return CallToolResult(isError=True, content=content, structuredContent=structured)
 
 
 def deny_result(exc: BaseException) -> CallToolResult:
@@ -171,7 +194,25 @@ def deny_result(exc: BaseException) -> CallToolResult:
             return _result(_Terminal(exc.reason, PRINCIPAL_REFUSED_RECOVER, False), str(exc))
         return _result(_Terminal(exc.reason, PRINCIPAL_UNSETTLED_RECOVER, True), str(exc))
     terminal = _TERMINALS.get(type(exc), _UNRECOGNIZED)
-    return _result(terminal, str(exc))
+    # The giver terminal also carries who the path went to and at which version
+    # as values the agent can report (the detail says both in prose). Only
+    # through its own row: without one it fails closed like any unknown type.
+    extra = (
+        _giver_fields(exc)
+        if isinstance(exc, GiverFenced) and terminal is not _UNRECOGNIZED
+        else None
+    )
+    return _result(terminal, str(exc), extra)
+
+
+def _giver_fields(exc: GiverFenced) -> dict:
+    """The successor (the wire string a client raises with) and the version
+    at transfer, each ``None`` when the refusal did not carry it typed."""
+    successor = exc.successor if isinstance(exc.successor, str) else None
+    version = exc.version_at_transfer
+    if isinstance(version, bool) or not isinstance(version, int):
+        version = None
+    return {"successor": successor, "version_at_transfer": version}
 
 
 def coordinator_unavailable_result(detail: str) -> CallToolResult:
