@@ -150,7 +150,7 @@ talks to it over stdin/stdout, and the server coordinates writes through an
 in-process `CoherentVolume` on the local filesystem. There is nothing to firewall
 and no endpoint to configure on this path. See the MCP sections of the
 [README](../README.md#mcp-server-stale-write-guard-fs) and the
-[guide](guide.md#stale-write-guard-fs-mcp-server) for setup and the five `swg_*`
+[guide](guide.md#stale-write-guard-fs-mcp-server) for setup and the ten `swg_*`
 tools.
 
 ## Who the coordinator can tell apart
@@ -204,6 +204,12 @@ What follows from that:
   nonce, the command exits `2`, and the attempt leaves a mint-nonce file
   behind, as a wrong session id does. A subagent's shell names
   its parent session, so a command run there acts as the parent.
+- `CoherentVolume` and the MCP server hand on and settle
+  [handoffs](guide.md#from-a-coherentvolume) only as their own session: they
+  present their own principal on every request, and the MCP handoff tools
+  take no session argument. So when a volume or MCP session is a handoff's
+  giver, or completes or overtakes one with its write, the record names the
+  session whose principal the coordinator checked.
 - `last_writer_id`, and the sessions listed by `/status`, record which session a
   caller *said* it was — verified against its principal when it has one. A
   handoff's transfer record holds ids of the same kind: its giver is the session
@@ -236,7 +242,13 @@ the volume's session rather than the per-attempt id that holds its grants — an
 never by session name or session id; the `metrics` view carries no record. Hook
 responses identify another session by its agent id, a one-way hash of the
 session id, and the handoff commands print the session-level agent id they act
-as, never the session id. The `agent-coherence-status` command is an operator tool and asks
+as, never the session id. The MCP server's `swg_status` returns
+`session_agent_id`, the session's own session-level agent id, to that session:
+it is a one-way hash of the `session_id` the same tool already returns, and
+the id a `handoff` key names that session by, so it discloses nothing new. The
+MCP tools that carry a `handoff` key (`swg_read`, `swg_status`,
+`swg_write_cas`) relay the coordinator's, so they too carry session-level agent
+ids only. The `agent-coherence-status` command is an operator tool and asks
 for the operator view by default, so its output does carry session names: run
 it with `--detail minimal` before pasting the output into a bug report, and
 point dashboards at `--detail metrics`. All of this is disclosure hygiene
