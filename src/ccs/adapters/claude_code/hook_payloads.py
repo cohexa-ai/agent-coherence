@@ -255,11 +255,11 @@ def emit_strict_deny(
 # ----------------------------------------------------------------------
 #
 # Byte-stable like the strict templates: every placeholder is a short agent
-# id, a path or a version, so the corpus can pin the rendered bytes (R38).
+# id, a path or a version, so the corpus can pin the rendered bytes.
 # None of this prose names a console script or invokes the withdraw verb:
 # withdraw is named only as the giver's exit taken on its user's or host's
 # instruction, because a terminal deny that hands the model the command lifting
-# it is a self-bypass the measured retry loop would take (KTD5). Python-only:
+# it is a self-bypass the measured retry loop would take. Python-only:
 # the Node backend serves no handoff, so there is no mirror to keep in step.
 
 _HANDOFF_FENCED_CLAUSE = (
@@ -280,7 +280,7 @@ HANDOFF_GIVER_DENY_REASON_TEMPLATE: str = (
     + "This denial is structural; retrying the same operation will produce "
     + "the same denial."
 )
-"""The giver's pre-edit deny (R13, R14). Placeholders: ``path``,
+"""The giver's pre-edit deny. Placeholders: ``path``,
 ``successor_short`` and ``version_at_transfer`` only, locked by
 ``test_handoff_giver_deny_reason_template_is_static``. It names the three exits
 -- the successor writes, the successor declines, the giver withdraws on its
@@ -306,7 +306,7 @@ HANDOFF_EDIT_ON_DISK_SENTENCE: str = (
     "Your edit landed in your local worktree but was not given a version by "
     "the coordinator."
 )
-"""KTD6: the post-edit handoff arm's statement of fact, as the preemption and
+"""The post-edit handoff arm's statement of fact, as the preemption and
 reclaim arms already make it -- no instruction to revert or re-edit. It is on
 the post-edit arm only: the pre-edit deny lands nothing, and the
 compare-and-swap refusal writes nothing before a win."""
@@ -317,7 +317,7 @@ HANDOFF_GIVER_COMMIT_REFUSED_TEMPLATE: str = (
     + _HANDOFF_EXITS_SENTENCE + " "
     + _HANDOFF_STOP_SENTENCE
 )
-"""The post-edit handoff arm (AE3): the giver's in-flight edit reported after
+"""The post-edit handoff arm: the giver's in-flight edit reported after
 the transfer landed. Delivered through the post-tool context envelope
 (:func:`emit_posttooluse_context`), beside the typed reason. Same placeholders
 as the deny."""
@@ -326,7 +326,7 @@ HANDOFF_PROVENANCE_TEMPLATE: str = (
     "Handoff: agent {giver_short} handed {path} to this session at "
     "v{version_at_transfer}; the hold it gave up was {hold_shape}."
 )
-"""R17: the successor's provenance -- by which agent, at which version, from
+"""The successor's provenance -- by which agent, at which version, from
 which hold shape (``EXCLUSIVE``, ``MODIFIED`` or ``SHARED``)."""
 
 HANDOFF_UNCOMMITTED_CLAIM_TEMPLATE: str = (
@@ -334,7 +334,7 @@ HANDOFF_UNCOMMITTED_CLAIM_TEMPLATE: str = (
     "on, so the file on disk may differ from v{version_at_transfer}; read "
     "{path} before editing it."
 )
-"""KTD6: added to the provenance for an ``EXCLUSIVE`` hold shape only. Worded
+"""Added to the provenance for an ``EXCLUSIVE`` hold shape only. Worded
 as a possibility: an EXCLUSIVE holder may or may not have written to disk, and
 the coordinator cannot tell. ``MODIFIED`` committed what it wrote, and
 ``SHARED`` never held a write claim."""
@@ -343,7 +343,7 @@ HANDOFF_READ_FIRST_TEMPLATE: str = (
     "⚠ You have not read {path} at v{version_at_transfer} or later; read it "
     "before editing."
 )
-"""R18: the successor's acquire, when its last observed version on the path is
+"""The successor's acquire, when its last observed version on the path is
 absent or below the version at transfer. A warning, never a deny: the
 strict-mode gate stays INVALID-only, so a fresh successor is warned."""
 
@@ -352,7 +352,7 @@ HANDOFF_OVERTAKEN_TEMPLATE: str = (
     "{giver_short} at v{version_at_transfer} was overtaken by agent "
     "{counterparty_short}."
 )
-"""R24 (AE8): the successor's touch after a bystander acquired or wrote past
+"""The successor's touch after a bystander acquired or wrote past
 the handoff."""
 
 HANDOFF_BYSTANDER_ADVISORY_TEMPLATE: str = (
@@ -360,14 +360,14 @@ HANDOFF_BYSTANDER_ADVISORY_TEMPLATE: str = (
     "{successor_short} at v{version_at_transfer}. This session is not a party "
     "to it; its edits are admitted and are recorded as overtaking the handoff."
 )
-"""R23: a third session is never refused because of a live handoff; it is
+"""A third session is never refused because of a live handoff; it is
 told whose handoff it is writing past."""
 
 HANDOFF_ENDED_UNRECORDED_TEMPLATE: str = (
     "Handoff ended: the handoff of {path} at v{version_at_transfer} was ended "
     "by a write at a later version whose writer was not recorded."
 )
-"""KTD6: one sentence, for the giver and the successor alike, for a record that
+"""One sentence, for the giver and the successor alike, for a record that
 is no longer live while its status is still ``pending`` -- the version moved
 and nothing labelled the record (a crash, or a failed label write, between a
 win and its completion)."""
@@ -388,7 +388,7 @@ HANDOFF_GIVER_OUTCOME_TEMPLATES: dict[str, str] = {
     ),
     TRANSFER_STATUS_WITHDRAWN: _HANDOFF_ENDED_PREFIX + "was withdrawn.",
 }
-"""R14: the giver's next touch after its handoff ended reports how it ended,
+"""The giver's next touch after its handoff ended reports how it ended,
 one template per ended status. A record still pending when it ended renders
 :data:`HANDOFF_ENDED_UNRECORDED_TEMPLATE` instead."""
 
@@ -423,7 +423,7 @@ def emit_handoff_giver_deny(
     version_at_transfer: int,
 ) -> dict[str, Any]:
     """Build the ``hookSpecificOutput`` deny envelope for the giver of a live
-    handoff (KTD5), the strict-deny-style builder of the third template.
+    handoff, the strict-deny-style builder of the third template.
 
     The reason renders :data:`HANDOFF_GIVER_DENY_REASON_TEMPLATE`, static and
     byte-stable across retries and across strict and warn mode. Its class is
@@ -469,7 +469,7 @@ def handoff_context_text(
     - bystander: the advisory naming giver and successor, while it is live.
 
     ``unread`` is the successor's acquire whose last observed version on the
-    path was absent or below the version at transfer (R18). A record no longer
+    path was absent or below the version at transfer. A record no longer
     live while still ``pending`` renders the one unrecorded-writer sentence for
     giver and successor alike."""
     if handoff["role"] == HANDOFF_ROLE_BYSTANDER:
@@ -649,7 +649,7 @@ class PostToolUseContextOutput(TypedDict):
     response -- prose for the model after the tool ran, with no decision.
 
     Carries the post-edit handoff arm to the giver whose in-flight edit was
-    refused a version (AE3). That Claude Code relays ``additionalContext``
+    refused a version. That Claude Code relays ``additionalContext``
     from a PostToolUse hook to the model is an assumption, observed once in
     the giver-deny measurement; if it is not relayed the arm is a wire-level
     answer and the giver learns its outcome on its next pre-read or

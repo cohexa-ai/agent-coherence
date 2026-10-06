@@ -10282,7 +10282,7 @@ def _giver_refusal(giver: _Session, successor: _Session, *, shape: str) -> dict:
 
 
 def _giver_deny_envelope(successor: _Session, path: str, version: int = 1) -> dict:
-    """The giver's pre-edit deny envelope, as a literal (KTD5)."""
+    """The giver's pre-edit deny envelope, as a literal."""
     s = successor.agent[:8]
     return {
         "hookEventName": "PreToolUse",
@@ -10299,8 +10299,7 @@ def _giver_deny_envelope(successor: _Session, path: str, version: int = 1) -> di
 
 
 def _commit_arm_envelope(successor: _Session, path: str, version: int = 1) -> dict:
-    """The post-edit handoff arm in the post-tool context envelope, as a
-    literal (AE3, KTD6)."""
+    """The post-edit handoff arm in the post-tool context envelope, as a literal."""
     s = successor.agent[:8]
     return {
         "hookEventName": "PostToolUse",
@@ -10671,7 +10670,7 @@ def test_a_compare_and_swap_win_carries_its_handoff_outcome(
     assert read["handoff"] == _projection(giver, successor, "giver", status="completed", live=False)
 
 
-# --- the handoff prose on the hook envelopes (KTD6) ---------------------------
+# --- the handoff prose on the hook envelopes ----------------------------------
 #
 # Hook clients get the handoff as prose too: provenance, the read-first
 # warning, the bystander advisory, the live giver's statement on a read and
@@ -10773,7 +10772,7 @@ def test_the_handoff_prose_templates_are_static() -> None:
     """The successor's and bystander's prose and the ended outcomes are
     under the deny's placeholder rule: short agent ids, the path, the version
     at transfer and the hold shape only -- no timestamp -- so the corpus can
-    pin their bytes (R38)."""
+    pin their bytes."""
     import re
 
     from ccs.adapters.claude_code import hook_payloads as payloads
@@ -10800,7 +10799,7 @@ def test_the_handoff_prose_templates_are_static() -> None:
 def test_the_givers_post_edit_refusal_renders_the_handoff_arm_in_the_post_tool_envelope(
     coordinator, client: _Client
 ) -> None:
-    """Covers AE3. A held ``plan.md`` EXCLUSIVE and handed it to B; A's
+    """A held ``plan.md`` EXCLUSIVE and handed it to B; A's
     in-flight edit then reports success. The commit is refused with the typed
     reason, and the handoff arm -- the three exits and the statement that the
     edit is on disk without a version -- reaches the hook client through the
@@ -10831,7 +10830,7 @@ def test_the_givers_post_edit_refusal_renders_the_handoff_arm_in_the_post_tool_e
 def test_the_successors_provenance_reads_before_editing_only_for_an_exclusive_hold(
     coordinator, client: _Client, shape: str
 ) -> None:
-    """R17 and KTD6. The successor's reads carry its provenance -- by which
+    """The successor's reads carry its provenance -- by which
     agent, at which version, from which hold shape -- in the context-only
     envelope, after its stale warning on the first read and alone on the
     next, byte for byte the same. The read-before-editing sentence rides the
@@ -10857,7 +10856,7 @@ def test_the_successors_provenance_reads_before_editing_only_for_an_exclusive_ho
 def test_the_successors_pre_edit_is_admitted_with_provenance_and_a_read_first_warning(
     coordinator, client: _Client, observed: str
 ) -> None:
-    """Covers AE5 and R18. The successor's pre-edit is admitted -- never
+    """The successor's pre-edit is admitted -- never
     denied -- and completes the handoff; its body carries the provenance in
     the context-only envelope with no permission decision (nothing through
     the allow emitter), plus the read-first warning exactly when the version
@@ -10891,7 +10890,7 @@ def test_the_successors_pre_edit_is_admitted_with_provenance_and_a_read_first_wa
 def test_a_bystander_is_advised_and_its_commit_reports_overtaken_to_the_successor(
     coordinator, client: _Client
 ) -> None:
-    """Covers AE8 (R23, R24). C's pre-edit on A's live handoff to B is
+    """The bystander C's pre-edit on A's live handoff to B is
     admitted with the advisory naming A and B; after C commits, B's next
     read reports the handoff overtaken by C, and so does A's (its outcome)."""
     giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
@@ -10983,7 +10982,7 @@ def test_only_the_giver_is_told_on_a_read_that_it_handed_the_path_off(
 def test_the_givers_next_touch_after_the_handoff_ended_reports_its_outcome(
     coordinator, client: _Client, ending: str
 ) -> None:
-    """R14. While the record is live the giver's read says it handed the
+    """While the record is live the giver's read says it handed the
     path off; once the record is no longer live, the giver's next touch
     reports how its handoff ended instead, and no longer says it may not
     write -- and, the fence lifted, a pre-edit is an admit that carries the
@@ -11022,7 +11021,7 @@ def test_the_givers_next_touch_after_the_handoff_ended_reports_its_outcome(
 def test_a_record_ended_by_an_unrecorded_writer_says_so_to_giver_and_successor(
     coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """KTD6. The successor's win lands but its label write fails, so the
+    """The successor's win lands but its label write fails, so the
     version moved while the record still says pending: it is no longer live,
     and nothing recorded who ended it. Giver and successor are both told the
     one static sentence for that case, not a completion nobody recorded."""

@@ -549,7 +549,7 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
 
 
 def _render_handoff_block(tracked: list[dict[str, Any]]) -> None:
-    """#185 (R27): one line per tracked artifact whose ``/status`` entry carries
+    """#185: one line per tracked artifact whose ``/status`` entry carries
     a transfer record (the ``handoff`` key) -- the path, giver and successor as
     short session-level agent ids, the version at transfer, the status (marked
     ended when the record is no longer live), and the record's age when the

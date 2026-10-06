@@ -1410,7 +1410,7 @@ def test_crediting_a_held_read_never_restores_a_revoked_grant(
 
 
 # ----------------------------------------------------------------------
-# The giver's pre-edit deny (#185, R13/R14/R38, KTD5)
+# The giver's pre-edit deny (#185)
 # ----------------------------------------------------------------------
 #
 # The third byte-stable deny template. It gets the strict template's three
@@ -1503,7 +1503,7 @@ def _expected_giver_deny_reason() -> str:
 
 
 def test_handoff_giver_deny_reason_template_is_static() -> None:
-    """KTD5 placeholder lock, the strict template's first pin: only the path,
+    """Placeholder lock, the strict template's first pin: only the path,
     the successor's short id and the version at transfer. A timestamp or a
     per-invocation field would rotate the bytes across retries, which the
     Phase 0 measurement showed worsens the retry loop."""
@@ -1524,7 +1524,7 @@ def test_the_live_givers_read_prose_template_is_static() -> None:
     """The prose a live giver's admitted read carries is under the deny's
     placeholder lock: the path, the successor's short id and the version at
     transfer only. A timestamp would rotate the bytes on every read and keep
-    the corpus from pinning them (R38)."""
+    the corpus from pinning them."""
     actual = set(re.findall(r"\{([a-z_]+)\}", HANDOFF_GIVER_READ_TEMPLATE))
     assert actual == {"path", "successor_short", "version_at_transfer"}, actual
 
@@ -1541,7 +1541,7 @@ def test_the_live_givers_read_prose_template_is_static() -> None:
 def test_handoff_giver_prose_names_no_console_script_and_no_withdraw_invocation(
     template: str,
 ) -> None:
-    """KTD5 negative pin, beside the placeholder lock: the deny, the
+    """Negative pin, beside the placeholder lock: the deny, the
     post-edit arm and the live giver's read prose name withdraw only as the
     giver's exit taken on its user's or host's instruction. A console-script
     name, a route or a call spelling in these bytes would hand the model the
@@ -1576,7 +1576,7 @@ def test_the_allow_emission_roster_is_unchanged_by_the_handoff_prose() -> None:
 def test_the_givers_pre_edit_is_denied_with_the_typed_reason_and_no_version_pair(
     tmp_path: Path, strict: bool,
 ) -> None:
-    """Covers AE4. The giver's pre-edit is denied inside the hook deny
+    """The giver's pre-edit is denied inside the hook deny
     envelope, with the typed reason at the top level beside it, in warn mode
     as in strict mode -- so warn mode cannot re-take the path one turn later.
     No version pair rides the deny even when the caller opts in. In strict
@@ -1600,7 +1600,7 @@ def test_the_givers_pre_edit_is_denied_with_the_typed_reason_and_no_version_pair
 
 
 def test_the_givers_deny_bytes_are_identical_across_retries_and_modes(tmp_path: Path) -> None:
-    """Covers AE4. The same reason bytes on a second attempt and in the other
+    """The same reason bytes on a second attempt and in the other
     mode: the template is static and fires ahead of the strict branch."""
     reasons: list[str] = []
     for strict in (False, True):
@@ -1617,7 +1617,7 @@ def test_the_givers_deny_bytes_are_identical_across_retries_and_modes(tmp_path: 
 def test_the_givers_deny_bumps_its_own_counter_only_and_writes_no_audit_line(
     tmp_path: Path,
 ) -> None:
-    """KTD5 bookkeeping, on a strict path where the strict branch would move
+    """The deny's bookkeeping, on a strict path where the strict branch would move
     both other counters: each deny bumps the giver-deny counter once, the
     strict-mode denial and stale-warning counters stay where they were, and
     no audit line is written (the strict appender would mislabel it)."""
@@ -1639,7 +1639,7 @@ def test_the_givers_deny_bumps_its_own_counter_only_and_writes_no_audit_line(
 
 
 def test_a_shell_read_after_the_givers_deny_counts_as_a_route_around(tmp_path: Path) -> None:
-    """KTD5: the giver's deny is recorded in the route-around detector's map,
+    """The giver's deny is recorded in the route-around detector's map,
     so a read-shaped shell command on the same path from the same session
     within the window is counted as routing around it. The giver is INVALID
     on the strict path after its transfer, so the shell read is strict-denied
@@ -1657,7 +1657,7 @@ def test_a_shell_read_after_the_givers_deny_counts_as_a_route_around(tmp_path: P
 
 
 def test_the_givers_strict_pre_read_deny_carries_no_handoff_prose(tmp_path: Path) -> None:
-    """R29: on a strict path the giver's read is the ordinary strict deny --
+    """On a strict path the giver's read is the ordinary strict deny --
     the transfer left its claim INVALID at an unmoved version, so the
     grant-change template -- with nothing beside or inside it: no ``handoff``
     key and no handoff prose, though the record is live. Fails if the live
@@ -1683,7 +1683,7 @@ def test_the_givers_strict_pre_read_deny_carries_no_handoff_prose(tmp_path: Path
 
 
 # ----------------------------------------------------------------------
-# A live record changes no strict deny and no shell body (#185, R29)
+# A live record changes no strict deny and no shell body (#185)
 # ----------------------------------------------------------------------
 #
 # The corpus rows below are replayed as recorded, then one transfer lands a
@@ -1702,7 +1702,7 @@ def test_the_givers_strict_pre_read_deny_carries_no_handoff_prose(tmp_path: Path
 def test_a_strict_corpus_row_answers_its_bytes_with_a_live_record_on_its_path(
     tmp_path: Path, row: str,
 ) -> None:
-    """R29: a strict deny's bytes, and the pre-bash and pre-grep bodies, are
+    """A strict deny's bytes, and the pre-bash and pre-grep bodies, are
     the corpus row's bytes while a live record names the denied session as
     successor. Fails if the ``handoff`` key or any handoff prose is attached
     to a strict deny, or if the shell routes start carrying either."""

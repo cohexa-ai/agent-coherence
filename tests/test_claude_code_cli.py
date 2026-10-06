@@ -1014,7 +1014,7 @@ def test_render_table_marks_a_holder_with_no_known_name(
 
 
 # ----------------------------------------------------------------------
-# coherence_status — the handoffs block (#185, R27)
+# coherence_status — the handoffs block (#185)
 # ----------------------------------------------------------------------
 
 _GIVER_AGENT = "4c9625da-356c-527f-b5d7-027f181f7748"
@@ -1074,7 +1074,7 @@ def _handoff_key(**extra: object) -> dict:
 def test_status_text_lists_a_handoff_after_the_artifacts_table(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """R27: an entry carrying the ``handoff`` key gets one line in a handoffs
+    """An entry carrying the ``handoff`` key gets one line in a handoffs
     block printed right after the artifacts table: the path, giver and
     successor as short session-level agent ids, the version at transfer, the
     status and the record's age from its created timestamp. Everything else
@@ -1099,7 +1099,7 @@ def test_status_text_lists_a_handoff_after_the_artifacts_table(
 def test_status_text_is_byte_identical_to_today_when_no_entry_carries_a_handoff(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """R27: with no ``handoff`` key on any entry the table is today's output,
+    """With no ``handoff`` key on any entry the table is today's output,
     byte for byte, with no empty handoffs heading. Prevents every workspace
     that never hands a path off seeing its status output change."""
     monkeypatch.setenv("COLUMNS", "80")
@@ -1143,12 +1143,12 @@ def test_status_text_marks_a_handoff_that_has_ended_although_its_label_still_rea
 
 
 # ----------------------------------------------------------------------
-# coherence_handoff — the four handoff verbs (#185, R36, AE23)
+# coherence_handoff — the four handoff verbs (#185)
 # ----------------------------------------------------------------------
 
 _SESSION_VAR = "CLAUDE_CODE_SESSION_ID"
 
-#: The verbs' exit codes, pinned by number (KTD12); 3 is the status self-test's.
+#: The verbs' exit codes, pinned by number; 3 is the status self-test's.
 _EXIT_DONE, _EXIT_USAGE, _EXIT_FAILED, _EXIT_NOT_SERVED = 0, 1, 2, 4
 
 _NOT_HELD_HINT = (
@@ -1253,7 +1253,7 @@ def stub_coordinator(git_workspace: Path):
 def test_transfer_with_no_session_flag_acts_as_the_session_the_harness_variable_names(
     live_coordinator, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Covers AE23 (R36). In a hook session's shell, with no ``--session``, the
+    """In a hook session's shell, with no ``--session``, the
     transfer acts as the session ``CLAUDE_CODE_SESSION_ID`` names: the
     coordinator records that session as the giver, the verb prints the
     session-level id it acted as (the giver id the answer returns) and that
@@ -1293,7 +1293,7 @@ def test_a_verb_with_no_session_flag_and_no_harness_variable_is_a_usage_error_th
     verb: str, live_coordinator, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Covers AE23 (R36). With neither ``--session`` nor ``CLAUDE_CODE_SESSION_ID``
+    """With neither ``--session`` nor ``CLAUDE_CODE_SESSION_ID``
     the verb refuses rather than guessing: exit 1 with its usage, and nothing
     reaches the coordinator -- no claim, no verb request, no caller-principal
     file. Prevents a verb run outside a Claude Code session acting as an
@@ -1317,7 +1317,7 @@ def test_a_verb_with_no_session_flag_and_no_harness_variable_is_a_usage_error_th
 def test_a_malformed_command_line_exits_1_not_argparse_2(
     git_workspace: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """KTD12: exit 1 is usage. argparse's own exit for a bad command line is 2,
+    """Exit 1 is usage. argparse's own exit for a bad command line is 2,
     which these verbs mean as a coordinator failure, so a transfer missing its
     successor exits 1. Prevents a script reading a typo as an unreachable
     coordinator."""
@@ -1335,7 +1335,7 @@ def test_each_verb_prints_the_session_agent_id_it_acted_as_and_where_the_session
     verb: str, source: str, live_coordinator, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """R36 / KTD12: every verb prints the session-level agent id it acted as and
+    """Every verb prints the session-level agent id it acted as and
     whether ``--session`` or ``CLAUDE_CODE_SESSION_ID`` named the session (the
     flag winning over the variable), and never the raw session id. Prevents a
     shell whose variable names another session acting as that session with
@@ -1364,7 +1364,7 @@ def test_each_verb_prints_the_session_agent_id_it_acted_as_and_where_the_session
 def test_a_verb_presents_the_stored_principal_of_a_session_its_hooks_already_claimed(
     live_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """R36: the verb presents the named session's stored caller principal, as
+    """The verb presents the named session's stored caller principal, as
     that session's hook events do, and the require-class route admits it on
     the first request: no principal refusal, no claim, the stored files
     untouched. Prevents the verb sending no principal for a bound session,
@@ -1391,7 +1391,7 @@ def test_a_verb_presents_the_stored_principal_of_a_session_its_hooks_already_cla
 def test_a_verb_for_a_session_with_no_principal_mints_claims_and_stores_it_as_a_first_hook_event_would(
     live_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """R36, and the fact docs/security.md states for the handoff CLI: for a named
+    """The fact docs/security.md states for the handoff CLI: for a named
     session with no stored principal and no binding, the verb creates the
     session's mint nonce, claims, and stores the principal -- both files
     exist afterwards, and the stored principal is the bound one -- and the
@@ -1421,7 +1421,7 @@ def test_a_verb_for_a_session_with_no_principal_mints_claims_and_stores_it_as_a_
 def test_a_verb_for_a_session_bound_under_another_nonce_is_refused_and_never_re_mints(
     live_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """R36 / KTD12: a session bound under ANOTHER mint nonce -- claimed first by
+    """A session bound under ANOTHER mint nonce -- claimed first by
     a direct claim, standing in for a live volume's or MCP session's id --
     cannot be acted for. Withdrawing that session's live handoff reports the
     caller-principal refusal and exits 2, stores no principal file, presents
@@ -1505,7 +1505,7 @@ def test_a_transfer_after_the_givers_turn_ended_is_not_held_with_a_hint_and_a_pr
 def test_the_subagent_flag_transfers_a_grant_the_subagent_holds(
     live_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """R36: a grant a subagent holds is its composite's, not the main thread's,
+    """A grant a subagent holds is its composite's, not the main thread's,
     and a subagent's shell names the parent session -- so without
     ``--subagent-id`` the transfer finds nothing held, and with it the
     subagent's claim is handed on, the record naming the SESSION as giver.
@@ -1531,7 +1531,7 @@ def test_the_subagent_flag_transfers_a_grant_the_subagent_holds(
 def test_a_verb_against_a_pid_file_naming_the_node_backend_exits_4_without_a_round_trip(
     verb: str, stub_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """KTD12: the Node coordinator does not serve the four routes and its pid
+    """The Node coordinator does not serve the four routes and its pid
     file says so on the backend line, so the verb exits 4 -- not on this
     backend -- before sending anything: no claim, no verb request, no
     caller-principal file. Prevents a Node workspace paying a round trip, and
@@ -1555,7 +1555,7 @@ def test_a_verb_against_a_pid_file_naming_the_node_backend_exits_4_without_a_rou
 def test_with_no_backend_line_not_served_is_the_verb_routes_own_404_never_the_claim_routes(
     answers: dict, expected_rc: int, stub_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """KTD12: with no backend line in the pid file, 'not served' is decided by
+    """With no backend line in the pid file, 'not served' is decided by
     the verb route's own 404 and never by the claim route's answer: a
     coordinator that issues principals but answers the withdraw 404 exits 4,
     and one that answers the claim 404 but serves the withdraw is answered by
@@ -1576,7 +1576,7 @@ def test_with_no_backend_line_not_served_is_the_verb_routes_own_404_never_the_cl
 def test_a_request_the_coordinator_cannot_read_exits_2_naming_what_to_check(
     live_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """KTD12: an HTTP error other than the verb route's 404 exits 2. A session
+    """An HTTP error other than the verb route's 404 exits 2. A session
     id that is not a UUID is answered 400, and the verb says what the
     coordinator could not read rather than a bare status. Prevents a
     mistyped ``--session`` reading as a coordinator fault with no lead."""

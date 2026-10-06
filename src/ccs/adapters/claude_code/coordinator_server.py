@@ -3018,7 +3018,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     caller = caller_principal_identity(session_id)
     now = monotonic_seconds()
-    # #185 R18: the version this agent last observed on the path, read BEFORE
+    # #185: the version this agent last observed on the path, read BEFORE
     # the acquire (which records the current version as observed), so the
     # successor's admit can warn when it never read the version it was handed.
     observed_before_acquire: int | None = None
@@ -3031,7 +3031,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         if artifact_id is None:
             artifact_id = coordinator.registry.resolve_or_register(path, content_hash="")
 
-        # #185 R13 (KTD5): the giver of a live handoff is denied AHEAD of the
+        # #185: the giver of a live handoff is denied AHEAD of the
         # strict-mode stale branch, and in warn mode too. The transfer left
         # the giver's claim INVALID, so on a strict path the stale branch
         # would otherwise answer first -- and in warn mode nothing would deny,
@@ -5101,7 +5101,7 @@ def _giver_deny_response(
     path: str,
     caller: UUID,
 ) -> dict:
-    """The giver's pre-edit deny (R13, KTD5): the typed reason at the top
+    """The giver's pre-edit deny: the typed reason at the top
     level, the third byte-stable template in the deny envelope beside it, and
     the path's ``handoff`` key -- a deny's body is fixed by its emitter, so
     the key is attached here rather than by the route's wrapper.
@@ -5126,7 +5126,7 @@ def _giver_deny_response(
 
 
 def _giver_commit_refused_body(exc: GiverFenced, *, path: str) -> dict:
-    """The giver's post-edit refusal (AE3, KTD6): the typed reason, and the
+    """The giver's post-edit refusal: the typed reason, and the
     handoff arm -- the three exits and the statement that the edit is on disk
     without a version -- through the post-tool context envelope. Rendered
     from the record the fence raised from, never from a notice row: notices
@@ -5269,7 +5269,7 @@ def _attach_hook_handoff(
     acquired: bool = False,
     observed: int | None = None,
 ) -> dict:
-    """The pre-read and pre-edit seam for a handoff (R29, KTD6), from ONE
+    """The pre-read and pre-edit seam for a handoff, from ONE
     read of the record.
 
     A deny is returned untouched: a strict deny keeps the corpus's bytes, and
@@ -5278,7 +5278,7 @@ def _attach_hook_handoff(
     role's prose through the context-only envelope -- never the allow
     emitter, which would widen a permission decision. ``acquired`` marks the
     pre-edit's acquire, where ``observed`` (this agent's last observed
-    version before it) decides the successor's read-first warning (R18)."""
+    version before it) decides the successor's read-first warning."""
     if _is_deny(result):
         return result
     read = _read_handoff(coordinator, path)
