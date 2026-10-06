@@ -39,7 +39,7 @@ from ccs.mcp.server import (
     _do_write_cas,
 )
 from ccs.mcp.session import SessionConfig
-from ccs.mcp.status import build_status
+from ccs.mcp.status import build_status, handoff_from_status
 
 PLAN = "data/plan.md"
 OTHER = "data/other.md"
@@ -217,6 +217,67 @@ def test_the_successors_read_carries_the_handoff_key_and_a_path_with_no_record_n
         }
         assert plain.isError is False
         assert "handoff" not in plain.structuredContent
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_the_givers_strict_denied_re_read_still_carries_its_handoff_key(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """On an enforced path the giver's own re-read after its transfer is the
+    coordinator's strict deny, whose bytes never carry the ``handoff`` key.
+    The read tool still returns the bytes, and without the key a giver reads
+    the path as having no record -- the silent all-clear the hook surface's
+    giver read notice exists to prevent. The record comes from ``/status``
+    instead, projected with the giver's role."""
+    _seed(tmp_path, PLAN, b"plan v1")
+    config = _config(tmp_path)
+    giver = _vol(tmp_path, fast_cfg)
+    successor = _vol(tmp_path, fast_cfg)
+    try:
+        _do_read(giver, config, PLAN)
+        assert _do_transfer(giver, config, [PLAN], _agent(successor)).isError is False
+
+        reread = _do_read(giver, config, PLAN)
+
+        assert giver.last_read_denied is True, "precondition: the re-read was strict-denied"
+        assert reread.isError is False
+        assert reread.structuredContent["content"] == "plan v1"
+        assert reread.structuredContent["handoff"] == {
+            "role": "giver",
+            "giver": _agent(giver),
+            "successor": _agent(successor),
+            "version_at_transfer": 1,
+            "hold_shape": "SHARED",
+            "status": "pending",
+            "live": True,
+        }
+        assert "handoff_unknown" not in reread.structuredContent
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_denied_read_whose_record_cannot_be_fetched_says_so(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When ``/status`` cannot be read after a denied read, the record is
+    unknown, not absent: the result says ``handoff_unknown`` rather than
+    omitting the key the way a path with no record does."""
+    _seed(tmp_path, PLAN, b"plan v1")
+    config = _config(tmp_path)
+    giver = _vol(tmp_path, fast_cfg)
+    successor = _vol(tmp_path, fast_cfg)
+    try:
+        _do_read(giver, config, PLAN)
+        assert _do_transfer(giver, config, [PLAN], _agent(successor)).isError is False
+        monkeypatch.setattr(giver, "coordinator_status", lambda: None)
+
+        reread = _do_read(giver, config, PLAN)
+
+        assert giver.last_read_denied is True, "precondition: the re-read was strict-denied"
+        assert reread.isError is False
+        assert reread.structuredContent["handoff_unknown"] is True
+        assert "handoff" not in reread.structuredContent
     finally:
         stop_coordinator(tmp_path)
 
@@ -480,3 +541,70 @@ def test_the_status_tool_derives_its_id_through_the_coordinators_function(
 
     assert calls == [(_FIXED_SESSION, None)]
     assert status["session_agent_id"] == str(UUID(int=7))
+
+
+class _StatusDocVolume:
+    """Just what ``handoff_from_status`` reads: a session id and a fixed
+    ``/status`` document (``None``: unreachable)."""
+
+    def __init__(self, session_id: str, status_doc: dict | None) -> None:
+        self.session_id = session_id
+        self._status_doc = status_doc
+
+    def coordinator_status(self) -> dict | None:
+        return self._status_doc
+
+
+_OTHER_AGENT = "11111111-2222-5333-8444-555555555555"
+
+
+def _status_with(record: dict | None) -> dict:
+    entry: dict = {"path": PLAN, "version": 3}
+    if record is not None:
+        entry["handoff"] = record
+    return {"tracked_artifacts": [{"path": OTHER, "version": 1}, entry]}
+
+
+@pytest.mark.parametrize(
+    ("giver", "successor", "role"),
+    [
+        (_FIXED_AGENT, _OTHER_AGENT, "giver"),
+        (_OTHER_AGENT, _FIXED_AGENT, "successor"),
+        (_OTHER_AGENT, str(UUID(int=9)), "bystander"),
+    ],
+)
+def test_a_status_record_is_projected_with_this_sessions_role(
+    giver: str, successor: str, role: str
+) -> None:
+    """``/status`` carries the record with no role; the read tool adds the
+    one the coordinator would give this session in a hook body, from the
+    session-level agent id alone."""
+    record = {
+        "giver": giver,
+        "successor": successor,
+        "version_at_transfer": 3,
+        "hold_shape": "MODIFIED",
+        "status": "pending",
+        "live": True,
+    }
+    volume = _StatusDocVolume(_FIXED_SESSION, _status_with(record))
+
+    assert handoff_from_status(volume, PLAN) == (True, {"role": role, **record})
+
+
+def test_a_status_lookup_tells_no_record_from_cannot_tell() -> None:
+    """A path ``/status`` lists without a record, or does not list, has no
+    record; an unreachable ``/status``, or one with no artifact list, cannot
+    tell -- and cannot-tell never collapses into "no record"."""
+    assert handoff_from_status(_StatusDocVolume(_FIXED_SESSION, _status_with(None)), PLAN) == (
+        True,
+        None,
+    )
+    assert handoff_from_status(
+        _StatusDocVolume(_FIXED_SESSION, {"tracked_artifacts": []}), PLAN
+    ) == (True, None)
+    assert handoff_from_status(_StatusDocVolume(_FIXED_SESSION, None), PLAN) == (False, None)
+    assert handoff_from_status(_StatusDocVolume(_FIXED_SESSION, {"detail": "minimal"}), PLAN) == (
+        False,
+        None,
+    )

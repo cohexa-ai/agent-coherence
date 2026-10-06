@@ -2569,10 +2569,24 @@ class CoherentVolume:
         the path has no record, or the read was strict-denied, failed or went
         unanswered. Every read call sets it, :meth:`read` and
         :meth:`read_with_version` alike; it is what the MCP read tool relays
-        as the read's provenance."""
+        as the read's provenance. After a strict-denied read (see
+        :attr:`last_read_denied`) ``None`` says nothing about the record: a
+        strict deny's bytes never carry the key."""
         _abs_path, rel = self._to_relative(path)
         handoff = self._read_handoffs.get(rel)
         return dict(handoff) if handoff is not None else None
+
+    @property
+    def last_read_denied(self) -> bool:
+        """Whether the coordinator refused this volume's most recent
+        :meth:`read_with_version_generation` with a strict-mode deny.
+
+        A handoff's giver meets one on its own re-read of a path it handed
+        off: the transfer left its claim INVALID at an unmoved version. The
+        deny carries no ``handoff`` key, so a reader that must tell "no
+        record" from "not told" asks ``/status`` after one, as the MCP read
+        tool does."""
+        return self._last_read_denied
 
     def _note_read_handoff(self, rel: str, resp: object) -> None:
         """Keep the ``handoff`` key a pre-read answer carried for

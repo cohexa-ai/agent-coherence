@@ -45,6 +45,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
+from ccs.adapters.claude_code.hook_payloads import (
+    HANDOFF_ROLE_BYSTANDER,
+    HANDOFF_ROLE_GIVER,
+    HANDOFF_ROLE_SUCCESSOR,
+)
 from ccs.adapters.claude_code.policy import matches_any
 
 if TYPE_CHECKING:
@@ -126,3 +131,37 @@ def _per_path(config: SessionConfig, status_doc: dict | None) -> dict:
             entry["handoff"] = handoff
         per_path[path] = entry
     return per_path
+
+
+def handoff_from_status(volume: CoherentVolume, path: str) -> tuple[bool, dict | None]:
+    """``path``'s transfer record as the coordinator's default ``/status`` tier
+    reports it, projected for this session the way a read's ``handoff`` key
+    is: ``(True, projection)``; ``(True, None)`` when ``/status`` lists no
+    record for the path; ``(False, None)`` when ``/status`` could not be read
+    -- cannot tell, which is never "no record".
+
+    The role is the one the coordinator gives this session in a hook body:
+    ``giver`` or ``successor`` when the record names this session's
+    session-level agent id, else ``bystander``. ``/status`` carries no role,
+    because it has no caller to be a party to the record."""
+    status_doc = volume.coordinator_status()
+    artifacts = status_doc.get("tracked_artifacts") if isinstance(status_doc, dict) else None
+    if not isinstance(artifacts, list):
+        return False, None
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or artifact.get("path") != path:
+            continue
+        record = artifact.get("handoff")
+        if not isinstance(record, dict):
+            return True, None
+        return True, {"role": _handoff_role(volume, record), **record}
+    return True, None
+
+
+def _handoff_role(volume: CoherentVolume, record: dict) -> str:
+    me = str(session_to_agent_id(volume.session_id))
+    if record.get("giver") == me:
+        return HANDOFF_ROLE_GIVER
+    if record.get("successor") == me:
+        return HANDOFF_ROLE_SUCCESSOR
+    return HANDOFF_ROLE_BYSTANDER

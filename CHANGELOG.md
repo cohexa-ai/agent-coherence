@@ -143,7 +143,9 @@ Alpha — APIs may change before `v1.0`.
   (`ccs.core.exceptions`), naming the successor and the version at transfer;
   it is never retried and no reacquire clears it; a multi-file publish that
   includes the path publishes none of its files. `vol.read_handoff(path)` returns the
-  `handoff` key the volume's latest read of the path received. See the
+  `handoff` key the volume's latest read of the path received, and
+  `vol.last_read_denied` says whether that read was a strict-mode deny, which
+  never carries the key. See the
   guide's [From a `CoherentVolume`](docs/guide.md#from-a-coherentvolume).
 
 - **Handoff tools in the `stale-write-guard-fs` MCP server (#185):
@@ -153,7 +155,9 @@ Alpha — APIs may change before `v1.0`.
   `swg_status` adds `session_agent_id`, the session's own session-level agent
   id, which is what another session passes to `swg_transfer` as the
   successor, and each path's handoff record; `swg_read` adds the read's
-  `handoff` key, and a `swg_write_cas` win that completed or overtook a live
+  `handoff` key (after a strict-mode deny, which never carries the key, from
+  `/status`, or `handoff_unknown: true` when `/status` cannot be read), and a
+  `swg_write_cas` win that completed or overtook a live
   handoff says which. A giver's `swg_write` or `swg_write_cas` of a path it
   handed off answers `reason: handed_off`, `recover: stop_and_report`,
   `retryable: false`, with the `successor`, the `version_at_transfer` and a

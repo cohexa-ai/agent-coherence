@@ -2201,6 +2201,7 @@ session, with one method per verb:
 | `vol.decline(path)` | the successor | `HandoffVerbResult` |
 | `vol.withdraw(path)` | the giver, on its user's or host's instruction | `HandoffVerbResult` |
 | `vol.read_handoff(path)` | the giver, the successor or a bystander | the `handoff` key the volume's latest read of `path` received, as a `dict`, or `None` |
+| `vol.last_read_denied` | anyone | `True` when the coordinator refused the volume's latest read with a strict-mode deny, whose answer never carries the `handoff` key |
 
 `paths` is one path or a sequence of paths, and `successor` is the successor's
 session-level agent id (see [Naming the successor](#naming-the-successor)). The
@@ -2259,7 +2260,9 @@ it calls `reacquire()`.
 key, with its `role`, from the answer to the volume's latest read of the path
 (every read method sets it, `reacquire()` included). It is `None` when that
 answer carried none: the path has no record, or the read was denied, failed or
-went unanswered. A compare-and-swap win's `CasCommitResult.handoff` is a
+went unanswered. A strict-mode deny never carries the key, so after a denied
+read (`vol.last_read_denied` is `True`) `None` says nothing about the record;
+the path's entry in `/status` has it. A compare-and-swap win's `CasCommitResult.handoff` is a
 `HandoffWinOutcome` when the win labelled a live handoff of the path:
 `outcome` is `completed` when the volume is the successor, and `overtaken`
 when it is a bystander, which is then named as `counterparty`; `giver`,
@@ -2346,7 +2349,11 @@ not change it:
 
 **Where the record shows.** When the path has a record, `swg_read` adds
 `handoff`, the key as the coordinator projected it for this session (with
-`role`), to an admitted read; `swg_status` adds `handoff` (without `role`) to
+`role`). A strict-mode deny never carries the key, and the giver's own re-read
+of a path it handed off is one, so after a denied read `swg_read` takes the
+record from the coordinator's `/status` and adds the same `role`; when
+`/status` cannot be read it adds `handoff_unknown: true` instead, which means
+the record is unknown, not absent. `swg_status` adds `handoff` (without `role`) to
 the path's `per_path` entry; and a `swg_write_cas` win that labelled a live
 handoff adds `handoff` with its `outcome` (`completed` when this session is
 the successor, `overtaken` with `counterparty` otherwise), `giver`,

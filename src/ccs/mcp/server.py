@@ -38,7 +38,7 @@ from ccs.adapters.effect_gate import check_fence
 from ccs.core.exceptions import HOLD_INPUT_VANISHED, CasVersionConflict, CoherenceError
 from ccs.mcp.deny import cas_exhausted_result, coordinator_unavailable_result, deny_result
 from ccs.mcp.session import SessionConfig, build_volume
-from ccs.mcp.status import build_status
+from ccs.mcp.status import build_status, handoff_from_status
 from ccs.mcp.uri import UriValidationError, validate_uri
 
 logger = logging.getLogger(__name__)
@@ -119,7 +119,8 @@ _READ_DESC = (
     "generations, so swg_gate will hold). When the path has a handoff record "
     "the result also carries handoff: the record as it concerns this session "
     "(role giver, successor or bystander, the two session_agent_ids, "
-    "version_at_transfer, hold_shape, status, live). A "
+    "version_at_transfer, hold_shape, status, live); handoff_unknown=true "
+    "instead means the read was denied and the record could not be fetched. A "
     "sticky-INVALID view returns fresh bytes but stays INVALID — use "
     "swg_reacquire to recover before writing. If the bytes on disk are not the "
     "content at the current version, the read is DENIED with reason=stale_view "
@@ -345,9 +346,17 @@ def _do_read(volume: CoherentVolume, config: SessionConfig, path: str) -> CallTo
         "encoding": "utf-8",
     }
     # The read's provenance (#185): the path's transfer record projected for
-    # this session, only when this read's answer carried one, so a read of a
-    # path with no record answers exactly what it did before.
+    # this session, only when the path has one, so a read of a path with no
+    # record answers exactly what it did before. A strict deny never carries
+    # the key -- its bytes stay the corpus's -- and the giver's own re-read of
+    # a path it handed off is one, so after a deny the record comes from
+    # /status; an omitted key must never read as "no record" when the
+    # coordinator was not asked.
     handoff = volume.read_handoff(key)
+    if handoff is None and volume.last_read_denied:
+        known, handoff = handoff_from_status(volume, key)
+        if not known:
+            structured["handoff_unknown"] = True
     if handoff is not None:
         structured["handoff"] = handoff
     return _ok_result(structured, text)
