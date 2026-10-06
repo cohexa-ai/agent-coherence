@@ -2032,14 +2032,16 @@ A transfer of several paths hands on every path it can and exits `2` if any
 was refused; its lines say which. When the coordinator could not confirm the
 outcome, the command says so and exits `2`: check the path's handoff in
 `agent-coherence-status` before acting again. Sending the same transfer again
-is safe (see [`POST /handoff/transfer`](#post-handofftransfer)).
+is safe only while the handoff it made is live: once the successor has written
+the path, a re-send from a giver session that holds the path again is a new
+handoff (see [`POST /handoff/transfer`](#post-handofftransfer)).
 
 **Not held.** A transfer refused as `handoff_not_held` prints the reason and a
 hint:
 
 ```text
 agent-coherence-transfer: notes.md not transferred (handoff_not_held)
-agent-coherence-transfer: hint: a Claude Code session's write grant ends when its turn ends; have the giver session read notes.md, then transfer it again
+agent-coherence-transfer: hint: a Claude Code session's write grant ends when its turn ends; if an earlier transfer of notes.md may have landed, check agent-coherence-status first, and otherwise have the giver session read notes.md, then transfer it again
 ```
 
 On a strict-mode path the re-read is denied, so the hint does not help there;

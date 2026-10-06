@@ -1153,7 +1153,9 @@ _EXIT_DONE, _EXIT_USAGE, _EXIT_FAILED, _EXIT_NOT_SERVED = 0, 1, 2, 4
 
 _NOT_HELD_HINT = (
     "hint: a Claude Code session's write grant ends when its turn ends; "
-    "have the giver session read plan.md, then transfer it again"
+    "if an earlier transfer of plan.md may have landed, check "
+    "agent-coherence-status first, and otherwise have the giver session read "
+    "plan.md, then transfer it again"
 )
 
 _VERB_RUNS = {

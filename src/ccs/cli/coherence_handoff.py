@@ -94,7 +94,9 @@ _NO_SESSION = (
 
 _NOT_HELD_HINT = (
     "hint: a Claude Code session's write grant ends when its turn ends; "
-    "have the giver session read {path}, then transfer it again"
+    "if an earlier transfer of {path} may have landed, check "
+    "agent-coherence-status first, and otherwise have the giver session read "
+    "{path}, then transfer it again"
 )
 """Printed after a ``handoff_not_held`` refusal, beside the wire reason, which
 is printed unchanged. Client-side only: the coordinator's answer is the same
