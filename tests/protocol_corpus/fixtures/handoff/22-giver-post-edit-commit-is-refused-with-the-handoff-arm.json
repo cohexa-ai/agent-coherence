@@ -1,6 +1,6 @@
 {
   "name": "handoff-giver-post-edit-commit-is-refused-with-the-handoff-arm",
-  "description": "The post-edit handoff arm. A's edit was in flight when its transfer landed (pre-edit, transfer, then post-edit success:true): the commit is refused handed_off, and the context-only PostToolUse envelope carries the commit-refused text with its on-disk sentence (R10, R14, R38).",
+  "description": "The post-edit handoff arm. A's edit was in flight when its transfer landed (pre-edit, transfer, then post-edit success:true): the commit is refused handed_off, and the context-only PostToolUse envelope carries the commit-refused text with its on-disk sentence.",
   "setup": {
     "tracked": [
       "plan.md"

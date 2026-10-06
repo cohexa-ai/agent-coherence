@@ -1,6 +1,6 @@
 {
   "name": "handoff-resend-of-a-live-transfer-is-idempotent",
-  "description": "Sending the same transfer again is safe: a grant whose live record names the same giver and successor answers transferred with the record's current status, and nothing moves (R6).",
+  "description": "Sending the same transfer again is safe: a grant whose live record names the same giver and successor answers transferred with the record's current status, and nothing moves.",
   "setup": {
     "tracked": [
       "plan.md"

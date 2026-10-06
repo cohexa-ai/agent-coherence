@@ -687,7 +687,7 @@ class CoherentVolume:
         # must rotate first: a held grant refuses a commit of that file only.
         self._grant_incarnations: dict[str, set[str]] = {}
         # Per path, the incarnation whose read registered this volume's standing
-        # SHARED view of it (KTD7, #185). A re-mint moves every later request to
+        # SHARED view of it (#185). A re-mint moves every later request to
         # a new incarnation but leaves that view with the one that took it, so a
         # transfer of the path must present it. Written only where a read
         # registered (_read_impl, _read_with_version), never on a verification,
@@ -2603,7 +2603,7 @@ class CoherentVolume:
 
     def _claim_incarnation(self, rel: str) -> str:
         """The incarnation this volume presents as the holder of its claim on
-        ``rel`` (KTD7): the one whose write() took a grant on it -- the current
+        ``rel``: the one whose write() took a grant on it -- the current
         incarnation's first, else the latest to record it, since each later
         acquire took the grant from the earlier ones -- else the one whose read
         registered the standing view, else, for a path neither written nor
@@ -3200,7 +3200,7 @@ class CoherentVolume:
                 content_differs = self._pre_read_hash_differs(resp)
                 # The comparand read the CAS ladder takes after its re-mint
                 # registers its incarnation too, so after a win this names the
-                # winning incarnation (KTD7). A verification read asked the
+                # winning incarnation. A verification read asked the
                 # coordinator not to register one, so it records nothing.
                 if observe and self._read_registered(resp):
                     self._read_incarnations[_rel] = reader

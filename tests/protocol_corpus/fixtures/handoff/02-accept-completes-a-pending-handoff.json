@@ -1,6 +1,6 @@
 {
   "name": "handoff-accept-completes-a-pending-handoff",
-  "description": "Status completed. A reads plan.md and hands it to B; B accepts without writing, and the pending record becomes completed (R20). The giver's fence stands: completion changes nothing about it (R10, R21).",
+  "description": "Status completed. A reads plan.md and hands it to B; B accepts without writing, and the pending record becomes completed. The giver's fence stands: completion changes nothing about it.",
   "setup": {
     "tracked": [
       "plan.md"

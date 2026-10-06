@@ -1,6 +1,6 @@
 {
   "name": "handoff-mixed-transfer-answers-per-grant-not-held",
-  "description": "handoff_not_held, in a two-path transfer. A holds a read on plan.md and nothing on spec.md (which B has read, so the coordinator knows the path). plan.md transfers; spec.md is refused as not held; the top-level answer is false, in request order (R3, R4, R5).",
+  "description": "handoff_not_held, in a two-path transfer. A holds a read on plan.md and nothing on spec.md (which B has read, so the coordinator knows the path). plan.md transfers; spec.md is refused as not held; the top-level answer is false, in request order.",
   "setup": {
     "tracked": [
       "plan.md",

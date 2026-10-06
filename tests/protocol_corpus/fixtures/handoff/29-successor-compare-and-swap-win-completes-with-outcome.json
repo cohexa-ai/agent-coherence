@@ -1,6 +1,6 @@
 {
   "name": "handoff-successor-compare-and-swap-win-completes-with-outcome",
-  "description": "The successor's compare-and-swap win at the transfer version. The win's answer is unchanged; the handoff key beside it reports the record completed, no longer live (the version moved), and the outcome the win gave it (R21, R29).",
+  "description": "The successor's compare-and-swap win at the transfer version. The win's answer is unchanged; the handoff key beside it reports the record completed, no longer live (the version moved), and the outcome the win gave it.",
   "setup": {
     "tracked": [
       "plan.md"

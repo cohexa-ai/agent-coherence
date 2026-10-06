@@ -1,6 +1,6 @@
 {
   "name": "handoff-giver-read-while-live-carries-the-notice",
-  "description": "The giver's read while its handoff is live (warn mode). The read is admitted by the ordinary rules, so today's stale-view warning comes first; the giver's notice follows it in the same envelope, and the body carries the handoff key for the giver (R14, R29).",
+  "description": "The giver's read while its handoff is live (warn mode). The read is admitted by the ordinary rules, so today's stale-view warning comes first; the giver's notice follows it in the same envelope, and the body carries the handoff key for the giver.",
   "setup": {
     "tracked": [
       "plan.md"

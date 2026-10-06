@@ -1,6 +1,6 @@
 {
   "name": "handoff-bystander-acquire-overtakes-a-live-handoff",
-  "description": "Status overtaken. While A's handoff to B is live, bystander C takes plan.md through pre-edit. It is admitted, never refused (R23), and its acquire labels the record overtaken with C as counterparty (R24). The acquire does not move the version, so the record is still live. The admitted body carries the handoff key projected for the bystander and, in a context-only envelope, the bystander advisory (R29).",
+  "description": "Status overtaken. While A's handoff to B is live, bystander C takes plan.md through pre-edit. It is admitted, never refused, and its acquire labels the record overtaken with C as counterparty. The acquire does not move the version, so the record is still live. The admitted body carries the handoff key projected for the bystander and, in a context-only envelope, the bystander advisory.",
   "setup": {
     "tracked": [
       "plan.md"

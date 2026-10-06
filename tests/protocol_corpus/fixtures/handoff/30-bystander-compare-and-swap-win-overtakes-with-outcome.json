@@ -1,6 +1,6 @@
 {
   "name": "handoff-bystander-compare-and-swap-win-overtakes-with-outcome",
-  "description": "A bystander's compare-and-swap win. C, holding a read, commits at the transfer version past A's live handoff to B: admitted (R23), the record is labelled overtaken with C as counterparty and ends as the version moves, and the key reports the win's outcome (R24, R29).",
+  "description": "A bystander's compare-and-swap win. C, holding a read, commits at the transfer version past A's live handoff to B: admitted; the record is labelled overtaken with C as counterparty and ends as the version moves, and the key reports the win's outcome.",
   "setup": {
     "tracked": [
       "plan.md"

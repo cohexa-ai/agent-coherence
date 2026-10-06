@@ -1,6 +1,6 @@
 {
   "name": "handoff-transfer-pending-hands-on-an-exclusive-claim",
-  "description": "Status pending. Session A takes EXCLUSIVE on plan.md through pre-edit -- the path's FIRST observation, which registers it at version 1 -- and hands it to session B. The answer is one transferred grant naming both session-level agent ids, the version at transfer and the hold shape given up (R1, R3, R25). This row is also the on-wire evidence that handoff_version_unconfirmed is unreachable from the hook surface: a path first seen through pre-edit is admitted at v1, because every HTTP registration path seeds version 1 and versions only rise.",
+  "description": "Status pending. Session A takes EXCLUSIVE on plan.md through pre-edit -- the path's FIRST observation, which registers it at version 1 -- and hands it to session B. The answer is one transferred grant naming both session-level agent ids, the version at transfer and the hold shape given up. This row is also the on-wire evidence that handoff_version_unconfirmed is unreachable from the hook surface: a path first seen through pre-edit is admitted at v1, because every HTTP registration path seeds version 1 and versions only rise.",
   "setup": {
     "tracked": [
       "plan.md"

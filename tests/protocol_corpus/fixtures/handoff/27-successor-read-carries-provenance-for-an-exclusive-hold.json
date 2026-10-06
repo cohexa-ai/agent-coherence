@@ -1,6 +1,6 @@
 {
   "name": "handoff-successor-read-carries-provenance-for-an-exclusive-hold",
-  "description": "The successor's provenance. A handed B a claim it held EXCLUSIVE; B's first read of plan.md carries, after today's first-observation warning, who handed it the path, at which version and from which hold shape, plus the sentence an EXCLUSIVE hold adds (R17, R29).",
+  "description": "The successor's provenance. A handed B a claim it held EXCLUSIVE; B's first read of plan.md carries, after today's first-observation warning, who handed it the path, at which version and from which hold shape, plus the sentence an EXCLUSIVE hold adds.",
   "setup": {
     "tracked": [
       "plan.md"

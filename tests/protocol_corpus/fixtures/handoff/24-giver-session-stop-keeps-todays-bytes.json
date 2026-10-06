@@ -1,6 +1,6 @@
 {
   "name": "handoff-giver-session-stop-keeps-todays-bytes",
-  "description": "A session stop on a live record. The giver A holds EXCLUSIVE on plan.md and spec.md and hands plan.md to B; its stop releases spec.md alone and answers today's clean bytes, with no per-grant list and no handoff key. A stop never withdraws or declines a handoff (R8, R35). The per-grant arm of a stop that leaves a grant held is not reachable from a fixture; see the module's documented-unreachable twin.",
+  "description": "A session stop on a live record. The giver A holds EXCLUSIVE on plan.md and spec.md and hands plan.md to B; its stop releases spec.md alone and answers today's clean bytes, with no per-grant list and no handoff key. A stop never withdraws or declines a handoff. The per-grant arm of a stop that leaves a grant held is not reachable from a fixture; see the module's documented-unreachable twin.",
   "setup": {
     "tracked": [
       "plan.md",

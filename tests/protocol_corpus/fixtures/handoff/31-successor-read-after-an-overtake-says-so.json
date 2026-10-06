@@ -1,6 +1,6 @@
 {
   "name": "handoff-successor-read-after-an-overtake-says-so",
-  "description": "The successor's touch after a bystander overtook its handoff. B had read plan.md before; C's acquire overtook the handoff (and revoked B's read). B's next read carries today's stale warning, then the overtaken sentence naming C (R24, R29).",
+  "description": "The successor's touch after a bystander overtook its handoff. B had read plan.md before; C's acquire overtook the handoff (and revoked B's read). B's next read carries today's stale warning, then the overtaken sentence naming C.",
   "setup": {
     "tracked": [
       "plan.md"

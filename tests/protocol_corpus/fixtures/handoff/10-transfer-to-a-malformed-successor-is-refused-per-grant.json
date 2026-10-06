@@ -1,6 +1,6 @@
 {
   "name": "handoff-transfer-to-a-malformed-successor-is-refused-per-grant",
-  "description": "handoff_successor_malformed. A successor that is not a well-formed agent id is answered per grant inside an HTTP 200, not as a 400 (R2, R3).",
+  "description": "handoff_successor_malformed. A successor that is not a well-formed agent id is answered per grant inside an HTTP 200, not as a 400.",
   "setup": {
     "tracked": [
       "plan.md"

@@ -1,6 +1,6 @@
 {
   "name": "handoff-accept-by-a-non-successor-is-refused",
-  "description": "handoff_not_successor. Bystander C tries to accept A's live handoff to B; refused with the record's status, nothing changes (R20).",
+  "description": "handoff_not_successor. Bystander C tries to accept A's live handoff to B; refused with the record's status, nothing changes.",
   "setup": {
     "tracked": [
       "plan.md"

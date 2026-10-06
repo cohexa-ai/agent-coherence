@@ -1,6 +1,6 @@
 {
   "name": "handoff-status-operator-tier-adds-the-created-timestamp",
-  "description": "GET /status?detail=full with the operator header: the same handoff key plus the record's created_at_unix_ts (R27). That wall-clock value is in the harness's timestamp scrub set, so this row pins the key's PRESENCE, not its value. Nothing has committed, so the last-writer fields are null. coordinator_root is the absolute workspace path at this tier and is ignored with policy_summary and coordinator_version.",
+  "description": "GET /status?detail=full with the operator header: the same handoff key plus the record's created_at_unix_ts. That wall-clock value is in the harness's timestamp scrub set, so this row pins the key's PRESENCE, not its value. Nothing has committed, so the last-writer fields are null. coordinator_root is the absolute workspace path at this tier and is ignored with policy_summary and coordinator_version.",
   "setup": {
     "tracked": [
       "plan.md"

@@ -1,6 +1,6 @@
 {
   "name": "handoff-transfer-to-self-is-refused",
-  "description": "handoff_to_self. A names its own session-level agent id as the successor; the grant is refused and left as it was (R2, R4).",
+  "description": "handoff_to_self. A names its own session-level agent id as the successor; the grant is refused and left as it was.",
   "setup": {
     "tracked": [
       "plan.md"

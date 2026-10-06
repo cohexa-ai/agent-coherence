@@ -1,6 +1,6 @@
 {
   "name": "handoff-giver-pre-edit-is-denied-handed-off",
-  "description": "handed_off on pre-edit. The giver A tries to re-take plan.md while its handoff to B is live, in warn mode: denied with the typed reason, the successor and the version at transfer at the top level, the giver-deny template in the deny envelope, and the handoff key projected for the giver (R13, R14, R38).",
+  "description": "handed_off on pre-edit. The giver A tries to re-take plan.md while its handoff to B is live, in warn mode: denied with the typed reason, the successor and the version at transfer at the top level, the giver-deny template in the deny envelope, and the handoff key projected for the giver.",
   "setup": {
     "tracked": [
       "plan.md"

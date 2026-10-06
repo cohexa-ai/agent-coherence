@@ -1,6 +1,6 @@
 {
   "name": "handoff-giver-read-after-completion-carries-the-outcome",
-  "description": "The giver's read after its handoff ended. B read plan.md and won a compare-and-swap at the transfer version, which completed the record and moved the version, ending it. A's next read says how its handoff ended, after today's stale warning, and the key reports completed and not live (R14, R27, R29).",
+  "description": "The giver's read after its handoff ended. B read plan.md and won a compare-and-swap at the transfer version, which completed the record and moved the version, ending it. A's next read says how its handoff ended, after today's stale warning, and the key reports completed and not live.",
   "setup": {
     "tracked": [
       "plan.md"

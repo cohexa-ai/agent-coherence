@@ -1,6 +1,6 @@
 {
   "name": "handoff-transfer-to-an-unknown-successor-is-refused",
-  "description": "handoff_successor_unknown. The successor is a well-formed session-level agent id (that of session dddddddd-dddd-4ddd-8ddd-dddddddddddd) for a session that never claimed a principal and never made a request, so the coordinator does not know it and every grant is refused (R2).",
+  "description": "handoff_successor_unknown. The successor is a well-formed session-level agent id (that of session dddddddd-dddd-4ddd-8ddd-dddddddddddd) for a session that never claimed a principal and never made a request, so the coordinator does not know it and every grant is refused.",
   "setup": {
     "tracked": [
       "plan.md"

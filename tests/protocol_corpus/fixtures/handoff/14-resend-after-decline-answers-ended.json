@@ -1,6 +1,6 @@
 {
   "name": "handoff-resend-after-decline-answers-ended",
-  "description": "handoff_ended. A re-sends a transfer B has declined, at an unmoved version: refused with the ended record's status, and nothing is written (R6).",
+  "description": "handoff_ended. A re-sends a transfer B has declined, at an unmoved version: refused with the ended record's status, and nothing is written.",
   "setup": {
     "tracked": [
       "plan.md"

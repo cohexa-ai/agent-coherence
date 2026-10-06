@@ -192,7 +192,7 @@ _WRITE_CAS_DESC = (
 )
 
 # Appended to each of the four handoff tools' descriptions: what a transfer
-# does to the giver and what it does not do to anyone else (R33).
+# does to the giver and what it does not do to anyone else.
 _HANDOFF_CLAUSE = (
     " A transfer fences the giver and does not reserve the path: other sessions "
     "keep reading and writing it by the ordinary rules, and the handoff only "

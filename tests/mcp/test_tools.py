@@ -238,7 +238,7 @@ def _registered_descriptions() -> dict[str, str]:
 
 
 def test_every_handoff_tool_and_the_instructions_say_a_transfer_fences_the_giver_and_reserves_nothing() -> None:
-    """R33. A model that reads only one handoff tool's description, or only the
+    """A model that reads only one handoff tool's description, or only the
     server instructions, must learn both halves: a transfer fences the giver
     (its own later writes are refused) and does not reserve the path (other
     sessions keep writing it). Read as a reservation, a successor would wait
@@ -257,7 +257,7 @@ def test_every_handoff_tool_and_the_instructions_say_a_transfer_fences_the_giver
 
 
 def test_the_transfer_tool_names_the_successor_by_the_id_its_own_status_tool_reports() -> None:
-    """R33, KTD7. The giver names the successor by the value the successor's
+    """The giver names the successor by the value the successor's
     OWN status tool reports, and the status tool says that value names the
     session as a successor only while its principal claim is bound (the
     coordinator knows a session-level id through its principal binding)."""
@@ -270,7 +270,7 @@ def test_the_transfer_tool_names_the_successor_by_the_id_its_own_status_tool_rep
 
 
 def test_the_withdraw_tool_is_taken_only_on_instruction_and_is_never_the_givers_recovery() -> None:
-    """R33. The giver's withdraw lifts its own fence, so it is one call away from
+    """The giver's withdraw lifts its own fence, so it is one call away from
     a fenced giver. Its description says it is taken only on the user's or
     host's explicit instruction and is never the recovery for the
     ``handed_off`` refusal, beside the non-reservation statement; and, the
@@ -287,7 +287,7 @@ def test_the_withdraw_tool_is_taken_only_on_instruction_and_is_never_the_givers_
 
 
 def test_the_read_and_cas_descriptions_name_the_handoff_key() -> None:
-    """R33. The read result carries the path's handoff record and a CAS win
+    """The read result carries the path's handoff record and a CAS win
     what it did to a live handoff; the descriptions say so, so a model knows
     the key it may find."""
     descriptions = _registered_descriptions()

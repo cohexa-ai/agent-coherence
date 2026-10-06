@@ -1,6 +1,6 @@
 {
   "name": "handoff-giver-compare-and-swap-is-refused-handed-off",
-  "description": "handed_off on the compare-and-swap route. The giver A commits at the transfer version while its handoff is live: refused with the typed reason, the successor and the version at transfer, no hookSpecificOutput, and the handoff key (R10, R11).",
+  "description": "handed_off on the compare-and-swap route. The giver A commits at the transfer version while its handoff is live: refused with the typed reason, the successor and the version at transfer, no hookSpecificOutput, and the handoff key.",
   "setup": {
     "tracked": [
       "plan.md"

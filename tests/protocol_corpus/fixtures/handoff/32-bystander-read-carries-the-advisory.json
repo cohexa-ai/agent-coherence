@@ -1,6 +1,6 @@
 {
   "name": "handoff-bystander-read-carries-the-advisory",
-  "description": "A bystander's read while a handoff is live. C's first read of plan.md carries, after today's first-observation warning, the advisory naming the giver and the successor (R23, R29); the key is projected for the bystander.",
+  "description": "A bystander's read while a handoff is live. C's first read of plan.md carries, after today's first-observation warning, the advisory naming the giver and the successor; the key is projected for the bystander.",
   "setup": {
     "tracked": [
       "plan.md"

@@ -1,4 +1,4 @@
-"""The MCP handoff tools (#185, plan U10) against a real loopback coordinator.
+"""The MCP handoff tools (#185) against a real loopback coordinator.
 
 An MCP session hands its own claim on a path to another session with
 ``swg_transfer``; the successor takes it with ``swg_accept`` (or a write) or
@@ -88,14 +88,14 @@ def _agent(vol: CoherentVolume) -> str:
     return str(session_to_agent_id(vol.session_id))
 
 
-# --- AE21: the giver's own write after its own transfer is a stop ----------
+# --- the giver's own write after its own transfer is a stop ----------------
 
 
 @pytest.mark.parametrize("route", ["swg_write", "swg_write_cas"])
 def test_a_givers_write_after_its_own_transfer_is_a_stop_a_reacquire_does_not_change(
     tmp_path: Path, fast_cfg: LifecycleConfig, route: str
 ) -> None:
-    """Covers AE21, R34. The MCP session reads plan.md, hands it to another
+    """The MCP session reads plan.md, hands it to another
     session, then writes it. Without a row of its own the giver's refusal read
     as an internal error (compare-and-swap) or, on an older client, as a stale
     view to reacquire, and no reacquire clears a fence keyed on the session,
@@ -139,13 +139,13 @@ def test_a_givers_write_after_its_own_transfer_is_a_stop_a_reacquire_does_not_ch
         stop_coordinator(tmp_path)
 
 
-# --- AE22: a path the MCP session does not hold is refused, never moved ----
+# --- a path the MCP session does not hold is refused, never moved ----------
 
 
 def test_the_transfer_tool_on_a_path_a_hook_session_holds_is_refused_as_not_held(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
-    """Covers AE22. A hook session holds data/y.md EXCLUSIVE and the MCP session
+    """A hook session holds data/y.md EXCLUSIVE and the MCP session
     holds nothing on it. The transfer tool answers that grant refused as
     ``handoff_not_held``, as a non-ignorable error, records no handoff, and
     leaves the hook session's grant where it was: it never silently
@@ -182,13 +182,13 @@ def test_the_transfer_tool_on_a_path_a_hook_session_holds_is_refused_as_not_held
         stop_coordinator(tmp_path)
 
 
-# --- R33: provenance on a read, the win outcome on a compare-and-swap ------
+# --- provenance on a read, the win outcome on a compare-and-swap -----------
 
 
 def test_the_successors_read_carries_the_handoff_key_and_a_path_with_no_record_none(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
-    """R33. The successor's read of a path handed to it carries the record
+    """The successor's read of a path handed to it carries the record
     projected for it -- who handed it on, at which version, from which hold
     shape -- in its structured content. A read of a path with no record
     carries no ``handoff`` key at all, so its result is what it was before."""
@@ -224,7 +224,7 @@ def test_the_successors_read_carries_the_handoff_key_and_a_path_with_no_record_n
 def test_a_cas_win_carries_what_it_did_to_the_handoff(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
-    """R33. The successor's compare-and-swap win completes the handoff and its
+    """The successor's compare-and-swap win completes the handoff and its
     result says so; a bystander's win overtakes a live handoff and its result
     names the pair it wrote past and itself as the counterparty. A win that
     labelled no live handoff carries no ``handoff`` key."""
@@ -264,13 +264,13 @@ def test_a_cas_win_carries_what_it_did_to_the_handoff(
         stop_coordinator(tmp_path)
 
 
-# --- R33: the four verbs for the MCP session's own claims ------------------
+# --- the four verbs for the MCP session's own claims -----------------------
 
 
 def test_the_transfer_tool_answers_per_grant_and_only_all_transferred_is_success(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
-    """R33. A transfer of a path the session read and one it never touched
+    """A transfer of a path the session read and one it never touched
     answers per grant, in order: the first transferred with its record, the
     second refused as not held. The result is an error unless every grant
     transferred, so a partly refused transfer is never read as done."""
@@ -307,7 +307,7 @@ def test_the_transfer_tool_answers_per_grant_and_only_all_transferred_is_success
 def test_the_accept_decline_and_withdraw_tools_answer_typed_results(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
-    """R33. A party's verb is taken and answers the record's status after it; a
+    """A party's verb is taken and answers the record's status after it; a
     verb from the wrong party or with no live record is refused with its typed
     reason, as a non-ignorable error, and changes nothing."""
     _seed(tmp_path, PLAN, b"plan v1")
@@ -354,13 +354,13 @@ def test_the_accept_decline_and_withdraw_tools_answer_typed_results(
         stop_coordinator(tmp_path)
 
 
-# --- R33: the status tool --------------------------------------------------
+# --- the status tool -------------------------------------------------------
 
 
 def test_the_status_tool_shows_a_paths_record_and_omits_the_key_where_there_is_none(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
-    """R33. The status tool renders the record from the coordinator's default
+    """The status tool renders the record from the coordinator's default
     ``/status`` tier on the handed-off path's entry, and an entry with no
     record keeps exactly the shape it had."""
     _seed(tmp_path, PLAN, b"plan v1")
@@ -395,7 +395,7 @@ def test_the_status_tool_shows_a_paths_record_and_omits_the_key_where_there_is_n
 def test_the_id_a_successors_status_tool_reports_is_the_successor_a_transfer_names(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
-    """R33, KTD12. Session B reads its own id off its status tool and session A
+    """Session B reads its own id off its status tool and session A
     passes that value to its transfer tool: the grant transfers, and the
     successor the coordinator answers (normalised, hyphenated lower-case) is
     that value. The id is session-level, so B re-minting its incarnation
@@ -444,7 +444,7 @@ _FIXED_AGENT = "e9ecb9fa-4642-5d3e-9961-4ede23e20191"
 
 
 def test_the_status_tools_id_is_the_coordinators_derivation_for_a_fixed_session() -> None:
-    """KTD12. The status tool's id is the session-level agent id the
+    """The status tool's id is the session-level agent id the
     coordinator derives from the session id alone, pinned as a literal, so a
     drift in either derivation is caught here rather than as a successor the
     coordinator refuses as unknown."""
@@ -458,7 +458,7 @@ def test_the_status_tools_id_is_the_coordinators_derivation_for_a_fixed_session(
 def test_the_status_tool_derives_its_id_through_the_coordinators_function(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """KTD12: never a second copy of the derivation string. The name the status
+    """Never a second copy of the derivation string. The name the status
     module derives with IS the coordinator module's function, and the status
     value comes from calling it with the session id alone: a local copy of the
     string would agree today and drift silently the day the coordinator's

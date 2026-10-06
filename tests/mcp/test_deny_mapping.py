@@ -394,7 +394,7 @@ def test_a_principal_refusal_subclass_does_not_inherit_the_mapping():
 
 
 def test_the_giver_terminal_is_a_typed_stop_that_says_report_and_never_withdraw():
-    """R34, KTD8. A session that handed a path off and writes it again gets the
+    """A session that handed a path off and writes it again gets the
     giver terminal on both routes. Without its own row it fell to
     ``internal_error`` / ``none``, the shape of a coordinator bug; read as a
     stale view it sent the giver to reacquire, which cannot clear a fence keyed

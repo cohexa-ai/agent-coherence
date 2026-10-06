@@ -1,6 +1,6 @@
 {
   "name": "handoff-giver-failed-edit-answers-per-grant",
-  "description": "The reachable per-grant release answer (R8). The giver A's failed-edit report on a path it handed off, while the record is live, is not a clean success: top-level false, handed_off, and one grant reported not held, handed to the successor at the version at transfer. Nothing changes: no release, no withdraw.",
+  "description": "The reachable per-grant release answer. The giver A's failed-edit report on a path it handed off, while the record is live, is not a clean success: top-level false, handed_off, and one grant reported not held, handed to the successor at the version at transfer. Nothing changes: no release, no withdraw.",
   "setup": {
     "tracked": [
       "plan.md"

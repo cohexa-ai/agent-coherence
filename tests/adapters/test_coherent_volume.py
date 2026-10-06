@@ -2392,7 +2392,7 @@ def test_stale_read_generation_is_cas_retry_eligible() -> None:
 
 
 def test_the_giver_reason_is_never_in_the_cas_retry_set() -> None:
-    """KTD8: the giver's ``handed_off`` refusal is a terminal. In the retry set
+    """The giver's ``handed_off`` refusal is a terminal. In the retry set
     the compare-and-swap loop would re-mint and commit again into a fence no
     re-mint clears (keyed on the session, not the incarnation), spend its whole
     budget, and report a contention it never had. Pinned as a deliberate
@@ -3639,7 +3639,7 @@ def test_the_release_pass_acts_on_each_grants_result(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
     answer: dict | None, kept: set[str],
 ) -> None:
-    """Covers AE13. The release of an abandoned incarnation reads the answer
+    """The release of an abandoned incarnation reads the answer
     per grant. A stop that released p and left q held answers top-level false
     with a grant list; read as one top-level failure it kept p recorded, and
     read as a success it dropped q, a grant the coordinator still holds, so

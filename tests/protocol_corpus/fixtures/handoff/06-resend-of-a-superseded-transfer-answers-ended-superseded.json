@@ -1,6 +1,6 @@
 {
   "name": "handoff-resend-of-a-superseded-transfer-answers-ended-superseded",
-  "description": "Status superseded, which no stored record carries: its row is the re-send of a superseded tuple. A hands plan.md to B, then, while that record is live, to C, which supersedes it. A late re-send naming B is refused as handoff_ended with status superseded and the replaced pair, rather than switching back (R6, R26).",
+  "description": "Status superseded, which no stored record carries: its row is the re-send of a superseded tuple. A hands plan.md to B, then, while that record is live, to C, which supersedes it. A late re-send naming B is refused as handoff_ended with status superseded and the replaced pair, rather than switching back.",
   "setup": {
     "tracked": [
       "plan.md"

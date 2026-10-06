@@ -1,6 +1,6 @@
 {
   "name": "handoff-successor-edit-without-a-read-warns-and-completes",
-  "description": "The successor's acquire without having read the path at the version at transfer. Admitted, never denied (R18); its acquire marks the record completed, still live (R21); the provenance carries the read-first warning.",
+  "description": "The successor's acquire without having read the path at the version at transfer. Admitted, never denied; its acquire marks the record completed, still live; the provenance carries the read-first warning.",
   "setup": {
     "tracked": [
       "plan.md"

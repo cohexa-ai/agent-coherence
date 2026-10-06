@@ -1,6 +1,6 @@
 {
   "name": "handoff-withdraw-by-a-non-giver-is-refused",
-  "description": "handoff_not_giver. The successor B tries to withdraw A's handoff; only the giver withdraws (R16).",
+  "description": "handoff_not_giver. The successor B tries to withdraw A's handoff; only the giver withdraws.",
   "setup": {
     "tracked": [
       "plan.md"

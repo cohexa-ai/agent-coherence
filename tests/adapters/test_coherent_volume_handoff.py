@@ -1,18 +1,18 @@
 # Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
-"""``CoherentVolume`` as a handoff client (#185, plan U9).
+"""``CoherentVolume`` as a handoff client (#185).
 
 A volume hands a path to a named successor, accepts, declines or withdraws a
 handoff, and gets typed results back. Every request a volume sends names its
 CURRENT incarnation, but the claim a transfer gives up may be held by an
 earlier one: a read stays with the incarnation that took it when a later
 re-mint rotates the volume, and a write grant stays with the incarnation that
-wrote. So a transfer presents, per path, the incarnation that holds the claim
-(KTD7); presenting the current one hands over nothing and is refused as not
-held. A giver's later write is refused with the typed ``handed_off`` reason on
+wrote. So a transfer presents, per path, the incarnation that holds the claim;
+presenting the current one hands over nothing and is refused as not held. A
+giver's later write is refused with the typed ``handed_off`` reason on
 both the pre-edit and the compare-and-swap route, and the volume raises one
-terminal for it, which it never retries (KTD8).
+terminal for it, which it never retries.
 
 Every test runs against a live coordinator the first volume spawns; every
 other volume sibling-attaches to it, so each volume is its own session.
@@ -120,14 +120,14 @@ def _status_handoff(vol: CoherentVolume, rel: str) -> dict | None:
     return entry.get("handoff")
 
 
-# --- AE1 / AE17: the giver terminal, on both routes, never retried ----------
+# --- the giver terminal, on both routes, never retried ----------------------
 
 
 @pytest.mark.parametrize("surface", ["write_cas_at", "write_cas"])
 def test_a_givers_cas_at_the_transfer_version_raises_the_giver_terminal(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, surface: str
 ) -> None:
-    """Covers AE1. A reads plan.md at v1 and hands it to B, writes another
+    """A reads plan.md at v1 and hands it to B, writes another
     path, then compare-and-swaps plan.md at the transfer version from a fresh
     incarnation. Before the fence that sequence won and overwrote the file. It
     is refused with the typed giver terminal naming B and v1, the disk is
@@ -165,7 +165,7 @@ def test_a_givers_cas_at_the_transfer_version_raises_the_giver_terminal(
 def test_the_givers_pre_edit_raises_the_same_terminal_without_a_reacquire(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Covers AE17. The coordinator answers a fenced giver's pre-edit with the
+    """The coordinator answers a fenced giver's pre-edit with the
     typed ``handed_off`` reason AND a deny envelope whose prose is the human
     text, which the volume's deny-reason helper prefers. Classified from that
     prose the answer read as an ordinary stale view (retryable, recover by
@@ -201,13 +201,13 @@ def test_the_givers_pre_edit_raises_the_same_terminal_without_a_reacquire(
         stop_coordinator(tmp_path)
 
 
-# --- KTD7 / AE19: the transfer presents the incarnation holding the claim ----
+# --- the transfer presents the incarnation holding the claim ----------------
 
 
 def test_a_transfer_after_a_re_mint_presents_the_incarnation_holding_the_read(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Covers AE19. A read plan.md, then compare-and-swapped another path,
+    """A read plan.md, then compare-and-swapped another path,
     which re-minted its incarnation. The read stays with the incarnation that
     took it, so a transfer presenting the CURRENT incarnation offers a claim
     that holds nothing on plan.md and is refused as not held. The transfer
@@ -651,13 +651,13 @@ def test_a_restarted_writer_cannot_hand_on_a_live_handoff_until_its_write_overta
         stop_coordinator(tmp_path)
 
 
-# --- the handoff key a read received (R33) ----------------------------------
+# --- the handoff key a read received ----------------------------------------
 
 
 def test_read_handoff_reports_the_key_the_latest_read_of_the_path_received(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
-    """R33. The read calls return bytes and versions (public contracts), not the
+    """The read calls return bytes and versions (public contracts), not the
     ``handoff`` key their answers carry, so a caller that must relay a read's
     provenance (the MCP read tool) asks ``read_handoff``: the key the answer to
     this volume's latest read of the path carried, from either read call, or

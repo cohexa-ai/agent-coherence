@@ -1,6 +1,6 @@
 {
   "name": "handoff-transfer-under-a-foreign-write-holder-is-refused",
-  "description": "handoff_other_holder. C holds plan.md EXCLUSIVE; A then reads it and tries to hand its read on. A read is not the write authority to hand on while another session holds a write grant (R5).",
+  "description": "handoff_other_holder. C holds plan.md EXCLUSIVE; A then reads it and tries to hand its read on. A read is not the write authority to hand on while another session holds a write grant.",
   "setup": {
     "tracked": [
       "plan.md"

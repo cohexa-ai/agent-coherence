@@ -1,7 +1,7 @@
 # Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
-"""Targeted grant handoff corpus: the handoff wire, pinned (#185, plan U12).
+"""Targeted grant handoff corpus: the handoff wire, pinned (#185).
 
 The four handoff routes (``/handoff/transfer``, ``/handoff/accept``,
 ``/handoff/decline``, ``/handoff/withdraw``) are served by the Python
@@ -10,7 +10,7 @@ pre-edit, post-edit, post-edit-cas) and ``/status`` while a path has a transfer
 record. This module pins those answers byte for byte from fixtures under
 ``fixtures/handoff/``, in the asymmetry style of the effect-fence corpus:
 Python rows record what the Python coordinator answers, and four node-only rows
-record that the sibling Node coordinator answers each route 404 (R30, AE16).
+record that the sibling Node coordinator answers each route 404.
 
 What the rows cover, and how this module keeps them covering it:
 
@@ -176,7 +176,7 @@ _ROLE_FIXTURES: dict[str, tuple[str, str, bool]] = {
     "bystander": ("handoff-bystander-read-carries-the-advisory", "bystander", True),
 }
 
-# Sentences the plan names a row for, hand-copied from docs/guide.md: the one an
+# Sentences a named row pins, hand-copied from docs/guide.md: the one an
 # EXCLUSIVE hold adds to the successor's provenance, and the post-edit arm's
 # statement that the edit is on disk without a version.
 _EXCLUSIVE_SHAPE_SENTENCE = (
@@ -217,7 +217,7 @@ _NODE_ROUTES = frozenset({
 
 _NODE_DIST_PATH = resolve_node_dist_path()
 _NODE_DIST_UNRESOLVED = (
-    "R30 needs a REAL answer from the sibling coordinator, and this row got none: "
+    "The Node asymmetry rows need a REAL answer from the sibling coordinator, and this row got none: "
     "the plugin dist could not be resolved. Failing rather than xfailing is "
     "deliberate -- the claim under test is that the Node backend answers 404 for "
     "the four handoff routes, and an xfail records that nobody asked. Build the "
@@ -393,7 +393,7 @@ def test_every_wire_reason_has_its_row_or_a_named_exclusion() -> None:
 
 
 def test_the_givers_refusal_is_pinned_on_each_write_route() -> None:
-    """``handed_off`` on pre-edit carries the deny envelope (R13); on the
+    """``handed_off`` on pre-edit carries the deny envelope; on the
     compare-and-swap route it carries none; on the post-edit commit it carries
     the context-only post-tool envelope with the on-disk sentence. All three
     keep the typed reason, the successor and the version at transfer at the
@@ -476,8 +476,8 @@ def test_every_identity_a_row_names_is_compared_verbatim() -> None:
 
 def test_the_status_rows_project_the_record_on_both_tiers() -> None:
     """``/status`` carries the record, without a role, on the default tier and
-    the operator tier, and only the operator tier adds ``created_at_unix_ts``
-    (R27). That key is a wall-clock value, so it must be in the harness's
+    the operator tier, and only the operator tier adds ``created_at_unix_ts``.
+    That key is a wall-clock value, so it must be in the harness's
     timestamp scrub set or the operator row is unpinnable: asserted directly,
     so removing it from the set is red here with a readable reason."""
     by_name = _by_name()
@@ -551,10 +551,11 @@ def test_ignore_keys_are_limited_to_documented_noise() -> None:
 
 
 def test_the_node_rows_cannot_be_satisfied_by_a_skip() -> None:
-    """R30 / AE16, asserted directly: the plugin dist resolves, and exactly the
-    four handoff routes have a node-only 404 row sent with the harness's valid
-    bearer (Node rejects auth before routing, so a bad one answers 401 and says
-    nothing about which routes exist). Every other row is Python-only.
+    """The Node asymmetry, asserted directly: the plugin dist resolves, and
+    exactly the four handoff routes have a node-only 404 row sent with the
+    harness's valid bearer (Node rejects auth before routing, so a bad one
+    answers 401 and says nothing about which routes exist). Every other row is
+    Python-only.
 
     Leave ``AGENT_COHERENCE_PLUGIN_DIST_PATH`` unset, point ``HOME`` elsewhere
     and run from a checkout with no sibling ``agent-coherence-plugin`` to watch

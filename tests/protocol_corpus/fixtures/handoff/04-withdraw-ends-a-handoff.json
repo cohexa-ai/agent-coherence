@@ -1,6 +1,6 @@
 {
   "name": "handoff-withdraw-ends-a-handoff",
-  "description": "Status withdrawn. The giver A withdraws its live handoff to B; the record ends withdrawn and the fence lifts (R15, R16).",
+  "description": "Status withdrawn. The giver A withdraws its live handoff to B; the record ends withdrawn and the fence lifts.",
   "setup": {
     "tracked": [
       "plan.md"

@@ -1,6 +1,6 @@
 {
   "name": "handoff-transfer-past-a-live-handoff-is-refused-in-flight",
-  "description": "handoff_in_flight. C holds a standing read on plan.md while A's handoff of it to B is live; C's own transfer of the path is refused, naming the pending pair and, in static text, what ends that handoff (R26).",
+  "description": "handoff_in_flight. C holds a standing read on plan.md while A's handoff of it to B is live; C's own transfer of the path is refused, naming the pending pair and, in static text, what ends that handoff.",
   "setup": {
     "tracked": [
       "plan.md"

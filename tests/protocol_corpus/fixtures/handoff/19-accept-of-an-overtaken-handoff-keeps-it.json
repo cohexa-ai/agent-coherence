@@ -1,6 +1,6 @@
 {
   "name": "handoff-accept-of-an-overtaken-handoff-keeps-it",
-  "description": "An accept of a live record a bystander has overtaken answers ok with the overtaken status and its counterparty, and changes nothing (R20).",
+  "description": "An accept of a live record a bystander has overtaken answers ok with the overtaken status and its counterparty, and changes nothing.",
   "setup": {
     "tracked": [
       "plan.md"

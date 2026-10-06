@@ -1,6 +1,6 @@
 {
   "name": "handoff-decline-ends-a-handoff",
-  "description": "Status declined. B declines the live handoff A gave it; the record ends declined and the giver's fence lifts (R15, R20).",
+  "description": "Status declined. B declines the live handoff A gave it; the record ends declined and the giver's fence lifts.",
   "setup": {
     "tracked": [
       "plan.md"
