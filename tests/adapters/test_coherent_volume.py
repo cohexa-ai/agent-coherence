@@ -2391,6 +2391,29 @@ def test_stale_read_generation_is_cas_retry_eligible() -> None:
     assert classify(stub, {"ok": False, "reason": "commit_cas_corruption"}) == "raise"
 
 
+def test_the_giver_reason_is_never_in_the_cas_retry_set() -> None:
+    """KTD8: the giver's ``handed_off`` refusal is a terminal. In the retry set
+    the compare-and-swap loop would re-mint and commit again into a fence no
+    re-mint clears (keyed on the session, not the incarnation), spend its whole
+    budget, and report a contention it never had. Pinned as a deliberate
+    duplicate of the set, with its cardinality, so an edit that adds a member
+    cannot move the expectation with it."""
+    from unittest.mock import MagicMock
+
+    assert CoherentVolume._CAS_RETRY_REASONS == frozenset(
+        {"version_mismatch", "other_holder", "caller_in_transient_state", "stale_read_generation"}
+    )
+    assert len(CoherentVolume._CAS_RETRY_REASONS) == 4
+    assert "handed_off" not in CoherentVolume._CAS_RETRY_REASONS
+    stub = MagicMock(spec=CoherentVolume)
+    stub._CAS_RETRY_REASONS = CoherentVolume._CAS_RETRY_REASONS
+    giver_body = {
+        "ok": False, "reason": "handed_off",
+        "successor": "4f1b7c2e-0000-4000-8000-000000000001", "version_at_transfer": 3,
+    }
+    assert CoherentVolume._classify_cas_response(stub, giver_body) == "raise"
+
+
 _CAS_ONCE = {
     "write_cas": lambda vol, rel, version: vol.write_cas(rel, lambda cur: cur + b"+mine"),
     "write_cas_at": lambda vol, rel, version: vol.write_cas_at(rel, version, b"mine"),
@@ -3588,6 +3611,75 @@ def test_a_failed_release_stops_the_pass_and_keeps_every_record(
         vol.reacquire(r)
         assert write_grants(first_row) == {} and write_grants(second_row) == {}, (
             "an incarnation the failed pass skipped was dropped from the record")
+    finally:
+        stop_coordinator(tmp_path)
+
+
+_P_PATH, _Q_PATH = "data/p.txt", "data/q.txt"
+_PER_GRANT_RELEASE = {  # what a stop that left q held answers (#185)
+    "ok": False,
+    "released_artifacts": [_P_PATH],
+    "grants": [
+        {"path": _P_PATH, "held": False, "cause": "release"},
+        {"path": _Q_PATH, "held": True, "reason": "internal: RuntimeError"},
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    ("answer", "kept"),
+    [
+        (_PER_GRANT_RELEASE, {_Q_PATH}),
+        (None, set()),  # the coordinator's own answer: both released, a clean ok:true
+        ({"ok": True, "degraded": True}, {_P_PATH, _Q_PATH}),
+    ],
+    ids=["per-grant", "clean", "degraded"],
+)
+def test_the_release_pass_acts_on_each_grants_result(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    answer: dict | None, kept: set[str],
+) -> None:
+    """Covers AE13. The release of an abandoned incarnation reads the answer
+    per grant. A stop that released p and left q held answers top-level false
+    with a grant list; read as one top-level failure it kept p recorded, and
+    read as a success it dropped q, a grant the coordinator still holds, so
+    nothing would ever release it. The record keeps exactly q, and the next
+    re-mint releases the incarnation again. A clean answer drops the whole
+    record; a degraded one keeps everything, since the release may not have
+    run."""
+    _seed(tmp_path, rel=_P_PATH, content=b"p1")
+    _seed(tmp_path, rel=_Q_PATH, content=b"q1")
+    spare = _seed(tmp_path, rel="data/spare.txt", content=b"s1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol.write(_P_PATH, b"p2")
+        vol.write(_Q_PATH, b"q2")
+        writer = vol._incarnation
+        real_post = coherent_volume_module._coordinator_post
+
+        def answer_the_stop(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            if path != "/hooks/session-stop" or answer is None:
+                return real_post(endpoint, path, payload, **kwargs)
+            if not answer.get("degraded"):
+                real_post(endpoint, path, payload, **kwargs)
+            return answer
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", answer_the_stop)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", CoherenceDegradedWarning)
+            vol.reacquire(spare)
+
+        assert vol._grant_incarnations == ({writer: kept} if kept else {})
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", real_post)
+        sent: list[tuple[str, dict, str]] = []
+        _count_stops(monkeypatch, sent, vol)
+        vol.reacquire(spare)
+        stops = [body["agent_id"] for route, body, _c in sent if route == "/hooks/session-stop"]
+        assert stops == ([writer] if kept else [])
+        assert vol._grant_incarnations == {}
+        writer_row = str(session_to_agent_id(vol.session_id, writer))
+        assert {v for v in _held(vol, writer_row).values()} <= {"SHARED"}
     finally:
         stop_coordinator(tmp_path)
 
