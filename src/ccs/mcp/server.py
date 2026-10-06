@@ -212,7 +212,12 @@ _TRANSFER_DESC = (
     "handoff_in_flight: another session's handoff of the path is live). The "
     "result is an error unless every grant transferred. While a handoff is "
     "live this session's swg_write and swg_write_cas on its path are denied "
-    "with reason=handed_off." + _HANDOFF_CLAUSE + _SCOPE_CLAUSE
+    "with reason=handed_off. If the answer is commit_unconfirmed the transfer "
+    "may have landed: swg_read the path and transfer again only if its "
+    "handoff names no handoff from you to that successor, live or ended, "
+    "since once the successor has written the path a second transfer is a new "
+    "handoff."
+    + _HANDOFF_CLAUSE + _SCOPE_CLAUSE
 )
 _ACCEPT_DESC = (
     "As the successor, accept the live handoff of a path without writing it: "

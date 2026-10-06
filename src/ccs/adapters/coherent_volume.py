@@ -2509,8 +2509,11 @@ class CoherentVolume:
         :class:`~ccs.core.exceptions.CommitUnconfirmed` when the answer does not
         settle the outcome (a lost answer in degrade mode, the coordinator's
         unconfirmed answer, or one this client cannot read): the transfer may
-        have landed, so read the path's handoff state, or send the same transfer
-        again, which answers a transfer that landed with its record's status.
+        have landed, so look at the path's record (``/status``, or
+        :meth:`read_handoff` after an admitted read) before sending it again.
+        A re-send answers a live record's status and moves nothing, but once
+        the successor has written the path a re-send from a volume that holds
+        it again is a new handoff.
         A transport failure under ``on_error="strict"`` raises
         :class:`~ccs.core.exceptions.CoherenceError` as on every route.
         """

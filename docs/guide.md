@@ -2225,9 +2225,11 @@ outcome, or there is no coordinator to ask:
 
 - `CommitUnconfirmed`: the coordinator answered a `handoff_*_unconfirmed`
   reason, its answer could not be read, or, with `on_error="degrade"`, the
-  request failed. The verb may have landed: read the path's handoff state
-  before acting on it, or send the same transfer again, which answers a
-  transfer that landed with its record's status.
+  request failed. The verb may have landed: look at the path's record on
+  `/status` before acting again. Sending the same transfer again answers a
+  live record's status and moves nothing, but once the successor has written
+  the path, a re-send from a volume that holds the path again is a new
+  handoff.
 - `CoherenceError`: a request that failed with `on_error="strict"`, as on every
   route; and, in both modes, a volume with no coordinator attached.
 
