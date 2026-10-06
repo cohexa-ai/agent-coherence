@@ -23,7 +23,7 @@ import logging
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
@@ -516,42 +516,21 @@ def _do_write_cas(
     if won.handoff is not None:
         # What the win did to a live handoff of the path (#185): completed it
         # (this session is the successor) or overtook it (a bystander).
-        structured["handoff"] = _present(
-            {
-                "outcome": won.handoff.outcome,
-                "giver": won.handoff.giver,
-                "successor": won.handoff.successor,
-                "version_at_transfer": won.handoff.version_at_transfer,
-                "counterparty": won.handoff.counterparty,
-            }
-        )
+        structured["handoff"] = _present(asdict(won.handoff))
     return _ok_result(structured, f"committed {key}")
 
 
 def _present(fields: dict) -> dict:
     """``fields`` without the ones the answer did not carry, so a result has
     the shape of the coordinator's answer (a refused grant is ``{path,
-    transferred, reason}``)."""
+    transferred, reason}``). ``fields`` is a volume result's ``asdict``: its
+    keys are the result's fields in declaration order, and every value is a
+    str, int, bool or ``None``, so ``False`` survives and only ``None`` goes."""
     return {key: value for key, value in fields.items() if value is not None}
 
 
 def _transfer_result(result: HandoffTransferResult) -> CallToolResult:
-    grants = [
-        _present(
-            {
-                "path": grant.path,
-                "transferred": grant.transferred,
-                "reason": grant.reason,
-                "giver": grant.giver,
-                "successor": grant.successor,
-                "version_at_transfer": grant.version_at_transfer,
-                "hold_shape": grant.hold_shape,
-                "status": grant.status,
-                "detail": grant.detail,
-            }
-        )
-        for grant in result.grants
-    ]
+    grants = [_present(asdict(grant)) for grant in result.grants]
     lines = [
         f"{grant.path}: transferred to {grant.successor} at v{grant.version_at_transfer} "
         f"({grant.status})"
@@ -569,15 +548,7 @@ def _transfer_result(result: HandoffTransferResult) -> CallToolResult:
 
 
 def _verb_result(verb: str, result: HandoffVerbResult) -> CallToolResult:
-    structured = _present(
-        {
-            "path": result.path,
-            "ok": result.ok,
-            "reason": result.reason,
-            "status": result.status,
-            "counterparty": result.counterparty,
-        }
-    )
+    structured = _present(asdict(result))
     if result.ok:
         text = f"{verb} {result.path}: taken (status={result.status})"
     else:

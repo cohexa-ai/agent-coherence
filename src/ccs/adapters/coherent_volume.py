@@ -495,6 +495,19 @@ def _handoff_unsettled(verb: str, rels: Sequence[str], why: str) -> str:
     )
 
 
+def _wire_str(body: dict, key: str) -> str | None:
+    """``body[key]`` when the answer carries it as a string, else ``None``."""
+    value = body.get(key)
+    return value if isinstance(value, str) else None
+
+
+def _wire_int(body: dict, key: str) -> int | None:
+    """``body[key]`` when the answer carries it as an integer, else ``None``.
+    A bool is not one, though Python counts it an ``int``."""
+    value = body.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 @dataclass(frozen=True)
 class ManagedGlobEnforcement:
     """What the coordinator's published policy says about a volume's managed
@@ -2576,15 +2589,11 @@ class CoherentVolume:
             self._ensure_attached()
             _abs_path, rel = self._to_relative(path)
             self._require_attached_for(verb, [rel])
-            resp = self._post(
-                f"/handoff/{verb}", {"session_id": self._session_id, "path": rel}
+            resp = self._require_answer(
+                verb,
+                [rel],
+                self._post(f"/handoff/{verb}", {"session_id": self._session_id, "path": rel}),
             )
-            if resp is None:
-                raise CommitUnconfirmed(_handoff_unsettled(verb, [rel], "the request failed"))
-            if resp.get("degraded"):
-                raise CommitUnconfirmed(
-                    _handoff_unsettled(verb, [rel], self._relayed_reason(resp))
-                )
             ok, reason = resp.get("ok"), resp.get("reason")
             if ok is not True and not (
                 ok is False and isinstance(reason, str) and reason in _HANDOFF_VERB_REFUSALS
@@ -2596,9 +2605,21 @@ class CoherentVolume:
                 path=rel,
                 ok=ok,
                 reason=None if ok else reason,
-                status=self._wire_str(resp, "status"),
-                counterparty=self._wire_str(resp, "counterparty"),
+                status=_wire_str(resp, "status"),
+                counterparty=_wire_str(resp, "counterparty"),
             )
+
+    def _require_answer(self, verb: str, rels: Sequence[str], resp: dict | None) -> dict:
+        """``resp``, once it is an answer that can settle ``verb``'s outcome;
+        raise ``CommitUnconfirmed`` when it cannot: no answer (the request
+        failed), or the coordinator's own unconfirmed answer. Whether the
+        answer then names an outcome this client can classify is each verb's
+        own check."""
+        if resp is None:
+            raise CommitUnconfirmed(_handoff_unsettled(verb, rels, "the request failed"))
+        if resp.get("degraded"):
+            raise CommitUnconfirmed(_handoff_unsettled(verb, rels, self._relayed_reason(resp)))
+        return resp
 
     def _require_attached_for(self, verb: str, rels: Sequence[str]) -> None:
         """A handoff verb needs the coordinator: with none attached (a
@@ -2644,12 +2665,7 @@ class CoherentVolume:
         ``CommitUnconfirmed`` when it does not settle the outcome: no answer,
         the coordinator's unconfirmed answer, or a grant list that is not one
         readable entry per path, in order."""
-        if resp is None:
-            raise CommitUnconfirmed(_handoff_unsettled("transfer", rels, "the request failed"))
-        if resp.get("degraded"):
-            raise CommitUnconfirmed(
-                _handoff_unsettled("transfer", rels, self._relayed_reason(resp))
-            )
+        resp = self._require_answer("transfer", rels, resp)
         unreadable = CommitUnconfirmed(
             _handoff_unsettled("transfer", rels, "no outcome this client can classify")
         )
@@ -2664,22 +2680,17 @@ class CoherentVolume:
                 and isinstance(entry.get("transferred"), bool)
             ):
                 raise unreadable
-            version = entry.get("version_at_transfer")
             grants.append(
                 HandoffGrantResult(
                     path=rel,
                     transferred=entry["transferred"],
-                    reason=self._wire_str(entry, "reason"),
-                    giver=self._wire_str(entry, "giver"),
-                    successor=self._wire_str(entry, "successor"),
-                    version_at_transfer=(
-                        version
-                        if isinstance(version, int) and not isinstance(version, bool)
-                        else None
-                    ),
-                    hold_shape=self._wire_str(entry, "hold_shape"),
-                    status=self._wire_str(entry, "status"),
-                    detail=self._wire_str(entry, "detail"),
+                    reason=_wire_str(entry, "reason"),
+                    giver=_wire_str(entry, "giver"),
+                    successor=_wire_str(entry, "successor"),
+                    version_at_transfer=_wire_int(entry, "version_at_transfer"),
+                    hold_shape=_wire_str(entry, "hold_shape"),
+                    status=_wire_str(entry, "status"),
+                    detail=_wire_str(entry, "detail"),
                 )
             )
         return HandoffTransferResult(grants=tuple(grants))
@@ -2693,24 +2704,17 @@ class CoherentVolume:
         handoff = resp.get("handoff")
         if not isinstance(handoff, dict):
             return None
-        outcome = handoff.get("outcome")
-        giver, successor = handoff.get("giver"), handoff.get("successor")
-        version = handoff.get("version_at_transfer")
-        if not (
-            isinstance(outcome, str)
-            and isinstance(giver, str)
-            and isinstance(successor, str)
-            and isinstance(version, int)
-            and not isinstance(version, bool)
-        ):
+        outcome = _wire_str(handoff, "outcome")
+        giver, successor = _wire_str(handoff, "giver"), _wire_str(handoff, "successor")
+        version = _wire_int(handoff, "version_at_transfer")
+        if outcome is None or giver is None or successor is None or version is None:
             return None
-        counterparty = handoff.get("counterparty")
         return HandoffWinOutcome(
             outcome=outcome,
             giver=giver,
             successor=successor,
             version_at_transfer=version,
-            counterparty=counterparty if isinstance(counterparty, str) else None,
+            counterparty=_wire_str(handoff, "counterparty"),
         )
 
     @staticmethod
@@ -2733,11 +2737,6 @@ class CoherentVolume:
         if isinstance(hook_output, dict) and hook_output.get("permissionDecision") == "deny":
             return False
         return resp.get("status") in ("fresh", "stale")
-
-    @staticmethod
-    def _wire_str(body: dict, key: str) -> str | None:
-        value = body.get(key)
-        return value if isinstance(value, str) else None
 
     @staticmethod
     def _relayed_reason(resp: dict) -> str:
