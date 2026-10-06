@@ -1,0 +1,84 @@
+{
+  "name": "handoff-decline-ends-a-handoff",
+  "description": "Status declined. B declines the live handoff A gave it; the record ends declined and the giver's fence lifts (R15, R20).",
+  "setup": {
+    "tracked": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/handoff/transfer",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+          "grants": [
+            {
+              "path": "plan.md"
+            }
+          ]
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/handoff/decline",
+    "body": {
+      "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      "path": "plan.md"
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_b}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "status": "declined"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

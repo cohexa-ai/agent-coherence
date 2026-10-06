@@ -1,0 +1,68 @@
+{
+  "name": "handoff-transfer-to-an-unknown-successor-is-refused",
+  "description": "handoff_successor_unknown. The successor is a well-formed session-level agent id (that of session dddddddd-dddd-4ddd-8ddd-dddddddddddd) for a session that never claimed a principal and never made a request, so the coordinator does not know it and every grant is refused (R2).",
+  "setup": {
+    "tracked": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/handoff/transfer",
+    "body": {
+      "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "successor": "025c15a0-699d-5ae8-9a10-c752a7573477",
+      "grants": [
+        {
+          "path": "plan.md"
+        }
+      ]
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_a}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": false,
+      "grants": [
+        {
+          "path": "plan.md",
+          "transferred": false,
+          "reason": "handoff_successor_unknown"
+        }
+      ]
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

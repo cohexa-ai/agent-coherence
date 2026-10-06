@@ -1,0 +1,101 @@
+{
+  "name": "handoff-giver-compare-and-swap-is-refused-handed-off",
+  "description": "handed_off on the compare-and-swap route. The giver A commits at the transfer version while its handoff is live: refused with the typed reason, the successor and the version at transfer, no hookSpecificOutput, and the handoff key (R10, R11).",
+  "setup": {
+    "tracked": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/handoff/transfer",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+          "grants": [
+            {
+              "path": "plan.md"
+            }
+          ]
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/post-edit-cas",
+    "body": {
+      "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "path": "plan.md",
+      "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "expected_version": 1
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_a}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": false,
+      "reason": "handed_off",
+      "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+      "version_at_transfer": 1,
+      "handoff": {
+        "role": "giver",
+        "giver": "09f031b6-cb23-50a2-b7a8-b405ed3810f4",
+        "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+        "version_at_transfer": 1,
+        "hold_shape": "SHARED",
+        "status": "pending",
+        "live": true
+      }
+    }
+  },
+  "preserve_identity": [
+    "giver",
+    "successor"
+  ],
+  "backends": [
+    "python"
+  ]
+}

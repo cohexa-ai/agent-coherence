@@ -1,0 +1,109 @@
+{
+  "name": "handoff-giver-failed-edit-answers-per-grant",
+  "description": "The reachable per-grant release answer (R8). The giver A's failed-edit report on a path it handed off, while the record is live, is not a clean success: top-level false, handed_off, and one grant reported not held, handed to the successor at the version at transfer. Nothing changes: no release, no withdraw.",
+  "setup": {
+    "tracked": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/handoff/transfer",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+          "grants": [
+            {
+              "path": "plan.md"
+            }
+          ]
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/post-edit",
+    "body": {
+      "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "path": "plan.md",
+      "success": false
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_a}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": false,
+      "reason": "handed_off",
+      "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+      "version_at_transfer": 1,
+      "grants": [
+        {
+          "path": "plan.md",
+          "held": false,
+          "cause": "handoff",
+          "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+          "version_at_transfer": 1
+        }
+      ],
+      "handoff": {
+        "role": "giver",
+        "giver": "09f031b6-cb23-50a2-b7a8-b405ed3810f4",
+        "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+        "version_at_transfer": 1,
+        "hold_shape": "EXCLUSIVE",
+        "status": "pending",
+        "live": true
+      }
+    }
+  },
+  "preserve_identity": [
+    "giver",
+    "successor"
+  ],
+  "backends": [
+    "python"
+  ]
+}

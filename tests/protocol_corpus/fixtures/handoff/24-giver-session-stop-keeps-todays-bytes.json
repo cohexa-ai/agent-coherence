@@ -1,0 +1,98 @@
+{
+  "name": "handoff-giver-session-stop-keeps-todays-bytes",
+  "description": "A session stop on a live record. The giver A holds EXCLUSIVE on plan.md and spec.md and hands plan.md to B; its stop releases spec.md alone and answers today's clean bytes, with no per-grant list and no handoff key. A stop never withdraws or declines a handoff (R8, R35). The per-grant arm of a stop that leaves a grant held is not reachable from a fixture; see the module's documented-unreachable twin.",
+  "setup": {
+    "tracked": [
+      "plan.md",
+      "spec.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\n",
+      "spec.md": "# Spec\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "path": "spec.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/handoff/transfer",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+          "grants": [
+            {
+              "path": "plan.md"
+            }
+          ]
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/session-stop",
+    "body": {
+      "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_a}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "released_artifacts": [
+        "spec.md"
+      ]
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

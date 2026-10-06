@@ -1,0 +1,108 @@
+{
+  "name": "handoff-mixed-transfer-answers-per-grant-not-held",
+  "description": "handoff_not_held, in a two-path transfer. A holds a read on plan.md and nothing on spec.md (which B has read, so the coordinator knows the path). plan.md transfers; spec.md is refused as not held; the top-level answer is false, in request order (R3, R4, R5).",
+  "setup": {
+    "tracked": [
+      "plan.md",
+      "spec.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\n",
+      "spec.md": "# Spec\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "path": "spec.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_b}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/handoff/transfer",
+    "body": {
+      "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+      "grants": [
+        {
+          "path": "plan.md"
+        },
+        {
+          "path": "spec.md"
+        }
+      ]
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_a}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": false,
+      "grants": [
+        {
+          "path": "plan.md",
+          "transferred": true,
+          "giver": "09f031b6-cb23-50a2-b7a8-b405ed3810f4",
+          "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+          "version_at_transfer": 1,
+          "hold_shape": "SHARED",
+          "status": "pending"
+        },
+        {
+          "path": "spec.md",
+          "transferred": false,
+          "reason": "handoff_not_held"
+        }
+      ]
+    }
+  },
+  "preserve_identity": [
+    "giver",
+    "successor"
+  ],
+  "backends": [
+    "python"
+  ]
+}

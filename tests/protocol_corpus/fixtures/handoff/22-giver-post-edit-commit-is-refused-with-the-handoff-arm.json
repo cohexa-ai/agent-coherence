@@ -1,0 +1,105 @@
+{
+  "name": "handoff-giver-post-edit-commit-is-refused-with-the-handoff-arm",
+  "description": "The post-edit handoff arm. A's edit was in flight when its transfer landed (pre-edit, transfer, then post-edit success:true): the commit is refused handed_off, and the context-only PostToolUse envelope carries the commit-refused text with its on-disk sentence (R10, R14, R38).",
+  "setup": {
+    "tracked": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/handoff/transfer",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+          "grants": [
+            {
+              "path": "plan.md"
+            }
+          ]
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/post-edit",
+    "body": {
+      "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "path": "plan.md",
+      "success": true,
+      "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_a}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": false,
+      "reason": "handed_off",
+      "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+      "version_at_transfer": 1,
+      "hookSpecificOutput": {
+        "hookEventName": "PostToolUse",
+        "additionalContext": "Commit refused: you handed plan.md to agent 14b6f5b5 at v1, so this session can no longer write it. Your edit landed in your local worktree but was not given a version by the coordinator. The handoff ends when agent 14b6f5b5 writes plan.md, when agent 14b6f5b5 declines it, or when you withdraw it on your user's or host's instruction. Stop and report to your user that plan.md was handed off."
+      },
+      "handoff": {
+        "role": "giver",
+        "giver": "09f031b6-cb23-50a2-b7a8-b405ed3810f4",
+        "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+        "version_at_transfer": 1,
+        "hold_shape": "EXCLUSIVE",
+        "status": "pending",
+        "live": true
+      }
+    }
+  },
+  "preserve_identity": [
+    "giver",
+    "successor"
+  ],
+  "backends": [
+    "python"
+  ]
+}

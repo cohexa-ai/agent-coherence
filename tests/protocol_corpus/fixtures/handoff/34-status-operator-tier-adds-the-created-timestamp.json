@@ -1,0 +1,160 @@
+{
+  "name": "handoff-status-operator-tier-adds-the-created-timestamp",
+  "description": "GET /status?detail=full with the operator header: the same handoff key plus the record's created_at_unix_ts (R27). That wall-clock value is in the harness's timestamp scrub set, so this row pins the key's PRESENCE, not its value. Nothing has committed, so the last-writer fields are null. coordinator_root is the absolute workspace path at this tier and is ignored with policy_summary and coordinator_version.",
+  "setup": {
+    "tracked": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/handoff/transfer",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+          "grants": [
+            {
+              "path": "plan.md"
+            }
+          ]
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "GET",
+    "path": "/status?detail=full",
+    "headers": {
+      "Coherence-Local-Operator": "true"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "audit_log_mode_drift_total": 0,
+      "auth_401_total": 0,
+      "caller_principal_absent_total": 0,
+      "caller_principal_refused_total": 0,
+      "cold_start_duration_ms": 0,
+      "coordinator_backend": "python",
+      "coordinator_pid": "<PID>",
+      "coordinator_root": "<IGNORED>",
+      "coordinator_uptime_s": "<UPTIME>",
+      "coordinator_uptime_seconds": "<UPTIME>",
+      "coordinator_version": "<IGNORED>",
+      "detail": "full",
+      "effect_fence_holds_total": 0,
+      "endpoint_counters": {
+        "effect_fence_total": 0,
+        "handoff_accept_total": 0,
+        "handoff_decline_total": 0,
+        "handoff_transfer_total": 1,
+        "handoff_withdraw_total": 0,
+        "policy_track_total": 0,
+        "policy_untrack_total": 0,
+        "post_edit_cas_total": 0,
+        "post_edit_total": 0,
+        "pre_bash_total": 0,
+        "pre_edit_total": 0,
+        "pre_grep_total": 0,
+        "pre_read_total": 1,
+        "principal_claim_total": 2,
+        "session_start_total": 0,
+        "session_stop_total": 0,
+        "status_total": 1
+      },
+      "fresh_shared_hash_mismatch_total": 0,
+      "handler_concurrency_overflows_total": 0,
+      "handoff_giver_denials_total": 0,
+      "in_flight_drain_timed_out": false,
+      "intra_task_acquire_release_total": 0,
+      "policy_summary": "<IGNORED>",
+      "sessions": [
+        {
+          "agent_id": "09f031b6-cb23-50a2-b7a8-b405ed3810f4",
+          "agent_name": "claude-session-<UUID>",
+          "states": {}
+        }
+      ],
+      "shared_foreign_lag_suppressed_total": 0,
+      "stale_warning_emitted_total": 0,
+      "stale_warning_reread_total": 0,
+      "strict_mode_denials_total": 0,
+      "strict_mode_routed_around_via_bash_total": 0,
+      "tracked_artifacts": [
+        {
+          "path": "plan.md",
+          "version": 1,
+          "id": "<UUID>",
+          "last_writer_agent_id": null,
+          "last_writer_at_unix_ts": null,
+          "handoff": {
+            "giver": "09f031b6-cb23-50a2-b7a8-b405ed3810f4",
+            "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+            "version_at_transfer": 1,
+            "hold_shape": "SHARED",
+            "status": "pending",
+            "live": true,
+            "created_at_unix_ts": "<TS>"
+          }
+        }
+      ],
+      "watchdog_late_aborts_total": 0,
+      "watchdog_late_completion_total": 0,
+      "watchdog_queue_overflows_total": 0,
+      "watchdog_timeouts_total": 0
+    }
+  },
+  "ignore_keys": [
+    "policy_summary",
+    "coordinator_version",
+    "coordinator_root"
+  ],
+  "preserve_identity": [
+    "giver",
+    "successor",
+    "agent_id"
+  ],
+  "backends": [
+    "python"
+  ]
+}

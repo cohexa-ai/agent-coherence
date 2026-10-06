@@ -1,0 +1,87 @@
+{
+  "name": "handoff-transfer-pending-hands-on-an-exclusive-claim",
+  "description": "Status pending. Session A takes EXCLUSIVE on plan.md through pre-edit -- the path's FIRST observation, which registers it at version 1 -- and hands it to session B. The answer is one transferred grant naming both session-level agent ids, the version at transfer and the hold shape given up (R1, R3, R25). This row is also the on-wire evidence that handoff_version_unconfirmed is unreachable from the hook surface: a path first seen through pre-edit is admitted at v1, because every HTTP registration path seeds version 1 and versions only rise.",
+  "setup": {
+    "tracked": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/handoff/transfer",
+    "body": {
+      "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+      "grants": [
+        {
+          "path": "plan.md"
+        }
+      ]
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_a}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "grants": [
+        {
+          "path": "plan.md",
+          "transferred": true,
+          "giver": "09f031b6-cb23-50a2-b7a8-b405ed3810f4",
+          "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+          "version_at_transfer": 1,
+          "hold_shape": "EXCLUSIVE",
+          "status": "pending"
+        }
+      ]
+    }
+  },
+  "preserve_identity": [
+    "giver",
+    "successor"
+  ],
+  "backends": [
+    "python"
+  ]
+}

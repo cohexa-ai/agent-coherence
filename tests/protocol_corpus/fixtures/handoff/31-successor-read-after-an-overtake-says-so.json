@@ -1,0 +1,149 @@
+{
+  "name": "handoff-successor-read-after-an-overtake-says-so",
+  "description": "The successor's touch after a bystander overtook its handoff. B had read plan.md before; C's acquire overtook the handoff (and revoked B's read). B's next read carries today's stale warning, then the overtaken sentence naming C (R24, R29).",
+  "setup": {
+    "tracked": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          "mint_nonce": "corpus-mint-nonce-c"
+        },
+        "capture": {
+          "principal_c": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_b}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/handoff/transfer",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+          "grants": [
+            {
+              "path": "plan.md"
+            }
+          ]
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_c}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      "path": "plan.md"
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_b}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "additionalContext": "⚠ Stale read [warning emitted <TS>]: your grant on plan.md was revoked and no new version was committed. plan.md is still at v1, the version you last saw. Re-acquire before writing to plan.md.\n\nHandoff overtaken: the handoff of plan.md to this session from agent 09f031b6 at v1 was overtaken by agent 637255db."
+      },
+      "status": "stale",
+      "summary": {
+        "path": "plan.md",
+        "current_version": 1,
+        "prior_version_seen_by_session": 1,
+        "last_writer_session_id": "<unknown>",
+        "last_writer_at_unix_ts": "<IGNORED>",
+        "warning_generated_at_unix_ts": "<IGNORED>",
+        "hash_differs": false
+      },
+      "handoff": {
+        "role": "successor",
+        "giver": "09f031b6-cb23-50a2-b7a8-b405ed3810f4",
+        "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+        "version_at_transfer": 1,
+        "hold_shape": "SHARED",
+        "status": "overtaken",
+        "live": true,
+        "counterparty": "637255db-866b-5c80-9db4-0afdc5898e12"
+      }
+    }
+  },
+  "ignore_keys": [
+    "last_writer_at_unix_ts",
+    "warning_generated_at_unix_ts"
+  ],
+  "preserve_identity": [
+    "giver",
+    "successor",
+    "counterparty"
+  ],
+  "backends": [
+    "python"
+  ]
+}

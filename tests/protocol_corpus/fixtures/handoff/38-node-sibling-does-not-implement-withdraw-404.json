@@ -1,0 +1,22 @@
+{
+  "name": "handoff-node-sibling-does-not-implement-withdraw-404",
+  "description": "R30 / AE16 -- THE ASYMMETRY, RECORDED. The sibling Node coordinator does not implement POST /handoff/withdraw and answers 404 with the shared error envelope. The bearer is the harness's VALID one: Node rejects auth before routing, so a bad bearer would answer 401 and say nothing about which routes exist. The day Node grows the route this row goes red. It must RUN, not skip: test_handoff_corpus.py fails rather than xfails when the plugin dist cannot be resolved.",
+  "setup": {},
+  "request": {
+    "method": "POST",
+    "path": "/handoff/withdraw",
+    "body": {
+      "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "path": "plan.md"
+    }
+  },
+  "expected": {
+    "status": 404,
+    "body": {
+      "error": "not found"
+    }
+  },
+  "backends": [
+    "node"
+  ]
+}

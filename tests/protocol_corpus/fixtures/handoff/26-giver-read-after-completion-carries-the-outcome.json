@@ -1,0 +1,138 @@
+{
+  "name": "handoff-giver-read-after-completion-carries-the-outcome",
+  "description": "The giver's read after its handoff ended. B read plan.md and won a compare-and-swap at the transfer version, which completed the record and moved the version, ending it. A's next read says how its handoff ended, after today's stale warning, and the key reports completed and not live (R14, R27, R29).",
+  "setup": {
+    "tracked": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/handoff/transfer",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+          "grants": [
+            {
+              "path": "plan.md"
+            }
+          ]
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_b}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit-cas",
+        "body": {
+          "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "path": "plan.md",
+          "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "expected_version": 1
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_b}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "path": "plan.md"
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_a}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "additionalContext": "⚠ Stale read [warning emitted <TS>]: plan.md was updated by agent 14b6f5b5 at <TS>. Current version is v2; you previously saw v1. Your worktree's content matches the last-recorded hash; the divergence is purely about version-tracking metadata. Consider re-reading plan.md before acting on stale assumptions.\n\nHandoff ended: your handoff of plan.md to agent 14b6f5b5 at v1 was completed by agent 14b6f5b5."
+      },
+      "status": "stale",
+      "summary": {
+        "path": "plan.md",
+        "current_version": 2,
+        "prior_version_seen_by_session": 1,
+        "last_writer_session_id": "14b6f5b5784c5b3e953a2456d93656f9",
+        "last_writer_at_unix_ts": "<IGNORED>",
+        "warning_generated_at_unix_ts": "<IGNORED>",
+        "hash_differs": false
+      },
+      "handoff": {
+        "role": "giver",
+        "giver": "09f031b6-cb23-50a2-b7a8-b405ed3810f4",
+        "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+        "version_at_transfer": 1,
+        "hold_shape": "SHARED",
+        "status": "completed",
+        "live": false
+      }
+    }
+  },
+  "ignore_keys": [
+    "last_writer_at_unix_ts",
+    "warning_generated_at_unix_ts"
+  ],
+  "preserve_identity": [
+    "giver",
+    "successor"
+  ],
+  "backends": [
+    "python"
+  ]
+}
