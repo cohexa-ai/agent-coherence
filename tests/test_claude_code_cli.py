@@ -1573,6 +1573,56 @@ def test_with_no_backend_line_not_served_is_the_verb_routes_own_404_never_the_cl
     assert "/handoff/withdraw" in _StubCoordinator.seen
 
 
+_CLAIM_SERVED = {"/principal/claim": (200, {"ok": True, "principal": "P" * 43})}
+
+
+@pytest.mark.parametrize("verb", ["transfer", "accept", "decline", "withdraw"])
+def test_an_unconfirmed_answer_exits_2_saying_the_outcome_is_unknown(
+    verb: str, stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A verb the coordinator's watchdog cut short may still have landed. The
+    command says the outcome is unknown and where to look before acting
+    again, and exits 2. Prevents an unconfirmed transfer exiting 0, which a
+    script would read as done, or reading as a refusal that changed
+    nothing."""
+    workspace, _ = stub_coordinator
+    reason = f"handoff_{verb}_unconfirmed"
+    _StubCoordinator.answers = {
+        **_CLAIM_SERVED,
+        f"/handoff/{verb}": (200, {"ok": False, "degraded": True, "reason": reason}),
+    }
+
+    rc = _VERB_RUNS[verb](["--root", str(workspace), "--session", str(uuid.uuid4()), "plan.md"])
+
+    err = capsys.readouterr().err
+    assert rc == _EXIT_FAILED, err
+    assert (
+        f"agent-coherence-{verb}: the coordinator could not confirm the {verb} ({reason}); "
+        "its outcome is unknown: check the path's handoff in agent-coherence-status "
+        "before acting again"
+    ) in err
+
+
+def test_a_transfer_answer_that_omits_a_named_path_exits_2_naming_it(
+    stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A transfer answer with no grant entry for a named path reports
+    nothing about that path, so the command cannot say it transferred: it
+    names the path and exits 2, even when the answer says ``ok``. Prevents
+    a path the answer left out reading as handed on."""
+    workspace, _ = stub_coordinator
+    _StubCoordinator.answers = {
+        **_CLAIM_SERVED,
+        "/handoff/transfer": (200, {"ok": True, "grants": []}),
+    }
+
+    rc = _VERB_RUNS["transfer"](["--root", str(workspace), "--session", str(uuid.uuid4()), "plan.md"])
+
+    err = capsys.readouterr().err
+    assert rc == _EXIT_FAILED, err
+    assert "agent-coherence-transfer: plan.md: the answer reports no outcome for it" in err
+
+
 def test_a_request_the_coordinator_cannot_read_exits_2_naming_what_to_check(
     live_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:
