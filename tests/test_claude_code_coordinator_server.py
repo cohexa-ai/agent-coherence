@@ -11289,3 +11289,352 @@ def test_a_coordinator_wiring_a_state_log_records_the_transfer_under_the_handoff
         ] == [(str(giver.composite("inc-1")), "SHARED", "INVALID", "handoff")]
     finally:
         server.shutdown()
+
+
+# ----------------------------------------------------------------------
+# The giver's shell write: the lookup's watchdog discipline (#185)
+#
+# Pre-bash refuses a handoff giver's shell write to the path it handed off.
+# Its giver lookup reads the registry only when the pure write detector names a
+# written tracked path, and then only in the watchdog pool, starting the
+# request's one deadline -- the caller-principal gate's discipline. A lookup
+# that cannot finish in time is counted and answers as if the check did not
+# exist. What a live record changes, and what it does not, is pinned in
+# tests/integration/test_strict_mode.py.
+# ----------------------------------------------------------------------
+
+_GIVER_SHELL_APPEND = "echo '- gamma' >> plan.md"
+
+
+def _record_giver_lookups(monkeypatch: pytest.MonkeyPatch) -> tuple[list[str], threading.Event]:
+    """Wrap pre-bash's giver lookup: record the thread each call runs on, and
+    set the event when a call returns."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    threads: list[str] = []
+    returned = threading.Event()
+    real = mod._first_write_handed_off_by
+
+    def recording(*args: Any):
+        threads.append(threading.current_thread().name)
+        try:
+            return real(*args)
+        finally:
+            returned.set()
+
+    monkeypatch.setattr(mod, "_first_write_handed_off_by", recording)
+    return threads, returned
+
+
+def test_a_givers_shell_write_is_denied_from_a_lookup_on_a_watchdog_thread(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The giver's shell append is denied, and the registry read deciding it
+    ran in the watchdog pool, never on the handler thread -- where a contended
+    registry would hold the hook past its budget with no deadline."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    threads, _ = _record_giver_lookups(monkeypatch)
+    status, body = client.post(
+        "/hooks/pre-bash", {"session_id": giver.sid, "command": _GIVER_SHELL_APPEND},
+        principal=giver.principal,
+    )
+    assert (status, body.get("reason")) == (200, "handed_off"), body
+    assert len(threads) == 1 and threads[0].startswith("coord-wd"), threads
+
+
+@pytest.mark.parametrize("command", [
+    "cat plan.md",
+    "echo x >> README.md",
+    "echo x >> /tmp/plan.md",
+    "echo 'x >> plan.md'",
+])
+def test_a_bash_command_writing_no_tracked_path_runs_no_giver_lookup(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """Detection is a pure string scan: a command that writes no tracked path
+    -- a read, an untracked write, a write outside the workspace, a quoted
+    operator -- costs no registry read for the check, even from the giver of a
+    live handoff."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    threads, _ = _record_giver_lookups(monkeypatch)
+    client.post("/hooks/pre-bash", {"session_id": giver.sid, "command": command}, principal=giver.principal)
+    assert threads == []
+
+
+def test_a_givers_shell_write_whose_lookup_cannot_read_answers_as_before_and_counts_a_timeout(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the registry lock held, the giver lookup cannot finish: the shell
+    write is answered within the watchdog with what pre-bash answered before
+    the check existed, and the timeout is counted like every other. The late
+    lookup, once the lock is released, only reads, so it is not reported as a
+    late completion. Fails if the lookup runs on the handler thread (no answer
+    until the lock is released) or under the mutating watchdog runner."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _, returned = _record_giver_lookups(monkeypatch)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    late_before = coordinator.counters_snapshot()["watchdog_late_completion_total"]
+    # No principal is presented, so the gate admits without a store read and
+    # the held lock blocks only the giver lookup.
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(
+            client, "/hooks/pre-bash", {"session_id": giver.sid, "command": _GIVER_SHELL_APPEND})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+
+    assert answered, f"no answer within {_GATE_ANSWER_BOUND_SEC}s"
+    assert answer.result() == (200, {"status": "fresh"})
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    assert returned.wait(_ABANDONED_BODY_SETTLE_SEC), "the late lookup never finished"
+    time.sleep(0.05)
+    assert coordinator.counters_snapshot()["watchdog_late_completion_total"] == late_before
+
+
+def test_a_givers_shell_write_lookup_and_the_work_body_share_one_watchdog_deadline(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lookup that spent part of the budget leaves the work body only what is
+    left: a body that then blocks is answered at the ONE deadline, not at the
+    lookup's time plus a fresh one. The lookup is a lock-free stand-in that
+    finds nothing after a delay, so the held lock blocks only the work body."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    deadline = 1.0
+    lookup_delay = 0.7 * deadline
+
+    def slow_no_record(*args: Any) -> None:
+        time.sleep(lookup_delay)
+        return None
+
+    monkeypatch.setattr(mod, "_first_write_handed_off_by", slow_no_record)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", deadline)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with _HeldRegistryLock(coordinator) as held:
+        started = time.monotonic()
+        answer = _Background(client, "/hooks/pre-bash", {
+            "session_id": str(uuid.uuid4()), "command": "cat plan.md && echo x >> plan.md",
+        })
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+        held.release()
+
+    assert answered, f"no answer within {_GATE_ANSWER_BOUND_SEC}s"
+    assert answer.result() == (200, mod._DEFAULT_DEGRADED_RESPONSE)
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    # One deadline answers at ~1.0s; a fresh one for the body at ~0.7 + 1.0s.
+    assert waited < deadline + lookup_delay / 2, (
+        f"answered after {waited:.2f}s: the work body got a fresh {deadline}s "
+        f"after a {lookup_delay:.2f}s giver lookup, not what was left of one deadline")
+
+
+def test_a_givers_shell_write_lookup_that_raises_answers_the_internal_error_envelope(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raising lookup answers the route's internal-error envelope, the one
+    exception arm a request's work has -- never the dispatcher's 500, which
+    every client reads as an absent coordinator."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    def broken(*args: Any) -> None:
+        raise RuntimeError("registry unavailable")
+
+    monkeypatch.setattr(mod, "_first_write_handed_off_by", broken)
+    answer = client.post(
+        "/hooks/pre-bash", {"session_id": str(uuid.uuid4()), "command": _GIVER_SHELL_APPEND},
+    )
+    assert answer == (200, {"ok": False, "reason": "internal: RuntimeError"})
+
+
+def test_a_bash_write_to_a_tracked_path_the_registry_does_not_know_registers_nothing(
+    coordinator, client: _Client
+) -> None:
+    """The giver lookup only reads: a shell write to a tracked path no session
+    has touched leaves the registry without it. Fails if the lookup resolves
+    the path through the registering call, seeding an artifact the edit hooks
+    would then treat as observed."""
+    answer = client.post(
+        "/hooks/pre-bash", {"session_id": str(uuid.uuid4()), "command": "echo x >> spec.md"},
+    )
+    assert answer == (200, {"status": "fresh"})
+    assert coordinator.registry.lookup_artifact_id_by_name("spec.md") is None
+
+
+#: A giver's write after a write to another path: the second path is the
+#: handed-off one, so the lookup must look past the first.
+_TWO_PATH_APPEND = "echo a >> spec.md && echo b >> plan.md"
+_STRICT_READER_SID = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+_STRICT_WRITER_SID = "22222222-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+
+class _OverflowingWatchdogQueue:
+    """Stands in for the watchdog pool's work queue, reporting a depth well
+    past ``WATCHDOG_QUEUE_LIMIT``."""
+
+    @staticmethod
+    def qsize() -> int:
+        return 100
+
+
+@pytest.mark.parametrize("first_path_known", [False, True], ids=["unknown", "known-without-a-record"])
+def test_a_givers_shell_write_is_denied_when_the_handed_off_path_is_not_the_first_written(
+    coordinator, client: _Client, first_path_known: bool
+) -> None:
+    """The command writes spec.md, then the handed-off plan.md: the lookup
+    looks past a first path the registry does not know, or knows with no
+    record naming the caller, and answers the giver's pre-edit deny for
+    plan.md. Fails if the lookup stops at the first written path."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    if first_path_known:
+        _read(client, giver, "spec.md")
+    shell = client.post(
+        "/hooks/pre-bash", {"session_id": giver.sid, "command": _TWO_PATH_APPEND},
+        principal=giver.principal,
+    )
+    edit = client.post(
+        "/hooks/pre-edit", {"session_id": giver.sid, "path": "plan.md"}, principal=giver.principal,
+    )
+    assert shell[0] == 200 and shell[1].get("reason") == "handed_off", shell
+    assert shell == edit
+
+
+def test_a_givers_shell_write_under_a_foreign_principal_is_refused_before_the_giver_check(
+    coordinator, client: _Client
+) -> None:
+    """The caller-principal gate runs first: the giver's session id presented
+    with a third session's principal is refused as foreign, and no giver deny
+    is answered or counted. Fails if the giver check runs ahead of the gate --
+    a request whose identity was never checked would be answered as the giver."""
+    giver, successor, third = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    denials_before = coordinator.counters_snapshot()["handoff_giver_denials_total"]
+    status, body = client.post(
+        "/hooks/pre-bash", {"session_id": giver.sid, "command": _GIVER_SHELL_APPEND},
+        principal=third.principal,
+    )
+    assert (status, body.get("reason"), set(body)) == (400, "caller_principal_foreign", {"error", "reason"})
+    assert coordinator.counters_snapshot()["handoff_giver_denials_total"] == denials_before
+
+
+def test_a_givers_shell_write_lookup_honours_the_watchdog_queue_limit(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the watchdog pool's queue past its limit, the giver lookup is not
+    queued: the request answers the queue-overflow 503 at once, as the gate's
+    lookup and a work body do (A7), and reads nothing. No principal is
+    presented, so the gate admits without a lookup and this gate is the one
+    answering. Fails if the lookup is submitted past a full queue."""
+    from unittest.mock import patch
+
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    threads, _ = _record_giver_lookups(monkeypatch)
+    overflows_before = coordinator.counters_snapshot()["watchdog_queue_overflows_total"]
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with patch.object(coordinator._watchdog, "_work_queue", _OverflowingWatchdogQueue()):
+        response = client.post(
+            "/hooks/pre-bash", {"session_id": giver.sid, "command": _GIVER_SHELL_APPEND})
+    assert response == (503, {"error": "watchdog queue overloaded"})
+    assert threads == [], f"the giver lookup ran past a full queue: {threads}"
+    assert coordinator.counters_snapshot()["watchdog_queue_overflows_total"] == overflows_before + 1
+    assert coordinator._watchdog_timeouts_total == timeouts_before
+
+
+def _serve_strict_plan(root: Path) -> tuple[CoordinatorHTTPServer, _Client]:
+    """A coordinator whose plan.md is strict, with the reader's read grant on
+    it revoked by the writer's acquire and no new version committed -- so the
+    reader's shell read of plan.md is answered the grant-change strict deny,
+    whose bytes carry no timestamp and so match across two coordinators."""
+    root.mkdir(parents=True)
+    coherence = root / ".coherence"
+    coherence.mkdir(mode=0o700)
+    (coherence / "strict_mode.yaml").write_text("- plan.md\n")
+    server = CoordinatorHTTPServer(root, port=0, instance_id="giver-shell-strict")
+    server.serve_in_thread()
+    time.sleep(0.05)
+    client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
+    assert client.post("/hooks/pre-read", {"session_id": _STRICT_READER_SID, "path": "plan.md"})[0] == 200
+    assert client.post("/hooks/pre-edit", {"session_id": _STRICT_WRITER_SID, "path": "plan.md"})[0] == 200
+    return server, client
+
+
+def _answer_without_the_giver_check(root: Path, command: str, monkeypatch: pytest.MonkeyPatch) -> tuple[int, dict]:
+    """What pre-bash answered the reader's ``command`` before the giver check
+    existed: the same scenario on its own coordinator, the check stood aside."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    server, client = _serve_strict_plan(root)
+    try:
+        with monkeypatch.context() as patched:
+            patched.setattr(mod, "_deny_giver_shell_write", lambda *args, **kwargs: False)
+            answer = client.post("/hooks/pre-bash", {"session_id": _STRICT_READER_SID, "command": command})
+    finally:
+        server.shutdown()
+    assert answer[1]["hookSpecificOutput"]["permissionDecision"] == "deny", answer
+    return answer
+
+
+@pytest.mark.parametrize("command", [
+    "cat plan.md && echo x >> plan.md",
+    "sed -i '' 's/a/b/' plan.md",
+])
+def test_a_giver_lookup_that_times_out_leaves_the_read_check_its_whole_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """No handoff anywhere; the command both writes and reads the strict
+    plan.md, so the giver lookup runs and the read check after it denies.
+    With the registry lock held the lookup times out; once that one timeout is
+    counted the lock is released, and the read check -- given back the budget
+    it had before the lookup -- answers exactly the strict deny it answered
+    before the check existed, with no second timeout. Fails if a timed-out
+    lookup leaves its spent deadline behind: the read check would then degrade
+    at once, answering fresh where it denied."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", 1.0)
+    expected = _answer_without_the_giver_check(tmp_path / "before", command, monkeypatch)
+    server, client = _serve_strict_plan(tmp_path / "now")
+    try:
+        timeouts_before = server._watchdog_timeouts_total
+        with _HeldRegistryLock(server) as held:
+            answer = _Background(
+                client, "/hooks/pre-bash", {"session_id": _STRICT_READER_SID, "command": command})
+            waited_until = time.monotonic() + _GATE_ANSWER_BOUND_SEC * 2
+            while server._watchdog_timeouts_total == timeouts_before and time.monotonic() < waited_until:
+                time.sleep(0.005)
+            held.release()
+        result = answer.result()
+        timeouts_after = server._watchdog_timeouts_total
+    finally:
+        server.shutdown()
+    assert result == expected
+    assert timeouts_after == timeouts_before + 1
+
+
+def test_a_bash_write_detection_that_raises_leaves_the_answer_as_before(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A detector bug must not cost the existing checks: with the write
+    detector raising, the reader's shell read of the strict plan.md still
+    answers the strict deny it answered before the giver check existed."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    command = "cat plan.md && echo x >> plan.md"
+    expected = _answer_without_the_giver_check(tmp_path / "before", command, monkeypatch)
+
+    def broken(*args: Any, **kwargs: Any) -> list[str]:
+        raise RuntimeError("detector bug")
+
+    monkeypatch.setattr(mod, "detect_tracked_writes", broken)
+    server, client = _serve_strict_plan(tmp_path / "now")
+    try:
+        answer = client.post("/hooks/pre-bash", {"session_id": _STRICT_READER_SID, "command": command})
+    finally:
+        server.shutdown()
+    assert answer == expected

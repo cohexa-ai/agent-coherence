@@ -76,6 +76,7 @@ from ccs.adapters.claude_code.auth import (
     verify_host,
 )
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
+from ccs.adapters.claude_code.bash_write_detector import detect_tracked_writes
 from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
 from ccs.coordinator.registry_protocol import CheckpointMember, TransferRecord
 from ccs.coordinator.service import (
@@ -160,7 +161,8 @@ class _RequestProtocol(Protocol):
     _route_key: tuple[str, str]
     #: ``time.monotonic()`` instant this request's handler watchdog expires, or
     #: ``None`` while nothing has started it. The dispatcher resets it; the
-    #: caller-principal gate starts it when it must read the registry, and the
+    #: caller-principal gate starts it when it must read the registry, as does
+    #: pre-bash's giver lookup (which puts it back when it times out), and the
     #: work body then waits only for what is left (:func:`_watchdog_deadline`).
     _watchdog_deadline: float | None
 
@@ -671,8 +673,7 @@ def _attributed_within_deadline(
         pass
     if _watchdog_queue_overflowed(req, coordinator):
         return None
-    deadline = time.monotonic() + HANDLER_TIMEOUT_SEC
-    req._watchdog_deadline = deadline
+    deadline = _start_watchdog_deadline(req)
     method, path = req._route_key
     try:
         return coordinator.run_admission_lookup(
@@ -1140,9 +1141,10 @@ class CoordinatorHTTPServer:
         # denied as a foreign edit. Pairs with strict_mode_denials_total to let
         # an operator size the lag-window (5s) false-negative exposure.
         self._shared_foreign_lag_suppressed_total: int = 0
-        # handoff_giver_denials_total (#185): how often the giver of a live
-        # handoff was denied on pre-edit. Its own counter, not the strict-mode
-        # one: the deny is not a stale-view deny and fires in warn mode too.
+        # handoff_giver_denials_total (#185): denies to the giver of a live
+        # handoff, on pre-edit or on pre-bash for a shell write. Its own
+        # counter, not the strict-mode one: the deny is not a stale-view deny
+        # and fires in warn mode too.
         self._handoff_giver_denials_total: int = 0
         # Per-(session, path) "recent strict-deny" memory for route-around
         # detection. Bounded by the registry's own (session, artifact)
@@ -1582,9 +1584,9 @@ class CoordinatorHTTPServer:
         self._shared_foreign_lag_suppressed_total += 1
 
     def increment_handoff_giver_denial(self) -> None:
-        """#185: bumped once per pre-edit deny of a live handoff's giver.
-        The strict-mode denial and stale-warning counters are not bumped
-        for it. Same GIL-atomicity contract as
+        """#185: bumped once per deny to the giver of a live handoff, on
+        pre-edit or on pre-bash for a shell write. The strict-mode denial and
+        stale-warning counters are not bumped for it. Same GIL-atomicity contract as
         :meth:`increment_strict_mode_denial`."""
         self._handoff_giver_denials_total += 1
 
@@ -1799,7 +1801,9 @@ class CoordinatorHTTPServer:
         """Run the caller-principal gate's durable-store lookup in the watchdog
         pool, waiting until ``deadline`` (a ``time.monotonic()`` instant) at
         most. Raises :class:`FuturesTimeout` when it is not done by then, and
-        re-raises whatever ``fn`` raised — a refusal included.
+        re-raises whatever ``fn`` raised — a refusal included. Pre-bash's giver
+        lookup (:func:`_deny_giver_shell_write`) runs here too, for the same
+        reason: it only reads.
 
         Unlike :meth:`run_with_watchdog` there is no abort and no late-completion
         accounting: the lookup only READS, so a late one lands no coordinator
@@ -2047,7 +2051,9 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
                     # caller-principal posture lookup (_admit_caller).
                     self._route_key = (method, route_path)
                     # No watchdog deadline yet: the caller-principal gate starts
-                    # one only when it has to read the registry.
+                    # one only when it has to read the registry, and pre-bash's
+                    # giver lookup only when the command writes a tracked path
+                    # (a lookup that times out puts the deadline back).
                     self._watchdog_deadline = None
                     handler(self, coordinator)
                 except Exception as exc:
@@ -3042,6 +3048,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         if handed is not None:
             return _giver_deny_response(
                 coordinator, handed, session_id=session_id, path=path, caller=caller,
+                source=_PRE_EDIT_GIVER_DENY_SOURCE,
             )
         observed_before_acquire = coordinator.registry.last_observed_version_for(
             artifact_id, agent_id
@@ -3132,6 +3139,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # the typed error maps to the same deny.
             return _giver_deny_response(
                 coordinator, exc, session_id=session_id, path=path, caller=caller,
+                source=_PRE_EDIT_GIVER_DENY_SOURCE,
             )
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
@@ -3983,8 +3991,16 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     negatives are acceptable (adversarial obfuscation, command
     substitution, etc. are OUT of scope per KTD-N).
 
+    First, though, a command that WRITES a path this session handed off
+    under a live record (#185) gets the giver's pre-edit deny, byte for byte
+    (:func:`_deny_giver_shell_write`); without such a record every answer
+    below is unchanged.
+
     Request: ``{session_id, command}``.
     Response:
+      - the giver's deny (``{ok: false, reason: "handed_off", ...}`` with a
+        ``hookSpecificOutput`` deny) if the command writes a path this
+        session handed off under a live record
       - ``{status: "fresh"}`` if no tracked paths detected (fast path)
       - ``{status: "fresh"}`` if all detected paths are fresh
       - ``{status: "stale", hookSpecificOutput: {...}, stale_paths: [...]}``
@@ -4012,6 +4028,12 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         return
 
     if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
+    # #185: ahead of the read detection, which never looks for a write -- a
+    # giver denied its Edit would otherwise append through the shell. Answers
+    # only when a live record names this session as giver of a path the
+    # command writes; otherwise nothing below changes by a byte.
+    if _deny_giver_shell_write(req, coordinator, session_id=session_id, command=command):
         return
     # Detect tracked paths the command would read. is_tracked is the
     # policy gate — handler never touches SQLite for an untracked workspace.
@@ -4178,6 +4200,90 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # the next live admit.
     abort = threading.Event()
     _run_or_degrade(req, coordinator, work_with_reground, abort=abort)
+
+
+def _deny_giver_shell_write(
+    req: _RequestProtocol,
+    coordinator: CoordinatorHTTPServer,
+    *,
+    session_id: str,
+    command: str,
+) -> bool:
+    """Answer the giver's deny when ``command`` writes a path this session
+    handed off under a live record (#185); return whether it answered.
+
+    Detection is a pure string scan, so a command that writes no tracked path
+    touches no registry (nor does one the detector fails on). Otherwise the
+    giver lookup -- a read: no grant, no registration, no pop -- runs in the
+    watchdog pool and STARTS the request's deadline, as the caller-principal
+    gate's lookup does. A lookup that finishes in time keeps that deadline, so
+    the lookup and whatever answers after it share one ``HANDLER_TIMEOUT_SEC``:
+    a hit answers the giver's pre-edit deny through the guarded path, and no
+    hit returns False. A lookup that times out is counted like every timeout,
+    puts the deadline back as it found it and returns False, so the caller
+    answers exactly what it answered before this check existed, on the budget
+    it had then. A full watchdog queue answers the 503 and a raising lookup the
+    internal-error envelope -- the gate's two other exits."""
+    written = _tracked_writes(coordinator, command)
+    if not written:
+        return False
+    caller = caller_principal_identity(session_id)
+    if _watchdog_queue_overflowed(req, coordinator):
+        return True
+    prior_deadline = _watchdog_deadline(req)
+    try:
+        handed = coordinator.run_admission_lookup(
+            lambda: _first_write_handed_off_by(coordinator, written, caller),
+            deadline=_start_watchdog_deadline(req),
+        )
+    except FuturesTimeout:
+        # The check stands aside: the read check after it must not inherit a
+        # deadline the lookup spent, and degrade where it would have answered.
+        req._watchdog_deadline = prior_deadline
+        coordinator.increment_watchdog_timeout()
+        logger.warning("pre-bash giver lookup timed out after %ss; answering without it", HANDLER_TIMEOUT_SEC)
+        return False
+    except Exception as exc:
+        _answer_handler_error(req, coordinator, exc, failed="pre-bash giver lookup")
+        return True
+    if handed is None:
+        return False
+    path, record = handed
+    _run_or_degrade(req, coordinator, lambda: _giver_deny_response(
+        coordinator, record, session_id=session_id, path=path, caller=caller,
+        source=_PRE_BASH_GIVER_DENY_SOURCE,
+    ))
+    return True
+
+
+def _tracked_writes(coordinator: CoordinatorHTTPServer, command: str) -> list[str]:
+    """The tracked paths ``command`` writes, or none when the detector raises:
+    a bug in the giver check must never take the read checks after it -- the
+    strict-mode shell-read deny among them -- down with it."""
+    try:
+        return detect_tracked_writes(
+            command, coordinator.policy.is_tracked, root=str(coordinator.coordinator_root)
+        )
+    except Exception:
+        logger.warning("pre-bash write detection raised; answering without the giver check", exc_info=True)
+        return []
+
+
+def _first_write_handed_off_by(
+    coordinator: CoordinatorHTTPServer, written: list[str], caller: UUID
+) -> tuple[str, TransferRecord] | None:
+    """The first of the ``written`` paths whose live transfer record names
+    ``caller`` as giver, with that record, or ``None``. A read only: a path the
+    registry does not know is looked up, never registered (a shell write must
+    not seed an artifact the edit hooks would then treat as observed)."""
+    for path in written:
+        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        if artifact_id is None:
+            continue
+        record = coordinator.service.live_handoff_given_by(artifact_id, caller)
+        if record is not None:
+            return path, record
+    return None
 
 
 def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -5094,6 +5200,12 @@ def _giver_fenced_body(
     return body
 
 
+_PRE_EDIT_GIVER_DENY_SOURCE = "pre_edit_handoff_giver_deny"
+_PRE_BASH_GIVER_DENY_SOURCE = "pre_bash_handoff_giver_deny"
+"""The routes' labels for the giver's deny (pre-bash answers it for a shell
+write). Neither reaches a wire byte: both routes answer the same deny."""
+
+
 def _giver_deny_response(
     coordinator: CoordinatorHTTPServer,
     fence: GiverFenced | TransferRecord,
@@ -5101,11 +5213,14 @@ def _giver_deny_response(
     session_id: str,
     path: str,
     caller: UUID,
+    source: str,
 ) -> dict:
     """The giver's pre-edit deny: the typed reason at the top
     level, the third byte-stable template in the deny envelope beside it, and
     the path's ``handoff`` key -- a deny's body is fixed by its emitter, so
-    the key is attached here rather than by the route's wrapper.
+    the key is attached here rather than by the route's wrapper. Pre-bash
+    answers the same bytes for a shell write; ``source`` names the route and
+    reaches no byte of the body.
 
     Bookkeeping copied from the strict block, minus what does not fit: the
     giver-deny counter only (this deny is neither a strict-mode nor a
@@ -5117,7 +5232,7 @@ def _giver_deny_response(
     body = {
         **_giver_fenced_body(fence),
         "hookSpecificOutput": _payloads.emit_handoff_giver_deny(
-            source="pre_edit_handoff_giver_deny",
+            source=source,
             path=path,
             successor_id=str(fence.successor),
             version_at_transfer=fence.version_at_transfer,
@@ -6901,9 +7016,22 @@ cannot drift."""
 
 
 def _watchdog_deadline(req: _RequestProtocol) -> float | None:
-    """The request's watchdog deadline, if its caller-principal gate started
-    one (``None`` — the full ``HANDLER_TIMEOUT_SEC`` — otherwise)."""
+    """The request's watchdog deadline, if a read ahead of the work body
+    started one -- the caller-principal gate's store lookup, or pre-bash's
+    giver lookup that finished in time -- and ``None`` (the full
+    ``HANDLER_TIMEOUT_SEC``) otherwise."""
     return getattr(req, "_watchdog_deadline", None)
+
+
+def _start_watchdog_deadline(req: _RequestProtocol) -> float:
+    """The request's watchdog deadline, started now when nothing earlier in the
+    request started it: a read made ahead of the work body then shares one
+    ``HANDLER_TIMEOUT_SEC`` with it (see :func:`_attributed_within_deadline`)."""
+    deadline = _watchdog_deadline(req)
+    if deadline is None:
+        deadline = time.monotonic() + HANDLER_TIMEOUT_SEC
+        req._watchdog_deadline = deadline
+    return deadline
 
 
 def _watchdog_queue_overflowed(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> bool:
@@ -6963,9 +7091,11 @@ def _run_or_degrade(
     _ThreadingHTTPServer.process_request — gates BEFORE this function
     is reached.
 
-    The watchdog deadline is the REQUEST's: when the caller-principal gate
-    already started it with a registry lookup, ``work`` gets only what is left
-    (:func:`_watchdog_deadline`).
+    The watchdog deadline is the REQUEST's: when a registry read ahead of the
+    work body already started it -- the caller-principal gate's lookup, or
+    pre-bash's giver lookup when it finished in time -- ``work`` gets only what
+    is left (:func:`_watchdog_deadline`). A giver lookup that timed out put the
+    deadline back, so the work after it runs on the budget it always had.
     """
     if _watchdog_queue_overflowed(req, coordinator):
         return

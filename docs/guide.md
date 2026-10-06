@@ -1516,6 +1516,7 @@ committed or invalidated:
 | Route | The giver's answer |
 |---|---|
 | `POST /hooks/pre-edit` | `{"ok": false, "reason": "handed_off", "successor": "<agent id>", "version_at_transfer": 7, "handoff": {…}}`, plus a deny in `hookSpecificOutput` that stops a Claude Code edit (see [Claude Code sessions](#claude-code-sessions)) |
+| `POST /hooks/pre-bash`, for a shell command that writes the path | the `pre-edit` answer, byte for byte, deny included (see [Claude Code sessions](#claude-code-sessions) for the shell writes it recognizes) |
 | `POST /hooks/post-edit` (`success: true`) | the same fields, with a context-only `PostToolUse` envelope in place of the deny |
 | `POST /hooks/post-edit-cas` | the same fields, with no `hookSpecificOutput` |
 | `POST /session/commit` | `{"ok": false, "reason": "handed_off", "successor": "<agent id>", "version_at_transfer": 7}` |
@@ -1823,6 +1824,36 @@ it is remembered for route-around detection: on a strict-mode path, a shell
 command from the same session that reads the file within 30 seconds is counted
 in `strict_mode_routed_around_via_bash_total`.
 
+**The giver's shell write is denied too.** While the record is live, a Bash
+command from the giver's session, or any of its subagents, that writes the path
+gets the same answer from `pre-bash` as the edit gets from `pre-edit`, byte for
+byte: the deny text above, the `handed_off` fields and the `handoff` key,
+counted in `handoff_giver_denials_total`. It fires in strict mode and in warn
+mode alike, and ahead of the shell read checks, so a command that reads the
+file and then appends to it gets this deny. The Bash hook recognizes the common
+shell writes:
+
+- a redirection (`>`, `>>`, `>|`, `&>`) or `tee`;
+- an in-place `sed -i` or `perl -i`, and an `ed` or `ex` script that writes;
+- `cp`, `mv`, `install`, `ln` or `rsync` onto the file, and `mv`, `rm`,
+  `truncate`, `dd of=`, `sort -o` or `patch` of it;
+- `git checkout`, `git restore`, `git rm` or `git mv` naming it;
+- a script that opens it for writing, run as a one-line `python -c`,
+  `perl -e`, `ruby -e`, `node -e` or `php -r` program or fed to one in a
+  heredoc;
+
+including inside `bash -c`, `sh -c` and `eval`, after a `cd` in the same
+command, and by an absolute path inside the workspace. It errs toward letting
+a command through: a path built from a variable or a command substitution
+(`"$PWD/plan.md"`, `$(git rev-parse --show-toplevel)/plan.md`) or, inside a
+program, assembled from pieces or mentioned inside a longer string, a writer tool
+it does not know (`gsed`, `awk -i inplace`, `vim`, `curl -o`, a formatter, a
+script run from a file) and a relative path after a `pushd`, or after a `cd`
+made by an earlier command (the hook is not told the session's working
+directory, so it resolves relative paths from the workspace root), are not
+refused. A shell command that only reads the file, and every other session's
+shell write, answer as before.
+
 **How models respond (measured).** We measured how Claude Code models respond
 when a session that handed a file off tries to change it again: Haiku 4.5,
 Sonnet 5.5 and Opus 5.5 on Claude Code 2.1.291, in warn and strict mode, with
@@ -1835,11 +1866,14 @@ told, on that read, that it handed the file off and must not change it by any
 route until the handoff ends; every session that saw this notice left the file
 alone and told its user, without even attempting the edit. If the handoff
 lands while an edit is already being applied, the edit stays on disk without a
-version, and Claude Code shows the model the coordinator's explanation. The
-refusal and the notice reach a session only through its edits and reads: a
-session that appends to the file with a shell command without reading it first
-(Sonnet sometimes does) is not stopped, in warn or strict mode, and its write
-lands without a version.
+version, and Claude Code shows the model the coordinator's explanation. Sonnet
+sometimes skipped the edit and the read altogether and appended to the file
+with a shell command: in one warn-mode setup it did so in 4 of 10 runs, each
+write landed without a version, and each session reported success without
+mentioning the handoff. With the shell write denied as the edit is (above), the
+same setup changed the file in none of its 10 runs: every session whose shell
+append was denied stopped, tried no other route, and told its user that the
+file had been handed off.
 
 An earlier measurement, of the strict-mode stale-read deny on an older Claude
 Code with older models, saw sessions retry two to five times and then reach the
@@ -1865,7 +1899,8 @@ goes ahead, and its commit is refused.
 `pre-read` or `pre-edit` on it carries prose for the caller's role, in a
 context-only envelope after any stale warning or notice. A deny carries none of
 it: the giver's deny is the text above, and a strict-mode deny keeps its own
-bytes. The shell and search hooks (`pre-bash`, `pre-grep`) answer as before.
+bytes. The shell and search hooks (`pre-bash`, `pre-grep`) carry none of it,
+and answer as before apart from the giver's shell write, which is denied.
 
 - **The giver**, on a read while the record is live (its edit is denied
   instead):
@@ -2131,19 +2166,22 @@ run in one workspace with the plugin's hooks and the Python coordinator.
 - **No reservation.** Covered above, and worth repeating: a transfer keeps no
   one out. A session that needs the path kept from other writers needs
   something else.
-- **A Claude Code giver can still write the file through the shell.** The
-  hooks deny the giver's Edit and Write and tell it on its Read that it handed
-  the file off, but a shell command that writes the file, such as an
-  `echo … >> plan.md` or a script, passes no edit hook. The Bash hook looks for
-  commands that read tracked files, not ones that write them, so the write is
-  not stopped, in warn or strict mode, and it lands on disk without a version.
-  The measurement above saw this from a session that appended to the file
-  without reading it first.
+- **A Claude Code giver's shell write is denied only in the forms the Bash
+  hook recognizes.** The common ones are denied as an edit is, in warn and
+  strict mode: a redirection or `tee` (`echo … >> plan.md`), an in-place
+  `sed -i` or `perl -i`, a `cp` or `mv` onto the file, and a script that opens
+  it for writing, run as a one-line program or fed to one in a heredoc (see
+  [Claude Code sessions](#claude-code-sessions)). Not covered: a path built
+  from a variable or a command substitution, a writer tool the hook does not
+  know (`gsed`, `awk -i inplace`, `vim`, `curl -o`, a formatter, a script run
+  from a file), and a relative path after a `cd` made by an earlier command.
+  Such a write lands on disk without a version.
 - **An edit in flight at the transfer lands without a version.** So does one
   admitted while the coordinator was degraded. See
   [Claude Code sessions](#claude-code-sessions).
 - **Writes that bypass the coordinator are not fenced.** An editor, a script
-  or a shell command writing the file directly goes around every route above;
+  or a shell command that writes the file without passing through the hooks
+  goes around every route above;
   [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)
   reports it afterwards.
 - **Python coordinator only.** The four routes are served by this package's
@@ -2210,8 +2248,9 @@ answer.
 **What it does not close.**
 
 - A refused agent can still write the file with a shell command. The Bash hook
-  looks for commands that read tracked files, not ones that write them, so a
-  write that goes around the Edit and Write tools is not refused;
+  refuses a shell write only from the giver of a live
+  [handoff](#targeted-grant-handoff), so a write that goes around the Edit and
+  Write tools is not refused here;
   [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)
   reports it afterwards.
 - A new kind of deny on the edit path is shown to the model, and that changes
