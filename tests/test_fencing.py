@@ -157,6 +157,7 @@ def test_reclaim_trigger_constants_are_equal_across_registries() -> None:
     from ccs.coordinator.registry import CLAIM_CAPTURE_TRIGGERS as MEM_CAPTURE
     from ccs.coordinator.registry import EPOCH_BUMP_TRIGGERS as MEM_BUMP
     from ccs.coordinator.registry import RECLAIM_TRIGGERS as IN_MEMORY
+    from ccs.coordinator.registry_protocol import HANDOFF_TRIGGER
     from ccs.coordinator.sqlite_registry import CLAIM_CAPTURE_TRIGGERS as SQL_CAPTURE
     from ccs.coordinator.sqlite_registry import EPOCH_BUMP_TRIGGERS as SQL_BUMP
     from ccs.coordinator.sqlite_registry import RECLAIM_TRIGGERS as SQLITE
@@ -165,10 +166,16 @@ def test_reclaim_trigger_constants_are_equal_across_registries() -> None:
         {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
     )
     # EPOCH_BUMP_TRIGGERS is what the bump sites actually key on: every reclaim
-    # trigger PLUS the voluntary "invalidate" release, which also ends a write
-    # claim without moving the version. The version-moving peer
-    # invalidations ("write"/"commit") stay out.
-    assert MEM_BUMP == SQL_BUMP == IN_MEMORY | frozenset({"invalidate"})
+    # trigger PLUS the voluntary "invalidate" release and the "handoff" a
+    # transfer moves its giver INVALID under -- each ends a write claim without
+    # moving the version. The version-moving peer invalidations
+    # ("write"/"commit") stay out. The handoff is a trigger of its own, not a
+    # reclaim and not a release: the reclaim set above is unchanged.
+    assert MEM_BUMP == SQL_BUMP == IN_MEMORY | frozenset({"invalidate", "handoff"})
+    assert len(MEM_BUMP) == 5
+    # The constant the transfer path emits, pinned to the literal: renaming it
+    # without the set would leave the bump keyed on a string nothing emits.
+    assert HANDOFF_TRIGGER == "handoff"
     assert MEM_CAPTURE == SQL_CAPTURE == frozenset({"fetch"})
 
 

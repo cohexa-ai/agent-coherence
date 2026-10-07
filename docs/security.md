@@ -168,8 +168,11 @@ What follows from that:
   trusted alike, the same boundary as your shell history or SSH agent socket.
 - A session whose client has claimed a [caller principal](guide.md#caller-principal)
   is refused, on the routes that release grants, commit, record who wrote, answer
-  the effect fence or record workspace ownership, when a request names it without
-  that principal or with another. That stops one writer's mistake — a copied
+  the effect fence, record workspace ownership, or hand a session's claims to a
+  successor or accept, decline or withdraw a
+  [handoff](guide.md#targeted-grant-handoff) in its name (`/handoff/transfer`,
+  `/handoff/accept`, `/handoff/decline`, `/handoff/withdraw`), when a request
+  names it without that principal or with another. That stops one writer's mistake — a copied
   request, a stale session id, a wrong id in a retry — from ending another
   writer's work or writing under its name. A session that never claimed one
   behaves as before: any holder of the secret can act as it.
@@ -183,9 +186,16 @@ What follows from that:
   that never claimed or presents the wrong principal, but does not tell sessions
   apart.
 - `last_writer_id`, and the sessions listed by `/status`, record which session a
-  caller *said* it was — verified against its principal when it has one. Treat
-  them as a record of cooperating writers, useful for debugging and display, not
-  as proof of who wrote.
+  caller *said* it was — verified against its principal when it has one. A
+  handoff's transfer record holds ids of the same kind: its giver is the session
+  the transfer request named, checked against that session's principal when it
+  has one; its successor is whoever the giver named; and a completion or an
+  overtake is attributed to the session the writing request named, which the
+  snapshot-session routes do not check when no principal is presented. The
+  record is kept in `.coherence/state.db` and holds agent ids, versions,
+  statuses and timestamps — no file content and no session id. Treat all of
+  these as a record of cooperating writers, useful for debugging and display,
+  not as proof of who wrote.
 - The snapshot-session routes (`/session/read`, `/session/commit`,
   `/session/commit_all`, `/session/heartbeat`) also require the token that
   `/session/begin` returns, and attribute a commit to the session that token was
@@ -199,7 +209,12 @@ operator view (`?detail=full` plus the `Coherence-Local-Operator: true` header).
 `CoherentVolume` reads that view once, at attach, to check that the coordinator
 enforces the globs it declared. The default `minimal` view reports `agent_name`
 as `null` and the pattern counts without the patterns, and the `metrics` view
-carries no sessions at all. Hook
+carries no sessions at all. A tracked artifact that has a handoff record
+carries a `handoff` key in the default and operator views, naming the giver,
+the successor and any session that overtook the handoff by session-level agent
+id — the agent id derived from the session id alone, so for a `CoherentVolume`
+the volume's session rather than the per-attempt id that holds its grants — and
+never by session name or session id; the `metrics` view carries no record. Hook
 responses identify another session by its agent id, a one-way hash of the
 session id. The `agent-coherence-status` command is an operator tool and asks
 for the operator view by default, so its output does carry session names: run

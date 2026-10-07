@@ -48,6 +48,10 @@
       "effect_fence_holds_total": 0,
       "endpoint_counters": {
         "effect_fence_total": 0,
+        "handoff_accept_total": 0,
+        "handoff_decline_total": 0,
+        "handoff_transfer_total": 0,
+        "handoff_withdraw_total": 0,
         "policy_track_total": 0,
         "policy_untrack_total": 0,
         "post_edit_cas_total": 0,

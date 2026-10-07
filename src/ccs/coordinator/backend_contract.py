@@ -12,7 +12,7 @@ shipped. Nothing here connects to, reads from, or writes to any store.
 
 It follows the :mod:`ccs.coordinator.registry_protocol` precedent (a module that
 owns Protocols + shared types the two registries re-export). Where that module
-names the registry SURFACE (the 61-member ``RegistryBase`` + ``SqliteExtended``
+names the registry SURFACE (the 65-member ``RegistryBase`` + ``SqliteExtended``
 Protocols; the 9 detection members sit on their own ``ForeignWriteDetection``),
 this module names the CONTRACT that surface must satisfy for a
 backend to host the atomic boundary: which members participate in the
@@ -110,7 +110,7 @@ class MemberContract:
     rationale: str
 
 
-# The 70 members of RegistryBase (47 methods + 1 property), SqliteExtended
+# The 74 members of RegistryBase (51 methods + 1 property), SqliteExtended
 # (+13 methods) and ForeignWriteDetection (+9 methods), classified against the CoordinatorService call sites. The
 # ATOMIC_CLASS members are the ones the service touches INSIDE its atomic
 # mutation paths (``write`` / ``commit`` / ``commit_cas`` under ``abort_guard``;
@@ -164,8 +164,9 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "Called inside every atomic mutation path (write/commit peer-invalidation "
         "+ grant, invalidate, and the same-lock sweep's M/E->INVALID reclaim). "
         "An M/E->INVALID transition that revokes the write claim WITHOUT moving "
-        "the version bumps owner_generation for the fence — the sweep reclaims "
-        "AND the voluntary invalidate release (EPOCH_BUMP_TRIGGERS); the "
+        "the version bumps owner_generation for the fence — the sweep reclaims, "
+        "the voluntary invalidate release AND the handoff trigger "
+        "(EPOCH_BUMP_TRIGGERS); the "
         "version-moving peer invalidations do not, because version-CAS already "
         "arbitrates those. Single-writer is checked after each such transition. "
         "The read_generation capture rides the same transition and is keyed on "
@@ -326,6 +327,43 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "R9 RMW: it decides which caller may name an identity, never a write. "
         "Its own store, never the session-meta one, so the session sweep, cap "
         "and release cannot reach it.",
+    ),
+    MemberContract(
+        "transfer_grants",
+        MemberClass.INDEPENDENT,
+        "base",
+        "The grant handoff's composite transfer (service transfer, #185): "
+        "decides every path of a request -- the giver's own record first, then "
+        "the hold, version, write-holder, other-giver, self and unknown checks "
+        "-- and applies the admitted subset (record upsert, the presented "
+        "composite's INVALID move under the handoff trigger, the state-log "
+        "entry) in ONE serialized step (sqlite: one BEGIN IMMEDIATE; in-memory: "
+        "one _lock hold, staged then applied after every emit). A backend must "
+        "keep that decide-then-apply atomic and all-or-nothing, but it is not "
+        "part of the R9 RMW: it arbitrates no writer and moves no version -- "
+        "the caller gives up only its own claim, the release-class epoch move a "
+        "voluntary invalidate also makes.",
+    ),
+    MemberContract(
+        "set_transfer_status",
+        MemberClass.INDEPENDENT,
+        "base",
+        "Writes a transfer record's label -- status, counterparty, updated_at "
+        "-- for accept, decline, withdraw, completion and overtake. "
+        "Unconditional: the service decides from the record it read under the "
+        "same abort-guard hold, because a win's label is written after the "
+        "version moved. Individually durable; not part of the boundary (a "
+        "failed label write never changes a win's answer, and liveness reads "
+        "the version, not the label).",
+    ),
+    MemberContract(
+        "evict_transfer_records",
+        MemberClass.INDEPENDENT,
+        "base",
+        "Deletes transfer records that are not live and older than an age "
+        "(the sweep's eviction, beside the notice eviction). Liveness is the "
+        "read's, so a live record is never evicted. Durable maintenance "
+        "delete; not part of the boundary.",
     ),
     # ---- READ_ONLY (base) --------------------------------------------------
     MemberContract(
@@ -539,6 +577,22 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "service.validate_caller_principal falls back to when its in-process "
         "cache misses (after a restart). Non-mutating.",
     ),
+    MemberContract(
+        "get_transfer_record",
+        MemberClass.READ_ONLY,
+        "base",
+        "Reads an artifact's transfer record together with whether it is live "
+        "(the version at transfer still equals the artifact's version and the "
+        "record was neither declined nor withdrawn), both from one read: the "
+        "single place the service's giver check, re-send answer and "
+        "completion/overtake decisions take liveness from. "
+        "Non-mutating; a lock-only select that serves a read-only open. "
+        "The giver fence built on it is a service-layer precondition, not a "
+        "registry leg: its atomicity with the write comes from the service "
+        "reading it inside the write path's abort_guard hold, so a cross-host "
+        "backend must re-home that read into the same critical section as the "
+        "write it fences.",
+    ),
     # ---- INDEPENDENT / READ_ONLY (sqlite_extended) ------------------------
     MemberContract(
         "resolve_or_register",
@@ -626,7 +680,11 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         MemberClass.READ_ONLY,
         "sqlite_extended",
         "Batch read of the artifact + state maps for the /status surface, "
-        "optionally scoping the state half to named agents. Non-mutating.",
+        "optionally scoping the state half to named agents. A keyword-only "
+        "opt-in, off by default, adds each artifact's transfer record and its "
+        "liveness, read inside the same lock hold so a record is judged "
+        "against the version its row reports (#185); only /status opts "
+        "in, and the default answer is unchanged. Non-mutating.",
     ),
     MemberContract(
         "record_foreign_write",
@@ -709,7 +767,7 @@ MEMBER_CLASSIFICATION: dict[str, MemberContract] = {
     contract.name: contract for contract in _MEMBER_CONTRACTS
 }
 """Every ``RegistryBase`` + ``SqliteExtended`` member → its :class:`MemberContract`
-(R8). Keyed by member name. The key set must equal the 70-member Protocol surface
+(R8). Keyed by member name. The key set must equal the 74-member Protocol surface
 exactly — :mod:`tests.test_backend_contract` fails if ``registry_protocol.py``
 gains or loses a member without a matching update here (bidirectional drift
 guard). Includes the ``coordinator_epoch`` property (property-omission teeth)."""
@@ -1017,6 +1075,16 @@ STATELESSNESS_INVENTORY: tuple[StateItem, ...] = (
         "failover forgets which identities are bound, so the next claimant of a "
         "bound identity would be issued a fresh principal and first-claim-wins "
         "would silently become last-failover-wins.",
+    ),
+    StateItem(
+        "transfer records (one per artifact: giver, holder, successor, version "
+        "at transfer, status)",
+        Disposition.MUST_REHOME,
+        "durable_registry",
+        "The grant handoff's record (sqlite schema v9, its own table), the "
+        "operand of the giver's fence. If not re-homed, a failover forgets every "
+        "live handoff, so a giver that handed a path off writes it again as "
+        "though it never had -- the lost update the handoff exists to prevent.",
     ),
     StateItem(
         "reaped-session tombstone (attribution only)",

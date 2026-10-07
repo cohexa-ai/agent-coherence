@@ -598,3 +598,98 @@ class FenceComparands:
     grant_did_not_stand: bool
     content_claim_present: bool
 
+
+
+# ---------------------------------------------------------------------------
+# Targeted grant handoff (#185): the transfer record's status
+# vocabulary and the two typed outcomes the handoff answers with.
+# ---------------------------------------------------------------------------
+#
+# The status a transfer record carries. Wire-stable constants matched by
+# identity (add, never rename). A status is a LABEL, not liveness: a record is
+# live while the artifact's version still equals the version at transfer and
+# the status is neither declined nor withdrawn, whatever else it says.
+#
+# - ``pending`` -- the transfer landed; the successor has not acted.
+# - ``completed`` -- the successor acquired, won a compare-and-swap, or accepted.
+#   Completion alone never lifts the giver's fence.
+# - ``declined`` -- the successor declined; the fence is off.
+# - ``withdrawn`` -- the giver withdrew; the fence is off.
+# - ``overtaken`` -- a third session acquired or won a compare-and-swap; the
+#   record names it as the counterparty.
+# - ``superseded`` -- the giver transferred the path again. No stored row
+#   carries it: the replacing record's cause records the supersession, and a
+#   re-sent superseded transfer answers this status.
+TRANSFER_STATUS_PENDING = "pending"
+TRANSFER_STATUS_COMPLETED = "completed"
+TRANSFER_STATUS_DECLINED = "declined"
+TRANSFER_STATUS_WITHDRAWN = "withdrawn"
+TRANSFER_STATUS_OVERTAKEN = "overtaken"
+TRANSFER_STATUS_SUPERSEDED = "superseded"
+TRANSFER_STATUSES: frozenset[str] = frozenset(
+    {
+        TRANSFER_STATUS_PENDING,
+        TRANSFER_STATUS_COMPLETED,
+        TRANSFER_STATUS_DECLINED,
+        TRANSFER_STATUS_WITHDRAWN,
+        TRANSFER_STATUS_OVERTAKEN,
+        TRANSFER_STATUS_SUPERSEDED,
+    }
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class TransferGrantOutcome:
+    """One grant's answer to a transfer: transferred, or refused with its
+    reason. A multi-path transfer answers one of these per path, and its
+    top-level result is success only when every grant transferred.
+
+    ``kw_only`` because ``giver`` and ``successor`` are two ids of one type side
+    by side: a positional swap reports the giver as the successor, which is the
+    handoff pointed the wrong way.
+
+    - ``transferred`` -- the grant was handed off (or a re-send found its live
+      record). ``reason`` is ``None`` then; otherwise it is the typed
+      refusal reason (see
+      :data:`ccs.core.exceptions.HANDOFF_TRANSFER_REFUSAL_REASONS`), and the
+      grant was left exactly as it was.
+    - ``giver`` / ``successor`` -- session-level ids: the normalised pair of a
+      transferred grant, or the pending pair a ``handoff_in_flight`` refusal
+      names. ``None`` where the answer names no record.
+    - ``version_at_transfer`` -- the artifact version the handoff is fenced on.
+    - ``hold_shape`` -- the grant given up: EXCLUSIVE, MODIFIED or SHARED.
+    - ``status`` -- the record's status (one of :data:`TRANSFER_STATUSES`) where
+      the answer reports one: a fresh or re-sent transfer, and the
+      ``handoff_ended`` refusal.
+    """
+
+    artifact_id: UUID
+    transferred: bool
+    reason: str | None = None
+    giver: UUID | None = None
+    successor: UUID | None = None
+    version_at_transfer: int | None = None
+    hold_shape: MESIState | None = None
+    status: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class TransferVerbOutcome:
+    """The answer to an accept, a decline or a withdraw of a path's handoff.
+
+    - ``ok`` -- the verb was taken. An accept of a record a bystander overtook is
+      taken but changes nothing, so it answers ``ok`` with the ``overtaken``
+      status and its ``counterparty``; a client tells it from a completion by
+      ``status``.
+    - ``reason`` -- ``None`` when ``ok``; otherwise the typed refusal
+      (``handoff_not_successor``, ``handoff_not_giver`` or ``handoff_not_live``,
+      see :data:`ccs.core.exceptions.HANDOFF_REASONS`), and nothing changed.
+    - ``status`` / ``counterparty`` -- the record's label after the verb, or
+      the label a refusal carries. ``None`` when the path has no record at all.
+    """
+
+    artifact_id: UUID
+    ok: bool
+    reason: str | None = None
+    status: str | None = None
+    counterparty: UUID | None = None
