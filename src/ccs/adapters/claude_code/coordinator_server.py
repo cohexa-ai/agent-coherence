@@ -5129,19 +5129,31 @@ def _attach_handoff_key(
 
     A read only -- nothing is granted, popped or marked -- so it may ride the
     safety-path reads too. The key is top-level: it never enters a
-    ``hookSpecificOutput``, so a strict deny's bytes are unchanged."""
-    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
-    if artifact_id is None:
+    ``hookSpecificOutput``, so a strict deny's bytes are unchanged.
+
+    Best-effort: ``result`` is the answer to work that already landed (a
+    grant, a win, notices popped), so a failed read answers ``result``
+    without the key rather than turning that work into an error the client
+    would act on. A missing key is therefore not proof the path has no
+    record."""
+    try:
+        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        if artifact_id is None:
+            return result
+        read = coordinator.registry.get_transfer_record(artifact_id)
+        if read is None:
+            return result
+        record, live = read
+        projection = _handoff_projection(record, live=live, caller=caller)
+        if won_at is not None:
+            outcome = _win_outcome(record, caller=caller, won_at=won_at)
+            if outcome is not None:
+                projection["outcome"] = outcome
+    except Exception:  # noqa: BLE001 — any raise; the landed answer stands
+        logger.warning(
+            "handoff key not attached for %r after the answer was decided", path, exc_info=True
+        )
         return result
-    read = coordinator.registry.get_transfer_record(artifact_id)
-    if read is None:
-        return result
-    record, live = read
-    projection = _handoff_projection(record, live=live, caller=caller)
-    if won_at is not None:
-        outcome = _win_outcome(record, caller=caller, won_at=won_at)
-        if outcome is not None:
-            projection["outcome"] = outcome
     return {**result, "handoff": projection}
 
 
