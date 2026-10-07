@@ -1178,9 +1178,10 @@ _EXIT_DONE, _EXIT_USAGE, _EXIT_FAILED, _EXIT_NOT_SERVED = 0, 1, 2, 4
 
 _NOT_HELD_HINT = (
     "hint: a Claude Code session's write grant ends when its turn ends; "
-    "if an earlier transfer of plan.md may have landed, check "
-    "agent-coherence-status first, and otherwise have the giver session read "
-    "plan.md, then transfer it again"
+    "if an earlier transfer of plan.md may have landed, check the path's "
+    "handoff in agent-coherence-status output first, and otherwise have the "
+    "giver session read plan.md, then transfer it again (on a strict-mode path "
+    "that read is denied: hand the path on in the same turn as its edit)"
 )
 
 _VERB_RUNS = {

@@ -2118,11 +2118,12 @@ hint:
 
 ```text
 agent-coherence-transfer: notes.md not transferred (handoff_not_held)
-agent-coherence-transfer: hint: a Claude Code session's write grant ends when its turn ends; if an earlier transfer of notes.md may have landed, check agent-coherence-status first, and otherwise have the giver session read notes.md, then transfer it again
+agent-coherence-transfer: hint: a Claude Code session's write grant ends when its turn ends; if an earlier transfer of notes.md may have landed, check the path's handoff in agent-coherence-status output first, and otherwise have the giver session read notes.md, then transfer it again (on a strict-mode path that read is denied: hand the path on in the same turn as its edit)
 ```
 
-On a strict-mode path the hint's `Read` is denied and grants nothing; see
-[Claude Code sessions](#claude-code-sessions) for what a shell read does there.
+On a strict-mode path the hint's `Read` is denied and grants nothing, as the
+hint's last clause says; see [Claude Code sessions](#claude-code-sessions) for
+what a shell read does there.
 
 **Python coordinator only.** Against the Claude Code plugin's Node coordinator
 the commands exit `4`. A plugin workspace created fresh runs the Node
@@ -2150,6 +2151,13 @@ The age, from the record's creation time, shows on the operator view only
 (`--detail full`, the default). With no record, the output is exactly what it
 was before. `--json` prints the `handoff` key as the coordinator sends it.
 
+This is the Python console script's view. Where the Claude Code plugin's
+`agent-coherence-status` comes first on the Bash tool's `PATH`, the command runs
+the plugin's own status view instead: it prints the coordinator's `/status`
+JSON, has no Handoffs block, and rejects `--json`. There, a handed-off path's
+record is the `handoff` key of its `tracked_artifacts` entry, and each session's
+full agent id is in `sessions`.
+
 ### Example: handing a file between Claude Code sessions
 
 Session A has been editing `plan.md`, and session B will carry on with it. Both
@@ -2169,7 +2177,9 @@ run in one workspace with the plugin's hooks and the Python coordinator.
    and claimed B's principal, which is what lets the coordinator know B (see
    [Naming the successor](#naming-the-successor)). `agent-coherence-status`
    also shows each session's agent id, cut to eight characters, beside its
-   session name, `claude-session-<session id>`; `--json` gives the whole id.
+   session name, `claude-session-<session id>`; the Python console script's
+   `--json`, or the plugin's status command, gives the whole id (see
+   [Handoffs in `agent-coherence-status`](#handoffs-in-agent-coherence-status)).
 2. **Hand the file on from A, in the turn of its edit.** Right after A edits
    `plan.md`, have it run:
 
@@ -2184,7 +2194,8 @@ run in one workspace with the plugin's hooks and the Python coordinator.
 
 3. **Check it.** `agent-coherence-status` lists
    `plan.md: bd35b34c → 6e271ee6 at version 2 (pending, 0s ago)` under
-   Handoffs.
+   Handoffs; through the plugin's status command, the same record is the
+   `handoff` key of `plan.md`'s `tracked_artifacts` entry.
 4. **A stops.** An Edit of `plan.md` from A is now denied:
 
    ```text
