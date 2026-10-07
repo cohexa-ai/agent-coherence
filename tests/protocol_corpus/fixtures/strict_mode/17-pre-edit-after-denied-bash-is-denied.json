@@ -1,6 +1,6 @@
 {
   "name": "pre-edit-after-denied-bash-is-denied",
-  "description": "A strict-denied `cat plan.md` re-grants SHARED but records no observation (fixture 11), so it must not let A write. A reads v1, B commits v2, and A's pre-bash on the strict path is denied: A now holds SHARED on v2 with v1 as the last version it observed. A's next pre-edit must take the strict deny, naming the write A never saw (prior v1, current v2). Before the fix, both backends admitted the edit because the strict pre-edit gate looked only for INVALID, and a whole-file write from A's v1 copy then overwrote B's commit. The retried twin is fixture 16. Timestamps vary per run; the reason bytes and the summary are the contract.",
+  "description": "A strict-denied `cat plan.md` re-grants SHARED but records no observation (fixture 11), so it must not let A write. A reads v1, B commits v2, and A's pre-bash on the strict path is denied: A now holds SHARED on v2 with v1 as the last version it observed. A's next pre-edit must take the strict deny, naming the write A never saw (prior v1, current v2). Before the fix, both backends admitted the edit because the strict pre-edit gate looked only for INVALID, and a whole-file write from A's v1 copy then overwrote B's commit. The retried twin is fixture 18. Timestamps vary per run; the reason bytes and the summary are the contract.",
   "setup": {
     "tracked": [
       "plan.md"

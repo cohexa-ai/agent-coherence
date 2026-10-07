@@ -1,6 +1,6 @@
 {
   "name": "pre-edit-after-a-denied-first-read-is-admitted-like-a-first-time-editor",
-  "description": "The deliberate edge of fixture 15. A has never read CLAUDE.md; B commits it. A's strict `cat plan.md CLAUDE.md` is denied (plan.md is stale for A), which re-grants SHARED on CLAUDE.md with no observation at all. A's pre-edit of CLAUDE.md is admitted, as a first-time editor's is: A has acted on no version of it, so there is nothing stale to refuse. Pins the null-observation guard on both backends; dropping it would deny first-time editors on every strict path. The Node backend also attaches a preemption advisory to this admit, so hookSpecificOutput is optional.",
+  "description": "The deliberate edge of fixture 17. A has never read CLAUDE.md; B commits it. A's strict `cat plan.md CLAUDE.md` is denied (plan.md is stale for A), which re-grants SHARED on CLAUDE.md with no observation at all. A's pre-edit of CLAUDE.md is admitted, as a first-time editor's is: A has acted on no version of it, so there is nothing stale to refuse. Pins the null-observation guard on both backends; dropping it would deny first-time editors on every strict path. The Node backend also attaches a preemption advisory to this admit, so hookSpecificOutput is optional.",
   "setup": {
     "tracked": [
       "plan.md",

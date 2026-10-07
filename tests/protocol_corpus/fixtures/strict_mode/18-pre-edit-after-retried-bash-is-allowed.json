@@ -1,6 +1,6 @@
 {
   "name": "pre-edit-after-retried-bash-is-allowed",
-  "description": "The way back after fixture 15's deny stays open. A reads v1, B commits v2 and ends its turn, and A's strict `cat plan.md` is denied, which re-grants SHARED without an observation. A runs the same command again: the grant is held, the command runs, and A reads v2 (fixture 13). A's next pre-edit is admitted, because A has now observed the current version. A gate that denied every re-armed SHARED holder, or a deny that stopped re-granting, would lock A out here.",
+  "description": "The way back after fixture 17's deny stays open. A reads v1, B commits v2 and ends its turn, and A's strict `cat plan.md` is denied, which re-grants SHARED without an observation. A runs the same command again: the grant is held, the command runs, and A reads v2 (fixture 13). A's next pre-edit is admitted, because A has now observed the current version. A gate that denied every re-armed SHARED holder, or a deny that stopped re-granting, would lock A out here.",
   "setup": {
     "tracked": [
       "plan.md"
