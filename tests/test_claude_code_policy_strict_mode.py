@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import itertools
 import logging
+import time
 from pathlib import Path
 
 import pytest
 
+from ccs.adapters.claude_code import policy as policy_module
 from ccs.adapters.claude_code.policy import (
     _ANY_ONE,
     _CLASS,
@@ -38,6 +40,10 @@ from ccs.adapters.claude_code.policy import (
 def root(tmp_path: Path) -> Path:
     (tmp_path / ".coherence").mkdir()
     return tmp_path
+
+
+def _quoted_yaml(patterns: list[str]) -> str:
+    return "".join(f"- '{p}'\n" for p in patterns)
 
 
 # --------------------------------------------------------------------
@@ -311,11 +317,10 @@ def test_a_star_heavy_untrack_entry_is_decided_within_the_budget(
     """A star-heavy entry is decided well inside the /policy/untrack handler
     (unbounded, this case explored the whole state space against every
     default tracked pattern: tens of seconds). A strict glob whose search
-    runs out of its budget counts as covered."""
-    import time
-
-    from ccs.adapters.claude_code import policy as policy_module
-
+    runs out of its budget counts as covered, unless no tracked pattern's
+    literal ends can meet it: ``docs/**/*.txt`` reaches no tracked path (the
+    default ``docs/`` patterns end in ``.md``), so nothing under it is
+    strict, and it is exactly not covered."""
     (root / ".coherence" / "tracked.yaml").write_text("- src/**/*.py\n")
     (root / ".coherence" / "strict_mode.yaml").write_text(
         "- 'docs/**/*.txt'\n- 'src/**/*.py'\n"
@@ -328,12 +333,10 @@ def test_a_star_heavy_untrack_entry_is_decided_within_the_budget(
     assert "src/**/*.py" in covering
 
     monkeypatch.setattr(policy_module, "GLOB_INTERSECT_PATTERN_BUDGET", 1)
-    assert policy.strict_patterns_covering(_STAR_HEAVY) == (
-        "docs/**/*.txt", "src/**/*.py",
-    )
+    assert policy.strict_patterns_covering(_STAR_HEAVY) == ("src/**/*.py",)
 
 
-_STAR_HEAVY_LOG = "**/" + "/".join(f"*{c}*" for c in "abcdefgh") + ".log"
+_STAR_HEAVY_LOG = _STAR_HEAVY + ".log"
 
 
 def test_each_strict_glob_is_decided_on_its_own_budget(
@@ -343,14 +346,14 @@ def test_each_strict_glob_is_decided_on_its_own_budget(
     only that one: a later strict glob is still decided. With one budget
     shared across the call, the first exhaustion marked every pattern after
     it as covering."""
-    from ccs.adapters.claude_code import policy as policy_module
-
-    (root / ".coherence" / "tracked.yaml").write_text("- '**/*.log'\n- data/**\n")
+    (root / ".coherence" / "tracked.yaml").write_text("- '**/*.log'\n")
     (root / ".coherence" / "strict_mode.yaml").write_text(
-        "- '**/*.log'\n- 'data/*.json'\n"
+        "- '**/*.log'\n- 'notes/[0-9].log'\n"
     )
     policy = TrackedArtifactPolicy.load(root)
-    monkeypatch.setattr(policy_module, "GLOB_INTERSECT_PATTERN_BUDGET", 100)
+    # The first search needs about 13,600 steps; the second settles "disjoint"
+    # (eight segments never fit notes/<digit>.log) in about 1,600.
+    monkeypatch.setattr(policy_module, "GLOB_INTERSECT_PATTERN_BUDGET", 5_000)
 
     assert policy.strict_patterns_covering(_STAR_HEAVY_LOG) == ("**/*.log",)
 
@@ -362,8 +365,6 @@ def test_once_the_call_budget_runs_out_undecided_globs_count_as_covered(
     counts as covered, unless its literal ends rule it out; a literal strict
     path is still decided exactly (``notes/a.log`` ends like the entry, so
     only matching it shows the entry's eight segments cannot reach it)."""
-    from ccs.adapters.claude_code import policy as policy_module
-
     (root / ".coherence" / "tracked.yaml").write_text("- '**/*.log'\n- data/**\n")
     (root / ".coherence" / "strict_mode.yaml").write_text(
         "- '**/*.log'\n- CLAUDE.md\n- notes/a.log\n- 'data/*.json'\n- 'src/**/*.log'\n"
@@ -380,10 +381,6 @@ def test_the_spawn_override_diagnostic_is_bounded_in_total(
     """The spawn-time diagnostic decides every ignored entry under one total
     budget, so a large or pathological ignored.yaml cannot hold the spawn up;
     once the budget runs out it errs toward reporting the entry overridden."""
-    import time
-
-    from ccs.adapters.claude_code import policy as policy_module
-
     # Each entry ends like the strict glob but needs a letter that src/<digit>.py
     # never holds: disjoint, which only a search shows.
     entries = [f"**/*{c}*.py" for c in "abdefghijklmnoqtuvwxz"]
@@ -417,8 +414,6 @@ def test_a_wide_class_range_untrack_entry_is_decided_quickly(root: Path) -> None
     from ignored.yaml). A class too wide to enumerate cheaply now counts as
     any one character, so the search is bounded and the answer errs toward
     "covers": the entry is refused, never accepted unchecked."""
-    import time
-
     (root / ".coherence" / "tracked.yaml").write_text("- data/**\n")
     (root / ".coherence" / "strict_mode.yaml").write_text("- 'data/*.json'\n")
     policy = TrackedArtifactPolicy.load(root)
@@ -445,8 +440,6 @@ def test_an_untrack_entry_of_many_distinct_characters_is_decided_quickly(
     """Literal characters join the search alphabet too, and each explored
     state is charged for every character it tries. Charged per new state
     only, an entry of 400 distinct characters took over 3 s."""
-    import time
-
     (root / ".coherence" / "tracked.yaml").write_text("- data/**\n")
     (root / ".coherence" / "strict_mode.yaml").write_text("- 'data/*.json'\n")
     policy = TrackedArtifactPolicy.load(root)
@@ -456,10 +449,6 @@ def test_an_untrack_entry_of_many_distinct_characters_is_decided_quickly(
     policy.strict_patterns_covering(entry)
 
     assert time.monotonic() - started < 1.0
-
-
-def _quoted_yaml(patterns: list[str]) -> str:
-    return "".join(f"- '{p}'\n" for p in patterns)
 
 
 @pytest.mark.parametrize("shape", ["globs", "literals"])

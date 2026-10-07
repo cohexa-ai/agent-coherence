@@ -38,7 +38,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Iterator, Sequence
 
 import yaml
 
@@ -258,48 +258,63 @@ class TrackedArtifactPolicy:
         untrack): a character class too wide to enumerate cheaply counts as
         any one character, a strict glob whose own budget runs out counts as
         covered, and once the call's budget runs out so does every strict glob
-        not yet decided and not ruled out by its literal prefix or suffix. Empty
+        not yet decided and not ruled out by literal prefixes and suffixes. Empty
         when no strict path is covered, which is always the case with no strict
         patterns."""
-        return self._strict_patterns_covering(pattern, _SearchBudget(GLOB_INTERSECT_CALL_BUDGET))
+        return tuple(
+            self._iter_strict_patterns_covering(
+                pattern, _SearchBudget(GLOB_INTERSECT_CALL_BUDGET)
+            )
+        )
 
-    def _strict_patterns_covering(
+    def _iter_strict_patterns_covering(
         self, pattern: str, call_budget: "_SearchBudget"
-    ) -> tuple[str, ...]:
+    ) -> Iterator[str]:
         if not self.strict_mode_paths:
-            return ()
+            return
         # Paths are matched with a leading "./" stripped (_normalize_relative),
-        # so an entry spelled that way names the same paths; removeprefix, not
-        # lstrip, keeps a dotfile entry such as ".env" intact.
-        pattern = pattern.removeprefix("./") or pattern
-        tracked = _union(self.user_added_patterns, self.tracked_patterns)
-        covering: list[str] = []
+        # so an entry spelled that way names the same paths.
+        pattern = _normalize_relative(pattern) or pattern
+        entry_affixes = _literal_affixes(_glob_tokens(pattern))
+        tracked_affixes = [
+            (t, _literal_affixes(_glob_tokens(t)))
+            for t in _union(self.user_added_patterns, self.tracked_patterns)
+        ]
         call_exhausted = False
         for strict in self.strict_mode_paths:
             if _is_literal_glob(strict):
                 # Its language is the one path, so membership decides it
                 # exactly, at no search cost.
                 if _glob_match(strict, pattern) and self._matches_tracked(strict):
-                    covering.append(strict)
+                    yield strict
+                continue
+            strict_affixes = _literal_affixes(_glob_tokens(strict))
+            # Only a tracked pattern whose literal ends nest with the entry's
+            # and the strict glob's can share a path with both; with none,
+            # the strict glob is exactly not covered, at no search cost.
+            tracked = [
+                t
+                for t, affixes in tracked_affixes
+                if _affixes_nest([entry_affixes, strict_affixes, affixes])
+            ]
+            if not tracked:
                 continue
             if call_exhausted:
-                # Undecided: covered, unless the literal ends rule it out.
-                if _affixes_nest([_literal_affixes(_glob_tokens(p)) for p in (pattern, strict)]):
-                    covering.append(strict)
+                yield strict
                 continue
             # A budget per strict glob, so one costly pattern (or many cheap
             # ones) never decides the others: a shared budget marked every
             # pattern after the point it ran out as covering.
             budget = _SearchBudget(GLOB_INTERSECT_PATTERN_BUDGET, parent=call_budget)
             try:
-                if _globs_intersect((pattern, strict), budget) and any(
+                covered = _globs_intersect((pattern, strict), budget) and any(
                     _globs_intersect((pattern, strict, t), budget) for t in tracked
-                ):
-                    covering.append(strict)
+                )
             except _BudgetExhausted as stop:
-                covering.append(strict)
+                covered = True
                 call_exhausted = stop.budget is call_budget
-        return tuple(covering)
+            if covered:
+                yield strict
 
     def ignored_patterns_overridden_by_strict(self) -> tuple[str, ...]:
         """Ignored patterns that cover a strict path, which strict therefore
@@ -307,12 +322,15 @@ class TrackedArtifactPolicy:
         not on hot reloads, so an operator learns that the ignore entry does
         not untrack those paths. Every entry is decided under one
         :data:`GLOB_INTERSECT_DIAGNOSTIC_BUDGET`, so a large or pathological
-        ``ignored.yaml`` cannot hold up the spawn; once it runs out, the
+        ``ignored.yaml`` cannot hold up the spawn, and an entry stops at the
+        first strict pattern it covers. Once the budget runs out, the
         remaining entries that a strict glob might cover are reported as
         overridden, erring toward the warning."""
         total = _SearchBudget(GLOB_INTERSECT_DIAGNOSTIC_BUDGET)
         return tuple(
-            p for p in self.ignored_patterns if self._strict_patterns_covering(p, total)
+            p
+            for p in self.ignored_patterns
+            if next(self._iter_strict_patterns_covering(p, total), None) is not None
         )
 
     def reloaded(self) -> "TrackedArtifactPolicy":
@@ -595,19 +613,18 @@ def _is_literal_glob(pattern: str) -> bool:
     return not any(c in pattern for c in "*?[")
 
 
-def _literal_affixes(tokens: list[tuple]) -> tuple[str, str]:
-    """The literal prefix and suffix every path matching ``tokens`` carries."""
-    prefix: list[str] = []
+def _literal_run(tokens: Iterable[tuple]) -> str:
+    run: list[str] = []
     for token in tokens:
         if token[0] != _LIT:
             break
-        prefix.append(token[1])
-    suffix: list[str] = []
-    for token in reversed(tokens):
-        if token[0] != _LIT:
-            break
-        suffix.append(token[1])
-    return "".join(prefix), "".join(reversed(suffix))
+        run.append(token[1])
+    return "".join(run)
+
+
+def _literal_affixes(tokens: list[tuple]) -> tuple[str, str]:
+    """The literal prefix and suffix every path matching ``tokens`` carries."""
+    return _literal_run(tokens), _literal_run(reversed(tokens))[::-1]
 
 
 def _affixes_nest(affixes: list[tuple[str, str]]) -> bool:
@@ -637,7 +654,7 @@ def _globs_intersect(patterns: Sequence[str], budget: _SearchBudget) -> bool:
     # against ``svc7/``) fail on their literal ends: settled without a search.
     if not _affixes_nest([_literal_affixes(t) for t in token_lists]):
         return False
-    alphabet: set[str | None] = {"/", None}
+    alphabet: set[str] = {"/"}
     for tokens in token_lists:
         for token in tokens:
             if token[0] == _LIT:
@@ -646,8 +663,9 @@ def _globs_intersect(patterns: Sequence[str], budget: _SearchBudget) -> bool:
                 alphabet.update(token[2])
     # Sorted: a set's order is hash-randomized per process, and the order
     # decides which states a bounded search reaches first, so the same entry
-    # could be refused on one coordinator run and accepted on the next.
-    ordered = sorted(alphabet, key=lambda ch: (ch is None, ch or ""))
+    # could be refused on one coordinator run and accepted on the next. None
+    # stands for every character no pattern names.
+    ordered: list[str | None] = [*sorted(alphabet), None]
     start = tuple(_closure(frozenset({0}), t) for t in token_lists)
     seen = {start}
     frontier = [start]
