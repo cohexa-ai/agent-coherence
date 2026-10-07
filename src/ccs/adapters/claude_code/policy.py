@@ -89,25 +89,9 @@ def _compile_glob_pattern(pattern: str) -> re.Pattern[str] | None:
     (those use fnmatch at match-time with no string-build overhead)."""
     if "**" not in pattern:
         return None
-    parts: list[str] = []
-    i = 0
-    while i < len(pattern):
-        c = pattern[i]
-        if c == "*":
-            if i + 1 < len(pattern) and pattern[i + 1] == "*":
-                parts.append(".*")
-                i += 2
-                if i < len(pattern) and pattern[i] == "/":
-                    i += 1
-            else:
-                parts.append("[^/]*")
-                i += 1
-        elif c == "?":
-            parts.append("[^/]")
-            i += 1
-        else:
-            parts.append(re.escape(c))
-            i += 1
+    # One parser for the ``**`` grammar: the matcher's regex is built from the
+    # same tokens the strict-coverage overlap search reads (#261).
+    parts = [_TOKEN_REGEX.get(token[0]) or re.escape(token[1]) for token in _glob_tokens(pattern)]
     return re.compile("^" + "".join(parts) + "$")
 
 
@@ -429,17 +413,20 @@ def _union(first: tuple[str, ...], second: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys((*first, *second)))
 
 
-# Glob tokens, mirroring _glob_match exactly. A ``**`` pattern is compiled by
-# _compile_glob_pattern (``**`` -> any run, a following ``/`` swallowed;
-# ``*`` -> a run without ``/``; ``?`` -> one char but ``/``; every other char,
-# ``[`` included, literal). Any other pattern goes to fnmatch.fnmatchcase
-# (``*`` -> any run, ``/`` included; ``?`` -> any one char; ``[...]`` a class).
+# Glob tokens. For a ``**`` pattern they are the matcher's own grammar:
+# _compile_glob_pattern builds its regex from them (``**`` -> any run, a
+# following ``/`` swallowed; ``*`` -> a run without ``/``; ``?`` -> one char
+# but ``/``; every other char, ``[`` included, literal). Any other pattern goes
+# to fnmatch.fnmatchcase, which the tokens mirror for the overlap search
+# (``*`` -> any run, ``/`` included; ``?`` -> any one char; ``[...]`` a class);
+# a differential test against matches_any pins that mirror.
 _ANY_RUN = "any_run"
 _SEG_RUN = "seg_run"
 _ANY_ONE = "any_one"
 _SEG_ONE = "seg_one"
 _LIT = "lit"
 _CLASS = "class"
+_TOKEN_REGEX = {_ANY_RUN: ".*", _SEG_RUN: "[^/]*", _SEG_ONE: "[^/]"}
 _CLASS_MEMBER_LIMIT = 64
 """Characters a class may enumerate before it is approximated as any one
 character. Every member joins the search alphabet, and every explored state
@@ -733,28 +720,8 @@ def _glob_match(
     if compiled is not None and pattern in compiled:
         return compiled[pattern].match(path) is not None
     # Slow path (called without a cache, e.g. from tests): build on the fly.
-    parts: list[str] = []
-    i = 0
-    while i < len(pattern):
-        c = pattern[i]
-        if c == "*":
-            if i + 1 < len(pattern) and pattern[i + 1] == "*":
-                parts.append(".*")
-                i += 2
-                # Skip trailing slash after `**/`
-                if i < len(pattern) and pattern[i] == "/":
-                    i += 1
-            else:
-                parts.append("[^/]*")
-                i += 1
-        elif c == "?":
-            parts.append("[^/]")
-            i += 1
-        else:
-            parts.append(re.escape(c))
-            i += 1
-    regex_str = "^" + "".join(parts) + "$"
-    return re.match(regex_str, path) is not None
+    compiled_pattern = _compile_glob_pattern(pattern)
+    return compiled_pattern is not None and compiled_pattern.match(path) is not None
 
 
 def _load_yaml_patterns(
