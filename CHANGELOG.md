@@ -160,7 +160,10 @@ Alpha — APIs may change before `v1.0`.
   `handoff` key (after a strict-mode deny, which never carries the key, from
   `/status`, or `handoff_unknown: true` when `/status` cannot be read), and a
   `swg_write_cas` win that completed or overtook a live
-  handoff says which. A giver's `swg_write` or `swg_write_cas` of a path it
+  handoff says which. An answer that does not settle a handoff tool's
+  outcome, a lost one included, answers `reason: commit_unconfirmed` with
+  `recover: check_handoff` and a fixed `next_step` sending the model to the
+  path's handoff before acting again, not the generic `read_then_retry`. A giver's `swg_write` or `swg_write_cas` of a path it
   handed off answers `reason: handed_off`, `recover: stop_and_report`,
   `retryable: false`, with the `successor`, the `version_at_transfer` and a
   fixed `next_step` telling the model to stop and report; `swg_reacquire`

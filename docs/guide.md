@@ -2326,9 +2326,18 @@ unless every grant transferred; its text has one line per path. The other three
 answer `{"path", "ok": true, "status"}`, with `counterparty` on an overtaken
 record, or, as an error result that changed nothing,
 `{"path", "ok": false, "reason", "status"}`, without `status` when the path
-has no record. An answer that does not settle the outcome is answered like any
-other terminal, as `reason: commit_unconfirmed` with
-`recover: read_then_retry`. The server's instructions and every one of these
+has no record. An answer that does not settle the outcome, a lost answer
+included, is an error result with `reason: commit_unconfirmed`,
+`recover: check_handoff`, `retryable: false` and a fixed `next_step` per tool:
+look at the path's handoff before acting again. For `swg_transfer`, a handoff
+from this session to that successor made at the version it held (its
+`version_at_transfer`), live or ended, means the transfer landed, so do not
+transfer again and do not withdraw to start over. For the other three, the
+record's status says whether the verb landed (`completed`, `declined`,
+`withdrawn`); while the handoff is still live, sending the verb again is safe,
+since a repeat changes nothing once it has landed. It is not the generic
+`read_then_retry`: once the successor has written the path, reading it and
+transferring again is a second handoff at the new version. The server's instructions and every one of these
 tools' descriptions say that a transfer fences the giver and does not reserve
 the path.
 

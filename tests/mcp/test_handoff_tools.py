@@ -26,8 +26,8 @@ import ccs.adapters.coherent_volume as coherent_volume_module
 from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
+from ccs.cli._coherence_client import CoordinatorUnavailable, resolve_endpoint
 from ccs.cli._coherence_client import post as _cc_post
-from ccs.cli._coherence_client import resolve_endpoint
 from ccs.mcp.server import (
     _do_accept,
     _do_decline,
@@ -51,6 +51,19 @@ _GIVER_REASON = "handed_off"
 _GIVER_RECOVER = "stop_and_report"
 #: FROZEN duplicate: the wire reason of an answer that does not settle an outcome.
 _UNCONFIRMED_REASON = "commit_unconfirmed"
+#: FROZEN duplicate: the recover verb an unconfirmed handoff tool answers. Not
+#: the generic ``read_then_retry``: reading the path and transferring again is
+#: the recipe that hands it on a second time once the successor has written it.
+_HANDOFF_UNCONFIRMED_RECOVER = "check_handoff"
+#: FROZEN duplicates: what each verb's unconfirmed next step must say "landed"
+#: looks like. A transfer's names the version, so an earlier round's ended
+#: record between the same sessions is not read as this transfer.
+_LANDED_MARKER = {
+    "transfer": "version_at_transfer",
+    "accept": "Status completed",
+    "decline": "Status declined",
+    "withdraw": "Status withdrawn",
+}
 #: The recover verbs that would send a fenced giver back to try again: none of
 #: them can clear a fence keyed on the session.
 _LOOPING_RECOVERS = ("reacquire", "read_then_merge", "reacquire_and_reread", "wait_and_retry")
@@ -376,9 +389,9 @@ def test_a_verb_tool_whose_answer_settles_nothing_is_the_unconfirmed_deny(
     verb: str, tool: object,
 ) -> None:
     """An answer the volume cannot classify (here the coordinator's failure
-    envelope) reaches the agent as the unconfirmed deny, which sends it to read
-    before acting again -- never as "refused ...; nothing changed", which would
-    be false if the verb landed."""
+    envelope) reaches the agent as the unconfirmed deny, which sends it to the
+    path's handoff before acting again -- never as "refused ...; nothing
+    changed", which would be false if the verb landed."""
     _seed(tmp_path, PLAN, b"plan v1")
     config = _config(tmp_path)
     volume = _vol(tmp_path, fast_cfg)
@@ -396,6 +409,7 @@ def test_a_verb_tool_whose_answer_settles_nothing_is_the_unconfirmed_deny(
 
         assert result.isError is True
         assert result.structuredContent["reason"] == _UNCONFIRMED_REASON
+        assert result.structuredContent["recover"] == _HANDOFF_UNCONFIRMED_RECOVER
         assert result.structuredContent["retryable"] is False
     finally:
         stop_coordinator(tmp_path)
@@ -644,3 +658,59 @@ def test_a_status_lookup_tells_no_record_from_cannot_tell() -> None:
         False,
         None,
     )
+
+
+def _answer_lost_after_forwarding(route: str, answer: object) -> object:
+    """``_coordinator_post`` that forwards ``route`` and then loses its answer
+    (``answer`` None) or hands back ``answer`` in its place."""
+    real_post = coherent_volume_module._coordinator_post
+
+    def post(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        if path != route:
+            return real_post(endpoint, path, payload, **kwargs)
+        real_post(endpoint, path, payload, **kwargs)
+        if answer is None:
+            raise CoordinatorUnavailable("simulated: the answer was lost")
+        return answer
+
+    return post
+
+
+@pytest.mark.parametrize("answer", [None, []], ids=["lost", "not_an_object"])
+@pytest.mark.parametrize("verb", ["transfer", "accept", "decline", "withdraw"])
+def test_a_handoff_tool_whose_answer_is_lost_is_the_check_handoff_deny(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, verb: str, answer: object
+) -> None:
+    """#276: a lost answer used to reach the agent as ``internal_error`` (or,
+    for a non-object answer, escape the tool as an ``AttributeError``) although
+    the verb had landed. It is the unconfirmed deny, and its recover verb sends
+    the agent to the path's handoff -- not to read and transfer again, which
+    after the successor's write is a second handoff. The next step is the
+    verb's own: "do not withdraw" belongs to a transfer only, and would drop a
+    withdraw that never landed."""
+    _seed(tmp_path, PLAN, b"plan v1")
+    config = _config(tmp_path)
+    volume = _vol(tmp_path, fast_cfg)
+    peer = _vol(tmp_path, fast_cfg)
+    try:
+        _do_read(volume, config, PLAN)
+        if verb != "transfer":
+            assert volume.transfer(PLAN, successor=_agent(peer)).ok
+        lose = _answer_lost_after_forwarding(f"/handoff/{verb}", answer)
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", lose)
+        if verb == "transfer":
+            result = _do_transfer(volume, config, [PLAN], _agent(peer))
+        else:
+            actor = peer if verb in ("accept", "decline") else volume
+            tool = {"accept": _do_accept, "decline": _do_decline, "withdraw": _do_withdraw}[verb]
+            result = tool(actor, config, PLAN)
+
+        assert result.isError is True
+        body = result.structuredContent
+        assert body["reason"] == _UNCONFIRMED_REASON
+        assert body["recover"] == _HANDOFF_UNCONFIRMED_RECOVER
+        assert body["retryable"] is False
+        assert _LANDED_MARKER[verb] in body["next_step"]
+        assert ("do not withdraw" in body["next_step"]) is (verb == "transfer")
+    finally:
+        stop_coordinator(tmp_path)

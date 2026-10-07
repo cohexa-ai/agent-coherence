@@ -98,6 +98,48 @@ _TERMINALS: dict[type, _Terminal] = {
     ),
 }
 
+# A handoff verb whose answer did not settle its outcome (#276). It may have
+# landed, and a transfer sent again after the path was read or written can be a
+# NEW handoff at the new version, so the four handoff tools send the agent to
+# the path's handoff record, never to the generic read-then-retry. Each verb
+# has its own next step: what "it landed" looks like differs per verb, and only
+# a transfer is unsafe to repeat (a repeated accept, decline or withdraw that
+# already landed changes nothing).
+HANDOFF_UNCONFIRMED_RECOVER = "check_handoff"
+_LOOK_FIRST = (
+    "It may have landed. Look at the path's handoff first (the handoff key of "
+    "swg_read, or swg_status). "
+)
+HANDOFF_UNCONFIRMED_NEXT_STEPS: dict[str, str] = {
+    # The version qualifier tells this transfer from an earlier round's ended
+    # record between the same two sessions.
+    "transfer": (
+        "Do not repeat this call yet. " + _LOOK_FIRST + "A handoff from you to that "
+        "successor made at the version you held (its version_at_transfer), live or "
+        "ended, means your transfer landed: do not transfer again, and do not "
+        "withdraw to start over. Transfer again only if no such handoff shows and "
+        "the path is still at the version you held; if it was written since, or "
+        "shows another session's handoff, ask your user first."
+    ),
+    "accept": (
+        _LOOK_FIRST + "Status completed means your accept landed. If the handoff "
+        "is still pending and names you as successor, call swg_accept again: a "
+        "repeat changes nothing once it has landed."
+    ),
+    "decline": (
+        _LOOK_FIRST + "Status declined means your decline landed. If the handoff "
+        "is still live and names you as successor, call swg_decline again: a "
+        "repeat changes nothing once it has landed."
+    ),
+    "withdraw": (
+        _LOOK_FIRST + "Status withdrawn means your withdraw landed. If the handoff "
+        "is still live and names you as giver, call swg_withdraw again, still only "
+        "on your user's or host's instruction: a repeat changes nothing once it "
+        "has landed."
+    ),
+}
+
+
 # A CAS refusal is four different terminals wearing one exception type. The
 # recover verb is what the agent acts on, so it is keyed on the coordinator's
 # reason rather than on the exception class. ``version_mismatch`` keeps its
@@ -203,6 +245,21 @@ def deny_result(exc: BaseException) -> CallToolResult:
         else None
     )
     return _result(terminal, str(exc), extra)
+
+
+def handoff_deny_result(exc: BaseException, verb: str) -> CallToolResult:
+    """:func:`deny_result` for the four handoff tools, except that an
+    unconfirmed ``verb`` answers ``check_handoff`` with that verb's next step
+    rather than ``read_then_retry`` (exact type, like ``_TERMINALS``)."""
+    if type(exc) is CommitUnconfirmed:
+        terminal = _Terminal(
+            CommitUnconfirmed.reason,
+            HANDOFF_UNCONFIRMED_RECOVER,
+            False,
+            HANDOFF_UNCONFIRMED_NEXT_STEPS[verb],
+        )
+        return _result(terminal, str(exc))
+    return deny_result(exc)
 
 
 def _giver_fields(exc: GiverFenced) -> dict:

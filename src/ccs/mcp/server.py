@@ -36,7 +36,12 @@ from ccs.adapters.coherent_volume import (
 )
 from ccs.adapters.effect_gate import check_fence
 from ccs.core.exceptions import HOLD_INPUT_VANISHED, CasVersionConflict, CoherenceError
-from ccs.mcp.deny import cas_exhausted_result, coordinator_unavailable_result, deny_result
+from ccs.mcp.deny import (
+    cas_exhausted_result,
+    coordinator_unavailable_result,
+    deny_result,
+    handoff_deny_result,
+)
 from ccs.mcp.session import SessionConfig, build_volume
 from ccs.mcp.status import build_status, handoff_from_status
 from ccs.mcp.uri import UriValidationError, validate_uri
@@ -212,11 +217,14 @@ _TRANSFER_DESC = (
     "handoff_in_flight: another session's handoff of the path is live). The "
     "result is an error unless every grant transferred. While a handoff is "
     "live this session's swg_write and swg_write_cas on its path are denied "
-    "with reason=handed_off. If the answer is commit_unconfirmed the transfer "
-    "may have landed: swg_read the path and transfer again only if its "
-    "handoff names no handoff from you to that successor, live or ended, "
-    "since once the successor has written the path a second transfer is a new "
-    "handoff."
+    "with reason=handed_off. If the answer is commit_unconfirmed "
+    "(recover=check_handoff) the transfer may have landed: look at the path's "
+    "handoff (swg_read or swg_status) first. A handoff from you to that "
+    "successor made at the version you held (its version_at_transfer), live "
+    "or ended, means it landed: do not transfer again, and do not withdraw to "
+    "start over. Transfer again only if no such handoff shows; if the path "
+    "was written since or shows another session's handoff, ask your user. Once the successor has written the path, a "
+    "second transfer is a new handoff."
     + _HANDOFF_CLAUSE + _SCOPE_CLAUSE
 )
 _ACCEPT_DESC = (
@@ -586,7 +594,7 @@ def _do_transfer(
     try:
         result = volume.transfer(keys, successor=successor)
     except CoherenceError as exc:
-        return deny_result(exc)
+        return handoff_deny_result(exc, "transfer")
     return _transfer_result(result)
 
 
@@ -609,7 +617,7 @@ def _do_handoff_verb(
     try:
         result = act(key)
     except CoherenceError as exc:
-        return deny_result(exc)
+        return handoff_deny_result(exc, verb)
     return _verb_result(verb, result)
 
 
