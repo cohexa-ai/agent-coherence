@@ -278,6 +278,20 @@ Alpha — APIs may change before `v1.0`.
   stopped writing, a bounded `conflict` (never a clobber) when it is still writing.
   Offline, deterministic, no keys: `python -m examples.session_handoff.main`.
 
+- **`CoherentVolume.incarnation`, `.agent_id` and `.root`: read-only accessors
+  for the attempt identity and the resolved root.** Since `session_id` became
+  stable for the volume's lifetime, the coordinator keys a volume's grants on
+  the session folded with a per-attempt incarnation, which was readable only as
+  the private `_incarnation`; the resolved root only as `_root`. `incarnation`
+  is the value the next request carries in its `agent_id` field; `agent_id` is
+  `str(session_to_agent_id(session_id, incarnation))`, the exact string `/status`
+  reports in `sessions[].agent_id` for this volume's rows; `root` is the path
+  resolved at construction. `incarnation` and `agent_id` change when an attempt
+  starts (`reacquire()`, `write_cas_at`, `atomic_publish`, a `write_cas` retry or
+  its rotation off its own `write()` grant, a forked child) and are stable in
+  between; `root` never changes. The private attributes are unchanged
+  ([#262](https://github.com/Cohexa-ai/agent-coherence/issues/262)).
+
 ### Changed
 
 - **A release that is not a clean success now answers per grant (#185).** A
@@ -434,6 +448,23 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **Strict mode no longer lets a session write a file it was just refused a
+  read of.** A strict-mode deny of a Bash or Grep read re-grants the session's
+  SHARED read so that the retry the deny invites can run, and records no
+  observation, because the denied command never ran. The strict `pre-edit`
+  check looked only for an INVALID session, so that re-granted read also
+  admitted the session's next edit: a whole-file write from the copy it read
+  before a peer's commit then overwrote the commit, with nothing denied after
+  the shell read (#275). `pre-edit` on a strict path now also denies a SHARED
+  holder whose last observed version is older than the artifact's current one,
+  and the deny names that version; re-running the Bash command, or a `Read`,
+  records the current version and lifts it (after a Grep deny only a `Read`
+  does, because a Grep lists files rather than showing them). As everywhere
+  else, a read counts whole: a `head` or a line-limited `Read` is credited as
+  reading the current version. A session with no recorded observation is
+  still admitted like a first-time editor. Both coordinator backends; pinned by
+  strict-mode corpus fixtures 15 and 16.
+
 - **A `CoherentVolume` whose managed globs the coordinator does not enforce now
   fails closed instead of running unguarded.** An attaching volume adds no
   globs to a running coordinator's policy, so a volume that attached later with
@@ -452,8 +483,55 @@ Alpha — APIs may change before `v1.0`.
   one or the Node coordinator, fails it closed as "cannot be confirmed" rather
   than being read as enforced. `CoherentVolume.managed_glob_enforcement()`
   returns that three-way answer. The comparison is literal and taken once, at
-  attach: a broader ignore pattern, or a path untracked after attach, is not
-  detected. Volumes declaring the coordinator's own globs are unaffected.
+  attach; the coordinator keeps the answer true for its lifetime (#261, below).
+  Volumes declaring the coordinator's own globs are unaffected.
+
+- **A strict path stays enforced for the coordinator's lifetime (#261).** After
+  a `CoherentVolume` attached confirmed, `POST /policy/untrack` of a managed
+  path or glob reloaded the policy and put the path on the untracked fast path:
+  a read reported version 0, `post-edit-cas` accepted any `expected_version`,
+  and a peer's `write_cas_at(expected_version=0)` overwrote a newer write with
+  nothing raised. An `ignored.yaml` that covered a strict glob under a broader
+  pattern (`**`) did the same from spawn. Now:
+  - `POST /policy/untrack` (and `agent-coherence-untrack`) refuses an entry that
+    covers a path the live policy holds in strict mode: HTTP 409
+    `{"ok": false, "reason": "untrack_strict_path", "refused": [{"path",
+    "strict_patterns"}], "rejected": [...], "error": <text>}`, and the whole
+    request writes nothing. Overlap is decided on the glob languages, so a
+    literal path, the strict glob itself, and a broader or differently spelled
+    glob are all caught; where the decision is approximate (a character class
+    too wide to enumerate cheaply, or a glob whose overlap search runs out of
+    its fixed step budget, decided per strict pattern) it errs toward refusing.
+    One request's entries share one step budget, so a request of many costly
+    entries is refused rather than held past the CLI's timeout. The CLI exits
+    3 on it. **Changed behaviour of a shipped verb:** to untrack a strict path,
+    remove its entry from `.coherence/strict_mode.yaml` and restart the
+    coordinator.
+  - Strict wins over ignore in `TrackedArtifactPolicy.is_tracked`: an ignored
+    pattern no longer untracks a path that is tracked and matches a strict
+    pattern (previously ignore won, and a strict path in `ignored.yaml` was
+    neither tracked nor strict). The spawn-time load logs each overridden
+    ignore entry; hot reloads do not recompute it. Non-strict paths are unchanged: ignore still wins there.
+  - The hot reload behind `/policy/track` and `/policy/untrack`
+    (`TrackedArtifactPolicy.reloaded()`) keeps every strict and user-added
+    pattern the live policy carries while strict patterns are live, so a
+    hand-edited YAML followed by a track cannot end enforcement mid-run.
+    Without strict patterns the reload reads the files verbatim, as before.
+  - The Node coordinator's `/policy/untrack` and policy evaluator are not
+    changed here; the new corpus fixtures
+    (`strict_mode/15-policy-untrack-of-a-strict-path-is-refused` and
+    `strict_mode/16-pre-edit-strict-path-under-an-ignore-pattern-stays-strict`)
+    are scoped to the Python coordinator and are the parity targets for the
+    plugin follow-up.
+
+- **A `**` pattern with many `*` runs no longer stalls every hook.** The
+  matcher compiled each `**` pattern to a regex that backtracks into every
+  `*` run, so a failing match cost up to the path's length to the power of
+  its runs. An accepted entry such as `'**' * 12 + 'Z'` in `ignored.yaml` or
+  `tracked.yaml` made every `is_tracked` call, on every hook, take seconds. A
+  `**` pattern with more than two runs is now matched by stepping through its
+  pattern one path character at a time: linear in the path, with the same
+  results.
 
 - **A Bash or Grep command denied in strict mode no longer counts as a read.**
   When `pre-bash` or `pre-grep` finds a stale tracked file, it re-grants the
