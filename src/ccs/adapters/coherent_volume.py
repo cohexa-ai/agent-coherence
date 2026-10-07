@@ -51,6 +51,7 @@ from typing import Literal, NamedTuple
 
 import yaml
 
+from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     connect_or_spawn,
@@ -679,8 +680,50 @@ class CoherentVolume:
 
         Stable for the volume's lifetime: :meth:`reacquire` and the optimistic
         retries shed stale coordinator state without changing it. A forked child
-        gets its own."""
+        gets its own. The coordinator keys its grant rows on :attr:`agent_id`,
+        not on this."""
         return self._session_id
+
+    @property
+    def incarnation(self) -> str:
+        """The current attempt's incarnation (32 lowercase hex characters): the
+        value every request this volume sends next carries in its subagent
+        field (``agent_id`` in the request body).
+
+        Read-only. A new one is minted for each new attempt: by every
+        :meth:`reacquire`; by :meth:`write_cas_at` and :meth:`atomic_publish`
+        before they read; by :meth:`write_cas` before a retry, and before its
+        first attempt when this volume's own :meth:`write` may still hold the
+        file; and in a forked child, which also gets a new :attr:`session_id`.
+        Nothing else changes it, so it is stable between those points, and a
+        value read after an operation returns names the attempt that operation
+        finished on. The one request that names an older incarnation is the
+        release of a write grant that incarnation abandoned."""
+        return self._incarnation
+
+    @property
+    def agent_id(self) -> str:
+        """The coordinator identity the next request is keyed on, in the form
+        the coordinator's ``/status`` reports as ``sessions[].agent_id``:
+        ``str(session_to_agent_id(session_id, incarnation))``.
+
+        The coordinator records grants, read views and a commit's writer
+        against this, not against :attr:`session_id`, so a caller that names
+        this volume to a third party (for example a registry joined against
+        ``/status``) names it by this value. Read-only and derived on each
+        access from :attr:`session_id` and :attr:`incarnation`: it changes
+        exactly when either does and is stable between re-mints. It is not the
+        caller principal, which is bound to the session and never exposed."""
+        return str(session_to_agent_id(self._session_id, self._incarnation))
+
+    @property
+    def root(self) -> Path:
+        """The volume's root, resolved (absolute, symlinks followed) once at
+        construction. Read-only and fixed for the volume's lifetime, a forked
+        child's included. Paths this volume accepts are relative to it, or
+        absolute and inside it; a local coordinator (any but a
+        ``remote_endpoint``) keeps its state in ``root / ".coherence"``."""
+        return self._root
 
     @property
     def is_attached(self) -> bool:

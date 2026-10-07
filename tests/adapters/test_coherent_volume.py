@@ -3168,6 +3168,98 @@ def test_every_attempt_lands_on_its_own_coordinator_row(
         stop_coordinator(tmp_path)
 
 
+def test_public_identity_accessors_name_what_every_request_sends(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``incarnation`` is the value the next request carries in its subagent
+    field and ``agent_id`` is the coordinator row that request lands on, in the
+    form ``/status`` reports it — so a caller can name the attempt to a third
+    party without reading a private attribute (#262). Pinned against the bodies
+    actually sent and against the coordinator's own ``/status`` rows; both change
+    on a re-mint, and only on one."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        sent: list[tuple[str, dict, str, str]] = []
+        real_post = coherent_volume_module._coordinator_post
+
+        def spy(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            sent.append((path, dict(payload), vol.incarnation, vol.agent_id))
+            return real_post(endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", spy)
+
+        session = vol.session_id
+        # Stable between re-mints: reads do not move the identity.
+        before = (vol.incarnation, vol.agent_id)
+        vol.read(rel)
+        vol.read(rel)
+        assert (vol.incarnation, vol.agent_id) == before
+        # /status keys this volume's grant on exactly the public agent_id.
+        assert _held(vol, vol.agent_id) == {rel: "SHARED"}
+
+        seen_agent_ids = [vol.agent_id]
+        vol.reacquire(rel)  # a re-mint: new incarnation, same session
+        assert vol.incarnation != before[0]
+        assert vol.agent_id not in seen_agent_ids
+        assert _held(vol, vol.agent_id) == {rel: "SHARED"}
+        seen_agent_ids.append(vol.agent_id)
+
+        _data, version = vol.read_with_version(rel)
+        vol.write_cas_at(rel, version, b"v2")  # re-mints before its read
+        assert vol.agent_id not in seen_agent_ids
+        vol.write_cas(rel, lambda cur: cur + b"+cas")
+
+        assert sent, "the spy saw no coordinator request"
+        for route, body, incarnation, agent_id in sent:
+            if route == "/hooks/session-stop":
+                continue  # the release names the incarnation it abandons
+            assert body["agent_id"] == incarnation, route
+            assert str(session_to_agent_id(body["session_id"], body["agent_id"])) == agent_id
+        assert vol.session_id == session
+        # The public accessors read the private state they front; the private
+        # names stay, because existing clients read them.
+        assert vol.incarnation == vol._incarnation
+        assert vol.agent_id == str(session_to_agent_id(vol._session_id, vol._incarnation))
+        assert vol.agent_id == _agent_id(vol)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_root_is_the_resolved_workspace_path(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``root`` is the path the volume resolved at construction — absolute, with
+    symlinks followed — not the spelling the caller passed (#262)."""
+    real = tmp_path / "real"
+    _seed(real, content=b"v1")
+    (tmp_path / "link").symlink_to(real, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+    vol = CoherentVolume("link", managed=("data/**",), config=fast_cfg)
+    try:
+        assert vol.root == real.resolve()
+        assert vol.root.is_absolute()
+        assert vol.root == vol._root
+        assert vol.read("data/shared.txt") == b"v1"
+        assert vol.read(vol.root / "data" / "shared.txt") == b"v1"
+    finally:
+        stop_coordinator(real)
+
+
+@pytest.mark.parametrize("name", ["incarnation", "agent_id", "root"])
+def test_identity_accessors_are_read_only(
+    tmp_path: Path, fast_cfg: LifecycleConfig, name: str
+) -> None:
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        with pytest.raises(AttributeError):
+            setattr(vol, name, "x")
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_every_request_names_the_current_incarnation(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
