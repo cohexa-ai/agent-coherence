@@ -73,7 +73,7 @@ from ccs.adapters.claude_code.auth import (
     verify_host,
 )
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
-from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
+from ccs.adapters.claude_code.policy import UNTRACK_STRICT_PATH_REASON, TrackedArtifactPolicy
 from ccs.coordinator.registry_protocol import CheckpointMember
 from ccs.coordinator.service import (
     CallerPrincipalUncached,
@@ -2928,7 +2928,28 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # The original Unit 2 design — INVALID-only — is the right
             # gate for the Edit/Write surface: pre-edit strict-deny
             # fires after a session has been explicitly preempted.
-            editor_stale = editor_state == MESIState.INVALID
+            #
+            # A preempted session can also hold SHARED without having read
+            # the current version: a strict Bash / Grep deny re-arms SHARED
+            # so the retry it invites goes through, and records no
+            # observation because the command never ran (see
+            # ``_apply_bash_grep_regrants``). Admitting that grant lets a
+            # whole-file write from the copy read before the peer's commit
+            # overwrite the commit (#275), so it is stale too until a retried
+            # Bash command or a Read records the current version (a retried
+            # Grep records none: it never showed the file). A SHARED holder
+            # with no observation at all has acted on no version and is
+            # admitted like a first-time editor.
+            observed = (
+                coordinator.registry.last_observed_version_for(artifact_id, agent_id)
+                if editor_state == MESIState.SHARED else None
+            )
+            unobserved_shared = (
+                artifact is not None
+                and observed is not None
+                and observed < artifact.version
+            )
+            editor_stale = editor_state == MESIState.INVALID or unobserved_shared
             if artifact is not None and artifact.version > 0 and editor_stale:
                 last_writer_id = _last_writer_for(coordinator, artifact_id)
                 last_writer_ts = (
@@ -2937,7 +2958,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 summary: _payloads.StaleSummary = {
                     "path": path,
                     "current_version": artifact.version,
-                    "prior_version_seen_by_session": _prior_version_observed(
+                    "prior_version_seen_by_session": observed if unobserved_shared else _prior_version_observed(
                         coordinator, artifact_id, agent_id,
                         agent_state=editor_state,
                         current_version=artifact.version,
@@ -3595,18 +3616,33 @@ def _handle_policy_track(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     # Reload the live policy so subsequent hook calls see the additions.
     #
     # COR-05: this is an atomic-swap-via-local-variable pattern. The RHS
-    # evaluates fully (TrackedArtifactPolicy.load returns a new object)
+    # evaluates fully (policy.reloaded() returns a new object)
     # before the attribute assignment fires. Single PyObject* write is
     # atomic on CPython, and even on free-threading builds the per-object
     # lock makes the swap visible to other threads as a single edge.
     # Handlers reading coordinator.policy bind it to a local at entry
     # (see pre-read / pre-edit / pre-bash / pre-grep) so a mid-handler
     # swap can't change which policy object the handler reasons about.
-    new_policy = TrackedArtifactPolicy.load(coordinator.coordinator_root)
+    #
+    # #261: ``reloaded`` never narrows strict enforcement mid-run (a strict or
+    # user-added pattern hand-removed from disk is kept until restart).
+    new_policy = coordinator.policy.reloaded()
     coordinator.policy = new_policy
     req._json(200, {
         "ok": True, "added": added, "rejected": rejected + pre_rejected,
     })
+
+
+def _untrack_strict_error(refused: list[dict]) -> str:
+    named = "; ".join(
+        f"{r['path']} (strict: {', '.join(r['strict_patterns'])})" for r in refused
+    )
+    return (
+        f"refusing to untrack paths the coordinator enforces in strict mode: {named}. "
+        "A strict path stays enforced while the coordinator runs; to untrack it, "
+        "remove its entry from .coherence/strict_mode.yaml and restart the "
+        f"coordinator ({UNTRACK_STRICT_PATH_REASON})"
+    )
 
 
 def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -3614,6 +3650,18 @@ def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
 
     Same hardening as /policy/track: per-path validate_path call + ValueError
     → HTTP 400 mapping.
+
+    #261: an entry (path or glob) that covers a path the live policy puts in
+    strict mode is refused, and the whole request with it — HTTP 409
+    ``{"ok": false, "error": <text>, "reason": "untrack_strict_path",
+    "refused": [{"path", "strict_patterns"}], "rejected": [...]}`` — with
+    nothing written to ignored.yaml. Untracking a strict path after a
+    ``CoherentVolume`` (or any CAS writer) attached put it on the untracked
+    fast path, where a CAS commit at any expected version is accepted: a
+    silent lost update. Strict wins over ignore in the policy anyway
+    (:meth:`TrackedArtifactPolicy.is_tracked`), so the refusal is what tells
+    the operator the entry would not take effect; the way to stop enforcing a
+    strict path is a coordinator restart without its strict entry.
     """
     body = req._read_json()
     if body is None:
@@ -3637,13 +3685,38 @@ def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
             safe_paths.append(p)
         else:
             pre_rejected.append({"path": p, "reason": v_err})
+    # Read without a lock, like every reload here (COR-05). That is safe only
+    # because a reload keeps every strict pattern of the policy it reloads
+    # (TrackedArtifactPolicy.reloaded), so the spawn-time strict set is never
+    # dropped: a reload racing this check can add a strict pattern, which
+    # strict-wins in is_tracked then enforces anyway. Two racing reloads are
+    # last-writer-wins on coordinator.policy, so a pattern hand-added to
+    # strict_mode.yaml inside that window can be lost; strict-wins still holds
+    # for every pattern that survives. A change that lets a reload drop a
+    # spawn-time strict pattern must make this check-then-append atomic with it.
+    policy = coordinator.policy
+    coverage = policy.strict_patterns_covering_each(safe_paths)
+    refused = [
+        {"path": p, "strict_patterns": list(covering)}
+        for p, covering in zip(safe_paths, coverage)
+        if covering
+    ]
+    if refused:
+        req._json(409, {
+            "ok": False,
+            "error": _untrack_strict_error(refused),
+            "reason": UNTRACK_STRICT_PATH_REASON,
+            "refused": refused,
+            "rejected": pre_rejected,
+        })
+        return
     yaml_path = coordinator.coordinator_root / ".coherence" / "ignored.yaml"
     try:
         added, yaml_rejected = _append_policy_yaml(yaml_path, safe_paths)
     except ValueError as exc:
         req._json(400, {"error": str(exc)})
         return
-    coordinator.policy = TrackedArtifactPolicy.load(coordinator.coordinator_root)
+    coordinator.policy = coordinator.policy.reloaded()
     req._json(200, {"ok": True, "removed": added, "rejected": yaml_rejected + pre_rejected})
 
 

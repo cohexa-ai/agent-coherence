@@ -1403,3 +1403,151 @@ def test_crediting_a_held_read_never_restores_a_revoked_grant(
     )
     assert _mesi(strict_coordinator, "plan.md", "A") == MESIState.INVALID
     assert _observed(strict_coordinator, "plan.md", "A") == 1
+
+
+# ----------------------------------------------------------------------
+# A denied shell read re-arms the grant, not the right to write
+# ----------------------------------------------------------------------
+#
+# A strict Bash / Grep deny re-grants SHARED so that the retry it invites goes
+# through, and it records no observation, because the command never ran. The
+# strict pre-edit gate used to look only for INVALID, so that re-armed grant
+# also admitted the session's next Edit or Write: a whole-file write from the
+# copy the session read before the peer's commit then overwrote that commit,
+# with no deny anywhere after the shell read (Cohexa-ai/agent-coherence#275).
+# The gate now also denies a SHARED holder whose last observed version is
+# behind the current one. A retried Bash command or a Read records the
+# observation and lifts it, so the way back the deny invites stays open (after a
+# Grep deny only a Read does: a Grep never showed the file).
+
+_DENIED_SHELL_READS = [
+    ("/hooks/pre-bash", {"command": "cat plan.md"}),
+    ("/hooks/pre-bash", {"command": "head -n 5 plan.md"}),
+    ("/hooks/pre-bash", {"command": "grep v1 plan.md"}),
+    ("/hooks/pre-bash", {"command": "sed -n 1p plan.md"}),
+    ("/hooks/pre-grep", {"search_root": ""}),
+]
+
+
+def _admitted(body: dict) -> bool:
+    """A pre-edit that let the edit through: no refusal, no deny envelope (an
+    admit may still carry a context-only collision advisory)."""
+    decision = (body.get("hookSpecificOutput") or {}).get("permissionDecision")
+    return body.get("ok", True) is True and decision != "deny"
+
+
+@pytest.mark.parametrize(
+    ("route", "extra"), _DENIED_SHELL_READS,
+    ids=["cat", "head", "grep", "sed-n", "grep-tool"],
+)
+def test_a_write_after_a_denied_shell_read_is_denied_until_the_session_reads(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+    route: str, extra: dict,
+) -> None:
+    """A read v1, B committed v2, and A's shell read of plan.md was denied, so
+    A never saw v2. A's next pre-edit must be the strict deny naming the write
+    A has not read (prior v1, current v2). Before the fix it was admitted, and
+    A's whole-file write from its v1 copy replaced B's commit. A Read then
+    records v2 and the same pre-edit is admitted."""
+    _setup_stale(strict_client, "plan.md")
+    status, body = strict_client.post(route, {"session_id": _sid("A"), **extra})
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+    # Asserted, not assumed: the deny re-armed SHARED and recorded no read.
+    assert _mesi(strict_coordinator, "plan.md", "A") == MESIState.SHARED
+    assert _observed(strict_coordinator, "plan.md", "A") == 1
+
+    status, edit = strict_client.post(
+        "/hooks/pre-edit", {"session_id": _sid("A"), "path": "plan.md"},
+    )
+    assert status == 200
+    assert edit["ok"] is False, edit
+    assert edit["hookSpecificOutput"]["permissionDecision"] == "deny", edit
+    assert edit["summary"]["prior_version_seen_by_session"] == 1, edit
+    assert edit["summary"]["current_version"] == 2, edit
+    assert _mesi(strict_coordinator, "plan.md", "A") == MESIState.SHARED, (
+        "the deny takes nothing: A keeps the re-armed grant its Read relies on"
+    )
+
+    _, read = strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "plan.md", "content_hash": _hash("v2")},
+    )
+    assert read["status"] == "fresh", read
+    _, edit = strict_client.post(
+        "/hooks/pre-edit", {"session_id": _sid("A"), "path": "plan.md"},
+    )
+    assert _admitted(edit), edit
+
+
+def test_a_write_after_the_retry_a_denied_bash_invites_is_admitted(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """The other way back: A runs the denied ``cat`` again. The grant is held,
+    so the command runs and A reads v2, and its next pre-edit is admitted. A
+    gate that denied every re-armed holder would lock A out here."""
+    _setup_stale(strict_client, "plan.md")
+    strict_client.post("/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"})
+    _, retry = strict_client.post(
+        "/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md"},
+    )
+    assert retry["status"] == "fresh", retry
+    assert _observed(strict_coordinator, "plan.md", "A") == 2
+
+    _, edit = strict_client.post(
+        "/hooks/pre-edit", {"session_id": _sid("A"), "path": "plan.md"},
+    )
+    assert _admitted(edit), edit
+
+
+def test_a_session_that_never_observed_the_path_edits_like_a_first_time_editor(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """The deliberate edge. A's only grant on CLAUDE.md came from a denied
+    command, so A holds SHARED with no recorded observation at all. Like a
+    first-time editor (no state), A has not acted on any version, so the gate,
+    which compares an observed version with the current one, admits it. Pinned
+    so that a change to this is a decision, not a side effect."""
+    strict_client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("B"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+    )
+    strict_client.post("/hooks/pre-edit", {"session_id": _sid("B"), "path": "CLAUDE.md"})
+    strict_client.post(
+        "/hooks/post-edit",
+        {"session_id": _sid("B"), "path": "CLAUDE.md", "content_hash": _hash("v2"), "success": True},
+    )
+    _setup_stale(strict_client, "plan.md")
+    _, body = strict_client.post(
+        "/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md CLAUDE.md"},
+    )
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+    assert _mesi(strict_coordinator, "CLAUDE.md", "A") == MESIState.SHARED
+    assert _observed(strict_coordinator, "CLAUDE.md", "A") is None
+
+    _, edit = strict_client.post(
+        "/hooks/pre-edit", {"session_id": _sid("A"), "path": "CLAUDE.md"},
+    )
+    assert _admitted(edit), edit
+
+
+def test_a_warn_path_re_armed_by_a_denied_command_still_edits(
+    strict_coordinator: CoordinatorHTTPServer, strict_client: _Client,
+) -> None:
+    """The gate is strict-only. A denied command that names a strict path and a
+    warn-only path re-arms SHARED on both without an observation; the warn-only
+    path's next pre-edit is admitted as it always was. Fails if the new check is
+    hoisted out of the strict branch and starts refusing warn-mode edits."""
+    _setup_stale(strict_client, "plan.md")
+    _setup_stale(strict_client, "docs/plans/x.md")
+    _, body = strict_client.post(
+        "/hooks/pre-bash", {"session_id": _sid("A"), "command": "cat plan.md docs/plans/x.md"},
+    )
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+    assert _mesi(strict_coordinator, "docs/plans/x.md", "A") == MESIState.SHARED
+    assert _observed(strict_coordinator, "docs/plans/x.md", "A") == 1
+
+    _, edit = strict_client.post(
+        "/hooks/pre-edit", {"session_id": _sid("A"), "path": "docs/plans/x.md"},
+    )
+    assert _admitted(edit), edit

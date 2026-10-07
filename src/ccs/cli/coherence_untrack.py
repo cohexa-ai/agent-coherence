@@ -12,6 +12,10 @@ Exit codes:
 - 0: all paths accepted
 - 1: not in a git repo / all paths rejected by local validation
 - 2: coordinator unreachable / HTTP error
+- 3: refused because a path is enforced in strict mode (#261) — the
+  coordinator answered ``reason: untrack_strict_path`` and wrote nothing.
+  Untracking a strict path takes a coordinator restart without its entry in
+  ``.coherence/strict_mode.yaml``.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import urllib.error
 from pathlib import Path
 from typing import Sequence
 
+from ccs.adapters.claude_code.policy import UNTRACK_STRICT_PATH_REASON
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli._coherence_client import (
     CoordinatorUnavailable,
@@ -92,6 +97,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     except urllib.error.HTTPError as exc:
         body = http_status_from_error(exc)
+        if (body or {}).get("reason") == UNTRACK_STRICT_PATH_REASON:
+            # Classified by the typed reason, never by the error text.
+            for entry in body.get("refused", []):
+                patterns = ", ".join(entry.get("strict_patterns", []))
+                err(
+                    f"agent-coherence-untrack: refused {entry.get('path')!r}: "
+                    f"enforced in strict mode by {patterns}"
+                )
+            err(
+                "agent-coherence-untrack: nothing was untracked. A strict path stays "
+                "enforced while the coordinator runs; remove its entry from "
+                ".coherence/strict_mode.yaml and restart the coordinator to untrack it."
+            )
+            return 3
         msg = (body or {}).get("error", str(exc))
         err(f"agent-coherence-untrack: HTTP {exc.code}: {msg}")
         return 2

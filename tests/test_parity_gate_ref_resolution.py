@@ -1,9 +1,11 @@
 """The protocol-corpus gate's plugin-ref resolution, executed rather than read.
 
-The gate builds the plugin branch whose name matches the branch under test and
-falls back to plugin ``main`` when no sibling exists. Its job summary then says
-which ref it proved against, and -- when it fell back -- how far that ref
-trails the plugin's own ``dev``.
+The gate builds the plugin branch whose name matches the branch under test.
+With no sibling it falls back to the plugin branch of the line the change is
+bound for: plugin ``dev`` for a pull request into ``dev`` or a hand-dispatched
+run on a feature branch, plugin ``main`` otherwise. Its job summary then says
+which ref it proved against, and -- when it fell back to ``main`` -- how far
+that ref trails the plugin's own ``dev``.
 
 Nothing exercised that shell block, so a wrong answer could only be found by
 reading it. These tests extract the step's ``run`` script straight from
@@ -56,6 +58,9 @@ def _run_step(
     tmp_path: Path,
     *,
     sibling_ref: str,
+    base_ref: str = "",
+    event_name: str = "push",
+    ref_name: str = "",
     plugin_branches: tuple[str, ...] = ("main", "dev"),
     curl_body: str = '{"status":"diverged","ahead_by":33,"behind_by":2}',
     curl_fails: bool = False,
@@ -113,6 +118,11 @@ def _run_step(
         **os.environ,
         "PATH": f"{stub_bin}:{os.environ.get('PATH', '')}",
         "SIBLING_REF": sibling_ref,
+        # Set explicitly, never inherited: a stray BASE_REF in the caller's
+        # environment would otherwise pick the fallback for the test.
+        "BASE_REF": base_ref,
+        "EVENT_NAME": event_name,
+        "REF_NAME": ref_name or sibling_ref,
         "GITHUB_OUTPUT": str(output),
         "GITHUB_STEP_SUMMARY": str(summary),
         "AC_STUB_BRANCHES": " ".join(plugin_branches),
@@ -132,6 +142,14 @@ def _run_step(
         f"exit={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
     )
     return summary.read_text()
+
+
+def _resolved_ref(tmp_path: Path) -> str:
+    """The ref the step handed to the checkout, from its GITHUB_OUTPUT line."""
+    for line in (tmp_path / "output.txt").read_text().splitlines():
+        if line.startswith("ref="):
+            return line[len("ref="):]
+    raise AssertionError("the step wrote no ref= output")
 
 
 def test_push_to_main_is_the_intended_pairing_not_a_fallback(tmp_path: Path) -> None:
@@ -198,3 +216,81 @@ def test_failed_staleness_lookup_says_so_rather_than_going_quiet(tmp_path: Path)
     assert "unavailable" in summary, (
         "a failed lookup must be distinguishable from a zero distance; got:\n" + summary
     )
+
+
+def test_a_pull_request_into_dev_with_no_twin_pairs_with_plugin_dev(tmp_path: Path) -> None:
+    """The case that left every library pull request into `dev` red.
+
+    With no same-named plugin branch, the old fallback was plugin `main`,
+    which trails plugin `dev` -- so rows `dev`'s own push run passes (it
+    pairs with plugin `dev`) failed on every pull request into `dev`. The
+    fallback now follows the line the change merges into.
+    """
+    summary = _run_step(
+        tmp_path,
+        sibling_ref="fix/no-such-plugin-branch",
+        base_ref="dev",
+        event_name="pull_request",
+    )
+    assert _resolved_ref(tmp_path) == "dev"
+    assert "agent-coherence-plugin@dev" in summary
+    assert "the line this change merges into" in summary
+    assert "behind" not in summary, (
+        "the staleness note measures main against dev; it means nothing for dev:\n"
+        + summary
+    )
+
+
+def test_a_dispatched_run_on_a_stacked_branch_pairs_with_plugin_dev(tmp_path: Path) -> None:
+    """Stacked pull requests get no PR checks, so their CI is dispatched by hand."""
+    summary = _run_step(
+        tmp_path,
+        sibling_ref="feat/stacked-branch",
+        event_name="workflow_dispatch",
+    )
+    assert _resolved_ref(tmp_path) == "dev"
+    assert "agent-coherence-plugin@dev" in summary
+
+
+def test_a_same_named_twin_still_wins_over_the_dev_fallback(tmp_path: Path) -> None:
+    summary = _run_step(
+        tmp_path,
+        sibling_ref="fix/paired-change",
+        base_ref="dev",
+        event_name="pull_request",
+        plugin_branches=("main", "dev", "fix/paired-change"),
+    )
+    assert _resolved_ref(tmp_path) == "fix/paired-change"
+    assert "fallback" not in summary
+
+
+@pytest.mark.parametrize(
+    ("base_ref", "event_name", "sibling_ref"),
+    [
+        ("main", "pull_request", "fix/no-such-plugin-branch"),
+        ("", "push", "v0.5.0"),
+    ],
+    ids=["pull-request-into-main", "tag"],
+)
+def test_changes_bound_for_main_still_fall_back_to_plugin_main(
+    tmp_path: Path, base_ref: str, event_name: str, sibling_ref: str
+) -> None:
+    """A release pull request and a tag prove parity against what ships."""
+    summary = _run_step(
+        tmp_path, sibling_ref=sibling_ref, base_ref=base_ref, event_name=event_name
+    )
+    assert _resolved_ref(tmp_path) == "main"
+    assert "the fallback" in summary
+    assert "33 commit(s) behind" in summary
+
+
+def test_a_plugin_without_dev_degrades_to_main_rather_than_failing(tmp_path: Path) -> None:
+    summary = _run_step(
+        tmp_path,
+        sibling_ref="fix/no-such-plugin-branch",
+        base_ref="dev",
+        event_name="pull_request",
+        plugin_branches=("main",),
+    )
+    assert _resolved_ref(tmp_path) == "main"
+    assert "the fallback" in summary
