@@ -673,7 +673,9 @@ To name the attempt to something else — a registry that joins the coordinator'
 `/status` `sessions[].agent_id` against its writers, for example — read
 `vol.agent_id`: the identity the coordinator keys the volume's next request on,
 in the same string form `/status` reports. `vol.incarnation` is the per-attempt
-part of it, the value every request carries in its `agent_id` field. Both change
+part of it, the value every request carries in its `agent_id` field (a
+`transfer()` also names, per path, the incarnation that holds the volume's
+claim there, which can be an earlier one). Both change
 only when an attempt starts (`reacquire()`, `write_cas_at`, `atomic_publish`, a
 `write_cas` that retries or first releases its own `write()` grant, and a forked
 child) and are stable in between, so read them after the operation whose
@@ -2307,11 +2309,13 @@ it calls `reacquire()`.
 **The successor and bystanders.** `read_handoff(path)` returns the `handoff`
 key, with its `role`, from the answer to the volume's latest read of the path
 (every read method sets it, `reacquire()` included). It is `None` when that
-answer carried none: the path has no record, or the read was denied, failed or
-went unanswered. A strict-mode deny never carries the key, so after a denied
+answer carried none: the path has no record, the read was denied, failed or
+went unanswered, or the coordinator could not read the record after the read
+landed (the key is best-effort), so `None` never proves the path has no record. A strict-mode deny never carries the key, so after a denied
 read (`vol.last_read_denied` is `True`) `None` says nothing about the record;
 the path's entry in `/status` has it. A compare-and-swap win's `CasCommitResult.handoff` is a
-`HandoffWinOutcome` when the win labelled a live handoff of the path:
+`HandoffWinOutcome` when the win labelled a live handoff of the path, read
+best-effort like the read's key:
 `outcome` is `completed` when the volume is the successor, and `overtaken`
 when it is a bystander, which is then named as `counterparty`; `giver`,
 `successor` and `version_at_transfer` name the handoff. A successor's plain
@@ -2406,7 +2410,9 @@ not change it:
 
 **Where the record shows.** When the path has a record, `swg_read` adds
 `handoff`, the key as the coordinator projected it for this session (with
-`role`). A strict-mode deny never carries the key, and the giver's own re-read
+`role`). The coordinator attaches it best-effort, so a result with neither
+`handoff` nor `handoff_unknown` does not prove there is no record; `swg_status`
+lists every record. A strict-mode deny never carries the key, and the giver's own re-read
 of a path it handed off is one, so after a denied read `swg_read` takes the
 record from the coordinator's `/status` and adds the same `role`; when
 `/status` cannot be read it adds `handoff_unknown: true` instead, which means

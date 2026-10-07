@@ -36,8 +36,8 @@ Alpha — APIs may change before `v1.0`.
   `CoherentVolume` through its new handoff methods, and an MCP session through
   four new tools (all below). `/status` counts each route among its endpoint
   counters. The protocol corpus pins the handoff answers (each status, each
-  refusal reason a request over HTTP can produce, the giver's answer on every
-  write route, and each role's text) and that the Node coordinator answers
+  refusal reason a request over HTTP can produce, the giver's answer on the
+  Claude Code hook routes, and each role's text) and that the Node coordinator answers
   the four routes `404`. See the guide's
   [Targeted grant handoff](docs/guide.md#targeted-grant-handoff) section.
 

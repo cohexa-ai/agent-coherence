@@ -125,7 +125,10 @@ _READ_DESC = (
     "the result also carries handoff: the record as it concerns this session "
     "(role giver, successor or bystander, the two session_agent_ids, "
     "version_at_transfer, hold_shape, status, live); handoff_unknown=true "
-    "instead means the read was denied and the record could not be fetched. A "
+    "instead means the read was denied and the record could not be fetched. "
+    "The coordinator attaches the record best-effort, so a result with "
+    "neither does not prove there is no record; swg_status lists every "
+    "record. A "
     "sticky-INVALID view returns fresh bytes but stays INVALID — use "
     "swg_reacquire to recover before writing. If the bytes on disk are not the "
     "content at the current version, the read is DENIED with reason=stale_view "
@@ -364,7 +367,9 @@ def _do_read(volume: CoherentVolume, config: SessionConfig, path: str) -> CallTo
     # the key -- its bytes stay the corpus's -- and the giver's own re-read of
     # a path it handed off is one, so after a deny the record comes from
     # /status; an omitted key must never read as "no record" when the
-    # coordinator was not asked.
+    # coordinator was not asked. An admitted read's key is best-effort on the
+    # coordinator too, so its absence there is not proof of no record either;
+    # the tool text says so.
     handoff = volume.read_handoff(key)
     if handoff is None and volume.last_read_denied:
         known, handoff = handoff_from_status(volume, key)

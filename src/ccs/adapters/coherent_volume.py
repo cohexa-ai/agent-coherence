@@ -872,8 +872,10 @@ class CoherentVolume:
         file; and in a forked child, which also gets a new :attr:`session_id`.
         Nothing else changes it, so it is stable between those points, and a
         value read after an operation returns names the attempt that operation
-        finished on. The one request that names an older incarnation is the
-        release of a write grant that incarnation abandoned."""
+        finished on. Two requests can name an older incarnation: the release
+        of a write grant that incarnation abandoned, and a :meth:`transfer`,
+        whose grants each name the incarnation that holds this volume's claim
+        on that path."""
         return self._incarnation
 
     @property
@@ -2631,8 +2633,10 @@ class CoherentVolume:
         overtaken record), as the coordinator sent it.
 
         ``None`` when the path was never read, or that answer carried no key:
-        the path has no record, or the read was strict-denied, failed or went
-        unanswered. Every read call sets it, :meth:`read` and
+        the path has no record, the read was strict-denied, failed or went
+        unanswered, or the coordinator could not read the record after the
+        read landed (the key is best-effort), so ``None`` never proves the path
+        has no record. Every read call sets it, :meth:`read` and
         :meth:`read_with_version` alike; it is what the MCP read tool relays
         as the read's provenance. After a strict-denied read (see
         :attr:`last_read_denied`) ``None`` says nothing about the record: a
