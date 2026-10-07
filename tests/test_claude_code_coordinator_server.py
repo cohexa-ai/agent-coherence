@@ -738,20 +738,27 @@ def test_policy_untrack_of_a_non_strict_path_round_trips_on_a_strict_coordinator
     assert strict_coordinator.policy.is_strict_mode("data/a.json")
 
 
+@pytest.mark.parametrize(
+    ("endpoint", "entry"),
+    [("/policy/track", "runbook.md"), ("/policy/untrack", "data/*.txt")],
+)
 def test_a_reload_after_a_hand_edit_keeps_the_strict_path_enforced(
-    strict_coordinator, strict_client: _Client
+    strict_coordinator, strict_client: _Client, endpoint: str, entry: str
 ) -> None:
     """The hot reload behind /policy/track and /policy/untrack never narrows
     strict enforcement: removing the strict and tracked entries from disk and
-    then running any track leaves the strict path tracked and strict until a
-    restart."""
+    then running either verb (here an untrack of a non-strict glob, which is
+    accepted) leaves the strict path tracked and strict until a restart.
+    Reverting either handler to a plain reload from disk ends enforcement."""
     root = strict_coordinator.coordinator_root
     (root / ".coherence" / "strict_mode.yaml").write_text("")
     (root / ".coherence" / "tracked.yaml").write_text("")
-    s, _ = strict_client.post("/policy/track", {"paths": ["runbook.md"]})
+    s, _ = strict_client.post(endpoint, {"paths": [entry]})
     assert s == 200
     assert strict_coordinator.policy.is_strict_mode("data/a.json")
-    assert strict_coordinator.policy.is_tracked("runbook.md")
+    assert strict_coordinator.policy.is_tracked("data/a.json")
+    if endpoint == "/policy/track":
+        assert strict_coordinator.policy.is_tracked(entry)
 
 
 def test_a_stale_cas_on_a_strict_path_ignored_at_spawn_conflicts(tmp_path: Path) -> None:
