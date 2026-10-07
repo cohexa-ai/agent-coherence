@@ -787,6 +787,23 @@ def test_the_status_write_refuses_a_status_no_row_may_carry(
     assert registry.get_transfer_record(art) == current
 
 
+def test_a_record_outside_the_cause_vocabulary_cannot_be_built() -> None:
+    """The cause is a closed vocabulary: a record naming any other cause is
+    refused on construction, which is also how the sqlite row is read back,
+    so a stray stored cause fails loudly instead of reading as a handoff."""
+    fields: dict[str, Any] = dict(
+        artifact_id=uuid4(), giver=uuid4(), holder=uuid4(), successor=uuid4(),
+        version_at_transfer=1, hold_shape=MESIState.SHARED,
+        superseded_successor=None, status="pending", counterparty=None,
+        created_at=1.0, updated_at=1.0,
+    )
+    for cause in ("handoff", "supersession"):
+        assert TransferRecord(cause=cause, **fields).cause == cause
+
+    with pytest.raises(ValueError, match="transfer cause 'reclaim'"):
+        TransferRecord(cause="reclaim", **fields)
+
+
 def test_the_status_write_on_a_path_with_no_record_raises(registry) -> None:
     """A label write with no record is a caller bug; both registries raise
     rather than one inventing a row and the other doing nothing."""
@@ -875,6 +892,22 @@ def test_sqlite_eviction_ages_from_the_artifacts_last_update_when_later(
             == 1
         )
         assert registry.get_transfer_record(art) is None
+
+
+def test_memory_eviction_ages_from_the_records_own_update_alone() -> None:
+    """The in-memory side of the test above, stated so the divergence is a
+    decision rather than drift: the slot keeps no wall-clock stamp of the
+    artifact's last update, so the same version-move ending is evicted as
+    soon as the RECORD is older than the age."""
+    registry = ArtifactRegistry()
+    art = _artifact(registry, version=3)
+    holder = uuid4()
+    _hold(registry, art, holder, MESIState.SHARED)
+    _transfer(registry, uuid4(), uuid4(), {art: holder}, now=1000.0)
+    _move_version(registry, art, expected=3)
+
+    assert registry.evict_transfer_records(max_age_sec=100.0, now_unix=1101.0) == 1
+    assert registry.get_transfer_record(art) is None
 
 
 # ---------------------------------------------------------------------------

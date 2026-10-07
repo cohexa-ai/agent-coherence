@@ -774,6 +774,39 @@ def test_a_label_write_that_raises_after_a_win_leaves_the_win_answered(
     assert _label(service, handoff.path) == ("pending", None, False)
 
 
+@pytest.mark.parametrize("arm", ["acquire", "batch commit"])
+def test_a_label_write_that_raises_after_an_acquire_or_batch_win_leaves_it_answered(
+    service, monkeypatch: pytest.MonkeyPatch, arm: str
+) -> None:
+    """The same best-effort rule on the other two labelling arms. The
+    pessimistic acquire still answers and holds EXCLUSIVE, and the record
+    keeps its label and stays live (the version did not move); the batch
+    win still answers its result, and the record reads not live by its
+    version, still pending."""
+    handoff = _hand_off(service)
+    writer = uuid4()
+
+    def refuse(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("injected label-write failure")
+
+    monkeypatch.setattr(service.registry, "set_transfer_status", refuse)
+
+    if arm == "acquire":
+        signals = service.write(agent_id=writer, artifact_id=handoff.path, caller=handoff.successor)
+        assert isinstance(signals, list), signals
+        assert service.registry.get_agent_state(handoff.path, writer) == MESIState.EXCLUSIVE
+        assert _label(service, handoff.path) == ("pending", None, True)
+        return
+    result = service.commit_all(
+        agent_id=writer,
+        writes={handoff.path: CommitAllEntry(expected_version=1, content_hash=_hash("p"))},
+        caller=handoff.successor,
+    )
+    assert isinstance(result, tuple) and isinstance(result[0], MultiCommitResult), result
+    assert service.registry.get_artifact(handoff.path).version == 2
+    assert _label(service, handoff.path) == ("pending", None, False)
+
+
 # ---------------------------------------------------------------------------
 # The transfer through the service
 # ---------------------------------------------------------------------------

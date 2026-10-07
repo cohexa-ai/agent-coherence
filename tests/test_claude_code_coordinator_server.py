@@ -10003,6 +10003,28 @@ def test_transfer_answers_each_grant_with_the_normalised_session_level_ids(
     assert _record(coordinator, "spec.md") is None
 
 
+def test_a_transfer_naming_only_unregistered_paths_answers_not_held_and_registers_nothing(
+    coordinator, client: _Client
+) -> None:
+    """A transfer whose every path was never registered answers each one
+    not held, without reaching the service (which refuses an empty
+    transfer), and leaves the paths unregistered: a handoff request never
+    mints the artifact it names."""
+    giver, successor = _claimed(client), _claimed(client)
+    _read(client, successor, "spec.md")  # registers the successor
+
+    answer = _transfer(client, giver, successor.agent, [
+        {"path": "never-registered.md"}, {"path": "also-never.md"},
+    ])
+
+    assert answer == (200, {"ok": False, "grants": [
+        {"path": "never-registered.md", "transferred": False, "reason": "handoff_not_held"},
+        {"path": "also-never.md", "transferred": False, "reason": "handoff_not_held"},
+    ]})
+    assert coordinator.registry.lookup_artifact_id_by_name("never-registered.md") is None
+    assert coordinator.registry.lookup_artifact_id_by_name("also-never.md") is None
+
+
 def test_transfer_presents_a_different_incarnation_per_path(
     coordinator, client: _Client
 ) -> None:
@@ -10447,8 +10469,9 @@ def test_a_snapshot_commit_without_a_principal_acts_as_the_bound_session_it_name
 
 def test_a_clean_session_stop_answers_todays_exact_bytes(coordinator, client: _Client) -> None:
     """A stop that releases every grant answers
-    the body the Node backend mirrors -- no per-grant list -- with the paths
-    in the order they were acquired (corpus warn_mode/18)."""
+    the body the Node backend mirrors -- no per-grant list. The paths come
+    back in the order the registry lists the session's rows, which the
+    corpus pins on both backends (warn_mode/18); no order is promised."""
     sid = _sid("clean-stop")
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "spec.md"})
@@ -10490,6 +10513,35 @@ def test_a_session_stop_that_keeps_a_grant_answers_per_grant(
     })
     assert _state(coordinator, "plan.md", agent_id) == MESIState.INVALID
     assert _state(coordinator, "spec.md", agent_id) == MESIState.EXCLUSIVE
+
+
+def test_a_failed_edit_release_that_keeps_its_grant_answers_per_grant(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The post-edit twin of the stop above: when a failed-edit report's
+    release is refused, the answer keeps its top-level false and reason and
+    adds the per-grant entry naming the grant still held, and the grant
+    really is still held. Fails if the answer falls back to the bare
+    ``{ok, reason}``, which a client dropping its record on the top-level
+    answer reads as nothing held."""
+    sid = _sid("failed-edit-held")
+    agent_id = session_to_agent_id(sid)
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+
+    def refusing(**kwargs: Any):
+        raise CoherenceError("release refused by the test")
+
+    monkeypatch.setattr(coordinator.service, "invalidate", refusing)
+    answer = client.post("/hooks/post-edit", {
+        "session_id": sid, "path": "plan.md", "success": False,
+    })
+
+    assert answer == (200, {
+        "ok": False,
+        "reason": "release refused by the test",
+        "grants": [{"path": "plan.md", "held": True, "reason": "release refused by the test"}],
+    })
+    assert _state(coordinator, "plan.md", agent_id) == MESIState.EXCLUSIVE
 
 
 def test_a_givers_failed_edit_report_is_answered_handed_off_and_changes_nothing(
@@ -10626,6 +10678,99 @@ def test_a_compare_and_swap_win_carries_its_handoff_outcome(
 
     read = _read(client, giver, "plan.md")
     assert read["handoff"] == _projection(giver, successor, "giver", status="completed", live=False)
+
+
+def test_a_later_win_by_the_successor_carries_no_outcome(
+    coordinator, client: _Client
+) -> None:
+    """Only the win that labelled the record reports an ``outcome``. The
+    successor's second win, at the version its first one made, reads the
+    same completed record back and must not claim it completed it again.
+    Fails if the outcome is read off the record's label alone."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    assert client.post("/hooks/post-edit-cas", {
+        "session_id": successor.sid, "agent_id": "s-1", "path": "plan.md",
+        "content_hash": _hash("plan-v2"), "expected_version": 1,
+    }, principal=successor.principal) == (200, {"ok": True, "version": 2, "handoff": _projection(
+        giver, successor, "successor", status="completed", live=False, outcome="completed")})
+
+    assert client.post("/hooks/post-edit-cas", {
+        "session_id": successor.sid, "agent_id": "s-1", "path": "plan.md",
+        "content_hash": _hash("plan-v3"), "expected_version": 2,
+    }, principal=successor.principal) == (200, {"ok": True, "version": 3, "handoff": _projection(
+        giver, successor, "successor", status="completed", live=False)})
+
+
+def _no_wall_clock(body: dict) -> str:
+    """``body`` serialised with every ``*_unix_ts`` value blanked: two denies
+    issued a moment apart differ only in those stamps."""
+
+    def blank(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: None if key.endswith("_unix_ts") else blank(item)
+                for key, item in value.items()
+            }
+        return value
+
+    return json.dumps(blank(body))
+
+
+def test_a_strict_deny_while_a_record_exists_carries_the_key_beside_unchanged_deny_bytes(
+    served_decider,
+) -> None:
+    """On a strict path with a record, the pre-read and pre-edit denies
+    carry the ``handoff`` key at the top level, and everything else in each
+    answer is byte-for-byte the same deny a path with no record gets. The
+    control runs the same preemption on a second strict path with no
+    record. Fails if a deny skips the key, or if the key enters the deny's
+    ``hookSpecificOutput``."""
+    server, client = served_decider
+    handed, control = _U3A_STRICT_PATH, _u3a_strict_path("no-record")
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, handed)
+    for path in (handed, control):
+        _read(client, bystander, path)
+        _pre_edit_with(client, successor.sid, successor.principal, path)
+        assert _state(server, path, session_to_agent_id(bystander.sid)) == MESIState.INVALID
+
+    for route, body in (
+        ("/hooks/pre-read", {"session_id": bystander.sid}),
+        ("/hooks/pre-edit", {"session_id": bystander.sid}),
+    ):
+        status, denied = client.post(route, {**body, "path": handed}, principal=bystander.principal)
+        status_c, plain = client.post(route, {**body, "path": control}, principal=bystander.principal)
+        assert status == status_c == 200, (denied, plain)
+        assert plain["hookSpecificOutput"]["permissionDecision"] == "deny", plain
+        assert "handoff" not in plain, plain
+        assert denied["handoff"] == _projection(giver, successor, "bystander", status="completed")
+        without_key = {key: value for key, value in denied.items() if key != "handoff"}
+        assert _no_wall_clock(without_key) == _no_wall_clock(plain).replace(control, handed), route
+
+
+def test_a_failed_handoff_read_leaves_a_landed_acquire_answered(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``handoff`` key is read after the work landed, so a raise while
+    reading it answers the landed work without the key -- here the
+    successor's acquire, which holds its grant -- never an error the client
+    would read as an acquire that failed."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+
+    def broken(*_args: Any, **_kwargs: Any) -> dict:
+        raise RuntimeError("injected handoff read failure")
+
+    monkeypatch.setattr(mod, "_handoff_projection", broken)
+    answer = client.post(
+        "/hooks/pre-edit", {"session_id": successor.sid, "path": "plan.md"},
+        principal=successor.principal)
+
+    assert answer == (200, {"ok": True})
+    assert _state(coordinator, "plan.md", session_to_agent_id(successor.sid)) == MESIState.EXCLUSIVE
 
 
 # ----------------------------------------------------------------------
