@@ -482,7 +482,8 @@ CREATE TABLE caller_principals (
 # the library delete verb drops the record with the artifact, exactly as the
 # in-memory slot removal does. Ids are stored as UUID hex and the hold shape as
 # the MESIState name, the way ``agent_states`` stores ids and states.
-# ``cause`` is a closed vocabulary (TRANSFER_CAUSES); ``superseded_successor`` is
+# ``cause`` is a closed vocabulary (TRANSFER_CAUSES), checked when a record is
+# decided for a write and never on read-back; ``superseded_successor`` is
 # set exactly when the cause is a supersession, so a late re-send of the
 # superseded tuple is recognised without parsing an id out of a string.
 # ``status`` is a LABEL; liveness is never stored -- it is read by joining the

@@ -787,21 +787,51 @@ def test_the_status_write_refuses_a_status_no_row_may_carry(
     assert registry.get_transfer_record(art) == current
 
 
-def test_a_record_outside_the_cause_vocabulary_cannot_be_built() -> None:
-    """The cause is a closed vocabulary: a record naming any other cause is
-    refused on construction, which is also how the sqlite row is read back,
-    so a stray stored cause fails loudly instead of reading as a handoff."""
-    fields: dict[str, Any] = dict(
-        artifact_id=uuid4(), giver=uuid4(), holder=uuid4(), successor=uuid4(),
-        version_at_transfer=1, hold_shape=MESIState.SHARED,
-        superseded_successor=None, status="pending", counterparty=None,
-        created_at=1.0, updated_at=1.0,
-    )
-    for cause in ("handoff", "supersession"):
-        assert TransferRecord(cause=cause, **fields).cause == cause
+def test_a_transfer_deciding_a_cause_outside_the_vocabulary_stores_nothing(
+    registry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cause is a closed vocabulary at write time: a decision carrying any
+    other cause (here a future edit to the handoff constant) raises before the
+    registry applies anything, so no record is stored and the holder keeps its
+    claim, on both backends."""
+    import ccs.coordinator.registry_protocol as protocol
 
-    with pytest.raises(ValueError, match="transfer cause 'reclaim'"):
-        TransferRecord(cause="reclaim", **fields)
+    art = _artifact(registry)
+    holder = uuid4()
+    _hold(registry, art, holder, MESIState.SHARED)
+    monkeypatch.setattr(protocol, "TRANSFER_CAUSE_HANDOFF", "reclaim")
+
+    with pytest.raises(ValueError, match="transfer cause 'reclaim' cannot be stored"):
+        _transfer(registry, uuid4(), uuid4(), {art: holder})
+
+    assert registry.get_transfer_record(art) is None
+    assert registry.get_agent_state(art, holder) == MESIState.SHARED
+
+
+def test_a_stored_cause_this_build_does_not_know_is_read_back(tmp_path: Path) -> None:
+    """A cause is add-only, so a row a later build wrote with a cause this one
+    does not know reads back as it is: the record, its liveness, the /status
+    projection and eviction all still work. Fails if the vocabulary is checked
+    on read-back, where one such row broke every /status and every sweep's
+    eviction pass."""
+    db_path = tmp_path / "later-cause.db"
+    with SqliteArtifactRegistry(db_path) as registry:
+        art = _artifact(registry)
+        holder = uuid4()
+        _hold(registry, art, holder, MESIState.SHARED)
+        _transfer(registry, uuid4(), uuid4(), {art: holder})
+    conn = sqlite3.connect(str(db_path))
+    with conn:
+        conn.execute("UPDATE transfer_records SET cause = 'reclaim'")
+    conn.close()
+
+    with SqliteArtifactRegistry(db_path) as registry:
+        record, live = registry.get_transfer_record(art)
+        assert (record.cause, live) == ("reclaim", True)
+        registry.status_snapshot(include_transfers=True)
+        assert registry.evict_transfer_records(max_age_sec=0.0, now_unix=10.0**12) == 0
+        registry.set_transfer_status(art, "declined", counterparty=None, now_unix=1.0)
+        assert registry.evict_transfer_records(max_age_sec=0.0, now_unix=10.0**12) == 1
 
 
 def test_the_status_write_on_a_path_with_no_record_raises(registry) -> None:

@@ -347,6 +347,18 @@ def require_storable_transfer_status(status: str) -> None:
         )
 
 
+def require_storable_transfer_cause(cause: str) -> None:
+    """Raise ``ValueError`` for a cause outside :data:`TRANSFER_CAUSES`.
+    Checked when a record is decided for a write, never when one is read
+    back: a stored cause is add-only, so a cause a later build writes must
+    not make this build's reads, ``/status`` or eviction fail."""
+    if cause not in TRANSFER_CAUSES:
+        raise ValueError(
+            f"transfer cause {cause!r} cannot be stored; expected one of "
+            f"{sorted(TRANSFER_CAUSES)}"
+        )
+
+
 # A claim the presented composite can hand on: a write grant or a standing read.
 _HELD_STATES: frozenset[MESIState] = frozenset(
     {MESIState.EXCLUSIVE, MESIState.MODIFIED, MESIState.SHARED}
@@ -388,14 +400,6 @@ class TransferRecord:
     counterparty: UUID | None
     created_at: float
     updated_at: float
-
-    def __post_init__(self) -> None:
-        # Checked on every construction, so a record built for a write and the
-        # sqlite row read back into one are both held to the closed vocabulary.
-        if self.cause not in TRANSFER_CAUSES:
-            raise ValueError(
-                f"transfer cause {self.cause!r} is not one of {sorted(TRANSFER_CAUSES)}"
-            )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -494,18 +498,26 @@ def decide_transfer_grant(
     Then, with no record naming the caller, the ordinary checks run on the
     presented composite, in order: hold, unconfirmed version, foreign write
     holder (not held already won), another giver's live record, self, unknown.
+
+    A record decided for a write must carry a cause in :data:`TRANSFER_CAUSES`
+    (``ValueError`` otherwise), raised here, before the registry applies any
+    path.
     """
     record = view.record
+    decided = None
     if record is not None and record.giver == request.giver:
         decided = _decide_on_own_record(
             request, view, record, successor_known=successor_known, now_unix=now_unix
         )
-        if decided is not None:
-            return decided
-        record = None  # arm (e)
-    return _decide_ordinary(
-        request, view, record, successor_known=successor_known, now_unix=now_unix
-    )
+        if decided is None:
+            record = None  # arm (e)
+    if decided is None:
+        decided = _decide_ordinary(
+            request, view, record, successor_known=successor_known, now_unix=now_unix
+        )
+    if decided.write is not None:
+        require_storable_transfer_cause(decided.write.cause)
+    return decided
 
 
 def _decide_on_own_record(
