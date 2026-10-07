@@ -5472,7 +5472,8 @@ def _attach_hook_handoff(
     observed: int | None = None,
 ) -> dict:
     """The pre-read and pre-edit seam for a handoff, from ONE
-    read of the record.
+    read of the record: :func:`_attach_handoff_key`'s, best-effort like it,
+    so a failed read answers ``result`` with neither the key nor the prose.
 
     A deny is returned untouched: a strict deny keeps the corpus's bytes, and
     the giver's deny carries its own key. Every other arm gets the
@@ -5480,30 +5481,16 @@ def _attach_hook_handoff(
     role's prose through the context-only envelope -- never the allow
     emitter, which would widen a permission decision. ``acquired`` marks the
     pre-edit's acquire, where ``observed`` (this agent's last observed
-    version before it) decides the successor's read-first warning.
-
-    Best-effort, as :func:`_attach_handoff_key`: the grant or the popped
-    notices in ``result`` already landed, so a failed read of the record
-    answers ``result`` as it is, with neither the key nor the prose."""
+    version before it) decides the successor's read-first warning."""
     if _is_deny(result):
         return result
-    try:
-        read = _read_handoff(coordinator, path)
-        if read is None:
-            return result
-        record, live = read
-        projection = _handoff_projection(record, live=live, caller=caller)
-    except Exception:  # noqa: BLE001 — any raise; the landed answer stands
-        logger.warning(
-            "handoff key not attached for %r after the answer was decided", path, exc_info=True
-        )
+    result = _attach_handoff_key(coordinator, result, path=path, caller=caller)
+    projection = result.get("handoff")
+    # No key, or a refusal body (``ok: false``), which gets the key only: the
+    # admit test is the one the re-grounding attach uses.
+    if projection is None or not _reground_qualifies(result):
         return result
-    result = {**result, "handoff": projection}
-    # The admit test the re-grounding attach uses: an allow envelope, or a
-    # bare admit body. A refusal body (``ok: false``) gets the key only.
-    if not _reground_qualifies(result):
-        return result
-    unread = acquired and (observed is None or observed < record.version_at_transfer)
+    unread = acquired and (observed is None or observed < projection["version_at_transfer"])
     text = _payloads.handoff_context_text(projection, path=path, unread=unread)
     return result if text is None else _attach_pretooluse_context(result, text)
 
