@@ -11053,6 +11053,29 @@ def test_once_the_handoff_ends_the_successor_and_bystanders_are_told_nothing(
         assert "Handoff" not in context, (who, context)
 
 
+def test_a_refused_edit_during_a_handoff_carries_the_key_and_no_prose(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal body (``ok: false``) gets the ``handoff`` key only: the role's
+    prose is for an admit. Fails if the prose seam stops checking for one, and
+    a bystander whose edit was refused is told its edits are admitted."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+
+    def refusing(**_kwargs: Any):
+        raise CoherenceError("acquire refused by the test")
+
+    monkeypatch.setattr(coordinator.service, "write", refusing)
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": bystander.sid, "path": "plan.md"},
+        principal=bystander.principal)
+
+    assert status == 200
+    assert body["ok"] is False, body
+    assert "hookSpecificOutput" not in body, body
+    assert body["handoff"] == _projection(giver, successor, "bystander")
+
+
 def test_the_handoff_prose_templates_are_static() -> None:
     """The successor's and bystander's prose and the ended outcomes are
     under the deny's placeholder rule: short agent ids, the path, the version
