@@ -1727,6 +1727,11 @@ header). The operator view adds `created_at_unix_ts`, when the record was
 written. The `metrics` view carries no record. `agent-coherence-status --json` prints the key as the coordinator
 sends it; the table view does not show it.
 
+`/status` also counts calls to the four routes as `handoff_transfer_total`,
+`handoff_accept_total`, `handoff_decline_total` and `handoff_withdraw_total`
+in `endpoint_counters`. These counters are present whether or not any path has
+a record.
+
 Every id in the key, here and on `/status`, is a session-level agent id. No
 session id or session name appears in it.
 
@@ -1738,7 +1743,7 @@ coordinator still holds:
 
 - **`POST /hooks/session-stop` that leaves a grant held** answers
   `{"ok": false, "released_artifacts": [...], "grants": [...]}`, one entry per
-  grant it tried to release, in the order they were acquired:
+  grant it tried to release, in no guaranteed order (match entries by `path`):
   `{"path", "held": false, "cause": "release"}` for a grant it released, and
   `{"path", "held": true, "reason"}` for one still held (with `detail` when the
   reason is a typed one). It used to answer `ok: true` and only log the

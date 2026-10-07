@@ -3565,8 +3565,9 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
             agent_id, {MESIState.EXCLUSIVE, MESIState.MODIFIED}
         )
         released: list[str] = []
-        # One entry per grant asked for, in acquisition order: answered only
-        # when a grant is still held (#185). A stop never withdraws or
+        # One entry per grant asked for, in no guaranteed order (the held
+        # rows come back unordered; a client matches entries by path):
+        # answered only when a grant is still held (#185). A stop never withdraws or
         # declines a handoff: it releases EXCLUSIVE/MODIFIED rows alone.
         grants: list[dict] = []
         for artifact_id in held:

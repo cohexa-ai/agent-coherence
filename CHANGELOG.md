@@ -62,8 +62,10 @@ Alpha — APIs may change before `v1.0`.
   each such `tracked_artifacts` entry on the default and operator tiers, and
   the operator tier adds the record's creation time. Every id in the key is a
   session-level agent id, never a session name or id. With no record every
-  answer is byte-for-byte unchanged, and the metrics tier never carries a
-  record.
+  per-path answer and `tracked_artifacts` entry is byte-for-byte unchanged, and
+  the metrics tier never carries a record. `GET /status` does gain four
+  `handoff_*_total` route counters in `endpoint_counters`, present whether or
+  not any record exists.
 
 - **`transfer_record_evict_max_age_sec`: ended handoff records are evicted
   (#185).** A new `LifecycleConfig` field, 86400 seconds by default. The
@@ -280,8 +282,8 @@ Alpha — APIs may change before `v1.0`.
   `session-stop` that left a grant held answered `ok: true` and only logged
   the failure, so a client dropping its record on that answer forgot a grant
   the coordinator still held. It now answers `ok: false` with
-  `released_artifacts` and a `grants` list naming each grant, in the order it
-  was acquired, as released (`"held": false, "cause": "release"`) or still held
+  `released_artifacts` and a `grants` list naming each grant, in no guaranteed
+  order (match entries by `path`), as released (`"held": false, "cause": "release"`) or still held
   (`"held": true` with its `reason`). A failed-edit `post-edit` whose release
   is refused adds the same `grants` list to its existing `ok: false` answer. A
   failed-edit report from the giver of a live handoff answers `ok: false` with
