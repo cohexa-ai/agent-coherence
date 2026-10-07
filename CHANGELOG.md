@@ -376,9 +376,12 @@ Alpha — APIs may change before `v1.0`.
     literal path, the strict glob itself, and a broader or differently spelled
     glob are all caught; where the decision is approximate (a character class
     too wide to enumerate cheaply, or a glob whose overlap search runs out of
-    its fixed step budget, decided per strict pattern) it errs toward refusing. The CLI exits 3 on it. **Changed
-    behaviour of a shipped verb:** to untrack a strict path, remove its entry from
-    `.coherence/strict_mode.yaml` and restart the coordinator.
+    its fixed step budget, decided per strict pattern) it errs toward refusing.
+    One request's entries share one step budget, so a request of many costly
+    entries is refused rather than held past the CLI's timeout. The CLI exits
+    3 on it. **Changed behaviour of a shipped verb:** to untrack a strict path,
+    remove its entry from `.coherence/strict_mode.yaml` and restart the
+    coordinator.
   - Strict wins over ignore in `TrackedArtifactPolicy.is_tracked`: an ignored
     pattern no longer untracks a path that is tracked and matches a strict
     pattern (previously ignore won, and a strict path in `ignored.yaml` was

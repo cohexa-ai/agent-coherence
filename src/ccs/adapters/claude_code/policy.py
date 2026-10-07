@@ -39,7 +39,7 @@ import re
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator, NamedTuple, Sequence
 
 import yaml
 
@@ -134,6 +134,16 @@ class TrackedArtifactPolicy:
     _compiled_patterns: dict[str, Callable[[str], bool]] = field(
         default_factory=dict, repr=False, compare=False
     )
+    # What the strict-coverage check (strict_patterns_covering) reads from the
+    # strict and tracked patterns, built once in __post_init__: an untrack
+    # request or the spawn diagnostic decides every entry against the same
+    # patterns, and re-reading them per entry cost more than the search.
+    _coverage_strict: tuple["_Glob", ...] = field(
+        default=(), init=False, repr=False, compare=False
+    )
+    _coverage_tracked: tuple["_Glob", ...] = field(
+        default=(), init=False, repr=False, compare=False
+    )
     # KTD-O one-shot threshold-warning guard. Reset on every reload() so a
     # post-track policy swap can re-emit the warning if the operator widened
     # the strict-mode glob in a hot-reload path.
@@ -142,7 +152,8 @@ class TrackedArtifactPolicy:
     )
 
     def __post_init__(self) -> None:
-        """Pre-compile all ``**``-containing patterns across all pattern sets."""
+        """Pre-compile all ``**``-containing patterns across all pattern sets,
+        and index the strict and tracked patterns for the coverage check."""
         for patterns in (
             self.tracked_patterns,
             self.ignored_patterns,
@@ -154,6 +165,16 @@ class TrackedArtifactPolicy:
                     compiled = _compile_glob_pattern(p)
                     if compiled is not None:
                         self._compiled_patterns[p] = compiled
+        # A literal strict path no tracked pattern reaches puts nothing in
+        # strict mode (an intersection), so no entry can cover it.
+        self._coverage_strict = tuple(
+            _Glob.of(s)
+            for s in self.strict_mode_paths
+            if not _is_literal_glob(s) or self._matches_tracked(s)
+        )
+        self._coverage_tracked = tuple(
+            _Glob.of(t) for t in _union(self.user_added_patterns, self.tracked_patterns)
+        )
 
     @classmethod
     def load(cls, coordinator_root: Path | str) -> "TrackedArtifactPolicy":
@@ -260,71 +281,88 @@ class TrackedArtifactPolicy:
         differently from the strict pattern is still caught: ``data/**`` and
         ``**`` both cover a strict ``data/*.json``; ``notes/**`` covers nothing
         when no tracked pattern reaches ``notes/``. A literal strict path (no
-        ``*``, ``?`` or ``[``) is decided exactly by matching it. A strict glob
-        is decided by a product search (:func:`_globs_intersect`) on its own
-        budget of :data:`GLOB_INTERSECT_PATTERN_BUDGET` steps, drawn from one
-        :data:`GLOB_INTERSECT_CALL_BUDGET` for the whole call. Every
-        approximation errs toward "covers" (a refusal, never a silent
-        untrack): a character class too wide to enumerate cheaply counts as
-        any one character, a strict glob whose own budget runs out counts as
-        covered, and once the call's budget runs out so does every strict glob
-        not yet decided and not ruled out by literal prefixes and suffixes. Empty
-        when no strict path is covered, which is always the case with no strict
+        ``*``, ``?`` or ``[``) is decided exactly by matching it, in time linear
+        in the path. A strict glob is decided by a product search
+        (:func:`_globs_intersect`) on its own budget of
+        :data:`GLOB_INTERSECT_PATTERN_BUDGET` steps, drawn from one
+        :data:`GLOB_INTERSECT_CALL_BUDGET` for the entry. Every approximation
+        errs toward "covers" (a refusal, never a silent untrack): a character
+        class too wide to enumerate cheaply counts as any one character, a
+        strict glob whose own budget runs out counts as covered, and once the
+        entry's budget runs out so does every strict pattern not yet decided
+        and not ruled out by literal prefixes and suffixes. Empty when no
+        strict path is covered, which is always the case with no strict
         patterns."""
+        return self.strict_patterns_covering_each((pattern,))[0]
+
+    def strict_patterns_covering_each(
+        self, patterns: Sequence[str]
+    ) -> tuple[tuple[str, ...], ...]:
+        """:meth:`strict_patterns_covering` for each of ``patterns``, in order:
+        one ``/policy/untrack`` request, decided under one
+        :data:`GLOB_INTERSECT_REQUEST_BUDGET` so its cost is bounded however
+        many entries it carries. Each entry still has its own
+        :data:`GLOB_INTERSECT_CALL_BUDGET`. Once the request's budget runs
+        out, every later entry counts as covering each strict pattern its
+        literal ends do not rule out, so a request of costly entries is
+        refused rather than held past the client's timeout."""
+        request_budget = _SearchBudget(GLOB_INTERSECT_REQUEST_BUDGET)
         return tuple(
-            self._iter_strict_patterns_covering(
-                pattern, _SearchBudget(GLOB_INTERSECT_CALL_BUDGET)
+            tuple(
+                self._iter_strict_patterns_covering(
+                    p, _SearchBudget(GLOB_INTERSECT_CALL_BUDGET, parent=request_budget)
+                )
             )
+            for p in patterns
         )
 
     def _iter_strict_patterns_covering(
         self, pattern: str, call_budget: "_SearchBudget"
     ) -> Iterator[str]:
-        if not self.strict_mode_paths:
+        if not self._coverage_strict:
             return
         # Paths are matched with a leading "./" stripped (_normalize_relative),
         # so an entry spelled that way names the same paths.
-        pattern = _normalize_relative(pattern) or pattern
-        entry_affixes = _literal_affixes(_glob_tokens(pattern))
-        tracked_affixes = [
-            (t, _literal_affixes(_glob_tokens(t)))
-            for t in _union(self.user_added_patterns, self.tracked_patterns)
-        ]
-        call_exhausted = False
-        for strict in self.strict_mode_paths:
-            if _is_literal_glob(strict):
-                # Its language is the one path, so membership decides it
-                # exactly, at no search cost.
-                if _glob_match(strict, pattern) and self._matches_tracked(strict):
-                    yield strict
+        entry = _Glob.of(_normalize_relative(pattern) or pattern)
+        for strict in self._coverage_strict:
+            # A path both match carries both literal prefixes and suffixes;
+            # if they do not nest, the strict pattern is exactly not covered,
+            # at no cost.
+            if not _affixes_nest([entry.affixes, strict.affixes]):
                 continue
-            strict_affixes = _literal_affixes(_glob_tokens(strict))
-            # Only a tracked pattern whose literal ends nest with the entry's
-            # and the strict glob's can share a path with both; with none,
-            # the strict glob is exactly not covered, at no search cost.
-            tracked = [
-                t
-                for t, affixes in tracked_affixes
-                if _affixes_nest([entry_affixes, strict_affixes, affixes])
-            ]
-            if not tracked:
-                continue
-            if call_exhausted:
-                yield strict
-                continue
-            # A budget per strict glob, so one costly pattern (or many cheap
-            # ones) never decides the others: a shared budget marked every
-            # pattern after the point it ran out as covering.
-            budget = _SearchBudget(GLOB_INTERSECT_PATTERN_BUDGET, parent=call_budget)
             try:
-                covered = _globs_intersect((pattern, strict), budget) and any(
-                    _globs_intersect((pattern, strict, t), budget) for t in tracked
-                )
-            except _BudgetExhausted as stop:
+                if _is_literal_glob(strict.pattern):
+                    # Its language is the one path (tracked: the index keeps
+                    # no other), so matching it decides it exactly.
+                    covered = _matches_charged(entry, strict.pattern, call_budget)
+                else:
+                    covered = self._strict_glob_covered(entry, strict, call_budget)
+            except _BudgetExhausted:
                 covered = True
-                call_exhausted = stop.budget is call_budget
             if covered:
-                yield strict
+                yield strict.pattern
+
+    def _strict_glob_covered(
+        self, entry: "_Glob", strict: "_Glob", call_budget: "_SearchBudget"
+    ) -> bool:
+        # Only a tracked pattern whose literal ends nest with the entry's and
+        # the strict glob's can share a path with both; with none, the strict
+        # glob is exactly not covered, at no search cost.
+        tracked = [
+            t
+            for t in self._coverage_tracked
+            if _affixes_nest([entry.affixes, strict.affixes, t.affixes])
+        ]
+        if not tracked:
+            return False
+        # A budget per strict glob, so one costly pattern (or many cheap ones)
+        # never decides the others: a shared budget marked every pattern after
+        # the point it ran out as covering.
+        budget = _SearchBudget(GLOB_INTERSECT_PATTERN_BUDGET, parent=call_budget)
+        return _globs_intersect((entry.tokens, strict.tokens), budget) and any(
+            _globs_intersect((entry.tokens, strict.tokens, t.tokens), budget)
+            for t in tracked
+        )
 
     def ignored_patterns_overridden_by_strict(self) -> tuple[str, ...]:
         """Ignored patterns that cover a strict path, which strict therefore
@@ -334,7 +372,7 @@ class TrackedArtifactPolicy:
         :data:`GLOB_INTERSECT_DIAGNOSTIC_BUDGET`, so a large or pathological
         ``ignored.yaml`` cannot hold up the spawn, and an entry stops at the
         first strict pattern it covers. Once the budget runs out, the
-        remaining entries that a strict glob might cover are reported as
+        remaining entries that a strict pattern might cover are reported as
         overridden, erring toward the warning."""
         total = _SearchBudget(GLOB_INTERSECT_DIAGNOSTIC_BUDGET)
         return tuple(
@@ -510,9 +548,10 @@ def _glob_tokens(pattern: str) -> list[tuple]:
                 j += 1
             if j < len(pattern) and pattern[j] == "]":
                 j += 1
-            while j < len(pattern) and pattern[j] != "]":
-                j += 1
-            if j >= len(pattern):
+            # find, not a character loop: an entry of many unterminated '['
+            # rescans the rest of the pattern once per '['.
+            j = pattern.find("]", j)
+            if j < 0:
                 tokens.append((_LIT, "["))
                 continue
             body = pattern[i:j]
@@ -581,15 +620,20 @@ def _advance(states: frozenset[int], tokens: list[tuple], ch: str | None) -> fro
     return _closure(frozenset(nxt), tokens)
 
 
-def _tokens_match(tokens: list[tuple], path: str) -> bool:
+def _tokens_match(
+    tokens: list[tuple], path: str, budget: "_SearchBudget | None" = None
+) -> bool:
     """Whether ``path`` matches the ``**`` pattern ``tokens`` exactly as its
     regex (:func:`_glob_regex`) does, in time linear in the path: the token
     automaton stepped one character at a time, never backtracking. The
     regex's own rules carry over: ``.*`` stops at a newline, and ``$`` also
-    matches before a final one."""
+    matches before a final one. Each character is charged to ``budget``,
+    when one is given, at the size of the state it leaves."""
     end = len(tokens)
     states = _closure(frozenset({0}), tokens)
     for i, ch in enumerate(path):
+        if budget is not None:
+            budget.spend(1 + len(states))
         if ch == "\n":
             if i == len(path) - 1 and end in states:
                 return True
@@ -600,19 +644,26 @@ def _tokens_match(tokens: list[tuple], path: str) -> bool:
     return end in states
 
 
-GLOB_INTERSECT_PATTERN_BUDGET: int = 50_000
+GLOB_INTERSECT_PATTERN_BUDGET: int = 200_000
 """Search steps one strict glob may take in
 :meth:`TrackedArtifactPolicy.strict_patterns_covering` before it counts as
-covered. A step is one automaton state carried across one character (about a
-microsecond), so the cost is bounded whatever the patterns' alphabet. Ordinary
-entries settle in under 10,000 steps per strict glob; a star-heavy one runs
-out and is refused."""
+covered. A step is one automaton state carried across one character (just
+under a microsecond), so the cost is bounded whatever the patterns' alphabet.
+The costliest ordinary decision measured takes about 65,000 steps (the
+three-segment ``**/archive/*/*/*.md`` against a strict ``**/plans/*/*/*.md``);
+a star-heavy entry runs out and is refused."""
 
-GLOB_INTERSECT_CALL_BUDGET: int = 500_000
-"""Search steps one :meth:`TrackedArtifactPolicy.strict_patterns_covering`
-call may take across all its strict globs: it runs inside the
-``/policy/untrack`` handler, once per entry. Ordinary entries against 40
-strict globs take up to about 300,000."""
+GLOB_INTERSECT_CALL_BUDGET: int = 2_000_000
+"""Search steps one untrack entry may take across all strict patterns. An
+ordinary entry against 45 multi-segment strict globs (``**/old/*/*.json``
+against ``**/svc<i>/*/*.json``) takes about 550,000."""
+
+GLOB_INTERSECT_REQUEST_BUDGET: int = 4_000_000
+"""Search steps one ``/policy/untrack`` request may take across all its
+entries (:meth:`TrackedArtifactPolicy.strict_patterns_covering_each`): about
+3.5 s, inside the CLI's 6 s timeout, so a request of costly entries is
+refused with the typed reason rather than reported as an unavailable
+coordinator."""
 
 GLOB_INTERSECT_DIAGNOSTIC_BUDGET: int = 2_000_000
 """Search steps the spawn-time override diagnostic
@@ -621,11 +672,7 @@ across every ignored entry: it runs before the coordinator binds its port."""
 
 
 class _BudgetExhausted(Exception):
-    """A bounded glob search ran out; ``budget`` is the budget that ran out."""
-
-    def __init__(self, budget: "_SearchBudget") -> None:
-        super().__init__()
-        self.budget = budget
+    """A bounded glob search ran out of steps."""
 
 
 class _SearchBudget:
@@ -640,9 +687,22 @@ class _SearchBudget:
     def spend(self, steps: int) -> None:
         self.remaining -= steps
         if self.remaining < 0:
-            raise _BudgetExhausted(self)
+            raise _BudgetExhausted
         if self.parent is not None:
             self.parent.spend(steps)
+
+
+class _Glob(NamedTuple):
+    """A pattern with what the strict-coverage check reads from it."""
+
+    pattern: str
+    tokens: list[tuple]
+    affixes: tuple[str, str]
+
+    @classmethod
+    def of(cls, pattern: str) -> "_Glob":
+        tokens = _glob_tokens(pattern)
+        return cls(pattern, tokens, _literal_affixes(tokens))
 
 
 def _is_literal_glob(pattern: str) -> bool:
@@ -675,9 +735,21 @@ def _affixes_nest(affixes: list[tuple[str, str]]) -> bool:
     )
 
 
-def _globs_intersect(patterns: Sequence[str], budget: _SearchBudget) -> bool:
-    """True when some non-empty path matches every one of ``patterns`` under
-    this module's matching rules (:func:`matches_any`).
+def _matches_charged(entry: _Glob, path: str, budget: _SearchBudget) -> bool:
+    """Whether ``path`` matches ``entry`` (:func:`matches_any`), charged to
+    ``budget``."""
+    if "**" in entry.pattern:
+        return _tokens_match(entry.tokens, path, budget)
+    # fnmatch's regex holds each run in an atomic group, so it never
+    # backtracks into an earlier run.
+    budget.spend(1 + len(path))
+    return fnmatch.fnmatchcase(path, entry.pattern)
+
+
+def _globs_intersect(token_lists: Sequence[list[tuple]], budget: _SearchBudget) -> bool:
+    """True when some non-empty path matches every pattern ``token_lists``
+    spells (:func:`_glob_tokens`) under this module's matching rules
+    (:func:`matches_any`).
 
     A product of the patterns' automata searched over an alphabet of every
     character the patterns name, ``/``, and one stand-in for every other
@@ -686,7 +758,6 @@ def _globs_intersect(patterns: Sequence[str], budget: _SearchBudget) -> bool:
     never less. Each transition is charged to ``budget`` at the size of the
     state it leaves; running out raises :class:`_BudgetExhausted`, which every
     caller counts as "intersects"."""
-    token_lists = [_glob_tokens(p) for p in patterns]
     # Most pairs an untrack check meets (``.log`` against ``.json``, ``svc3/``
     # against ``svc7/``) fail on their literal ends: settled without a search.
     if not _affixes_nest([_literal_affixes(t) for t in token_lists]):

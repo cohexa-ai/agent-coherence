@@ -619,7 +619,10 @@ lifetime:
 - the untrack command (`POST /policy/untrack`) refuses an entry, a path or a
   glob, that covers a path the coordinator holds in strict mode. It answers
   HTTP 409 with `reason: "untrack_strict_path"`, names the strict pattern for
-  each refused entry under `refused`, and writes nothing; the CLI exits 3;
+  each refused entry under `refused`, and writes nothing; the CLI exits 3. The
+  check is bounded in time: an entry it cannot settle within that bound counts
+  as covering, so a very large or unusual request can be refused for a strict
+  pattern it does not reach. Untrack fewer entries at a time if that happens;
 - an ignored pattern never takes a strict path off the tracked set, whether it
   was in `.coherence/ignored.yaml` at spawn or added later, and however broadly
   it is spelled (`**`): strict wins over ignore, and the coordinator logs the

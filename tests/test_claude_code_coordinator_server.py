@@ -23,6 +23,7 @@ from urllib import request as urlrequest
 
 import pytest
 
+from ccs.adapters.claude_code import policy as policy_module
 from ccs.adapters.claude_code.auth import load_secret
 from ccs.adapters.claude_code.coordinator_server import (
     _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC,
@@ -720,6 +721,21 @@ def test_policy_untrack_refuses_an_entry_covering_a_strict_path(
     assert not (strict_coordinator.coordinator_root / ".coherence" / "ignored.yaml").exists()
     assert strict_coordinator.policy.is_strict_mode("data/a.json")
     assert strict_coordinator.policy.is_tracked("data/notes.txt")
+
+
+def test_policy_untrack_decides_the_request_under_one_budget(
+    strict_coordinator, strict_client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The handler decides a request's entries under one search budget, so
+    the request answers within the CLI's timeout however many costly entries
+    it carries. Once that budget runs out, a later entry is refused (the
+    check errs toward refusing) and nothing is written."""
+    # data/[0-9] covers nothing; only a search of about 460 steps shows it.
+    monkeypatch.setattr(policy_module, "GLOB_INTERSECT_REQUEST_BUDGET", 700)
+    s, b = strict_client.post("/policy/untrack", {"paths": ["data/[0-9]", "data/[0-8]"]})
+    assert s == 409, b
+    assert b["refused"] == [{"path": "data/[0-8]", "strict_patterns": ["data/*.json"]}]
+    assert not (strict_coordinator.coordinator_root / ".coherence" / "ignored.yaml").exists()
 
 
 def test_policy_untrack_of_a_non_strict_path_round_trips_on_a_strict_coordinator(

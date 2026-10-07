@@ -3665,17 +3665,21 @@ def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
         else:
             pre_rejected.append({"path": p, "reason": v_err})
     # Read without a lock, like every reload here (COR-05). That is safe only
-    # because the strict set never shrinks while the coordinator runs
-    # (TrackedArtifactPolicy.reloaded): a reload racing this check can add a
-    # strict pattern, which strict-wins in is_tracked then enforces anyway,
-    # but never remove one. A change that lets a reload drop a strict pattern
-    # must make this check-then-append atomic with it.
+    # because a reload keeps every strict pattern of the policy it reloads
+    # (TrackedArtifactPolicy.reloaded), so the spawn-time strict set is never
+    # dropped: a reload racing this check can add a strict pattern, which
+    # strict-wins in is_tracked then enforces anyway. Two racing reloads are
+    # last-writer-wins on coordinator.policy, so a pattern hand-added to
+    # strict_mode.yaml inside that window can be lost; strict-wins still holds
+    # for every pattern that survives. A change that lets a reload drop a
+    # spawn-time strict pattern must make this check-then-append atomic with it.
     policy = coordinator.policy
-    refused: list[dict] = []
-    for p in safe_paths:
-        covering = policy.strict_patterns_covering(p)
-        if covering:
-            refused.append({"path": p, "strict_patterns": list(covering)})
+    coverage = policy.strict_patterns_covering_each(safe_paths)
+    refused = [
+        {"path": p, "strict_patterns": list(covering)}
+        for p, covering in zip(safe_paths, coverage)
+        if covering
+    ]
     if refused:
         req._json(409, {
             "ok": False,
