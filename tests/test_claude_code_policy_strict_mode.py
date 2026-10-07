@@ -14,6 +14,7 @@ Covers:
 
 from __future__ import annotations
 
+import itertools
 import logging
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from ccs.adapters.claude_code.policy import (
     _glob_tokens,
     _globs_intersect,
     _SearchBudget,
+    matches_any,
 )
 
 
@@ -187,6 +189,7 @@ def test_ignore_still_wins_for_tracked_non_strict_paths(root: Path) -> None:
         ("data/a.txt", ()),                       # tracked, not strict
         ("data/*.txt", ()),                       # disjoint glob
         ("notes/**", ()),                         # strict-free and untracked
+        ("data?a.json", ("data/*.json",)),        # fnmatch '?' crosses '/'
     ],
 )
 def test_strict_patterns_covering_decides_on_the_glob_languages(
@@ -197,6 +200,50 @@ def test_strict_patterns_covering_decides_on_the_glob_languages(
     policy = TrackedArtifactPolicy.load(root)
 
     assert policy.strict_patterns_covering(entry) == covering
+
+
+def test_a_root_level_path_is_covered_by_a_leading_double_star(root: Path) -> None:
+    """``**/`` matches zero directories: the matcher swallows the slash after
+    ``**``, so a strict ``**/plan.md`` holds the root-level ``plan.md``."""
+    (root / ".coherence" / "strict_mode.yaml").write_text("- '**/plan.md'\n")
+    policy = TrackedArtifactPolicy.load(root)
+    assert policy.is_strict_mode("plan.md")
+
+    assert policy.strict_patterns_covering("plan.md") == ("**/plan.md",)
+
+
+# Every glob shape the matcher handles: ``**`` patterns (a run, a segment run,
+# a segment character, the slash swallowed after ``**``) and fnmatch patterns
+# (``*`` and ``?`` crossing '/', classes, negation, an unterminated '[').
+_GRAMMAR_CORPUS = (
+    "a", "a.x", "x", "*", "?", "**", "**/a", "a/**", "a/**/b", "**/*", "**/a?",
+    "**/*.x", "a?", "a*b", "*.x", "a/*", "*/b", "?/?", "[ab]", "[!a]", "a[", "[a-b]/x",
+)
+_GRAMMAR_PATHS = tuple(
+    "".join(chars)
+    for length in range(1, 5)
+    for chars in itertools.product("ab/x.", repeat=length)
+)
+
+
+def test_the_overlap_automaton_never_under_reports_the_matcher() -> None:
+    """``_glob_tokens`` re-reads the glob grammar ``matches_any`` uses, so
+    nothing else ties the overlap search to the matcher it must agree with.
+    Over every path of up to four characters, wherever some path matches
+    each pattern of a pair or triple, the search must say they intersect: an
+    under-report accepts an untrack that covers a strict path. (It may
+    over-report: its approximations err toward "intersects".)"""
+    matching = {
+        g: {p for p in _GRAMMAR_PATHS if matches_any(p, [g])} for g in _GRAMMAR_CORPUS
+    }
+    missed = [
+        combo
+        for size in (2, 3)
+        for combo in itertools.combinations(_GRAMMAR_CORPUS, size)
+        if set.intersection(*(matching[g] for g in combo))
+        and not _globs_intersect(combo, _SearchBudget(10_000_000))
+    ]
+    assert missed == []
 
 
 def test_a_strict_pattern_with_no_tracked_cover_is_not_covering(root: Path) -> None:
