@@ -268,6 +268,10 @@ class TrackedArtifactPolicy:
     ) -> tuple[str, ...]:
         if not self.strict_mode_paths:
             return ()
+        # Paths are matched with a leading "./" stripped (_normalize_relative),
+        # so an entry spelled that way names the same paths; removeprefix, not
+        # lstrip, keeps a dotfile entry such as ".env" intact.
+        pattern = pattern.removeprefix("./") or pattern
         tracked = _union(self.user_added_patterns, self.tracked_patterns)
         covering: list[str] = []
         call_exhausted = False

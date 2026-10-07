@@ -190,6 +190,8 @@ def test_ignore_still_wins_for_tracked_non_strict_paths(root: Path) -> None:
         ("data/*.txt", ()),                       # disjoint glob
         ("notes/**", ()),                         # strict-free and untracked
         ("data?a.json", ("data/*.json",)),        # fnmatch '?' crosses '/'
+        ("./data/a.json", ("data/*.json",)),      # a leading ./ is the same path
+        ("./data/**", ("data/*.json",)),          # ... and the same glob
     ],
 )
 def test_strict_patterns_covering_decides_on_the_glob_languages(
