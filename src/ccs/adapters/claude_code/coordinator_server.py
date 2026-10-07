@@ -7605,22 +7605,15 @@ def _claim_reground_context(
         return None
 
 
-def _attach_reground(result: dict, text: str) -> dict:
-    """SB-10 U4: merge the claimed re-grounding prose into a qualifying
-    admit response. An existing envelope keeps its text AND its existing
-    permission decision, and gets the block appended AFTER it (notices and
-    stale warnings render first — KTD6 ordering); a bare admit body gains
-    a CONTEXT-ONLY PreToolUse envelope. The deferred path rides the
-    PreToolUse shape — never the SessionStart ``hookSpecificOutput``
-    shape."""
-    return _attach_pretooluse_context(result, text)
-
-
 def _attach_pretooluse_context(result: dict, text: str) -> dict:
     """Merge advisory prose into an admit response: appended after an
     existing envelope's text, keeping its permission decision, or carried by
     a CONTEXT-ONLY PreToolUse envelope on a bare admit body. The one merge
-    rule the deferred re-grounding and the handoff prose (#185) share."""
+    rule the deferred re-grounding (SB-10 U4) and the handoff prose (#185)
+    share. Appending is what orders the blocks (KTD6): notices and stale
+    warnings render first, then the handoff prose, then the re-grounding,
+    which is attached last. Always the PreToolUse shape, never the
+    SessionStart ``hookSpecificOutput`` shape."""
     hso = result.get("hookSpecificOutput")
     if hso is None:
         # WHY context-only rather than emit_allow: re-grounding is
@@ -7718,7 +7711,7 @@ def _deliver_pending_reground(
     text = _claim_reground_context(coordinator, session_id, body, abort=abort)
     if text is None:
         return result
-    return _attach_reground(result, text)
+    return _attach_pretooluse_context(result, text)
 
 
 def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> str | None:
