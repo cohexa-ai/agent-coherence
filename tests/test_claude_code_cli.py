@@ -836,6 +836,31 @@ def test_untrack_against_live_coordinator(
     assert "docs/draft.md" in ignored_yaml.read_text()
 
 
+def test_untrack_of_a_strict_path_is_refused_with_its_own_exit_code(
+    git_workspace: Path, fast_cfg: LifecycleConfig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#261: the coordinator refuses to untrack a path it enforces in strict
+    mode (typed reason ``untrack_strict_path``, nothing written). The CLI
+    classifies the refusal by that reason, names the strict pattern, says how
+    to untrack it (restart without the strict entry), and exits 3 — distinct
+    from a transport error (2)."""
+    coherence_dir = git_workspace / ".coherence"
+    coherence_dir.mkdir()
+    (coherence_dir / "tracked.yaml").write_text("- data/**\n")
+    (coherence_dir / "strict_mode.yaml").write_text("- data/**\n")
+    assert ensure_coordinator(git_workspace, config=fast_cfg) > 0
+    try:
+        rc = coherence_untrack.main(["--root", str(git_workspace), "data/a.txt", "notes.md"])
+        captured = capsys.readouterr()
+        assert rc == 3, captured
+        assert "refused 'data/a.txt': enforced in strict mode by data/**" in captured.err
+        assert "restart the coordinator" in captured.err
+        assert captured.out == ""
+        assert not (coherence_dir / "ignored.yaml").exists(), "the request wrote nothing"
+    finally:
+        stop_coordinator(git_workspace)
+
+
 @pytest.mark.parametrize("bad_path,reason_substr", [
     # See test_track_rejects_invalid_paths_without_network for rationale on
     # the 2026-05-26 message change from "must be relative" to "outside
