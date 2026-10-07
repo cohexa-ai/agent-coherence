@@ -1436,7 +1436,7 @@ class CoordinatorHTTPServer:
         (A3 validation), so one session's prefix can never be a prefix of
         another's. Restart-empty maps are an accepted degradation (KTD5):
         subagents re-enter on their next hook call."""
-        subagent_prefix = f"claude-session-{session_id}:subagent-"
+        subagent_prefix = f"{_AGENT_NAME_PREFIX}{session_id}{_SUBAGENT_NAME_INFIX}"
         with self._agent_names_lock:
             subagents = [
                 (agent_id, name[len(subagent_prefix):])

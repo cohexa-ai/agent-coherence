@@ -389,6 +389,14 @@ class TransferRecord:
     created_at: float
     updated_at: float
 
+    def __post_init__(self) -> None:
+        # Checked on every construction, so a record built for a write and the
+        # sqlite row read back into one are both held to the closed vocabulary.
+        if self.cause not in TRANSFER_CAUSES:
+            raise ValueError(
+                f"transfer cause {self.cause!r} is not one of {sorted(TRANSFER_CAUSES)}"
+            )
+
 
 @dataclass(frozen=True, kw_only=True)
 class TransferRequest:
