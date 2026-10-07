@@ -2217,7 +2217,10 @@ run in one workspace with the plugin's hooks and the Python coordinator.
   from a variable or a command substitution, a writer tool the hook does not
   know (`gsed`, `awk -i inplace`, `vim`, `curl -o`, a formatter, a script run
   from a file), and a relative path after a `cd` made by an earlier command.
-  Such a write lands on disk without a version.
+  Such a write lands on disk without a version. So does a recognized one when
+  the coordinator cannot answer the check in time (it is slow or overloaded,
+  or its registry fails): the command runs, and unlike a giver's `Edit`, whose
+  commit is then refused, nothing refuses the shell write afterwards.
 - **An edit in flight at the transfer lands without a version.** So does one
   admitted while the coordinator was degraded. See
   [Claude Code sessions](#claude-code-sessions).
