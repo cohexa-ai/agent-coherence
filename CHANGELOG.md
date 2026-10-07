@@ -372,8 +372,55 @@ Alpha — APIs may change before `v1.0`.
   one or the Node coordinator, fails it closed as "cannot be confirmed" rather
   than being read as enforced. `CoherentVolume.managed_glob_enforcement()`
   returns that three-way answer. The comparison is literal and taken once, at
-  attach: a broader ignore pattern, or a path untracked after attach, is not
-  detected. Volumes declaring the coordinator's own globs are unaffected.
+  attach; the coordinator keeps the answer true for its lifetime (#261, below).
+  Volumes declaring the coordinator's own globs are unaffected.
+
+- **A strict path stays enforced for the coordinator's lifetime (#261).** After
+  a `CoherentVolume` attached confirmed, `POST /policy/untrack` of a managed
+  path or glob reloaded the policy and put the path on the untracked fast path:
+  a read reported version 0, `post-edit-cas` accepted any `expected_version`,
+  and a peer's `write_cas_at(expected_version=0)` overwrote a newer write with
+  nothing raised. An `ignored.yaml` that covered a strict glob under a broader
+  pattern (`**`) did the same from spawn. Now:
+  - `POST /policy/untrack` (and `agent-coherence-untrack`) refuses an entry that
+    covers a path the live policy holds in strict mode: HTTP 409
+    `{"ok": false, "reason": "untrack_strict_path", "refused": [{"path",
+    "strict_patterns"}], "rejected": [...], "error": <text>}`, and the whole
+    request writes nothing. Overlap is decided on the glob languages, so a
+    literal path, the strict glob itself, and a broader or differently spelled
+    glob are all caught; where the decision is approximate (a character class
+    too wide to enumerate cheaply, or a glob whose overlap search runs out of
+    its fixed step budget, decided per strict pattern) it errs toward refusing.
+    One request's entries share one step budget, so a request of many costly
+    entries is refused rather than held past the CLI's timeout. The CLI exits
+    3 on it. **Changed behaviour of a shipped verb:** to untrack a strict path,
+    remove its entry from `.coherence/strict_mode.yaml` and restart the
+    coordinator.
+  - Strict wins over ignore in `TrackedArtifactPolicy.is_tracked`: an ignored
+    pattern no longer untracks a path that is tracked and matches a strict
+    pattern (previously ignore won, and a strict path in `ignored.yaml` was
+    neither tracked nor strict). The spawn-time load logs each overridden
+    ignore entry; hot reloads do not recompute it. Non-strict paths are unchanged: ignore still wins there.
+  - The hot reload behind `/policy/track` and `/policy/untrack`
+    (`TrackedArtifactPolicy.reloaded()`) keeps every strict and user-added
+    pattern the live policy carries while strict patterns are live, so a
+    hand-edited YAML followed by a track cannot end enforcement mid-run.
+    Without strict patterns the reload reads the files verbatim, as before.
+  - The Node coordinator's `/policy/untrack` and policy evaluator are not
+    changed here; the new corpus fixtures
+    (`strict_mode/15-policy-untrack-of-a-strict-path-is-refused` and
+    `strict_mode/16-pre-edit-strict-path-under-an-ignore-pattern-stays-strict`)
+    are scoped to the Python coordinator and are the parity targets for the
+    plugin follow-up.
+
+- **A `**` pattern with many `*` runs no longer stalls every hook.** The
+  matcher compiled each `**` pattern to a regex that backtracks into every
+  `*` run, so a failing match cost up to the path's length to the power of
+  its runs. An accepted entry such as `'**' * 12 + 'Z'` in `ignored.yaml` or
+  `tracked.yaml` made every `is_tracked` call, on every hook, take seconds. A
+  `**` pattern with more than two runs is now matched by stepping through its
+  pattern one path character at a time: linear in the path, with the same
+  results.
 
 - **A Bash or Grep command denied in strict mode no longer counts as a read.**
   When `pre-bash` or `pre-grep` finds a stale tracked file, it re-grants the
