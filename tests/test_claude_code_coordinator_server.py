@@ -556,9 +556,11 @@ def test_failed_edit_releases_grant_without_bump(coordinator, client: _Client) -
     # Agent state is no longer EXCLUSIVE (some non-M/E state)
     state = coordinator.registry.get_agent_state(artifact_id, agent_id)
     assert state not in (MESIState.EXCLUSIVE, MESIState.MODIFIED)
-    # Another session can now acquire immediately
+    # Another session's acquire is clean, with no collision warning naming A.
+    # A pre-edit takes over from a holder either way, so ``ok`` alone would
+    # pass on a release that did nothing.
     s2, b2 = client.post("/hooks/pre-edit", {"session_id": _sid("B"), "path": "plan.md"})
-    assert s2 == 200 and b2.get("ok") is True
+    assert s2 == 200 and b2 == {"ok": True}
 
 
 def test_session_stop_malformed_agent_id_does_not_release_parent(client: _Client) -> None:
