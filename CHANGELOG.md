@@ -71,8 +71,9 @@ Alpha — APIs may change before `v1.0`.
   without retrying, and told its user the file had been handed off. The giver's
   shell write to the path gets the same deny from `pre-bash`, byte for byte, in
   warn and strict mode: a redirection or `tee`, an in-place `sed -i` or
-  `perl -i`, a `cp` or `mv` onto it, or a one-line program that opens it for
-  writing (a Sonnet setup that appended with `echo … >>` in 4 of 10 runs
+  `perl -i`, a `cp` or `mv` onto it, or a one-line program that writes it,
+  by name or through a variable, but not one that only reads it and writes
+  another file (a Sonnet setup that appended with `echo … >>` in 4 of 10 runs
   changed the file in none with the deny in place). A path built from a
   variable or a command substitution, a writer tool the hook does not know, and
   a write that bypasses the hooks are still not stopped. See the guide's

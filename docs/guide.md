@@ -1875,15 +1875,18 @@ shell writes:
 - `cp`, `mv`, `install`, `ln` or `rsync` onto the file, and `mv`, `rm`,
   `truncate`, `dd of=`, `sort -o` or `patch` of it;
 - `git checkout`, `git restore`, `git rm` or `git mv` naming it;
-- a script that opens it for writing, run as a one-line `python -c`,
-  `perl -e`, `ruby -e`, `node -e` or `php -r` program or fed to one in a
-  heredoc;
+- a script that writes it -- opens it for writing, writes, appends to,
+  deletes, renames or copies onto it, by its name or through a variable the
+  name is assigned to -- run as a one-line `python -c`, `perl -e`, `ruby -e`,
+  `node -e` or `php -r` program or fed to one in a heredoc; a script that only
+  reads the file and writes another one is not refused;
 
 including inside `bash -c`, `sh -c` and `eval`, after a `cd` in the same
 command, and by an absolute path inside the workspace. It errs toward letting
 a command through: a path built from a variable or a command substitution
 (`"$PWD/plan.md"`, `$(git rev-parse --show-toplevel)/plan.md`) or, inside a
-program, assembled from pieces or mentioned inside a longer string, a writer tool
+program, assembled from pieces, mentioned inside a longer string or reached
+through a list, a loop or a dictionary, a writer tool
 it does not know (`gsed`, `awk -i inplace`, `vim`, `curl -o`, a formatter, a
 script run from a file) and a relative path after a `pushd`, or after a `cd`
 made by an earlier command (the hook is not told the session's working

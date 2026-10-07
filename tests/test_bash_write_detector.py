@@ -362,6 +362,11 @@ _DOCUMENTED_MISSES: tuple[str, ...] = (
     # A wrapper given options of its own.
     "sudo -E tee docs/plans/plan.md",
     "sudo -u root tee -a docs/plans/plan.md",
+    # In a program body, a path that reaches the write through a container or
+    # a loop, or is built from pieces.
+    "python3 - <<'PY'\nfrom pathlib import Path\nfor name in ['CLAUDE.md', 'AGENTS.md']:\n    Path(name).write_text('x')\nPY",
+    "node -e \"const cfg = { out: 'docs/plans/plan.md' }; require('fs').writeFileSync(cfg.out, 'x');\"",
+    "python3 -c \"from pathlib import Path; (Path('docs') / 'plans' / 'plan.md').write_text('x')\"",
 )
 
 
@@ -457,6 +462,29 @@ def test_nested_shell_bodies_are_scanned_three_levels_deep_and_no_deeper() -> No
     ("ruby -e 'File.write(\"/tmp/o.md\", File.read(\"docs/plans/plan.md\"))'", []),
     # A program that writes nothing names no path.
     ("python3 -c \"print('docs/plans/plan.md')\"", []),
+    # Read the path, write elsewhere, in the read forms a write-anything rule
+    # took as writes: only a write call's target is written.
+    ("python3 -c \"from pathlib import Path; p = Path('CLAUDE.md'); Path('/tmp/c.md').write_text(p.read_text())\"", []),
+    ("python3 -c \"import json; json.dump({'t': open('plan.md', mode='r').read()}, open('/tmp/p.json', 'w'))\"", []),
+    ("node -e 'const fs=require(\"fs\"); const s=fs.readFileSync(\"docs/specs/api.md\",{encoding:\"utf8\"}); fs.writeFileSync(\"/tmp/e.json\", s)'", []),
+    ("node -e \"const fs=require('fs'); fs.promises.readFile('task.md','utf8').then(d => fs.promises.writeFile('/tmp/t.txt', d))\"", []),
+    ("ruby -e 'File.write(\"/tmp/r.txt\", File.readlines(\"task.md\").join)'", []),
+    ("perl -e 'open(my $in, \"<\", \"plan.md\") or die; open(my $o, \">\", \"/tmp/p.txt\") or die; print $o <$in>'", []),
+    ("php -r 'file_put_contents(\"/tmp/a.txt\", file_get_contents(\"AGENTS.md\"));'", []),
+    ("python3 - <<'PY'\nfiles = ['CLAUDE.md', 'AGENTS.md']\nwith open('/tmp/bundle.md', 'w') as out:\n    for name in files:\n        out.write(open(name).read())\nPY", []),
+    # A path bound to a name, then written through the name.
+    ("python3 -c \"from pathlib import Path; p = Path('CLAUDE.md'); p.write_text(p.read_text().upper())\"", ["CLAUDE.md"]),
+    ("python3 - <<'PY'\npath = 'docs/plans/plan.md'\nwith open(path, 'a') as fh:\n    fh.write('x')\nPY", [_PLAN]),
+    ("node -e \"const fs = require('fs'); const f = 'task.md'; fs.appendFileSync(f, 'x');\"", ["task.md"]),
+    ("perl -e 'my $f = \"task.md\"; open my $out, \">\", $f or die; print $out \"x\"'", ["task.md"]),
+    ("php -r '$t = \"AGENTS.md\"; file_put_contents($t, str_replace(\"a\", \"b\", file_get_contents($t)));'", ["AGENTS.md"]),
+    ("python3 - <<'PY'\nmode = 'a'\ntarget = 'docs/plans/plan.md'\nwith open(target, mode) as fh:\n    fh.write('x')\nPY", [_PLAN]),
+    # A name bound again: only the binding the write call sees counts.
+    ("python3 - <<'PY'\npath = 'docs/specs/api.md'\nspec = open(path).read()\npath = '/tmp/out.txt'\nwith open(path, 'w') as f:\n    f.write(spec)\nPY", []),
+    # Deletes, and a move of the path away.
+    ("python3 -c \"import os; os.remove('task.md')\"", ["task.md"]),
+    ("node -e \"require('fs').rmSync('task.md')\"", ["task.md"]),
+    ("ruby -e 'File.rename(\"AGENTS.md\", \"/tmp/AGENTS.md.bak\")'", ["AGENTS.md"]),
     # A move, a rename and a copy's destination are writes; a copy's source is not.
     ("python3 -c \"import os; os.replace('/tmp/x.md', 'docs/plans/plan.md')\"", [_PLAN]),
     ("python3 -c \"import shutil; shutil.move('docs/plans/plan.md', '/tmp/x.md')\"", [_PLAN]),
@@ -571,21 +599,27 @@ def test_empty_and_pathological_commands_return_promptly() -> None:
     'python3 -c "' + "open(a, " * 2000 + '"',
     'python3 -c "' + "open(," * 2600 + '"',
     'python3 -c "' + "x = 'a.md'; " * 1300 + "open('b.md', 'w')" + '"',
+    ('python3 -c "' + "".join(f"x{i} = 'a.md'; " for i in range(1000))
+     + "".join(f"open(x{i}, 'w'); " for i in range(60)) + '"')[:16384],
 ], ids=["ex-herestring-spaces", "ex-c-spaces", "ed-herestring-spaces", "open-calls",
-        "open-calls-with-args", "open-calls-with-commas", "many-path-literals"])
+        "open-calls-with-args", "open-calls-with-commas", "many-path-literals",
+        "many-bound-names"])
 def test_a_16k_script_body_is_scanned_in_linear_time(command: str) -> None:
     """Script and program checks stay linear on a 16K body: an ex prefix whose
-    two whitespace runs could split one run many ways, or an unbounded scan
-    for an ``open(`` mode, made one of these take seconds."""
+    two whitespace runs could split one run many ways, an unbounded scan for
+    an ``open(`` mode, or following every one of a thousand bound names to the
+    end of the body, made one of these take seconds."""
     started = time.monotonic()
     _detect(command)
     assert time.monotonic() - started < 0.25
 
 
-def test_the_scan_for_an_open_mode_stops_200_characters_in() -> None:
-    """The bound that keeps a body of unclosed ``open(`` calls linear: a mode
-    argument more than 200 characters past its ``open(`` is not read as a
-    write call (a deliberate miss), one within 200 is."""
-    near = "python3 -c \"open('docs/plans/plan.md' + '" + "x" * 150 + "', 'w')\""
-    far = "python3 -c \"open('docs/plans/plan.md' + '" + "x" * 250 + "', 'w')\""
-    assert (_detect(near), _detect(far)) == ([_PLAN], [])
+def test_a_literal_that_only_starts_a_built_path_is_not_the_path_written() -> None:
+    """``open('plan.md' + suffix, 'w')`` writes a file whose name merely starts
+    with the literal, so the literal is not the open's target and is not
+    reported: a path assembled from pieces is a documented miss, however close
+    the mode sits. (The ``open(`` mode scan of the write-call filter stays
+    bounded; the linear-time cases cover it.)"""
+    for pad in (0, 150, 250):
+        command = "python3 -c \"open('docs/plans/plan.md' + '" + "x" * pad + "', 'w')\""
+        assert _detect(command) == [], pad
