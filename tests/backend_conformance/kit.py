@@ -49,6 +49,7 @@ from uuid import UUID, uuid4
 
 from ccs.coordinator.backend_contract import R18_LIVENESS_SOURCE, LivenessSourceObligation
 from ccs.coordinator.registry import ArtifactRegistry
+from ccs.coordinator.registry_protocol import TransferRequest
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import (
@@ -609,6 +610,60 @@ def assert_epoch_moves_on_handoff(factory: RegistryFactory) -> None:
         f"handoff must not fence a reader whose claim nobody revoked, got {result!r}"
     )
     assert reg.get_artifact(shared_art).version == 2  # type: ignore[attr-defined]
+
+    # The production path. No route calls set_agent_state with the handoff
+    # trigger: transfer_grants moves the giver through each registry's own
+    # INVALID move. Drive both shapes through it, and check that the move
+    # leaves the giver's read_generation and last_observed_version as they
+    # were -- a move that cleared the read_generation would ADMIT the late
+    # commit below (admit-on-absent), whatever the epoch did.
+    write_art, read_art = uuid4(), uuid4()
+    _register(reg, write_art, version=1, name="handed-write.md")
+    _register(reg, read_art, version=1, name="handed-read.md")
+    holder, successor = uuid4(), uuid4()
+    reg.set_agent_state(write_art, holder, MESIState.EXCLUSIVE, tick=12)  # type: ignore[attr-defined]
+    reg.set_agent_state(read_art, bystander, MESIState.SHARED, trigger="fetch", tick=13)  # type: ignore[attr-defined]
+    reg.set_agent_state(read_art, holder, MESIState.SHARED, trigger="fetch", tick=14)  # type: ignore[attr-defined]
+    handed = (write_art, read_art)
+    kept = {
+        art: (
+            reg.get_read_generation(art, holder),  # type: ignore[attr-defined]
+            reg.last_observed_version_for(art, holder),  # type: ignore[attr-defined]
+        )
+        for art in handed
+    }
+    epochs = {art: reg.get_owner_generation(art) for art in handed}  # type: ignore[attr-defined]
+    outcomes = reg.transfer_grants(  # type: ignore[attr-defined]
+        TransferRequest(
+            giver=uuid4(),
+            successor=successor,
+            holders={write_art: holder, read_art: holder},
+            successor_known=True,
+        ),
+        tick=15,
+    )
+    assert len(outcomes) == 2 and all(o.transferred for o in outcomes), outcomes
+    for art in handed:
+        assert reg.get_agent_state(art, holder) == MESIState.INVALID  # type: ignore[attr-defined]
+        assert (
+            reg.get_read_generation(art, holder),  # type: ignore[attr-defined]
+            reg.last_observed_version_for(art, holder),  # type: ignore[attr-defined]
+        ) == kept[art], "transfer_grants rewrote the giver's read_generation or observed version"
+    assert reg.get_owner_generation(write_art) > epochs[write_art], (  # type: ignore[attr-defined]
+        "transfer_grants handed off a write grant without moving owner_generation"
+    )
+    assert reg.get_owner_generation(read_art) == epochs[read_art], (  # type: ignore[attr-defined]
+        "transfer_grants moved owner_generation for a handed-off read"
+    )
+    reg.set_agent_state(write_art, holder, MESIState.SHARED, trigger="peer_regrant", tick=16)  # type: ignore[attr-defined]
+    result = reg.commit_cas(  # type: ignore[attr-defined]
+        write_art, holder, expected_version=1, content_hash=_hash("late-handed"), tick=17
+    )
+    assert isinstance(result, ConflictDetail), (
+        "the giver's commit was ADMITTED at the unchanged version after a "
+        f"transfer_grants handoff, got {result!r}"
+    )
+    assert result.reason == STALE_READ_GENERATION_REASON, result.reason
 
 
 def assert_fence_admits_absent_read_generation(factory: RegistryFactory) -> None:

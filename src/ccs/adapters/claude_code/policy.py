@@ -20,6 +20,15 @@ Design constraints:
   Node, Rust, Django, or other-language repos. Unit 8 1000-path benchmark covers.
 - All policy decisions key on **parent-repo-relative** paths (KTD-7 normalization
   happens upstream in the hook handler).
+- **A strict path stays enforced for the coordinator's lifetime** (#261). A
+  path that is tracked and matches a strict pattern is never untracked by an
+  ignored pattern (strict wins over ignore, at load and after every reload),
+  the ``/policy/track`` and ``/policy/untrack`` hot reloads
+  (:meth:`TrackedArtifactPolicy.reloaded`) never drop a strict or user-added
+  pattern while strict patterns are live, and ``/policy/untrack`` refuses an
+  entry that would cover a strict path (:meth:`TrackedArtifactPolicy.strict_patterns_covering`).
+  The one way to stop enforcing a strict path is to restart the coordinator
+  without its strict entry.
 """
 
 from __future__ import annotations
@@ -28,8 +37,9 @@ import fnmatch
 import logging
 import re
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Iterator, NamedTuple, Sequence
 
 import yaml
 
@@ -65,31 +75,33 @@ the 1000-path benchmark in Unit 8 verifies 0 false positives across Node,
 Rust, Django, and other-ecosystem path samples."""
 
 
-def _compile_glob_pattern(pattern: str) -> re.Pattern[str] | None:
+UNTRACK_STRICT_PATH_REASON: str = "untrack_strict_path"
+"""Typed reason ``POST /policy/untrack`` answers (HTTP 409, nothing written)
+when an entry would untrack a path the live policy puts in strict mode (#261).
+The body names, per refused entry, the strict patterns it covers. A client
+classifies the refusal by equality on this value, never by the ``error`` text.
+Untracking a strict path takes a coordinator restart without the strict entry:
+a hot reload never narrows strict enforcement."""
+
+
+def _compile_glob_pattern(pattern: str) -> Callable[[str], bool] | None:
     """PERF-2 / finding #16: pre-compile a ``**``-containing glob pattern into
-    a re.Pattern at construction time. Returns None for patterns without ``**``
+    a matcher at construction time. Returns None for patterns without ``**``
     (those use fnmatch at match-time with no string-build overhead)."""
     if "**" not in pattern:
         return None
-    parts: list[str] = []
-    i = 0
-    while i < len(pattern):
-        c = pattern[i]
-        if c == "*":
-            if i + 1 < len(pattern) and pattern[i + 1] == "*":
-                parts.append(".*")
-                i += 2
-                if i < len(pattern) and pattern[i] == "/":
-                    i += 1
-            else:
-                parts.append("[^/]*")
-                i += 1
-        elif c == "?":
-            parts.append("[^/]")
-            i += 1
-        else:
-            parts.append(re.escape(c))
-            i += 1
+    # One parser for the ``**`` grammar: the matcher is built from the same
+    # tokens the strict-coverage overlap search reads (#261).
+    tokens = _glob_tokens(pattern)
+    if sum(token[0] in _RUN_KINDS for token in tokens) > _REGEX_RUN_LIMIT:
+        return partial(_tokens_match, tokens)
+    regex = _glob_regex(tokens)
+    return lambda path: regex.match(path) is not None
+
+
+def _glob_regex(tokens: list[tuple]) -> re.Pattern[str]:
+    """The regex a ``**`` pattern's tokens spell."""
+    parts = [_TOKEN_REGEX.get(token[0]) or re.escape(token[1]) for token in tokens]
     return re.compile("^" + "".join(parts) + "$")
 
 
@@ -117,10 +129,20 @@ class TrackedArtifactPolicy:
     """Patterns rejected by the path-traversal guard, with reason. Surfaced
     by :meth:`rejected` for status/debug visibility."""
 
-    # PERF-2 / finding #16: pre-compiled regex cache for ``**`` patterns.
+    # PERF-2 / finding #16: pre-compiled matcher cache for ``**`` patterns.
     # Built in __post_init__ so the cost is paid exactly once at load time.
-    _compiled_patterns: dict[str, re.Pattern[str]] = field(
+    _compiled_patterns: dict[str, Callable[[str], bool]] = field(
         default_factory=dict, repr=False, compare=False
+    )
+    # What the strict-coverage check (strict_patterns_covering) reads from the
+    # strict and tracked patterns, built once in __post_init__: an untrack
+    # request or the spawn diagnostic decides every entry against the same
+    # patterns, and re-reading them per entry cost more than the search.
+    _coverage_strict: tuple["_Glob", ...] = field(
+        default=(), init=False, repr=False, compare=False
+    )
+    _coverage_tracked: tuple["_Glob", ...] = field(
+        default=(), init=False, repr=False, compare=False
     )
     # KTD-O one-shot threshold-warning guard. Reset on every reload() so a
     # post-track policy swap can re-emit the warning if the operator widened
@@ -130,7 +152,8 @@ class TrackedArtifactPolicy:
     )
 
     def __post_init__(self) -> None:
-        """Pre-compile all ``**``-containing patterns across all pattern sets."""
+        """Pre-compile all ``**``-containing patterns across all pattern sets,
+        and index the strict and tracked patterns for the coverage check."""
         for patterns in (
             self.tracked_patterns,
             self.ignored_patterns,
@@ -142,6 +165,16 @@ class TrackedArtifactPolicy:
                     compiled = _compile_glob_pattern(p)
                     if compiled is not None:
                         self._compiled_patterns[p] = compiled
+        # A literal strict path no tracked pattern reaches puts nothing in
+        # strict mode (an intersection), so no entry can cover it.
+        self._coverage_strict = tuple(
+            _Glob.of(s)
+            for s in self.strict_mode_paths
+            if not _is_literal_glob(s) or self._matches_tracked(s)
+        )
+        self._coverage_tracked = tuple(
+            _Glob.of(t) for t in _union(self.user_added_patterns, self.tracked_patterns)
+        )
 
     @classmethod
     def load(cls, coordinator_root: Path | str) -> "TrackedArtifactPolicy":
@@ -149,6 +182,22 @@ class TrackedArtifactPolicy:
         ``.coherence/ignored.yaml`` opt-out + ``.coherence/strict_mode.yaml``
         v0.2 opt-in (KTD-O). All YAML files are optional. Patterns failing
         the path-traversal guard are rejected with WARNING."""
+        policy = cls._read(coordinator_root)
+        overridden = policy.ignored_patterns_overridden_by_strict()
+        if overridden:
+            logger.warning(
+                "ignored pattern(s) %s cover paths in strict mode; strict wins, so "
+                "those paths stay tracked and enforced (#261). To stop enforcing a "
+                "strict path, remove its entry from .coherence/strict_mode.yaml and "
+                "restart the coordinator.",
+                ", ".join(overridden),
+            )
+        return policy
+
+    @classmethod
+    def _read(cls, coordinator_root: Path | str) -> "TrackedArtifactPolicy":
+        """Read the policy files without :meth:`load`'s strict-override
+        diagnostic, which hot reloads (:meth:`reloaded`) skip."""
         root = Path(coordinator_root).resolve()
         rejected: list[tuple[str, str]] = []
 
@@ -164,38 +213,52 @@ class TrackedArtifactPolicy:
             rejected_patterns=tuple(rejected),
         )
 
+    def _matches_tracked(self, normalized: str) -> bool:
+        # PERF-2 / finding #16: pass pre-compiled cache so _glob_match skips
+        # the string-build loop for ``**`` patterns.
+        cache = self._compiled_patterns
+        return (
+            matches_any(normalized, self.tracked_patterns, cache)
+            or matches_any(normalized, self.user_added_patterns, cache)
+        )
+
+    def _matches_strict(self, normalized: str) -> bool:
+        return bool(self.strict_mode_paths) and matches_any(
+            normalized, self.strict_mode_paths, self._compiled_patterns
+        )
+
     def is_tracked(self, parent_relative_path: str) -> bool:
         """Return True if the given parent-repo-relative path is coordinated.
 
         Algorithm: path is tracked if it matches any default OR user-added
-        pattern, AND does not match any ignored pattern. Ignore wins ties.
+        pattern, AND does not match any ignored pattern — unless it also
+        matches a strict pattern: strict wins over ignore (#261). An ignore
+        pattern, however broad (``**``), and however it arrived (a leftover
+        ``ignored.yaml`` at spawn or ``/policy/untrack`` at runtime), never
+        silently drops a strict path onto the untracked fast path, where a read
+        reports version 0 and a CAS commit is accepted at any expected version.
+        For every path no strict pattern matches, ignore wins ties as before.
         """
         normalized = _normalize_relative(parent_relative_path)
         if normalized is None:
             # Absolute path or .. traversal — never tracked.
             return False
-
-        # PERF-2 / finding #16: pass pre-compiled cache so _glob_match skips
-        # the string-build loop for ``**`` patterns.
-        cache = self._compiled_patterns
-        tracked = (
-            matches_any(normalized, self.tracked_patterns, cache)
-            or matches_any(normalized, self.user_added_patterns, cache)
-        )
-        if not tracked:
+        if not self._matches_tracked(normalized):
             return False
-        if matches_any(normalized, self.ignored_patterns, cache):
-            return False
-        return True
+        if not matches_any(normalized, self.ignored_patterns, self._compiled_patterns):
+            return True
+        return self._matches_strict(normalized)
 
     def is_strict_mode(self, parent_relative_path: str) -> bool:
         """v0.2 KTD-O: return True iff the path is in strict mode.
 
         Strict-mode contract: a path is in strict mode iff it is in the
-        tracked set AND matches at least one strict_mode_paths glob.
-        Intersection semantics — never applies to untracked paths even when
-        a strict_mode pattern would match them. Empty strict_mode_paths
-        short-circuits to False (back-compat with v0.1.1).
+        tracked set (a default or user-added pattern) AND matches at least one
+        strict_mode_paths glob. Intersection semantics — never applies to a
+        path no tracked pattern matches, even when a strict_mode pattern would
+        match it. An ignored pattern does not take a path out of strict mode
+        (see :meth:`is_tracked`). Empty strict_mode_paths short-circuits to
+        False (back-compat with v0.1.1).
 
         Hooks gate strict-mode behavior (``permissionDecision: "deny"``) on
         this method only; the v0.1.1 warn-mode allow path is preserved for
@@ -203,13 +266,144 @@ class TrackedArtifactPolicy:
         if not self.strict_mode_paths:
             # Fast path — no strict-mode opt-in; v0.1.1 behavior preserved.
             return False
-        if not self.is_tracked(parent_relative_path):
-            # Intersection: strict mode never applies to untracked paths.
-            return False
         normalized = _normalize_relative(parent_relative_path)
         if normalized is None:
             return False
-        return matches_any(normalized, self.strict_mode_paths, self._compiled_patterns)
+        return self._matches_tracked(normalized) and self._matches_strict(normalized)
+
+    def strict_patterns_covering(self, pattern: str) -> tuple[str, ...]:
+        """The strict patterns under which ``pattern`` — a path or a glob, as
+        ``/policy/untrack`` receives it — matches at least one path this policy
+        puts in strict mode: some path matches ``pattern``, a strict pattern,
+        and a tracked (default or user-added) pattern at once.
+
+        Decided on the glob languages themselves, so an entry spelled
+        differently from the strict pattern is still caught: ``data/**`` and
+        ``**`` both cover a strict ``data/*.json``; ``notes/**`` covers nothing
+        when no tracked pattern reaches ``notes/``. A literal strict path (no
+        ``*``, ``?`` or ``[``) is decided exactly by matching it, in time linear
+        in the path. A strict glob is decided by a product search
+        (:func:`_globs_intersect`) on its own budget of
+        :data:`GLOB_INTERSECT_PATTERN_BUDGET` steps, drawn from one
+        :data:`GLOB_INTERSECT_CALL_BUDGET` for the entry. Every approximation
+        errs toward "covers" (a refusal, never a silent untrack): a character
+        class too wide to enumerate cheaply counts as any one character, a
+        strict glob whose own budget runs out counts as covered, and once the
+        entry's budget runs out so does every strict pattern not yet decided
+        and not ruled out by literal prefixes and suffixes. Empty when no
+        strict path is covered, which is always the case with no strict
+        patterns."""
+        return self.strict_patterns_covering_each((pattern,))[0]
+
+    def strict_patterns_covering_each(
+        self, patterns: Sequence[str]
+    ) -> tuple[tuple[str, ...], ...]:
+        """:meth:`strict_patterns_covering` for each of ``patterns``, in order:
+        one ``/policy/untrack`` request, decided under one
+        :data:`GLOB_INTERSECT_REQUEST_BUDGET` so its cost is bounded however
+        many entries it carries. Each entry still has its own
+        :data:`GLOB_INTERSECT_CALL_BUDGET`. Once the request's budget runs
+        out, every later entry counts as covering each strict pattern its
+        literal ends do not rule out, so a request of costly entries is
+        refused rather than held past the client's timeout."""
+        request_budget = _SearchBudget(GLOB_INTERSECT_REQUEST_BUDGET)
+        return tuple(
+            tuple(
+                self._iter_strict_patterns_covering(
+                    p, _SearchBudget(GLOB_INTERSECT_CALL_BUDGET, parent=request_budget)
+                )
+            )
+            for p in patterns
+        )
+
+    def _iter_strict_patterns_covering(
+        self, pattern: str, call_budget: "_SearchBudget"
+    ) -> Iterator[str]:
+        if not self._coverage_strict:
+            return
+        # Paths are matched with a leading "./" stripped (_normalize_relative),
+        # so an entry spelled that way names the same paths.
+        entry = _Glob.of(_normalize_relative(pattern) or pattern)
+        for strict in self._coverage_strict:
+            # A path both match carries both literal prefixes and suffixes;
+            # if they do not nest, the strict pattern is exactly not covered,
+            # at no cost.
+            if not _affixes_nest([entry.affixes, strict.affixes]):
+                continue
+            try:
+                if _is_literal_glob(strict.pattern):
+                    # Its language is the one path (tracked: the index keeps
+                    # no other), so matching it decides it exactly.
+                    covered = _matches_charged(entry, strict.pattern, call_budget)
+                else:
+                    covered = self._strict_glob_covered(entry, strict, call_budget)
+            except _BudgetExhausted:
+                covered = True
+            if covered:
+                yield strict.pattern
+
+    def _strict_glob_covered(
+        self, entry: "_Glob", strict: "_Glob", call_budget: "_SearchBudget"
+    ) -> bool:
+        # Only a tracked pattern whose literal ends nest with the entry's and
+        # the strict glob's can share a path with both; with none, the strict
+        # glob is exactly not covered, at no search cost.
+        tracked = [
+            t
+            for t in self._coverage_tracked
+            if _affixes_nest([entry.affixes, strict.affixes, t.affixes])
+        ]
+        if not tracked:
+            return False
+        # A budget per strict glob, so one costly pattern (or many cheap ones)
+        # never decides the others: a shared budget marked every pattern after
+        # the point it ran out as covering.
+        budget = _SearchBudget(GLOB_INTERSECT_PATTERN_BUDGET, parent=call_budget)
+        return _globs_intersect((entry.tokens, strict.tokens), budget) and any(
+            _globs_intersect((entry.tokens, strict.tokens, t.tokens), budget)
+            for t in tracked
+        )
+
+    def ignored_patterns_overridden_by_strict(self) -> tuple[str, ...]:
+        """Ignored patterns that cover a strict path, which strict therefore
+        overrides (:meth:`is_tracked`). Logged once at :meth:`load` (spawn),
+        not on hot reloads, so an operator learns that the ignore entry does
+        not untrack those paths. Every entry is decided under one
+        :data:`GLOB_INTERSECT_DIAGNOSTIC_BUDGET`, so a large or pathological
+        ``ignored.yaml`` cannot hold up the spawn, and an entry stops at the
+        first strict pattern it covers. Once the budget runs out, the
+        remaining entries that a strict pattern might cover are reported as
+        overridden, erring toward the warning."""
+        total = _SearchBudget(GLOB_INTERSECT_DIAGNOSTIC_BUDGET)
+        return tuple(
+            p
+            for p in self.ignored_patterns
+            if next(self._iter_strict_patterns_covering(p, total), None) is not None
+        )
+
+    def reloaded(self) -> "TrackedArtifactPolicy":
+        """Re-read the policy files for a hot reload (``/policy/track``,
+        ``/policy/untrack``) without narrowing strict enforcement (#261).
+
+        Ignored patterns are taken from disk as they are; they cannot untrack
+        a strict path anyway. While this policy has strict patterns, every
+        strict and user-added pattern it carries is kept even if the file on
+        disk no longer lists it — strict mode needs both — so a hand-edited
+        ``strict_mode.yaml`` or ``tracked.yaml`` followed by any track or
+        untrack cannot end enforcement mid-run. Additions on disk still take
+        effect. Without strict patterns a reload reads the files verbatim, as
+        before."""
+        fresh = TrackedArtifactPolicy._read(self.coordinator_root)
+        if not self.strict_mode_paths:
+            return fresh
+        return TrackedArtifactPolicy(
+            coordinator_root=fresh.coordinator_root,
+            tracked_patterns=fresh.tracked_patterns,
+            ignored_patterns=fresh.ignored_patterns,
+            user_added_patterns=_union(self.user_added_patterns, fresh.user_added_patterns),
+            strict_mode_paths=_union(self.strict_mode_paths, fresh.strict_mode_paths),
+            rejected_patterns=fresh.rejected_patterns,
+        )
 
     def count_strict_mode_matches(self, candidate_paths: Iterable[str]) -> int:
         """Count how many of ``candidate_paths`` are in strict mode.
@@ -284,6 +478,321 @@ class TrackedArtifactPolicy:
 # ----------------------------------------------------------------------
 
 
+def _union(first: tuple[str, ...], second: tuple[str, ...]) -> tuple[str, ...]:
+    """Order-preserving union: ``first``, then what ``second`` adds."""
+    return tuple(dict.fromkeys((*first, *second)))
+
+
+# Glob tokens. For a ``**`` pattern they are the matcher's own grammar:
+# _compile_glob_pattern builds its regex from them (``**`` -> any run, a
+# following ``/`` swallowed; ``*`` -> a run without ``/``; ``?`` -> one char
+# but ``/``; every other char, ``[`` included, literal). Any other pattern goes
+# to fnmatch.fnmatchcase, which the tokens mirror for the overlap search
+# (``*`` -> any run, ``/`` included; ``?`` -> any one char; ``[...]`` a class);
+# a differential test against matches_any pins that mirror.
+_ANY_RUN = "any_run"
+_SEG_RUN = "seg_run"
+_ANY_ONE = "any_one"
+_SEG_ONE = "seg_one"
+_LIT = "lit"
+_CLASS = "class"
+_TOKEN_REGEX = {_ANY_RUN: ".*", _SEG_RUN: "[^/]*", _SEG_ONE: "[^/]"}
+_RUN_KINDS = (_ANY_RUN, _SEG_RUN)
+_REGEX_RUN_LIMIT = 2
+"""Runs (``*`` or ``**``) a ``**`` pattern may hold and still be matched by
+its regex. The regex backtracks into every run, so a failing match costs up
+to the path's length to the power of its runs: two runs take about a
+millisecond on a 1,024-character path, three took 330 ms, and an accepted
+``'**' * 12 + 'Z'`` in ignored.yaml held every hook for seconds. A pattern
+over the limit is matched by :func:`_tokens_match`, linear in the path."""
+_CLASS_MEMBER_LIMIT = 64
+"""Characters a class may enumerate before it is approximated as any one
+character. Every member joins the search alphabet, and every explored state
+walks the whole alphabet, so an unbounded class made one untrack entry cost
+minutes."""
+
+
+def _glob_tokens(pattern: str) -> list[tuple]:
+    tokens: list[tuple] = []
+    i = 0
+    if "**" in pattern:
+        while i < len(pattern):
+            c = pattern[i]
+            if c == "*" and i + 1 < len(pattern) and pattern[i + 1] == "*":
+                tokens.append((_ANY_RUN,))
+                i += 2
+                if i < len(pattern) and pattern[i] == "/":
+                    i += 1
+            elif c == "*":
+                tokens.append((_SEG_RUN,))
+                i += 1
+            elif c == "?":
+                tokens.append((_SEG_ONE,))
+                i += 1
+            else:
+                tokens.append((_LIT, c))
+                i += 1
+        return tokens
+    while i < len(pattern):
+        c = pattern[i]
+        i += 1
+        if c == "*":
+            tokens.append((_ANY_RUN,))
+        elif c == "?":
+            tokens.append((_ANY_ONE,))
+        elif c == "[":
+            # fnmatch.translate: '!' negates, a leading ']' is literal, and an
+            # unterminated '[' is a literal '['.
+            j = i
+            if j < len(pattern) and pattern[j] == "!":
+                j += 1
+            if j < len(pattern) and pattern[j] == "]":
+                j += 1
+            # find, not a character loop: an entry of many unterminated '['
+            # rescans the rest of the pattern once per '['.
+            j = pattern.find("]", j)
+            if j < 0:
+                tokens.append((_LIT, "["))
+                continue
+            body = pattern[i:j]
+            i = j + 1
+            negated = body.startswith("!")
+            if negated:
+                body = body[1:]
+            members: set[str] = set()
+            too_wide = False
+            k = 0
+            while k < len(body) and not too_wide:
+                if k + 2 < len(body) and body[k + 1] == "-":
+                    lo, hi = body[k], body[k + 2]
+                    if ord(hi) - ord(lo) < _CLASS_MEMBER_LIMIT:
+                        members.update(chr(o) for o in range(ord(lo), ord(hi) + 1))
+                    else:
+                        too_wide = True
+                    k += 3
+                else:
+                    members.add(body[k])
+                    k += 1
+                too_wide = too_wide or len(members) > _CLASS_MEMBER_LIMIT
+            if too_wide:
+                # Any one character accepts more than the class does, never
+                # less, in either polarity (a negated class accepts '/' too):
+                # approximate toward "intersects".
+                tokens.append((_ANY_ONE,))
+            else:
+                tokens.append((_CLASS, negated, frozenset(members)))
+        else:
+            tokens.append((_LIT, c))
+    return tokens
+
+
+def _token_accepts(token: tuple, ch: str | None) -> bool:
+    """Whether ``token`` consumes ``ch``; ``None`` stands for every character
+    no pattern names (not ``/``)."""
+    kind = token[0]
+    if kind in (_ANY_RUN, _ANY_ONE):
+        return True
+    if kind in (_SEG_RUN, _SEG_ONE):
+        return ch != "/"
+    if kind == _LIT:
+        return ch == token[1]
+    negated, members = token[1], token[2]
+    return (ch not in members) if negated else (ch in members)
+
+
+def _closure(states: frozenset[int], tokens: list[tuple]) -> frozenset[int]:
+    out = set(states)
+    stack = list(states)
+    while stack:
+        i = stack.pop()
+        if i < len(tokens) and tokens[i][0] in _RUN_KINDS and i + 1 not in out:
+            out.add(i + 1)
+            stack.append(i + 1)
+    return frozenset(out)
+
+
+def _advance(states: frozenset[int], tokens: list[tuple], ch: str | None) -> frozenset[int]:
+    nxt: set[int] = set()
+    for i in states:
+        if i >= len(tokens) or not _token_accepts(tokens[i], ch):
+            continue
+        nxt.add(i if tokens[i][0] in _RUN_KINDS else i + 1)
+    return _closure(frozenset(nxt), tokens)
+
+
+def _tokens_match(
+    tokens: list[tuple], path: str, budget: "_SearchBudget | None" = None
+) -> bool:
+    """Whether ``path`` matches the ``**`` pattern ``tokens`` exactly as its
+    regex (:func:`_glob_regex`) does, in time linear in the path: the token
+    automaton stepped one character at a time, never backtracking. The
+    regex's own rules carry over: ``.*`` stops at a newline, and ``$`` also
+    matches before a final one. Each character is charged to ``budget``,
+    when one is given, at the size of the state it leaves."""
+    end = len(tokens)
+    states = _closure(frozenset({0}), tokens)
+    for i, ch in enumerate(path):
+        if budget is not None:
+            budget.spend(1 + len(states))
+        if ch == "\n":
+            if i == len(path) - 1 and end in states:
+                return True
+            states = frozenset(j for j in states if j == end or tokens[j][0] != _ANY_RUN)
+        states = _advance(states, tokens, ch)
+        if not states:
+            return False
+    return end in states
+
+
+GLOB_INTERSECT_PATTERN_BUDGET: int = 200_000
+"""Search steps one strict glob may take in
+:meth:`TrackedArtifactPolicy.strict_patterns_covering` before it counts as
+covered. A step is one automaton state carried across one character (just
+under a microsecond), so the cost is bounded whatever the patterns' alphabet.
+The costliest ordinary decision measured takes about 65,000 steps (the
+three-segment ``**/archive/*/*/*.md`` against a strict ``**/plans/*/*/*.md``);
+a star-heavy entry runs out and is refused."""
+
+GLOB_INTERSECT_CALL_BUDGET: int = 2_000_000
+"""Search steps one untrack entry may take across all strict patterns. An
+ordinary entry against 45 multi-segment strict globs (``**/old/*/*.json``
+against ``**/svc<i>/*/*.json``) takes about 550,000."""
+
+GLOB_INTERSECT_REQUEST_BUDGET: int = 4_000_000
+"""Search steps one ``/policy/untrack`` request may take across all its
+entries (:meth:`TrackedArtifactPolicy.strict_patterns_covering_each`): about
+3.5 s, inside the CLI's 6 s timeout, so a request of costly entries is
+refused with the typed reason rather than reported as an unavailable
+coordinator."""
+
+GLOB_INTERSECT_DIAGNOSTIC_BUDGET: int = 2_000_000
+"""Search steps the spawn-time override diagnostic
+(:meth:`TrackedArtifactPolicy.ignored_patterns_overridden_by_strict`) may take
+across every ignored entry: it runs before the coordinator binds its port."""
+
+
+class _BudgetExhausted(Exception):
+    """A bounded glob search ran out of steps."""
+
+
+class _SearchBudget:
+    """Search steps left, drawn from ``parent`` too when one is given."""
+
+    __slots__ = ("remaining", "parent")
+
+    def __init__(self, steps: int, parent: "_SearchBudget | None" = None) -> None:
+        self.remaining = steps
+        self.parent = parent
+
+    def spend(self, steps: int) -> None:
+        self.remaining -= steps
+        if self.remaining < 0:
+            raise _BudgetExhausted
+        if self.parent is not None:
+            self.parent.spend(steps)
+
+
+class _Glob(NamedTuple):
+    """A pattern with what the strict-coverage check reads from it."""
+
+    pattern: str
+    tokens: list[tuple]
+    affixes: tuple[str, str]
+
+    @classmethod
+    def of(cls, pattern: str) -> "_Glob":
+        tokens = _glob_tokens(pattern)
+        return cls(pattern, tokens, _literal_affixes(tokens))
+
+
+def _is_literal_glob(pattern: str) -> bool:
+    """True when ``pattern`` matches exactly one path, itself."""
+    return not any(c in pattern for c in "*?[")
+
+
+def _literal_run(tokens: Iterable[tuple]) -> str:
+    run: list[str] = []
+    for token in tokens:
+        if token[0] != _LIT:
+            break
+        run.append(token[1])
+    return "".join(run)
+
+
+def _literal_affixes(tokens: list[tuple]) -> tuple[str, str]:
+    """The literal prefix and suffix every path matching ``tokens`` carries."""
+    return _literal_run(tokens), _literal_run(reversed(tokens))[::-1]
+
+
+def _affixes_nest(affixes: list[tuple[str, str]]) -> bool:
+    """False when no path can carry every literal prefix and suffix: the
+    prefixes must each start the longest one, the suffixes each end theirs.
+    Exact as a necessary condition, so it rules a search out, never in."""
+    longest_prefix = max((a[0] for a in affixes), key=len)
+    longest_suffix = max((a[1] for a in affixes), key=len)
+    return all(longest_prefix.startswith(a[0]) for a in affixes) and all(
+        longest_suffix.endswith(a[1]) for a in affixes
+    )
+
+
+def _matches_charged(entry: _Glob, path: str, budget: _SearchBudget) -> bool:
+    """Whether ``path`` matches ``entry`` (:func:`matches_any`), charged to
+    ``budget``."""
+    if "**" in entry.pattern:
+        return _tokens_match(entry.tokens, path, budget)
+    # fnmatch's regex holds each run in an atomic group, so it never
+    # backtracks into an earlier run.
+    budget.spend(1 + len(path))
+    return fnmatch.fnmatchcase(path, entry.pattern)
+
+
+def _globs_intersect(token_lists: Sequence[list[tuple]], budget: _SearchBudget) -> bool:
+    """True when some non-empty path matches every pattern ``token_lists``
+    spells (:func:`_glob_tokens`) under this module's matching rules
+    (:func:`matches_any`).
+
+    A product of the patterns' automata searched over an alphabet of every
+    character the patterns name, ``/``, and one stand-in for every other
+    character. Exact for ``*``, ``**`` and ``?``; a class wider than
+    :data:`_CLASS_MEMBER_LIMIT` characters is approximated so it accepts more,
+    never less. Each transition is charged to ``budget`` at the size of the
+    state it leaves; running out raises :class:`_BudgetExhausted`, which every
+    caller counts as "intersects"."""
+    # Most pairs an untrack check meets (``.log`` against ``.json``, ``svc3/``
+    # against ``svc7/``) fail on their literal ends: settled without a search.
+    if not _affixes_nest([_literal_affixes(t) for t in token_lists]):
+        return False
+    alphabet: set[str] = {"/"}
+    for tokens in token_lists:
+        for token in tokens:
+            if token[0] == _LIT:
+                alphabet.add(token[1])
+            elif token[0] == _CLASS:
+                alphabet.update(token[2])
+    # Sorted: a set's order is hash-randomized per process, and the order
+    # decides which states a bounded search reaches first, so the same entry
+    # could be refused on one coordinator run and accepted on the next. None
+    # stands for every character no pattern names.
+    ordered: list[str | None] = [*sorted(alphabet), None]
+    start = tuple(_closure(frozenset({0}), t) for t in token_lists)
+    seen = {start}
+    frontier = [start]
+    while frontier:
+        state = frontier.pop()
+        step = 1 + sum(len(s) for s in state)
+        for ch in ordered:
+            budget.spend(step)
+            nxt = tuple(_advance(s, t, ch) for s, t in zip(state, token_lists))
+            if not all(nxt):
+                continue
+            if all(len(t) in s for s, t in zip(nxt, token_lists)):
+                return True
+            if nxt not in seen:
+                seen.add(nxt)
+                frontier.append(nxt)
+    return False
+
+
 def _normalize_relative(p: str) -> str | None:
     """Return the path with leading ``./`` stripped, or None if the path
     is absolute or contains ``..`` components (defense-in-depth even
@@ -309,14 +818,14 @@ def _normalize_relative(p: str) -> str | None:
 def matches_any(
     path: str,
     patterns: Iterable[str],
-    compiled: dict[str, re.Pattern[str]] | None = None,
+    compiled: dict[str, Callable[[str], bool]] | None = None,
 ) -> bool:
     """Glob-match path against a list of patterns. Uses ``fnmatch`` for
     ``*``/``?`` semantics; ``**`` is treated as zero-or-more path segments.
 
     PERF-2 / finding #16: ``compiled`` is an optional pre-compiled pattern
     cache (keyed by pattern string). When provided, ``**`` patterns skip the
-    string-build loop and use the cached re.Pattern directly."""
+    string-build loop and use the cached matcher directly."""
     posix_path = path.replace("\\", "/")
     for pattern in patterns:
         if _glob_match(posix_path, pattern, compiled):
@@ -327,42 +836,22 @@ def matches_any(
 def _glob_match(
     path: str,
     pattern: str,
-    compiled: dict[str, re.Pattern[str]] | None = None,
+    compiled: dict[str, Callable[[str], bool]] | None = None,
 ) -> bool:
     """Match a posix-style path against a glob pattern supporting ``**``.
 
     PERF-2 / finding #16: when ``compiled`` is provided, ``**`` patterns use
-    the pre-compiled re.Pattern directly, skipping the string-build loop."""
+    the pre-compiled matcher directly, skipping the string-build loop."""
     # fnmatch handles ``*`` (any chars in segment) and ``?`` (single char).
     # For ``**`` (any number of path segments), convert to a regex-equivalent.
     if "**" not in pattern:
         return fnmatch.fnmatchcase(path, pattern)
     # Fast path: use the pre-compiled pattern if available.
     if compiled is not None and pattern in compiled:
-        return compiled[pattern].match(path) is not None
+        return compiled[pattern](path)
     # Slow path (called without a cache, e.g. from tests): build on the fly.
-    parts: list[str] = []
-    i = 0
-    while i < len(pattern):
-        c = pattern[i]
-        if c == "*":
-            if i + 1 < len(pattern) and pattern[i + 1] == "*":
-                parts.append(".*")
-                i += 2
-                # Skip trailing slash after `**/`
-                if i < len(pattern) and pattern[i] == "/":
-                    i += 1
-            else:
-                parts.append("[^/]*")
-                i += 1
-        elif c == "?":
-            parts.append("[^/]")
-            i += 1
-        else:
-            parts.append(re.escape(c))
-            i += 1
-    regex_str = "^" + "".join(parts) + "$"
-    return re.match(regex_str, path) is not None
+    matcher = _compile_glob_pattern(pattern)
+    return matcher is not None and matcher(path)
 
 
 def _load_yaml_patterns(

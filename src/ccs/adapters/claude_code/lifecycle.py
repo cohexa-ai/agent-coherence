@@ -889,8 +889,10 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
             if evicted:
                 logger.info("sweep evicted %d stale preemption notice(s)", evicted)
             # #185: drop transfer records no longer live and older than
-            # the knob; the age runs from the later of the record's and its
-            # artifact's last update, so a version-move ending stays readable.
+            # the knob. On sqlite the age runs from the later of the record's
+            # and its artifact's last update, so a version-move ending stays
+            # readable; the in-memory registry keeps no artifact wall-clock
+            # stamp and ages from the record's own update alone.
             evicted_records = coordinator.registry.evict_transfer_records(
                 max_age_sec=cfg.transfer_record_evict_max_age_sec,
             )

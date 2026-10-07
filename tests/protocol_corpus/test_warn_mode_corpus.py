@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from tests.protocol_corpus.harness import (
+    ALL_BACKENDS,
     BACKEND_NODE,
     Fixture,
     load_fixtures,
@@ -94,17 +95,39 @@ def test_warn_mode_fixture_response_matches_expected(
     )
 
 
+#: The release baselines the #185 grant handoff is measured against, by
+#: fixture name: two pin the release answers, three check that the release
+#: frees the path, and one is the collision control those three rely on.
+#: Named rather than numbered, because a count floor stays green when one of
+#: them goes missing while other rows land.
+_RELEASE_BASELINES = frozenset({
+    "post-edit-failure-releases-exclusive-grant",
+    "session-stop-releases-two-held-paths",
+    "post-edit-failure-release-frees-the-path",
+    "session-stop-release-frees-the-held-paths",
+    "session-stop-release-frees-the-first-held-path",
+    "pre-edit-collision-between-sessions",
+})
+
+
 def test_collection_loaded_fixtures() -> None:
     """Self-test: the fixtures are present so parametrize doesn't silently
     no-op. Catches the failure mode where the fixtures directory is empty or
-    path-resolution is wrong, and — with the floor at the current count — a
-    row that goes missing, such as the release baselines (17, 18) the #185
-    grant handoff is measured against."""
+    path-resolution is wrong, and a release baseline that goes missing or
+    stops running on one of the backends."""
     fixtures = _all_warn_mode_fixtures()
-    assert len(fixtures) >= 18, (
-        f"Expected ≥18 warn-mode fixtures, found {len(fixtures)}. "
+    assert len(fixtures) >= 22, (
+        f"Expected ≥22 warn-mode fixtures, found {len(fixtures)}. "
         f"Add coverage in tests/protocol_corpus/fixtures/warn_mode/."
     )
+    by_name = {f.name: f for f in fixtures}
+    missing = _RELEASE_BASELINES - by_name.keys()
+    assert not missing, f"Release baseline rows missing: {sorted(missing)}"
+    narrowed = sorted(
+        name for name in _RELEASE_BASELINES
+        if set(by_name[name].backends) != set(ALL_BACKENDS)
+    )
+    assert not narrowed, f"Release baseline rows not run on both backends: {narrowed}"
 
 
 def test_normalizer_self_test_detects_real_divergence() -> None:

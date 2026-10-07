@@ -1,0 +1,27 @@
+{
+  "name": "policy-untrack-of-a-strict-path-is-refused",
+  "description": "#261: POST /policy/untrack refuses, with the typed reason untrack_strict_path and HTTP 409, an entry that covers a path the live policy holds in strict mode (here the strict glob itself, beside a valid non-strict entry), naming the strict pattern; the whole request writes nothing. Before, the untrack reloaded the policy and the strict path dropped to the untracked fast path, where a CAS commit is accepted at any expected_version (a silent lost update). The error text is prose for the CLI and is not pinned; clients classify by reason. Python only: the Node coordinator serves /policy/untrack but its policy evaluator lives in the plugin repository (not in this tree), so the Node row is a follow-up there rather than a fixture that would fail.",
+  "setup": {
+    "tracked": ["data/**"],
+    "strict_mode": ["data/**"]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/policy/untrack",
+    "body": {
+      "paths": ["data/**", "notes.md"]
+    }
+  },
+  "expected": {
+    "status": 409,
+    "body": {
+      "ok": false,
+      "error": "<IGNORED>",
+      "reason": "untrack_strict_path",
+      "refused": [{"path": "data/**", "strict_patterns": ["data/**"]}],
+      "rejected": []
+    }
+  },
+  "ignore_keys": ["error"],
+  "backends": ["python"]
+}

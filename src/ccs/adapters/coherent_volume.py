@@ -51,6 +51,7 @@ from typing import Literal, NamedTuple
 
 import yaml
 
+from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     connect_or_spawn,
@@ -257,8 +258,10 @@ _PUBLISH_UNCLASSIFIABLE_MESSAGE = (
 # holding a copy (KTD-1), which the refusal of the commit cannot undo; on a
 # path it does not track, the request takes its fast path and does neither.
 # Both answer a bare {"ok": true}, and nothing the volume holds says which
-# (its managed globs do not: an ignored.yaml untracks a managed path, and
-# /policy/untrack can change it at runtime), so the text states both cases.
+# (its managed globs do not: a coordinator that predates #261 lets an
+# ignored.yaml or a runtime /policy/untrack untrack a managed path; a current
+# one keeps a strict path tracked for its lifetime, but the volume cannot tell
+# which it attached to), so the text states both cases.
 # A degraded or lost answer leaves the grant and the peers unknown.
 _GRANT_REQUEST_ADMITTED = (
     "If the coordinator tracked the path when it admitted this write's grant "
@@ -363,8 +366,10 @@ class ManagedGlobEnforcement:
 
     ``enforced`` are the globs the coordinator carries in both its strict set
     and its tracked set. ``unenforced`` are the declared globs it does not carry
-    that way. (An ``ignored.yaml`` entry untracks paths for every volume alike,
-    and the coordinator answers that per path; it is not part of this check.)
+    that way. (On a coordinator that carries #261 an ignore entry never
+    untracks a strict path — strict wins — so an ignore covering a managed glob
+    under another spelling is harmless there; a literal ignore of the glob is
+    still reported as not enforced, which is conservative for an older one.)
     ``unavailable`` is set when the sets could not be read at all — an older
     coordinator whose summary publishes only counts, the Node coordinator, which
     does not serve the operator view, or a ``/status`` that failed — and then
@@ -451,8 +456,12 @@ class CoherentVolume:
     (:meth:`managed_glob_enforcement`) and fails closed — strict raises,
     degrade warns and runs detached — when any is not enforced (not tracked,
     not strict, or ignored), naming the globs, or when the sets cannot be read
-    at all. The check is a literal, attach-time comparison; a later untrack of
-    a managed path is not seen. Before this check existed a sibling whose globs differed from the
+    at all. The check runs once, at attach, and its answer holds for the
+    coordinator's lifetime: the coordinator refuses to untrack a strict path
+    (typed reason ``untrack_strict_path``), an ignore pattern never overrides a
+    strict one, and its hot reloads never drop a strict or tracked pattern
+    (#261); a strict path stops being enforced only when the coordinator
+    restarts without its strict entry. Before this check existed a sibling whose globs differed from the
     spawner's passed on the spawner's pattern *count*, and its stale writes
     landed with no signal (#190).
     """
@@ -679,8 +688,50 @@ class CoherentVolume:
 
         Stable for the volume's lifetime: :meth:`reacquire` and the optimistic
         retries shed stale coordinator state without changing it. A forked child
-        gets its own."""
+        gets its own. The coordinator keys its grant rows on :attr:`agent_id`,
+        not on this."""
         return self._session_id
+
+    @property
+    def incarnation(self) -> str:
+        """The current attempt's incarnation (32 lowercase hex characters): the
+        value every request this volume sends next carries in its subagent
+        field (``agent_id`` in the request body).
+
+        Read-only. A new one is minted for each new attempt: by every
+        :meth:`reacquire`; by :meth:`write_cas_at` and :meth:`atomic_publish`
+        before they read; by :meth:`write_cas` before a retry, and before its
+        first attempt when this volume's own :meth:`write` may still hold the
+        file; and in a forked child, which also gets a new :attr:`session_id`.
+        Nothing else changes it, so it is stable between those points, and a
+        value read after an operation returns names the attempt that operation
+        finished on. The one request that names an older incarnation is the
+        release of a write grant that incarnation abandoned."""
+        return self._incarnation
+
+    @property
+    def agent_id(self) -> str:
+        """The coordinator identity the next request is keyed on, in the form
+        the coordinator's ``/status`` reports as ``sessions[].agent_id``:
+        ``str(session_to_agent_id(session_id, incarnation))``.
+
+        The coordinator records grants, read views and a commit's writer
+        against this, not against :attr:`session_id`, so a caller that names
+        this volume to a third party (for example a registry joined against
+        ``/status``) names it by this value. Read-only and derived on each
+        access from :attr:`session_id` and :attr:`incarnation`: it changes
+        exactly when either does and is stable between re-mints. It is not the
+        caller principal, which is bound to the session and never exposed."""
+        return str(session_to_agent_id(self._session_id, self._incarnation))
+
+    @property
+    def root(self) -> Path:
+        """The volume's root, resolved (absolute, symlinks followed) once at
+        construction. Read-only and fixed for the volume's lifetime, a forked
+        child's included. Paths this volume accepts are relative to it, or
+        absolute and inside it; a local coordinator (any but a
+        ``remote_endpoint``) keeps its state in ``root / ".coherence"``."""
+        return self._root
 
     @property
     def is_attached(self) -> bool:
@@ -846,9 +897,10 @@ class CoherentVolume:
         #   * a sibling spawned it with OTHER globs, a foreign coordinator
         #     (e.g. a Claude Code session), or a policy that ignores our globs
         #     -> our globs are not enforced and an attach adds none -> fail
-        #     closed, naming them. The comparison is literal and the answer is
-        #     an attach-time snapshot: a covering ignore pattern or a later
-        #     /policy/untrack is not seen (managed_glob_enforcement says so).
+        #     closed, naming them. The comparison is literal and taken once;
+        #     the coordinator keeps the answer true for its lifetime (#261:
+        #     strict wins over ignore, /policy/untrack refuses a strict path,
+        #     a reload never drops a strict pattern).
         #   * the sets cannot be read (an older coordinator publishing counts
         #     only, the Node coordinator, a failed /status) -> cannot tell ->
         #     fail closed, saying so; never read as enforced.
@@ -1022,14 +1074,20 @@ class CoherentVolume:
         under another spelling, or ignores them under a covering pattern, is
         not matched, so the answer is as literal as the comparison.
 
-        The attach checks this answer once. ``/policy/track`` and
-        ``/policy/untrack`` reload the coordinator's policy while it runs, and
-        nothing re-runs the check: a path under a managed glob that is
-        untracked after attach answers every hook as untracked — a read reports
-        version 0 and a CAS commit is accepted at any expected version — with
-        no signal unless a caller asks this method again (a literal untrack is
-        reported then; :data:`_GRANT_REQUEST_ADMITTED` says why nothing the
-        volume holds can tell on its own).
+        The attach checks this answer once, and the coordinator keeps it true
+        while it runs (#261): ``/policy/untrack`` refuses, with the typed reason
+        ``untrack_strict_path`` and nothing written, an entry covering a path it
+        holds in strict mode; an ignored pattern never takes a strict path off
+        the tracked set, whether it was on disk at spawn or arrived later, and
+        however broadly it is spelled; and the hot reload behind
+        ``/policy/track`` and ``/policy/untrack`` never drops a strict or
+        tracked pattern. A strict path stops being enforced only when the
+        coordinator restarts without its strict entry, and a volume attaching
+        to that coordinator is checked again. (A coordinator that predates the
+        fix lets an untrack or a covering ignore put a managed path on the
+        untracked fast path — a read reports version 0 and a CAS commit is
+        accepted at any expected version — with no signal unless a caller asks
+        this method again.)
 
         The view is read for this check only. When it cannot be read, or carries
         no glob sets, the result is ``unavailable`` with the reason, and nothing
