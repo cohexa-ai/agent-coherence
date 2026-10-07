@@ -3664,6 +3664,12 @@ def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
             safe_paths.append(p)
         else:
             pre_rejected.append({"path": p, "reason": v_err})
+    # Read without a lock, like every reload here (COR-05). That is safe only
+    # because the strict set never shrinks while the coordinator runs
+    # (TrackedArtifactPolicy.reloaded): a reload racing this check can add a
+    # strict pattern, which strict-wins in is_tracked then enforces anyway,
+    # but never remove one. A change that lets a reload drop a strict pattern
+    # must make this check-then-append atomic with it.
     policy = coordinator.policy
     refused: list[dict] = []
     for p in safe_paths:
