@@ -11022,6 +11022,37 @@ def test_a_pending_re_grounding_rides_the_admit_that_carries_handoff_prose(
     assert coordinator.has_compact_pending(who.sid) is False
 
 
+@pytest.mark.parametrize("ending", ["successor commits", "successor declines", "giver withdraws"])
+def test_once_the_handoff_ends_the_successor_and_bystanders_are_told_nothing(
+    coordinator, client: _Client, ending: str
+) -> None:
+    """A record that is no longer live keeps its ``handoff`` key, but the
+    successor is no longer told it was handed the path and a bystander is no
+    longer told a handoff is in progress. Fails if either role's prose
+    ignores liveness: the model would then act on a handoff that is over."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    if ending == "successor commits":
+        _pre_edit_with(client, successor.sid, successor.principal, "plan.md")
+        status, body = client.post("/hooks/post-edit", {
+            "session_id": successor.sid, "path": "plan.md", "success": True,
+            "content_hash": _hash("plan-v2"),
+        }, principal=successor.principal)
+        assert status == 200 and body["ok"] is True, body
+    elif ending == "successor declines":
+        assert _verb(client, _DECLINE, successor, "plan.md") == (
+            200, {"ok": True, "status": "declined"})
+    else:
+        assert _verb(client, _WITHDRAW, giver, "plan.md") == (
+            200, {"ok": True, "status": "withdrawn"})
+
+    for who in (successor, bystander):
+        read = _read(client, who, "plan.md")
+        assert read["handoff"]["live"] is False, read
+        context = (read.get("hookSpecificOutput") or {}).get("additionalContext", "")
+        assert "Handoff" not in context, (who, context)
+
+
 def test_the_handoff_prose_templates_are_static() -> None:
     """The successor's and bystander's prose and the ended outcomes are
     under the deny's placeholder rule: short agent ids, the path, the version
