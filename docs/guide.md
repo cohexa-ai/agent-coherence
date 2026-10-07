@@ -1974,7 +1974,10 @@ and answer as before apart from the giver's shell write, which is denied.
   ```
 
   On its edit, when it has not read the path at the version at transfer or
-  later, it adds a warning. The edit is still admitted:
+  later, it adds a warning, and the edit is still admitted. On a strict-mode
+  path the strict-mode checks run first: a successor that is `INVALID` there,
+  or holds a standing read older than the current version, is denied, and the
+  deny carries none of this text. The warning:
 
   ```text
   ⚠ You have not read {path} at v{version_at_transfer} or later; read it before editing.
@@ -2017,9 +2020,11 @@ write grant ends with its turn:
   standing read that outlives the turn. The session can hand it on at any
   time.
 - **On a strict-mode path**, a session whose write grant was released is
-  denied its re-read by the strict-mode stale-view deny, and a denied read
-  grants nothing, so the session cannot pick up a standing read again. There,
-  hand the path on in the same turn as the edit.
+  denied its `Read` of the file by the strict-mode stale-view deny, and that
+  denied read grants nothing. A shell read of the file (`cat`, for example) is
+  denied too, but its deny re-grants a standing read without recording a read
+  of the current version, and a transfer hands that on as `SHARED`. Handing
+  the path on in the same turn as the edit avoids both.
 
 ### Handoff commands
 
@@ -2116,8 +2121,8 @@ agent-coherence-transfer: notes.md not transferred (handoff_not_held)
 agent-coherence-transfer: hint: a Claude Code session's write grant ends when its turn ends; if an earlier transfer of notes.md may have landed, check agent-coherence-status first, and otherwise have the giver session read notes.md, then transfer it again
 ```
 
-On a strict-mode path the re-read is denied, so the hint does not help there;
-see [Claude Code sessions](#claude-code-sessions).
+On a strict-mode path the hint's `Read` is denied and grants nothing; see
+[Claude Code sessions](#claude-code-sessions) for what a shell read does there.
 
 **Python coordinator only.** Against the Claude Code plugin's Node coordinator
 the commands exit `4`. A plugin workspace created fresh runs the Node
