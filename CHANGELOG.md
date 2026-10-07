@@ -134,8 +134,10 @@ Alpha — APIs may change before `v1.0`.
   path's live handoff. They return typed results, `HandoffTransferResult`
   (one `HandoffGrantResult` per path) and `HandoffVerbResult`, exported from
   `ccs.adapters`: a refusal is a value, and only an answer that does not settle
-  the outcome raises (`CommitUnconfirmed`), as does a failed request under
-  `on_error="strict"` or a volume with no coordinator. A transfer hands on
+  the outcome raises (`CommitUnconfirmed`, in both `on_error` modes, a lost
+  answer or an HTTP 5xx included), as does a request the coordinator refused
+  outright under `on_error="strict"` (`CoherenceError`) or a volume with no
+  coordinator. A transfer hands on
   the claim the volume actually holds on the path, its write grant or its
   standing read, even after a fresh attempt. While the handoff is live, the
   giver's `write()`, `write_cas()`, `write_cas_at()` and an

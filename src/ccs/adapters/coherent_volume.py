@@ -2507,15 +2507,18 @@ class CoherentVolume:
         Returns one :class:`HandoffGrantResult` per path, in order; a refused
         grant is a typed result, not a raise. Raises
         :class:`~ccs.core.exceptions.CommitUnconfirmed` when the answer does not
-        settle the outcome (a lost answer in degrade mode, the coordinator's
-        unconfirmed answer, or one this client cannot read): the transfer may
-        have landed, so look at the path's record (``/status``, or
-        :meth:`read_handoff` after an admitted read) before sending it again.
+        settle the outcome (no answer, such as a dropped connection, a timeout
+        or an HTTP 5xx, in either ``on_error`` mode; the coordinator's
+        unconfirmed answer; or one this client cannot read): the transfer may
+        have landed, so look at the path's record (:meth:`coordinator_status`,
+        or :meth:`read_handoff` after an admitted read) before sending it again.
         A re-send answers a live record's status and moves nothing, but once
         the successor has written the path a re-send from a volume that holds
         it again is a new handoff.
-        A transport failure under ``on_error="strict"`` raises
-        :class:`~ccs.core.exceptions.CoherenceError` as on every route.
+        A request the coordinator refused outright (HTTP 4xx) raises
+        :class:`~ccs.core.exceptions.CoherenceError` under ``on_error="strict"``;
+        under ``"degrade"`` it warns and raises ``CommitUnconfirmed``, since
+        degrade mode does not tell a refusal from a failure.
         """
         targets = [paths] if isinstance(paths, (str, os.PathLike)) else list(paths)
         with self._single_op_guard():
@@ -2531,6 +2534,7 @@ class CoherentVolume:
                         {"path": rel, "agent_id": self._claim_incarnation(rel)} for rel in rels
                     ],
                 },
+                outcome_unknown_on_failure=True,
             )
             result = self._transfer_result(resp, rels)
             for grant in result.grants:
@@ -2609,7 +2613,11 @@ class CoherentVolume:
             resp = self._require_answer(
                 verb,
                 [rel],
-                self._post(f"/handoff/{verb}", {"session_id": self._session_id, "path": rel}),
+                self._post(
+                    f"/handoff/{verb}",
+                    {"session_id": self._session_id, "path": rel},
+                    outcome_unknown_on_failure=True,
+                ),
             )
             ok, reason = resp.get("ok"), resp.get("reason")
             if ok is not True and not (
@@ -2626,14 +2634,18 @@ class CoherentVolume:
                 counterparty=_wire_str(resp, "counterparty"),
             )
 
-    def _require_answer(self, verb: str, rels: Sequence[str], resp: dict | None) -> dict:
+    def _require_answer(self, verb: str, rels: Sequence[str], resp: object) -> dict:
         """``resp``, once it is an answer that can settle ``verb``'s outcome;
         raise ``CommitUnconfirmed`` when it cannot: no answer (the request
-        failed), or the coordinator's own unconfirmed answer. Whether the
-        answer then names an outcome this client can classify is each verb's
-        own check."""
+        failed), a body that is not a JSON object, or the coordinator's own
+        unconfirmed answer. Whether the answer then names an outcome this
+        client can classify is each verb's own check."""
         if resp is None:
             raise CommitUnconfirmed(_handoff_unsettled(verb, rels, "the request failed"))
+        if not isinstance(resp, dict):
+            raise CommitUnconfirmed(
+                _handoff_unsettled(verb, rels, "no outcome this client can classify")
+            )
         if resp.get("degraded"):
             raise CommitUnconfirmed(_handoff_unsettled(verb, rels, self._relayed_reason(resp)))
         return resp
@@ -2896,10 +2908,18 @@ class CoherentVolume:
         tmp = self._stage_tmp(abs_path, data)
         self._replace_tmp(tmp, abs_path)
 
-    def _post(self, endpoint_path: str, payload: dict) -> dict | None:
+    def _post(
+        self, endpoint_path: str, payload: dict, *, outcome_unknown_on_failure: bool = False
+    ) -> dict | None:
         """POST to the coordinator. Transport errors and non-2xx HTTP responses
         route through ``on_error`` (strict raises, degrade warns + returns
         ``None``). Otherwise returns the parsed 200 body.
+
+        With ``outcome_unknown_on_failure`` (the handoff verbs), a request
+        whose outcome is unknown -- no answer, or an HTTP 5xx -- returns
+        ``None`` in BOTH modes, so the caller raises ``CommitUnconfirmed``
+        rather than a generic error that reads as "nothing happened"; degrade
+        mode still warns and counts it. A 4xx still follows ``on_error``.
 
         Every request names the current incarnation in the subagent field
         (``agent_id``), which the coordinator folds into the grant-row key; a
@@ -2921,14 +2941,16 @@ class CoherentVolume:
         ``CommitUnconfirmed``, bytes written to disk unrecorded)."""
         payload = {"agent_id": self._incarnation, **payload}
         self._settle_unconfirmed_claim()
-        sent = self._send(endpoint_path, payload)
+        sent = self._send(endpoint_path, payload, outcome_unknown_on_failure=outcome_unknown_on_failure)
         if sent.principal_refusal is None:
             return sent.body
         reason = sent.principal_refusal
         recovery = self._recover_principal()
         detail = recovery.detail
         if recovery.action == "retry":
-            sent = self._send(endpoint_path, payload)
+            sent = self._send(
+                endpoint_path, payload, outcome_unknown_on_failure=outcome_unknown_on_failure
+            )
             if sent.principal_refusal is None:
                 return sent.body
             reason, detail = sent.principal_refusal, PRINCIPAL_REFUSED_AGAIN
@@ -2960,7 +2982,9 @@ class CoherentVolume:
         self._adopt_claim(claim)
         return decide_principal_recovery(claim, presented)
 
-    def _send(self, endpoint_path: str, payload: dict) -> _Sent:
+    def _send(
+        self, endpoint_path: str, payload: dict, *, outcome_unknown_on_failure: bool = False
+    ) -> _Sent:
         """One POST presenting the current principal. A caller-principal
         refusal is returned for :meth:`_post` to recover; every other failure
         routes through ``on_error`` here.
@@ -2980,10 +3004,10 @@ class CoherentVolume:
         except urllib.error.HTTPError as exc:
             status, reason = exc.code, principal_refusal_reason(exc)
         except CoordinatorUnavailable as exc:
-            self._fail_closed_or_degrade(
-                f"coordinator request to {endpoint_path} failed: {exc}"
+            return self._failed_request(
+                f"coordinator request to {endpoint_path} failed: {exc}",
+                outcome_unknown=outcome_unknown_on_failure,
             )
-            return _Sent(None, None)  # reached only in degrade mode
         else:
             return _Sent(body, None)
         # R2: a remote 401 is a wrong/missing secret — fail LOUD and CLOSED
@@ -2997,9 +3021,22 @@ class CoherentVolume:
             )
         if reason is not None:
             return _Sent(None, reason)
-        self._fail_closed_or_degrade(
-            f"coordinator request to {endpoint_path} failed: HTTP {status}"
+        return self._failed_request(
+            f"coordinator request to {endpoint_path} failed: HTTP {status}",
+            outcome_unknown=outcome_unknown_on_failure and status >= 500,
         )
+
+    def _failed_request(self, message: str, *, outcome_unknown: bool) -> _Sent:
+        """A request that got no answer to read. When its outcome is unknown (a
+        lost answer, an HTTP 5xx) it yields no answer in BOTH ``on_error``
+        modes and the caller raises ``CommitUnconfirmed``; degrade mode still
+        warns and counts it. Otherwise strict raises and degrade warns, as on
+        every route. The strict log line is the only record of the errno or
+        status: the unconfirmed message is built from constants."""
+        if outcome_unknown and self._on_error == "strict":
+            logger.warning("CoherentVolume request outcome unknown: %s", message)
+            return _Sent(None, None)
+        self._fail_closed_or_degrade(message)
         return _Sent(None, None)  # reached only in degrade mode
 
     def read_with_version(self, path: str | os.PathLike[str]) -> tuple[bytes, int]:

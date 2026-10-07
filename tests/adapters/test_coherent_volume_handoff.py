@@ -20,6 +20,9 @@ other volume sibling-attaches to it, so each volume is its own session.
 
 from __future__ import annotations
 
+import io
+import json
+import urllib.error
 import warnings
 from pathlib import Path
 
@@ -38,7 +41,7 @@ from ccs.adapters.coherent_volume import (
     HandoffWinOutcome,
 )
 from ccs.cli._coherence_client import CoordinatorUnavailable
-from ccs.core.exceptions import CoherenceDegradedWarning, CommitUnconfirmed, GiverFenced
+from ccs.core.exceptions import CoherenceDegradedWarning, CoherenceError, CommitUnconfirmed, GiverFenced
 
 _MANAGED = ("data/**",)
 _PLAN = "data/plan.md"
@@ -646,30 +649,164 @@ def test_a_verb_answer_that_is_not_a_typed_refusal_raises_unconfirmed(
         stop_coordinator(tmp_path)
 
 
-def test_a_transfer_whose_answer_is_lost_raises_in_degrade_mode(
-    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """In degrade mode a transport failure warns and the request yields no
-    answer. For a transfer that is an unknown outcome, not an empty result: it
-    raises the unconfirmed terminal rather than returning a value a caller
-    could read as nothing transferred."""
-    _seed(tmp_path, _PLAN, b"plan v1")
-    giver = CoherentVolume(tmp_path, managed=_MANAGED, on_error="degrade", config=fast_cfg)
-    successor = CoherentVolume(tmp_path, managed=_MANAGED, on_error="degrade", config=fast_cfg)
-    try:
-        giver.read(_PLAN)
-        real_post = coherent_volume_module._coordinator_post
+#: The status a verb leaves on the path's record once it has landed.
+_LANDED_STATUS = {"transfer": "pending", "accept": "completed", "decline": "declined", "withdraw": "withdrawn"}
 
-        def lose_the_transfer(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
-            if path == "/handoff/transfer":
-                raise CoordinatorUnavailable("simulated: the answer was lost")
+
+def _http_error(code: int, body: dict) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        "http://coordinator", code, "x", {}, io.BytesIO(json.dumps(body).encode())  # type: ignore[arg-type]
+    )
+
+
+def _fail_on(route: str, kind: str) -> object:
+    """``_coordinator_post`` that fails ``route`` the way ``kind`` names: the
+    answer lost after the request was forwarded (a reset, an HTTP 500), or an
+    HTTP 503 before it was."""
+    real_post = coherent_volume_module._coordinator_post
+
+    def post(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        if path != route:
             return real_post(endpoint, path, payload, **kwargs)
+        if kind == "http_503_before_forwarding":
+            raise _http_error(503, {"error": "handler concurrency exceeded"})
+        real_post(endpoint, path, payload, **kwargs)
+        if kind == "reset_after_forwarding":
+            raise CoordinatorUnavailable("simulated: the answer was lost")
+        raise _http_error(500, {"error": "internal"})
 
-        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", lose_the_transfer)
+    return post
+
+
+def _act(verb: str, giver: CoherentVolume, successor: CoherentVolume) -> object:
+    """Run ``verb`` from the side that sends it: the giver transfers and
+    withdraws, the successor accepts and declines."""
+    if verb == "transfer":
+        return giver.transfer(_PLAN, successor=_agent(successor))
+    return getattr(successor if verb in ("accept", "decline") else giver, verb)(_PLAN)
+
+
+def _volume_pair(tmp_path: Path, cfg: LifecycleConfig, on_error: str, verb: str) -> tuple[CoherentVolume, CoherentVolume]:
+    """A giver that read the path and a successor; for every verb but transfer,
+    the giver has already handed the path to the successor. Call it inside the
+    test's ``try``: the first volume spawns the coordinator its ``finally``
+    stops."""
+    _seed(tmp_path, _PLAN, b"plan v1")
+    giver = CoherentVolume(tmp_path, managed=_MANAGED, on_error=on_error, config=cfg)
+    successor = CoherentVolume(tmp_path, managed=_MANAGED, on_error=on_error, config=cfg)
+    giver.read(_PLAN)
+    if verb != "transfer":
+        assert giver.transfer(_PLAN, successor=_agent(successor)).ok
+    return giver, successor
+
+
+@pytest.mark.parametrize("kind", ["reset_after_forwarding", "http_500_after_forwarding", "http_503_before_forwarding"])
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+@pytest.mark.parametrize("verb", ["transfer", "accept", "decline", "withdraw"])
+def test_a_handoff_verb_whose_answer_is_lost_raises_unconfirmed_in_both_modes(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, verb: str, on_error: str, kind: str
+) -> None:
+    """A lost answer or a 5xx on a handoff verb is an unknown outcome in BOTH
+    modes (#276). Under strict it used to raise a plain ``CoherenceError``,
+    which reads as "nothing happened" although the verb may have landed; the
+    caller would then repeat it. The record shows the verb did land whenever
+    the request was forwarded."""
+    try:
+        giver, successor = _volume_pair(tmp_path, fast_cfg, on_error, verb)
+        before = (_status_handoff(giver, _PLAN) or {}).get("status")
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", _fail_on(f"/handoff/{verb}", kind))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", CoherenceDegradedWarning)
-            with pytest.raises(CommitUnconfirmed):
-                giver.transfer(_PLAN, successor=_agent(successor))
+            with pytest.raises(CommitUnconfirmed) as raised:
+                _act(verb, giver, successor)
+        assert type(raised.value) is CommitUnconfirmed
+        assert "whether it landed is unknown" in str(raised.value)
+        monkeypatch.undo()
+        after = (_status_handoff(giver, _PLAN) or {}).get("status")
+        assert after == (before if kind == "http_503_before_forwarding" else _LANDED_STATUS[verb])
+        sender = successor if verb in ("accept", "decline") else giver
+        assert sender.degradation_count == (1 if on_error == "degrade" else 0)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("answer", [[], "ok"], ids=["list", "string"])
+@pytest.mark.parametrize("verb", ["transfer", "accept", "decline", "withdraw"])
+def test_a_handoff_verb_answer_that_is_not_a_json_object_raises_unconfirmed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, verb: str, answer: object
+) -> None:
+    """A body that parses as JSON but is not an object used to escape as an
+    ``AttributeError`` on every surface, the MCP tools included."""
+    try:
+        giver, successor = _volume_pair(tmp_path, fast_cfg, "strict", verb)
+        real_post = coherent_volume_module._coordinator_post
+
+        def not_an_object(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            body = real_post(endpoint, path, payload, **kwargs)
+            return answer if path == f"/handoff/{verb}" else body
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", not_an_object)
+        with pytest.raises(CommitUnconfirmed, match="no outcome this client can classify"):
+            _act(verb, giver, successor)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("verb", ["transfer", "accept"])
+def test_a_handoff_request_the_coordinator_refused_outright_stays_a_coherence_error_under_strict(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, verb: str
+) -> None:
+    """A 4xx is the coordinator's definite refusal: nothing landed, so it is
+    not an unknown outcome and keeps strict mode's ``CoherenceError``."""
+    try:
+        giver, successor = _volume_pair(tmp_path, fast_cfg, "strict", verb)
+        before = _status_handoff(giver, _PLAN)
+        real_post = coherent_volume_module._coordinator_post
+
+        def refuse(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            if path == f"/handoff/{verb}":
+                raise _http_error(400, {"error": "grants contains duplicate paths"})
+            return real_post(endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", refuse)
+        with pytest.raises(CoherenceError) as raised:
+            _act(verb, giver, successor)
+        assert type(raised.value) is CoherenceError
+        monkeypatch.undo()
+        assert _status_handoff(giver, _PLAN) == before
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("verb", ["transfer", "withdraw"])
+def test_a_handoff_verb_whose_principal_retry_loses_its_answer_raises_unconfirmed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, verb: str
+) -> None:
+    """The one retry after a caller-principal refusal is the same verb sent
+    again, so a lost answer to it is just as unknown: strict mode raises
+    ``CommitUnconfirmed``, not the generic error, and the verb has landed."""
+    try:
+        giver, successor = _volume_pair(tmp_path, fast_cfg, "strict", verb)
+        real_post = coherent_volume_module._coordinator_post
+        sends: list[str] = []
+
+        def refuse_then_lose(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            if path != f"/handoff/{verb}":
+                return real_post(endpoint, path, payload, **kwargs)
+            sends.append(path)
+            real_post(endpoint, path, payload, **kwargs)  # the first send is refused here
+            raise CoordinatorUnavailable("simulated: the retry's answer was lost")
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", refuse_then_lose)
+        giver._principal = "X" * 43  # a principal the coordinator does not hold for this session
+
+        with pytest.raises(CommitUnconfirmed) as raised:
+            _act(verb, giver, successor)
+
+        assert type(raised.value) is CommitUnconfirmed
+        assert len(sends) == 2, "refused once for its principal, then retried once"
+        monkeypatch.undo()
+        assert (_status_handoff(giver, _PLAN) or {}).get("status") == _LANDED_STATUS[verb]
     finally:
         stop_coordinator(tmp_path)
 

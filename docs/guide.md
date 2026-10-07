@@ -2224,14 +2224,18 @@ nothing changed. A method raises only when the answer does not settle the
 outcome, or there is no coordinator to ask:
 
 - `CommitUnconfirmed`: the coordinator answered a `handoff_*_unconfirmed`
-  reason, its answer could not be read, or, with `on_error="degrade"`, the
-  request failed. The verb may have landed: look at the path's record on
-  `/status` before acting again. Sending the same transfer again answers a
+  reason, its answer could not be read, or the request got no answer (a
+  dropped connection, a timeout, an HTTP 5xx), in either `on_error` mode. The
+  verb may have landed: look at the path's record (`coordinator_status()`, or
+  `/status`) before acting again. Sending the same transfer again answers a
   live record's status and moves nothing, but once the successor has written
   the path, a re-send from a volume that holds the path again is a new
   handoff.
-- `CoherenceError`: a request that failed with `on_error="strict"`, as on every
-  route; and, in both modes, a volume with no coordinator attached.
+- `CoherenceError`: a request the coordinator refused outright (HTTP 4xx) with
+  `on_error="strict"`; and, in both modes, a volume with no coordinator
+  attached. With `on_error="degrade"` a 4xx warns and raises
+  `CommitUnconfirmed` instead: degrade mode does not tell a refusal from a
+  failure.
 
 **Which claim a transfer hands on.** For each path, the claim the volume holds
 there: the write grant a `write()` of the path left it holding (`MODIFIED`), or
