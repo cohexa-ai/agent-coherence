@@ -22,8 +22,10 @@ found answered as writes -- never derived from the code under test.
 """
 from __future__ import annotations
 
+import json
 import shlex
 import time
+from pathlib import Path
 
 import pytest
 
@@ -366,6 +368,10 @@ _DOCUMENTED_MISSES: tuple[str, ...] = (
     # a loop, or is built from pieces.
     "python3 - <<'PY'\nfrom pathlib import Path\nfor name in ['CLAUDE.md', 'AGENTS.md']:\n    Path(name).write_text('x')\nPY",
     "node -e \"const cfg = { out: 'docs/plans/plan.md' }; require('fs').writeFileSync(cfg.out, 'x');\"",
+    "python3 -c \"src, dst = 'task.md', 'docs/plans/plan.md'; open(dst, 'w').write(open(src).read())\"",
+    "python3 - <<'PY'\nfrom pathlib import Path\ndef bump(p):\n    p.write_text('x')\nbump(Path('docs/plans/plan.md'))\nPY",
+    "python3 - <<'PY'\nPLAN = 'docs/plans/plan.md'\n" + "# padding\n" * 900 + "open(PLAN, 'a').write('x')\nPY",
+    "python3 -c \"" + "".join(f"x{i} = 'n{i}.md'; " for i in range(64)) + "p = 'task.md'; open(p, 'w').write('x')\"",
     "python3 -c \"from pathlib import Path; (Path('docs') / 'plans' / 'plan.md').write_text('x')\"",
 )
 
@@ -485,6 +491,34 @@ def test_nested_shell_bodies_are_scanned_three_levels_deep_and_no_deeper() -> No
     ("python3 -c \"import os; os.remove('task.md')\"", ["task.md"]),
     ("node -e \"require('fs').rmSync('task.md')\"", ["task.md"]),
     ("ruby -e 'File.rename(\"AGENTS.md\", \"/tmp/AGENTS.md.bak\")'", ["AGENTS.md"]),
+    # A temp file moved onto the path: the move's source is a variable.
+    ("python3 - <<'PY'\nimport os, tempfile\nfd, tmp = tempfile.mkstemp(dir='.')\nos.write(fd, b'x')\nos.replace(tmp, 'docs/plans/plan.md')\nPY", [_PLAN]),
+    ("python3 -c \"import os; os.replace(str(tmp), 'docs/plans/plan.md')\"", [_PLAN]),
+    ("node -e \"require('fs').renameSync(tmp, 'task.md')\"", ["task.md"]),
+    # Write forms named in other ways: a stream, a flags open, a keyword, a
+    # qualified Path, a Path built around a bound name, perl's list rename.
+    ("node -e \"const s = require('fs').createWriteStream('task.md'); s.write('x')\"", ["task.md"]),
+    ("python3 -c \"import os; fd = os.open('task.md', os.O_WRONLY|os.O_TRUNC); os.write(fd, b'x')\"", ["task.md"]),
+    ("python3 -c \"open(file='task.md', mode='w').write('x')\"", ["task.md"]),
+    ("python3 -c \"import pathlib; p = pathlib.Path('task.md'); p.write_text('x')\"", ["task.md"]),
+    ("python3 -c \"from pathlib import Path; p = 'task.md'; Path(p).write_text('x')\"", ["task.md"]),
+    ("perl -e 'rename \"plan.md\", \"task.md\"'", ["plan.md", "task.md"]),
+    ("perl -e 'my $f = \"task.md\"; unlink $f;'", ["task.md"]),
+    ("python3 -c \"from pathlib import Path; p = Path('task.md'); p.touch()\"", ["task.md"]),
+    # A name bound again, a keyword argument and a comparison are not bindings.
+    ("python3 -c \"p = 'task.md'; log(p=1); open(p, 'w').write('x')\"", ["task.md"]),
+    ("python3 -c \"p = 'task.md'; ok = p == 'x'; open(p, 'w').write('x')\"", ["task.md"]),
+    ("python3 -c \"a = 'plan.md'; b = 'task.md'; open(b, 'w').write(open(a).read())\"", ["task.md"]),
+    ("python3 -c \"import shutil; d = 'task.md'; shutil.copyfile('/tmp/x', d)\"", ["task.md"]),
+    # Read the path and write something else through a name or an expression.
+    ("python3 - <<'PY'\nfrom pathlib import Path\npath = Path('task.md')\nbackup_path = Path('/tmp/b.md')\nbackup_path.write_text(path.read_text())\nPY", []),
+    ("python3 -c \"import os; p = 'task.md'; t = open(p).read(); os.rename('/tmp/a', '/tmp/b')\"", []),
+    ("python3 -c \"p = 'task.md'; q = p.replace('task', 'x'); open('/tmp/o', 'w').write(q)\"", []),
+    ("node -e \"const fs=require('fs'); const f='task.md'; fs.writeFileSync(f.replace('.md','.html'), fs.readFileSync(f))\"", []),
+    ("node -e \"const fs=require('fs'); const f='task.md'; fs.writeFileSync(f + '.html', fs.readFileSync(f))\"", []),
+    # A name bound to a value built from the literal is not the literal.
+    ("python3 -c \"p = 'task.md' + '.bak'; open(p, 'w').write('x')\"", []),
+    ("node -e \"const f = 'task.md' + '.bak'; require('fs').writeFileSync(f, 'x')\"", []),
     # A move, a rename and a copy's destination are writes; a copy's source is not.
     ("python3 -c \"import os; os.replace('/tmp/x.md', 'docs/plans/plan.md')\"", [_PLAN]),
     ("python3 -c \"import shutil; shutil.move('docs/plans/plan.md', '/tmp/x.md')\"", [_PLAN]),
@@ -609,9 +643,106 @@ def test_a_16k_script_body_is_scanned_in_linear_time(command: str) -> None:
     two whitespace runs could split one run many ways, an unbounded scan for
     an ``open(`` mode, or following every one of a thousand bound names to the
     end of the body, made one of these take seconds."""
-    started = time.monotonic()
+    started = time.process_time()
     _detect(command)
-    assert time.monotonic() - started < 0.25
+    assert time.process_time() - started < 0.25
+
+
+#: FROZEN: one write call each, so a call dropped from the detector's table
+#: (or misspelled in it) fails a row. Never derived from the table itself.
+_WRITE_CALL_ROWS: tuple[tuple[str, list[str]], ...] = (
+    ("node -e \"require('fs').writeFileSync('task.md', 'x')\"", ["task.md"]),
+    ("node -e \"require('fs').writeFile('task.md', 'x', () => {})\"", ["task.md"]),
+    ("node -e \"require('fs').appendFileSync('task.md', 'x')\"", ["task.md"]),
+    ("node -e \"require('fs').appendFile('task.md', 'x', () => {})\"", ["task.md"]),
+    ("node -e \"require('fs').createWriteStream('task.md').write('x')\"", ["task.md"]),
+    ("node -e \"require('fs').unlinkSync('task.md')\"", ["task.md"]),
+    ("node -e \"require('fs').rmSync('task.md')\"", ["task.md"]),
+    ("node -e \"require('fs').truncateSync('task.md')\"", ["task.md"]),
+    ("node -e \"require('fs').renameSync('/tmp/x', 'task.md')\"", ["task.md"]),
+    ("node -e \"require('fs').copyFileSync('/tmp/x', 'task.md')\"", ["task.md"]),
+    ("node -e \"require('fs').copyFile('/tmp/x', 'task.md', () => {})\"", ["task.md"]),
+    ("node -e \"const fs = require('fs'); fs.writeSync(fs.openSync('task.md', 'a'), 'x')\"", ["task.md"]),
+    ("php -r \"file_put_contents('task.md', 'x');\"", ["task.md"]),
+    ("php -r \"unlink('task.md');\"", ["task.md"]),
+    ("php -r \"rename('/tmp/x', 'task.md');\"", ["task.md"]),
+    ("php -r \"fwrite(fopen('task.md', 'w'), 'x');\"", ["task.md"]),
+    ("ruby -e 'File.write(\"task.md\", \"x\")'", ["task.md"]),
+    ("ruby -e 'IO.write(\"task.md\", \"x\")'", ["task.md"]),
+    ("ruby -e 'File.delete(\"task.md\")'", ["task.md"]),
+    ("ruby -e 'File.open(\"task.md\", \"a\") { |f| f.puts \"x\" }'", ["task.md"]),
+    ("ruby -e 'File.new(\"task.md\", \"w\").write(\"x\")'", ["task.md"]),
+    ("ruby -e 'require \"fileutils\"; FileUtils.rm(\"task.md\")'", ["task.md"]),
+    ("ruby -e 'require \"fileutils\"; FileUtils.rm_f(\"task.md\")'", ["task.md"]),
+    ("ruby -e 'require \"fileutils\"; FileUtils.touch(\"task.md\")'", ["task.md"]),
+    ("ruby -e 'require \"fileutils\"; FileUtils.mv(\"/tmp/x\", \"task.md\")'", ["task.md"]),
+    ("ruby -e 'require \"fileutils\"; FileUtils.cp(\"/tmp/x\", \"task.md\")'", ["task.md"]),
+    ("perl -e 'unlink \"task.md\"'", ["task.md"]),
+    ("perl -e 'open(my $f, \">>\", \"task.md\"); print $f \"x\"'", ["task.md"]),
+    ("python3 -c \"import os; os.remove('task.md')\"", ["task.md"]),
+    ("python3 -c \"import os; os.unlink('task.md')\"", ["task.md"]),
+    ("python3 -c \"import os; os.truncate('task.md', 0)\"", ["task.md"]),
+    ("python3 -c \"import os; os.replace('/tmp/x', 'task.md')\"", ["task.md"]),
+    ("python3 -c \"import os; os.rename('/tmp/x', 'task.md')\"", ["task.md"]),
+    ("python3 -c \"import shutil; shutil.move('/tmp/x', 'task.md')\"", ["task.md"]),
+    ("python3 -c \"import shutil; shutil.copy('/tmp/x', 'task.md')\"", ["task.md"]),
+    ("python3 -c \"import shutil; shutil.copy2('/tmp/x', 'task.md')\"", ["task.md"]),
+    ("python3 -c \"open('task.md', 'w').write('x')\"", ["task.md"]),
+    ("python3 -c \"import io; io.open('task.md', 'w').write('x')\"", ["task.md"]),
+    ("python3 -c \"import codecs; codecs.open('task.md', 'w', 'utf-8').write('x')\"", ["task.md"]),
+    ("python3 -c \"import os; os.write(os.open('task.md', os.O_WRONLY), b'x')\"", ["task.md"]),
+    ("python3 -c \"from pathlib import Path; Path('task.md').write_text('x')\"", ["task.md"]),
+    ("python3 -c \"from pathlib import Path; Path('task.md').write_bytes(b'x')\"", ["task.md"]),
+    ("python3 -c \"from pathlib import Path; Path('task.md').unlink()\"", ["task.md"]),
+    ("python3 -c \"from pathlib import Path; Path('task.md').touch()\"", ["task.md"]),
+    ("python3 -c \"from pathlib import Path; Path('task.md').rename('/tmp/x')\"", ["task.md"]),
+    ("python3 -c \"from pathlib import Path; Path('task.md').replace('/tmp/x')\"", ["task.md"]),
+    ("python3 -c \"from pathlib import Path; Path('task.md').open('w').close()\"", ["task.md"]),
+)
+
+
+@pytest.mark.parametrize(("command", "expected"), _WRITE_CALL_ROWS)
+def test_every_write_call_the_detector_knows_is_detected(command: str, expected: list[str]) -> None:
+    assert _detect(command) == expected
+
+
+#: The measurement corpus behind the program-body rule: 120 interpreter
+#: commands written by three independent agents, each label re-checked by a
+#: second one. A frozen file; its labels are the truth, not the detector.
+_PROGRAM_CORPUS = json.loads(
+    (Path(__file__).parent / "fixtures" / "shell_write_programs.json").read_text()
+)
+#: FROZEN: where the detector knowingly differs from a label, with what it
+#: answers and the documented reason (module docstring, OUT of scope).
+_PINNED_DIFFERENCES: dict[int, tuple[list[str], str]] = {
+    23: ([], "loop over a list"),
+    28: ([], "path held in an object property"),
+    32: ([], "path held in a dict"),
+    33: ([], "path built from pieces"),
+    34: ([], "path built from pieces"),
+    36: ([], "loop over a list"),
+    37: ([], "path passed as a script argument"),
+    38: ([], "path passed as a script argument"),
+    39: ([], "a directory deleted, not the path"),
+    81: ([], "path built from pieces"),
+    85: ([], "path built from pieces"),
+    93: ([], "path built from pieces"),
+    94: ([], "path built from pieces"),
+    96: ([], "loop over a tuple"),
+    97: ([], "path passed as a script argument"),
+    112: (["CLAUDE.md"], "a string that spells a write call is read as one"),
+}
+
+
+def test_the_measurement_corpus_answers_its_labels_or_its_pinned_differences() -> None:
+    assert len(_PROGRAM_CORPUS) == 120
+    wrong = []
+    for index, row in enumerate(_PROGRAM_CORPUS):
+        expected = _PINNED_DIFFERENCES.get(index, (sorted(row["writes"]), ""))[0]
+        got = sorted(set(_detect(row["command"])))
+        if got != expected:
+            wrong.append((index, row["class"], got, expected))
+    assert wrong == []
 
 
 def test_a_literal_that_only_starts_a_built_path_is_not_the_path_written() -> None:

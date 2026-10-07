@@ -1,0 +1,728 @@
+[
+ {
+  "class": "writes",
+  "command": "python3 -c \"open('plan.md','w').write('# Plan\\n\\n- [ ] Draft API\\n- [ ] Write tests\\n')\"",
+  "writes": [
+   "plan.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 -c \"from pathlib import Path; Path('task.md').write_text('## Task\\nImplement retry backoff for the HTTP client.\\n')\"",
+  "writes": [
+   "task.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "node -e \"require('fs').writeFileSync('AGENTS.md', '# Agents\\n\\nRun pytest before committing.\\n')\"",
+  "writes": [
+   "AGENTS.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "ruby -e 'File.write(\"docs/specs/api.md\", \"# API Spec\\n\\n## GET /users\\nReturns a list of users.\\n\")'",
+  "writes": [
+   "docs/specs/api.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "php -r 'file_put_contents(\"docs/brainstorms/idea.md\", \"- idea: cache warmup on deploy\\n\", FILE_APPEND);'",
+  "writes": [
+   "docs/brainstorms/idea.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "perl -e 'open(my $fh, \">>\", \"CLAUDE.md\") or die $!; print $fh \"\\n- Always run ruff before committing.\\n\"; close $fh;'",
+  "writes": [
+   "CLAUDE.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 -c \"from pathlib import Path; p = Path('CLAUDE.md'); p.write_text(p.read_text().replace('pytest -q', 'pytest -q -x'))\"",
+  "writes": [
+   "CLAUDE.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 - <<'PY'\npath = 'docs/plans/plan.md'\nwith open(path, 'a') as fh:\n    fh.write('\\n## Status\\n- Phase 1 complete\\n')\nPY",
+  "writes": [
+   "docs/plans/plan.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "node -e \"const fs = require('fs'); const f = 'task.md'; fs.appendFileSync(f, '\\n- [ ] Update changelog\\n');\"",
+  "writes": [
+   "task.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 - <<'PY'\nimport json\ntarget = 'docs/specs/api.md'\nschema = {\"endpoint\": \"/v1/items\", \"method\": \"GET\", \"params\": [\"limit\", \"cursor\"]}\nwith open(target, 'w') as fh:\n    fh.write('# API\\n\\n```json\\n')\n    json.dump(schema, fh, indent=2)\n    fh.write('\\n```\\n')\nPY",
+  "writes": [
+   "docs/specs/api.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 -c \"import json; target = 'plan.md'; json.dump({'steps': ['parse', 'validate', 'emit']}, open(target, 'w'), indent=2)\"",
+  "writes": [
+   "plan.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 -c \"import os; os.rename('plan.md', 'docs/plans/plan.md')\"",
+  "writes": [
+   "docs/plans/plan.md",
+   "plan.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 -c \"import os; os.remove('task.md')\"",
+  "writes": [
+   "task.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "node -e \"require('fs').unlinkSync('docs/brainstorms/idea.md')\"",
+  "writes": [
+   "docs/brainstorms/idea.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "ruby -e 'File.rename(\"AGENTS.md\", \"AGENTS.md.bak\")'",
+  "writes": [
+   "AGENTS.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "perl -e 'unlink \"plan.md\" or die \"cannot remove: $!\"'",
+  "writes": [
+   "plan.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "php -r 'rename(\"docs/specs/api.md\", \"docs/specs/api-v1.md\");'",
+  "writes": [
+   "docs/specs/api.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 -c \"from pathlib import Path; stale = Path('docs/brainstorms/idea.md'); stale.unlink(missing_ok=True)\"",
+  "writes": [
+   "docs/brainstorms/idea.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 -c \"import shutil; shutil.copyfile('templates/task_template.md', 'task.md')\"",
+  "writes": [
+   "task.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 -c \"import shutil; shutil.copy('plan.md', 'docs/plans/plan.md')\"",
+  "writes": [
+   "docs/plans/plan.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "node -e \"const fs = require('fs/promises'); (async () => { const file = 'docs/specs/api.md'; const src = await fs.readFile(file, 'utf8'); await fs.writeFile(file, src.replace(/v1/g, 'v2')); })();\"",
+  "writes": [
+   "docs/specs/api.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 - <<'PY'\nfrom pathlib import Path\nplan = Path('docs/plans/plan.md').read_text()\ntodos = [l for l in plan.splitlines() if l.strip().startswith('- [ ]')]\nPath('task.md').write_text('# Open tasks\\n\\n' + '\\n'.join(todos) + '\\n')\nPY",
+  "writes": [
+   "task.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 - <<'PY'\nimport json, re\nfrom pathlib import Path\nspec = Path('docs/specs/api.md').read_text()\nendpoints = re.findall(r'^## (GET|POST|PUT|DELETE) (\\S+)', spec, re.M)\nPath('endpoints.json').write_text(json.dumps(endpoints, indent=2))\nwith open('plan.md', 'a') as fh:\n    fh.write(f\"\\n- Implement {len(endpoints)} endpoints from spec\\n\")\nPY",
+  "writes": [
+   "plan.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 - <<'PY'\nfrom pathlib import Path\nheader = '<!-- generated: do not edit by hand -->\\n'\nfor name in ['CLAUDE.md', 'AGENTS.md']:\n    p = Path(name)\n    body = p.read_text()\n    if not body.startswith(header):\n        p.write_text(header + body)\nPY",
+  "writes": [
+   "AGENTS.md",
+   "CLAUDE.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 - <<'PY'\nfrom pathlib import Path\nsrc = Path('CLAUDE.md')\nPath('CLAUDE.md.bak').write_text(src.read_text())\nlines = [l.rstrip() for l in src.read_text().splitlines()]\nsrc.write_text('\\n'.join(lines) + '\\n')\nPY",
+  "writes": [
+   "CLAUDE.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "ruby -e 'path = \"docs/brainstorms/idea.md\"; File.open(path, \"a\") { |f| f.puts \"\", \"## #{Time.now.strftime(\"%Y-%m-%d\")}\", \"- try streaming parser for large specs\" }'",
+  "writes": [
+   "docs/brainstorms/idea.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "perl -e 'my $f = \"task.md\"; open my $in, \"<\", $f or die; local $/; my $s = <$in>; close $in; $s =~ s/- \\[ \\]/- [x]/g; open my $out, \">\", $f or die; print $out $s; close $out;'",
+  "writes": [
+   "task.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "php -r '$target = \"AGENTS.md\"; $body = file_get_contents($target); file_put_contents($target, str_replace(\"npm test\", \"pnpm test\", $body));'",
+  "writes": [
+   "AGENTS.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "node -e \"const cfg = { out: 'docs/plans/plan.md' }; require('fs').promises.writeFile(cfg.out, '# Plan\\n\\n## Milestones\\n- M1: schema\\n- M2: API\\n');\"",
+  "writes": [
+   "docs/plans/plan.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "node -e \"const fs = require('fs'); const from = 'task.md'; const to = 'docs/plans/plan.md'; fs.renameSync(from, to);\"",
+  "writes": [
+   "docs/plans/plan.md",
+   "task.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 - <<'PY'\nimport os, tempfile\ntarget = 'AGENTS.md'\nfd, tmp = tempfile.mkstemp(dir='.', suffix='.md')\nwith os.fdopen(fd, 'w') as fh:\n    fh.write('# AGENTS\\n\\n- Use uv for dependency management.\\n')\nos.replace(tmp, target)\nPY",
+  "writes": [
+   "AGENTS.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 - <<'PY'\nfrom pathlib import Path\nidea = Path('docs/brainstorms/idea.md')\nplan = Path('docs/plans/plan.md')\nplan.write_text(plan.read_text() + '\\n## Imported ideas\\n' + idea.read_text())\nidea.unlink()\nPY",
+  "writes": [
+   "docs/brainstorms/idea.md",
+   "docs/plans/plan.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 - <<'PY'\nfrom pathlib import Path\ndocs = {'spec': Path('docs/specs/api.md'), 'notes': Path('notes/summary.md')}\ndocs['notes'].parent.mkdir(exist_ok=True)\ndocs['notes'].write_text('summary\\n')\ndocs['spec'].write_text(docs['spec'].read_text().rstrip() + '\\n\\n_Last reviewed: 2026-10-08_\\n')\nPY",
+  "writes": [
+   "docs/specs/api.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 -c \"name = 'plan'; open(f'docs/plans/{name}.md', 'a').write('\\n- [ ] Revisit rollout\\n')\"",
+  "writes": [
+   "docs/plans/plan.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 -c \"from pathlib import Path; root = Path('docs') / 'specs'; (root / 'api.md').write_text('# API\\n\\nTBD\\n')\"",
+  "writes": [
+   "docs/specs/api.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "node - <<'JS'\nconst fs = require('fs');\nconst pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));\nconst scripts = Object.entries(pkg.scripts || {}).map(([k, v]) => `- \\`npm run ${k}\\`: ${v}`).join('\\n');\nconst target = 'AGENTS.md';\nfs.writeFileSync(target, `# Agent commands\\n\\n${scripts}\\n`);\nJS",
+  "writes": [
+   "AGENTS.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "perl -e 'my @targets = (\"plan.md\", \"task.md\"); for my $t (@targets) { open my $fh, \">>\", $t or die \"$t: $!\"; print $fh \"\\n<!-- reviewed 2026-10-08 -->\\n\"; close $fh }'",
+  "writes": [
+   "plan.md",
+   "task.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 - docs/specs/api.md <<'PY'\nimport sys\nfrom pathlib import Path\ntarget = Path(sys.argv[1])\nlines = target.read_text().splitlines()\ntoc = [f\"- [{l[3:]}](#{l[3:].lower().replace(' ', '-')})\" for l in lines if l.startswith('## ')]\ntarget.write_text('\\n'.join(['## Contents', *toc, '', *lines]) + '\\n')\nPY",
+  "writes": [
+   "docs/specs/api.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "node -e \"const fs = require('fs'); const [file] = process.argv.slice(1); fs.appendFileSync(file, '\\n- [ ] Add pagination tests\\n');\" task.md",
+  "writes": [
+   "task.md"
+  ]
+ },
+ {
+  "class": "writes",
+  "command": "python3 -c \"import shutil; shutil.rmtree('docs/brainstorms')\"",
+  "writes": [
+   "docs/brainstorms/idea.md"
+  ]
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 -c \"from pathlib import Path; t=Path('docs/plans/plan.md').read_text(); Path('/tmp/plan_summary.txt').write_text('\\n'.join(l for l in t.splitlines() if l.startswith('#')))\"",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 - <<'PY'\nimport json\nfrom pathlib import Path\nsections = {}\ncurrent = None\nfor line in Path('docs/specs/api.md').read_text(encoding='utf-8').splitlines():\n    if line.startswith('## '):\n        current = line[3:].strip()\n        sections[current] = []\n    elif current:\n        sections[current].append(line)\nPath('api_sections.json').write_text(json.dumps({k: '\\n'.join(v).strip() for k, v in sections.items()}, indent=2))\nPY",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 -c \"todos=[l.strip() for l in open('task.md') if 'TODO' in l]; open('report.txt','w').write('\\n'.join(todos)+'\\n')\"",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 - <<'PY'\nwith open('CLAUDE.md', encoding='utf-8') as f:\n    lines = f.readlines()\nwith open('/tmp/claude_md_stats.txt', 'w') as out:\n    out.write(f'lines: {len(lines)}\\n')\n    out.write(f'headings: {sum(1 for l in lines if l.startswith(\"#\"))}\\n')\nPY",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 -c \"import shutil; shutil.copy('AGENTS.md', '/tmp/AGENTS.md.bak')\"",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 -c \"import shutil; shutil.copyfile('docs/plans/plan.md', 'docs/plans/plan.md.bak')\"",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 -c \"import json; json.dump({'text': open('plan.md', mode='r').read()}, open('plan.json', 'w'))\"",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 -c \"from pathlib import Path; p = Path('CLAUDE.md'); Path('/tmp/CLAUDE.md').write_text(p.read_text())\"",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 - <<'PY'\nimport csv\nfrom pathlib import Path\nrows = []\nwith Path('docs/specs/api.md').open(encoding='utf-8') as f:\n    for line in f:\n        if line.startswith('|') and '---' not in line:\n            rows.append([c.strip() for c in line.strip().strip('|').split('|')])\nwith open('data.csv', 'w', newline='') as out:\n    csv.writer(out).writerows(rows)\nPY",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 - <<'PY'\nimport difflib\na = open('plan.md').readlines()\nb = open('docs/plans/plan.md').readlines()\nwith open('/tmp/plan_diff.patch', 'w') as f:\n    f.writelines(difflib.unified_diff(a, b, 'plan.md', 'docs/plans/plan.md'))\nPY",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 - <<'PY'\nfrom pathlib import Path\nSRC = Path('docs/brainstorms/idea.md')\nDEST = Path('notes/summary.md')\nDEST.parent.mkdir(parents=True, exist_ok=True)\nparas = [p.strip() for p in SRC.read_text().split('\\n\\n') if p.strip()]\nDEST.write_text('# Idea summary\\n\\n' + '\\n\\n'.join(paras[:3]) + '\\n')\nPY",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 - <<'PY'\nfrom datetime import date\nfrom pathlib import Path\nname = 'AGENTS.md'\nout = Path(f'/tmp/backups/{name}.{date.today().isoformat()}')\nout.parent.mkdir(parents=True, exist_ok=True)\nout.write_bytes(Path(name).read_bytes())\nPY",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 - <<'PY'\nfrom pathlib import Path\nfiles = ['CLAUDE.md', 'AGENTS.md', 'task.md', 'plan.md']\nwith open('/tmp/context_bundle.md', 'w', encoding='utf-8') as out:\n    for name in files:\n        out.write(f'\\n\\n<!-- {name} -->\\n\\n')\n        out.write(Path(name).read_text(encoding='utf-8'))\nPY",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 - <<'PY'\nimport csv\ndocs = ['docs/plans/plan.md', 'docs/specs/api.md', 'docs/brainstorms/idea.md']\nwith open('/tmp/todo_counts.csv', 'w', newline='') as fh:\n    writer = csv.writer(fh)\n    writer.writerow(['file', 'todos'])\n    for path in docs:\n        with open(path, mode='r') as src:\n            writer.writerow([path, sum(line.count('TODO') for line in src)])\nPY",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 - <<'PY'\nimport hashlib\nimport json\nimport os\nindex_path = '/tmp/doc_index.json'\nindex = json.load(open(index_path)) if os.path.exists(index_path) else {}\nfor name in ('CLAUDE.md', 'AGENTS.md'):\n    index[name] = hashlib.sha256(open(name, 'rb').read()).hexdigest()\njson.dump(index, open(index_path, 'w'), indent=2)\nPY",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 - <<'PY'\nimport json\nimport yaml\nraw = open('docs/plans/plan.md', encoding='utf-8').read()\n_, front, body = raw.split('---', 2)\nmeta = yaml.safe_load(front) or {}\nmeta['body_lines'] = len(body.strip().splitlines())\nwith open('/tmp/plan_meta.json', 'w') as f:\n    json.dump(meta, f, indent=2, default=str)\nPY",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 -c \"from pathlib import Path; lines = Path('task.md').read_text().splitlines(); fh = Path('/tmp/task_numbered.txt').open('w'); fh.writelines(f'{i:03d} {l}\\n' for i, l in enumerate(lines, 1)); fh.close()\"",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 -c \"import collections, json; words = open('docs/brainstorms/idea.md', encoding='utf-8').read().lower().split(); top = collections.Counter(words).most_common(20); print(top[:5]); json.dump(top, open('/tmp/idea_top_words.json', 'w'))\"",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "python3 - <<'PY'\nimport os\nsrc = 'docs/plans/plan.md'\ndst = os.path.join(os.path.dirname(src), 'plan.outline.md')\nwith open(src) as f:\n    heads = [line for line in f if line.lstrip().startswith('#')]\nwith open(dst, 'w') as f:\n    f.writelines(heads)\nPY",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "node -e 'const fs=require(\"fs\"); const s=fs.readFileSync(\"docs/specs/api.md\",{encoding:\"utf8\"}); const eps=s.match(/^(GET|POST|PUT|DELETE|PATCH) \\S+/gm)||[]; fs.writeFileSync(\"endpoints.json\", JSON.stringify(eps,null,2));'",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "node -e 'const fs=require(\"fs\"); const txt=fs.readFileSync(\"plan.md\").toString(); const done=(txt.match(/- \\[x\\]/g)||[]).length; const pending=(txt.match(/- \\[ \\]/g)||[]).length; fs.writeFileSync(\"/tmp/plan_progress.json\", JSON.stringify({done, pending}));'",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "node - <<'JS'\nconst fs = require('fs');\n(async () => {\n  const idea = await fs.promises.readFile('docs/brainstorms/idea.md', 'utf8');\n  const bullets = idea.split('\\n').filter(l => l.trim().startsWith('- '));\n  await fs.promises.writeFile('/tmp/idea_bullets.md', bullets.join('\\n') + '\\n');\n})();\nJS",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "node -e 'const fs=require(\"fs\"); fs.readFile(\"task.md\",\"utf8\",(err,data)=>{ if(err) throw err; const items=data.split(\"\\n\").filter(l=>/^- \\[ \\]/.test(l)); fs.writeFile(\"/tmp/open_tasks.txt\", items.join(\"\\n\"), e=>{ if(e) throw e; }); });'",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "node -e 'require(\"fs\").copyFileSync(\"docs/specs/api.md\", \"/tmp/api.md.orig\")'",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "node - <<'JS'\nconst fs = require('fs');\nconst path = require('path');\nconst src = path.join('docs', 'plans', 'plan.md');\nconst outDir = path.join('build', 'reports');\nfs.mkdirSync(outDir, { recursive: true });\nconst md = fs.readFileSync(src, { encoding: 'utf8' });\nconst steps = md.split('\\n').filter(l => /^\\d+\\. /.test(l)).map(l => l.replace(/^\\d+\\. /, ''));\nfs.writeFileSync(path.join(outDir, 'plan-steps.json'), JSON.stringify({ source: src, steps }, null, 2));\nJS",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "node -e 'const fs=require(\"fs\"); const md=fs.readFileSync(\"docs/specs/api.md\",\"utf8\"); const out=md.split(/\\n(?=## )/).map(s=>({title:s.split(\"\\n\")[0].replace(/^#+\\s*/,\"\"), chars:s.length})); fs.writeFileSync(\"docs/specs/api.json\", JSON.stringify(out,null,2));'",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "node --input-type=module -e 'import { readFile, writeFile } from \"node:fs/promises\"; const t = await readFile(\"AGENTS.md\", \"utf8\"); const links = [...t.matchAll(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g)].map(m => m[2]); await writeFile(\"/tmp/agents_links.txt\", links.join(\"\\n\") + \"\\n\");'",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "ruby -e 'lines = File.readlines(\"task.md\"); File.open(\"todo_report.txt\", \"w\") { |f| lines.each_with_index { |l, i| f.puts \"#{i + 1}: #{l}\" if l =~ /TODO|FIXME/ } }'",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "ruby -e 'count = 0; File.foreach(\"CLAUDE.md\") { |l| count += 1 if l.start_with?(\"- \") }; File.write(\"/tmp/claude_rules_count.txt\", \"#{count}\\n\")'",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "ruby -e 'require \"json\"; heads = IO.readlines(\"docs/plans/plan.md\").grep(/^#+ /).map(&:strip); File.write(\"plan_outline.json\", JSON.pretty_generate(heads))'",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "ruby - <<'RB'\nrequire 'json'\nspec = File.read('docs/specs/api.md')\nendpoints = spec.scan(/^(GET|POST|PUT|PATCH|DELETE)\\s+(\\S+)/).map { |m, p| { method: m, path: p } }\nFile.open('out.json', 'w') { |f| f.write(JSON.pretty_generate(endpoints)) }\nRB",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "ruby -e 'require \"fileutils\"; FileUtils.mkdir_p(\"/tmp/snap\"); %w[CLAUDE.md AGENTS.md].each { |f| FileUtils.cp(f, \"/tmp/snap/#{f}\") }'",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "ruby -e 'plan = File.open(\"plan.md\", \"r\") { |f| f.read }; head = plan.lines.first(10).join; puts head; File.write(\"/tmp/plan_head.md\", head)'",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "perl -e 'open(my $fh, \"<\", \"docs/specs/api.md\") or die $!; open(my $out, \">\", \"/tmp/api_headings.txt\") or die $!; while (<$fh>) { print $out $_ if /^#/ } close $out;'",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "perl -e 'open(my $in, \"<\", \"plan.md\") or die \"plan.md: $!\"; my @t = grep { /TODO/ } <$in>; open(my $log, \">>\", \"/tmp/todo_audit.log\") or die \"log: $!\"; printf $log \"%d TODOs in plan.md\\n\", scalar @t; close $log;'",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "perl -e 'open(my $fh, \"<:encoding(UTF-8)\", \"docs/brainstorms/idea.md\") or die \"open: $!\"; my $txt = do { local $/; <$fh> }; close $fh; my @w = split /\\s+/, $txt; open(my $o, \">\", \"/tmp/idea_words.txt\") or die $!; printf $o \"%d words\\n\", scalar @w; close $o;'",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "perl - <<'PL'\nuse strict;\nuse warnings;\nmy %count;\nfor my $file (qw(CLAUDE.md AGENTS.md)) {\n    open(my $fh, '<', $file) or die \"cannot read $file: $!\";\n    while (my $line = <$fh>) { $count{$file}++ if $line =~ /^\\s*[-*] / }\n    close $fh;\n}\nopen(my $out, '>', 'report.txt') or die $!;\nprint $out \"$_: $count{$_} bullet rules\\n\" for sort keys %count;\nclose $out;\nPL",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "php -r '$md = file_get_contents(\"docs/brainstorms/idea.md\"); file_put_contents(\"/tmp/idea_length.txt\", strlen($md) . \" bytes\\n\");'",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "php <<'PHP'\n<?php\n$spec = file_get_contents('docs/specs/api.md');\npreg_match_all('/^##\\s+(.+)$/m', $spec, $m);\nfile_put_contents('/tmp/api_sections.txt', implode(PHP_EOL, $m[1]) . PHP_EOL);\nPHP",
+  "writes": []
+ },
+ {
+  "class": "read_elsewhere",
+  "command": "php -r '$todos = array_filter(file(\"task.md\", FILE_IGNORE_NEW_LINES), fn($l) => stripos($l, \"todo\") !== false); $fh = fopen(\"/tmp/task_todos.txt\", \"w\"); foreach ($todos as $t) { fwrite($fh, $t . \"\\n\"); } fclose($fh);'",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\nimport shutil\nfrom pathlib import Path\nsrc = Path(\"docs/plans/plan.md\")\nshutil.copy(src, \"/tmp/plan.md.bak\")\ntext = src.read_text()\nsrc.write_text(text.replace(\"- [ ]\", \"- [x]\", 1))\nPY",
+  "writes": [
+   "docs/plans/plan.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "python3 -c \"import os; p = os.path.join('docs/plans', 'plan.md'); open(p, 'a').write('\\n## Status\\nPhase 2 complete.\\n')\"",
+  "writes": [
+   "docs/plans/plan.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\nwith open(\"CLAUDE.md\", \"r+\") as fh:\n    body = fh.read()\n    fh.seek(0)\n    fh.write(body.rstrip() + \"\\n\\n- Run pytest inside the worktree, not the repo root.\\n\")\n    fh.truncate()\nPY",
+  "writes": [
+   "CLAUDE.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "python3 -c \"import shutil; shutil.copy('drafts/api_v2.md', 'docs/specs/api.md')\"",
+  "writes": [
+   "docs/specs/api.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\npath = \"notes/summary.md\"\nsummary = open(path).read()\npath = \"task.md\"\nwith open(path, \"w\") as f:\n    f.write(\"# Task\\n\\n\" + summary)\nPY",
+  "writes": [
+   "task.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "node -e \"const fs = require('fs'), path = require('path'); const p = path.join('docs', 'specs', 'api.md'); const s = fs.readFileSync(p, 'utf8'); fs.writeFileSync(p, s.replace(/\\/v1\\//g, '/v2/'));\"",
+  "writes": [
+   "docs/specs/api.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "ruby -e 'File.write(\"AGENTS.md\", File.read(\"CLAUDE.md\")); puts \"synced CLAUDE.md -> AGENTS.md\"'",
+  "writes": [
+   "AGENTS.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "perl -e 'open(my $fh, \">>\", \"docs/brainstorms/idea.md\") or die \"open: $!\"; print $fh \"\\n- idea: fence stale writes with a generation counter\\n\"; close $fh'",
+  "writes": [
+   "docs/brainstorms/idea.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "python3 -c \"import os; os.makedirs('archive', exist_ok=True); os.rename('plan.md', 'archive/plan-2026-10.md')\"",
+  "writes": [
+   "plan.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\nfrom pathlib import Path\nstale = Path(\"./task.md\")\nif stale.exists():\n    print(f\"removing {stale}\")\n    stale.unlink()\nPY",
+  "writes": [
+   "task.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "php -r 'file_put_contents(\"AGENTS.md\", \"\\n## Tooling\\nUse uv for Python envs.\\n\", FILE_APPEND);'",
+  "writes": [
+   "AGENTS.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\nimport json\nitems = json.load(open(\"data/tasks.json\"))\nlines = [f\"- [ ] {t['title']}\" for t in items]\nwith open(\"plan.md\", \"w\") as out:\n    out.write(\"# Plan (generated; canonical copy lives in docs/plans/plan.md)\\n\\n\")\n    out.write(\"\\n\".join(lines) + \"\\n\")\nPY",
+  "writes": [
+   "plan.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "node - <<'JS'\nconst { readFile, writeFile } = require('fs/promises');\n(async () => {\n  const target = 'docs/plans/plan.md';\n  const src = await readFile(target, 'utf8');\n  const toc = src.split('\\n').filter(l => l.startsWith('## ')).map(l => `- ${l.slice(3)}`).join('\\n');\n  await writeFile(target, `## Contents\\n${toc}\\n\\n${src}`);\n})();\nJS",
+  "writes": [
+   "docs/plans/plan.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\nfrom pathlib import Path\nkind, name = \"specs\", \"api\"\ntarget = Path(f\"docs/{kind}/{name}.md\")\ntarget.write_text(target.read_text().replace(\"TODO\", \"TBD\"))\nPY",
+  "writes": [
+   "docs/specs/api.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "python3 -c \"from pathlib import Path; d = Path('docs') / 'brainstorms'; (d / 'idea.md').write_text('# Idea\\n\\nTBD\\n')\"",
+  "writes": [
+   "docs/brainstorms/idea.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\nimport os, tempfile\ntarget = \"CLAUDE.md\"\nwith open(target) as fh:\n    lines = fh.read().splitlines()\ncleaned = [l.rstrip() for l in lines]\nfd, tmp = tempfile.mkstemp(dir=\".\", suffix=\".tmp\")\nwith os.fdopen(fd, \"w\") as out:\n    out.write(\"\\n\".join(cleaned) + \"\\n\")\nos.replace(tmp, target)\nPY",
+  "writes": [
+   "CLAUDE.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\nfrom pathlib import Path\nheader = Path(\"templates/agent_header.md\").read_text()\nfor name in (\"CLAUDE.md\", \"AGENTS.md\"):\n    p = Path(name)\n    body = p.read_text()\n    if not body.startswith(header):\n        p.write_text(header + body)\nPY",
+  "writes": [
+   "AGENTS.md",
+   "CLAUDE.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "ruby -e 'path = ARGV[0]; text = File.read(path); File.open(path, \"w\") { |f| f.write(text.gsub(/\\r\\n/, \"\\n\")) }' docs/specs/api.md",
+  "writes": [
+   "docs/specs/api.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "perl -e 'open(my $fh, \"+<\", \"task.md\") or die \"open: $!\"; local $/; my $t = <$fh>; $t =~ s/^Status: .*/Status: done/m; seek($fh, 0, 0); print $fh $t; truncate($fh, tell($fh)); close $fh'",
+  "writes": [
+   "task.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\nmode = \"a\"\nlog_target = \"docs/brainstorms/idea.md\"\nwith open(log_target, mode) as fh:\n    fh.write(\"\\n- follow-up: measure lease contention with 8 agents\\n\")\nprint(f\"appended to {log_target}\")\nPY",
+  "writes": [
+   "docs/brainstorms/idea.md"
+  ]
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\nimport logging\nlogging.basicConfig(filename=\"sync.log\", level=logging.INFO)\nlogging.info(\"would update docs/plans/plan.md; dry run, nothing written\")\nPY",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\nimport os\npath = \"docs/specs/api.md\"\nspec = open(path).read()\nendpoints = [l for l in spec.splitlines() if l.startswith(\"### \")]\npath = \"out/endpoints.txt\"\nos.makedirs(\"out\", exist_ok=True)\nwith open(path, \"w\") as f:\n    f.write(\"\\n\".join(endpoints) + \"\\n\")\nPY",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "python3 -c \"import shutil; shutil.copy('CLAUDE.md', '/tmp/CLAUDE.md.bak')\"",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "python3 -c \"for p in ['CLAUDE.md', 'AGENTS.md', 'task.md']: print(f'{p}: tracked, writes need a grant')\"",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\ndef count_todos(path):\n    with open(path) as fh:\n        return sum(line.count(\"TODO\") for line in fh)\ntotal = count_todos(\"docs/plans/plan.md\") + count_todos(\"plan.md\")\nwith open(\"report.txt\", \"w\") as out:\n    out.write(f\"open TODOs: {total}\\n\")\nPY",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\nimport json\nfrom pathlib import Path\nsummary = {\"source\": \"docs/specs/api.md\", \"sections\": Path(\"docs/specs/api.md\").read_text().count(\"\\n## \")}\nPath(\"out.json\").write_text(json.dumps(summary, indent=2))\nPY",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "node -e \"const fs = require('fs'); const md = fs.readFileSync('task.md', 'utf8'); const items = md.split('\\n').filter(l => /^- \\[[ x]\\]/.test(l)).map(l => ({done: l[3] === 'x', text: l.slice(6)})); fs.writeFileSync('task.json', JSON.stringify(items, null, 2));\"",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "ruby -e 'src = \"docs/plans/plan.md\"; File.write(\"#{src}.orig\", File.read(src))'",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "python3 -c \"from pathlib import Path; Path('notes').mkdir(exist_ok=True); Path('notes/plan.md').write_text(Path('plan.md').read_text().split('## Risks')[0])\"",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "perl -e 'open(my $in, \"<\", \"AGENTS.md\") or die \"open: $!\"; open(my $out, \">\", \"agents_toc.txt\") or die \"open: $!\"; while (<$in>) { print $out $_ if /^#+ / } close $in; close $out'",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\nimport shutil, datetime, os\nplan_md = \"docs/plans/plan.md\"\nstamp = datetime.date.today().isoformat()\nos.makedirs(\"backups\", exist_ok=True)\nshutil.copy2(plan_md, f\"backups/plan-{stamp}.md\")\nprint(f\"backed up {plan_md}\")\nPY",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "python3 -c \"import os; p = os.path.join('docs/brainstorms', 'idea.md'); print(len(open(p, 'r').read().split()))\"",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\nwith open(\"CLAUDE.md\", encoding=\"utf-8\") as fh:\n    rules = [l for l in fh if l.lstrip().startswith(\"- \")]\nnote = \"open('CLAUDE.md', 'w') is blocked by the hook; edit via the Edit tool\"\nwith open(\"/tmp/claude_rules.txt\", \"w\") as out:\n    out.write(note + \"\\n\" + \"\".join(rules))\nPY",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "node -e \"require('fs').copyFileSync('AGENTS.md', 'AGENTS.backup.md')\"",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "php -r '$lines = file(\"docs/plans/plan.md\"); $fh = fopen(\"data.csv\", \"w\"); foreach ($lines as $i => $l) { if (preg_match(\"/^- \\[( |x)\\] (.*)/\", $l, $m)) fputcsv($fh, [$i + 1, $m[1] === \"x\" ? \"done\" : \"open\", trim($m[2])]); } fclose($fh);'",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\nimport json\nfrom pathlib import Path\nsources = {\"docs/specs/api.md\": \"build/api.json\", \"docs/plans/plan.md\": \"build/plan.json\"}\nPath(\"build\").mkdir(exist_ok=True)\nfor src, dst in sources.items():\n    heads = [l[3:].strip() for l in Path(src).read_text().splitlines() if l.startswith(\"## \")]\n    Path(dst).write_text(json.dumps({\"source\": src, \"sections\": heads}))\nPY",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "ruby -e 'todos = File.foreach(\"task.md\").grep(/TODO/); File.write(\"todo_report.md\", \"# TODOs from task.md\\n\" + todos.join)'",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\nfrom pathlib import Path\nsrc = Path(\"docs/specs/api.md\")\nbackup = src.with_suffix(\".md.bak\")\nbackup.write_bytes(src.read_bytes())\nprint(f\"saved {backup}\")\nPY",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "python3 - <<'PY'\nimport difflib, tempfile\norig = open(\"plan.md\").read().splitlines(keepends=True)\nnew = [l.replace(\"WIP\", \"In progress\") for l in orig]\nwith tempfile.NamedTemporaryFile(\"w\", suffix=\".md\", delete=False) as tmp:\n    tmp.writelines(new)\nprint(\"\".join(difflib.unified_diff(orig, new, \"plan.md\", tmp.name)))\nPY",
+  "writes": []
+ },
+ {
+  "class": "tricky",
+  "command": "node -e \"const fs = require('fs'), path = require('path'); const files = ['CLAUDE.md', 'AGENTS.md', path.join('docs', 'plans', 'plan.md')]; const out = files.map(f => ({file: f, bytes: fs.statSync(f).size})); fs.writeFileSync('status.json', JSON.stringify(out, null, 2));\"",
+  "writes": []
+ }
+]

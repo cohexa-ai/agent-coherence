@@ -47,9 +47,12 @@ unfollowed directory change, not resolved:
 - paths built from variables or command substitution (``"$PWD/plan.md"``,
   ``$(git rev-parse --show-toplevel)/plan.md``), ``~`` paths and globs, and
   in a program body a path assembled from pieces or held inside a longer
-  string, or one that reaches the write call through a container or a loop
+  string, or one that reaches the write call through a container, a loop, a
+  tuple assignment or a function's parameter
   (``for name in ['plan.md']: Path(name).write_text(...)``,
-  ``cfg = {'out': 'plan.md'}``);
+  ``cfg = {'out': 'plan.md'}``, ``src, dst = 'a.md', 'plan.md'``), or
+  through a name bound more than 8000 characters before the write or after
+  the program's first 64 bindings;
 - writer tools not listed above, e.g. ``gsed``, ``awk -i inplace``, ``vim``,
   ``curl -o``, ``wget -O``, ``prettier --write``, and any script run from a
   file (``python3 fix.py``);
@@ -453,70 +456,97 @@ def _interpreter_writes(interpreter: _Interpreter, args: Sequence[str], stdin: S
     return _programs_writes(programs)
 
 
+@dataclass(frozen=True)
+class _WriteCall:
+    """A call that writes a path it is given: ``head`` matches the call up to
+    its first argument, ``written`` names the argument positions it writes
+    (0 the first, 1 the second), and ``moded`` marks an open, which writes
+    only when the mode argument after the path writes. The one list every
+    program-body rule is built from -- the write-call filter, a literal's
+    target test and a bound name's -- so the three cannot drift apart."""
+
+    head: str
+    written: tuple[int, ...] = (0,)
+    moded: bool = False
+
+
+_WRITE_CALLS: tuple[_WriteCall, ...] = (
+    _WriteCall(
+        r"\b(?:writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream|"
+        r"unlinkSync|rmSync|truncateSync|file_put_contents|File\.write|IO\.write|"
+        r"File\.delete|FileUtils\.rm\w*|FileUtils\.touch|os\.remove|os\.truncate)\("
+    ),
+    _WriteCall(r"\bunlink(?:\(|\s+)"),
+    _WriteCall(r"\b(?:os\.replace|shutil\.move|FileUtils\.mv|renameSync|rename)(?:\(|\s+)", (0, 1)),
+    _WriteCall(r"\b(?:shutil\.copy\w*|copyFileSync|copyFile|FileUtils\.cp)\(", (1,)),
+    # ``open(`` also matches ``os.open(``, ``io.open(``, ``codecs.open(`` and
+    # ruby's ``File.open(``.
+    _WriteCall(r"\b(?:open|fopen|openSync|File\.new)\(", moded=True),
+    # perl's three-argument open: the mode comes before the path.
+    _WriteCall(r"""\bopen\s*\(?\s*(?:my\s+)?[\$\w]+\s*,\s*['"](?:\+?>{1,2}|\+<)[^'"]*['"]\s*,\s*"""),
+)
+# A mode that writes: a literal with w, a, x or +, a mode held in a variable
+# (``open(p, mode)``, which a read rarely spells), or os.open's write flags.
+_WRITE_MODE = (
+    r"""\s*,\s*(?:(?:mode\s*=\s*|flags\s*=\s*)?['"][^'"]*[wax+]|[A-Za-z_]\w*\s*\)|"""
+    r"""[\w.|\s]{0,80}\bO_(?:WRONLY|RDWR|CREAT|TRUNC|APPEND)\b)"""
+)
+# A first argument a second, written one follows: anything up to the comma,
+# one level of parentheses deep.
+_FIRST_ARG = r"(?:[^,()]|\([^()]*\)){1,200}"
+# A pathlib object's writing methods, and the subset a str also answers to.
+_PATH_WRITE_METHOD = (
+    r"""\.(?:write_text|write_bytes|unlink|touch|rename|replace|"""
+    r"""open\(\s*(?:mode\s*=\s*)?['"][^'"]*[wax+])"""
+)
+_STR_SAFE_WRITE_METHOD = (
+    r"""\.(?:write_text|write_bytes|unlink|touch|"""
+    r"""open\(\s*(?:mode\s*=\s*)?['"][^'"]*[wax+])"""
+)
+_PATH_CALL = r"\b(?:\w+\.)?Path\("
+
+
+def _heads(*, at: int, moded: bool) -> str:
+    return "(?:" + "|".join(
+        call.head for call in _WRITE_CALLS if at in call.written and call.moded == moded
+    ) + ")"
+
+
 # A write call anywhere in a program body; one makes the body's path tokens
-# candidates. Each alternative names a file operation, never a string method
-# (``str.replace``) or a flag (``grep -i``): a read-only one-liner that happens
-# to spell one must not turn its paths into writes. The ``open(`` scan is
-# bounded so a body of unclosed calls stays linear.
+# candidates. Built from the same table as the target rules below, plus the
+# pathlib methods and a redirection inside a shell string.
 _WRITE_HINT_RE = re.compile(
-    r"""(\.write|write_text|write_bytes|appendFile|writeFile|File\.write|file_put_contents|"""
-    r"""rmSync|File\.delete|FileUtils\.|copyFile|"""
-    r"""open\([^)\n]{0,200},\s*['"][wax+]|"""
-    r"""['"]\s*>|>>|\bunlink|\bremove\(|\brename|\bos\.replace\(|truncate|shutil\.(copy|move))"""
+    "(?:" + "|".join(call.head for call in _WRITE_CALLS) + "|"
+    + _PATH_WRITE_METHOD + "|"
+    + r"""['"]\s*>|>>)"""
 )
 # A path a program can name as a file: a whole string literal, after a perl
 # open mode if any (``'p'``, ``">>p"``), or a redirection's target inside a
 # shell string (``"echo x >> p"``). A path inside prose is not one.
 _LITERAL_START_RE = re.compile(r"""(['"])[+<>]*\s*$""")
 _REDIRECT_START_RE = re.compile(r""">\s*$""")
-# A path literal is written only as the TARGET of a write call; reading it,
-# copying from it or naming it in a string being written is not a write. The
-# calls whose first argument is written:
-_FIRST_ARG_WRITERS = (
-    r"(?:writeFileSync|writeFile|appendFileSync|appendFile|File\.write|IO\.write|"
-    r"file_put_contents|unlinkSync|\bunlink|os\.remove|rmSync|truncateSync|os\.truncate|"
-    r"File\.delete|FileUtils\.rm\w*|FileUtils\.touch)"
-)
-# Moves and renames, which write both their arguments, and copies, which write
-# their second.
-_MOVERS = r"(?:os\.rename|os\.replace|shutil\.move|renameSync|\brename|File\.rename|FileUtils\.mv)"
-_COPIERS = r"(?:shutil\.copy\w*|copyFileSync|copyFile|FileUtils\.cp)"
-# Opens, written when their mode writes: a literal mode with w, a, x or +, or a
-# mode held in a variable (``open(p, mode)``), which a read rarely spells.
-_OPENERS = r"(?:\bopen|fopen|File\.open|io\.open|codecs\.open)"
-_WRITE_MODE = r"""\s*,\s*(?:(?:mode\s*=\s*)?['"][^'"]*[wax+]|[A-Za-z_]\w*\s*\))"""
-_PERL_WRITE_MODE = r"""['"](?:\+?>{1,2}|\+<)[^'"]*['"]"""
-# A pathlib object's writing methods.
-_PATH_WRITE_METHOD = (
-    r"""\.(?:write_text|write_bytes|unlink|touch|rename|replace|"""
-    r"""open\(\s*(?:mode\s*=\s*)?['"][^'"]*[wax+])"""
-)
-_FIRST_ARG_BEFORE_RE = re.compile(_FIRST_ARG_WRITERS + r"""\(\s*['"]$""")
-_MOVE_SOURCE_BEFORE_RE = re.compile(_MOVERS + r"""\(\s*['"]$""")
-_MOVE_TARGET_BEFORE_RE = re.compile(_MOVERS + r"""\(\s*['"][^'"]{1,200}['"]\s*,\s*['"]$""")
-_COPY_TARGET_BEFORE_RE = re.compile(_COPIERS + r"""\([^,()]{1,200},\s*['"]$""")
-_OPEN_BEFORE_RE = re.compile(_OPENERS + r"""\(\s*['"]$""")
+# A literal is written only as the TARGET of a write call: reading it, copying
+# from it or naming it in text the program writes is not a write.
+_FIRST_TARGET_BEFORE_RE = re.compile(_heads(at=0, moded=False) + r"""\s*['"]$""")
+_SECOND_TARGET_BEFORE_RE = re.compile(_heads(at=1, moded=False) + r"\s*" + _FIRST_ARG + r"""\s*,\s*['"]$""")
+_OPEN_TARGET_BEFORE_RE = re.compile(_heads(at=0, moded=True) + r"""\s*(?:file\s*=\s*)?['"]$""")
 _WRITE_MODE_AFTER_RE = re.compile(r"""^['"]""" + _WRITE_MODE)
-_PERL_OPEN_BEFORE_RE = re.compile(
-    r"""\bopen\s*\(?\s*(?:my\s+)?[\$\w]+\s*,\s*""" + _PERL_WRITE_MODE + r"""\s*,\s*['"]$"""
-)
-_PERL_TWO_ARG_BEFORE_RE = re.compile(r"""['"]\+?>{1,2}\s*$""")
-_PERL_UNLINK_BEFORE_RE = re.compile(r"""\bunlink\s+['"]$""")
-_PATH_BEFORE_RE = re.compile(r"""\bPath\(\s*['"]$""")
+_PATH_BEFORE_RE = re.compile(_PATH_CALL + r"""\s*['"]$""")
 _PATH_WRITE_AFTER_RE = re.compile(r"""^['"]\s*\)\s*""" + _PATH_WRITE_METHOD)
-_QUOTE_END_RE = re.compile(r"""['"]\s*$""")
-# A literal bound to a name (``p = 'x'``, ``p = Path('x')``, ``const f = 'x'``,
-# ``my $f = "x"``): written when the name is passed to a write call before it
-# is bound again.
+# A literal bound to a name at the start of a statement (``p = 'x'``,
+# ``p = Path('x')``, ``const f = 'x'``, ``my $f = "x"``), the statement
+# ending with it: a value built from it (``'x' + '.bak'``), a tuple target and
+# a keyword argument are not bindings.
+_STATEMENT_START = r"(?:[;\n{]|\b(?:const|let|var|my)\b)\s*"
 _ASSIGNED_BEFORE_RE = re.compile(
-    r"""(?:\b(?:const|let|var|my)\s+)?(\$?[A-Za-z_]\w*)\s*=\s*(?:Path\(\s*)?['"]$"""
+    _STATEMENT_START + r"""(\$?[A-Za-z_]\w*)\s*=\s*(""" + _PATH_CALL + r"""\s*)?['"]$"""
 )
-_ASSIGNED_AFTER_RE = re.compile(r"""^['"]\s*\)?\s*(?:;|\n|$|,|#|\)|\s)""")
+_ASSIGNED_AFTER_RE = re.compile(r"""^['"]\s*\)?[ \t]*(?:;|\n|$|#)""")
 _CALL_CONTEXT_CHARS = 240
 _CONTEXT_CHARS = 40
 # The bounds that keep name tracking linear on a 16K body: a name's uses are
 # looked for this far after its binding, for this many bindings per program.
-_NAME_SCAN_CHARS = 2000
+_NAME_SCAN_CHARS = 8000
 _MAX_TRACKED_NAMES = 64
 
 
@@ -551,7 +581,9 @@ class _NameBudget:
 
 def _may_be_written(program: str, match: re.Match[str], names: _NameBudget) -> bool:
     """Is this occurrence of a path token a file the program writes?"""
-    before = program[max(0, match.start() - _CALL_CONTEXT_CHARS):match.start()]
+    start = max(0, match.start() - _CALL_CONTEXT_CHARS)
+    # The body's own start counts as a statement start.
+    before = ("\n" if start == 0 else "") + program[start:match.start()]
     after = program[match.end():match.end() + _CONTEXT_CHARS]
     if not _names_a_file(before[-_CONTEXT_CHARS:], after):
         return False
@@ -569,22 +601,14 @@ def _names_a_file(before: str, after: str) -> bool:
 
 def _written_in_place(before: str, after: str) -> bool:
     """Is the literal itself the target of a write call, or a redirection's
-    target inside a shell string? Reading it, copying from it, or naming it in
-    text the program writes is not a write, so a one-liner that reads the path
-    and writes elsewhere goes undetected."""
-    if _REDIRECT_START_RE.search(before) and not _QUOTE_END_RE.search(before):
+    target (a shell string's ``> p``, perl's ``">>p"``)? Reading it, copying
+    from it, or naming it in text the program writes is not a write, so a
+    one-liner that reads the path and writes elsewhere goes undetected."""
+    if _REDIRECT_START_RE.search(before):
         return True
-    if (
-        _FIRST_ARG_BEFORE_RE.search(before)
-        or _MOVE_SOURCE_BEFORE_RE.search(before)
-        or _MOVE_TARGET_BEFORE_RE.search(before)
-        or _COPY_TARGET_BEFORE_RE.search(before)
-        or _PERL_OPEN_BEFORE_RE.search(before)
-        or _PERL_TWO_ARG_BEFORE_RE.search(before)
-        or _PERL_UNLINK_BEFORE_RE.search(before)
-    ):
+    if _FIRST_TARGET_BEFORE_RE.search(before) or _SECOND_TARGET_BEFORE_RE.search(before):
         return True
-    if _OPEN_BEFORE_RE.search(before):
+    if _OPEN_TARGET_BEFORE_RE.search(before):
         return bool(_WRITE_MODE_AFTER_RE.match(after))
     return bool(_PATH_BEFORE_RE.search(before) and _PATH_WRITE_AFTER_RE.match(after))
 
@@ -592,24 +616,29 @@ def _written_in_place(before: str, after: str) -> bool:
 def _written_through_name(
     program: str, match: re.Match[str], before: str, after: str, names: _NameBudget
 ) -> bool:
-    """Is the literal bound to a name that a write call is given before the
-    name is bound again? A path that reaches the write through a container, a
-    loop or a value built from pieces is not followed."""
+    """Is the literal bound to a name that a write call is given, as a whole
+    argument, before the name is bound again? A path that reaches the write
+    through a container, a loop, a tuple, a function's parameter or a value
+    built from pieces is not followed."""
     bound = _ASSIGNED_BEFORE_RE.search(before)
     if bound is None or not _ASSIGNED_AFTER_RE.match(after) or not names.take():
         return False
-    name = re.escape(bound.group(1))
+    name = r"(?<![\w$.])" + re.escape(bound.group(1)) + r"(?![\w$])"
     window = program[match.end():match.end() + _NAME_SCAN_CHARS]
-    rebound = re.search(r"(?<![\w$.])" + name + r"\s*=(?!=)", window)
+    rebound = re.search(_STATEMENT_START + name + r"\s*=(?!=)", window)
     if rebound is not None:
         window = window[:rebound.start()]
+    arg = r"(?:" + _PATH_CALL + r"\s*" + name + r"\s*\)|\bstr\(\s*" + name + r"\s*\)|" + name + r")"
+    # The name is the whole argument: what follows ends it (or a perl
+    # ``$f or die``), never an operator building a new value from it.
+    whole = r"(?=\s*(?:[,);]|$)|\s+(?:(?:or|and)\b|\|\||&&|\{))"
+    method = _PATH_WRITE_METHOD if bound.group(2) else _STR_SAFE_WRITE_METHOD
     uses = (
-        name + r"\s*" + _PATH_WRITE_METHOD,
-        _FIRST_ARG_WRITERS + r"\(\s*" + name + r"\b",
-        _OPENERS + r"\(\s*" + name + r"\b" + _WRITE_MODE,
-        r"""\bopen\s*\(?\s*(?:my\s+)?[\$\w]+\s*,\s*""" + _PERL_WRITE_MODE + r"\s*,\s*" + name + r"\b",
-        _MOVERS + r"\([^()]{0,200}?" + name + r"\b",
-        _COPIERS + r"\([^,()]{1,200},\s*" + name + r"\b",
+        name + r"\s*" + method,
+        _PATH_CALL + r"\s*" + name + r"\s*\)\s*" + _PATH_WRITE_METHOD,
+        _heads(at=0, moded=False) + r"\s*" + arg + whole,
+        _heads(at=1, moded=False) + r"\s*" + _FIRST_ARG + r"\s*,\s*" + arg + whole,
+        _heads(at=0, moded=True) + r"\s*(?:file\s*=\s*)?" + arg + _WRITE_MODE,
     )
     return any(re.search(use, window) for use in uses)
 
