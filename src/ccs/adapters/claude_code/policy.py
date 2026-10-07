@@ -37,8 +37,9 @@ import fnmatch
 import logging
 import re
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 
 import yaml
 
@@ -83,15 +84,24 @@ Untracking a strict path takes a coordinator restart without the strict entry:
 a hot reload never narrows strict enforcement."""
 
 
-def _compile_glob_pattern(pattern: str) -> re.Pattern[str] | None:
+def _compile_glob_pattern(pattern: str) -> Callable[[str], bool] | None:
     """PERF-2 / finding #16: pre-compile a ``**``-containing glob pattern into
-    a re.Pattern at construction time. Returns None for patterns without ``**``
+    a matcher at construction time. Returns None for patterns without ``**``
     (those use fnmatch at match-time with no string-build overhead)."""
     if "**" not in pattern:
         return None
-    # One parser for the ``**`` grammar: the matcher's regex is built from the
-    # same tokens the strict-coverage overlap search reads (#261).
-    parts = [_TOKEN_REGEX.get(token[0]) or re.escape(token[1]) for token in _glob_tokens(pattern)]
+    # One parser for the ``**`` grammar: the matcher is built from the same
+    # tokens the strict-coverage overlap search reads (#261).
+    tokens = _glob_tokens(pattern)
+    if sum(token[0] in _RUN_KINDS for token in tokens) > _REGEX_RUN_LIMIT:
+        return partial(_tokens_match, tokens)
+    regex = _glob_regex(tokens)
+    return lambda path: regex.match(path) is not None
+
+
+def _glob_regex(tokens: list[tuple]) -> re.Pattern[str]:
+    """The regex a ``**`` pattern's tokens spell."""
+    parts = [_TOKEN_REGEX.get(token[0]) or re.escape(token[1]) for token in tokens]
     return re.compile("^" + "".join(parts) + "$")
 
 
@@ -119,9 +129,9 @@ class TrackedArtifactPolicy:
     """Patterns rejected by the path-traversal guard, with reason. Surfaced
     by :meth:`rejected` for status/debug visibility."""
 
-    # PERF-2 / finding #16: pre-compiled regex cache for ``**`` patterns.
+    # PERF-2 / finding #16: pre-compiled matcher cache for ``**`` patterns.
     # Built in __post_init__ so the cost is paid exactly once at load time.
-    _compiled_patterns: dict[str, re.Pattern[str]] = field(
+    _compiled_patterns: dict[str, Callable[[str], bool]] = field(
         default_factory=dict, repr=False, compare=False
     )
     # KTD-O one-shot threshold-warning guard. Reset on every reload() so a
@@ -449,6 +459,14 @@ _SEG_ONE = "seg_one"
 _LIT = "lit"
 _CLASS = "class"
 _TOKEN_REGEX = {_ANY_RUN: ".*", _SEG_RUN: "[^/]*", _SEG_ONE: "[^/]"}
+_RUN_KINDS = (_ANY_RUN, _SEG_RUN)
+_REGEX_RUN_LIMIT = 2
+"""Runs (``*`` or ``**``) a ``**`` pattern may hold and still be matched by
+its regex. The regex backtracks into every run, so a failing match costs up
+to the path's length to the power of its runs: two runs take about a
+millisecond on a 1,024-character path, three took 330 ms, and an accepted
+``'**' * 12 + 'Z'`` in ignored.yaml held every hook for seconds. A pattern
+over the limit is matched by :func:`_tokens_match`, linear in the path."""
 _CLASS_MEMBER_LIMIT = 64
 """Characters a class may enumerate before it is approximated as any one
 character. Every member joins the search alphabet, and every explored state
@@ -548,7 +566,7 @@ def _closure(states: frozenset[int], tokens: list[tuple]) -> frozenset[int]:
     stack = list(states)
     while stack:
         i = stack.pop()
-        if i < len(tokens) and tokens[i][0] in (_ANY_RUN, _SEG_RUN) and i + 1 not in out:
+        if i < len(tokens) and tokens[i][0] in _RUN_KINDS and i + 1 not in out:
             out.add(i + 1)
             stack.append(i + 1)
     return frozenset(out)
@@ -559,8 +577,27 @@ def _advance(states: frozenset[int], tokens: list[tuple], ch: str | None) -> fro
     for i in states:
         if i >= len(tokens) or not _token_accepts(tokens[i], ch):
             continue
-        nxt.add(i if tokens[i][0] in (_ANY_RUN, _SEG_RUN) else i + 1)
+        nxt.add(i if tokens[i][0] in _RUN_KINDS else i + 1)
     return _closure(frozenset(nxt), tokens)
+
+
+def _tokens_match(tokens: list[tuple], path: str) -> bool:
+    """Whether ``path`` matches the ``**`` pattern ``tokens`` exactly as its
+    regex (:func:`_glob_regex`) does, in time linear in the path: the token
+    automaton stepped one character at a time, never backtracking. The
+    regex's own rules carry over: ``.*`` stops at a newline, and ``$`` also
+    matches before a final one."""
+    end = len(tokens)
+    states = _closure(frozenset({0}), tokens)
+    for i, ch in enumerate(path):
+        if ch == "\n":
+            if i == len(path) - 1 and end in states:
+                return True
+            states = frozenset(j for j in states if j == end or tokens[j][0] != _ANY_RUN)
+        states = _advance(states, tokens, ch)
+        if not states:
+            return False
+    return end in states
 
 
 GLOB_INTERSECT_PATTERN_BUDGET: int = 50_000
@@ -710,14 +747,14 @@ def _normalize_relative(p: str) -> str | None:
 def matches_any(
     path: str,
     patterns: Iterable[str],
-    compiled: dict[str, re.Pattern[str]] | None = None,
+    compiled: dict[str, Callable[[str], bool]] | None = None,
 ) -> bool:
     """Glob-match path against a list of patterns. Uses ``fnmatch`` for
     ``*``/``?`` semantics; ``**`` is treated as zero-or-more path segments.
 
     PERF-2 / finding #16: ``compiled`` is an optional pre-compiled pattern
     cache (keyed by pattern string). When provided, ``**`` patterns skip the
-    string-build loop and use the cached re.Pattern directly."""
+    string-build loop and use the cached matcher directly."""
     posix_path = path.replace("\\", "/")
     for pattern in patterns:
         if _glob_match(posix_path, pattern, compiled):
@@ -728,22 +765,22 @@ def matches_any(
 def _glob_match(
     path: str,
     pattern: str,
-    compiled: dict[str, re.Pattern[str]] | None = None,
+    compiled: dict[str, Callable[[str], bool]] | None = None,
 ) -> bool:
     """Match a posix-style path against a glob pattern supporting ``**``.
 
     PERF-2 / finding #16: when ``compiled`` is provided, ``**`` patterns use
-    the pre-compiled re.Pattern directly, skipping the string-build loop."""
+    the pre-compiled matcher directly, skipping the string-build loop."""
     # fnmatch handles ``*`` (any chars in segment) and ``?`` (single char).
     # For ``**`` (any number of path segments), convert to a regex-equivalent.
     if "**" not in pattern:
         return fnmatch.fnmatchcase(path, pattern)
     # Fast path: use the pre-compiled pattern if available.
     if compiled is not None and pattern in compiled:
-        return compiled[pattern].match(path) is not None
+        return compiled[pattern](path)
     # Slow path (called without a cache, e.g. from tests): build on the fly.
-    compiled_pattern = _compile_glob_pattern(pattern)
-    return compiled_pattern is not None and compiled_pattern.match(path) is not None
+    matcher = _compile_glob_pattern(pattern)
+    return matcher is not None and matcher(path)
 
 
 def _load_yaml_patterns(

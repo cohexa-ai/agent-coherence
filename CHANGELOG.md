@@ -396,6 +396,15 @@ Alpha — APIs may change before `v1.0`.
     are scoped to the Python coordinator and are the parity targets for the
     plugin follow-up.
 
+- **A `**` pattern with many `*` runs no longer stalls every hook.** The
+  matcher compiled each `**` pattern to a regex that backtracks into every
+  `*` run, so a failing match cost up to the path's length to the power of
+  its runs. An accepted entry such as `'**' * 12 + 'Z'` in `ignored.yaml` or
+  `tracked.yaml` made every `is_tracked` call, on every hook, take seconds. A
+  `**` pattern with more than two runs is now matched by stepping through its
+  pattern one path character at a time: linear in the path, with the same
+  results.
+
 - **A Bash or Grep command denied in strict mode no longer counts as a read.**
   When `pre-bash` or `pre-grep` finds a stale tracked file, it re-grants the
   session SHARED. It does this in strict mode too: the deny fires once, and a

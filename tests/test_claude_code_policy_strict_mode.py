@@ -29,9 +29,11 @@ from ccs.adapters.claude_code.policy import (
     STRICT_MODE_PATH_WARN_THRESHOLD,
     TrackedArtifactPolicy,
     _BudgetExhausted,
+    _glob_regex,
     _glob_tokens,
     _globs_intersect,
     _SearchBudget,
+    _tokens_match,
     matches_any,
 )
 
@@ -254,6 +256,51 @@ def test_the_overlap_automaton_never_under_reports_the_matcher() -> None:
     assert missed == []
 
 
+@pytest.mark.parametrize(
+    ("path", "pattern", "expected"),
+    [
+        ("a/b", "**/a*b", False),
+        ("x/axb", "**/a*b", True),
+        ("a/b", "**/a?b", False),
+        ("src/x/state/a", "src/*/state/**", True),
+        ("src/x/y/state/a", "src/*/state/**", False),
+        # Over the regex run limit, matched by stepping the tokens.
+        ("x/a/b", "**/*a*/*b*", True),
+        ("a/x/b", "**/*a*/*b*", False),
+    ],
+)
+def test_a_single_star_in_a_double_star_pattern_stays_within_a_segment(
+    path: str, pattern: str, expected: bool
+) -> None:
+    """Literal expectations for the ``**`` matcher: its regex and the overlap
+    search read the same tokens, so comparing the two cannot catch a ``*``
+    or ``?`` that starts crossing ``/``, which would widen every ``**``
+    pattern a user tracks, ignores or holds strict."""
+    assert matches_any(path, [pattern]) is expected
+
+
+_RUN_HEAVY = ("**/*a*b", "**/**/**/a", "a/**/*/*b*", "**/*a*/*b*", "*/**/*x*")
+
+
+def test_the_linear_matcher_agrees_with_the_double_star_regex() -> None:
+    """A ``**`` pattern with more runs than its regex can match without
+    backtracking is matched by stepping its tokens instead. Over every short
+    path, newlines included (the regex's ``.*`` stops at one, and its ``$``
+    also matches before a final one), the two must agree."""
+    patterns = [g for g in _GRAMMAR_CORPUS + _RUN_HEAVY if "**" in g]
+    paths = _GRAMMAR_PATHS + tuple(
+        "".join(chars) for length in range(1, 5) for chars in itertools.product("a/\nx", repeat=length)
+    )
+    disagree = [
+        (g, p)
+        for g in patterns
+        for p in paths
+        if _tokens_match(_glob_tokens(g), p)
+        != (_glob_regex(_glob_tokens(g)).match(p) is not None)
+    ]
+    assert disagree == []
+
+
 def test_a_strict_pattern_with_no_tracked_cover_is_not_covering(root: Path) -> None:
     """Strict mode is an intersection: a strict glob that reaches no tracked
     path puts nothing in strict mode, so untracking under it is not refused."""
@@ -447,6 +494,40 @@ def test_an_untrack_entry_of_many_distinct_characters_is_decided_quickly(
 
     started = time.monotonic()
     policy.strict_patterns_covering(entry)
+
+    assert time.monotonic() - started < 1.0
+
+
+_BACKTRACKING = "**" * 12 + "Z"
+
+
+def test_a_double_star_heavy_ignore_entry_does_not_stall_the_matcher(root: Path) -> None:
+    """The ``**`` matcher's regex backtracks into every run: with an accepted
+    ``'**' * 12 + 'Z'`` in ignored.yaml, every ``is_tracked`` call, on every
+    hook, took several seconds. A pattern of that many runs is matched in
+    time linear in the path."""
+    (root / ".coherence" / "ignored.yaml").write_text(_quoted_yaml([_BACKTRACKING]))
+
+    started = time.monotonic()
+    policy = TrackedArtifactPolicy.load(root)
+    assert policy.is_tracked("docs/plans/feature-y.md")
+
+    assert time.monotonic() - started < 1.0
+
+
+def test_a_literal_strict_path_is_matched_in_linear_time(root: Path) -> None:
+    """A literal strict path is decided by matching the entry against it. With
+    the entry's backtracking regex, a 30-character untrack entry held the
+    handler for several seconds, and the same entry in ignored.yaml held the
+    spawn before the port was bound."""
+    entry = "**" * 12 + "Z**.md"  # its literal ends nest with the strict path's
+    (root / ".coherence" / "strict_mode.yaml").write_text("- docs/plans/feature-x.md\n")
+    (root / ".coherence" / "ignored.yaml").write_text(_quoted_yaml([entry]))
+
+    started = time.monotonic()
+    policy = TrackedArtifactPolicy.load(root)
+    assert policy.strict_patterns_covering(entry) == ()
+    assert policy.ignored_patterns_overridden_by_strict() == ()
 
     assert time.monotonic() - started < 1.0
 
