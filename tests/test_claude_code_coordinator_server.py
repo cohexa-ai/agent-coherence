@@ -10492,6 +10492,37 @@ def test_a_fenced_givers_pre_edit_is_refused_with_the_typed_reason(
     assert _state(coordinator, "plan.md", giver.composite("inc-2")) is None
 
 
+def test_a_transfer_landing_between_the_giver_check_and_the_acquire_is_still_denied(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The race the pre-edit's second arm covers: the handler's own giver
+    check misses (the transfer lands just after it), so the acquire raises
+    the typed refusal, and that must map to the same deny body. Without the
+    arm the giver gets the bare typed refusal with no deny envelope, and the
+    hook client lets the Edit land on disk."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    real = coordinator.service.live_handoff_given_by
+    calls = []
+
+    def missing_once(*args: Any, **kwargs: Any):
+        calls.append(args)
+        return None if len(calls) == 1 else real(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator.service, "live_handoff_given_by", missing_once)
+    answer = client.post(
+        "/hooks/pre-edit", {"session_id": giver.sid, "agent_id": "inc-2", "path": "plan.md"},
+        principal=giver.principal,
+    )
+
+    assert len(calls) >= 2, "the acquire never consulted the giver check"
+    assert answer == (200, {
+        **_giver_refusal(giver, successor, shape="SHARED"),
+        "hookSpecificOutput": _giver_deny_envelope(successor, "plan.md"),
+    })
+    assert _state(coordinator, "plan.md", giver.composite("inc-2")) is None
+
+
 def test_a_fenced_givers_post_edit_commit_is_refused_with_the_typed_reason(
     coordinator, client: _Client
 ) -> None:
