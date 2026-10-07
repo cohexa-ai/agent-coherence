@@ -1886,7 +1886,7 @@ command, and by an absolute path inside the workspace. It errs toward letting
 a command through: a path built from a variable or a command substitution
 (`"$PWD/plan.md"`, `$(git rev-parse --show-toplevel)/plan.md`) or, inside a
 program, assembled from pieces, mentioned inside a longer string or reached
-through a list, a loop or a dictionary, a writer tool
+through a list, a loop, a dictionary or a function's parameter, a writer tool
 it does not know (`gsed`, `awk -i inplace`, `vim`, `curl -o`, a formatter, a
 script run from a file) and a relative path after a `pushd`, or after a `cd`
 made by an earlier command (the hook is not told the session's working
@@ -2225,12 +2225,14 @@ run in one workspace with the plugin's hooks and the Python coordinator.
 - **A Claude Code giver's shell write is denied only in the forms the Bash
   hook recognizes.** The common ones are denied as an edit is, in warn and
   strict mode: a redirection or `tee` (`echo … >> plan.md`), an in-place
-  `sed -i` or `perl -i`, a `cp` or `mv` onto the file, and a script that opens
-  it for writing, run as a one-line program or fed to one in a heredoc (see
-  [Claude Code sessions](#claude-code-sessions)). Not covered: a path built
-  from a variable or a command substitution, a writer tool the hook does not
-  know (`gsed`, `awk -i inplace`, `vim`, `curl -o`, a formatter, a script run
-  from a file), and a relative path after a `cd` made by an earlier command.
+  `sed -i` or `perl -i`, a `cp` or `mv` onto the file, and a script that
+  writes it, by name or through a variable, run as a one-line program or fed
+  to one in a heredoc (see [Claude Code sessions](#claude-code-sessions)).
+  Not covered: a path built from a variable or a command substitution, or,
+  inside a script, built from pieces or reached through a list, a loop, a
+  dictionary or a function's parameter; a writer tool the hook does not know
+  (`gsed`, `awk -i inplace`, `vim`, `curl -o`, a formatter, a script run from
+  a file); and a relative path after a `cd` made by an earlier command.
   Such a write lands on disk without a version. So does a recognized one when
   the coordinator cannot answer the check in time (it is slow or overloaded,
   or its registry fails): the command runs, and unlike a giver's `Edit`, whose
