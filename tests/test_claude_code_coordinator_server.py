@@ -13,6 +13,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import sys
 import threading
 import time
 import uuid
@@ -10749,28 +10750,91 @@ def test_a_strict_deny_while_a_record_exists_carries_the_key_beside_unchanged_de
         assert _no_wall_clock(without_key) == _no_wall_clock(plain).replace(control, handed), route
 
 
-def test_a_failed_handoff_read_leaves_a_landed_acquire_answered(
-    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+def _fail_the_handoff_key_read(
+    coordinator, monkeypatch: pytest.MonkeyPatch, site: str
 ) -> None:
-    """The ``handoff`` key is read after the work landed, so a raise while
-    reading it answers the landed work without the key -- here the
-    successor's acquire, which holds its grant -- never an error the client
-    would read as an acquire that failed."""
+    """Make one step of the ``handoff`` key read raise. A registry read raises
+    only when the key read calls it: the route's own work makes the same
+    reads (the giver fence among them), and those must still succeed."""
     import ccs.adapters.claude_code.coordinator_server as mod
 
-    giver, successor = _claimed(client), _claimed(client)
-    _hand_off(client, giver, successor, "plan.md")
-
-    def broken(*_args: Any, **_kwargs: Any) -> dict:
+    def broken(*_args: Any, **_kwargs: Any) -> Any:
         raise RuntimeError("injected handoff read failure")
 
-    monkeypatch.setattr(mod, "_handoff_projection", broken)
+    if site in ("_handoff_projection", "_win_outcome"):
+        monkeypatch.setattr(mod, site, broken)
+        return
+    real = getattr(coordinator.registry, site)
+
+    def raising_for_the_key_read(*args: Any, **kwargs: Any) -> Any:
+        if sys._getframe(1).f_code.co_name == "_attach_handoff_key":
+            raise RuntimeError("injected handoff read failure")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator.registry, site, raising_for_the_key_read)
+
+
+@pytest.mark.parametrize(
+    "site", ["lookup_artifact_id_by_name", "get_transfer_record", "_handoff_projection"]
+)
+def test_a_failed_handoff_read_leaves_a_landed_acquire_answered(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    """The ``handoff`` key is read after the work landed, so a raise at any
+    step of that read answers the landed work without the key -- here the
+    successor's acquire, which holds its grant -- never an error the client
+    would read as an acquire that failed."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _fail_the_handoff_key_read(coordinator, monkeypatch, site)
+
     answer = client.post(
         "/hooks/pre-edit", {"session_id": successor.sid, "path": "plan.md"},
         principal=successor.principal)
 
     assert answer == (200, {"ok": True})
     assert _state(coordinator, "plan.md", session_to_agent_id(successor.sid)) == MESIState.EXCLUSIVE
+
+
+def test_a_failed_handoff_read_leaves_a_landed_win_answered(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same on a compare-and-swap win: a raise while working out the
+    win's outcome answers the win, version and all, without the key."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _fail_the_handoff_key_read(coordinator, monkeypatch, "_win_outcome")
+
+    assert client.post("/hooks/post-edit-cas", {
+        "session_id": successor.sid, "agent_id": "s-1", "path": "plan.md",
+        "content_hash": _hash("plan-v2"), "expected_version": 1,
+    }, principal=successor.principal) == (200, {"ok": True, "version": 2})
+    assert _record(coordinator, "plan.md")[0].status == "completed"
+
+
+def test_a_failed_handoff_read_keeps_the_notices_a_read_already_drained(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh pre-read pops the session's preemption notices before the key
+    is read; popping is destructive, so a failed key read must still deliver
+    them in the answer rather than lose them."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _read(client, bystander, "spec.md")
+    bystander_agent = session_to_agent_id(bystander.sid)
+    spec_id = coordinator.registry.lookup_artifact_id_by_name("spec.md")
+    coordinator.registry.record_preemption_notice(
+        victim_agent_id=bystander_agent, artifact_id=spec_id,
+        preempter_agent_id=session_to_agent_id(str(uuid.uuid4())),
+        preempted_at_unix_ts=1234.0,
+    )
+    _fail_the_handoff_key_read(coordinator, monkeypatch, "get_transfer_record")
+
+    answer = _read(client, bystander, "plan.md")
+
+    assert "handoff" not in answer, answer
+    assert "spec.md" in answer["hookSpecificOutput"]["additionalContext"], answer
+    assert coordinator.registry.peek_preemption_notice(bystander_agent, spec_id) is None
 
 
 # ----------------------------------------------------------------------
