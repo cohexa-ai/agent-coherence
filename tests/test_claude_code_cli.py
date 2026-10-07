@@ -1152,10 +1152,13 @@ _SESSION_VAR = "CLAUDE_CODE_SESSION_ID"
 _EXIT_DONE, _EXIT_USAGE, _EXIT_FAILED, _EXIT_NOT_SERVED = 0, 1, 2, 4
 
 _NOT_HELD_HINT = (
-    "hint: a Claude Code session's write grant ends when its turn ends; "
-    "if an earlier transfer of plan.md may have landed, check "
-    "agent-coherence-status first, and otherwise have the giver session read "
-    "plan.md, then transfer it again"
+    "hint: a Claude Code session's write grant ends when its turn ends. If an "
+    "earlier transfer of plan.md may have landed, check its handoff in "
+    "agent-coherence-status first: a handoff from this session to that "
+    "successor made at the version it held, live or ended, means it landed, so "
+    "do not transfer again, and if it shows another session's handoff, ask "
+    "before transferring; otherwise have the giver session read plan.md, then "
+    "transfer it again"
 )
 
 _VERB_RUNS = {

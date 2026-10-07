@@ -2104,7 +2104,7 @@ hint:
 
 ```text
 agent-coherence-transfer: notes.md not transferred (handoff_not_held)
-agent-coherence-transfer: hint: a Claude Code session's write grant ends when its turn ends; if an earlier transfer of notes.md may have landed, check agent-coherence-status first, and otherwise have the giver session read notes.md, then transfer it again
+agent-coherence-transfer: hint: a Claude Code session's write grant ends when its turn ends. If an earlier transfer of notes.md may have landed, check its handoff in agent-coherence-status first: a handoff from this session to that successor made at the version it held, live or ended, means it landed, so do not transfer again, and if it shows another session's handoff, ask before transferring; otherwise have the giver session read notes.md, then transfer it again
 ```
 
 On a strict-mode path the re-read is denied, so the hint does not help there;

@@ -93,10 +93,13 @@ _NO_SESSION = (
 )
 
 _NOT_HELD_HINT = (
-    "hint: a Claude Code session's write grant ends when its turn ends; "
-    "if an earlier transfer of {path} may have landed, check "
-    "agent-coherence-status first, and otherwise have the giver session read "
-    "{path}, then transfer it again"
+    "hint: a Claude Code session's write grant ends when its turn ends. If an "
+    "earlier transfer of {path} may have landed, check its handoff in "
+    "agent-coherence-status first: a handoff from this session to that "
+    "successor made at the version it held, live or ended, means it landed, so "
+    "do not transfer again, and if it shows another session's handoff, ask "
+    "before transferring; otherwise have the giver session read {path}, then "
+    "transfer it again"
 )
 """Printed after a ``handoff_not_held`` refusal, beside the wire reason, which
 is printed unchanged. Client-side only: the coordinator's answer is the same
