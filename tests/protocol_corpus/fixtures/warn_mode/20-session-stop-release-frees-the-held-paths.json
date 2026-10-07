@@ -1,0 +1,53 @@
+{
+  "name": "session-stop-release-frees-the-held-paths",
+  "description": "KTD-11 end-of-turn release, checked by its effect on both backends rather than by its answer: session A takes EXCLUSIVE on two tracked paths (preflight pre-edits, plan.md first, then CLAUDE.md) and stops, then session B pre-edits CLAUDE.md, the path A acquired last. B's acquire must be clean, the bare {ok:true} with no collision warning, because the stop released A's grants. Row 18 pins the stop's answer, which lists the paths whether or not their grants were freed; this row fails instead when the stop frees nothing, or stops before the last grant, because B would find A still holding EXCLUSIVE and get the collision envelope of row 13.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md",
+      "plan.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n",
+      "plan.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444",
+          "path": "plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444",
+          "path": "CLAUDE.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/session-stop",
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "66666666-6666-4666-8666-666666666666",
+      "path": "CLAUDE.md"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true
+    }
+  }
+}

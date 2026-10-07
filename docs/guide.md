@@ -620,11 +620,27 @@ detached. When the sets cannot be read at all, because the coordinator is older
 and publishes only counts, or is the Node coordinator, the volume fails closed
 the same way and says that enforcement could not be confirmed.
 `vol.managed_glob_enforcement()` returns the same three-way answer. The
-comparison is literal and taken once, at attach: a coordinator that ignores the
-paths under a broader pattern, or a path untracked after attach with the untrack
-command, is not detected, and such paths answer every operation as untracked. A
-fleet with mixed globs is still unsupported; it now refuses instead of running
-unguarded.
+comparison is literal and taken once, at attach, and the coordinator keeps the
+answer true while it runs. A strict path stays enforced for the coordinator's
+lifetime:
+
+- the untrack command (`POST /policy/untrack`) refuses an entry, a path or a
+  glob, that covers a path the coordinator holds in strict mode. It answers
+  HTTP 409 with `reason: "untrack_strict_path"`, names the strict pattern for
+  each refused entry under `refused`, and writes nothing; the CLI exits 3. The
+  check is bounded in time: an entry it cannot settle within that bound counts
+  as covering, so a very large or unusual request can be refused for a strict
+  pattern it does not reach. Untrack fewer entries at a time if that happens;
+- an ignored pattern never takes a strict path off the tracked set, whether it
+  was in `.coherence/ignored.yaml` at spawn or added later, and however broadly
+  it is spelled (`**`): strict wins over ignore, and the coordinator logs the
+  overridden ignore entry at load. For every non-strict path ignore still wins;
+- the reload behind the track and untrack commands never drops a strict or
+  tracked pattern, even one removed from the YAML on disk by hand.
+
+To stop enforcing a strict path, remove its entry from
+`.coherence/strict_mode.yaml` and restart the coordinator. A fleet with mixed
+globs is still unsupported; it refuses instead of running unguarded.
 
 ```python
 from ccs.adapters.coherent_volume import CoherentVolume
@@ -652,6 +668,17 @@ child gets a session of its own. The fresh attempt travels in the request's
 from 0.13.0, or the Claude Code plugin's from 0.3.0. A volume hands a file to
 another session with `vol.transfer()`; see
 [From a `CoherentVolume`](#from-a-coherentvolume).
+
+To name the attempt to something else — a registry that joins the coordinator's
+`/status` `sessions[].agent_id` against its writers, for example — read
+`vol.agent_id`: the identity the coordinator keys the volume's next request on,
+in the same string form `/status` reports. `vol.incarnation` is the per-attempt
+part of it, the value every request carries in its `agent_id` field. Both change
+only when an attempt starts (`reacquire()`, `write_cas_at`, `atomic_publish`, a
+`write_cas` that retries or first releases its own `write()` grant, and a forked
+child) and are stable in between, so read them after the operation whose
+attempt you are reporting. `vol.root` is the workspace root as the volume
+resolved it at construction (absolute, symlinks followed); it never changes.
 
 ### Concurrent writers: `write_cas`
 
@@ -1759,9 +1786,14 @@ The key sits beside the answer's other fields and never inside a
 `hookSpecificOutput`. A strict-mode deny on `pre-read` or `pre-edit` carries no
 key at all: its body is byte-for-byte what it is with no record on the path.
 The giver's own `pre-edit` deny does carry the key. With no record on the
-path, every one of these answers is byte-for-byte what it was before.
+path, none of these answers carries the key.
 Admitted `pre-read` and `pre-edit` answers also carry the record as prose for
 Claude Code; see [Claude Code sessions](#claude-code-sessions).
+
+The key is best-effort. If the coordinator cannot read the record after the
+request's work has landed, it answers without the key (and without that
+prose) and logs a warning, so a missing key does not prove the path has no
+record. Read the path on `/status` when you need to be sure.
 
 `GET /status` carries the same fields, without `role`, in the
 `tracked_artifacts` entry of each path that has a record, on the default view
@@ -1770,6 +1802,11 @@ header). The operator view adds `created_at_unix_ts`, when the record was
 written. The `metrics` view carries no record. `agent-coherence-status --json` prints the key as the coordinator
 sends it, and the table view lists each record in a Handoffs block (see
 [Handoffs in `agent-coherence-status`](#handoffs-in-agent-coherence-status)).
+
+`/status` also counts calls to the four routes as `handoff_transfer_total`,
+`handoff_accept_total`, `handoff_decline_total` and `handoff_withdraw_total`
+in `endpoint_counters`. These counters are present whether or not any path has
+a record.
 
 Every id in the key, here and on `/status`, is a session-level agent id. No
 session id or session name appears in it.
@@ -1782,7 +1819,7 @@ coordinator still holds:
 
 - **`POST /hooks/session-stop` that leaves a grant held** answers
   `{"ok": false, "released_artifacts": [...], "grants": [...]}`, one entry per
-  grant it tried to release, in the order they were acquired:
+  grant it tried to release, in no guaranteed order (match entries by `path`):
   `{"path", "held": false, "cause": "release"}` for a grant it released, and
   `{"path", "held": true, "reason"}` for one still held (with `detail` when the
   reason is a typed one). It used to answer `ok: true` and only log the
@@ -1965,7 +2002,10 @@ and answer as before apart from the giver's shell write, which is denied.
   ```
 
   On its edit, when it has not read the path at the version at transfer or
-  later, it adds a warning. The edit is still admitted:
+  later, it adds a warning, and the edit is still admitted. On a strict-mode
+  path the strict-mode checks run first: a successor that is `INVALID` there,
+  or holds a standing read older than the current version, is denied, and the
+  deny carries none of this text. The warning:
 
   ```text
   ⚠ You have not read {path} at v{version_at_transfer} or later; read it before editing.
@@ -2008,9 +2048,11 @@ write grant ends with its turn:
   standing read that outlives the turn. The session can hand it on at any
   time.
 - **On a strict-mode path**, a session whose write grant was released is
-  denied its re-read by the strict-mode stale-view deny, and a denied read
-  grants nothing, so the session cannot pick up a standing read again. There,
-  hand the path on in the same turn as the edit.
+  denied its `Read` of the file by the strict-mode stale-view deny, and that
+  denied read grants nothing. A shell read of the file (`cat`, for example) is
+  denied too, but its deny re-grants a standing read without recording a read
+  of the current version, and a transfer hands that on as `SHARED`. Handing
+  the path on in the same turn as the edit avoids both.
 
 ### Handoff commands
 
@@ -2107,8 +2149,8 @@ agent-coherence-transfer: notes.md not transferred (handoff_not_held)
 agent-coherence-transfer: hint: a Claude Code session's write grant ends when its turn ends. If an earlier transfer of notes.md may have landed, check its handoff in agent-coherence-status first: a handoff from this session to that successor made at the version it held, live or ended, means it landed, so do not transfer again, and if it shows another session's handoff, ask before transferring; otherwise have the giver session read notes.md, then transfer it again
 ```
 
-On a strict-mode path the re-read is denied, so the hint does not help there;
-see [Claude Code sessions](#claude-code-sessions).
+On a strict-mode path the hint's `Read` is denied and grants nothing; see
+[Claude Code sessions](#claude-code-sessions) for what a shell read does there.
 
 **Python coordinator only.** Against the Claude Code plugin's Node coordinator
 the commands exit `4`. A plugin workspace created fresh runs the Node

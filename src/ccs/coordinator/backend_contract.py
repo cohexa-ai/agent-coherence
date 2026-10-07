@@ -586,7 +586,12 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "record was neither declined nor withdrawn), both from one read: the "
         "single place the service's giver check, re-send answer and "
         "completion/overtake decisions take liveness from. "
-        "Non-mutating; a lock-only select that serves a read-only open.",
+        "Non-mutating; a lock-only select that serves a read-only open. "
+        "The giver fence built on it is a service-layer precondition, not a "
+        "registry leg: its atomicity with the write comes from the service "
+        "reading it inside the write path's abort_guard hold, so a cross-host "
+        "backend must re-home that read into the same critical section as the "
+        "write it fences.",
     ),
     # ---- INDEPENDENT / READ_ONLY (sqlite_extended) ------------------------
     MemberContract(
