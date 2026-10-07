@@ -192,10 +192,15 @@ jobs:
       # So: build the plugin branch whose name matches the branch under
       # test — the PR's head branch on pull_request (`head_ref`), the pushed
       # branch on push (`ref_name`, so a push to `dev` pairs with the
-      # plugin's `dev` and a push to `main` with its `main`) — and fall back
-      # to `main` when no same-named plugin branch exists (tags fall back
-      # too: no plugin branch is named `v*`). An absent or unreachable
-      # sibling degrades to `main` rather than failing the job.
+      # plugin's `dev` and a push to `main` with its `main`). With no
+      # same-named plugin branch, fall back to the plugin branch named like
+      # the line the change is heading for: a PR into `dev` (`base_ref`) and
+      # a hand-dispatched run on a feature branch -- stacked PRs get no PR
+      # checks, so their CI is dispatched -- pair with the plugin's `dev`,
+      # because that is what this repo's `dev` push will pair with after the
+      # merge. A PR into `main`, a dispatch on `main` and a tag fall back to
+      # the plugin's `main` (no plugin branch is named `v*`). An absent or
+      # unreachable fallback degrades to `main` rather than failing the job.
       #
       # `head_ref` is attacker-controlled on a fork PR, so it reaches the
       # script through the environment and is never interpolated into it.
@@ -203,6 +208,9 @@ jobs:
         id: plugin_ref
         env:
           SIBLING_REF: ${{ github.head_ref || github.ref_name }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           remote=https://github.com/Cohexa-ai/agent-coherence-plugin.git
           ref=main
@@ -216,6 +224,19 @@ jobs:
                >/dev/null 2>&1; then
             ref="$SIBLING_REF"
             fellback=no
+          else
+            # The fallback follows the integration line: `dev` for a PR into
+            # `dev` or a dispatch on a non-`main` branch, `main` otherwise.
+            fallback=main
+            if [ "$BASE_REF" = dev ] ||
+               { [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REF_NAME" != main ]; }; then
+              fallback=dev
+            fi
+            if [ "$fallback" != main ] &&
+               git ls-remote --exit-code --heads "$remote" "$fallback" \
+                 >/dev/null 2>&1; then
+              ref="$fallback"
+            fi
           fi
           # Record the SHA too: the sibling branch can move without a commit
           # here, so the ref name alone does not identify what was proven.
@@ -231,7 +252,9 @@ jobs:
           # rate-limited or unreachable API never turns a passing parity run
           # red. `|| true` is load-bearing under the default `bash -e`.
           note=""
-          if [ "$fellback" = yes ]; then
+          if [ "$fellback" = yes ] && [ "$ref" = dev ]; then
+            note=" — the fallback, the plugin's \`dev\` (the line this change merges into)"
+          elif [ "$fellback" = yes ]; then
             # `.ahead_by` on a three-dot compare is how far `dev` leads, i.e.
             # how far `main` trails. `.behind_by` would report the opposite
             # and is wrong here -- today the two are diverged (33 / 2).
