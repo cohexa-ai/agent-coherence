@@ -635,14 +635,25 @@ def test_empty_and_pathological_commands_return_promptly() -> None:
     'python3 -c "' + "x = 'a.md'; " * 1300 + "open('b.md', 'w')" + '"',
     ('python3 -c "' + "".join(f"x{i} = 'a.md'; " for i in range(1000))
      + "".join(f"open(x{i}, 'w'); " for i in range(60)) + '"')[:16384],
+    'python3 -c "p = \'a.md\'\nrename' + " " * 16000 + '"',
+    'python3 -c "p = \'a.md\'\nunlink' + " " * 16000 + '"',
+    'python3 -c "' + "".join(f"x{i} = 'a.md'\n" for i in range(16)) + "copyFile(" + " " * 16000 + '"',
+    'python3 -c "' + "".join(f"x{i} = 'a.md'\n" for i in range(64)) + "copyFile(x" + " " * 16000 + '"',
+    'python3 -c "p = \'a.md\'\nopen' + " " * 16000 + '"',
+    'python3 -c "' + "".join(f"x{i} = 'a.md'\n" for i in range(16)) + "open F, '>'," + " " * 16000 + '"',
+    'python3 -c "p = \'a.md\'\nwriteFileSync(q)' + "\n" * 16000 + '"',
 ], ids=["ex-herestring-spaces", "ex-c-spaces", "ed-herestring-spaces", "open-calls",
         "open-calls-with-args", "open-calls-with-commas", "many-path-literals",
-        "many-bound-names"])
+        "many-bound-names", "rename-then-blanks", "unlink-then-blanks", "copy-then-blanks",
+        "copy-arg-then-blanks", "perl-open-then-blanks", "perl-open-mode-then-blanks", "bound-name-then-newlines"])
 def test_a_16k_script_body_is_scanned_in_linear_time(command: str) -> None:
     """Script and program checks stay linear on a 16K body: an ex prefix whose
     two whitespace runs could split one run many ways, an unbounded scan for
-    an ``open(`` mode, or following every one of a thousand bound names to the
-    end of the body, made one of these take seconds."""
+    an ``open(`` mode, following every one of a thousand bound names to the
+    end of the body, or two blank patterns back to back in a write-call rule
+    (after ``rename``, ``unlink``, ``copyFile(`` or a perl ``open``, or after
+    each newline of a run) made one of these take seconds; the blank runs held
+    the coordinator for minutes."""
     started = time.process_time()
     _detect(command)
     assert time.process_time() - started < 0.25

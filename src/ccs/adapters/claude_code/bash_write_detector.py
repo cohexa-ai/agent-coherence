@@ -476,14 +476,17 @@ _WRITE_CALLS: tuple[_WriteCall, ...] = (
         r"unlinkSync|rmSync|truncateSync|file_put_contents|File\.write|IO\.write|"
         r"File\.delete|FileUtils\.rm\w*|FileUtils\.touch|os\.remove|os\.truncate)\("
     ),
-    _WriteCall(r"\bunlink(?:\(|\s+)"),
-    _WriteCall(r"\b(?:os\.replace|shutil\.move|FileUtils\.mv|renameSync|rename)(?:\(|\s+)", (0, 1)),
+    # A head ends on the ``(`` or the ONE blank after the call's name: every
+    # rule appends its own ``\s*``, and two runs of blanks back to back can split
+    # one long run many ways.
+    _WriteCall(r"\bunlink(?:\(|\s)"),
+    _WriteCall(r"\b(?:os\.replace|shutil\.move|FileUtils\.mv|renameSync|rename)(?:\(|\s)", (0, 1)),
     _WriteCall(r"\b(?:shutil\.copy\w*|copyFileSync|copyFile|FileUtils\.cp)\(", (1,)),
     # ``open(`` also matches ``os.open(``, ``io.open(``, ``codecs.open(`` and
     # ruby's ``File.open(``.
     _WriteCall(r"\b(?:open|fopen|openSync|File\.new)\(", moded=True),
     # perl's three-argument open: the mode comes before the path.
-    _WriteCall(r"""\bopen\s*\(?\s*(?:my\s+)?[\$\w]+\s*,\s*['"](?:\+?>{1,2}|\+<)[^'"]*['"]\s*,\s*"""),
+    _WriteCall(r"""\bopen\s*(?:\(\s*)?(?:my\s+)?[\$\w]+\s*,\s*['"](?:\+?>{1,2}|\+<)[^'"]*['"]\s*,"""),
 )
 # A mode that writes: a literal with w, a, x or +, a mode held in a variable
 # (``open(p, mode)``, which a read rarely spells), or os.open's write flags.
@@ -492,8 +495,10 @@ _WRITE_MODE = (
     r"""[\w.|\s]{0,80}\bO_(?:WRONLY|RDWR|CREAT|TRUNC|APPEND)\b)"""
 )
 # A first argument a second, written one follows: anything up to the comma,
-# one level of parentheses deep.
-_FIRST_ARG = r"(?:[^,()]|\([^()]*\)){1,200}"
+# one level of parentheses deep. It starts on a non-blank and runs to the
+# comma itself, so no blank run is shared with a ``\s*`` on either side: a
+# shared run made a 16K body of blanks after ``copyFile(`` take minutes.
+_FIRST_ARG = r"(?:[^,()\s]|\([^()]*\))(?:[^,()]|\([^()]*\)){0,199}"
 # A pathlib object's writing methods, and the subset a str also answers to.
 _PATH_WRITE_METHOD = (
     r"""\.(?:write_text|write_bytes|unlink|touch|rename|replace|"""
@@ -528,7 +533,7 @@ _REDIRECT_START_RE = re.compile(r""">\s*$""")
 # A literal is written only as the TARGET of a write call: reading it, copying
 # from it or naming it in text the program writes is not a write.
 _FIRST_TARGET_BEFORE_RE = re.compile(_heads(at=0, moded=False) + r"""\s*['"]$""")
-_SECOND_TARGET_BEFORE_RE = re.compile(_heads(at=1, moded=False) + r"\s*" + _FIRST_ARG + r"""\s*,\s*['"]$""")
+_SECOND_TARGET_BEFORE_RE = re.compile(_heads(at=1, moded=False) + r"\s*" + _FIRST_ARG + r""",\s*['"]$""")
 _OPEN_TARGET_BEFORE_RE = re.compile(_heads(at=0, moded=True) + r"""\s*(?:file\s*=\s*)?['"]$""")
 _WRITE_MODE_AFTER_RE = re.compile(r"""^['"]""" + _WRITE_MODE)
 _PATH_BEFORE_RE = re.compile(_PATH_CALL + r"""\s*['"]$""")
@@ -537,7 +542,10 @@ _PATH_WRITE_AFTER_RE = re.compile(r"""^['"]\s*\)\s*""" + _PATH_WRITE_METHOD)
 # ``p = Path('x')``, ``const f = 'x'``, ``my $f = "x"``), the statement
 # ending with it: a value built from it (``'x' + '.bak'``), a tuple target and
 # a keyword argument are not bindings.
-_STATEMENT_START = r"(?:[;\n{]|\b(?:const|let|var|my)\b)\s*"
+# A newline is a statement start of its own, so the blanks after one stop at
+# the line: a ``\s*`` there let every newline of a long run start a match
+# that scanned the rest of the run.
+_STATEMENT_START = r"(?:[;\n{][ \t]*|\b(?:const|let|var|my)\b\s*)"
 _ASSIGNED_BEFORE_RE = re.compile(
     _STATEMENT_START + r"""(\$?[A-Za-z_]\w*)\s*=\s*(""" + _PATH_CALL + r"""\s*)?['"]$"""
 )
@@ -637,7 +645,7 @@ def _written_through_name(
         name + r"\s*" + method,
         _PATH_CALL + r"\s*" + name + r"\s*\)\s*" + _PATH_WRITE_METHOD,
         _heads(at=0, moded=False) + r"\s*" + arg + whole,
-        _heads(at=1, moded=False) + r"\s*" + _FIRST_ARG + r"\s*,\s*" + arg + whole,
+        _heads(at=1, moded=False) + r"\s*" + _FIRST_ARG + r",\s*" + arg + whole,
         _heads(at=0, moded=True) + r"\s*(?:file\s*=\s*)?" + arg + _WRITE_MODE,
     )
     return any(re.search(use, window) for use in uses)
