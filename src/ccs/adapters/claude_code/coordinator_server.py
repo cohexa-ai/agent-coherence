@@ -7556,10 +7556,15 @@ def _reground_qualifies(result: dict) -> bool:
     (AE3). An envelope-less response qualifies iff it is an admit body —
     ``{ok: true}`` (pre-edit) or ``{status: "fresh"}`` (pre-read /
     pre-bash / pre-grep). A service-refusal body (``{ok: false, ...}``)
-    is neither a deny envelope nor an admit: no attach, no consume."""
+    is neither a deny envelope nor an admit: no attach, no consume.
+
+    A CONTEXT-ONLY envelope (no permission decision; the handoff prose
+    puts one on a bare admit) decides nothing, so it qualifies exactly as
+    the body under it would: otherwise prose on an admit would hold the
+    re-grounding back past every touch of a handed-off path."""
     hso = result.get("hookSpecificOutput")
-    if hso is not None:
-        return hso.get("permissionDecision") == "allow"
+    if hso is not None and "permissionDecision" in hso:
+        return hso["permissionDecision"] == "allow"
     return result.get("ok") is True or result.get("status") == "fresh"
 
 

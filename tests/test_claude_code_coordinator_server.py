@@ -10955,6 +10955,42 @@ def _hand_off_shape(client: _Client, giver: _Session, successor: _Session, shape
     return version
 
 
+@pytest.mark.parametrize("role", ["successor", "bystander", "giver"])
+def test_a_pending_re_grounding_rides_the_admit_that_carries_handoff_prose(
+    coordinator, client: _Client, role: str
+) -> None:
+    """After a compaction, the first admitted touch of a handed-off path
+    carries the handoff prose AND the deferred re-grounding, handoff first,
+    and consumes the flag: the successor's and a bystander's edit, and the
+    live giver's read. The prose rides a context-only envelope (no permission
+    decision), which the re-grounding seam used to refuse, so the flag stayed
+    pending past every such admit and expired with the turn. The giver's
+    case is its fresh read: its first read after the transfer is stale, and
+    a stale warning already carries an allow."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    who = {"successor": successor, "bystander": bystander, "giver": giver}[role]
+    _read(client, who, "spec.md")  # state worth re-grounding, whatever the role
+    if role == "giver":
+        # The giver's first read after the transfer is stale, and its warning
+        # already carries an allow; the next, fresh read is a bare admit.
+        _read(client, giver, "plan.md")
+    coordinator.mark_compact_pending(who.sid)
+
+    route = "/hooks/pre-read" if role == "giver" else "/hooks/pre-edit"
+    status, body = client.post(
+        route, {"session_id": who.sid, "path": "plan.md"}, principal=who.principal)
+
+    assert status == 200, body
+    envelope = body["hookSpecificOutput"]
+    assert "permissionDecision" not in envelope, envelope
+    text = envelope["additionalContext"]
+    handoff_at = text.index("Handoff")
+    reground_at = text.index("Post-compaction re-grounding (agent-coherence):")
+    assert handoff_at < reground_at, text
+    assert coordinator.has_compact_pending(who.sid) is False
+
+
 def test_the_handoff_prose_templates_are_static() -> None:
     """The successor's and bystander's prose and the ended outcomes are
     under the deny's placeholder rule: short agent ids, the path, the version
