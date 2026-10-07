@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -33,6 +36,7 @@ from ccs.adapters.claude_code.policy import (
     _glob_regex,
     _glob_tokens,
     _globs_intersect,
+    _normalize_relative,
     _SearchBudget,
     _tokens_match,
     matches_any,
@@ -217,6 +221,32 @@ def test_strict_patterns_covering_decides_on_the_glob_languages(
     assert policy.strict_patterns_covering(entry) == covering
 
 
+@pytest.mark.parametrize(
+    ("tracked", "strict", "entry", "covering"),
+    [
+        # Only the second tracked pattern reaches data/a.json: every tracked
+        # pattern is tried, not just the first, and one is enough.
+        (["data/[x]*.json", "data/**"], "data/*.json", "data/a.json", ("data/*.json",)),
+        # The entry and the strict glob meet (data/c.json), but no tracked
+        # path is among them, so nothing they share is strict.
+        (["data/[ab]*.json"], "data/*", "data/c*.json", ()),
+    ],
+)
+def test_a_strict_glob_is_covered_only_through_a_tracked_pattern(
+    root: Path, tracked: list[str], strict: str, entry: str, covering: tuple[str, ...]
+) -> None:
+    """Strict mode is an intersection, so an entry covers a strict glob only
+    where the two meet on a tracked path. Deciding it on the first tracked
+    pattern alone, or requiring every tracked pattern, accepts the first
+    entry's untrack of a strict path; skipping the tracked check refuses the
+    second's ordinary one."""
+    (root / ".coherence" / "tracked.yaml").write_text(_quoted_yaml(tracked))
+    (root / ".coherence" / "strict_mode.yaml").write_text(_quoted_yaml([strict]))
+    policy = TrackedArtifactPolicy.load(root)
+
+    assert policy.strict_patterns_covering(entry) == covering
+
+
 def test_a_literal_strict_path_no_tracked_pattern_reaches_is_not_covered(
     root: Path,
 ) -> None:
@@ -228,6 +258,41 @@ def test_a_literal_strict_path_no_tracked_pattern_reaches_is_not_covered(
     assert not policy.is_strict_mode("scratch/x.tmp")
     assert policy.strict_patterns_covering("scratch/*") == ()
     assert policy.strict_patterns_covering("scratch/x.tmp") == ()
+
+
+@pytest.mark.parametrize(
+    ("entry", "covering"),
+    [
+        ("./.github/ci.yml", (".github/*.yml",)),
+        ("./.github/**", (".github/*.yml",)),
+        (".github/**", (".github/*.yml",)),
+        ("./.env", ()),
+    ],
+)
+def test_a_leading_dot_slash_on_a_dotfile_entry_names_the_same_path(
+    root: Path, entry: str, covering: tuple[str, ...]
+) -> None:
+    """Only the literal ``./`` is stripped from an entry (removeprefix): an
+    lstrip of the characters ``.`` and ``/`` would turn ``./.github/ci.yml``
+    into ``github/ci.yml`` and accept its untrack."""
+    (root / ".coherence" / "tracked.yaml").write_text("- '.github/**'\n")
+    (root / ".coherence" / "strict_mode.yaml").write_text("- '.github/*.yml'\n")
+    policy = TrackedArtifactPolicy.load(root)
+
+    assert policy.strict_patterns_covering(entry) == covering
+
+
+def test_the_overlap_search_keeps_single_stars_within_a_segment(root: Path) -> None:
+    """The search is exact for ``*``, ``**`` and ``?``: in a ``**`` pattern
+    ``*`` never crosses ``/``, so an entry only a crossing star could reach
+    is not covered. Letting it cross over-reports, refusing the untrack."""
+    assert not _intersect(("**/a*b", "a/b"), _SearchBudget(100_000))
+    (root / ".coherence" / "tracked.yaml").write_text("- src/**\n")
+    (root / ".coherence" / "strict_mode.yaml").write_text("- 'src/a/b/x/[0-9]'\n")
+    policy = TrackedArtifactPolicy.load(root)
+
+    assert policy.strict_patterns_covering("src/*/x/**") == ()
+    assert policy.strict_patterns_covering("src/*/*/x/**") == ("src/a/b/x/[0-9]",)
 
 
 def test_a_root_level_path_is_covered_by_a_leading_double_star(root: Path) -> None:
@@ -246,6 +311,9 @@ def test_a_root_level_path_is_covered_by_a_leading_double_star(root: Path) -> No
 _GRAMMAR_CORPUS = (
     "a", "a.x", "x", "*", "?", "**", "**/a", "a/**", "a/**/b", "**/*", "**/a?",
     "**/*.x", "a?", "a*b", "*.x", "a/*", "*/b", "?/?", "[ab]", "[!a]", "a[", "[a-b]/x",
+    # A '*' meeting a segment boundary inside a ** pattern, a leading '/',
+    # and a negated class whose only witness is '/'.
+    "**/a*b", "*x/**", "/x/a", "a*/**", "a[!x]b",
 )
 _GRAMMAR_PATHS = tuple(
     "".join(chars)
@@ -317,6 +385,31 @@ def test_the_linear_matcher_agrees_with_the_double_star_regex() -> None:
         != (_glob_regex(_glob_tokens(g)).match(p) is not None)
     ]
     assert disagree == []
+
+
+def test_the_coverage_shortcuts_never_under_report() -> None:
+    """``strict_patterns_covering`` skips the search where literal ends rule a
+    strict pattern out, matches a literal strict path instead of searching,
+    and keeps only tracked literal paths. Over every (entry, strict, tracked)
+    triple of the grammar corpus, wherever a short path is strict and matches
+    the entry, the strict pattern must be reported."""
+    paths = {n for n in map(_normalize_relative, _GRAMMAR_PATHS) if n is not None}
+    matching = {g: {p for p in paths if matches_any(p, [g])} for g in _GRAMMAR_CORPUS}
+    missed = []
+    for strict, tracked in itertools.product(_GRAMMAR_CORPUS, repeat=2):
+        strict_paths = matching[strict] & matching[tracked]
+        if not strict_paths:
+            continue
+        policy = TrackedArtifactPolicy(
+            coordinator_root=Path("."), tracked_patterns=(tracked,), strict_mode_paths=(strict,)
+        )
+        missed += [
+            (entry, strict, tracked)
+            for entry in _GRAMMAR_CORPUS
+            if matching[entry] & strict_paths
+            and policy.strict_patterns_covering(entry) != (strict,)
+        ]
+    assert missed == []
 
 
 def test_a_strict_pattern_with_no_tracked_cover_is_not_covering(root: Path) -> None:
@@ -621,6 +714,33 @@ def test_a_literal_strict_path_is_matched_in_linear_time(root: Path) -> None:
     assert policy.ignored_patterns_overridden_by_strict() == ()
 
     assert time.monotonic() - started < 1.0
+
+
+_SEARCH_STEPS_SCRIPT = """
+from ccs.adapters.claude_code.policy import _SearchBudget, _glob_tokens, _globs_intersect
+budget = _SearchBudget(10**9)
+_globs_intersect([_glob_tokens("**/*a*b*c*"), _glob_tokens("src/**/*.py")], budget)
+print(10**9 - budget.remaining)
+"""
+
+
+def test_the_search_explores_in_the_same_order_in_every_process() -> None:
+    """A set's iteration order is hash-randomized per process, and the order
+    decides how far a bounded search gets before it finds a shared path, so
+    which strict patterns a refusal names could change from one coordinator
+    run to the next. The search alphabet is sorted: the steps it takes are
+    the same under every hash seed."""
+    steps = {
+        subprocess.run(
+            [sys.executable, "-c", _SEARCH_STEPS_SCRIPT],
+            env={**os.environ, "PYTHONHASHSEED": seed},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        for seed in ("1", "2", "3")
+    }
+    assert len(steps) == 1, steps
 
 
 @pytest.mark.parametrize("shape", ["globs", "literals"])
