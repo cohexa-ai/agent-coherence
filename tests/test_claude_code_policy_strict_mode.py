@@ -20,10 +20,15 @@ from pathlib import Path
 import pytest
 
 from ccs.adapters.claude_code.policy import (
+    _ANY_ONE,
+    _CLASS,
     DEFAULT_TRACKED_PATTERNS,
     STRICT_MODE_PATH_WARN_THRESHOLD,
     TrackedArtifactPolicy,
-    globs_intersect,
+    _BudgetExhausted,
+    _glob_tokens,
+    _globs_intersect,
+    _SearchBudget,
 )
 
 
@@ -223,7 +228,7 @@ def test_a_class_range_too_wide_to_expand_errs_toward_covering(
     policy = TrackedArtifactPolicy.load(root)
     assert policy.is_strict_mode("data/5.json")
 
-    assert globs_intersect("data/5.json", strict)
+    assert _globs_intersect(("data/5.json", strict), _SearchBudget(100_000))
     assert policy.strict_patterns_covering("data/5.json") == (strict,)
     assert policy.ignored_patterns_overridden_by_strict() == ("data/5.json",)
 
@@ -231,21 +236,33 @@ def test_a_class_range_too_wide_to_expand_errs_toward_covering(
 _STAR_HEAVY = "**/" + "/".join(f"*{c}*" for c in "abcdefgh")
 
 
-def test_a_search_over_its_state_budget_answers_intersects() -> None:
+def test_a_search_over_its_budget_stops() -> None:
     """The product search is exponential in a star-heavy glob's segments; a
-    bounded search stops and errs toward "intersects" (the refusal side)."""
-    assert not globs_intersect("**/*a*/*b*/*c*", "src/**/*.py", "**/plan.md")
-    assert globs_intersect(_STAR_HEAVY, "src/**/*.py", "**/plan.md", max_states=50)
+    bounded search stops by raising, which every caller counts as
+    "intersects" (the refusal side)."""
+    # Disjoint, but only a search shows it: no segment of src/<digit> holds an 'a'.
+    assert not _globs_intersect(("**/*a*", "src/[0-9]"), _SearchBudget(1_000_000))
+    with pytest.raises(_BudgetExhausted):
+        _globs_intersect((_STAR_HEAVY, "src/**/*.py"), _SearchBudget(50))
+
+
+def test_literal_ends_rule_a_search_out_at_no_cost() -> None:
+    """Every path a glob matches starts with its literal prefix and ends with
+    its literal suffix, so globs whose prefixes or suffixes do not nest
+    cannot intersect: decided before any step is spent."""
+    budget = _SearchBudget(0)
+    assert not _globs_intersect(("**/*.log", "svc3/state/*.json"), budget)
+    assert not _globs_intersect(("svc3/**", "svc7/**"), budget)
+    assert budget.remaining == 0
 
 
 def test_a_star_heavy_untrack_entry_is_decided_within_the_budget(
     root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """strict_patterns_covering shares one state budget across the call, so a
-    star-heavy entry is decided well inside the /policy/untrack deadline
+    """A star-heavy entry is decided well inside the /policy/untrack handler
     (unbounded, this case explored the whole state space against every
-    default tracked pattern: tens of seconds). Strict patterns left undecided
-    when the budget runs out count as covered."""
+    default tracked pattern: tens of seconds). A strict glob whose search
+    runs out of its budget counts as covered."""
     import time
 
     from ccs.adapters.claude_code import policy as policy_module
@@ -261,10 +278,164 @@ def test_a_star_heavy_untrack_entry_is_decided_within_the_budget(
     assert time.monotonic() - started < 2.0
     assert "src/**/*.py" in covering
 
-    monkeypatch.setattr(policy_module, "GLOB_INTERSECT_STATE_BUDGET", 1)
+    monkeypatch.setattr(policy_module, "GLOB_INTERSECT_PATTERN_BUDGET", 1)
     assert policy.strict_patterns_covering(_STAR_HEAVY) == (
         "docs/**/*.txt", "src/**/*.py",
     )
+
+
+_STAR_HEAVY_LOG = "**/" + "/".join(f"*{c}*" for c in "abcdefgh") + ".log"
+
+
+def test_each_strict_glob_is_decided_on_its_own_budget(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One strict glob running out of search budget counts as covered, and
+    only that one: a later strict glob is still decided. With one budget
+    shared across the call, the first exhaustion marked every pattern after
+    it as covering."""
+    from ccs.adapters.claude_code import policy as policy_module
+
+    (root / ".coherence" / "tracked.yaml").write_text("- '**/*.log'\n- data/**\n")
+    (root / ".coherence" / "strict_mode.yaml").write_text(
+        "- '**/*.log'\n- 'data/*.json'\n"
+    )
+    policy = TrackedArtifactPolicy.load(root)
+    monkeypatch.setattr(policy_module, "GLOB_INTERSECT_PATTERN_BUDGET", 100)
+
+    assert policy.strict_patterns_covering(_STAR_HEAVY_LOG) == ("**/*.log",)
+
+
+def test_once_the_call_budget_runs_out_undecided_globs_count_as_covered(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After the call's budget runs out, every strict glob not yet decided
+    counts as covered, unless its literal ends rule it out; a literal strict
+    path is still decided exactly (``notes/a.log`` ends like the entry, so
+    only matching it shows the entry's eight segments cannot reach it)."""
+    from ccs.adapters.claude_code import policy as policy_module
+
+    (root / ".coherence" / "tracked.yaml").write_text("- '**/*.log'\n- data/**\n")
+    (root / ".coherence" / "strict_mode.yaml").write_text(
+        "- '**/*.log'\n- CLAUDE.md\n- notes/a.log\n- 'data/*.json'\n- 'src/**/*.log'\n"
+    )
+    policy = TrackedArtifactPolicy.load(root)
+    monkeypatch.setattr(policy_module, "GLOB_INTERSECT_CALL_BUDGET", 100)
+
+    assert policy.strict_patterns_covering(_STAR_HEAVY_LOG) == ("**/*.log", "src/**/*.log")
+
+
+def test_the_spawn_override_diagnostic_is_bounded_in_total(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The spawn-time diagnostic decides every ignored entry under one total
+    budget, so a large or pathological ignored.yaml cannot hold the spawn up;
+    once the budget runs out it errs toward reporting the entry overridden."""
+    import time
+
+    from ccs.adapters.claude_code import policy as policy_module
+
+    # Each entry ends like the strict glob but needs a letter that src/<digit>.py
+    # never holds: disjoint, which only a search shows.
+    entries = [f"**/*{c}*.py" for c in "abdefghijklmnoqtuvwxz"]
+    (root / ".coherence" / "tracked.yaml").write_text("- src/**/*.py\n")
+    (root / ".coherence" / "strict_mode.yaml").write_text("- 'src/[0-9].py'\n")
+    (root / ".coherence" / "ignored.yaml").write_text(_quoted_yaml(entries))
+
+    started = time.monotonic()
+    policy = TrackedArtifactPolicy.load(root)
+    assert time.monotonic() - started < 5.0
+    assert policy.ignored_patterns_overridden_by_strict() == ()
+
+    monkeypatch.setattr(policy_module, "GLOB_INTERSECT_DIAGNOSTIC_BUDGET", 1)
+    policy = TrackedArtifactPolicy.load(root)
+    assert policy.ignored_patterns_overridden_by_strict() == tuple(entries)
+
+
+def _wide_class_entry(ranges: int) -> str:
+    """An untrack entry whose one class holds ``ranges`` 512-code-point ranges:
+    short on the wire, but each range used to add 512 characters to the
+    search alphabet, and every explored state walked the whole alphabet."""
+    body = "".join(
+        chr(0x100 + 600 * k) + "-" + chr(0x100 + 600 * k + 511) for k in range(ranges)
+    )
+    return "*[" + body + "]*"
+
+
+def test_a_wide_class_range_untrack_entry_is_decided_quickly(root: Path) -> None:
+    """A /policy/untrack entry of 60 wide class ranges used to hold the
+    handler for over 20 s and was then accepted (and replayed at every spawn
+    from ignored.yaml). A class too wide to enumerate cheaply now counts as
+    any one character, so the search is bounded and the answer errs toward
+    "covers": the entry is refused, never accepted unchecked."""
+    import time
+
+    (root / ".coherence" / "tracked.yaml").write_text("- data/**\n")
+    (root / ".coherence" / "strict_mode.yaml").write_text("- 'data/*.json'\n")
+    policy = TrackedArtifactPolicy.load(root)
+
+    started = time.monotonic()
+    covering = policy.strict_patterns_covering(_wide_class_entry(60))
+
+    assert time.monotonic() - started < 1.0
+    assert covering == ("data/*.json",)
+
+
+def test_a_class_too_wide_to_enumerate_is_any_one_character() -> None:
+    """Every class member joins the search alphabet, so a class over the
+    member limit is approximated as any one character, in either polarity:
+    it accepts more than the class, never less."""
+    assert _glob_tokens("[\u0100-\u01ff]") == [(_ANY_ONE,)]
+    assert _glob_tokens("[!\u0100-\u01ff]") == [(_ANY_ONE,)]
+    assert _glob_tokens("[a-c]") == [(_CLASS, False, frozenset("abc"))]
+
+
+def test_an_untrack_entry_of_many_distinct_characters_is_decided_quickly(
+    root: Path,
+) -> None:
+    """Literal characters join the search alphabet too, and each explored
+    state is charged for every character it tries. Charged per new state
+    only, an entry of 400 distinct characters took over 3 s."""
+    import time
+
+    (root / ".coherence" / "tracked.yaml").write_text("- data/**\n")
+    (root / ".coherence" / "strict_mode.yaml").write_text("- 'data/*.json'\n")
+    policy = TrackedArtifactPolicy.load(root)
+    entry = "*" + "".join(chr(0x4E00 + i) for i in range(400)) + "*"
+
+    started = time.monotonic()
+    policy.strict_patterns_covering(entry)
+
+    assert time.monotonic() - started < 1.0
+
+
+def _quoted_yaml(patterns: list[str]) -> str:
+    return "".join(f"- '{p}'\n" for p in patterns)
+
+
+@pytest.mark.parametrize("shape", ["globs", "literals"])
+def test_an_ordinary_untrack_is_not_refused_on_a_large_strict_set(
+    root: Path, shape: str
+) -> None:
+    """An entry that covers no strict path is accepted however many strict
+    patterns are live. One search budget used to be shared across every
+    strict pattern in the call, and running out marked every pattern not yet
+    decided as covering: 40 strict globs refused ``**/*.log`` naming 30 of
+    them, and 60 literal strict paths refused it naming 3."""
+    if shape == "globs":
+        strict = [f"svc{i}/**" for i in range(40)]
+        tracked = [f"svc{i}/state/*.json" for i in range(40)]
+    else:
+        strict = tracked = [f"pkg{i}/deep/nested/dir/manifest.json" for i in range(60)]
+    (root / ".coherence" / "tracked.yaml").write_text(_quoted_yaml(tracked))
+    (root / ".coherence" / "strict_mode.yaml").write_text(_quoted_yaml(strict))
+    policy = TrackedArtifactPolicy.load(root)
+
+    assert policy.strict_patterns_covering("**/*.log") == ()
+    assert policy.strict_patterns_covering("*.tmp") == ()
+    # Control: an entry that does cover one strict path names exactly that one.
+    hit = "svc7/state/a.json" if shape == "globs" else "pkg7/deep/nested/dir/manifest.json"
+    assert policy.strict_patterns_covering(hit) == (strict[7],)
 
 
 def test_a_hot_reload_skips_the_spawn_time_override_diagnostic(

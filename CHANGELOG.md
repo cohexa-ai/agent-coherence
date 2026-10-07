@@ -374,9 +374,9 @@ Alpha — APIs may change before `v1.0`.
     "strict_patterns"}], "rejected": [...], "error": <text>}`, and the whole
     request writes nothing. Overlap is decided on the glob languages, so a
     literal path, the strict glob itself, and a broader or differently spelled
-    glob are all caught; where the decision is approximate (a class range too
-    wide to expand, or a star-heavy glob whose overlap search exceeds a fixed
-    state budget) it errs toward refusing. The CLI exits 3 on it. **Changed
+    glob are all caught; where the decision is approximate (a character class
+    too wide to enumerate cheaply, or a glob whose overlap search runs out of
+    its fixed step budget, decided per strict pattern) it errs toward refusing. The CLI exits 3 on it. **Changed
     behaviour of a shipped verb:** to untrack a strict path, remove its entry from
     `.coherence/strict_mode.yaml` and restart the coordinator.
   - Strict wins over ignore in `TrackedArtifactPolicy.is_tracked`: an ignored
