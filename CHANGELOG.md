@@ -538,7 +538,7 @@ Alpha — APIs may change before `v1.0`.
   else, a read counts whole: a `head` or a line-limited `Read` is credited as
   reading the current version. A session with no recorded observation is
   still admitted like a first-time editor. Both coordinator backends; pinned by
-  strict-mode corpus fixtures 15 and 16.
+  strict-mode corpus fixtures 17, 18 and 19.
 
 - **A `CoherentVolume` whose managed globs the coordinator does not enforce now
   fails closed instead of running unguarded.** An attaching volume adds no
