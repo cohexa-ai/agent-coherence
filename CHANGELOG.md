@@ -61,9 +61,11 @@ Alpha — APIs may change before `v1.0`.
   `overtaken` it. `GET /status` carries the same fields, without the role, in
   each such `tracked_artifacts` entry on the default and operator tiers, and
   the operator tier adds the record's creation time. Every id in the key is a
-  session-level agent id, never a session name or id. With no record every
-  per-path answer and `tracked_artifacts` entry is byte-for-byte unchanged, and
-  the metrics tier never carries a record. `GET /status` does gain four
+  session-level agent id, never a session name or id. With no record no answer
+  and no `tracked_artifacts` entry carries the key, and the metrics tier never
+  carries a record. The key is best-effort: if the coordinator cannot read the
+  record after a request's work has landed, it answers without the key and logs
+  a warning, so a missing key does not prove there is no record. `GET /status` does gain four
   `handoff_*_total` route counters in `endpoint_counters`, present whether or
   not any record exists.
 

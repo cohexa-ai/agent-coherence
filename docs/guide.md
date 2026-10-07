@@ -1718,7 +1718,12 @@ for the caller:
 `outcome`: `completed` for the successor's win, `overtaken` for anyone else's.
 The key sits beside the answer's other fields and never inside a
 `hookSpecificOutput`, so the text of a deny is unchanged. With no record on the
-path, every one of these answers is byte-for-byte what it was before.
+path, none of these answers carries the key.
+
+The key is best-effort. If the coordinator cannot read the record after the
+request's work has landed, it answers without the key and logs a warning, so a
+missing key does not prove the path has no record. Read the path on `/status`
+when you need to be sure.
 
 `GET /status` carries the same fields, without `role`, in the
 `tracked_artifacts` entry of each path that has a record, on the default view
