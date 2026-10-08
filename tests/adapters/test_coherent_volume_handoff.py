@@ -1245,6 +1245,37 @@ def test_an_admitted_read_clears_last_read_denied_whichever_read_method_took_it(
         stop_coordinator(tmp_path)
 
 
+def test_a_read_that_fails_after_a_denied_one_clears_last_read_denied(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The flag is reset before each read's request, beside the handoff key, so
+    a read whose answer is lost leaves it ``False``: the denied answer it would
+    otherwise keep belongs to an earlier read, not to this one."""
+    _seed(tmp_path, _PLAN, b"plan v1")
+    _seed(tmp_path, _OTHER, b"other v1")
+    giver = CoherentVolume(tmp_path, managed=_MANAGED, on_error="degrade", config=fast_cfg)
+    successor = CoherentVolume(tmp_path, managed=_MANAGED, on_error="degrade", config=fast_cfg)
+    try:
+        giver.read(_PLAN)
+        assert giver.transfer(_PLAN, successor=_agent(successor)).ok
+        giver.read(_PLAN)
+        assert giver.last_read_denied is True, "precondition: the re-read was strict-denied"
+        real_post = coherent_volume_module._coordinator_post
+
+        def lose_the_read(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            if path == "/hooks/pre-read":
+                raise CoordinatorUnavailable("simulated: the answer was lost")
+            return real_post(endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", lose_the_read)
+        with pytest.warns(CoherenceDegradedWarning):
+            giver.read(_OTHER)
+
+        assert giver.last_read_denied is False
+    finally:
+        stop_coordinator(tmp_path)
+
+
 # --- public names -----------------------------------------------------------
 
 

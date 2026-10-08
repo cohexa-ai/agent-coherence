@@ -409,12 +409,17 @@ def test_the_transfer_tool_answers_per_grant_and_only_all_transferred_is_success
 
 
 @pytest.mark.parametrize(
-    "paths",
-    [[], [PLAN, "./" + PLAN], [PLAN, "data/plan-link.md"]],
+    ("paths", "detail"),
+    [
+        ([], "paths must name at least one path, each once"),
+        ([PLAN, "./" + PLAN], "paths must name at least one path, each once"),
+        ([PLAN, "data/plan-link.md"], "transfer names a path more than once: data/plan.md"),
+    ],
     ids=["no-path", "one-path-twice", "a-path-and-its-symlink"],
 )
 def test_the_transfer_tool_answers_no_path_or_one_path_twice_as_a_path_error(
-    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, paths: list[str]
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    paths: list[str], detail: str,
 ) -> None:
     """An empty path list, or one path named twice in two spellings, is the
     agent's own input mistake. It reached the coordinator, which answered
@@ -447,6 +452,7 @@ def test_the_transfer_tool_answers_no_path_or_one_path_twice_as_a_path_error(
         assert (structured["reason"], structured["recover"], structured["retryable"]) == (
             "invalid_path", "fix_path", False,
         )
+        assert structured["detail"] == detail  # the tool's own check, or the volume's
         assert "/handoff/transfer" not in sent
     finally:
         stop_coordinator(tmp_path)
