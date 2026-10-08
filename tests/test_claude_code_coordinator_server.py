@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -10149,6 +10150,73 @@ def test_sweep_counts_and_logs_reclaims_that_landed_before_a_mid_walk_error(
     assert payload["sweep_reclaims_total"] == landed
     logged = [r for r in caplog.records if "sweep reclaimed grant" in r.getMessage()]
     assert len(logged) == landed
+
+
+class _OneSweepTick:
+    """The coordinator as ``_sweep_loop`` sees it, shutting down after one tick.
+
+    The loop reads ``shutting_down`` before its sleep and again after it, then
+    runs a tick; the third read is the first one after that tick."""
+
+    def __init__(self, coordinator) -> None:
+        self._coordinator = coordinator
+        self._reads = 0
+
+    @property
+    def shutting_down(self) -> bool:
+        self._reads += 1
+        return self._reads > 2
+
+    def __getattr__(self, name: str):
+        return getattr(self._coordinator, name)
+
+
+def test_the_sweep_loop_counts_and_logs_a_heartbeat_reclaim(
+    coordinator,
+    client: _Client,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One tick of the coordinator's own sweep loop, on its own clock. The
+    sweep once never fired over HTTP while direct calls with a tick the test
+    chose passed, so this drives the loop rather than the pass: the counter,
+    the trigger key and the log line must come out of the shipped wiring."""
+    from ccs.adapters.claude_code import coordinator_server as server_mod
+    from ccs.adapters.claude_code.lifecycle import LifecycleConfig, _sweep_loop
+
+    stale_sid, live_sid = _sid("loop-stale-195"), _sid("loop-live-195")
+    # The stale holder took its grant, and last heartbeated, 1000 seconds ago.
+    real_clock = server_mod.monotonic_seconds
+    monkeypatch.setattr(server_mod, "monotonic_seconds", lambda: real_clock() - 1_000)
+    assert client.post("/hooks/pre-edit", {"session_id": stale_sid, "path": "plan.md"})[0] == 200
+    monkeypatch.setattr(server_mod, "monotonic_seconds", real_clock)
+    assert client.post("/hooks/pre-edit", {"session_id": live_sid, "path": "task.md"})[0] == 200
+
+    cfg = LifecycleConfig(
+        sweep_interval_sec=0.2,
+        grant_heartbeat_timeout_sec=60,
+        grant_max_hold_sec=999_999_999,
+    )
+    tick_floor = real_clock()
+    with caplog.at_level(logging.WARNING, logger="ccs.adapters.claude_code.lifecycle"):
+        _sweep_loop(SimpleNamespace(coordinator=_OneSweepTick(coordinator)), cfg)
+
+    _, metrics = client.get("/status?detail=metrics")
+    assert metrics["sweep_reclaims_total"] == 1
+    assert metrics["sweep_reclaims_by_trigger"] == {"reclaim_heartbeat": 1, "reclaim_max_hold": 0}
+
+    [record] = [r for r in caplog.records if "sweep reclaimed grant" in r.getMessage()]
+    assert "trigger=reclaim_heartbeat" in record.getMessage()
+    assert str(session_to_agent_id(stale_sid)) in record.getMessage()
+    assert stale_sid not in record.getMessage()
+
+    payload = _operator_status(client)
+    [cause] = _row_for(payload, stale_sid)["reclaimed"].values()
+    assert cause["trigger"] == "reclaim_heartbeat"
+    assert cause["tick"] >= tick_floor
+    # The live holder is untouched: only the stale grant was pulled.
+    assert _row_for(payload, live_sid)["states"] == {"task.md": "EXCLUSIVE"}
+    assert _row_for(payload, live_sid)["reclaimed"] == {}
 
 
 def test_status_never_reports_a_pair_both_held_and_reclaimed(
