@@ -267,6 +267,35 @@ def test_a_transfer_after_a_re_mint_presents_the_incarnation_holding_the_read(
         stop_coordinator(tmp_path)
 
 
+def test_a_multi_file_publishs_members_are_read_before_they_can_be_handed_on(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A multi-file publish commits through its snapshot session, which leaves
+    the members held by that session's commit and not by any incarnation the
+    volume can present. A transfer right after it is refused ``handoff_not_held``,
+    as ``transfer()`` and ``atomic_publish()`` say, and a read of the member
+    registers a claim the transfer then hands on at the published version."""
+    _seed(tmp_path, _PLAN, b"plan v1")
+    _seed(tmp_path, _OTHER, b"other v1")
+    giver, successor = _volumes(tmp_path, fast_cfg, 2)
+    try:
+        giver.read_with_version(_PLAN)
+        giver.read_with_version(_OTHER)
+        assert giver.atomic_publish([(_PLAN, 1, b"plan v2"), (_OTHER, 1, b"other v2")]) == {
+            _PLAN: 2, _OTHER: 2,
+        }
+
+        refused = giver.transfer(_PLAN, successor=_agent(successor))
+        giver.read(_PLAN)
+        handed = giver.transfer(_PLAN, successor=_agent(successor))
+
+        assert refused.grants[0].reason == "handoff_not_held"
+        [grant] = handed.grants
+        assert (grant.transferred, grant.version_at_transfer, grant.hold_shape) == (True, 2, "SHARED")
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_a_transfer_after_a_cas_win_presents_the_winning_incarnation(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

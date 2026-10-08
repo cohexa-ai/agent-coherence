@@ -2292,6 +2292,14 @@ class CoherentVolume:
         **Single-host, cooperative** (like the rest of the volume): recovery from
         a HELD publish is ``reacquire`` + re-read + retry; the caller must write
         from freshly re-read bytes, never a buffer computed before the hold.
+
+        **Handing members on afterwards.** A multi-member publish commits
+        through its snapshot session, so the members end up held by that
+        session's commit rather than by an incarnation of this volume, and no
+        :meth:`transfer` can present that. A transfer of a member right after
+        the publish is refused ``handoff_not_held``: read the member first,
+        then hand it on. A single-member publish's comparand read registers
+        its incarnation, so its member can be handed on directly.
         """
         entries = self._normalize_publish_writes(writes)
         with self._single_op_guard():
@@ -2581,6 +2589,9 @@ class CoherentVolume:
         No path, or one path named twice (after normalising, so two spellings
         of one file count), is the caller's error: ``ValueError`` in both
         modes, as for :meth:`atomic_publish`, and nothing is sent.
+        After a multi-file :meth:`atomic_publish`, read each member before
+        handing it on: the publish leaves no claim this volume can present,
+        so the transfer is refused ``handoff_not_held``.
         """
         targets = [paths] if isinstance(paths, (str, os.PathLike)) else list(paths)
         with self._single_op_guard():

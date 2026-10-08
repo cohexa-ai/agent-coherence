@@ -2304,8 +2304,11 @@ a `write_cas` or `write_cas_at` win leaves). The volume finds that claim even
 after `reacquire()` or a `write_cas` has started a fresh attempt. A path it
 holds no claim on is refused as `handoff_not_held`. That includes a path whose
 read returned bytes from a stale view, because such a read registers nothing:
-`reacquire()` the path before you transfer it. The transfer gives the claim up
-at the coordinator, so a write grant the volume held on the path ends with it.
+`reacquire()` the path before you transfer it. It also includes the members of
+a multi-file `atomic_publish()`, which commits through a snapshot session and
+leaves them held by that session's commit, not by the volume: read each member
+before you hand it on. The transfer gives the claim up at the coordinator, so a
+write grant the volume held on the path ends with it.
 
 **The giver's writes.** While the handoff is live, `write()`, `write_cas()`,
 `write_cas_at()` and an `atomic_publish()` that includes the path raise
