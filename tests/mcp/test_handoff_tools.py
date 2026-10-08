@@ -273,6 +273,33 @@ def test_the_givers_strict_denied_re_read_still_carries_its_handoff_key(
         stop_coordinator(tmp_path)
 
 
+def test_a_givers_denied_re_read_through_a_symlink_takes_the_record_from_status(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The coordinator knows the file by its resolved name, and ``/status``
+    lists it under that name. A giver that read, handed off and re-read the
+    file through an in-root symlink gets a denied re-read, so the read tool
+    asks ``/status``. Looking the record up under the link's name found no
+    entry and answered "no record" for a live handoff."""
+    _seed(tmp_path, PLAN, b"plan v1")
+    (tmp_path / "data" / "plan-link.md").symlink_to("plan.md")
+    link = "data/plan-link.md"
+    config = _config(tmp_path)
+    giver = _vol(tmp_path, fast_cfg)
+    successor = _vol(tmp_path, fast_cfg)
+    try:
+        _do_read(giver, config, link)
+        assert _do_transfer(giver, config, [link], _agent(successor)).isError is False
+
+        reread = _do_read(giver, config, link)
+
+        assert giver.last_read_denied is True, "precondition: the re-read was strict-denied"
+        assert reread.structuredContent["handoff"]["role"] == "giver"
+        assert reread.structuredContent["handoff"]["status"] == "pending"
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_a_denied_read_whose_record_cannot_be_fetched_says_so(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -692,12 +719,14 @@ def test_the_status_tool_derives_its_id_through_the_coordinators_function(
 
 
 class _StatusDocVolume:
-    """Just what ``handoff_from_status`` reads: a session id and a fixed
-    ``/status`` document (``None``: unreachable)."""
+    """Just what ``handoff_from_status`` reads: a session id, a fixed
+    ``/status`` document (``None``: unreachable) and a root the path is
+    resolved against (one with no files, so every path keeps its name)."""
 
     def __init__(self, session_id: str, status_doc: dict | None) -> None:
         self.session_id = session_id
         self._status_doc = status_doc
+        self.root = Path("/nonexistent-volume-root")
 
     def coordinator_status(self) -> dict | None:
         return self._status_doc

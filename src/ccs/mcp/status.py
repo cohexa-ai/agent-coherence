@@ -143,13 +143,20 @@ def handoff_from_status(volume: CoherentVolume, path: str) -> tuple[bool, dict |
     The role is the one the coordinator gives this session in a hook body:
     ``giver`` or ``successor`` when the record names this session's
     session-level agent id, else ``bystander``. ``/status`` carries no role,
-    because it has no caller to be a party to the record."""
+    because it has no caller to be a party to the record.
+
+    ``/status`` lists the file under the name the volume sends, resolved
+    against its root with symlinks followed, so ``path`` is matched under
+    that name: under an in-root link's own name it matches nothing and a
+    live record would read as none."""
     status_doc = volume.coordinator_status()
     artifacts = status_doc.get("tracked_artifacts") if isinstance(status_doc, dict) else None
     if not isinstance(artifacts, list):
         return False, None
+    resolved = (volume.root / path).resolve()
+    known_as = resolved.relative_to(volume.root).as_posix() if resolved.is_relative_to(volume.root) else path
     for artifact in artifacts:
-        if not isinstance(artifact, dict) or artifact.get("path") != path:
+        if not isinstance(artifact, dict) or artifact.get("path") != known_as:
             continue
         record = artifact.get("handoff")
         if not isinstance(record, dict):
