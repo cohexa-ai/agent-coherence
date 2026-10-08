@@ -503,9 +503,11 @@ Alpha — APIs may change before `v1.0`.
   `claim_checkpoint_registration` returns `(holder, newly_claimed)`, and
   `retry_of_own_registration` is derived from it, so a concurrent retry by the
   same controller is reported as a retry. `GET /workspace/checkpoints`
-  shows `receiver` and `registered_by`. A client that registered a write-set
-  outside the manifest, or a fingerprint other than the captured one, now gets
-  `ok: false`. See the guide's
+  shows `receiver` and `registered_by` when they are set; each of the new keys,
+  `retry_of_own_registration` included, is present only when it carries a
+  value, so an existing client's answers are unchanged. A client that
+  registered a write-set outside the manifest, or a fingerprint other than the
+  captured one, now gets `ok: false`. See the guide's
   [Who may restore a checkpoint](docs/guide.md#who-may-restore-a-checkpoint-and-what-its-registration-accepts).
 
 - **Registry schema version 10 (forward-only).** `workspace_checkpoints` gains

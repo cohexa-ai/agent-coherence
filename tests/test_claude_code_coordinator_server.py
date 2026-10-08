@@ -12159,4 +12159,4 @@ def test_checkpoint_receiver_binding_holds_as_far_as_the_principal(
         principal=receiver_principal,
     )
     assert status == 200 and body["ok"] is True, body
-    assert body["retry_of_own_registration"] is False
+    assert "retry_of_own_registration" not in body

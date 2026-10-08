@@ -6058,15 +6058,18 @@ def _handle_workspace_checkpoint(
             # Typed domain failure: identity-stable reason token on the wire
             # (the restore/register posture), prose preserved in "detail".
             return _typed_reason_response(exc)
-        return {
+        body = {
             "ok": True,
             "checkpoint_id": record.checkpoint_id,
             "name": record.name,
             "window_min": record.window_min,
             "window_max": record.window_max,
-            "receiver": str(record.receiver) if record.receiver is not None else None,
             "coordinator_epoch": coordinator.registry.coordinator_epoch,
         }
+        # #191: only when the request named one (a new key fires only when set).
+        if record.receiver is not None:
+            body["receiver"] = str(record.receiver)
+        return body
 
     # Fail-closed degrade + abort threading (the A6 session-commit lesson):
     # a timed-out registration must NOT read as success, and the abort Event
@@ -6126,20 +6129,16 @@ def _handle_workspace_checkpoints(
                     "restore_status": record.restore_status,
                     "restore_updated_at": record.restore_updated_at,
                     "pin_refcount": record.pin_refcount,
-                    # #191: who may register a restore (null = anyone) and
-                    # who did (null = nobody yet). Both are controller ids of
-                    # the same class as ``owner``.
-                    "receiver": (
-                        str(record.receiver) if record.receiver is not None else None
-                    ),
-                    "registered_by": (
-                        str(record.registered_by)
-                        if record.registered_by is not None
-                        else None
-                    ),
                     "members": [_render_checkpoint_member(m) for m in members],
                 }
             )
+            # #191: who may register a restore and who did, each present only
+            # when set (absent: anyone may; nobody has yet). Both are
+            # controller ids of the same class as ``owner``.
+            if record.receiver is not None:
+                checkpoints[-1]["receiver"] = str(record.receiver)
+            if record.registered_by is not None:
+                checkpoints[-1]["registered_by"] = str(record.registered_by)
         return {
             "ok": True,
             "checkpoints": checkpoints,
@@ -6405,11 +6404,11 @@ def _handle_workspace_restore_register(
 
     Responses:
       - WIN → ``{ok: true, status, detail, versions: {path: v}, skipped,
-        refused: {path: reason}, invalidated, retry_of_own_registration,
-        coordinator_epoch}`` (``status`` from the closed WORKSPACE_REGISTRATION
-        set; ``refused`` non-empty only on ``status == "refused"`` — nothing
-        mutated then, all-or-nothing; ``retry_of_own_registration`` is true
-        when this session's controller had already claimed the checkpoint)
+        refused: {path: reason}, invalidated, coordinator_epoch}`` (``status``
+        from the closed WORKSPACE_REGISTRATION set; ``refused`` non-empty only
+        on ``status == "refused"`` — nothing mutated then, all-or-nothing),
+        plus ``retry_of_own_registration: true`` only when this session's
+        controller had already claimed the checkpoint
       - unknown checkpoint → ``{ok: false, reason: "checkpoint_unknown"}``
       - registration refused → ``{ok: false, reason, detail, member_paths}``
         with ``reason`` one of ``not_a_checkpoint_member`` /
@@ -6496,7 +6495,7 @@ def _handle_workspace_restore_register(
             return _giver_fenced_body(exc, path=fenced.name if fenced else None)
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
-        return {
+        body = {
             "ok": True,
             "checkpoint_id": checkpoint_id,
             "status": result.status,
@@ -6507,9 +6506,12 @@ def _handle_workspace_restore_register(
                 path: conflict.reason for path, conflict in result.refused.items()
             },
             "invalidated": len(result.signals),
-            "retry_of_own_registration": result.retry_of_own_registration,
             "coordinator_epoch": coordinator.registry.coordinator_epoch,
         }
+        # #191: only when it fires, so a first registration's body is unchanged.
+        if result.retry_of_own_registration:
+            body["retry_of_own_registration"] = True
+        return body
 
     abort = threading.Event()
     _run_or_degrade(
