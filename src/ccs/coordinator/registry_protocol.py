@@ -50,6 +50,8 @@ from typing import (
 from uuid import UUID
 
 from ccs.core.exceptions import (
+    CHECKPOINT_ALREADY_REGISTERED_REASON,
+    CHECKPOINT_NOT_THE_RECEIVER_REASON,
     HANDOFF_ENDED_REASON,
     HANDOFF_IN_FLIGHT_REASON,
     HANDOFF_NOT_HELD_REASON,
@@ -57,6 +59,7 @@ from ccs.core.exceptions import (
     HANDOFF_SELF_REASON,
     HANDOFF_SUCCESSOR_UNKNOWN_REASON,
     HANDOFF_VERSION_UNCONFIRMED_REASON,
+    CheckpointRegistrationRefused,
 )
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import (
@@ -173,6 +176,21 @@ class CheckpointRecord:
     (durable because restore is crash-resumable); the vocabulary is the service
     layer's — the registry stores the string. ``pin_refcount`` is the Unit-6 GC
     pin bookkeeping (never negative; adjusted only through the registry).
+
+    ``owner`` is PROVENANCE, not authorization (#191): who took the checkpoint.
+    The restore registration never compares a controller with it, because the
+    checkpoint is the join point between two writers and the one restoring it
+    is routinely not the one that took it. Authorization reads the two fields
+    below instead (schema v10):
+
+    - ``receiver`` — the one controller allowed to register a restore of this
+      checkpoint, named at creation; ``None`` (the default) admits any
+      controller, which is the behaviour before #191;
+    - ``registered_by`` — the controller whose registration claimed this
+      checkpoint first, set once through
+      :meth:`RegistryBase.claim_checkpoint_registration` and never rebound. A
+      later registration by another controller is refused
+      ``already_registered``; a retry by this one is not.
     """
 
     checkpoint_id: str
@@ -185,6 +203,26 @@ class CheckpointRecord:
     restore_status: str = "none"
     restore_updated_at: float | None = None
     pin_refcount: int = 0
+    receiver: UUID | None = None
+    registered_by: UUID | None = None
+
+    def require_registrable_by(self, controller: UUID) -> None:
+        """Raise the controller refusal ``controller`` gets for this
+        checkpoint (#191), or return: ``not_the_receiver`` when the checkpoint
+        names another receiver, then ``already_registered`` when another
+        controller claimed it (naming nobody). The owner is never compared.
+
+        The one copy of the rule: the service's registration and progress
+        gates and ``WorkspaceVersioner.restore`` all call it, so the
+        in-process restore and the HTTP routes answer a checkpoint alike."""
+        if self.receiver is not None and self.receiver != controller:
+            raise CheckpointRegistrationRefused(
+                self.checkpoint_id, CHECKPOINT_NOT_THE_RECEIVER_REASON
+            )
+        if self.registered_by is not None and self.registered_by != controller:
+            raise CheckpointRegistrationRefused(
+                self.checkpoint_id, CHECKPOINT_ALREADY_REGISTERED_REASON
+            )
 
 
 @dataclass(frozen=True)
@@ -777,7 +815,24 @@ class RegistryBase(Protocol):
         INCLUDED, same transaction) plus every member row — atomically: all rows
         land or none do. Raises ``ValueError`` on an absent owner (fail-closed:
         an ownerless manifest is never persisted), on a duplicate
-        ``checkpoint_id``, and on duplicate member paths within the manifest."""
+        ``checkpoint_id``, on duplicate member paths within the manifest, and on
+        a header that arrives already ``registered_by`` someone (a registration
+        claim is only ever made through :meth:`claim_checkpoint_registration`)."""
+        ...
+
+    def claim_checkpoint_registration(
+        self, checkpoint_id: str, controller: UUID
+    ) -> tuple[UUID, bool]:
+        """Claim the restore registration of ``checkpoint_id`` for
+        ``controller``, first claim wins (#191).
+
+        One atomic compare-and-set: when the header's ``registered_by`` is
+        unset it becomes ``controller``; when it is set it is left alone.
+        Returns ``(holder, newly_claimed)``: the ``registered_by`` that holds
+        AFTER the call, and whether THIS call set it. Both come from inside
+        the atomic step, so the caller tells "I just claimed it", "I already
+        held it" and "another controller does" without a second read that
+        could race. Raises ``KeyError`` for an unknown checkpoint."""
         ...
 
     def evict_transfer_records(

@@ -1003,9 +1003,14 @@ def _transfer_row_count(db_path: Path) -> int:
 
 
 def _revert_to_v8_shape(db_path: Path) -> None:
-    """A current db rewound to what a v8 build produced: no transfer table."""
+    """A current db rewound to what a v8 build produced: no transfer table, and
+    none of the v10 checkpoint columns (#191) either."""
     conn = sqlite3.connect(str(db_path))
     try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(workspace_checkpoints)")}
+        for column in ("receiver", "registered_by"):
+            if column in columns:
+                conn.execute(f"ALTER TABLE workspace_checkpoints DROP COLUMN {column}")
         conn.execute("DROP TABLE IF EXISTS transfer_records")
         conn.execute("PRAGMA user_version = 8")
         conn.commit()
@@ -1065,14 +1070,14 @@ def test_a_read_only_handle_serves_the_record_and_refuses_the_mutators(
         assert read_only.get_transfer_record(art) == stored
 
 
-def test_fresh_db_is_created_at_v9_with_the_transfer_table(tmp_path: Path) -> None:
+def test_fresh_db_is_created_at_the_head_with_the_transfer_table(tmp_path: Path) -> None:
     """A fresh store lands the table at the head version directly; no
     migration step ever runs against it."""
     db = tmp_path / "fresh.db"
     with SqliteArtifactRegistry(db):
         pass
-    assert SCHEMA_USER_VERSION == 9
-    assert _user_version(db) == 9
+    assert SCHEMA_USER_VERSION == 10
+    assert _user_version(db) == 10
     assert "transfer_records" in _tables(db)
 
 
@@ -1091,7 +1096,7 @@ def test_a_migrated_transfer_table_equals_a_fresh_one(tmp_path: Path) -> None:
     with SqliteArtifactRegistry(migrated):
         pass
 
-    assert _user_version(migrated) == 9
+    assert _user_version(migrated) == 10
     assert _transfer_table_shape(migrated) == _transfer_table_shape(fresh)
     columns, foreign_keys = _transfer_table_shape(fresh)
     assert columns and foreign_keys  # non-empty: the probe sees the table
@@ -1113,11 +1118,11 @@ def test_a_migrated_table_enforces_the_cascade(tmp_path: Path) -> None:
     assert _transfer_row_count(db) == 0
 
 
-def test_v7_origin_walk_lands_the_transfer_table_at_the_v9_stamp(tmp_path: Path) -> None:
+def test_v7_origin_walk_lands_the_transfer_table_at_the_head_stamp(tmp_path: Path) -> None:
     """THE RE-STAMP TRAP, fifth arming. ``_migrate_v7_to_v8`` was the final step
-    and stamped the constant; with the constant at 9 it must stamp its own
-    literal 8, or a v7-origin db is stamped 9 WITHOUT the transfer table and
-    the chained v8->v9 loser-guard no-ops."""
+    and stamped the constant; with the constant past 8 it must stamp its own
+    literal 8, or a v7-origin db is stamped at the head WITHOUT the transfer
+    table and the chained v8->v9 loser-guard no-ops."""
     db = tmp_path / "v7.db"
     with SqliteArtifactRegistry(db):
         pass
@@ -1127,13 +1132,15 @@ def test_v7_origin_walk_lands_the_transfer_table_at_the_v9_stamp(tmp_path: Path)
     with SqliteArtifactRegistry(db):
         pass
 
-    assert _user_version(db) == 9
+    assert _user_version(db) == 10
     assert {"caller_principals", "transfer_records"} <= _tables(db)
 
 
 def test_a_crash_before_the_v9_stamp_leaves_a_bootable_v8(tmp_path: Path) -> None:
     """The DDL and the stamp share one transaction: a failure between them
-    rolls the table back with the stamp, and a clean reopen re-migrates."""
+    rolls the table back with the stamp, and a clean reopen re-migrates. The
+    step stamps its own literal 9 now that v10 follows it, so that is the
+    statement the crash intercepts."""
     db = tmp_path / "crash.db"
     with SqliteArtifactRegistry(db):
         pass
@@ -1168,13 +1175,15 @@ def test_a_crash_before_the_v9_stamp_leaves_a_bootable_v8(tmp_path: Path) -> Non
     assert "transfer_records" not in _tables(db)
     with SqliteArtifactRegistry(db):
         pass
-    assert _user_version(db) == 9
+    assert _user_version(db) == 10
     assert "transfer_records" in _tables(db)
 
 
-def test_a_v9_stamp_without_the_transfer_table_is_refused(tmp_path: Path) -> None:
-    """No ledger this build recognizes stamps 9 without the table, so the open
-    fails closed -- with a control that a genuine v9 opens."""
+@pytest.mark.parametrize("stamp", range(9, SCHEMA_USER_VERSION + 1))
+def test_a_v9_stamp_without_the_transfer_table_is_refused(tmp_path: Path, stamp: int) -> None:
+    """No ledger this build recognizes stamps 9 or later without the table, so
+    the open fails closed -- with a control that a genuine store opens. Every
+    stamp the probe covers is forged, so narrowing its range fails here."""
     genuine, forged = tmp_path / "genuine.db", tmp_path / "forged.db"
     for db in (genuine, forged):
         with SqliteArtifactRegistry(db):
@@ -1182,10 +1191,11 @@ def test_a_v9_stamp_without_the_transfer_table_is_refused(tmp_path: Path) -> Non
     conn = sqlite3.connect(str(forged))
     try:
         conn.execute("DROP TABLE transfer_records")
+        conn.execute(f"PRAGMA user_version = {stamp}")
         conn.commit()
     finally:
         conn.close()
-    assert _user_version(forged) == 9
+    assert _user_version(forged) == stamp
 
     with SqliteArtifactRegistry(genuine):
         pass

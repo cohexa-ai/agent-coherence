@@ -39,11 +39,12 @@ Exit codes:
 - 0: verb succeeded (restore: concluded with no absorbing/hold outcome)
 - 1: not in a git repo / validation error (bad path, no members, pre-flight) /
      a typed coherence contention error (e.g. the observe-commit loop exhausted)
-- 2: typed coherence refusal (binary member, unknown checkpoint, persist
-     failure, member-path containment refusal — symlink component, hardlinked
-     regular file (external co-owner), non-regular leaf (FIFO/socket/device),
-     ``.coherence`` self-target, workspace escape, or an unreadable non-file
-     member)
+- 2: typed coherence refusal (binary member, unknown checkpoint, a checkpoint
+     bound to another receiver or registered by another controller (#191),
+     persist failure, member-path containment refusal — symlink component,
+     hardlinked regular file (external co-owner), non-regular leaf
+     (FIFO/socket/device), ``.coherence`` self-target, workspace escape, or an
+     unreadable non-file member)
 - 3: restore CONCLUDED but at least one member ended in an absorbing/hold
      outcome (``conflict`` / ``target_lost`` / ``held_unconfirmed``) or the
      registration was refused — the report on stdout carries the per-member truth
@@ -103,6 +104,7 @@ from ccs.core.exceptions import (
     RESTORE_STATUS_CONCLUDED,
     WORKSPACE_REGISTRATION_REFUSED,
     CasVersionConflict,
+    CheckpointRegistrationRefused,
     CheckpointUnknown,
     CoherenceError,
     CommitUnconfirmed,
@@ -1290,7 +1292,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             args, exit_code=2, reason=exc.reason, message=str(exc), exc=exc
         )
         return 2
-    except CheckpointUnknown as exc:
+    except (CheckpointUnknown, CheckpointRegistrationRefused) as exc:
+        # CheckpointRegistrationRefused (#191): the checkpoint names another
+        # receiver, or another controller registered it — refused before the
+        # restore wrote anything. The CLI uses one owner per workspace root,
+        # so only a checkpoint created through another path can reach this.
         err(f"{_PROG}: refused ({exc.reason}): {exc}")
         _emit_error_envelope(
             args, exit_code=2, reason=exc.reason, message=str(exc), exc=exc

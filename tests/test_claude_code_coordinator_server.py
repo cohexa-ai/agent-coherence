@@ -8494,10 +8494,10 @@ def test_posture_table_classifies_every_session_id_route_with_no_residual() -> N
     ``_ROUTES`` that reads a session id without a table entry fails here, and
     so does an entry for a route that no longer exists.
 
-    ``/workspace/restore/status`` and ``/workspace/restore/member`` validate
-    the session id and then never consult it; they are DECIDED require-class
-    rather than dropped (see the table's harm text), and the frozen
-    expectation pins that decision."""
+    ``/workspace/restore/status`` and ``/workspace/restore/member`` derive a
+    controller from the session id and gate on the checkpoint's receiver and
+    registration claim (#191), so require-class is what binds them to a
+    bound receiver's principal; the frozen expectation pins that decision."""
     import inspect
 
     from ccs.adapters.claude_code.coordinator_server import (
@@ -12102,3 +12102,115 @@ def test_a_bash_write_detection_that_raises_leaves_the_answer_as_before(
     finally:
         server.shutdown()
     assert answer == expected
+
+
+# #191 — the checkpoint receiver binding composes with the caller principal
+# ----------------------------------------------------------------------
+
+
+def test_checkpoint_receiver_binding_holds_as_far_as_the_principal(
+    client: _Client,
+) -> None:
+    """A checkpoint naming ``receiver_session_id`` admits only that session's
+    registration, and once the receiver session has claimed a principal a
+    register naming it must present it — a copied request naming the
+    receiver without the principal is refused before the handler, so the
+    receiver binding is exactly as strong as the require-class check."""
+    owner_sid, receiver_sid = _sid("191-owner"), _sid("191-receiver")
+    fingerprint = _hash("191-captured")
+    receiver_principal = _explicit_claim(client, receiver_sid)
+    status, body = client.post(
+        "/workspace/checkpoint",
+        {
+            "session_id": owner_sid,
+            "name": "handoff",
+            "window_min": 1.0,
+            "window_max": 1.0,
+            "members": [
+                {"member_path": "plan.md", "native_token": "v1",
+                 "fingerprint": fingerprint, "captured_at": 1.0}
+            ],
+            "receiver_session_id": receiver_sid,
+        },
+    )
+    assert status == 200 and body["ok"] is True, body
+    register = {
+        "checkpoint_id": body["checkpoint_id"],
+        "writes": [{"member_path": "plan.md", "fingerprint": fingerprint}],
+    }
+
+    # The owner's own session is not the receiver.
+    status, body = client.post(
+        "/workspace/restore/register", {"session_id": owner_sid, **register}
+    )
+    assert status == 200 and body["ok"] is False
+    assert body["reason"] == "not_the_receiver"
+
+    # Naming the receiver without its principal: refused at the gate.
+    status, body = client.post(
+        "/workspace/restore/register", {"session_id": receiver_sid, **register}
+    )
+    assert status == 400
+    assert body["reason"] == "caller_principal_absent"
+
+    status, body = client.post(
+        "/workspace/restore/register",
+        {"session_id": receiver_sid, **register},
+        principal=receiver_principal,
+    )
+    assert status == 200 and body["ok"] is True, body
+    assert "retry_of_own_registration" not in body
+
+
+@pytest.mark.parametrize(
+    "route, extra",
+    [
+        ("/workspace/restore/status", {"status": "in_progress"}),
+        (
+            "/workspace/restore/member",
+            {"member_path": "plan.md", "restore_outcome": "restored"},
+        ),
+    ],
+    ids=["status", "member"],
+)
+def test_restore_progress_for_a_bound_receiver_requires_its_principal(
+    client: _Client, route: str, extra: dict
+) -> None:
+    """The restore progress routes derive the controller from the named
+    session and gate on the checkpoint's receiver, so a request naming the
+    receiver's session drives that restore. Once the receiver session has
+    claimed a principal, such a request without it is refused at the gate:
+    require-class is what keeps a copied request from concluding or
+    recording members of the receiver's restore."""
+    owner_sid, receiver_sid = _sid("191-progress-owner"), _sid("191-progress-receiver")
+    fingerprint = _hash("191-progress-captured")
+    receiver_principal = _explicit_claim(client, receiver_sid)
+    status, body = client.post(
+        "/workspace/checkpoint",
+        {
+            "session_id": owner_sid,
+            "name": "progress",
+            "window_min": 1.0,
+            "window_max": 1.0,
+            "members": [
+                {"member_path": "plan.md", "native_token": "v1",
+                 "fingerprint": fingerprint, "captured_at": 1.0}
+            ],
+            "receiver_session_id": receiver_sid,
+        },
+    )
+    assert status == 200 and body["ok"] is True, body
+    request = {"checkpoint_id": body["checkpoint_id"], **extra}
+
+    status, body = client.post(route, {"session_id": owner_sid, **request})
+    assert status == 200 and body["ok"] is False
+    assert body["reason"] == "not_the_receiver"
+
+    status, body = client.post(route, {"session_id": receiver_sid, **request})
+    assert status == 400
+    assert body["reason"] == "caller_principal_absent"
+
+    status, body = client.post(
+        route, {"session_id": receiver_sid, **request}, principal=receiver_principal
+    )
+    assert status == 200 and body["ok"] is True, body

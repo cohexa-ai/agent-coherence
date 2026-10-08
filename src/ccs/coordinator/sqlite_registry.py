@@ -34,7 +34,7 @@ Contract divergence from in-memory ``ArtifactRegistry`` (per plan KTD-13):
   content-fetch semantics are NOT a v0.1 goal for this storage layer.
 
 Schema: the v1 BASELINE only (KTD-3), kept for orientation. The live schema is
-``SCHEMA_USER_VERSION`` (currently 9); the ``_migrate_vN_to_vM`` chain below is
+``SCHEMA_USER_VERSION`` (currently 10); the ``_migrate_vN_to_vM`` chain below is
 the source of truth for everything the baseline does not show, including the
 columns later versions add to ``agent_states`` (``read_generation``,
 ``last_observed_version``) and every table and index added after v1. Read a db's
@@ -156,7 +156,7 @@ CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 """Reuses the same schema version as in-memory registry (state_log emissions
 are interchangeable from a downstream consumer's perspective)."""
 
-SCHEMA_USER_VERSION = 9
+SCHEMA_USER_VERSION = 10
 """Schema version stamped via ``PRAGMA user_version`` on init.
 
 **v1 -> v2** (plan item N v1) added the durable ``artifact_versions`` table and
@@ -241,6 +241,18 @@ conversion (the re-stamp trap, fifth arming): ``_migrate_v7_to_v8`` stamped the
 constant while it was the final step and now stamps its own literal 8.
 FORWARD-ONLY like v8: an earlier build refuses a v9 store.
 
+**v9 -> v10** (#191, the restore-registration receiver binding) adds two
+nullable columns to ``workspace_checkpoints``: ``receiver`` (the one controller
+allowed to register a restore of the checkpoint, named at creation; NULL admits
+any controller) and ``registered_by`` (the controller whose registration
+claimed the checkpoint first; set once by ``claim_checkpoint_registration``,
+never rebound). Column-only and additive; every existing manifest migrates with
+both NULL, which is exactly the pre-#191 behaviour (any controller registers,
+nothing claimed yet). The step carries the ``_V9_USER_VERSION`` literal
+conversion (the re-stamp trap, sixth arming): ``_migrate_v8_to_v9`` stamped the
+constant while it was the final step and now stamps its own literal 9.
+FORWARD-ONLY: once a store opens at v10, an earlier build refuses it.
+
 **CROSS-RUNTIME LEDGER DIVERGENCE (security).** The sibling Node coordinator
 (agent-coherence-plugin) shares the SAME ``state.db`` path but keeps its OWN
 ledger: its v3 is ``ALTER TABLE agent_states ADD COLUMN deadline_tick`` — a
@@ -313,6 +325,14 @@ _V8_USER_VERSION = 8
 v9 (the ``transfer_records`` table) landed. Stamping the constant would mark a
 v7-origin db ``user_version=9`` WITHOUT the transfer table, and the chained
 v8->v9 loser-guard would no-op (the re-stamp trap, fifth arming)."""
+
+_V9_USER_VERSION = 9
+"""``_migrate_v8_to_v9``'s guard/stamp literal: it adds the ``transfer_records``
+table and advances to v9 — NO LONGER the final step once v10 (the
+``workspace_checkpoints`` receiver/registration columns, #191) landed. Stamping
+the constant would mark a v8-origin db ``user_version=10`` WITHOUT the columns,
+and the chained v9->v10 loser-guard would no-op (the re-stamp trap, sixth
+arming)."""
 
 _DB_FILE_MODE = 0o600
 """state.db (and its -wal/-shm sidecars) must be owner-read/write only.
@@ -419,7 +439,9 @@ CREATE TABLE workspace_checkpoints (
     window_max         REAL NOT NULL,
     restore_status     TEXT NOT NULL DEFAULT 'none',
     restore_updated_at REAL,
-    pin_refcount       INTEGER NOT NULL DEFAULT 0
+    pin_refcount       INTEGER NOT NULL DEFAULT 0,
+    receiver           TEXT,
+    registered_by      TEXT
 )
 """
 
@@ -907,10 +929,10 @@ class SqliteArtifactRegistry:
 
         - ``user_version == 0`` (brand-new file) → ``_apply_v2_schema``: the
           COMPLETE current schema (v2 tables + ``session_pins`` + ``session_meta``
-          + the workspace-checkpoint tables + the v6 ``last_observed_version``
-          column + the indexes + the v8 ``caller_principals`` table + the v9
-          ``transfer_records`` table) in one atomic transaction (no shim ever
-          runs on a fresh db).
+          + the workspace-checkpoint tables (with the v10 receiver/registration
+          columns) + the v6 ``last_observed_version`` column + the indexes + the
+          v8 ``caller_principals`` table + the v9 ``transfer_records`` table) in
+          one atomic transaction (no shim ever runs on a fresh db).
         - ``user_version == 1`` (any wild v1 variant) → ``_migrate_v1_to_v2`` then
           ``_migrate_v2_to_v3`` then ``_migrate_v3_to_v4`` then
           ``_migrate_v4_to_v5`` then ``_migrate_v5_to_v6``: idempotently subsumes
@@ -936,8 +958,10 @@ class SqliteArtifactRegistry:
           table.
         - ``user_version == 8`` → ``_migrate_v8_to_v9``: the ``transfer_records``
           table.
-        - Every branch above ends at ``_migrate_v8_to_v9``, the final chain step.
-        - ``user_version == 9`` (SCHEMA_USER_VERSION) → ``_rehydrate_meta``: the
+        - ``user_version == 9`` → ``_migrate_v9_to_v10``: the
+          ``workspace_checkpoints.receiver`` / ``registered_by`` columns (#191).
+        - Every branch above ends at ``_migrate_v9_to_v10``, the final chain step.
+        - ``user_version == 10`` (SCHEMA_USER_VERSION) → ``_rehydrate_meta``: the
           WRITE-FREE open path (no ALTER, no IF-NOT-EXISTS) — the prerequisite for
           read-only mode.
         - anything else → :class:`SchemaVersionError` (no destructive advice).
@@ -965,6 +989,7 @@ class SqliteArtifactRegistry:
                 self._migrate_v6_to_v7(instance_id)
                 self._migrate_v7_to_v8(instance_id)
                 self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == 2:
                 # 2 → 3 → 4 → 5 → 6: session_pins, session_meta + index,
                 # checkpoints, last_observed_version.
@@ -975,6 +1000,7 @@ class SqliteArtifactRegistry:
                 self._migrate_v6_to_v7(instance_id)
                 self._migrate_v7_to_v8(instance_id)
                 self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == _V3_USER_VERSION:
                 # An existing v3 db (session_pins, NO session_meta — earlier
                 # commits of that branch stamped it) → add session_meta + index,
@@ -987,6 +1013,7 @@ class SqliteArtifactRegistry:
                 self._migrate_v6_to_v7(instance_id)
                 self._migrate_v7_to_v8(instance_id)
                 self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == _V4_USER_VERSION:
                 # An existing v4 db → the workspace-checkpoint tables (v5), then
                 # the last_observed_version column (v6).
@@ -995,6 +1022,7 @@ class SqliteArtifactRegistry:
                 self._migrate_v6_to_v7(instance_id)
                 self._migrate_v7_to_v8(instance_id)
                 self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == _V5_USER_VERSION:
                 # An existing v5 db → last_observed_version (v6), then the
                 # agent_id index (v7).
@@ -1002,6 +1030,7 @@ class SqliteArtifactRegistry:
                 self._migrate_v6_to_v7(instance_id)
                 self._migrate_v7_to_v8(instance_id)
                 self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == _V6_USER_VERSION:
                 # An existing v6 db (SB-10-era) → index agent_states(agent_id),
                 # then the caller-principal table (v8), then the transfer
@@ -1009,16 +1038,24 @@ class SqliteArtifactRegistry:
                 self._migrate_v6_to_v7(instance_id)
                 self._migrate_v7_to_v8(instance_id)
                 self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == _V7_USER_VERSION:
                 # An existing v7 db → the caller-principal table (v8), then the
                 # transfer records (v9).
                 self._migrate_v7_to_v8(instance_id)
                 self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == _V8_USER_VERSION:
-                # An existing v8 db → the transfer-record table (v9).
+                # An existing v8 db → the transfer-record table (v9), then the
+                # checkpoint receiver/registration columns (v10, #191).
                 self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
+            elif current == _V9_USER_VERSION:
+                # An existing v9 db → the checkpoint receiver/registration
+                # columns (v10, #191).
+                self._migrate_v9_to_v10(instance_id)
             elif current == SCHEMA_USER_VERSION:
-                # Existing v9 database — rehydrate; NO writes on this path (the
+                # Existing v10 database — rehydrate; NO writes on this path (the
                 # prerequisite for read-only open mode).
                 self._rehydrate_meta(instance_id)
             else:
@@ -1159,18 +1196,26 @@ class SqliteArtifactRegistry:
         add that column), so probe 2 still neither misses a Node db nor
         false-positives on a Python v6 one.
 
-        6. ``user_version == 8`` WITHOUT ``caller_principals`` — the v5 probe's
+        6. ``user_version`` 8 or 9 WITHOUT ``caller_principals`` — the v5 probe's
            reasoning for the v8 table: ``_migrate_v7_to_v8`` / the fresh apply
            create it atomically with the v8 stamp (the ``_V7_USER_VERSION``
            literal conversion makes that hold for every origin), and the Node
            ledger stops below v8, so the state is foreign-or-corrupt either
-           way. Literal ``8`` — pins Python-v8 semantics.
-        7. ``user_version == 9`` WITHOUT ``transfer_records`` — the same
+           way. Literals ``8``..``10`` — every Python store from v8 on carries
+           the table (the v9 and v10 steps keep it), so the probe covers all.
+        7. ``user_version`` 9 or 10 WITHOUT ``transfer_records`` — the same
            reasoning for the v9 table: ``_migrate_v8_to_v9`` / the fresh apply
            create it atomically with the v9 stamp (the ``_V8_USER_VERSION``
            literal conversion makes that hold for every origin), and no ledger
-           this build recognizes stamps 9 without it. Literal ``9`` — pins
-           Python-v9 semantics.
+           this build recognizes stamps 9 or later without it. Literals
+           ``9``..``10`` — the v10 step keeps the table.
+        8. ``user_version == 10`` WITHOUT ``workspace_checkpoints.receiver`` or
+           ``registered_by`` — the same reasoning for the v10 columns:
+           ``_migrate_v9_to_v10`` / the fresh apply land them atomically with
+           the v10 stamp, and the Node ledger stops below v8 and has no
+           checkpoint tables. Literal ``10`` only: a v9 store legitimately
+           lacks both columns (they arrive at v10), so a v9 probe for them
+           would refuse every store a v9 build wrote.
 
         ``user_version == 1`` is deliberately NOT blocked: the Node ledger's
         v1 is a byte-for-byte mirror of this repo's v1 schema, so the two are
@@ -1208,19 +1253,29 @@ class SqliteArtifactRegistry:
                 "it atomically with the v5 stamp; no ledger this build "
                 "recognizes stamps 5 without it)"
             )
-        if current == 8 and not self._has_table("caller_principals"):
+        if 8 <= current <= 10 and not self._has_table("caller_principals"):
             self._raise_cross_runtime(
-                "is user_version=8 without the caller_principals table (a "
-                "Python-v8 store always has it — the v7->v8 migration creates "
-                "it atomically with the v8 stamp; no ledger this build "
-                "recognizes stamps 8 without it)"
+                f"is user_version={current} without the caller_principals table "
+                "(a Python-v8+ store always has it — the v7->v8 migration "
+                "creates it atomically with the v8 stamp; no ledger this build "
+                f"recognizes stamps {current} without it)"
             )
-        if current == 9 and not self._has_table("transfer_records"):
+        if 9 <= current <= 10 and not self._has_table("transfer_records"):
             self._raise_cross_runtime(
-                "is user_version=9 without the transfer_records table (a "
-                "Python-v9 store always has it — the v8->v9 migration creates "
-                "it atomically with the v9 stamp; no ledger this build "
-                "recognizes stamps 9 without it)"
+                f"is user_version={current} without the transfer_records table "
+                "(a Python-v9+ store always has it — the v8->v9 migration "
+                "creates it atomically with the v9 stamp; no ledger this build "
+                f"recognizes stamps {current} without it)"
+            )
+        if current == 10 and not (
+            self._has_column("workspace_checkpoints", "receiver")
+            and self._has_column("workspace_checkpoints", "registered_by")
+        ):
+            self._raise_cross_runtime(
+                "is user_version=10 without the workspace_checkpoints.receiver "
+                "and registered_by columns (a Python-v10 store always has both — "
+                "the v9->v10 migration adds them atomically with the v10 stamp; "
+                "no ledger this build recognizes stamps 10 without them)"
             )
 
     def _raise_cross_runtime(self, detail: str) -> NoReturn:
@@ -1922,8 +1977,10 @@ class SqliteArtifactRegistry:
     def _migrate_v8_to_v9(self, instance_id: str | None) -> None:
         """Migrate a v8 db to v9 in ONE atomic transaction (targeted grant
         handoff, #185): create the ``transfer_records`` table, then stamp
-        ``user_version=9``. Caller holds lock. The FINAL step of the chain, so
-        it stamps ``SCHEMA_USER_VERSION``.
+        ``user_version=9``. Caller holds lock. Guards and stamps the
+        ``_V9_USER_VERSION`` literal — v10 (#191's checkpoint columns) made this
+        a chained step, so stamping the constant would re-arm the re-stamp trap
+        (sixth arming).
 
         Table-only and additive: no existing table, column or index is touched,
         and the DDL is the very ``_TRANSFER_RECORDS_DDL`` the fresh apply runs,
@@ -1951,7 +2008,7 @@ class SqliteArtifactRegistry:
         c = self._conn
         c.execute("BEGIN IMMEDIATE")
         try:
-            if c.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_USER_VERSION:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= _V9_USER_VERSION:
                 # A racing winner already advanced to v9 — nothing to do.
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
@@ -1961,6 +2018,60 @@ class SqliteArtifactRegistry:
                     "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
                 )
             )
+            c.execute(f"PRAGMA user_version = {_V9_USER_VERSION}")
+            c.execute("COMMIT")
+        except BaseException:
+            try:
+                c.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        # Load meta from the now-migrated db (write-free).
+        self._rehydrate_meta(instance_id)
+
+    def _migrate_v9_to_v10(self, instance_id: str | None) -> None:
+        """Migrate a v9 db to v10 in ONE atomic transaction (#191, the
+        restore-registration receiver binding): add the nullable
+        ``workspace_checkpoints.receiver`` and ``registered_by`` columns, then
+        stamp ``user_version=10``. Caller holds lock. The FINAL step of the
+        chain, so it stamps ``SCHEMA_USER_VERSION``.
+
+        Column-only and additive. Every existing manifest lands with both NULL:
+        no receiver (any controller may register, the pre-#191 rule) and no
+        registration claim (the first registration after the upgrade claims
+        it). ALTER TABLE has no IF NOT EXISTS, so a ``_has_column`` probe per
+        column is the half-migrated-db guard (the ``_migrate_v5_to_v6``
+        idiom). Same atomicity discipline as every other step: ONE ``BEGIN
+        IMMEDIATE`` wrapping both ALTERs + the stamp, ``except BaseException``
+        ROLLBACK.
+
+        FORWARD-ONLY: an earlier build opening a v10 store raises on the
+        unrecognized ``user_version``; there is no down step.
+
+        NODE-LEDGER COORDINATION: the sibling Node coordinator's ledger stops
+        below v8 and has no checkpoint tables; its guard refuses a
+        Python-lineage store on the ``schema_runtime='python'`` stamp before it
+        interprets the integer, so this Python-only bump needs no coordinated
+        guard edit. This side adds probe 8 to ``_reject_foreign_ledger_db``.
+
+        Concurrent-loser path: both processes can read ``user_version == 9``
+        pre-lock and both land here; they serialize on ``BEGIN IMMEDIATE``,
+        and the loser re-reads the version inside its txn and no-ops.
+        """
+        c = self._conn
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_USER_VERSION:
+                # A racing winner already advanced to v10 — nothing to do.
+                c.execute("COMMIT")
+                self._rehydrate_meta(instance_id)
+                return
+            if not self._has_column("workspace_checkpoints", "receiver"):
+                c.execute("ALTER TABLE workspace_checkpoints ADD COLUMN receiver TEXT")
+            if not self._has_column("workspace_checkpoints", "registered_by"):
+                c.execute(
+                    "ALTER TABLE workspace_checkpoints ADD COLUMN registered_by TEXT"
+                )
             c.execute(f"PRAGMA user_version = {SCHEMA_USER_VERSION}")
             c.execute("COMMIT")
         except BaseException:
@@ -3207,7 +3318,15 @@ class SqliteArtifactRegistry:
             raise ValueError(
                 "create_checkpoint requires an owner: a checkpoint manifest "
                 "without owner metadata is unrepresentable (fail-closed; the "
-                "restore path owner-validates against it)"
+                "owner is provenance — who took it — and the restore "
+                "registration's authorization reads the optional receiver "
+                "instead)"
+            )
+        if checkpoint.registered_by is not None:
+            raise ValueError(
+                "create_checkpoint: a new manifest cannot arrive already "
+                "registered — the registration claim is made only through "
+                "claim_checkpoint_registration"
             )
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -3217,8 +3336,8 @@ class SqliteArtifactRegistry:
                     INSERT INTO workspace_checkpoints
                         (checkpoint_id, name, owner, created_at, created_at_tick,
                          window_min, window_max, restore_status,
-                         restore_updated_at, pin_refcount)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         restore_updated_at, pin_refcount, receiver)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         checkpoint.checkpoint_id,
@@ -3231,6 +3350,9 @@ class SqliteArtifactRegistry:
                         checkpoint.restore_status,
                         checkpoint.restore_updated_at,
                         checkpoint.pin_refcount,
+                        checkpoint.receiver.hex
+                        if checkpoint.receiver is not None
+                        else None,
                     ),
                 )
                 for member in members:
@@ -3277,10 +3399,45 @@ class SqliteArtifactRegistry:
             row = self._conn.execute(
                 "SELECT checkpoint_id, name, owner, created_at, created_at_tick, "
                 "window_min, window_max, restore_status, restore_updated_at, "
-                "pin_refcount FROM workspace_checkpoints WHERE checkpoint_id = ?",
+                "pin_refcount, receiver, registered_by "
+                "FROM workspace_checkpoints WHERE checkpoint_id = ?",
                 (checkpoint_id,),
             ).fetchone()
         return self._checkpoint_record_from_row(row) if row is not None else None
+
+    def claim_checkpoint_registration(
+        self, checkpoint_id: str, controller: UUID
+    ) -> tuple[UUID, bool]:
+        """First-claim-wins registration claim (#191): read + conditional set
+        in ONE ``BEGIN IMMEDIATE``, so two concurrent claimants (in this
+        process or another) cannot both win. Returns ``(holder, newly_claimed)``
+        decided inside that transaction; raises ``KeyError`` for an unknown
+        checkpoint.
+        Parity with :meth:`ArtifactRegistry.claim_checkpoint_registration`."""
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT registered_by FROM workspace_checkpoints "
+                    "WHERE checkpoint_id = ?",
+                    (checkpoint_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
+                if row[0] is not None:
+                    self._conn.execute("COMMIT")
+                    return UUID(hex=row[0]), False
+                self._conn.execute(
+                    "UPDATE workspace_checkpoints SET registered_by = ? "
+                    "WHERE checkpoint_id = ? AND registered_by IS NULL",
+                    (controller.hex, checkpoint_id),
+                )
+                self._conn.execute("COMMIT")
+                return controller, True
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def list_checkpoints(self) -> list[CheckpointRecord]:
         """Return every checkpoint header, ordered by ``(created_at,
@@ -3289,7 +3446,7 @@ class SqliteArtifactRegistry:
             rows = self._conn.execute(
                 "SELECT checkpoint_id, name, owner, created_at, created_at_tick, "
                 "window_min, window_max, restore_status, restore_updated_at, "
-                "pin_refcount FROM workspace_checkpoints "
+                "pin_refcount, receiver, registered_by FROM workspace_checkpoints "
                 "ORDER BY created_at, checkpoint_id"
             ).fetchall()
         return [self._checkpoint_record_from_row(r) for r in rows]
@@ -3464,6 +3621,8 @@ class SqliteArtifactRegistry:
             restore_status=row[7],
             restore_updated_at=float(row[8]) if row[8] is not None else None,
             pin_refcount=int(row[9]),
+            receiver=UUID(hex=row[10]) if row[10] is not None else None,
+            registered_by=UUID(hex=row[11]) if row[11] is not None else None,
         )
 
     # ------------------------------------------------------------------

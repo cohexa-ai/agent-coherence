@@ -841,7 +841,7 @@ def test_fresh_db_has_fence_schema(db_path: Path) -> None:
         assert "transfer_records" in tables
         # A fresh db is created directly at the current head.
         assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
-        assert SCHEMA_USER_VERSION == 9
+        assert SCHEMA_USER_VERSION == 10
 
 
 def test_pre_fence_db_upgrades_in_place_additively(db_path: Path) -> None:
