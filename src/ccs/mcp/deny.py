@@ -126,14 +126,21 @@ _LOOK_FIRST = (
     "It may have landed. Look at the path's handoff first (the handoff key of "
     "swg_read, or swg_status). "
 )
+# How a giver tells that a transfer it is unsure of landed. One copy, used by
+# every text that gives the rule (the unconfirmed transfer, the not-held
+# refusal, the transfer tool's description): a tightening that missed a copy
+# would leave an agent on the old rule, and that failure is a second handoff.
+HANDOFF_LANDED_TRANSFER = (
+    "A handoff from you to that successor made at the version you held (its "
+    "version_at_transfer), live or ended, means your transfer landed: do not "
+    "transfer again, and do not withdraw to start over. "
+)
 HANDOFF_UNCONFIRMED_NEXT_STEPS: dict[str, str] = {
     # The version qualifier tells this transfer from an earlier round's ended
     # record between the same two sessions.
     "transfer": (
-        "Do not repeat this call yet. " + _LOOK_FIRST + "A handoff from you to that "
-        "successor made at the version you held (its version_at_transfer), live or "
-        "ended, means your transfer landed: do not transfer again, and do not "
-        "withdraw to start over. Transfer again only if no such handoff shows and "
+        "Do not repeat this call yet. " + _LOOK_FIRST + HANDOFF_LANDED_TRANSFER
+        + "Transfer again only if no such handoff shows and "
         "the path is still at the version you held; if it was written since, or "
         "shows another session's handoff, ask your user first."
     ),
@@ -199,10 +206,8 @@ HANDOFF_REFUSALS: dict[str, _Terminal] = {
         "Nothing changed: this session holds no claim on this path, and a transfer of "
         "it that already landed gets exactly this answer. Look at the path's handoff "
         "in swg_status first: it lists every record, while swg_read's handoff key is "
-        "best-effort, so a read without one proves nothing. A handoff from you to that "
-        "successor made at the version you held (its version_at_transfer), live or "
-        "ended, means your transfer landed: do not transfer again, and do not withdraw "
-        "to start over. Ask your user or host first if any other handoff shows, if "
+        "best-effort, so a read without one proves nothing. " + HANDOFF_LANDED_TRANSFER
+        + "Ask your user or host first if any other handoff shows, if "
         "swg_status reports the path past the version you last held, or if you have no "
         "version of your own to compare. Only if no handoff shows and swg_status "
         "reports the path at the version you last held: swg_reacquire the path to take "

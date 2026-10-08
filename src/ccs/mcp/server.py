@@ -37,6 +37,7 @@ from ccs.adapters.coherent_volume import (
 from ccs.adapters.effect_gate import check_fence
 from ccs.core.exceptions import HOLD_INPUT_VANISHED, CasVersionConflict, CoherenceError
 from ccs.mcp.deny import (
+    HANDOFF_LANDED_TRANSFER,
     cas_exhausted_result,
     coordinator_unavailable_result,
     deny_result,
@@ -235,10 +236,8 @@ _TRANSFER_DESC = (
     "another session's and is not refused, so write a path you handed off by "
     "no route. If the answer is commit_unconfirmed "
     "(recover=check_handoff) the transfer may have landed: look at the path's "
-    "handoff (swg_read or swg_status) first. A handoff from you to that "
-    "successor made at the version you held (its version_at_transfer), live "
-    "or ended, means it landed: do not transfer again, and do not withdraw to "
-    "start over. Transfer again only if no such handoff shows; if the path "
+    "handoff (swg_read or swg_status) first. " + HANDOFF_LANDED_TRANSFER
+    + "Transfer again only if no such handoff shows; if the path "
     "was written since or shows another session's handoff, ask your user. Once the successor has written the path, a "
     "second transfer is a new handoff."
     + _HANDOFF_CLAUSE + _SCOPE_CLAUSE
