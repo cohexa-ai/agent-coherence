@@ -1405,7 +1405,10 @@ class CoherentVolume:
         # after the refusal is overwritten. setdefault never replaces an earlier
         # observation, so the refused bytes cannot absolve an edit made after one.
         self._last_observed_hash.setdefault(rel, content_hash)
-        self._read_handoffs.pop(rel, None)  # this read's answer replaces it
+        # This read's answer replaces both: its handoff key and whether it was
+        # a strict deny. An unanswered or failed read leaves neither set.
+        self._read_handoffs.pop(rel, None)
+        self._last_read_denied = False
         if self._endpoint is not None:
             reader = self._incarnation  # the incarnation this request names
             resp = self._post(
@@ -1417,6 +1420,9 @@ class CoherentVolume:
                 },
             )
             self._note_read_handoff(rel, resp)
+            hook_output = resp.get("hookSpecificOutput") if isinstance(resp, dict) else None
+            denied = isinstance(hook_output, dict) and hook_output.get("permissionDecision") == "deny"
+            self._last_read_denied = denied
             # A stale / strict-deny response is expected and changes nothing here
             # (read returns current bytes; INVALID stays sticky). Two answers
             # are infra failures that take the unanswered-request seam: a
@@ -1427,21 +1433,14 @@ class CoherentVolume:
                 )
             elif isinstance(resp, dict) and resp.get("ok") is False:
                 self._fail_closed_or_degrade(self._pre_read_failure(resp, rel))
-            elif _enforce_stale and self._on_stale_read == "raise":
+            elif _enforce_stale and self._on_stale_read == "raise" and denied:
                 # PH-A read-surface instance (opt-in): surface a strict
                 # foreign-edit / stale-view deny as StaleView so the caller can
                 # abort or reacquire(), instead of silently returning current
                 # bytes. Default ("allow") keeps the back-compat swallow.
                 # reacquire()'s recovery read passes _enforce_stale=False so
                 # recovery is never blocked.
-                hook_output = (
-                    resp.get("hookSpecificOutput") if isinstance(resp, dict) else None
-                )
-                if (
-                    isinstance(hook_output, dict)
-                    and hook_output.get("permissionDecision") == "deny"
-                ):
-                    raise StaleView(self._deny_reason(resp))
+                raise StaleView(self._deny_reason(resp))
             if self._read_registered(resp):
                 self._read_incarnations[rel] = reader
         # SB-23: advance the foreign-edit baseline only HERE, where the bytes
@@ -2647,8 +2646,12 @@ class CoherentVolume:
 
     @property
     def last_read_denied(self) -> bool:
-        """Whether the coordinator refused this volume's most recent
-        :meth:`read_with_version_generation` with a strict-mode deny.
+        """Whether the coordinator refused this volume's most recent read, by
+        any read method (:meth:`read`, :meth:`read_with_version`,
+        :meth:`read_with_version_generation`, the read :meth:`reacquire`
+        takes, and a compare-and-swap's comparand read), with a strict-mode
+        deny. ``False`` after an admitted read, and after one that failed or
+        went unanswered.
 
         A handoff's giver meets one on its own re-read of a path it handed
         off: the transfer left its claim INVALID at an unmoved version. The
@@ -3148,9 +3151,11 @@ class CoherentVolume:
         if result.split_pair:
             raise StaleView(_SPLIT_READ_DENY_REASON)
 
-    #: Whether the most recent :meth:`read_with_version_generation` was refused
-    #: by the coordinator (strict-mode deny). Read by the effect fence to name
-    #: the HOLD cause precisely; per-instance and overwritten each call.
+    #: Whether the most recent read, by any read method, was refused by the
+    #: coordinator (strict-mode deny); the public face is
+    #: :attr:`last_read_denied`. The effect fence reads it right after its own
+    #: :meth:`read_with_version_generation` to name the HOLD cause precisely;
+    #: per-instance and overwritten by every read.
     _last_read_denied: bool = False
 
     #: Whether the most recent :meth:`read_with_version_generation` came back
@@ -3269,7 +3274,10 @@ class CoherentVolume:
         stale_status = False
         content_differs = False
         owner_generation: int | None = None
-        self._read_handoffs.pop(_rel, None)  # this read's answer replaces it
+        # This read's answer replaces both: its handoff key and whether it was
+        # a strict deny. An unanswered or failed read leaves neither set.
+        self._read_handoffs.pop(_rel, None)
+        self._last_read_denied = False
         if self._endpoint is not None:
             reader = self._incarnation  # the incarnation this request names
             resp = self._post(
@@ -3318,6 +3326,7 @@ class CoherentVolume:
                 hook_output = resp.get("hookSpecificOutput")
                 if isinstance(hook_output, dict):
                     stale_denied = hook_output.get("permissionDecision") == "deny"
+                self._last_read_denied = stale_denied
                 # Any stale-status response — warn re-grant or deny alike —
                 # means this instance's prior grant did not stand at this read.
                 stale_status = resp.get("status") == "stale"

@@ -907,6 +907,55 @@ def test_read_handoff_reports_the_key_the_latest_read_of_the_path_received(
         stop_coordinator(tmp_path)
 
 
+@pytest.mark.parametrize("read_call", ["read", "read_with_version", "read_with_version_generation"])
+def test_a_strict_denied_re_read_sets_last_read_denied_whichever_read_method_took_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig, read_call: str
+) -> None:
+    """The guide sends a library giver to ``read_handoff()`` and
+    ``last_read_denied`` after its re-read of a path it handed off. The re-read
+    is strict-denied and carries no ``handoff`` key, so ``read_handoff()`` is
+    ``None``, and only the flag says that ``None`` means "not told" rather than
+    "no record". A flag set only by ``read_with_version_generation`` told a
+    giver whose ``read()`` or ``read_with_version()`` was denied that the read
+    was admitted."""
+    _seed(tmp_path, _PLAN, b"plan v1")
+    giver, successor = _volumes(tmp_path, fast_cfg, 2)
+    try:
+        giver.read(_PLAN)
+        assert giver.transfer(_PLAN, successor=_agent(successor)).ok
+
+        getattr(giver, read_call)(_PLAN)
+
+        assert giver.last_read_denied is True
+        assert giver.read_handoff(_PLAN) is None
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("read_call", ["read", "read_with_version", "reacquire"])
+def test_an_admitted_read_clears_last_read_denied_whichever_read_method_took_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig, read_call: str
+) -> None:
+    """The flag answers for the volume's LATEST read: after a denied re-read of
+    the handed-off path, an admitted read of another path by any read method
+    clears it. A flag left set would mark that admitted read's missing
+    ``handoff`` key as "not told" when the path simply has no record."""
+    _seed(tmp_path, _PLAN, b"plan v1")
+    _seed(tmp_path, _OTHER, b"other v1")
+    giver, successor = _volumes(tmp_path, fast_cfg, 2)
+    try:
+        giver.read(_PLAN)
+        assert giver.transfer(_PLAN, successor=_agent(successor)).ok
+        giver.read_with_version_generation(_PLAN)
+        assert giver.last_read_denied is True, "precondition: the re-read was strict-denied"
+
+        getattr(giver, read_call)(_OTHER)
+
+        assert giver.last_read_denied is False
+    finally:
+        stop_coordinator(tmp_path)
+
+
 # --- public names -----------------------------------------------------------
 
 
