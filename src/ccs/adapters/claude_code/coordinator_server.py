@@ -6619,18 +6619,6 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     the record's ``created_at_unix_ts``. An entry with no record, and the
     metrics tier always, keep today's bytes.
 
-    AC-07 — metrics-tier stability contract (operator-facing):
-
-      Fields PRESENT in the metrics tier are stable within a major
-      version. ``coordinator_uptime_seconds``, ``coordinator_backend``,
-      ``coordinator_version``, ``watchdog_timeouts_total``,
-      ``watchdog_queue_overflows_total``,
-      ``handler_concurrency_overflows_total``,
-      ``in_flight_drain_timed_out``, ``cold_start_duration_ms``,
-      ``endpoint_counters``, ``intra_task_acquire_release_total``,
-      ``stale_warning_emitted_total``, ``stale_warning_reread_total``,
-      ``sweep_reclaims_total``, ``sweep_reclaims_by_trigger`` (#195).
-
     #195 — reclaim cause at the operator tier: every ``sessions[]`` row at
     ``detail=full`` carries ``reclaimed``, a map SIBLING to ``states``:
     ``{path: {"trigger": "reclaim_heartbeat" | "reclaim_max_hold", "tick": int}}``
@@ -6652,6 +6640,18 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     that is unnamed, holds nothing and is listed only for a reclaim gets a row
     only while its newest reclaim is younger than
     ``_RECLAIM_ONLY_ROW_MAX_AGE_SEC`` (24h), so dead sessions do not pile up.
+
+    AC-07 — metrics-tier stability contract (operator-facing):
+
+      Fields PRESENT in the metrics tier are stable within a major
+      version. ``coordinator_uptime_seconds``, ``coordinator_backend``,
+      ``coordinator_version``, ``watchdog_timeouts_total``,
+      ``watchdog_queue_overflows_total``,
+      ``handler_concurrency_overflows_total``,
+      ``in_flight_drain_timed_out``, ``cold_start_duration_ms``,
+      ``endpoint_counters``, ``intra_task_acquire_release_total``,
+      ``stale_warning_emitted_total``, ``stale_warning_reread_total``,
+      ``sweep_reclaims_total``, ``sweep_reclaims_by_trigger`` (#195).
 
       Fields may be ADDED in minor versions (additive change is
       non-breaking for dashboards using selective key access).
