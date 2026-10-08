@@ -425,6 +425,60 @@ def test_the_transfer_tool_answers_no_path_or_one_path_twice_as_a_path_error(
         stop_coordinator(tmp_path)
 
 
+@pytest.mark.parametrize("verb", ["transfer", "accept", "decline", "withdraw"])
+def test_a_handoff_tool_on_a_session_whose_coordinator_is_gone_answers_unavailable(
+    tmp_path: Path, fast_cfg: LifecycleConfig, verb: str
+) -> None:
+    """With the coordinator endpoint lost, every handoff tool answers
+    ``coordinator_unavailable``, the answer an agent retries later, rather than
+    ``internal_error`` from a volume that cannot reach anyone."""
+    _seed(tmp_path, PLAN, b"plan v1")
+    config = _config(tmp_path)
+    volume = _vol(tmp_path, fast_cfg)
+    try:
+        volume._endpoint = None
+        if verb == "transfer":
+            result = _do_transfer(volume, config, [PLAN], str(uuid4()))
+        else:
+            result = {"accept": _do_accept, "decline": _do_decline, "withdraw": _do_withdraw}[verb](
+                volume, config, PLAN
+            )
+
+        assert result.isError is True
+        assert result.structuredContent["reason"] == "coordinator_unavailable"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_successors_read_after_a_bystander_overtook_reports_the_overtaken_record(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The successor's first read carries the pending record. A bystander's
+    win then overtakes it and moves the version, so the successor's next read
+    is strict-denied and carries no key: the read tool must take the record
+    from ``/status`` and report it overtaken, not relay the earlier read's
+    pending key as if nothing had happened."""
+    _seed(tmp_path, PLAN, b"plan v1")
+    config = _config(tmp_path)
+    giver = _vol(tmp_path, fast_cfg)
+    successor = _vol(tmp_path, fast_cfg)
+    bystander = _vol(tmp_path, fast_cfg)
+    try:
+        _do_read(giver, config, PLAN)
+        assert _do_transfer(giver, config, [PLAN], _agent(successor)).isError is False
+        first = _do_read(successor, config, PLAN)
+        assert first.structuredContent["handoff"]["status"] == "pending", "precondition"
+        bystander.write_cas_at(PLAN, 1, b"plan v2 by a bystander")
+
+        second = _do_read(successor, config, PLAN)
+
+        assert successor.last_read_denied is True, "precondition: the re-read was strict-denied"
+        assert second.structuredContent["handoff"]["status"] == "overtaken"
+        assert second.structuredContent["handoff"]["counterparty"] == _agent(bystander)
+    finally:
+        stop_coordinator(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("verb", "tool"), [("accept", _do_accept), ("decline", _do_decline), ("withdraw", _do_withdraw)]
 )

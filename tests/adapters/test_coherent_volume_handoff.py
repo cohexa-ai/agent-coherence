@@ -25,6 +25,7 @@ import json
 import urllib.error
 import warnings
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -40,7 +41,8 @@ from ccs.adapters.coherent_volume import (
     HandoffVerbResult,
     HandoffWinOutcome,
 )
-from ccs.cli._coherence_client import CoordinatorUnavailable
+from ccs.cli._coherence_client import CoordinatorUnavailable, resolve_endpoint
+from ccs.cli._coherence_client import post as _cc_post
 from ccs.core.exceptions import CoherenceDegradedWarning, CoherenceError, CommitUnconfirmed, GiverFenced
 
 _MANAGED = ("data/**",)
@@ -872,6 +874,195 @@ def test_a_handoff_request_the_coordinator_refused_outright_stays_a_coherence_er
         assert type(raised.value) is CoherenceError
         monkeypatch.undo()
         assert _status_handoff(giver, _PLAN) == before
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("verb", ["transfer", "accept", "decline", "withdraw"])
+def test_a_handoff_request_the_coordinator_refused_outright_is_unconfirmed_under_degrade(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, verb: str
+) -> None:
+    """Degrade mode does not tell a refusal from a failure, so a 4xx warns and
+    raises ``CommitUnconfirmed``, as ``transfer()`` documents, never a
+    ``CoherenceError`` that reads as "nothing happened" and never a value."""
+    try:
+        giver, successor = _volume_pair(tmp_path, fast_cfg, "degrade", verb)
+        real_post = coherent_volume_module._coordinator_post
+
+        def refuse(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            if path == f"/handoff/{verb}":
+                raise _http_error(400, {"error": "grants contains duplicate paths"})
+            return real_post(endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", refuse)
+        with pytest.warns(CoherenceDegradedWarning), pytest.raises(CommitUnconfirmed):
+            _act(verb, giver, successor)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- fail-closed edges --------------------------------------------------------
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+@pytest.mark.parametrize("verb", ["transfer", "accept", "decline", "withdraw"])
+def test_a_handoff_verb_on_a_volume_with_no_coordinator_fails_closed_in_both_modes(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    on_error: str, verb: str,
+) -> None:
+    """A volume that lost its coordinator endpoint cannot hand anything on or
+    settle anything. Each verb raises ``CoherenceError`` naming the missing
+    endpoint, in both modes, and sends nothing: without the check a
+    degrade-mode volume posted to no endpoint and reported the verb as
+    unconfirmed, "may have landed", when it never left the process."""
+    try:
+        giver, successor = _volume_pair(tmp_path, fast_cfg, on_error, verb)
+        sent: list[tuple[str, dict]] = []
+        _record_posts(monkeypatch, sent)
+        giver._endpoint = None
+        successor._endpoint = None
+
+        with pytest.raises(CoherenceError, match="endpoint unavailable") as raised:
+            _act(verb, giver, successor)
+
+        assert type(raised.value) is CoherenceError
+        assert [route for route, _body in sent if route.startswith("/handoff/")] == []
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("read_call", ["read", "read_with_version"])
+@pytest.mark.parametrize("answer", ["strict_deny", "degraded"])
+def test_a_denied_or_degraded_re_read_does_not_move_the_presented_incarnation(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    read_call: str, answer: str,
+) -> None:
+    """A read registers a claim only when the coordinator admitted it. A strict
+    deny (here, of a fresh incarnation reading bytes edited out of band) and a
+    watchdog-degraded answer, which still says ``status: fresh``, register
+    nothing, so the transfer still presents the incarnation whose read holds
+    the path. Recording the denied or degraded read would present an
+    incarnation that holds nothing, refused as not held."""
+    target = _seed(tmp_path, _PLAN, b"plan v1")
+    _seed(tmp_path, _OTHER, b"other v1")
+    on_error = "strict" if answer == "strict_deny" else "degrade"
+    giver = CoherentVolume(tmp_path, managed=_MANAGED, on_error=on_error, config=fast_cfg)
+    successor = CoherentVolume(tmp_path, managed=_MANAGED, on_error=on_error, config=fast_cfg)
+    try:
+        giver.read(_PLAN)
+        reader = giver._incarnation
+        giver.reacquire(_OTHER)  # a re-mint: later requests name a new incarnation
+        assert giver._incarnation != reader, "precondition"
+        if answer == "strict_deny":
+            target.write_bytes(b"plan edited out of band")
+        else:
+            real_post = coherent_volume_module._coordinator_post
+
+            def degraded(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+                if path == "/hooks/pre-read" and payload.get("path") == _PLAN:
+                    return {"status": "fresh", "degraded": True}  # the watchdog's answer
+                return real_post(endpoint, path, payload, **kwargs)
+
+            monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degraded)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", CoherenceDegradedWarning)
+            try:
+                getattr(giver, read_call)(_PLAN)
+            except CoherenceError:
+                pass  # a split pair is refused; the claim question is unchanged
+        monkeypatch.undo()
+        sent: list[tuple[str, dict]] = []
+        _record_posts(monkeypatch, sent)
+
+        result = giver.transfer(_PLAN, successor=_agent(successor))
+
+        assert _presented(sent) == [{"path": _PLAN, "agent_id": reader}]
+        assert result.ok
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_an_accept_of_a_live_handoff_a_bystander_overtook_names_the_bystander(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A bystander's acquire of the path without a write overtakes the handoff
+    and leaves it live. The successor's accept is taken but changes nothing:
+    it answers ``overtaken``, naming the bystander as ``counterparty``."""
+    _seed(tmp_path, _PLAN, b"plan v1")
+    giver, successor = _volumes(tmp_path, fast_cfg, 2)
+    bystander = str(uuid4())
+    try:
+        giver.read(_PLAN)
+        assert giver.transfer(_PLAN, successor=_agent(successor)).ok
+        acquired = _cc_post(
+            resolve_endpoint(tmp_path), "/hooks/pre-edit", {"session_id": bystander, "path": _PLAN}
+        )
+        assert acquired.get("ok") is True, "precondition: the bystander holds the path"
+
+        assert successor.accept(_PLAN) == HandoffVerbResult(
+            path=_PLAN, ok=True, status="overtaken",
+            counterparty=str(session_to_agent_id(bystander)),
+        )
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_the_latest_of_two_stranded_write_grants_is_the_one_presented(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two incarnations stranded by unconfirmed releases both record the path,
+    but the later one's write took the grant from the earlier one. The
+    transfer presents the later writer; the earlier holds nothing and would
+    be refused as not held."""
+    _seed(tmp_path, _PLAN, b"plan v1")
+    _seed(tmp_path, _OTHER, b"other v1")
+    giver, successor = _volumes(tmp_path, fast_cfg, 2)
+    try:
+        real_post = coherent_volume_module._coordinator_post
+
+        def refuse_releases(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            if path == "/hooks/session-stop":
+                return {"ok": False, "reason": "internal: RuntimeError"}  # not released
+            return real_post(endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", refuse_releases)
+        giver.write(_PLAN, b"plan v2")
+        first = giver._incarnation
+        giver.reacquire(_OTHER)
+        giver.write(_PLAN, b"plan v3")
+        second = giver._incarnation
+        giver.reacquire(_OTHER)
+        assert len({first, second, giver._incarnation}) == 3, "precondition"
+        monkeypatch.undo()
+        sent: list[tuple[str, dict]] = []
+        _record_posts(monkeypatch, sent)
+
+        result = giver.transfer(_PLAN, successor=_agent(successor))
+
+        assert _presented(sent) == [{"path": _PLAN, "agent_id": second}]
+        assert result.ok
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_single_file_publish_of_a_handed_path_raises_the_giver_terminal(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A one-member publish takes the compare-and-swap route, not the batch
+    session, and is fenced the same way: the giver terminal naming the
+    successor and the version at transfer, and nothing written."""
+    target = _seed(tmp_path, _PLAN, b"plan v1")
+    giver, successor = _volumes(tmp_path, fast_cfg, 2)
+    try:
+        assert giver.read_with_version(_PLAN) == (b"plan v1", 1)
+        assert giver.transfer(_PLAN, successor=_agent(successor)).ok
+
+        with pytest.raises(GiverFenced) as raised:
+            giver.atomic_publish([(_PLAN, 1, b"late plan")])
+
+        assert (raised.value.successor, raised.value.version_at_transfer) == (_agent(successor), 1)
+        assert target.read_bytes() == b"plan v1"
     finally:
         stop_coordinator(tmp_path)
 
