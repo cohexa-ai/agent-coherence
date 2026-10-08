@@ -5971,8 +5971,8 @@ def _handle_workspace_checkpoint(
 
     Responses:
       - WIN → ``{ok: true, checkpoint_id, name, window_min, window_max,
-        receiver, coordinator_epoch}`` (``receiver`` is the derived controller
-        id as a string, or null)
+        coordinator_epoch}``, plus ``receiver`` (the derived controller id as
+        a string) only when the request named a ``receiver_session_id``
       - validation / registry rejection → ``{ok: false, reason}``; a typed
         ``CoherenceError`` carries its identity-stable ``reason`` token with
         the prose in ``detail``
