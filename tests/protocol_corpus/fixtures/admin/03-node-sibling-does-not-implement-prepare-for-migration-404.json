@@ -1,0 +1,22 @@
+{
+  "name": "admin-node-sibling-does-not-implement-prepare-for-migration-404",
+  "description": "The Node coordinator does not serve /admin/prepare-for-migration (its migration path is the Python CLI's). Pinned so a Node route growing one is a deliberate parity change, made with a both-backend row.",
+  "setup": {},
+  "request": {
+    "method": "POST",
+    "path": "/admin/prepare-for-migration",
+    "body": {},
+    "headers": {
+      "Coherence-Local-Operator": "true"
+    }
+  },
+  "expected": {
+    "status": 404,
+    "body": {
+      "error": "not found"
+    }
+  },
+  "backends": [
+    "node"
+  ]
+}

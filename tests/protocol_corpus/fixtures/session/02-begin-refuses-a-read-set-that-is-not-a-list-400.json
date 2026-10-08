@@ -1,0 +1,29 @@
+{
+  "name": "session-begin-refuses-a-read-set-that-is-not-a-list-400",
+  "description": "A malformed /session/begin is an HTTP 400 with a bare `{error}` -- the boundary shape gate, not the `{ok: false, reason}` envelope the route uses for a typed refusal. A client must branch on the status code for this class and on `reason` for the other.",
+  "setup": {
+    "tracked": [
+      "docs/**"
+    ],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/session/begin",
+    "body": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "read_set": "docs/plan.md"
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": "read_set must be a list of repo-relative path strings"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}
