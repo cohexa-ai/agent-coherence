@@ -1245,16 +1245,18 @@ def test_an_admitted_read_clears_last_read_denied_whichever_read_method_took_it(
         stop_coordinator(tmp_path)
 
 
+@pytest.mark.parametrize("read_call", ["read", "read_with_version"])
 def test_a_read_that_fails_after_a_denied_one_clears_last_read_denied(
-    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, read_call: str
 ) -> None:
-    """The flag is reset before each read's request, beside the handoff key, so
-    a read whose answer is lost leaves it ``False``: the denied answer it would
-    otherwise keep belongs to an earlier read, not to this one."""
+    """The flag is reset before each read's request, beside the handoff key.
+    In strict mode a read whose answer is lost raises before any answer is
+    looked at, and without the reset the flag kept the denied answer of an
+    earlier read: a caller that caught the failure and then asked whether
+    "its" read was denied was told yes."""
     _seed(tmp_path, _PLAN, b"plan v1")
     _seed(tmp_path, _OTHER, b"other v1")
-    giver = CoherentVolume(tmp_path, managed=_MANAGED, on_error="degrade", config=fast_cfg)
-    successor = CoherentVolume(tmp_path, managed=_MANAGED, on_error="degrade", config=fast_cfg)
+    giver, successor = _volumes(tmp_path, fast_cfg, 2)
     try:
         giver.read(_PLAN)
         assert giver.transfer(_PLAN, successor=_agent(successor)).ok
@@ -1268,8 +1270,8 @@ def test_a_read_that_fails_after_a_denied_one_clears_last_read_denied(
             return real_post(endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", lose_the_read)
-        with pytest.warns(CoherenceDegradedWarning):
-            giver.read(_OTHER)
+        with pytest.raises(CoherenceError):
+            getattr(giver, read_call)(_OTHER)
 
         assert giver.last_read_denied is False
     finally:
