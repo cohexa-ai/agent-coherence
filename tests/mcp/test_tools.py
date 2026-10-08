@@ -282,6 +282,19 @@ def test_the_accept_tool_says_an_overtaken_handoff_answers_overtaken() -> None:
     assert "refused handoff_not_live" in text
 
 
+def test_the_transfer_tool_says_how_a_giver_tells_its_transfer_landed() -> None:
+    """A giver unsure whether an earlier transfer landed (its context was
+    compacted, or the session restarted) may hold no result's next step, only
+    the tool's description, so the description carries the same rule: a
+    handoff at the version it held means the transfer landed, and transferring
+    again or withdrawing to start over hands the path on a second time."""
+    text = _registered_descriptions()["swg_transfer"]
+
+    assert "version_at_transfer" in text
+    assert "means your transfer landed" in text
+    assert "do not transfer again, and do not withdraw to start over" in text
+
+
 def test_the_transfer_tool_names_the_successor_by_the_id_its_own_status_tool_reports() -> None:
     """The giver names the successor by the value the successor's
     OWN status tool reports, and the status tool says that value names the
