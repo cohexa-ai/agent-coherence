@@ -842,6 +842,53 @@ def test_progress_controller_gate_unknown_checkpoint_is_keyerror(service) -> Non
             write()
 
 
+@pytest.mark.parametrize("which", [0, 1], ids=["status", "member"])
+def test_a_claim_cannot_land_between_the_progress_gate_and_its_write(
+    service, registry, monkeypatch, which
+) -> None:
+    """The progress gate's header read and the write it admits are one
+    critical section, so a rival's claim lands before the read (and the gate
+    refuses) or after the write, never between them. Between them, the gate
+    would admit a controller the claim has just excluded, and its write would
+    conclude or record members of a checkpoint another controller now owns.
+
+    The rival claims from another thread while the gate holds its read. With
+    the read inside the write's registry hold that claim waits for the write;
+    with the read outside it, the claim lands and the write follows it."""
+    checkpoint_id = _mint_checkpoint(service)
+    rival = uuid4()
+    real_get_checkpoint = registry.get_checkpoint
+    window: dict = {}
+
+    def gate_read(cid: str):
+        record = real_get_checkpoint(cid)
+        if "claimant" not in window:
+            claimant = threading.Thread(
+                target=registry.claim_checkpoint_registration,
+                args=(checkpoint_id, rival),
+            )
+            window["claimant"] = claimant
+            claimant.start()
+            claimant.join(timeout=1.0)
+            window["claimed_inside"] = not claimant.is_alive()
+        return record
+
+    monkeypatch.setattr(registry, "get_checkpoint", gate_read)
+    write = _progress_writes(service, checkpoint_id, OWNER)[which]
+    try:
+        write()
+        landed = True
+    except CheckpointRegistrationRefused:
+        landed = False
+    window["claimant"].join(timeout=10.0)
+    monkeypatch.undo()
+
+    assert registry.get_checkpoint(checkpoint_id).registered_by == rival
+    assert not (window["claimed_inside"] and landed), (
+        "the progress write landed after a rival's claim its gate never saw"
+    )
+
+
 # ---------------------------------------------------------------------------
 # #191 — the registry claim primitive (parity across both backends)
 # ---------------------------------------------------------------------------

@@ -2789,9 +2789,11 @@ class CoordinatorService:
                 f"{sorted(RESTORE_STATUSES)} (fail-closed — an unknown status "
                 "would orphan crash-resume, which matches by identity)"
             )
-        if controller is not None:
-            self._require_restore_controller(checkpoint_id, controller)
         with self.registry.abort_guard(abort):
+            # Inside the write's hold: a claim landing between the gate's read
+            # and the write would admit a controller it has just excluded.
+            if controller is not None:
+                self._require_restore_controller(checkpoint_id, controller)
             self.registry.set_checkpoint_restore_status(
                 checkpoint_id, status, updated_at=updated_at
             )
@@ -2830,9 +2832,11 @@ class CoordinatorService:
                 f"vocabulary is {sorted(RESTORE_MEMBER_OUTCOMES)} (fail-closed "
                 "— crash-resume classifies terminality by identity against it)"
             )
-        if controller is not None:
-            self._require_restore_controller(checkpoint_id, controller)
         with self.registry.abort_guard(abort):
+            # Inside the write's hold: a claim landing between the gate's read
+            # and the write would admit a controller it has just excluded.
+            if controller is not None:
+                self._require_restore_controller(checkpoint_id, controller)
             self.registry.set_checkpoint_member_restore(
                 checkpoint_id,
                 member_path,
