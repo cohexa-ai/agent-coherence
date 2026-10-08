@@ -470,8 +470,12 @@ class CasCommitResult:
     """A compare-and-swap win on ``path`` (:meth:`CoherentVolume.write_cas`,
     :meth:`~CoherentVolume.write_cas_at`): the ``version`` it committed, and
     ``handoff``, what it did to a live handoff of the path, ``None`` when it
-    labelled none. ``version`` is ``None`` only from a degrade-mode volume with
-    no coordinator attached, which wrote best-effort at no version."""
+    labelled none. ``version`` is the expected version plus one, the version a
+    win commits. A path the coordinator does not track (its reads report
+    version 0) takes the commit without versioning it, so there the number
+    is nominal: do not use it as a comparand. ``version`` is ``None`` only from a
+    degrade-mode volume with no coordinator attached, which wrote best-effort
+    at no version."""
 
     path: str
     version: int | None
