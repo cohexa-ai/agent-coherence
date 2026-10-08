@@ -18,6 +18,7 @@ from __future__ import annotations
 import pytest
 
 from ccs.core.exceptions import (
+    HANDOFF_TRANSFER_REFUSAL_REASONS,
     CallerPrincipalRefused,
     CasRetriesExhausted,
     CoherenceError,
@@ -28,7 +29,12 @@ from ccs.core.exceptions import (
     StaleView,
     ViewWedged,
 )
-from ccs.mcp.deny import coordinator_unavailable_result, deny_result
+from ccs.mcp.deny import (
+    coordinator_unavailable_result,
+    deny_result,
+    handoff_transfer_refusal_result,
+    handoff_verb_refusal_result,
+)
 
 #: FROZEN duplicates of the three typed principal-refusal reasons and the
 #: recover verb the mapper gives them (never imported from the code under
@@ -426,3 +432,110 @@ def test_the_giver_terminal_is_a_typed_stop_that_says_report_and_never_withdraw(
     assert "stop" in words.lower()
     assert "withdraw" not in words.lower()
 
+
+
+# --- Type C: a handoff tool's typed refusal (#185) ---------------------------
+
+#: FROZEN duplicates (never read off the code under test): every refusal a
+#: handoff tool answers, and the recover verb it answers with.
+_HANDOFF_REFUSAL_RECOVER = {
+    "handoff_to_self": "fix_successor",
+    "handoff_successor_unknown": "fix_successor",
+    "handoff_successor_malformed": "fix_successor",
+    "handoff_not_held": "check_handoff",
+    "handoff_version_unconfirmed": "stop_and_report",
+    "handoff_in_flight": "stop_and_report",
+    "handoff_other_holder": "stop_and_report",
+    "handoff_ended": "stop_and_report",
+    "handoff_not_successor": "stop_and_report",
+    "handoff_not_giver": "stop_and_report",
+    "handoff_not_live": "stop_and_report",
+}
+_VERB_REFUSALS = ("handoff_not_successor", "handoff_not_giver", "handoff_not_live")
+
+
+def _refused_grant(path: str, reason: str) -> dict:
+    return {"path": path, "transferred": False, "reason": reason}
+
+
+def test_the_frozen_refusal_table_covers_every_handoff_refusal() -> None:
+    """A refusal added to the vocabulary without a row would fail closed as
+    ``internal_error`` with ``recover: none``: this pins that every one has a
+    row, and how many there are."""
+    assert set(_HANDOFF_REFUSAL_RECOVER) == set(HANDOFF_TRANSFER_REFUSAL_REASONS) | set(_VERB_REFUSALS)
+    assert len(_HANDOFF_REFUSAL_RECOVER) == 11
+
+
+@pytest.mark.parametrize("reason", sorted(_HANDOFF_REFUSAL_RECOVER))
+def test_every_handoff_refusal_carries_its_recover_verb_and_a_fixed_next_step(reason: str) -> None:
+    """Every error result carries reason, recover, retryable and detail; a
+    handoff refusal carried only the reason. None is retryable: nothing
+    changed and the same call gets the same answer. Each has a next step,
+    in structured content and as the second text item, and none tells the
+    agent to withdraw."""
+    if reason in _VERB_REFUSALS:
+        result = handoff_verb_refusal_result(reason, "the detail", {"path": "p", "ok": False})
+    else:
+        result = handoff_transfer_refusal_result([_refused_grant("p", reason)], "the detail")
+    structured = result.structuredContent
+
+    assert result.isError is True
+    assert (structured["reason"], structured["recover"], structured["retryable"]) == (
+        reason, _HANDOFF_REFUSAL_RECOVER[reason], False,
+    )
+    assert structured["detail"] == "the detail"
+    assert [item.text for item in result.content] == ["the detail", structured["next_step"]]
+    assert "call swg_withdraw" not in structured["next_step"]
+
+
+@pytest.mark.parametrize("reason", ["handoff_made_up", None])
+def test_a_refusal_reason_outside_the_vocabulary_fails_closed(reason: str | None) -> None:
+    """An unvetted reason never reaches the top level: it answers
+    ``internal_error`` with ``recover: none``. A transfer grant keeps the wire
+    reason it was answered with beside that row."""
+    verb = handoff_verb_refusal_result(reason, "d", {"path": "p", "ok": False, "reason": reason})
+    transfer = handoff_transfer_refusal_result([{"path": "p", "transferred": False, "reason": reason}], "d")
+
+    for result in (verb, transfer):
+        assert (result.structuredContent["reason"], result.structuredContent["recover"]) == ("internal_error", "none")
+        assert "next_step" not in result.structuredContent
+    [grant] = transfer.structuredContent["grants"]
+    assert (grant["reason"], grant["recover"], grant["retryable"]) == (reason, "none", False)
+
+
+@pytest.mark.parametrize(
+    ("reasons", "top"),
+    [
+        (["handoff_not_held", "handoff_in_flight"], "handoff_in_flight"),
+        (["handoff_to_self", "handoff_not_held"], "handoff_not_held"),
+        (["handoff_in_flight", "handoff_other_holder"], "handoff_in_flight"),
+        (["handoff_other_holder", "handoff_in_flight"], "handoff_other_holder"),
+    ],
+    ids=["stop-before-check", "check-before-fix", "tie-first", "tie-first-reversed"],
+)
+def test_a_mixed_transfer_speaks_for_its_most_restrictive_refused_grant(reasons: list[str], top: str) -> None:
+    """An agent that obeys only the top level must never take a step riskier
+    than some refused grant allows: the top level speaks for a stop before a
+    record check before a successor fix, and a tie goes to the first refused
+    grant. Every other refused reason's next step follows, labelled."""
+    grants = [_refused_grant(f"p{i}", reason) for i, reason in enumerate(reasons)]
+
+    result = handoff_transfer_refusal_result(grants, "d")
+
+    structured = result.structuredContent
+    assert structured["reason"] == top
+    others = [r for r in reasons if r != top]
+    assert [item.text.split("] ", 1)[0] for item in result.content[2:]] == [f"[{r}" for r in others]
+    assert [g["recover"] for g in structured["grants"]] == [_HANDOFF_REFUSAL_RECOVER[r] for r in reasons]
+
+
+def test_a_partly_transferred_transfer_says_never_to_send_the_transferred_path_again() -> None:
+    """A transferred grant must not be re-sent: that is a second handoff. The
+    top-level next step opens by saying so, then gives the refused grant's."""
+    transferred = {"path": "a", "transferred": True, "status": "pending"}
+
+    result = handoff_transfer_refusal_result([transferred, _refused_grant("b", "handoff_in_flight")], "d")
+
+    next_step = result.structuredContent["next_step"]
+    assert next_step.startswith("Not every path was handed off. A path listed as transferred was handed off: never send it again. ")
+    assert result.structuredContent["grants"][0] == transferred

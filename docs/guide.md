@@ -2385,13 +2385,27 @@ none takes a session argument.
 | `swg_withdraw(path)` | the giver | withdraws it; the giver's fence lifts. Its description says to take it only on the user's or host's explicit instruction, and never as the way out of a `handed_off` refusal |
 
 `swg_transfer` answers `{"ok": ..., "grants": [...]}` with one entry per path,
-carrying the fields of the [transfer answer](#post-handofftransfer) (a refused
-one is `{"path", "transferred": false, "reason"}`), and is an error result
-unless every grant transferred; its text has one line per path. The other three
-answer `{"path", "ok": true, "status"}`, with `counterparty` on an overtaken
-record, or, as an error result that changed nothing,
-`{"path", "ok": false, "reason", "status"}`, without `status` when the path
-has no record. An answer that does not settle the outcome, a lost answer
+carrying the fields of the [transfer answer](#post-handofftransfer), and is an
+error result unless every grant transferred; its `detail` and first text item
+have one line per path. A refused grant is
+`{"path", "transferred": false, "reason", "recover", "retryable": false,
+"next_step"}`, and the error result's own `reason`, `recover`, `retryable` and
+`next_step` are those of its most restrictive refused grant (a stop before a
+record check before a successor fix); when another grant transferred, that
+`next_step` first says never to send the transferred path again, and each other
+refused reason's `next_step` follows as a text item labelled with its reason.
+The other three answer `{"path", "ok": true, "status"}`, with `counterparty` on
+an overtaken record, or, as an error result that changed nothing,
+`{"path", "ok": false, "reason", "status", "recover", "retryable": false,
+"detail", "next_step"}`, without `status` when the path has no record.
+
+| Refusal | `recover` |
+|---|---|
+| `handoff_to_self`, `handoff_successor_unknown`, `handoff_successor_malformed` | `fix_successor`: name the other session by the `session_agent_id` its own `swg_status` reports |
+| `handoff_not_held` | `check_handoff`: a transfer that already landed answers this too, so look at the path's handoff in `swg_status` before anything else |
+| `handoff_version_unconfirmed`, `handoff_in_flight`, `handoff_other_holder`, `handoff_ended`, `handoff_not_successor`, `handoff_not_giver`, `handoff_not_live` | `stop_and_report` |
+
+None is retryable: the same call gets the same answer. An answer that does not settle the outcome, a lost answer
 included, is an error result with `reason: commit_unconfirmed`,
 `recover: check_handoff`, `retryable: false` and a fixed `next_step` per tool:
 look at the path's handoff before acting again. For `swg_transfer`, a handoff

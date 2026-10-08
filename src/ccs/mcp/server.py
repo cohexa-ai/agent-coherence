@@ -41,6 +41,8 @@ from ccs.mcp.deny import (
     coordinator_unavailable_result,
     deny_result,
     handoff_deny_result,
+    handoff_transfer_refusal_result,
+    handoff_verb_refusal_result,
 )
 from ccs.mcp.session import SessionConfig, build_volume
 from ccs.mcp.status import build_status, handoff_from_status
@@ -221,7 +223,12 @@ _TRANSFER_DESC = (
     "nothing changed (handoff_not_held: this session holds no claim on the "
     "path; handoff_successor_unknown: the coordinator does not know that id; "
     "handoff_in_flight: another session's handoff of the path is live). The "
-    "result is an error unless every grant transferred. While a handoff is "
+    "result is an error unless every grant transferred, and each refused grant "
+    "carries recover and retryable=false and a fixed next_step: fix_successor "
+    "for a successor id that names no other session, check_handoff for "
+    "handoff_not_held (a transfer that already landed answers it too), "
+    "stop_and_report otherwise; the top level speaks for the most restrictive "
+    "refused grant. While a handoff is "
     "live this session's swg_write and swg_write_cas on its path are denied "
     "with reason=handed_off. The fence covers this MCP session only: a write "
     "you make through any other route (your own file tools, a shell) is "
@@ -244,12 +251,14 @@ _ACCEPT_DESC = (
     "the accept is taken but changes nothing: it answers status=overtaken "
     "and names that session as counterparty. Refused "
     "with handoff_not_successor or handoff_not_live, as an error that changes "
-    "nothing." + _HANDOFF_CLAUSE + _SCOPE_CLAUSE
+    "nothing (recover=stop_and_report, retryable=false, and a fixed next_step)."
+    + _HANDOFF_CLAUSE + _SCOPE_CLAUSE
 )
 _DECLINE_DESC = (
     "As the successor, decline the live handoff of a path: the handoff ends "
     "and its giver's fence lifts. Refused with handoff_not_successor or "
-    "handoff_not_live, as an error that changes nothing."
+    "handoff_not_live, as an error that changes nothing (recover=stop_and_report, "
+    "retryable=false, and a fixed next_step)."
     + _HANDOFF_CLAUSE + _SCOPE_CLAUSE
 )
 _WITHDRAW_DESC = (
@@ -258,8 +267,8 @@ _WITHDRAW_DESC = (
     "user's or host's explicit instruction. It is never the recovery for the "
     "handed_off refusal: when a write of a path you handed off is refused, stop "
     "and report to your user or host. Refused with handoff_not_giver or "
-    "handoff_not_live, as an error that changes nothing."
-    + _HANDOFF_CLAUSE + _SCOPE_CLAUSE
+    "handoff_not_live, as an error that changes nothing, whose next_step says "
+    "to stop and report." + _HANDOFF_CLAUSE + _SCOPE_CLAUSE
 )
 
 _REACQUIRE_NOTE = "write FROM these exact bytes — the server enforces version lineage, not content derivation"
@@ -559,7 +568,8 @@ def _do_write_cas(
 def _present(fields: dict) -> dict:
     """``fields`` without the ones the answer did not carry, so a result has
     the shape of the coordinator's answer (a refused grant is ``{path,
-    transferred, reason}``). ``fields`` is a volume result's ``asdict``: its
+    transferred, reason}``, to which the error result then adds its
+    ``recover``, ``retryable`` and ``next_step``). ``fields`` is a volume result's ``asdict``: its
     keys are the result's fields in declaration order, and every value is a
     str, int, bool or ``None``, so ``False`` survives and only ``None`` goes."""
     return {key: value for key, value in fields.items() if value is not None}
@@ -574,24 +584,26 @@ def _transfer_result(result: HandoffTransferResult) -> CallToolResult:
         else f"{grant.path}: not transferred ({grant.reason})"
         for grant in result.grants
     ]
+    if result.ok:
+        return CallToolResult(
+            isError=False,
+            content=[TextContent(type="text", text="\n".join(lines))],
+            structuredContent={"ok": True, "grants": grants},
+        )
     # Not every grant moved: a non-ignorable error, so a partly refused
-    # transfer never reads as done.
-    return CallToolResult(
-        isError=not result.ok,
-        content=[TextContent(type="text", text="\n".join(lines))],
-        structuredContent={"ok": result.ok, "grants": grants},
-    )
+    # transfer never reads as done, carrying a recover verb like every other.
+    return handoff_transfer_refusal_result(grants, "\n".join(lines))
 
 
 def _verb_result(verb: str, result: HandoffVerbResult) -> CallToolResult:
     structured = _present(asdict(result))
-    if result.ok:
-        text = f"{verb} {result.path}: taken (status={result.status})"
-    else:
-        text = f"{verb} {result.path}: refused ({result.reason}); nothing changed"
+    if not result.ok:
+        return handoff_verb_refusal_result(
+            result.reason, f"{verb} {result.path}: refused ({result.reason}); nothing changed", structured
+        )
     return CallToolResult(
-        isError=not result.ok,
-        content=[TextContent(type="text", text=text)],
+        isError=False,
+        content=[TextContent(type="text", text=f"{verb} {result.path}: taken (status={result.status})")],
         structuredContent=structured,
     )
 

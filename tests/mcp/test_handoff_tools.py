@@ -64,6 +64,35 @@ _LANDED_MARKER = {
     "decline": "Status declined",
     "withdraw": "Status withdrawn",
 }
+#: FROZEN duplicates (never read off the code under test): the recover verb a
+#: refused handoff tool answers, per reason. None is retryable: nothing changed,
+#: and the same call gets the same answer.
+_REFUSAL_RECOVER = {
+    "handoff_to_self": "fix_successor",
+    "handoff_successor_unknown": "fix_successor",
+    "handoff_successor_malformed": "fix_successor",
+    "handoff_not_held": "check_handoff",
+    "handoff_version_unconfirmed": "stop_and_report",
+    "handoff_in_flight": "stop_and_report",
+    "handoff_other_holder": "stop_and_report",
+    "handoff_ended": "stop_and_report",
+    "handoff_not_successor": "stop_and_report",
+    "handoff_not_giver": "stop_and_report",
+    "handoff_not_live": "stop_and_report",
+}
+
+
+def _refused(structured: dict) -> dict:
+    """A refused result or grant with its fixed ``next_step`` checked and
+    dropped: present, and never telling the agent to withdraw (it may name
+    the tool only to say which status it sets)."""
+    shape = dict(structured)
+    next_step = shape.pop("next_step")
+    assert isinstance(next_step, str) and next_step.startswith("Nothing"), next_step
+    assert "call swg_withdraw" not in next_step
+    return shape
+
+
 #: The recover verbs that would send a fenced giver back to try again: none of
 #: them can clear a fence keyed on the session.
 _LOOPING_RECOVERS = ("reacquire", "read_then_merge", "reacquire_and_reread", "wait_and_retry")
@@ -182,9 +211,11 @@ def test_the_transfer_tool_on_a_path_a_hook_session_holds_is_refused_as_not_held
 
         assert result.isError is True
         assert result.structuredContent["ok"] is False
-        assert result.structuredContent["grants"] == [
-            {"path": rel, "transferred": False, "reason": "handoff_not_held"}
-        ]
+        [grant] = result.structuredContent["grants"]
+        assert _refused(grant) == {
+            "path": rel, "transferred": False, "reason": "handoff_not_held",
+            "recover": _REFUSAL_RECOVER["handoff_not_held"], "retryable": False,
+        }
         status = mcp_session.coordinator_status()
         assert status is not None
         [entry] = [e for e in status["tracked_artifacts"] if e["path"] == rel]
@@ -389,20 +420,31 @@ def test_the_transfer_tool_answers_per_grant_and_only_all_transferred_is_success
         result = _do_transfer(giver, config, [PLAN, OTHER], _agent(successor))
 
         assert result.isError is True
-        assert result.structuredContent == {
-            "ok": False,
-            "grants": [
-                {
-                    "path": PLAN,
-                    "transferred": True,
-                    "giver": _agent(giver),
-                    "successor": _agent(successor),
-                    "version_at_transfer": 1,
-                    "hold_shape": "SHARED",
-                    "status": "pending",
-                },
-                {"path": OTHER, "transferred": False, "reason": "handoff_not_held"},
-            ],
+        structured = dict(result.structuredContent)
+        transferred, refused = structured.pop("grants")
+        assert transferred == {
+            "path": PLAN,
+            "transferred": True,
+            "giver": _agent(giver),
+            "successor": _agent(successor),
+            "version_at_transfer": 1,
+            "hold_shape": "SHARED",
+            "status": "pending",
+        }
+        assert _refused(refused) == {
+            "path": OTHER, "transferred": False, "reason": "handoff_not_held",
+            "recover": "check_handoff", "retryable": False,
+        }
+        # The top level speaks for the refused grant, and its next step first
+        # says the transferred path must never be sent again.
+        assert structured["next_step"].startswith("Not every path was handed off.")
+        assert structured["next_step"].endswith(refused["next_step"])
+        del structured["next_step"]
+        assert structured == {
+            "ok": False, "reason": "handoff_not_held", "recover": "check_handoff",
+            "retryable": False,
+            "detail": f"{PLAN}: transferred to {_agent(successor)} at v1 (pending)\n"
+            f"{OTHER}: not transferred (handoff_not_held)",
         }
     finally:
         stop_coordinator(tmp_path)
@@ -570,26 +612,25 @@ def test_the_accept_decline_and_withdraw_tools_answer_typed_results(
         not_live = _do_decline(successor, config, PLAN)
         declined = _do_decline(successor, config, OTHER)
 
-        assert no_record.isError is True
-        assert no_record.structuredContent == {
-            "path": OTHER, "ok": False, "reason": "handoff_not_live",
-        }
-        assert not_successor.isError is True
-        assert not_successor.structuredContent == {
-            "path": PLAN, "ok": False, "reason": "handoff_not_successor", "status": "pending",
-        }
-        assert not_giver.isError is True
-        assert not_giver.structuredContent == {
-            "path": PLAN, "ok": False, "reason": "handoff_not_giver", "status": "pending",
-        }
+        for result, verb, path, reason, status in (
+            (no_record, "accept", OTHER, "handoff_not_live", None),
+            (not_successor, "accept", PLAN, "handoff_not_successor", "pending"),
+            (not_giver, "withdraw", PLAN, "handoff_not_giver", "pending"),
+            (not_live, "decline", PLAN, "handoff_not_live", "withdrawn"),
+        ):
+            assert result.isError is True
+            expected = {
+                "path": path, "ok": False, "reason": reason,
+                "recover": _REFUSAL_RECOVER[reason], "retryable": False,
+                "detail": f"{verb} {path}: refused ({reason}); nothing changed",
+            }
+            if status is not None:
+                expected["status"] = status
+            assert _refused(result.structuredContent) == expected
         assert accepted.isError is False
         assert accepted.structuredContent == {"path": PLAN, "ok": True, "status": "completed"}
         assert withdrawn.isError is False
         assert withdrawn.structuredContent == {"path": PLAN, "ok": True, "status": "withdrawn"}
-        assert not_live.isError is True
-        assert not_live.structuredContent == {
-            "path": PLAN, "ok": False, "reason": "handoff_not_live", "status": "withdrawn",
-        }
         assert declined.isError is False
         assert declined.structuredContent == {"path": OTHER, "ok": True, "status": "declined"}
     finally:
