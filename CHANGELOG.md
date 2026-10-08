@@ -250,43 +250,53 @@ Alpha — APIs may change before `v1.0`.
   whoever asks.
 
 - **A sweep reclaim is now visible to someone other than the reclaimed
-  session (#195).** A session whose grant the coordinator sweep pulled (stale
-  heartbeat or max-hold ceiling) used to look exactly like one that released
-  voluntarily: both vanish from `/status` `states`. The cause was recorded in
-  the registry but only the reclaimed session itself could read it, at its next
-  commit or post-edit. Now:
+  session (#195).** A session whose write grant the coordinator sweep pulled
+  (stale heartbeat or max-hold ceiling) used to look exactly like one that
+  released voluntarily: both vanish from `/status` `states`. The cause was
+  recorded in the registry, but only the reclaimed session itself could read
+  it, at its next commit or post-edit. Now:
   - `GET /status?detail=full` gives every `sessions[]` row a `reclaimed` map
     beside `states`: `{path: {"trigger": "reclaim_heartbeat" |
-    "reclaim_max_hold", "tick": <int>}}` for each path the session is INVALID
-    on because the sweep reclaimed its last write grant there. `states` is
-    unchanged (held grants only), so existing readers see the same body. A
-    release, a peer preemption or a commit leaves `reclaimed` empty. The cause
-    is cleared when the session takes a write grant on that path again. A
-    session that later re-reads the path shows it under `states` as `SHARED`;
-    if a peer invalidates that read, the path goes back to `reclaimed` with
-    the original trigger and tick, because the cause describes the session's
-    last write grant there, not its most recent exit. The cause survives a
-    coordinator restart, so after one a reclaimed session gets a row (with a
-    null name) even if it has not sent a request since. That row lasts 24
-    hours from the reclaim: the cause is never cleared for a session that
-    crashed (it never takes a write grant again), and without a bound every
-    crashed session would stay in the table for good. `tick` is wall-clock
-    seconds. The map is in the operator tier only, like the writer attribution
-    above; the `minimal` tier is unchanged.
-  - The counter block (every tier, including `?detail=metrics`) adds
-    `sweep_reclaims_total` and `sweep_reclaims_by_trigger`
-    (`reclaim_heartbeat`, `reclaim_max_hold`). They are process-local like
-    the other counters and reset when the coordinator restarts.
+    "reclaim_max_hold", "tick": <int>}}` for each path whose last write grant
+    the sweep reclaimed, with no write grant there since. It is history, not
+    current state. A session that re-reads the path keeps it listed beside its
+    `SHARED` state, because a read does not version the edit the reclaim left
+    on disk, and a peer invalidating that read leaves the original trigger and
+    tick in place. A new write grant on the path clears the entry, and a path
+    is never both held for writing and listed. A release, a peer preemption or
+    a handoff adds no entry. `states` is unchanged (held grants only), so
+    existing readers see the same body. Both maps come from one registry read,
+    so a single response never shows a reclaimed grant as a clean release.
+    `tick` is wall-clock seconds.
+  - The reclaim is kept in the registry across a coordinator restart; session
+    names are not. After a restart, a reclaimed session that has not sent a
+    request since gets a row with a null name until 24 hours after its newest
+    reclaim. A crashed session never takes a write grant again, so without
+    that bound it would stay in the table for good. A named session, or one
+    that still holds a grant, keeps its row and its `reclaimed` map regardless.
+  - The map is in the operator tier only, like the writer attribution above.
+    The counter block at every tier, the default view and `?detail=metrics`
+    included, adds `sweep_reclaims_total` and `sweep_reclaims_by_trigger`
+    (`reclaim_heartbeat`, `reclaim_max_hold`), which name no session or path.
+    They are process-local like the other counters and restart at zero
+    whenever the coordinator does, including its idle exit, so a zero proves
+    neither that nothing was reclaimed nor that the sweep ran.
   - The sweep logs one WARNING line per reclaim (trigger, tick, agent id,
-    path). The sweep used to discard the reclaimed count, so a tick that pulled
-    a live grant logged nothing. The line names the agent id, never the session
-    id. A reclaim is counted and logged even when a later pair in the
-    same pass raises.
-  - New registry read `invalid_reclamations()` on both backends (in-memory and
-    SQLite). It is one batched query, so `/status` stays free of per-pair
-    reads.
-  - `agent-coherence-status` prints reclaimed paths under each session,
-    labelled with trigger and tick, plus the new counter.
+    path), naming the agent id, never the session id. A coordinator the hooks
+    start in the background discards its stderr, so there `/status` and the
+    counters are the record. A reclaim is counted and logged even when a later
+    pair in the same pass raises.
+  - `CoordinatorService.enforce_stable_grant_timeouts` now calls `on_reclaim`
+    before its single-writer check on the reclaimed artifact, so a check that
+    raises no longer skips the callback for a reclaim already written. Only
+    code that passes its own `on_reclaim` sees the change: `CoherenceAdapterCore`
+    logs and discards a failed sweep as before.
+  - `SqliteArtifactRegistry.status_snapshot` takes a keyword-only
+    `include_reclamations` opt-in that adds each pair's reclaim slot, read from
+    the same rows as the states.
+  - `agent-coherence-status` prints each reclaimed path under its session,
+    labelled with trigger and tick (after the held state when the session has
+    re-read the path), plus the new counters.
 
   The plugin's Node coordinator runs no grant sweep and answers
   `detail=full` with `501`, so it has nothing to report here.

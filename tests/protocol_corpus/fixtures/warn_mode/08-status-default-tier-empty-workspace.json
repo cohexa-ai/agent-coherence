@@ -1,6 +1,6 @@
 {
   "name": "status-default-tier-empty-workspace",
-  "description": "GET /status on a freshly-spawned Python coordinator with no tracked artifacts and no sessions. Validates the minimal-tier wire shape including all telemetry counters. tracked_artifacts may contain policy defaults; sessions/policy_summary/coordinator_root are normalized to keep the fixture portable. This fixture is python-only because the Node coordinator emits a different /status envelope (see fixture 09).",
+  "description": "GET /status on a freshly-spawned Python coordinator with no tracked artifacts and no sessions. Validates the minimal-tier wire shape including all telemetry counters. tracked_artifacts may contain policy defaults; sessions/policy_summary/coordinator_root are normalized to keep the fixture portable. This fixture is python-only because the Node coordinator emits a different /status envelope (see fixture 09). The sweep reclaim counters are part of that counter set and read zero.",
   "setup": {},
   "request": {
     "method": "GET",
