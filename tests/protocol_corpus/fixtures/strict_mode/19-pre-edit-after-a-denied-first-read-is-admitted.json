@@ -1,0 +1,119 @@
+{
+  "name": "pre-edit-after-a-denied-first-read-is-admitted-like-a-first-time-editor",
+  "description": "The deliberate edge of fixture 17. A has never read CLAUDE.md; B commits it. A's strict `cat plan.md CLAUDE.md` is denied (plan.md is stale for A), which re-grants SHARED on CLAUDE.md with no observation at all. A's pre-edit of CLAUDE.md is admitted, as a first-time editor's is: A has acted on no version of it, so there is nothing stale to refuse. Pins the null-observation guard on both backends; dropping it would deny first-time editors on every strict path. The Node backend also attaches a preemption advisory to this admit, so hookSpecificOutput is optional.",
+  "setup": {
+    "tracked": [
+      "plan.md",
+      "CLAUDE.md"
+    ],
+    "strict_mode": [
+      "plan.md",
+      "CLAUDE.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\nv1\n",
+      "CLAUDE.md": "# Plan\nv1\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "CLAUDE.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "CLAUDE.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "CLAUDE.md",
+          "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f",
+          "success": true
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "plan.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md",
+          "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f",
+          "success": true
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/session-stop",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-bash",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "command": "cat plan.md CLAUDE.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "CLAUDE.md"
+    }
+  },
+  "optional_keys": [
+    "hookSpecificOutput"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

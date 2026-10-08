@@ -44,7 +44,7 @@ shows a hole rather than interpolating across it.
 **A run row is a claim about a span, so every way of not watching ends it.**
 There are three, and the first two are the only ones this pass can see: a poll
 that failed, and a tick that found nothing in scope. The third is the pass not
-running at all — a suspended host, or the four safety passes ahead of detection
+running at all — a suspended host, or the five safety passes ahead of detection
 stuck on the store — which leaves no trace here by construction. So a tick that
 arrives further from the last one than the sweep cadence can explain opens a
 new interval instead of joining the old, and the stall reads as the hole it was.
@@ -442,7 +442,7 @@ def _repository_is_absent(root: Path, *, budget_sec: float = _WALK_BUDGET_SEC) -
 
     The walk runs on a bounded daemon thread because its own calls cannot be
     interrupted: ``os.lstat`` on a wedged network or FUSE mount never returns,
-    and this runs on the sweep thread, whose other four passes reclaim grants
+    and this runs on the sweep thread, whose other five passes reclaim grants
     and reap dead sessions. ``_disk_hash`` states the same rule for the read
     path — a path replaced by a named pipe "fails instead of blocking this
     thread forever" — and this is that rule on the classification path. A walk

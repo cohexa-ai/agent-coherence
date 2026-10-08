@@ -34,7 +34,7 @@ Contract divergence from in-memory ``ArtifactRegistry`` (per plan KTD-13):
   content-fetch semantics are NOT a v0.1 goal for this storage layer.
 
 Schema: the v1 BASELINE only (KTD-3), kept for orientation. The live schema is
-``SCHEMA_USER_VERSION`` (currently 9); the ``_migrate_vN_to_vM`` chain below is
+``SCHEMA_USER_VERSION`` (currently 10); the ``_migrate_vN_to_vM`` chain below is
 the source of truth for everything the baseline does not show, including the
 columns later versions add to ``agent_states`` (``read_generation``,
 ``last_observed_version``) and every table and index added after v1. Read a db's
@@ -120,6 +120,7 @@ from ccs.core.types import (
     ConflictDetail,
     MultiCommitConflict,
     MultiCommitResult,
+    TransferGrantOutcome,
     VersionedReadRejection,
 )
 
@@ -130,6 +131,7 @@ from .registry_protocol import (
     CLAIM_CAPTURE_TRIGGERS,
     EPOCH_BUMP_TRIGGERS,
     FOREIGN_WRITE_OUTCOMES,
+    HANDOFF_TRIGGER,
     RECLAIM_TRIGGERS,  # noqa: F401 — re-exported; see the parity test
     CaptureResult,
     CasResult,
@@ -137,7 +139,14 @@ from .registry_protocol import (
     CheckpointRecord,
     DetectionRun,
     ReclamationSlot,
+    TransferDecision,
+    TransferPathView,
+    TransferRecord,
+    TransferRequest,
     UncoverableRun,
+    decide_transfer_grant,
+    require_storable_transfer_status,
+    transfer_record_live,
 )
 from .retention import RetentionPolicy, collectible_versions
 
@@ -147,7 +156,7 @@ CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 """Reuses the same schema version as in-memory registry (state_log emissions
 are interchangeable from a downstream consumer's perspective)."""
 
-SCHEMA_USER_VERSION = 9
+SCHEMA_USER_VERSION = 10
 """Schema version stamped via ``PRAGMA user_version`` on init.
 
 **v1 -> v2** (plan item N v1) added the durable ``artifact_versions`` table and
@@ -221,17 +230,28 @@ step and now stamps its own literal 7. FORWARD-ONLY: once a store opens at v8,
 an earlier build refuses it (an unrecognized ``user_version`` raises; there is
 no down step).
 
-**v8 -> v9** (#191, the restore-registration receiver binding) adds two
+**v8 -> v9** (targeted grant handoff, #185) adds the ``transfer_records``
+table: one row per artifact holding its current transfer record (giver,
+holding composite, successor, version at transfer, hold shape, cause, status,
+counterparty, wall-clock timestamps). Keyed on the artifact id with ``ON DELETE
+CASCADE`` -- the ``pending_notices`` shape, not the ``caller_principals`` one --
+so deleting an artifact drops its record exactly as the in-memory slot removal
+does. Additive-only. The step carries the ``_V8_USER_VERSION`` literal
+conversion (the re-stamp trap, fifth arming): ``_migrate_v7_to_v8`` stamped the
+constant while it was the final step and now stamps its own literal 8.
+FORWARD-ONLY like v8: an earlier build refuses a v9 store.
+
+**v9 -> v10** (#191, the restore-registration receiver binding) adds two
 nullable columns to ``workspace_checkpoints``: ``receiver`` (the one controller
 allowed to register a restore of the checkpoint, named at creation; NULL admits
 any controller) and ``registered_by`` (the controller whose registration
 claimed the checkpoint first; set once by ``claim_checkpoint_registration``,
 never rebound). Column-only and additive; every existing manifest migrates with
 both NULL, which is exactly the pre-#191 behaviour (any controller registers,
-nothing claimed yet). The step carries the ``_V8_USER_VERSION`` literal
-conversion (the re-stamp trap, fifth arming): ``_migrate_v7_to_v8`` stamped the
-constant while it was the final step and now stamps its own literal 8.
-FORWARD-ONLY: once a store opens at v9, an earlier build refuses it.
+nothing claimed yet). The step carries the ``_V9_USER_VERSION`` literal
+conversion (the re-stamp trap, sixth arming): ``_migrate_v8_to_v9`` stamped the
+constant while it was the final step and now stamps its own literal 9.
+FORWARD-ONLY: once a store opens at v10, an earlier build refuses it.
 
 **CROSS-RUNTIME LEDGER DIVERGENCE (security).** The sibling Node coordinator
 (agent-coherence-plugin) shares the SAME ``state.db`` path but keeps its OWN
@@ -302,10 +322,17 @@ v7->v8 loser-guard would no-op (the re-stamp trap, fourth arming)."""
 _V8_USER_VERSION = 8
 """``_migrate_v7_to_v8``'s guard/stamp literal: it adds the
 ``caller_principals`` table and advances to v8 — NO LONGER the final step once
-v9 (the ``workspace_checkpoints`` receiver/registration columns, #191) landed.
-Stamping the constant would mark a v7-origin db ``user_version=9`` WITHOUT the
-columns, and the chained v8->v9 loser-guard would no-op (the re-stamp trap,
-fifth arming)."""
+v9 (the ``transfer_records`` table) landed. Stamping the constant would mark a
+v7-origin db ``user_version=9`` WITHOUT the transfer table, and the chained
+v8->v9 loser-guard would no-op (the re-stamp trap, fifth arming)."""
+
+_V9_USER_VERSION = 9
+"""``_migrate_v8_to_v9``'s guard/stamp literal: it adds the ``transfer_records``
+table and advances to v9 — NO LONGER the final step once v10 (the
+``workspace_checkpoints`` receiver/registration columns, #191) landed. Stamping
+the constant would mark a v8-origin db ``user_version=10`` WITHOUT the columns,
+and the chained v9->v10 loser-guard would no-op (the re-stamp trap, sixth
+arming)."""
 
 _DB_FILE_MODE = 0o600
 """state.db (and its -wal/-shm sidecars) must be owner-read/write only.
@@ -469,6 +496,72 @@ CREATE TABLE caller_principals (
     principal  TEXT NOT NULL,
     mint_nonce TEXT NOT NULL
 )
+"""
+
+# Transfer records (schema v9; targeted grant handoff #185). One row per
+# artifact: the current handoff of that path. Keyed on the artifact id with ON
+# DELETE CASCADE (the ``pending_notices`` shape, not ``caller_principals``'), so
+# the library delete verb drops the record with the artifact, exactly as the
+# in-memory slot removal does. Ids are stored as UUID hex and the hold shape as
+# the MESIState name, the way ``agent_states`` stores ids and states.
+# ``cause`` is a closed vocabulary (TRANSFER_CAUSES), checked when a record is
+# decided for a write and never on read-back; ``superseded_successor`` is
+# set exactly when the cause is a supersession, so a late re-send of the
+# superseded tuple is recognised without parsing an id out of a string.
+# ``status`` is a LABEL; liveness is never stored -- it is read by joining the
+# artifact's version (``SqliteArtifactRegistry._transfer_read``). Timestamps are
+# wall-clock unix seconds (the coordinator's ticks reset on restart).
+_TRANSFER_RECORDS_DDL = """
+CREATE TABLE transfer_records (
+    artifact_id          TEXT PRIMARY KEY,
+    giver                TEXT NOT NULL,
+    holder               TEXT NOT NULL,
+    successor            TEXT NOT NULL,
+    version_at_transfer  INTEGER NOT NULL,
+    hold_shape           TEXT NOT NULL,
+    cause                TEXT NOT NULL,
+    superseded_successor TEXT,
+    status               TEXT NOT NULL,
+    counterparty         TEXT,
+    created_at           REAL NOT NULL,
+    updated_at           REAL NOT NULL,
+    FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
+)
+"""
+
+# The liveness join: a record's columns, then its artifact's version and last
+# update, read by ONE statement so the version a record is judged against is
+# the one that coexisted with it. ``_TRANSFER_READ_ALL_SQL`` serves every path
+# (the eviction, and the status snapshot's opt-in); ``_TRANSFER_READ_SQL`` one
+# path (the read, the composite transfer), the same statement narrowed by its
+# WHERE, so the two can never disagree on the column order that is
+# ``_transfer_read_from_row``'s contract.
+_TRANSFER_READ_ALL_SQL = """
+SELECT t.artifact_id, t.giver, t.holder, t.successor, t.version_at_transfer,
+       t.hold_shape, t.cause, t.superseded_successor, t.status, t.counterparty,
+       t.created_at, t.updated_at, a.version, a.updated_at
+FROM transfer_records t JOIN artifacts a ON a.id = t.artifact_id
+"""
+_TRANSFER_READ_SQL = _TRANSFER_READ_ALL_SQL + "WHERE t.artifact_id = ?\n"
+
+# The record upsert: insert, replace an ended record, or supersede a live one.
+_TRANSFER_UPSERT_SQL = """
+INSERT INTO transfer_records (
+    artifact_id, giver, holder, successor, version_at_transfer, hold_shape,
+    cause, superseded_successor, status, counterparty, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(artifact_id) DO UPDATE SET
+    giver = excluded.giver,
+    holder = excluded.holder,
+    successor = excluded.successor,
+    version_at_transfer = excluded.version_at_transfer,
+    hold_shape = excluded.hold_shape,
+    cause = excluded.cause,
+    superseded_successor = excluded.superseded_successor,
+    status = excluded.status,
+    counterparty = excluded.counterparty,
+    created_at = excluded.created_at,
+    updated_at = excluded.updated_at
 """
 
 # The CLI's ``list``/``restore <name>`` verbs resolve checkpoints by NAME, which
@@ -836,10 +929,10 @@ class SqliteArtifactRegistry:
 
         - ``user_version == 0`` (brand-new file) → ``_apply_v2_schema``: the
           COMPLETE current schema (v2 tables + ``session_pins`` + ``session_meta``
-          + the workspace-checkpoint tables (with the v9 receiver/registration
-          columns) + the v6 ``last_observed_version`` column + the indexes +
-          the v8 ``caller_principals`` table) in one
-          atomic transaction (no shim ever runs on a fresh db).
+          + the workspace-checkpoint tables (with the v10 receiver/registration
+          columns) + the v6 ``last_observed_version`` column + the indexes + the
+          v8 ``caller_principals`` table + the v9 ``transfer_records`` table) in
+          one atomic transaction (no shim ever runs on a fresh db).
         - ``user_version == 1`` (any wild v1 variant) → ``_migrate_v1_to_v2`` then
           ``_migrate_v2_to_v3`` then ``_migrate_v3_to_v4`` then
           ``_migrate_v4_to_v5`` then ``_migrate_v5_to_v6``: idempotently subsumes
@@ -863,10 +956,12 @@ class SqliteArtifactRegistry:
         - ``user_version == 6`` → ``_migrate_v6_to_v7`` (the agent_id index).
         - ``user_version == 7`` → ``_migrate_v7_to_v8``: the ``caller_principals``
           table.
-        - ``user_version == 8`` → ``_migrate_v8_to_v9``: the
+        - ``user_version == 8`` → ``_migrate_v8_to_v9``: the ``transfer_records``
+          table.
+        - ``user_version == 9`` → ``_migrate_v9_to_v10``: the
           ``workspace_checkpoints.receiver`` / ``registered_by`` columns (#191).
-        - Every branch above ends at ``_migrate_v8_to_v9``, the final chain step.
-        - ``user_version == 9`` (SCHEMA_USER_VERSION) → ``_rehydrate_meta``: the
+        - Every branch above ends at ``_migrate_v9_to_v10``, the final chain step.
+        - ``user_version == 10`` (SCHEMA_USER_VERSION) → ``_rehydrate_meta``: the
           WRITE-FREE open path (no ALTER, no IF-NOT-EXISTS) — the prerequisite for
           read-only mode.
         - anything else → :class:`SchemaVersionError` (no destructive advice).
@@ -894,6 +989,7 @@ class SqliteArtifactRegistry:
                 self._migrate_v6_to_v7(instance_id)
                 self._migrate_v7_to_v8(instance_id)
                 self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == 2:
                 # 2 → 3 → 4 → 5 → 6: session_pins, session_meta + index,
                 # checkpoints, last_observed_version.
@@ -904,6 +1000,7 @@ class SqliteArtifactRegistry:
                 self._migrate_v6_to_v7(instance_id)
                 self._migrate_v7_to_v8(instance_id)
                 self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == _V3_USER_VERSION:
                 # An existing v3 db (session_pins, NO session_meta — earlier
                 # commits of that branch stamped it) → add session_meta + index,
@@ -916,6 +1013,7 @@ class SqliteArtifactRegistry:
                 self._migrate_v6_to_v7(instance_id)
                 self._migrate_v7_to_v8(instance_id)
                 self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == _V4_USER_VERSION:
                 # An existing v4 db → the workspace-checkpoint tables (v5), then
                 # the last_observed_version column (v6).
@@ -924,6 +1022,7 @@ class SqliteArtifactRegistry:
                 self._migrate_v6_to_v7(instance_id)
                 self._migrate_v7_to_v8(instance_id)
                 self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == _V5_USER_VERSION:
                 # An existing v5 db → last_observed_version (v6), then the
                 # agent_id index (v7).
@@ -931,22 +1030,32 @@ class SqliteArtifactRegistry:
                 self._migrate_v6_to_v7(instance_id)
                 self._migrate_v7_to_v8(instance_id)
                 self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == _V6_USER_VERSION:
                 # An existing v6 db (SB-10-era) → index agent_states(agent_id),
-                # then the caller-principal table (v8).
+                # then the caller-principal table (v8), then the transfer
+                # records (v9).
                 self._migrate_v6_to_v7(instance_id)
                 self._migrate_v7_to_v8(instance_id)
                 self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == _V7_USER_VERSION:
-                # An existing v7 db → the caller-principal table (v8).
+                # An existing v7 db → the caller-principal table (v8), then the
+                # transfer records (v9).
                 self._migrate_v7_to_v8(instance_id)
                 self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == _V8_USER_VERSION:
-                # An existing v8 db → the checkpoint receiver/registration
-                # columns (v9, #191).
+                # An existing v8 db → the transfer-record table (v9), then the
+                # checkpoint receiver/registration columns (v10, #191).
                 self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
+            elif current == _V9_USER_VERSION:
+                # An existing v9 db → the checkpoint receiver/registration
+                # columns (v10, #191).
+                self._migrate_v9_to_v10(instance_id)
             elif current == SCHEMA_USER_VERSION:
-                # Existing v9 database — rehydrate; NO writes on this path (the
+                # Existing v10 database — rehydrate; NO writes on this path (the
                 # prerequisite for read-only open mode).
                 self._rehydrate_meta(instance_id)
             else:
@@ -1092,12 +1201,21 @@ class SqliteArtifactRegistry:
            create it atomically with the v8 stamp (the ``_V7_USER_VERSION``
            literal conversion makes that hold for every origin), and the Node
            ledger stops below v8, so the state is foreign-or-corrupt either
-           way. Literals ``8``..``9`` — every Python store from v8 on
-           carries the table (the v9 step keeps it), so the probe covers both.
-        7. ``user_version == 9`` WITHOUT ``workspace_checkpoints.registered_by``
-           — the same reasoning for the v9 columns: ``_migrate_v8_to_v9`` / the
-           fresh apply land them atomically with the v9 stamp, and the Node
-           ledger stops below v8 and has no checkpoint tables. Literal ``9``.
+           way. Literals ``8``..``10`` — every Python store from v8 on carries
+           the table (the v9 and v10 steps keep it), so the probe covers all.
+        7. ``user_version`` 9 or 10 WITHOUT ``transfer_records`` — the same
+           reasoning for the v9 table: ``_migrate_v8_to_v9`` / the fresh apply
+           create it atomically with the v9 stamp (the ``_V8_USER_VERSION``
+           literal conversion makes that hold for every origin), and no ledger
+           this build recognizes stamps 9 or later without it. Literals
+           ``9``..``10`` — the v10 step keeps the table.
+        8. ``user_version == 10`` WITHOUT ``workspace_checkpoints.receiver`` or
+           ``registered_by`` — the same reasoning for the v10 columns:
+           ``_migrate_v9_to_v10`` / the fresh apply land them atomically with
+           the v10 stamp, and the Node ledger stops below v8 and has no
+           checkpoint tables. Literal ``10`` only: a v9 store legitimately
+           lacks both columns (they arrive at v10), so a v9 probe for them
+           would refuse every store a v9 build wrote.
 
         ``user_version == 1`` is deliberately NOT blocked: the Node ledger's
         v1 is a byte-for-byte mirror of this repo's v1 schema, so the two are
@@ -1135,21 +1253,29 @@ class SqliteArtifactRegistry:
                 "it atomically with the v5 stamp; no ledger this build "
                 "recognizes stamps 5 without it)"
             )
-        if 8 <= current <= 9 and not self._has_table("caller_principals"):
+        if 8 <= current <= 10 and not self._has_table("caller_principals"):
             self._raise_cross_runtime(
                 f"is user_version={current} without the caller_principals table "
                 "(a Python-v8+ store always has it — the v7->v8 migration "
                 "creates it atomically with the v8 stamp; no ledger this build "
                 f"recognizes stamps {current} without it)"
             )
-        if current == 9 and not self._has_column(
-            "workspace_checkpoints", "registered_by"
+        if 9 <= current <= 10 and not self._has_table("transfer_records"):
+            self._raise_cross_runtime(
+                f"is user_version={current} without the transfer_records table "
+                "(a Python-v9+ store always has it — the v8->v9 migration "
+                "creates it atomically with the v9 stamp; no ledger this build "
+                f"recognizes stamps {current} without it)"
+            )
+        if current == 10 and not (
+            self._has_column("workspace_checkpoints", "receiver")
+            and self._has_column("workspace_checkpoints", "registered_by")
         ):
             self._raise_cross_runtime(
-                "is user_version=9 without the workspace_checkpoints."
-                "registered_by column (a Python-v9 store always has it — the "
-                "v8->v9 migration adds it atomically with the v9 stamp; no "
-                "ledger this build recognizes stamps 9 without it)"
+                "is user_version=10 without the workspace_checkpoints.receiver "
+                "and registered_by columns (a Python-v10 store always has both — "
+                "the v9->v10 migration adds them atomically with the v10 stamp; "
+                "no ledger this build recognizes stamps 10 without them)"
             )
 
     def _raise_cross_runtime(self, detail: str) -> NoReturn:
@@ -1177,8 +1303,10 @@ class SqliteArtifactRegistry:
     def _apply_v2_schema(self, instance_id: str | None) -> None:
         """Create the COMPLETE current schema (v2 tables + the v3 ``session_pins``
         table + the v4 ``session_meta`` table/index + the v5 workspace-checkpoint
-        tables + the v6 ``agent_states.last_observed_version`` column) + seed
-        registry_meta, stamping ``user_version=SCHEMA_USER_VERSION``.
+        tables + the v6 ``agent_states.last_observed_version`` column + the v7
+        index + the v8 ``caller_principals`` and v9 ``transfer_records``
+        tables) + seed registry_meta, stamping
+        ``user_version=SCHEMA_USER_VERSION``.
         Caller holds lock. (The method keeps its historical ``_apply_v2_schema``
         name; a fresh db is always built at the latest schema directly so no
         migration shim ever runs against it.)
@@ -1294,6 +1422,9 @@ class SqliteArtifactRegistry:
             c.execute(_WORKSPACE_CHECKPOINTS_NAME_INDEX_DDL)
             # Caller-principal bindings (v8, caller-principal U4): same rule.
             c.execute(_CALLER_PRINCIPALS_DDL)
+            # Transfer records (v9, grant handoff #185): same rule — the fresh
+            # store and a migrated one must carry the identical table.
+            c.execute(_TRANSFER_RECORDS_DDL)
             seed_epoch = uuid4().hex
             # schema_runtime: the cross-runtime lineage stamp, seeded inside
             # THIS creation transaction (no extra txn) so the sibling Node
@@ -1793,9 +1924,9 @@ class SqliteArtifactRegistry:
         """Migrate a v7 db to v8 in ONE atomic transaction (coordinator caller
         principal, U4): create the ``caller_principals`` table, then stamp
         ``user_version=8``. Caller holds lock. Guards and stamps the
-        ``_V8_USER_VERSION`` literal — v9 (#191's checkpoint columns) made this
-        a chained step, so stamping the constant would re-arm the re-stamp trap
-        (fifth arming).
+        ``_V8_USER_VERSION`` literal — v9 (the ``transfer_records`` table) made
+        this a chained step, so stamping the constant would re-arm the
+        re-stamp trap (fifth arming).
 
         Table-only and additive: no existing table, column or index is touched.
         ``CREATE TABLE IF NOT EXISTS`` is the half-migrated-db guard (a crash
@@ -1844,10 +1975,65 @@ class SqliteArtifactRegistry:
         self._rehydrate_meta(instance_id)
 
     def _migrate_v8_to_v9(self, instance_id: str | None) -> None:
-        """Migrate a v8 db to v9 in ONE atomic transaction (#191, the
+        """Migrate a v8 db to v9 in ONE atomic transaction (targeted grant
+        handoff, #185): create the ``transfer_records`` table, then stamp
+        ``user_version=9``. Caller holds lock. Guards and stamps the
+        ``_V9_USER_VERSION`` literal — v10 (#191's checkpoint columns) made this
+        a chained step, so stamping the constant would re-arm the re-stamp trap
+        (sixth arming).
+
+        Table-only and additive: no existing table, column or index is touched,
+        and the DDL is the very ``_TRANSFER_RECORDS_DDL`` the fresh apply runs,
+        so a migrated store and a fresh one carry the identical table (key,
+        columns and cascade). ``CREATE TABLE IF NOT EXISTS`` is the
+        half-migrated-db guard (a crash after the CREATE but before the stamp
+        rolls both back under the one transaction; a re-migrate re-creates).
+        Same atomicity discipline as every other step: ONE ``BEGIN IMMEDIATE``
+        wrapping CREATE + stamp, individual ``execute()`` calls, ``except
+        BaseException`` ROLLBACK.
+
+        FORWARD-ONLY: an earlier build opening a v9 store raises on the
+        unrecognized ``user_version``; there is no down step.
+
+        NODE-LEDGER COORDINATION: as for v8, the sibling Node coordinator's
+        ledger stops below v8 and refuses a Python-lineage store on its
+        ``schema_runtime`` stamp before it reads the integer, so this
+        Python-only bump needs no coordinated guard edit. This side adds probe 7
+        to ``_reject_foreign_ledger_db`` (v9 stamped WITHOUT the table).
+
+        Concurrent-loser path: both processes can read ``user_version == 8``
+        pre-lock and both land here; they serialize on ``BEGIN IMMEDIATE``,
+        and the loser re-reads the version inside its txn and no-ops.
+        """
+        c = self._conn
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= _V9_USER_VERSION:
+                # A racing winner already advanced to v9 — nothing to do.
+                c.execute("COMMIT")
+                self._rehydrate_meta(instance_id)
+                return
+            c.execute(
+                _TRANSFER_RECORDS_DDL.replace(
+                    "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
+                )
+            )
+            c.execute(f"PRAGMA user_version = {_V9_USER_VERSION}")
+            c.execute("COMMIT")
+        except BaseException:
+            try:
+                c.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        # Load meta from the now-migrated db (write-free).
+        self._rehydrate_meta(instance_id)
+
+    def _migrate_v9_to_v10(self, instance_id: str | None) -> None:
+        """Migrate a v9 db to v10 in ONE atomic transaction (#191, the
         restore-registration receiver binding): add the nullable
         ``workspace_checkpoints.receiver`` and ``registered_by`` columns, then
-        stamp ``user_version=9``. Caller holds lock. The FINAL step of the
+        stamp ``user_version=10``. Caller holds lock. The FINAL step of the
         chain, so it stamps ``SCHEMA_USER_VERSION``.
 
         Column-only and additive. Every existing manifest lands with both NULL:
@@ -1859,16 +2045,16 @@ class SqliteArtifactRegistry:
         IMMEDIATE`` wrapping both ALTERs + the stamp, ``except BaseException``
         ROLLBACK.
 
-        FORWARD-ONLY: an earlier build opening a v9 store raises on the
+        FORWARD-ONLY: an earlier build opening a v10 store raises on the
         unrecognized ``user_version``; there is no down step.
 
         NODE-LEDGER COORDINATION: the sibling Node coordinator's ledger stops
         below v8 and has no checkpoint tables; its guard refuses a
         Python-lineage store on the ``schema_runtime='python'`` stamp before it
         interprets the integer, so this Python-only bump needs no coordinated
-        guard edit. This side adds probe 7 to ``_reject_foreign_ledger_db``.
+        guard edit. This side adds probe 8 to ``_reject_foreign_ledger_db``.
 
-        Concurrent-loser path: both processes can read ``user_version == 8``
+        Concurrent-loser path: both processes can read ``user_version == 9``
         pre-lock and both land here; they serialize on ``BEGIN IMMEDIATE``,
         and the loser re-reads the version inside its txn and no-ops.
         """
@@ -1876,15 +2062,16 @@ class SqliteArtifactRegistry:
         c.execute("BEGIN IMMEDIATE")
         try:
             if c.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_USER_VERSION:
-                # A racing winner already advanced to v9 — nothing to do.
+                # A racing winner already advanced to v10 — nothing to do.
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
-            for column in ("receiver", "registered_by"):
-                if not self._has_column("workspace_checkpoints", column):
-                    c.execute(
-                        f"ALTER TABLE workspace_checkpoints ADD COLUMN {column} TEXT"
-                    )
+            if not self._has_column("workspace_checkpoints", "receiver"):
+                c.execute("ALTER TABLE workspace_checkpoints ADD COLUMN receiver TEXT")
+            if not self._has_column("workspace_checkpoints", "registered_by"):
+                c.execute(
+                    "ALTER TABLE workspace_checkpoints ADD COLUMN registered_by TEXT"
+                )
             c.execute(f"PRAGMA user_version = {SCHEMA_USER_VERSION}")
             c.execute("COMMIT")
         except BaseException:
@@ -2810,6 +2997,268 @@ class SqliteArtifactRegistry:
             ).fetchone()
         return row[0] if row is not None else None
 
+    # ------------------------------------------------------------------
+    # Transfer records (targeted grant handoff #185)
+    # ------------------------------------------------------------------
+
+    def transfer_grants(
+        self,
+        request: TransferRequest,
+        *,
+        tick: int = 0,
+        now_unix: float | None = None,
+    ) -> list[TransferGrantOutcome]:
+        """The composite transfer; see :meth:`RegistryBase.transfer_grants`.
+
+        ONE ``BEGIN IMMEDIATE``: every path is read and decided first, then the
+        admitted subset is applied -- the record upsert, and for a plain
+        handoff the agent-state upsert and the epoch bump INLINED (each public
+        mutator opens its own transaction, so ``set_agent_state`` cannot be
+        called here), each followed by its state-log entry. Any raise rolls
+        back every path and every ``_seq`` reservation (COR-02)."""
+        now = time.time() if now_unix is None else now_unix
+        self._guard_writable()
+        with self._lock:
+            seq_incremented_count = 0
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                known = self._successor_known_in_txn(request)
+                views = [
+                    self._transfer_view_in_txn(artifact_id, holder)
+                    for artifact_id, holder in request.holders.items()
+                ]
+                decisions = [
+                    decide_transfer_grant(request, view, successor_known=known, now_unix=now)
+                    for view in views
+                ]
+                for view, decision in zip(views, decisions):
+                    seq_incremented_count += self._apply_transfer_in_txn(
+                        view, decision, tick=tick
+                    )
+                self._conn.execute("COMMIT")
+                seq_incremented_count = 0
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                if seq_incremented_count:
+                    self._seq -= seq_incremented_count
+                raise
+        return [decision.outcome for decision in decisions]
+
+    def get_transfer_record(
+        self, artifact_id: UUID
+    ) -> tuple[TransferRecord, bool] | None:
+        """The record and its liveness from ONE joined SELECT under the lock
+        (no transaction), so it serves a read-only open too."""
+        with self._lock:
+            return self._transfer_read(artifact_id)
+
+    def set_transfer_status(
+        self,
+        artifact_id: UUID,
+        status: str,
+        *,
+        counterparty: UUID | None = None,
+        now_unix: float | None = None,
+    ) -> None:
+        """Write the label unconditionally; see
+        :meth:`RegistryBase.set_transfer_status`."""
+        require_storable_transfer_status(status)
+        now = time.time() if now_unix is None else now_unix
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._conn.execute(
+                    "UPDATE transfer_records SET status = ?, counterparty = ?, "
+                    "updated_at = ? WHERE artifact_id = ?",
+                    (
+                        status,
+                        counterparty.hex if counterparty is not None else None,
+                        now,
+                        artifact_id.hex,
+                    ),
+                )
+                if cursor.rowcount == 0:
+                    raise KeyError(f"no transfer record for artifact {artifact_id}")
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def evict_transfer_records(
+        self, *, max_age_sec: float, now_unix: float | None = None
+    ) -> int:
+        """Delete not-live records older than ``max_age_sec``, aged from the
+        later of the record's ``updated_at`` and the artifact's own last
+        update: a version move stamps the artifact, so the ending it
+        caused survives the full age from the move, long enough for the
+        giver's next touch to report it."""
+        now = time.time() if now_unix is None else now_unix
+        cutoff = now - max_age_sec
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                doomed = [
+                    row[0]
+                    for row in self._conn.execute(_TRANSFER_READ_ALL_SQL).fetchall()
+                    if self._transfer_evictable(row, cutoff)
+                ]
+                for artifact_hex in doomed:
+                    self._conn.execute(
+                        "DELETE FROM transfer_records WHERE artifact_id = ?",
+                        (artifact_hex,),
+                    )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        return len(doomed)
+
+    def _transfer_read(self, artifact_id: UUID) -> tuple[TransferRecord, bool] | None:
+        """THE sqlite liveness helper: one SELECT joining the record to
+        its artifact's version, judged by :func:`transfer_record_live`. The
+        read, the composite transfer and the eviction all go through it (or
+        its row converter). Caller holds the lock -- and, for a decision, the
+        open transaction the decision's apply will commit in."""
+        row = self._conn.execute(_TRANSFER_READ_SQL, (artifact_id.hex,)).fetchone()
+        return self._transfer_read_from_row(row) if row is not None else None
+
+    @staticmethod
+    def _transfer_read_from_row(row: "tuple[Any, ...]") -> tuple[TransferRecord, bool]:
+        """Convert one ``_TRANSFER_READ_SQL`` row into ``(record, live)``."""
+        record = TransferRecord(
+            artifact_id=UUID(hex=row[0]),
+            giver=UUID(hex=row[1]),
+            holder=UUID(hex=row[2]),
+            successor=UUID(hex=row[3]),
+            version_at_transfer=int(row[4]),
+            hold_shape=MESIState[row[5]],
+            cause=row[6],
+            superseded_successor=UUID(hex=row[7]) if row[7] is not None else None,
+            status=row[8],
+            counterparty=UUID(hex=row[9]) if row[9] is not None else None,
+            created_at=float(row[10]),
+            updated_at=float(row[11]),
+        )
+        return record, transfer_record_live(record, int(row[12]))
+
+    @classmethod
+    def _transfer_evictable(cls, row: "tuple[Any, ...]", cutoff: float) -> bool:
+        record, live = cls._transfer_read_from_row(row)
+        return not live and max(record.updated_at, float(row[13])) < cutoff
+
+    def _transfer_view_in_txn(self, artifact_id: UUID, holder: UUID) -> TransferPathView:
+        """One path's facts for the decision, read inside the open transaction."""
+        version_row = self._conn.execute(
+            "SELECT version FROM artifacts WHERE id = ?", (artifact_id.hex,)
+        ).fetchone()
+        read = self._transfer_read(artifact_id)
+        state_row = self._conn.execute(
+            "SELECT state FROM agent_states WHERE artifact_id = ? AND agent_id = ?",
+            (artifact_id.hex, holder.hex),
+        ).fetchone()
+        other_write_holder = self._conn.execute(
+            "SELECT 1 FROM agent_states WHERE artifact_id = ? AND agent_id != ? "
+            "AND state IN (?, ?) LIMIT 1",
+            (artifact_id.hex, holder.hex, MESIState.MODIFIED.name, MESIState.EXCLUSIVE.name),
+        ).fetchone()
+        return TransferPathView(
+            artifact_id=artifact_id,
+            holder=holder,
+            current_version=version_row[0] if version_row is not None else None,
+            record=read[0] if read is not None else None,
+            live=read[1] if read is not None else False,
+            holder_state=MESIState[state_row[0]] if state_row is not None else None,
+            other_write_holder=other_write_holder is not None,
+        )
+
+    def _successor_known_in_txn(self, request: TransferRequest) -> bool:
+        """When the registry counts a successor as known: the caller resolved
+        it, it has a bound principal, or it holds a grant row on some artifact
+        (the library caller's arm --
+        a row in any state means the coordinator has seen the identity; the
+        lookup rides ``idx_agent_states_agent``)."""
+        if request.successor_known:
+            return True
+        successor_hex = request.successor.hex
+        if self._conn.execute(
+            "SELECT 1 FROM caller_principals WHERE identity = ?", (successor_hex,)
+        ).fetchone() is not None:
+            return True
+        return self._conn.execute(
+            "SELECT 1 FROM agent_states WHERE agent_id = ? LIMIT 1", (successor_hex,)
+        ).fetchone() is not None
+
+    def _apply_transfer_in_txn(
+        self, view: TransferPathView, decision: TransferDecision, *, tick: int
+    ) -> int:
+        """Apply one decided path inside the open transaction; return the
+        ``_seq`` reservations its state-log entry made (0 or 1)."""
+        record = decision.write
+        if record is None:
+            return 0
+        self._conn.execute(
+            _TRANSFER_UPSERT_SQL,
+            (
+                record.artifact_id.hex,
+                record.giver.hex,
+                record.holder.hex,
+                record.successor.hex,
+                record.version_at_transfer,
+                record.hold_shape.name,
+                record.cause,
+                record.superseded_successor.hex if record.superseded_successor else None,
+                record.status,
+                record.counterparty.hex if record.counterparty else None,
+                record.created_at,
+                record.updated_at,
+            ),
+        )
+        if not decision.move_holder:
+            return 0
+        return self._move_holder_invalid_in_txn(view, tick=tick)
+
+    def _move_holder_invalid_in_txn(self, view: TransferPathView, *, tick: int) -> int:
+        """The presented composite's INVALID move under the handoff trigger,
+        inlined from :meth:`set_agent_state`'s leaving-M/E branch: the grant
+        tick is dropped, the epoch moves because the trigger is in
+        ``EPOCH_BUMP_TRIGGERS`` (keyed on the set, as at that site), the
+        recorded ``last_observed_version`` and ``read_generation`` are left as
+        they were, and the state-log entry follows the mutation."""
+        trigger = HANDOFF_TRIGGER
+        from_state = (
+            view.holder_state if view.holder_state is not None else MESIState.INVALID
+        )
+        leaving_write_claim = from_state in _M_OR_E_STATES
+        self._conn.execute(
+            "UPDATE agent_states SET state = ?, granted_at_tick = "
+            "CASE WHEN ? THEN NULL ELSE granted_at_tick END "
+            "WHERE artifact_id = ? AND agent_id = ?",
+            (
+                MESIState.INVALID.name,
+                1 if leaving_write_claim else 0,
+                view.artifact_id.hex,
+                view.holder.hex,
+            ),
+        )
+        if leaving_write_claim and trigger in EPOCH_BUMP_TRIGGERS:
+            self._conn.execute(
+                "UPDATE artifacts SET owner_generation = owner_generation + 1 "
+                "WHERE id = ?",
+                (view.artifact_id.hex,),
+            )
+        return self._emit_state_log(
+            artifact_id=view.artifact_id,
+            agent_id=view.holder,
+            from_state=from_state,
+            to_state=MESIState.INVALID,
+            trigger=trigger,
+            tick=tick,
+            version=view.current_version or 0,
+            content_hash=None,
+        )
+
     def get_session_cut(self, session_token: str) -> dict[UUID, int] | None:
         """Return the pinned cut ``{artifact_id: version}`` for ``session_token``,
         or ``None`` if the token has no live pin rows (SB-17 / TX-1, Unit 3 / R2).
@@ -3193,10 +3642,18 @@ class SqliteArtifactRegistry:
         self,
         *,
         agent_ids: Iterable[UUID] | None = None,
-    ) -> tuple[
-        dict[UUID, dict[str, Any]],
-        dict[UUID, dict[UUID, MESIState]],
-    ]:
+        include_transfers: bool = False,
+    ) -> (
+        tuple[
+            dict[UUID, dict[str, Any]],
+            dict[UUID, dict[UUID, MESIState]],
+        ]
+        | tuple[
+            dict[UUID, dict[str, Any]],
+            dict[UUID, dict[UUID, MESIState]],
+            dict[UUID, tuple[TransferRecord, bool]],
+        ]
+    ):
         """PERF-1 single-query batch for /status. Returns:
 
         - ``artifact_by_id``: ``{artifact_id: {"name", "version",
@@ -3264,6 +3721,14 @@ class SqliteArtifactRegistry:
         artifact row and mints a ``UUID(hex=...)`` per artifact, so a scoped
         call on an artifact-heavy workspace stays O(all artifacts) however
         small the session is.
+
+        ``include_transfers`` (#185) adds a THIRD element,
+        ``{artifact_id: (TransferRecord, live)}`` for every artifact that has
+        a transfer record, read by a third query inside the same lock hold and
+        judged by the one liveness helper, so each record's liveness matches
+        the version its artifact row reports. Off by default: the default call
+        answers the two-element tuple, and the session-start builder, which
+        renders no record, never pays for the read. Only ``/status`` opts in.
         """
         artifact_by_id: dict[UUID, dict[str, Any]] = {}
         state_by_artifact: dict[UUID, dict[UUID, MESIState]] = {}
@@ -3301,7 +3766,16 @@ class SqliteArtifactRegistry:
                 if aid not in state_by_artifact:
                     continue
                 state_by_artifact[aid][gid] = MESIState[row[2]]
-        return artifact_by_id, state_by_artifact
+            if not include_transfers:
+                return artifact_by_id, state_by_artifact
+            transfer_by_artifact = {
+                record.artifact_id: (record, live)
+                for record, live in map(
+                    self._transfer_read_from_row,
+                    self._conn.execute(_TRANSFER_READ_ALL_SQL).fetchall(),
+                )
+            }
+        return artifact_by_id, state_by_artifact, transfer_by_artifact
 
     def get_agent_state(self, artifact_id: UUID, agent_id: UUID) -> MESIState | None:
         """Return MESI state for one agent/artifact pair if present."""
@@ -3378,10 +3852,11 @@ class SqliteArtifactRegistry:
 
                 # Read-generation fence: when an M/E -> INVALID transition
                 # revokes the write claim WITHOUT moving the version (a sweep
-                # reclaim or the voluntary "invalidate" release — see
-                # EPOCH_BUMP_TRIGGERS), bump the artifact's ownership epoch
-                # atomically with the state transition in this BEGIN IMMEDIATE,
-                # so a commit by the ex-holder fails the generation check.
+                # reclaim, the voluntary "invalidate" release, or a handoff
+                # under HANDOFF_TRIGGER — see EPOCH_BUMP_TRIGGERS), bump the
+                # artifact's ownership epoch atomically with the state
+                # transition in this BEGIN IMMEDIATE, so a commit by the
+                # ex-holder fails the generation check.
                 if prev_in_me and not new_in_me and trigger in EPOCH_BUMP_TRIGGERS:
                     self._conn.execute(
                         "UPDATE artifacts SET owner_generation = owner_generation + 1 "

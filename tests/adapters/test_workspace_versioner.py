@@ -3579,6 +3579,14 @@ def _route_checkpoint(
         payload["receiver_session_id"] = receiver_session_id
     status, body = client("POST", "/workspace/checkpoint", payload)
     assert status == 200 and body["ok"] is True
+    # #191: the answer names the receiver only when the request named one, so
+    # a checkpoint taken without one answers exactly as before.
+    if receiver_session_id is None:
+        assert "receiver" not in body
+    else:
+        from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
+
+        assert body["receiver"] == str(session_to_agent_id(receiver_session_id))
     return body["checkpoint_id"]
 
 
@@ -3725,7 +3733,7 @@ def test_route_restore_register_first_observation_then_commit(client) -> None:
     assert body["status"] == "committed"
     assert body["versions"] == {"notes/plan.md": 2}
     assert body["refused"] == {}
-    assert body["retry_of_own_registration"] is False
+    assert "retry_of_own_registration" not in body
 
 
 def test_route_restore_register_refuses_non_member_and_mints_nothing(
@@ -3754,7 +3762,7 @@ def test_route_restore_register_refuses_non_member_and_mints_nothing(
     assert coordinator.registry.lookup_artifact_id_by_name("secrets/other.md") is None
     status, listing = client("GET", "/workspace/checkpoints")
     (cp,) = listing["checkpoints"]
-    assert cp["registered_by"] is None
+    assert "registered_by" not in cp
 
 
 def test_route_restore_register_second_session_refused(client, coordinator) -> None:
@@ -3778,7 +3786,7 @@ def test_route_restore_register_second_session_refused(client, coordinator) -> N
         return body
 
     first = register(first_sid)
-    assert first["ok"] is True and first["retry_of_own_registration"] is False
+    assert first["ok"] is True and "retry_of_own_registration" not in first
 
     second = register(second_sid)
     assert second["ok"] is False
@@ -3796,7 +3804,7 @@ def test_route_restore_register_second_session_refused(client, coordinator) -> N
     status, listing = client("GET", "/workspace/checkpoints")
     (cp,) = listing["checkpoints"]
     assert cp["registered_by"] == first_agent
-    assert cp["receiver"] is None
+    assert "receiver" not in cp
 
 
 def test_route_checkpoint_receiver_binds_the_registration(client) -> None:
@@ -3823,7 +3831,7 @@ def test_route_checkpoint_receiver_binds_the_registration(client) -> None:
     assert status == 200 and body["ok"] is False
     assert body["reason"] == "not_the_receiver"
     status, listing = client("GET", "/workspace/checkpoints")
-    assert listing["checkpoints"][0]["registered_by"] is None
+    assert "registered_by" not in listing["checkpoints"][0]
 
     status, body = client(
         "POST",
@@ -3864,7 +3872,7 @@ def test_route_restore_progress_is_gated_like_the_registration(client) -> None:
     status, listing = client("GET", "/workspace/checkpoints")
     (cp,) = listing["checkpoints"]
     assert cp["restore_status"] == "none"
-    assert cp["registered_by"] is None
+    assert "registered_by" not in cp
     (row,) = cp["members"]
     assert row["restore_outcome"] is None
 

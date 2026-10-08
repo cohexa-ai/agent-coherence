@@ -29,7 +29,10 @@ parity-proven:
 
 from __future__ import annotations
 
+import sys
 import threading
+import time
+import warnings
 from pathlib import Path
 from uuid import uuid4
 
@@ -842,6 +845,53 @@ def test_progress_controller_gate_unknown_checkpoint_is_keyerror(service) -> Non
             write()
 
 
+@pytest.mark.parametrize("which", [0, 1], ids=["status", "member"])
+def test_a_claim_cannot_land_between_the_progress_gate_and_its_write(
+    service, registry, monkeypatch, which
+) -> None:
+    """The progress gate's header read and the write it admits are one
+    critical section, so a rival's claim lands before the read (and the gate
+    refuses) or after the write, never between them. Between them, the gate
+    would admit a controller the claim has just excluded, and its write would
+    conclude or record members of a checkpoint another controller now owns.
+
+    The rival claims from another thread while the gate holds its read. With
+    the read inside the write's registry hold that claim waits for the write;
+    with the read outside it, the claim lands and the write follows it."""
+    checkpoint_id = _mint_checkpoint(service)
+    rival = uuid4()
+    real_get_checkpoint = registry.get_checkpoint
+    window: dict = {}
+
+    def gate_read(cid: str):
+        record = real_get_checkpoint(cid)
+        if "claimant" not in window:
+            claimant = threading.Thread(
+                target=registry.claim_checkpoint_registration,
+                args=(checkpoint_id, rival),
+            )
+            window["claimant"] = claimant
+            claimant.start()
+            claimant.join(timeout=1.0)
+            window["claimed_inside"] = not claimant.is_alive()
+        return record
+
+    monkeypatch.setattr(registry, "get_checkpoint", gate_read)
+    write = _progress_writes(service, checkpoint_id, OWNER)[which]
+    try:
+        write()
+        landed = True
+    except CheckpointRegistrationRefused:
+        landed = False
+    window["claimant"].join(timeout=10.0)
+    monkeypatch.undo()
+
+    assert registry.get_checkpoint(checkpoint_id).registered_by == rival
+    assert not (window["claimed_inside"] and landed), (
+        "the progress write landed after a rival's claim its gate never saw"
+    )
+
+
 # ---------------------------------------------------------------------------
 # #191 — the registry claim primitive (parity across both backends)
 # ---------------------------------------------------------------------------
@@ -867,6 +917,83 @@ def test_registry_claim_first_wins_and_never_rebinds(service, registry) -> None:
     assert listed.registered_by == first
     with pytest.raises(KeyError):
         registry.claim_checkpoint_registration("no-such-checkpoint", first)
+
+
+_CLAIMANTS = 6
+_CLAIM_ROUNDS = 12
+
+
+@pytest.mark.parametrize("backend", ["in_memory", "sqlite"])
+def test_concurrent_claimants_have_exactly_one_winner(tmp_path: Path, backend: str) -> None:
+    """First-claim-wins under real concurrency: claimants released together on
+    a barrier, per checkpoint, get exactly one ``newly_claimed=True``, every
+    claimant is told the same holder, and that holder is the one stored. The
+    sequential and stale-header tests above prove how the service reacts to
+    the primitive's answer, not that the answer is decided atomically; this
+    is the test that fails if the read and the set are split. On sqlite each
+    claimant uses its own handle on one file, so the transaction, not the
+    handle's lock, is what serializes them."""
+    db = tmp_path / "state.db"
+    shared = ArtifactRegistry() if backend == "in_memory" else SqliteArtifactRegistry(db)
+    handles = []
+    try:
+        service = CoordinatorService(shared)
+        checkpoint_ids = [_mint_checkpoint(service) for _ in range(_CLAIM_ROUNDS)]
+        handles = (
+            [shared] * _CLAIMANTS
+            if backend == "in_memory"
+            else [SqliteArtifactRegistry(db) for _ in range(_CLAIMANTS)]
+        )
+        spans: list[tuple[float, float]] = []
+        default_switch_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            for checkpoint_id in checkpoint_ids:
+                start = threading.Barrier(_CLAIMANTS, timeout=5)
+                results: list[tuple] = []
+                failures: list[BaseException] = []
+
+                def _claim(handle, controller) -> None:
+                    try:
+                        start.wait()
+                        began = time.perf_counter()
+                        answer = handle.claim_checkpoint_registration(checkpoint_id, controller)
+                        spans.append((began, time.perf_counter()))
+                        results.append((controller, *answer))
+                    except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
+                        failures.append(exc)
+
+                threads = [
+                    threading.Thread(target=_claim, args=(handle, uuid4()), daemon=True)
+                    for handle in handles
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=30)
+                    assert not thread.is_alive(), "a claimant never finished"
+
+                assert not failures, f"a claimant raised: {failures[0]!r}"
+                winners = [controller for controller, holder, newly in results if newly]
+                assert len(winners) == 1, f"{len(winners)} claimants were told they claimed"
+                (winner,) = winners
+                assert {holder for _controller, holder, _newly in results} == {winner}
+                assert shared.get_checkpoint(checkpoint_id).registered_by == winner
+        finally:
+            sys.setswitchinterval(default_switch_interval)
+    finally:
+        if backend == "sqlite":
+            for handle in handles:
+                handle.close()
+            shared.close()
+    spans.sort()
+    if not any(later[0] < earlier[1] for earlier, later in zip(spans, spans[1:])):
+        warnings.warn(
+            "no two claims overlapped: this runner serialized the claimants, so "
+            "the run proves less than it could",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def test_registry_refuses_a_pre_registered_header(registry) -> None:

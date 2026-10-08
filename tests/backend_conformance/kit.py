@@ -49,6 +49,7 @@ from uuid import UUID, uuid4
 
 from ccs.coordinator.backend_contract import R18_LIVENESS_SOURCE, LivenessSourceObligation
 from ccs.coordinator.registry import ArtifactRegistry
+from ccs.coordinator.registry_protocol import TransferRequest
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import (
@@ -77,6 +78,14 @@ _RECLAIM_TRIGGER = "reclaim_heartbeat"
 # the ownership epoch too (EPOCH_BUMP_TRIGGERS = RECLAIM_TRIGGERS + this). Named
 # here as the wire-stable constant, matched by identity, never by substring.
 _RELEASE_TRIGGER = "invalidate"
+
+# The handoff trigger: a transfer moves its giver INVALID under this trigger,
+# distinct from the release so the state log can tell the two apart. Given up
+# from EXCLUSIVE or MODIFIED it ends a write claim at an UNCHANGED version
+# exactly as a release does, so it moves the ownership epoch too; given up from
+# SHARED it revokes no write claim and must not. Named here as the wire-stable
+# literal, matched by identity, never by substring.
+_HANDOFF_TRIGGER = "handoff"
 
 # The single-writer conflict reason the arbitration leg emits when a version-
 # matching OCC writer meets a pessimistic M/E peer. The registries return it as a
@@ -168,8 +177,10 @@ class SqliteFactory:
 # ---------------------------------------------------------------------------
 
 
-def _register(reg: object, artifact_id: UUID, *, version: int = 1) -> Artifact:
-    art = Artifact(id=artifact_id, name="plan.md", version=version, content_hash="h-init")
+def _register(
+    reg: object, artifact_id: UUID, *, version: int = 1, name: str = "plan.md"
+) -> Artifact:
+    art = Artifact(id=artifact_id, name=name, version=version, content_hash="h-init")
     reg.register_artifact(art, content="")  # type: ignore[attr-defined]
     return art
 
@@ -512,6 +523,147 @@ def assert_epoch_moves_on_voluntary_release(factory: RegistryFactory) -> None:
     assert reg.get_owner_generation(artifact_id) == steady, (  # type: ignore[attr-defined]
         "a version-moving peer invalidation must NOT move the epoch"
     )
+
+
+def assert_epoch_moves_on_handoff(factory: RegistryFactory) -> None:
+    """Read-generation fence — HANDOFF-BUMP leg (MUST-MATCH). The twin of
+    :func:`assert_epoch_moves_on_voluntary_release` for the handoff trigger.
+    A giver that hands a path off from EXCLUSIVE or MODIFIED ends its write
+    claim at an unchanged version, exactly as a release does, so the move to
+    INVALID MUST move ``owner_generation``; a giver that hands off a standing
+    SHARED read revoked no write claim, so its move MUST NOT.
+
+    Each leg fails a different backend. One that leaves the epoch behind on a
+    write-shape handoff ADMITS the giver's late commit at the unchanged version
+    — the lost update the handoff exists to prevent, invisible to version-CAS.
+    One that bumps on a SHARED-shape handoff REJECTS every bystander that read
+    the path, as ``stale_read_generation``, for a revocation that never
+    happened. Both legs are made load-bearing below, not just observed."""
+    reg = factory()
+    exclusive_art, modified_art, shared_art = uuid4(), uuid4(), uuid4()
+    # One artifact per hold shape, so each leg starts from its own clean epoch.
+    for name, artifact_id in (
+        ("exclusive.md", exclusive_art), ("modified.md", modified_art), ("shared.md", shared_art),
+    ):
+        _register(reg, artifact_id, version=1, name=name)
+    giver, bystander = uuid4(), uuid4()
+
+    # EXCLUSIVE giver: the acquire captures read_generation at the epoch.
+    reg.set_agent_state(exclusive_art, giver, MESIState.EXCLUSIVE, tick=1)  # type: ignore[attr-defined]
+    before = reg.get_owner_generation(exclusive_art)  # type: ignore[attr-defined]
+    assert reg.get_read_generation(exclusive_art, giver) is not None, (  # type: ignore[attr-defined]
+        "an M/E acquire must capture a read_generation"
+    )
+    reg.set_agent_state(  # type: ignore[attr-defined]
+        exclusive_art, giver, MESIState.INVALID, trigger=_HANDOFF_TRIGGER, tick=2
+    )
+    assert reg.get_artifact(exclusive_art).version == 1  # type: ignore[attr-defined]
+    assert reg.get_owner_generation(exclusive_art) > before, (  # type: ignore[attr-defined]
+        "an EXCLUSIVE giver's handoff revoked its write claim without moving "
+        "owner_generation: its late commit at the unchanged version can no "
+        "longer be fenced"
+    )
+    # Load-bearing: the giver's commit at the unchanged version is rejected,
+    # exactly as a released holder's is.
+    reg.set_agent_state(exclusive_art, giver, MESIState.SHARED, trigger="peer_regrant", tick=3)  # type: ignore[attr-defined]
+    result = reg.commit_cas(  # type: ignore[attr-defined]
+        exclusive_art, giver, expected_version=1, content_hash=_hash("late"), tick=4
+    )
+    assert isinstance(result, ConflictDetail), (
+        "the EXCLUSIVE giver's commit was ADMITTED at the unchanged version after "
+        f"its handoff; the handoff-path epoch move is not load-bearing, got {result!r}"
+    )
+    assert result.reason == STALE_READ_GENERATION_REASON, result.reason
+    assert reg.get_artifact(exclusive_art).version == 1  # type: ignore[attr-defined]
+
+    # MODIFIED giver: the same move from M bumps the same way.
+    reg.set_agent_state(modified_art, giver, MESIState.EXCLUSIVE, tick=5)  # type: ignore[attr-defined]
+    reg.set_agent_state(modified_art, giver, MESIState.MODIFIED, tick=6)  # type: ignore[attr-defined]
+    before = reg.get_owner_generation(modified_art)  # type: ignore[attr-defined]
+    reg.set_agent_state(  # type: ignore[attr-defined]
+        modified_art, giver, MESIState.INVALID, trigger=_HANDOFF_TRIGGER, tick=7
+    )
+    assert reg.get_artifact(modified_art).version == 1  # type: ignore[attr-defined]
+    assert reg.get_owner_generation(modified_art) > before, (  # type: ignore[attr-defined]
+        "a MODIFIED giver's handoff revoked its write claim without moving "
+        "owner_generation"
+    )
+
+    # SHARED giver: a bystander read the path first, capturing the epoch; the
+    # giver's own standing read is handed off.
+    reg.set_agent_state(shared_art, bystander, MESIState.SHARED, trigger="fetch", tick=8)  # type: ignore[attr-defined]
+    reg.set_agent_state(shared_art, giver, MESIState.SHARED, trigger="fetch", tick=9)  # type: ignore[attr-defined]
+    before = reg.get_owner_generation(shared_art)  # type: ignore[attr-defined]
+    reg.set_agent_state(  # type: ignore[attr-defined]
+        shared_art, giver, MESIState.INVALID, trigger=_HANDOFF_TRIGGER, tick=10
+    )
+    assert reg.get_owner_generation(shared_art) == before, (  # type: ignore[attr-defined]
+        "a SHARED giver's handoff moved owner_generation: no write claim was "
+        "revoked, so the bump fences bystanders for nothing"
+    )
+    # Load-bearing: the bystander's commit at the unchanged version still wins.
+    result = reg.commit_cas(  # type: ignore[attr-defined]
+        shared_art, bystander, expected_version=1, content_hash=_hash("bystander"), tick=11
+    )
+    assert isinstance(result, tuple), (
+        "a bystander's commit was REJECTED after a SHARED giver's handoff; the "
+        f"handoff must not fence a reader whose claim nobody revoked, got {result!r}"
+    )
+    assert reg.get_artifact(shared_art).version == 2  # type: ignore[attr-defined]
+
+    # The production path. No route calls set_agent_state with the handoff
+    # trigger: transfer_grants moves the giver through each registry's own
+    # INVALID move. Drive both shapes through it, and check that the move
+    # leaves the giver's read_generation and last_observed_version as they
+    # were -- a move that cleared the read_generation would ADMIT the late
+    # commit below (admit-on-absent), whatever the epoch did.
+    write_art, read_art = uuid4(), uuid4()
+    _register(reg, write_art, version=1, name="handed-write.md")
+    _register(reg, read_art, version=1, name="handed-read.md")
+    holder, successor = uuid4(), uuid4()
+    reg.set_agent_state(write_art, holder, MESIState.EXCLUSIVE, tick=12)  # type: ignore[attr-defined]
+    reg.set_agent_state(read_art, bystander, MESIState.SHARED, trigger="fetch", tick=13)  # type: ignore[attr-defined]
+    reg.set_agent_state(read_art, holder, MESIState.SHARED, trigger="fetch", tick=14)  # type: ignore[attr-defined]
+    handed = (write_art, read_art)
+    kept = {
+        art: (
+            reg.get_read_generation(art, holder),  # type: ignore[attr-defined]
+            reg.last_observed_version_for(art, holder),  # type: ignore[attr-defined]
+        )
+        for art in handed
+    }
+    epochs = {art: reg.get_owner_generation(art) for art in handed}  # type: ignore[attr-defined]
+    outcomes = reg.transfer_grants(  # type: ignore[attr-defined]
+        TransferRequest(
+            giver=uuid4(),
+            successor=successor,
+            holders={write_art: holder, read_art: holder},
+            successor_known=True,
+        ),
+        tick=15,
+    )
+    assert len(outcomes) == 2 and all(o.transferred for o in outcomes), outcomes
+    for art in handed:
+        assert reg.get_agent_state(art, holder) == MESIState.INVALID  # type: ignore[attr-defined]
+        assert (
+            reg.get_read_generation(art, holder),  # type: ignore[attr-defined]
+            reg.last_observed_version_for(art, holder),  # type: ignore[attr-defined]
+        ) == kept[art], "transfer_grants rewrote the giver's read_generation or observed version"
+    assert reg.get_owner_generation(write_art) > epochs[write_art], (  # type: ignore[attr-defined]
+        "transfer_grants handed off a write grant without moving owner_generation"
+    )
+    assert reg.get_owner_generation(read_art) == epochs[read_art], (  # type: ignore[attr-defined]
+        "transfer_grants moved owner_generation for a handed-off read"
+    )
+    reg.set_agent_state(write_art, holder, MESIState.SHARED, trigger="peer_regrant", tick=16)  # type: ignore[attr-defined]
+    result = reg.commit_cas(  # type: ignore[attr-defined]
+        write_art, holder, expected_version=1, content_hash=_hash("late-handed"), tick=17
+    )
+    assert isinstance(result, ConflictDetail), (
+        "the giver's commit was ADMITTED at the unchanged version after a "
+        f"transfer_grants handoff, got {result!r}"
+    )
+    assert result.reason == STALE_READ_GENERATION_REASON, result.reason
 
 
 def assert_fence_admits_absent_read_generation(factory: RegistryFactory) -> None:

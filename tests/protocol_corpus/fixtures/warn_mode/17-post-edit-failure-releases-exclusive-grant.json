@@ -1,0 +1,54 @@
+{
+  "name": "post-edit-failure-releases-exclusive-grant",
+  "description": "KTD-1 release-on-failure, pinned on both backends as they answer today: the session holds EXCLUSIVE on a tracked path (preflight pre-edit), then its post-edit reports the tool FAILED (success:false, no content_hash -- what the hook client sends when the tool reports failure). The grant is released without a version bump and the answer is {ok:true, released:true}. This is the baseline the targeted grant handoff (#185) starts from: a release that is not a clean success may later answer per grant, but this clean one must keep these bytes. The session claims a principal on Python (the claim is scoped, since Node answers 404) and presents it on the pre-edit and the post-edit, both require-class; Node issues none, so the harness omits the header there. The row pins the answer only: the body alone cannot tell a performed release from a skipped one.",
+  "setup": {
+    "tracked": ["CLAUDE.md"],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "backends": ["python"],
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444",
+          "path": "CLAUDE.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/post-edit",
+    "body": {
+      "session_id": "44444444-4444-4444-8444-444444444444",
+      "path": "CLAUDE.md",
+      "success": false
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_a}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "released": true
+    }
+  }
+}

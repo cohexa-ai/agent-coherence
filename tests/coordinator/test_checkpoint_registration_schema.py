@@ -1,19 +1,22 @@
 # Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
-"""Registry schema v9 — the checkpoint receiver and registration claim (#191).
+"""Registry schema v10 — the checkpoint receiver and registration claim (#191).
 
-The v8 -> v9 step adds two nullable columns to ``workspace_checkpoints``
-(``receiver``, ``registered_by``). Pinned here, in the house migration shape:
+The v9 -> v10 step adds two nullable columns to ``workspace_checkpoints``
+(``receiver``, ``registered_by``). v9 is the grant handoff's
+``transfer_records`` table (#185), so a store a v9 build wrote carries that
+table and neither column. Pinned here, in the house migration shape:
 
 - a fresh db lands both columns at the current stamp;
-- a v8 db migrates in place and keeps its manifests, which come back with no
-  receiver and no claim (the pre-#191 behaviour) and can then be claimed;
-- the re-stamp trap, fifth arming: a v7-origin walk lands the v8 table AND the
-  v9 columns at the v9 stamp (fails if ``_migrate_v7_to_v8`` stamps the
-  constant again);
-- a failure before the v9 stamp leaves a bootable v8;
-- a v9 stamp without the columns is refused as foreign-or-corrupt.
+- a v9 db (the transfer table, no #191 columns) is NOT refused as foreign: it
+  migrates in place and keeps its manifests, which come back with no receiver
+  and no claim (the pre-#191 behaviour) and can then be claimed;
+- the re-stamp trap, sixth arming: a v8-origin walk lands the v9 table AND the
+  v10 columns at the v10 stamp (fails if ``_migrate_v8_to_v9`` stamps the
+  constant again), and a v7-origin walk lands all three steps;
+- a failure before the v10 stamp leaves a bootable v9;
+- a v10 stamp without either column is refused as foreign-or-corrupt.
 """
 
 from __future__ import annotations
@@ -56,12 +59,36 @@ def _checkpoint_columns(db: Path) -> set[str]:
         conn.close()
 
 
-def _revert_to_v8_shape(db: Path) -> None:
-    """A current db rewound to what a v8 build produced: no #191 columns."""
+def _tables(db: Path) -> set[str]:
+    conn = sqlite3.connect(str(db))
+    try:
+        return {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        conn.close()
+
+
+def _revert_to_v9_shape(db: Path) -> None:
+    """A current db rewound to what a v9 build produced: the transfer table
+    (#185) and no #191 columns."""
     conn = sqlite3.connect(str(db))
     try:
         conn.execute("ALTER TABLE workspace_checkpoints DROP COLUMN receiver")
         conn.execute("ALTER TABLE workspace_checkpoints DROP COLUMN registered_by")
+        conn.execute("PRAGMA user_version = 9")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _revert_to_v8_shape(db: Path) -> None:
+    """Rewound one step further: the v9 transfer table absent too."""
+    _revert_to_v9_shape(db)
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("DROP TABLE IF EXISTS transfer_records")
         conn.execute("PRAGMA user_version = 8")
         conn.commit()
     finally:
@@ -97,22 +124,28 @@ def _mint(reg: SqliteArtifactRegistry) -> str:
     ).checkpoint_id
 
 
-def test_fresh_db_has_the_columns_at_the_v9_stamp(tmp_path: Path) -> None:
+def test_fresh_db_has_the_columns_at_the_v10_stamp(tmp_path: Path) -> None:
     db = tmp_path / "fresh.db"
     with SqliteArtifactRegistry(db):
         pass
-    assert SCHEMA_USER_VERSION == 9
-    assert _user_version(db) == 9
+    assert SCHEMA_USER_VERSION == 10
+    assert _user_version(db) == 10
     assert {"receiver", "registered_by"} <= _checkpoint_columns(db)
 
 
-def test_v8_db_migrates_and_its_manifests_are_unclaimed(tmp_path: Path) -> None:
-    db = tmp_path / "v8.db"
+def test_a_v9_store_migrates_and_its_manifests_are_unclaimed(tmp_path: Path) -> None:
+    """A store a v9 build wrote has the transfer table and neither #191
+    column. It is a genuine Python store one step behind, so the open must
+    migrate it, not refuse it as foreign: a probe that read v9 as "must carry
+    the columns" would leave every coordinator and CLI that ran a v9 build
+    unable to start."""
+    db = tmp_path / "v9.db"
     with SqliteArtifactRegistry(db) as reg:
         checkpoint_id = _mint(reg)
-    _revert_to_v8_shape(db)
-    assert _user_version(db) == 8
-    assert "registered_by" not in _checkpoint_columns(db)
+    _revert_to_v9_shape(db)
+    assert _user_version(db) == 9
+    assert "transfer_records" in _tables(db)
+    assert not {"receiver", "registered_by"} & _checkpoint_columns(db)
 
     with SqliteArtifactRegistry(db) as reg:
         record = reg.get_checkpoint(checkpoint_id)
@@ -126,13 +159,31 @@ def test_v8_db_migrates_and_its_manifests_are_unclaimed(tmp_path: Path) -> None:
         )
         assert result.retry_of_own_registration is False
         assert reg.get_checkpoint(checkpoint_id).registered_by == controller
-    assert _user_version(db) == 9
+    assert _user_version(db) == 10
+    assert "transfer_records" in _tables(db)
 
 
-def test_v7_origin_walk_lands_table_and_columns_at_v9(tmp_path: Path) -> None:
-    """THE RE-STAMP TRAP, fifth arming: ``_migrate_v7_to_v8`` must stamp its
-    own literal 8, or a v7-origin db is stamped 9 without the v9 columns and
-    the chained v8->v9 loser-guard no-ops."""
+def test_v8_origin_walk_lands_table_and_columns_at_v10(tmp_path: Path) -> None:
+    """THE RE-STAMP TRAP, sixth arming: ``_migrate_v8_to_v9`` must stamp its
+    own literal 9, or a v8-origin db is stamped 10 without the v10 columns and
+    the chained v9->v10 loser-guard no-ops."""
+    db = tmp_path / "v8.db"
+    with SqliteArtifactRegistry(db):
+        pass
+    _revert_to_v8_shape(db)
+    assert _user_version(db) == 8
+
+    with SqliteArtifactRegistry(db):
+        pass
+
+    assert _user_version(db) == 10
+    assert "transfer_records" in _tables(db)
+    assert {"receiver", "registered_by"} <= _checkpoint_columns(db)
+
+
+def test_v7_origin_walk_lands_both_tables_and_columns_at_v10(tmp_path: Path) -> None:
+    """The fifth arming still holds under the sixth: ``_migrate_v7_to_v8``
+    stamps its own literal 8, so a v7-origin walk runs all three steps."""
     db = tmp_path / "v7.db"
     with SqliteArtifactRegistry(db):
         pass
@@ -142,15 +193,16 @@ def test_v7_origin_walk_lands_table_and_columns_at_v9(tmp_path: Path) -> None:
     with SqliteArtifactRegistry(db):
         pass
 
-    assert _user_version(db) == 9
+    assert _user_version(db) == 10
+    assert {"caller_principals", "transfer_records"} <= _tables(db)
     assert {"receiver", "registered_by"} <= _checkpoint_columns(db)
 
 
-def test_a_crash_before_the_v9_stamp_leaves_a_bootable_v8(tmp_path: Path) -> None:
+def test_a_crash_before_the_v10_stamp_leaves_a_bootable_v9(tmp_path: Path) -> None:
     db = tmp_path / "crash.db"
     with SqliteArtifactRegistry(db):
         pass
-    _revert_to_v8_shape(db)
+    _revert_to_v9_shape(db)
 
     class _Crash(RuntimeError):
         pass
@@ -160,7 +212,7 @@ def test_a_crash_before_the_v9_stamp_leaves_a_bootable_v8(tmp_path: Path) -> Non
             self._inner = inner
 
         def execute(self, sql: str, *args):
-            if sql.strip() == f"PRAGMA user_version = {SCHEMA_USER_VERSION}":
+            if sql.strip() == "PRAGMA user_version = 10":
                 raise _Crash("simulated kill before the stamp")
             return self._inner.execute(sql, *args)
 
@@ -173,32 +225,35 @@ def test_a_crash_before_the_v9_stamp_leaves_a_bootable_v8(tmp_path: Path) -> Non
         reg._conn = _CrashingConn(real)  # noqa: SLF001 — the seam under test
         reg._db_path = db  # noqa: SLF001
         with pytest.raises(_Crash):
-            reg._migrate_v8_to_v9(None)  # noqa: SLF001
+            reg._migrate_v9_to_v10(None)  # noqa: SLF001
     finally:
         real.close()
 
-    assert _user_version(db) == 8
+    assert _user_version(db) == 9
     assert "registered_by" not in _checkpoint_columns(db)
     with SqliteArtifactRegistry(db):
         pass
-    assert _user_version(db) == 9
+    assert _user_version(db) == 10
     assert {"receiver", "registered_by"} <= _checkpoint_columns(db)
 
 
-def test_a_v9_stamp_without_the_columns_is_refused(tmp_path: Path) -> None:
+@pytest.mark.parametrize("column", ["receiver", "registered_by"])
+def test_a_v10_stamp_without_a_column_is_refused(tmp_path: Path, column: str) -> None:
+    """Each column is probed on its own: a v10 store missing either one is
+    foreign-or-corrupt, with a control that a genuine v10 opens."""
     genuine, forged = tmp_path / "genuine.db", tmp_path / "forged.db"
     for db in (genuine, forged):
         with SqliteArtifactRegistry(db):
             pass
     conn = sqlite3.connect(str(forged))
     try:
-        conn.execute("ALTER TABLE workspace_checkpoints DROP COLUMN registered_by")
+        conn.execute(f"ALTER TABLE workspace_checkpoints DROP COLUMN {column}")
         conn.commit()
     finally:
         conn.close()
-    assert _user_version(forged) == 9
+    assert _user_version(forged) == 10
 
     with SqliteArtifactRegistry(genuine):
         pass
-    with pytest.raises(CrossRuntimeSchemaError, match="registered_by"):
+    with pytest.raises(CrossRuntimeSchemaError, match="receiver and registered_by"):
         SqliteArtifactRegistry(forged)

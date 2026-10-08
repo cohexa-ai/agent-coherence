@@ -270,13 +270,13 @@ INMEM_SURFACE = frozenset({
     "commit_all", "commit_cas", "conflict_outcome_totals", "coordinator_epoch",
     "artifacts_with_detection_edge", "clear_detection_edges",
     "close_detection_run", "create_checkpoint", "detection_runs",
-    "detection_uncoverable", "foreign_write_totals",
+    "detection_uncoverable", "evict_transfer_records", "foreign_write_totals",
     "get_agent_state", "get_agent_transient", "get_artifact",
     "get_artifact_and_generation", "get_caller_principal", "get_checkpoint",
     "get_checkpoint_members",
     "get_content", "get_content_at_version", "get_last_reclamation",
     "get_owner_generation", "get_read_generation", "get_session_cut",
-    "get_session_meta", "get_state_map", "get_transient_map",
+    "get_session_meta", "get_state_map", "get_transfer_record", "get_transient_map",
     "get_transient_tick", "get_version_record", "granted_at_tick",
     "has_artifact", "instance_id", "last_heartbeat_tick",
     "last_observed_version_for", "list_checkpoints",
@@ -286,7 +286,8 @@ INMEM_SURFACE = frozenset({
     "remove_artifact", "retention_meta", "session_count", "set_agent_state",
     "set_agent_transient", "set_artifact_and_content",
     "set_checkpoint_member_pin", "set_checkpoint_member_restore",
-    "set_checkpoint_restore_status", "valid_holders",
+    "set_checkpoint_restore_status", "set_transfer_status", "transfer_grants",
+    "valid_holders",
 })
 SQLITE_SURFACE = INMEM_SURFACE | frozenset({
     "artifact_names_under_prefix", "artifacts_held_by_agent", "close",
@@ -366,6 +367,12 @@ def _synth_value(param: inspect.Parameter):
         # fixed three-value vocabulary BEFORE its lock, so a bogus string never
         # reaches the hold — same shape as `checkpoint` above.
         return FOREIGN_WRITE_OUTCOMES[0]
+    if name == "status":
+        # set_transfer_status validates the status against the closed
+        # vocabulary BEFORE its lock (a bogus string never reaches the hold) --
+        # the same shape as `outcome` above. The checkpoint status write takes
+        # any string, so a real status serves it too.
+        return "completed"
     if name == "members":
         return []
     if name == "writes":
