@@ -52,7 +52,8 @@ unfollowed directory change, not resolved:
   (``for name in ['plan.md']: Path(name).write_text(...)``,
   ``cfg = {'out': 'plan.md'}``, ``src, dst = 'a.md', 'plan.md'``), or
   through a name bound more than 8000 characters before the write or after
-  the program's first 64 bindings;
+  the program's first 64 bindings, and a move or copy whose first argument
+  runs past 200 characters, blanks before its comma included;
 - writer tools not listed above, e.g. ``gsed``, ``awk -i inplace``, ``vim``,
   ``curl -o``, ``wget -O``, ``prettier --write``, and any script run from a
   file (``python3 fix.py``);
@@ -542,10 +543,11 @@ _PATH_WRITE_AFTER_RE = re.compile(r"""^['"]\s*\)\s*""" + _PATH_WRITE_METHOD)
 # ``p = Path('x')``, ``const f = 'x'``, ``my $f = "x"``), the statement
 # ending with it: a value built from it (``'x' + '.bak'``), a tuple target and
 # a keyword argument are not bindings.
-# A newline is a statement start of its own, so the blanks after one stop at
-# the line: a ``\s*`` there let every newline of a long run start a match
-# that scanned the rest of the run.
-_STATEMENT_START = r"(?:[;\n{][ \t]*|\b(?:const|let|var|my)\b\s*)"
+# A newline is a statement start of its own, so the blanks after one stay on
+# the line (a form feed among them, which Python skips at a line's start): a
+# ``\s*`` there let every newline of a long run start a match that scanned
+# the rest of the run.
+_STATEMENT_START = r"(?:[;\n{][^\S\n]*|\b(?:const|let|var|my)\b\s*)"
 _ASSIGNED_BEFORE_RE = re.compile(
     _STATEMENT_START + r"""(\$?[A-Za-z_]\w*)\s*=\s*(""" + _PATH_CALL + r"""\s*)?['"]$"""
 )

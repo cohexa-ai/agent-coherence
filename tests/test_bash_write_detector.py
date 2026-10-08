@@ -373,6 +373,8 @@ _DOCUMENTED_MISSES: tuple[str, ...] = (
     "python3 - <<'PY'\nPLAN = 'docs/plans/plan.md'\n" + "# padding\n" * 900 + "open(PLAN, 'a').write('x')\nPY",
     "python3 -c \"" + "".join(f"x{i} = 'n{i}.md'; " for i in range(64)) + "p = 'task.md'; open(p, 'w').write('x')\"",
     "python3 -c \"from pathlib import Path; (Path('docs') / 'plans' / 'plan.md').write_text('x')\"",
+    # A move whose first argument runs past 200 characters, blanks included.
+    "python3 -c \"import os; os.replace('a.tmp'" + " " * 200 + ", 'task.md')\"",
 )
 
 
@@ -485,6 +487,8 @@ def test_nested_shell_bodies_are_scanned_three_levels_deep_and_no_deeper() -> No
     ("perl -e 'my $f = \"task.md\"; open my $out, \">\", $f or die; print $out \"x\"'", ["task.md"]),
     ("php -r '$t = \"AGENTS.md\"; file_put_contents($t, str_replace(\"a\", \"b\", file_get_contents($t)));'", ["AGENTS.md"]),
     ("python3 - <<'PY'\nmode = 'a'\ntarget = 'docs/plans/plan.md'\nwith open(target, mode) as fh:\n    fh.write('x')\nPY", [_PLAN]),
+    # A binding after a form feed, which Python skips at a line's start.
+    ("python3 - <<'PY'\nimport os\n\x0ctarget = 'docs/plans/plan.md'\nwith open(target, 'w') as fh:\n    fh.write('x')\nPY", [_PLAN]),
     # A name bound again: only the binding the write call sees counts.
     ("python3 - <<'PY'\npath = 'docs/specs/api.md'\nspec = open(path).read()\npath = '/tmp/out.txt'\nwith open(path, 'w') as f:\n    f.write(spec)\nPY", []),
     # Deletes, and a move of the path away.
