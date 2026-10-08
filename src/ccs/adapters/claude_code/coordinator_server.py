@@ -238,7 +238,7 @@ _RECLAIM_ONLY_ROW_MAX_AGE_SEC: int = 24 * 60 * 60
 
 #: The states a write grant holds a pair in. ``/status``'s ``reclaimed`` map
 #: never lists a pair in one of them (#195): a write grant clears the slot.
-_WRITE_HELD_STATES: frozenset[MESIState] = frozenset({MESIState.EXCLUSIVE, MESIState.MODIFIED})
+_M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
 
 MAX_POLICY_PATHS_PER_REQUEST = 20
 """Cap on the number of paths /policy/track and /policy/untrack accept
@@ -6630,19 +6630,19 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     #195 — reclaim cause at the operator tier: every ``sessions[]`` row at
     ``detail=full`` carries ``reclaimed``, a map SIBLING to ``states``:
     ``{path: {"trigger": "reclaim_heartbeat" | "reclaim_max_hold", "tick": int}}``
-    for each artifact this agent is INVALID on because the stable-grant sweep
-    pulled its grant (the registry's ``last_reclaim_trigger`` /
+    for each artifact whose last write grant the stable-grant sweep pulled
+    from this agent (the registry's ``last_reclaim_trigger`` /
     ``last_reclaim_tick`` slot). ``states`` keeps its meaning — held grants
     only, INVALID omitted — so a consumer that never reads ``reclaimed`` sees
     exactly today's body. A voluntary release, a peer preemption and a commit
-    record no slot and leave ``reclaimed`` empty; re-acquiring M/E clears the
-    slot, and a re-read to SHARED moves the path back into ``states`` and out
-    of ``reclaimed``. The slot clears only on the next M/E acquire, so an
-    entry means "this session's most recent write grant on this path was
-    reclaimed and it has held none since": a later read grant that a peer
-    invalidates returns the path to ``reclaimed`` with the original
-    trigger/tick. ``tick`` is the sweep's tick basis, wall-clock seconds over
-    the HTTP transport. The key is absent below the operator tier. An agent
+    record no slot and leave ``reclaimed`` empty. The slot clears only on the
+    next M/E acquire, so an entry means "this session's most recent write
+    grant on this path was reclaimed and it has held none since": a re-read
+    to SHARED shows the path in ``states`` and keeps it in ``reclaimed``, and
+    a peer invalidating that read leaves the original trigger/tick. A pair
+    held M/E is never listed. Both maps come from one registry read.
+    ``tick`` is the sweep's tick basis, wall-clock seconds over the HTTP
+    transport. The key is absent below the operator tier. An agent
     that is unnamed, holds nothing and is listed only for a reclaim gets a row
     only while its newest reclaim is younger than
     ``_RECLAIM_ONLY_ROW_MAX_AGE_SEC`` (24h), so dead sessions do not pile up.
@@ -6702,14 +6702,16 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # get_artifact + one get_state_map per artifact) with 2 SELECTs total
     # held under one registry lock so the view is consistent. #185: the
     # transfer rows ride the same hold as a third SELECT, so each record's
-    # liveness is judged against the version its entry shows. #195: the
-    # reclaim slots ride the agent-state SELECT itself, so a reclaim cannot
-    # land between the state a row shows and the cause it lists.
-    artifact_by_id, state_by_artifact, transfer_by_artifact, reclaim_by_artifact = (
-        coordinator.registry.status_snapshot(
-            include_transfers=True, include_reclamations=True
-        )
+    # liveness is judged against the version its entry shows. #195: at the
+    # operator tier, the only one that shows them, the reclaim slots ride the
+    # agent-state SELECT itself, so a reclaim cannot land between the state a
+    # row shows and the cause it lists.
+    operator_tier = detail == "full"
+    snapshot = coordinator.registry.status_snapshot(
+        include_transfers=True, include_reclamations=operator_tier
     )
+    artifact_by_id, state_by_artifact, transfer_by_artifact = snapshot[:3]
+    reclamation_by_artifact = snapshot[3] if operator_tier else {}
     named_agents = coordinator.agent_names_snapshot()
 
     tracked: list[dict] = []
@@ -6774,11 +6776,11 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # and reclaimed.
     reclaimed_by_agent: dict[UUID, dict[str, dict[str, Any]]] = {}
     if detail == "full":
-        for artifact_id, slots in reclaim_by_artifact.items():
+        for artifact_id, slots in reclamation_by_artifact.items():
             meta = artifact_by_id[artifact_id]
             snap_states = state_by_artifact[artifact_id]
             for agent_id, (trigger, tick) in slots.items():
-                if snap_states.get(agent_id) in _WRITE_HELD_STATES:
+                if snap_states.get(agent_id) in _M_OR_E_STATES:
                     continue
                 reclaimed_by_agent.setdefault(agent_id, {})[meta["name"]] = {
                     "trigger": trigger,

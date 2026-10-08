@@ -10188,19 +10188,19 @@ def test_the_sweep_loop_counts_and_logs_a_heartbeat_reclaim(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One tick of the coordinator's own sweep loop, on its own clock. The
-    sweep once never fired over HTTP while direct calls with a tick the test
-    chose passed, so this drives the loop rather than the pass: the counter,
-    the trigger key and the log line must come out of the shipped wiring."""
+    """One tick of the coordinator's own sweep loop, on its own clock, rather
+    than the sweep pass with a tick the test chooses: the loop's clock is part
+    of what is under test, and the counter, the trigger key and the log line
+    must come out of the shipped wiring."""
     from ccs.adapters.claude_code import coordinator_server as server_mod
     from ccs.adapters.claude_code.lifecycle import LifecycleConfig, _sweep_loop
 
     stale_sid, live_sid = _sid("loop-stale-195"), _sid("loop-live-195")
     # The stale holder took its grant, and last heartbeated, 1000 seconds ago.
     real_clock = server_mod.monotonic_seconds
-    monkeypatch.setattr(server_mod, "monotonic_seconds", lambda: real_clock() - 1_000)
-    assert client.post("/hooks/pre-edit", {"session_id": stale_sid, "path": "plan.md"})[0] == 200
-    monkeypatch.setattr(server_mod, "monotonic_seconds", real_clock)
+    with monkeypatch.context() as clock:
+        clock.setattr(server_mod, "monotonic_seconds", lambda: real_clock() - 1_000)
+        assert client.post("/hooks/pre-edit", {"session_id": stale_sid, "path": "plan.md"})[0] == 200
     assert client.post("/hooks/pre-edit", {"session_id": live_sid, "path": "task.md"})[0] == 200
 
     cfg = LifecycleConfig(
@@ -10259,6 +10259,40 @@ def test_status_reads_the_reclaim_slots_inside_the_snapshot_lock_hold(
     assert any("FROM artifacts" in sql for sql in hold), hold
 
 
+def test_status_below_the_operator_tier_never_reads_the_reclaim_slots(
+    coordinator, client: _Client
+) -> None:
+    """Only the operator tier shows the reclaim cause, so only it pays for the
+    read: the default view, the one dashboards poll, selects no slot column."""
+    client.post("/hooks/pre-edit", {"session_id": _sid("tier-195"), "path": "plan.md"})
+    _sweep(coordinator, int(time.time()) + 999_999)
+
+    status, body, holds, unheld = _status_registry_holds(coordinator, client, "/status")
+    assert status == 200
+    assert body["sweep_reclaims_total"] == 1
+    assert not [sql for sql in [*unheld, *sum(holds, [])] if "last_reclaim" in sql]
+
+
+def test_status_never_lists_a_pair_still_held_for_writing(
+    coordinator, client: _Client
+) -> None:
+    """A write grant clears the reclaim slot, so a held pair carrying one is a
+    ledger this coordinator did not write (another runtime shares the file).
+    It still reads as the grant it is, never as a reclaim."""
+    sid = _sid("held-195")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    [artifact] = [
+        a for a in _operator_status(client)["tracked_artifacts"] if a["path"] == "plan.md"
+    ]
+    coordinator.registry.record_last_reclamation(
+        session_to_agent_id(sid), uuid.UUID(artifact["id"]), "reclaim_heartbeat", 1
+    )
+
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {"plan.md": "EXCLUSIVE"}
+    assert row["reclaimed"] == {}
+
+
 def test_status_drops_an_unnamed_reclaim_only_row_once_the_reclaim_is_old(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -10274,12 +10308,11 @@ def test_status_drops_an_unnamed_reclaim_only_row_once_the_reclaim_is_old(
         secret = load_secret(first.coordinator_root)
         assert secret is not None
         # The grant was taken, and last heartbeated, before the reclaim.
-        real_clock = cs.monotonic_seconds
-        monkeypatch.setattr(cs, "monotonic_seconds", lambda: reclaim_tick - 1_000)
-        _Client("127.0.0.1", first.port, secret).post(
-            "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"}
-        )
-        monkeypatch.setattr(cs, "monotonic_seconds", real_clock)
+        with monkeypatch.context() as clock:
+            clock.setattr(cs, "monotonic_seconds", lambda: reclaim_tick - 1_000)
+            _Client("127.0.0.1", first.port, secret).post(
+                "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"}
+            )
         assert _sweep(first, reclaim_tick) == 1
     finally:
         first.shutdown()

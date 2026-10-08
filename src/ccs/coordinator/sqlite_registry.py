@@ -3731,7 +3731,7 @@ class SqliteArtifactRegistry:
         """
         artifact_by_id: dict[UUID, dict[str, Any]] = {}
         state_by_artifact: dict[UUID, dict[UUID, MESIState]] = {}
-        reclaim_by_artifact: dict[UUID, dict[UUID, ReclamationSlot]] = {}
+        reclamation_by_artifact: dict[UUID, dict[UUID, ReclamationSlot]] = {}
         extras: list[Any] = []
         columns = "artifact_id, agent_id, state"
         if include_reclamations:
@@ -3771,7 +3771,7 @@ class SqliteArtifactRegistry:
                     continue
                 state_by_artifact[aid][gid] = MESIState[row[2]]
                 if include_reclamations and row[3] is not None:
-                    reclaim_by_artifact.setdefault(aid, {})[gid] = (row[3], row[4])
+                    reclamation_by_artifact.setdefault(aid, {})[gid] = (row[3], row[4])
             if include_transfers:
                 extras.append({
                     record.artifact_id: (record, live)
@@ -3780,8 +3780,8 @@ class SqliteArtifactRegistry:
                         self._conn.execute(_TRANSFER_READ_ALL_SQL).fetchall(),
                     )
                 })
-        if include_reclamations:
-            extras.append(reclaim_by_artifact)
+            if include_reclamations:
+                extras.append(reclamation_by_artifact)
         return (artifact_by_id, state_by_artifact, *extras)
 
     def get_agent_state(self, artifact_id: UUID, agent_id: UUID) -> MESIState | None:
