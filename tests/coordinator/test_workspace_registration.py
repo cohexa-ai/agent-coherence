@@ -846,6 +846,35 @@ def test_progress_controller_gate_unknown_checkpoint_is_keyerror(service) -> Non
 
 
 @pytest.mark.parametrize("which", [0, 1], ids=["status", "member"])
+def test_abort_event_fails_a_gated_progress_write_closed(service, registry, which) -> None:
+    """A6 on the progress writes: a pre-set abort Event fails a gated write
+    closed at the registry lock, so a watchdog-abandoned /restore/status or
+    /restore/member request writes nothing after its client was already told
+    the answer was degraded."""
+    checkpoint_id = _mint_checkpoint(service)
+    abort = threading.Event()
+    abort.set()
+    writes = (
+        lambda: service.set_workspace_checkpoint_restore_status(
+            checkpoint_id, "concluded", updated_at=5.0, controller=OWNER, abort=abort
+        ),
+        lambda: service.set_workspace_checkpoint_member_restore(
+            checkpoint_id,
+            "notes/plan.md",
+            restore_outcome="restored",
+            deleted_at_restore=5.0,
+            controller=OWNER,
+            abort=abort,
+        ),
+    )
+    with pytest.raises(WatchdogAbandoned):
+        writes[which]()
+    assert registry.get_checkpoint(checkpoint_id).restore_status == "none"
+    (member,) = registry.get_checkpoint_members(checkpoint_id)
+    assert member.restore_outcome is None and member.deleted_at_restore is None
+
+
+@pytest.mark.parametrize("which", [0, 1], ids=["status", "member"])
 def test_a_claim_cannot_land_between_the_progress_gate_and_its_write(
     service, registry, monkeypatch, which
 ) -> None:
