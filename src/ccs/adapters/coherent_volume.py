@@ -2677,8 +2677,9 @@ class CoherentVolume:
         any read method (:meth:`read`, :meth:`read_with_version`,
         :meth:`read_with_version_generation`, the read :meth:`reacquire`
         takes, and a compare-and-swap's comparand read), with a strict-mode
-        deny. ``False`` after an admitted read, and after one that failed or
-        went unanswered.
+        deny. ``False`` after an admitted read, and after one whose request
+        failed or went unanswered. A read refused before it sends anything (a
+        missing file, a path outside the root) leaves the flag as it was.
 
         A handoff's giver meets one on its own re-read of a path it handed
         off: the transfer left its claim INVALID at an unmoved version. The
