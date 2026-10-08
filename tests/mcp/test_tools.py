@@ -256,6 +256,30 @@ def test_every_handoff_tool_and_the_instructions_say_a_transfer_fences_the_giver
     assert "handed_off" in instructions and "stop_and_report" in instructions
 
 
+def test_the_transfer_tool_and_the_instructions_say_the_fence_covers_this_session_only() -> None:
+    """The fence is on this MCP session's writes. The same model writing the
+    path through its own file tools or a shell is another session, and nothing
+    refuses it, so the giver must learn before its first refused write, not
+    after, that it may write a handed-off path by no route at all."""
+    transfer = _registered_descriptions()["swg_transfer"].lower()
+    instructions = INSTRUCTIONS.lower()
+
+    for text in (transfer, instructions):
+        assert "the fence covers this mcp session only" in text
+        assert "is not refused" in text
+
+
+def test_the_accept_tool_says_an_overtaken_handoff_answers_overtaken() -> None:
+    """An accept of a handoff a bystander overtook is taken but changes
+    nothing and answers ``status=overtaken`` with the bystander as
+    ``counterparty``: not an error, so a successor reading only the
+    description must learn that an accept is not always a completion."""
+    text = _registered_descriptions()["swg_accept"]
+
+    assert "status=overtaken" in text
+    assert "counterparty" in text
+
+
 def test_the_transfer_tool_names_the_successor_by_the_id_its_own_status_tool_reports() -> None:
     """The giver names the successor by the value the successor's
     OWN status tool reports, and the status tool says that value names the

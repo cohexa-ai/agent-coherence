@@ -87,7 +87,10 @@ reading and writing it by the ordinary rules, and the handoff only labels what
 they do. While the handoff is live, this session's swg_write and swg_write_cas
 on the path are DENIED with reason=handed_off, retryable=false,
 recover=stop_and_report: stop and report to your user or host that the path
-was handed off. The successor sees the handoff in the handoff key of its
+was handed off. The fence covers this MCP session only: a write you make to
+the path through any other route (your own file tools, a shell) is another
+session's write and is not refused, so do not write a path you handed off by
+any route. The successor sees the handoff in the handoff key of its
 swg_read and swg_status, and takes it with swg_accept or a write, or refuses it
 with swg_decline. swg_withdraw is taken only on the user's or host's explicit
 instruction, never as the recovery for a handed_off deny.
@@ -220,7 +223,10 @@ _TRANSFER_DESC = (
     "handoff_in_flight: another session's handoff of the path is live). The "
     "result is an error unless every grant transferred. While a handoff is "
     "live this session's swg_write and swg_write_cas on its path are denied "
-    "with reason=handed_off. If the answer is commit_unconfirmed "
+    "with reason=handed_off. The fence covers this MCP session only: a write "
+    "you make through any other route (your own file tools, a shell) is "
+    "another session's and is not refused, so write a path you handed off by "
+    "no route. If the answer is commit_unconfirmed "
     "(recover=check_handoff) the transfer may have landed: look at the path's "
     "handoff (swg_read or swg_status) first. A handoff from you to that "
     "successor made at the version you held (its version_at_transfer), live "
@@ -233,7 +239,10 @@ _TRANSFER_DESC = (
 _ACCEPT_DESC = (
     "As the successor, accept the live handoff of a path without writing it: "
     "a pending handoff becomes completed (a write of the path completes it "
-    "too). The giver stays fenced until a write moves the version. Refused "
+    "too). The giver stays fenced until a write moves the version. If another "
+    "session already overtook the handoff by acquiring or writing the path, "
+    "the accept is taken but changes nothing: it answers status=overtaken "
+    "and names that session as counterparty. Refused "
     "with handoff_not_successor or handoff_not_live, as an error that changes "
     "nothing." + _HANDOFF_CLAUSE + _SCOPE_CLAUSE
 )
