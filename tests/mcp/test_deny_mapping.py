@@ -486,6 +486,10 @@ def test_every_handoff_refusal_carries_its_recover_verb_and_a_fixed_next_step(re
     assert structured["detail"] == "the detail"
     assert [item.text for item in result.content] == ["the detail", structured["next_step"]]
     assert "call swg_withdraw" not in structured["next_step"]
+    for grant in structured.get("grants", []):  # the row as the refused grant carries it
+        assert (grant["recover"], grant["retryable"], grant["next_step"]) == (
+            _HANDOFF_REFUSAL_RECOVER[reason], False, structured["next_step"],
+        )
 
 
 @pytest.mark.parametrize("reason", ["handoff_made_up", None])
