@@ -43,7 +43,13 @@ from ccs.adapters.coherent_volume import (
 )
 from ccs.cli._coherence_client import CoordinatorUnavailable, resolve_endpoint
 from ccs.cli._coherence_client import post as _cc_post
-from ccs.core.exceptions import CoherenceDegradedWarning, CoherenceError, CommitUnconfirmed, GiverFenced
+from ccs.core.exceptions import (
+    CoherenceDegradedWarning,
+    CoherenceError,
+    CommitUnconfirmed,
+    GiverFenced,
+    HandoffPathsInvalid,
+)
 
 _MANAGED = ("data/**",)
 _PLAN = "data/plan.md"
@@ -697,8 +703,10 @@ def test_a_transfer_of_no_path_or_one_path_twice_is_a_caller_error_never_sent(
         sent: list[tuple[str, dict]] = []
         _record_posts(monkeypatch, sent)
 
-        with pytest.raises(ValueError):
+        with pytest.raises(HandoffPathsInvalid) as raised:
             giver.transfer(paths, successor=_agent(successor))
+
+        assert isinstance(raised.value, ValueError)
 
         assert _presented(sent) == []
     finally:

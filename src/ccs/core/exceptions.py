@@ -702,6 +702,15 @@ class CoherenceTopologyWarning(UserWarning):
     """
 
 
+class HandoffPathsInvalid(ValueError):
+    """A transfer named no path, or one path twice (two spellings of one file
+    count): the caller's error, raised before anything is sent. A
+    ``ValueError``, as ``atomic_publish``'s refusal of an empty or repeated
+    write-set is, and its own type so a caller catches exactly it: a broader
+    ``except ValueError`` around a transfer would also swallow a fault after
+    the request went out, which must read as an unknown outcome instead."""
+
+
 class InvalidTransitionError(CoherenceError):
     """Raised when the MESI transition table rejects a state transition."""
 

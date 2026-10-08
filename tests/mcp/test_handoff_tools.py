@@ -526,6 +526,28 @@ def test_an_accept_after_a_bystanders_write_is_refused_not_live_as_the_descripti
         stop_coordinator(tmp_path)
 
 
+def test_a_fault_from_the_volumes_transfer_that_is_not_a_path_error_is_not_answered_as_one(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the volume's own path refusal is answered ``invalid_path``. Any
+    other ``ValueError`` could come after the request went out, when the
+    transfer may have landed, and answering it as the agent's input mistake
+    would tell the agent nothing was sent."""
+    _seed(tmp_path, PLAN, b"plan v1")
+    config = _config(tmp_path)
+    volume = _vol(tmp_path, fast_cfg)
+    try:
+
+        def fails(*args: object, **kwargs: object) -> object:
+            raise ValueError("a fault after the request went out")
+
+        monkeypatch.setattr(volume, "transfer", fails)
+        with pytest.raises(ValueError, match="after the request went out"):
+            _do_transfer(volume, config, [PLAN], str(uuid4()))
+    finally:
+        stop_coordinator(tmp_path)
+
+
 @pytest.mark.parametrize("verb", ["transfer", "accept", "decline", "withdraw"])
 def test_a_handoff_tool_on_a_session_whose_coordinator_is_gone_answers_unavailable(
     tmp_path: Path, fast_cfg: LifecycleConfig, verb: str

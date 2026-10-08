@@ -98,6 +98,7 @@ from ccs.core.exceptions import (
     CommitPreempted,
     CommitUnconfirmed,
     GiverFenced,
+    HandoffPathsInvalid,
     InternalConcurrencyError,
     PublishMaterializationError,
     RedirectRefused,
@@ -2591,8 +2592,9 @@ class CoherentVolume:
         under ``"degrade"`` it warns and raises ``CommitUnconfirmed``, since
         degrade mode does not tell a refusal from a failure.
         No path, or one path named twice (after normalising, so two spellings
-        of one file count), is the caller's error: ``ValueError`` in both
-        modes, as for :meth:`atomic_publish`, and nothing is sent.
+        of one file count), is the caller's error:
+        :class:`~ccs.core.exceptions.HandoffPathsInvalid`, a ``ValueError``,
+        in both modes, as for :meth:`atomic_publish`, and nothing is sent.
         After a multi-file :meth:`atomic_publish`, read each member before
         handing it on: the publish leaves no claim this volume can present,
         so the transfer is refused ``handoff_not_held``.
@@ -2602,11 +2604,11 @@ class CoherentVolume:
             self._ensure_attached()
             rels = [self._to_relative(target)[1] for target in targets]
             if not rels:
-                raise ValueError("transfer requires at least one path")
+                raise HandoffPathsInvalid("transfer requires at least one path")
             seen: set[str] = set()
             for rel in rels:
                 if rel in seen:
-                    raise ValueError(f"transfer names a path more than once: {rel}")
+                    raise HandoffPathsInvalid(f"transfer names a path more than once: {rel}")
                 seen.add(rel)
             self._require_attached_for("transfer", rels)
             resp = self._post(

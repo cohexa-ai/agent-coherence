@@ -143,7 +143,7 @@ Alpha — APIs may change before `v1.0`.
   answer or an HTTP 5xx included), as does a request the coordinator refused
   outright under `on_error="strict"` (`CoherenceError`) or a volume with no
   coordinator. A transfer of no path, or of one path twice, is the caller's
-  error (`ValueError`) and sends nothing. A transfer hands on
+  error (`HandoffPathsInvalid`, a `ValueError`) and sends nothing. A transfer hands on
   the claim the volume actually holds on the path, its write grant or its
   standing read, even after a fresh attempt. While the handoff is live, the
   giver's `write()`, `write_cas()`, `write_cas_at()` and an

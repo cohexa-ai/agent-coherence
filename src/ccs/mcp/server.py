@@ -35,7 +35,12 @@ from ccs.adapters.coherent_volume import (
     HandoffVerbResult,
 )
 from ccs.adapters.effect_gate import check_fence
-from ccs.core.exceptions import HOLD_INPUT_VANISHED, CasVersionConflict, CoherenceError
+from ccs.core.exceptions import (
+    HOLD_INPUT_VANISHED,
+    CasVersionConflict,
+    CoherenceError,
+    HandoffPathsInvalid,
+)
 from ccs.mcp.deny import (
     HANDOFF_LANDED_TRANSFER,
     cas_exhausted_result,
@@ -619,7 +624,7 @@ def _do_transfer(
         return coordinator_unavailable_result(f"coordinator unattached; cannot transfer {', '.join(keys)}")
     try:
         result = volume.transfer(keys, successor=successor)
-    except ValueError as exc:  # two spellings the volume resolves to one file
+    except HandoffPathsInvalid as exc:  # two spellings the volume resolves to one file
         return _client_error_result("invalid_path", "fix_path", str(exc))
     except CoherenceError as exc:
         return handoff_deny_result(exc, "transfer")
