@@ -1711,6 +1711,12 @@ class CoordinatorHTTPServer:
         ``_handle_status`` uses this instead of reaching into private attrs,
         giving a single source-of-truth for the counter set.
         """
+        # The sweep bumps the reclaim total and its by-trigger entry under one
+        # lock hold; reading them under that hold too keeps the pair
+        # consistent, so a total never counts a reclaim its map does not.
+        with self._reliability_counter_lock:
+            sweep_reclaims_total = self._sweep_reclaims_total
+            sweep_reclaims_by_trigger = dict(self._sweep_reclaims_by_trigger)
         return {
             "watchdog_timeouts_total": self._watchdog_timeouts_total,
             "watchdog_queue_overflows_total": self._watchdog_queue_overflows_total,
@@ -1733,8 +1739,8 @@ class CoordinatorHTTPServer:
             "shared_foreign_lag_suppressed_total": self._shared_foreign_lag_suppressed_total,
             "handoff_giver_denials_total": self._handoff_giver_denials_total,
             "effect_fence_holds_total": self._effect_fence_holds_total,
-            "sweep_reclaims_total": self._sweep_reclaims_total,
-            "sweep_reclaims_by_trigger": dict(self._sweep_reclaims_by_trigger),
+            "sweep_reclaims_total": sweep_reclaims_total,
+            "sweep_reclaims_by_trigger": sweep_reclaims_by_trigger,
             "caller_principal_absent_total": self._caller_principal_absent_total,
             "caller_principal_refused_total": self._caller_principal_refused_total,
             "auth_401_total": self._auth_401_total,
