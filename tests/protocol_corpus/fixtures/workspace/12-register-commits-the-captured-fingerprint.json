@@ -1,6 +1,6 @@
 {
   "name": "workspace-restore-register-commits-the-captured-fingerprint",
-  "description": "The restore leg: peer C reads docs/plan.md and commits a different hash through the OCC path, so the coordinator knows it at version 2 with C holding SHARED. The receiver B registers the checkpoint's captured fingerprint for it: one all-or-nothing commit_all moves it FORWARD to version 3 (old bytes, new version), invalidates C atomically (`invalidated: 1`, a count -- peers learn through the protocol, not from this body), and `retry_of_own_registration` is false because this call made the claim.",
+  "description": "The restore leg: peer C reads docs/plan.md and commits a different hash through the OCC path, so the coordinator knows it at version 2 with C holding SHARED. The receiver B registers the checkpoint's captured fingerprint for it: one all-or-nothing commit_all moves it FORWARD to version 3 (old bytes, new version), invalidates C atomically (`invalidated: 1`, a count -- peers learn through the protocol, not from this body), and there is no `retry_of_own_registration` key because this call made the claim (it appears only when true).",
   "setup": {
     "tracked": [
       "docs/**"
@@ -87,7 +87,6 @@
       "skipped": [],
       "refused": {},
       "invalidated": 1,
-      "retry_of_own_registration": false,
       "coordinator_epoch": "<MINTED>"
     }
   },

@@ -101,7 +101,6 @@
       "skipped": [],
       "refused": {},
       "invalidated": 1,
-      "retry_of_own_registration": false,
       "coordinator_epoch": "<MINTED>"
     }
   },

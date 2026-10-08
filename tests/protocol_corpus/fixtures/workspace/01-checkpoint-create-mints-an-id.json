@@ -1,6 +1,6 @@
 {
   "name": "workspace-checkpoint-create-mints-an-id",
-  "description": "POST /workspace/checkpoint with the four required fields and no receiver. The server mints `checkpoint_id` (a uuid4, scrubbed to `<UUID>`), echoes name and window, and answers `receiver: null` -- any session may register a restore of it, the pre-#191 behaviour.",
+  "description": "POST /workspace/checkpoint with the four required fields and no receiver. The server mints `checkpoint_id` (a uuid4, scrubbed to `<UUID>`), echoes name and window, and answers no `receiver` key (it appears only when the request names one) -- any session may register a restore of it, the pre-#191 behaviour.",
   "setup": {
     "tracked": [
       "docs/**"
@@ -44,7 +44,6 @@
       "name": "before-refactor",
       "window_min": 100.0,
       "window_max": 101.0,
-      "receiver": null,
       "coordinator_epoch": "<MINTED>"
     }
   },

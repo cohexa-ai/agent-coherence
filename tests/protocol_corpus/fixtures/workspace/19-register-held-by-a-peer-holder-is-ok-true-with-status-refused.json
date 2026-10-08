@@ -87,7 +87,6 @@
         "docs/plan.md": "other_holder"
       },
       "invalidated": 0,
-      "retry_of_own_registration": false,
       "coordinator_epoch": "<MINTED>"
     }
   },

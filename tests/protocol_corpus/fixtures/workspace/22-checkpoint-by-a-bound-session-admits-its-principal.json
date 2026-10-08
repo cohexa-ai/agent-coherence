@@ -60,7 +60,6 @@
       "name": "before-refactor",
       "window_min": 100.0,
       "window_max": 101.0,
-      "receiver": null,
       "coordinator_epoch": "<MINTED>"
     }
   },

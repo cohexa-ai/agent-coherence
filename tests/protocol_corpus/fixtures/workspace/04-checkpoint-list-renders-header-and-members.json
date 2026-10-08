@@ -1,6 +1,6 @@
 {
   "name": "workspace-checkpoint-list-renders-header-and-members",
-  "description": "GET /workspace/checkpoints after one create: the header with its owner (the creating session's controller id), the #191 `receiver` and `registered_by` (both null: anyone may register, nobody has), and every member row with the honesty fields a consumer must see. `owner` is preserved verbatim so the row says WHO took it. `restore_status` is the string `none`, not null, and `restore_updated_at` is null until a status write. `created_at` and `created_at_tick` are both stamped from the clock at create time, so both are ignored.",
+  "description": "GET /workspace/checkpoints after one create: the header with its owner (the creating session's controller id), no #191 `receiver` or `registered_by` key (each appears only when set: here anyone may register, and nobody has), and every member row with the honesty fields a consumer must see. `owner` is preserved verbatim so the row says WHO took it. `restore_status` is the string `none`, not null, and `restore_updated_at` is null until a status write. `created_at` and `created_at_tick` are both stamped from the clock at create time, so both are ignored.",
   "setup": {
     "tracked": [
       "docs/**"
@@ -58,8 +58,6 @@
           "restore_status": "none",
           "restore_updated_at": null,
           "pin_refcount": 0,
-          "receiver": null,
-          "registered_by": null,
           "members": [
             {
               "member_path": "docs/plan.md",
