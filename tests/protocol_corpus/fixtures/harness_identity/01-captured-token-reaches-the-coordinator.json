@@ -1,6 +1,6 @@
 {
   "name": "harness-captured-token-reaches-the-coordinator",
-  "description": "R15, CARRY HALF. A fixture can express a value the coordinator MINTS at run time. The second preflight opens a snapshot session; the server mints `session_token` and the fixture captures it under the name `minted_session_token`. The main request substitutes those exact bytes into its own body, and the coordinator answers as it would for that session -- ok:true with the pinned version from the cut. The proof this fixture is not decorative is the control in test_effect_fence_corpus.py: the SAME request with a well-formed but never-minted token answers ok:false / session_not_found, so the affirmative answer here is caused by the captured bytes and by nothing else. Before this unit the harness discarded every preflight response, so no fixture could reach a minted value at all. `coordinator_epoch` is ignored: it is a per-coordinator 32-hex value with no dashes, which neither the UUID nor the ISO-8601 string scrubber touches, so pinning it would flake per run.",
+  "description": "R15, CARRY HALF. A fixture can express a value the coordinator MINTS at run time. The second preflight opens a snapshot session; the server mints `session_token` and the fixture captures it under the name `minted_session_token`. The main request substitutes those exact bytes into its own body, and the coordinator answers as it would for that session -- ok:true with the pinned version from the cut. The proof this fixture is not decorative is the control in test_effect_fence_corpus.py: the SAME request with a well-formed but never-minted token answers ok:false / session_invalidated, so the affirmative answer here is caused by the captured bytes and by nothing else. Before this unit the harness discarded every preflight response, so no fixture could reach a minted value at all. `coordinator_epoch` is a per-coordinator 32-hex value minted per boot; the harness scrubs it by name to `<MINTED>` (#193), so the KEY is still asserted present while its per-run value is not compared.",
   "setup": {
     "tracked": ["docs/**"],
     "files": {
@@ -44,9 +44,8 @@
       "served": "data_plane_deferred",
       "version": 1,
       "content_hash": null,
-      "coordinator_epoch": "<ignored>"
+      "coordinator_epoch": "<MINTED>"
     }
   },
-  "ignore_keys": ["coordinator_epoch"],
   "backends": ["python"]
 }

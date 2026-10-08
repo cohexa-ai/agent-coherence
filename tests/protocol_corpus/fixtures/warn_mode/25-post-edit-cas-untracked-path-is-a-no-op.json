@@ -1,0 +1,32 @@
+{
+  "name": "post-edit-cas-untracked-path-is-a-no-op",
+  "description": "A CAS on a path the policy does not track is acknowledged with a bare `{ok: true}` and no version, on both coordinators.",
+  "setup": {
+    "tracked": [
+      "docs/**"
+    ],
+    "files": {
+      "notes.txt": "# coherence corpus fixture  \n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/post-edit-cas",
+    "body": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "path": "notes.txt",
+      "content_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "expected_version": 1
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}
