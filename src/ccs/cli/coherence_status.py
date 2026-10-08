@@ -532,11 +532,15 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
             per_artifact = dict(s.get("states", {}))
             # #195: the operator tier names the paths this session lost to the
             # coordinator sweep. They are not held grants, so they render in
-            # the same column under their own label rather than as a state.
+            # the same column under their own label rather than as a state. A
+            # reclaimed path the session has re-read is held SHARED as well,
+            # so its line keeps that state ahead of the reclaim label.
             for path, cause in (s.get("reclaimed") or {}).items():
-                per_artifact[path] = (
+                label = (
                     f"reclaimed ({cause.get('trigger', '?')} at tick {cause.get('tick', '?')})"
                 )
+                held = per_artifact.get(path)
+                per_artifact[path] = f"{held}; {label}" if held else label
             print(f"  {sid[:8]}  {name}")
             if not per_artifact:
                 print("    (no held grants)")

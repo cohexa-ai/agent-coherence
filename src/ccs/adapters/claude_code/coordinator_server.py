@@ -236,6 +236,10 @@ _SWEEP_RECLAIM_TRIGGERS: tuple[str, ...] = ("reclaim_heartbeat", "reclaim_max_ho
 #: holds a grant, keeps its row and its ``reclaimed`` map regardless.
 _RECLAIM_ONLY_ROW_MAX_AGE_SEC: int = 24 * 60 * 60
 
+#: The states a write grant holds a pair in. ``/status``'s ``reclaimed`` map
+#: never lists a pair in one of them (#195): a write grant clears the slot.
+_WRITE_HELD_STATES: frozenset[MESIState] = frozenset({MESIState.EXCLUSIVE, MESIState.MODIFIED})
+
 MAX_POLICY_PATHS_PER_REQUEST = 20
 """Cap on the number of paths /policy/track and /policy/untrack accept
 in one request body (security-lens P1)."""
@@ -6698,9 +6702,13 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # get_artifact + one get_state_map per artifact) with 2 SELECTs total
     # held under one registry lock so the view is consistent. #185: the
     # transfer rows ride the same hold as a third SELECT, so each record's
-    # liveness is judged against the version its entry shows.
-    artifact_by_id, state_by_artifact, transfer_by_artifact = (
-        coordinator.registry.status_snapshot(include_transfers=True)
+    # liveness is judged against the version its entry shows. #195: the
+    # reclaim slots ride the agent-state SELECT itself, so a reclaim cannot
+    # land between the state a row shows and the cause it lists.
+    artifact_by_id, state_by_artifact, transfer_by_artifact, reclaim_by_artifact = (
+        coordinator.registry.status_snapshot(
+            include_transfers=True, include_reclamations=True
+        )
     )
     named_agents = coordinator.agent_names_snapshot()
 
@@ -6756,25 +6764,21 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # #199's writer attribution: it says which session lost which path, and
     # when). A SIBLING map, never folded into ``states``: ``states`` is "what
     # this session holds", and every consumer that reads it (the status CLI,
-    # Arbiter's poller, the corpus) keeps that answer byte-for-byte.
+    # dashboards, the corpus) keeps that answer byte-for-byte.
     #
-    # The slot read is a second registry call, so it is filtered against THIS
-    # snapshot: a path is reported reclaimed only where the snapshot above
-    # also has the pair INVALID. A reclaim that lands between the two reads
-    # therefore shows as the grant it was in the snapshot, never as both a
-    # held state and a reclaim in one row; a re-acquire in between clears the
-    # slot and reads as a release — the only tear left, and the conservative
-    # one. One batched read, not ``get_last_reclamation`` per INVALID pair:
-    # nothing GCs ``agent_states``, so that would be the N+1 PERF-1 removed.
+    # It is history, not current state: the pair's last write grant ended in
+    # a sweep reclaim and it has held none since. A re-read (SHARED) does not
+    # version the edit the reclaim stranded, so the path stays listed beside
+    # that SHARED state; only a new write grant clears the slot. A pair still
+    # write-held is never listed, so a path is never both held for writing
+    # and reclaimed.
     reclaimed_by_agent: dict[UUID, dict[str, dict[str, Any]]] = {}
     if detail == "full":
-        for artifact_id, slots in coordinator.registry.invalid_reclamations().items():
-            meta = artifact_by_id.get(artifact_id)
-            if meta is None:
-                continue
+        for artifact_id, slots in reclaim_by_artifact.items():
+            meta = artifact_by_id[artifact_id]
             snap_states = state_by_artifact[artifact_id]
             for agent_id, (trigger, tick) in slots.items():
-                if snap_states.get(agent_id) != MESIState.INVALID:
+                if snap_states.get(agent_id) in _WRITE_HELD_STATES:
                     continue
                 reclaimed_by_agent.setdefault(agent_id, {})[meta["name"]] = {
                     "trigger": trigger,

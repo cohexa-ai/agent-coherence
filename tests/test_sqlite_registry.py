@@ -23,6 +23,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from ccs.coordinator.retention import RetentionPolicy
+from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import (
     _ARTIFACT_VERSIONS_DDL,
     _DB_FILE_MODE,
@@ -37,7 +38,7 @@ from ccs.coordinator.sqlite_registry import (
 )
 from ccs.core.exceptions import CROSS_RUNTIME_SCHEMA_REASON
 from ccs.core.states import MESIState, TransientState
-from ccs.core.types import Artifact, CasCorruption, ConflictDetail
+from ccs.core.types import Artifact, CasCorruption, ConflictDetail, FetchRequest
 
 
 @pytest.fixture
@@ -2271,6 +2272,77 @@ def test_status_snapshot_scoped_to_no_agents_reads_no_state(db_path: Path) -> No
         artifact_by_id, state_by_artifact = reg.status_snapshot(agent_ids=[])
         assert set(artifact_by_id) == {art.id}
         assert state_by_artifact == {art.id: {}}
+
+
+def _swept_holder(reg: SqliteArtifactRegistry):
+    """A plan.md writer whose stale heartbeat the sweep reclaimed at tick 100."""
+    svc = CoordinatorService(reg)
+    artifact = svc.register_artifact(name="plan.md", content="v1")
+    agent = uuid4()
+    svc.fetch(FetchRequest(artifact_id=artifact.id, requesting_agent_id=agent, requested_at_tick=0))
+    svc.record_heartbeat(agent_id=agent, now_tick=0)
+    assert svc.enforce_stable_grant_timeouts(
+        current_tick=100, heartbeat_timeout_ticks=10, max_hold_ticks=10_000
+    ) == 1
+    return svc, artifact, agent
+
+
+def _reclaim_slots(reg: SqliteArtifactRegistry) -> dict:
+    *_, slots = reg.status_snapshot(include_reclamations=True)
+    return slots
+
+
+def test_status_snapshot_reclaim_slots_last_until_a_write_grant(db_path: Path) -> None:
+    """#195: the slot is history. It stays through a SHARED re-read (the
+    reclaimed edit is still unversioned) and only a new write grant clears it."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        svc, artifact, agent = _swept_holder(reg)
+        cause = {artifact.id: {agent: ("reclaim_heartbeat", 100)}}
+        assert _reclaim_slots(reg) == cause
+
+        # A peer takes the write grant, so the ex-holder's re-read is SHARED.
+        svc.write(agent_id=uuid4(), artifact_id=artifact.id, issued_at_tick=101)
+        svc.fetch(FetchRequest(artifact_id=artifact.id, requesting_agent_id=agent, requested_at_tick=102))
+        assert reg.get_agent_state(artifact.id, agent) == MESIState.SHARED
+        assert _reclaim_slots(reg) == cause
+
+        svc.write(agent_id=agent, artifact_id=artifact.id, issued_at_tick=200)
+        assert _reclaim_slots(reg) == {}
+
+
+def test_status_snapshot_reclaim_slots_name_only_the_reclaimed_pair(db_path: Path) -> None:
+    """A live holder and a voluntary release carry no slot; the pair the sweep
+    pulled does, keyed by artifact then agent."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        svc, plan, stale = _swept_holder(reg)
+        spec = svc.register_artifact(name="spec.md", content="v1")
+        live, released = uuid4(), uuid4()
+        svc.fetch(FetchRequest(artifact_id=spec.id, requesting_agent_id=live, requested_at_tick=100))
+        notes = svc.register_artifact(name="notes.md", content="v1")
+        svc.fetch(FetchRequest(artifact_id=notes.id, requesting_agent_id=released, requested_at_tick=100))
+        svc.invalidate(
+            agent_id=released,
+            artifact_id=notes.id,
+            new_version=notes.version,
+            issuer_agent_id=released,
+            issued_at_tick=101,
+        )
+        assert reg.get_agent_state(notes.id, released) == MESIState.INVALID
+        assert _reclaim_slots(reg) == {plan.id: {stale: ("reclaim_heartbeat", 100)}}
+
+
+def test_status_snapshot_opt_ins_append_in_a_fixed_order(db_path: Path) -> None:
+    """Each opt-in adds one element: the transfer rows first, the reclaim
+    slots last, and the default call keeps its two-element answer."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        _, artifact, agent = _swept_holder(reg)
+        slots = {artifact.id: {agent: ("reclaim_heartbeat", 100)}}
+        assert len(reg.status_snapshot()) == 2
+        assert reg.status_snapshot(include_transfers=True)[2] == {}
+        assert reg.status_snapshot(include_reclamations=True)[2] == slots
+        both = reg.status_snapshot(include_transfers=True, include_reclamations=True)
+        assert len(both) == 4
+        assert both[2] == {} and both[3] == slots
 
 
 def test_status_snapshot_scoped_query_is_index_backed(db_path: Path) -> None:

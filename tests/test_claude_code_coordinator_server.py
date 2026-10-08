@@ -10054,22 +10054,33 @@ def test_metrics_tier_counts_sweep_reclaims_by_trigger(coordinator, client: _Cli
     assert row["reclaimed"] == {"plan.md": {"trigger": "reclaim_max_hold", "tick": now_tick}}
 
 
-def test_reclaimed_path_returns_to_states_on_a_reread_and_clears_on_reacquire(
+def test_a_reclaimed_path_stays_listed_through_a_reread_and_clears_on_reacquire(
     coordinator, client: _Client
 ) -> None:
-    """The slot is the registry's: a SHARED re-read keeps it but moves the
-    path back into ``states`` (never both maps at once); a fresh M/E acquire
-    clears it."""
+    """``reclaimed`` is history: the session's last write grant on the path
+    ended in a reclaim and it has held none since. A re-read does not version
+    the edit the reclaim stranded, so the path stays listed beside its SHARED
+    state, and stays listed with the ORIGINAL tick when a peer invalidates
+    that read. Only a new write grant clears it."""
     sid, peer = _sid("reread-195"), _sid("reread-peer-195")
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
-    _sweep(coordinator, int(time.time()) + 999_999)
+    reclaim_tick = int(time.time()) + 999_999
+    _sweep(coordinator, reclaim_tick)
+    cause = {"plan.md": {"trigger": "reclaim_heartbeat", "tick": reclaim_tick}}
     # A peer read first, so the re-read is granted SHARED rather than E.
     client.post("/hooks/pre-read", {"session_id": peer, "path": "plan.md", "content_hash": _hash("x")})
     client.post("/hooks/pre-read", {"session_id": sid, "path": "plan.md", "content_hash": _hash("x")})
 
     row = _row_for(_operator_status(client), sid)
     assert row["states"] == {"plan.md": "SHARED"}
-    assert row["reclaimed"] == {}
+    assert row["reclaimed"] == cause
+
+    # The peer's write invalidates the re-read; the cause is unchanged.
+    client.post("/hooks/pre-edit", {"session_id": peer, "path": "plan.md"})
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {}
+    assert row["reclaimed"] == cause
+    client.post("/hooks/session-stop", {"session_id": peer})
 
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
     client.post("/hooks/session-stop", {"session_id": sid})
@@ -10219,30 +10230,37 @@ def test_the_sweep_loop_counts_and_logs_a_heartbeat_reclaim(
     assert _row_for(payload, live_sid)["reclaimed"] == {}
 
 
-def test_status_never_reports_a_pair_both_held_and_reclaimed(
-    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+def test_status_reads_the_reclaim_slots_inside_the_snapshot_lock_hold(
+    coordinator, client: _Client
 ) -> None:
-    """The slot read is a second registry call after ``status_snapshot``. A
-    reclaim landing between the two must read as the grant the snapshot saw,
-    never as a held state and a reclaim in one row."""
-    sid = _sid("race-195")
+    """The reclaim slots are read in the ONE registry hold that reads the
+    artifact and agent-state rows. A second read after that hold lets a
+    reclaim land between the two, so one response could show a pulled grant
+    as a clean release."""
+    sid = _sid("hold-195")
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
-    payload = _operator_status(client)
-    [artifact] = [a for a in payload["tracked_artifacts"] if a["path"] == "plan.md"]
-    agent_id = session_to_agent_id(sid)
+    reclaim_tick = int(time.time()) + 999_999
+    _sweep(coordinator, reclaim_tick)
 
-    monkeypatch.setattr(
-        coordinator.registry,
-        "invalid_reclamations",
-        lambda: {uuid.UUID(artifact["id"]): {agent_id: ("reclaim_heartbeat", int(time.time()))}},
+    status, body, holds, unheld = _status_registry_holds(
+        coordinator,
+        client,
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
     )
-    row = _row_for(_operator_status(client), sid)
-    assert row["states"] == {"plan.md": "EXCLUSIVE"}
-    assert row["reclaimed"] == {}
+    assert status == 200
+    assert _row_for(body, sid)["reclaimed"] == {
+        "plan.md": {"trigger": "reclaim_heartbeat", "tick": reclaim_tick}
+    }
+    assert not [sql for sql in unheld if "last_reclaim" in sql]
+    reclaim_holds = [hold for hold in holds if any("last_reclaim" in sql for sql in hold)]
+    assert len(reclaim_holds) == 1, reclaim_holds
+    [hold] = reclaim_holds
+    assert any("FROM artifacts" in sql for sql in hold), hold
 
 
 def test_status_drops_an_unnamed_reclaim_only_row_once_the_reclaim_is_old(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A dead session's slot never clears (it never acquires again), so the
     unnamed reclaim-only row is bounded by the reclaim's age: a crashed
@@ -10250,14 +10268,19 @@ def test_status_drops_an_unnamed_reclaim_only_row_once_the_reclaim_is_old(
     from ccs.adapters.claude_code import coordinator_server as cs
 
     sid = _sid("stale-195")
+    reclaim_tick = int(time.time()) - cs._RECLAIM_ONLY_ROW_MAX_AGE_SEC - 60
     first = _restart_on(tmp_path, "stale-before")
     try:
         secret = load_secret(first.coordinator_root)
         assert secret is not None
+        # The grant was taken, and last heartbeated, before the reclaim.
+        real_clock = cs.monotonic_seconds
+        monkeypatch.setattr(cs, "monotonic_seconds", lambda: reclaim_tick - 1_000)
         _Client("127.0.0.1", first.port, secret).post(
             "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"}
         )
-        assert _sweep(first, int(time.time()) + 999_999) == 1
+        monkeypatch.setattr(cs, "monotonic_seconds", real_clock)
+        assert _sweep(first, reclaim_tick) == 1
     finally:
         first.shutdown()
 
@@ -10265,18 +10288,7 @@ def test_status_drops_an_unnamed_reclaim_only_row_once_the_reclaim_is_old(
     try:
         secret = load_secret(second.coordinator_root)
         assert secret is not None
-        client = _Client("127.0.0.1", second.port, secret)
-        real = second.registry.invalid_reclamations
-        old_tick = int(time.time()) - cs._RECLAIM_ONLY_ROW_MAX_AGE_SEC - 60
-
-        def _aged() -> dict:
-            return {
-                artifact_id: {agent: (trigger, old_tick) for agent, (trigger, _) in slots.items()}
-                for artifact_id, slots in real().items()
-            }
-
-        second.registry.invalid_reclamations = _aged
-        payload = _operator_status(client)
+        payload = _operator_status(_Client("127.0.0.1", second.port, secret))
     finally:
         second.shutdown()
 
@@ -12000,18 +12012,13 @@ def test_status_operator_tier_without_its_header_is_refused_unchanged_with_a_liv
     })
 
 
-def test_status_reads_the_transfer_rows_inside_the_snapshot_lock_hold(
-    coordinator, client: _Client
-) -> None:
-    """The transfer rows are read inside the ONE registry hold that reads
-    the artifact and agent-state rows. A per-artifact read outside that hold
-    lets a concurrent version move land between the two, so an entry would
-    pair one version with a liveness judged against another -- the one-lock
-    rule reopened at the status site."""
+def _status_registry_holds(
+    coordinator, client: _Client, route: str, **request_kw: Any
+) -> tuple[int, Any, list[list[str]], list[str]]:
+    """GET ``route`` with every registry statement recorded, grouped by the
+    outermost lock hold it ran in (``unheld`` collects the rest)."""
     from tests.test_registry_lock_coverage import _TrackingRLock
 
-    giver, successor = _claimed(client), _claimed(client)
-    _hand_off(client, giver, successor, "plan.md")
     registry = coordinator.registry
     tracker = _TrackingRLock()
     real_lock, real_conn = registry._lock, registry._conn
@@ -12028,11 +12035,9 @@ def test_status_reads_the_transfer_rows_inside_the_snapshot_lock_hold(
 
     registry._lock, registry._conn = tracker, _RecordingConnection()
     try:
-        status, body = client.get("/status")
+        status, body = client.get(route, **request_kw)
     finally:
         registry._lock, registry._conn = real_lock, real_conn
-    assert status == 200
-    assert _status_entry(body, "plan.md")["handoff"] == _status_handoff(giver, successor)
 
     holds: list[list[str]] = []
     unheld: list[str] = []
@@ -12048,6 +12053,22 @@ def test_status_reads_the_transfer_rows_inside_the_snapshot_lock_hold(
             unheld.append(event)
         else:
             holds[-1].append(event)
+    return status, body, holds, unheld
+
+
+def test_status_reads_the_transfer_rows_inside_the_snapshot_lock_hold(
+    coordinator, client: _Client
+) -> None:
+    """The transfer rows are read inside the ONE registry hold that reads
+    the artifact and agent-state rows. A per-artifact read outside that hold
+    lets a concurrent version move land between the two, so an entry would
+    pair one version with a liveness judged against another -- the one-lock
+    rule reopened at the status site."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    status, body, holds, unheld = _status_registry_holds(coordinator, client, "/status")
+    assert status == 200
+    assert _status_entry(body, "plan.md")["handoff"] == _status_handoff(giver, successor)
     assert not [sql for sql in unheld if "transfer_records" in sql]
     transfer_holds = [hold for hold in holds if any("transfer_records" in sql for sql in hold)]
     assert len(transfer_holds) == 1, transfer_holds

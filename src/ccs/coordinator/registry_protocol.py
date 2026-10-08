@@ -479,6 +479,21 @@ def transfer_record_live(record: TransferRecord, current_version: int) -> bool:
     )
 
 
+#: What ``SqliteExtended.status_snapshot`` answers: the artifact rows and the
+#: per-artifact state maps, then one element per keyword opt-in it was asked
+#: for, in a fixed order -- the transfer rows (#185), then the reclaim slots
+#: (#195).
+StatusSnapshot: TypeAlias = (
+    "tuple[dict[UUID, dict[str, Any]], dict[UUID, dict[UUID, MESIState]]]"
+    " | tuple[dict[UUID, dict[str, Any]], dict[UUID, dict[UUID, MESIState]],"
+    " dict[UUID, tuple[TransferRecord, bool]]]"
+    " | tuple[dict[UUID, dict[str, Any]], dict[UUID, dict[UUID, MESIState]],"
+    " dict[UUID, dict[UUID, ReclamationSlot]]]"
+    " | tuple[dict[UUID, dict[str, Any]], dict[UUID, dict[UUID, MESIState]],"
+    " dict[UUID, tuple[TransferRecord, bool]], dict[UUID, dict[UUID, ReclamationSlot]]]"
+)
+
+
 @dataclass(frozen=True, kw_only=True)
 class TransferPathView:
     """What one path looks like to the composite transfer, read by a registry
@@ -892,24 +907,6 @@ class RegistryBase(Protocol):
     ) -> ReclamationSlot | None:
         ...
 
-    def invalid_reclamations(self) -> dict[UUID, dict[UUID, ReclamationSlot]]:
-        """Return ``{artifact_id: {agent_id: (trigger, tick)}}`` for every pair
-        that is INVALID right now AND carries a recorded reclamation slot (#195).
-
-        One batched read for ``/status``, so the reclaim cause is observable by
-        a process other than the reclaimed session without a per-pair
-        ``get_last_reclamation`` call (the PERF-1 N+1 ``status_snapshot``
-        removed). The slot is cleared only when the pair next acquires M/E, so
-        what it states is "this pair's most recent WRITE grant ended in a sweep
-        reclaim, and it has held none since". A pair that re-read to SHARED
-        keeps the slot (the checkpoint-restore diagnostic) but is not INVALID,
-        so it is excluded while SHARED; if a peer later invalidates that read,
-        the pair is INVALID again and reported with the ORIGINAL reclaim's
-        trigger and tick -- still true of its last write grant, though the most
-        recent exit was the peer's. Artifacts with no qualifying pair are
-        absent. Non-mutating."""
-        ...
-
     def get_owner_generation(self, artifact_id: UUID) -> int:
         ...
 
@@ -1256,24 +1253,23 @@ class SqliteExtended(RegistryBase, Protocol):
         *,
         agent_ids: Iterable[UUID] | None = None,
         include_transfers: bool = False,
-    ) -> (
-        tuple[
-            dict[UUID, dict[str, Any]],
-            dict[UUID, dict[UUID, MESIState]],
-        ]
-        | tuple[
-            dict[UUID, dict[str, Any]],
-            dict[UUID, dict[UUID, MESIState]],
-            dict[UUID, tuple[TransferRecord, bool]],
-        ]
-    ):
+        include_reclamations: bool = False,
+    ) -> StatusSnapshot:
         """The artifact rows and the per-artifact state maps, read under ONE
         lock hold; ``agent_ids`` scopes the state half to the named agents.
 
-        ``include_transfers`` (keyword-only, off by default) adds a third
-        element, ``{artifact_id: (record, live)}`` for every artifact that has
-        a transfer record, read inside the same hold and judged by the same
-        liveness helper :meth:`RegistryBase.get_transfer_record` uses,
-        so ``/status`` renders each record beside the version it was judged
-        against. Without it the answer is the two-element tuple, unchanged."""
+        ``include_transfers`` (keyword-only, off by default) adds an element,
+        ``{artifact_id: (record, live)}`` for every artifact that has a
+        transfer record, read inside the same hold and judged by the same
+        liveness helper :meth:`RegistryBase.get_transfer_record` uses, so
+        ``/status`` renders each record beside the version it was judged
+        against.
+
+        ``include_reclamations`` (keyword-only, off by default; #195) adds a
+        last element, ``{artifact_id: {agent_id: (trigger, tick)}}`` for every
+        pair that carries a reclaim slot, whatever its state, read from the
+        same agent-state rows as the state maps. The slot is cleared only when
+        the pair next acquires a write grant, so it says "this pair's last
+        write grant ended in a sweep reclaim and it has held none since".
+        Without either opt-in the answer is the two-element tuple, unchanged."""
         ...

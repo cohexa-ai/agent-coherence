@@ -139,6 +139,7 @@ from .registry_protocol import (
     CheckpointRecord,
     DetectionRun,
     ReclamationSlot,
+    StatusSnapshot,
     TransferDecision,
     TransferPathView,
     TransferRecord,
@@ -3643,17 +3644,8 @@ class SqliteArtifactRegistry:
         *,
         agent_ids: Iterable[UUID] | None = None,
         include_transfers: bool = False,
-    ) -> (
-        tuple[
-            dict[UUID, dict[str, Any]],
-            dict[UUID, dict[UUID, MESIState]],
-        ]
-        | tuple[
-            dict[UUID, dict[str, Any]],
-            dict[UUID, dict[UUID, MESIState]],
-            dict[UUID, tuple[TransferRecord, bool]],
-        ]
-    ):
+        include_reclamations: bool = False,
+    ) -> StatusSnapshot:
         """PERF-1 single-query batch for /status. Returns:
 
         - ``artifact_by_id``: ``{artifact_id: {"name", "version",
@@ -3722,16 +3714,28 @@ class SqliteArtifactRegistry:
         call on an artifact-heavy workspace stays O(all artifacts) however
         small the session is.
 
-        ``include_transfers`` (#185) adds a THIRD element,
+        ``include_transfers`` (#185) adds an element,
         ``{artifact_id: (TransferRecord, live)}`` for every artifact that has
         a transfer record, read by a third query inside the same lock hold and
         judged by the one liveness helper, so each record's liveness matches
         the version its artifact row reports. Off by default: the default call
         answers the two-element tuple, and the session-start builder, which
         renders no record, never pays for the read. Only ``/status`` opts in.
+
+        ``include_reclamations`` (#195) adds a last element,
+        ``{artifact_id: {agent_id: (trigger, tick)}}`` for every pair carrying
+        a reclaim slot. The slot columns ride the agent-state SELECT itself,
+        so each pair's slot and state come from the same row and no second
+        read lets a reclaim land between them. Off by default, like the
+        transfer rows; only ``/status`` opts in.
         """
         artifact_by_id: dict[UUID, dict[str, Any]] = {}
         state_by_artifact: dict[UUID, dict[UUID, MESIState]] = {}
+        reclaim_by_artifact: dict[UUID, dict[UUID, ReclamationSlot]] = {}
+        extras: list[Any] = []
+        columns = "artifact_id, agent_id, state"
+        if include_reclamations:
+            columns += ", last_reclaim_trigger, last_reclaim_tick"
         scoped_hexes = None if agent_ids is None else [a.hex for a in agent_ids]
         with self._lock:
             for row in self._conn.execute(
@@ -3747,12 +3751,12 @@ class SqliteArtifactRegistry:
                 state_by_artifact[aid] = {}
             if scoped_hexes is None:
                 state_rows = self._conn.execute(
-                    "SELECT artifact_id, agent_id, state FROM agent_states"
+                    f"SELECT {columns} FROM agent_states"
                 ).fetchall()
             elif scoped_hexes:
                 placeholders = ", ".join("?" * len(scoped_hexes))
                 state_rows = self._conn.execute(
-                    "SELECT artifact_id, agent_id, state FROM agent_states "
+                    f"SELECT {columns} FROM agent_states "
                     f"WHERE agent_id IN ({placeholders})",
                     scoped_hexes,
                 ).fetchall()
@@ -3766,16 +3770,19 @@ class SqliteArtifactRegistry:
                 if aid not in state_by_artifact:
                     continue
                 state_by_artifact[aid][gid] = MESIState[row[2]]
-            if not include_transfers:
-                return artifact_by_id, state_by_artifact
-            transfer_by_artifact = {
-                record.artifact_id: (record, live)
-                for record, live in map(
-                    self._transfer_read_from_row,
-                    self._conn.execute(_TRANSFER_READ_ALL_SQL).fetchall(),
-                )
-            }
-        return artifact_by_id, state_by_artifact, transfer_by_artifact
+                if include_reclamations and row[3] is not None:
+                    reclaim_by_artifact.setdefault(aid, {})[gid] = (row[3], row[4])
+            if include_transfers:
+                extras.append({
+                    record.artifact_id: (record, live)
+                    for record, live in map(
+                        self._transfer_read_from_row,
+                        self._conn.execute(_TRANSFER_READ_ALL_SQL).fetchall(),
+                    )
+                })
+        if include_reclamations:
+            extras.append(reclaim_by_artifact)
+        return (artifact_by_id, state_by_artifact, *extras)
 
     def get_agent_state(self, artifact_id: UUID, agent_id: UUID) -> MESIState | None:
         """Return MESI state for one agent/artifact pair if present."""
@@ -4176,26 +4183,6 @@ class SqliteArtifactRegistry:
         if row is None or row[0] is None:
             return None
         return (row[0], row[1])
-
-    def invalid_reclamations(self) -> dict[UUID, dict[UUID, ReclamationSlot]]:
-        """Reclamation slots of the pairs that are INVALID right now (#195).
-
-        See the Protocol docstring. One SELECT, so the state predicate and the
-        slot are read from the same row; a slot whose artifact row is gone is
-        dropped the same way ``status_snapshot`` drops orphans (the join)."""
-        out: dict[UUID, dict[UUID, ReclamationSlot]] = {}
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT s.artifact_id, s.agent_id, s.last_reclaim_trigger, s.last_reclaim_tick
-                FROM agent_states AS s JOIN artifacts AS a ON a.id = s.artifact_id
-                WHERE s.state = ? AND s.last_reclaim_trigger IS NOT NULL
-                """,
-                (MESIState.INVALID.name,),
-            ).fetchall()
-        for artifact_hex, agent_hex, trigger, tick in rows:
-            out.setdefault(UUID(hex=artifact_hex), {})[UUID(hex=agent_hex)] = (trigger, tick)
-        return out
 
     def granted_at_tick(self, agent_id: UUID, artifact_id: UUID) -> int | None:
         """Return the tick at which agent acquired its current M/E grant on artifact, if any."""
