@@ -49,6 +49,7 @@ from ccs.cli._coherence_client import (
     resolve_endpoint,
 )
 from ccs.core.exceptions import RedirectRefused
+from ccs.core.states import MESIState
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -423,6 +424,10 @@ def _elide_middle(text: str, max_len: int) -> str:
     return f"{text[:head]}…{text[-(keep - head):]}"
 
 
+#: The widest MESI state name; a per-session line sizes its path column for it.
+_STATE_NAME_W = max(len(state.name) for state in MESIState)
+
+
 def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None:
     """Manual column alignment — stdlib only, no rich/tabulate."""
     tracked = payload.get("tracked_artifacts", [])
@@ -529,14 +534,27 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
                 "(name unknown — redacted below the operator tier, "
                 "or a grant predating this coordinator)"
             )
-            per_artifact = s.get("states", {})
+            per_artifact = dict(s.get("states", {}))
+            # #195: the operator tier names the paths this session lost to the
+            # coordinator sweep. They are not held grants, so they render in
+            # the same column under their own label rather than as a state. A
+            # reclaimed path the session has re-read is held SHARED as well,
+            # so its line keeps that state ahead of the reclaim label.
+            for path, cause in (s.get("reclaimed") or {}).items():
+                label = (
+                    f"reclaimed ({cause.get('trigger', '?')} at tick {cause.get('tick', '?')})"
+                )
+                held = per_artifact.get(path)
+                per_artifact[path] = f"{held}; {label}" if held else label
             print(f"  {sid[:8]}  {name}")
             if not per_artifact:
                 print("    (no held grants)")
                 continue
             # Same elision as the artifacts table so a long held path can't
-            # push the MESI state column off-screen onto a wrapped line.
-            state_w = max(len(s) for s in per_artifact.values())
+            # push the MESI state column off-screen onto a wrapped line. The
+            # column is sized for a state name only: a reclaim label runs past
+            # the line's end rather than eliding every path in the session.
+            state_w = min(max(len(s) for s in per_artifact.values()), _STATE_NAME_W)
             chrome = 4 + 2 + state_w + 1
             max_path_w = max(1, _terminal_columns() - chrome)
             path_w = min(max(len(p) for p in per_artifact), max_path_w)
@@ -609,6 +627,7 @@ def _render_counter_block(payload: dict[str, Any]) -> None:
             "watchdog_queue_overflows_total",
             "handler_concurrency_overflows_total",
             "cold_start_duration_ms",
+            "sweep_reclaims_total",
         ) if k in payload
     ]
     if not has_endpoint_counters and not keys_present:

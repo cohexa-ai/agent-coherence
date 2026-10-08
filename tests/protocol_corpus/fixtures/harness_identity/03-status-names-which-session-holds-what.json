@@ -1,6 +1,6 @@
 {
   "name": "harness-status-names-which-session-holds-what",
-  "description": "R15, DISTINGUISH HALF, over a UUID-SHAPED identity. Session A takes SHARED on docs/plan.md and peer session B takes EXCLUSIVE on docs/spec.md; GET /status then reports one row per agent, and the content of this fixture is WHICH agent holds WHICH artifact. `sessions[].agent_id` is the hyphenated 8-4-4-4-12 form (`str(session_to_agent_id(...))`), so it is hit by BOTH default scrubs -- the `_UUID_KEYS` name rule and the string-position `_UUID_RE` -- and without `preserve_identity` both rows collapse to `<UUID>`, leaving a body that reads as an attribution and cannot tell A-holds-plan from the swap. That is the difference from fixture 02, whose writer field is 32-char hex that the 8-4-4-4-12 regex never matched: 02 would pass identically with the opt-in deleted, so the opt-in was shipped unexercised. This fixture is what observes it, and `test_status_identity_fixture_distinguishes_which_session_holds_what` is where the swap is pinned. `agent_name` is null on purpose and is not noise: R6 moved the name behind the operator tier because it renders the raw session id, so the non-reversible `agent_id` is the only identity this tier carries -- which is exactly why it has to be compared verbatim. policy_summary carries the absolute workspace root and coordinator_version tracks the package version, so both are ignored for the same reasons fixture warn_mode/08 ignores them.",
+  "description": "R15, DISTINGUISH HALF, over a UUID-SHAPED identity. Session A takes SHARED on docs/plan.md and peer session B takes EXCLUSIVE on docs/spec.md; GET /status then reports one row per agent, and the content of this fixture is WHICH agent holds WHICH artifact. `sessions[].agent_id` is the hyphenated 8-4-4-4-12 form (`str(session_to_agent_id(...))`), so it is hit by BOTH default scrubs -- the `_UUID_KEYS` name rule and the string-position `_UUID_RE` -- and without `preserve_identity` both rows collapse to `<UUID>`, leaving a body that reads as an attribution and cannot tell A-holds-plan from the swap. That is the difference from fixture 02, whose writer field is 32-char hex that the 8-4-4-4-12 regex never matched: 02 would pass identically with the opt-in deleted, so the opt-in was shipped unexercised. This fixture is what observes it, and `test_status_identity_fixture_distinguishes_which_session_holds_what` is where the swap is pinned. `agent_name` is null on purpose and is not noise: R6 moved the name behind the operator tier because it renders the raw session id, so the non-reversible `agent_id` is the only identity this tier carries -- which is exactly why it has to be compared verbatim. policy_summary carries the absolute workspace root and coordinator_version tracks the package version, so both are ignored for the same reasons fixture warn_mode/08 ignores them. The sweep reclaim counters read zero: nothing was reclaimed.",
   "setup": {
     "tracked": ["docs/**"],
     "files": {
@@ -92,6 +92,11 @@
       "stale_warning_reread_total": 0,
       "strict_mode_denials_total": 0,
       "strict_mode_routed_around_via_bash_total": 0,
+      "sweep_reclaims_by_trigger": {
+        "reclaim_heartbeat": 0,
+        "reclaim_max_hold": 0
+      },
+      "sweep_reclaims_total": 0,
       "tracked_artifacts": [
         {
           "id": "<UUID>",

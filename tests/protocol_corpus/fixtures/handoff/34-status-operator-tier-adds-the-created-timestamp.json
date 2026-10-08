@@ -1,6 +1,6 @@
 {
   "name": "handoff-status-operator-tier-adds-the-created-timestamp",
-  "description": "GET /status?detail=full with the operator header: the same handoff key plus the record's created_at_unix_ts. That wall-clock value is in the harness's timestamp scrub set, so this row pins the key's PRESENCE, not its value. Nothing has committed, so the last-writer fields are null. coordinator_root is the absolute workspace path at this tier and is ignored with policy_summary and coordinator_version.",
+  "description": "GET /status?detail=full with the operator header: the same handoff key plus the record's created_at_unix_ts. That wall-clock value is in the harness's timestamp scrub set, so this row pins the key's PRESENCE, not its value. Nothing has committed, so the last-writer fields are null. coordinator_root is the absolute workspace path at this tier and is ignored with policy_summary and coordinator_version. A's session row carries an empty `reclaimed` map and the sweep reclaim counters read zero: a handoff is not a reclaim.",
   "setup": {
     "tracked": [
       "plan.md"
@@ -112,6 +112,7 @@
         {
           "agent_id": "09f031b6-cb23-50a2-b7a8-b405ed3810f4",
           "agent_name": "claude-session-<UUID>",
+          "reclaimed": {},
           "states": {}
         }
       ],
@@ -120,6 +121,11 @@
       "stale_warning_reread_total": 0,
       "strict_mode_denials_total": 0,
       "strict_mode_routed_around_via_bash_total": 0,
+      "sweep_reclaims_by_trigger": {
+        "reclaim_heartbeat": 0,
+        "reclaim_max_hold": 0
+      },
+      "sweep_reclaims_total": 0,
       "tracked_artifacts": [
         {
           "path": "plan.md",

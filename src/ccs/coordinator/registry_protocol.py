@@ -479,6 +479,19 @@ def transfer_record_live(record: TransferRecord, current_version: int) -> bool:
     )
 
 
+#: What ``SqliteExtended.status_snapshot`` answers: the artifact rows and the
+#: per-artifact state maps, then the transfer rows (#185) at ``[2]`` and the
+#: reclaim slots (#195) at ``[3]``. Each keeps its index whatever else was
+#: asked for: a call for the reclaim slots alone answers an empty ``[2]``.
+StatusSnapshot: TypeAlias = (
+    "tuple[dict[UUID, dict[str, Any]], dict[UUID, dict[UUID, MESIState]]]"
+    " | tuple[dict[UUID, dict[str, Any]], dict[UUID, dict[UUID, MESIState]],"
+    " dict[UUID, tuple[TransferRecord, bool]]]"
+    " | tuple[dict[UUID, dict[str, Any]], dict[UUID, dict[UUID, MESIState]],"
+    " dict[UUID, tuple[TransferRecord, bool]], dict[UUID, dict[UUID, ReclamationSlot]]]"
+)
+
+
 @dataclass(frozen=True, kw_only=True)
 class TransferPathView:
     """What one path looks like to the composite transfer, read by a registry
@@ -1238,24 +1251,25 @@ class SqliteExtended(RegistryBase, Protocol):
         *,
         agent_ids: Iterable[UUID] | None = None,
         include_transfers: bool = False,
-    ) -> (
-        tuple[
-            dict[UUID, dict[str, Any]],
-            dict[UUID, dict[UUID, MESIState]],
-        ]
-        | tuple[
-            dict[UUID, dict[str, Any]],
-            dict[UUID, dict[UUID, MESIState]],
-            dict[UUID, tuple[TransferRecord, bool]],
-        ]
-    ):
+        include_reclamations: bool = False,
+    ) -> StatusSnapshot:
         """The artifact rows and the per-artifact state maps, read under ONE
         lock hold; ``agent_ids`` scopes the state half to the named agents.
 
-        ``include_transfers`` (keyword-only, off by default) adds a third
-        element, ``{artifact_id: (record, live)}`` for every artifact that has
-        a transfer record, read inside the same hold and judged by the same
-        liveness helper :meth:`RegistryBase.get_transfer_record` uses,
-        so ``/status`` renders each record beside the version it was judged
-        against. Without it the answer is the two-element tuple, unchanged."""
+        ``include_transfers`` (keyword-only, off by default) fills element
+        ``[2]``, ``{artifact_id: (record, live)}`` for every artifact that has a
+        transfer record, read inside the same hold and judged by the same
+        liveness helper :meth:`RegistryBase.get_transfer_record` uses, so
+        ``/status`` renders each record beside the version it was judged
+        against.
+
+        ``include_reclamations`` (keyword-only, off by default; #195) fills
+        element ``[3]``, ``{artifact_id: {agent_id: (trigger, tick)}}`` for
+        every pair that carries a reclaim slot, whatever its state, read from
+        the same agent-state rows as the state maps; without
+        ``include_transfers``, ``[2]`` is an empty dict, so neither element's
+        index depends on the other flag. The slot is cleared only when the
+        pair next acquires a write grant, so it says "this pair's last write
+        grant ended in a sweep reclaim and it has held none since". Without
+        either opt-in the answer is the two-element tuple, unchanged."""
         ...

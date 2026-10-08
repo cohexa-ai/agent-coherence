@@ -13,7 +13,7 @@ import pytest
 
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.service import CoordinatorService
-from ccs.core.exceptions import CoherenceError
+from ccs.core.exceptions import CoherenceError, InvariantViolationError
 from ccs.core.invariants import check_monotonic_version, check_single_writer
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import FetchRequest
@@ -50,6 +50,36 @@ def test_heartbeat_stale_exclusive_is_reclaimed() -> None:
     assert last_entry["trigger"] == "reclaim_heartbeat"
     assert last_entry["content_hash"] is None
     assert last_entry["to_state"] == "INVALID"
+
+
+def test_reclaim_callback_fires_before_a_failing_single_writer_check() -> None:
+    """The reclaim is in the registry before the post-write single-writer
+    check runs, so a check that raises must not cost a direct caller the
+    ``on_reclaim`` callback for that reclaim, and the error must still reach
+    that caller."""
+    registry = ArtifactRegistry()
+    svc = CoordinatorService(registry)
+    artifact = svc.register_artifact(name="plan.md", content="v1")
+    stale, writer_b, writer_c = uuid4(), uuid4(), uuid4()
+    svc.fetch(FetchRequest(artifact_id=artifact.id, requesting_agent_id=stale, requested_at_tick=1))
+    svc.record_heartbeat(agent_id=stale, now_tick=1)
+    # Two more live writers on the same artifact: the state the check exists
+    # to catch, so it raises once the stale grant is gone.
+    for writer in (writer_b, writer_c):
+        registry.set_agent_state(artifact.id, writer, MESIState.EXCLUSIVE, trigger="test", tick=19)
+        svc.record_heartbeat(agent_id=writer, now_tick=20)
+    delivered: list[tuple] = []
+
+    with pytest.raises(InvariantViolationError, match="single_writer_violated"):
+        svc.enforce_stable_grant_timeouts(
+            current_tick=20,
+            heartbeat_timeout_ticks=10,
+            max_hold_ticks=1000,
+            on_reclaim=lambda *reclaim: delivered.append(reclaim),
+        )
+
+    assert delivered == [(artifact.id, stale, "reclaim_heartbeat")]
+    assert registry.get_agent_state(artifact.id, stale) == MESIState.INVALID
 
 
 def test_max_hold_modified_is_reclaimed_with_fresh_heartbeat() -> None:

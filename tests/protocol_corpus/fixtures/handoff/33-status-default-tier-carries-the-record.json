@@ -1,6 +1,6 @@
 {
   "name": "handoff-status-default-tier-carries-the-record",
-  "description": "GET /status (default tier) while A's handoff of plan.md to B is live: the path's tracked_artifacts entry carries the handoff key with session-level agent ids, no role and no timestamp. A's own row is empty: its read went INVALID with the transfer. policy_summary and coordinator_version are ignored for the reasons warn_mode/08 gives.",
+  "description": "GET /status (default tier) while A's handoff of plan.md to B is live: the path's tracked_artifacts entry carries the handoff key with session-level agent ids, no role and no timestamp. A's own row is empty: its read went INVALID with the transfer. policy_summary and coordinator_version are ignored for the reasons warn_mode/08 gives. The sweep reclaim counters read zero: a handoff is not a reclaim.",
   "setup": {
     "tracked": [
       "plan.md"
@@ -117,6 +117,11 @@
       "stale_warning_reread_total": 0,
       "strict_mode_denials_total": 0,
       "strict_mode_routed_around_via_bash_total": 0,
+      "sweep_reclaims_by_trigger": {
+        "reclaim_heartbeat": 0,
+        "reclaim_max_hold": 0
+      },
+      "sweep_reclaims_total": 0,
       "tracked_artifacts": [
         {
           "path": "plan.md",

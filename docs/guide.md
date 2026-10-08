@@ -505,6 +505,92 @@ reclaims, with structured `extra` fields `trigger`, `agent_id_short`,
 instance are silent; a companion `DEBUG` log carries the full UUIDs. Bind a
 handler to `ccs.adapters.base` to surface or ingest these events.
 
+The coordinator behind `/status` logs one line per reclaim, at `WARNING` on the
+`ccs.adapters.claude_code.lifecycle` logger:
+`sweep reclaimed grant: trigger=… tick=… agent_id=… artifact=…`. It names the
+agent id, never the session id. A coordinator started in the background (the
+detached `agent-coherence-coordinator` process) sends its stderr to
+`/dev/null`, so there the line is lost; read the reclaim from `/status`
+instead (see [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status)).
+
+### Reading a sweep reclaim from `/status`
+
+This applies to the Python coordinator. The Claude Code plugin's Node
+coordinator runs no grant sweep, so it has nothing to report.
+
+When the sweep takes a write grant back, the holder drops out of `states`
+exactly as it would after a release. Two things let anyone other than that
+holder tell the two apart:
+
+- **The operator view.** `GET /status?detail=full`, sent with the
+  `Coherence-Local-Operator: true` header, gives each `sessions[]` row a
+  `reclaimed` map beside `states`:
+
+  ```json
+  {
+    "agent_name": "claude-session-<id>",
+    "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
+    "states": {},
+    "reclaimed": {"plan.md": {"trigger": "reclaim_heartbeat", "tick": 1789558656}}
+  }
+  ```
+
+  `trigger` is `reclaim_heartbeat` (no coordinator call for
+  `grant_heartbeat_timeout_sec`) or `reclaim_max_hold` (held past
+  `grant_max_hold_sec`), and `tick` is the reclaim's wall-clock time in
+  seconds.
+- **The counters.** Every view, the default one and `?detail=metrics`
+  included, carries `sweep_reclaims_total` and `sweep_reclaims_by_trigger`.
+  They name no session or path: a count that rose tells you the sweep pulled
+  something, and one operator-view read tells you what.
+
+An entry means the holder's last write grant on the path ended in a reclaim
+and it has taken none since. Its edit may be on disk with no version recording
+it, so do not hand the path to another session on the strength of an empty
+`states` alone. The entry stays listed:
+
+- while the holder re-reads the path and is granted `SHARED` because another
+  session holds it too, since a read does not version the edit;
+- after a peer writes or commits the path, after the holder itself commits by
+  compare-and-swap (that leaves it `SHARED`), and after the holder's session
+  ends.
+
+It clears when that holder next takes the path `EXCLUSIVE` or `MODIFIED`: a
+pre-edit, or a re-read while no other session holds the path, because the
+coordinator grants a sole reader `EXCLUSIVE`. From then on `states` shows the
+holder holding the path, so it does not read as released. The map
+tells you a reclaim happened; whether its edit has been dealt with since is
+yours to decide. One clue: if the path's `last_writer_at_unix_ts` in the same
+response is later than the entry's `tick`, someone has committed the path since
+the reclaim.
+
+Limits:
+
+- The counters and session names live in the coordinator process. A restart,
+  including the coordinator's own exit after 15 idle minutes
+  (`idle_shutdown_sec`), sets the counters back to zero and forgets the names.
+  The reclaim itself is kept, so after a restart the holder still gets a row,
+  with a null `agent_name`, until 24 hours after its newest reclaim. Then the
+  row is dropped.
+- A zero count does not prove the sweep is running: it reads the same when
+  there was nothing to reclaim.
+- Only the grant sweep's two triggers are recorded. A holder the coordinator
+  invalidates because it sat mid-transition past `transient_timeout_sec` gets
+  no `reclaimed` entry and no count.
+- The Python console script `agent-coherence-status` asks for the operator view
+  by default and prints each reclaimed path under its session, after the held
+  state when the session has re-read it:
+
+  ```text
+  Sessions:
+    4c9625da  claude-session-<id>
+      plan.md  SHARED; reclaimed (reclaim_heartbeat at tick 1789558656)
+  ```
+
+  The Claude Code plugin's status command cannot send the operator header, so
+  it shows the counters but never the `reclaimed` map. Use the Python console
+  script, or request `GET /status?detail=full` with the header yourself.
+
 ### Reference
 
 For the formal protocol model (TLA+/TLC) covering single-writer, monotonic
@@ -730,7 +816,8 @@ neither does a `session-stop` that names only `vol.session_id`, because each
 attempt holds its grants under its own `agent_id`. The coordinator
 takes the file back once the holder has made no coordinator calls for
 `grant_heartbeat_timeout_sec` (600 s by default), or has held it for
-`grant_max_hold_sec` (1800 s by default).
+`grant_max_hold_sec` (1800 s by default). The operator view of `/status` then
+lists the file under that holder's `reclaimed` map (see [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status)).
 Both are `LifecycleConfig` fields, passed as `config` to the volume that starts
 the coordinator. A Claude Code session releases what it holds when its turn ends.
 So after `other_holder`, retry once the holder has released, not in a tight loop,
@@ -3423,6 +3510,7 @@ All bundled CLIs are installed as console scripts when you
 | `ccs-compare` | — | Compare two or more strategies on the same scenario |
 | `ccs-check-architecture` | — | Verify the four-layer architecture boundary (also runs in CI) |
 | `agent-coherence-replay` | `[langgraph]` | Replay a captured coordinator session and report invariant breaches |
+| `agent-coherence-status` | — | Print the coordinator's tracked paths, sessions, handoffs, sweep reclaims and counters; see [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status) |
 | `agent-coherence-workspace` | — | Checkpoint / list / status / restore a workspace of file and forward-only members; see [Workspace versioning & restore](#workspace-versioning--restore-workspaceversioner) |
 | `agent-coherence-transfer`, `agent-coherence-accept`, `agent-coherence-decline`, `agent-coherence-withdraw` | — | Hand a path from one Claude Code session to another, and accept, decline or withdraw the handoff; see [Handoff commands](#handoff-commands) |
 

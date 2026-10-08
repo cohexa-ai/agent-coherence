@@ -221,7 +221,8 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "follow-on AFTER the M/E->INVALID reclaim, NOT one atomic RMW with it "
         "(verified: set_agent_state and record_last_reclamation each open their own "
         "BEGIN IMMEDIATE, called consecutively by the sweep). Read back by commit "
-        "only to explain a reclaimed-grant failure — a diagnostic write a backend "
+        "to explain a reclaimed-grant failure and by /status's operator view "
+        "(status_snapshot's reclaim opt-in) — a diagnostic write a backend "
         "makes individually durable, not part of the single-writer boundary "
         "(cf. the heartbeat record, likewise INDEPENDENT).",
     ),
@@ -695,8 +696,10 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "optionally scoping the state half to named agents. A keyword-only "
         "opt-in, off by default, adds each artifact's transfer record and its "
         "liveness, read inside the same lock hold so a record is judged "
-        "against the version its row reports (#185); only /status opts "
-        "in, and the default answer is unchanged. Non-mutating.",
+        "against the version its row reports (#185). A second opt-in adds each "
+        "pair's reclamation slot, read from the same agent-state rows (#195). "
+        "Only /status opts in, and the default answer is unchanged. "
+        "Non-mutating.",
     ),
     MemberContract(
         "record_foreign_write",

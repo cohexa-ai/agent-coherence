@@ -701,13 +701,17 @@ class StatusResponse(TypedDict):
     ``tracked_artifacts`` entries are ``{"path", "version", "id"}``;
     ``sessions`` entries are ``{"agent_name", "agent_id", "states"}``, where
     ``agent_name`` is ``None`` for a holder the adapter has no name for (a
-    grant that outlived the coordinator process that issued it). The earlier
+    grant that outlived the coordinator process that issued it). At the
+    operator tier each entry also carries ``reclaimed``: ``{path: {"trigger",
+    "tick"}}`` for each path whose last write grant the coordinator sweep
+    reclaimed, with no write grant there since. The earlier
     annotation documented ``last_writer`` and ``session_id`` keys the handler
     has never emitted; nothing in the tree type-checks against this TypedDict,
     so the drift went unnoticed.
     """
 
     tracked_artifacts: list[dict]  # [{"path": "...", "version": int, "id": "..."}, ...]
+    # The operator tier adds "reclaimed": {path: {"trigger": str, "tick": int}}.
     sessions: list[dict]  # [{"agent_name": str|None, "agent_id": "...", "states": {path: state_name}}, ...]
     # AC-02: canonical name follows KTD-J convention (full-word _seconds
     # suffix). ``coordinator_uptime_s`` is emitted alongside as a
