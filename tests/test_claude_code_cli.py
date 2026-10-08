@@ -1077,6 +1077,34 @@ def test_render_table_names_a_sweep_reclaim_beside_held_states(
     assert "sweep_reclaims_total" in out
 
 
+def test_render_table_keeps_full_paths_beside_a_reclaim_at_80_columns(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#195: a reclaim label is far wider than a state name. At the 80-column
+    fallback an agent's shell tool gets, it must not shrink the path column
+    until two different paths print the same."""
+    monkeypatch.delenv("COLUMNS", raising=False)
+    plan_a, plan_b = "docs/plans/2026-10-a-rollout-plan.md", "docs/plans/2026-10-b-rollout-plan.md"
+    payload = {
+        "tracked_artifacts": [{"path": plan_a, "version": 2}, {"path": plan_b, "version": 1}],
+        "sessions": [
+            {
+                "agent_name": "claude-session-x",
+                "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
+                "states": {plan_a: "SHARED", plan_b: "EXCLUSIVE"},
+                "reclaimed": {plan_a: {"trigger": "reclaim_heartbeat", "tick": 1789558656}},
+            },
+        ],
+        "policy_summary": {},
+        "coordinator_pid": 0,
+    }
+    coherence_status._render_table(payload)
+    session_lines = capsys.readouterr().out.split("Sessions:", 1)[1].splitlines()
+
+    assert any(plan_a in ln and "reclaimed (reclaim_heartbeat" in ln for ln in session_lines)
+    assert any(plan_b in ln and "EXCLUSIVE" in ln for ln in session_lines)
+
+
 def test_render_table_keeps_a_reread_state_beside_its_reclaim(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
