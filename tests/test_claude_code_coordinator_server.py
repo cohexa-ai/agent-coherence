@@ -3164,22 +3164,9 @@ def test_adv004_sweep_reclamation_records_preemption_notice(
     artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
     assert artifact_id is not None
 
-    # Drive the sweep manually so the heartbeat-stale path fires
-    # immediately. heartbeat_timeout_ticks=1 + current_tick well past
-    # the agent's last heartbeat triggers reclaim_heartbeat.
-    reclaimed_n = coordinator.service.enforce_stable_grant_timeouts(
-        current_tick=int(time.time()) + 999_999,
-        heartbeat_timeout_ticks=1,
-        max_hold_ticks=999_999_999,
-        on_reclaim=lambda artifact_id, agent_id, trigger: (
-            coordinator.registry.record_preemption_notice(
-                victim_agent_id=agent_id,
-                artifact_id=artifact_id,
-                preempter_agent_id=SWEEP_RECLAMATION_PREEMPTER_ID,
-                preempted_at_unix_ts=time.time(),
-            )
-        ),
-    )
+    # Drive the shipped sweep pass (the coordinator loop's own callback) with
+    # a tick well past the agent's last heartbeat, so reclaim_heartbeat fires.
+    reclaimed_n = _sweep(coordinator, int(time.time()) + 999_999)
     assert reclaimed_n == 1, "sweep should have reclaimed exactly one M/E grant"
 
     # The preemption notice for the victim must be present and tagged
@@ -3197,29 +3184,12 @@ def test_adv004_post_edit_after_reclamation_returns_reclaimed_message(
     'reclaimed by coordinator sweep' message (NOT the generic
     CoherenceError) and the response carries reclaimed=True instead of
     preempted=True."""
-    from ccs.adapters.claude_code.coordinator_server import (
-        SWEEP_RECLAMATION_PREEMPTER_ID,
-        session_to_agent_id,
-    )
-
     sid = _sid("adv004-B")
-    agent_id = session_to_agent_id(sid)
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
-    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
 
-    # Sweep reclaims agent's grant + records notice via the on_reclaim
-    # callback (same wiring the real adapter sweep uses).
-    coordinator.service.enforce_stable_grant_timeouts(
-        current_tick=int(time.time()) + 999_999,
-        heartbeat_timeout_ticks=1,
-        max_hold_ticks=999_999_999,
-        on_reclaim=lambda aid, sid_, trigger: coordinator.registry.record_preemption_notice(
-            victim_agent_id=sid_,
-            artifact_id=aid,
-            preempter_agent_id=SWEEP_RECLAMATION_PREEMPTER_ID,
-            preempted_at_unix_ts=time.time(),
-        ),
-    )
+    # The shipped sweep pass reclaims the grant and records the notice
+    # through the coordinator loop's own callback.
+    assert _sweep(coordinator, int(time.time()) + 999_999) == 1
 
     # Now post-edit fires — should fail with the reclaimed-message.
     s, body = client.post("/hooks/post-edit", {
@@ -10163,6 +10133,57 @@ def test_sweep_counts_and_logs_reclaims_that_landed_before_a_mid_walk_error(
     assert len(logged) == landed
 
 
+def test_sweep_counts_and_logs_a_reclaim_whose_notice_write_fails(
+    coordinator,
+    client: _Client,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The callback records the reclaim before it writes the victim's notice,
+    so a notice write that raises still leaves the reclaim counted and logged."""
+    client.post("/hooks/pre-edit", {"session_id": _sid("notice-fail-195"), "path": "plan.md"})
+
+    def _refuse(**_kwargs: Any) -> None:
+        raise RuntimeError("notice store unavailable")
+
+    monkeypatch.setattr(coordinator.registry, "record_preemption_notice", _refuse)
+    with caplog.at_level(logging.WARNING):
+        assert _sweep(coordinator, int(time.time()) + 999_999) == 1
+
+    _, metrics = client.get("/status?detail=metrics")
+    assert metrics["sweep_reclaims_total"] == 1
+    assert [r for r in caplog.records if "sweep reclaimed grant" in r.getMessage()]
+
+
+def test_sweep_reports_every_reclaim_when_one_count_update_fails(
+    coordinator,
+    client: _Client,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reporting is best-effort per reclaim: a counter update that raises for
+    one reclaim neither stops the others nor the log line for each."""
+    for name, path in (("count-a-195", "plan.md"), ("count-b-195", "task.md")):
+        client.post("/hooks/pre-edit", {"session_id": _sid(name), "path": path})
+    real_record = coordinator.record_sweep_reclaim
+    calls = {"n": 0}
+
+    def _first_fails(trigger: str) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("counter unavailable")
+        real_record(trigger)
+
+    monkeypatch.setattr(coordinator, "record_sweep_reclaim", _first_fails)
+    with caplog.at_level(logging.WARNING, logger="ccs.adapters.claude_code.lifecycle"):
+        assert _sweep(coordinator, int(time.time()) + 999_999) == 2
+
+    _, metrics = client.get("/status?detail=metrics")
+    assert metrics["sweep_reclaims_total"] == 1
+    logged = [r for r in caplog.records if "sweep reclaimed grant" in r.getMessage()]
+    assert len(logged) == 2
+
+
 class _OneSweepTick:
     """The coordinator as ``_sweep_loop`` sees it, shutting down after one tick.
 
@@ -12108,6 +12129,28 @@ def test_status_reads_the_transfer_rows_inside_the_snapshot_lock_hold(
     [hold] = transfer_holds
     assert any("FROM artifacts" in sql and "transfer_records" not in sql for sql in hold), hold
     assert any("FROM agent_states" in sql for sql in hold), hold
+
+
+def test_status_shows_a_live_handoff_and_its_givers_reclaim_in_one_response(
+    coordinator, client: _Client
+) -> None:
+    """#195 with #185: a giver whose handoff of one path is live and whose
+    write grant on another path the sweep reclaimed. The one operator-tier
+    response carries both the path's handoff record and the giver's reclaim."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    status, _ = client.post(
+        "/hooks/pre-edit", {"session_id": giver.sid, "path": "task.md"}, principal=giver.principal
+    )
+    assert status == 200
+    reclaim_tick = int(time.time()) + 999_999
+    assert _sweep(coordinator, reclaim_tick) == 1
+
+    body = _operator_status(client)
+    assert _status_entry(body, "plan.md")["handoff"]["live"] is True
+    assert _row_for(body, giver.sid)["reclaimed"] == {
+        "task.md": {"trigger": "reclaim_heartbeat", "tick": reclaim_tick}
+    }
 
 
 def test_session_start_is_byte_identical_with_a_live_handoff_on_its_path(
