@@ -278,6 +278,8 @@ def test_the_accept_tool_says_an_overtaken_handoff_answers_overtaken() -> None:
 
     assert "status=overtaken" in text
     assert "counterparty" in text
+    assert "nothing has written it since" in text  # only an acquire leaves it live
+    assert "refused handoff_not_live" in text
 
 
 def test_the_transfer_tool_names_the_successor_by_the_id_its_own_status_tool_reports() -> None:

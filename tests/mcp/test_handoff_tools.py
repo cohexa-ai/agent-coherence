@@ -499,6 +499,33 @@ def test_the_transfer_tool_answers_no_path_or_one_path_twice_as_a_path_error(
         stop_coordinator(tmp_path)
 
 
+def test_an_accept_after_a_bystanders_write_is_refused_not_live_as_the_description_says(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A bystander's write moves the version, which ends the handoff, so the
+    successor's accept is refused ``handoff_not_live`` with status
+    ``overtaken``, as swg_accept's description says. An acquire with no write
+    since leaves it live, and that accept is taken; the description used to
+    promise that answer after a write too."""
+    _seed(tmp_path, PLAN, b"plan v1")
+    config = _config(tmp_path)
+    giver = _vol(tmp_path, fast_cfg)
+    successor = _vol(tmp_path, fast_cfg)
+    bystander = _vol(tmp_path, fast_cfg)
+    try:
+        _do_read(giver, config, PLAN)
+        assert _do_transfer(giver, config, [PLAN], _agent(successor)).isError is False
+        bystander.write_cas_at(PLAN, 1, b"plan v2 by a bystander")
+
+        result = _do_accept(successor, config, PLAN)
+
+        assert result.isError is True
+        structured = result.structuredContent
+        assert (structured["reason"], structured["status"]) == ("handoff_not_live", "overtaken")
+    finally:
+        stop_coordinator(tmp_path)
+
+
 @pytest.mark.parametrize("verb", ["transfer", "accept", "decline", "withdraw"])
 def test_a_handoff_tool_on_a_session_whose_coordinator_is_gone_answers_unavailable(
     tmp_path: Path, fast_cfg: LifecycleConfig, verb: str
