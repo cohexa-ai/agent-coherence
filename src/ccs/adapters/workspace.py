@@ -755,10 +755,16 @@ class RestoreRegistration:
     ``empty_write_set`` (nothing needed a commit; ``commit_all`` was never
     called), ``registered_by_prior_run`` (the durable ``registered`` marker —
     a crashed run already completed the step; nothing re-registered), or
-    ``refused`` (the batch was HELD: NOTHING registered, ``refused`` maps each
-    failing member path to its typed conflict reason — identity-matched wire
-    constants; ``stale_read_generation`` is the fence rejecting a superseded
-    controller's late apply, never retried).
+    ``refused`` (NOTHING registered; ``refused`` maps member paths to
+    identity-matched wire reasons). Two causes land here. The batch was HELD:
+    each failing member path maps to its typed conflict reason, and
+    ``stale_read_generation`` is the fence rejecting a superseded controller's
+    late apply, never retried. Or the registration itself was refused (#191),
+    past the pre-flight: the reason is one of
+    :data:`~ccs.core.exceptions.CHECKPOINT_REGISTRATION_REFUSAL_REASONS`, keyed
+    by the offending paths for the two membership reasons and repeated for
+    every write path for the two controller reasons (an empty map when the
+    write-set was empty; ``detail`` names the reason then).
 
     The per-member-class honesty surfaces: ``substrate_registered`` names the
     written S3 members whose registration is MANIFEST-SIDE by design (the
