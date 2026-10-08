@@ -78,7 +78,11 @@ from ccs.adapters.claude_code.auth import (
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.bash_write_detector import detect_tracked_writes
 from ccs.adapters.claude_code.policy import UNTRACK_STRICT_PATH_REASON, TrackedArtifactPolicy
-from ccs.coordinator.registry_protocol import CheckpointMember, TransferRecord
+from ccs.coordinator.registry_protocol import (
+    RECLAIM_TRIGGERS,
+    CheckpointMember,
+    TransferRecord,
+)
 from ccs.coordinator.service import (
     CallerPrincipalUncached,
     CoordinatorService,
@@ -222,9 +226,9 @@ SWEEP_RECLAMATION_PREEMPTER_ID: UUID = uuid5(
 #: #195: the triggers the STABLE-grant sweep reclaims under
 #: (``CoordinatorService.enforce_stable_grant_timeouts``). The keys of the
 #: ``sweep_reclaims_by_trigger`` counter and the values ``/status?detail=full``
-#: reports under ``sessions[].reclaimed[path].trigger``. The transient sweep's
-#: ``timeout`` is in ``RECLAIM_TRIGGERS`` too but records no reclamation slot.
-_SWEEP_RECLAIM_TRIGGERS: tuple[str, ...] = ("reclaim_heartbeat", "reclaim_max_hold")
+#: reports under ``sessions[].reclaimed[path].trigger``: every reclaim trigger
+#: but the transient sweep's ``timeout``, which records no reclamation slot.
+_SWEEP_RECLAIM_TRIGGERS: tuple[str, ...] = tuple(sorted(RECLAIM_TRIGGERS - {"timeout"}))
 
 #: #195: how long a reclaim keeps an otherwise-empty, unnamed agent listed in
 #: ``/status?detail=full`` ``sessions[]``. The slot itself is durable and
@@ -6638,9 +6642,11 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     record no slot and leave ``reclaimed`` empty. The slot clears only on the
     next M/E acquire, so an entry means "this session's most recent write
     grant on this path was reclaimed and it has held none since": a re-read
-    to SHARED shows the path in ``states`` and keeps it in ``reclaimed``, and
-    a peer invalidating that read leaves the original trigger/tick. A pair
-    held M/E is never listed. Both maps come from one registry read.
+    granted SHARED shows the path in ``states`` and keeps it in ``reclaimed``,
+    and a peer invalidating that read leaves the original trigger/tick. A
+    sole reader's re-read is granted EXCLUSIVE, an M/E acquire that clears the
+    slot. A pair held M/E is never listed. Both maps come from one registry
+    read.
     ``tick`` is the sweep's tick basis, wall-clock seconds over the HTTP
     transport. The key is absent below the operator tier. An agent
     that is unnamed, holds nothing and is listed only for a reclaim gets a row
@@ -6769,23 +6775,24 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # dashboards, the corpus) keeps that answer byte-for-byte.
     #
     # It is history, not current state: the pair's last write grant ended in
-    # a sweep reclaim and it has held none since. A re-read (SHARED) does not
-    # version the edit the reclaim stranded, so the path stays listed beside
-    # that SHARED state; only a new write grant clears the slot. A pair still
-    # write-held is never listed, so a path is never both held for writing
-    # and reclaimed.
+    # a sweep reclaim and it has held none since. A re-read granted SHARED does
+    # not version the edit the reclaim stranded, so the path stays listed
+    # beside that SHARED state; only an M/E acquire clears the slot, including
+    # the EXCLUSIVE a sole reader's re-read is granted. A pair still write-held
+    # is never listed, so a path is never both held for writing and reclaimed.
     reclaimed_by_agent: dict[UUID, dict[str, dict[str, Any]]] = {}
-    if detail == "full":
-        for artifact_id, slots in reclamation_by_artifact.items():
-            meta = artifact_by_id[artifact_id]
-            snap_states = state_by_artifact[artifact_id]
-            for agent_id, (trigger, tick) in slots.items():
-                if snap_states.get(agent_id) in _M_OR_E_STATES:
-                    continue
-                reclaimed_by_agent.setdefault(agent_id, {})[meta["name"]] = {
-                    "trigger": trigger,
-                    "tick": tick,
-                }
+    for artifact_id, slots in reclamation_by_artifact.items():
+        meta = artifact_by_id[artifact_id]
+        snap_states = state_by_artifact[artifact_id]
+        for agent_id, (trigger, tick) in slots.items():
+            # Defensive: a write grant clears the slot, so this runtime never
+            # leaves one on a held pair; a ledger another writer touched might.
+            if snap_states.get(agent_id) in _M_OR_E_STATES:
+                continue
+            reclaimed_by_agent.setdefault(agent_id, {})[meta["name"]] = {
+                "trigger": trigger,
+                "tick": tick,
+            }
 
     # R6: ``agent_name`` renders the raw session id verbatim
     # (``session_to_agent_name`` → ``claude-session-<sid>``, and the SB-25
@@ -6806,7 +6813,7 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
             "agent_id": str(agent_id),
             "states": states_by_agent.get(agent_id, {}),
         }
-        if detail == "full":
+        if operator_tier:
             row["reclaimed"] = reclaimed_by_agent.get(agent_id, {})
         return row
 
@@ -6826,13 +6833,13 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # reclaim (``_RECLAIM_ONLY_ROW_MAX_AGE_SEC``) so dead sessions do not
     # accumulate in the table for ever.
     reclaim_row_cutoff = monotonic_seconds() - _RECLAIM_ONLY_ROW_MAX_AGE_SEC
-    recent_reclaim_only = {
+    recently_reclaimed = {
         agent_id
         for agent_id, paths in reclaimed_by_agent.items()
         if max(slot["tick"] for slot in paths.values()) >= reclaim_row_cutoff
     }
     for agent_id in sorted(
-        (states_by_agent.keys() | recent_reclaim_only) - named_ids, key=str
+        (states_by_agent.keys() | recently_reclaimed) - named_ids, key=str
     ):
         sessions.append(_row(agent_id, None))
 
