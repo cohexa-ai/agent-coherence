@@ -563,12 +563,14 @@ class FileRestoreTarget(FileMemberSource, Protocol):
     carve-out). A confirmed win lands ``new_content`` and advances the version
     deterministically to ``expected_version + 1``. Like the read leg it may
     raise :class:`StructuralMemberRefused` to refuse the member outright (no
-    write lands); the restore absorbs that into ``target_lost``.
+    write lands); the restore absorbs that into ``target_lost``. The restore
+    ignores the return value, so a target may return anything: a
+    ``CoherentVolume`` win returns its ``CasCommitResult``.
     """
 
     def write_cas_at(
         self, path: str, expected_version: int, new_content: bytes
-    ) -> None:
+    ) -> object:
         ...
 
 
