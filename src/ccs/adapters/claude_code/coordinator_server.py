@@ -6071,7 +6071,7 @@ def _handle_workspace_checkpoint(
             "window_max": record.window_max,
             "coordinator_epoch": coordinator.registry.coordinator_epoch,
         }
-        # #191: only when the request named one (a new key fires only when set).
+        # #191: present only when the request named a receiver.
         if record.receiver is not None:
             body["receiver"] = str(record.receiver)
         return body
@@ -6122,28 +6122,27 @@ def _handle_workspace_checkpoints(
         checkpoints = []
         for record in coordinator.registry.list_checkpoints():
             members = coordinator.registry.get_checkpoint_members(record.checkpoint_id)
-            checkpoints.append(
-                {
-                    "checkpoint_id": record.checkpoint_id,
-                    "name": record.name,
-                    "owner": str(record.owner),
-                    "created_at": record.created_at,
-                    "created_at_tick": record.created_at_tick,
-                    "window_min": record.window_min,
-                    "window_max": record.window_max,
-                    "restore_status": record.restore_status,
-                    "restore_updated_at": record.restore_updated_at,
-                    "pin_refcount": record.pin_refcount,
-                    "members": [_render_checkpoint_member(m) for m in members],
-                }
-            )
+            entry = {
+                "checkpoint_id": record.checkpoint_id,
+                "name": record.name,
+                "owner": str(record.owner),
+                "created_at": record.created_at,
+                "created_at_tick": record.created_at_tick,
+                "window_min": record.window_min,
+                "window_max": record.window_max,
+                "restore_status": record.restore_status,
+                "restore_updated_at": record.restore_updated_at,
+                "pin_refcount": record.pin_refcount,
+            }
             # #191: who may register a restore and who did, each present only
             # when set (absent: anyone may; nobody has yet). Both are
             # controller ids of the same class as ``owner``.
             if record.receiver is not None:
-                checkpoints[-1]["receiver"] = str(record.receiver)
+                entry["receiver"] = str(record.receiver)
             if record.registered_by is not None:
-                checkpoints[-1]["registered_by"] = str(record.registered_by)
+                entry["registered_by"] = str(record.registered_by)
+            entry["members"] = [_render_checkpoint_member(m) for m in members]
+            checkpoints.append(entry)
         return {
             "ok": True,
             "checkpoints": checkpoints,
@@ -6513,7 +6512,7 @@ def _handle_workspace_restore_register(
             "invalidated": len(result.signals),
             "coordinator_epoch": coordinator.registry.coordinator_epoch,
         }
-        # #191: only when it fires, so a first registration's body is unchanged.
+        # #191: present only when this controller had already claimed.
         if result.retry_of_own_registration:
             body["retry_of_own_registration"] = True
         return body
