@@ -142,7 +142,8 @@ Alpha — APIs may change before `v1.0`.
   the outcome raises (`CommitUnconfirmed`, in both `on_error` modes, a lost
   answer or an HTTP 5xx included), as does a request the coordinator refused
   outright under `on_error="strict"` (`CoherenceError`) or a volume with no
-  coordinator. A transfer hands on
+  coordinator. A transfer of no path, or of one path twice, is the caller's
+  error (`ValueError`) and sends nothing. A transfer hands on
   the claim the volume actually holds on the path, its write grant or its
   standing read, even after a fresh attempt. While the handoff is live, the
   giver's `write()`, `write_cas()`, `write_cas_at()` and an
@@ -159,6 +160,12 @@ Alpha — APIs may change before `v1.0`.
   `swg_transfer`, `swg_accept`, `swg_decline` and `swg_withdraw`.** They act
   for the MCP session's own claims and take no session argument. A transfer
   answers per grant and is an error result unless every grant transferred.
+  A refused handoff answers `recover` and `retryable: false` with a fixed
+  `next_step`, like every other error result: `fix_successor` for a successor
+  id that names no other session, `check_handoff` for `handoff_not_held` (a
+  transfer that already landed answers it too), `stop_and_report` otherwise;
+  a partly refused transfer speaks for its most restrictive refused grant. An
+  empty or repeated path list answers `invalid_path` / `fix_path`.
   `swg_status` adds `session_agent_id`, the session's own session-level agent
   id, which is what another session passes to `swg_transfer` as the
   successor, and each path's handoff record; `swg_read` adds the read's
