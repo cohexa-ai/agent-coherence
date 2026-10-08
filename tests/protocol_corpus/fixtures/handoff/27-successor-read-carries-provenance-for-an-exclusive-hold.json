@@ -1,0 +1,114 @@
+{
+  "name": "handoff-successor-read-carries-provenance-for-an-exclusive-hold",
+  "description": "The successor's provenance. A handed B a claim it held EXCLUSIVE; B's first read of plan.md carries, after today's first-observation warning, who handed it the path, at which version and from which hold shape, plus the sentence an EXCLUSIVE hold adds.",
+  "setup": {
+    "tracked": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/handoff/transfer",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+          "grants": [
+            {
+              "path": "plan.md"
+            }
+          ]
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      "path": "plan.md"
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_b}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "additionalContext": "⚠ Stale read [warning emitted <TS>]: plan.md was updated by agent <unknown> at <TS>. Current version is v1; this is the first time your session has observed this artifact (another session in this workspace registered it before you). Your worktree's content matches the last-recorded hash; the divergence is purely about version-tracking metadata. Consider re-reading plan.md before acting on stale assumptions.\n\nHandoff: agent 09f031b6 handed plan.md to this session at v1; the hold it gave up was EXCLUSIVE. Agent 09f031b6 held an uncommitted write claim when it handed plan.md on, so the file on disk may differ from v1; read plan.md before editing it."
+      },
+      "status": "stale",
+      "summary": {
+        "path": "plan.md",
+        "current_version": 1,
+        "prior_version_seen_by_session": null,
+        "last_writer_session_id": "<unknown>",
+        "last_writer_at_unix_ts": "<IGNORED>",
+        "warning_generated_at_unix_ts": "<IGNORED>",
+        "hash_differs": false
+      },
+      "handoff": {
+        "role": "successor",
+        "giver": "09f031b6-cb23-50a2-b7a8-b405ed3810f4",
+        "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+        "version_at_transfer": 1,
+        "hold_shape": "EXCLUSIVE",
+        "status": "pending",
+        "live": true
+      }
+    }
+  },
+  "ignore_keys": [
+    "last_writer_at_unix_ts",
+    "warning_generated_at_unix_ts"
+  ],
+  "preserve_identity": [
+    "giver",
+    "successor"
+  ],
+  "backends": [
+    "python"
+  ]
+}

@@ -1,0 +1,153 @@
+{
+  "name": "handoff-status-default-tier-carries-the-record",
+  "description": "GET /status (default tier) while A's handoff of plan.md to B is live: the path's tracked_artifacts entry carries the handoff key with session-level agent ids, no role and no timestamp. A's own row is empty: its read went INVALID with the transfer. policy_summary and coordinator_version are ignored for the reasons warn_mode/08 gives.",
+  "setup": {
+    "tracked": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/handoff/transfer",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+          "grants": [
+            {
+              "path": "plan.md"
+            }
+          ]
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "GET",
+    "path": "/status"
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "audit_log_mode_drift_total": 0,
+      "auth_401_total": 0,
+      "caller_principal_absent_total": 0,
+      "caller_principal_refused_total": 0,
+      "cold_start_duration_ms": 0,
+      "coordinator_backend": "python",
+      "coordinator_pid": "<PID>",
+      "coordinator_root": ".",
+      "coordinator_uptime_s": "<UPTIME>",
+      "coordinator_uptime_seconds": "<UPTIME>",
+      "coordinator_version": "<IGNORED>",
+      "detail": "minimal",
+      "effect_fence_holds_total": 0,
+      "endpoint_counters": {
+        "effect_fence_total": 0,
+        "handoff_accept_total": 0,
+        "handoff_decline_total": 0,
+        "handoff_transfer_total": 1,
+        "handoff_withdraw_total": 0,
+        "policy_track_total": 0,
+        "policy_untrack_total": 0,
+        "post_edit_cas_total": 0,
+        "post_edit_total": 0,
+        "pre_bash_total": 0,
+        "pre_edit_total": 0,
+        "pre_grep_total": 0,
+        "pre_read_total": 1,
+        "principal_claim_total": 2,
+        "session_start_total": 0,
+        "session_stop_total": 0,
+        "status_total": 1
+      },
+      "fresh_shared_hash_mismatch_total": 0,
+      "handler_concurrency_overflows_total": 0,
+      "handoff_giver_denials_total": 0,
+      "in_flight_drain_timed_out": false,
+      "intra_task_acquire_release_total": 0,
+      "policy_summary": "<IGNORED>",
+      "sessions": [
+        {
+          "agent_id": "09f031b6-cb23-50a2-b7a8-b405ed3810f4",
+          "agent_name": null,
+          "states": {}
+        }
+      ],
+      "shared_foreign_lag_suppressed_total": 0,
+      "stale_warning_emitted_total": 0,
+      "stale_warning_reread_total": 0,
+      "strict_mode_denials_total": 0,
+      "strict_mode_routed_around_via_bash_total": 0,
+      "tracked_artifacts": [
+        {
+          "path": "plan.md",
+          "version": 1,
+          "id": "<UUID>",
+          "handoff": {
+            "giver": "09f031b6-cb23-50a2-b7a8-b405ed3810f4",
+            "successor": "14b6f5b5-784c-5b3e-953a-2456d93656f9",
+            "version_at_transfer": 1,
+            "hold_shape": "SHARED",
+            "status": "pending",
+            "live": true
+          }
+        }
+      ],
+      "watchdog_late_aborts_total": 0,
+      "watchdog_late_completion_total": 0,
+      "watchdog_queue_overflows_total": 0,
+      "watchdog_timeouts_total": 0
+    }
+  },
+  "ignore_keys": [
+    "policy_summary",
+    "coordinator_version"
+  ],
+  "preserve_identity": [
+    "giver",
+    "successor",
+    "agent_id"
+  ],
+  "backends": [
+    "python"
+  ]
+}

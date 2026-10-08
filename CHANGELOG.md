@@ -32,9 +32,13 @@ Alpha — APIs may change before `v1.0`.
   claimed one, answer a watchdog timeout with a fail-closed `ok: false` and a
   `handoff_*_unconfirmed` reason, and are served by the Python coordinator
   only: the Claude Code plugin's Node coordinator answers them `404`.
-  `CoherentVolume` and the MCP server do not call them yet; Claude Code
-  sessions reach them through the handoff commands below. `/status` counts
-  each route among its endpoint counters. See the guide's
+  Claude Code sessions reach them through the handoff commands, a
+  `CoherentVolume` through its new handoff methods, and an MCP session through
+  four new tools (all below). `/status` counts each route among its endpoint
+  counters. The protocol corpus pins the handoff answers (each status, each
+  refusal reason a request over HTTP can produce, the giver's answer on the
+  Claude Code hook routes, and each role's text) and that the Node coordinator answers
+  the four routes `404`. See the guide's
   [Targeted grant handoff](docs/guide.md#targeted-grant-handoff) section.
 
 - **The giver of a live handoff cannot write the path it handed off (#185).**
@@ -126,6 +130,61 @@ Alpha — APIs may change before `v1.0`.
   unconfirmed, unreachable or another HTTP error; `4` this coordinator does not
   serve the commands, as the Node coordinator does not. See the guide's
   [Handoff commands](docs/guide.md#handoff-commands).
+
+- **`CoherentVolume` hands paths off (#185).** `vol.transfer(paths, *,
+  successor)` hands the volume's claim on one path or several to the session
+  named by `successor`, its session-level agent id
+  (`str(session_to_agent_id(vol.session_id))` for another volume), and
+  `vol.accept(path)`, `vol.decline(path)` and `vol.withdraw(path)` settle a
+  path's live handoff. They return typed results, `HandoffTransferResult`
+  (one `HandoffGrantResult` per path) and `HandoffVerbResult`, exported from
+  `ccs.adapters`: a refusal is a value, and only an answer that does not settle
+  the outcome raises (`CommitUnconfirmed`, in both `on_error` modes, a lost
+  answer or an HTTP 5xx included), as does a request the coordinator refused
+  outright under `on_error="strict"` (`CoherenceError`) or a volume with no
+  coordinator. A transfer of no path, or of one path twice, is the caller's
+  error (`HandoffPathsInvalid`, a `ValueError`) and sends nothing. A transfer hands on
+  the claim the volume actually holds on the path, its write grant or its
+  standing read, even after a fresh attempt. While the handoff is live, the
+  giver's `write()`, `write_cas()`, `write_cas_at()` and an
+  `atomic_publish()` that includes the path raise the new `GiverFenced`
+  (`ccs.core.exceptions`), naming the successor and the version at transfer;
+  it is never retried and no reacquire clears it; a multi-file publish that
+  includes the path publishes none of its files. `vol.read_handoff(path)` returns the
+  `handoff` key the volume's latest read of the path received, and
+  `vol.last_read_denied` says whether that read was a strict-mode deny, which
+  never carries the key. See the
+  guide's [From a `CoherentVolume`](docs/guide.md#from-a-coherentvolume).
+
+- **Handoff tools in the `stale-write-guard-fs` MCP server (#185):
+  `swg_transfer`, `swg_accept`, `swg_decline` and `swg_withdraw`.** They act
+  for the MCP session's own claims and take no session argument. A transfer
+  answers per grant and is an error result unless every grant transferred.
+  A refused handoff answers `recover` and `retryable: false` with a fixed
+  `next_step`, like every other error result: `fix_successor` for a successor
+  id that names no other session, `check_handoff` for `handoff_not_held` (a
+  transfer that already landed answers it too), `stop_and_report` otherwise;
+  a partly refused transfer speaks for its most restrictive refused grant. An
+  empty or repeated path list answers `invalid_path` / `fix_path`.
+  `swg_status` adds `session_agent_id`, the session's own session-level agent
+  id, which is what another session passes to `swg_transfer` as the
+  successor, and each path's handoff record; `swg_read` adds the read's
+  `handoff` key (after a strict-mode deny, which never carries the key, from
+  `/status`, or `handoff_unknown: true` when `/status` cannot be read), and a
+  `swg_write_cas` win that completed or overtook a live
+  handoff says which. An answer that does not settle a handoff tool's
+  outcome, a lost one included, answers `reason: commit_unconfirmed` with
+  `recover: check_handoff` and a fixed `next_step` sending the model to the
+  path's handoff before acting again, not the generic `read_then_retry`. A giver's `swg_write` or `swg_write_cas` of a path it
+  handed off answers `reason: handed_off`, `recover: stop_and_report`,
+  `retryable: false`, with the `successor`, the `version_at_transfer` and a
+  fixed `next_step` telling the model to stop and report; `swg_reacquire`
+  does not change it. The tool descriptions and the server instructions say
+  that a transfer fences the giver and does not reserve the path, and that
+  `swg_withdraw` is taken only on the user's or host's explicit instruction.
+  A model that uses both Claude Code's hooks and the MCP server is two
+  sessions, and a handoff fences only the one that gave it. See the guide's
+  [From the MCP server](docs/guide.md#from-the-mcp-server).
 
 - **`agent-coherence-status` lists handoffs (#185).** The table view adds a
   Handoffs block after the artifacts table: each path with a transfer record,
@@ -382,6 +441,25 @@ Alpha — APIs may change before `v1.0`.
   `reason: "handed_off"` and the grant reported handed to the successor, and
   changes nothing: it neither releases nor withdraws. A clean release answers
   exactly as before. The Node coordinator's answers are unchanged.
+  `CoherentVolume`, which releases a write grant an earlier attempt left held
+  when it starts a fresh one, now forgets only the paths such an answer
+  reports released, and releases the rest again at its next fresh attempt.
+
+- **`CoherentVolume.write_cas()` and `write_cas_at()` return a
+  `CasCommitResult` (#185).** They returned `None`; they now return the
+  `version` the win committed and, as `handoff`, what the win did to a live
+  handoff of the path (`completed` or `overtaken`), or `None`. Code that
+  ignores the return value is unaffected.
+
+- **Upgrade clients together with the coordinator (#185).** A
+  `CoherentVolume` from an earlier release can still be a handoff's giver
+  when another client sends the transfer in its name. Against this
+  coordinator it writes nothing on either route, but on the compare-and-swap
+  route it raises a plain `CoherenceError`, which an older MCP server reports
+  as `internal_error`, and on the pre-edit route its ordinary `StaleView`,
+  which an older MCP server reports as `stale_view`, retryable, with
+  `recover: reacquire`. A reacquire does not clear the fence, so an older MCP
+  giver can loop until its client is upgraded.
 
 - **`session-stop` refuses a malformed subagent id with HTTP `400` (#185).** A
   present but malformed `agent_id` answered `{"ok": true, "released_artifacts":
