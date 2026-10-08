@@ -569,7 +569,8 @@ def _present(fields: dict) -> dict:
     """``fields`` without the ones the answer did not carry, so a result has
     the shape of the coordinator's answer (a refused grant is ``{path,
     transferred, reason}``, to which the error result then adds its
-    ``recover``, ``retryable`` and ``next_step``). ``fields`` is a volume result's ``asdict``: its
+    ``recover``, ``retryable`` and ``next_step``). ``fields`` is a volume
+    result's ``asdict``: its
     keys are the result's fields in declaration order, and every value is a
     str, int, bool or ``None``, so ``False`` survives and only ``None`` goes."""
     return {key: value for key, value in fields.items() if value is not None}
@@ -585,11 +586,7 @@ def _transfer_result(result: HandoffTransferResult) -> CallToolResult:
         for grant in result.grants
     ]
     if result.ok:
-        return CallToolResult(
-            isError=False,
-            content=[TextContent(type="text", text="\n".join(lines))],
-            structuredContent={"ok": True, "grants": grants},
-        )
+        return _ok_result({"ok": True, "grants": grants}, "\n".join(lines))
     # Not every grant moved: a non-ignorable error, so a partly refused
     # transfer never reads as done, carrying a recover verb like every other.
     return handoff_transfer_refusal_result(grants, "\n".join(lines))
@@ -601,11 +598,7 @@ def _verb_result(verb: str, result: HandoffVerbResult) -> CallToolResult:
         return handoff_verb_refusal_result(
             result.reason, f"{verb} {result.path}: refused ({result.reason}); nothing changed", structured
         )
-    return CallToolResult(
-        isError=False,
-        content=[TextContent(type="text", text=f"{verb} {result.path}: taken (status={result.status})")],
-        structuredContent=structured,
-    )
+    return _ok_result(structured, f"{verb} {result.path}: taken (status={result.status})")
 
 
 def _do_transfer(

@@ -418,19 +418,16 @@ def handoff_verb_refusal_result(reason: object, detail: str, extra: dict) -> Cal
     """A refused accept, decline or withdraw: ``reason`` mapped through
     :data:`HANDOFF_REFUSALS` by exact membership in the three verb refusals,
     and anything else failing closed as ``internal_error``. ``extra`` carries
-    the result's own fields (path, ok, status, counterparty) and never a
-    ``reason``, so an unvetted string cannot reach the top level."""
-    terminal = (
-        HANDOFF_REFUSALS[reason]
-        if isinstance(reason, str) and reason in _HANDOFF_VERB_REFUSALS
-        else _UNRECOGNIZED
-    )
+    the result's own fields (path, ok, status, counterparty); a ``reason`` in
+    it is dropped, so an unvetted string cannot reach the top level."""
+    terminal = _refusal_terminal(reason, _HANDOFF_VERB_REFUSALS)
     return _result(terminal, detail, {k: v for k, v in extra.items() if k != "reason"})
 
 
-def _grant_terminal(grant: dict) -> _Terminal:
-    reason = grant.get("reason")
-    if isinstance(reason, str) and reason in HANDOFF_TRANSFER_REFUSAL_REASONS:
+def _refusal_terminal(reason: object, vocabulary: frozenset[str]) -> _Terminal:
+    """``reason``'s row when it is one of ``vocabulary``, the refusals the
+    calling tool can answer; anything else fails closed."""
+    if isinstance(reason, str) and reason in vocabulary:
         return HANDOFF_REFUSALS[reason]
     return _UNRECOGNIZED
 
@@ -443,7 +440,11 @@ def handoff_transfer_refusal_result(grants: list[dict], detail: str) -> CallTool
     transferred its next step opens by saying never to send those again. The
     other refused reasons' next steps follow as text items, labelled by
     reason when more than one reason was refused."""
-    rows = [None if grant.get("transferred") else _grant_terminal(grant) for grant in grants]
+    rows = [
+        None if grant.get("transferred")
+        else _refusal_terminal(grant.get("reason"), HANDOFF_TRANSFER_REFUSAL_REASONS)
+        for grant in grants
+    ]
     entries = [grant if row is None else _with_row(grant, row) for grant, row in zip(grants, rows)]
     refused = [row for row in rows if row is not None]
     chosen = min(refused, key=lambda row: _RECOVER_RANK[row.recover])

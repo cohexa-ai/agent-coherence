@@ -454,7 +454,7 @@ _HANDOFF_REFUSAL_RECOVER = {
 _VERB_REFUSALS = ("handoff_not_successor", "handoff_not_giver", "handoff_not_live")
 
 
-def _refused_grant(path: str, reason: str) -> dict:
+def _refused_grant(path: str, reason: object) -> dict:
     return {"path": path, "transferred": False, "reason": reason}
 
 
@@ -498,7 +498,7 @@ def test_a_refusal_reason_outside_the_vocabulary_fails_closed(reason: str | None
     ``internal_error`` with ``recover: none``. A transfer grant keeps the wire
     reason it was answered with beside that row."""
     verb = handoff_verb_refusal_result(reason, "d", {"path": "p", "ok": False, "reason": reason})
-    transfer = handoff_transfer_refusal_result([{"path": "p", "transferred": False, "reason": reason}], "d")
+    transfer = handoff_transfer_refusal_result([_refused_grant("p", reason)], "d")
 
     for result in (verb, transfer):
         assert (result.structuredContent["reason"], result.structuredContent["recover"]) == ("internal_error", "none")

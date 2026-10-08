@@ -269,7 +269,7 @@ def test_a_transfer_after_a_re_mint_presents_the_incarnation_holding_the_read(
         stop_coordinator(tmp_path)
 
 
-def test_a_multi_file_publishs_members_are_read_before_they_can_be_handed_on(
+def test_the_members_of_a_multi_file_publish_are_read_before_they_can_be_handed_on(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
     """A multi-file publish commits through its snapshot session, which leaves
@@ -692,11 +692,8 @@ def test_a_transfer_of_no_path_or_one_path_twice_is_a_caller_error_never_sent(
     certainly did not. Like ``atomic_publish`` with an empty or repeated
     write-set, it is the caller's error: ``ValueError`` in both modes, and
     nothing is sent."""
-    _seed(tmp_path, _PLAN, b"plan v1")
-    giver = CoherentVolume(tmp_path, managed=_MANAGED, on_error=on_error, config=fast_cfg)
-    successor = CoherentVolume(tmp_path, managed=_MANAGED, on_error=on_error, config=fast_cfg)
     try:
-        giver.read(_PLAN)
+        giver, successor = _volume_pair(tmp_path, fast_cfg, on_error, "transfer")
         sent: list[tuple[str, dict]] = []
         _record_posts(monkeypatch, sent)
 
@@ -943,13 +940,11 @@ def test_a_denied_or_degraded_re_read_does_not_move_the_presented_incarnation(
     nothing, so the transfer still presents the incarnation whose read holds
     the path. Recording the denied or degraded read would present an
     incarnation that holds nothing, refused as not held."""
-    target = _seed(tmp_path, _PLAN, b"plan v1")
     _seed(tmp_path, _OTHER, b"other v1")
+    target = tmp_path / _PLAN
     on_error = "strict" if answer == "strict_deny" else "degrade"
-    giver = CoherentVolume(tmp_path, managed=_MANAGED, on_error=on_error, config=fast_cfg)
-    successor = CoherentVolume(tmp_path, managed=_MANAGED, on_error=on_error, config=fast_cfg)
     try:
-        giver.read(_PLAN)
+        giver, successor = _volume_pair(tmp_path, fast_cfg, on_error, "transfer")
         reader = giver._incarnation
         giver.reacquire(_OTHER)  # a re-mint: later requests name a new incarnation
         assert giver._incarnation != reader, "precondition"

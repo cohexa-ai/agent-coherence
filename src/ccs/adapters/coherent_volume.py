@@ -2603,9 +2603,11 @@ class CoherentVolume:
             rels = [self._to_relative(target)[1] for target in targets]
             if not rels:
                 raise ValueError("transfer requires at least one path")
-            repeated = next((rel for i, rel in enumerate(rels) if rel in rels[:i]), None)
-            if repeated is not None:
-                raise ValueError(f"transfer names a path more than once: {repeated}")
+            seen: set[str] = set()
+            for rel in rels:
+                if rel in seen:
+                    raise ValueError(f"transfer names a path more than once: {rel}")
+                seen.add(rel)
             self._require_attached_for("transfer", rels)
             resp = self._post(
                 "/handoff/transfer",
