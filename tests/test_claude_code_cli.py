@@ -11,22 +11,33 @@ control-flow / output-rendering paths.
 
 from __future__ import annotations
 
+import http.server
 import json
 import os
+import secrets
+import threading
 import time
+import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, ensure_coordinator, stop_coordinator
 from ccs.cli import (
     coherence_coordinator,
+    coherence_handoff,
     coherence_status,
     coherence_track,
     coherence_untrack,
 )
 from ccs.cli._coherence_client import (
     CoordinatorUnavailable,
+    caller_principal_headers,
+    claim_caller_principal,
+    get,
+    post,
+    post_with_stored_principal,
     resolve_endpoint,
 )
 
@@ -836,6 +847,31 @@ def test_untrack_against_live_coordinator(
     assert "docs/draft.md" in ignored_yaml.read_text()
 
 
+def test_untrack_of_a_strict_path_is_refused_with_its_own_exit_code(
+    git_workspace: Path, fast_cfg: LifecycleConfig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#261: the coordinator refuses to untrack a path it enforces in strict
+    mode (typed reason ``untrack_strict_path``, nothing written). The CLI
+    classifies the refusal by that reason, names the strict pattern, says how
+    to untrack it (restart without the strict entry), and exits 3 — distinct
+    from a transport error (2)."""
+    coherence_dir = git_workspace / ".coherence"
+    coherence_dir.mkdir()
+    (coherence_dir / "tracked.yaml").write_text("- data/**\n")
+    (coherence_dir / "strict_mode.yaml").write_text("- data/**\n")
+    assert ensure_coordinator(git_workspace, config=fast_cfg) > 0
+    try:
+        rc = coherence_untrack.main(["--root", str(git_workspace), "data/a.txt", "notes.md"])
+        captured = capsys.readouterr()
+        assert rc == 3, captured
+        assert "refused 'data/a.txt': enforced in strict mode by data/**" in captured.err
+        assert "restart the coordinator" in captured.err
+        assert captured.out == ""
+        assert not (coherence_dir / "ignored.yaml").exists(), "the request wrote nothing"
+    finally:
+        stop_coordinator(git_workspace)
+
+
 @pytest.mark.parametrize("bad_path,reason_substr", [
     # See test_track_rejects_invalid_paths_without_network for rationale on
     # the 2026-05-26 message change from "must be relative" to "outside
@@ -1039,3 +1075,673 @@ def test_render_table_names_a_sweep_reclaim_beside_held_states(
     # The released session (y) still reads as holding nothing.
     assert out.count("(no held grants)") == 1
     assert "sweep_reclaims_total" in out
+
+
+# ----------------------------------------------------------------------
+# coherence_status — the handoffs block (#185)
+# ----------------------------------------------------------------------
+
+_GIVER_AGENT = "4c9625da-356c-527f-b5d7-027f181f7748"
+_SUCCESSOR_AGENT = "0f3e1a2b-5c6d-5e7f-8a9b-0c1d2e3f4a5b"
+
+
+def _status_payload(**plan_entry_extra: object) -> dict:
+    """A ``/status`` payload with two tracked artifacts and one session; the
+    ``plan.md`` entry gains ``plan_entry_extra`` (the ``handoff`` key)."""
+    return {
+        "coordinator_pid": 4242,
+        "coordinator_uptime_seconds": 12.0,
+        "coordinator_backend": "python",
+        "coordinator_version": "9.9.9",
+        "policy_summary": {
+            "default_pattern_count": 3, "user_added_pattern_count": 0, "ignored_pattern_count": 0,
+        },
+        "tracked_artifacts": [
+            {"path": "plan.md", "version": 2, **plan_entry_extra},
+            {"path": "spec.md", "version": 1},
+        ],
+        "sessions": [
+            {"agent_id": _GIVER_AGENT, "agent_name": "claude-session-x", "states": {"spec.md": "SHARED"}},
+        ],
+    }
+
+
+#: Today's text rendering of :func:`_status_payload` with no handoff key, at 80
+#: columns, written out by hand.
+_STATUS_TEXT_WITHOUT_HANDOFF = (
+    "Coordinator: pid=4242 uptime=12s backend=python version=9.9.9\n"
+    "\n"
+    "Policy: 3 default pattern(s), 0 user-added, 0 ignored\n"
+    "\n"
+    "Observed artifacts:\n"
+    "  version = artifact revision: starts at 1, +1 on every committed edit\n"
+    "  (a read is flagged stale when its version is behind the current one)\n"
+    "\n"
+    "  path     version\n"
+    "  -------  -------\n"
+    "  plan.md        2\n"
+    "  spec.md        1\n"
+    "\n"
+    "Sessions:\n"
+    "  4c9625da  claude-session-x\n"
+    "    spec.md  SHARED\n"
+)
+
+
+def _handoff_key(**extra: object) -> dict:
+    return {
+        "giver": _GIVER_AGENT, "successor": _SUCCESSOR_AGENT, "version_at_transfer": 2,
+        "hold_shape": "SHARED", "status": "pending", "live": True, **extra,
+    }
+
+
+def test_status_text_lists_a_handoff_after_the_artifacts_table(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An entry carrying the ``handoff`` key gets one line in a handoffs
+    block printed right after the artifacts table: the path, giver and
+    successor as short session-level agent ids, the version at transfer, the
+    status and the record's age from its created timestamp. Everything else
+    is today's output. Prevents a pending handoff being visible only in
+    ``--json``, so an operator reading the table sees a fenced giver as an
+    ordinary holder."""
+    monkeypatch.setenv("COLUMNS", "80")
+    payload = _status_payload(handoff=_handoff_key(created_at_unix_ts=time.time() - 125))
+
+    coherence_status._render_table(payload)
+
+    handoffs_block = (
+        "Handoffs:\n"
+        "  giver → successor, by session agent id (first 8 characters, as under Sessions)\n"
+        "  plan.md: 4c9625da → 0f3e1a2b at version 2 (pending, 2m ago)\n"
+        "\n"
+    )
+    expected = _STATUS_TEXT_WITHOUT_HANDOFF.replace("\nSessions:\n", "\n" + handoffs_block + "Sessions:\n")
+    assert capsys.readouterr().out == expected
+
+
+def test_status_text_is_byte_identical_to_today_when_no_entry_carries_a_handoff(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no ``handoff`` key on any entry the table is today's output,
+    byte for byte, with no empty handoffs heading. Prevents every workspace
+    that never hands a path off seeing its status output change."""
+    monkeypatch.setenv("COLUMNS", "80")
+
+    coherence_status._render_table(_status_payload())
+
+    assert capsys.readouterr().out == _STATUS_TEXT_WITHOUT_HANDOFF
+
+
+def test_status_text_renders_a_handoff_without_an_age_when_the_entry_has_no_timestamp(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The default tier's ``handoff`` key carries no created timestamp (only the
+    operator tier does): the line is printed without an age rather than with
+    a made-up one. Prevents a ``--detail minimal`` table inventing how long a
+    handoff has been pending."""
+    monkeypatch.setenv("COLUMNS", "80")
+    payload = _status_payload(handoff=_handoff_key(status="completed"))
+
+    coherence_status._render_table(payload)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "  plan.md: 4c9625da → 0f3e1a2b at version 2 (completed)" in lines
+    assert not any("ago" in line for line in lines)
+
+
+def test_status_text_marks_a_handoff_that_has_ended_although_its_label_still_reads_pending(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A record ends when the path's version moves, and a write can move it
+    without changing the label, so an ended record can still read
+    ``pending``. The line says it has ended. Prevents an operator reading the
+    table as a giver still fenced and acting on a handoff that is over."""
+    monkeypatch.setenv("COLUMNS", "80")
+    payload = _status_payload(handoff=_handoff_key(live=False))
+
+    coherence_status._render_table(payload)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "  plan.md: 4c9625da → 0f3e1a2b at version 2 (pending, ended)" in lines
+
+
+# ----------------------------------------------------------------------
+# coherence_handoff — the four handoff verbs (#185)
+# ----------------------------------------------------------------------
+
+_SESSION_VAR = "CLAUDE_CODE_SESSION_ID"
+
+#: The verbs' exit codes, pinned by number; 3 is the status self-test's.
+_EXIT_DONE, _EXIT_USAGE, _EXIT_FAILED, _EXIT_NOT_SERVED = 0, 1, 2, 4
+
+_NOT_HELD_HINT = (
+    "hint: a Claude Code session's write grant ends when its turn ends. If an "
+    "earlier transfer of plan.md may have landed, check the path's handoff in "
+    "agent-coherence-status output first: a handoff from this session to that "
+    "successor made at the version it held, live or ended, means it landed, so "
+    "do not transfer again, and if it shows another session's handoff, ask "
+    "before transferring; otherwise have the giver session read plan.md, then "
+    "transfer it again (on a strict-mode path that read is denied: hand the "
+    "path on in the same turn as its edit)"
+)
+
+_VERB_RUNS = {
+    "transfer": lambda argv: coherence_handoff.transfer_main(["--successor", str(uuid.uuid4()), *argv]),
+    "accept": coherence_handoff.accept_main,
+    "decline": coherence_handoff.decline_main,
+    "withdraw": coherence_handoff.withdraw_main,
+}
+
+
+def _session_agent(session_id: str) -> str:
+    """A session's session-level agent id, by the derivation docs/guide.md
+    states -- computed here, never read back from the code under test."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"ccs-agent:claude-session-{session_id}"))
+
+
+def _hook(workspace: Path, route: str, body: dict) -> dict:
+    """One hook event for the session ``body`` names, sent as the hook client
+    sends it: presenting the session's stored principal, which its first
+    event claims and stores."""
+    return post_with_stored_principal(resolve_endpoint(workspace), workspace, route, body)
+
+
+def _known_successor(workspace: Path) -> str:
+    """A fresh session that has made one hook event, so it has claimed a
+    principal and the coordinator knows it; its session-level agent id."""
+    sid = str(uuid.uuid4())
+    _hook(workspace, "/hooks/pre-read", {"session_id": sid, "path": "spec.md"})
+    return _session_agent(sid)
+
+
+def _operator_status(workspace: Path) -> dict:
+    return get(
+        resolve_endpoint(workspace), "/status?detail=full",
+        extra_headers={"Coherence-Local-Operator": "true"},
+    )
+
+
+def _handoff_on(workspace: Path, path: str) -> dict | None:
+    for entry in _operator_status(workspace)["tracked_artifacts"]:
+        if entry["path"] == path:
+            return entry.get("handoff")
+    return None
+
+
+def _principal_files(workspace: Path, suffix: str = "") -> list[Path]:
+    return sorted((workspace / ".coherence").glob(f"caller-principal-*{suffix}"))
+
+
+def _principal_file(workspace: Path, session_id: str, suffix: str) -> Path:
+    key = uuid.UUID(_session_agent(session_id)).hex
+    return workspace / ".coherence" / f"caller-principal-{key}{suffix}"
+
+
+class _StubCoordinator(http.server.BaseHTTPRequestHandler):
+    """A coordinator of another build: answers each route from ``answers``
+    (path -> (status, body)), every other route 404 as a coordinator answers
+    an unknown one, and records each request's path in ``seen``."""
+
+    answers: dict[str, tuple[int, dict]] = {}
+    seen: list[str] = []
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib name
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.seen.append(self.path)
+        status, body = self.answers.get(self.path, (404, {"error": "unknown route"}))
+        raw = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, *_args: Any) -> None:
+        return
+
+
+@pytest.fixture
+def stub_coordinator(git_workspace: Path):
+    """A workspace wired to a :class:`_StubCoordinator` whose pid file has no
+    backend line (the Python coordinator's format); yields (workspace, port)."""
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir(mode=0o700)
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _StubCoordinator)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    (coherence / "server.pid").write_text(f"999\n{port}\n")
+    (coherence / "hook.secret").write_text("test-secret")
+    _StubCoordinator.answers, _StubCoordinator.seen = {}, []
+    try:
+        yield git_workspace, port
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_transfer_with_no_session_flag_acts_as_the_session_the_harness_variable_names(
+    live_coordinator, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """In a hook session's shell, with no ``--session``, the
+    transfer acts as the session ``CLAUDE_CODE_SESSION_ID`` names: the
+    coordinator records that session as the giver, the verb prints the
+    session-level id it acted as (the giver id the answer returns) and that
+    the variable named the session, and the raw session id is printed
+    nowhere. The status table then lists the handoff. Prevents the default
+    resolving to some other identity with nothing on screen to show it."""
+    workspace, _ = live_coordinator
+    giver = str(uuid.uuid4())
+    successor_agent = _known_successor(workspace)
+    _hook(workspace, "/hooks/pre-read", {"session_id": giver, "path": "plan.md"})
+    monkeypatch.setenv(_SESSION_VAR, giver)
+
+    rc = coherence_handoff.transfer_main([
+        "--root", str(workspace), "--successor", successor_agent, "plan.md",
+    ])
+
+    captured = capsys.readouterr()
+    assert rc == _EXIT_DONE, captured.err
+    giver_agent = _session_agent(giver)
+    assert (
+        f"agent-coherence-transfer: acting as session agent {giver_agent} "
+        f"(session from CLAUDE_CODE_SESSION_ID)"
+    ) in captured.out
+    assert giver not in captured.out + captured.err
+    handoff = _handoff_on(workspace, "plan.md")
+    assert handoff is not None
+    assert (handoff["giver"], handoff["successor"], handoff["status"]) == (
+        giver_agent, successor_agent, "pending")
+
+    assert coherence_status.main(["--root", str(workspace)]) == 0
+    status_out = capsys.readouterr().out
+    assert f"  plan.md: {giver_agent[:8]} → {successor_agent[:8]} at version 1 (pending, " in status_out
+
+
+@pytest.mark.parametrize("verb", sorted(_VERB_RUNS))
+def test_a_verb_with_no_session_flag_and_no_harness_variable_is_a_usage_error_that_sends_nothing(
+    verb: str, live_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With neither ``--session`` nor ``CLAUDE_CODE_SESSION_ID``
+    the verb refuses rather than guessing: exit 1 with its usage, and nothing
+    reaches the coordinator -- no claim, no verb request, no caller-principal
+    file. Prevents a verb run outside a Claude Code session acting as an
+    identity it made up."""
+    workspace, _ = live_coordinator
+    monkeypatch.delenv(_SESSION_VAR, raising=False)
+    before = _operator_status(workspace)["endpoint_counters"]
+
+    rc = _VERB_RUNS[verb](["--root", str(workspace), "plan.md"])
+
+    captured = capsys.readouterr()
+    assert rc == _EXIT_USAGE
+    assert f"usage: agent-coherence-{verb}" in captured.err
+    assert "--session" in captured.err and _SESSION_VAR in captured.err
+    after = _operator_status(workspace)["endpoint_counters"]
+    for counter in ("principal_claim_total", f"handoff_{verb}_total"):
+        assert after[counter] == before[counter], counter
+    assert _principal_files(workspace) == []
+
+
+def test_a_malformed_command_line_exits_1_not_argparse_2(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exit 1 is usage. argparse's own exit for a bad command line is 2,
+    which these verbs mean as a coordinator failure, so a transfer missing its
+    successor exits 1. Prevents a script reading a typo as an unreachable
+    coordinator."""
+    with pytest.raises(SystemExit) as exc:
+        coherence_handoff.transfer_main([
+            "--root", str(git_workspace), "--session", str(uuid.uuid4()), "plan.md",
+        ])
+    assert exc.value.code == _EXIT_USAGE
+    assert "--successor" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("source", ["flag", "variable"])
+@pytest.mark.parametrize("verb", sorted(_VERB_RUNS))
+def test_each_verb_prints_the_session_agent_id_it_acted_as_and_where_the_session_came_from(
+    verb: str, source: str, live_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every verb prints the session-level agent id it acted as and
+    whether ``--session`` or ``CLAUDE_CODE_SESSION_ID`` named the session (the
+    flag winning over the variable), and never the raw session id. Prevents a
+    shell whose variable names another session acting as that session with
+    nothing on screen to show it."""
+    workspace, _ = live_coordinator
+    acting, other = str(uuid.uuid4()), str(uuid.uuid4())
+    if source == "flag":
+        monkeypatch.setenv(_SESSION_VAR, other)
+        argv, named_by = ["--root", str(workspace), "--session", acting, "plan.md"], "--session"
+    else:
+        monkeypatch.setenv(_SESSION_VAR, acting)
+        argv, named_by = ["--root", str(workspace), "plan.md"], _SESSION_VAR
+
+    _VERB_RUNS[verb](argv)
+
+    captured = capsys.readouterr()
+    assert (
+        f"agent-coherence-{verb}: acting as session agent {_session_agent(acting)} "
+        f"(session from {named_by})"
+    ) in captured.out
+    printed = captured.out + captured.err
+    assert acting not in printed
+    assert other not in printed and _session_agent(other) not in printed
+
+
+def test_a_verb_presents_the_stored_principal_of_a_session_its_hooks_already_claimed(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The verb presents the named session's stored caller principal, as
+    that session's hook events do, and the require-class route admits it on
+    the first request: no principal refusal, no claim, the stored files
+    untouched. Prevents the verb sending no principal for a bound session,
+    which every require-class route refuses."""
+    workspace, _ = live_coordinator
+    giver = str(uuid.uuid4())
+    successor_agent = _known_successor(workspace)
+    _hook(workspace, "/hooks/pre-read", {"session_id": giver, "path": "plan.md"})
+    stored = {p.name: p.read_bytes() for p in _principal_files(workspace)}
+    before = _operator_status(workspace)
+
+    rc = coherence_handoff.transfer_main([
+        "--root", str(workspace), "--session", giver, "--successor", successor_agent, "plan.md",
+    ])
+
+    assert rc == _EXIT_DONE, capsys.readouterr().err
+    after = _operator_status(workspace)
+    assert after["caller_principal_refused_total"] == before["caller_principal_refused_total"]
+    claims = "principal_claim_total"
+    assert after["endpoint_counters"][claims] == before["endpoint_counters"][claims]
+    assert {p.name: p.read_bytes() for p in _principal_files(workspace)} == stored
+
+
+def test_a_verb_for_a_session_with_no_principal_mints_claims_and_stores_it_as_a_first_hook_event_would(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The fact docs/security.md states for the handoff CLI: for a named
+    session with no stored principal and no binding, the verb creates the
+    session's mint nonce, claims, and stores the principal -- both files
+    exist afterwards, and the stored principal is the bound one -- and the
+    route then answers on its own terms. Prevents the verb binding the
+    session under a nonce it keeps nowhere, which would lock that session's
+    own hook events out."""
+    workspace, _ = live_coordinator
+    session = str(uuid.uuid4())
+
+    rc = coherence_handoff.withdraw_main(["--root", str(workspace), "--session", session, "plan.md"])
+
+    captured = capsys.readouterr()
+    assert rc == _EXIT_FAILED
+    assert "(handoff_not_live)" in captured.err
+    nonce_file = _principal_file(workspace, session, ".nonce")
+    principal_file = _principal_file(workspace, session, ".principal")
+    assert _principal_files(workspace) == [nonce_file, principal_file]
+    # The session's next require-class hook event, presenting the stored
+    # principal, is admitted: the binding is the one the files hold.
+    answer = post(
+        resolve_endpoint(workspace), "/hooks/pre-edit", {"session_id": session, "path": "plan.md"},
+        extra_headers=caller_principal_headers(principal_file.read_text().strip()),
+    )
+    assert answer.get("ok") is True
+
+
+def test_a_verb_for_a_session_bound_under_another_nonce_is_refused_and_never_re_mints(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A session bound under ANOTHER mint nonce -- claimed first by
+    a direct claim, standing in for a live volume's or MCP session's id --
+    cannot be acted for. Withdrawing that session's live handoff reports the
+    caller-principal refusal and exits 2, stores no principal file, presents
+    the same stored nonce on a second run rather than minting a new one, and
+    leaves the transfer record as it was. Prevents the CLI withdrawing a
+    handoff in the name of a writer it is not, and re-minting, which would
+    reopen the first-claim gate."""
+    workspace, _ = live_coordinator
+    endpoint = resolve_endpoint(workspace)
+    volume = str(uuid.uuid4())
+    claim = claim_caller_principal(endpoint, volume, secrets.token_urlsafe(32))
+    assert claim.outcome == "bound"
+    headers = caller_principal_headers(claim.principal)
+    successor_agent = _known_successor(workspace)
+    post(endpoint, "/hooks/pre-read", {"session_id": volume, "path": "plan.md"}, extra_headers=headers)
+    handed = post(endpoint, "/handoff/transfer", {
+        "session_id": volume, "successor": successor_agent, "grants": [{"path": "plan.md"}],
+    }, extra_headers=headers)
+    assert handed["ok"] is True
+    record = _handoff_on(workspace, "plan.md")
+    nonce_file = _principal_file(workspace, volume, ".nonce")
+
+    nonces = []
+    for _ in range(2):
+        rc = coherence_handoff.withdraw_main([
+            "--root", str(workspace), "--session", volume, "plan.md",
+        ])
+        captured = capsys.readouterr()
+        assert rc == _EXIT_FAILED
+        assert "(caller_principal_absent)" in captured.err
+        assert "different mint nonce" in captured.err
+        assert claim.principal not in captured.out + captured.err
+        assert not _principal_file(workspace, volume, ".principal").exists()
+        nonces.append(nonce_file.read_bytes())
+    assert nonces[0] == nonces[1]
+    assert _handoff_on(workspace, "plan.md") == record
+    assert (record["status"], record["live"]) == ("pending", True)
+
+
+def test_a_transfer_after_the_givers_turn_ended_is_not_held_with_a_hint_and_a_pre_read_makes_it_transferable(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A hook session's write grant ends at its turn end (its session-stop), so
+    a transfer run afterwards answers not held: the verb prints the wire
+    reason unchanged, adds the client-side hint (have the giver session read
+    the path, then transfer) and exits 2. After the giver session's pre-read
+    the same transfer goes through, giving up a SHARED claim. Prevents an
+    operator meeting a bare refusal with no way forward."""
+    workspace, _ = live_coordinator
+    giver = str(uuid.uuid4())
+    successor_agent = _known_successor(workspace)
+    _hook(workspace, "/hooks/pre-edit", {"session_id": giver, "path": "plan.md"})
+    _hook(workspace, "/hooks/post-edit", {
+        "session_id": giver, "path": "plan.md", "content_hash": "b" * 64, "success": True,
+    })
+    _hook(workspace, "/hooks/session-stop", {"session_id": giver})
+    argv = ["--root", str(workspace), "--session", giver, "--successor", successor_agent, "plan.md"]
+
+    rc = coherence_handoff.transfer_main(argv)
+
+    captured = capsys.readouterr()
+    assert rc == _EXIT_FAILED
+    assert "agent-coherence-transfer: plan.md not transferred (handoff_not_held)" in captured.err
+    assert f"agent-coherence-transfer: {_NOT_HELD_HINT}" in captured.err
+    assert _handoff_on(workspace, "plan.md") is None
+
+    _hook(workspace, "/hooks/pre-read", {"session_id": giver, "path": "plan.md"})
+    rc = coherence_handoff.transfer_main(argv)
+
+    captured = capsys.readouterr()
+    assert rc == _EXIT_DONE, captured.err
+    assert (
+        f"agent-coherence-transfer: transferred plan.md to {successor_agent} "
+        f"at version 2 (gave up SHARED; status pending)"
+    ) in captured.out
+    handoff = _handoff_on(workspace, "plan.md")
+    assert handoff is not None
+    assert (handoff["hold_shape"], handoff["version_at_transfer"]) == ("SHARED", 2)
+
+
+@pytest.mark.parametrize(("verb", "party", "taken", "status"), [
+    ("accept", "successor", "accepted", "completed"),
+    ("decline", "successor", "declined", "declined"),
+    ("withdraw", "giver", "withdrew", "withdrawn"),
+])
+def test_a_settling_verb_that_lands_exits_0_and_says_what_it_did(
+    live_coordinator, capsys: pytest.CaptureFixture[str],
+    verb: str, party: str, taken: str, status: str,
+) -> None:
+    """Against a live coordinator, after a real transfer, accept and decline
+    run as the successor and withdraw as the giver: each exits 0, prints the
+    one line saying what it did with the record's new status, and the record
+    reads that status. Fails if a verb reports success with another verb's
+    wording (a decline that tells the model it accepted) or with a wrong
+    exit code."""
+    workspace, _ = live_coordinator
+    giver, successor = str(uuid.uuid4()), str(uuid.uuid4())
+    _hook(workspace, "/hooks/pre-read", {"session_id": successor, "path": "spec.md"})
+    _hook(workspace, "/hooks/pre-read", {"session_id": giver, "path": "plan.md"})
+    assert coherence_handoff.transfer_main([
+        "--root", str(workspace), "--session", giver,
+        "--successor", _session_agent(successor), "plan.md",
+    ]) == _EXIT_DONE
+    capsys.readouterr()
+
+    acting = giver if party == "giver" else successor
+    rc = _VERB_RUNS[verb](["--root", str(workspace), "--session", acting, "plan.md"])
+
+    captured = capsys.readouterr()
+    assert rc == _EXIT_DONE, captured.err
+    assert (
+        f"agent-coherence-{verb}: {taken} the handoff of plan.md (status {status})"
+    ) in captured.out.splitlines(), captured.out
+    assert _handoff_on(workspace, "plan.md")["status"] == status
+
+
+def test_the_subagent_flag_transfers_a_grant_the_subagent_holds(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A grant a subagent holds is its composite's, not the main thread's,
+    and a subagent's shell names the parent session -- so without
+    ``--subagent-id`` the transfer finds nothing held, and with it the
+    subagent's claim is handed on, the record naming the SESSION as giver.
+    Prevents a subagent's grant being out of the CLI's reach."""
+    workspace, _ = live_coordinator
+    giver = str(uuid.uuid4())
+    successor_agent = _known_successor(workspace)
+    _hook(workspace, "/hooks/pre-read", {"session_id": giver, "agent_id": "worker-1", "path": "plan.md"})
+    argv = ["--root", str(workspace), "--session", giver, "--successor", successor_agent, "plan.md"]
+
+    assert coherence_handoff.transfer_main(argv) == _EXIT_FAILED
+    assert "plan.md not transferred (handoff_not_held)" in capsys.readouterr().err
+
+    rc = coherence_handoff.transfer_main([*argv, "--subagent-id", "worker-1"])
+
+    assert rc == _EXIT_DONE, capsys.readouterr().err
+    handoff = _handoff_on(workspace, "plan.md")
+    assert handoff is not None
+    assert (handoff["giver"], handoff["hold_shape"]) == (_session_agent(giver), "SHARED")
+
+
+@pytest.mark.parametrize("verb", sorted(_VERB_RUNS))
+def test_a_verb_against_a_pid_file_naming_the_node_backend_exits_4_without_a_round_trip(
+    verb: str, stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The Node coordinator does not serve the four routes and its pid
+    file says so on the backend line, so the verb exits 4 -- not on this
+    backend -- before sending anything: no claim, no verb request, no
+    caller-principal file. Prevents a Node workspace paying a round trip, and
+    leaving principal files, for an answer the pid file already gave."""
+    workspace, port = stub_coordinator
+    (workspace / ".coherence" / "server.pid").write_text(f"999\n{port}\nbackend=node\n")
+
+    rc = _VERB_RUNS[verb](["--root", str(workspace), "--session", str(uuid.uuid4()), "plan.md"])
+
+    captured = capsys.readouterr()
+    assert rc == _EXIT_NOT_SERVED
+    assert "does not serve" in captured.err and "Python coordinator" in captured.err
+    assert _StubCoordinator.seen == []
+    assert _principal_files(workspace) == []
+
+
+@pytest.mark.parametrize(("answers", "expected_rc"), [
+    ({"/principal/claim": (200, {"ok": True, "principal": "P" * 43})}, _EXIT_NOT_SERVED),
+    ({"/handoff/withdraw": (200, {"ok": True, "status": "withdrawn"})}, _EXIT_DONE),
+], ids=["claim-served-verb-404", "claim-404-verb-served"])
+def test_with_no_backend_line_not_served_is_the_verb_routes_own_404_never_the_claim_routes(
+    answers: dict, expected_rc: int, stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no backend line in the pid file, 'not served' is decided by
+    the verb route's own 404 and never by the claim route's answer: a
+    coordinator that issues principals but answers the withdraw 404 exits 4,
+    and one that answers the claim 404 but serves the withdraw is answered by
+    the withdraw. Prevents a coordinator without the verb reading as an
+    ordinary HTTP error, and a coordinator without principals reading as one
+    without the verb."""
+    workspace, _ = stub_coordinator
+    _StubCoordinator.answers = answers
+
+    rc = coherence_handoff.withdraw_main([
+        "--root", str(workspace), "--session", str(uuid.uuid4()), "plan.md",
+    ])
+
+    assert rc == expected_rc, capsys.readouterr().err
+    assert "/handoff/withdraw" in _StubCoordinator.seen
+
+
+_CLAIM_SERVED = {"/principal/claim": (200, {"ok": True, "principal": "P" * 43})}
+
+
+@pytest.mark.parametrize("verb", ["transfer", "accept", "decline", "withdraw"])
+def test_an_unconfirmed_answer_exits_2_saying_the_outcome_is_unknown(
+    verb: str, stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A verb the coordinator's watchdog cut short may still have landed. The
+    command says the outcome is unknown and where to look before acting
+    again, and exits 2. Prevents an unconfirmed transfer exiting 0, which a
+    script would read as done, or reading as a refusal that changed
+    nothing."""
+    workspace, _ = stub_coordinator
+    reason = f"handoff_{verb}_unconfirmed"
+    _StubCoordinator.answers = {
+        **_CLAIM_SERVED,
+        f"/handoff/{verb}": (200, {"ok": False, "degraded": True, "reason": reason}),
+    }
+
+    rc = _VERB_RUNS[verb](["--root", str(workspace), "--session", str(uuid.uuid4()), "plan.md"])
+
+    err = capsys.readouterr().err
+    assert rc == _EXIT_FAILED, err
+    assert (
+        f"agent-coherence-{verb}: the coordinator could not confirm the {verb} ({reason}); "
+        "its outcome is unknown: check the path's handoff in agent-coherence-status "
+        "before acting again"
+    ) in err
+
+
+def test_a_transfer_answer_that_omits_a_named_path_exits_2_naming_it(
+    stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A transfer answer with no grant entry for a named path reports
+    nothing about that path, so the command cannot say it transferred: it
+    names the path and exits 2, even when the answer says ``ok``. Prevents
+    a path the answer left out reading as handed on."""
+    workspace, _ = stub_coordinator
+    _StubCoordinator.answers = {
+        **_CLAIM_SERVED,
+        "/handoff/transfer": (200, {"ok": True, "grants": []}),
+    }
+
+    rc = _VERB_RUNS["transfer"](["--root", str(workspace), "--session", str(uuid.uuid4()), "plan.md"])
+
+    err = capsys.readouterr().err
+    assert rc == _EXIT_FAILED, err
+    assert "agent-coherence-transfer: plan.md: the answer reports no outcome for it" in err
+
+
+def test_a_request_the_coordinator_cannot_read_exits_2_naming_what_to_check(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An HTTP error other than the verb route's 404 exits 2. A session
+    id that is not a UUID is answered 400, and the verb says what the
+    coordinator could not read rather than a bare status. Prevents a
+    mistyped ``--session`` reading as a coordinator fault with no lead."""
+    workspace, _ = live_coordinator
+
+    rc = coherence_handoff.withdraw_main(["--root", str(workspace), "--session", "not-a-session", "plan.md"])
+
+    assert rc == _EXIT_FAILED
+    assert (
+        "agent-coherence-withdraw: HTTP 400: the coordinator could not read the request; "
+        "check the session id, the subagent id and the paths"
+    ) in capsys.readouterr().err

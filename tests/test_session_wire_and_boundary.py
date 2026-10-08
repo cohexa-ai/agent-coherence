@@ -496,6 +496,9 @@ def test_sweep_loop_uses_wall_clock_basis() -> None:
         def evict_stale_notices(self, *, max_age_sec):
             return 0
 
+        def evict_transfer_records(self, *, max_age_sec):
+            return 0
+
         def record_preemption_notice(self, **kw):
             pass
 
@@ -509,6 +512,7 @@ def test_sweep_loop_uses_wall_clock_basis() -> None:
         grant_heartbeat_timeout_sec=120,
         grant_max_hold_sec=300,
         notice_evict_max_age_sec=600,
+        transfer_record_evict_max_age_sec=86_400,
     )
 
     _lifecycle._sweep_loop(entry, cfg)
@@ -948,3 +952,179 @@ def test_a_degraded_mint_reads_as_failure_and_carries_no_principal(
     assert status == 200
     assert body == {"ok": False, "degraded": True, "reason": "claim_unconfirmed"}
     assert body["reason"] not in HOLD_REASONS
+
+
+# ----------------------------------------------------------------------
+# Targeted grant handoff routes (#185)
+# ----------------------------------------------------------------------
+
+from ccs.adapters.claude_code.coordinator_server import (  # noqa: E402
+    _MIGRATION_REJECTED_ROUTES,
+)
+
+#: FROZEN duplicate of the four handoff routes and their attempt counters.
+_HANDOFF_ROUTE_COUNTERS = {
+    "/handoff/transfer": "handoff_transfer_total",
+    "/handoff/accept": "handoff_accept_total",
+    "/handoff/decline": "handoff_decline_total",
+    "/handoff/withdraw": "handoff_withdraw_total",
+}
+
+
+@pytest.mark.parametrize("route", sorted(_HANDOFF_ROUTE_COUNTERS))
+def test_handoff_route_is_registered_counted_and_served_during_a_drain(
+    route: str, coordinator, client: _Client
+) -> None:
+    """Each handoff verb is registered in the central table (so the bearer and
+    Host seam applies), is counted in BOTH counter registrations -- the
+    increment helper silently ignores a name missing from the counter dict,
+    so the bump itself is asserted -- and keeps serving during a migration
+    drain: a transfer initiates no write, and its epoch move is the
+    release-class bump the drain performs itself."""
+    counter = _HANDOFF_ROUTE_COUNTERS[route]
+    assert ("POST", route) in _ROUTES
+    assert _ENDPOINT_COUNTER_NAMES[("POST", route)] == counter
+    assert ("POST", route) not in _MIGRATION_REJECTED_ROUTES
+    before = coordinator.endpoint_counters_snapshot()[counter]
+    coordinator._migration_draining = True
+    try:
+        status, body = client.post(route, {"session_id": _sid("handoff-drain")})
+    finally:
+        coordinator._migration_draining = False
+    assert status == 400, (status, body)  # the handler answered: not the drain's 503
+    assert coordinator.endpoint_counters_snapshot()[counter] == before + 1
+
+
+@pytest.mark.parametrize("route", sorted(_HANDOFF_ROUTE_COUNTERS))
+def test_handoff_route_without_bearer_is_401(coordinator, route: str) -> None:
+    url = f"http://127.0.0.1:{coordinator.port}{route}"
+    req = urlrequest.Request(
+        url, data=b"{}", method="POST",
+        headers={"Host": "127.0.0.1", "Content-Type": "application/json"},
+    )
+    with pytest.raises(urlerror.HTTPError) as err:
+        urlrequest.urlopen(req, timeout=5)
+    assert err.value.code == 401
+
+
+# ----------------------------------------------------------------------
+# Transfer-record eviction on the sweep (#185)
+# ----------------------------------------------------------------------
+
+from ccs.adapters.claude_code import foreign_write_detector as _detector  # noqa: E402
+from ccs.coordinator.registry_protocol import TransferRequest  # noqa: E402
+from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry  # noqa: E402
+from ccs.core.states import MESIState  # noqa: E402
+from ccs.core.types import Artifact  # noqa: E402
+
+
+class _OneTickService:
+    """The grant and session sweeps as no-ops; the last ends the loop after
+    the tick it runs in, so the eviction passes behind it run exactly once."""
+
+    def __init__(self, coordinator: SimpleNamespace) -> None:
+        self._coordinator = coordinator
+
+    def enforce_transient_timeouts(self, **_kwargs) -> int:
+        return 0
+
+    def enforce_stable_grant_timeouts(self, **_kwargs) -> int:
+        return 0
+
+    def enforce_session_liveness(self, **_kwargs) -> int:
+        self._coordinator.shutting_down = True
+        return 0
+
+
+def _sweep_one_tick(registry: object, *, transfer_record_evict_max_age_sec: float) -> None:
+    """Drive ONE tick of the real ``_sweep_loop`` over ``registry``."""
+    coord = SimpleNamespace(shutting_down=False, registry=registry)
+    coord.service = _OneTickService(coord)
+    cfg = SimpleNamespace(
+        sweep_interval_sec=0.01,
+        transient_timeout_sec=5,
+        grant_heartbeat_timeout_sec=120,
+        grant_max_hold_sec=300,
+        notice_evict_max_age_sec=600,
+        transfer_record_evict_max_age_sec=transfer_record_evict_max_age_sec,
+    )
+    _lifecycle._sweep_loop(SimpleNamespace(coordinator=coord), cfg)
+
+
+def _handed_off(registry: SqliteArtifactRegistry, name: str) -> uuid.UUID:
+    """A path at v1 whose SHARED reader handed it to a successor: a live record."""
+    artifact = Artifact(id=uuid.uuid4(), name=name, version=1, content_hash="h0")
+    registry.register_artifact(artifact, "")
+    holder = uuid.uuid4()
+    registry.set_agent_state(artifact.id, holder, MESIState.SHARED, trigger="fetch", tick=1)
+    request = TransferRequest(
+        giver=uuid.uuid4(), successor=uuid.uuid4(), holders={artifact.id: holder},
+        successor_known=True,
+    )
+    [outcome] = registry.transfer_grants(request, tick=2)
+    assert outcome.transferred, outcome
+    return artifact.id
+
+
+def test_the_transfer_record_eviction_knob_defaults_to_one_day() -> None:
+    """An ended record outlives a writer left idle overnight, so its
+    next touch still learns how its handoff ended."""
+    assert _lifecycle.LifecycleConfig().transfer_record_evict_max_age_sec == 86_400.0
+
+
+def test_the_sweep_evicts_ended_transfer_records_older_than_its_knob_and_never_a_live_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Eviction on the sweep: a declined record, and a pending one whose version
+    moved with no label written, are kept while younger than the knob and
+    evicted once older; a live record survives any knob, because removing it
+    would lift the giver's fence with nobody having ended the handoff."""
+    monkeypatch.setattr(_detector, "run_detection_pass", lambda *_args, **_kwargs: 0)
+    with SqliteArtifactRegistry(tmp_path / "sweep.db") as registry:
+        live = _handed_off(registry, "live.md")
+        declined = _handed_off(registry, "declined.md")
+        registry.set_transfer_status(declined, "declined")
+        moved = _handed_off(registry, "moved.md")
+        won = registry.commit_cas(moved, uuid.uuid4(), expected_version=1, content_hash="h1")
+        assert isinstance(won, tuple), won
+        assert registry.get_transfer_record(moved)[0].status == "pending"
+
+        _sweep_one_tick(registry, transfer_record_evict_max_age_sec=3600.0)
+        assert [registry.get_transfer_record(a)[1] for a in (live, declined, moved)] == [
+            True, False, False]
+
+        # The tick sleeps one sweep interval (10ms) before it runs, so every
+        # stamp above is older than a 1ms knob by then.
+        _sweep_one_tick(registry, transfer_record_evict_max_age_sec=0.001)
+        assert registry.get_transfer_record(live)[1] is True
+        assert registry.get_transfer_record(declined) is None
+        assert registry.get_transfer_record(moved) is None
+
+
+def test_the_sweep_evicts_transfer_records_after_notices_under_the_same_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The eviction runs right after notice eviction with its own knob,
+    inside the best-effort guard the other passes share, so a failing eviction
+    costs this tick nothing else and never takes the sweep down."""
+    calls: list[tuple[str, float]] = []
+    detected: list[int] = []
+
+    class _Registry:
+        def evict_stale_notices(self, *, max_age_sec: float) -> int:
+            calls.append(("notices", max_age_sec))
+            return 0
+
+        def evict_transfer_records(self, *, max_age_sec: float) -> int:
+            calls.append(("transfer_records", max_age_sec))
+            raise RuntimeError("injected eviction failure")
+
+    def _detection(*_args, **_kwargs) -> int:
+        detected.append(1)
+        return 0
+
+    monkeypatch.setattr(_detector, "run_detection_pass", _detection)
+    _sweep_one_tick(_Registry(), transfer_record_evict_max_age_sec=7200.0)
+
+    assert calls == [("notices", 600), ("transfer_records", 7200.0)]
+    assert detected == [1]

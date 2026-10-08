@@ -48,6 +48,10 @@
       "effect_fence_holds_total": 0,
       "endpoint_counters": {
         "effect_fence_total": 0,
+        "handoff_accept_total": 0,
+        "handoff_decline_total": 0,
+        "handoff_transfer_total": 0,
+        "handoff_withdraw_total": 0,
         "policy_track_total": 0,
         "policy_untrack_total": 0,
         "post_edit_cas_total": 0,
@@ -63,6 +67,7 @@
       },
       "fresh_shared_hash_mismatch_total": 0,
       "handler_concurrency_overflows_total": 0,
+      "handoff_giver_denials_total": 0,
       "in_flight_drain_timed_out": false,
       "intra_task_acquire_release_total": 0,
       "policy_summary": "<IGNORED>",
@@ -112,6 +117,6 @@
   },
   "ignore_keys": ["policy_summary", "coordinator_version"],
   "preserve_identity": ["agent_id"],
-  "_comment": "The two agent ids are uuid5(NAMESPACE_URL, 'ccs-agent:claude-session-<session id>') over the two session ids this fixture supplies, so they are derived rather than observed and the same two values are recomputed in test_effect_fence_corpus.py rather than pasted. Row ORDER is the adapter's _agent_names insertion order, i.e. the preflight order: A registers on pre-read, B on pre-edit. tracked_artifacts[].id IS scrubbed -- an artifact id is minted per run and is not an identity this fixture asserts -- which doubles as the in-body control that the opt-in is scoped to the declared key and did not disable the default wholesale. python-only for the same reason fixture warn_mode/08 is: the Node /status envelope is a different shape (see warn_mode/09). caller_principal_absent_total is 2 because both preflights are sent without a caller principal and name sessions nobody claimed: pre-read (accept-class) and pre-edit (require-class, which admits an unclaimed session -- KTD15) are each admitted and counted (plan U6), and nothing else in the fixture moves it. Nothing is refused, so caller_principal_refused_total is 0.",
+  "_comment": "The two agent ids are uuid5(NAMESPACE_URL, 'ccs-agent:claude-session-<session id>') over the two session ids this fixture supplies, so they are derived rather than observed and the same two values are recomputed in test_effect_fence_corpus.py rather than pasted. Row ORDER is the adapter's _agent_names insertion order, i.e. the preflight order: A registers on pre-read, B on pre-edit. tracked_artifacts[].id IS scrubbed -- an artifact id is minted per run and is not an identity this fixture asserts -- which doubles as the in-body control that the opt-in is scoped to the declared key and did not disable the default wholesale. python-only for the same reason fixture warn_mode/08 is: the Node /status envelope is a different shape (see warn_mode/09). caller_principal_absent_total is 2 because both preflights are sent without a caller principal and name sessions nobody claimed: pre-read (accept-class) and pre-edit (require-class, which admits an unclaimed session -- KTD15) are each admitted and counted (plan U6), and nothing else in the fixture moves it. Nothing is refused, so caller_principal_refused_total is 0. handoff_giver_denials_total (#185) is 0: no handoff exists, so no giver is denied.",
   "backends": ["python"]
 }

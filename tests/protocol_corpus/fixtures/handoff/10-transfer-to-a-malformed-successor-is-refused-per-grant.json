@@ -1,0 +1,68 @@
+{
+  "name": "handoff-transfer-to-a-malformed-successor-is-refused-per-grant",
+  "description": "handoff_successor_malformed. A successor that is not a well-formed agent id is answered per grant inside an HTTP 200, not as a 400.",
+  "setup": {
+    "tracked": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "path": "plan.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/handoff/transfer",
+    "body": {
+      "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "successor": "not-an-agent-id",
+      "grants": [
+        {
+          "path": "plan.md"
+        }
+      ]
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_a}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": false,
+      "grants": [
+        {
+          "path": "plan.md",
+          "transferred": false,
+          "reason": "handoff_successor_malformed"
+        }
+      ]
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

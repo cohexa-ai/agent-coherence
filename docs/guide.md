@@ -33,22 +33,23 @@ full command-line toolset, and the API reference.
 13. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
 14. [Effect fence over HTTP](#effect-fence-over-http)
 15. [Caller principal](#caller-principal)
-16. [Acquire-or-fail on `pre-edit` (specified, not yet built)](#acquire-or-fail-on-pre-edit-specified-not-yet-built)
-17. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
-18. [Inline benchmark mode](#inline-benchmark-mode)
-19. [Telemetry](#telemetry)
-20. [Graceful degradation](#graceful-degradation)
-21. [Examples](#examples)
-22. [Real-workload benchmarks](#real-workload-benchmarks)
-23. [Benchmarking your own workload](#benchmarking-your-own-workload)
-24. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-25. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
-26. [Replay (v0.8.2+)](#replay-v082)
-27. [Command-line tools](#command-line-tools)
-28. [API reference](#api-reference)
-29. [Low-level adapter API](#low-level-adapter-api)
-30. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-31. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+16. [Targeted grant handoff](#targeted-grant-handoff)
+17. [Acquire-or-fail on `pre-edit` (specified, not yet built)](#acquire-or-fail-on-pre-edit-specified-not-yet-built)
+18. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
+19. [Inline benchmark mode](#inline-benchmark-mode)
+20. [Telemetry](#telemetry)
+21. [Graceful degradation](#graceful-degradation)
+22. [Examples](#examples)
+23. [Real-workload benchmarks](#real-workload-benchmarks)
+24. [Benchmarking your own workload](#benchmarking-your-own-workload)
+25. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+26. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
+27. [Replay (v0.8.2+)](#replay-v082)
+28. [Command-line tools](#command-line-tools)
+29. [API reference](#api-reference)
+30. [Low-level adapter API](#low-level-adapter-api)
+31. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+32. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -266,11 +267,12 @@ Each entry is a flat `dict` with exactly these eight keys:
 | `"write"` | Write request; peers are invalidated (→ INVALID), requester receives EXCLUSIVE |
 | `"commit"` | Write commit; peers are invalidated (→ INVALID), committer transitions to MODIFIED |
 | `"invalidate"` | Explicit invalidation signal; agent transitions to INVALID |
+| `"handoff"` | [Targeted grant handoff](#targeted-grant-handoff): the giver hands its claim (EXCLUSIVE, MODIFIED or a standing SHARED read) to a successor and transitions to INVALID |
 | `"timeout"` | Transient state timeout; agent force-invalidated (→ INVALID) |
 | `"reclaim_heartbeat"` | Crash recovery: agent's heartbeat older than `heartbeat_timeout_ticks` |
 | `"reclaim_max_hold"` | Crash recovery: grant held for at least `max_hold_ticks` |
 
-The last four triggers move the artifact's **ownership epoch** when they take a
+The last five triggers move the artifact's **ownership epoch** when they take a
 holder out of EXCLUSIVE/MODIFIED, because each of them ends a write claim
 *without the version moving* — the one case a version check cannot see. A later
 commit from that ex-holder is then rejected with `stale_read_generation` rather
@@ -280,6 +282,12 @@ agent's side of the check — the generation it captured — is written only by
 its own acquire or its own read; being downgraded by another agent's fetch
 never refreshes it, so an ex-holder rejected with `stale_read_generation`
 stays rejected until it re-reads or re-acquires itself.
+
+`"handoff"`, like `"invalidate"`, is the holder's own act, not a reclaim. A
+giver that hands off a write grant moves the epoch exactly as a release does; a
+giver that hands off a standing SHARED read takes no one out of
+EXCLUSIVE/MODIFIED and moves no epoch, so sessions that read the path are not
+fenced as though a writer had been reclaimed.
 
 An explicit invalidation is also **pinned**: one issued by a peer is dropped as
 obsolete if the agent it names has since observed a version at least as new as
@@ -612,11 +620,27 @@ detached. When the sets cannot be read at all, because the coordinator is older
 and publishes only counts, or is the Node coordinator, the volume fails closed
 the same way and says that enforcement could not be confirmed.
 `vol.managed_glob_enforcement()` returns the same three-way answer. The
-comparison is literal and taken once, at attach: a coordinator that ignores the
-paths under a broader pattern, or a path untracked after attach with the untrack
-command, is not detected, and such paths answer every operation as untracked. A
-fleet with mixed globs is still unsupported; it now refuses instead of running
-unguarded.
+comparison is literal and taken once, at attach, and the coordinator keeps the
+answer true while it runs. A strict path stays enforced for the coordinator's
+lifetime:
+
+- the untrack command (`POST /policy/untrack`) refuses an entry, a path or a
+  glob, that covers a path the coordinator holds in strict mode. It answers
+  HTTP 409 with `reason: "untrack_strict_path"`, names the strict pattern for
+  each refused entry under `refused`, and writes nothing; the CLI exits 3. The
+  check is bounded in time: an entry it cannot settle within that bound counts
+  as covering, so a very large or unusual request can be refused for a strict
+  pattern it does not reach. Untrack fewer entries at a time if that happens;
+- an ignored pattern never takes a strict path off the tracked set, whether it
+  was in `.coherence/ignored.yaml` at spawn or added later, and however broadly
+  it is spelled (`**`): strict wins over ignore, and the coordinator logs the
+  overridden ignore entry at load. For every non-strict path ignore still wins;
+- the reload behind the track and untrack commands never drops a strict or
+  tracked pattern, even one removed from the YAML on disk by hand.
+
+To stop enforcing a strict path, remove its entry from
+`.coherence/strict_mode.yaml` and restart the coordinator. A fleet with mixed
+globs is still unsupported; it refuses instead of running unguarded.
 
 ```python
 from ccs.adapters.coherent_volume import CoherentVolume
@@ -641,7 +665,22 @@ same for the volume's lifetime: `reacquire()` and the retries inside `write_cas`
 clear a stale view by starting a fresh attempt under that same session. A forked
 child gets a session of its own. The fresh attempt travels in the request's
 `agent_id` field, so the volume needs a coordinator that reads it: this package's
-from 0.13.0, or the Claude Code plugin's from 0.3.0.
+from 0.13.0, or the Claude Code plugin's from 0.3.0. A volume hands a file to
+another session with `vol.transfer()`; see
+[From a `CoherentVolume`](#from-a-coherentvolume).
+
+To name the attempt to something else — a registry that joins the coordinator's
+`/status` `sessions[].agent_id` against its writers, for example — read
+`vol.agent_id`: the identity the coordinator keys the volume's next request on,
+in the same string form `/status` reports. `vol.incarnation` is the per-attempt
+part of it, the value every request carries in its `agent_id` field (a
+`transfer()` also names, per path, the incarnation that holds the volume's
+claim there, which can be an earlier one). Both change
+only when an attempt starts (`reacquire()`, `write_cas_at`, `atomic_publish`, a
+`write_cas` that retries or first releases its own `write()` grant, and a forked
+child) and are stable in between, so read them after the operation whose
+attempt you are reporting. `vol.root` is the workspace root as the volume
+resolved it at construction (absolute, symlinks followed); it never changes.
 
 ### Concurrent writers: `write_cas`
 
@@ -654,6 +693,11 @@ silently dropped. A single-shot variant, `write_cas_at(path, expected_version,
 content)`, commits against an explicit version with no retry loop. See the race
 live: `python -m examples.concurrent_writers.main` runs two threads through the
 identical update — a plain file loses one write, `write_cas` preserves both.
+
+Both return a `CasCommitResult` (importable from `ccs.adapters`): the `path`,
+the `version` the win committed, and `handoff`, what the win did to a live
+[handoff](#from-a-coherentvolume) of the path, or `None`. They used to return
+`None`, so code that ignores the return value is unaffected.
 
 A volume can `write()` a file and then commit it through the optimistic lane. A
 successful `write()` leaves the volume holding that file's write grant after it
@@ -1320,7 +1364,9 @@ the client:
   in `.coherence/` by the session id in the event. A hook carrying another
   session's id can therefore find that session's principal too. On this surface
   the principal makes a client that never claimed, or one presenting the wrong
-  principal, visible; it does not tell sessions apart.
+  principal, visible; it does not tell sessions apart. The
+  [handoff commands](#handoff-commands) find a session's principal the same
+  way, by the session id they are given.
 
 ### You usually do nothing
 
@@ -1357,19 +1403,27 @@ Every route that takes a `session_id` is in one of three classes:
 
 | Class | Routes | A request naming a session that has claimed a principal… |
 |---|---|---|
-| require | `/hooks/pre-edit`, `/hooks/session-stop`, `/hooks/post-edit`, `/hooks/post-edit-cas`, `/hooks/effect-fence`, `/workspace/checkpoint`, `/workspace/restore/register`, `/workspace/restore/status`, `/workspace/restore/member` | …must present it. Without it, or with a different one, the answer is `400`. |
+| require | `/hooks/pre-edit`, `/hooks/session-stop`, `/hooks/post-edit`, `/hooks/post-edit-cas`, `/hooks/effect-fence`, `/workspace/checkpoint`, `/workspace/restore/register`, `/workspace/restore/status`, `/workspace/restore/member`, `/handoff/transfer`, `/handoff/accept`, `/handoff/decline`, `/handoff/withdraw` | …must present it. Without it, or with a different one, the answer is `400`. |
 | accept | `/hooks/pre-read`, `/hooks/pre-bash`, `/hooks/pre-grep`, `/hooks/session-start`, and the five `/session/*` routes | …is admitted without it, but refused with a different one. |
 | mint | `/principal/claim` | …is where principals come from; its gate is the mint nonce. |
 
 The require class is the routes that take, release or commit a session's
 grants, record who wrote a version, answer the effect fence about a session's
-grant, or record workspace ownership — the things a caller naming the wrong
-session could do to someone else's work. `pre-edit` is among them because a
-grant taken without the principal could then be neither committed nor released.
-The accept-class reads change no grant or version, but they do deliver the
-named session's pending notices, so a read naming the wrong session can consume
-advisories meant for it. The snapshot-session routes are accept-class because
-each is already gated by the server-issued session token.
+grant, record workspace ownership, or hand a session's claims on or settle a
+[handoff](#targeted-grant-handoff) in its name — the things a caller naming the
+wrong session could do to someone else's work. `pre-edit` is among them because
+a grant taken without the principal could then be neither committed nor
+released. The accept-class reads change no grant or version, but they do
+deliver the named session's pending notices, so a read naming the wrong session
+can consume advisories meant for it. The snapshot-session routes are
+accept-class because each is already gated by the server-issued session token.
+That token is issued to whichever session `/session/begin` names, and that
+route is accept-class too, so a request that presents no principal and names a
+bound session commits as that session on `/session/commit` and
+`/session/commit_all`. Against a live handoff of the path it is therefore
+refused as that session when that session is the giver, completes the handoff
+when it is the successor, and is recorded as the counterparty of an overtake
+otherwise.
 
 A refusal is HTTP `400` with an `error` field naming the header and a `reason`
 field: `caller_principal_absent` when a claimed session is named with no
@@ -1413,12 +1467,1142 @@ earlier schema steps it is forward-only: once a workspace's `state.db` has been
 opened by this version, an older release refuses it. Upgrade forward rather than
 rolling back.
 
+## Targeted grant handoff
+
+A session that is done with a path can hand it to one named session, the
+**successor**. The coordinator records the handoff, so afterwards it can tell a
+deliberate handoff from an abandoned claim: the giver's late write is refused
+with a reason that says it handed the path off, the successor can see that it
+was handed the path and at which version, and the state log records the
+giver's move under a trigger of its own, `handoff`, rather than as a release or
+a reclaim.
+
+Use it when one session passes its work on a file to another — a lead handing a
+plan to a worker, a session ending its task handing the file it was editing to
+the session that carries on — and the first session must not write that file
+again unless the handoff is undone.
+
+Most of this section describes the coordinator's HTTP API. Claude Code
+sessions use it through the hook client and four console scripts: the hooks
+deny the giver's edit and tell each session about the handoff in its read and
+edit answers (see [Claude Code sessions](#claude-code-sessions)), and the
+commands hand a path on and accept, decline or withdraw a handoff (see
+[Handoff commands](#handoff-commands)). `CoherentVolume` has a method for each
+verb (see [From a `CoherentVolume`](#from-a-coherentvolume)), and the MCP server
+a tool for each (see [From the MCP server](#from-the-mcp-server)). Any other
+client calls the routes over HTTP.
+
+### What a transfer does
+
+A transfer names one successor and one or more paths. For each path the giver
+must hold a claim: a write grant (EXCLUSIVE, or MODIFIED after a commit) or a
+standing SHARED read. The transfer then, for every path it admits, in one step:
+
+- moves the giver's claim to INVALID under the `handoff` trigger, giving it up
+  as a release would (see the [trigger vocabulary](#trigger-vocabulary) for
+  what that does to the ownership epoch);
+- stores one **transfer record** for the path: the giver, the successor, the
+  version at transfer, the hold shape given up, and a status;
+- fences the giver, which can no longer write the path while the record is
+  live.
+
+It grants the successor nothing. The successor reads or acquires the path
+itself, by the ordinary rules. Its acquire, its optimistic commit or its accept
+completes the handoff; a read alone does not.
+
+**A transfer does not reserve the path.** No other session is refused because
+of it: a third session's read is served, its acquire is granted and its
+compare-and-swap commits by the ordinary rules. The record labels what happened
+(see [Bystanders and overtake](#bystanders-and-overtake)); it keeps no one out.
+
+**The parties are sessions.** The giver is the session the transfer request
+names, and the successor is resolved to a session too. Every subagent and every
+fresh attempt of the giver's session is fenced alike, and a subagent of the
+successor's session accepts or declines for it. A transfer to the caller's own
+session, directly or through one of its own subagents, is refused as
+`handoff_to_self`.
+
+| Call | Who may make it | Anyone else is refused with |
+|---|---|---|
+| transfer | a session holding a claim on the path; while a live record exists, only that record's giver | a per-grant reason (see [`POST /handoff/transfer`](#post-handofftransfer)) |
+| accept | the live record's successor | `handoff_not_successor` |
+| decline | the live record's successor | `handoff_not_successor` |
+| withdraw | the live record's giver | `handoff_not_giver` |
+
+### Statuses, and when a record is live
+
+| `status` | Set when | Giver fenced |
+|---|---|---|
+| `pending` | the transfer landed and the successor has not acted | while live |
+| `completed` | the successor accepted, acquired the path, or won an optimistic commit on it (`post-edit-cas`, or a snapshot-session commit) | while live |
+| `overtaken` | a session other than the successor acquired the path or won an optimistic commit on it; the record names that session as its `counterparty` | while live |
+| `declined` | the successor declined | no |
+| `withdrawn` | the giver withdrew | no |
+| `superseded` | never stored: the answer to a re-send of a transfer the giver has since replaced with one to another successor | — |
+
+A record is **live** while the path's version still equals the version at
+transfer and the record was neither declined nor withdrawn, whatever its status
+says. The [`handoff` key](#the-handoff-key) and `/status` report `live` beside
+`status`.
+
+### The giver's fence
+
+While its record is live, every write route refuses the giver's session on that
+path, whichever subagent or attempt the request names. Nothing is granted,
+committed or invalidated:
+
+| Route | The giver's answer |
+|---|---|
+| `POST /hooks/pre-edit` | `{"ok": false, "reason": "handed_off", "successor": "<agent id>", "version_at_transfer": 7, "handoff": {…}}`, plus a deny in `hookSpecificOutput` that stops a Claude Code edit (see [Claude Code sessions](#claude-code-sessions)) |
+| `POST /hooks/pre-bash`, for a shell command that writes the path | the `pre-edit` answer, byte for byte, deny included (see [Claude Code sessions](#claude-code-sessions) for the shell writes it recognizes) |
+| `POST /hooks/post-edit` (`success: true`) | the same fields, with a context-only `PostToolUse` envelope in place of the deny |
+| `POST /hooks/post-edit-cas` | the same fields, with no `hookSpecificOutput` |
+| `POST /session/commit` | `{"ok": false, "reason": "handed_off", "successor": "<agent id>", "version_at_transfer": 7}` |
+| `POST /session/commit_all` | the same, plus `path` naming the handed-off member; no member of the batch commits |
+| `POST /workspace/restore/register` | the same, plus `path` |
+
+The fence covers writes only: a read from the giver is answered by the ordinary
+rules and carries the [`handoff` key](#the-handoff-key) with its outcome,
+unless the answer is a strict-mode deny. An admitted read also tells a Claude
+Code giver, in words, that it handed the path off (see
+[Claude Code sessions](#claude-code-sessions)).
+
+`handed_off` is not a conflict to retry. No retry, re-read or reacquire clears
+it, because the fence is keyed on the giver's session. The fence lifts only
+when the record stops being live, which happens in exactly three ways:
+
+- **the version moves**: any session commits a write to the path — the
+  successor, or a bystander;
+- **the successor declines** (`POST /handoff/decline`);
+- **the giver withdraws** (`POST /handoff/withdraw`).
+
+Nothing else lifts it. There is no timer: a handoff nobody acts on stays live,
+and its giver stays fenced, for as long as the version stays put. Completion
+does not lift it either — after the successor accepts or acquires, the giver
+stays fenced until a write moves the version, so a late write from the giver
+cannot land at the transfer version ahead of a successor that has not written
+yet. A `session-stop` from either party, and a failed edit the giver reports,
+leave the record as it is.
+
+Once the fence has lifted, the giver's writes are judged by the ordinary rules
+again. After the successor's commit, for example, the giver's compare-and-swap
+at the transfer version answers `version_mismatch`.
+
+Withdraw is the giver's own act: it needs the giver's session id and, if that
+session has claimed a [caller principal](#caller-principal), that principal. If
+the giver can no longer send it, the handoff ends only by the successor's
+decline or by the next committed write to the path. A Claude Code session's
+principal is stored under `.coherence/`, so a Claude Code giver can still
+withdraw after its session has ended: run `agent-coherence-withdraw --session
+<its session id> <path>` (see [Handoff commands](#handoff-commands)). A
+client that keeps its principal only in memory, such as a `CoherentVolume` or
+the MCP server, can withdraw only while its process is running (see
+[When a volume or MCP session stops](#when-a-volume-or-mcp-session-stops)).
+
+### Bystanders and overtake
+
+Any session other than the giver and the successor is a bystander, and a
+handoff never refuses one. A bystander's acquire (`pre-edit`) or optimistic
+commit on a live record marks it `overtaken` and stores the bystander's
+session-level agent id as the `counterparty`. That labels the record without
+ending it: an acquire does not move the version, so after it the record is
+still live and the giver still fenced. The bystander's commit moves the version
+and ends the record.
+
+While an overtaken record is live, the successor's own acquire or optimistic
+commit marks it `completed`. An accept does not: accepting an overtaken record
+answers `ok: true` with `"status": "overtaken"` and the `counterparty`, and
+changes nothing. The successor's decline and the giver's withdraw end an
+overtaken record as they end any other.
+
+Bystanders see the record in the `handoff` key of their read and edit answers,
+with `"role": "bystander"`, and a Claude Code bystander is also told in words
+(see [Claude Code sessions](#claude-code-sessions)). The key is advisory:
+nothing stops a bystander that writes past it.
+
+While a record is live, no session other than its giver can hand the path on,
+the successor included: their transfer of that path is refused as
+`handoff_in_flight`, naming the pending giver and successor, until the handoff
+ends.
+
+### Naming the successor
+
+Name the successor by its **session-level agent id**: the agent id the
+coordinator derives from the successor's session id alone, with no subagent id.
+In Python that is `session_to_agent_id(session_id)` from
+`ccs.adapters.claude_code.coordinator_server`, which computes
+`uuid.uuid5(uuid.NAMESPACE_URL, "ccs-agent:claude-session-" + session_id)`. It is the id
+`/status` lists in `sessions[]` for a Claude Code session's main thread, and the
+id every answer about the record uses for both parties. The coordinator accepts
+it hyphenated or as 32 hex digits, in either case, and answers with the
+hyphenated lower-case spelling.
+
+The coordinator must know the id, or every grant of the transfer is refused as
+`handoff_successor_unknown`:
+
+- A session-level id is known when its session has claimed a caller principal,
+  as every bundled client does against this coordinator; the binding survives
+  a coordinator restart. A session that never claimed one is known only while
+  the coordinator's in-memory name map holds it, as below.
+- A composite id — a subagent's, or the per-attempt id a `CoherentVolume` sends
+  — is resolved to its session, so naming another session's subagent hands the
+  path to that whole session. It is known only while the coordinator's
+  in-memory name map holds it. The coordinator fills that map as identities
+  make requests and loses it when its process exits, so after a restart a
+  composite id is refused as unknown, even while it still holds a grant.
+
+So name the session-level id, which needs no live name map when the successor
+has claimed a principal. Where each kind of session's id comes from:
+
+- **A Claude Code session**: derive it from the session's id, which Claude
+  Code sets as `CLAUDE_CODE_SESSION_ID` in the session's shells (see the
+  [example](#example-handing-a-file-between-claude-code-sessions)).
+- **A `CoherentVolume`**: `str(session_to_agent_id(vol.session_id))`, with the
+  function above. Do not take a volume's id from `sessions[]` on `/status`:
+  the ids listed there for a volume are its per-attempt composite ids, which a
+  restart of the coordinator forgets.
+- **An MCP session**: the `session_agent_id` its own `swg_status` reports (see
+  [From the MCP server](#from-the-mcp-server)).
+
+A volume or MCP session is known as a successor as soon as it has claimed its
+principal, which it does when it attaches to the coordinator.
+
+### `POST /handoff/transfer`
+
+All four handoff routes take JSON over `POST` and pass the same bearer-token
+and host checks as every coordinator route (see
+[Effect fence over HTTP](#effect-fence-over-http)). All four are require-class
+for the [caller principal](#caller-principal): a request naming a session that
+has claimed one must present it in the `Coherence-Caller-Principal` header.
+
+| Field | Type | What it is |
+|---|---|---|
+| `session_id` | UUID string | The giver's session. |
+| `successor` | agent id string | The session to hand the paths to; see [Naming the successor](#naming-the-successor). |
+| `grants` | list of 1 to 64 `{"path", "agent_id"}` objects | The paths to hand on, each at most once. A grant's optional `agent_id` names the subagent or attempt holding the claim on that path. |
+| `agent_id` | string, optional | The holder for every grant that names none. With neither, the claim given up is the session's own. |
+
+The answer is HTTP `200` with one entry per grant, in request order, and `ok`
+is `true` only when every grant transferred:
+
+```json
+{"ok": true, "grants": [
+  {"path": "plans/plan.md", "transferred": true,
+   "giver": "<agent id>", "successor": "<agent id>",
+   "version_at_transfer": 7, "hold_shape": "EXCLUSIVE", "status": "pending"}
+]}
+```
+
+`hold_shape` is `EXCLUSIVE`, `MODIFIED` or `SHARED`; `giver` and `successor`
+are session-level agent ids. A refused grant is
+`{"path", "transferred": false, "reason"}` and is left exactly as it was, while
+the other grants of the same request still transfer:
+
+| `reason` | What it means |
+|---|---|
+| `handoff_not_held` | the claim presented holds nothing on the path (no EXCLUSIVE or MODIFIED grant and no standing read), or the coordinator has never seen the path |
+| `handoff_version_unconfirmed` | the coordinator has no confirmed version for the path, so there is no version to fence on |
+| `handoff_other_holder` | another agent holds the path EXCLUSIVE or MODIFIED, so the claim presented is not the write authority to hand on |
+| `handoff_in_flight` | another session's handoff of the path is live. The entry adds `giver`, `successor` and a fixed `detail` saying what ends that handoff |
+| `handoff_to_self` | the successor is the caller's own session |
+| `handoff_successor_unknown` | the coordinator does not know the successor id. Every grant of the request gets it |
+| `handoff_successor_malformed` | the successor is not a well-formed agent id. Every grant of the request gets it |
+| `handoff_ended` | a re-send of a handoff that ended at an unmoved version: declined, withdrawn or superseded. The entry adds `giver`, `successor`, `version_at_transfer`, `hold_shape` and `status` |
+
+Match on the whole value; the reasons may grow, and none is ever renamed.
+
+**Sending the same transfer again is safe while its record is live.** A grant
+whose live record already names the same giver and successor answers
+`transferred: true` with the record's current status, and nothing moves. A
+request carries no version, so once the path's version has moved -- the
+successor or anyone else wrote it -- a re-send cannot be told from a new
+transfer: from a giver that holds a claim on the path again (a read registers
+one), it records a new handoff at the new version and fences the giver again. While its record is live, the giver
+naming a *different* successor for the path replaces the record: the new one is
+`pending` for the new successor, at the same version at transfer and hold
+shape. A late re-send naming the replaced successor answers `handoff_ended`
+with status `superseded` rather than switching back. Once a record has ended,
+any other transfer of the path is decided by the checks in the table, and one
+that is admitted replaces the ended record.
+
+**Requests that cannot be read** answer HTTP `400` with an `error` field, and
+nothing changes: a missing or malformed `session_id`; `grants` missing, empty,
+longer than 64, holding something other than objects, naming a path twice or a
+path that fails validation; a malformed `agent_id` at either level, which is
+refused rather than read as the main thread because the main thread's claim is
+not the one asked for; or no `successor`. A malformed successor is not a `400`:
+it is answered per grant, as above.
+
+**A timed-out transfer** answers
+`{"ok": false, "degraded": true, "reason": "handoff_transfer_unconfirmed"}`.
+The outcome is unknown: either nothing landed or every grant that would have
+transferred did. Read the path's `handoff` key on `/status` first: a transfer
+that landed shows its record there, live or ended. Send the same transfer
+again only when it shows no handoff from you to that successor; while one is
+live, the re-send answers its status and moves nothing.
+
+### Accept, decline and withdraw
+
+`POST /handoff/accept`, `POST /handoff/decline` and `POST /handoff/withdraw`
+each take `{"session_id": "<uuid>", "path": "<path>"}` and act on the path's
+record as that session.
+
+| Route | Who | What it does |
+|---|---|---|
+| `/handoff/accept` | the successor | `pending` becomes `completed` without a write. A `completed` record is answered as it stands; an `overtaken` one is answered with its status and `counterparty` and keeps them. The fence stays |
+| `/handoff/decline` | the successor | ends the record as `declined`, whatever its status. The fence lifts |
+| `/handoff/withdraw` | the giver | ends the record as `withdrawn`, whatever its status. The fence lifts |
+
+A verb that is taken answers `{"ok": true, "status": "<status after it>"}`, with
+`counterparty` on an overtaken record. A refusal is
+`{"ok": false, "reason": "...", "status": "..."}` and changes nothing:
+
+| `reason` | When |
+|---|---|
+| `handoff_not_live` | there is no live record: it ended (its `status` says how), or the path has no record at all (no `status`) |
+| `handoff_not_successor` | an accept or decline from a session that is not the live record's successor |
+| `handoff_not_giver` | a withdraw from a session that is not the live record's giver |
+
+A missing or malformed `session_id` or `path` is HTTP `400`. A timed-out call
+answers `ok: false`, `degraded: true` and `handoff_accept_unconfirmed`,
+`handoff_decline_unconfirmed` or `handoff_withdraw_unconfirmed`: the outcome is
+unknown, so read the record again before acting on it.
+
+### The `handoff` key
+
+While a path has a transfer record — live, or ended and not yet evicted — the
+answers of `POST /hooks/pre-read`, `/hooks/pre-edit`, `/hooks/post-edit` and
+`/hooks/post-edit-cas` for that path carry a top-level `handoff` key, projected
+for the caller:
+
+```json
+"handoff": {"role": "successor", "giver": "<agent id>", "successor": "<agent id>",
+            "version_at_transfer": 7, "hold_shape": "EXCLUSIVE",
+            "status": "pending", "live": true}
+```
+
+`role` is `giver`, `successor` or `bystander`. An overtaken record adds
+`counterparty`. A compare-and-swap win that labelled the record adds
+`outcome`: `completed` for the successor's win, `overtaken` for anyone else's.
+The key sits beside the answer's other fields and never inside a
+`hookSpecificOutput`. A strict-mode deny on `pre-read` or `pre-edit` carries no
+key at all: its body is byte-for-byte what it is with no record on the path.
+The giver's own `pre-edit` deny does carry the key. With no record on the
+path, none of these answers carries the key.
+Admitted `pre-read` and `pre-edit` answers also carry the record as prose for
+Claude Code; see [Claude Code sessions](#claude-code-sessions).
+
+The key is best-effort. If the coordinator cannot read the record after the
+request's work has landed, it answers without the key (and without that
+prose) and logs a warning, so a missing key does not prove the path has no
+record. Read the path on `/status` when you need to be sure.
+
+`GET /status` carries the same fields, without `role`, in the
+`tracked_artifacts` entry of each path that has a record, on the default view
+and the operator view (`?detail=full` with the `Coherence-Local-Operator: true`
+header). The operator view adds `created_at_unix_ts`, when the record was
+written. The `metrics` view carries no record. `agent-coherence-status --json` prints the key as the coordinator
+sends it, and the table view lists each record in a Handoffs block (see
+[Handoffs in `agent-coherence-status`](#handoffs-in-agent-coherence-status)).
+
+`/status` also counts calls to the four routes as `handoff_transfer_total`,
+`handoff_accept_total`, `handoff_decline_total` and `handoff_withdraw_total`
+in `endpoint_counters`. These counters are present whether or not any path has
+a record.
+
+Every id in the key, here and on `/status`, is a session-level agent id. No
+session id or session name appears in it.
+
+### Release answers, per grant
+
+A release that is a clean success answers as it always has. One that is not now
+reports each grant, so a client never drops its record of a grant the
+coordinator still holds:
+
+- **`POST /hooks/session-stop` that leaves a grant held** answers
+  `{"ok": false, "released_artifacts": [...], "grants": [...]}`, one entry per
+  grant it tried to release, in no guaranteed order (match entries by `path`):
+  `{"path", "held": false, "cause": "release"}` for a grant it released, and
+  `{"path", "held": true, "reason"}` for one still held (with `detail` when the
+  reason is a typed one). It used to answer `ok: true` and only log the
+  failure.
+- **`POST /hooks/post-edit` with `success: false` whose release is refused**
+  keeps its `ok: false` and `reason`, and adds the same `grants` list.
+- **The giver's own failed-edit report on a path it handed off** — while the
+  record is live — answers `ok: false` with `"reason": "handed_off"`, the
+  `successor` and `version_at_transfer`, and a grant entry
+  `{"path", "held": false, "cause": "handoff", "successor", "version_at_transfer"}`.
+  It changes nothing: the claim already went with the transfer, and the record
+  is not withdrawn.
+
+`CoherentVolume` reads this answer when it releases a write grant that an
+earlier attempt left held (see [Concurrent writers](#concurrent-writers-write_cas)):
+it forgets only the paths the answer reports released, and releases the rest
+again at its next fresh attempt.
+
+`session-stop` now refuses a malformed `agent_id` with HTTP `400`, before the
+principal check. It used to answer `{"ok": true, "released_artifacts": []}`,
+which reads as a release that found nothing to release.
+
+### Ended records and eviction
+
+A record that has ended is kept, so the giver's next read, edit or `/status`
+call learns how its handoff ended. The coordinator's sweep removes a record
+once it is no longer live and neither it nor its path has been updated for
+`transfer_record_evict_max_age_sec` (86400 s, one day, by default, so a giver
+left idle overnight still learns its outcome). A live record is never removed,
+however old. The setting is a `LifecycleConfig` field, passed as `config` to the
+volume that starts the coordinator.
+
+After eviction the path has no record and the answers carry no `handoff` key.
+A giver idle longer than that learns only what any out-of-date writer does: a
+compare-and-swap at the transfer version, after the version moved, answers
+`version_mismatch` with nothing saying why.
+
+### Claude Code sessions
+
+The Claude Code hook client passes the coordinator's answers to Claude Code.
+On a path with a transfer record, those answers deny the giver's edit and tell
+each session where the handoff stands. Every text below is fixed: its only
+variable parts are the path, the version at transfer, the hold shape given up,
+and agent ids cut to their first eight characters (`{successor_short}`,
+`{giver_short}`, `{counterparty_short}`, the record's session-level agent ids
+as `agent-coherence-status` shows them). The same situation always produces the
+same words.
+
+**The giver's edit is denied.** While the record is live, the giver's
+`pre-edit` on the path, an Edit or Write from the session or any of its
+subagents, is denied in strict mode and in warn mode alike. The check runs
+before the strict-mode stale check, so on a strict-mode path the giver gets
+this deny rather than the stale-view one. Claude Code shows the model:
+
+```text
+Edit denied: you handed {path} to agent {successor_short} at v{version_at_transfer}, so this session can no longer write it. The handoff ends when agent {successor_short} writes {path}, when agent {successor_short} declines it, or when you withdraw it on your user's or host's instruction. Stop and report to your user that {path} was handed off. This denial is structural; retrying the same operation will produce the same denial.
+```
+
+The text names withdraw only as a step the giver takes on instruction, and it
+never names a command: a refusal that hands the model the command that lifts
+it invites the model to run that command. The body keeps the typed
+`handed_off` reason, `successor` and `version_at_transfer` at the top level
+beside the deny (see [The giver's fence](#the-givers-fence)). Each deny adds
+one to `handoff_giver_denials_total` on `/status` (not to the strict-mode or
+stale-warning counters) and writes no audit-log line. Like a strict-mode deny,
+it is remembered for route-around detection: on a strict-mode path, a shell
+command from the same session that reads the file within 30 seconds is counted
+in `strict_mode_routed_around_via_bash_total`.
+
+**The giver's shell write is denied too.** While the record is live, a Bash
+command from the giver's session, or any of its subagents, that writes the path
+gets the same answer from `pre-bash` as the edit gets from `pre-edit`, byte for
+byte: the deny text above, the `handed_off` fields and the `handoff` key,
+counted in `handoff_giver_denials_total`. It fires in strict mode and in warn
+mode alike, and ahead of the shell read checks, so a command that reads the
+file and then appends to it gets this deny. The Bash hook recognizes the common
+shell writes:
+
+- a redirection (`>`, `>>`, `>|`, `&>`) or `tee`;
+- an in-place `sed -i` or `perl -i`, and an `ed` or `ex` script that writes;
+- `cp`, `mv`, `install`, `ln` or `rsync` onto the file, and `mv`, `rm`,
+  `truncate`, `dd of=`, `sort -o` or `patch` of it;
+- `git checkout`, `git restore`, `git rm` or `git mv` naming it;
+- a script that writes it -- opens it for writing, writes, appends to,
+  deletes, renames or copies onto it, by its name or through a variable the
+  name is assigned to -- run as a one-line `python -c`, `perl -e`, `ruby -e`,
+  `node -e` or `php -r` program or fed to one in a heredoc; a script that only
+  reads the file and writes another one is not refused;
+
+including inside `bash -c`, `sh -c` and `eval`, after a `cd` in the same
+command, and by an absolute path inside the workspace. It errs toward letting
+a command through: a path built from a variable or a command substitution
+(`"$PWD/plan.md"`, `$(git rev-parse --show-toplevel)/plan.md`) or, inside a
+program, assembled from pieces, mentioned inside a longer string or reached
+through a list, a loop, a dictionary or a function's parameter, a writer tool
+it does not know (`gsed`, `awk -i inplace`, `vim`, `curl -o`, a formatter, a
+script run from a file) and a relative path after a `pushd`, or after a `cd`
+made by an earlier command (the hook is not told the session's working
+directory, so it resolves relative paths from the workspace root), are not
+refused. A shell command that only reads the file, and every other session's
+shell write, answer as before.
+
+**How models respond (measured).** We measured how Claude Code models respond
+when a session that handed a file off tries to change it again: Haiku 4.5,
+Sonnet 5.5 and Opus 5.5 on Claude Code 2.1.291, in warn and strict mode, with
+and without the handoff commands allowlisted. Every session that met the
+coordinator's refusal of its edit stopped after that one refusal. It did not
+retry or work around it, and it told its user that the file had been handed
+off. None ran the withdraw or decline command, even where those commands were
+allowed to run without approval. A session that reads a file it handed off is
+told, on that read, that it handed the file off and must not change it by any
+route until the handoff ends; every session that saw this notice left the file
+alone and told its user, without even attempting the edit. If the handoff
+lands while an edit is already being applied, the edit stays on disk without a
+version, and Claude Code shows the model the coordinator's explanation. Sonnet
+sometimes skipped the edit and the read altogether and appended to the file
+with a shell command: in one warn-mode setup it did so in 4 of 10 runs, each
+write landed without a version, and each session reported success without
+mentioning the handoff. With the shell write denied as the edit is (above), the
+same setup changed the file in none of its 10 runs: every session whose shell
+append was denied stopped, tried no other route, and told its user that the
+file had been handed off.
+
+An earlier measurement, of the strict-mode stale-read deny on an older Claude
+Code with older models, saw sessions retry two to five times and then reach the
+file through the shell. This one saw no retries. The two setups differ in more
+than the text of the deny, so this compares the two measurements' numbers; it
+is not a controlled test of the wording.
+
+**An edit already in flight.** If the transfer lands after the giver's
+`pre-edit` was admitted and before its `post-edit`, the edit is already on
+disk. Its commit is refused, and the `post-edit` answer carries this text in a
+context-only `PostToolUse` envelope:
+
+```text
+Commit refused: you handed {path} to agent {successor_short} at v{version_at_transfer}, so this session can no longer write it. Your edit landed in your local worktree but was not given a version by the coordinator. The handoff ends when agent {successor_short} writes {path}, when agent {successor_short} declines it, or when you withdraw it on your user's or host's instruction. Stop and report to your user that {path} was handed off.
+```
+
+The file on disk then differs from the version the coordinator recorded. The
+same happens to an edit admitted while the coordinator was degraded: a
+`pre-edit` that times out answers `{"ok": true, "degraded": true}`, so the edit
+goes ahead, and its commit is refused.
+
+**What each session is told.** While a path has a transfer record, an admitted
+`pre-read` or `pre-edit` on it carries prose for the caller's role, in a
+context-only envelope after any stale warning or notice. A deny carries none of
+it: the giver's deny is the text above, and a strict-mode deny keeps its own
+bytes. The shell and search hooks (`pre-bash`, `pre-grep`) carry none of it,
+and answer as before apart from the giver's shell write, which is denied.
+
+- **The giver**, on a read while the record is live (its edit is denied
+  instead):
+
+  ```text
+  Handoff: you handed {path} to agent {successor_short} at v{version_at_transfer}, so this session can no longer write it. The handoff ends when agent {successor_short} writes {path}, when agent {successor_short} declines it, or when you withdraw it on your user's or host's instruction. Until the handoff ends, do not change {path} by any route, a shell command included. Stop and report to your user that {path} was handed off.
+  ```
+
+  On a strict-mode path this read is not admitted: the transfer left the
+  handed-off claim INVALID, so the Read of the identity that held it gets the
+  ordinary strict-mode stale-view deny, which carries no handoff text.
+- **The giver**, on a read or edit after the record ended, until the record is
+  [evicted](#ended-records-and-eviction), one of:
+
+  ```text
+  Handoff ended: your handoff of {path} to agent {successor_short} at v{version_at_transfer} was completed by agent {successor_short}.
+  Handoff ended: your handoff of {path} to agent {successor_short} at v{version_at_transfer} was overtaken by agent {counterparty_short}.
+  Handoff ended: your handoff of {path} to agent {successor_short} at v{version_at_transfer} was declined by agent {successor_short}.
+  Handoff ended: your handoff of {path} to agent {successor_short} at v{version_at_transfer} was withdrawn.
+  ```
+
+- **The successor**, on a read or edit while the record is live and not
+  overtaken:
+
+  ```text
+  Handoff: agent {giver_short} handed {path} to this session at v{version_at_transfer}; the hold it gave up was {hold_shape}.
+  ```
+
+  When the hold given up was `EXCLUSIVE`, a write claim the giver had not
+  committed, it adds:
+
+  ```text
+  Agent {giver_short} held an uncommitted write claim when it handed {path} on, so the file on disk may differ from v{version_at_transfer}; read {path} before editing it.
+  ```
+
+  On its edit, when it has not read the path at the version at transfer or
+  later, it adds a warning, and the edit is still admitted. On a strict-mode
+  path the strict-mode checks run first: a successor that is `INVALID` there,
+  or holds a standing read older than the current version, is denied, and the
+  deny carries none of this text. The warning:
+
+  ```text
+  ⚠ You have not read {path} at v{version_at_transfer} or later; read it before editing.
+  ```
+
+- **The successor**, once a bystander has overtaken the handoff, until the
+  record is evicted:
+
+  ```text
+  Handoff overtaken: the handoff of {path} to this session from agent {giver_short} at v{version_at_transfer} was overtaken by agent {counterparty_short}.
+  ```
+
+- **A bystander**, while the record is live:
+
+  ```text
+  Handoff in progress: agent {giver_short} handed {path} to agent {successor_short} at v{version_at_transfer}. This session is not a party to it; its edits are admitted and are recorded as overtaking the handoff.
+  ```
+
+- **The giver or the successor**, when the record ended while still labelled
+  `pending`: the path's version moved, but nothing recorded who wrote it, as a
+  coordinator stopping between a write and its record can leave it:
+
+  ```text
+  Handoff ended: the handoff of {path} at v{version_at_transfer} was ended by a write at a later version whose writer was not recorded.
+  ```
+
+**Which claim a Claude Code session can hand on.** A transfer needs the giver
+to hold a claim on the path when it runs (see
+[What a transfer does](#what-a-transfer-does)), and a Claude Code session's
+write grant ends with its turn:
+
+- **A file the session edited this turn.** Have the session run the transfer
+  in the same turn, right after the edit. The transfer hands on the write
+  grant (`MODIFIED` once the edit is committed).
+- **After that turn has ended**, the end-of-turn hook has released the write
+  grant, and the transfer is refused as `handoff_not_held`. On a warn-mode
+  path, have the session read the file again: the read gives it a standing
+  read, and a transfer then hands that on (`SHARED`).
+- **A file the session has only read**, and nobody has written since, is a
+  standing read that outlives the turn. The session can hand it on at any
+  time.
+- **On a strict-mode path**, a session whose write grant was released is
+  denied its `Read` of the file by the strict-mode stale-view deny, and that
+  denied read grants nothing. A shell read of the file (`cat`, for example) is
+  denied too, but its deny re-grants a standing read without recording a read
+  of the current version, and a transfer hands that on as `SHARED`. Handing
+  the path on in the same turn as the edit avoids both.
+
+### Handoff commands
+
+Four console scripts hand a path from one Claude Code session to another, each
+acting as one named session. They come with the Python package
+(`pip install agent-coherence`), which a workspace running the Python
+coordinator already has; the Claude Code plugin does not ship them.
+
+| Command | Run as | What it does |
+|---|---|---|
+| `agent-coherence-transfer --successor AGENT_ID [--subagent-id SUBAGENT_ID] path [path ...]` | the giver | hands the session's claims on the paths to the successor ([`POST /handoff/transfer`](#post-handofftransfer)) |
+| `agent-coherence-accept path` | the successor | accepts the handoff without writing the path |
+| `agent-coherence-decline path` | the successor | declines the handoff; the giver may write the path again |
+| `agent-coherence-withdraw path` | the giver | withdraws the handoff |
+
+Every command also takes `--session SESSION_ID` and `--root ROOT` (the
+coordinator's root; by default, the git root found from the current directory,
+which for a git worktree is the main checkout's). A path is relative to that
+root, or absolute inside it. `--successor` takes the successor's session-level
+agent id, hyphenated or as 32 hex digits (see
+[Naming the successor](#naming-the-successor)). As with any shell command,
+Claude Code asks before running one unless the workspace's permissions allow
+it.
+
+**Which session a command acts as.** The session named by `--session`, or
+otherwise by `CLAUDE_CODE_SESSION_ID`, which Claude Code sets in the shells its
+Bash tool runs. With neither, the command is a usage error (exit `1`) and sends
+nothing. Measured on Claude Code 2.1.291, the variable equals the session id
+the session's hooks carry: in the session's own shell; in a subagent's shell,
+where it names the parent session; after `--resume`; after a fork; after
+`/clear`; and after `/compact`. So a command the model runs through its Bash
+tool acts as the session that runs it.
+
+A fork and `/clear` give the session a new session id, and the hooks and the
+variable move to it together; `--resume` and `/compact` keep the id. A handoff
+belongs to the session id that gave the path, so after a fork or `/clear` the
+session is a different session to the coordinator: it is not fenced as the
+giver, and its edit of the path is admitted and recorded as overtaking the
+handoff.
+
+A subagent's shell names its parent session, so a command run there acts as
+the parent. A claim a subagent holds is the subagent's own, not the parent's:
+hand it on with `--subagent-id`, naming the subagent whose claim it is.
+
+**Acting as the session.** The command presents the named session's stored
+[caller principal](#caller-principal), found in `.coherence/` by that
+session's id exactly as the session's own hooks find it. For a session with no
+stored principal it creates the session's mint nonce, then claims and stores
+the principal, as the session's first hook event would. So:
+
+- A mistyped `--session` is not refused as such. The command binds a principal
+  for an id no session uses, leaving its two files in `.coherence/` (see
+  [security.md](security.md#caller-principal-files-claude-code-hook-client)
+  for removing them), and then reports the coordinator's answer; for a
+  transfer, that is `handoff_not_held`.
+- It cannot act for a `CoherentVolume` or MCP session, which keeps its
+  principal in its own process. The claim is refused because that session is
+  bound under another nonce, and the command reports the caller-principal
+  refusal and exits `2`.
+
+**What it prints.** Before it sends anything, every command prints the
+session-level agent id it acts as, and which of the two named the session. It
+never prints the session id:
+
+```text
+agent-coherence-transfer: acting as session agent bd35b34c-f785-51c6-a184-5922aee7cbea (session from CLAUDE_CODE_SESSION_ID)
+```
+
+The line ends `(session from --session)` when the flag named it. Check it: a
+shell whose variable names some other session shows up here. A transfer then
+prints one line per path, and the other commands one line. Results go to
+standard output; refusals, hints and errors go to standard error.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Done: every named path transferred, or the accept, decline or withdraw was taken. |
+| `1` | Usage: a bad command line, a path that fails validation, not in a git repository, or no session to act as. Nothing is sent. |
+| `2` | The coordinator could not be reached, answered an HTTP error (a caller-principal refusal among them), refused the request or any one of its paths, or could not confirm the outcome. |
+| `4` | This coordinator does not serve the handoff commands: `.coherence/server.pid` names the Node backend, which the command reads before sending anything, or the command's route answered `404`. |
+
+A transfer of several paths hands on every path it can and exits `2` if any
+was refused; its lines say which. When the coordinator could not confirm the
+outcome, the command says so and exits `2`: check the path's handoff in
+`agent-coherence-status` before acting again. Sending the same transfer again
+is safe only while the handoff it made is live: once the successor has written
+the path, a re-send from a giver session that holds the path again is a new
+handoff (see [`POST /handoff/transfer`](#post-handofftransfer)).
+
+**Not held.** A transfer refused as `handoff_not_held` prints the reason and a
+hint:
+
+```text
+agent-coherence-transfer: notes.md not transferred (handoff_not_held)
+agent-coherence-transfer: hint: a Claude Code session's write grant ends when its turn ends. If an earlier transfer of notes.md may have landed, check the path's handoff in agent-coherence-status output first: a handoff from this session to that successor made at the version it held, live or ended, means it landed, so do not transfer again, and if it shows another session's handoff, ask before transferring; otherwise have the giver session read notes.md, then transfer it again (on a strict-mode path that read is denied: hand the path on in the same turn as its edit)
+```
+
+On a strict-mode path the hint's `Read` is denied and grants nothing, as the
+hint's last clause says; see [Claude Code sessions](#claude-code-sessions) for
+what a shell read does there.
+
+**Python coordinator only.** Against the Claude Code plugin's Node coordinator
+the commands exit `4`. A plugin workspace created fresh runs the Node
+coordinator unless the Python one is selected; see "Selecting the backend" in
+the plugin README's
+[Architecture](https://github.com/Cohexa-ai/agent-coherence-plugin#architecture)
+section.
+
+### Handoffs in `agent-coherence-status`
+
+The table view of `agent-coherence-status` lists every path that has a
+transfer record in a Handoffs block after the artifacts table:
+
+```text
+Handoffs:
+  giver → successor, by session agent id (first 8 characters, as under Sessions)
+  plan.md: bd35b34c → 6e271ee6 at version 2 (pending, 4m ago)
+```
+
+Each line gives the path; the giver and the successor, as the first eight
+characters of their session-level agent ids; the version at transfer; and the
+record's status. `ended` follows the status when the record is no longer live,
+which matters for a record still labelled `pending` after a write ended it.
+The age, from the record's creation time, shows on the operator view only
+(`--detail full`, the default). With no record, the output is exactly what it
+was before. `--json` prints the `handoff` key as the coordinator sends it.
+
+This is the Python console script's view. Where the Claude Code plugin's
+`agent-coherence-status` comes first on the Bash tool's `PATH`, the command runs
+the plugin's own status view instead: it prints the coordinator's `/status`
+JSON, has no Handoffs block, and rejects `--json`. There, a handed-off path's
+record is the `handoff` key of its `tracked_artifacts` entry, and each session's
+full agent id is in `sessions`.
+
+### Example: handing a file between Claude Code sessions
+
+Session A has been editing `plan.md`, and session B will carry on with it. Both
+run in one workspace with the plugin's hooks and the Python coordinator.
+
+1. **Find B's session-level agent id.** In session B, have Claude run:
+
+   ```bash
+   python3 -c 'import sys, uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, "ccs-agent:claude-session-" + sys.argv[1]))' "$CLAUDE_CODE_SESSION_ID"
+   ```
+
+   ```text
+   6e271ee6-5a71-5508-bedf-ffd46d8898ce
+   ```
+
+   Running it is a tool call, so B's hooks have sent the coordinator a request
+   and claimed B's principal, which is what lets the coordinator know B (see
+   [Naming the successor](#naming-the-successor)). `agent-coherence-status`
+   also shows each session's agent id, cut to eight characters, beside its
+   session name, `claude-session-<session id>`; the Python console script's
+   `--json`, or the plugin's status command, gives the whole id (see
+   [Handoffs in `agent-coherence-status`](#handoffs-in-agent-coherence-status)).
+2. **Hand the file on from A, in the turn of its edit.** Right after A edits
+   `plan.md`, have it run:
+
+   ```bash
+   agent-coherence-transfer --successor 6e271ee6-5a71-5508-bedf-ffd46d8898ce plan.md
+   ```
+
+   ```text
+   agent-coherence-transfer: acting as session agent bd35b34c-f785-51c6-a184-5922aee7cbea (session from CLAUDE_CODE_SESSION_ID)
+   agent-coherence-transfer: transferred plan.md to 6e271ee6-5a71-5508-bedf-ffd46d8898ce at version 2 (gave up MODIFIED; status pending)
+   ```
+
+3. **Check it.** `agent-coherence-status` lists
+   `plan.md: bd35b34c → 6e271ee6 at version 2 (pending, 0s ago)` under
+   Handoffs; through the plugin's status command, the same record is the
+   `handoff` key of `plan.md`'s `tracked_artifacts` entry.
+4. **A stops.** An Edit of `plan.md` from A is now denied:
+
+   ```text
+   Edit denied: you handed plan.md to agent 6e271ee6 at v2, so this session can no longer write it. The handoff ends when agent 6e271ee6 writes plan.md, when agent 6e271ee6 declines it, or when you withdraw it on your user's or host's instruction. Stop and report to your user that plan.md was handed off. This denial is structural; retrying the same operation will produce the same denial.
+   ```
+
+   On a warn-mode path, A's next Read of `plan.md` carries the giver's read
+   notice shown in [Claude Code sessions](#claude-code-sessions).
+5. **B carries on.** B's read of `plan.md` carries
+   `Handoff: agent bd35b34c handed plan.md to this session at v2; the hold it gave up was MODIFIED.`
+   B's edit completes the handoff, and its commit, version 3, ends it and lifts
+   A's fence. A's next read of `plan.md` says
+   `Handoff ended: your handoff of plan.md to agent 6e271ee6 at v2 was completed by agent 6e271ee6.`
+6. **Or undo it.** B runs `agent-coherence-decline plan.md`, or, on your
+   instruction, A runs `agent-coherence-withdraw plan.md`. You can also run the
+   withdraw from any terminal in the workspace with `--session <A's session id>`.
+   Either ends the handoff and lifts A's fence.
+
+### From a `CoherentVolume`
+
+A `CoherentVolume` hands on its own claims and settles handoffs as its own
+session, with one method per verb:
+
+| Method | Run as | Returns |
+|---|---|---|
+| `vol.transfer(paths, *, successor)` | the giver | `HandoffTransferResult` |
+| `vol.accept(path)` | the successor | `HandoffVerbResult` |
+| `vol.decline(path)` | the successor | `HandoffVerbResult` |
+| `vol.withdraw(path)` | the giver, on its user's or host's instruction | `HandoffVerbResult` |
+| `vol.read_handoff(path)` | the giver, the successor or a bystander | the `handoff` key the volume's latest read of `path` received, as a `dict`, or `None` |
+| `vol.last_read_denied` | anyone | `True` when the coordinator refused the volume's latest read with a strict-mode deny, whose answer never carries the `handoff` key |
+
+`paths` is one path or a sequence of paths, and `successor` is the successor's
+session-level agent id (see [Naming the successor](#naming-the-successor)). The
+result types, like `CasCommitResult` and `HandoffWinOutcome` below, are frozen
+dataclasses importable from `ccs.adapters`, and every id in them is a
+session-level agent id as the coordinator answers it.
+
+- `HandoffTransferResult.grants` holds one `HandoffGrantResult` per path, in
+  the order given, and `.ok` is `True` only when every grant transferred. Each
+  grant has `path`, `transferred`, and the fields of its entry in the
+  [transfer answer](#post-handofftransfer): `reason`, `giver`, `successor`,
+  `version_at_transfer`, `hold_shape`, `status` and `detail`, each `None` when
+  the entry does not carry it.
+- `HandoffVerbResult` has `path`, `ok`, `reason`, `status` and `counterparty`.
+
+A refusal is a value, not an exception: a refused grant has
+`transferred=False` and its `reason`, and a refused verb has `ok=False` and
+`handoff_not_successor`, `handoff_not_giver` or `handoff_not_live`, with
+nothing changed. A method raises only when the answer does not settle the
+outcome, or there is no coordinator to ask:
+
+- `CommitUnconfirmed`: the coordinator answered a `handoff_*_unconfirmed`
+  reason, its answer could not be read, or the request got no answer (a
+  dropped connection, a timeout, an HTTP 5xx), in either `on_error` mode. The
+  verb may have landed: look at the path's record (`coordinator_status()`, or
+  `/status`) before acting again. Sending the same transfer again answers a
+  live record's status and moves nothing, but once the successor has written
+  the path, a re-send from a volume that holds the path again is a new
+  handoff.
+- `CoherenceError`: a request the coordinator refused outright (HTTP 4xx) with
+  `on_error="strict"`; and, in both modes, a volume with no coordinator
+  attached. With `on_error="degrade"` a 4xx warns and raises
+  `CommitUnconfirmed` instead: degrade mode does not tell a refusal from a
+  failure.
+- `HandoffPathsInvalid` (from `ccs.core.exceptions`, a `ValueError`): a
+  transfer of no path, or of one path named twice (two spellings of one file
+  count), in both modes; nothing is sent.
+
+**Which claim a transfer hands on.** For each path, the claim the volume holds
+there: the write grant a `write()` of the path left it holding (`MODIFIED`), or
+else the standing read its latest read registered (`SHARED`, which is also what
+a `write_cas` or `write_cas_at` win leaves). The volume finds that claim even
+after `reacquire()` or a `write_cas` has started a fresh attempt. A path it
+holds no claim on is refused as `handoff_not_held`. That includes a path whose
+read returned bytes from a stale view, because such a read registers nothing:
+`reacquire()` the path before you transfer it. It also includes the members of
+a multi-file `atomic_publish()`, which commits through a snapshot session and
+leaves them held by that session's commit, not by the volume: read each member
+before you hand it on. The transfer gives the claim up at the coordinator, so a
+write grant the volume held on the path ends with it.
+
+**The giver's writes.** While the handoff is live, `write()`, `write_cas()`,
+`write_cas_at()` and an `atomic_publish()` that includes the path raise
+`GiverFenced` (from `ccs.core.exceptions`), and nothing lands. It carries
+`reason` (`"handed_off"`), `successor`, `version_at_transfer` and
+`artifact_id` (the path). It is a terminal, not a conflict: the volume never
+retries it, and no `reacquire()` clears it, because the fence is keyed on the
+volume's session, which a fresh attempt keeps. Stop and report it. A
+multi-file `atomic_publish()` publishes none of its files when one of them is a
+path the volume handed off, and names that path in `artifact_id`.
+
+Once the handoff ends, the giver's writes follow the ordinary rules again. A
+withdraw lifts the fence but does not give the claim back: the transfer left
+it INVALID, so the giver's next `write()` of the path raises `StaleView` until
+it calls `reacquire()`.
+
+**The successor and bystanders.** `read_handoff(path)` returns the `handoff`
+key, with its `role`, from the answer to the volume's latest read of the path
+(every read method sets it, `reacquire()` included). It is `None` when that
+answer carried none: the path has no record, the read was denied, failed or
+went unanswered, or the coordinator could not read the record after the read
+landed (the key is best-effort), so `None` never proves the path has no record. A strict-mode deny never carries the key, so after a denied
+read (`vol.last_read_denied` is `True`) `None` says nothing about the record;
+the path's entry in `/status` has it. A compare-and-swap win's `CasCommitResult.handoff` is a
+`HandoffWinOutcome` when the win labelled a live handoff of the path, read
+best-effort like the read's key:
+`outcome` is `completed` when the volume is the successor, and `overtaken`
+when it is a bystander, which is then named as `counterparty`; `giver`,
+`successor` and `version_at_transfer` name the handoff. A successor's plain
+`write()` completes the handoff too, through its acquire, but returns nothing.
+
+```python
+from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
+from ccs.adapters.coherent_volume import CoherentVolume
+from ccs.core.exceptions import GiverFenced
+
+lead = CoherentVolume(workspace_root, managed=("plans/**",))
+worker = CoherentVolume(workspace_root, managed=("plans/**",))  # its own session
+worker_id = str(session_to_agent_id(worker.session_id))
+
+lead.read("plans/plan.md")                    # a standing read at version 1
+result = lead.transfer("plans/plan.md", successor=worker_id)
+result.ok                                     # True
+result.grants[0].hold_shape                   # 'SHARED' ('MODIFIED' after a write())
+result.grants[0].status                       # 'pending'
+
+try:
+    lead.write("plans/plan.md", b"a late edit\n")
+except GiverFenced as fenced:                 # nothing landed
+    fenced.successor, fenced.version_at_transfer   # (worker_id, 1)
+
+worker.read("plans/plan.md")
+worker.read_handoff("plans/plan.md")["role"]  # 'successor'
+won = worker.write_cas("plans/plan.md", lambda current: current + b"the worker's edit\n")
+won.version, won.handoff.outcome              # (2, 'completed'): the fence lifts
+```
+
+Instead of writing, the worker can call `worker.decline("plans/plan.md")`, or,
+on your instruction, the lead `lead.withdraw("plans/plan.md")`. Either ends
+the handoff and answers `ok=True` with the status it ended in, `declined` or
+`withdrawn`.
+
+### From the MCP server
+
+The [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server) has a
+tool for each verb. Each acts as the MCP session itself, on its own claims;
+none takes a session argument.
+
+| Tool | Run as | What it does |
+|---|---|---|
+| `swg_transfer(paths, successor)` | the giver | hands this session's claim on each path in the list `paths`, the write grant from `swg_write` or the standing read from `swg_read`, to the successor |
+| `swg_accept(path)` | the successor | accepts the live handoff without writing the path |
+| `swg_decline(path)` | the successor | declines it; the giver's fence lifts |
+| `swg_withdraw(path)` | the giver | withdraws it; the giver's fence lifts. Its description says to take it only on the user's or host's explicit instruction, and never as the way out of a `handed_off` refusal |
+
+`swg_transfer` answers `{"ok": ..., "grants": [...]}` with one entry per path,
+carrying the fields of the [transfer answer](#post-handofftransfer), and is an
+error result unless every grant transferred; its `detail` and first text item
+have one line per path. A refused grant is
+`{"path", "transferred": false, "reason", "recover", "retryable": false,
+"next_step"}`, and the error result's own `reason`, `recover`, `retryable` and
+`next_step` are those of its most restrictive refused grant (a stop before a
+record check before a successor fix); when another grant transferred, that
+`next_step` first says never to send the transferred path again, and each other
+refused reason's `next_step` follows as a text item labelled with its reason.
+The other three answer `{"path", "ok": true, "status"}`, with `counterparty` on
+an overtaken record, or, as an error result that changed nothing,
+`{"path", "ok": false, "reason", "status", "recover", "retryable": false,
+"detail", "next_step"}`, without `status` when the path has no record.
+
+| Refusal | `recover` |
+|---|---|
+| `handoff_to_self`, `handoff_successor_unknown`, `handoff_successor_malformed` | `fix_successor`: name the other session by the `session_agent_id` its own `swg_status` reports |
+| `handoff_not_held` | `check_handoff`: a transfer that already landed answers this too, so look at the path's handoff in `swg_status` before anything else |
+| `handoff_version_unconfirmed`, `handoff_in_flight`, `handoff_other_holder`, `handoff_ended`, `handoff_not_successor`, `handoff_not_giver`, `handoff_not_live` | `stop_and_report` |
+
+None is retryable: the same call gets the same answer. An answer that does not settle the outcome, a lost answer
+included, is an error result with `reason: commit_unconfirmed`,
+`recover: check_handoff`, `retryable: false` and a fixed `next_step` per tool:
+look at the path's handoff before acting again. For `swg_transfer`, a handoff
+from this session to that successor made at the version it held (its
+`version_at_transfer`), live or ended, means the transfer landed, so do not
+transfer again and do not withdraw to start over. For the other three, the
+record's status says whether the verb landed (`completed`, `declined`,
+`withdrawn`); while the handoff is still live, sending the verb again is safe,
+since a repeat changes nothing once it has landed. It is not the generic
+`read_then_retry`: once the successor has written the path, reading it and
+transferring again is a second handoff at the new version. The server's instructions and every one of these
+tools' descriptions say that a transfer fences the giver and does not reserve
+the path.
+
+**Naming the successor.** Each MCP session's `swg_status` reports
+`session_agent_id`, its own session-level agent id: the value another session
+passes to `swg_transfer` as `successor` to hand it a path. It stays the same
+when the session reacquires, and it names the session as a successor while
+`swg_status` reports `principal_claim: bound`. Do not pass `session_id`: a
+transfer naming it is refused as `handoff_successor_unknown`.
+
+**The giver's writes.** While the handoff is live, `swg_write` and
+`swg_write_cas` on the path answer this error result, and `swg_reacquire` does
+not change it:
+
+```json
+{"reason": "handed_off", "recover": "stop_and_report", "retryable": false,
+ "detail": "handed_off artifact=plans/plan.md successor=87d930e5-2201-5609-91a3-5a3ed2f44c86 version_at_transfer=1 (no write landed: this was handed off to the successor at that version. The fence ends when the successor writes it, when the successor declines, or when the giver withdraws on its user's or host's instruction; stop and report, a retry cannot clear it)",
+ "next_step": "Stop: this session handed this path off, so it can no longer write it, and no retry, reacquire or re-read changes that. Do not write it by any other route. Report to your user or host that the path was handed off to the successor named here, at the version named here.",
+ "successor": "87d930e5-2201-5609-91a3-5a3ed2f44c86", "version_at_transfer": 1}
+```
+
+`next_step` is also the result's second text item. Nothing in the answer names
+`swg_withdraw`.
+
+**Where the record shows.** When the path has a record, `swg_read` adds
+`handoff`, the key as the coordinator projected it for this session (with
+`role`). The coordinator attaches it best-effort, so a result with neither
+`handoff` nor `handoff_unknown` does not prove there is no record; `swg_status`
+lists every record. A strict-mode deny never carries the key, and the giver's own re-read
+of a path it handed off is one, so after a denied read `swg_read` takes the
+record from the coordinator's `/status` and adds the same `role`; when
+`/status` cannot be read it adds `handoff_unknown: true` instead, which means
+the record is unknown, not absent. `swg_status` adds `handoff` (without `role`) to
+the path's `per_path` entry; and a `swg_write_cas` win that labelled a live
+handoff adds `handoff` with its `outcome` (`completed` when this session is
+the successor, `overtaken` with `counterparty` otherwise), `giver`,
+`successor` and `version_at_transfer`. Without a record none of them carries
+the key. An MCP session is not sent the prose a Claude Code session is shown.
+
+**Example.** Two MCP sessions, A and B, on one workspace:
+
+1. B calls `swg_status`, which reports
+   `"session_agent_id": "87d930e5-2201-5609-91a3-5a3ed2f44c86"` and
+   `"principal_claim": "bound"`.
+2. A calls `swg_read` on `plans/plan.md` (version 1), then `swg_transfer` with
+   `{"paths": ["plans/plan.md"], "successor": "87d930e5-2201-5609-91a3-5a3ed2f44c86"}`:
+
+   ```json
+   {"ok": true, "grants": [{"path": "plans/plan.md", "transferred": true,
+     "giver": "38fc3666-40a0-50c2-b315-ce6bdf16c3af",
+     "successor": "87d930e5-2201-5609-91a3-5a3ed2f44c86",
+     "version_at_transfer": 1, "hold_shape": "SHARED", "status": "pending"}]}
+   ```
+
+3. A's `swg_write` of `plans/plan.md` now answers the `handed_off` error above,
+   and so does its `swg_write` after `swg_reacquire`.
+4. B's `swg_read` of the file carries
+   `"handoff": {"role": "successor", "giver": "38fc3666-40a0-50c2-b315-ce6bdf16c3af", "successor": "87d930e5-2201-5609-91a3-5a3ed2f44c86", "version_at_transfer": 1, "hold_shape": "SHARED", "status": "pending", "live": true}`.
+   B's `swg_write_cas` at version 1 answers `"ok": true` with
+   `"handoff": {"outcome": "completed", …}`; its commit ends the handoff and
+   lifts A's fence. Instead, B can call `swg_decline`, or A, on your
+   instruction, `swg_withdraw`.
+
+**One model, two sessions.** A Claude Code model that has both the plugin's
+hooks and this MCP server is two sessions to the coordinator: the Claude Code
+session its hooks act as, and the MCP server's own session. A handoff fences
+only the session that gave it. After an `swg_transfer`, the same model's Edit
+or Write of the path goes through the hooks as the Claude Code session: it is
+admitted as a bystander's edit, recorded as overtaking the handoff, and told
+so in the bystander text shown in [Claude Code sessions](#claude-code-sessions).
+The other way round, a handoff command run as the Claude Code session fences
+only that session, and the model's `swg_write` of the path is a bystander's.
+The handoff commands cannot act as the MCP session (see
+[Handoff commands](#handoff-commands)). Denying the native file tools on
+managed paths, as the [MCP server section](#stale-write-guard-fs-mcp-server)
+recommends, keeps such a model's writes on the MCP session.
+
+### When a volume or MCP session stops
+
+A `CoherentVolume`'s session id and principal live only in its process, and an
+MCP session is one volume; a forked child of a volume is a new session too.
+After the process exits nothing can act as that session: the
+[handoff commands](#handoff-commands) cannot, and a writer started in its place
+is a new session. A new session cannot withdraw, accept or decline a record
+that names its predecessor (`handoff_not_giver`, `handoff_not_successor`), is
+not fenced as the giver, and its write of the path is recorded as overtaking
+the handoff, not completing it, even when it carries on the successor's work.
+
+So settle a handoff while the giver's process is still running:
+
+- **If the successor is gone**, have the giver withdraw, or transfer the path
+  again to the replacement's session-level id (while the record is live, the
+  giver's transfer to another successor replaces it), before you stop the
+  giver.
+- **A giver that stops after a transfer whose successor is still running**
+  needs nothing more: the successor writes, accepts or declines as usual.
+  The exception is a giver whose process also runs the coordinator. A volume
+  that finds no coordinator running starts one in its own process, and when
+  that process exits the coordinator stops and every volume attached to it
+  fails closed. The records stay in `.coherence/state.db` and the next
+  coordinator serves them, but a successor that was a volume or MCP session
+  attached to the stopped coordinator does not come back, and its replacement
+  is a new session. Stop that process last.
+
+If the giver is gone, its record ends when the successor declines or when any
+session commits a write to the path. Until then no other session can hand the
+path on (its transfer is refused as `handoff_in_flight`), bystanders keep
+receiving the `handoff` key, and a Claude Code bystander the bystander text,
+and `/status` and `agent-coherence-status` keep showing the pair. No write is
+refused because of it.
+
+### Scope, honestly
+
+- **No reservation.** Covered above, and worth repeating: a transfer keeps no
+  one out. A session that needs the path kept from other writers needs
+  something else.
+- **A Claude Code giver's shell write is denied only in the forms the Bash
+  hook recognizes.** The common ones are denied as an edit is, in warn and
+  strict mode: a redirection or `tee` (`echo … >> plan.md`), an in-place
+  `sed -i` or `perl -i`, a `cp` or `mv` onto the file, and a script that
+  writes it, by name or through a variable, run as a one-line program or fed
+  to one in a heredoc (see [Claude Code sessions](#claude-code-sessions)).
+  Not covered: a path built from a variable or a command substitution, or,
+  inside a script, built from pieces or reached through a list, a loop, a
+  dictionary or a function's parameter; a writer tool the hook does not know
+  (`gsed`, `awk -i inplace`, `vim`, `curl -o`, a formatter, a script run from
+  a file); and a relative path after a `cd` made by an earlier command.
+  Such a write lands on disk without a version. So does a recognized one when
+  the coordinator cannot answer the check in time (it is slow or overloaded,
+  or its registry fails): the command runs, and unlike a giver's `Edit`, whose
+  commit is then refused, nothing refuses the shell write afterwards.
+- **An edit in flight at the transfer lands without a version.** So does one
+  admitted while the coordinator was degraded. See
+  [Claude Code sessions](#claude-code-sessions).
+- **Writes that bypass the coordinator are not fenced.** An editor, a script
+  or a shell command that writes the file without passing through the hooks
+  goes around every route above;
+  [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)
+  reports it afterwards.
+- **Python coordinator only.** The four routes are served by this package's
+  coordinator. The Claude Code plugin's Node coordinator answers them `404`,
+  keeps no transfer records and answers `session-stop` as before, and the
+  [handoff commands](#handoff-commands) exit `4` against it. The routes
+  keep answering while the coordinator drains for a backend migration.
+- **One model with both the hooks and the MCP server is two sessions,** and a
+  handoff fences only the one that gave it. See
+  [From the MCP server](#from-the-mcp-server).
+- **A volume's or MCP session's handoff outlives its process,** and nothing
+  can withdraw it once the process has exited. See
+  [When a volume or MCP session stops](#when-a-volume-or-mcp-session-stops).
+- Single host, single coordinator, and cooperative.
+
+### Upgrading
+
+Transfer records live in their own table, added by registry schema version 9.
+A workspace's `state.db` at version 8, or any earlier version, migrates on first
+open, with nothing to do. Like earlier schema steps it is forward-only: once a
+workspace's `state.db` has been opened by this version, an older release
+refuses it. Upgrade forward rather than rolling back.
+
+Upgrade the library, and with it the MCP server, together with the
+coordinator. A `CoherentVolume` from an earlier release has no `transfer()`,
+but its session can still be a giver when another client sends a transfer in
+its name: a release from before [caller principals](#caller-principal) claims
+none, so any client that knows its session id can. Against a coordinator that
+answers the giver's `handed_off` reason, such a giver writes nothing on either
+route, but it reads the refusal differently on each:
+
+- **Compare-and-swap** (`write_cas`, `write_cas_at`, and so `swg_write_cas`):
+  it raises a plain `CoherenceError` whose message is `handed_off`, which an
+  older MCP server reports as `reason: internal_error`, `retryable: false`.
+- **Pre-edit** (`write()`, and so `swg_write`): it raises its ordinary
+  `StaleView`, carrying the coordinator's `Edit denied: you handed …` text,
+  which an older MCP server reports as `reason: stale_view`,
+  `recover: reacquire`, `retryable: true`. A reacquire does not clear the
+  fence, so an older MCP giver can loop on reacquire and write until its
+  client is upgraded.
+
 ## Acquire-or-fail on `pre-edit` (specified, not yet built)
 
 **Nothing in this section is implemented.** It fixes the shape of an opt-in
 refusal so the change that builds it does not have to re-decide it.
 
-Today `POST /hooks/pre-edit` grants EXCLUSIVE to whoever asks. A session already
+Today `POST /hooks/pre-edit` grants EXCLUSIVE to whoever asks, except the giver
+of a live [handoff](#targeted-grant-handoff) of the path. A session already
 holding the grant is set to INVALID — nothing is committed — and finds out on its
 next request. There is no request that declines instead, so a real mutex cannot be
 built on this route: the second session to ask always wins.
@@ -1440,7 +2624,8 @@ carries no retry hint because none exists. Committing does not end a grant: a
 holder that commits keeps the file MODIFIED, and the optimistic lane is no way
 around it — `post-edit-cas` answers `other_holder` against a MODIFIED holder
 too. A grant ends when its holder releases it — `session-stop`, which a Claude
-Code session sends at the end of its turn, or a failed `post-edit` — or when the
+Code session sends at the end of its turn, or a failed `post-edit` — or hands it
+on with a [transfer](#targeted-grant-handoff), or when the
 coordinator reclaims it from a silent holder (no heartbeat for
 `grant_heartbeat_timeout_sec`, or held longer than `grant_max_hold_sec`). Poll
 with backoff rather than wait for a signal.
@@ -1456,8 +2641,9 @@ answer.
 **What it does not close.**
 
 - A refused agent can still write the file with a shell command. The Bash hook
-  looks for commands that read tracked files, not ones that write them, so a
-  write that goes around the Edit and Write tools is not refused;
+  refuses a shell write only from the giver of a live
+  [handoff](#targeted-grant-handoff), so a write that goes around the Edit and
+  Write tools is not refused here;
   [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)
   reports it afterwards.
 - A new kind of deny on the edit path is shown to the model, and that changes
@@ -1497,12 +2683,16 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 
 | Tool | What it does |
 |---|---|
-| `swg_read` | Tracked read — registers the agent's view of the file. If the bytes on disk are not what the coordinator recorded, the read returns a `stale_view` deny with no version. Retry `swg_reacquire` + `swg_read` for a few seconds first, since a peer's commit may still be reaching disk; if it stays denied, the file was changed outside the coordinator (an out-of-band edit, or a commit whose disk write failed), so `swg_write` the reacquired content to record it |
-| `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite |
+| `swg_read` | Tracked read — registers the agent's view of the file. If the bytes on disk are not what the coordinator recorded, the read returns a `stale_view` deny with no version. Retry `swg_reacquire` + `swg_read` for a few seconds first, since a peer's commit may still be reaching disk; if it stays denied, the file was changed outside the coordinator (an out-of-band edit, or a commit whose disk write failed), so `swg_write` the reacquired content to record it. When the path has a [handoff](#from-the-mcp-server) record, the result carries its `handoff` key |
+| `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite. On a path this session handed off, a `handed_off` deny with `recover: stop_and_report` |
 | `swg_reacquire` | Recovery after a deny — clears the stale view + mandatory fresh read |
-| `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
+| `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention. A win that completed or overtook a live handoff says which, in `handoff`; on a path this session handed off, the same `handed_off` deny as `swg_write` |
 | `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed OR a peer's write-claim preempted it (which moves neither comparand — the fence also re-checks that the grant still stands) |
-| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `principal_claim` and the coordinator's two caller-principal counters |
+| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `principal_claim`, its `session_agent_id` (the id another session names to hand it a path), the coordinator's two caller-principal counters, and each path's handoff record |
+| `swg_transfer` | Hands this session's claim on one or more paths to another session, named by that session's `session_agent_id`; see [From the MCP server](#from-the-mcp-server) |
+| `swg_accept` | As the successor, accepts a handoff without writing the path |
+| `swg_decline` | As the successor, declines a handoff; the giver may write the path again |
+| `swg_withdraw` | As the giver, withdraws a handoff, on the user's or host's explicit instruction only |
 | `POST /hooks/effect-fence` | **Not a tool — the HTTP sibling of `swg_gate`.** The coordinator answers the same fence verdict to any client that can make an HTTP request, with no MCP and no Python in the loop, and it is the only surface that can answer the no-content-claim leg. See [Effect fence over HTTP](#effect-fence-over-http) |
 
 Denials are machine-readable: an agent parses the typed payload (for example
@@ -1534,7 +2724,9 @@ is unreachable or does not report them.
 
 **Multiple sessions, one workspace.** Multiple `stale-write-guard-fs` instances
 pointed at the same `SWG_ROOT` attach to one coordinator, so a stale write is denied
-across sessions; if the coordinator's session exits, peers fail closed.
+across sessions; if the coordinator's session exits, peers fail closed. One
+session hands a path to another with `swg_transfer`; see
+[From the MCP server](#from-the-mcp-server).
 
 **Wiring a client to prefer `swg_*` over native file tools.** Registering the
 server exposes the `swg_*` tools, but an agent will still reach for its native
@@ -2213,6 +3405,7 @@ All bundled CLIs are installed as console scripts when you
 | `ccs-check-architecture` | — | Verify the four-layer architecture boundary (also runs in CI) |
 | `agent-coherence-replay` | `[langgraph]` | Replay a captured coordinator session and report invariant breaches |
 | `agent-coherence-workspace` | — | Checkpoint / list / status / restore a workspace of file and forward-only members; see [Workspace versioning & restore](#workspace-versioning--restore-workspaceversioner) |
+| `agent-coherence-transfer`, `agent-coherence-accept`, `agent-coherence-decline`, `agent-coherence-withdraw` | — | Hand a path from one Claude Code session to another, and accept, decline or withdraw the handoff; see [Handoff commands](#handoff-commands) |
 
 Run any command with `--help` for the full option list.
 

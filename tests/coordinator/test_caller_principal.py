@@ -804,9 +804,11 @@ def _principal_table_shape(db_path: Path) -> list[tuple]:
 
 
 def _revert_to_v7_shape(db_path: Path) -> None:
-    """A current db rewound to what a v7 build produced: no principal table."""
+    """A current db rewound to what a v7 build produced: no principal table,
+    and no v9 transfer-record table either."""
     conn = sqlite3.connect(str(db_path))
     try:
+        conn.execute("DROP TABLE IF EXISTS transfer_records")
         conn.execute("DROP TABLE IF EXISTS caller_principals")
         conn.execute("PRAGMA user_version = 7")
         conn.commit()
@@ -826,12 +828,12 @@ def _revert_to_v6_shape(db_path: Path) -> None:
         conn.close()
 
 
-def test_fresh_db_is_created_at_v8_with_the_principal_table(tmp_path: Path) -> None:
+def test_fresh_db_is_created_with_the_principal_table(tmp_path: Path) -> None:
     db = tmp_path / "fresh.db"
     with SqliteArtifactRegistry(db):
         pass
-    assert SCHEMA_USER_VERSION == 8
-    assert _user_version(db) == 8
+    assert SCHEMA_USER_VERSION == 9
+    assert _user_version(db) == 9
     assert "caller_principals" in _tables(db)
 
 
@@ -850,14 +852,15 @@ def test_v7_db_gains_the_principal_table_and_keeps_its_data(tmp_path: Path) -> N
             identity=identity, mint_nonce=_nonce()
         )
         assert reg.get_caller_principal(identity) == principal
-    assert _user_version(db) == 8
+    assert _user_version(db) == 9
 
 
-def test_v6_origin_walk_lands_the_table_at_the_v8_stamp(tmp_path: Path) -> None:
+def test_v6_origin_walk_lands_the_table_at_the_head_stamp(tmp_path: Path) -> None:
     """THE RE-STAMP TRAP, fourth arming. ``_migrate_v6_to_v7`` was the final
-    step and stamped the constant; with the constant at 8 it must stamp its own
-    literal 7, or a v6-origin db is stamped 8 WITHOUT the principal table and
-    the chained v7->v8 loser-guard no-ops. Fails if that literal is reverted."""
+    step and stamped the constant; once the constant moved past 7 it must stamp
+    its own literal 7, or a v6-origin db is stamped at the head WITHOUT the
+    principal table and the chained v7->v8 loser-guard no-ops. Fails if that
+    literal is reverted."""
     db = tmp_path / "v6.db"
     with SqliteArtifactRegistry(db):
         pass
@@ -867,7 +870,7 @@ def test_v6_origin_walk_lands_the_table_at_the_v8_stamp(tmp_path: Path) -> None:
     with SqliteArtifactRegistry(db):
         pass
 
-    assert _user_version(db) == 8
+    assert _user_version(db) == 9
     assert "caller_principals" in _tables(db)
 
 
@@ -886,7 +889,9 @@ def test_upgraded_and_fresh_principal_tables_are_identical(tmp_path: Path) -> No
 
 def test_a_crash_before_the_v8_stamp_leaves_a_bootable_v7(tmp_path: Path) -> None:
     """The DDL and the stamp share one transaction: a failure between them
-    rolls the table back with the stamp, and a clean reopen re-migrates."""
+    rolls the table back with the stamp, and a clean reopen re-migrates. The
+    step stamps its own literal 8 now that v9 follows it, so that is the
+    statement the crash intercepts."""
     db = tmp_path / "crash.db"
     with SqliteArtifactRegistry(db):
         pass
@@ -900,7 +905,7 @@ def test_a_crash_before_the_v8_stamp_leaves_a_bootable_v7(tmp_path: Path) -> Non
             self._inner = inner
 
         def execute(self, sql: str, *args):
-            if sql.strip() == f"PRAGMA user_version = {SCHEMA_USER_VERSION}":
+            if sql.strip() == "PRAGMA user_version = 8":
                 raise _Crash("simulated kill before the stamp")
             return self._inner.execute(sql, *args)
 
@@ -921,7 +926,7 @@ def test_a_crash_before_the_v8_stamp_leaves_a_bootable_v7(tmp_path: Path) -> Non
     assert "caller_principals" not in _tables(db)
     with SqliteArtifactRegistry(db):
         pass
-    assert _user_version(db) == 8
+    assert _user_version(db) == 9
     assert "caller_principals" in _tables(db)
 
 
@@ -933,9 +938,12 @@ def test_a_v8_stamp_without_the_principal_table_is_refused(tmp_path: Path) -> No
     for db in (genuine, forged):
         with SqliteArtifactRegistry(db):
             pass
+    # A v8 stamp: what a v8 build wrote, minus the principal table.
     conn = sqlite3.connect(str(forged))
     try:
+        conn.execute("DROP TABLE transfer_records")
         conn.execute("DROP TABLE caller_principals")
+        conn.execute("PRAGMA user_version = 8")
         conn.commit()
     finally:
         conn.close()

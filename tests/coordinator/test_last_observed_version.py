@@ -206,7 +206,7 @@ def test_fresh_v6_init_has_column(db_path: Path) -> None:
     the ``agent_states`` DDL, ``user_version=6`` — no migration shim ever runs."""
     with SqliteArtifactRegistry(db_path) as reg:
         assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
-    assert SCHEMA_USER_VERSION == 8
+    assert SCHEMA_USER_VERSION == 9
     cols = {row[1] for row in _agent_states_shape(db_path)}
     assert "last_observed_version" in cols
 

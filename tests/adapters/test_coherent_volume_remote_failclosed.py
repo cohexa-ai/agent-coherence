@@ -63,6 +63,28 @@ def test_op_401_raises_remote_auth_failed(tmp_path: Path, monkeypatch: pytest.Mo
         vol._post("/hooks/pre-edit", {"session_id": vol.session_id, "path": "x"})
 
 
+@pytest.mark.parametrize("verb", ["transfer", "accept", "decline", "withdraw"])
+def test_a_handoff_verb_answered_401_raises_remote_auth_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
+):
+    """The handoff verbs treat a lost answer as an unknown outcome
+    (``CommitUnconfirmed``), so a 401 must still be caught first: read as a
+    failed request, a wrong remote secret would surface as "the verb may have
+    landed" instead of a loud auth failure."""
+    vol = _remote_volume(tmp_path, monkeypatch)
+    (tmp_path / "plan.md").write_bytes(b"v1")
+
+    def raise_401(ep, path, payload, **k):
+        raise _http_error(401)
+
+    monkeypatch.setattr(cv, "_coordinator_post", raise_401)
+    with pytest.raises(RemoteAuthFailed):
+        if verb == "transfer":
+            vol.transfer("plan.md", successor="0" * 32)
+        else:
+            getattr(vol, verb)("plan.md")
+
+
 def test_attach_401_raises_remote_auth_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     def probe_401(ep, path, **k):
         raise _http_error(401)

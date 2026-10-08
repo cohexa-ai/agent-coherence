@@ -150,7 +150,7 @@ talks to it over stdin/stdout, and the server coordinates writes through an
 in-process `CoherentVolume` on the local filesystem. There is nothing to firewall
 and no endpoint to configure on this path. See the MCP sections of the
 [README](../README.md#mcp-server-stale-write-guard-fs) and the
-[guide](guide.md#stale-write-guard-fs-mcp-server) for setup and the five `swg_*`
+[guide](guide.md#stale-write-guard-fs-mcp-server) for setup and the ten `swg_*`
 tools.
 
 ## Who the coordinator can tell apart
@@ -168,8 +168,11 @@ What follows from that:
   trusted alike, the same boundary as your shell history or SSH agent socket.
 - A session whose client has claimed a [caller principal](guide.md#caller-principal)
   is refused, on the routes that release grants, commit, record who wrote, answer
-  the effect fence or record workspace ownership, when a request names it without
-  that principal or with another. That stops one writer's mistake — a copied
+  the effect fence, record workspace ownership, or hand a session's claims to a
+  successor or accept, decline or withdraw a
+  [handoff](guide.md#targeted-grant-handoff) in its name (`/handoff/transfer`,
+  `/handoff/accept`, `/handoff/decline`, `/handoff/withdraw`), when a request
+  names it without that principal or with another. That stops one writer's mistake — a copied
   request, a stale session id, a wrong id in a retry — from ending another
   writer's work or writing under its name. A session that never claimed one
   behaves as before: any holder of the secret can act as it.
@@ -182,10 +185,42 @@ What follows from that:
   session id can find a matching principal; there the principal exposes a client
   that never claimed or presents the wrong principal, but does not tell sessions
   apart.
+- The [handoff commands](guide.md#handoff-commands) (`agent-coherence-transfer`,
+  `-accept`, `-decline`, `-withdraw`) act as the Claude Code session they name,
+  through `--session` or the `CLAUDE_CODE_SESSION_ID` variable Claude Code sets
+  in its shells. They present that session's stored principal through the hook
+  client's own helper, so they have exactly the hook client's trust: they
+  separate writers that follow the protocol, and a command given another
+  session's id acts as that session. When the named session has no stored
+  principal, the command creates that session's mint nonce and claims and
+  stores its principal, as the session's first hook event would. A wrong
+  session id typed to a command therefore binds a principal and leaves both
+  files for an identity no session uses. Under the trust model that is
+  harmless; remove the two files by hand, as
+  [Caller-principal files](#caller-principal-files-claude-code-hook-client)
+  describes. The commands cannot act for a `CoherentVolume` or MCP session,
+  which keeps its principal in its own process and has none stored on disk:
+  the command's claim is refused because the session is bound under another
+  nonce, the command exits `2`, and the attempt leaves a mint-nonce file
+  behind, as a wrong session id does. A subagent's shell names
+  its parent session, so a command run there acts as the parent.
+- `CoherentVolume` and the MCP server hand on and settle
+  [handoffs](guide.md#from-a-coherentvolume) only as their own session: they
+  present their own principal on every request, and the MCP handoff tools
+  take no session argument. So when a volume or MCP session is a handoff's
+  giver, or completes or overtakes one with its write, the record names the
+  session whose principal the coordinator checked.
 - `last_writer_id`, and the sessions listed by `/status`, record which session a
-  caller *said* it was — verified against its principal when it has one. Treat
-  them as a record of cooperating writers, useful for debugging and display, not
-  as proof of who wrote.
+  caller *said* it was — verified against its principal when it has one. A
+  handoff's transfer record holds ids of the same kind: its giver is the session
+  the transfer request named, checked against that session's principal when it
+  has one; its successor is whoever the giver named; and a completion or an
+  overtake is attributed to the session the writing request named, which the
+  snapshot-session routes do not check when no principal is presented. The
+  record is kept in `.coherence/state.db` and holds agent ids, versions,
+  statuses and timestamps — no file content and no session id. Treat all of
+  these as a record of cooperating writers, useful for debugging and display,
+  not as proof of who wrote.
 - The snapshot-session routes (`/session/read`, `/session/commit`,
   `/session/commit_all`, `/session/heartbeat`) also require the token that
   `/session/begin` returns, and attribute a commit to the session that token was
@@ -202,9 +237,21 @@ coordinator's grant sweep, and why (`sessions[].reclaimed`), is likewise in the
 operator view only; the other views carry just the reclaim counts
 (`sweep_reclaims_total`, `sweep_reclaims_by_trigger`). The default `minimal` view reports `agent_name`
 as `null` and the pattern counts without the patterns, and the `metrics` view
-carries no sessions at all. Hook
+carries no sessions at all. A tracked artifact that has a handoff record
+carries a `handoff` key in the default and operator views, naming the giver,
+the successor and any session that overtook the handoff by session-level agent
+id — the agent id derived from the session id alone, so for a `CoherentVolume`
+the volume's session rather than the per-attempt id that holds its grants — and
+never by session name or session id; the `metrics` view carries no record. Hook
 responses identify another session by its agent id, a one-way hash of the
-session id. The `agent-coherence-status` command is an operator tool and asks
+session id, and the handoff commands print the session-level agent id they act
+as, never the session id. The MCP server's `swg_status` returns
+`session_agent_id`, the session's own session-level agent id, to that session:
+it is a one-way hash of the `session_id` the same tool already returns, and
+the id a `handoff` key names that session by, so it discloses nothing new. The
+MCP tools that carry a `handoff` key (`swg_read`, `swg_status`,
+`swg_write_cas`) relay the coordinator's, so they too carry session-level agent
+ids only. The `agent-coherence-status` command is an operator tool and asks
 for the operator view by default, so its output does carry session names: run
 it with `--detail minimal` before pasting the output into a bug report, and
 point dashboards at `--detail metrics`. All of this is disclosure hygiene
@@ -274,12 +321,14 @@ location other than the explicit `session_dir` argument.
 The Claude Code hook client runs one process per hook event, so it keeps each
 session's [caller principal](guide.md#caller-principal) on disk beside
 `hook.secret`, keyed by the session's agent id — the one-way hash of the session
-id that `/status` shows, never the raw session id. `CoherentVolume`, the MCP
-server and the substrate session hold theirs in memory and write neither file.
+id that `/status` shows, never the raw session id. The
+[handoff commands](guide.md#handoff-commands) read and write the same two
+files for the session they act as. `CoherentVolume`, the MCP server and the
+substrate session hold theirs in memory and write neither file.
 
 | File | Path | Mode | Created when |
 |---|---|---|---|
-| Mint nonce | `<workspace>/.coherence/caller-principal-<agent-id>.nonce` | `0600` | The session's first hook event with no stored principal, unless `server.pid` names the plugin's Node backend — *before* the claim is sent, so an older Python coordinator that then answers `404` leaves the file behind too. Created exclusively (`O_CREAT` with `O_EXCL`) and never rewritten; two hook processes racing on a new session share the winner's nonce |
+| Mint nonce | `<workspace>/.coherence/caller-principal-<agent-id>.nonce` | `0600` | The session's first hook event with no stored principal, or the first handoff command (`agent-coherence-transfer`, `-accept`, `-decline`, `-withdraw`) naming a session with none, unless `server.pid` names the plugin's Node backend — *before* the claim is sent, so an older Python coordinator that then answers `404` leaves the file behind too. Created exclusively (`O_CREAT` with `O_EXCL`) and never rewritten; two hook processes racing on a new session share the winner's nonce |
 | Caller principal | `<workspace>/.coherence/caller-principal-<agent-id>.principal` | `0600` | When the claim binds. Written to a private temporary file (`O_CREAT` with `O_EXCL`, `0600`) and renamed over the stored file, and replaced the same way when a refused request is recovered by claiming again |
 
 The nonce is what lets the session re-obtain its principal after a lost claim
@@ -290,7 +339,9 @@ session on every route. The client never deletes them. Remove them only when no
 hook of that session can still run: a session whose nonce file is gone claims
 again under a new nonce, which the coordinator refuses
 (`caller_principal_claimed`), and from then on the routes that require a
-principal refuse that session.
+principal refuse that session. The files a handoff command leaves for a
+mistyped session id, or for a `CoherentVolume` or MCP session it could not act
+for, belong to no hook session, so you can remove them at any time.
 
 ### Durable version retention (opt-in)
 

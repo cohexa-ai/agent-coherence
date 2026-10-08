@@ -142,6 +142,10 @@ _TIMESTAMP_KEYS: frozenset[str] = frozenset({
     "last_completed_ms",
     "first_observation_ts",
     "last_seen_at",
+    # #185: the operator tier's handoff key carries the transfer record's
+    # creation wall clock. Scrubbed so that row can pin the key's presence;
+    # every other handoff field is compared literally.
+    "created_at_unix_ts",
 })
 
 _UPTIME_KEYS: frozenset[str] = frozenset({

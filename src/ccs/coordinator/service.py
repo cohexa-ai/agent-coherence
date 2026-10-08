@@ -13,8 +13,8 @@ import threading
 import time
 import warnings
 from collections import OrderedDict
-from dataclasses import dataclass
-from typing import Callable, Iterable, Mapping, Optional, Sequence
+from dataclasses import dataclass, replace
+from typing import Callable, Iterable, Literal, Mapping, Optional, Sequence
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from ccs.coordinator.retention import collectible_versions
@@ -25,6 +25,9 @@ from ccs.core.exceptions import (
     CURRENT_VERSION_REASON,
     EPOCH_MISMATCH_REASON,
     FUTURE_VERSION_REASON,
+    HANDOFF_NOT_GIVER_REASON,
+    HANDOFF_NOT_LIVE_REASON,
+    HANDOFF_NOT_SUCCESSOR_REASON,
     NOT_RETAINED_REASON,
     OCC_CALLER_TRANSIENT_REASON,
     PIN_STATES,
@@ -43,6 +46,7 @@ from ccs.core.exceptions import (
     CallerPrincipalRefused,
     CheckpointUnknown,
     CoherenceError,
+    GiverFenced,
     OccCallerTransientError,
     SessionInvalidated,
     StaleReadGeneration,
@@ -52,6 +56,11 @@ from ccs.core.invariants import check_monotonic_version, check_single_writer
 from ccs.core.states import MESIState, TransientState
 from ccs.core.substrate import RestoreTier
 from ccs.core.types import (
+    TRANSFER_STATUS_COMPLETED,
+    TRANSFER_STATUS_DECLINED,
+    TRANSFER_STATUS_OVERTAKEN,
+    TRANSFER_STATUS_PENDING,
+    TRANSFER_STATUS_WITHDRAWN,
     Artifact,
     CasCorruption,
     CommitAllEntry,
@@ -67,6 +76,8 @@ from ccs.core.types import (
     SessionCommitRejection,
     SessionReadRejection,
     SnapshotSession,
+    TransferGrantOutcome,
+    TransferVerbOutcome,
     VersionedContent,
     VersionedReadRejection,
     WorkspaceRegistrationResult,
@@ -78,6 +89,8 @@ from .registry_protocol import (
     CheckpointRecord,
     RegistryBase,
     SqliteExtended,
+    TransferRecord,
+    TransferRequest,
 )
 
 # The write-claim states, as one membership set (mirrors the registries' _M_OR_E_STATES).
@@ -1290,6 +1303,12 @@ class CoordinatorService:
         # lands as a phantom write behind the client's back. Every other mutating
         # path (write / write_cas) threads ``abort`` the same way; ``session_commit``
         # had silently dropped it before this fix.
+        #
+        # ``caller`` -- the owner validated above -- rides along as the caller
+        # identity while ``committer_id`` stays the agent id: the giver
+        # fence and the completion/overtake label key on who the session
+        # belongs to, never on the token-minted committer, and the
+        # admit-on-absent read-generation path is unchanged.
         return self.commit_cas(
             agent_id=committer_id,
             artifact_id=artifact_id,
@@ -1299,6 +1318,7 @@ class CoordinatorService:
             size_tokens=size_tokens,
             content=content,
             abort=abort,
+            caller=caller,
         )
 
     def _validate_session_owner(
@@ -2093,16 +2113,23 @@ class CoordinatorService:
         artifact_id: UUID,
         issued_at_tick: int = 0,
         abort: threading.Event | None = None,
+        caller: UUID | None = None,
     ) -> list[InvalidationSignal]:
         """Request write ownership by invalidating peers and granting EXCLUSIVE.
 
         Wrapped in :meth:`registry.abort_guard` (finding A6): if the handler
         watchdog already timed out, the grant aborts before it lands rather than
         leaving a phantom EXCLUSIVE the agent never saw (and silently
-        invalidating its peers)."""
+        invalidating its peers).
+
+        ``caller`` is the caller's session-level identity; ``None``
+        compares ``agent_id`` itself, so a library agent is unchanged. The giver
+        of a live handoff of the path is refused with :class:`GiverFenced`
+        before anyone is invalidated; any other acquire on a live record labels
+        it completed (the successor) or overtaken (anyone else)."""
         with self.registry.abort_guard(abort):
             return self._write_impl(
-                agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=issued_at_tick
+                agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=issued_at_tick, caller=caller
             )
 
     def _write_impl(
@@ -2111,8 +2138,14 @@ class CoordinatorService:
         agent_id: UUID,
         artifact_id: UUID,
         issued_at_tick: int = 0,
+        caller: UUID | None = None,
     ) -> list[InvalidationSignal]:
         artifact = self._require_artifact(artifact_id)
+        identity = caller if caller is not None else agent_id
+        # Before the acquire: a giver's re-acquire must never invalidate
+        # the successor's read and then meet it as another holder.
+        self._refuse_handed_off_giver(artifact_id, identity)
+        admitted = self._live_transfer_record(artifact_id)
         self.registry.set_agent_transient(
             artifact_id,
             agent_id,
@@ -2144,6 +2177,7 @@ class CoordinatorService:
         self.registry.set_agent_state(artifact_id, agent_id, MESIState.EXCLUSIVE, trigger="write", tick=issued_at_tick)
         self.registry.clear_agent_transient(artifact_id, agent_id)
         self._validate_single_writer(artifact_id)
+        self._label_live_transfer(admitted, identity)
         return signals
 
     def upgrade(
@@ -2166,8 +2200,12 @@ class CoordinatorService:
         content_hash: str | None = None,
         size_tokens: int | None = None,
         abort: threading.Event | None = None,
+        caller: UUID | None = None,
     ) -> tuple[Artifact, list[InvalidationSignal]]:
-        """Commit modified content under the A6 abort guard (see _commit_impl)."""
+        """Commit modified content under the A6 abort guard (see _commit_impl).
+
+        ``caller`` is the caller's session-level identity; ``None``
+        compares ``agent_id`` itself."""
         with self.registry.abort_guard(abort):
             return self._commit_impl(
                 agent_id=agent_id,
@@ -2176,6 +2214,7 @@ class CoordinatorService:
                 issued_at_tick=issued_at_tick,
                 content_hash=content_hash,
                 size_tokens=size_tokens,
+                caller=caller,
             )
 
     def _commit_impl(
@@ -2187,10 +2226,15 @@ class CoordinatorService:
         issued_at_tick: int = 0,
         content_hash: str | None = None,
         size_tokens: int | None = None,
+        caller: UUID | None = None,
     ) -> tuple[Artifact, list[InvalidationSignal]]:
         """Commit modified content, increment version, and invalidate peers.
 
         Raises:
+            GiverFenced: the caller handed this path off and the handoff is
+                still live -- checked first, so a giver whose grant was
+                handed off is never answered commit_not_allowed, nor shown a
+                reclaim it did not suffer.
             CoherenceError: the committer does not hold M/E (e.g. its grant was
                 already reclaimed — the error names the reclaim trigger/tick).
             StaleReadGeneration: the read-generation fence fired — a sweep
@@ -2201,6 +2245,7 @@ class CoordinatorService:
                 (unlike ``write_cas``).
         """
         artifact = self._require_artifact(artifact_id)
+        self._refuse_handed_off_giver(artifact_id, caller if caller is not None else agent_id)
         agent_state = self.registry.get_agent_state(artifact_id, agent_id)
         if agent_state not in {MESIState.EXCLUSIVE, MESIState.MODIFIED}:
             reclamation = self.registry.get_last_reclamation(agent_id, artifact_id)
@@ -2293,8 +2338,12 @@ class CoordinatorService:
         size_tokens: int | None = None,
         content: bytes | str | None = None,
         abort: threading.Event | None = None,
+        caller: UUID | None = None,
     ) -> tuple[Artifact, list[InvalidationSignal]] | ConflictDetail:
-        """Optimistic-concurrency commit under the A6 abort guard (see _commit_cas_impl)."""
+        """Optimistic-concurrency commit under the A6 abort guard (see _commit_cas_impl).
+
+        ``caller`` is the caller's session-level identity; ``None``
+        compares ``agent_id`` itself, so a library agent is unchanged."""
         with self.registry.abort_guard(abort):
             return self._commit_cas_impl(
                 agent_id=agent_id,
@@ -2304,6 +2353,7 @@ class CoordinatorService:
                 issued_at_tick=issued_at_tick,
                 size_tokens=size_tokens,
                 content=content,
+                caller=caller,
             )
 
     def _commit_cas_impl(
@@ -2316,6 +2366,7 @@ class CoordinatorService:
         issued_at_tick: int = 0,
         size_tokens: int | None = None,
         content: bytes | str | None = None,
+        caller: UUID | None = None,
     ) -> tuple[Artifact, list[InvalidationSignal]] | ConflictDetail:
         """Optimistic-concurrency commit via an atomic version-checked CAS.
 
@@ -2336,7 +2387,12 @@ class CoordinatorService:
           ``None``, else ``CoherenceError``);
         - the caller's MESI state must be SHARED or INVALID — a MODIFIED/EXCLUSIVE
           holder is an *acquired* pessimistic writer and must use plain
-          :meth:`commit` (rejected with a ``CoherenceError`` pointing there).
+          :meth:`commit` (rejected with a ``CoherenceError`` pointing there);
+        - the caller must not be the giver of a live handoff of the path
+          (:class:`GiverFenced`): ``caller`` is its session-level
+          identity, or ``agent_id`` itself when none is passed. A WIN on a
+          record that was live when it was admitted then labels it completed
+          (the successor) or overtaken (anyone else), best-effort.
 
         Three-outcome discrimination of the registry result (plan R2):
 
@@ -2393,6 +2449,12 @@ class CoordinatorService:
                 f"(use commit() for an EXCLUSIVE/MODIFIED holder)"
             )
 
+        # Before the registry legs: a giver's write is refused whatever
+        # version-CAS and the read-generation fence would have answered.
+        identity = caller if caller is not None else agent_id
+        self._refuse_handed_off_giver(artifact_id, identity)
+        admitted = self._live_transfer_record(artifact_id)
+
         result = self.registry.commit_cas(
             artifact_id,
             agent_id,
@@ -2429,6 +2491,7 @@ class CoordinatorService:
             for _ in invalidated_ids
         ]
         self._validate_single_writer(artifact_id)
+        self._label_live_transfer(admitted, identity)
         return updated, signals
 
     def commit_all(
@@ -2438,6 +2501,7 @@ class CoordinatorService:
         writes: Mapping[UUID, CommitAllEntry],
         issued_at_tick: int = 0,
         abort: threading.Event | None = None,
+        caller: UUID | None = None,
     ) -> tuple[MultiCommitResult, list[InvalidationSignal]] | MultiCommitConflict:
         """Atomic multi-artifact publish (SB-18) under the A6 abort guard.
 
@@ -2447,10 +2511,15 @@ class CoordinatorService:
         precondition layer + the ``InvalidationSignal`` construction. The signals
         are RETURNED for the caller to publish to the event bus AFTER the commit
         (broadcast-after-commit — never mid-batch).
+
+        ``caller`` is the caller's session-level identity; ``None``
+        compares ``agent_id`` itself. A member the caller handed off under a live
+        record refuses the whole batch with :class:`GiverFenced`; a WIN labels
+        each member's live record completed or overtaken.
         """
         with self.registry.abort_guard(abort):
             return self._commit_all_impl(
-                agent_id=agent_id, writes=writes, issued_at_tick=issued_at_tick
+                agent_id=agent_id, writes=writes, issued_at_tick=issued_at_tick, caller=caller
             )
 
     def _commit_all_impl(
@@ -2459,9 +2528,12 @@ class CoordinatorService:
         agent_id: UUID,
         writes: Mapping[UUID, CommitAllEntry],
         issued_at_tick: int = 0,
+        caller: UUID | None = None,
     ) -> tuple[MultiCommitResult, list[InvalidationSignal]] | MultiCommitConflict:
         if not writes:
             raise CoherenceError("commit_all requires a non-empty write-set")
+        identity = caller if caller is not None else agent_id
+        admitted: dict[UUID, TransferRecord | None] = {}
         # D4 precondition layer (per member, all-or-nothing): each artifact must
         # exist, the caller must not be mid-transient, and must be SHARED/INVALID
         # (an M/E holder is a pessimistic writer — use commit()). One failing member
@@ -2480,6 +2552,8 @@ class CoordinatorService:
                     f"state={state} reason=occ_is_shared_or_invalid_only "
                     f"(use commit() for an EXCLUSIVE/MODIFIED holder)"
                 )
+            self._refuse_handed_off_giver(artifact_id, identity)
+            admitted[artifact_id] = self._live_transfer_record(artifact_id)
 
         result = self.registry.commit_all(agent_id, writes, tick=issued_at_tick)
 
@@ -2507,6 +2581,8 @@ class CoordinatorService:
                     )
                 )
             self._validate_single_writer(art_id)
+        for record in admitted.values():
+            self._label_live_transfer(record, identity)
         return result, signals
 
     def session_commit_all(
@@ -2568,8 +2644,14 @@ class CoordinatorService:
             )
             for artifact_id, (content, size_tokens) in writes.items()
         }
+        # The validated owner is the caller identity the giver fence keys on,
+        # as in session_commit.
         return self.commit_all(
-            agent_id=committer_id, writes=batch, issued_at_tick=issued_at_tick, abort=abort
+            agent_id=committer_id,
+            writes=batch,
+            issued_at_tick=issued_at_tick,
+            abort=abort,
+            caller=caller,
         )
 
     def create_workspace_checkpoint(
@@ -3028,6 +3110,177 @@ class CoordinatorService:
                 return artifact.content_hash == fingerprint
         return False
 
+    # ------------------------------------------------------------------
+    # Targeted grant handoff (#185): transfer, accept, decline and
+    # withdraw; the giver fence every write path consults; and the
+    # completion or overtake an admitted acquire or win records.
+    # ------------------------------------------------------------------
+
+    def transfer(
+        self,
+        *,
+        giver: UUID,
+        successor: UUID,
+        holders: Mapping[UUID, UUID],
+        successor_known: bool = False,
+        issued_at_tick: int = 0,
+        abort: threading.Event | None = None,
+    ) -> list[TransferGrantOutcome]:
+        """Hand each path in ``holders`` to ``successor``.
+
+        ``giver`` is the caller's session-level identity -- what the record
+        stores and the fence keys on. ``holders`` maps each artifact to the
+        composite presented as holding the claim there: the grant given
+        up is the one that composite holds. ``successor`` arrives already
+        normalised to a session-level identity, and ``successor_known`` says
+        whether the caller resolved it through a name map this service cannot
+        see.
+
+        The registry's composite member decides every path in the order
+        :func:`~ccs.coordinator.registry_protocol.decide_transfer_grant`
+        documents and applies the admitted ones atomically; this method adds
+        no decision of its own. The abort is checked once, when the hold is won: an abort set
+        while the request waits for the lock lands nothing
+        (``WatchdogAbandoned``), and one set after the hold is taken lets every
+        admitted path land together.
+
+        Returns one :class:`TransferGrantOutcome` per path, in request order;
+        the request succeeded only if every grant transferred.
+
+        Raises:
+            CoherenceError: ``holders`` names no path -- a request with nothing
+                to hand on must not read as a success.
+        """
+        if not holders:
+            raise CoherenceError("transfer requires at least one path")
+        request = TransferRequest(
+            giver=giver, successor=successor, holders=dict(holders), successor_known=successor_known
+        )
+        with self.registry.abort_guard(abort):
+            return self.registry.transfer_grants(request, tick=issued_at_tick)
+
+    def accept_transfer(
+        self, *, artifact_id: UUID, caller: UUID, abort: threading.Event | None = None
+    ) -> TransferVerbOutcome:
+        """The successor accepts the live handoff of ``artifact_id`` without
+        writing. A pending record becomes completed; a completed one is
+        answered as it stands; an overtaken one is answered with its status and
+        counterparty and keeps its label. Completion never lifts the giver's
+        fence: only a version move, a decline or a withdraw does. ``caller``
+        is the session-level identity; with no live record the answer is not
+        live, and anyone but the successor is refused as not the successor."""
+        return self._settle_transfer(_ACCEPT, artifact_id=artifact_id, caller=caller, abort=abort)
+
+    def decline_transfer(
+        self, *, artifact_id: UUID, caller: UUID, abort: threading.Event | None = None
+    ) -> TransferVerbOutcome:
+        """The successor declines the live handoff of ``artifact_id``,
+        whatever its label: the record ends as declined and the giver's fence
+        lifts at once. Refused as for :meth:`accept_transfer`."""
+        return self._settle_transfer(_DECLINE, artifact_id=artifact_id, caller=caller, abort=abort)
+
+    def withdraw_transfer(
+        self, *, artifact_id: UUID, caller: UUID, abort: threading.Event | None = None
+    ) -> TransferVerbOutcome:
+        """The giver withdraws its live handoff of ``artifact_id``,
+        whatever its label: the record ends as withdrawn and the fence lifts.
+        Anyone but the giver is refused as not the giver. Nothing else
+        withdraws: a session stop and a failed edit never call this."""
+        return self._settle_transfer(_WITHDRAW, artifact_id=artifact_id, caller=caller, abort=abort)
+
+    def live_handoff_given_by(self, artifact_id: UUID, identity: UUID) -> TransferRecord | None:
+        """The giver predicate, the one read every write path consults: the
+        live transfer record of ``artifact_id`` whose giver is ``identity``, or
+        ``None``.
+
+        Present-record, like the read-generation fence's admit-on-absent: a path
+        with NO record fences nobody, so a plain optimistic writer is never
+        refused. ``identity`` is the session-level identity the route
+        passed, so a re-minted incarnation and a subagent of the giver are
+        fenced alike. Liveness is the registry's: a record whose
+        version moved, or that was declined or withdrawn, fences nobody.
+
+        Read-only. The write paths call it inside their abort-guard hold; a
+        handler calls it to render the giver's pre-edit deny and its failed
+        edit, which is answered not held and handed to the successor at the
+        transfer version and changes nothing."""
+        read = self.registry.get_transfer_record(artifact_id)
+        if read is None:
+            return None
+        record, live = read
+        return record if live and record.giver == identity else None
+
+    def _refuse_handed_off_giver(self, artifact_id: UUID, identity: UUID) -> None:
+        """Raise :class:`GiverFenced` when ``identity`` gave ``artifact_id``
+        away under a live record. Caller holds the abort guard."""
+        record = self.live_handoff_given_by(artifact_id, identity)
+        if record is not None:
+            raise GiverFenced(artifact_id, record.successor, record.version_at_transfer)
+
+    def _live_transfer_record(self, artifact_id: UUID) -> TransferRecord | None:
+        """The path's record if it is live now. Read inside the write path's
+        hold before its acquire or win, so it is the record that was live when
+        that write was admitted -- the only kind a write may label."""
+        read = self.registry.get_transfer_record(artifact_id)
+        return read[0] if read is not None and read[1] else None
+
+    def _label_live_transfer(self, admitted: TransferRecord | None, identity: UUID) -> None:
+        """Completion or overtake after an admitted acquire or win.
+
+        ``admitted`` is the record that was live when the write was admitted
+        (``None``: nothing to label -- an ended record is never relabelled).
+        The successor's write marks it completed; anyone else's marks it
+        overtaken with ``identity`` as counterparty, each replacing the other.
+        The registry's write is unconditional because a win has already moved
+        the version, so the decision is made here, from the read taken before.
+
+        Best-effort relative to the write's own answer: the acquire or win
+        already landed, so a failed label write must not turn it into a failure
+        the client would retry. After a win the record then reads by its
+        version -- not live, with the outcome of a write whose writer was not
+        recorded; after an acquire it keeps its previous label."""
+        if admitted is None:
+            return
+        if identity == admitted.successor:
+            status, counterparty = TRANSFER_STATUS_COMPLETED, None
+        else:
+            status, counterparty = TRANSFER_STATUS_OVERTAKEN, identity
+        try:
+            self.registry.set_transfer_status(admitted.artifact_id, status, counterparty=counterparty)
+        except Exception:  # noqa: BLE001 — any raise; the admitted write stands
+            logger.warning(
+                "handoff label %r not written for artifact %s after an admitted write; "
+                "the record now reads by its version",
+                status,
+                admitted.artifact_id,
+                exc_info=True,
+            )
+
+    def _settle_transfer(
+        self,
+        verb: "_TransferVerb",
+        *,
+        artifact_id: UUID,
+        caller: UUID,
+        abort: threading.Event | None,
+    ) -> TransferVerbOutcome:
+        """Accept, decline or withdraw: read, decide and relabel under one
+        abort-guard hold, so the answer describes the record as the verb left
+        it. The abort is checked once, when the hold is won."""
+        with self.registry.abort_guard(abort):
+            read = self.registry.get_transfer_record(artifact_id)
+            if read is None:
+                return TransferVerbOutcome(artifact_id=artifact_id, ok=False, reason=HANDOFF_NOT_LIVE_REASON)
+            record, live = read
+            refusal = verb.refusal(record, live=live, caller=caller)
+            if refusal is not None:
+                return _verb_answer(record, reason=refusal)
+            status = verb.relabel(record.status)
+            if status is None:
+                return _verb_answer(record)
+            self.registry.set_transfer_status(artifact_id, status)
+            return _verb_answer(replace(record, status=status, counterparty=None))
+
     def invalidate(
         self,
         *,
@@ -3350,6 +3603,47 @@ class CoordinatorService:
         if artifact is None:
             raise CoherenceError(f"artifact_not_found artifact={artifact_id}")
         return artifact
+
+
+@dataclass(frozen=True)
+class _TransferVerb:
+    """What tells accept, decline and withdraw apart: whose verb it is, and the
+    label it writes over the record's current one (``None``: change nothing)."""
+
+    party: Literal["giver", "successor"]
+    not_party_reason: str
+    relabel: Callable[[str], Optional[str]]
+
+    def refusal(self, record: TransferRecord, *, live: bool, caller: UUID) -> str | None:
+        """Not live is decided first: with no live record there is nothing for
+        any party to act on, and the not-giver / not-successor reasons name a
+        LIVE record's parties."""
+        if not live:
+            return HANDOFF_NOT_LIVE_REASON
+        party = record.giver if self.party == "giver" else record.successor
+        return None if caller == party else self.not_party_reason
+
+
+# An accept turns only a pending record completed; a completed one is
+# answered as it stands, and an overtaken one is never relabelled by an accept.
+_ACCEPT = _TransferVerb(
+    "successor",
+    HANDOFF_NOT_SUCCESSOR_REASON,
+    lambda status: TRANSFER_STATUS_COMPLETED if status == TRANSFER_STATUS_PENDING else None,
+)
+_DECLINE = _TransferVerb("successor", HANDOFF_NOT_SUCCESSOR_REASON, lambda _status: TRANSFER_STATUS_DECLINED)
+_WITHDRAW = _TransferVerb("giver", HANDOFF_NOT_GIVER_REASON, lambda _status: TRANSFER_STATUS_WITHDRAWN)
+
+
+def _verb_answer(record: TransferRecord, *, reason: str | None = None) -> TransferVerbOutcome:
+    """The answer carrying ``record``'s label: taken when ``reason`` is None."""
+    return TransferVerbOutcome(
+        artifact_id=record.artifact_id,
+        ok=reason is None,
+        reason=reason,
+        status=record.status,
+        counterparty=record.counterparty,
+    )
 
 
 def _invalidation_transient_for_state(state: MESIState) -> TransientState | None:
