@@ -549,12 +549,16 @@ and it has taken none since. Its edit may be on disk with no version recording
 it, so do not hand the path to another session on the strength of an empty
 `states` alone. The entry stays listed:
 
-- while the holder re-reads the path, beside its `SHARED` state, because a
-  read does not version the edit;
+- while the holder re-reads the path and is granted `SHARED` because another
+  session holds it too, since a read does not version the edit;
 - after a peer writes or commits the path, after the holder itself commits by
-  compare-and-swap, and after the holder's session ends.
+  compare-and-swap (that leaves it `SHARED`), and after the holder's session
+  ends.
 
-It clears only when that holder takes a write grant on the path again. The map
+It clears when that holder next takes the path `EXCLUSIVE` or `MODIFIED`: a
+pre-edit, or a re-read while no other session holds the path, because the
+coordinator grants a sole reader `EXCLUSIVE`. From then on `states` shows the
+holder holding the path, so it does not read as released. The map
 tells you a reclaim happened; whether its edit has been dealt with since is
 yours to decide. One clue: if the path's `last_writer_at_unix_ts` in the same
 response is later than the entry's `tick`, someone has committed the path since
@@ -570,6 +574,9 @@ Limits:
   row is dropped.
 - A zero count does not prove the sweep is running: it reads the same when
   there was nothing to reclaim.
+- Only the grant sweep's two triggers are recorded. A holder the coordinator
+  invalidates because it sat mid-transition past `transient_timeout_sec` gets
+  no `reclaimed` entry and no count.
 - The Python console script `agent-coherence-status` asks for the operator view
   by default and prints each reclaimed path under its session, after the held
   state when the session has re-read it:

@@ -259,11 +259,13 @@ Alpha — APIs may change before `v1.0`.
     beside `states`: `{path: {"trigger": "reclaim_heartbeat" |
     "reclaim_max_hold", "tick": <int>}}` for each path whose last write grant
     the sweep reclaimed, with no write grant there since. It is history, not
-    current state. A session that re-reads the path keeps it listed beside its
-    `SHARED` state, because a read does not version the edit the reclaim left
-    on disk, and a peer invalidating that read leaves the original trigger and
-    tick in place. A new write grant on the path clears the entry, and a path
-    is never both held for writing and listed. A release, a peer preemption or
+    current state. A session whose re-read is granted `SHARED` (another
+    session holds the path too) keeps it listed beside that state, because a
+    read does not version the edit the reclaim left on disk, and a peer
+    invalidating that read leaves the original trigger and tick in place. An
+    `EXCLUSIVE` or `MODIFIED` grant on the path clears the entry, including the
+    `EXCLUSIVE` a sole reader's re-read is granted; `states` then shows the
+    path held. A path is never both held for writing and listed. A release, a peer preemption or
     a handoff adds no entry. `states` is unchanged (held grants only), so
     existing readers see the same body. Both maps come from one registry read,
     so a single response never shows a reclaimed grant as a clean release.
@@ -296,7 +298,7 @@ Alpha — APIs may change before `v1.0`.
     the same rows as the states.
   - `agent-coherence-status` prints each reclaimed path under its session,
     labelled with trigger and tick (after the held state when the session has
-    re-read the path), plus the new counters.
+    re-read the path), plus `sweep_reclaims_total` in its counter block.
 
   The plugin's Node coordinator runs no grant sweep and answers
   `detail=full` with `501`, so it has nothing to report here.
