@@ -509,17 +509,22 @@ _CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
     ("POST", "/workspace/checkpoint"): RoutePrincipalPosture(_REQUIRE, (
         "records durable checkpoint-manifest ownership under the named "
         "identity: a caller without a claimed identity's principal could "
-        "record a manifest as that identity's")),
+        "record a manifest as that identity's. The body's optional "
+        "receiver_session_id names a second identity, the one controller "
+        "allowed to register a restore of the checkpoint (#191); it is "
+        "recorded, not acted as, so the check applies to session_id only")),
     ("POST", "/workspace/restore/status"): RoutePrincipalPosture(_REQUIRE, (
-        "writes durable restore progress that crash-resume acts on. The route "
-        "validates the identity and never consults it, so the check refuses "
-        "only a request naming a CLAIMED identity without its principal; a "
-        "caller naming an unclaimed identity is admitted, so this class does "
-        "not limit who moves a restore's state. Kept require (not the field "
-        "dropped) to match its register sibling; see the plan's U6 choice")),
+        "writes durable restore progress that crash-resume acts on, as a "
+        "controller derived from the named session: the checkpoint's receiver "
+        "binding and registration claim (#191) refuse any other controller, "
+        "so a caller without a claimed receiver's principal could conclude "
+        "that receiver's restore. A caller naming an unclaimed identity is "
+        "admitted as that identity, so the gate binds a controller only as "
+        "far as its session claimed a principal")),
     ("POST", "/workspace/restore/member"): RoutePrincipalPosture(_REQUIRE, (
-        "writes a member's durable restore terminal; as /workspace/restore/"
-        "status, the identity is validated but not consulted")),
+        "writes a member's durable restore terminal (the delete half of a "
+        "registration), gated on the derived controller as "
+        "/workspace/restore/status is")),
     ("POST", "/workspace/restore/register"): RoutePrincipalPosture(_REQUIRE, (
         "a version-bumping write registered under a controller identity "
         "derived from the named session: a caller without a claimed session's "
