@@ -76,6 +76,7 @@ from ccs.adapters.claude_code.auth import (
     verify_host,
 )
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
+from ccs.adapters.claude_code.bash_write_detector import detect_tracked_writes
 from ccs.adapters.claude_code.policy import UNTRACK_STRICT_PATH_REASON, TrackedArtifactPolicy
 from ccs.coordinator.registry_protocol import CheckpointMember, TransferRecord
 from ccs.coordinator.service import (
@@ -160,7 +161,8 @@ class _RequestProtocol(Protocol):
     _route_key: tuple[str, str]
     #: ``time.monotonic()`` instant this request's handler watchdog expires, or
     #: ``None`` while nothing has started it. The dispatcher resets it; the
-    #: caller-principal gate starts it when it must read the registry, and the
+    #: caller-principal gate starts it when it must read the registry, as does
+    #: pre-bash's giver lookup (which puts it back when it times out), and the
     #: work body then waits only for what is left (:func:`_watchdog_deadline`).
     _watchdog_deadline: float | None
 
@@ -671,8 +673,7 @@ def _attributed_within_deadline(
         pass
     if _watchdog_queue_overflowed(req, coordinator):
         return None
-    deadline = time.monotonic() + HANDLER_TIMEOUT_SEC
-    req._watchdog_deadline = deadline
+    deadline = _start_watchdog_deadline(req)
     method, path = req._route_key
     try:
         return coordinator.run_admission_lookup(
@@ -1140,6 +1141,11 @@ class CoordinatorHTTPServer:
         # denied as a foreign edit. Pairs with strict_mode_denials_total to let
         # an operator size the lag-window (5s) false-negative exposure.
         self._shared_foreign_lag_suppressed_total: int = 0
+        # handoff_giver_denials_total (#185): denies to the giver of a live
+        # handoff, on pre-edit or on pre-bash for a shell write. Its own
+        # counter, not the strict-mode one: the deny is not a stale-view deny
+        # and fires in warn mode too.
+        self._handoff_giver_denials_total: int = 0
         # Per-(session, path) "recent strict-deny" memory for route-around
         # detection. Bounded by the registry's own (session, artifact)
         # cardinality at worst — same upper bound as _stale_warned_pairs.
@@ -1577,11 +1583,19 @@ class CoordinatorHTTPServer:
         :meth:`increment_strict_mode_denial`."""
         self._shared_foreign_lag_suppressed_total += 1
 
+    def increment_handoff_giver_denial(self) -> None:
+        """#185: bumped once per deny to the giver of a live handoff, on
+        pre-edit or on pre-bash for a shell write. The strict-mode denial and
+        stale-warning counters are not bumped for it. Same GIL-atomicity contract as
+        :meth:`increment_strict_mode_denial`."""
+        self._handoff_giver_denials_total += 1
+
     def record_strict_deny(self, session_id: str, path: str) -> None:
         """v0.2 Unit 4 route-around tracker — store the (session, path)
         pair with monotonic timestamp so a subsequent pre-bash deny on
         the same pair within STRICT_DENY_ROUTE_AROUND_WINDOW_SEC can be
-        recognized as a route-around."""
+        recognized as a route-around. #185: the giver's pre-edit deny is
+        recorded here too, so a shell read routing around it is counted."""
         with self._recent_strict_denies_lock:
             self._recent_strict_denies[(session_id, path)] = time.monotonic()
 
@@ -1673,6 +1687,7 @@ class CoordinatorHTTPServer:
             "stale_warning_reread_total": self._stale_warning_reread_total,
             "fresh_shared_hash_mismatch_total": self._fresh_shared_hash_mismatch_total,
             "shared_foreign_lag_suppressed_total": self._shared_foreign_lag_suppressed_total,
+            "handoff_giver_denials_total": self._handoff_giver_denials_total,
             "effect_fence_holds_total": self._effect_fence_holds_total,
             "caller_principal_absent_total": self._caller_principal_absent_total,
             "caller_principal_refused_total": self._caller_principal_refused_total,
@@ -1786,7 +1801,9 @@ class CoordinatorHTTPServer:
         """Run the caller-principal gate's durable-store lookup in the watchdog
         pool, waiting until ``deadline`` (a ``time.monotonic()`` instant) at
         most. Raises :class:`FuturesTimeout` when it is not done by then, and
-        re-raises whatever ``fn`` raised — a refusal included.
+        re-raises whatever ``fn`` raised — a refusal included. Pre-bash's giver
+        lookup (:func:`_deny_giver_shell_write`) runs here too, for the same
+        reason: it only reads.
 
         Unlike :meth:`run_with_watchdog` there is no abort and no late-completion
         accounting: the lookup only READS, so a late one lands no coordinator
@@ -2034,7 +2051,9 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
                     # caller-principal posture lookup (_admit_caller).
                     self._route_key = (method, route_path)
                     # No watchdog deadline yet: the caller-principal gate starts
-                    # one only when it has to read the registry.
+                    # one only when it has to read the registry, and pre-bash's
+                    # giver lookup only when the command writes a tracked path
+                    # (a lookup that times out puts the deadline back).
                     self._watchdog_deadline = None
                     handler(self, coordinator)
                 except Exception as exc:
@@ -2519,10 +2538,11 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                         additional_context=notice_text,
                     ),
                 }
-        # #185: the structured handoff key, on every arm (a strict deny
-        # included -- it is a top-level key, never inside the deny's bytes),
-        # and only while the path has a transfer record.
-        result = _attach_handoff_key(coordinator, result, path=path, caller=caller)
+        # #185: only while the path has a transfer record, the structured
+        # handoff key on every arm but a strict deny (whose bytes stay the
+        # corpus's), and on an admit the handoff prose in the context-only
+        # envelope, after the notices.
+        result = _attach_hook_handoff(coordinator, result, path=path, caller=caller)
         # SB-10 U4 (KTD6): the deferred re-grounding seam sits AFTER the
         # deny decision inside work() — a strict deny returns untouched and
         # keeps the flag pending — and AFTER the notice drain above, so
@@ -3004,13 +3024,35 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     caller = caller_principal_identity(session_id)
     now = monotonic_seconds()
+    # #185: the version this agent last observed on the path, read BEFORE
+    # the acquire (which records the current version as observed), so the
+    # successor's admit can warn when it never read the version it was handed.
+    observed_before_acquire: int | None = None
 
     def work() -> dict:
+        nonlocal observed_before_acquire
         coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
         # Seed the artifact row if this is the first Edit on a fresh path.
         artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
         if artifact_id is None:
             artifact_id = coordinator.registry.resolve_or_register(path, content_hash="")
+
+        # #185: the giver of a live handoff is denied AHEAD of the
+        # strict-mode stale branch, and in warn mode too. The transfer left
+        # the giver's claim INVALID, so on a strict path the stale branch
+        # would otherwise answer first -- and in warn mode nothing would deny,
+        # letting the giver re-take the path one turn later. The service's
+        # one liveness member picks the envelope; this handler owns only the
+        # ordering.
+        handed = coordinator.service.live_handoff_given_by(artifact_id, caller)
+        if handed is not None:
+            return _giver_deny_response(
+                coordinator, handed, session_id=session_id, path=path, caller=caller,
+                source=_PRE_EDIT_GIVER_DENY_SOURCE,
+            )
+        observed_before_acquire = coordinator.registry.last_observed_version_for(
+            artifact_id, agent_id
+        )
 
         # v0.2 KTD-O / KTD-P: strict-mode stale-edit deny branch. If the
         # artifact is opted into strict mode AND the editor's prior state
@@ -3114,7 +3156,12 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             )
         except GiverFenced as exc:
             # Ahead of the generic arm, which would answer the refusal as prose.
-            return _giver_fenced_body(exc)
+            # A transfer that landed between the check above and this acquire:
+            # the typed error maps to the same deny.
+            return _giver_deny_response(
+                coordinator, exc, session_id=session_id, path=path, caller=caller,
+                source=_PRE_EDIT_GIVER_DENY_SOURCE,
+            )
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
 
@@ -3170,9 +3217,16 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # inside work(); notices are already merged into the result's
         # additionalContext, so the re-grounding block always lands last.
         # The abort token rides along so a timed-out request never
-        # consumes the compact-pending flag. #185: the handoff key is a
-        # top-level key, attached on every arm while a record exists.
-        result = _attach_handoff_key(coordinator, work(), path=path, caller=caller)
+        # consumes the compact-pending flag. #185: while a record exists the
+        # handoff key rides every arm but a deny (the giver's deny carries its
+        # own), and an admit gets the handoff prose before the re-grounding
+        # block. work() runs first, on its own line: it is what sets
+        # ``observed_before_acquire``, which the attach then reads.
+        produced = work()
+        result = _attach_hook_handoff(
+            coordinator, produced, path=path, caller=caller,
+            acquired=True, observed=observed_before_acquire,
+        )
         return _deliver_pending_reground(
             coordinator, session_id, body, result, abort=abort
         )
@@ -3189,6 +3243,8 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # only: a late body that takes the strict-deny branch never reaches it,
     # so it completes and records a deny (counter, route-around marker,
     # audit line) for an edit the caller was already told to proceed with.
+    # The giver's deny (#185) is the same: a timed-out giver is admitted, its
+    # late body records the deny, and its commit is refused by the fence.
     abort = threading.Event()
     _run_or_degrade(
         req, coordinator, work_with_reground,
@@ -3283,8 +3339,10 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
             )
         except GiverFenced as exc:
             # Ahead of the generic arm, which would read a preemption notice
-            # into it and answer the refusal as prose.
-            return _giver_fenced_body(exc)
+            # into it and answer the refusal as prose. The giver's edit was
+            # in flight when the transfer landed: the handoff arm, never the
+            # preemption or reclaim one, reaches it in the post-tool envelope.
+            return _giver_commit_refused_body(exc, path=path)
         except StaleReadGeneration:
             # Read-generation fence: a sweep reclaimed this committer in the race
             # window between its grant and this commit. Surface the STABLE machine
@@ -4007,8 +4065,16 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     negatives are acceptable (adversarial obfuscation, command
     substitution, etc. are OUT of scope per KTD-N).
 
+    First, though, a command that WRITES a path this session handed off
+    under a live record (#185) gets the giver's pre-edit deny, byte for byte
+    (:func:`_deny_giver_shell_write`); without such a record every answer
+    below is unchanged.
+
     Request: ``{session_id, command}``.
     Response:
+      - the giver's deny (``{ok: false, reason: "handed_off", ...}`` with a
+        ``hookSpecificOutput`` deny) if the command writes a path this
+        session handed off under a live record
       - ``{status: "fresh"}`` if no tracked paths detected (fast path)
       - ``{status: "fresh"}`` if all detected paths are fresh
       - ``{status: "stale", hookSpecificOutput: {...}, stale_paths: [...]}``
@@ -4036,6 +4102,12 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         return
 
     if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
+    # #185: ahead of the read detection, which never looks for a write -- a
+    # giver denied its Edit would otherwise append through the shell. Answers
+    # only when a live record names this session as giver of a path the
+    # command writes; otherwise nothing below changes by a byte.
+    if _deny_giver_shell_write(req, coordinator, session_id=session_id, command=command):
         return
     # Detect tracked paths the command would read. is_tracked is the
     # policy gate — handler never touches SQLite for an untracked workspace.
@@ -4202,6 +4274,90 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # the next live admit.
     abort = threading.Event()
     _run_or_degrade(req, coordinator, work_with_reground, abort=abort)
+
+
+def _deny_giver_shell_write(
+    req: _RequestProtocol,
+    coordinator: CoordinatorHTTPServer,
+    *,
+    session_id: str,
+    command: str,
+) -> bool:
+    """Answer the giver's deny when ``command`` writes a path this session
+    handed off under a live record (#185); return whether it answered.
+
+    Detection is a pure string scan, so a command that writes no tracked path
+    touches no registry (nor does one the detector fails on). Otherwise the
+    giver lookup -- a read: no grant, no registration, no pop -- runs in the
+    watchdog pool and STARTS the request's deadline, as the caller-principal
+    gate's lookup does. A lookup that finishes in time keeps that deadline, so
+    the lookup and whatever answers after it share one ``HANDLER_TIMEOUT_SEC``:
+    a hit answers the giver's pre-edit deny through the guarded path, and no
+    hit returns False. A lookup that times out is counted like every timeout,
+    puts the deadline back as it found it and returns False, so the caller
+    answers exactly what it answered before this check existed, on the budget
+    it had then. A full watchdog queue answers the 503 and a raising lookup the
+    internal-error envelope -- the gate's two other exits."""
+    written = _tracked_writes(coordinator, command)
+    if not written:
+        return False
+    caller = caller_principal_identity(session_id)
+    if _watchdog_queue_overflowed(req, coordinator):
+        return True
+    prior_deadline = _watchdog_deadline(req)
+    try:
+        handed = coordinator.run_admission_lookup(
+            lambda: _first_write_handed_off_by(coordinator, written, caller),
+            deadline=_start_watchdog_deadline(req),
+        )
+    except FuturesTimeout:
+        # The check stands aside: the read check after it must not inherit a
+        # deadline the lookup spent, and degrade where it would have answered.
+        req._watchdog_deadline = prior_deadline
+        coordinator.increment_watchdog_timeout()
+        logger.warning("pre-bash giver lookup timed out after %ss; answering without it", HANDLER_TIMEOUT_SEC)
+        return False
+    except Exception as exc:
+        _answer_handler_error(req, coordinator, exc, failed="pre-bash giver lookup")
+        return True
+    if handed is None:
+        return False
+    path, record = handed
+    _run_or_degrade(req, coordinator, lambda: _giver_deny_response(
+        coordinator, record, session_id=session_id, path=path, caller=caller,
+        source=_PRE_BASH_GIVER_DENY_SOURCE,
+    ))
+    return True
+
+
+def _tracked_writes(coordinator: CoordinatorHTTPServer, command: str) -> list[str]:
+    """The tracked paths ``command`` writes, or none when the detector raises:
+    a bug in the giver check must never take the read checks after it -- the
+    strict-mode shell-read deny among them -- down with it."""
+    try:
+        return detect_tracked_writes(
+            command, coordinator.policy.is_tracked, root=str(coordinator.coordinator_root)
+        )
+    except Exception:
+        logger.warning("pre-bash write detection raised; answering without the giver check", exc_info=True)
+        return []
+
+
+def _first_write_handed_off_by(
+    coordinator: CoordinatorHTTPServer, written: list[str], caller: UUID
+) -> tuple[str, TransferRecord] | None:
+    """The first of the ``written`` paths whose live transfer record names
+    ``caller`` as giver, with that record, or ``None``. A read only: a path the
+    registry does not know is looked up, never registered (a shell write must
+    not seed an artifact the edit hooks would then treat as observed)."""
+    for path in written:
+        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        if artifact_id is None:
+            continue
+        record = coordinator.service.live_handoff_given_by(artifact_id, caller)
+        if record is not None:
+            return path, record
+    return None
 
 
 def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -5040,10 +5196,10 @@ MAX_TRANSFER_GRANTS = MAX_SESSION_READ_SET_PATHS
 publish's bound, for the same defense-in-depth reason."""
 
 #: The caller's role in a record, as the ``handoff`` key's ``role`` says it.
-#: Wire values: add, never rename.
-_HANDOFF_ROLE_GIVER = "giver"
-_HANDOFF_ROLE_SUCCESSOR = "successor"
-_HANDOFF_ROLE_BYSTANDER = "bystander"
+#: Wire values, defined once beside the prose that renders each role.
+_HANDOFF_ROLE_GIVER = _payloads.HANDOFF_ROLE_GIVER
+_HANDOFF_ROLE_SUCCESSOR = _payloads.HANDOFF_ROLE_SUCCESSOR
+_HANDOFF_ROLE_BYSTANDER = _payloads.HANDOFF_ROLE_BYSTANDER
 
 #: Why a grant a release answer reports is no longer held. Wire values:
 #: add, never rename. ``release`` is this request's own release, recorded under
@@ -5105,15 +5261,76 @@ def _giver_fenced_body(
     :class:`GiverFenced`, or the live record a handler read the fence from:
     both carry the two facts, so no handler builds an exception to carry them.
 
-    No ``hookSpecificOutput`` and no prose yet: the hook client's deny
-    envelope comes with the hook-path handoff work, as a byte-stable
-    template, and it will sit beside this same top-level reason."""
+    The hook routes add their envelope beside it: the pre-edit deny
+    (:func:`_giver_deny_response`) and the post-edit handoff arm
+    (:func:`_giver_commit_refused_body`). The compare-and-swap and snapshot
+    routes answer it bare, and the giver's failed-edit report
+    (:func:`_handed_off_release`) adds its per-grant list."""
     body: dict = {"ok": False, "reason": GIVER_FENCED_REASON}
     if path is not None:
         body["path"] = path
     body["successor"] = str(fence.successor)
     body["version_at_transfer"] = fence.version_at_transfer
     return body
+
+
+_PRE_EDIT_GIVER_DENY_SOURCE = "pre_edit_handoff_giver_deny"
+_PRE_BASH_GIVER_DENY_SOURCE = "pre_bash_handoff_giver_deny"
+"""The routes' labels for the giver's deny (pre-bash answers it for a shell
+write). Neither reaches a wire byte: both routes answer the same deny."""
+
+
+def _giver_deny_response(
+    coordinator: CoordinatorHTTPServer,
+    fence: GiverFenced | TransferRecord,
+    *,
+    session_id: str,
+    path: str,
+    caller: UUID,
+    source: str,
+) -> dict:
+    """The giver's pre-edit deny: the typed reason at the top
+    level, the third byte-stable template in the deny envelope beside it, and
+    the path's ``handoff`` key -- a deny's body is fixed by its emitter, so
+    the key is attached here rather than by the route's wrapper. Pre-bash
+    answers the same bytes for a shell write; ``source`` names the route and
+    reaches no byte of the body.
+
+    Bookkeeping copied from the strict block, minus what does not fit: the
+    giver-deny counter only (this deny is neither a strict-mode nor a
+    stale-view deny, and it fires in warn mode), the route-around detector's
+    map so a shell read routing around it is counted, and no audit line (the
+    strict appender would label it a strict deny with a raw session id)."""
+    coordinator.increment_handoff_giver_denial()
+    coordinator.record_strict_deny(session_id, path)
+    body = {
+        **_giver_fenced_body(fence),
+        "hookSpecificOutput": _payloads.emit_handoff_giver_deny(
+            source=source,
+            path=path,
+            successor_id=str(fence.successor),
+            version_at_transfer=fence.version_at_transfer,
+        ),
+    }
+    return _attach_handoff_key(coordinator, body, path=path, caller=caller)
+
+
+def _giver_commit_refused_body(exc: GiverFenced, *, path: str) -> dict:
+    """The giver's post-edit refusal: the typed reason, and the
+    handoff arm -- the three exits and the statement that the edit is on disk
+    without a version -- through the post-tool context envelope. Rendered
+    from the record the fence raised from, never from a notice row: notices
+    carry no cause and are overwritten newest-wins."""
+    return {
+        **_giver_fenced_body(exc),
+        "hookSpecificOutput": _payloads.emit_posttooluse_context(
+            additional_context=_payloads.handoff_commit_refused_text(
+                path=path,
+                successor_id=str(exc.successor),
+                version_at_transfer=exc.version_at_transfer,
+            ),
+        ),
+    }
 
 
 def _handoff_record_fields(record: TransferRecord, *, live: bool) -> dict:
@@ -5203,7 +5420,7 @@ def _attach_handoff_key(
 
     A read only -- nothing is granted, popped or marked -- so it may ride the
     safety-path reads too. The key is top-level: it never enters a
-    ``hookSpecificOutput``, so a strict deny's bytes are unchanged.
+    ``hookSpecificOutput``.
 
     Best-effort: ``result`` is the answer to work that already landed (a
     grant, a win, notices popped), so a failed read answers ``result``
@@ -5211,10 +5428,7 @@ def _attach_handoff_key(
     would act on. A missing key is therefore not proof the path has no
     record."""
     try:
-        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
-        if artifact_id is None:
-            return result
-        read = coordinator.registry.get_transfer_record(artifact_id)
+        read = _read_handoff(coordinator, path)
         if read is None:
             return result
         record, live = read
@@ -5229,6 +5443,56 @@ def _attach_handoff_key(
         )
         return result
     return {**result, "handoff": projection}
+
+
+def _read_handoff(
+    coordinator: CoordinatorHTTPServer, path: str
+) -> tuple[TransferRecord, bool] | None:
+    """``path``'s transfer record and its liveness, or ``None`` when the path
+    is unknown or has no record. A read only."""
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    if artifact_id is None:
+        return None
+    return coordinator.registry.get_transfer_record(artifact_id)
+
+
+def _is_deny(result: dict) -> bool:
+    """Does ``result`` carry a deny envelope (a strict deny or the giver's)?"""
+    hso = result.get("hookSpecificOutput")
+    return hso is not None and hso.get("permissionDecision") == "deny"
+
+
+def _attach_hook_handoff(
+    coordinator: CoordinatorHTTPServer,
+    result: dict,
+    *,
+    path: str,
+    caller: UUID,
+    acquired: bool = False,
+    observed: int | None = None,
+) -> dict:
+    """The pre-read and pre-edit seam for a handoff, from ONE
+    read of the record: :func:`_attach_handoff_key`'s, best-effort like it,
+    so a failed read answers ``result`` with neither the key nor the prose.
+
+    A deny is returned untouched: a strict deny keeps the corpus's bytes, and
+    the giver's deny carries its own key. Every other arm gets the
+    ``handoff`` key while the path has a record, and an admit also gets the
+    role's prose through the context-only envelope -- never the allow
+    emitter, which would widen a permission decision. ``acquired`` marks the
+    pre-edit's acquire, where ``observed`` (this agent's last observed
+    version before it) decides the successor's read-first warning."""
+    if _is_deny(result):
+        return result
+    result = _attach_handoff_key(coordinator, result, path=path, caller=caller)
+    projection = result.get("handoff")
+    # No key, or a refusal body (``ok: false``), which gets the key only: the
+    # admit test is the one the re-grounding attach uses.
+    if projection is None or not _reground_qualifies(result):
+        return result
+    unread = acquired and (observed is None or observed < projection["version_at_transfer"])
+    text = _payloads.handoff_context_text(projection, path=path, unread=unread)
+    return result if text is None else _attach_pretooluse_context(result, text)
 
 
 def _released_grant(path: str) -> dict:
@@ -6835,9 +7099,22 @@ cannot drift."""
 
 
 def _watchdog_deadline(req: _RequestProtocol) -> float | None:
-    """The request's watchdog deadline, if its caller-principal gate started
-    one (``None`` — the full ``HANDLER_TIMEOUT_SEC`` — otherwise)."""
+    """The request's watchdog deadline, if a read ahead of the work body
+    started one -- the caller-principal gate's store lookup, or pre-bash's
+    giver lookup that finished in time -- and ``None`` (the full
+    ``HANDLER_TIMEOUT_SEC``) otherwise."""
     return getattr(req, "_watchdog_deadline", None)
+
+
+def _start_watchdog_deadline(req: _RequestProtocol) -> float:
+    """The request's watchdog deadline, started now when nothing earlier in the
+    request started it: a read made ahead of the work body then shares one
+    ``HANDLER_TIMEOUT_SEC`` with it (see :func:`_attributed_within_deadline`)."""
+    deadline = _watchdog_deadline(req)
+    if deadline is None:
+        deadline = time.monotonic() + HANDLER_TIMEOUT_SEC
+        req._watchdog_deadline = deadline
+    return deadline
 
 
 def _watchdog_queue_overflowed(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> bool:
@@ -6897,9 +7174,11 @@ def _run_or_degrade(
     _ThreadingHTTPServer.process_request — gates BEFORE this function
     is reached.
 
-    The watchdog deadline is the REQUEST's: when the caller-principal gate
-    already started it with a registry lookup, ``work`` gets only what is left
-    (:func:`_watchdog_deadline`).
+    The watchdog deadline is the REQUEST's: when a registry read ahead of the
+    work body already started it -- the caller-principal gate's lookup, or
+    pre-bash's giver lookup when it finished in time -- ``work`` gets only what
+    is left (:func:`_watchdog_deadline`). A giver lookup that timed out put the
+    deadline back, so the work after it runs on the budget it always had.
     """
     if _watchdog_queue_overflowed(req, coordinator):
         return
@@ -7264,10 +7543,15 @@ def _reground_qualifies(result: dict) -> bool:
     (AE3). An envelope-less response qualifies iff it is an admit body —
     ``{ok: true}`` (pre-edit) or ``{status: "fresh"}`` (pre-read /
     pre-bash / pre-grep). A service-refusal body (``{ok: false, ...}``)
-    is neither a deny envelope nor an admit: no attach, no consume."""
+    is neither a deny envelope nor an admit: no attach, no consume.
+
+    A CONTEXT-ONLY envelope (no permission decision; the handoff prose
+    puts one on a bare admit) decides nothing, so it qualifies exactly as
+    the body under it would: otherwise prose on an admit would hold the
+    re-grounding back past every touch of a handed-off path."""
     hso = result.get("hookSpecificOutput")
-    if hso is not None:
-        return hso.get("permissionDecision") == "allow"
+    if hso is not None and "permissionDecision" in hso:
+        return hso["permissionDecision"] == "allow"
     return result.get("ok") is True or result.get("status") == "fresh"
 
 
@@ -7321,14 +7605,15 @@ def _claim_reground_context(
         return None
 
 
-def _attach_reground(result: dict, text: str) -> dict:
-    """SB-10 U4: merge the claimed re-grounding prose into a qualifying
-    admit response. An existing envelope keeps its text AND its existing
-    permission decision, and gets the block appended AFTER it (notices and
-    stale warnings render first — KTD6 ordering); a bare admit body gains
-    a CONTEXT-ONLY PreToolUse envelope. The deferred path rides the
-    PreToolUse shape — never the SessionStart ``hookSpecificOutput``
-    shape."""
+def _attach_pretooluse_context(result: dict, text: str) -> dict:
+    """Merge advisory prose into an admit response: appended after an
+    existing envelope's text, keeping its permission decision, or carried by
+    a CONTEXT-ONLY PreToolUse envelope on a bare admit body. The one merge
+    rule the deferred re-grounding (SB-10 U4) and the handoff prose (#185)
+    share. Appending is what orders the blocks (KTD6): notices and stale
+    warnings render first, then the handoff prose, then the re-grounding,
+    which is attached last. Always the PreToolUse shape, never the
+    SessionStart ``hookSpecificOutput`` shape."""
     hso = result.get("hookSpecificOutput")
     if hso is None:
         # WHY context-only rather than emit_allow: re-grounding is
@@ -7426,7 +7711,7 @@ def _deliver_pending_reground(
     text = _claim_reground_context(coordinator, session_id, body, abort=abort)
     if text is None:
         return result
-    return _attach_reground(result, text)
+    return _attach_pretooluse_context(result, text)
 
 
 def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> str | None:

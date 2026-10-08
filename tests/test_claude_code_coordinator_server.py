@@ -10426,10 +10426,11 @@ def test_a_handoff_verb_cut_short_by_the_watchdog_answers_unconfirmed_and_lands_
 
 
 def _giver_refusal(giver: _Session, successor: _Session, *, shape: str) -> dict:
-    """What a fenced giver's write answers: the typed reason with the
-    successor and the version at transfer as top-level fields, and the
-    ``handoff`` key -- no ``hookSpecificOutput`` and no prose (the hook
-    client's deny envelope comes with the hook-path handoff work)."""
+    """What a fenced giver's write answers on the compare-and-swap route: the
+    typed reason with the successor and the version at transfer as top-level
+    fields, and the ``handoff`` key. The pre-edit and post-edit routes add
+    their hook envelope beside it (:func:`_giver_deny_envelope`,
+    :func:`_commit_arm_envelope`)."""
     return {
         "ok": False, "reason": "handed_off", "successor": successor.agent,
         "version_at_transfer": 1,
@@ -10437,20 +10438,88 @@ def _giver_refusal(giver: _Session, successor: _Session, *, shape: str) -> dict:
     }
 
 
+def _giver_deny_envelope(successor: _Session, path: str, version: int = 1) -> dict:
+    """The giver's pre-edit deny envelope, as a literal."""
+    s = successor.agent[:8]
+    return {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": (
+            f"Edit denied: you handed {path} to agent {s} at v{version}, so this "
+            f"session can no longer write it. The handoff ends when agent {s} "
+            f"writes {path}, when agent {s} declines it, or when you withdraw it "
+            f"on your user's or host's instruction. Stop and report to your user "
+            f"that {path} was handed off. This denial is structural; retrying "
+            f"the same operation will produce the same denial."
+        ),
+    }
+
+
+def _commit_arm_envelope(successor: _Session, path: str, version: int = 1) -> dict:
+    """The post-edit handoff arm in the post-tool context envelope, as a literal."""
+    s = successor.agent[:8]
+    return {
+        "hookEventName": "PostToolUse",
+        "additionalContext": (
+            f"Commit refused: you handed {path} to agent {s} at v{version}, so "
+            f"this session can no longer write it. Your edit landed in your local "
+            f"worktree but was not given a version by the coordinator. The "
+            f"handoff ends when agent {s} writes {path}, when agent {s} declines "
+            f"it, or when you withdraw it on your user's or host's instruction. "
+            f"Stop and report to your user that {path} was handed off."
+        ),
+    }
+
+
 def test_a_fenced_givers_pre_edit_is_refused_with_the_typed_reason(
     coordinator, client: _Client
 ) -> None:
     """The giver's pessimistic re-acquire, from a fresh incarnation,
-    is refused with the typed reason and takes no grant. Without its own arm
-    ahead of the generic CoherenceError one, the refusal would be answered as
-    the exception's prose."""
+    is refused with the typed reason at the top level and the deny envelope
+    beside it, and takes no grant. Without its own arm ahead of the generic
+    CoherenceError one, the refusal would be answered as the exception's
+    prose; without the envelope the hook client would let the edit proceed."""
     giver, successor = _claimed(client), _claimed(client)
     _hand_off(client, giver, successor, "plan.md")
     answer = client.post(
         "/hooks/pre-edit", {"session_id": giver.sid, "agent_id": "inc-2", "path": "plan.md"},
         principal=giver.principal,
     )
-    assert answer == (200, _giver_refusal(giver, successor, shape="SHARED"))
+    assert answer == (200, {
+        **_giver_refusal(giver, successor, shape="SHARED"),
+        "hookSpecificOutput": _giver_deny_envelope(successor, "plan.md"),
+    })
+    assert _state(coordinator, "plan.md", giver.composite("inc-2")) is None
+
+
+def test_a_transfer_landing_between_the_giver_check_and_the_acquire_is_still_denied(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The race the pre-edit's second arm covers: the handler's own giver
+    check misses (the transfer lands just after it), so the acquire raises
+    the typed refusal, and that must map to the same deny body. Without the
+    arm the giver gets the bare typed refusal with no deny envelope, and the
+    hook client lets the Edit land on disk."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    real = coordinator.service.live_handoff_given_by
+    calls = []
+
+    def missing_once(*args: Any, **kwargs: Any):
+        calls.append(args)
+        return None if len(calls) == 1 else real(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator.service, "live_handoff_given_by", missing_once)
+    answer = client.post(
+        "/hooks/pre-edit", {"session_id": giver.sid, "agent_id": "inc-2", "path": "plan.md"},
+        principal=giver.principal,
+    )
+
+    assert len(calls) >= 2, "the acquire never consulted the giver check"
+    assert answer == (200, {
+        **_giver_refusal(giver, successor, shape="SHARED"),
+        "hookSpecificOutput": _giver_deny_envelope(successor, "plan.md"),
+    })
     assert _state(coordinator, "plan.md", giver.composite("inc-2")) is None
 
 
@@ -10473,7 +10542,10 @@ def test_a_fenced_givers_post_edit_commit_is_refused_with_the_typed_reason(
         "content_hash": _hash("late-edit"),
     }, principal=giver.principal)
 
-    assert answer == (200, _giver_refusal(giver, successor, shape="EXCLUSIVE"))
+    assert answer == (200, {
+        **_giver_refusal(giver, successor, shape="EXCLUSIVE"),
+        "hookSpecificOutput": _commit_arm_envelope(successor, "plan.md"),
+    })
     assert _artifact_version(coordinator, "plan.md") == 1
 
 
@@ -10767,7 +10839,8 @@ def test_the_read_and_edit_bodies_carry_the_handoff_key_only_while_a_record_exis
         "/hooks/pre-edit", {"session_id": bystander.sid, "path": "plan.md"},
         principal=bystander.principal,
     ) == (200, {"ok": True, "handoff": _projection(
-        giver, successor, "bystander", status="overtaken", counterparty=bystander.agent)})
+        giver, successor, "bystander", status="overtaken", counterparty=bystander.agent),
+        "hookSpecificOutput": _context(_advisory(giver, successor, "plan.md"))})
     assert client.post("/hooks/post-edit", {
         "session_id": bystander.sid, "path": "plan.md", "success": True,
         "content_hash": _hash("plan-v2"),
@@ -10815,6 +10888,468 @@ def test_a_compare_and_swap_win_carries_its_handoff_outcome(
     assert read["handoff"] == _projection(giver, successor, "giver", status="completed", live=False)
 
 
+# --- the handoff prose on the hook envelopes ----------------------------------
+#
+# Hook clients get the handoff as prose too: provenance, the read-first
+# warning, the bystander advisory, the live giver's statement on a read and
+# the giver's outcome through the context-only PreToolUse envelope on admits,
+# and the handoff arm through the PostToolUse envelope on the giver's refused
+# commit. Every expected sentence is a hand-written literal; the short ids in
+# it are the first eight characters of the session-level ids the test computes
+# from its own session ids.
+
+
+def _context(text: str) -> dict:
+    """A context-only PreToolUse envelope: prose, and no permission decision."""
+    return {"hookEventName": "PreToolUse", "additionalContext": text}
+
+
+def _last_block(body: dict) -> str:
+    """The last paragraph of an admit's additionalContext: where the handoff
+    prose lands, after any notice or stale warning."""
+    return body["hookSpecificOutput"]["additionalContext"].split("\n\n")[-1]
+
+
+def _advisory(giver: _Session, successor: _Session, path: str, version: int = 1) -> str:
+    return (
+        f"Handoff in progress: agent {giver.agent[:8]} handed {path} to agent "
+        f"{successor.agent[:8]} at v{version}. This session is not a party to it; "
+        f"its edits are admitted and are recorded as overtaking the handoff."
+    )
+
+
+def _provenance(giver: _Session, path: str, *, version: int, shape: str) -> str:
+    g = giver.agent[:8]
+    text = (
+        f"Handoff: agent {g} handed {path} to this session at v{version}; the "
+        f"hold it gave up was {shape}."
+    )
+    if shape == "EXCLUSIVE":
+        text += (
+            f" Agent {g} held an uncommitted write claim when it handed {path} "
+            f"on, so the file on disk may differ from v{version}; read {path} "
+            f"before editing it."
+        )
+    return text
+
+
+def _read_first(path: str, version: int) -> str:
+    return f"⚠ You have not read {path} at v{version} or later; read it before editing."
+
+
+def _giver_fenced_read(successor: _Session, path: str, version: int = 1) -> str:
+    """The prose a live giver's admitted read carries, as a literal."""
+    s = successor.agent[:8]
+    return (
+        f"Handoff: you handed {path} to agent {s} at v{version}, so this session "
+        f"can no longer write it. The handoff ends when agent {s} writes {path}, "
+        f"when agent {s} declines it, or when you withdraw it on your user's or "
+        f"host's instruction. Until the handoff ends, do not change {path} by any "
+        f"route, a shell command included. Stop and report to your user that "
+        f"{path} was handed off."
+    )
+
+
+def _ended_unrecorded(path: str, version: int = 1) -> str:
+    return (
+        f"Handoff ended: the handoff of {path} at v{version} was ended by a write "
+        f"at a later version whose writer was not recorded."
+    )
+
+
+def _cas(client: _Client, who: _Session, path: str, expected: int, label: str) -> dict:
+    status, answer = client.post("/hooks/post-edit-cas", {
+        "session_id": who.sid, "path": path, "content_hash": _hash(label),
+        "expected_version": expected,
+    }, principal=who.principal)
+    assert status == 200, answer
+    return answer
+
+
+def _hand_off_shape(client: _Client, giver: _Session, successor: _Session, shape: str) -> int:
+    """``giver`` takes ``plan.md`` in ``shape`` and hands it to ``successor``;
+    answers the version at transfer."""
+    if shape == "SHARED":
+        _read(client, giver, "plan.md")
+    else:
+        _pre_edit_with(client, giver.sid, giver.principal, "plan.md")
+    if shape == "MODIFIED":
+        status, body = client.post("/hooks/post-edit", {
+            "session_id": giver.sid, "path": "plan.md", "success": True,
+            "content_hash": _hash("plan-v2"),
+        }, principal=giver.principal)
+        assert body == {"ok": True}, body
+    version = 2 if shape == "MODIFIED" else 1
+    answer = _transfer(client, giver, successor.agent, [{"path": "plan.md"}])
+    assert answer == (200, {"ok": True, "grants": [
+        _handed(giver, successor, "plan.md", version=version, shape=shape)]}), answer
+    return version
+
+
+@pytest.mark.parametrize("role", ["successor", "bystander", "giver"])
+def test_a_pending_re_grounding_rides_the_admit_that_carries_handoff_prose(
+    coordinator, client: _Client, role: str
+) -> None:
+    """After a compaction, the first admitted touch of a handed-off path
+    carries the handoff prose AND the deferred re-grounding, handoff first,
+    and consumes the flag: the successor's and a bystander's edit, and the
+    live giver's read. The prose rides a context-only envelope (no permission
+    decision), which the re-grounding seam used to refuse, so the flag stayed
+    pending past every such admit and expired with the turn. The giver's
+    case is its fresh read: its first read after the transfer is stale, and
+    a stale warning already carries an allow."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    who = {"successor": successor, "bystander": bystander, "giver": giver}[role]
+    _read(client, who, "spec.md")  # state worth re-grounding, whatever the role
+    if role == "giver":
+        # The giver's first read after the transfer is stale, and its warning
+        # already carries an allow; the next, fresh read is a bare admit.
+        _read(client, giver, "plan.md")
+    coordinator.mark_compact_pending(who.sid)
+
+    route = "/hooks/pre-read" if role == "giver" else "/hooks/pre-edit"
+    status, body = client.post(
+        route, {"session_id": who.sid, "path": "plan.md"}, principal=who.principal)
+
+    assert status == 200, body
+    envelope = body["hookSpecificOutput"]
+    assert "permissionDecision" not in envelope, envelope
+    text = envelope["additionalContext"]
+    handoff_at = text.index("Handoff")
+    reground_at = text.index("Post-compaction re-grounding (agent-coherence):")
+    assert handoff_at < reground_at, text
+    assert coordinator.has_compact_pending(who.sid) is False
+
+
+@pytest.mark.parametrize("ending", ["successor commits", "successor declines", "giver withdraws"])
+def test_once_the_handoff_ends_the_successor_and_bystanders_are_told_nothing(
+    coordinator, client: _Client, ending: str
+) -> None:
+    """A record that is no longer live keeps its ``handoff`` key, but the
+    successor is no longer told it was handed the path and a bystander is no
+    longer told a handoff is in progress. Fails if either role's prose
+    ignores liveness: the model would then act on a handoff that is over."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    if ending == "successor commits":
+        _pre_edit_with(client, successor.sid, successor.principal, "plan.md")
+        status, body = client.post("/hooks/post-edit", {
+            "session_id": successor.sid, "path": "plan.md", "success": True,
+            "content_hash": _hash("plan-v2"),
+        }, principal=successor.principal)
+        assert status == 200 and body["ok"] is True, body
+    elif ending == "successor declines":
+        assert _verb(client, _DECLINE, successor, "plan.md") == (
+            200, {"ok": True, "status": "declined"})
+    else:
+        assert _verb(client, _WITHDRAW, giver, "plan.md") == (
+            200, {"ok": True, "status": "withdrawn"})
+
+    for who in (successor, bystander):
+        read = _read(client, who, "plan.md")
+        assert read["handoff"]["live"] is False, read
+        context = (read.get("hookSpecificOutput") or {}).get("additionalContext", "")
+        assert "Handoff" not in context, (who, context)
+
+
+def test_a_refused_edit_during_a_handoff_carries_the_key_and_no_prose(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal body (``ok: false``) gets the ``handoff`` key only: the role's
+    prose is for an admit. Fails if the prose seam stops checking for one, and
+    a bystander whose edit was refused is told its edits are admitted."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+
+    def refusing(**_kwargs: Any):
+        raise CoherenceError("acquire refused by the test")
+
+    monkeypatch.setattr(coordinator.service, "write", refusing)
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": bystander.sid, "path": "plan.md"},
+        principal=bystander.principal)
+
+    assert status == 200
+    assert body["ok"] is False, body
+    assert "hookSpecificOutput" not in body, body
+    assert body["handoff"] == _projection(giver, successor, "bystander")
+
+
+def test_the_handoff_prose_templates_are_static() -> None:
+    """The successor's and bystander's prose and the ended outcomes are
+    under the deny's placeholder rule: short agent ids, the path, the version
+    at transfer and the hold shape only -- no timestamp -- so the corpus can
+    pin their bytes."""
+    import re
+
+    from ccs.adapters.claude_code import hook_payloads as payloads
+
+    def placeholders(template: str) -> set[str]:
+        return set(re.findall(r"\{([a-z_]+)\}", template))
+
+    assert placeholders(payloads.HANDOFF_PROVENANCE_TEMPLATE) == {
+        "giver_short", "path", "version_at_transfer", "hold_shape"}
+    assert placeholders(payloads.HANDOFF_UNCOMMITTED_CLAIM_TEMPLATE) == {
+        "giver_short", "path", "version_at_transfer"}
+    assert placeholders(payloads.HANDOFF_READ_FIRST_TEMPLATE) == {"path", "version_at_transfer"}
+    assert placeholders(payloads.HANDOFF_OVERTAKEN_TEMPLATE) == {
+        "path", "giver_short", "version_at_transfer", "counterparty_short"}
+    assert placeholders(payloads.HANDOFF_BYSTANDER_ADVISORY_TEMPLATE) == {
+        "giver_short", "path", "successor_short", "version_at_transfer"}
+    assert placeholders(payloads.HANDOFF_ENDED_UNRECORDED_TEMPLATE) == {
+        "path", "version_at_transfer"}
+    for template in payloads.HANDOFF_GIVER_OUTCOME_TEMPLATES.values():
+        assert placeholders(template) <= {
+            "path", "successor_short", "version_at_transfer", "counterparty_short"}, template
+
+
+def test_the_givers_post_edit_refusal_renders_the_handoff_arm_in_the_post_tool_envelope(
+    coordinator, client: _Client
+) -> None:
+    """A held ``plan.md`` EXCLUSIVE and handed it to B; A's
+    in-flight edit then reports success. The commit is refused with the typed
+    reason, and the handoff arm -- the three exits and the statement that the
+    edit is on disk without a version -- reaches the hook client through the
+    post-tool context envelope. It is not the preemption or reclaim arm: no
+    ``preempted`` or ``reclaimed`` flag, and no such wording. A second report
+    answers the same bytes."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off_shape(client, giver, successor, "EXCLUSIVE")
+    report = {
+        "session_id": giver.sid, "path": "plan.md", "success": True,
+        "content_hash": _hash("late-edit"),
+    }
+    first = client.post("/hooks/post-edit", report, principal=giver.principal)
+    second = client.post("/hooks/post-edit", report, principal=giver.principal)
+
+    assert first == (200, {
+        "ok": False, "reason": "handed_off", "successor": successor.agent,
+        "version_at_transfer": 1,
+        "hookSpecificOutput": _commit_arm_envelope(successor, "plan.md"),
+        "handoff": _projection(giver, successor, "giver", shape="EXCLUSIVE"),
+    })
+    assert second == first
+    arm = first[1]["hookSpecificOutput"]["additionalContext"]
+    assert "preempt" not in arm and "reclaim" not in arm, arm
+
+
+@pytest.mark.parametrize("shape", ["EXCLUSIVE", "MODIFIED", "SHARED"])
+def test_the_successors_provenance_reads_before_editing_only_for_an_exclusive_hold(
+    coordinator, client: _Client, shape: str
+) -> None:
+    """The successor's reads carry its provenance -- by which
+    agent, at which version, from which hold shape -- in the context-only
+    envelope, after its stale warning on the first read and alone on the
+    next, byte for byte the same. The read-before-editing sentence rides the
+    EXCLUSIVE shape only: the giver may have written without committing.
+    MODIFIED committed what it wrote and SHARED never held a write claim."""
+    giver, successor = _claimed(client), _claimed(client)
+    version = _hand_off_shape(client, giver, successor, shape)
+    expected = _provenance(giver, "plan.md", version=version, shape=shape)
+
+    first = _read(client, successor, "plan.md")
+    assert first["hookSpecificOutput"]["permissionDecision"] == "allow", first
+    assert first["hookSpecificOutput"]["additionalContext"].endswith("\n\n" + expected), first
+    second = _read(client, successor, "plan.md")
+    assert second == {
+        "status": "fresh", "version": version,
+        "handoff": _projection(giver, successor, "successor", shape=shape)
+        | {"version_at_transfer": version},
+        "hookSpecificOutput": _context(expected),
+    }
+
+
+@pytest.mark.parametrize("observed", ["never", "at_transfer", "below_transfer"])
+def test_the_successors_pre_edit_is_admitted_with_provenance_and_a_read_first_warning(
+    coordinator, client: _Client, observed: str
+) -> None:
+    """The successor's pre-edit is admitted -- never
+    denied -- and completes the handoff; its body carries the provenance in
+    the context-only envelope with no permission decision (nothing through
+    the allow emitter), plus the read-first warning exactly when the version
+    it last observed is absent or below the version at transfer."""
+    giver, successor = _claimed(client), _claimed(client)
+    if observed != "never":
+        _read(client, successor, "plan.md")
+    if observed == "below_transfer":
+        version = _hand_off_shape(client, giver, successor, "MODIFIED")
+        shape = "MODIFIED"
+    else:
+        version = _hand_off_shape(client, giver, successor, "EXCLUSIVE")
+        shape = "EXCLUSIVE"
+    expected = _provenance(giver, "plan.md", version=version, shape=shape)
+    if observed != "at_transfer":
+        expected += " " + _read_first("plan.md", version)
+
+    answer = client.post(
+        "/hooks/pre-edit", {"session_id": successor.sid, "path": "plan.md"},
+        principal=successor.principal,
+    )
+
+    assert answer == (200, {
+        "ok": True,
+        "handoff": _projection(giver, successor, "successor", shape=shape, status="completed")
+        | {"version_at_transfer": version},
+        "hookSpecificOutput": _context(expected),
+    })
+
+
+def test_a_bystander_is_advised_and_its_commit_reports_overtaken_to_the_successor(
+    coordinator, client: _Client
+) -> None:
+    """The bystander C's pre-edit on A's live handoff to B is
+    admitted with the advisory naming A and B; after C commits, B's next
+    read reports the handoff overtaken by C, and so does A's (its outcome)."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+
+    answer = client.post(
+        "/hooks/pre-edit", {"session_id": bystander.sid, "path": "plan.md"},
+        principal=bystander.principal,
+    )
+    assert answer == (200, {
+        "ok": True,
+        "handoff": _projection(
+            giver, successor, "bystander", status="overtaken", counterparty=bystander.agent),
+        "hookSpecificOutput": _context(_advisory(giver, successor, "plan.md")),
+    })
+    status, body = client.post("/hooks/post-edit", {
+        "session_id": bystander.sid, "path": "plan.md", "success": True,
+        "content_hash": _hash("plan-v2"),
+    }, principal=bystander.principal)
+    assert body["ok"] is True and "hookSpecificOutput" not in body, body
+
+    g, c = giver.agent[:8], bystander.agent[:8]
+    assert _last_block(_read(client, successor, "plan.md")) == (
+        f"Handoff overtaken: the handoff of plan.md to this session from agent {g} "
+        f"at v1 was overtaken by agent {c}."
+    )
+    assert _last_block(_read(client, giver, "plan.md", "inc-1")) == (
+        f"Handoff ended: your handoff of plan.md to agent {successor.agent[:8]} at v1 "
+        f"was overtaken by agent {c}."
+    )
+
+
+def test_a_live_givers_read_says_it_handed_the_path_off_after_the_stale_warning(
+    coordinator, client: _Client
+) -> None:
+    """A Claude Code giver whose handoff is live reads the handed path. The
+    transfer left its claim INVALID, so the first read answers the generic
+    stale warning ending "Re-acquire before writing", and the read after it
+    is fresh -- measured to read as an all-clear for a shell write, or as a
+    cue to edit. Both carry the specific statement: the giver handed the
+    path off, may not change it by any route, and should stop and report. On
+    the stale read it follows the warning in the warning's own envelope, whose
+    allow decision is the warning's; on the fresh read it rides the
+    context-only envelope with no permission decision. Fails if a live
+    giver's read is silent about the handoff."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    expected = _giver_fenced_read(successor, "plan.md")
+
+    stale = _read(client, giver, "plan.md", "inc-1")
+    assert stale["status"] == "stale", stale
+    assert stale["handoff"] == _projection(giver, successor, "giver")
+    assert stale["hookSpecificOutput"]["permissionDecision"] == "allow", stale
+    warning, handoff = stale["hookSpecificOutput"]["additionalContext"].split("\n\n")
+    assert warning.endswith("Re-acquire before writing to plan.md."), warning
+    assert handoff == expected
+
+    assert _read(client, giver, "plan.md", "inc-1") == {
+        "status": "fresh", "version": 1,
+        "handoff": _projection(giver, successor, "giver"),
+        "hookSpecificOutput": _context(expected),
+    }
+
+
+@pytest.mark.parametrize("role", ["successor", "bystander"])
+def test_only_the_giver_is_told_on_a_read_that_it_handed_the_path_off(
+    coordinator, client: _Client, role: str
+) -> None:
+    """The live giver's statement is the giver's alone: while the record is
+    live the successor's reads carry its provenance and a bystander's the
+    advisory -- after the stale warning on the first read, alone on the fresh
+    one -- and neither is told it handed the path off. Fails if the
+    statement renders for every role."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    reader = successor if role == "successor" else bystander
+    expected = (
+        _provenance(giver, "plan.md", version=1, shape="SHARED")
+        if role == "successor" else _advisory(giver, successor, "plan.md")
+    )
+
+    first = _read(client, reader, "plan.md")
+    assert _last_block(first) == expected
+    assert "you handed" not in first["hookSpecificOutput"]["additionalContext"], first
+    assert _read(client, reader, "plan.md")["hookSpecificOutput"] == _context(expected)
+
+
+@pytest.mark.parametrize("ending", ["completed", "declined", "withdrawn"])
+def test_the_givers_next_touch_after_the_handoff_ended_reports_its_outcome(
+    coordinator, client: _Client, ending: str
+) -> None:
+    """While the record is live the giver's read says it handed the
+    path off; once the record is no longer live, the giver's next touch
+    reports how its handoff ended instead, and no longer says it may not
+    write -- and, the fence lifted, a pre-edit is an admit that carries the
+    outcome too. Fails if the live statement outlives the record."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    fenced = _giver_fenced_read(successor, "plan.md")
+    assert _last_block(_read(client, giver, "plan.md", "inc-1")) == fenced
+
+    if ending == "completed":
+        _read(client, successor, "plan.md")
+        assert _cas(client, successor, "plan.md", 1, "plan-v2")["ok"] is True
+    elif ending == "declined":
+        assert _verb(client, _DECLINE, successor, "plan.md")[1]["ok"] is True
+    else:
+        assert _verb(client, _WITHDRAW, giver, "plan.md")[1]["ok"] is True
+
+    s = successor.agent[:8]
+    outcome = {
+        "completed": f"was completed by agent {s}.",
+        "declined": f"was declined by agent {s}.",
+        "withdrawn": "was withdrawn.",
+    }[ending]
+    expected = f"Handoff ended: your handoff of plan.md to agent {s} at v1 {outcome}"
+    ended_read = _read(client, giver, "plan.md", "inc-1")
+    assert _last_block(ended_read) == expected
+    assert fenced not in ended_read["hookSpecificOutput"]["additionalContext"], ended_read
+    if ending != "completed":
+        status, body = client.post(
+            "/hooks/pre-edit", {"session_id": giver.sid, "path": "plan.md"},
+            principal=giver.principal,
+        )
+        assert body["ok"] is True and body["hookSpecificOutput"] == _context(expected), body
+
+
+def test_a_record_ended_by_an_unrecorded_writer_says_so_to_giver_and_successor(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The successor's win lands but its label write fails, so the
+    version moved while the record still says pending: it is no longer live,
+    and nothing recorded who ended it. Giver and successor are both told the
+    one static sentence for that case, not a completion nobody recorded."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _read(client, successor, "plan.md")
+
+    def failing_label_write(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("injected label-write failure")
+
+    monkeypatch.setattr(coordinator.registry, "set_transfer_status", failing_label_write)
+    assert _cas(client, successor, "plan.md", 1, "plan-v2")["version"] == 2
+    record, live = _record(coordinator, "plan.md")
+    assert (record.status, live) == ("pending", False)
+
+    assert _last_block(_read(client, giver, "plan.md", "inc-1")) == _ended_unrecorded("plan.md")
+    assert _read(client, successor, "plan.md")["hookSpecificOutput"] == _context(
+        _ended_unrecorded("plan.md"))
+
+
 def test_a_later_win_by_the_successor_carries_no_outcome(
     coordinator, client: _Client
 ) -> None:
@@ -10852,15 +11387,14 @@ def _no_wall_clock(body: dict) -> str:
     return json.dumps(blank(body))
 
 
-def test_a_strict_deny_while_a_record_exists_carries_the_key_beside_unchanged_deny_bytes(
+def test_a_strict_deny_while_a_record_exists_keeps_its_no_record_bytes(
     served_decider,
 ) -> None:
     """On a strict path with a record, the pre-read and pre-edit denies
-    carry the ``handoff`` key at the top level, and everything else in each
-    answer is byte-for-byte the same deny a path with no record gets. The
-    control runs the same preemption on a second strict path with no
-    record. Fails if a deny skips the key, or if the key enters the deny's
-    ``hookSpecificOutput``."""
+    carry no ``handoff`` key and no prose: each answer is byte-for-byte the
+    same deny a path with no record gets. The control runs the same
+    preemption on a second strict path with no record. Fails if a strict
+    deny gains the key, anywhere in its body."""
     server, client = served_decider
     handed, control = _U3A_STRICT_PATH, _u3a_strict_path("no-record")
     giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
@@ -10879,17 +11413,17 @@ def test_a_strict_deny_while_a_record_exists_carries_the_key_beside_unchanged_de
         assert status == status_c == 200, (denied, plain)
         assert plain["hookSpecificOutput"]["permissionDecision"] == "deny", plain
         assert "handoff" not in plain, plain
-        assert denied["handoff"] == _projection(giver, successor, "bystander", status="completed")
-        without_key = {key: value for key, value in denied.items() if key != "handoff"}
-        assert _no_wall_clock(without_key) == _no_wall_clock(plain).replace(control, handed), route
+        assert "handoff" not in json.dumps(denied), denied
+        assert _no_wall_clock(denied) == _no_wall_clock(plain).replace(control, handed), route
 
 
 def _fail_the_handoff_key_read(
     coordinator, monkeypatch: pytest.MonkeyPatch, site: str
 ) -> None:
     """Make one step of the ``handoff`` key read raise. A registry read raises
-    only when the key read calls it: the route's own work makes the same
-    reads (the giver fence among them), and those must still succeed."""
+    only when the key read calls it (directly, or through ``_read_handoff``):
+    the route's own work makes the same reads (the giver fence among them),
+    and those must still succeed."""
     import ccs.adapters.claude_code.coordinator_server as mod
 
     def broken(*_args: Any, **_kwargs: Any) -> Any:
@@ -10901,7 +11435,7 @@ def _fail_the_handoff_key_read(
     real = getattr(coordinator.registry, site)
 
     def raising_for_the_key_read(*args: Any, **kwargs: Any) -> Any:
-        if sys._getframe(1).f_code.co_name == "_attach_handoff_key":
+        if sys._getframe(1).f_code.co_name in ("_attach_handoff_key", "_read_handoff"):
             raise RuntimeError("injected handoff read failure")
         return real(*args, **kwargs)
 
@@ -11219,3 +11753,352 @@ def test_a_coordinator_wiring_a_state_log_records_the_transfer_under_the_handoff
         ] == [(str(giver.composite("inc-1")), "SHARED", "INVALID", "handoff")]
     finally:
         server.shutdown()
+
+
+# ----------------------------------------------------------------------
+# The giver's shell write: the lookup's watchdog discipline (#185)
+#
+# Pre-bash refuses a handoff giver's shell write to the path it handed off.
+# Its giver lookup reads the registry only when the pure write detector names a
+# written tracked path, and then only in the watchdog pool, starting the
+# request's one deadline -- the caller-principal gate's discipline. A lookup
+# that cannot finish in time is counted and answers as if the check did not
+# exist. What a live record changes, and what it does not, is pinned in
+# tests/integration/test_strict_mode.py.
+# ----------------------------------------------------------------------
+
+_GIVER_SHELL_APPEND = "echo '- gamma' >> plan.md"
+
+
+def _record_giver_lookups(monkeypatch: pytest.MonkeyPatch) -> tuple[list[str], threading.Event]:
+    """Wrap pre-bash's giver lookup: record the thread each call runs on, and
+    set the event when a call returns."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    threads: list[str] = []
+    returned = threading.Event()
+    real = mod._first_write_handed_off_by
+
+    def recording(*args: Any):
+        threads.append(threading.current_thread().name)
+        try:
+            return real(*args)
+        finally:
+            returned.set()
+
+    monkeypatch.setattr(mod, "_first_write_handed_off_by", recording)
+    return threads, returned
+
+
+def test_a_givers_shell_write_is_denied_from_a_lookup_on_a_watchdog_thread(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The giver's shell append is denied, and the registry read deciding it
+    ran in the watchdog pool, never on the handler thread -- where a contended
+    registry would hold the hook past its budget with no deadline."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    threads, _ = _record_giver_lookups(monkeypatch)
+    status, body = client.post(
+        "/hooks/pre-bash", {"session_id": giver.sid, "command": _GIVER_SHELL_APPEND},
+        principal=giver.principal,
+    )
+    assert (status, body.get("reason")) == (200, "handed_off"), body
+    assert len(threads) == 1 and threads[0].startswith("coord-wd"), threads
+
+
+@pytest.mark.parametrize("command", [
+    "cat plan.md",
+    "echo x >> README.md",
+    "echo x >> /tmp/plan.md",
+    "echo 'x >> plan.md'",
+])
+def test_a_bash_command_writing_no_tracked_path_runs_no_giver_lookup(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """Detection is a pure string scan: a command that writes no tracked path
+    -- a read, an untracked write, a write outside the workspace, a quoted
+    operator -- costs no registry read for the check, even from the giver of a
+    live handoff."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    threads, _ = _record_giver_lookups(monkeypatch)
+    client.post("/hooks/pre-bash", {"session_id": giver.sid, "command": command}, principal=giver.principal)
+    assert threads == []
+
+
+def test_a_givers_shell_write_whose_lookup_cannot_read_answers_as_before_and_counts_a_timeout(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the registry lock held, the giver lookup cannot finish: the shell
+    write is answered within the watchdog with what pre-bash answered before
+    the check existed, and the timeout is counted like every other. The late
+    lookup, once the lock is released, only reads, so it is not reported as a
+    late completion. Fails if the lookup runs on the handler thread (no answer
+    until the lock is released) or under the mutating watchdog runner."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _, returned = _record_giver_lookups(monkeypatch)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    late_before = coordinator.counters_snapshot()["watchdog_late_completion_total"]
+    # No principal is presented, so the gate admits without a store read and
+    # the held lock blocks only the giver lookup.
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(
+            client, "/hooks/pre-bash", {"session_id": giver.sid, "command": _GIVER_SHELL_APPEND})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+
+    assert answered, f"no answer within {_GATE_ANSWER_BOUND_SEC}s"
+    assert answer.result() == (200, {"status": "fresh"})
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    assert returned.wait(_ABANDONED_BODY_SETTLE_SEC), "the late lookup never finished"
+    time.sleep(0.05)
+    assert coordinator.counters_snapshot()["watchdog_late_completion_total"] == late_before
+
+
+def test_a_givers_shell_write_lookup_and_the_work_body_share_one_watchdog_deadline(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lookup that spent part of the budget leaves the work body only what is
+    left: a body that then blocks is answered at the ONE deadline, not at the
+    lookup's time plus a fresh one. The lookup is a lock-free stand-in that
+    finds nothing after a delay, so the held lock blocks only the work body."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    deadline = 1.0
+    lookup_delay = 0.7 * deadline
+
+    def slow_no_record(*args: Any) -> None:
+        time.sleep(lookup_delay)
+        return None
+
+    monkeypatch.setattr(mod, "_first_write_handed_off_by", slow_no_record)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", deadline)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with _HeldRegistryLock(coordinator) as held:
+        started = time.monotonic()
+        answer = _Background(client, "/hooks/pre-bash", {
+            "session_id": str(uuid.uuid4()), "command": "cat plan.md && echo x >> plan.md",
+        })
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+        held.release()
+
+    assert answered, f"no answer within {_GATE_ANSWER_BOUND_SEC}s"
+    assert answer.result() == (200, mod._DEFAULT_DEGRADED_RESPONSE)
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    # One deadline answers at ~1.0s; a fresh one for the body at ~0.7 + 1.0s.
+    assert waited < deadline + lookup_delay / 2, (
+        f"answered after {waited:.2f}s: the work body got a fresh {deadline}s "
+        f"after a {lookup_delay:.2f}s giver lookup, not what was left of one deadline")
+
+
+def test_a_givers_shell_write_lookup_that_raises_answers_the_internal_error_envelope(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raising lookup answers the route's internal-error envelope, the one
+    exception arm a request's work has -- never the dispatcher's 500, which
+    every client reads as an absent coordinator."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    def broken(*args: Any) -> None:
+        raise RuntimeError("registry unavailable")
+
+    monkeypatch.setattr(mod, "_first_write_handed_off_by", broken)
+    answer = client.post(
+        "/hooks/pre-bash", {"session_id": str(uuid.uuid4()), "command": _GIVER_SHELL_APPEND},
+    )
+    assert answer == (200, {"ok": False, "reason": "internal: RuntimeError"})
+
+
+def test_a_bash_write_to_a_tracked_path_the_registry_does_not_know_registers_nothing(
+    coordinator, client: _Client
+) -> None:
+    """The giver lookup only reads: a shell write to a tracked path no session
+    has touched leaves the registry without it. Fails if the lookup resolves
+    the path through the registering call, seeding an artifact the edit hooks
+    would then treat as observed."""
+    answer = client.post(
+        "/hooks/pre-bash", {"session_id": str(uuid.uuid4()), "command": "echo x >> spec.md"},
+    )
+    assert answer == (200, {"status": "fresh"})
+    assert coordinator.registry.lookup_artifact_id_by_name("spec.md") is None
+
+
+#: A giver's write after a write to another path: the second path is the
+#: handed-off one, so the lookup must look past the first.
+_TWO_PATH_APPEND = "echo a >> spec.md && echo b >> plan.md"
+_STRICT_READER_SID = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+_STRICT_WRITER_SID = "22222222-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+
+class _OverflowingWatchdogQueue:
+    """Stands in for the watchdog pool's work queue, reporting a depth well
+    past ``WATCHDOG_QUEUE_LIMIT``."""
+
+    @staticmethod
+    def qsize() -> int:
+        return 100
+
+
+@pytest.mark.parametrize("first_path_known", [False, True], ids=["unknown", "known-without-a-record"])
+def test_a_givers_shell_write_is_denied_when_the_handed_off_path_is_not_the_first_written(
+    coordinator, client: _Client, first_path_known: bool
+) -> None:
+    """The command writes spec.md, then the handed-off plan.md: the lookup
+    looks past a first path the registry does not know, or knows with no
+    record naming the caller, and answers the giver's pre-edit deny for
+    plan.md. Fails if the lookup stops at the first written path."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    if first_path_known:
+        _read(client, giver, "spec.md")
+    shell = client.post(
+        "/hooks/pre-bash", {"session_id": giver.sid, "command": _TWO_PATH_APPEND},
+        principal=giver.principal,
+    )
+    edit = client.post(
+        "/hooks/pre-edit", {"session_id": giver.sid, "path": "plan.md"}, principal=giver.principal,
+    )
+    assert shell[0] == 200 and shell[1].get("reason") == "handed_off", shell
+    assert shell == edit
+
+
+def test_a_givers_shell_write_under_a_foreign_principal_is_refused_before_the_giver_check(
+    coordinator, client: _Client
+) -> None:
+    """The caller-principal gate runs first: the giver's session id presented
+    with a third session's principal is refused as foreign, and no giver deny
+    is answered or counted. Fails if the giver check runs ahead of the gate --
+    a request whose identity was never checked would be answered as the giver."""
+    giver, successor, third = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    denials_before = coordinator.counters_snapshot()["handoff_giver_denials_total"]
+    status, body = client.post(
+        "/hooks/pre-bash", {"session_id": giver.sid, "command": _GIVER_SHELL_APPEND},
+        principal=third.principal,
+    )
+    assert (status, body.get("reason"), set(body)) == (400, "caller_principal_foreign", {"error", "reason"})
+    assert coordinator.counters_snapshot()["handoff_giver_denials_total"] == denials_before
+
+
+def test_a_givers_shell_write_lookup_honours_the_watchdog_queue_limit(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the watchdog pool's queue past its limit, the giver lookup is not
+    queued: the request answers the queue-overflow 503 at once, as the gate's
+    lookup and a work body do (A7), and reads nothing. No principal is
+    presented, so the gate admits without a lookup and this gate is the one
+    answering. Fails if the lookup is submitted past a full queue."""
+    from unittest.mock import patch
+
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    threads, _ = _record_giver_lookups(monkeypatch)
+    overflows_before = coordinator.counters_snapshot()["watchdog_queue_overflows_total"]
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with patch.object(coordinator._watchdog, "_work_queue", _OverflowingWatchdogQueue()):
+        response = client.post(
+            "/hooks/pre-bash", {"session_id": giver.sid, "command": _GIVER_SHELL_APPEND})
+    assert response == (503, {"error": "watchdog queue overloaded"})
+    assert threads == [], f"the giver lookup ran past a full queue: {threads}"
+    assert coordinator.counters_snapshot()["watchdog_queue_overflows_total"] == overflows_before + 1
+    assert coordinator._watchdog_timeouts_total == timeouts_before
+
+
+def _serve_strict_plan(root: Path) -> tuple[CoordinatorHTTPServer, _Client]:
+    """A coordinator whose plan.md is strict, with the reader's read grant on
+    it revoked by the writer's acquire and no new version committed -- so the
+    reader's shell read of plan.md is answered the grant-change strict deny,
+    whose bytes carry no timestamp and so match across two coordinators."""
+    root.mkdir(parents=True)
+    coherence = root / ".coherence"
+    coherence.mkdir(mode=0o700)
+    (coherence / "strict_mode.yaml").write_text("- plan.md\n")
+    server = CoordinatorHTTPServer(root, port=0, instance_id="giver-shell-strict")
+    server.serve_in_thread()
+    time.sleep(0.05)
+    client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
+    assert client.post("/hooks/pre-read", {"session_id": _STRICT_READER_SID, "path": "plan.md"})[0] == 200
+    assert client.post("/hooks/pre-edit", {"session_id": _STRICT_WRITER_SID, "path": "plan.md"})[0] == 200
+    return server, client
+
+
+def _answer_without_the_giver_check(root: Path, command: str, monkeypatch: pytest.MonkeyPatch) -> tuple[int, dict]:
+    """What pre-bash answered the reader's ``command`` before the giver check
+    existed: the same scenario on its own coordinator, the check stood aside."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    server, client = _serve_strict_plan(root)
+    try:
+        with monkeypatch.context() as patched:
+            patched.setattr(mod, "_deny_giver_shell_write", lambda *args, **kwargs: False)
+            answer = client.post("/hooks/pre-bash", {"session_id": _STRICT_READER_SID, "command": command})
+    finally:
+        server.shutdown()
+    assert answer[1]["hookSpecificOutput"]["permissionDecision"] == "deny", answer
+    return answer
+
+
+@pytest.mark.parametrize("command", [
+    "cat plan.md && echo x >> plan.md",
+    "sed -i '' 's/a/b/' plan.md",
+])
+def test_a_giver_lookup_that_times_out_leaves_the_read_check_its_whole_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """No handoff anywhere; the command both writes and reads the strict
+    plan.md, so the giver lookup runs and the read check after it denies.
+    With the registry lock held the lookup times out; once that one timeout is
+    counted the lock is released, and the read check -- given back the budget
+    it had before the lookup -- answers exactly the strict deny it answered
+    before the check existed, with no second timeout. Fails if a timed-out
+    lookup leaves its spent deadline behind: the read check would then degrade
+    at once, answering fresh where it denied."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", 1.0)
+    expected = _answer_without_the_giver_check(tmp_path / "before", command, monkeypatch)
+    server, client = _serve_strict_plan(tmp_path / "now")
+    try:
+        timeouts_before = server._watchdog_timeouts_total
+        with _HeldRegistryLock(server) as held:
+            answer = _Background(
+                client, "/hooks/pre-bash", {"session_id": _STRICT_READER_SID, "command": command})
+            waited_until = time.monotonic() + _GATE_ANSWER_BOUND_SEC * 2
+            while server._watchdog_timeouts_total == timeouts_before and time.monotonic() < waited_until:
+                time.sleep(0.005)
+            held.release()
+        result = answer.result()
+        timeouts_after = server._watchdog_timeouts_total
+    finally:
+        server.shutdown()
+    assert result == expected
+    assert timeouts_after == timeouts_before + 1
+
+
+def test_a_bash_write_detection_that_raises_leaves_the_answer_as_before(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A detector bug must not cost the existing checks: with the write
+    detector raising, the reader's shell read of the strict plan.md still
+    answers the strict deny it answered before the giver check existed."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    command = "cat plan.md && echo x >> plan.md"
+    expected = _answer_without_the_giver_check(tmp_path / "before", command, monkeypatch)
+
+    def broken(*args: Any, **kwargs: Any) -> list[str]:
+        raise RuntimeError("detector bug")
+
+    monkeypatch.setattr(mod, "detect_tracked_writes", broken)
+    server, client = _serve_strict_plan(tmp_path / "now")
+    try:
+        answer = client.post("/hooks/pre-bash", {"session_id": _STRICT_READER_SID, "command": command})
+    finally:
+        server.shutdown()
+    assert answer == expected

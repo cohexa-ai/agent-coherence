@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import secrets
 import shutil
+import time
 import urllib.error
 import uuid
 from pathlib import Path
@@ -494,6 +495,7 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
             label = _elide_middle(a.get("path", ""), path_w)
             print(f"  {label:<{path_w}}  {a.get('version', 0):>{ver_w}}")
     print()
+    _render_handoff_block(tracked)
 
     if show_policy:
         observed_paths = {a.get("path", "") for a in tracked}
@@ -544,6 +546,52 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
     # KTD-J (Unit 8): counters section. Only printed when the payload
     # actually carries counter data — the minimal tier strips them.
     _render_counter_block(payload)
+
+
+def _render_handoff_block(tracked: list[dict[str, Any]]) -> None:
+    """#185: one line per tracked artifact whose ``/status`` entry carries
+    a transfer record (the ``handoff`` key) -- the path, giver and successor as
+    short session-level agent ids, the version at transfer, the status (marked
+    ended when the record is no longer live), and the record's age when the
+    entry carries its created timestamp (the operator tier). Prints nothing at all when no entry carries the key, so
+    the table stays byte-identical to its output before handoffs existed."""
+    handed_off = [a for a in tracked if isinstance(a.get("handoff"), dict)]
+    if not handed_off:
+        return
+    print("Handoffs:")
+    print("  giver → successor, by session agent id (first 8 characters, as under Sessions)")
+    now = time.time()
+    for a in handed_off:
+        print(f"  {_handoff_line(a.get('path', ''), a['handoff'], now)}")
+    print()
+
+
+def _handoff_line(path: str, handoff: dict[str, Any], now: float) -> str:
+    giver, successor = (_short_agent_id(handoff.get(key)) for key in ("giver", "successor"))
+    facts = [str(handoff.get("status", "?"))]
+    # A write can end a record without relabelling it, so ``pending`` alone
+    # would read as a giver still fenced; say it has ended.
+    if handoff.get("live") is False:
+        facts.append("ended")
+    created = handoff.get("created_at_unix_ts")
+    if isinstance(created, (int, float)) and not isinstance(created, bool):
+        facts.append(f"{_format_age(now - created)} ago")
+    version = handoff.get("version_at_transfer", "?")
+    return f"{path}: {giver} → {successor} at version {version} ({', '.join(facts)})"
+
+
+def _short_agent_id(agent_id: object) -> str:
+    """The first 8 characters, as the Sessions block prints an agent id."""
+    return agent_id[:8] if isinstance(agent_id, str) and agent_id else "?"
+
+
+def _format_age(seconds: float) -> str:
+    """``42s``, ``3m``, ``5h`` or ``2d``: whole units, rounded down."""
+    whole = max(0, int(seconds))
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if whole >= size:
+            return f"{whole // size}{unit}"
+    return f"{whole}s"
 
 
 def _render_counter_block(payload: dict[str, Any]) -> None:

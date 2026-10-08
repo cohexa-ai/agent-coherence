@@ -31,9 +31,10 @@ Alpha — APIs may change before `v1.0`.
   restart. All four routes require the caller principal of a session that has
   claimed one, answer a watchdog timeout with a fail-closed `ok: false` and a
   `handoff_*_unconfirmed` reason, and are served by the Python coordinator
-  only: the Claude Code plugin's Node coordinator answers them `404`. The
-  bundled clients do not call them. `/status` counts each route among its
-  endpoint counters. See the guide's
+  only: the Claude Code plugin's Node coordinator answers them `404`.
+  `CoherentVolume` and the MCP server do not call them yet; Claude Code
+  sessions reach them through the handoff commands below. `/status` counts
+  each route among its endpoint counters. See the guide's
   [Targeted grant handoff](docs/guide.md#targeted-grant-handoff) section.
 
 - **The giver of a live handoff cannot write the path it handed off (#185).**
@@ -47,10 +48,36 @@ Alpha — APIs may change before `v1.0`.
   no retry, re-read or reacquire clears it. It lifts when any session's commit
   moves the version, when the successor declines, or when the giver withdraws
   — never on a timer, and not on the successor's accept or acquire. A path
-  with no record answers exactly as before. The Claude Code hook client relays
-  the `pre-edit` answer as it is, with no deny, so the fence by itself does not
-  keep a hook session's edit from landing on disk; only its grant and commit
-  are refused.
+  with no record answers exactly as before. For a Claude Code giver, the
+  `pre-edit` answer also carries a deny that stops the edit before it lands
+  (see the next entry, and the correction under Changed).
+
+- **A Claude Code session that handed a path off is denied its next edit of
+  it (#185).** While the handoff is live, the giver's `pre-edit` answer adds a
+  deny envelope beside the typed `handed_off` reason, so Claude Code stops the
+  Edit or Write before it lands. The deny fires in strict and in warn mode, for
+  every subagent of the giver's session, and ahead of strict mode's stale-view
+  check. Its text is fixed apart from the path, the successor's short agent id
+  and the version at transfer; it names the three ways the handoff ends (the
+  successor writes, the successor declines, or the giver withdraws on its
+  user's or host's instruction), tells the session to stop and report, and
+  names no command that would lift it. Each deny is counted in a new `/status`
+  counter, `handoff_giver_denials_total`, not in the strict-mode counters, and
+  writes no audit-log line. An edit already in flight when the transfer landed
+  has its commit refused, and the `post-edit` answer says, in a context-only
+  `PostToolUse` envelope, that the edit is on disk without a version. Measured
+  with Haiku 4.5, Sonnet 5.5 and Opus 5.5 on Claude Code 2.1.291, in warn and
+  strict mode: every session that met the deny stopped after that one refusal,
+  without retrying, and told its user the file had been handed off. The giver's
+  shell write to the path gets the same deny from `pre-bash`, byte for byte, in
+  warn and strict mode: a redirection or `tee`, an in-place `sed -i` or
+  `perl -i`, a `cp` or `mv` onto it, or a one-line program that writes it,
+  by name or through a variable, but not one that only reads it and writes
+  another file (a Sonnet setup that appended with `echo … >>` in 4 of 10 runs
+  changed the file in none with the deny in place). A path built from a
+  variable or a command substitution, a writer tool the hook does not know, and
+  a write that bypasses the hooks are still not stopped. See the guide's
+  [Claude Code sessions](docs/guide.md#claude-code-sessions).
 
 - **Read, edit and status answers show a path's handoff (#185).** While a path
   has a transfer record, the `pre-read`, `pre-edit`, `post-edit` and
@@ -62,12 +89,50 @@ Alpha — APIs may change before `v1.0`.
   each such `tracked_artifacts` entry on the default and operator tiers, and
   the operator tier adds the record's creation time. Every id in the key is a
   session-level agent id, never a session name or id. With no record no answer
-  and no `tracked_artifacts` entry carries the key, and the metrics tier never
-  carries a record. The key is best-effort: if the coordinator cannot read the
-  record after a request's work has landed, it answers without the key and logs
-  a warning, so a missing key does not prove there is no record. `GET /status` does gain four
-  `handoff_*_total` route counters in `endpoint_counters`, present whether or
-  not any record exists.
+  and no `tracked_artifacts` entry carries the key; a strict-mode deny on
+  `pre-read` or `pre-edit` carries no key even with one; and the metrics tier
+  never carries a record. The key is best-effort: if the coordinator cannot
+  read the record after a request's work has landed, it answers without the
+  key and logs a warning, so a missing key does not prove there is no record.
+  `GET /status` does gain four `handoff_*_total` route counters in
+  `endpoint_counters`, present whether or not any record exists.
+
+- **Claude Code sessions are told about a handoff in their read and edit
+  answers (#185).** While a path has a transfer record, admitted `pre-read`
+  and `pre-edit` answers carry context-only prose for the caller's role, after
+  any stale warning. The giver, while the handoff is live, is told on its reads
+  that it handed the path off and must not change it by any route, a shell
+  command included, until the handoff ends; afterwards, how the handoff ended.
+  The successor is told who handed it the path, at which version and from
+  which hold, to read the file before editing it when the giver gave up an
+  uncommitted write claim, and, on its edit, to read the version it was handed
+  if it has not. A bystander is told a handoff is in progress and that its
+  edits overtake it. Every text is fixed apart from paths, versions, hold
+  shapes and short agent ids. Denies keep their bytes, and the shell and
+  search hooks carry none of this prose.
+
+- **Handoff commands for Claude Code sessions (#185):
+  `agent-coherence-transfer`, `agent-coherence-accept`,
+  `agent-coherence-decline` and `agent-coherence-withdraw`.** Each acts as one
+  Claude Code session, named by `--session` or, by default, by the
+  `CLAUDE_CODE_SESSION_ID` variable Claude Code sets in its shells; with
+  neither it is a usage error and sends nothing. It presents that session's
+  stored caller principal as the session's hooks do, claiming one for a
+  session that has none, and prints the session-level agent id it acted as,
+  never the session id. `agent-coherence-transfer` takes `--successor` and one
+  or more paths, plus `--subagent-id` for a claim a subagent holds; a transfer
+  refused as not held adds a hint that a Claude Code session's write grant
+  ends with its turn. Exit codes: `0` done; `1` usage; `2` refused,
+  unconfirmed, unreachable or another HTTP error; `4` this coordinator does not
+  serve the commands, as the Node coordinator does not. See the guide's
+  [Handoff commands](docs/guide.md#handoff-commands).
+
+- **`agent-coherence-status` lists handoffs (#185).** The table view adds a
+  Handoffs block after the artifacts table: each path with a transfer record,
+  its giver and successor by short session-level agent id, the version at
+  transfer, the status, `ended` once the record is no longer live, and the
+  record's age on the operator view. With no record the output is unchanged,
+  and `--json` is unchanged.
 
 - **`transfer_record_evict_max_age_sec`: ended handoff records are evicted
   (#185).** A new `LifecycleConfig` field, 86400 seconds by default. The
@@ -293,6 +358,17 @@ Alpha — APIs may change before `v1.0`.
   ([#262](https://github.com/Cohexa-ai/agent-coherence/issues/262)).
 
 ### Changed
+
+- **A Claude Code giver's edit no longer lands (#185).** As the giver's fence
+  was first built, its `pre-edit` answer carried the typed `handed_off` reason
+  and no deny, so a Claude Code session that had handed a path off could still
+  edit it: its Edit or Write landed on disk, and only the grant and the commit
+  were refused. `pre-edit` now adds the deny envelope described under Added,
+  and the giver's refused `post-edit` commit a context-only `PostToolUse`
+  envelope, beside the unchanged top-level fields; `post-edit-cas` and the
+  snapshot-session and restore routes answer as before. A strict-mode deny on `pre-read` or
+  `pre-edit`, which carried the `handoff` key beside it while the path had a
+  record, now carries no key and keeps its bytes.
 
 - **A release that is not a clean success now answers per grant (#185).** A
   `session-stop` that left a grant held answered `ok: true` and only logged
