@@ -649,6 +649,47 @@ def test_a_verb_answer_that_is_not_a_typed_refusal_raises_unconfirmed(
         stop_coordinator(tmp_path)
 
 
+#: FROZEN: answers to a one-path transfer that do not settle the outcome. Each
+#: reaches the grant-list check: none is degraded, and each is a JSON object.
+_UNCLASSIFIABLE_TRANSFER_ANSWERS = [
+    {"ok": False, "reason": "internal: RuntimeError"},  # the failure envelope
+    {"grants": []},  # a grant short
+    {"grants": [{"path": _PLAN, "transferred": True}, {"path": _OTHER, "transferred": True}]},
+    {"grants": [{"path": _OTHER, "transferred": True}]},  # another path
+    {"grants": [{"path": _PLAN, "transferred": "yes"}]},  # not a bool
+    {"grants": ["data/plan.md"]},  # not an entry
+]
+
+
+@pytest.mark.parametrize("answer", _UNCLASSIFIABLE_TRANSFER_ANSWERS)
+def test_a_transfer_answer_without_one_readable_grant_per_path_raises_unconfirmed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, answer: dict
+) -> None:
+    """A transfer is settled only by one readable entry per path, in order.
+    Without the check, ``zip`` drops a path the coordinator never answered and
+    ``HandoffTransferResult.ok`` can read ``True``, and the failure envelope
+    escapes as a ``TypeError`` no caller maps to "look at the handoff first".
+    The transfer may have landed, so each raises the unconfirmed terminal and
+    the volume still presents its claim on the path."""
+    _seed(tmp_path, _PLAN, b"plan v1")
+    giver, successor = _volumes(tmp_path, fast_cfg, 2)
+    try:
+        giver.read(_PLAN)
+        real_post = coherent_volume_module._coordinator_post
+
+        def unclassifiable(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            if path == "/handoff/transfer":
+                return json.loads(json.dumps(answer))
+            return real_post(endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", unclassifiable)
+        with pytest.raises(CommitUnconfirmed, match="no outcome this client can classify"):
+            giver.transfer(_PLAN, successor=_agent(successor))
+        assert giver._claim_incarnation(_PLAN) in giver._read_incarnations.values()
+    finally:
+        stop_coordinator(tmp_path)
+
+
 #: The status a verb leaves on the path's record once it has landed.
 _LANDED_STATUS = {"transfer": "pending", "accept": "completed", "decline": "declined", "withdraw": "withdrawn"}
 
