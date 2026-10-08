@@ -2578,11 +2578,19 @@ class CoherentVolume:
         :class:`~ccs.core.exceptions.CoherenceError` under ``on_error="strict"``;
         under ``"degrade"`` it warns and raises ``CommitUnconfirmed``, since
         degrade mode does not tell a refusal from a failure.
+        No path, or one path named twice (after normalising, so two spellings
+        of one file count), is the caller's error: ``ValueError`` in both
+        modes, as for :meth:`atomic_publish`, and nothing is sent.
         """
         targets = [paths] if isinstance(paths, (str, os.PathLike)) else list(paths)
         with self._single_op_guard():
             self._ensure_attached()
             rels = [self._to_relative(target)[1] for target in targets]
+            if not rels:
+                raise ValueError("transfer requires at least one path")
+            repeated = next((rel for i, rel in enumerate(rels) if rel in rels[:i]), None)
+            if repeated is not None:
+                raise ValueError(f"transfer names a path more than once: {repeated}")
             self._require_attached_for("transfer", rels)
             resp = self._post(
                 "/handoff/transfer",

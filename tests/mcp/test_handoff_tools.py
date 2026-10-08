@@ -382,6 +382,50 @@ def test_the_transfer_tool_answers_per_grant_and_only_all_transferred_is_success
 
 
 @pytest.mark.parametrize(
+    "paths",
+    [[], [PLAN, "./" + PLAN], [PLAN, "data/plan-link.md"]],
+    ids=["no-path", "one-path-twice", "a-path-and-its-symlink"],
+)
+def test_the_transfer_tool_answers_no_path_or_one_path_twice_as_a_path_error(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, paths: list[str]
+) -> None:
+    """An empty path list, or one path named twice in two spellings, is the
+    agent's own input mistake. It reached the coordinator, which answered
+    HTTP 400, and the tool answered ``internal_error`` with ``recover: none``,
+    an infrastructure fault the agent stops or escalates on. It is answered
+    like every other bad input, ``invalid_path`` / ``fix_path``, and no
+    transfer is sent. An in-root symlink to the path is a third spelling: the
+    tool's own check sees two names, and the volume, which resolves the link,
+    refuses the pair."""
+    _seed(tmp_path, PLAN, b"plan v1")
+    (tmp_path / "data" / "plan-link.md").symlink_to("plan.md")
+    config = _config(tmp_path)
+    giver = _vol(tmp_path, fast_cfg)
+    successor = _vol(tmp_path, fast_cfg)
+    try:
+        _do_read(giver, config, PLAN)
+        sent: list[str] = []
+        real_post = coherent_volume_module._coordinator_post
+
+        def spy(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            sent.append(path)
+            return real_post(endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", spy)
+
+        result = _do_transfer(giver, config, paths, _agent(successor))
+
+        assert result.isError is True
+        structured = result.structuredContent
+        assert (structured["reason"], structured["recover"], structured["retryable"]) == (
+            "invalid_path", "fix_path", False,
+        )
+        assert "/handoff/transfer" not in sent
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize(
     ("verb", "tool"), [("accept", _do_accept), ("decline", _do_decline), ("withdraw", _do_withdraw)]
 )
 def test_a_verb_tool_whose_answer_settles_nothing_is_the_unconfirmed_deny(

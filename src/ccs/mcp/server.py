@@ -594,10 +594,18 @@ def _do_transfer(
         keys = [validate_uri(path, root=config.root) for path in paths]
     except UriValidationError as exc:
         return _client_error_result("invalid_path", "fix_path", str(exc))
+    # The agent's own input mistake, answered like any bad path rather than
+    # sent on for the coordinator's HTTP 400, which reads as an internal error.
+    if not keys or len(set(keys)) != len(keys):
+        return _client_error_result(
+            "invalid_path", "fix_path", "paths must name at least one path, each once"
+        )
     if not volume.is_attached:
         return coordinator_unavailable_result(f"coordinator unattached; cannot transfer {', '.join(keys)}")
     try:
         result = volume.transfer(keys, successor=successor)
+    except ValueError as exc:  # two spellings the volume resolves to one file
+        return _client_error_result("invalid_path", "fix_path", str(exc))
     except CoherenceError as exc:
         return handoff_deny_result(exc, "transfer")
     return _transfer_result(result)

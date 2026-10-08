@@ -649,6 +649,34 @@ def test_a_verb_answer_that_is_not_a_typed_refusal_raises_unconfirmed(
         stop_coordinator(tmp_path)
 
 
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+@pytest.mark.parametrize("paths", [[], [_PLAN, "./" + _PLAN]], ids=["no-path", "one-path-twice"])
+def test_a_transfer_of_no_path_or_one_path_twice_is_a_caller_error_never_sent(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    on_error: str, paths: list[str],
+) -> None:
+    """The coordinator answers HTTP 400 to an empty grant list or a path named
+    twice, which strict mode raised as a generic ``CoherenceError`` and degrade
+    mode as ``CommitUnconfirmed``, "may have landed", for a request that
+    certainly did not. Like ``atomic_publish`` with an empty or repeated
+    write-set, it is the caller's error: ``ValueError`` in both modes, and
+    nothing is sent."""
+    _seed(tmp_path, _PLAN, b"plan v1")
+    giver = CoherentVolume(tmp_path, managed=_MANAGED, on_error=on_error, config=fast_cfg)
+    successor = CoherentVolume(tmp_path, managed=_MANAGED, on_error=on_error, config=fast_cfg)
+    try:
+        giver.read(_PLAN)
+        sent: list[tuple[str, dict]] = []
+        _record_posts(monkeypatch, sent)
+
+        with pytest.raises(ValueError):
+            giver.transfer(paths, successor=_agent(successor))
+
+        assert _presented(sent) == []
+    finally:
+        stop_coordinator(tmp_path)
+
+
 #: FROZEN: answers to a one-path transfer that do not settle the outcome. Each
 #: reaches the grant-list check: none is degraded, and each is a JSON object.
 _UNCLASSIFIABLE_TRANSFER_ANSWERS = [

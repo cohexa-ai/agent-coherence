@@ -2294,6 +2294,8 @@ outcome, or there is no coordinator to ask:
   attached. With `on_error="degrade"` a 4xx warns and raises
   `CommitUnconfirmed` instead: degrade mode does not tell a refusal from a
   failure.
+- `ValueError`: a transfer of no path, or of one path named twice (two
+  spellings of one file count), in both modes; nothing is sent.
 
 **Which claim a transfer hands on.** For each path, the claim the volume holds
 there: the write grant a `write()` of the path left it holding (`MODIFIED`), or
