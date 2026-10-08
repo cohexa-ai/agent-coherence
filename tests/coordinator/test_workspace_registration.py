@@ -846,6 +846,35 @@ def test_progress_controller_gate_unknown_checkpoint_is_keyerror(service) -> Non
 
 
 @pytest.mark.parametrize("which", [0, 1], ids=["status", "member"])
+def test_abort_event_fails_a_gated_progress_write_closed(service, registry, which) -> None:
+    """A6 on the progress writes: a pre-set abort Event fails a gated write
+    closed at the registry lock, so a watchdog-abandoned /restore/status or
+    /restore/member request writes nothing after its client was already told
+    the answer was degraded."""
+    checkpoint_id = _mint_checkpoint(service)
+    abort = threading.Event()
+    abort.set()
+    writes = (
+        lambda: service.set_workspace_checkpoint_restore_status(
+            checkpoint_id, "concluded", updated_at=5.0, controller=OWNER, abort=abort
+        ),
+        lambda: service.set_workspace_checkpoint_member_restore(
+            checkpoint_id,
+            "notes/plan.md",
+            restore_outcome="restored",
+            deleted_at_restore=5.0,
+            controller=OWNER,
+            abort=abort,
+        ),
+    )
+    with pytest.raises(WatchdogAbandoned):
+        writes[which]()
+    assert registry.get_checkpoint(checkpoint_id).restore_status == "none"
+    (member,) = registry.get_checkpoint_members(checkpoint_id)
+    assert member.restore_outcome is None and member.deleted_at_restore is None
+
+
+@pytest.mark.parametrize("which", [0, 1], ids=["status", "member"])
 def test_a_claim_cannot_land_between_the_progress_gate_and_its_write(
     service, registry, monkeypatch, which
 ) -> None:
@@ -861,19 +890,18 @@ def test_a_claim_cannot_land_between_the_progress_gate_and_its_write(
     checkpoint_id = _mint_checkpoint(service)
     rival = uuid4()
     real_get_checkpoint = registry.get_checkpoint
-    window: dict = {}
+    claimant = threading.Thread(
+        target=registry.claim_checkpoint_registration, args=(checkpoint_id, rival)
+    )
+    claimed_inside = False
 
     def gate_read(cid: str):
+        nonlocal claimed_inside
         record = real_get_checkpoint(cid)
-        if "claimant" not in window:
-            claimant = threading.Thread(
-                target=registry.claim_checkpoint_registration,
-                args=(checkpoint_id, rival),
-            )
-            window["claimant"] = claimant
+        if not claimant.is_alive() and claimant.ident is None:
             claimant.start()
             claimant.join(timeout=1.0)
-            window["claimed_inside"] = not claimant.is_alive()
+            claimed_inside = not claimant.is_alive()
         return record
 
     monkeypatch.setattr(registry, "get_checkpoint", gate_read)
@@ -883,11 +911,10 @@ def test_a_claim_cannot_land_between_the_progress_gate_and_its_write(
         landed = True
     except CheckpointRegistrationRefused:
         landed = False
-    window["claimant"].join(timeout=10.0)
-    monkeypatch.undo()
+    claimant.join(timeout=10.0)
 
-    assert registry.get_checkpoint(checkpoint_id).registered_by == rival
-    assert not (window["claimed_inside"] and landed), (
+    assert real_get_checkpoint(checkpoint_id).registered_by == rival
+    assert not (claimed_inside and landed), (
         "the progress write landed after a rival's claim its gate never saw"
     )
 
@@ -920,7 +947,42 @@ def test_registry_claim_first_wins_and_never_rebinds(service, registry) -> None:
 
 
 _CLAIMANTS = 6
-_CLAIM_ROUNDS = 12
+_CLAIM_ROUNDS = 64
+
+
+def _claim_round(handles: list, checkpoint_id: str, spans: list) -> list[tuple]:
+    """Release one claimant per handle together on a barrier; return each
+    claimant's ``(controller, holder, newly_claimed)`` and record its span."""
+    start = threading.Barrier(len(handles), timeout=5)
+    results: list[tuple] = []
+    failures: list[BaseException] = []
+
+    def _claim(handle, controller) -> None:
+        try:
+            start.wait()
+            began = time.perf_counter()
+            answer = handle.claim_checkpoint_registration(checkpoint_id, controller)
+            spans.append((began, time.perf_counter()))
+            results.append((controller, *answer))
+        except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
+            failures.append(exc)
+
+    threads = [threading.Thread(target=_claim, args=(h, uuid4()), daemon=True) for h in handles]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive(), "a claimant never finished"
+    assert not failures, f"a claimant raised: {failures[0]!r}"
+    return results
+
+
+def _claims_overlapped(spans: list[tuple[float, float]]) -> bool:
+    ordered = sorted(spans)
+    return any(
+        later_start < earlier_end
+        for (_, earlier_end), (later_start, _) in zip(ordered, ordered[1:])
+    )
 
 
 @pytest.mark.parametrize("backend", ["in_memory", "sqlite"])
@@ -935,7 +997,9 @@ def test_concurrent_claimants_have_exactly_one_winner(tmp_path: Path, backend: s
     handle's lock, is what serializes them."""
     db = tmp_path / "state.db"
     shared = ArtifactRegistry() if backend == "in_memory" else SqliteArtifactRegistry(db)
-    handles = []
+    handles: list = []
+    spans: list[tuple[float, float]] = []
+    default_switch_interval = sys.getswitchinterval()
     try:
         service = CoordinatorService(shared)
         checkpoint_ids = [_mint_checkpoint(service) for _ in range(_CLAIM_ROUNDS)]
@@ -944,50 +1008,21 @@ def test_concurrent_claimants_have_exactly_one_winner(tmp_path: Path, backend: s
             if backend == "in_memory"
             else [SqliteArtifactRegistry(db) for _ in range(_CLAIMANTS)]
         )
-        spans: list[tuple[float, float]] = []
-        default_switch_interval = sys.getswitchinterval()
         sys.setswitchinterval(1e-6)
-        try:
-            for checkpoint_id in checkpoint_ids:
-                start = threading.Barrier(_CLAIMANTS, timeout=5)
-                results: list[tuple] = []
-                failures: list[BaseException] = []
-
-                def _claim(handle, controller) -> None:
-                    try:
-                        start.wait()
-                        began = time.perf_counter()
-                        answer = handle.claim_checkpoint_registration(checkpoint_id, controller)
-                        spans.append((began, time.perf_counter()))
-                        results.append((controller, *answer))
-                    except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
-                        failures.append(exc)
-
-                threads = [
-                    threading.Thread(target=_claim, args=(handle, uuid4()), daemon=True)
-                    for handle in handles
-                ]
-                for thread in threads:
-                    thread.start()
-                for thread in threads:
-                    thread.join(timeout=30)
-                    assert not thread.is_alive(), "a claimant never finished"
-
-                assert not failures, f"a claimant raised: {failures[0]!r}"
-                winners = [controller for controller, holder, newly in results if newly]
-                assert len(winners) == 1, f"{len(winners)} claimants were told they claimed"
-                (winner,) = winners
-                assert {holder for _controller, holder, _newly in results} == {winner}
-                assert shared.get_checkpoint(checkpoint_id).registered_by == winner
-        finally:
-            sys.setswitchinterval(default_switch_interval)
+        for checkpoint_id in checkpoint_ids:
+            results = _claim_round(handles, checkpoint_id, spans)
+            winners = [controller for controller, _holder, newly in results if newly]
+            assert len(winners) == 1, f"{len(winners)} claimants were told they claimed"
+            (winner,) = winners
+            assert {holder for _controller, holder, _newly in results} == {winner}
+            assert shared.get_checkpoint(checkpoint_id).registered_by == winner
     finally:
+        sys.setswitchinterval(default_switch_interval)
         if backend == "sqlite":
             for handle in handles:
                 handle.close()
             shared.close()
-    spans.sort()
-    if not any(later[0] < earlier[1] for earlier, later in zip(spans, spans[1:])):
+    if not _claims_overlapped(spans):
         warnings.warn(
             "no two claims overlapped: this runner serialized the claimants, so "
             "the run proves less than it could",

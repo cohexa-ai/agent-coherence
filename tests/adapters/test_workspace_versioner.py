@@ -3579,8 +3579,7 @@ def _route_checkpoint(
         payload["receiver_session_id"] = receiver_session_id
     status, body = client("POST", "/workspace/checkpoint", payload)
     assert status == 200 and body["ok"] is True
-    # #191: the answer names the receiver only when the request named one, so
-    # a checkpoint taken without one answers exactly as before.
+    # #191: the answer names the receiver only when the request named one.
     if receiver_session_id is None:
         assert "receiver" not in body
     else:

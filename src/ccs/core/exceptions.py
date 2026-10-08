@@ -1524,9 +1524,11 @@ class CheckpointRegistrationRefused(CoherenceError):
     (the caller's own paths, nothing it did not send) and is empty for the two
     controller reasons. Neither controller reason names another controller.
 
-    Raised by ``CoordinatorService.register_workspace_restore`` and, for the
-    two controller reasons, by ``WorkspaceVersioner.restore`` as a pre-flight
-    refusal before any status write or member leg.
+    Raised by ``CoordinatorService.register_workspace_restore``; for the two
+    controller reasons, also by the service's restore progress writes when
+    given a ``controller`` (nothing written), and by
+    ``WorkspaceVersioner.restore`` as a pre-flight refusal before any status
+    write or member leg.
     """
 
     def __init__(
