@@ -426,9 +426,10 @@ def handoff_verb_refusal_result(reason: object, detail: str, extra: dict) -> Cal
 
 def _refusal_terminal(reason: object, vocabulary: frozenset[str]) -> _Terminal:
     """``reason``'s row when it is one of ``vocabulary``, the refusals the
-    calling tool can answer; anything else fails closed."""
+    calling tool can answer; anything else, a vocabulary reason with no row
+    included, fails closed."""
     if isinstance(reason, str) and reason in vocabulary:
-        return HANDOFF_REFUSALS[reason]
+        return HANDOFF_REFUSALS.get(reason, _UNRECOGNIZED)
     return _UNRECOGNIZED
 
 
@@ -447,19 +448,25 @@ def handoff_transfer_refusal_result(grants: list[dict], detail: str) -> CallTool
     ]
     entries = [grant if row is None else _with_row(grant, row) for grant, row in zip(grants, rows)]
     refused = [row for row in rows if row is not None]
-    chosen = min(refused, key=lambda row: _RECOVER_RANK[row.recover])
+    chosen = min(refused, key=_rank)
     lead = HANDOFF_PARTIAL_TRANSFER_LEAD if len(refused) < len(grants) else None
     next_step = " ".join(step for step in (lead, chosen.next_step) if step) or None
     result = _result(
         _Terminal(chosen.reason, chosen.recover, False, next_step), detail,
         {"ok": False, "grants": entries},
     )
-    distinct = sorted({row.reason: row for row in refused}.values(), key=lambda row: _RECOVER_RANK[row.recover])
+    distinct = sorted({row.reason: row for row in refused}.values(), key=_rank)
     for row in distinct:
         if row is not chosen and row.next_step is not None:
             text = f"[{row.reason}] {row.next_step}" if len(distinct) > 1 else row.next_step
             result.content.append(TextContent(type="text", text=text))
     return result
+
+
+def _rank(row: _Terminal) -> int:
+    """A row's place in :data:`_RECOVER_RANK`; a verb with no place ranks with
+    the stops, the most restrictive."""
+    return _RECOVER_RANK.get(row.recover, 0)
 
 
 def _with_row(grant: dict, row: _Terminal) -> dict:

@@ -17,8 +17,12 @@ from __future__ import annotations
 
 import pytest
 
+import ccs.mcp.deny as deny
 from ccs.core.exceptions import (
+    GIVER_FENCED_REASON,
+    HANDOFF_REASONS,
     HANDOFF_TRANSFER_REFUSAL_REASONS,
+    HANDOFF_UNCONFIRMED_REASONS,
     CallerPrincipalRefused,
     CasRetriesExhausted,
     CoherenceError,
@@ -464,6 +468,13 @@ def test_the_frozen_refusal_table_covers_every_handoff_refusal() -> None:
     row, and how many there are."""
     assert set(_HANDOFF_REFUSAL_RECOVER) == set(HANDOFF_TRANSFER_REFUSAL_REASONS) | set(_VERB_REFUSALS)
     assert len(_HANDOFF_REFUSAL_RECOVER) == 11
+    # The verb refusals are what the vocabulary leaves after the transfer
+    # refusals, the unconfirmed answers and the giver terminal: a fourth verb
+    # refusal added there would otherwise answer internal_error unseen.
+    assert set(_VERB_REFUSALS) == (
+        set(HANDOFF_REASONS) - set(HANDOFF_TRANSFER_REFUSAL_REASONS)
+        - set(HANDOFF_UNCONFIRMED_REASONS) - {GIVER_FENCED_REASON}
+    )
 
 
 @pytest.mark.parametrize("reason", sorted(_HANDOFF_REFUSAL_RECOVER))
@@ -543,3 +554,49 @@ def test_a_partly_transferred_transfer_says_never_to_send_the_transferred_path_a
     next_step = result.structuredContent["next_step"]
     assert next_step.startswith("Not every path was handed off. A path listed as transferred was handed off: never send it again. ")
     assert result.structuredContent["grants"][0] == transferred
+
+
+@pytest.mark.parametrize(
+    "reasons",
+    [
+        ["handoff_not_held", "handoff_made_up"],
+        ["handoff_made_up", "handoff_not_held"],
+        ["handoff_to_self", "handoff_made_up"],
+        ["handoff_not_successor"],  # a verb refusal is no transfer refusal
+    ],
+    ids=["unknown-after-check", "unknown-first", "unknown-beside-fix", "verb-reason-on-a-grant"],
+)
+def test_an_unrecognized_grant_in_a_mixed_transfer_makes_the_result_fail_closed(reasons: list[str]) -> None:
+    """Grant reasons reach the tool as the coordinator sent them. One outside
+    the transfer refusals fails closed as ``internal_error``/``none``, ranked
+    with the stops, so it speaks for the result ahead of a record check or a
+    successor fix whichever grant comes first."""
+    result = handoff_transfer_refusal_result([_refused_grant(f"p{i}", r) for i, r in enumerate(reasons)], "d")
+
+    assert (result.structuredContent["reason"], result.structuredContent["recover"]) == ("internal_error", "none")
+
+
+def test_a_transfer_reason_on_a_verb_result_fails_closed() -> None:
+    """An accept, decline or withdraw answers only its three refusals; a
+    transfer refusal on one is outside its vocabulary."""
+    result = handoff_verb_refusal_result("handoff_in_flight", "d", {"path": "p", "ok": False})
+
+    assert (result.structuredContent["reason"], result.structuredContent["recover"]) == ("internal_error", "none")
+
+
+def test_a_vocabulary_reason_with_no_row_fails_closed_rather_than_raising(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A refusal added to the vocabulary before the table gets its row must
+    answer ``internal_error``/``none``, as the module promises, not escape the
+    tool call as a ``KeyError``; and a row whose verb has no rank ranks with
+    the stops."""
+    monkeypatch.setattr(deny, "HANDOFF_TRANSFER_REFUSAL_REASONS", HANDOFF_TRANSFER_REFUSAL_REASONS | {"handoff_new"})
+    monkeypatch.setitem(deny.HANDOFF_REFUSALS, "handoff_newer", deny._Terminal("handoff_newer", "a_new_verb", False))
+    monkeypatch.setattr(deny, "HANDOFF_TRANSFER_REFUSAL_REASONS", deny.HANDOFF_TRANSFER_REFUSAL_REASONS | {"handoff_newer"})
+
+    rowless = handoff_transfer_refusal_result([_refused_grant("p", "handoff_new")], "d")
+    unranked = handoff_transfer_refusal_result(
+        [_refused_grant("a", "handoff_not_held"), _refused_grant("b", "handoff_newer")], "d"
+    )
+
+    assert (rowless.structuredContent["reason"], rowless.structuredContent["recover"]) == ("internal_error", "none")
+    assert unranked.structuredContent["reason"] == "handoff_newer"
