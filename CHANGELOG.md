@@ -502,7 +502,10 @@ Alpha — APIs may change before `v1.0`.
   or record its members ahead of its receiver. The registry's
   `claim_checkpoint_registration` returns `(holder, newly_claimed)`, and
   `retry_of_own_registration` is derived from it, so a concurrent retry by the
-  same controller is reported as a retry. `GET /workspace/checkpoints`
+  same controller is reported as a retry. The claim is never released: a
+  controller that claims a checkpoint and stops leaves it registrable by no one
+  else, so resume with the same controller or take a new checkpoint (which
+  captures the workspace as it is now). `GET /workspace/checkpoints`
   shows `receiver` and `registered_by` when they are set; each of the new keys,
   `retry_of_own_registration` included, is present only when it carries a
   value, so an existing client's answers are unchanged. A client that
