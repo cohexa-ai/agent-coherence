@@ -8,6 +8,199 @@ Alpha — APIs may change before `v1.0`.
 
 ### Added
 
+- **Targeted grant handoff: a session can hand a path to a named successor
+  (#185).** Until now a session done with a file could only release its claim,
+  and the coordinator could not tell a deliberate handoff from an abandoned
+  claim. `POST /handoff/transfer` hands one or more paths — each held as a
+  write grant or a standing read — to one successor session, and the
+  coordinator keeps one transfer record per path: the giver, the successor, the
+  version at transfer, the hold shape given up and a status (`pending`,
+  `completed`, `overtaken`, `declined` or `withdrawn`; a re-send of a transfer
+  the giver has since replaced answers `superseded`). The answer is per grant,
+  in request order, and `ok` only when every grant transferred; a refused grant
+  is left exactly as it was, and an exact re-send moves nothing. The successor
+  accepts or declines with `POST /handoff/accept` or `/handoff/decline`, and
+  the giver withdraws with `POST /handoff/withdraw`. The giver's claim moves to
+  INVALID under a new state-log trigger, `handoff`, which moves the ownership
+  epoch for a write grant as a release does, moves nothing for a standing
+  read, and is not a reclaim. A handoff reserves nothing: other sessions keep
+  reading, acquiring and committing, and an acquire or optimistic commit by
+  anyone but the successor marks the record `overtaken`. Name the successor by
+  its session-level agent id; a subagent's or a per-attempt id is accepted only
+  while the coordinator process still holds it in its name map, so not after a
+  restart. All four routes require the caller principal of a session that has
+  claimed one, answer a watchdog timeout with a fail-closed `ok: false` and a
+  `handoff_*_unconfirmed` reason, and are served by the Python coordinator
+  only: the Claude Code plugin's Node coordinator answers them `404`.
+  Claude Code sessions reach them through the handoff commands, a
+  `CoherentVolume` through its new handoff methods, and an MCP session through
+  four new tools (all below). `/status` counts each route among its endpoint
+  counters. The protocol corpus pins the handoff answers (each status, each
+  refusal reason a request over HTTP can produce, the giver's answer on the
+  Claude Code hook routes, and each role's text) and that the Node coordinator answers
+  the four routes `404`. See the guide's
+  [Targeted grant handoff](docs/guide.md#targeted-grant-handoff) section.
+
+- **The giver of a live handoff cannot write the path it handed off (#185).**
+  While the record is live — the path's version unchanged since the transfer,
+  and the handoff neither declined nor withdrawn — `pre-edit`, `post-edit`,
+  `post-edit-cas`, `/session/commit`, `/session/commit_all` and
+  `/workspace/restore/register` answer the giver's session
+  `{"ok": false, "reason": "handed_off"}` with the `successor` and the
+  `version_at_transfer`, and grant or commit nothing. The fence is keyed on the
+  session, so a subagent or a fresh attempt of the giver is refused alike, and
+  no retry, re-read or reacquire clears it. It lifts when any session's commit
+  moves the version, when the successor declines, or when the giver withdraws
+  — never on a timer, and not on the successor's accept or acquire. A path
+  with no record answers exactly as before. For a Claude Code giver, the
+  `pre-edit` answer also carries a deny that stops the edit before it lands
+  (see the next entry, and the correction under Changed).
+
+- **A Claude Code session that handed a path off is denied its next edit of
+  it (#185).** While the handoff is live, the giver's `pre-edit` answer adds a
+  deny envelope beside the typed `handed_off` reason, so Claude Code stops the
+  Edit or Write before it lands. The deny fires in strict and in warn mode, for
+  every subagent of the giver's session, and ahead of strict mode's stale-view
+  check. Its text is fixed apart from the path, the successor's short agent id
+  and the version at transfer; it names the three ways the handoff ends (the
+  successor writes, the successor declines, or the giver withdraws on its
+  user's or host's instruction), tells the session to stop and report, and
+  names no command that would lift it. Each deny is counted in a new `/status`
+  counter, `handoff_giver_denials_total`, not in the strict-mode counters, and
+  writes no audit-log line. An edit already in flight when the transfer landed
+  has its commit refused, and the `post-edit` answer says, in a context-only
+  `PostToolUse` envelope, that the edit is on disk without a version. Measured
+  with Haiku 4.5, Sonnet 5.5 and Opus 5.5 on Claude Code 2.1.291, in warn and
+  strict mode: every session that met the deny stopped after that one refusal,
+  without retrying, and told its user the file had been handed off. The giver's
+  shell write to the path gets the same deny from `pre-bash`, byte for byte, in
+  warn and strict mode: a redirection or `tee`, an in-place `sed -i` or
+  `perl -i`, a `cp` or `mv` onto it, or a one-line program that writes it,
+  by name or through a variable, but not one that only reads it and writes
+  another file (a Sonnet setup that appended with `echo … >>` in 4 of 10 runs
+  changed the file in none with the deny in place). A path built from a
+  variable or a command substitution, a writer tool the hook does not know, and
+  a write that bypasses the hooks are still not stopped. See the guide's
+  [Claude Code sessions](docs/guide.md#claude-code-sessions).
+
+- **Read, edit and status answers show a path's handoff (#185).** While a path
+  has a transfer record, the `pre-read`, `pre-edit`, `post-edit` and
+  `post-edit-cas` answers carry a top-level `handoff` key projected for the
+  caller's `role` (`giver`, `successor` or `bystander`), with the record's
+  status, whether it is still live, and the `counterparty` of an overtake; a
+  compare-and-swap win that labelled the record adds whether it `completed` or
+  `overtaken` it. `GET /status` carries the same fields, without the role, in
+  each such `tracked_artifacts` entry on the default and operator tiers, and
+  the operator tier adds the record's creation time. Every id in the key is a
+  session-level agent id, never a session name or id. With no record no answer
+  and no `tracked_artifacts` entry carries the key; a strict-mode deny on
+  `pre-read` or `pre-edit` carries no key even with one; and the metrics tier
+  never carries a record. The key is best-effort: if the coordinator cannot
+  read the record after a request's work has landed, it answers without the
+  key and logs a warning, so a missing key does not prove there is no record.
+  `GET /status` does gain four `handoff_*_total` route counters in
+  `endpoint_counters`, present whether or not any record exists.
+
+- **Claude Code sessions are told about a handoff in their read and edit
+  answers (#185).** While a path has a transfer record, admitted `pre-read`
+  and `pre-edit` answers carry context-only prose for the caller's role, after
+  any stale warning. The giver, while the handoff is live, is told on its reads
+  that it handed the path off and must not change it by any route, a shell
+  command included, until the handoff ends; afterwards, how the handoff ended.
+  The successor is told who handed it the path, at which version and from
+  which hold, to read the file before editing it when the giver gave up an
+  uncommitted write claim, and, on its edit, to read the version it was handed
+  if it has not. A bystander is told a handoff is in progress and that its
+  edits overtake it. Every text is fixed apart from paths, versions, hold
+  shapes and short agent ids. Denies keep their bytes, and the shell and
+  search hooks carry none of this prose.
+
+- **Handoff commands for Claude Code sessions (#185):
+  `agent-coherence-transfer`, `agent-coherence-accept`,
+  `agent-coherence-decline` and `agent-coherence-withdraw`.** Each acts as one
+  Claude Code session, named by `--session` or, by default, by the
+  `CLAUDE_CODE_SESSION_ID` variable Claude Code sets in its shells; with
+  neither it is a usage error and sends nothing. It presents that session's
+  stored caller principal as the session's hooks do, claiming one for a
+  session that has none, and prints the session-level agent id it acted as,
+  never the session id. `agent-coherence-transfer` takes `--successor` and one
+  or more paths, plus `--subagent-id` for a claim a subagent holds; a transfer
+  refused as not held adds a hint that a Claude Code session's write grant
+  ends with its turn. Exit codes: `0` done; `1` usage; `2` refused,
+  unconfirmed, unreachable or another HTTP error; `4` this coordinator does not
+  serve the commands, as the Node coordinator does not. See the guide's
+  [Handoff commands](docs/guide.md#handoff-commands).
+
+- **`CoherentVolume` hands paths off (#185).** `vol.transfer(paths, *,
+  successor)` hands the volume's claim on one path or several to the session
+  named by `successor`, its session-level agent id
+  (`str(session_to_agent_id(vol.session_id))` for another volume), and
+  `vol.accept(path)`, `vol.decline(path)` and `vol.withdraw(path)` settle a
+  path's live handoff. They return typed results, `HandoffTransferResult`
+  (one `HandoffGrantResult` per path) and `HandoffVerbResult`, exported from
+  `ccs.adapters`: a refusal is a value, and only an answer that does not settle
+  the outcome raises (`CommitUnconfirmed`, in both `on_error` modes, a lost
+  answer or an HTTP 5xx included), as does a request the coordinator refused
+  outright under `on_error="strict"` (`CoherenceError`) or a volume with no
+  coordinator. A transfer of no path, or of one path twice, is the caller's
+  error (`HandoffPathsInvalid`, a `ValueError`) and sends nothing. A transfer hands on
+  the claim the volume actually holds on the path, its write grant or its
+  standing read, even after a fresh attempt. While the handoff is live, the
+  giver's `write()`, `write_cas()`, `write_cas_at()` and an
+  `atomic_publish()` that includes the path raise the new `GiverFenced`
+  (`ccs.core.exceptions`), naming the successor and the version at transfer;
+  it is never retried and no reacquire clears it; a multi-file publish that
+  includes the path publishes none of its files. `vol.read_handoff(path)` returns the
+  `handoff` key the volume's latest read of the path received, and
+  `vol.last_read_denied` says whether that read was a strict-mode deny, which
+  never carries the key. See the
+  guide's [From a `CoherentVolume`](docs/guide.md#from-a-coherentvolume).
+
+- **Handoff tools in the `stale-write-guard-fs` MCP server (#185):
+  `swg_transfer`, `swg_accept`, `swg_decline` and `swg_withdraw`.** They act
+  for the MCP session's own claims and take no session argument. A transfer
+  answers per grant and is an error result unless every grant transferred.
+  A refused handoff answers `recover` and `retryable: false` with a fixed
+  `next_step`, like every other error result: `fix_successor` for a successor
+  id that names no other session, `check_handoff` for `handoff_not_held` (a
+  transfer that already landed answers it too), `stop_and_report` otherwise;
+  a partly refused transfer speaks for its most restrictive refused grant. An
+  empty or repeated path list answers `invalid_path` / `fix_path`.
+  `swg_status` adds `session_agent_id`, the session's own session-level agent
+  id, which is what another session passes to `swg_transfer` as the
+  successor, and each path's handoff record; `swg_read` adds the read's
+  `handoff` key (after a strict-mode deny, which never carries the key, from
+  `/status`, or `handoff_unknown: true` when `/status` cannot be read), and a
+  `swg_write_cas` win that completed or overtook a live
+  handoff says which. An answer that does not settle a handoff tool's
+  outcome, a lost one included, answers `reason: commit_unconfirmed` with
+  `recover: check_handoff` and a fixed `next_step` sending the model to the
+  path's handoff before acting again, not the generic `read_then_retry`. A giver's `swg_write` or `swg_write_cas` of a path it
+  handed off answers `reason: handed_off`, `recover: stop_and_report`,
+  `retryable: false`, with the `successor`, the `version_at_transfer` and a
+  fixed `next_step` telling the model to stop and report; `swg_reacquire`
+  does not change it. The tool descriptions and the server instructions say
+  that a transfer fences the giver and does not reserve the path, and that
+  `swg_withdraw` is taken only on the user's or host's explicit instruction.
+  A model that uses both Claude Code's hooks and the MCP server is two
+  sessions, and a handoff fences only the one that gave it. See the guide's
+  [From the MCP server](docs/guide.md#from-the-mcp-server).
+
+- **`agent-coherence-status` lists handoffs (#185).** The table view adds a
+  Handoffs block after the artifacts table: each path with a transfer record,
+  its giver and successor by short session-level agent id, the version at
+  transfer, the status, `ended` once the record is no longer live, and the
+  record's age on the operator view. With no record the output is unchanged,
+  and `--json` is unchanged.
+
+- **`transfer_record_evict_max_age_sec`: ended handoff records are evicted
+  (#185).** A new `LifecycleConfig` field, 86400 seconds by default. The
+  coordinator's sweep removes a transfer record once it is no longer live and
+  neither it nor its path has been updated for that long, so a giver left idle
+  overnight still learns how its handoff ended. A live record is never
+  removed. A giver idle past eviction learns only what any out-of-date writer
+  does, such as a `version_mismatch` on its next compare-and-swap.
+
 - **A caller principal: the coordinator can check which session a request is
   from.** The coordinator authenticates the workspace, not the caller — the
   session a request acts as is a body field — so a copied request, a stale
@@ -209,7 +402,76 @@ Alpha — APIs may change before `v1.0`.
   stopped writing, a bounded `conflict` (never a clobber) when it is still writing.
   Offline, deterministic, no keys: `python -m examples.session_handoff.main`.
 
+- **`CoherentVolume.incarnation`, `.agent_id` and `.root`: read-only accessors
+  for the attempt identity and the resolved root.** Since `session_id` became
+  stable for the volume's lifetime, the coordinator keys a volume's grants on
+  the session folded with a per-attempt incarnation, which was readable only as
+  the private `_incarnation`; the resolved root only as `_root`. `incarnation`
+  is the value the next request carries in its `agent_id` field; `agent_id` is
+  `str(session_to_agent_id(session_id, incarnation))`, the exact string `/status`
+  reports in `sessions[].agent_id` for this volume's rows; `root` is the path
+  resolved at construction. `incarnation` and `agent_id` change when an attempt
+  starts (`reacquire()`, `write_cas_at`, `atomic_publish`, a `write_cas` retry or
+  its rotation off its own `write()` grant, a forked child) and are stable in
+  between; `root` never changes. The private attributes are unchanged
+  ([#262](https://github.com/Cohexa-ai/agent-coherence/issues/262)).
+
 ### Changed
+
+- **A Claude Code giver's edit no longer lands (#185).** As the giver's fence
+  was first built, its `pre-edit` answer carried the typed `handed_off` reason
+  and no deny, so a Claude Code session that had handed a path off could still
+  edit it: its Edit or Write landed on disk, and only the grant and the commit
+  were refused. `pre-edit` now adds the deny envelope described under Added,
+  and the giver's refused `post-edit` commit a context-only `PostToolUse`
+  envelope, beside the unchanged top-level fields; `post-edit-cas` and the
+  snapshot-session and restore routes answer as before. A strict-mode deny on `pre-read` or
+  `pre-edit`, which carried the `handoff` key beside it while the path had a
+  record, now carries no key and keeps its bytes.
+
+- **A release that is not a clean success now answers per grant (#185).** A
+  `session-stop` that left a grant held answered `ok: true` and only logged
+  the failure, so a client dropping its record on that answer forgot a grant
+  the coordinator still held. It now answers `ok: false` with
+  `released_artifacts` and a `grants` list naming each grant, in no guaranteed
+  order (match entries by `path`), as released (`"held": false, "cause": "release"`) or still held
+  (`"held": true` with its `reason`). A failed-edit `post-edit` whose release
+  is refused adds the same `grants` list to its existing `ok: false` answer. A
+  failed-edit report from the giver of a live handoff answers `ok: false` with
+  `reason: "handed_off"` and the grant reported handed to the successor, and
+  changes nothing: it neither releases nor withdraws. A clean release answers
+  exactly as before. The Node coordinator's answers are unchanged.
+  `CoherentVolume`, which releases a write grant an earlier attempt left held
+  when it starts a fresh one, now forgets only the paths such an answer
+  reports released, and releases the rest again at its next fresh attempt.
+
+- **`CoherentVolume.write_cas()` and `write_cas_at()` return a
+  `CasCommitResult` (#185).** They returned `None`; they now return the
+  `version` the win committed and, as `handoff`, what the win did to a live
+  handoff of the path (`completed` or `overtaken`), or `None`. Code that
+  ignores the return value is unaffected.
+
+- **Upgrade clients together with the coordinator (#185).** A
+  `CoherentVolume` from an earlier release can still be a handoff's giver
+  when another client sends the transfer in its name. Against this
+  coordinator it writes nothing on either route, but on the compare-and-swap
+  route it raises a plain `CoherenceError`, which an older MCP server reports
+  as `internal_error`, and on the pre-edit route its ordinary `StaleView`,
+  which an older MCP server reports as `stale_view`, retryable, with
+  `recover: reacquire`. A reacquire does not clear the fence, so an older MCP
+  giver can loop until its client is upgraded.
+
+- **`session-stop` refuses a malformed subagent id with HTTP `400` (#185).** A
+  present but malformed `agent_id` answered `{"ok": true, "released_artifacts":
+  []}`, which reads as a release that found nothing to release. It is now
+  `400 {"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"}`, before the
+  caller-principal check. The Node coordinator still answers the empty
+  success.
+
+- **Registry schema version 9 (forward-only).** Transfer records get their own
+  table. As with earlier steps, the migration runs on first open, from version
+  8 or any earlier version, and there is no down step: once a workspace's
+  `state.db` is at version 9, an older release refuses it.
 
 - **A restore registration is checked against its checkpoint, and the first
   controller to register a checkpoint claims it (#191).** `POST
@@ -246,13 +508,14 @@ Alpha — APIs may change before `v1.0`.
   `ok: false`. See the guide's
   [Who may restore a checkpoint](docs/guide.md#who-may-restore-a-checkpoint-and-what-its-registration-accepts).
 
-- **Registry schema version 9 (forward-only).** `workspace_checkpoints` gains
+- **Registry schema version 10 (forward-only).** `workspace_checkpoints` gains
   two nullable columns, `receiver` and `registered_by`, for #191. Existing
   checkpoints migrate with neither set — no receiver, not yet registered — so
   the first registration after the upgrade claims them. The migration runs on
-  first open and there is no down step: once a workspace's `state.db` (or the
-  CLI's `workspace.db`) is at version 9, an older release refuses it. The
-  v7→v8 step now stamps its own literal version.
+  first open, from version 9 (the transfer records) or any earlier version, and
+  there is no down step: once a workspace's `state.db` (or the CLI's
+  `workspace.db`) is at version 10, an older release refuses it. The v8→v9 step
+  now stamps its own literal version.
 
 - **Requests naming a session that has claimed a principal must present it on
   the routes that can change another writer's work.** `pre-edit`,
@@ -383,6 +646,23 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **Strict mode no longer lets a session write a file it was just refused a
+  read of.** A strict-mode deny of a Bash or Grep read re-grants the session's
+  SHARED read so that the retry the deny invites can run, and records no
+  observation, because the denied command never ran. The strict `pre-edit`
+  check looked only for an INVALID session, so that re-granted read also
+  admitted the session's next edit: a whole-file write from the copy it read
+  before a peer's commit then overwrote the commit, with nothing denied after
+  the shell read (#275). `pre-edit` on a strict path now also denies a SHARED
+  holder whose last observed version is older than the artifact's current one,
+  and the deny names that version; re-running the Bash command, or a `Read`,
+  records the current version and lifts it (after a Grep deny only a `Read`
+  does, because a Grep lists files rather than showing them). As everywhere
+  else, a read counts whole: a `head` or a line-limited `Read` is credited as
+  reading the current version. A session with no recorded observation is
+  still admitted like a first-time editor. Both coordinator backends; pinned by
+  strict-mode corpus fixtures 17, 18 and 19.
+
 - **A `CoherentVolume` whose managed globs the coordinator does not enforce now
   fails closed instead of running unguarded.** An attaching volume adds no
   globs to a running coordinator's policy, so a volume that attached later with
@@ -401,8 +681,55 @@ Alpha — APIs may change before `v1.0`.
   one or the Node coordinator, fails it closed as "cannot be confirmed" rather
   than being read as enforced. `CoherentVolume.managed_glob_enforcement()`
   returns that three-way answer. The comparison is literal and taken once, at
-  attach: a broader ignore pattern, or a path untracked after attach, is not
-  detected. Volumes declaring the coordinator's own globs are unaffected.
+  attach; the coordinator keeps the answer true for its lifetime (#261, below).
+  Volumes declaring the coordinator's own globs are unaffected.
+
+- **A strict path stays enforced for the coordinator's lifetime (#261).** After
+  a `CoherentVolume` attached confirmed, `POST /policy/untrack` of a managed
+  path or glob reloaded the policy and put the path on the untracked fast path:
+  a read reported version 0, `post-edit-cas` accepted any `expected_version`,
+  and a peer's `write_cas_at(expected_version=0)` overwrote a newer write with
+  nothing raised. An `ignored.yaml` that covered a strict glob under a broader
+  pattern (`**`) did the same from spawn. Now:
+  - `POST /policy/untrack` (and `agent-coherence-untrack`) refuses an entry that
+    covers a path the live policy holds in strict mode: HTTP 409
+    `{"ok": false, "reason": "untrack_strict_path", "refused": [{"path",
+    "strict_patterns"}], "rejected": [...], "error": <text>}`, and the whole
+    request writes nothing. Overlap is decided on the glob languages, so a
+    literal path, the strict glob itself, and a broader or differently spelled
+    glob are all caught; where the decision is approximate (a character class
+    too wide to enumerate cheaply, or a glob whose overlap search runs out of
+    its fixed step budget, decided per strict pattern) it errs toward refusing.
+    One request's entries share one step budget, so a request of many costly
+    entries is refused rather than held past the CLI's timeout. The CLI exits
+    3 on it. **Changed behaviour of a shipped verb:** to untrack a strict path,
+    remove its entry from `.coherence/strict_mode.yaml` and restart the
+    coordinator.
+  - Strict wins over ignore in `TrackedArtifactPolicy.is_tracked`: an ignored
+    pattern no longer untracks a path that is tracked and matches a strict
+    pattern (previously ignore won, and a strict path in `ignored.yaml` was
+    neither tracked nor strict). The spawn-time load logs each overridden
+    ignore entry; hot reloads do not recompute it. Non-strict paths are unchanged: ignore still wins there.
+  - The hot reload behind `/policy/track` and `/policy/untrack`
+    (`TrackedArtifactPolicy.reloaded()`) keeps every strict and user-added
+    pattern the live policy carries while strict patterns are live, so a
+    hand-edited YAML followed by a track cannot end enforcement mid-run.
+    Without strict patterns the reload reads the files verbatim, as before.
+  - The Node coordinator's `/policy/untrack` and policy evaluator are not
+    changed here; the new corpus fixtures
+    (`strict_mode/15-policy-untrack-of-a-strict-path-is-refused` and
+    `strict_mode/16-pre-edit-strict-path-under-an-ignore-pattern-stays-strict`)
+    are scoped to the Python coordinator and are the parity targets for the
+    plugin follow-up.
+
+- **A `**` pattern with many `*` runs no longer stalls every hook.** The
+  matcher compiled each `**` pattern to a regex that backtracks into every
+  `*` run, so a failing match cost up to the path's length to the power of
+  its runs. An accepted entry such as `'**' * 12 + 'Z'` in `ignored.yaml` or
+  `tracked.yaml` made every `is_tracked` call, on every hook, take seconds. A
+  `**` pattern with more than two runs is now matched by stepping through its
+  pattern one path character at a time: linear in the path, with the same
+  results.
 
 - **A Bash or Grep command denied in strict mode no longer counts as a read.**
   When `pre-bash` or `pre-grep` finds a stale tracked file, it re-grants the

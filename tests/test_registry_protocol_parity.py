@@ -11,7 +11,7 @@ module pins the WHOLE surface:
 
 - both registries are ``isinstance`` of :class:`RegistryBase`, and the SQLite one
   is additionally ``isinstance`` of :class:`SqliteExtended`;
-- the exact expected method names (48 base + 13 extended) are present + callable
+- the exact expected method names (52 base + 13 extended) are present + callable
   on each registry, and the base **property** members (e.g. ``coordinator_epoch``)
   are present as properties — the callable checks cannot see them, so they are
   pinned separately;
@@ -60,6 +60,7 @@ BASE_METHODS = frozenset(
         "commit_all",
         "commit_cas",
         "create_checkpoint",
+        "evict_transfer_records",
         "get_agent_state",
         "get_agent_transient",
         "get_artifact",
@@ -75,6 +76,7 @@ BASE_METHODS = frozenset(
         "get_session_cut",
         "get_session_meta",
         "get_state_map",
+        "get_transfer_record",
         "get_transient_map",
         "get_transient_tick",
         "get_version_record",
@@ -96,6 +98,8 @@ BASE_METHODS = frozenset(
         "set_checkpoint_member_pin",
         "set_checkpoint_member_restore",
         "set_checkpoint_restore_status",
+        "set_transfer_status",
+        "transfer_grants",
         "valid_holders",
     }
 )
@@ -335,6 +339,22 @@ def test_sqlite_extended_method_structure_matches_protocol(
     proto = getattr(SqliteExtended, name)
     impl = getattr(type(sqlite_registry), name)
     assert _param_structure(impl) == _param_structure(proto)
+
+
+def test_status_snapshot_transfer_opt_in_is_keyword_only_and_off_by_default(
+    sqlite_registry: SqliteArtifactRegistry,
+) -> None:
+    """The transfer rows (#185) ride the status snapshot as a keyword-only
+    opt-in that defaults off, so the session-start builder's default call keeps
+    its two-element answer. Pinned as a literal on the Protocol and the
+    implementation alike: the comparison above would pass a signature both
+    sides changed together, a positional or default-on opt-in included."""
+    expected = [
+        ("agent_ids", inspect.Parameter.KEYWORD_ONLY, None),
+        ("include_transfers", inspect.Parameter.KEYWORD_ONLY, False),
+    ]
+    assert _param_structure(SqliteExtended.status_snapshot) == expected
+    assert _param_structure(type(sqlite_registry).status_snapshot) == expected
 
 
 # ---------------------------------------------------------------------------

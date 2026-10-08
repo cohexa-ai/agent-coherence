@@ -49,6 +49,15 @@ agent-coherence-coordinator = "ccs.cli.coherence_coordinator:main"
 agent-coherence-status = "ccs.cli.coherence_status:main"
 agent-coherence-track = "ccs.cli.coherence_track:main"
 agent-coherence-untrack = "ccs.cli.coherence_untrack:main"
+# The four targeted-grant-handoff verbs (#185), one module with one entry point
+# per verb. Each acts as a named Claude Code session (--session, defaulting to
+# CLAUDE_CODE_SESSION_ID) and presents that session's stored caller principal.
+# Served by the Python coordinator only: against the Node coordinator they exit
+# 4. Exit codes are listed in the module docstring.
+agent-coherence-transfer = "ccs.cli.coherence_handoff:transfer_main"
+agent-coherence-accept = "ccs.cli.coherence_handoff:accept_main"
+agent-coherence-decline = "ccs.cli.coherence_handoff:decline_main"
+agent-coherence-withdraw = "ccs.cli.coherence_handoff:withdraw_main"
 # Scans workspace CLAUDE.md for prose tool-class rules ("use rg, not grep",
 # "never sudo") and proposes permissions.deny entries. Flag-only by default;
 # --apply writes to settings.local.json after a confirmation prompt.

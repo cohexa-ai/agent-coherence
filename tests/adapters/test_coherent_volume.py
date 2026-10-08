@@ -1052,12 +1052,13 @@ def test_a_managed_glob_the_coordinator_carries_in_only_one_set_is_not_enforced(
 def test_a_managed_glob_the_coordinator_ignores_is_not_enforced(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
-    """The coordinator enforces a path only when it is tracked, strict, and
-    matches no ignored pattern, and its hooks answer an ignored path as
-    untracked: a read reports version 0 and a CAS commit is accepted at any
-    expected version. A volume whose managed glob the coordinator's policy
-    ignores is therefore refused at attach, by name, like one it does not
-    track.
+    """A coordinator that predates #261 enforces a path only when it is
+    tracked, strict, and matches no ignored pattern, and answers an ignored
+    path as untracked: a read reports version 0 and a CAS commit is accepted at
+    any expected version. The volume cannot tell which coordinator it attached
+    to, so a managed glob the policy literally ignores is still refused at
+    attach, by name, like one it does not track (a current coordinator would
+    enforce it — strict wins over ignore — so the refusal is conservative).
 
     Prevents the attach check confirming a glob the coordinator ignores: with
     ``ignored.yaml`` carrying the glob before the spawn, the check answered
@@ -1072,6 +1073,93 @@ def test_a_managed_glob_the_coordinator_ignores_is_not_enforced(
         message = str(raised.value)
         assert "does not enforce strict mode for managed glob(s) data/**" in message, message
         assert "ignored" in message, message
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def _untrack_refusal(vol: CoherentVolume, paths: list[str]) -> tuple[int, dict]:
+    """POST /policy/untrack expecting the typed strict refusal; the status and
+    the decoded body."""
+    import urllib.error
+
+    from ccs.cli._coherence_client import http_status_from_error
+
+    with pytest.raises(urllib.error.HTTPError) as raised:
+        coherent_volume_module._coordinator_post(vol._endpoint, "/policy/untrack", {"paths": paths})
+    return raised.value.code, http_status_from_error(raised.value) or {}
+
+
+@pytest.mark.parametrize("untrack", ["data/**", "data/shared.txt", "**"])
+def test_untracking_a_managed_path_after_attach_is_refused_and_a_stale_cas_still_conflicts(
+    tmp_path: Path, fast_cfg: LifecycleConfig, untrack: str
+) -> None:
+    """The #261 reproduction: both volumes attach confirmed, the managed glob
+    (or a path under it, or a broader pattern) is untracked through
+    ``/policy/untrack``, and a peer's ``write_cas_at(expected_version=0)``
+    lands over a newer write with nothing raised — the untrack had put the
+    path on the untracked fast path, where a CAS commit is accepted at any
+    expected version.
+
+    The coordinator now refuses the untrack with the typed reason, naming the
+    strict pattern, and writes nothing; the path stays enforced, so the stale
+    CAS raises CasVersionConflict and the newer bytes survive."""
+    target = _seed(tmp_path, content=b"v1")
+    vol, peer = _pair(tmp_path, fast_cfg)
+    try:
+        assert vol.managed_glob_enforcement().confirmed and peer.managed_glob_enforcement().confirmed
+        status, body = _untrack_refusal(vol, [untrack])
+        assert status == 409, body
+        assert body["ok"] is False and body["reason"] == "untrack_strict_path", body
+        assert body["refused"] == [{"path": untrack, "strict_patterns": ["data/**"]}], body
+        assert not (tmp_path / ".coherence" / "ignored.yaml").exists(), "nothing was written"
+
+        vol.write("data/shared.txt", b"newer")
+        _data, version = vol.read_with_version("data/shared.txt")
+        assert version >= 1, "the path is still version-tracked"
+        with pytest.raises(CasVersionConflict):
+            peer.write_cas_at("data/shared.txt", 0, b"stale")
+        assert target.read_bytes() == b"newer", "the newer write survived"
+        assert vol.managed_glob_enforcement().confirmed, "still enforced after the attempt"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_broader_ignore_pattern_at_spawn_does_not_unguard_a_managed_path(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The issue's second case: an ``ignored.yaml`` that covers the managed
+    glob under another spelling (``**``) passes the volume's literal attach
+    check. Before #261 the coordinator then answered every hook for the path as
+    untracked and a stale CAS landed; strict now wins over ignore on the
+    coordinator, so the path stays enforced and the stale CAS conflicts."""
+    target = _seed(tmp_path, content=b"v1")
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True)
+    CoherentVolume._merge_yaml_list(coherence_dir / "ignored.yaml", ("**",))
+    vol, peer = _pair(tmp_path, fast_cfg)
+    try:
+        assert vol.is_attached and not vol.is_degraded
+        vol.write("data/shared.txt", b"newer")
+        with pytest.raises(CasVersionConflict):
+            peer.write_cas_at("data/shared.txt", 0, b"stale")
+        assert target.read_bytes() == b"newer"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_untracking_an_unmanaged_path_on_a_strict_coordinator_still_works(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """Control: the refusal is keyed on the strict set only. A path the
+    coordinator tracks but does not hold in strict mode untracks as before."""
+    _seed(tmp_path)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        answer = coherent_volume_module._coordinator_post(
+            vol._endpoint, "/policy/untrack", {"paths": ["docs/plans/**"]}
+        )
+        assert answer == {"ok": True, "removed": ["docs/plans/**"], "rejected": []}, answer
+        assert vol.managed_glob_enforcement().confirmed
     finally:
         stop_coordinator(tmp_path)
 
@@ -2391,6 +2479,29 @@ def test_stale_read_generation_is_cas_retry_eligible() -> None:
     assert classify(stub, {"ok": False, "reason": "commit_cas_corruption"}) == "raise"
 
 
+def test_the_giver_reason_is_never_in_the_cas_retry_set() -> None:
+    """The giver's ``handed_off`` refusal is a terminal. In the retry set
+    the compare-and-swap loop would re-mint and commit again into a fence no
+    re-mint clears (keyed on the session, not the incarnation), spend its whole
+    budget, and report a contention it never had. Pinned as a deliberate
+    duplicate of the set, with its cardinality, so an edit that adds a member
+    cannot move the expectation with it."""
+    from unittest.mock import MagicMock
+
+    assert CoherentVolume._CAS_RETRY_REASONS == frozenset(
+        {"version_mismatch", "other_holder", "caller_in_transient_state", "stale_read_generation"}
+    )
+    assert len(CoherentVolume._CAS_RETRY_REASONS) == 4
+    assert "handed_off" not in CoherentVolume._CAS_RETRY_REASONS
+    stub = MagicMock(spec=CoherentVolume)
+    stub._CAS_RETRY_REASONS = CoherentVolume._CAS_RETRY_REASONS
+    giver_body = {
+        "ok": False, "reason": "handed_off",
+        "successor": "4f1b7c2e-0000-4000-8000-000000000001", "version_at_transfer": 3,
+    }
+    assert CoherentVolume._classify_cas_response(stub, giver_body) == "raise"
+
+
 _CAS_ONCE = {
     "write_cas": lambda vol, rel, version: vol.write_cas(rel, lambda cur: cur + b"+mine"),
     "write_cas_at": lambda vol, rel, version: vol.write_cas_at(rel, version, b"mine"),
@@ -3168,6 +3279,98 @@ def test_every_attempt_lands_on_its_own_coordinator_row(
         stop_coordinator(tmp_path)
 
 
+def test_public_identity_accessors_name_what_every_request_sends(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``incarnation`` is the value the next request carries in its subagent
+    field and ``agent_id`` is the coordinator row that request lands on, in the
+    form ``/status`` reports it — so a caller can name the attempt to a third
+    party without reading a private attribute (#262). Pinned against the bodies
+    actually sent and against the coordinator's own ``/status`` rows; both change
+    on a re-mint, and only on one."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        sent: list[tuple[str, dict, str, str]] = []
+        real_post = coherent_volume_module._coordinator_post
+
+        def spy(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            sent.append((path, dict(payload), vol.incarnation, vol.agent_id))
+            return real_post(endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", spy)
+
+        session = vol.session_id
+        # Stable between re-mints: reads do not move the identity.
+        before = (vol.incarnation, vol.agent_id)
+        vol.read(rel)
+        vol.read(rel)
+        assert (vol.incarnation, vol.agent_id) == before
+        # /status keys this volume's grant on exactly the public agent_id.
+        assert _held(vol, vol.agent_id) == {rel: "SHARED"}
+
+        seen_agent_ids = [vol.agent_id]
+        vol.reacquire(rel)  # a re-mint: new incarnation, same session
+        assert vol.incarnation != before[0]
+        assert vol.agent_id not in seen_agent_ids
+        assert _held(vol, vol.agent_id) == {rel: "SHARED"}
+        seen_agent_ids.append(vol.agent_id)
+
+        _data, version = vol.read_with_version(rel)
+        vol.write_cas_at(rel, version, b"v2")  # re-mints before its read
+        assert vol.agent_id not in seen_agent_ids
+        vol.write_cas(rel, lambda cur: cur + b"+cas")
+
+        assert sent, "the spy saw no coordinator request"
+        for route, body, incarnation, agent_id in sent:
+            if route == "/hooks/session-stop":
+                continue  # the release names the incarnation it abandons
+            assert body["agent_id"] == incarnation, route
+            assert str(session_to_agent_id(body["session_id"], body["agent_id"])) == agent_id
+        assert vol.session_id == session
+        # The public accessors read the private state they front; the private
+        # names stay, because existing clients read them.
+        assert vol.incarnation == vol._incarnation
+        assert vol.agent_id == str(session_to_agent_id(vol._session_id, vol._incarnation))
+        assert vol.agent_id == _agent_id(vol)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_root_is_the_resolved_workspace_path(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``root`` is the path the volume resolved at construction — absolute, with
+    symlinks followed — not the spelling the caller passed (#262)."""
+    real = tmp_path / "real"
+    _seed(real, content=b"v1")
+    (tmp_path / "link").symlink_to(real, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+    vol = CoherentVolume("link", managed=("data/**",), config=fast_cfg)
+    try:
+        assert vol.root == real.resolve()
+        assert vol.root.is_absolute()
+        assert vol.root == vol._root
+        assert vol.read("data/shared.txt") == b"v1"
+        assert vol.read(vol.root / "data" / "shared.txt") == b"v1"
+    finally:
+        stop_coordinator(real)
+
+
+@pytest.mark.parametrize("name", ["incarnation", "agent_id", "root"])
+def test_identity_accessors_are_read_only(
+    tmp_path: Path, fast_cfg: LifecycleConfig, name: str
+) -> None:
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        with pytest.raises(AttributeError):
+            setattr(vol, name, "x")
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_every_request_names_the_current_incarnation(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3588,6 +3791,75 @@ def test_a_failed_release_stops_the_pass_and_keeps_every_record(
         vol.reacquire(r)
         assert write_grants(first_row) == {} and write_grants(second_row) == {}, (
             "an incarnation the failed pass skipped was dropped from the record")
+    finally:
+        stop_coordinator(tmp_path)
+
+
+_P_PATH, _Q_PATH = "data/p.txt", "data/q.txt"
+_PER_GRANT_RELEASE = {  # what a stop that left q held answers (#185)
+    "ok": False,
+    "released_artifacts": [_P_PATH],
+    "grants": [
+        {"path": _P_PATH, "held": False, "cause": "release"},
+        {"path": _Q_PATH, "held": True, "reason": "internal: RuntimeError"},
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    ("answer", "kept"),
+    [
+        (_PER_GRANT_RELEASE, {_Q_PATH}),
+        (None, set()),  # the coordinator's own answer: both released, a clean ok:true
+        ({"ok": True, "degraded": True}, {_P_PATH, _Q_PATH}),
+    ],
+    ids=["per-grant", "clean", "degraded"],
+)
+def test_the_release_pass_acts_on_each_grants_result(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    answer: dict | None, kept: set[str],
+) -> None:
+    """The release of an abandoned incarnation reads the answer
+    per grant. A stop that released p and left q held answers top-level false
+    with a grant list; read as one top-level failure it kept p recorded, and
+    read as a success it dropped q, a grant the coordinator still holds, so
+    nothing would ever release it. The record keeps exactly q, and the next
+    re-mint releases the incarnation again. A clean answer drops the whole
+    record; a degraded one keeps everything, since the release may not have
+    run."""
+    _seed(tmp_path, rel=_P_PATH, content=b"p1")
+    _seed(tmp_path, rel=_Q_PATH, content=b"q1")
+    spare = _seed(tmp_path, rel="data/spare.txt", content=b"s1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol.write(_P_PATH, b"p2")
+        vol.write(_Q_PATH, b"q2")
+        writer = vol._incarnation
+        real_post = coherent_volume_module._coordinator_post
+
+        def answer_the_stop(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+            if path != "/hooks/session-stop" or answer is None:
+                return real_post(endpoint, path, payload, **kwargs)
+            if not answer.get("degraded"):
+                real_post(endpoint, path, payload, **kwargs)
+            return answer
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", answer_the_stop)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", CoherenceDegradedWarning)
+            vol.reacquire(spare)
+
+        assert vol._grant_incarnations == ({writer: kept} if kept else {})
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", real_post)
+        sent: list[tuple[str, dict, str]] = []
+        _count_stops(monkeypatch, sent, vol)
+        vol.reacquire(spare)
+        stops = [body["agent_id"] for route, body, _c in sent if route == "/hooks/session-stop"]
+        assert stops == ([writer] if kept else [])
+        assert vol._grant_incarnations == {}
+        writer_row = str(session_to_agent_id(vol.session_id, writer))
+        assert {v for v in _held(vol, writer_row).values()} <= {"SHARED"}
     finally:
         stop_coordinator(tmp_path)
 
@@ -5662,15 +5934,14 @@ def _tracked_version(vol: CoherentVolume, rel: str) -> int | None:
     return None
 
 
-# Where the refused write goes: a path the coordinator tracks, one it does not
-# track, and one the VOLUME manages but the coordinator is told to ignore AFTER
-# the attach (the attach check sees the policy the coordinator started with; the
-# untrack command reloads it) — so nothing the volume holds says whether the
-# coordinator tracks a path.
+# Where the refused write goes: a path the coordinator tracks and one it does
+# not. (A third arm, a managed path the coordinator was told to ignore after the
+# attach, is gone: /policy/untrack now refuses a strict path and strict wins
+# over ignore, #261. The message still states both cases, because a volume may
+# attach to a coordinator that predates that.)
 _REFUSED_WRITE_PATHS = {
-    "tracked": ("data/shared.txt", None),
-    "untracked": ("notes/free.txt", None),
-    "managed-but-ignored": ("data/shared.txt", "data/**"),
+    "tracked": "data/shared.txt",
+    "untracked": "notes/free.txt",
 }
 
 # What the refused write puts, against what the file and the volume already
@@ -5699,8 +5970,8 @@ def test_every_clause_of_an_unrecorded_write_holds_wherever_the_write_went(
     whether the coordinator tracks the path — it took EXCLUSIVE and
     invalidated every peer holding a copy — or does not, when it took no
     grant and invalidated nobody. The volume cannot tell which (its managed
-    globs do not decide it: an ignored path is managed here and untracked
-    there), so the message states both cases, and each is observed where it
+    globs do not decide it: on a coordinator that predates #261 an ignored
+    path is managed here and untracked there), so the message states both cases, and each is observed where it
     applies. The disk clause says whether THIS call wrote the file, and each
     arm counts the disk writes it made (see ``_REFUSED_WRITE_BYTES``).
 
@@ -5711,20 +5982,13 @@ def test_every_clause_of_an_unrecorded_write_holds_wherever_the_write_went(
     freely."""
     from ccs.core.exceptions import CallerPrincipalRefused
 
-    rel, ignored = _REFUSED_WRITE_PATHS[where]
+    rel = _REFUSED_WRITE_PATHS[where]
     data, expected_disk_writes = _REFUSED_WRITE_BYTES[rewrite]
     target = _seed(tmp_path, rel=rel, content=b"v1")
     on_stale_write = "allow" if rewrite == "committed-over-foreign" else "raise"
     vol = CoherentVolume(tmp_path, managed=("data/**",), on_stale_write=on_stale_write, config=fast_cfg)
     peer = CoherentVolume(tmp_path, managed=("data/**",), on_stale_write="allow", config=fast_cfg)
     try:
-        if ignored is not None:
-            # Ignored after the attach: the coordinator reloads its policy and
-            # untracks the managed path, and neither volume sees that.
-            untracked = coherent_volume_module._coordinator_post(
-                vol._endpoint, "/policy/untrack", {"paths": [ignored]}
-            )
-            assert untracked.get("ok") is True and untracked.get("removed") == [ignored], untracked
         vol.read(rel)
         if rewrite in ("same-bytes", "committed-over-foreign"):
             vol.write(rel, b"v2")  # recorded: the refused write below writes these bytes again

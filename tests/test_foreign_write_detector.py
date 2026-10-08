@@ -492,7 +492,7 @@ def test_a_late_tick_opens_a_new_interval_rather_than_stretching_the_old(
 
     Closing the interval when a tick observes nothing only covers the windows
     this pass can SEE. A sweep thread that arrives late — the host suspended,
-    the four safety passes ahead of detection stuck on the store — observes
+    the five safety passes ahead of detection stuck on the store — observes
     nothing in between and says nothing about it, so the next successful tick
     would extend the same interval across the stall and `covers()` would answer
     True for it. A tick further from the last one than the sweep can explain
@@ -882,7 +882,7 @@ def test_a_walk_that_cannot_answer_says_present_rather_than_absent(
 def test_a_walk_that_never_answers_cannot_hold_the_sweep_thread(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The walk runs on the sweep thread, whose other four passes reclaim
+    """The walk runs on the sweep thread, whose other five passes reclaim
     grants and reap dead sessions. ``os.lstat`` on a wedged network or FUSE
     mount never returns and cannot be interrupted, so an unbounded walk would
     stall the coordinator's safety work for as long as the mount stays wedged.

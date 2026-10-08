@@ -100,6 +100,7 @@ RAG corpora and agent memory are **shared mutable state**, so the stale-read→w
 - 🚦 [Effect-ordering gate](#effect-ordering-gate) — `gate()`, fire an agent's effect only on the input state — value and grant — it decided from; the same verdict over MCP (`swg_gate`) and over HTTP ([`POST /hooks/effect-fence`](docs/guide.md#effect-fence-over-http))
 - 📸 [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions) — read several artifacts as one consistent cut; no torn reads
 - 📦 [Atomic multi-file publish](#atomic-multi-file-publish) — `atomic_publish`, land a set of files all-or-nothing; never a torn pair
+- 🤝 [Targeted grant handoff](docs/guide.md#targeted-grant-handoff) — hand a file to one named session; the giver's later write is refused as `handed_off` until the version moves, the successor declines, or the giver withdraws. From Claude Code, `CoherentVolume`, MCP or HTTP; served by the Python coordinator only
 - 🧮 [Formal verification](formal/tla/README.md) — the TLA+ specs, invariant ↔ implementation map, mutant recipes
 - 🩺 [`ccs-diagnose` CLI](docs/ccs-diagnose.md) — find divergent reads in your existing LangGraph graph without changing any code
 - 📊 [Conflict-outcome counters](docs/guide.md#conflict-outcome-counters--how-often-did-it-actually-fire) — count how often each typed refusal actually fired, read offline from a closed `state.db`
@@ -125,7 +126,7 @@ Five synchronization strategies ship out of the box: `lazy` (default), `eager`, 
 - **Coordinator** (`ccs.coordinator`) — authority service tracking directory state, publishing invalidations, arbitrating commit-CAS, and reclaiming stale grants (crash recovery + read-generation fence).
 - **Adapters** (`ccs.adapters`) — framework integrations for LangGraph, CrewAI, and AutoGen (~100 lines each), plus an experimental OpenAI Agents SDK adapter (`Session`-cache coherence + `RunHooks`).
 - **Coherent workspace** (`ccs.adapters.coherent_volume`) — the **data-plane appliance**: an out-of-process coordinator client that brings the same guarantee to plain files on disk, no framework required. See [Coherent workspace](#coherent-workspace-the-data-plane-for-shared-files).
-- **MCP server** (`ccs.mcp`) — the `stale-write-guard-fs` stdio server that exposes the coherent-workspace guarantee to any [Model Context Protocol](https://modelcontextprotocol.io) client over six `swg_*` tools. See [MCP server](#mcp-server-stale-write-guard-fs).
+- **MCP server** (`ccs.mcp`) — the `stale-write-guard-fs` stdio server that exposes the coherent-workspace guarantee to any [Model Context Protocol](https://modelcontextprotocol.io) client over ten `swg_*` tools. See [MCP server](#mcp-server-stale-write-guard-fs).
 - **Simulation** (`ccs.simulation`) — deterministic tick-driven engine for scenario benchmarks with failure injection.
 - **Event bus** (`ccs.bus`) — the transport for invalidation signals; in-memory / in-process today (`InMemoryEventBus`). Networked transports (Redis, Kafka, NATS, gRPC) for a multi-host deployment are on the roadmap, demand-gated.
 
@@ -175,7 +176,7 @@ fresh = vol.reacquire("plans/plan.md")  # recover: fresh read, re-derive, re-wri
 
 ## MCP server: `stale-write-guard-fs`
 
-The same guarantee for agents that speak [Model Context Protocol](https://modelcontextprotocol.io) — Claude Code, Cursor, or a custom runtime — with **no Python integration at all**. `stale-write-guard-fs` is a stdio MCP server that wraps `CoherentVolume` and exposes coordinated file access as six tools:
+The same guarantee for agents that speak [Model Context Protocol](https://modelcontextprotocol.io) — Claude Code, Cursor, or a custom runtime — with **no Python integration at all**. `stale-write-guard-fs` is a stdio MCP server that wraps `CoherentVolume` and exposes coordinated file access as ten tools:
 
 ```bash
 pip install "agent-coherence[mcp]"
@@ -199,7 +200,11 @@ pip install "agent-coherence[mcp]"
 | `swg_reacquire` | Recovery — clears the stale view + mandatory fresh read after a deny |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
 | `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed OR a peer's write-claim preempted it (which moves neither comparand — the fence also re-checks that the grant still stands) |
-| `swg_status` | Three-state coordination health: `on` / `off` / `unknown` |
+| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `session_agent_id`, the id another session names to hand it a path |
+| `swg_transfer` | Hands this session's claim on one or more paths to the session whose `session_agent_id` it names; until the handoff ends, this session's `swg_write` / `swg_write_cas` on those paths gets a typed `handed_off` deny ([Targeted grant handoff](docs/guide.md#from-the-mcp-server)) |
+| `swg_accept` | As the successor, accepts a handoff without writing the path |
+| `swg_decline` | As the successor, declines a handoff; the giver may write the path again |
+| `swg_withdraw` | As the giver, withdraws a handoff, on the user's or host's explicit instruction only |
 | `POST /hooks/effect-fence` | **Not a tool — the HTTP sibling of `swg_gate`.** The coordinator answers the same fence verdict to any client that can make an HTTP request, with no MCP and no Python in the loop, and it is the only surface that can answer the no-content-claim leg. See [Effect fence over HTTP](docs/guide.md#effect-fence-over-http) |
 
 The server binds one workspace per session (`SWG_ROOT`, defaulting to its working directory; the whole workspace is guarded unless `SWG_MANAGED` — a comma-separated glob list — narrows it), rejects path traversal and any access to the coordinator's own state directory, and fails closed on IO errors. Denials come back as typed, machine-readable payloads — an agent can parse `recover: reacquire` and self-heal instead of retrying blindly. Run the red→green demo: `python -m examples.mcp_stale_write_guard.main` (offline, deterministic, no keys).
