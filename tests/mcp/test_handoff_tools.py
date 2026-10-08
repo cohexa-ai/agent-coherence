@@ -84,12 +84,11 @@ _REFUSAL_RECOVER = {
 
 def _refused(structured: dict) -> dict:
     """A refused result or grant with its fixed ``next_step`` checked and
-    dropped: present, and never telling the agent to withdraw (it may name
-    the tool only to say which status it sets)."""
+    dropped (what each row's text must say is pinned per reason in
+    ``tests/mcp/test_deny_mapping.py``)."""
     shape = dict(structured)
     next_step = shape.pop("next_step")
     assert isinstance(next_step, str) and next_step.startswith("Nothing"), next_step
-    assert "call swg_withdraw" not in next_step
     return shape
 
 

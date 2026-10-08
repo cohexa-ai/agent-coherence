@@ -457,6 +457,28 @@ _HANDOFF_REFUSAL_RECOVER = {
 }
 _VERB_REFUSALS = ("handoff_not_successor", "handoff_not_giver", "handoff_not_live")
 
+#: FROZEN: what each refusal's next step must keep saying. These are the
+#: sentences that stop an agent from the obvious and unsafe move (a second
+#: handoff, a write, a withdraw, a retry loop); a reword that turned one into
+#: an instruction would otherwise ship with every test green.
+_REFUSAL_PROHIBITIONS = {
+    "handoff_to_self": ("Name the other session", "do not guess one"),
+    "handoff_successor_unknown": ("Do not guess, and do not retry the same id",),
+    "handoff_successor_malformed": ("Do not pass a name or a shortened id", "Do not guess"),
+    "handoff_not_held": (
+        "Look at the path's handoff in swg_status first",
+        "do not transfer again, and do not withdraw to start over",
+        "Ask your user or host first",
+    ),
+    "handoff_version_unconfirmed": ("Do not write the path just to give it a version",),
+    "handoff_in_flight": ("do not write the path", "do not call another handoff tool"),
+    "handoff_other_holder": ("Do not retry in a loop", "do not write the path to clear it"),
+    "handoff_ended": ("Do not send it again", "do not hand the path to another session", "do not write it"),
+    "handoff_not_successor": ("do not write it or transfer it to take the handoff over",),
+    "handoff_not_giver": ("do not write the path, decline it, or call another handoff tool",),
+    "handoff_not_live": ("do not repeat the call", "Do not write the path as if it had been handed to you"),
+}
+
 
 def _refused_grant(path: str, reason: object) -> dict:
     return {"path": path, "transferred": False, "reason": reason}
@@ -475,6 +497,7 @@ def test_the_frozen_refusal_table_covers_every_handoff_refusal() -> None:
         set(HANDOFF_REASONS) - set(HANDOFF_TRANSFER_REFUSAL_REASONS)
         - set(HANDOFF_UNCONFIRMED_REASONS) - {GIVER_FENCED_REASON}
     )
+    assert set(_REFUSAL_PROHIBITIONS) == set(_HANDOFF_REFUSAL_RECOVER)
 
 
 @pytest.mark.parametrize("reason", sorted(_HANDOFF_REFUSAL_RECOVER))
@@ -496,7 +519,8 @@ def test_every_handoff_refusal_carries_its_recover_verb_and_a_fixed_next_step(re
     )
     assert structured["detail"] == "the detail"
     assert [item.text for item in result.content] == ["the detail", structured["next_step"]]
-    assert "call swg_withdraw" not in structured["next_step"]
+    for prohibition in _REFUSAL_PROHIBITIONS[reason]:
+        assert prohibition in structured["next_step"], prohibition
     for grant in structured.get("grants", []):  # the row as the refused grant carries it
         assert (grant["recover"], grant["retryable"], grant["next_step"]) == (
             _HANDOFF_REFUSAL_RECOVER[reason], False, structured["next_step"],
