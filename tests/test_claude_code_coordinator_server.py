@@ -10492,6 +10492,37 @@ def test_a_fenced_givers_pre_edit_is_refused_with_the_typed_reason(
     assert _state(coordinator, "plan.md", giver.composite("inc-2")) is None
 
 
+def test_a_transfer_landing_between_the_giver_check_and_the_acquire_is_still_denied(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The race the pre-edit's second arm covers: the handler's own giver
+    check misses (the transfer lands just after it), so the acquire raises
+    the typed refusal, and that must map to the same deny body. Without the
+    arm the giver gets the bare typed refusal with no deny envelope, and the
+    hook client lets the Edit land on disk."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    real = coordinator.service.live_handoff_given_by
+    calls = []
+
+    def missing_once(*args: Any, **kwargs: Any):
+        calls.append(args)
+        return None if len(calls) == 1 else real(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator.service, "live_handoff_given_by", missing_once)
+    answer = client.post(
+        "/hooks/pre-edit", {"session_id": giver.sid, "agent_id": "inc-2", "path": "plan.md"},
+        principal=giver.principal,
+    )
+
+    assert len(calls) >= 2, "the acquire never consulted the giver check"
+    assert answer == (200, {
+        **_giver_refusal(giver, successor, shape="SHARED"),
+        "hookSpecificOutput": _giver_deny_envelope(successor, "plan.md"),
+    })
+    assert _state(coordinator, "plan.md", giver.composite("inc-2")) is None
+
+
 def test_a_fenced_givers_post_edit_commit_is_refused_with_the_typed_reason(
     coordinator, client: _Client
 ) -> None:
@@ -10953,6 +10984,96 @@ def _hand_off_shape(client: _Client, giver: _Session, successor: _Session, shape
     assert answer == (200, {"ok": True, "grants": [
         _handed(giver, successor, "plan.md", version=version, shape=shape)]}), answer
     return version
+
+
+@pytest.mark.parametrize("role", ["successor", "bystander", "giver"])
+def test_a_pending_re_grounding_rides_the_admit_that_carries_handoff_prose(
+    coordinator, client: _Client, role: str
+) -> None:
+    """After a compaction, the first admitted touch of a handed-off path
+    carries the handoff prose AND the deferred re-grounding, handoff first,
+    and consumes the flag: the successor's and a bystander's edit, and the
+    live giver's read. The prose rides a context-only envelope (no permission
+    decision), which the re-grounding seam used to refuse, so the flag stayed
+    pending past every such admit and expired with the turn. The giver's
+    case is its fresh read: its first read after the transfer is stale, and
+    a stale warning already carries an allow."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    who = {"successor": successor, "bystander": bystander, "giver": giver}[role]
+    _read(client, who, "spec.md")  # state worth re-grounding, whatever the role
+    if role == "giver":
+        # The giver's first read after the transfer is stale, and its warning
+        # already carries an allow; the next, fresh read is a bare admit.
+        _read(client, giver, "plan.md")
+    coordinator.mark_compact_pending(who.sid)
+
+    route = "/hooks/pre-read" if role == "giver" else "/hooks/pre-edit"
+    status, body = client.post(
+        route, {"session_id": who.sid, "path": "plan.md"}, principal=who.principal)
+
+    assert status == 200, body
+    envelope = body["hookSpecificOutput"]
+    assert "permissionDecision" not in envelope, envelope
+    text = envelope["additionalContext"]
+    handoff_at = text.index("Handoff")
+    reground_at = text.index("Post-compaction re-grounding (agent-coherence):")
+    assert handoff_at < reground_at, text
+    assert coordinator.has_compact_pending(who.sid) is False
+
+
+@pytest.mark.parametrize("ending", ["successor commits", "successor declines", "giver withdraws"])
+def test_once_the_handoff_ends_the_successor_and_bystanders_are_told_nothing(
+    coordinator, client: _Client, ending: str
+) -> None:
+    """A record that is no longer live keeps its ``handoff`` key, but the
+    successor is no longer told it was handed the path and a bystander is no
+    longer told a handoff is in progress. Fails if either role's prose
+    ignores liveness: the model would then act on a handoff that is over."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    if ending == "successor commits":
+        _pre_edit_with(client, successor.sid, successor.principal, "plan.md")
+        status, body = client.post("/hooks/post-edit", {
+            "session_id": successor.sid, "path": "plan.md", "success": True,
+            "content_hash": _hash("plan-v2"),
+        }, principal=successor.principal)
+        assert status == 200 and body["ok"] is True, body
+    elif ending == "successor declines":
+        assert _verb(client, _DECLINE, successor, "plan.md") == (
+            200, {"ok": True, "status": "declined"})
+    else:
+        assert _verb(client, _WITHDRAW, giver, "plan.md") == (
+            200, {"ok": True, "status": "withdrawn"})
+
+    for who in (successor, bystander):
+        read = _read(client, who, "plan.md")
+        assert read["handoff"]["live"] is False, read
+        context = (read.get("hookSpecificOutput") or {}).get("additionalContext", "")
+        assert "Handoff" not in context, (who, context)
+
+
+def test_a_refused_edit_during_a_handoff_carries_the_key_and_no_prose(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal body (``ok: false``) gets the ``handoff`` key only: the role's
+    prose is for an admit. Fails if the prose seam stops checking for one, and
+    a bystander whose edit was refused is told its edits are admitted."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+
+    def refusing(**_kwargs: Any):
+        raise CoherenceError("acquire refused by the test")
+
+    monkeypatch.setattr(coordinator.service, "write", refusing)
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": bystander.sid, "path": "plan.md"},
+        principal=bystander.principal)
+
+    assert status == 200
+    assert body["ok"] is False, body
+    assert "hookSpecificOutput" not in body, body
+    assert body["handoff"] == _projection(giver, successor, "bystander")
 
 
 def test_the_handoff_prose_templates_are_static() -> None:

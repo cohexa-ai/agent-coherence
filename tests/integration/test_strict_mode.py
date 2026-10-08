@@ -648,7 +648,7 @@ ALLOW_EMISSION_SOURCES: list[str] = [
     "pre_bash_stale_warn",           # coordinator_server._handle_pre_bash
     "pre_grep_stale_warn",           # coordinator_server._handle_pre_grep
     "watchdog_degraded_read",        # coordinator_server._DEFAULT_DEGRADED_RESPONSE (A7)
-    # NOT listed: coordinator_server._attach_reground. The SB-10 deferred
+    # NOT listed: coordinator_server._attach_pretooluse_context. The SB-10 deferred
     # re-grounding attach no longer emits an allow — a bare admit body now
     # gains a CONTEXT-ONLY PreToolUse envelope (hookEventName +
     # additionalContext, no permissionDecision) via

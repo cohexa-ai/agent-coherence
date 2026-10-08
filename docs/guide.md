@@ -1905,15 +1905,18 @@ shell writes:
 - `cp`, `mv`, `install`, `ln` or `rsync` onto the file, and `mv`, `rm`,
   `truncate`, `dd of=`, `sort -o` or `patch` of it;
 - `git checkout`, `git restore`, `git rm` or `git mv` naming it;
-- a script that opens it for writing, run as a one-line `python -c`,
-  `perl -e`, `ruby -e`, `node -e` or `php -r` program or fed to one in a
-  heredoc;
+- a script that writes it -- opens it for writing, writes, appends to,
+  deletes, renames or copies onto it, by its name or through a variable the
+  name is assigned to -- run as a one-line `python -c`, `perl -e`, `ruby -e`,
+  `node -e` or `php -r` program or fed to one in a heredoc; a script that only
+  reads the file and writes another one is not refused;
 
 including inside `bash -c`, `sh -c` and `eval`, after a `cd` in the same
 command, and by an absolute path inside the workspace. It errs toward letting
 a command through: a path built from a variable or a command substitution
 (`"$PWD/plan.md"`, `$(git rev-parse --show-toplevel)/plan.md`) or, inside a
-program, assembled from pieces or mentioned inside a longer string, a writer tool
+program, assembled from pieces, mentioned inside a longer string or reached
+through a list, a loop, a dictionary or a function's parameter, a writer tool
 it does not know (`gsed`, `awk -i inplace`, `vim`, `curl -o`, a formatter, a
 script run from a file) and a relative path after a `pushd`, or after a `cd`
 made by an earlier command (the hook is not told the session's working
@@ -2148,11 +2151,12 @@ hint:
 
 ```text
 agent-coherence-transfer: notes.md not transferred (handoff_not_held)
-agent-coherence-transfer: hint: a Claude Code session's write grant ends when its turn ends. If an earlier transfer of notes.md may have landed, check its handoff in agent-coherence-status first: a handoff from this session to that successor made at the version it held, live or ended, means it landed, so do not transfer again, and if it shows another session's handoff, ask before transferring; otherwise have the giver session read notes.md, then transfer it again
+agent-coherence-transfer: hint: a Claude Code session's write grant ends when its turn ends. If an earlier transfer of notes.md may have landed, check the path's handoff in agent-coherence-status output first: a handoff from this session to that successor made at the version it held, live or ended, means it landed, so do not transfer again, and if it shows another session's handoff, ask before transferring; otherwise have the giver session read notes.md, then transfer it again (on a strict-mode path that read is denied: hand the path on in the same turn as its edit)
 ```
 
-On a strict-mode path the hint's `Read` is denied and grants nothing; see
-[Claude Code sessions](#claude-code-sessions) for what a shell read does there.
+On a strict-mode path the hint's `Read` is denied and grants nothing, as the
+hint's last clause says; see [Claude Code sessions](#claude-code-sessions) for
+what a shell read does there.
 
 **Python coordinator only.** Against the Claude Code plugin's Node coordinator
 the commands exit `4`. A plugin workspace created fresh runs the Node
@@ -2180,6 +2184,13 @@ The age, from the record's creation time, shows on the operator view only
 (`--detail full`, the default). With no record, the output is exactly what it
 was before. `--json` prints the `handoff` key as the coordinator sends it.
 
+This is the Python console script's view. Where the Claude Code plugin's
+`agent-coherence-status` comes first on the Bash tool's `PATH`, the command runs
+the plugin's own status view instead: it prints the coordinator's `/status`
+JSON, has no Handoffs block, and rejects `--json`. There, a handed-off path's
+record is the `handoff` key of its `tracked_artifacts` entry, and each session's
+full agent id is in `sessions`.
+
 ### Example: handing a file between Claude Code sessions
 
 Session A has been editing `plan.md`, and session B will carry on with it. Both
@@ -2199,7 +2210,9 @@ run in one workspace with the plugin's hooks and the Python coordinator.
    and claimed B's principal, which is what lets the coordinator know B (see
    [Naming the successor](#naming-the-successor)). `agent-coherence-status`
    also shows each session's agent id, cut to eight characters, beside its
-   session name, `claude-session-<session id>`; `--json` gives the whole id.
+   session name, `claude-session-<session id>`; the Python console script's
+   `--json`, or the plugin's status command, gives the whole id (see
+   [Handoffs in `agent-coherence-status`](#handoffs-in-agent-coherence-status)).
 2. **Hand the file on from A, in the turn of its edit.** Right after A edits
    `plan.md`, have it run:
 
@@ -2214,7 +2227,8 @@ run in one workspace with the plugin's hooks and the Python coordinator.
 
 3. **Check it.** `agent-coherence-status` lists
    `plan.md: bd35b34c → 6e271ee6 at version 2 (pending, 0s ago)` under
-   Handoffs.
+   Handoffs; through the plugin's status command, the same record is the
+   `handoff` key of `plan.md`'s `tracked_artifacts` entry.
 4. **A stops.** An Edit of `plan.md` from A is now denied:
 
    ```text
@@ -2503,13 +2517,18 @@ refused because of it.
 - **A Claude Code giver's shell write is denied only in the forms the Bash
   hook recognizes.** The common ones are denied as an edit is, in warn and
   strict mode: a redirection or `tee` (`echo … >> plan.md`), an in-place
-  `sed -i` or `perl -i`, a `cp` or `mv` onto the file, and a script that opens
-  it for writing, run as a one-line program or fed to one in a heredoc (see
-  [Claude Code sessions](#claude-code-sessions)). Not covered: a path built
-  from a variable or a command substitution, a writer tool the hook does not
-  know (`gsed`, `awk -i inplace`, `vim`, `curl -o`, a formatter, a script run
-  from a file), and a relative path after a `cd` made by an earlier command.
-  Such a write lands on disk without a version.
+  `sed -i` or `perl -i`, a `cp` or `mv` onto the file, and a script that
+  writes it, by name or through a variable, run as a one-line program or fed
+  to one in a heredoc (see [Claude Code sessions](#claude-code-sessions)).
+  Not covered: a path built from a variable or a command substitution, or,
+  inside a script, built from pieces or reached through a list, a loop, a
+  dictionary or a function's parameter; a writer tool the hook does not know
+  (`gsed`, `awk -i inplace`, `vim`, `curl -o`, a formatter, a script run from
+  a file); and a relative path after a `cd` made by an earlier command.
+  Such a write lands on disk without a version. So does a recognized one when
+  the coordinator cannot answer the check in time (it is slow or overloaded,
+  or its registry fails): the command runs, and unlike a giver's `Edit`, whose
+  commit is then refused, nothing refuses the shell write afterwards.
 - **An edit in flight at the transfer lands without a version.** So does one
   admitted while the coordinator was degraded. See
   [Claude Code sessions](#claude-code-sessions).

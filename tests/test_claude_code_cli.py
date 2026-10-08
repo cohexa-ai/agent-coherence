@@ -1178,12 +1178,13 @@ _EXIT_DONE, _EXIT_USAGE, _EXIT_FAILED, _EXIT_NOT_SERVED = 0, 1, 2, 4
 
 _NOT_HELD_HINT = (
     "hint: a Claude Code session's write grant ends when its turn ends. If an "
-    "earlier transfer of plan.md may have landed, check its handoff in "
-    "agent-coherence-status first: a handoff from this session to that "
+    "earlier transfer of plan.md may have landed, check the path's handoff in "
+    "agent-coherence-status output first: a handoff from this session to that "
     "successor made at the version it held, live or ended, means it landed, so "
     "do not transfer again, and if it shows another session's handoff, ask "
     "before transferring; otherwise have the giver session read plan.md, then "
-    "transfer it again"
+    "transfer it again (on a strict-mode path that read is denied: hand the "
+    "path on in the same turn as its edit)"
 )
 
 _VERB_RUNS = {
@@ -1530,6 +1531,42 @@ def test_a_transfer_after_the_givers_turn_ended_is_not_held_with_a_hint_and_a_pr
     handoff = _handoff_on(workspace, "plan.md")
     assert handoff is not None
     assert (handoff["hold_shape"], handoff["version_at_transfer"]) == ("SHARED", 2)
+
+
+@pytest.mark.parametrize(("verb", "party", "taken", "status"), [
+    ("accept", "successor", "accepted", "completed"),
+    ("decline", "successor", "declined", "declined"),
+    ("withdraw", "giver", "withdrew", "withdrawn"),
+])
+def test_a_settling_verb_that_lands_exits_0_and_says_what_it_did(
+    live_coordinator, capsys: pytest.CaptureFixture[str],
+    verb: str, party: str, taken: str, status: str,
+) -> None:
+    """Against a live coordinator, after a real transfer, accept and decline
+    run as the successor and withdraw as the giver: each exits 0, prints the
+    one line saying what it did with the record's new status, and the record
+    reads that status. Fails if a verb reports success with another verb's
+    wording (a decline that tells the model it accepted) or with a wrong
+    exit code."""
+    workspace, _ = live_coordinator
+    giver, successor = str(uuid.uuid4()), str(uuid.uuid4())
+    _hook(workspace, "/hooks/pre-read", {"session_id": successor, "path": "spec.md"})
+    _hook(workspace, "/hooks/pre-read", {"session_id": giver, "path": "plan.md"})
+    assert coherence_handoff.transfer_main([
+        "--root", str(workspace), "--session", giver,
+        "--successor", _session_agent(successor), "plan.md",
+    ]) == _EXIT_DONE
+    capsys.readouterr()
+
+    acting = giver if party == "giver" else successor
+    rc = _VERB_RUNS[verb](["--root", str(workspace), "--session", acting, "plan.md"])
+
+    captured = capsys.readouterr()
+    assert rc == _EXIT_DONE, captured.err
+    assert (
+        f"agent-coherence-{verb}: {taken} the handoff of plan.md (status {status})"
+    ) in captured.out.splitlines(), captured.out
+    assert _handoff_on(workspace, "plan.md")["status"] == status
 
 
 def test_the_subagent_flag_transfers_a_grant_the_subagent_holds(

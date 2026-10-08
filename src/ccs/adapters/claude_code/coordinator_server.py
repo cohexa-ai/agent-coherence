@@ -5472,7 +5472,8 @@ def _attach_hook_handoff(
     observed: int | None = None,
 ) -> dict:
     """The pre-read and pre-edit seam for a handoff, from ONE
-    read of the record.
+    read of the record: :func:`_attach_handoff_key`'s, best-effort like it,
+    so a failed read answers ``result`` with neither the key nor the prose.
 
     A deny is returned untouched: a strict deny keeps the corpus's bytes, and
     the giver's deny carries its own key. Every other arm gets the
@@ -5480,30 +5481,16 @@ def _attach_hook_handoff(
     role's prose through the context-only envelope -- never the allow
     emitter, which would widen a permission decision. ``acquired`` marks the
     pre-edit's acquire, where ``observed`` (this agent's last observed
-    version before it) decides the successor's read-first warning.
-
-    Best-effort, as :func:`_attach_handoff_key`: the grant or the popped
-    notices in ``result`` already landed, so a failed read of the record
-    answers ``result`` as it is, with neither the key nor the prose."""
+    version before it) decides the successor's read-first warning."""
     if _is_deny(result):
         return result
-    try:
-        read = _read_handoff(coordinator, path)
-        if read is None:
-            return result
-        record, live = read
-        projection = _handoff_projection(record, live=live, caller=caller)
-    except Exception:  # noqa: BLE001 — any raise; the landed answer stands
-        logger.warning(
-            "handoff key not attached for %r after the answer was decided", path, exc_info=True
-        )
+    result = _attach_handoff_key(coordinator, result, path=path, caller=caller)
+    projection = result.get("handoff")
+    # No key, or a refusal body (``ok: false``), which gets the key only: the
+    # admit test is the one the re-grounding attach uses.
+    if projection is None or not _reground_qualifies(result):
         return result
-    result = {**result, "handoff": projection}
-    # The admit test the re-grounding attach uses: an allow envelope, or a
-    # bare admit body. A refusal body (``ok: false``) gets the key only.
-    if not _reground_qualifies(result):
-        return result
-    unread = acquired and (observed is None or observed < record.version_at_transfer)
+    unread = acquired and (observed is None or observed < projection["version_at_transfer"])
     text = _payloads.handoff_context_text(projection, path=path, unread=unread)
     return result if text is None else _attach_pretooluse_context(result, text)
 
@@ -7556,10 +7543,15 @@ def _reground_qualifies(result: dict) -> bool:
     (AE3). An envelope-less response qualifies iff it is an admit body —
     ``{ok: true}`` (pre-edit) or ``{status: "fresh"}`` (pre-read /
     pre-bash / pre-grep). A service-refusal body (``{ok: false, ...}``)
-    is neither a deny envelope nor an admit: no attach, no consume."""
+    is neither a deny envelope nor an admit: no attach, no consume.
+
+    A CONTEXT-ONLY envelope (no permission decision; the handoff prose
+    puts one on a bare admit) decides nothing, so it qualifies exactly as
+    the body under it would: otherwise prose on an admit would hold the
+    re-grounding back past every touch of a handed-off path."""
     hso = result.get("hookSpecificOutput")
-    if hso is not None:
-        return hso.get("permissionDecision") == "allow"
+    if hso is not None and "permissionDecision" in hso:
+        return hso["permissionDecision"] == "allow"
     return result.get("ok") is True or result.get("status") == "fresh"
 
 
@@ -7613,22 +7605,15 @@ def _claim_reground_context(
         return None
 
 
-def _attach_reground(result: dict, text: str) -> dict:
-    """SB-10 U4: merge the claimed re-grounding prose into a qualifying
-    admit response. An existing envelope keeps its text AND its existing
-    permission decision, and gets the block appended AFTER it (notices and
-    stale warnings render first — KTD6 ordering); a bare admit body gains
-    a CONTEXT-ONLY PreToolUse envelope. The deferred path rides the
-    PreToolUse shape — never the SessionStart ``hookSpecificOutput``
-    shape."""
-    return _attach_pretooluse_context(result, text)
-
-
 def _attach_pretooluse_context(result: dict, text: str) -> dict:
     """Merge advisory prose into an admit response: appended after an
     existing envelope's text, keeping its permission decision, or carried by
     a CONTEXT-ONLY PreToolUse envelope on a bare admit body. The one merge
-    rule the deferred re-grounding and the handoff prose (#185) share."""
+    rule the deferred re-grounding (SB-10 U4) and the handoff prose (#185)
+    share. Appending is what orders the blocks (KTD6): notices and stale
+    warnings render first, then the handoff prose, then the re-grounding,
+    which is attached last. Always the PreToolUse shape, never the
+    SessionStart ``hookSpecificOutput`` shape."""
     hso = result.get("hookSpecificOutput")
     if hso is None:
         # WHY context-only rather than emit_allow: re-grounding is
@@ -7726,7 +7711,7 @@ def _deliver_pending_reground(
     text = _claim_reground_context(coordinator, session_id, body, abort=abort)
     if text is None:
         return result
-    return _attach_reground(result, text)
+    return _attach_pretooluse_context(result, text)
 
 
 def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> str | None:
