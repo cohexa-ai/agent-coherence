@@ -2364,15 +2364,20 @@ def test_status_snapshot_reclaim_slots_name_only_the_reclaimed_pair(db_path: Pat
         assert _reclaim_slots(reg) == {plan.id: {stale: ("reclaim_heartbeat", 100)}}
 
 
-def test_status_snapshot_opt_ins_append_in_a_fixed_order(db_path: Path) -> None:
-    """Each opt-in adds one element: the transfer rows first, the reclaim
-    slots last, and the default call keeps its two-element answer."""
+def test_status_snapshot_opt_ins_keep_fixed_positions(db_path: Path) -> None:
+    """Each element has one index whatever else was asked for: the transfer
+    rows at [2], the reclaim slots at [3]. Asking for the reclaim slots
+    without the transfer rows leaves [2] empty rather than moving the slots
+    into it; the default and transfer-only answers keep their dev shapes."""
     with SqliteArtifactRegistry(db_path) as reg:
         _, artifact, agent = _swept_holder(reg)
         slots = {artifact.id: {agent: ("reclaim_heartbeat", 100)}}
         assert len(reg.status_snapshot()) == 2
-        assert reg.status_snapshot(include_transfers=True)[2] == {}
-        assert reg.status_snapshot(include_reclamations=True)[2] == slots
+        transfers_only = reg.status_snapshot(include_transfers=True)
+        assert len(transfers_only) == 3 and transfers_only[2] == {}
+        reclamations_only = reg.status_snapshot(include_reclamations=True)
+        assert len(reclamations_only) == 4
+        assert reclamations_only[2] == {} and reclamations_only[3] == slots
         both = reg.status_snapshot(include_transfers=True, include_reclamations=True)
         assert len(both) == 4
         assert both[2] == {} and both[3] == slots

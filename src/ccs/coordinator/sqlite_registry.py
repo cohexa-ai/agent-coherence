@@ -3714,7 +3714,7 @@ class SqliteArtifactRegistry:
         call on an artifact-heavy workspace stays O(all artifacts) however
         small the session is.
 
-        ``include_transfers`` (#185) adds an element,
+        ``include_transfers`` (#185) fills element ``[2]``,
         ``{artifact_id: (TransferRecord, live)}`` for every artifact that has
         a transfer record, read by a third query inside the same lock hold and
         judged by the one liveness helper, so each record's liveness matches
@@ -3722,17 +3722,19 @@ class SqliteArtifactRegistry:
         answers the two-element tuple, and the session-start builder, which
         renders no record, never pays for the read. Only ``/status`` opts in.
 
-        ``include_reclamations`` (#195) adds a last element,
+        ``include_reclamations`` (#195) fills element ``[3]``,
         ``{artifact_id: {agent_id: (trigger, tick)}}`` for every pair carrying
-        a reclaim slot. The slot columns ride the agent-state SELECT itself,
-        so each pair's slot and state come from the same row and no second
-        read lets a reclaim land between them. Off by default, like the
-        transfer rows; only ``/status`` opts in.
+        a reclaim slot, and always answers four elements: without
+        ``include_transfers``, ``[2]`` is an empty dict, so neither element's
+        index depends on the other flag. The slot columns ride the agent-state
+        SELECT itself, so each pair's slot and state come from the same row
+        and no second read lets a reclaim land between them. Off by default,
+        like the transfer rows; only ``/status`` opts in.
         """
         artifact_by_id: dict[UUID, dict[str, Any]] = {}
         state_by_artifact: dict[UUID, dict[UUID, MESIState]] = {}
         reclamation_by_artifact: dict[UUID, dict[UUID, ReclamationSlot]] = {}
-        extras: list[Any] = []
+        transfer_by_artifact: dict[UUID, tuple[TransferRecord, bool]] = {}
         columns = "artifact_id, agent_id, state"
         if include_reclamations:
             columns += ", last_reclaim_trigger, last_reclaim_tick"
@@ -3773,16 +3775,18 @@ class SqliteArtifactRegistry:
                 if include_reclamations and row[3] is not None:
                     reclamation_by_artifact.setdefault(aid, {})[gid] = (row[3], row[4])
             if include_transfers:
-                extras.append({
+                transfer_by_artifact = {
                     record.artifact_id: (record, live)
                     for record, live in map(
                         self._transfer_read_from_row,
                         self._conn.execute(_TRANSFER_READ_ALL_SQL).fetchall(),
                     )
-                })
-            if include_reclamations:
-                extras.append(reclamation_by_artifact)
-        return (artifact_by_id, state_by_artifact, *extras)
+                }
+        if include_reclamations:
+            return (artifact_by_id, state_by_artifact, transfer_by_artifact, reclamation_by_artifact)
+        if include_transfers:
+            return artifact_by_id, state_by_artifact, transfer_by_artifact
+        return artifact_by_id, state_by_artifact
 
     def get_agent_state(self, artifact_id: UUID, agent_id: UUID) -> MESIState | None:
         """Return MESI state for one agent/artifact pair if present."""
