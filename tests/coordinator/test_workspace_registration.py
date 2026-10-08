@@ -19,12 +19,20 @@ parity-proven:
 - HELD batches surface as the typed ``refused`` (``other_holder`` /
   ``stale_read_generation`` — the fence rejecting a superseded controller);
 - the abort Event threads into the commit path (A6) and fails it closed;
-- the new ``registered`` restore status round-trips both registries.
+- the new ``registered`` restore status round-trips both registries;
+- #191: a write-set is checked against the manifest (membership AND the
+  captured fingerprint) before anything resolves, the optional receiver binds
+  who may register, and the first registering controller claims the
+  checkpoint — a different controller is refused ``already_registered``, the
+  same one retries idempotently and is told so.
 """
 
 from __future__ import annotations
 
+import sys
 import threading
+import time
+import warnings
 from pathlib import Path
 from uuid import uuid4
 
@@ -35,12 +43,17 @@ from ccs.coordinator.registry_protocol import CheckpointMember
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import (
+    CHECKPOINT_ALREADY_REGISTERED_REASON,
+    CHECKPOINT_FINGERPRINT_MISMATCH_REASON,
+    CHECKPOINT_NOT_A_MEMBER_REASON,
+    CHECKPOINT_NOT_THE_RECEIVER_REASON,
     CHECKPOINT_UNKNOWN_REASON,
     RESTORE_STATUS_REGISTERED,
     STALE_READ_GENERATION_REASON,
     WORKSPACE_REGISTRATION_COMMITTED,
     WORKSPACE_REGISTRATION_EMPTY,
     WORKSPACE_REGISTRATION_REFUSED,
+    CheckpointRegistrationRefused,
     CheckpointUnknown,
     WatchdogAbandoned,
 )
@@ -81,21 +94,36 @@ def service(registry) -> _CountingService:
     return _CountingService(registry)
 
 
-def _mint_checkpoint(service: CoordinatorService) -> str:
-    member = CheckpointMember(
-        member_path="notes/plan.md",
+def _member(path: str, fingerprint: str | None) -> CheckpointMember:
+    return CheckpointMember(
+        member_path=path,
         artifact_id=None,
         native_token="7",
-        fingerprint=FP_NEW,
+        fingerprint=fingerprint,
         captured_at=100.0,
     )
+
+
+def _mint_checkpoint(
+    service: CoordinatorService,
+    members: "dict[str, str | None] | None" = None,
+    *,
+    receiver=None,
+) -> str:
+    """A checkpoint over ``members`` ({path: captured fingerprint}); by
+    default the one member ``notes/plan.md`` captured at ``FP_NEW``."""
+    rows = [
+        _member(path, fingerprint)
+        for path, fingerprint in (members or {"notes/plan.md": FP_NEW}).items()
+    ]
     record = service.create_workspace_checkpoint(
         name="reg-cp",
         owner=OWNER,
-        members=[member],
+        members=rows,
         window_min=100.0,
         window_max=100.0,
         issued_at_tick=101,
+        receiver=receiver,
     )
     return record.checkpoint_id
 
@@ -246,8 +274,13 @@ def test_hash_identical_member_skipped_no_bump(service, registry) -> None:
 
 def test_pessimistic_holder_refuses_batch_all_or_nothing(service, registry) -> None:
     """One member blocked by an M/E holder HOLDS the whole batch: nothing
-    registered, per-member typed reasons returned."""
-    checkpoint_id = _mint_checkpoint(service)
+    registered, per-member typed reasons returned. Both writes are members of
+    the checkpoint at their captured fingerprints (#191: a write outside the
+    manifest is refused before the batch is ever built)."""
+    checkpoint_id = _mint_checkpoint(
+        service,
+        {"notes/plan.md": FP_NEW, "docs/readme.md": sha256_hex(b"new-doc")},
+    )
     blocked = service.register_artifact(
         name="notes/plan.md", content="old-body", content_hash=FP_OLD
     )
@@ -425,3 +458,609 @@ def test_in_memory_first_observation_race_mints_one_artifact() -> None:
     assert len(named) == 1  # exactly one mint
     assert named[0].version == 1
     assert named[0].content_hash == FP_NEW
+
+
+# ---------------------------------------------------------------------------
+# #191 — the write-set must match the manifest (membership half)
+# ---------------------------------------------------------------------------
+
+
+def _register(service, checkpoint_id: str, controller, *writes):
+    return service.register_workspace_restore(
+        checkpoint_id=checkpoint_id,
+        controller=controller,
+        writes=tuple(WorkspaceRestoreWrite(path, fp) for path, fp in writes),
+    )
+
+
+def _refusal(service, checkpoint_id: str, controller, *writes):
+    with pytest.raises(CheckpointRegistrationRefused) as excinfo:
+        _register(service, checkpoint_id, controller, *writes)
+    return excinfo.value
+
+
+def test_non_member_path_refused_before_any_mint(service, registry) -> None:
+    """The issue's first case: ``secrets/other.md`` is not in the manifest.
+    Refused typed, and the refusal lands BEFORE resolution — the coordinator
+    never saw the path, and still has no artifact for it afterwards."""
+    checkpoint_id = _mint_checkpoint(service)
+    ids_before = set(registry.artifact_ids())
+
+    exc = _refusal(
+        service,
+        checkpoint_id,
+        OWNER,
+        ("notes/plan.md", FP_NEW),
+        ("secrets/other.md", FP_NEW),
+    )
+
+    assert exc.reason is CHECKPOINT_NOT_A_MEMBER_REASON
+    assert exc.member_paths == ("secrets/other.md",)
+    assert set(registry.artifact_ids()) == ids_before  # nothing minted
+    assert service.commit_all_calls == 0
+    # A refused registration claims nothing: the checkpoint is still open.
+    assert registry.get_checkpoint(checkpoint_id).registered_by is None
+
+
+def test_non_member_path_never_bumps_a_known_artifact(service, registry) -> None:
+    """A known artifact outside the manifest is not version-bumped and its
+    peers are not invalidated."""
+    checkpoint_id = _mint_checkpoint(service)
+    other = service.register_artifact(
+        name="secrets/other.md", content="x", content_hash=FP_OLD
+    )
+    peer = uuid4()
+    registry.set_agent_state(other.id, peer, MESIState.SHARED, trigger="fetch", tick=1)
+
+    exc = _refusal(service, checkpoint_id, OWNER, ("secrets/other.md", FP_NEW))
+
+    assert exc.reason is CHECKPOINT_NOT_A_MEMBER_REASON
+    assert registry.get_artifact(other.id).version == 1
+    assert registry.get_artifact(other.id).content_hash == FP_OLD
+    assert registry.get_agent_state(other.id, peer) == MESIState.SHARED
+
+
+def test_member_at_foreign_fingerprint_refused(service, registry) -> None:
+    """The issue's third case: a member at a fingerprint of the caller's own
+    choosing used to commit forward (v3). The captured fingerprint is the
+    only one a restore registers."""
+    checkpoint_id = _mint_checkpoint(service)
+    artifact = service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=FP_OLD
+    )
+
+    exc = _refusal(
+        service, checkpoint_id, OWNER, ("notes/plan.md", sha256_hex(b"mine"))
+    )
+
+    assert exc.reason is CHECKPOINT_FINGERPRINT_MISMATCH_REASON
+    assert exc.member_paths == ("notes/plan.md",)
+    assert registry.get_artifact(artifact.id).version == 1
+    assert registry.get_artifact(artifact.id).content_hash == FP_OLD
+    assert service.commit_all_calls == 0
+
+
+def test_member_captured_without_fingerprint_matches_nothing(service, registry) -> None:
+    """A member captured absent (or forward-only) has no fingerprint, so no
+    write can register it — and nothing is minted for it either."""
+    checkpoint_id = _mint_checkpoint(service, {"gone.md": None})
+    ids_before = set(registry.artifact_ids())
+
+    exc = _refusal(service, checkpoint_id, OWNER, ("gone.md", FP_NEW))
+
+    assert exc.reason is CHECKPOINT_FINGERPRINT_MISMATCH_REASON
+    assert set(registry.artifact_ids()) == ids_before
+
+
+def test_membership_refusal_is_all_or_nothing(service, registry) -> None:
+    """One bad write refuses the whole write-set: the good member is neither
+    minted nor committed."""
+    checkpoint_id = _mint_checkpoint(
+        service, {"notes/plan.md": FP_NEW, "docs/readme.md": FP_NEW}
+    )
+    ids_before = set(registry.artifact_ids())
+
+    exc = _refusal(
+        service,
+        checkpoint_id,
+        OWNER,
+        ("notes/plan.md", FP_NEW),
+        ("docs/readme.md", FP_OLD),
+    )
+
+    assert exc.reason is CHECKPOINT_FINGERPRINT_MISMATCH_REASON
+    assert exc.member_paths == ("docs/readme.md",)
+    assert set(registry.artifact_ids()) == ids_before
+
+
+# ---------------------------------------------------------------------------
+# #191 — who may register (receiver / owner half)
+# ---------------------------------------------------------------------------
+
+
+def test_owner_authorizes_nothing_any_controller_may_register(service, registry) -> None:
+    """Q1: with no receiver named, a controller other than the one that took
+    the checkpoint registers it — a handoff is the point of a checkpoint.
+    ``owner`` is provenance and is never compared."""
+    checkpoint_id = _mint_checkpoint(service)
+    receiver = uuid4()
+
+    result = _register(service, checkpoint_id, receiver, ("notes/plan.md", FP_NEW))
+
+    assert result.status is WORKSPACE_REGISTRATION_EMPTY
+    assert result.retry_of_own_registration is False
+    assert registry.get_checkpoint(checkpoint_id).registered_by == receiver
+    assert registry.get_checkpoint(checkpoint_id).owner == OWNER
+
+
+def test_second_controller_refused_already_registered(service, registry) -> None:
+    """The issue's second case, and plan B7: a second register of the same
+    checkpoint by an unrelated controller used to get a success-shaped
+    ``empty_write_set``. It is now refused, typed, naming nobody."""
+    checkpoint_id = _mint_checkpoint(service)
+    artifact = service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=FP_OLD
+    )
+    first = _register(service, checkpoint_id, OWNER, ("notes/plan.md", FP_NEW))
+    assert first.status is WORKSPACE_REGISTRATION_COMMITTED
+    assert first.retry_of_own_registration is False
+
+    intruder = uuid4()
+    exc = _refusal(service, checkpoint_id, intruder, ("notes/plan.md", FP_NEW))
+
+    assert exc.reason is CHECKPOINT_ALREADY_REGISTERED_REASON
+    assert exc.member_paths == ()
+    # The refusal names nobody: neither the registrant nor the intruder.
+    assert str(OWNER) not in str(exc) and OWNER.hex not in str(exc)
+    assert str(intruder) not in str(exc)
+    assert registry.get_artifact(artifact.id).version == 2  # untouched by B
+    assert registry.get_checkpoint(checkpoint_id).registered_by == OWNER
+
+
+def test_same_controller_retry_is_idempotent_and_says_so(service, registry) -> None:
+    """Q3: a retry by the controller that registered stays idempotent (no
+    second bump) and its result says it was a retry of its own registration
+    — "I registered this" is distinguishable from "someone else did"."""
+    checkpoint_id = _mint_checkpoint(service)
+    service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=FP_OLD
+    )
+    first = _register(service, checkpoint_id, OWNER, ("notes/plan.md", FP_NEW))
+    again = _register(service, checkpoint_id, OWNER, ("notes/plan.md", FP_NEW))
+
+    assert first.status is WORKSPACE_REGISTRATION_COMMITTED
+    assert first.retry_of_own_registration is False
+    assert again.status is WORKSPACE_REGISTRATION_EMPTY
+    assert again.skipped == ("notes/plan.md",)
+    assert again.retry_of_own_registration is True
+    assert _artifact_named(registry, "notes/plan.md").version == 2
+    assert service.commit_all_calls == 1
+
+
+def test_empty_write_set_claims_the_checkpoint(service, registry) -> None:
+    """An empty write-set is still a registration of the checkpoint: it
+    claims it, so a second controller is refused the same way."""
+    checkpoint_id = _mint_checkpoint(service)
+    first = _register(service, checkpoint_id, OWNER)
+    assert first.status is WORKSPACE_REGISTRATION_EMPTY
+    assert registry.get_checkpoint(checkpoint_id).registered_by == OWNER
+
+    exc = _refusal(service, checkpoint_id, uuid4())
+    assert exc.reason is CHECKPOINT_ALREADY_REGISTERED_REASON
+    assert _register(service, checkpoint_id, OWNER).retry_of_own_registration is True
+
+
+def test_named_receiver_binds_the_registration(service, registry) -> None:
+    """A receiver named at creation is the only controller that may register;
+    the owner itself is refused, and a refused attempt claims nothing."""
+    receiver = uuid4()
+    checkpoint_id = _mint_checkpoint(service, receiver=receiver)
+    assert registry.get_checkpoint(checkpoint_id).receiver == receiver
+    ids_before = set(registry.artifact_ids())
+
+    for stranger in (OWNER, uuid4()):
+        exc = _refusal(service, checkpoint_id, stranger, ("notes/plan.md", FP_NEW))
+        assert exc.reason is CHECKPOINT_NOT_THE_RECEIVER_REASON
+        assert exc.member_paths == ()
+    assert set(registry.artifact_ids()) == ids_before
+    assert registry.get_checkpoint(checkpoint_id).registered_by is None
+
+    result = _register(service, checkpoint_id, receiver, ("notes/plan.md", FP_NEW))
+    assert result.status is WORKSPACE_REGISTRATION_EMPTY
+    assert registry.get_checkpoint(checkpoint_id).registered_by == receiver
+
+
+def test_receiver_check_precedes_membership(service, registry) -> None:
+    """A non-receiver learns only that it is not the receiver — the write-set
+    is not evaluated for it."""
+    checkpoint_id = _mint_checkpoint(service, receiver=uuid4())
+    exc = _refusal(service, checkpoint_id, OWNER, ("secrets/other.md", FP_NEW))
+    assert exc.reason is CHECKPOINT_NOT_THE_RECEIVER_REASON
+
+
+def test_claim_survives_a_held_registration(service, registry) -> None:
+    """The claim is sticky: a registration whose batch HELDs keeps it, so the
+    same controller re-drives and nobody else takes the checkpoint mid-retry."""
+    checkpoint_id = _mint_checkpoint(service)
+    artifact = service.register_artifact(
+        name="notes/plan.md", content="old-body", content_hash=FP_OLD
+    )
+    holder = uuid4()
+    registry.set_agent_state(
+        artifact.id, holder, MESIState.EXCLUSIVE, trigger="write", tick=1
+    )
+    held = _register(service, checkpoint_id, OWNER, ("notes/plan.md", FP_NEW))
+    assert held.status is WORKSPACE_REGISTRATION_REFUSED
+
+    exc = _refusal(service, checkpoint_id, uuid4(), ("notes/plan.md", FP_NEW))
+    assert exc.reason is CHECKPOINT_ALREADY_REGISTERED_REASON
+
+    registry.set_agent_state(
+        artifact.id, holder, MESIState.INVALID, trigger="release", tick=2
+    )
+    retried = _register(service, checkpoint_id, OWNER, ("notes/plan.md", FP_NEW))
+    assert retried.status is WORKSPACE_REGISTRATION_COMMITTED
+    assert retried.retry_of_own_registration is True
+
+
+def test_concurrent_claim_loser_refused_before_resolution(
+    service, registry, monkeypatch
+) -> None:
+    """The race: both controllers pass the header pre-check, one claims first.
+    The loser is refused by the atomic claim — still before resolution, so it
+    mints and commits nothing."""
+    checkpoint_id = _mint_checkpoint(service)
+    stale_header = registry.get_checkpoint(checkpoint_id)
+    winner = uuid4()
+    assert registry.claim_checkpoint_registration(checkpoint_id, winner) == (
+        winner,
+        True,
+    )
+    # The loser read the header before the winner's claim landed.
+    monkeypatch.setattr(registry, "get_checkpoint", lambda _cid: stale_header)
+    ids_before = set(registry.artifact_ids())
+
+    exc = _refusal(service, checkpoint_id, OWNER, ("notes/plan.md", FP_NEW))
+
+    assert exc.reason is CHECKPOINT_ALREADY_REGISTERED_REASON
+    assert set(registry.artifact_ids()) == ids_before
+    assert service.commit_all_calls == 0
+
+
+def test_abort_event_fails_the_claim_closed(service, registry) -> None:
+    """A6: the claim is a durable write, so a pre-set abort Event fails it
+    closed — a watchdog-abandoned request claims nothing."""
+    checkpoint_id = _mint_checkpoint(service)
+    abort = threading.Event()
+    abort.set()
+    with pytest.raises(WatchdogAbandoned):
+        service.register_workspace_restore(
+            checkpoint_id=checkpoint_id,
+            controller=OWNER,
+            writes=(WorkspaceRestoreWrite("notes/plan.md", FP_NEW),),
+            abort=abort,
+        )
+    assert registry.get_checkpoint(checkpoint_id).registered_by is None
+
+
+@pytest.mark.parametrize(
+    "write",
+    [("secrets/other.md", FP_NEW), ("notes/plan.md", FP_OLD)],
+    ids=["non_member", "fingerprint_mismatch"],
+)
+def test_already_registered_precedes_membership(service, registry, write) -> None:
+    """Step 2 before step 3: once another controller holds the claim, an
+    intruder learns only ``already_registered`` — its write-set (a stranger
+    path, or a member at a foreign fingerprint) is not evaluated for it."""
+    checkpoint_id = _mint_checkpoint(service)
+    _register(service, checkpoint_id, OWNER, ("notes/plan.md", FP_NEW))
+
+    exc = _refusal(service, checkpoint_id, uuid4(), write)
+
+    assert exc.reason is CHECKPOINT_ALREADY_REGISTERED_REASON
+    assert exc.member_paths == ()
+
+
+def test_concurrent_own_retry_reports_retry_from_the_claim(
+    service, registry, monkeypatch
+) -> None:
+    """Two concurrent registers by ONE controller: both read the header
+    unclaimed, the other call claims first. The second is a retry of its own
+    registration and must say so — the flag comes from the atomic claim, not
+    from the header it read before claiming."""
+    checkpoint_id = _mint_checkpoint(service)
+    real_get = registry.get_checkpoint
+
+    def _read_then_overlap(cid):
+        record = real_get(cid)
+        registry.claim_checkpoint_registration(cid, OWNER)
+        return record
+
+    monkeypatch.setattr(registry, "get_checkpoint", _read_then_overlap)
+    result = _register(service, checkpoint_id, OWNER, ("notes/plan.md", FP_NEW))
+
+    assert result.retry_of_own_registration is True
+
+
+# ---------------------------------------------------------------------------
+# #191 — the restore progress writes are gated like the registration
+# ---------------------------------------------------------------------------
+
+
+def _progress_writes(service, checkpoint_id: str, controller):
+    """The two progress writes a restore makes, each by ``controller``."""
+    return (
+        lambda: service.set_workspace_checkpoint_restore_status(
+            checkpoint_id, "concluded", updated_at=5.0, controller=controller
+        ),
+        lambda: service.set_workspace_checkpoint_member_restore(
+            checkpoint_id,
+            "notes/plan.md",
+            restore_outcome="restored",
+            deleted_at_restore=5.0,
+            controller=controller,
+        ),
+    )
+
+
+def test_non_receiver_cannot_drive_restore_progress(service, registry) -> None:
+    """A controller the receiver binding excludes cannot conclude the
+    checkpoint or record member outcomes (deletes register here) — which
+    would turn the receiver's own restore into a no-op."""
+    receiver = uuid4()
+    checkpoint_id = _mint_checkpoint(service, receiver=receiver)
+    for write in _progress_writes(service, checkpoint_id, uuid4()):
+        with pytest.raises(CheckpointRegistrationRefused) as excinfo:
+            write()
+        assert excinfo.value.reason is CHECKPOINT_NOT_THE_RECEIVER_REASON
+    record = registry.get_checkpoint(checkpoint_id)
+    assert record.restore_status == "none"
+    assert record.registered_by is None
+    (member,) = registry.get_checkpoint_members(checkpoint_id)
+    assert member.restore_outcome is None and member.deleted_at_restore is None
+
+    for write in _progress_writes(service, checkpoint_id, receiver):
+        write()
+    assert registry.get_checkpoint(checkpoint_id).restore_status == "concluded"
+    # A progress write makes no claim.
+    assert registry.get_checkpoint(checkpoint_id).registered_by is None
+
+
+def test_rival_of_the_registrant_cannot_drive_restore_progress(
+    service, registry
+) -> None:
+    checkpoint_id = _mint_checkpoint(service)
+    _register(service, checkpoint_id, OWNER)
+    for write in _progress_writes(service, checkpoint_id, uuid4()):
+        with pytest.raises(CheckpointRegistrationRefused) as excinfo:
+            write()
+        assert excinfo.value.reason is CHECKPOINT_ALREADY_REGISTERED_REASON
+    for write in _progress_writes(service, checkpoint_id, OWNER):
+        write()
+
+
+def test_progress_controller_gate_unknown_checkpoint_is_keyerror(service) -> None:
+    for write in _progress_writes(service, "no-such-checkpoint", OWNER):
+        with pytest.raises(KeyError):
+            write()
+
+
+@pytest.mark.parametrize("which", [0, 1], ids=["status", "member"])
+def test_abort_event_fails_a_gated_progress_write_closed(service, registry, which) -> None:
+    """A6 on the progress writes: a pre-set abort Event fails a gated write
+    closed at the registry lock, so a watchdog-abandoned /restore/status or
+    /restore/member request writes nothing after its client was already told
+    the answer was degraded."""
+    checkpoint_id = _mint_checkpoint(service)
+    abort = threading.Event()
+    abort.set()
+    writes = (
+        lambda: service.set_workspace_checkpoint_restore_status(
+            checkpoint_id, "concluded", updated_at=5.0, controller=OWNER, abort=abort
+        ),
+        lambda: service.set_workspace_checkpoint_member_restore(
+            checkpoint_id,
+            "notes/plan.md",
+            restore_outcome="restored",
+            deleted_at_restore=5.0,
+            controller=OWNER,
+            abort=abort,
+        ),
+    )
+    with pytest.raises(WatchdogAbandoned):
+        writes[which]()
+    assert registry.get_checkpoint(checkpoint_id).restore_status == "none"
+    (member,) = registry.get_checkpoint_members(checkpoint_id)
+    assert member.restore_outcome is None and member.deleted_at_restore is None
+
+
+@pytest.mark.parametrize("which", [0, 1], ids=["status", "member"])
+def test_a_claim_cannot_land_between_the_progress_gate_and_its_write(
+    service, registry, monkeypatch, which
+) -> None:
+    """The progress gate's header read and the write it admits are one
+    critical section, so a rival's claim lands before the read (and the gate
+    refuses) or after the write, never between them. Between them, the gate
+    would admit a controller the claim has just excluded, and its write would
+    conclude or record members of a checkpoint another controller now owns.
+
+    The rival claims from another thread while the gate holds its read. With
+    the read inside the write's registry hold that claim waits for the write;
+    with the read outside it, the claim lands and the write follows it."""
+    checkpoint_id = _mint_checkpoint(service)
+    rival = uuid4()
+    real_get_checkpoint = registry.get_checkpoint
+    claimant = threading.Thread(
+        target=registry.claim_checkpoint_registration, args=(checkpoint_id, rival)
+    )
+    claimed_inside = False
+
+    def gate_read(cid: str):
+        nonlocal claimed_inside
+        record = real_get_checkpoint(cid)
+        if not claimant.is_alive() and claimant.ident is None:
+            claimant.start()
+            claimant.join(timeout=1.0)
+            claimed_inside = not claimant.is_alive()
+        return record
+
+    monkeypatch.setattr(registry, "get_checkpoint", gate_read)
+    write = _progress_writes(service, checkpoint_id, OWNER)[which]
+    try:
+        write()
+        landed = True
+    except CheckpointRegistrationRefused:
+        landed = False
+    claimant.join(timeout=10.0)
+
+    assert real_get_checkpoint(checkpoint_id).registered_by == rival
+    assert not (claimed_inside and landed), (
+        "the progress write landed after a rival's claim its gate never saw"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #191 — the registry claim primitive (parity across both backends)
+# ---------------------------------------------------------------------------
+
+
+def test_registry_claim_first_wins_and_never_rebinds(service, registry) -> None:
+    checkpoint_id = _mint_checkpoint(service)
+    first, second = uuid4(), uuid4()
+    assert registry.claim_checkpoint_registration(checkpoint_id, first) == (
+        first,
+        True,
+    )
+    assert registry.claim_checkpoint_registration(checkpoint_id, second) == (
+        first,
+        False,
+    )
+    assert registry.claim_checkpoint_registration(checkpoint_id, first) == (
+        first,
+        False,
+    )
+    assert registry.get_checkpoint(checkpoint_id).registered_by == first
+    (listed,) = registry.list_checkpoints()
+    assert listed.registered_by == first
+    with pytest.raises(KeyError):
+        registry.claim_checkpoint_registration("no-such-checkpoint", first)
+
+
+_CLAIMANTS = 6
+_CLAIM_ROUNDS = 64
+
+
+def _claim_round(handles: list, checkpoint_id: str, spans: list) -> list[tuple]:
+    """Release one claimant per handle together on a barrier; return each
+    claimant's ``(controller, holder, newly_claimed)`` and record its span."""
+    start = threading.Barrier(len(handles), timeout=5)
+    results: list[tuple] = []
+    failures: list[BaseException] = []
+
+    def _claim(handle, controller) -> None:
+        try:
+            start.wait()
+            began = time.perf_counter()
+            answer = handle.claim_checkpoint_registration(checkpoint_id, controller)
+            spans.append((began, time.perf_counter()))
+            results.append((controller, *answer))
+        except BaseException as exc:  # noqa: BLE001 — reported, not swallowed
+            failures.append(exc)
+
+    threads = [threading.Thread(target=_claim, args=(h, uuid4()), daemon=True) for h in handles]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive(), "a claimant never finished"
+    assert not failures, f"a claimant raised: {failures[0]!r}"
+    return results
+
+
+def _claims_overlapped(spans: list[tuple[float, float]]) -> bool:
+    ordered = sorted(spans)
+    return any(
+        later_start < earlier_end
+        for (_, earlier_end), (later_start, _) in zip(ordered, ordered[1:])
+    )
+
+
+@pytest.mark.parametrize("backend", ["in_memory", "sqlite"])
+def test_concurrent_claimants_have_exactly_one_winner(tmp_path: Path, backend: str) -> None:
+    """First-claim-wins under real concurrency: claimants released together on
+    a barrier, per checkpoint, get exactly one ``newly_claimed=True``, every
+    claimant is told the same holder, and that holder is the one stored. The
+    sequential and stale-header tests above prove how the service reacts to
+    the primitive's answer, not that the answer is decided atomically; this
+    is the test that fails if the read and the set are split. On sqlite each
+    claimant uses its own handle on one file, so the transaction, not the
+    handle's lock, is what serializes them."""
+    db = tmp_path / "state.db"
+    shared = ArtifactRegistry() if backend == "in_memory" else SqliteArtifactRegistry(db)
+    handles: list = []
+    spans: list[tuple[float, float]] = []
+    default_switch_interval = sys.getswitchinterval()
+    try:
+        service = CoordinatorService(shared)
+        checkpoint_ids = [_mint_checkpoint(service) for _ in range(_CLAIM_ROUNDS)]
+        handles = (
+            [shared] * _CLAIMANTS
+            if backend == "in_memory"
+            else [SqliteArtifactRegistry(db) for _ in range(_CLAIMANTS)]
+        )
+        sys.setswitchinterval(1e-6)
+        for checkpoint_id in checkpoint_ids:
+            results = _claim_round(handles, checkpoint_id, spans)
+            winners = [controller for controller, _holder, newly in results if newly]
+            assert len(winners) == 1, f"{len(winners)} claimants were told they claimed"
+            (winner,) = winners
+            assert {holder for _controller, holder, _newly in results} == {winner}
+            assert shared.get_checkpoint(checkpoint_id).registered_by == winner
+    finally:
+        sys.setswitchinterval(default_switch_interval)
+        if backend == "sqlite":
+            for handle in handles:
+                handle.close()
+            shared.close()
+    if not _claims_overlapped(spans):
+        warnings.warn(
+            "no two claims overlapped: this runner serialized the claimants, so "
+            "the run proves less than it could",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+def test_registry_refuses_a_pre_registered_header(registry) -> None:
+    from ccs.coordinator.registry_protocol import CheckpointRecord
+
+    header = CheckpointRecord(
+        checkpoint_id="pre-claimed",
+        name="cp",
+        owner=OWNER,
+        created_at=1.0,
+        created_at_tick=1,
+        window_min=1.0,
+        window_max=1.0,
+        registered_by=uuid4(),
+    )
+    with pytest.raises(ValueError, match="already registered"):
+        registry.create_checkpoint(header, [_member("a.md", FP_NEW)])
+    assert registry.get_checkpoint("pre-claimed") is None
+
+
+def test_receiver_and_claim_survive_a_restart(tmp_path: Path) -> None:
+    """sqlite: both #191 fields are durable."""
+    receiver = uuid4()
+    db = tmp_path / "state.db"
+    with SqliteArtifactRegistry(db) as reg:
+        checkpoint_id = _mint_checkpoint(CoordinatorService(reg), receiver=receiver)
+        reg.claim_checkpoint_registration(checkpoint_id, receiver)
+    with SqliteArtifactRegistry(db) as reg:
+        record = reg.get_checkpoint(checkpoint_id)
+        assert record.receiver == receiver
+        assert record.registered_by == receiver
+        exc = _refusal(
+            CoordinatorService(reg), checkpoint_id, OWNER, ("notes/plan.md", FP_NEW)
+        )
+        assert exc.reason is CHECKPOINT_NOT_THE_RECEIVER_REASON

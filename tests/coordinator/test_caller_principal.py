@@ -805,9 +805,13 @@ def _principal_table_shape(db_path: Path) -> list[tuple]:
 
 def _revert_to_v7_shape(db_path: Path) -> None:
     """A current db rewound to what a v7 build produced: no principal table,
-    and no v9 transfer-record table either."""
+    no v9 transfer-record table, and no v10 checkpoint columns (#191)."""
     conn = sqlite3.connect(str(db_path))
     try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(workspace_checkpoints)")}
+        for column in ("receiver", "registered_by"):
+            if column in columns:
+                conn.execute(f"ALTER TABLE workspace_checkpoints DROP COLUMN {column}")
         conn.execute("DROP TABLE IF EXISTS transfer_records")
         conn.execute("DROP TABLE IF EXISTS caller_principals")
         conn.execute("PRAGMA user_version = 7")
@@ -832,8 +836,8 @@ def test_fresh_db_is_created_with_the_principal_table(tmp_path: Path) -> None:
     db = tmp_path / "fresh.db"
     with SqliteArtifactRegistry(db):
         pass
-    assert SCHEMA_USER_VERSION == 9
-    assert _user_version(db) == 9
+    assert SCHEMA_USER_VERSION == 10
+    assert _user_version(db) == 10
     assert "caller_principals" in _tables(db)
 
 
@@ -852,7 +856,7 @@ def test_v7_db_gains_the_principal_table_and_keeps_its_data(tmp_path: Path) -> N
             identity=identity, mint_nonce=_nonce()
         )
         assert reg.get_caller_principal(identity) == principal
-    assert _user_version(db) == 9
+    assert _user_version(db) == 10
 
 
 def test_v6_origin_walk_lands_the_table_at_the_head_stamp(tmp_path: Path) -> None:
@@ -870,7 +874,7 @@ def test_v6_origin_walk_lands_the_table_at_the_head_stamp(tmp_path: Path) -> Non
     with SqliteArtifactRegistry(db):
         pass
 
-    assert _user_version(db) == 9
+    assert _user_version(db) == 10
     assert "caller_principals" in _tables(db)
 
 
@@ -926,28 +930,34 @@ def test_a_crash_before_the_v8_stamp_leaves_a_bootable_v7(tmp_path: Path) -> Non
     assert "caller_principals" not in _tables(db)
     with SqliteArtifactRegistry(db):
         pass
-    assert _user_version(db) == 9
+    assert _user_version(db) == 10
     assert "caller_principals" in _tables(db)
 
 
-def test_a_v8_stamp_without_the_principal_table_is_refused(tmp_path: Path) -> None:
-    """No ledger this build recognizes stamps 8 without the table, so the open
-    fails closed rather than serving a store whose schema it cannot trust —
-    with a control that a genuine v8 opens."""
+@pytest.mark.parametrize("stamp", range(8, SCHEMA_USER_VERSION + 1))
+def test_a_v8_stamp_without_the_principal_table_is_refused(tmp_path: Path, stamp: int) -> None:
+    """No ledger this build recognizes stamps 8 (or later) without the table,
+    so the open fails closed rather than serving a store whose schema it
+    cannot trust — with a control that a genuine store opens. Every stamp the
+    probe covers is forged, each in the shape that version's build wrote, so a
+    probe narrowed to fewer stamps fails here."""
     genuine, forged = tmp_path / "genuine.db", tmp_path / "forged.db"
     for db in (genuine, forged):
         with SqliteArtifactRegistry(db):
             pass
-    # A v8 stamp: what a v8 build wrote, minus the principal table.
     conn = sqlite3.connect(str(forged))
     try:
-        conn.execute("DROP TABLE transfer_records")
+        if stamp < 10:
+            conn.execute("ALTER TABLE workspace_checkpoints DROP COLUMN receiver")
+            conn.execute("ALTER TABLE workspace_checkpoints DROP COLUMN registered_by")
+        if stamp < 9:
+            conn.execute("DROP TABLE transfer_records")
         conn.execute("DROP TABLE caller_principals")
-        conn.execute("PRAGMA user_version = 8")
+        conn.execute(f"PRAGMA user_version = {stamp}")
         conn.commit()
     finally:
         conn.close()
-    assert _user_version(forged) == 8
+    assert _user_version(forged) == stamp
 
     with SqliteArtifactRegistry(genuine):
         pass
