@@ -222,8 +222,6 @@ from ccs.adapters.substrate import CasConflict, ReconcileVerdict
 from ccs.coordinator.registry_protocol import CheckpointMember, CheckpointRecord
 from ccs.core.clock import monotonic_seconds
 from ccs.core.exceptions import (
-    CHECKPOINT_ALREADY_REGISTERED_REASON,
-    CHECKPOINT_NOT_THE_RECEIVER_REASON,
     PIN_STATE_HELD,
     PIN_STATE_RELEASED,
     PIN_STATE_UNAVAILABLE,
@@ -1782,7 +1780,13 @@ class WorkspaceVersioner:
         record = store.get_workspace_checkpoint(checkpoint_id)
         if record is None:
             raise CheckpointUnknown(checkpoint_id)
-        self._require_registrable_by_owner(record)
+        # Refuse, before any status write or member leg, a restore whose
+        # registration could never land (#191): the checkpoint is bound to
+        # another receiver or registered by another controller. A concurrent
+        # restore that claims between this read and this run's registration is
+        # caught by the service's atomic claim instead, and concludes
+        # ``refused`` (see :meth:`_drive_registration`).
+        record.require_registrable_by(self._owner)
         rows = store.get_workspace_checkpoint_members(checkpoint_id)
         self._require_known_restore_state(record, rows)
         if record.restore_status == RESTORE_STATUS_CONCLUDED:
@@ -2021,29 +2025,6 @@ class WorkspaceVersioner:
             # version_mismatch / other_holder: re-drive from fresh comparands.
 
     # --- restore pre-flight (fail-fast, before any status write) --------------
-
-    def _require_registrable_by_owner(self, record: CheckpointRecord) -> None:
-        """Refuse a restore this versioner's registration could never land
-        (#191) — BEFORE any status write or member leg, so a refused restore
-        writes no bytes.
-
-        The two controller refusals of
-        ``CoordinatorService.register_workspace_restore``, read from the
-        header: the checkpoint names a receiver that is not this versioner's
-        ``owner`` (``not_the_receiver``), or another controller already
-        registered it (``already_registered``, naming nobody). A concurrent
-        restore that claims the checkpoint between this read and this run's
-        registration is caught by the service's atomic claim instead, and
-        concludes ``refused`` (see :meth:`_drive_registration`).
-        """
-        if record.receiver is not None and record.receiver != self._owner:
-            raise CheckpointRegistrationRefused(
-                record.checkpoint_id, CHECKPOINT_NOT_THE_RECEIVER_REASON
-            )
-        if record.registered_by is not None and record.registered_by != self._owner:
-            raise CheckpointRegistrationRefused(
-                record.checkpoint_id, CHECKPOINT_ALREADY_REGISTERED_REASON
-            )
 
     def _require_restore_store(self) -> CheckpointRestoreStore:
         if not isinstance(self._service, CheckpointRestoreStore):

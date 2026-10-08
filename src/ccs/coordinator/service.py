@@ -25,7 +25,6 @@ from ccs.core.exceptions import (
     CHECKPOINT_ALREADY_REGISTERED_REASON,
     CHECKPOINT_FINGERPRINT_MISMATCH_REASON,
     CHECKPOINT_NOT_A_MEMBER_REASON,
-    CHECKPOINT_NOT_THE_RECEIVER_REASON,
     CURRENT_VERSION_REASON,
     EPOCH_MISMATCH_REASON,
     FUTURE_VERSION_REASON,
@@ -3155,7 +3154,7 @@ class CoordinatorService:
         fails closed at the registry lock instead of claiming late.
         """
         checkpoint_id = record.checkpoint_id
-        _refuse_excluded_controller(record, controller)
+        record.require_registrable_by(controller)
         members = {
             row.member_path: row
             for row in self.registry.get_checkpoint_members(checkpoint_id)
@@ -3206,7 +3205,7 @@ class CoordinatorService:
         record = self.registry.get_checkpoint(checkpoint_id)
         if record is None:
             raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
-        _refuse_excluded_controller(record, controller)
+        record.require_registrable_by(controller)
 
     def _resolve_workspace_member_artifact(
         self, member_path: str, fingerprint: str
@@ -3749,21 +3748,6 @@ class CoordinatorService:
         if artifact is None:
             raise CoherenceError(f"artifact_not_found artifact={artifact_id}")
         return artifact
-
-
-def _refuse_excluded_controller(record: CheckpointRecord, controller: UUID) -> None:
-    """Raise the #191 controller refusal ``controller`` gets for ``record``:
-    ``not_the_receiver`` when the checkpoint names another receiver,
-    ``already_registered`` when another controller claimed it. The owner is
-    never compared (it is provenance)."""
-    if record.receiver is not None and record.receiver != controller:
-        raise CheckpointRegistrationRefused(
-            record.checkpoint_id, CHECKPOINT_NOT_THE_RECEIVER_REASON
-        )
-    if record.registered_by is not None and record.registered_by != controller:
-        raise CheckpointRegistrationRefused(
-            record.checkpoint_id, CHECKPOINT_ALREADY_REGISTERED_REASON
-        )
 
 
 @dataclass(frozen=True)

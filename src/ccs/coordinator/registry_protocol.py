@@ -50,6 +50,8 @@ from typing import (
 from uuid import UUID
 
 from ccs.core.exceptions import (
+    CHECKPOINT_ALREADY_REGISTERED_REASON,
+    CHECKPOINT_NOT_THE_RECEIVER_REASON,
     HANDOFF_ENDED_REASON,
     HANDOFF_IN_FLIGHT_REASON,
     HANDOFF_NOT_HELD_REASON,
@@ -57,6 +59,7 @@ from ccs.core.exceptions import (
     HANDOFF_SELF_REASON,
     HANDOFF_SUCCESSOR_UNKNOWN_REASON,
     HANDOFF_VERSION_UNCONFIRMED_REASON,
+    CheckpointRegistrationRefused,
 )
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import (
@@ -202,6 +205,24 @@ class CheckpointRecord:
     pin_refcount: int = 0
     receiver: UUID | None = None
     registered_by: UUID | None = None
+
+    def require_registrable_by(self, controller: UUID) -> None:
+        """Raise the controller refusal ``controller`` gets for this
+        checkpoint (#191), or return: ``not_the_receiver`` when the checkpoint
+        names another receiver, then ``already_registered`` when another
+        controller claimed it (naming nobody). The owner is never compared.
+
+        The one copy of the rule: the service's registration and progress
+        gates and ``WorkspaceVersioner.restore`` all call it, so the
+        in-process restore and the HTTP routes answer a checkpoint alike."""
+        if self.receiver is not None and self.receiver != controller:
+            raise CheckpointRegistrationRefused(
+                self.checkpoint_id, CHECKPOINT_NOT_THE_RECEIVER_REASON
+            )
+        if self.registered_by is not None and self.registered_by != controller:
+            raise CheckpointRegistrationRefused(
+                self.checkpoint_id, CHECKPOINT_ALREADY_REGISTERED_REASON
+            )
 
 
 @dataclass(frozen=True)
