@@ -793,9 +793,10 @@ Alpha — APIs may change before `v1.0`.
   - `agent-coherence-status` exits `2` on a degraded answer. The table prints
     one line on standard error naming registry contention, and `--json`
     prints the body unchanged. MCP `swg_status` reports `per_path` as `null`
-    rather than `{}`, `swg_read`'s handoff fallback reports
-    `handoff_unknown`, and a volume attaching meanwhile still checks its
-    globs, from the `policy_summary` the degraded answer carries.
+    rather than `{}` and says `per_path=unavailable` in its text result,
+    `swg_read`'s handoff fallback reports `handoff_unknown`, and a volume
+    attaching meanwhile still checks its globs, from the `policy_summary` the
+    degraded answer carries.
   - `abort_guard` on both registries takes a keyword-only `deadline` that
     bounds the wait for the registry lock; past it the guard raises the new
     `RegistryLockTimeout` (in `ccs.core.exceptions`) having run nothing.

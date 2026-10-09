@@ -767,10 +767,11 @@ What the shipped readers do with a degraded answer:
   ```
 
   `--json` prints the body unchanged and also exits `2`.
-- The MCP server's `swg_status` reports `per_path` as `null`, not `{}`. (An
-  unreachable coordinator still gives `{}`, with `coordinator` reported as
-  `unknown`.) When `swg_read` falls back to `/status` for a handoff record, it
-  adds `handoff_unknown: true`.
+- The MCP server's `swg_status` reports `per_path` as `null`, not `{}`, and its
+  text result adds `per_path=unavailable` after the coordinator state, for
+  clients that show only text. (An unreachable coordinator still gives `{}`,
+  with `coordinator` reported as `unknown`.) When `swg_read` falls back to
+  `/status` for a handoff record, it adds `handoff_unknown: true`.
 - A `CoherentVolume` attaching meanwhile still checks its managed globs: it
   reads them from `policy_summary`, which a degraded answer carries.
 
@@ -2995,7 +2996,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 | `swg_reacquire` | Recovery after a deny — clears the stale view + mandatory fresh read |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention. A win that completed or overtook a live handoff says which, in `handoff`; on a path this session handed off, the same `handed_off` deny as `swg_write` |
 | `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed OR a peer's write-claim preempted it (which moves neither comparand — the fence also re-checks that the grant still stands) |
-| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `principal_claim`, its `session_agent_id` (the id another session names to hand it a path), the coordinator's two caller-principal counters, and each path's handoff record. `per_path` is `null`, not `{}`, when the coordinator's `/status` answers [degraded](#when-the-registry-is-busy) because its registry was busy: which paths are tracked cannot be told then, so retry shortly and do not read it as nothing tracked |
+| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `principal_claim`, its `session_agent_id` (the id another session names to hand it a path), the coordinator's two caller-principal counters, and each path's handoff record. `per_path` is `null`, not `{}`, when the coordinator could not report which paths are tracked, for example when its `/status` answers [degraded](#when-the-registry-is-busy) because its registry was busy; the text result then says `per_path=unavailable`. Retry shortly and do not read it as nothing tracked |
 | `swg_transfer` | Hands this session's claim on one or more paths to another session, named by that session's `session_agent_id`; see [From the MCP server](#from-the-mcp-server) |
 | `swg_accept` | As the successor, accepts a handoff without writing the path |
 | `swg_decline` | As the successor, declines a handoff; the giver may write the path again |

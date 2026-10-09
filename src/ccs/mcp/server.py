@@ -51,7 +51,7 @@ from ccs.mcp.deny import (
     handoff_verb_refusal_result,
 )
 from ccs.mcp.session import SessionConfig, build_volume
-from ccs.mcp.status import build_status, handoff_from_status
+from ccs.mcp.status import PER_PATH_UNAVAILABLE_TEXT, build_status, handoff_from_status
 from ccs.mcp.uri import UriValidationError, validate_uri
 
 logger = logging.getLogger(__name__)
@@ -180,9 +180,10 @@ _STATUS_DESC = (
     "Report coherence state: coordinator on|off|unknown (unknown is NOT off), "
     "per-path enforced|not_registered (with handoff: the path's handoff record "
     "-- giver, successor, version_at_transfer, hold_shape, status, live -- when "
-    "it has one; per_path is null, not {}, when the coordinator's /status is "
-    "degraded because its registry was busy: which paths are tracked cannot be "
-    "told, so retry shortly and do not treat it as nothing tracked), "
+    "it has one; per_path is null, not {}, when the coordinator could not "
+    "report which paths are tracked, for example when its /status answered "
+    "degraded because its registry was busy: retry shortly and do not treat it "
+    "as nothing tracked; the text result then says per_path=unavailable), "
     "is_attached/is_degraded/session_id, session_agent_id (this "
     "session's id as a handoff successor: the value another session passes to "
     "swg_transfer to hand this session a path; it does not change when this "
@@ -528,7 +529,12 @@ def _do_reacquire(volume: CoherentVolume, config: SessionConfig, path: str) -> C
 
 def _do_status(volume: CoherentVolume, config: SessionConfig) -> CallToolResult:
     status = build_status(volume, config)
-    return _ok_result(status, f"coordinator={status['coordinator']}")
+    text = f"coordinator={status['coordinator']}"
+    if status["per_path"] is None:
+        # A client that shows only the text channel must still see that the
+        # tracked paths could not be told: coordinator=on alone reads healthy.
+        text = f"{text} {PER_PATH_UNAVAILABLE_TEXT}"
+    return _ok_result(status, text)
 
 
 def _do_write_cas(
