@@ -149,7 +149,12 @@ def test_per_path_is_none_when_status_is_degraded() -> None:
 
 
 def test_the_status_description_says_per_path_is_null_when_status_is_degraded() -> None:
+    """The description says what a null ``per_path`` means and what to do:
+    retry, never read it as nothing tracked. Prevents an agent taking a busy
+    registry's ``coordinator=on`` answer for an empty workspace."""
     assert "per_path is null" in _STATUS_DESC and "degraded" in _STATUS_DESC
+    assert "retry shortly" in _STATUS_DESC
+    assert "do not treat it as nothing tracked" in _STATUS_DESC
 
 
 def test_handoff_from_status_cannot_tell_on_a_degraded_status() -> None:
