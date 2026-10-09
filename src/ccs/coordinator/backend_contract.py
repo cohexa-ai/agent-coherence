@@ -702,6 +702,9 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "liveness, read inside the same lock hold so a record is judged "
         "against the version its row reports (#185). A second opt-in adds each "
         "pair's reclamation slot, read from the same agent-state rows (#195). "
+        "A third adds each artifact's owner generation, each pair's grant tick "
+        "and each agent's last heartbeat, in the same hold, so a reader can "
+        "compute a grant's reclaim deadline from one consistent read (#187). "
         "Only /status opts in, and the default answer is unchanged. "
         "Non-mutating.",
     ),

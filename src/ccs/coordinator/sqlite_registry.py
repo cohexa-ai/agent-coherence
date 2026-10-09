@@ -3667,6 +3667,7 @@ class SqliteArtifactRegistry:
         agent_ids: Iterable[UUID] | None = None,
         include_transfers: bool = False,
         include_reclamations: bool = False,
+        include_grant_detail: bool = False,
     ) -> StatusSnapshot:
         """PERF-1 single-query batch for /status. Returns:
 
@@ -3752,18 +3753,43 @@ class SqliteArtifactRegistry:
         SELECT itself, so each pair's slot and state come from the same row
         and no second read lets a reclaim land between them. Off by default,
         like the transfer rows; only ``/status`` opts in.
+
+        ``include_grant_detail`` (#187) fills element ``[4]``, a
+        :data:`GrantDetail` pair, and always answers five elements, with
+        ``[2]`` and ``[3]`` empty when their flags were not passed. Its first
+        map is ``{artifact_id: {agent_id: granted_at_tick}}`` for every pair
+        whose row carries a grant tick, whatever its state, from one more
+        column on the agent-state SELECT. The caller projects by state: the
+        live grant paths set the tick on an M/E acquire and clear it on leaving
+        M/E, but a migrated or externally written ledger need not, and the
+        state is what the sweep acts on. Its second map is ``{agent_id:
+        last_tick}`` from one SELECT over the heartbeat rows, so it covers
+        agents with no agent-state row and, like the artifact half, is not
+        narrowed by ``agent_ids``; an agent with no heartbeat on record is
+        absent. The flag also adds ``owner_generation`` to each artifact's
+        metadata. All of it is read in the same hold as the state maps, and
+        the default and scoped statements are unchanged. Off by default; only
+        ``/status``'s operator tier opts in.
         """
         artifact_by_id: dict[UUID, dict[str, Any]] = {}
         state_by_artifact: dict[UUID, dict[UUID, MESIState]] = {}
         reclamation_by_artifact: dict[UUID, dict[UUID, ReclamationSlot]] = {}
         transfer_by_artifact: dict[UUID, tuple[TransferRecord, bool]] = {}
+        granted_at_by_artifact: dict[UUID, dict[UUID, int]] = {}
+        last_heartbeat_by_agent: dict[UUID, int] = {}
+        artifact_columns = "id, name, version, last_writer_id, updated_at"
         columns = "artifact_id, agent_id, state"
         if include_reclamations:
             columns += ", last_reclaim_trigger, last_reclaim_tick"
+        if include_grant_detail:
+            artifact_columns += ", owner_generation"
+            columns += ", granted_at_tick"
+        # The grant tick follows the reclaim pair when that pair was selected.
+        granted_at_column = 5 if include_reclamations else 3
         scoped_hexes = None if agent_ids is None else [a.hex for a in agent_ids]
         with self._lock:
             for row in self._conn.execute(
-                "SELECT id, name, version, last_writer_id, updated_at FROM artifacts"
+                f"SELECT {artifact_columns} FROM artifacts"
             ).fetchall():
                 aid = UUID(hex=row[0])
                 artifact_by_id[aid] = {
@@ -3772,6 +3798,8 @@ class SqliteArtifactRegistry:
                     "last_writer_id": UUID(hex=row[3]) if row[3] else None,
                     "updated_at": float(row[4]),
                 }
+                if include_grant_detail:
+                    artifact_by_id[aid]["owner_generation"] = row[5]
                 state_by_artifact[aid] = {}
             if scoped_hexes is None:
                 state_rows = self._conn.execute(
@@ -3796,6 +3824,8 @@ class SqliteArtifactRegistry:
                 state_by_artifact[aid][gid] = MESIState[row[2]]
                 if include_reclamations and row[3] is not None:
                     reclamation_by_artifact.setdefault(aid, {})[gid] = (row[3], row[4])
+                if include_grant_detail and row[granted_at_column] is not None:
+                    granted_at_by_artifact.setdefault(aid, {})[gid] = row[granted_at_column]
             if include_transfers:
                 transfer_by_artifact = {
                     record.artifact_id: (record, live)
@@ -3804,6 +3834,21 @@ class SqliteArtifactRegistry:
                         self._conn.execute(_TRANSFER_READ_ALL_SQL).fetchall(),
                     )
                 }
+            if include_grant_detail:
+                last_heartbeat_by_agent = {
+                    UUID(hex=agent_hex): last_tick
+                    for agent_hex, last_tick in self._conn.execute(
+                        "SELECT agent_id, last_tick FROM heartbeats"
+                    ).fetchall()
+                }
+        if include_grant_detail:
+            return (
+                artifact_by_id,
+                state_by_artifact,
+                transfer_by_artifact,
+                reclamation_by_artifact,
+                (granted_at_by_artifact, last_heartbeat_by_agent),
+            )
         if include_reclamations:
             return (artifact_by_id, state_by_artifact, transfer_by_artifact, reclamation_by_artifact)
         if include_transfers:

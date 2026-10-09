@@ -23,6 +23,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from ccs.coordinator.registry_protocol import TransferRequest
 from ccs.coordinator.retention import RetentionPolicy
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import (
@@ -2392,23 +2393,223 @@ def test_status_snapshot_reclaim_slots_name_only_the_reclaimed_pair(db_path: Pat
         assert _reclaim_slots(reg) == {plan.id: {stale: ("reclaim_heartbeat", 100)}}
 
 
-def test_status_snapshot_opt_ins_keep_fixed_positions(db_path: Path) -> None:
+def _handed_off_reader(reg: SqliteArtifactRegistry) -> UUID:
+    """A spec.md SHARED reader handed to a successor, so a transfer record exists."""
+    spec = _make_artifact(name="spec.md", content_hash="h2")
+    reg.register_artifact(spec, content="")
+    reader = uuid4()
+    reg.set_agent_state(spec.id, reader, MESIState.SHARED, trigger="fetch", tick=1)
+    request = TransferRequest(
+        giver=uuid4(), successor=uuid4(), holders={spec.id: reader}, successor_known=True
+    )
+    (outcome,) = reg.transfer_grants(request, tick=2, now_unix=1000.0)
+    assert outcome.transferred is True
+    return spec.id
+
+
+@pytest.mark.parametrize("include_grant_detail", [False, True], ids=["no_detail", "detail"])
+@pytest.mark.parametrize("include_reclamations", [False, True], ids=["no_slots", "slots"])
+@pytest.mark.parametrize("include_transfers", [False, True], ids=["no_transfers", "transfers"])
+def test_status_snapshot_opt_ins_keep_fixed_positions(
+    db_path: Path,
+    include_transfers: bool,
+    include_reclamations: bool,
+    include_grant_detail: bool,
+) -> None:
     """Each element has one index whatever else was asked for: the transfer
-    rows at [2], the reclaim slots at [3]. Asking for the reclaim slots
-    without the transfer rows leaves [2] empty rather than moving the slots
-    into it; the default and transfer-only answers keep their dev shapes."""
+    rows at [2], the reclaim slots at [3], the grant detail at [4]. Asking for
+    a later element without an earlier one leaves the earlier one empty rather
+    than moving the later one into it; the default, transfer-only and
+    reclaim-slot answers keep their dev shapes."""
     with SqliteArtifactRegistry(db_path) as reg:
-        _, artifact, agent = _swept_holder(reg)
-        slots = {artifact.id: {agent: ("reclaim_heartbeat", 100)}}
-        assert len(reg.status_snapshot()) == 2
-        transfers_only = reg.status_snapshot(include_transfers=True)
-        assert len(transfers_only) == 3 and transfers_only[2] == {}
-        reclamations_only = reg.status_snapshot(include_reclamations=True)
-        assert len(reclamations_only) == 4
-        assert reclamations_only[2] == {} and reclamations_only[3] == slots
-        both = reg.status_snapshot(include_transfers=True, include_reclamations=True)
-        assert len(both) == 4
-        assert both[2] == {} and both[3] == slots
+        svc, plan, reclaimed = _swept_holder(reg)
+        writer = uuid4()
+        svc.write(agent_id=writer, artifact_id=plan.id, issued_at_tick=101)
+        reg.record_heartbeat(writer, 102)
+        spec_id = _handed_off_reader(reg)
+
+        answer = reg.status_snapshot(
+            include_transfers=include_transfers,
+            include_reclamations=include_reclamations,
+            include_grant_detail=include_grant_detail,
+        )
+
+        if include_grant_detail:
+            expected_len = 5
+        elif include_reclamations:
+            expected_len = 4
+        elif include_transfers:
+            expected_len = 3
+        else:
+            expected_len = 2
+        assert len(answer) == expected_len
+        if expected_len >= 3:
+            assert set(answer[2]) == ({spec_id} if include_transfers else set())
+        if expected_len >= 4:
+            assert answer[3] == (
+                {plan.id: {reclaimed: ("reclaim_heartbeat", 100)}} if include_reclamations else {}
+            )
+        if expected_len == 5:
+            assert answer[4] == ({plan.id: {writer: 101}}, {reclaimed: 0, writer: 102})
+
+
+def test_status_snapshot_grant_detail_carries_each_write_grant_and_heartbeat(
+    db_path: Path,
+) -> None:
+    """#187: a write holder's grant tick, and its agent's last heartbeat, come
+    back from the snapshot itself; a holder with no heartbeat on record has
+    no entry in the heartbeat map (read with ``.get``, it is None)."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        plan, spec = _make_artifact(), _make_artifact(name="spec.md", content_hash="h2")
+        reg.register_artifact(plan, content="")
+        reg.register_artifact(spec, content="")
+        beating, silent = uuid4(), uuid4()
+        reg.set_agent_state(plan.id, beating, MESIState.EXCLUSIVE, trigger="write", tick=40)
+        reg.record_heartbeat(beating, 50)
+        reg.record_heartbeat(beating, 70)
+        reg.set_agent_state(spec.id, silent, MESIState.EXCLUSIVE, trigger="write", tick=12)
+
+        *_, (granted_at, last_heartbeat) = reg.status_snapshot(include_grant_detail=True)
+
+        assert granted_at == {plan.id: {beating: 40}, spec.id: {silent: 12}}
+        assert last_heartbeat == {beating: 70}
+        assert last_heartbeat.get(silent) is None
+
+
+def test_status_snapshot_heartbeat_map_covers_agents_without_a_write_grant(
+    db_path: Path,
+) -> None:
+    """The heartbeat map is read from the heartbeat rows, not from the grants:
+    a SHARED-only reader, an agent whose only row is a reclaimed INVALID one,
+    and an agent with a heartbeat but no state row at all (a session that has
+    only sent session-stop) each map to their own last tick."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        svc = CoordinatorService(reg)
+        plan = svc.register_artifact(name="plan.md", content="v1")
+        reclaimed, reader, stopped = uuid4(), uuid4(), uuid4()
+        svc.fetch(FetchRequest(artifact_id=plan.id, requesting_agent_id=reclaimed, requested_at_tick=5))
+        svc.record_heartbeat(agent_id=reclaimed, now_tick=7)
+        assert svc.enforce_stable_grant_timeouts(
+            current_tick=100, heartbeat_timeout_ticks=10, max_hold_ticks=10_000
+        ) == 1
+        reg.set_agent_state(plan.id, reader, MESIState.SHARED, trigger="fetch", tick=101)
+        reg.record_heartbeat(reader, 121)
+        reg.record_heartbeat(stopped, 133)
+
+        _, state_by_artifact, _, _, (granted_at, last_heartbeat) = reg.status_snapshot(
+            include_grant_detail=True
+        )
+
+        assert state_by_artifact == {
+            plan.id: {reclaimed: MESIState.INVALID, reader: MESIState.SHARED}
+        }
+        assert granted_at == {}
+        assert last_heartbeat == {reclaimed: 7, reader: 121, stopped: 133}
+
+
+def test_status_snapshot_owner_generation_rides_only_the_grant_detail(db_path: Path) -> None:
+    """``owner_generation`` joins an artifact's metadata only under the
+    grant-detail opt-in, and reads the epoch the sweep moved: 1 after one
+    reclaim of an EXCLUSIVE holder, 0 on an artifact nobody was reclaimed
+    from."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        svc, plan, _ = _swept_holder(reg)
+        spec = svc.register_artifact(name="spec.md", content="v1")
+        for answer in (
+            reg.status_snapshot(),
+            reg.status_snapshot(include_transfers=True),
+            reg.status_snapshot(include_reclamations=True),
+        ):
+            assert all("owner_generation" not in row for row in answer[0].values())
+
+        artifact_by_id = reg.status_snapshot(include_grant_detail=True)[0]
+
+        assert artifact_by_id[plan.id]["owner_generation"] == 1
+        assert artifact_by_id[spec.id]["owner_generation"] == 0
+
+
+def _snapshot_holds(reg: SqliteArtifactRegistry, **flags) -> tuple[list[list[str]], list[str]]:
+    """Call ``status_snapshot(**flags)`` with every statement recorded, grouped
+    by the outermost registry lock hold it ran in (``unheld`` collects the
+    rest). The statements are recorded verbatim, unnormalized."""
+    from tests.test_registry_lock_coverage import _TrackingRLock
+
+    tracker = _TrackingRLock()
+    real_lock, real_conn = reg._lock, reg._conn
+
+    class _RecordingConnection:
+        def execute(self, sql: str, *args):
+            tracker.events.append(sql)
+            return real_conn.execute(sql, *args)
+
+        def __getattr__(self, name: str):
+            return getattr(real_conn, name)
+
+    reg._lock, reg._conn = tracker, _RecordingConnection()
+    try:
+        reg.status_snapshot(**flags)
+    finally:
+        reg._lock, reg._conn = real_lock, real_conn
+
+    holds: list[list[str]] = []
+    unheld: list[str] = []
+    depth = 0
+    for event in tracker.events:
+        if event == "acquire":
+            if depth == 0:
+                holds.append([])
+            depth += 1
+        elif event == "release":
+            depth -= 1
+        elif depth == 0:
+            unheld.append(event)
+        else:
+            holds[-1].append(event)
+    return holds, unheld
+
+
+def test_status_snapshot_default_and_scoped_statements_are_unchanged(db_path: Path) -> None:
+    """KTD3: the grant detail touches only its own opt-in. The default and
+    the agent-scoped reads (the session-start builder's) run exactly the
+    statements they ran before it, byte for byte, in one hold."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        art = _make_artifact()
+        reg.register_artifact(art, content="")
+        first, second = uuid4(), uuid4()
+
+        assert _snapshot_holds(reg) == (
+            [[
+                "SELECT id, name, version, last_writer_id, updated_at FROM artifacts",
+                "SELECT artifact_id, agent_id, state FROM agent_states",
+            ]],
+            [],
+        )
+        assert _snapshot_holds(reg, agent_ids=[first, second]) == (
+            [[
+                "SELECT id, name, version, last_writer_id, updated_at FROM artifacts",
+                "SELECT artifact_id, agent_id, state FROM agent_states WHERE agent_id IN (?, ?)",
+            ]],
+            [],
+        )
+
+
+def test_status_snapshot_grant_detail_reads_inside_the_one_hold(db_path: Path) -> None:
+    """R5: the generation, the grant ticks and the heartbeats come from the
+    same hold as the state rows, so no reclaim or heartbeat lands between a
+    grant and the values a reader computes its deadline from."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        art = _make_artifact()
+        reg.register_artifact(art, content="")
+
+        holds, unheld = _snapshot_holds(
+            reg, include_transfers=True, include_reclamations=True, include_grant_detail=True
+        )
+
+        assert unheld == []
+        [hold] = holds
+        assert any("owner_generation" in sql and "FROM artifacts" in sql for sql in hold)
+        assert any("granted_at_tick" in sql and "FROM agent_states" in sql for sql in hold)
+        assert any("FROM heartbeats" in sql for sql in hold)
 
 
 def test_status_snapshot_scoped_query_is_index_backed(db_path: Path) -> None:
