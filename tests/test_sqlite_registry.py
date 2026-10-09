@@ -2416,6 +2416,45 @@ def test_status_snapshot_reclaim_slots_name_only_the_reclaimed_pair(db_path: Pat
         assert _reclaim_slots(reg) == {plan.id: {stale: ("reclaim_heartbeat", 100)}}
 
 
+def test_sweep_reclaim_slot_survives_a_peer_writer_in_the_gap(
+    db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another connection takes the database write lock the instant the
+    reclaim's transition commits and keeps it until the sweep is done. The
+    slot is written by that transition, so the sweep needs no second write: it
+    returns its count and the pair carries its cause. A separate slot write
+    would wait out the busy timeout, raise 'database is locked' and leave an
+    INVALID pair with no slot, which /status reads as a release."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        svc = CoordinatorService(reg)
+        artifact = svc.register_artifact(name="plan.md", content="v1")
+        agent = uuid4()
+        svc.fetch(FetchRequest(artifact_id=artifact.id, requesting_agent_id=agent, requested_at_tick=0))
+        svc.record_heartbeat(agent_id=agent, now_tick=0)
+        peer = sqlite3.connect(db_path, isolation_level=None, timeout=0)
+        transition = reg.set_agent_state
+
+        def _peer_writes_after_a_reclaim(*args, **kwargs) -> None:
+            transition(*args, **kwargs)
+            if kwargs.get("trigger") == "reclaim_heartbeat":
+                peer.execute("BEGIN IMMEDIATE")
+
+        monkeypatch.setattr(reg, "set_agent_state", _peer_writes_after_a_reclaim)
+        try:
+            reclaimed = svc.enforce_stable_grant_timeouts(
+                current_tick=100, heartbeat_timeout_ticks=10, max_hold_ticks=10_000
+            )
+            assert peer.in_transaction, "the peer never took the write lock"
+        finally:
+            if peer.in_transaction:
+                peer.execute("ROLLBACK")
+            peer.close()
+
+        assert reclaimed == 1
+        assert reg.get_agent_state(artifact.id, agent) == MESIState.INVALID
+        assert _reclaim_slots(reg) == {artifact.id: {agent: ("reclaim_heartbeat", 100)}}
+
+
 def _handed_off_reader(reg: SqliteArtifactRegistry) -> UUID:
     """A spec.md SHARED reader handed to a successor, so a transfer record exists."""
     spec = _make_artifact(name="spec.md", content_hash="h2")

@@ -280,6 +280,13 @@ class CheckpointMember:
 RECLAIM_TRIGGERS: frozenset[str] = frozenset(
     {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
 )
+# SWEEP_RECLAIM_TRIGGERS: the stable-grant sweep's own two triggers. An M/E ->
+# INVALID transition under one of them records the pair's reclaim slot in the
+# SAME write as the transition, so a reclaim is never stored without its cause:
+# /status tells a reclaim from a release by that slot alone, and the next sweep
+# skips an already-INVALID pair, so a slot written separately and lost would
+# stay lost. "timeout" stays out: the transient sweep records no slot.
+SWEEP_RECLAIM_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS - {"timeout"}
 # HANDOFF_TRIGGER: the trigger a transfer moves its giver INVALID under (the
 # targeted grant handoff, #185). Its own value, distinct from "invalidate", so
 # the state log records a deliberate handoff as a handoff rather than as a
@@ -1061,6 +1068,14 @@ class RegistryBase(Protocol):
         INVALID does: the prior value kept, a never-observed pair still None.
         It never affects the state written, the grant tick, the epoch or the
         read-generation capture.
+
+        An M/E -> INVALID transition under a :data:`SWEEP_RECLAIM_TRIGGERS`
+        trigger also records the pair's reclaim slot, ``(trigger, tick)``, in
+        the SAME write as the state and the epoch bump (sqlite: the same
+        ``BEGIN IMMEDIATE``; in memory: the same lock hold, before the
+        state-log emit), so the slot lands exactly when the transition does.
+        The sweep makes no second write: a reclaimed pair is never left
+        INVALID without the slot that tells it from a release.
         """
         ...
 

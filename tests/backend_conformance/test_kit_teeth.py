@@ -267,6 +267,60 @@ def test_rearming_stub_fails_peer_fetch_scenario() -> None:
     )
 
 
+class _CauselessReclaimRegistry:
+    """A degraded backend whose ``set_agent_state`` performs a sweep reclaim but
+    records no reclamation slot, as a backend would that relied on a separate
+    slot write the sweep no longer makes. Everything else is the real in-memory
+    registry."""
+
+    def __init__(self) -> None:
+        self._inner = ArtifactRegistry()
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def set_agent_state(self, artifact_id: UUID, agent_id: UUID, state: MESIState, **kwargs: object) -> None:
+        self._inner.set_agent_state(artifact_id, agent_id, state, **kwargs)  # type: ignore[arg-type]
+        # THE DROPPED OBLIGATION: the real registry recorded the slot in the
+        # transition; this stub forgets it.
+        self._inner._records[artifact_id].last_reclamation_by_agent.pop(agent_id, None)  # noqa: SLF001
+
+
+class _CauselessReclaimFactory:
+    """A :class:`RegistryFactory` minting one process-scoped
+    :class:`_CauselessReclaimRegistry` (same shape as :class:`_DegradedFactory`)."""
+
+    def __init__(self) -> None:
+        self._reg: _CauselessReclaimRegistry | None = None
+
+    def __call__(self) -> _CauselessReclaimRegistry:
+        if self._reg is None:
+            self._reg = _CauselessReclaimRegistry()
+        return self._reg
+
+    def close_all(self) -> None:
+        return None
+
+    @property
+    def db_path(self) -> Path | None:
+        return None
+
+
+def test_causeless_reclaim_stub_fails_reclaim_cause_scenario() -> None:
+    """THE TEETH for the reclaim-cause scenario. A backend that reclaims a grant
+    without recording why MUST FAIL the kit: the sweep writes no slot of its
+    own, so on that backend every reclaim would read as a release."""
+    factory: RegistryFactory = _CauselessReclaimFactory()
+    with pytest.raises(AssertionError) as excinfo:
+        kit.assert_sweep_reclaim_records_its_cause(factory)
+    message = str(excinfo.value)
+    assert "reclamation slot None" in message
+    assert "same write as the reclaim" in message, (
+        "the teeth failure must name the obligation a backend author skipped; "
+        f"got: {message}"
+    )
+
+
 def test_torn_pair_stub_fails_pair_atomicity_scenario() -> None:
     """THE TEETH for the pair-atomicity scenario. A backend serving
     ``get_artifact_and_generation`` as two independent reads MUST FAIL the kit —
