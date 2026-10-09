@@ -344,19 +344,36 @@ def test_sqlite_extended_method_structure_matches_protocol(
 def test_status_snapshot_opt_ins_are_keyword_only_and_off_by_default(
     sqlite_registry: SqliteArtifactRegistry,
 ) -> None:
-    """The transfer rows (#185) and the reclaim slots (#195) ride the status
-    snapshot as keyword-only opt-ins that default off, so the session-start
-    builder's default call keeps its two-element answer. Pinned as a literal on
-    the Protocol and the implementation alike: the comparison above would pass
-    a signature both sides changed together, a positional or default-on opt-in
-    included."""
+    """The transfer rows (#185), the reclaim slots (#195) and the grant detail
+    (#187) ride the status snapshot as keyword-only opt-ins that default off,
+    so the session-start builder's default call keeps its two-element answer.
+    Pinned as a literal on the Protocol and the implementation alike: the
+    comparison above would pass a signature both sides changed together, a
+    positional or default-on opt-in included."""
     expected = [
         ("agent_ids", inspect.Parameter.KEYWORD_ONLY, None),
         ("include_transfers", inspect.Parameter.KEYWORD_ONLY, False),
         ("include_reclamations", inspect.Parameter.KEYWORD_ONLY, False),
+        ("include_grant_detail", inspect.Parameter.KEYWORD_ONLY, False),
     ]
     assert _param_structure(SqliteExtended.status_snapshot) == expected
     assert _param_structure(type(sqlite_registry).status_snapshot) == expected
+
+
+def test_abort_guard_deadline_is_keyword_only_and_off_by_default(
+    inmem_registry: ArtifactRegistry, sqlite_registry: SqliteArtifactRegistry
+) -> None:
+    """The bounded lock wait (#238) is a keyword-only ``deadline`` that
+    defaults to no bound, so every existing ``abort_guard(abort)`` call keeps
+    its unbounded wait. Pinned as a literal on the Protocol and both
+    registries, for the same reason as the status-snapshot pin above."""
+    expected = [
+        ("abort", inspect.Parameter.POSITIONAL_OR_KEYWORD, None),
+        ("deadline", inspect.Parameter.KEYWORD_ONLY, None),
+    ]
+    assert _param_structure(RegistryBase.abort_guard) == expected
+    assert _param_structure(type(inmem_registry).abort_guard) == expected
+    assert _param_structure(type(sqlite_registry).abort_guard) == expected
 
 
 # ---------------------------------------------------------------------------

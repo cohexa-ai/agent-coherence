@@ -531,14 +531,16 @@ holder tell the two apart:
     "agent_name": "claude-session-<id>",
     "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
     "states": {},
-    "reclaimed": {"plan.md": {"trigger": "reclaim_heartbeat", "tick": 1789558656}}
+    "reclaimed": {"plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": 1789558656}}
   }
   ```
 
-  `trigger` is `reclaim_heartbeat` (no coordinator call for
-  `grant_heartbeat_timeout_sec`) or `reclaim_max_hold` (held past
-  `grant_max_hold_sec`), and `tick` is the reclaim's wall-clock time in
-  seconds.
+  `trigger` is `reclaim_heartbeat` (no heartbeat recorded for
+  `grant_heartbeat_timeout_sec`; see
+  [which requests record one](#reading-when-the-sweep-will-reclaim-a-grant))
+  or `reclaim_max_hold` (held past
+  `grant_max_hold_sec`), and `reclaimed_at_unix_ts` is when the reclaim
+  happened, in unix seconds.
 - **The counters.** Every view, the default one and `?detail=metrics`
   included, carries `sweep_reclaims_total` and `sweep_reclaims_by_trigger`.
   They name no session or path: a count that rose tells you the sweep pulled
@@ -549,20 +551,21 @@ and it has taken none since. Its edit may be on disk with no version recording
 it, so do not hand the path to another session on the strength of an empty
 `states` alone. The entry stays listed:
 
-- while the holder re-reads the path and is granted `SHARED` because another
-  session holds it too, since a read does not version the edit;
-- after a peer writes or commits the path, after the holder itself commits by
-  compare-and-swap (that leaves it `SHARED`), and after the holder's session
+- while the holder re-reads the path. A re-read is granted `SHARED`, even when
+  no other session holds the path, and a read does not version the edit;
+- while the holder's compare-and-swap commits of the path are refused with
+  `stale_read_generation`. A re-read does not lift that refusal;
+- after a peer writes or commits the path, and after the holder's session
   ends.
 
-It clears when that holder next takes the path `EXCLUSIVE` or `MODIFIED`: a
-pre-edit, or a re-read while no other session holds the path, because the
-coordinator grants a sole reader `EXCLUSIVE`. From then on `states` shows the
-holder holding the path, so it does not read as released. The map
+A reclaimed session gets its write back by editing the path again: the edit
+takes the write grant (`EXCLUSIVE`), which clears the entry, and commits like
+any other edit. `states` then shows the holder holding the path, so it does
+not read as released. The map
 tells you a reclaim happened; whether its edit has been dealt with since is
 yours to decide. One clue: if the path's `last_writer_at_unix_ts` in the same
-response is later than the entry's `tick`, someone has committed the path since
-the reclaim.
+response is later than the entry's `reclaimed_at_unix_ts`, someone has committed
+the path since the reclaim.
 
 Limits:
 
@@ -584,13 +587,206 @@ Limits:
   ```text
   Sessions:
     4c9625da  claude-session-<id>
-      plan.md  SHARED; reclaimed (reclaim_heartbeat at tick 1789558656)
+      plan.md  SHARED; reclaimed (reclaim_heartbeat at 1789558656)
   ```
 
   Without `--detail full` it asks for the default view, which carries the
-  counters but not the `reclaimed` map; so does the Claude Code plugin's status
-  command. Use the Python console script with `--detail full`, or request
-  `GET /status?detail=full` with the header yourself.
+  counters but not the `reclaimed` map. So does the Claude Code plugin's
+  `/agent-coherence:status` command, and the plugin's own
+  `agent-coherence-status` where that comes first on the Bash tool's `PATH`;
+  in plugin releases through 0.5.0 that program's `--detail full` does not
+  send the operator header, so the coordinator refuses it. Use the Python
+  console script with `--detail full`, or request `GET /status?detail=full`
+  with the header yourself.
+
+To see a reclaim coming rather than after it lands, read the grant times and
+thresholds in the same view; see
+[Reading when the sweep will reclaim a grant](#reading-when-the-sweep-will-reclaim-a-grant).
+
+### Reading when the sweep will reclaim a grant
+
+This applies to the Python coordinator. The Node coordinator answers
+`detail=full` with `501`.
+
+The operator view (`GET /status?detail=full` with the
+`Coherence-Local-Operator: true` header) also carries what the sweep decides
+from:
+
+- Each `tracked_artifacts` entry carries `owner_generation`, the artifact's
+  ownership generation, an integer (see below).
+- Each `sessions[]` row carries `grants`, one entry for each path the session
+  holds `EXCLUSIVE` or `MODIFIED`, and `last_heartbeat_unix_ts`, the session's
+  last heartbeat, or `null` when the coordinator has none on record. Every row
+  has both keys, including a row that holds only `SHARED` paths and a row that
+  lists only reclaims. A `SHARED` path is never in `grants`.
+- The body carries `grant_heartbeat_timeout_sec` and `grant_max_hold_sec`, the
+  two thresholds the running sweep enforces.
+
+Trimmed to the keys this section uses:
+
+```json
+{
+  "tracked_artifacts": [
+    {"path": "plan.md", "version": 4, "id": "9b1e6f0c-3a57-4e7e-9a43-6f5d2c8e1b70", "owner_generation": 2}
+  ],
+  "sessions": [
+    {
+      "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
+      "states": {"plan.md": "MODIFIED"},
+      "grants": {"plan.md": {"granted_at_unix_ts": 1789558000}},
+      "last_heartbeat_unix_ts": 1789558540
+    }
+  ],
+  "grant_heartbeat_timeout_sec": 600,
+  "grant_max_hold_sec": 1800
+}
+```
+
+`granted_at_unix_ts` is when the session's current, unbroken `EXCLUSIVE` or
+`MODIFIED` hold on the path began. A commit does not reset it; the hold ends
+when the session leaves both states. A `null` time means none is on record for
+that grant, and the max-hold limit does not apply to it. All the times are
+whole unix seconds from the coordinator's clock, the clock the sweep compares
+against, and all of it comes from the same registry read as `states` and
+`reclaimed`.
+
+**The deadline.** For a path in a row's `grants`, the earliest time the sweep
+reclaims it is:
+
+```text
+min(last_heartbeat_unix_ts + grant_heartbeat_timeout_sec,
+    granted_at_unix_ts + grant_max_hold_sec)
+```
+
+- A `null` `last_heartbeat_unix_ts` on a row with grants means the grants are
+  reclaimed at the next sweep pass: no heartbeat on record counts as stale.
+- A `null` `granted_at_unix_ts` drops the second term.
+- Both comparisons are `>=`: the grant is reclaimable at that second, not after
+  it.
+- The reclaim lands at the first sweep pass at or after that time. A pass runs
+  every `sweep_interval_sec` (5 s by default), so it usually lands within one
+  period, but there is no upper bound while the registry is busy.
+- The heartbeat term moves later only when the session sends a request that
+  records a heartbeat, so a deadline holds only as of the read it came from.
+  These requests record one: `pre-read`, `pre-edit`, `post-edit` and
+  `post-edit-cas` on a tracked path; `pre-bash` on a command that reads a
+  tracked file; `pre-grep` on a directory holding a tracked file the
+  coordinator already knows; and `session-stop`, as it releases the session's
+  write grants.
+- No other request records one: not a hook request that reaches no tracked
+  path, `session-start`, `/status`, `POST /hooks/effect-fence`, or
+  `POST /session/heartbeat`, which keeps a snapshot session's lease, not a
+  grant. A request answered with `"degraded": true` may record its heartbeat
+  late, or not at all.
+- Each agent has its own heartbeat: a subagent's requests record the
+  subagent's, not its parent session's. So a session that holds a write grant
+  and then works only on untracked files, or only through a subagent, is
+  reclaimed at its last heartbeat plus `grant_heartbeat_timeout_sec` while it
+  is still busy.
+- The grant-time term does not move until the hold ends.
+- A grant in the middle of a state transition is governed by the transient
+  timeout (`transient_timeout_sec`) instead, and `/status` does not show
+  transient state.
+- Compute the deadline against the same wall clock the coordinator reads. A
+  caller on a skewed clock computes a skewed deadline.
+
+**When the thresholds are `null`.** Both are `null` when no sweep enforces
+them: `sweep_interval_sec` is `0`, which turns the sweep off; either
+threshold is below `1`, which makes the sweep's grant check fail on every pass;
+or `transient_timeout_sec` is below `1`, which makes the transient check that
+runs before it fail on every pass, so the grant check never runs. Each failure
+is logged. There is then no deadline to compute. All four are
+`LifecycleConfig` fields (`grant_heartbeat_timeout_sec` 600,
+`grant_max_hold_sec` 1800, `sweep_interval_sec` 5, `transient_timeout_sec` 60
+by default), applied by whatever starts the coordinator.
+
+**Reading `owner_generation`.** The generation goes up by one each time a write
+claim (`EXCLUSIVE` or `MODIFIED`) on the artifact ends without the version
+moving, which a version comparison cannot see. That happens on:
+
+- a sweep reclaim (`reclaim_heartbeat`, `reclaim_max_hold`);
+- the transient timeout taking a write grant back (`timeout`);
+- a voluntary release (`invalidate`): a failed post-edit, a session-stop, or
+  the release of every grant by `agent-coherence-coordinator
+  --prepare-for-migration`;
+- a handoff from a giver holding the path `EXCLUSIVE` or `MODIFIED`
+  (`handoff`).
+
+It does not move when a peer's write-acquire preempts the holder, on a commit
+(the version moves instead), or when a giver hands off a `SHARED` read. The
+names in parentheses are the [state-transition triggers](#trigger-vocabulary).
+Compare generations per artifact `id`, not per path: a path that is removed
+and registered again gets a new `id`, and its generation starts again at 0.
+
+None of these fields appear below the operator view; the default and `metrics`
+views are unchanged. The table that `agent-coherence-status` prints does not
+show them; `agent-coherence-status --detail full --json` prints them as the
+coordinator sends them.
+
+### When the registry is busy
+
+This is the Python coordinator's behavior.
+
+**`/status`.** The default and operator views read the registry before they
+answer. If another request holds the registry lock, they wait for it for about
+2 seconds at most: the wait ends at the 4-second handler budget, or earlier, so
+that a lock won late still leaves time to read and answer within 6 seconds,
+the timeout this package's clients use: the `agent-coherence-status` console
+script, `CoherentVolume` and the MCP server's `swg_status`. A client that waits
+less can give up before the answer arrives when the lock is won at the end of
+that wait. If the lock is still held then, the answer is `200` with every key
+that view normally carries (the counters and `policy_summary`, and in the
+operator view the pattern lists and the sweep thresholds), plus
+`"degraded": true`, and with both registry lists set to `null` (other keys
+omitted here):
+
+```json
+{"detail": "minimal", "tracked_artifacts": null, "sessions": null, "degraded": true}
+```
+
+A `null` list means the coordinator cannot tell you, at that moment, what is
+tracked or who holds what. It never means "nothing tracked", which is an empty
+list. `degraded` never appears in a normal answer, so check for it, or for a
+`null` list, before reading the lists.
+
+- The wait that ran out is counted in `watchdog_timeouts_total`, which the same
+  answer reports, and logged at `WARNING`. There is no separate `/status`
+  counter.
+- A client polling `/status` should back off after a degraded answer rather
+  than ask again at once.
+- Any other failure to read the registry still answers `500`. The `metrics`
+  view never reads the registry and is unaffected.
+
+What the shipped readers do with a degraded answer:
+
+- `agent-coherence-status` exits `2`. The table prints nothing on standard
+  output and one line on standard error:
+
+  ```text
+  agent-coherence-status: the coordinator's registry is busy (lock contention), so tracked artifacts and sessions are unavailable; try again shortly
+  ```
+
+  `--json` prints the body unchanged and also exits `2`.
+- The MCP server's `swg_status` reports `per_path` as `null`, not `{}`, and its
+  text result adds `per_path=unavailable` after the coordinator state, for
+  clients that show only text. (An unreachable coordinator still gives `{}`,
+  with `coordinator` reported as `unknown`.) When `swg_read` falls back to
+  `/status` for a handoff record, it adds `handoff_unknown: true`.
+- A `CoherentVolume` attaching meanwhile still checks its managed globs: it
+  reads them from `policy_summary`, which a degraded answer carries.
+
+**The Grep hook.** `POST /hooks/pre-grep` looks up the tracked paths under the
+search root under the same request deadline, and that lookup and the rest of
+the hook's work share one 4-second handler budget. When the lookup cannot take
+the registry lock in time, the hook answers `"degraded": true` with the
+advisory a read hook gives when its check times out, which reaches the model
+as added context:
+
+```text
+⚠ Coherence could not verify this file's freshness — the coordinator staleness check timed out under load. Proceeding WITHOUT a stale-read guarantee: if this file is shared with other agents or sessions, re-read it before relying on its contents.
+```
+
+It counts in `watchdog_timeouts_total` too.
 
 ### Reference
 
@@ -815,8 +1011,9 @@ A `CoherentVolume` that wrote a file keeps holding it until its own next
 `atomic_publish` or `reacquire()` releases it. Closing the volume or exiting the process does not release it, and
 neither does a `session-stop` that names only `vol.session_id`, because each
 attempt holds its grants under its own `agent_id`. The coordinator
-takes the file back once the holder has made no coordinator calls for
-`grant_heartbeat_timeout_sec` (600 s by default), or has held it for
+takes the file back once the holder has recorded no heartbeat for
+`grant_heartbeat_timeout_sec` (600 s by default; only its reads, writes and
+commits of tracked files record one), or has held it for
 `grant_max_hold_sec` (1800 s by default). The operator view of `/status` then
 lists the file under that holder's `reclaimed` map (see [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status)).
 Both are `LifecycleConfig` fields, passed as `config` to the volume that starts
@@ -2236,13 +2433,16 @@ agent-coherence-transfer: acting as session agent bd35b34c-f785-51c6-a184-5922ae
 The line ends `(session from --session)` when the flag named it. Check it: a
 shell whose variable names some other session shows up here. A transfer then
 prints one line per path, and the other commands one line. Results go to
-standard output; refusals, hints and errors go to standard error.
+standard output; refusals, hints and errors go to standard error. Text taken
+from the coordinator's answer, such as a reason, a status or an error, prints
+with non-printable characters escaped, as described under
+[Status, track and untrack commands](#status-track-and-untrack-commands).
 
 | Exit code | Meaning |
 |---|---|
 | `0` | Done: every named path transferred, or the accept, decline or withdraw was taken. |
 | `1` | Usage: a bad command line, a path that fails validation, not in a git repository, or no session to act as. Nothing is sent. |
-| `2` | The coordinator could not be reached, answered an HTTP error (a caller-principal refusal among them), refused the request or any one of its paths, or could not confirm the outcome. |
+| `2` | The coordinator could not be reached, the connection failed TLS verification or configuration, or the coordinator redirected the request (never followed), answered an HTTP error (a caller-principal refusal among them) or a body that is not a JSON object, refused the request or any one of its paths, or could not confirm the outcome. |
 | `4` | This coordinator does not serve the handoff commands: `.coherence/server.pid` names the Node backend, which the command reads before sending anything, or the command's route answered `404`. |
 
 A transfer of several paths hands on every path it can and exits `2` if any
@@ -2558,8 +2758,9 @@ not change it:
 lists every record. A strict-mode deny never carries the key, and the giver's own re-read
 of a path it handed off is one, so after a denied read `swg_read` takes the
 record from the coordinator's `/status` and adds the same `role`; when
-`/status` cannot be read it adds `handoff_unknown: true` instead, which means
-the record is unknown, not absent. `swg_status` adds `handoff` (without `role`) to
+`/status` cannot be read, or answers [degraded](#when-the-registry-is-busy)
+because the coordinator's registry was busy, it adds `handoff_unknown: true`
+instead, which means the record is unknown, not absent. `swg_status` adds `handoff` (without `role`) to
 the path's `per_path` entry; and a `swg_write_cas` win that labelled a live
 handoff adds `handoff` with its `outcome` (`completed` when this session is
 the successor, `overtaken` with `counterparty` otherwise), `giver`,
@@ -2797,7 +2998,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 | `swg_reacquire` | Recovery after a deny — clears the stale view + mandatory fresh read |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention. A win that completed or overtook a live handoff says which, in `handoff`; on a path this session handed off, the same `handed_off` deny as `swg_write` |
 | `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed OR a peer's write-claim preempted it (which moves neither comparand — the fence also re-checks that the grant still stands) |
-| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `principal_claim`, its `session_agent_id` (the id another session names to hand it a path), the coordinator's two caller-principal counters, and each path's handoff record |
+| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `principal_claim`, its `session_agent_id` (the id another session names to hand it a path), the coordinator's two caller-principal counters, and each path's handoff record. `per_path` is `null`, not `{}`, when the coordinator's `/status` answer carries no list of tracked paths, as a [degraded](#when-the-registry-is-busy) answer does when its registry was busy; the text result then says `per_path=unavailable`. Retry shortly and do not read it as nothing tracked. With `coordinator` `unknown`, `per_path` is `{}` and says nothing about what is tracked |
 | `swg_transfer` | Hands this session's claim on one or more paths to another session, named by that session's `session_agent_id`; see [From the MCP server](#from-the-mcp-server) |
 | `swg_accept` | As the successor, accepts a handoff without writing the path |
 | `swg_decline` | As the successor, declines a handoff; the giver may write the path again |
@@ -3513,11 +3714,57 @@ All bundled CLIs are installed as console scripts when you
 | `ccs-compare` | — | Compare two or more strategies on the same scenario |
 | `ccs-check-architecture` | — | Verify the four-layer architecture boundary (also runs in CI) |
 | `agent-coherence-replay` | `[langgraph]` | Replay a captured coordinator session and report invariant breaches |
-| `agent-coherence-status` | — | Print the coordinator's tracked paths, sessions, handoffs, sweep reclaims and counters; see [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status) |
+| `agent-coherence-status` | — | Print the coordinator's tracked paths, sessions, handoffs, sweep reclaims and counters; see [Status, track and untrack commands](#status-track-and-untrack-commands) and [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status) |
+| `agent-coherence-track` | — | Add paths to the coordinator's tracked set; see [Status, track and untrack commands](#status-track-and-untrack-commands) |
+| `agent-coherence-untrack` | — | Add paths to the coordinator's ignored set (a path enforced in strict mode is refused); see [Status, track and untrack commands](#status-track-and-untrack-commands) |
 | `agent-coherence-workspace` | — | Checkpoint / list / status / restore a workspace of file and forward-only members; see [Workspace versioning & restore](#workspace-versioning--restore-workspaceversioner) |
 | `agent-coherence-transfer`, `agent-coherence-accept`, `agent-coherence-decline`, `agent-coherence-withdraw` | — | Hand a path from one Claude Code session to another, and accept, decline or withdraw the handoff; see [Handoff commands](#handoff-commands) |
 
 Run any command with `--help` for the full option list.
+
+### Status, track and untrack commands
+
+Three console scripts read and change a running coordinator's view of the
+workspace. Each finds the coordinator from the git root of the current
+directory, or from `--root ROOT`; a path is relative to that root, or absolute
+inside it.
+
+| Command | What it does |
+|---|---|
+| `agent-coherence-status [--detail LEVEL] [--json] [--show-policy]` | prints `/status` as a table, or with `--json` as the body itself. `LEVEL` picks the view: `full`, the operator view, by default; `minimal`, which names no session; or `metrics`, the counters only |
+| `agent-coherence-track path [path ...]` | adds the paths to the coordinator's tracked set (`POST /policy/track`) |
+| `agent-coherence-untrack path [path ...]` | adds the paths to the coordinator's ignored set (`POST /policy/untrack`); a path enforced in strict mode is refused, and then nothing is untracked |
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Done. For `agent-coherence-status` this includes no coordinator running, which it reports on standard error. A path the command rejects itself, next to paths it sends, is reported and does not change the code. |
+| `1` | Not in a git repository; for `track` and `untrack`, also every path rejected by the command's own validation. Nothing is sent. |
+| `2` | `track` or `untrack` could not reach the coordinator; the connection failed TLS verification or configuration; or the coordinator redirected the request (never followed), answered an HTTP error, or answered a body that is not a JSON object or whose fields have the wrong types. `agent-coherence-status` also exits `2` on a [degraded answer](#when-the-registry-is-busy). |
+| `3` | `agent-coherence-status --self-test` failed, or `agent-coherence-untrack` was refused because a path is enforced in strict mode and untracked nothing. A refusal that does not name each refused path with the strict patterns covering it exits `2` instead, as the HTTP error it is, with the coordinator's error text. |
+
+An exit `2` prints one line on standard error, starting with the command's
+name, never a traceback; the one exception is `agent-coherence-status --json`
+on an answer without its two lists, such as a degraded one, which prints the
+body instead. An HTTP error reads `HTTP <code>: <error>`, with the
+coordinator's `error` text, or `HTTP <code>` when it sent none.
+
+**Escaping.** Every string these commands print from a coordinator answer
+(paths, session names, states, reclaim triggers, handoff statuses, counter
+values, error text) has each non-printable character written the way Python's
+`repr` writes it, without the quotes: an escape character as `\x1b`, a newline
+as `\n`, a right-to-left override as `\u202e`. So an answer cannot move the
+cursor, recolor the terminal or reorder a line. Printable text, the ASCII space
+included, prints unchanged, so ordinary output is exactly what it was. Other
+spaces and invisible joiners, such as a no-break space, U+3000 or a zero-width
+joiner, print escaped. A path the coordinator rejected or refused prints in
+quoted `repr` form, as a path the command rejects itself already did. The
+[handoff commands](#handoff-commands) escape the coordinator's text the same
+way.
+
+These are the Python console scripts' rules. Where the Claude Code plugin's own
+`agent-coherence-status`, `agent-coherence-track` or `agent-coherence-untrack`
+comes first on the Bash tool's `PATH`, that program runs instead, with its own
+output and exit codes.
 
 ### `ccs-simulate` and `ccs-compare`
 

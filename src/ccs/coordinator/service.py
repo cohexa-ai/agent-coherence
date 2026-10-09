@@ -3716,6 +3716,12 @@ class CoordinatorService:
                     else:
                         continue
 
+                # One write: set_agent_state records the reclaim slot with the
+                # transition (SWEEP_RECLAIM_TRIGGERS). A separate slot write
+                # that failed after the grant was gone would leave a reclaim
+                # that /status and the holder's commit error read as a release,
+                # and the next sweep skips the INVALID pair, so it would never
+                # be repaired.
                 self.registry.set_agent_state(
                     artifact_id,
                     agent_id,
@@ -3724,7 +3730,6 @@ class CoordinatorService:
                     tick=current_tick,
                     content_hash=None,
                 )
-                self.registry.record_last_reclamation(agent_id, artifact_id, trigger, current_tick)
                 # The callback fires once the reclaim is durable and BEFORE the
                 # single-writer check: a check that raises still leaves this
                 # pair reclaimed (each pair commits on its own), and a reclaim

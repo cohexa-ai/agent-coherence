@@ -14,6 +14,9 @@ THIS server's managed globs — not a cross-checked coordinator fact. This
 server's own globs are checked against the coordinator's published policy when
 its volume attaches (a mismatch fails the volume closed), but a PEER's differing
 scope is still not visible here (``heterogeneous_scope_detectable=false``).
+Under the same SC5 rule ``per_path`` is ``None``, never ``{}``, when ``/status``
+carries no artifact list, as a degraded answer does when its registry was busy
+(#238).
 
 ``principal_claim`` is the session's own caller-principal state
 (:attr:`~ccs.adapters.coherent_volume.CoherentVolume.principal_claim_outcome`):
@@ -55,6 +58,13 @@ from ccs.adapters.claude_code.policy import matches_any
 if TYPE_CHECKING:
     from ccs.adapters.coherent_volume import CoherentVolume
     from ccs.mcp.session import SessionConfig
+
+# The text-channel line ``swg_status`` adds when ``per_path`` is ``None``, so a
+# client that surfaces only text still tells "cannot tell" from a healthy answer.
+PER_PATH_UNAVAILABLE_TEXT = (
+    "per_path=unavailable: the coordinator could not report which paths are "
+    "tracked; retry shortly and do not treat this as nothing tracked"
+)
 
 
 def build_status(volume: CoherentVolume, config: SessionConfig) -> dict:
@@ -107,15 +117,24 @@ def _counter(status_doc: dict | None, key: str) -> int | None:
     return value
 
 
-def _per_path(config: SessionConfig, status_doc: dict | None) -> dict:
+def _per_path(config: SessionConfig, status_doc: dict | None) -> dict | None:
     """Per tracked artifact: its version and whether it is ``enforced`` (matches
     this server's managed globs) or merely ``not_registered`` for strict
     enforcement by this server, plus its transfer record as ``handoff`` when
-    the coordinator reports one."""
+    the coordinator reports one.
+
+    ``None`` when ``/status`` carries no artifact list: a degraded answer
+    (#238), whose registry read timed out, carries it as null, and any other
+    answer without a list cannot tell either -- never "nothing tracked". An
+    unreachable coordinator still gives ``{}``, with ``coordinator`` reported
+    ``unknown``."""
     per_path: dict[str, dict] = {}
     if not isinstance(status_doc, dict):
         return per_path
-    for artifact in status_doc.get("tracked_artifacts", []):
+    artifacts = status_doc.get("tracked_artifacts")
+    if not isinstance(artifacts, list):
+        return None
+    for artifact in artifacts:
         if not isinstance(artifact, dict):
             continue
         path = artifact.get("path")

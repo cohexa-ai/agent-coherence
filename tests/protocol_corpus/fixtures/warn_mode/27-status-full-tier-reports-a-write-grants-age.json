@@ -1,0 +1,105 @@
+{
+  "name": "status-full-tier-reports-a-write-grants-age",
+  "description": "GET /status?detail=full with the operator header after one session's pre-edit took plan.md EXCLUSIVE. The operator tier carries the inputs to a sweep reclaim (#187): the entry's owner_generation (0: nothing has reclaimed or handed off the path), the holder's grants map with the path's grant time, the holder's last heartbeat, and the two sweep thresholds, null because the harness builds the coordinator without lifecycle. The grant time and heartbeat are wall-clock ticks: a number is scrubbed to <TS> by type, so a null in either place fails this row. Python-only: the Node coordinator answers 501 at this tier.",
+  "setup": {
+    "tracked": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "path": "plan.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "GET",
+    "path": "/status?detail=full",
+    "headers": {
+      "Coherence-Local-Operator": "true"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "audit_log_mode_drift_total": 0,
+      "auth_401_total": 0,
+      "caller_principal_absent_total": 1,
+      "caller_principal_refused_total": 0,
+      "cold_start_duration_ms": 0,
+      "coordinator_backend": "python",
+      "coordinator_pid": "<PID>",
+      "coordinator_root": "<IGNORED>",
+      "coordinator_uptime_s": "<UPTIME>",
+      "coordinator_uptime_seconds": "<UPTIME>",
+      "coordinator_version": "<IGNORED>",
+      "detail": "full",
+      "effect_fence_holds_total": 0,
+      "endpoint_counters": "<IGNORED>",
+      "fresh_shared_hash_mismatch_total": 0,
+      "grant_heartbeat_timeout_sec": null,
+      "grant_max_hold_sec": null,
+      "handler_concurrency_overflows_total": 0,
+      "handoff_giver_denials_total": 0,
+      "in_flight_drain_timed_out": false,
+      "intra_task_acquire_release_total": 0,
+      "policy_summary": "<IGNORED>",
+      "sessions": [
+        {
+          "agent_id": "<UUID>",
+          "agent_name": "claude-session-<UUID>",
+          "grants": {
+            "plan.md": {
+              "granted_at_unix_ts": "<TS>"
+            }
+          },
+          "last_heartbeat_unix_ts": "<TS>",
+          "reclaimed": {},
+          "states": {
+            "plan.md": "EXCLUSIVE"
+          }
+        }
+      ],
+      "shared_foreign_lag_suppressed_total": 0,
+      "stale_warning_emitted_total": 0,
+      "stale_warning_reread_total": 0,
+      "strict_mode_denials_total": 0,
+      "strict_mode_routed_around_via_bash_total": 0,
+      "sweep_reclaims_by_trigger": {
+        "reclaim_heartbeat": 0,
+        "reclaim_max_hold": 0
+      },
+      "sweep_reclaims_total": 0,
+      "tracked_artifacts": [
+        {
+          "id": "<UUID>",
+          "last_writer_agent_id": null,
+          "last_writer_at_unix_ts": null,
+          "owner_generation": 0,
+          "path": "plan.md",
+          "version": 1
+        }
+      ],
+      "watchdog_late_aborts_total": 0,
+      "watchdog_late_completion_total": 0,
+      "watchdog_queue_overflows_total": 0,
+      "watchdog_timeouts_total": 0
+    }
+  },
+  "ignore_keys": [
+    "policy_summary",
+    "endpoint_counters",
+    "coordinator_version",
+    "coordinator_root"
+  ],
+  "backends": [
+    "python"
+  ]
+}

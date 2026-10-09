@@ -11,9 +11,13 @@ suppress warnings because the path is excluded.
 Exit codes:
 - 0: all paths accepted
 - 1: not in a git repo / all paths rejected by local validation
-- 2: coordinator unreachable / HTTP error
+- 2: coordinator unreachable / HTTP error / a refused redirect / a TLS
+  failure / an answer that is not a /policy/untrack answer, a strict
+  refusal that does not name each refused path with its strict patterns
+  among them
 - 3: refused because a path is enforced in strict mode (#261) — the
-  coordinator answered ``reason: untrack_strict_path`` and wrote nothing.
+  coordinator answered ``reason: untrack_strict_path``, named each refused
+  path with its strict patterns, and wrote nothing.
   Untracking a strict path takes a coordinator restart without its entry in
   ``.coherence/strict_mode.yaml``.
 """
@@ -23,18 +27,23 @@ from __future__ import annotations
 import argparse
 import urllib.error
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from ccs.adapters.claude_code.policy import UNTRACK_STRICT_PATH_REASON
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli._coherence_client import (
+    NOT_A_JSON_OBJECT_LINE,
     CoordinatorUnavailable,
     err,
+    escape_nonprintable,
+    http_error_line,
     http_status_from_error,
     normalize_workspace_path,
     post,
+    redirect_refused_line,
     resolve_endpoint,
 )
+from ccs.core.exceptions import RedirectRefused, TlsConfigError, TlsVerificationFailed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -92,37 +101,72 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         endpoint = resolve_endpoint(Path(root))
         payload = post(endpoint, "/policy/untrack", {"paths": valid})
-    except CoordinatorUnavailable as exc:
-        err(f"agent-coherence-untrack: {exc}")
+    except (CoordinatorUnavailable, TlsVerificationFailed, TlsConfigError) as exc:
+        err(f"agent-coherence-untrack: {escape_nonprintable(exc)}")
         return 2
     except urllib.error.HTTPError as exc:
         body = http_status_from_error(exc)
-        if (body or {}).get("reason") == UNTRACK_STRICT_PATH_REASON:
+        refused = _strict_refusal_entries(body)
+        if refused is not None:
             # Classified by the typed reason, never by the error text.
-            for entry in body.get("refused", []):
-                patterns = ", ".join(entry.get("strict_patterns", []))
-                err(
-                    f"agent-coherence-untrack: refused {entry.get('path')!r}: "
-                    f"enforced in strict mode by {patterns}"
-                )
-            err(
-                "agent-coherence-untrack: nothing was untracked. A strict path stays "
-                "enforced while the coordinator runs; remove its entry from "
-                ".coherence/strict_mode.yaml and restart the coordinator to untrack it."
-            )
+            _report_strict_refusal(refused)
             return 3
-        msg = (body or {}).get("error", str(exc))
-        err(f"agent-coherence-untrack: HTTP {exc.code}: {msg}")
+        err(f"agent-coherence-untrack: {http_error_line(exc.code, body)}")
+        return 2
+    except RedirectRefused as exc:
+        err(f"agent-coherence-untrack: {redirect_refused_line(exc)}")
+        return 2
+    if not isinstance(payload, dict):
+        err(f"agent-coherence-untrack: {NOT_A_JSON_OBJECT_LINE}")
         return 2
 
-    removed: list[str] = payload.get("removed", [])
+    removed = payload.get("removed", [])
+    # A list of paths, checked before anything prints: a string iterates as
+    # its characters and an object as its keys.
+    if not (isinstance(removed, list) and all(isinstance(p, str) for p in removed)):
+        err("agent-coherence-untrack: unexpected /policy/untrack answer shape")
+        return 2
     for p in removed:
         # Success → stdout (machine-parseable by callers).
-        print(f"agent-coherence-untrack: untracked {p}", flush=True)
+        print(f"agent-coherence-untrack: untracked {escape_nonprintable(p)}", flush=True)
     for p, reason in invalid:
         err(f"agent-coherence-untrack: rejected {p!r}: {reason}")
 
     return 0
+
+
+def _strict_refusal_entries(body: dict[str, Any] | None) -> list[dict[str, Any]] | None:
+    """The refused entries of a strict refusal: the typed reason with a
+    non-empty ``refused`` list, every entry naming its path and the strict
+    patterns covering it as strings. ``None`` for any other body, which then
+    reads as the HTTP error it is: exit 2, like every answer of the wrong
+    shape, with the coordinator's own error text, which names the paths."""
+    if body is None or body.get("reason") != UNTRACK_STRICT_PATH_REASON:
+        return None
+    refused = body.get("refused")
+    if not (isinstance(refused, list) and refused and all(map(_is_refused_entry, refused))):
+        return None
+    return refused
+
+
+def _is_refused_entry(entry: object) -> bool:
+    if not (isinstance(entry, dict) and isinstance(entry.get("path"), str)):
+        return False
+    patterns = entry.get("strict_patterns")
+    return isinstance(patterns, list) and bool(patterns) and all(isinstance(p, str) for p in patterns)
+
+
+def _report_strict_refusal(refused: list[dict[str, Any]]) -> None:
+    """One line per refused path -- in the quoted ``repr`` form, its strict
+    patterns escaped (#245) -- then what to do."""
+    for entry in refused:
+        named = ", ".join(map(escape_nonprintable, entry["strict_patterns"]))
+        err(f"agent-coherence-untrack: refused {entry['path']!r}: enforced in strict mode by {named}")
+    err(
+        "agent-coherence-untrack: nothing was untracked. A strict path stays "
+        "enforced while the coordinator runs; remove its entry from "
+        ".coherence/strict_mode.yaml and restart the coordinator to untrack it."
+    )
 
 
 if __name__ == "__main__":

@@ -169,6 +169,11 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "(EPOCH_BUMP_TRIGGERS); the "
         "version-moving peer invalidations do not, because version-CAS already "
         "arbitrates those. Single-writer is checked after each such transition. "
+        "A sweep reclaim (SWEEP_RECLAIM_TRIGGERS) records the pair's (trigger, "
+        "tick) reclamation slot in the SAME write as the transition, so the slot "
+        "commits or rolls back with the state and the epoch bump: a reclaim is "
+        "never stored without its cause, which /status needs to tell it from a "
+        "release. "
         "The read_generation capture rides the same transition and is keyed on "
         "the agent's OWN claim: an I/S->M/E acquire, or a genuine read the agent "
         "requested (CLAIM_CAPTURE_TRIGGERS plus the not-previously-in-M/E "
@@ -210,21 +215,28 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "commit_cas / invalidate). It is the boundary's serialization + fail-shut "
         "seam: a watchdog-aborted mutation fails closed at the write lock instead "
         "of landing as a phantom write. A backend re-homing the boundary must "
-        "provide the equivalent atomic-or-abort envelope.",
+        "provide the equivalent atomic-or-abort envelope. Its keyword-only "
+        "deadline bounds the wait for that envelope (#238): past it the guard "
+        "raises RegistryLockTimeout having run nothing, so a request-thread "
+        "read answers without the registry instead of blocking on a peer's "
+        "hold. A backend must offer the same bounded wait.",
     ),
     MemberContract(
         "record_last_reclamation",
         MemberClass.INDEPENDENT,
         "base",
-        "Records the (trigger, tick) reclamation slot during the same-lock "
-        "enforce_stable_grant_timeouts sweep, in its OWN transaction — a serialized "
-        "follow-on AFTER the M/E->INVALID reclaim, NOT one atomic RMW with it "
-        "(verified: set_agent_state and record_last_reclamation each open their own "
-        "BEGIN IMMEDIATE, called consecutively by the sweep). Read back by commit "
-        "to explain a reclaimed-grant failure and by /status's operator view "
-        "(status_snapshot's reclaim opt-in) — a diagnostic write a backend "
-        "makes individually durable, not part of the single-writer boundary "
-        "(cf. the heartbeat record, likewise INDEPENDENT).",
+        "Writes a (trigger, tick) reclamation slot for one pair, in its OWN "
+        "transaction. NOT the sweep's write: enforce_stable_grant_timeouts does "
+        "not call it, because set_agent_state records a sweep reclaim's slot in "
+        "the same write as the M/E->INVALID transition — a separate write that "
+        "failed or was cut short after the reclaim would leave an INVALID pair "
+        "/status reads as a plain release, and the next sweep skips an INVALID "
+        "pair, so nothing would repair it. Kept as an explicit, independent "
+        "writer of the same slot (seeding a slot, e.g. in tests); the slot is "
+        "read back by commit to explain a reclaimed-grant failure "
+        "and by /status's operator view (status_snapshot's reclaim opt-in). "
+        "Not part of the single-writer boundary (cf. the heartbeat record, "
+        "likewise INDEPENDENT).",
     ),
     # ---- ATOMIC_CLASS reads consumed INSIDE the boundary -------------------
     MemberContract(
@@ -454,8 +466,8 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         MemberClass.READ_ONLY,
         "base",
         "Reads the (trigger, tick) reclamation slot to EXPLAIN a reclaimed-grant "
-        "commit failure (commit). Non-mutating; the WRITE side "
-        "(record_last_reclamation) is ATOMIC_CLASS.",
+        "commit failure (commit). Non-mutating; the sweep WRITES it inside "
+        "set_agent_state's reclaim transition, which is ATOMIC_CLASS.",
     ),
     MemberContract(
         "get_owner_generation",
@@ -698,6 +710,9 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "liveness, read inside the same lock hold so a record is judged "
         "against the version its row reports (#185). A second opt-in adds each "
         "pair's reclamation slot, read from the same agent-state rows (#195). "
+        "A third adds each artifact's owner generation, each pair's grant tick "
+        "and each agent's last heartbeat, in the same hold, so a reader can "
+        "compute a grant's reclaim deadline from one consistent read (#187). "
         "Only /status opts in, and the default answer is unchanged. "
         "Non-mutating.",
     ),

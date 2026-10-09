@@ -31,11 +31,16 @@ principal, the mint is neither.
 Every handler:
 - Verifies ``Authorization: Bearer <secret>`` (constant-time)
 - Verifies ``Host`` header is localhost / 127.0.0.1 (DNS-rebind guard)
-- Records the calling session's heartbeat (KTD-2)
+- Records the calling agent's grant heartbeat only on session-stop and on the
+  hook routes (pre-read, pre-edit, post-edit, post-edit-cas, pre-bash,
+  pre-grep) whose request reaches a tracked path; an untracked fast path,
+  session-start, ``/status`` and every other route record none
 - Runs the coordinator call under a 4s ThreadPoolExecutor timeout
   (handler-side watchdog — keeps us under the 5s hook timeout even when
   SQLite contention exceeds busy_timeout=2000); a caller-principal gate that
-  must read the registry runs under the same deadline, before the call
+  must read the registry runs under the same deadline, before the call.
+  ``/status`` and pre-grep's registry lookup read on the request thread
+  instead, bounding their wait for the registry lock by that deadline (#238)
 - Converts ``CoherenceError`` to 200 ``{ok: false, reason}`` (NOT 500 — we
   want hooks to proceed gracefully on protocol violations, not block)
 - Logs request/response at DEBUG, errors at WARNING
@@ -118,6 +123,7 @@ from ccs.core.exceptions import (
     CoherenceError,
     GiverFenced,
     OccCallerTransientError,
+    RegistryLockTimeout,
     SessionInvalidated,
     StaleReadGeneration,
     WatchdogAbandoned,
@@ -181,6 +187,29 @@ class _RequestProtocol(Protocol):
 
 
 HANDLER_TIMEOUT_SEC = 4.0
+
+_STATUS_CLIENT_TIMEOUT_SEC = 6.0
+"""How long this package's ``/status`` clients wait for the answer: the
+``agent-coherence-status`` console script, the volume's attach checks and MCP
+``swg_status`` all read it through ``ccs.cli._coherence_client``, whose
+``CLI_HTTP_TIMEOUT_SEC`` this duplicates (that module imports this one, so the
+value cannot be imported back; a test pins the two equal). A client that waits
+less can give up on a lock won at the wait cap before its answer arrives."""
+
+_STATUS_READ_RESERVE_SEC = 4.0
+"""#238: how much of :data:`_STATUS_CLIENT_TIMEOUT_SEC` ``/status``
+keeps for its registry read, so a lock won late still answers before the
+client gives up: the wait for the registry lock ends this long before the
+client's timeout, or at the handler budget if that comes first. That caps the
+wait at 2.0 s, which a held lock now spends before ``/status`` answers its
+marked degraded body.
+
+Sized from the slower of the two reads on a 500k-row ``agent_states`` ledger
+(the size behind ``status_snapshot``'s 2804 ms figure), across four
+artifact x agent shapes from 5000 x 100 to 100 x 5000, eight runs each on an
+Intel Mac: the operator-tier read took 2.56-3.07 s and the default-tier read
+2.34-2.53 s, and the whole operator-tier answer, read plus projection and
+encoding, at most 3.19 s. The reserve is that answer plus a quarter."""
 
 # v0.2 Unit 4: window for the "Read strict-deny → Bash cat strict-deny on
 # same (session, path)" route-around detector. Phase 0 saw the model
@@ -1057,6 +1086,17 @@ class CoordinatorHTTPServer:
         # lifecycle module sets it; remains 0.0 when the server is
         # constructed directly in tests.
         self.cold_start_duration_ms: float = 0.0
+
+        # #187 — the stable-grant sweep thresholds, in seconds, that the
+        # lifecycle winner path started this coordinator's sweep with. Set
+        # before serve_in_thread(), so no handler sees them change. None when
+        # no sweep enforces them: the server was constructed directly (tests,
+        # the corpus harness), or lifecycle ran no sweep or one whose passes
+        # all fail (a threshold or the transient timeout below 1). Lifecycle
+        # hands over plain values; this module never imports lifecycle (it
+        # imports this one).
+        self.grant_heartbeat_timeout_sec: int | None = None
+        self.grant_max_hold_sec: int | None = None
 
         # KTD-J (Unit 8) — telemetry counters. CACHE, not persistent
         # state: reset to 0 on coordinator respawn (do NOT persist in
@@ -4439,6 +4479,16 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     ``path`` arg, empty string for workspace root).
 
     Response shape mirrors /hooks/pre-bash.
+
+    #238: the registry lookup that decides whether anything is tracked under
+    the root runs on the request thread and waits for the registry lock only
+    until the request's watchdog deadline, which it starts (or inherits from
+    the caller-principal gate), so the lookup and everything after it -- the
+    zero-tracked fast path's delivery, the work body -- share one
+    ``HANDLER_TIMEOUT_SEC``. A lookup that runs out answers the
+    "could not verify freshness" advisory (:data:`_DEFAULT_DEGRADED_RESPONSE`,
+    as a timed-out work body does) having registered no session, recorded no
+    heartbeat and left any pending re-grounding for the next request.
     """
     body = req._read_json()
     if body is None:
@@ -4462,7 +4512,19 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # Find registry-known tracked artifacts under the search root.
     # SB-10 U4 (KTD6): advisory peek hoisted above the zero-tracked-
     # artifacts exit so a pending payload still reaches this admit.
-    tracked_paths = coordinator.registry.artifact_names_under_prefix(search_root)
+    # #238: only this lookup is bounded here; the work body below
+    # already runs under the watchdog, on what the lookup left of the deadline.
+    try:
+        with coordinator.registry.abort_guard(deadline=_start_watchdog_deadline(req)):
+            tracked_paths = coordinator.registry.artifact_names_under_prefix(search_root)
+    except RegistryLockTimeout:
+        coordinator.increment_watchdog_timeout()
+        logger.warning(
+            "pre-grep could not take the registry lock within %ss; degrading",
+            HANDLER_TIMEOUT_SEC,
+        )
+        req._json(200, _DEFAULT_DEGRADED_RESPONSE)
+        return
     if not tracked_paths:
         _fast_path_json(req, coordinator, session_id, body, {"status": "fresh"})
         return
@@ -6598,15 +6660,17 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     | metrics   | ?detail=metrics      | none — telemetry block only    |
     | full      | ?detail=full         | ``Coherence-Local-Operator: true`` header opt-in |
 
-    ``minimal`` is the default and includes no absolute paths (workspace
-    root is reported as a sentinel ``.``) and no session names (R6:
-    ``agent_name`` embeds the raw session id, so it is null below the
-    operator tier; the non-reversible ``agent_id`` and the per-artifact
-    ``states`` map stay). ``metrics`` returns only the
-    counter block — useful for operators scraping /status into a
+    ``minimal`` is the default and includes no absolute paths: the workspace
+    root is reported as the sentinel ``.``, both as the top-level
+    ``coordinator_root`` and as ``policy_summary.coordinator_root``. It
+    carries no session names (R6: ``agent_name`` embeds the raw session id,
+    so it is null below the operator tier; the non-reversible ``agent_id``
+    and the per-artifact ``states`` map stay). ``metrics`` returns
+    only the counter block — useful for operators scraping /status into a
     dashboard without leaking workspace state; it carries no sessions at
     all and is unaffected by R6. ``full`` is the legacy
-    everything-block plus absolute ``coordinator_root`` and ``coordinator_pid``,
+    everything-block plus the absolute top-level ``coordinator_root``
+    (``coordinator_pid`` is at the minimal tier too, P1 #7),
     gated by the explicit ``Coherence-Local-Operator: true`` header so a
     same-user adversary (Adversary 1 in auth.py) cannot trivially grab
     the operator's home-directory path. Bearer auth is enforced by the
@@ -6621,7 +6685,7 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
 
     #195 — reclaim cause at the operator tier: every ``sessions[]`` row at
     ``detail=full`` carries ``reclaimed``, a map SIBLING to ``states``:
-    ``{path: {"trigger": "reclaim_heartbeat" | "reclaim_max_hold", "tick": int}}``
+    ``{path: {"trigger": "reclaim_heartbeat" | "reclaim_max_hold", "reclaimed_at_unix_ts": int}}``
     for each artifact whose last write grant the stable-grant sweep pulled
     from this agent (the registry's ``last_reclaim_trigger`` /
     ``last_reclaim_tick`` slot). ``states`` keeps its meaning — held grants
@@ -6631,15 +6695,51 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     next M/E acquire, so an entry means "this session's most recent write
     grant on this path was reclaimed and it has held none since": a re-read
     granted SHARED shows the path in ``states`` and keeps it in ``reclaimed``,
-    and a peer invalidating that read leaves the original trigger/tick. A
-    sole reader's re-read is granted EXCLUSIVE, an M/E acquire that clears the
-    slot. A pair held M/E is never listed. Both maps come from one registry
-    read.
-    ``tick`` is the sweep's tick basis, wall-clock seconds over the HTTP
-    transport. The key is absent below the operator tier. An agent
-    that is unnamed, holds nothing and is listed only for a reclaim gets a row
-    only while its newest reclaim is younger than
-    ``_RECLAIM_ONLY_ROW_MAX_AGE_SEC`` (24h), so dead sessions do not pile up.
+    and a peer invalidating that read leaves the original trigger and time.
+    Over the hooks a re-read is granted SHARED even when no other session
+    holds the path: the pre-read's re-grant of a stale or held reader does
+    not capture the read generation, so the session's compare-and-swap stays
+    refused ``stale_read_generation`` and the path stays listed until its
+    next pre-edit, the M/E acquire that clears the slot. (Only the library's
+    ``CoordinatorService.fetch`` grants a sole reader EXCLUSIVE.) A pair held
+    M/E is never listed. Both maps come from one registry read.
+    ``reclaimed_at_unix_ts`` is when the sweep reclaimed the grant, in whole
+    unix seconds like the other ``*_unix_ts`` fields. The key is absent below
+    the operator tier. An agent that is unnamed, holds nothing and is listed
+    only for a reclaim gets a row only while its newest reclaim is younger
+    than ``_RECLAIM_ONLY_ROW_MAX_AGE_SEC`` (24h), so dead sessions do not pile
+    up.
+
+    #187 — the inputs to a reclaim, at the operator tier: each
+    ``tracked_artifacts`` entry carries ``owner_generation`` (an int), and
+    each ``sessions[]`` row, reclaim-only rows included, carries ``grants``,
+    ``{path: {"granted_at_unix_ts": int | None}}`` for exactly the paths the
+    row holds EXCLUSIVE or MODIFIED, and ``last_heartbeat_unix_ts``, the
+    agent's last heartbeat, or null with none on record. The state decides
+    what ``grants`` lists, because the state is what the sweep acts on: a
+    write grant with no tick on record is listed with a null time (no
+    max-hold limit applies to it), and a read is never listed. The body also
+    carries ``grant_heartbeat_timeout_sec`` and ``grant_max_hold_sec``, the
+    thresholds the running sweep enforces, null when lifecycle started none.
+    All of it comes from the same registry read as ``states`` and
+    ``reclaimed``; the times are the sweep's tick basis, whole unix seconds.
+    None of it appears below the operator tier.
+
+    #238 — a bounded wait for the registry: the minimal and full tiers wait
+    for the registry lock on the request thread, through the registry's own
+    ``abort_guard(deadline=...)``, until the request's watchdog deadline
+    (``HANDLER_TIMEOUT_SEC``) or until only ``_STATUS_READ_RESERVE_SEC`` of
+    :data:`_STATUS_CLIENT_TIMEOUT_SEC` remains, whichever comes first. A lock
+    won in time is read in one hold as before. Past that deadline the tier
+    answers 200 with the keys it normally carries -- ``policy_summary`` with
+    its pattern lists at the full tier, the counters, the thresholds at the
+    full tier -- with ``tracked_artifacts`` and ``sessions`` null and
+    ``"degraded": true`` added, and counts the timeout in
+    ``watchdog_timeouts_total``, which that same body shows. Nothing is left
+    running behind it. ``degraded`` never appears in a normal body, and a null
+    list means "cannot tell", never "nothing tracked". Any other failure of
+    the read keeps the dispatcher's 500. Pre-grep bounds its registry lookup
+    the same way (:func:`_handle_pre_grep`).
 
     AC-07 — metrics-tier stability contract (operator-facing):
 
@@ -6664,7 +6764,9 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
 
       Fields EXPLICITLY OMITTED from metrics tier vs. full tier:
       ``tracked_artifacts``, ``sessions``, ``policy_summary``,
-      ``coordinator_root``, ``coordinator_pid``. Operators wanting
+      ``coordinator_root``, ``coordinator_pid``,
+      ``grant_heartbeat_timeout_sec``, ``grant_max_hold_sec`` (#187),
+      ``degraded`` (#238). Operators wanting
       these for a dashboard must call ``?detail=full`` with the
       ``Coherence-Local-Operator: true`` header.
     """
@@ -6679,27 +6781,7 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
             })
             return
 
-    # Counter block — present at every tier so the telemetry-only
-    # consumer (?detail=metrics) doesn't pay for the artifact/session
-    # walk. KTD-J (Unit 8) adds per-endpoint + product-signal counters
-    # alongside the existing watchdog/concurrency counters.
-    # M-03 / finding #31: use counters_snapshot() instead of reaching into
-    # private attrs directly — single source of truth for the counter set.
-    # AC-02 cross-backend parity: KTD-J naming convention locks the
-    # full-word ``_seconds`` suffix for duration fields. Node emits
-    # ``coordinator_uptime_seconds``; Python now matches. The old
-    # ``coordinator_uptime_s`` field is emitted ALONGSIDE the new one
-    # for one release as a backward-compat alias (consumers can detect
-    # which field to read by checking which is present, or just read
-    # the canonical name). Deprecation note in docs/metrics.md (TODO).
-    _uptime = coordinator.uptime_s
-    counters = {
-        "coordinator_uptime_seconds": _uptime,
-        "coordinator_uptime_s": _uptime,  # AC-02: deprecated alias, removed in v0.2
-        "coordinator_backend": "python",
-        "coordinator_version": _COORDINATOR_VERSION,
-        **coordinator.counters_snapshot(),
-    }
+    counters = _status_counters(coordinator)
     if detail == "metrics":
         req._json(200, {"detail": "metrics", **counters})
         return
@@ -6711,13 +6793,41 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # liveness is judged against the version its entry shows. #195: at the
     # operator tier, the only one that shows them, the reclaim slots ride the
     # agent-state SELECT itself, so a reclaim cannot land between the state a
-    # row shows and the cause it lists.
+    # row shows and the cause it lists. #187: the grant detail (each pair's
+    # grant tick, each agent's heartbeat, each artifact's generation) rides
+    # the same hold, at the operator tier only.
+    #
+    # #238: the hold is taken through the guard, which stops waiting at the
+    # wait cap; the snapshot's own lock acquire then re-enters at once, so
+    # the read is still one hold. Only the wait is bounded: a lock won by the
+    # cap is read to the end, in the time the read reserve leaves.
     operator_tier = detail == "full"
-    snapshot = coordinator.registry.status_snapshot(
-        include_transfers=True, include_reclamations=operator_tier
-    )
+    try:
+        with coordinator.registry.abort_guard(deadline=_status_wait_deadline(req)):
+            snapshot = coordinator.registry.status_snapshot(
+                include_transfers=True,
+                include_reclamations=operator_tier,
+                include_grant_detail=operator_tier,
+            )
+    except RegistryLockTimeout:
+        # #238: counted BEFORE the counters are read, so the answer reports
+        # its own timeout, and logged as a degraded hook is. The body is built
+        # only now, from what needs no registry, with the two registry lists
+        # null -- never empty, which a reader takes for "nothing tracked".
+        coordinator.increment_watchdog_timeout()
+        logger.warning(
+            "/status could not take the registry lock within its budget; "
+            "answering without the registry"
+        )
+        degraded = _status_body(coordinator, detail, _status_counters(coordinator))
+        degraded["degraded"] = True
+        req._json(200, degraded)
+        return
     artifact_by_id, state_by_artifact, transfer_by_artifact = snapshot[:3]
     reclamation_by_artifact = snapshot[3] if operator_tier else {}
+    granted_at_by_artifact, last_heartbeat_by_agent = (
+        snapshot[4] if operator_tier else ({}, {})
+    )
     named_agents = coordinator.agent_names_snapshot()
 
     tracked: list[dict] = []
@@ -6744,6 +6854,10 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
             writer = meta.get("last_writer_id")
             entry["last_writer_agent_id"] = str(writer) if writer else None
             entry["last_writer_at_unix_ts"] = meta.get("updated_at") if writer else None
+            # #187: the ownership generation moves when a write claim ends
+            # without a version move (a reclaim, a release, a handoff from
+            # M/E), the one change a version comparison cannot see.
+            entry["owner_generation"] = meta["owner_generation"]
         # #185: the path's transfer record, only while one exists, so an
         # entry with no record keeps today's bytes at every tier.
         transfer = transfer_by_artifact.get(artifact_id)
@@ -6761,12 +6875,25 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # coordinator process that issued it, while the durable ``agent_states``
     # row kept arbitrating (a peer's pre-edit still collides against a holder
     # the payload never named). Build from the registry, then label.
+    #
+    # #187: the operator tier's ``grants`` are the write grants the
+    # sweep can reclaim, projected by STATE in the same walk. The live grant
+    # paths set the tick on an M/E acquire and clear it on leaving M/E, so
+    # state and tick agree; a ledger another runtime wrote need not, and the
+    # sweep acts on the state. So an M/E pair is listed even with no tick
+    # (null: the max-hold limit does not apply to it) and a pair in any other
+    # state is not, whatever tick it carries.
     states_by_agent: dict[UUID, dict[str, str]] = {}
+    grants_by_agent: dict[UUID, dict[str, dict[str, int | None]]] = {}
     for artifact_id, meta in artifact_by_id.items():
         for agent_id, state in state_by_artifact[artifact_id].items():
             if state == MESIState.INVALID:
                 continue
             states_by_agent.setdefault(agent_id, {})[meta["name"]] = state.name
+            if operator_tier and state in _M_OR_E_STATES:
+                grants_by_agent.setdefault(agent_id, {})[meta["name"]] = {
+                    "granted_at_unix_ts": granted_at_by_artifact.get(artifact_id, {}).get(agent_id),
+                }
 
     # #195: the reclaim cause, operator tier only (the same disclosure call as
     # #199's writer attribution: it says which session lost which path, and
@@ -6777,9 +6904,12 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # It is history, not current state: the pair's last write grant ended in
     # a sweep reclaim and it has held none since. A re-read granted SHARED does
     # not version the edit the reclaim stranded, so the path stays listed
-    # beside that SHARED state; only an M/E acquire clears the slot, including
-    # the EXCLUSIVE a sole reader's re-read is granted. A pair still write-held
-    # is never listed, so a path is never both held for writing and reclaimed.
+    # beside that SHARED state; only an M/E acquire clears the slot. Over the
+    # hooks that is the session's next pre-edit: the pre-read re-grants a
+    # stale reader SHARED even when no other session holds the path, and that
+    # re-grant is not a claim, so the compare-and-swap stays refused too. A
+    # pair still write-held is never listed, so a path is never both held for
+    # writing and reclaimed.
     reclaimed_by_agent: dict[UUID, dict[str, dict[str, Any]]] = {}
     for artifact_id, slots in reclamation_by_artifact.items():
         meta = artifact_by_id[artifact_id]
@@ -6791,7 +6921,7 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
                 continue
             reclaimed_by_agent.setdefault(agent_id, {})[meta["name"]] = {
                 "trigger": trigger,
-                "tick": tick,
+                "reclaimed_at_unix_ts": tick,
             }
 
     # R6: ``agent_name`` renders the raw session id verbatim
@@ -6815,6 +6945,11 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
         }
         if operator_tier:
             row["reclaimed"] = reclaimed_by_agent.get(agent_id, {})
+            # #187: on every operator row, reclaim-only ones included -- a
+            # heartbeat is per agent, and an agent with no ledger row (one
+            # that only stopped) still has one on record.
+            row["grants"] = grants_by_agent.get(agent_id, {})
+            row["last_heartbeat_unix_ts"] = last_heartbeat_by_agent.get(agent_id)
         return row
 
     for agent_id, name in named_agents:
@@ -6836,13 +6971,63 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     recently_reclaimed = {
         agent_id
         for agent_id, paths in reclaimed_by_agent.items()
-        if max(slot["tick"] for slot in paths.values()) >= reclaim_row_cutoff
+        if max(slot["reclaimed_at_unix_ts"] for slot in paths.values()) >= reclaim_row_cutoff
     }
     for agent_id in sorted(
         (states_by_agent.keys() | recently_reclaimed) - named_ids, key=str
     ):
         sessions.append(_row(agent_id, None))
 
+    body = _status_body(coordinator, detail, counters)
+    body["tracked_artifacts"] = tracked
+    body["sessions"] = sessions
+    req._json(200, body)
+
+
+def _status_counters(coordinator: CoordinatorHTTPServer) -> dict[str, Any]:
+    """The ``/status`` counter block, at every tier.
+
+    Present at every tier so the telemetry-only consumer (?detail=metrics)
+    doesn't pay for the artifact/session walk. KTD-J (Unit 8) adds
+    per-endpoint + product-signal counters alongside the existing
+    watchdog/concurrency counters. M-03 / finding #31: use
+    counters_snapshot() instead of reaching into private attrs directly —
+    single source of truth for the counter set. AC-02 cross-backend parity:
+    KTD-J naming convention locks the full-word ``_seconds`` suffix for
+    duration fields. Node emits ``coordinator_uptime_seconds``; Python now
+    matches. The old ``coordinator_uptime_s`` field is emitted ALONGSIDE the
+    new one for one release as a backward-compat alias (consumers can detect
+    which field to read by checking which is present, or just read the
+    canonical name). Deprecation note in docs/metrics.md (TODO)."""
+    _uptime = coordinator.uptime_s
+    return {
+        "coordinator_uptime_seconds": _uptime,
+        "coordinator_uptime_s": _uptime,  # AC-02: deprecated alias, removed in v0.2
+        "coordinator_backend": "python",
+        "coordinator_version": _COORDINATOR_VERSION,
+        **coordinator.counters_snapshot(),
+    }
+
+
+def _status_wait_deadline(req: _RequestProtocol) -> float:
+    """#238: when ``/status`` stops waiting for the registry lock --
+    the request's watchdog deadline, or the moment only
+    ``_STATUS_READ_RESERVE_SEC`` remains of :data:`_STATUS_CLIENT_TIMEOUT_SEC`,
+    whichever comes first, so a lock won at the cap still leaves the read time
+    to answer before the client gives up. Nothing earlier in the request
+    starts the deadline, so both are measured from now."""
+    reserve_cap = time.monotonic() + _STATUS_CLIENT_TIMEOUT_SEC - _STATUS_READ_RESERVE_SEC
+    return min(_start_watchdog_deadline(req), reserve_cap)
+
+
+def _status_body(
+    coordinator: CoordinatorHTTPServer, detail: str, counters: dict[str, Any]
+) -> dict[str, Any]:
+    """A minimal- or full-tier ``/status`` body with everything but its two
+    registry lists, ``tracked_artifacts`` and ``sessions``, which it leaves
+    null: the caller fills them from the snapshot, or a degraded answer (#238)
+    sends them null. One builder, so the degraded body carries exactly the
+    keys, in the order, the normal body of its tier does."""
     # The pattern lists are workspace-relative paths and globs. Publishing
     # them at the minimal/metrics tiers would expose the operator's directory
     # layout to non-operator callers — ask for them only at the full tier;
@@ -6853,10 +7038,10 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
         # gets the same sentinel as the top-level key, or the default tier
         # publishes $HOME / directory layout through it anyway.
         policy_summary = {**policy_summary, "coordinator_root": "."}
-    base = {
+    body: dict[str, Any] = {
         "detail": detail,
-        "tracked_artifacts": tracked,
-        "sessions": sessions,
+        "tracked_artifacts": None,
+        "sessions": None,
         "policy_summary": policy_summary,
         # P1 #7: coordinator_pid is in the minimal tier too. Process IDs
         # are public on POSIX (anyone with `ps` sees them) so this is
@@ -6873,12 +7058,17 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
         # Full tier still adds the absolute workspace root — that DOES
         # leak $HOME / directory layout and stays gated behind the
         # Coherence-Local-Operator: true header.
-        base["coordinator_root"] = str(coordinator.coordinator_root)
+        body["coordinator_root"] = str(coordinator.coordinator_root)
+        # #187 R4: the thresholds the running sweep enforces, so an operator
+        # can compute when it reclaims each listed grant. None (null) when
+        # lifecycle started no sweep, or one that cannot enforce them.
+        body["grant_heartbeat_timeout_sec"] = coordinator.grant_heartbeat_timeout_sec
+        body["grant_max_hold_sec"] = coordinator.grant_max_hold_sec
     else:
-        # Minimal: replace absolute workspace path with sentinel "." so the
-        # default tier never leaks $HOME or directory layout.
-        base["coordinator_root"] = "."
-    req._json(200, base)
+        # Minimal: the top-level root is the sentinel ".", like the summary's
+        # own ``coordinator_root`` above.
+        body["coordinator_root"] = "."
+    return body
 
 
 def _parse_detail_query(query: str) -> str:

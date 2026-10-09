@@ -34,6 +34,7 @@ registry classes themselves (the registries import this module's Protocols under
 
 from __future__ import annotations
 
+import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from threading import Event
@@ -60,6 +61,7 @@ from ccs.core.exceptions import (
     HANDOFF_SUCCESSOR_UNKNOWN_REASON,
     HANDOFF_VERSION_UNCONFIRMED_REASON,
     CheckpointRegistrationRefused,
+    RegistryLockTimeout,
 )
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import (
@@ -278,6 +280,13 @@ class CheckpointMember:
 RECLAIM_TRIGGERS: frozenset[str] = frozenset(
     {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
 )
+# SWEEP_RECLAIM_TRIGGERS: the stable-grant sweep's own two triggers. An M/E ->
+# INVALID transition under one of them records the pair's reclaim slot in the
+# SAME write as the transition, so a reclaim is never stored without its cause:
+# /status tells a reclaim from a release by that slot alone, and the next sweep
+# skips an already-INVALID pair, so a slot written separately and lost would
+# stay lost. "timeout" stays out: the transient sweep records no slot.
+SWEEP_RECLAIM_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS - {"timeout"}
 # HANDOFF_TRIGGER: the trigger a transfer moves its giver INVALID under (the
 # targeted grant handoff, #185). Its own value, distinct from "invalidate", so
 # the state log records a deliberate handoff as a handoff rather than as a
@@ -479,16 +488,42 @@ def transfer_record_live(record: TransferRecord, current_version: int) -> bool:
     )
 
 
+def acquire_by_deadline(lock: Any, deadline: float | None) -> None:
+    """Take the registry ``lock`` for ``abort_guard``, waiting at most until
+    ``deadline`` (#238): a :func:`time.monotonic` instant past which this raises
+    :class:`RegistryLockTimeout` having taken nothing. ``None`` waits as long as
+    the lock is held. A free lock, or one this thread already holds, is taken
+    at once, and a deadline already past is one non-blocking try."""
+    timeout = -1 if deadline is None else max(0.0, deadline - time.monotonic())
+    if not lock.acquire(timeout=timeout):
+        raise RegistryLockTimeout(
+            "another thread held the registry lock past the caller's "
+            "deadline; nothing was read or written (#238)."
+        )
+
+
+#: ``status_snapshot``'s grant detail (#187): each pair's recorded grant tick,
+#: ``{artifact_id: {agent_id: granted_at_tick}}``, then each agent's last
+#: heartbeat tick, ``{agent_id: last_tick}``. Both are ticks as their writers
+#: recorded them: whole unix seconds on the HTTP coordinator.
+GrantDetail: TypeAlias = tuple[dict[UUID, dict[UUID, int]], dict[UUID, int]]
+
+
 #: What ``SqliteExtended.status_snapshot`` answers: the artifact rows and the
-#: per-artifact state maps, then the transfer rows (#185) at ``[2]`` and the
-#: reclaim slots (#195) at ``[3]``. Each keeps its index whatever else was
-#: asked for: a call for the reclaim slots alone answers an empty ``[2]``.
+#: per-artifact state maps, then the transfer rows (#185) at ``[2]``, the
+#: reclaim slots (#195) at ``[3]`` and the grant detail (#187) at ``[4]``. Each
+#: keeps its index whatever else was asked for: a call for the reclaim slots
+#: alone answers an empty ``[2]``, and one for the grant detail alone empty
+#: ``[2]`` and ``[3]``.
 StatusSnapshot: TypeAlias = (
     "tuple[dict[UUID, dict[str, Any]], dict[UUID, dict[UUID, MESIState]]]"
     " | tuple[dict[UUID, dict[str, Any]], dict[UUID, dict[UUID, MESIState]],"
     " dict[UUID, tuple[TransferRecord, bool]]]"
     " | tuple[dict[UUID, dict[str, Any]], dict[UUID, dict[UUID, MESIState]],"
     " dict[UUID, tuple[TransferRecord, bool]], dict[UUID, dict[UUID, ReclamationSlot]]]"
+    " | tuple[dict[UUID, dict[str, Any]], dict[UUID, dict[UUID, MESIState]],"
+    " dict[UUID, tuple[TransferRecord, bool]], dict[UUID, dict[UUID, ReclamationSlot]],"
+    " GrantDetail]"
 )
 
 
@@ -748,7 +783,16 @@ class RegistryBase(Protocol):
     ``str | bytes | None``.
     """
 
-    def abort_guard(self, abort: "Event | None" = None) -> AbstractContextManager[None]:
+    def abort_guard(
+        self, abort: "Event | None" = None, *, deadline: float | None = None
+    ) -> AbstractContextManager[None]:
+        """Hold the registry lock across the caller's whole sequence, failing
+        closed with ``WatchdogAbandoned`` when ``abort`` is already set once the
+        lock is won (A6). ``deadline`` (keyword-only, #238) is a
+        :func:`time.monotonic` instant that bounds the wait: past it the guard
+        raises ``RegistryLockTimeout``, having run nothing, instead of waiting
+        on. A free or already-held lock is taken at once; ``None`` waits as long
+        as the lock is held."""
         ...
 
     def adjust_checkpoint_pin_refcount(self, checkpoint_id: str, delta: int) -> int:
@@ -1024,6 +1068,14 @@ class RegistryBase(Protocol):
         INVALID does: the prior value kept, a never-observed pair still None.
         It never affects the state written, the grant tick, the epoch or the
         read-generation capture.
+
+        An M/E -> INVALID transition under a :data:`SWEEP_RECLAIM_TRIGGERS`
+        trigger also records the pair's reclaim slot, ``(trigger, tick)``, in
+        the SAME write as the state and the epoch bump (sqlite: the same
+        ``BEGIN IMMEDIATE``; in memory: the same lock hold, before the
+        state-log emit), so the slot lands exactly when the transition does.
+        The sweep makes no second write: a reclaimed pair is never left
+        INVALID without the slot that tells it from a release.
         """
         ...
 
@@ -1252,6 +1304,7 @@ class SqliteExtended(RegistryBase, Protocol):
         agent_ids: Iterable[UUID] | None = None,
         include_transfers: bool = False,
         include_reclamations: bool = False,
+        include_grant_detail: bool = False,
     ) -> StatusSnapshot:
         """The artifact rows and the per-artifact state maps, read under ONE
         lock hold; ``agent_ids`` scopes the state half to the named agents.
@@ -1270,6 +1323,16 @@ class SqliteExtended(RegistryBase, Protocol):
         ``include_transfers``, ``[2]`` is an empty dict, so neither element's
         index depends on the other flag. The slot is cleared only when the
         pair next acquires a write grant, so it says "this pair's last write
-        grant ended in a sweep reclaim and it has held none since". Without
-        either opt-in the answer is the two-element tuple, unchanged."""
+        grant ended in a sweep reclaim and it has held none since".
+
+        ``include_grant_detail`` (keyword-only, off by default; #187) fills
+        element ``[4]``, a :data:`GrantDetail`: every pair whose row carries a
+        grant tick, whatever its state, and every agent's last heartbeat tick,
+        read from the heartbeat rows so an agent with no state row is
+        included and one with no heartbeat on record is absent. It also adds
+        ``owner_generation`` to each artifact's metadata. ``[2]`` and ``[3]``
+        are empty dicts when their own flags were not passed, so no element's
+        index depends on another flag. All of it comes from the same hold as
+        the state maps. Without any opt-in the answer is the two-element
+        tuple, unchanged."""
         ...
