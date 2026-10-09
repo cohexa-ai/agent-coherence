@@ -729,6 +729,22 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **Opening a store the Node coordinator created no longer points you at a
+  switch that does not exist.** The `CrossRuntimeSchemaError` raised for a
+  Node-ledger `state.db` said to "switch the store to this backend" with
+  `agent-coherence-coordinator --prepare-for-migration`, "the supported
+  backend-switch path, which preserves the live coordination state". That
+  command converts nothing. Run against a live Node coordinator it gets HTTP
+  404 and exits 2, because the Node coordinator does not serve
+  `/admin/prepare-for-migration`. Run with none running, it exits 0 without
+  touching the store, and this coordinator refuses the store exactly as
+  before. The message now says no tool converts a store between backends,
+  that `--prepare-for-migration` only drains and stops a running Python
+  coordinator, and that `coherence.coordinator_backend = "node"` keeps the
+  runtime that owns the store. It still never advises deleting the file. The
+  Node coordinator's matching message for a Python-created store is
+  corrected in the plugin (Cohexa-ai/agent-coherence-plugin#188).
+
 - **Strict mode no longer lets a session write a file it was just refused a
   read of.** A strict-mode deny of a Bash or Grep read re-grants the session's
   SHARED read so that the retry the deny invites can run, and records no

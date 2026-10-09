@@ -1283,11 +1283,15 @@ class SqliteArtifactRegistry:
         """Compose the single :class:`CrossRuntimeSchemaError` message shape.
 
         Wording rules: name the sibling Node coordinator as the likely writer,
-        state the fail-closed posture, and point at the Node CLI's
-        ``--prepare-for-migration`` as the supported backend-switch path. Per
-        the :class:`SchemaVersionError` rule, NEVER advise deleting the db —
-        it holds the sibling runtime's live coordination state (and possibly
-        retained content), which a delete destroys.
+        state the fail-closed posture, say that no tool converts the store,
+        and name the selection that keeps the runtime that owns it. It must
+        not offer ``--prepare-for-migration`` as a switch: that command only
+        drains and stops a running Python coordinator, the Node coordinator
+        does not serve its route, and this guard refuses the store just the
+        same afterwards. Per the :class:`SchemaVersionError` rule, NEVER
+        advise deleting the db — it holds the sibling runtime's live
+        coordination state (and possibly retained content), which a delete
+        destroys.
         """
         raise CrossRuntimeSchemaError(
             f"the database at {self._db_path} {detail}. The likely writer is "
@@ -1295,10 +1299,11 @@ class SqliteArtifactRegistry:
             f"which shares this path but keeps its own migration ledger — the "
             f"two ledgers assign different meanings to the same user_version "
             f"numbers. This Python coordinator will not read or migrate a "
-            f"foreign-ledger db. To switch the store to this backend, run "
-            f"`agent-coherence-coordinator --prepare-for-migration` (the "
-            f"supported backend-switch path, which preserves the live "
-            f"coordination state the file holds)."
+            f"foreign-ledger db, and no tool converts a store between "
+            f"backends: `agent-coherence-coordinator --prepare-for-migration` "
+            f"only drains and stops a running Python coordinator. To keep "
+            f"using the runtime that owns this store, set "
+            f'coherence.coordinator_backend = "node".'
         )
 
     def _apply_v2_schema(self, instance_id: str | None) -> None:

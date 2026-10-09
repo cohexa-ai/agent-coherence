@@ -1490,8 +1490,17 @@ class TestCrossRuntimeGuard:
         # Typed signal: match the wire-stable constant with ==, never the text.
         assert ei.value.reason == CROSS_RUNTIME_SCHEMA_REASON
         msg = str(ei.value)
-        # The supported backend-switch path is named; deletion never advised.
-        assert "agent-coherence-coordinator --prepare-for-migration" in msg
+        # No conversion exists, so none is offered: --prepare-for-migration is
+        # named only as what it is, and the owning runtime is the way forward.
+        # Deletion is never advised.
+        assert "no tool converts a store between backends" in msg
+        assert (
+            "`agent-coherence-coordinator --prepare-for-migration` only drains "
+            "and stops a running Python coordinator" in msg
+        )
+        assert 'set coherence.coordinator_backend = "node"' in msg
+        assert "switch the store to this backend" not in msg
+        assert "backend-switch path" not in msg
         _assert_no_delete_advice(msg)
         # Fail-closed means NO migration/write happened: still the Node shape.
         assert _user_version(db_path) == 3
