@@ -199,7 +199,10 @@ _STATUS_DESC = (
     "while the coordinator stays on; not_attempted = nothing claimed yet), "
     "caller_principal_absent_total and caller_principal_refused_total (the "
     "coordinator's counters; null, never 0, when it is unreachable or does not "
-    "report them), and heterogeneous_scope_detectable=false (a multi-host or "
+    "report them), registry_schema_version (the schema version of the "
+    "coordinator's store, an integer; an older release refuses a store at a "
+    "newer version; null when the coordinator is unreachable or does not report "
+    "one), and heterogeneous_scope_detectable=false (a multi-host or "
     "differently-scoped setup is NOT distinguishable in v1)." + _SCOPE_CLAUSE
 )
 

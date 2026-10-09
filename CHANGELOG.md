@@ -552,6 +552,14 @@ Alpha — APIs may change before `v1.0`.
   plugin's Node coordinator, both lines are unchanged
   ([#294](https://github.com/Cohexa-ai/agent-coherence/issues/294)).
 
+- **`swg_status` forwards the store format.** The MCP server's `swg_status`
+  answer now carries `registry_schema_version`, forwarded from the
+  coordinator's `/status` the way the two caller-principal counters are:
+  `null`, never a guess, when the coordinator is unreachable or does not send
+  it. The Node coordinator's `schema_version` is never read in its place. The
+  text result is unchanged
+  ([#294](https://github.com/Cohexa-ai/agent-coherence/issues/294)).
+
 ### Changed
 
 - **`dev` now reports version `0.15.0.dev0`, not `0.14.1` (#263).**

@@ -221,6 +221,22 @@ def test_the_registered_status_description_names_the_principal_claim_and_counter
     assert "null" in description
 
 
+#: FROZEN duplicate of the store-format field ``swg_status`` forwards (#294).
+_SCHEMA_FIELD = "registry_schema_version"
+
+
+def test_the_registered_status_description_names_the_registry_schema_version() -> None:
+    """The registered ``swg_status`` description names
+    ``registry_schema_version`` and, in the same clause, says it is ``null``
+    when the coordinator does not report one. Prevents a model reading a null
+    schema as a store with no version, or never learning the field exists."""
+    description = _registered_descriptions()["swg_status"]
+
+    assert _SCHEMA_FIELD in description
+    clause = description.split(_SCHEMA_FIELD, 1)[1].split(")", 1)[0]
+    assert "null" in clause, clause
+
+
 #: FROZEN duplicate of the four handoff tools' registered names (#185).
 _HANDOFF_TOOLS = ("swg_transfer", "swg_accept", "swg_decline", "swg_withdraw")
 

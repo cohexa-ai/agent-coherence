@@ -2998,7 +2998,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 | `swg_reacquire` | Recovery after a deny — clears the stale view + mandatory fresh read |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention. A win that completed or overtook a live handoff says which, in `handoff`; on a path this session handed off, the same `handed_off` deny as `swg_write` |
 | `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed OR a peer's write-claim preempted it (which moves neither comparand — the fence also re-checks that the grant still stands) |
-| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `principal_claim`, its `session_agent_id` (the id another session names to hand it a path), the coordinator's two caller-principal counters, and each path's handoff record. `per_path` is `null`, not `{}`, when the coordinator's `/status` answer carries no list of tracked paths, as a [degraded](#when-the-registry-is-busy) answer does when its registry was busy; the text result then says `per_path=unavailable`. Retry shortly and do not read it as nothing tracked. With `coordinator` `unknown`, `per_path` is `{}` and says nothing about what is tracked |
+| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `principal_claim`, its `session_agent_id` (the id another session names to hand it a path), the coordinator's two caller-principal counters, its `registry_schema_version` (the schema version of its store, `null` when the coordinator is unreachable or does not report one), and each path's handoff record. `per_path` is `null`, not `{}`, when the coordinator's `/status` answer carries no list of tracked paths, as a [degraded](#when-the-registry-is-busy) answer does when its registry was busy; the text result then says `per_path=unavailable`. Retry shortly and do not read it as nothing tracked. With `coordinator` `unknown`, `per_path` is `{}` and says nothing about what is tracked |
 | `swg_transfer` | Hands this session's claim on one or more paths to another session, named by that session's `session_agent_id`; see [From the MCP server](#from-the-mcp-server) |
 | `swg_accept` | As the successor, accepts a handoff without writing the path |
 | `swg_decline` | As the successor, declines a handoff; the giver may write the path again |
@@ -3781,7 +3781,9 @@ counts a different set of steps, so the two are not comparable.
 `agent-coherence-status` prints the number at the end of its `Coordinator:`
 header line, for example `schema=10`, and at the end of the summary line with
 `--detail metrics`; `--json` prints the field itself. A coordinator that does
-not send the field gets no `schema=` in either line.
+not send the field gets no `schema=` in either line. The MCP server's
+`swg_status` forwards the field as `registry_schema_version`, `null` when the
+coordinator is unreachable or does not send it.
 
 ### `ccs-simulate` and `ccs-compare`
 
