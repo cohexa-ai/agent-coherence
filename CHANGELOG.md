@@ -303,6 +303,39 @@ Alpha — APIs may change before `v1.0`.
   The plugin's Node coordinator runs no grant sweep and answers
   `detail=full` with `501`, so it has nothing to report here.
 
+- **`GET /status?detail=full` now shows when the sweep will reclaim each write
+  grant (#187).** The sweep reclaims a write grant from values the registry
+  keeps (when the grant began, the holder's last heartbeat) and two thresholds
+  set when the coordinator starts, and a reclaim moves the artifact's
+  ownership generation. None of that reached any HTTP answer, so a dashboard
+  could not warn that a grant was close to being reclaimed, explain afterwards
+  why a post-edit failed, or see the generation move without attempting a
+  write. The operator tier now carries:
+  - on each `tracked_artifacts` entry, `owner_generation`, an integer;
+  - on each `sessions[]` row, `grants`,
+    `{path: {"granted_at_unix_ts": <int | null>}}` for exactly the paths the
+    row holds `EXCLUSIVE` or `MODIFIED` (a null time means none is on record,
+    and the max-hold limit does not apply to that grant), and
+    `last_heartbeat_unix_ts`, or null when no heartbeat is on record. Every
+    row carries both, including rows that hold only `SHARED` paths, reclaim-only
+    rows and named rows that hold nothing;
+  - on the body, `grant_heartbeat_timeout_sec` and `grant_max_hold_sec`, the
+    thresholds the running sweep enforces, or null when none enforces them
+    (`sweep_interval_sec` is `0`, or either threshold is below `1`).
+
+  Times are whole unix seconds, the sweep's own clock, and all of it comes from
+  the same registry read as `states` and `reclaimed`. A grant's earliest
+  reclaim is `min(last_heartbeat_unix_ts + grant_heartbeat_timeout_sec,
+  granted_at_unix_ts + grant_max_hold_sec)`; the guide's
+  [Reading when the sweep will reclaim a grant](docs/guide.md#reading-when-the-sweep-will-reclaim-a-grant)
+  section gives the caveats and which events move `owner_generation`. None of
+  it appears below the operator tier, so the default and metrics bodies are
+  unchanged; the `agent-coherence-status` table does not print it, and
+  `--json` does. `SqliteArtifactRegistry.status_snapshot` takes a keyword-only
+  `include_grant_detail` opt-in that reads the grant times, heartbeats and
+  generations in the same lock hold as the states. The plugin's Node
+  coordinator answers `detail=full` with `501`, as before.
+
 - **`GET /status?detail=full` now says who last wrote each tracked
   artifact (#199 §2).** Every `tracked_artifacts` entry at the operator tier
   carries `last_writer_agent_id` (the committing agent's UUID, joinable against
@@ -728,6 +761,85 @@ Alpha — APIs may change before `v1.0`.
   previously let an effect through. That is the fix, not a regression.
 
 ### Fixed
+
+- **`GET /status` and the Grep hook no longer wait as long as the registry is
+  busy (#238).** Both read the registry on the request thread, outside the
+  handler's 4-second watchdog. While another request held the registry lock,
+  `/status` waited as long as the lock was held, and a Grep hook could run past
+  its client's timeout and hand the model an empty answer. A `CoherentVolume`
+  attaching in that window could not read the operator view and failed closed
+  with its globs unconfirmed. Now:
+  - `/status`, in the default and operator views, waits for the registry lock
+    until the 4-second handler budget runs out or until only 4 seconds of the
+    shipped clients' 6-second timeout are left, whichever comes first: about
+    2 seconds. Past that it answers `200` with every key that view normally
+    carries, `policy_summary` and, in the operator view, the sweep thresholds
+    included, with `tracked_artifacts` and `sessions` set to `null` and
+    `"degraded": true` added. `degraded` never appears in a normal answer.
+    The timeout is counted in `watchdog_timeouts_total`, which the same answer
+    reports, and logged at WARNING; nothing is left running behind it. Any
+    other failure to read the registry still answers `500`, and the metrics
+    view, which never reads the registry, is unchanged.
+  - `POST /hooks/pre-grep` bounds its registry lookup by the same request
+    deadline, shared with the rest of the hook's work, and when the lookup
+    times out answers the "could not verify this file's freshness" advisory a
+    timed-out read hook already gives.
+  - `agent-coherence-status` exits `2` on a degraded answer. The table prints
+    one line on standard error naming registry contention, and `--json`
+    prints the body unchanged. MCP `swg_status` reports `per_path` as `null`
+    rather than `{}`, `swg_read`'s handoff fallback reports
+    `handoff_unknown`, and a volume attaching meanwhile still checks its
+    globs, from the `policy_summary` the degraded answer carries.
+  - `abort_guard` on both registries takes a keyword-only `deadline` that
+    bounds the wait for the registry lock; past it the guard raises the new
+    `RegistryLockTimeout` (in `ccs.core.exceptions`) having run nothing.
+    Without a deadline it waits as before.
+
+  **Wire change:** a `200` `/status` answer can now carry
+  `tracked_artifacts: null` and `sessions: null`. A null list means "cannot
+  tell", never "nothing tracked": check for `degraded` or a null list before
+  reading the lists, and back off before polling again. MCP `swg_status`'s
+  `per_path` is `null` on such an answer. See the guide's
+  [When the registry is busy](docs/guide.md#when-the-registry-is-busy).
+
+- **The status, track, untrack and handoff commands no longer print raw
+  control characters or exit `1` with a traceback (#245).** These Python
+  console scripts printed strings from the coordinator's answers as sent, so
+  an answer carrying an escape sequence or a bidi control could drive or
+  reorder the terminal, and one carrying a lone surrogate crashed the print.
+  An error body that was not a JSON object, a refused redirect or a TLS
+  failure could end in a traceback and exit `1`, which these commands document
+  as "not in a git repository". Now:
+  - every coordinator-provided string they print (paths, session names,
+    states, reasons, counter values, error text) has each non-printable
+    character written as Python's `repr` writes it, without the quotes:
+    `\x1b`, `\n`, `\u202e`. Printable text, the ASCII space included, prints
+    unchanged, so ordinary output is byte-identical; other spaces and joiners
+    (a no-break space, U+3000, a zero-width joiner) print escaped. A path the
+    coordinator rejected or refused prints in quoted `repr` form, as the
+    commands' own rejections already did.
+  - each command exits `2` with one line on standard error, never `1` with a
+    traceback, on an error body that is not a JSON object, a refused redirect,
+    a TLS verification or configuration failure, a `200` body that is not a
+    JSON object, or an answer whose fields have the wrong types. An HTTP error
+    reads `HTTP <code>: <error>`, or `HTTP <code>` when the body carries no
+    `error` text.
+  - exit `1` still means not in a git repository (for track and untrack, also
+    every path rejected by local validation; for the handoff commands, a
+    usage error), and untrack's `3` is still the strict-mode refusal.
+
+  The Claude Code plugin's own `agent-coherence-status`, `-track` and
+  `-untrack`, which run instead where they come first on the Bash tool's
+  `PATH`, are separate programs and are not changed here. See the guide's
+  [Status, track and untrack commands](docs/guide.md#status-track-and-untrack-commands).
+
+- **The docs no longer say the `minimal` `/status` view carries no absolute
+  path.** It reports the top-level `coordinator_root` as `.`, but
+  `policy_summary.coordinator_root` is the workspace's absolute path at that
+  view too, as it always was. The `--detail` help of `agent-coherence-status`
+  now says so, and `docs/security.md`'s advice on pasting output is corrected:
+  the `--detail minimal` table carries no absolute path, but its `--json`
+  output does. Behavior is unchanged.
 
 - **Strict mode no longer lets a session write a file it was just refused a
   read of.** A strict-mode deny of a Bash or Grep read re-grants the session's
