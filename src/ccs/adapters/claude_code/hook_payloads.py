@@ -703,8 +703,8 @@ class StatusResponse(TypedDict):
     ``agent_name`` is ``None`` for a holder the adapter has no name for (a
     grant that outlived the coordinator process that issued it). At the
     operator tier each entry also carries ``reclaimed``: ``{path: {"trigger",
-    "tick"}}`` for each path whose last write grant the coordinator sweep
-    reclaimed, with no write grant there since. The earlier
+    "reclaimed_at_unix_ts"}}`` for each path whose last write grant the
+    coordinator sweep reclaimed, with no write grant there since. The earlier
     annotation documented ``last_writer`` and ``session_id`` keys the handler
     has never emitted; nothing in the tree type-checks against this TypedDict,
     so the drift went unnoticed.
@@ -719,7 +719,7 @@ class StatusResponse(TypedDict):
     # never "nothing tracked". A normal answer never carries "degraded".
     tracked_artifacts: list[dict]  # [{"path": "...", "version": int, "id": "..."}, ...]
     # The operator tier adds per entry "owner_generation": int (#187).
-    # The operator tier adds per session "reclaimed": {path: {"trigger": str, "tick": int}},
+    # The operator tier adds per session "reclaimed": {path: {"trigger": str, "reclaimed_at_unix_ts": int}},
     # "grants": {path: {"granted_at_unix_ts": int|None}} for its EXCLUSIVE and
     # MODIFIED paths, and "last_heartbeat_unix_ts": int|None (#187).
     sessions: list[dict]  # [{"agent_name": str|None, "agent_id": "...", "states": {path: state_name}}, ...]

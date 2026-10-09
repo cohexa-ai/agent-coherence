@@ -531,14 +531,14 @@ holder tell the two apart:
     "agent_name": "claude-session-<id>",
     "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
     "states": {},
-    "reclaimed": {"plan.md": {"trigger": "reclaim_heartbeat", "tick": 1789558656}}
+    "reclaimed": {"plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": 1789558656}}
   }
   ```
 
   `trigger` is `reclaim_heartbeat` (no coordinator call for
   `grant_heartbeat_timeout_sec`) or `reclaim_max_hold` (held past
-  `grant_max_hold_sec`), and `tick` is the reclaim's wall-clock time in
-  seconds.
+  `grant_max_hold_sec`), and `reclaimed_at_unix_ts` is when the reclaim
+  happened, in unix seconds.
 - **The counters.** Every view, the default one and `?detail=metrics`
   included, carries `sweep_reclaims_total` and `sweep_reclaims_by_trigger`.
   They name no session or path: a count that rose tells you the sweep pulled
@@ -549,20 +549,21 @@ and it has taken none since. Its edit may be on disk with no version recording
 it, so do not hand the path to another session on the strength of an empty
 `states` alone. The entry stays listed:
 
-- while the holder re-reads the path and is granted `SHARED` because another
-  session holds it too, since a read does not version the edit;
-- after a peer writes or commits the path, after the holder itself commits by
-  compare-and-swap (that leaves it `SHARED`), and after the holder's session
+- while the holder re-reads the path. A re-read is granted `SHARED`, even when
+  no other session holds the path, and a read does not version the edit;
+- while the holder's compare-and-swap commits of the path are refused with
+  `stale_read_generation`. A re-read does not lift that refusal;
+- after a peer writes or commits the path, and after the holder's session
   ends.
 
-It clears when that holder next takes the path `EXCLUSIVE` or `MODIFIED`: a
-pre-edit, or a re-read while no other session holds the path, because the
-coordinator grants a sole reader `EXCLUSIVE`. From then on `states` shows the
-holder holding the path, so it does not read as released. The map
+A reclaimed session gets its write back by editing the path again: the edit
+takes the write grant (`EXCLUSIVE`), which clears the entry, and commits like
+any other edit. `states` then shows the holder holding the path, so it does
+not read as released. The map
 tells you a reclaim happened; whether its edit has been dealt with since is
 yours to decide. One clue: if the path's `last_writer_at_unix_ts` in the same
-response is later than the entry's `tick`, someone has committed the path since
-the reclaim.
+response is later than the entry's `reclaimed_at_unix_ts`, someone has committed
+the path since the reclaim.
 
 Limits:
 
@@ -584,7 +585,7 @@ Limits:
   ```text
   Sessions:
     4c9625da  claude-session-<id>
-      plan.md  SHARED; reclaimed (reclaim_heartbeat at tick 1789558656)
+      plan.md  SHARED; reclaimed (reclaim_heartbeat at 1789558656)
   ```
 
   The Claude Code plugin's status command cannot send the operator header, so

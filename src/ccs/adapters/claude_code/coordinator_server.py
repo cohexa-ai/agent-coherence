@@ -6681,7 +6681,7 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
 
     #195 — reclaim cause at the operator tier: every ``sessions[]`` row at
     ``detail=full`` carries ``reclaimed``, a map SIBLING to ``states``:
-    ``{path: {"trigger": "reclaim_heartbeat" | "reclaim_max_hold", "tick": int}}``
+    ``{path: {"trigger": "reclaim_heartbeat" | "reclaim_max_hold", "reclaimed_at_unix_ts": int}}``
     for each artifact whose last write grant the stable-grant sweep pulled
     from this agent (the registry's ``last_reclaim_trigger`` /
     ``last_reclaim_tick`` slot). ``states`` keeps its meaning — held grants
@@ -6691,15 +6691,20 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     next M/E acquire, so an entry means "this session's most recent write
     grant on this path was reclaimed and it has held none since": a re-read
     granted SHARED shows the path in ``states`` and keeps it in ``reclaimed``,
-    and a peer invalidating that read leaves the original trigger/tick. A
-    sole reader's re-read is granted EXCLUSIVE, an M/E acquire that clears the
-    slot. A pair held M/E is never listed. Both maps come from one registry
-    read.
-    ``tick`` is the sweep's tick basis, wall-clock seconds over the HTTP
-    transport. The key is absent below the operator tier. An agent
-    that is unnamed, holds nothing and is listed only for a reclaim gets a row
-    only while its newest reclaim is younger than
-    ``_RECLAIM_ONLY_ROW_MAX_AGE_SEC`` (24h), so dead sessions do not pile up.
+    and a peer invalidating that read leaves the original trigger and time.
+    Over the hooks a re-read is granted SHARED even when no other session
+    holds the path: the pre-read's re-grant of a stale or held reader does
+    not capture the read generation, so the session's compare-and-swap stays
+    refused ``stale_read_generation`` and the path stays listed until its
+    next pre-edit, the M/E acquire that clears the slot. (Only the library's
+    ``CoordinatorService.fetch`` grants a sole reader EXCLUSIVE.) A pair held
+    M/E is never listed. Both maps come from one registry read.
+    ``reclaimed_at_unix_ts`` is when the sweep reclaimed the grant, in whole
+    unix seconds like the other ``*_unix_ts`` fields. The key is absent below
+    the operator tier. An agent that is unnamed, holds nothing and is listed
+    only for a reclaim gets a row only while its newest reclaim is younger
+    than ``_RECLAIM_ONLY_ROW_MAX_AGE_SEC`` (24h), so dead sessions do not pile
+    up.
 
     #187 — the inputs to a reclaim, at the operator tier: each
     ``tracked_artifacts`` entry carries ``owner_generation`` (an int), and
@@ -6895,9 +6900,12 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # It is history, not current state: the pair's last write grant ended in
     # a sweep reclaim and it has held none since. A re-read granted SHARED does
     # not version the edit the reclaim stranded, so the path stays listed
-    # beside that SHARED state; only an M/E acquire clears the slot, including
-    # the EXCLUSIVE a sole reader's re-read is granted. A pair still write-held
-    # is never listed, so a path is never both held for writing and reclaimed.
+    # beside that SHARED state; only an M/E acquire clears the slot. Over the
+    # hooks that is the session's next pre-edit: the pre-read re-grants a
+    # stale reader SHARED even when no other session holds the path, and that
+    # re-grant is not a claim, so the compare-and-swap stays refused too. A
+    # pair still write-held is never listed, so a path is never both held for
+    # writing and reclaimed.
     reclaimed_by_agent: dict[UUID, dict[str, dict[str, Any]]] = {}
     for artifact_id, slots in reclamation_by_artifact.items():
         meta = artifact_by_id[artifact_id]
@@ -6909,7 +6917,7 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
                 continue
             reclaimed_by_agent.setdefault(agent_id, {})[meta["name"]] = {
                 "trigger": trigger,
-                "tick": tick,
+                "reclaimed_at_unix_ts": tick,
             }
 
     # R6: ``agent_name`` renders the raw session id verbatim
@@ -6959,7 +6967,7 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     recently_reclaimed = {
         agent_id
         for agent_id, paths in reclaimed_by_agent.items()
-        if max(slot["tick"] for slot in paths.values()) >= reclaim_row_cutoff
+        if max(slot["reclaimed_at_unix_ts"] for slot in paths.values()) >= reclaim_row_cutoff
     }
     for agent_id in sorted(
         (states_by_agent.keys() | recently_reclaimed) - named_ids, key=str

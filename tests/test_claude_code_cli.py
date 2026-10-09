@@ -1043,7 +1043,7 @@ def test_render_table_names_a_sweep_reclaim_beside_held_states(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """#195: the operator tier's ``reclaimed`` map renders under the session,
-    labelled as a reclaim with its trigger and tick — not as a held state, and
+    labelled as a reclaim with its trigger and time — not as a held state, and
     not as the "no held grants" line a clean release prints."""
     monkeypatch.setenv("COLUMNS", "120")
     payload = {
@@ -1054,7 +1054,7 @@ def test_render_table_names_a_sweep_reclaim_beside_held_states(
                 "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
                 "states": {"docs/spec.md": "SHARED"},
                 "reclaimed": {
-                    "docs/plan.md": {"trigger": "reclaim_heartbeat", "tick": 1789558656}
+                    "docs/plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": 1789558656}
                 },
             },
             {
@@ -1071,7 +1071,7 @@ def test_render_table_names_a_sweep_reclaim_beside_held_states(
     coherence_status._render_table(payload)
     out = capsys.readouterr().out
 
-    assert "reclaimed (reclaim_heartbeat at tick 1789558656)" in out
+    assert "reclaimed (reclaim_heartbeat at 1789558656)" in out
     assert "docs/spec.md" in out and "SHARED" in out
     # The released session (y) still reads as holding nothing.
     assert out.count("(no held grants)") == 1
@@ -1093,7 +1093,7 @@ def test_render_table_keeps_full_paths_beside_a_reclaim_at_80_columns(
                 "agent_name": "claude-session-x",
                 "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
                 "states": {plan_a: "SHARED", plan_b: "EXCLUSIVE"},
-                "reclaimed": {plan_a: {"trigger": "reclaim_heartbeat", "tick": 1789558656}},
+                "reclaimed": {plan_a: {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": 1789558656}},
             },
         ],
         "policy_summary": {},
@@ -1121,7 +1121,7 @@ def test_render_table_keeps_a_reread_state_beside_its_reclaim(
                 "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
                 "states": {"docs/plan.md": "SHARED"},
                 "reclaimed": {
-                    "docs/plan.md": {"trigger": "reclaim_heartbeat", "tick": 1789558656}
+                    "docs/plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": 1789558656}
                 },
             },
         ],
@@ -1133,7 +1133,46 @@ def test_render_table_keeps_a_reread_state_beside_its_reclaim(
 
     [line] = [ln for ln in out.splitlines() if "docs/plan.md" in ln and "reclaimed" in ln]
     assert "SHARED" in line
-    assert "reclaimed (reclaim_heartbeat at tick 1789558656)" in line
+    assert "reclaimed (reclaim_heartbeat at 1789558656)" in line
+
+
+def test_render_table_prints_a_bare_reclaim_label_for_a_path_the_session_no_longer_holds(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A reclaimed path the session holds nothing on prints the label alone,
+    with no state ahead of it, and an entry missing its fields prints ``?``
+    for each rather than failing. A session listed only for reclaims is not
+    one that holds nothing, so neither prints the "no held grants" line."""
+    monkeypatch.setenv("COLUMNS", "120")
+    payload = {
+        "tracked_artifacts": [{"path": "docs/plan.md", "version": 2}],
+        "sessions": [
+            {
+                "agent_name": None,
+                "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
+                "states": {},
+                "reclaimed": {
+                    "docs/plan.md": {"trigger": "reclaim_max_hold", "reclaimed_at_unix_ts": 1789558656}
+                },
+            },
+            {
+                "agent_name": "claude-session-z",
+                "agent_id": "6c9625da-356c-527f-b5d7-027f181f7748",
+                "states": {},
+                "reclaimed": {"docs/spec.md": {}},
+            },
+        ],
+        "policy_summary": {},
+        "coordinator_pid": 0,
+    }
+    coherence_status._render_table(payload)
+    session_lines = capsys.readouterr().out.split("Sessions:", 1)[1].splitlines()
+
+    [line] = [ln for ln in session_lines if "docs/plan.md" in ln]
+    assert line.split() == ["docs/plan.md", "reclaimed", "(reclaim_max_hold", "at", "1789558656)"]
+    [line] = [ln for ln in session_lines if "docs/spec.md" in ln]
+    assert line.split() == ["docs/spec.md", "reclaimed", "(?", "at", "?)"]
+    assert "(no held grants)" not in "\n".join(session_lines)
 
 
 # ----------------------------------------------------------------------
@@ -1859,7 +1898,7 @@ def _hostile_status_body() -> dict:
         "sessions": [{
             "agent_id": "\x1b[31m\u202e4c9625da", "agent_name": f"name{_HOSTILE}",
             "states": {f"held{_HOSTILE}": f"state{_HOSTILE}"},
-            "reclaimed": {f"lost{_HOSTILE}": {"trigger": f"trigger{_HOSTILE}", "tick": f"tick{_HOSTILE}"}},
+            "reclaimed": {f"lost{_HOSTILE}": {"trigger": f"trigger{_HOSTILE}", "reclaimed_at_unix_ts": f"reclaimed_at{_HOSTILE}"}},
         }],
         "endpoint_counters": {"pre_read_total": f"count{_HOSTILE}"},
         "sweep_reclaims_total": f"sweep{_HOSTILE}",
@@ -1872,7 +1911,7 @@ def test_status_prints_every_coordinator_string_with_its_control_characters_esca
     """Every string the status table takes from the coordinator -- the header,
     the policy counts, a pending pattern, a path and its version, the handoff
     line, a session's id and name, a held path and its state, a reclaim's path,
-    trigger and tick, and a counter -- prints with ESC, CR, LF, NUL, the C1
+    trigger and time, and a counter -- prints with ESC, CR, LF, NUL, the C1
     CSI, bidi controls, a lone surrogate and an ideographic space escaped as
     ``repr`` writes them, each on its own line, and the command exits 0.
     Prevents a coordinator answer
@@ -1900,7 +1939,7 @@ def test_status_prints_every_coordinator_string_with_its_control_characters_esca
     assert f"  \\x1b[31m\\u202e4c  name{_PRINTED}" in lines
     assert any(f"held{_PRINTED}" in ln and ln.endswith(f"state{_PRINTED}") for ln in lines)
     assert any(
-        f"lost{_PRINTED}" in ln and ln.endswith(f"reclaimed (trigger{_PRINTED} at tick tick{_PRINTED})")
+        f"lost{_PRINTED}" in ln and ln.endswith(f"reclaimed (trigger{_PRINTED} at reclaimed_at{_PRINTED})")
         for ln in lines
     )
     assert any(ln.startswith("  pre_read_total") and ln.endswith(f"count{_PRINTED}") for ln in lines)
