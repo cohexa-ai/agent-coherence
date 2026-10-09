@@ -25,6 +25,7 @@ from uuid import UUID, uuid4
 from ccs.core.exceptions import (
     STALE_READ_GENERATION_REASON,
     UNKNOWN_ARTIFACT_REASON,
+    RegistryLockTimeout,
     StaleReadGeneration,
     WatchdogAbandoned,
 )
@@ -142,7 +143,9 @@ class ArtifactRegistry:
     """
 
     @contextmanager
-    def abort_guard(self, abort: "threading.Event | None" = None) -> Iterator[None]:
+    def abort_guard(
+        self, abort: "threading.Event | None" = None, *, deadline: float | None = None
+    ) -> Iterator[None]:
         """Hold ``self._lock`` across the caller's whole mutation, failing
         closed if the handler watchdog already timed out (finding A6). The
         same guarantee, word for word, as
@@ -161,14 +164,29 @@ class ArtifactRegistry:
         late "phantom grant" aborts before it lands. ``abort=None`` (every
         non-watchdog caller) is a plain lock acquire with no behavioural
         change.
+
+        ``deadline`` (keyword-only, #238) bounds the wait for the lock with the
+        same meaning as on the SQLite registry: past that
+        :func:`time.monotonic` instant the guard raises
+        :class:`RegistryLockTimeout` before the ``abort`` check and runs
+        nothing; a free or already-held lock is taken at once; ``None`` waits
+        as long as the lock is held.
         """
-        with self._lock:
+        timeout = -1 if deadline is None else max(0.0, deadline - time.monotonic())
+        if not self._lock.acquire(timeout=timeout):
+            raise RegistryLockTimeout(
+                "another thread held the registry lock past the caller's "
+                "deadline; nothing was read or written (#238)."
+            )
+        try:
             if abort is not None and abort.is_set():
                 raise WatchdogAbandoned(
                     "handler watchdog timed out before this mutation ran; "
                     "aborting before it lands (A6)."
                 )
             yield
+        finally:
+            self._lock.release()
 
     def __init__(
         self,

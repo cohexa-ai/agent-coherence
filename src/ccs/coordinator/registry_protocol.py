@@ -748,7 +748,16 @@ class RegistryBase(Protocol):
     ``str | bytes | None``.
     """
 
-    def abort_guard(self, abort: "Event | None" = None) -> AbstractContextManager[None]:
+    def abort_guard(
+        self, abort: "Event | None" = None, *, deadline: float | None = None
+    ) -> AbstractContextManager[None]:
+        """Hold the registry lock across the caller's whole sequence, failing
+        closed with ``WatchdogAbandoned`` when ``abort`` is already set once the
+        lock is won (A6). ``deadline`` (keyword-only, #238) is a
+        :func:`time.monotonic` instant that bounds the wait: past it the guard
+        raises ``RegistryLockTimeout``, having run nothing, instead of waiting
+        on. A free or already-held lock is taken at once; ``None`` waits as long
+        as the lock is held."""
         ...
 
     def adjust_checkpoint_pin_refcount(self, checkpoint_id: str, delta: int) -> int:

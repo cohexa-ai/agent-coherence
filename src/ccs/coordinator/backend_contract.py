@@ -210,7 +210,11 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "commit_cas / invalidate). It is the boundary's serialization + fail-shut "
         "seam: a watchdog-aborted mutation fails closed at the write lock instead "
         "of landing as a phantom write. A backend re-homing the boundary must "
-        "provide the equivalent atomic-or-abort envelope.",
+        "provide the equivalent atomic-or-abort envelope. Its keyword-only "
+        "deadline bounds the wait for that envelope (#238): past it the guard "
+        "raises RegistryLockTimeout having run nothing, so a request-thread "
+        "read answers without the registry instead of blocking on a peer's "
+        "hold. A backend must offer the same bounded wait.",
     ),
     MemberContract(
         "record_last_reclamation",

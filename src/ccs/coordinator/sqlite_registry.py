@@ -109,6 +109,7 @@ from ccs.core.exceptions import (
     STORE_SIGNAL_UNREADABLE,
     STORE_SIGNAL_WAL_RECOVERY,
     UNKNOWN_ARTIFACT_REASON,
+    RegistryLockTimeout,
     StaleReadGeneration,
     WatchdogAbandoned,
 )
@@ -1077,7 +1078,9 @@ class SqliteArtifactRegistry:
     # ------------------------------------------------------------------
 
     @contextmanager
-    def abort_guard(self, abort: "threading.Event | None" = None) -> Iterator[None]:
+    def abort_guard(
+        self, abort: "threading.Event | None" = None, *, deadline: float | None = None
+    ) -> Iterator[None]:
         """Acquire the registry write lock, then fail closed if the handler
         watchdog already timed out (finding A6).
 
@@ -1098,14 +1101,33 @@ class SqliteArtifactRegistry:
         contention is not covered. That window is narrow — the coordinator is
         single-process, so the RLock already serializes in-process writers — and
         remains observed by ``watchdog_late_completion_total``.
+
+        ``deadline`` (keyword-only, #238) bounds the wait for the lock: a
+        :func:`time.monotonic` instant past which the guard stops waiting and
+        raises :class:`RegistryLockTimeout`, before the ``abort`` check and
+        without running the caller's body. It lets a read on a request thread
+        (``/status``, pre-grep's lookup) answer without the registry while a
+        peer holds the lock, instead of blocking for as long as it is held. A
+        deadline already past is one non-blocking try. A free lock, or one this
+        thread already holds, is taken at once whatever the deadline, so the
+        guard re-enters exactly as the unbounded form does. ``deadline=None``
+        waits as long as the lock is held, as before.
         """
-        with self._lock:
+        timeout = -1 if deadline is None else max(0.0, deadline - time.monotonic())
+        if not self._lock.acquire(timeout=timeout):
+            raise RegistryLockTimeout(
+                "another thread held the registry lock past the caller's "
+                "deadline; nothing was read or written (#238)."
+            )
+        try:
             if abort is not None and abort.is_set():
                 raise WatchdogAbandoned(
                     "handler watchdog timed out while this mutation was blocked "
                     "on the registry write lock; aborting before it lands (A6)."
                 )
             yield
+        finally:
+            self._lock.release()
 
     def _has_table(self, name: str) -> bool:
         """Read-only probe: does a table exist? (sqlite_master, no writes)."""

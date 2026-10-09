@@ -359,6 +359,22 @@ def test_status_snapshot_opt_ins_are_keyword_only_and_off_by_default(
     assert _param_structure(type(sqlite_registry).status_snapshot) == expected
 
 
+def test_abort_guard_deadline_is_keyword_only_and_off_by_default(
+    inmem_registry: ArtifactRegistry, sqlite_registry: SqliteArtifactRegistry
+) -> None:
+    """The bounded lock wait (#238) is a keyword-only ``deadline`` that
+    defaults to no bound, so every existing ``abort_guard(abort)`` call keeps
+    its unbounded wait. Pinned as a literal on the Protocol and both
+    registries, for the same reason as the status-snapshot pin above."""
+    expected = [
+        ("abort", inspect.Parameter.POSITIONAL_OR_KEYWORD, None),
+        ("deadline", inspect.Parameter.KEYWORD_ONLY, None),
+    ]
+    assert _param_structure(RegistryBase.abort_guard) == expected
+    assert _param_structure(type(inmem_registry).abort_guard) == expected
+    assert _param_structure(type(sqlite_registry).abort_guard) == expected
+
+
 # ---------------------------------------------------------------------------
 # Teeth — an incomplete stub is rejected
 # ---------------------------------------------------------------------------

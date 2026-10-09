@@ -16,6 +16,7 @@ import os
 import sqlite3
 import stat
 import threading
+import time
 import warnings
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -2272,6 +2273,33 @@ def test_status_snapshot_scoped_to_no_agents_reads_no_state(db_path: Path) -> No
         artifact_by_id, state_by_artifact = reg.status_snapshot(agent_ids=[])
         assert set(artifact_by_id) == {art.id}
         assert state_by_artifact == {art.id: {}}
+
+
+def test_status_snapshot_re_enters_a_deadline_guard_hold(db_path: Path) -> None:
+    """#238: a bounded ``abort_guard`` hold is the registry's own re-entrant
+    lock, so the snapshot inside it re-enters at once instead of waiting on
+    its own caller's hold, which is how ``/status`` bounds its wait for the
+    read."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        art = _make_artifact()
+        reg.register_artifact(art, content="")
+        holder = uuid4()
+        reg.set_agent_state(art.id, holder, MESIState.EXCLUSIVE, tick=1)
+        answers: list = []
+
+        def _guarded_read() -> None:
+            with reg.abort_guard(deadline=time.monotonic() + 5.0):
+                answers.append(reg.status_snapshot())
+
+        reader = threading.Thread(target=_guarded_read, daemon=True)
+        reader.start()
+        reader.join(timeout=5.0)
+        assert not reader.is_alive(), "the snapshot blocked inside the guard's own hold"
+        [(artifact_by_id, state_by_artifact)] = answers
+        assert {aid: (row["name"], row["version"]) for aid, row in artifact_by_id.items()} == {
+            art.id: ("plan.md", 1)
+        }
+        assert state_by_artifact == {art.id: {holder: MESIState.EXCLUSIVE}}
 
 
 def _swept_holder(reg: SqliteArtifactRegistry):
