@@ -1,6 +1,6 @@
 {
   "name": "handoff-status-operator-tier-adds-the-created-timestamp",
-  "description": "GET /status?detail=full with the operator header: the same handoff key plus the record's created_at_unix_ts. That wall-clock value is in the harness's timestamp scrub set, so this row pins the key's PRESENCE, not its value. Nothing has committed, so the last-writer fields are null. coordinator_root is the absolute workspace path at this tier and is ignored with policy_summary and coordinator_version. A's session row carries an empty `reclaimed` map and the sweep reclaim counters read zero: a handoff is not a reclaim.",
+  "description": "GET /status?detail=full with the operator header: the same handoff key plus the record's created_at_unix_ts. That wall-clock value is in the harness's timestamp scrub set, so this row pins the key's PRESENCE, not its value. Nothing has committed, so the last-writer fields are null. coordinator_root is the absolute workspace path at this tier and is ignored with policy_summary and coordinator_version. A's session row carries an empty `reclaimed` map and the sweep reclaim counters read zero: a handoff is not a reclaim. The #187 operator fields are present: owner_generation 0 (a SHARED handoff does not move it), an empty grants map and a last heartbeat (a number, scrubbed by type, so null would fail) on A's row, and null sweep thresholds, because the harness builds the coordinator without lifecycle.",
   "setup": {
     "tracked": [
       "plan.md"
@@ -103,6 +103,8 @@
         "status_total": 1
       },
       "fresh_shared_hash_mismatch_total": 0,
+      "grant_heartbeat_timeout_sec": null,
+      "grant_max_hold_sec": null,
       "handler_concurrency_overflows_total": 0,
       "handoff_giver_denials_total": 0,
       "in_flight_drain_timed_out": false,
@@ -113,6 +115,8 @@
           "agent_id": "09f031b6-cb23-50a2-b7a8-b405ed3810f4",
           "agent_name": "claude-session-<UUID>",
           "reclaimed": {},
+          "grants": {},
+          "last_heartbeat_unix_ts": "<TS>",
           "states": {}
         }
       ],
@@ -131,6 +135,7 @@
           "path": "plan.md",
           "version": 1,
           "id": "<UUID>",
+          "owner_generation": 0,
           "last_writer_agent_id": null,
           "last_writer_at_unix_ts": null,
           "handoff": {

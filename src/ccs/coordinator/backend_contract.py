@@ -210,7 +210,11 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "commit_cas / invalidate). It is the boundary's serialization + fail-shut "
         "seam: a watchdog-aborted mutation fails closed at the write lock instead "
         "of landing as a phantom write. A backend re-homing the boundary must "
-        "provide the equivalent atomic-or-abort envelope.",
+        "provide the equivalent atomic-or-abort envelope. Its keyword-only "
+        "deadline bounds the wait for that envelope (#238): past it the guard "
+        "raises RegistryLockTimeout having run nothing, so a request-thread "
+        "read answers without the registry instead of blocking on a peer's "
+        "hold. A backend must offer the same bounded wait.",
     ),
     MemberContract(
         "record_last_reclamation",
@@ -698,6 +702,9 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "liveness, read inside the same lock hold so a record is judged "
         "against the version its row reports (#185). A second opt-in adds each "
         "pair's reclamation slot, read from the same agent-state rows (#195). "
+        "A third adds each artifact's owner generation, each pair's grant tick "
+        "and each agent's last heartbeat, in the same hold, so a reader can "
+        "compute a grant's reclaim deadline from one consistent read (#187). "
         "Only /status opts in, and the default answer is unchanged. "
         "Non-mutating.",
     ),

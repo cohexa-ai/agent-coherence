@@ -32,7 +32,9 @@ from ccs.cli import (
     coherence_untrack,
 )
 from ccs.cli._coherence_client import (
+    CoordinatorEndpoint,
     CoordinatorUnavailable,
+    PrincipalClaim,
     caller_principal_headers,
     claim_caller_principal,
     get,
@@ -40,6 +42,7 @@ from ccs.cli._coherence_client import (
     post_with_stored_principal,
     resolve_endpoint,
 )
+from ccs.core.exceptions import TlsConfigError, TlsVerificationFailed
 
 
 @pytest.fixture
@@ -1042,7 +1045,7 @@ def test_render_table_names_a_sweep_reclaim_beside_held_states(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """#195: the operator tier's ``reclaimed`` map renders under the session,
-    labelled as a reclaim with its trigger and tick — not as a held state, and
+    labelled as a reclaim with its trigger and time — not as a held state, and
     not as the "no held grants" line a clean release prints."""
     monkeypatch.setenv("COLUMNS", "120")
     payload = {
@@ -1053,7 +1056,7 @@ def test_render_table_names_a_sweep_reclaim_beside_held_states(
                 "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
                 "states": {"docs/spec.md": "SHARED"},
                 "reclaimed": {
-                    "docs/plan.md": {"trigger": "reclaim_heartbeat", "tick": 1789558656}
+                    "docs/plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": 1789558656}
                 },
             },
             {
@@ -1070,7 +1073,7 @@ def test_render_table_names_a_sweep_reclaim_beside_held_states(
     coherence_status._render_table(payload)
     out = capsys.readouterr().out
 
-    assert "reclaimed (reclaim_heartbeat at tick 1789558656)" in out
+    assert "reclaimed (reclaim_heartbeat at 1789558656)" in out
     assert "docs/spec.md" in out and "SHARED" in out
     # The released session (y) still reads as holding nothing.
     assert out.count("(no held grants)") == 1
@@ -1092,7 +1095,7 @@ def test_render_table_keeps_full_paths_beside_a_reclaim_at_80_columns(
                 "agent_name": "claude-session-x",
                 "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
                 "states": {plan_a: "SHARED", plan_b: "EXCLUSIVE"},
-                "reclaimed": {plan_a: {"trigger": "reclaim_heartbeat", "tick": 1789558656}},
+                "reclaimed": {plan_a: {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": 1789558656}},
             },
         ],
         "policy_summary": {},
@@ -1120,7 +1123,7 @@ def test_render_table_keeps_a_reread_state_beside_its_reclaim(
                 "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
                 "states": {"docs/plan.md": "SHARED"},
                 "reclaimed": {
-                    "docs/plan.md": {"trigger": "reclaim_heartbeat", "tick": 1789558656}
+                    "docs/plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": 1789558656}
                 },
             },
         ],
@@ -1132,7 +1135,46 @@ def test_render_table_keeps_a_reread_state_beside_its_reclaim(
 
     [line] = [ln for ln in out.splitlines() if "docs/plan.md" in ln and "reclaimed" in ln]
     assert "SHARED" in line
-    assert "reclaimed (reclaim_heartbeat at tick 1789558656)" in line
+    assert "reclaimed (reclaim_heartbeat at 1789558656)" in line
+
+
+def test_render_table_prints_a_bare_reclaim_label_for_a_path_the_session_no_longer_holds(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A reclaimed path the session holds nothing on prints the label alone,
+    with no state ahead of it, and an entry missing its fields prints ``?``
+    for each rather than failing. A session listed only for reclaims is not
+    one that holds nothing, so neither prints the "no held grants" line."""
+    monkeypatch.setenv("COLUMNS", "120")
+    payload = {
+        "tracked_artifacts": [{"path": "docs/plan.md", "version": 2}],
+        "sessions": [
+            {
+                "agent_name": None,
+                "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
+                "states": {},
+                "reclaimed": {
+                    "docs/plan.md": {"trigger": "reclaim_max_hold", "reclaimed_at_unix_ts": 1789558656}
+                },
+            },
+            {
+                "agent_name": "claude-session-z",
+                "agent_id": "6c9625da-356c-527f-b5d7-027f181f7748",
+                "states": {},
+                "reclaimed": {"docs/spec.md": {}},
+            },
+        ],
+        "policy_summary": {},
+        "coordinator_pid": 0,
+    }
+    coherence_status._render_table(payload)
+    session_lines = capsys.readouterr().out.split("Sessions:", 1)[1].splitlines()
+
+    [line] = [ln for ln in session_lines if "docs/plan.md" in ln]
+    assert line.split() == ["docs/plan.md", "reclaimed", "(reclaim_max_hold", "at", "1789558656)"]
+    [line] = [ln for ln in session_lines if "docs/spec.md" in ln]
+    assert line.split() == ["docs/spec.md", "reclaimed", "(?", "at", "?)"]
+    assert "(no held grants)" not in "\n".join(session_lines)
 
 
 # ----------------------------------------------------------------------
@@ -1337,19 +1379,30 @@ def _principal_file(workspace: Path, session_id: str, suffix: str) -> Path:
 
 
 class _StubCoordinator(http.server.BaseHTTPRequestHandler):
-    """A coordinator of another build: answers each route from ``answers``
-    (path -> (status, body)), every other route 404 as a coordinator answers
-    an unknown one, and records each request's path in ``seen``."""
+    """A coordinator of another build: answers each route (the path without
+    its query) from ``answers`` -- route -> (status, body) or (status, body,
+    reason phrase); a ``bytes`` body is sent as is and any other as JSON, and
+    a 3xx carries a ``Location`` -- every other route 404 as a coordinator
+    answers an unknown one, and records each request's path in ``seen``."""
 
-    answers: dict[str, tuple[int, dict]] = {}
+    answers: dict[str, tuple[Any, ...]] = {}
     seen: list[str] = []
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib name
         self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self._answer()
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib name
+        self._answer()
+
+    def _answer(self) -> None:
         self.seen.append(self.path)
-        status, body = self.answers.get(self.path, (404, {"error": "unknown route"}))
-        raw = json.dumps(body).encode()
-        self.send_response(status)
+        route = self.path.split("?", 1)[0]
+        status, body, *reason = self.answers.get(route, (404, {"error": "unknown route"}))
+        raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+        self.send_response(status, *reason)
+        if 300 <= status < 400:
+            self.send_header("Location", "http://127.0.0.1:9/elsewhere")
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
@@ -1803,3 +1856,807 @@ def test_a_request_the_coordinator_cannot_read_exits_2_naming_what_to_check(
         "agent-coherence-withdraw: HTTP 400: the coordinator could not read the request; "
         "check the session id, the subagent id and the paths"
     ) in capsys.readouterr().err
+
+
+# ----------------------------------------------------------------------
+# #245 -- coordinator text printed escaped, and one error path (exit 2)
+# ----------------------------------------------------------------------
+
+#: One coordinator string carrying each kind of character the commands must
+#: not print raw: C0 controls (ESC opening a colour sequence, CR, LF, NUL), the
+#: C1 CSI, a bidi override and a bidi isolate, a lone surrogate (a JSON string
+#: can carry one) and an ideographic space.
+_HOSTILE = "a\x1b[31m\r\n\x00\x9b\u202e\u2066\ud800\u3000z"
+#: :data:`_HOSTILE` as the commands print it: each of those characters written
+#: as ``repr`` writes it, without the quotes.
+_PRINTED = r"a\x1b[31m\r\n\x00\x9b\u202e\u2066\ud800\u3000z"
+_RAW_CHARACTERS = ("\x1b", "\r", "\x00", "\x9b", "\u202e", "\u2066", "\ud800", "\u3000")
+
+
+def _raw_characters_in(text: str) -> list[str]:
+    return [c for c in _RAW_CHARACTERS if c in text]
+
+
+def _hostile_status_body() -> dict:
+    """An operator-tier ``/status`` body with :data:`_HOSTILE` in every value
+    the table prints, each behind a marker naming the field."""
+    return {
+        "coordinator_pid": f"pid{_HOSTILE}",
+        "coordinator_uptime_seconds": 12.0,
+        "coordinator_backend": f"backend{_HOSTILE}",
+        "coordinator_version": f"version{_HOSTILE}",
+        "policy_summary": {
+            "default_pattern_count": f"dflt{_HOSTILE}", "user_added_pattern_count": f"user{_HOSTILE}",
+            "ignored_pattern_count": f"ign{_HOSTILE}",
+            "user_added_patterns": [f"pattern{_HOSTILE}"],
+        },
+        "tracked_artifacts": [{
+            "path": f"path{_HOSTILE}", "version": f"ver{_HOSTILE}",
+            "handoff": {
+                "giver": "\x1b\u202e\ud800giver-agent", "successor": "\x9b\r\nsucc-agent",
+                "version_at_transfer": f"vat{_HOSTILE}", "status": f"status{_HOSTILE}", "live": True,
+            },
+        }],
+        "sessions": [{
+            "agent_id": "\x1b[31m\u202e4c9625da", "agent_name": f"name{_HOSTILE}",
+            "states": {f"held{_HOSTILE}": f"state{_HOSTILE}"},
+            "reclaimed": {f"lost{_HOSTILE}": {"trigger": f"trigger{_HOSTILE}", "reclaimed_at_unix_ts": f"reclaimed_at{_HOSTILE}"}},
+        }],
+        "endpoint_counters": {"pre_read_total": f"count{_HOSTILE}"},
+        "sweep_reclaims_total": f"sweep{_HOSTILE}",
+    }
+
+
+def test_status_prints_every_coordinator_string_with_its_control_characters_escaped(
+    stub_coordinator, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every string the status table takes from the coordinator -- the header,
+    the policy counts, a pending pattern, a path and its version, the handoff
+    line, a session's id and name, a held path and its state, a reclaim's path,
+    trigger and time, and a counter -- prints with ESC, CR, LF, NUL, the C1
+    CSI, bidi controls, a lone surrogate and an ideographic space escaped as
+    ``repr`` writes them, each on its own line, and the command exits 0.
+    Prevents a coordinator answer
+    driving the operator's terminal (colours, a cursor move, a reordered line)
+    or crashing the print on a surrogate."""
+    workspace, _ = stub_coordinator
+    monkeypatch.setenv("COLUMNS", "300")
+    _StubCoordinator.answers = {"/status": (200, _hostile_status_body())}
+
+    rc = coherence_status.main(["--root", str(workspace), "--show-policy"])
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    lines = captured.out.splitlines()
+    assert f"Coordinator: pid=pid{_PRINTED} uptime=12s backend=backend{_PRINTED} version=version{_PRINTED}" in lines
+    assert (
+        f"Policy: dflt{_PRINTED} default pattern(s), user{_PRINTED} user-added, ign{_PRINTED} ignored"
+    ) in lines
+    assert f"  pattern{_PRINTED}" in lines
+    assert any(f"path{_PRINTED}" in ln and ln.endswith(f"ver{_PRINTED}") for ln in lines)
+    assert (
+        f"  path{_PRINTED}: \\x1b\\u202e\\ud800giver → \\x9b\\r\\nsucc- at version vat{_PRINTED} "
+        f"(status{_PRINTED})"
+    ) in lines
+    assert f"  \\x1b[31m\\u202e4c  name{_PRINTED}" in lines
+    assert any(f"held{_PRINTED}" in ln and ln.endswith(f"state{_PRINTED}") for ln in lines)
+    assert any(
+        f"lost{_PRINTED}" in ln and ln.endswith(f"reclaimed (trigger{_PRINTED} at reclaimed_at{_PRINTED})")
+        for ln in lines
+    )
+    assert any(ln.startswith("  pre_read_total") and ln.endswith(f"count{_PRINTED}") for ln in lines)
+    assert any(ln.startswith("  sweep_reclaims_total") and ln.endswith(f"sweep{_PRINTED}") for ln in lines)
+    assert _raw_characters_in(captured.out + captured.err) == []
+
+
+def test_status_metrics_prints_the_coordinators_backend_and_version_escaped(
+    stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--detail metrics`` prints the coordinator's backend and version in its
+    header line, and its counters, with their control characters escaped.
+    Prevents a coordinator answer driving a scraper's terminal through the
+    metrics header."""
+    workspace, _ = stub_coordinator
+    _StubCoordinator.answers = {"/status": (200, _hostile_status_body())}
+
+    rc = coherence_status.main(["--root", str(workspace), "--detail", "metrics"])
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    lines = captured.out.splitlines()
+    assert lines[0] == f"Coordinator metrics: backend=backend{_PRINTED} version=version{_PRINTED}"
+    assert any(ln.startswith("  pre_read_total") and ln.endswith(f"count{_PRINTED}") for ln in lines)
+    assert _raw_characters_in(captured.out + captured.err) == []
+
+
+def test_status_elides_an_escaped_long_path_and_keeps_its_columns_aligned(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A long path carrying an ESC is middle-elided on its escaped text, so the
+    escape's four characters count toward the column: every row of the
+    artifacts table is the same width within the terminal, the version stays
+    on the path's line, and the session's state column starts at one offset.
+    Prevents a widened escape pushing its row past the screen edge or out of
+    line with the rest."""
+    monkeypatch.setenv("COLUMNS", "80")
+    long_path = "docs/" + "x" * 70 + "\x1b[31m.md"
+    payload = {
+        "tracked_artifacts": [{"path": "plan.md", "version": 2}, {"path": long_path, "version": 13}],
+        "sessions": [{
+            "agent_id": _GIVER_AGENT, "agent_name": "claude-session-x",
+            "states": {"plan.md": "SHARED", long_path: "EXCLUSIVE"},
+        }],
+        "policy_summary": {},
+        "coordinator_pid": 0,
+    }
+
+    coherence_status._render_table(payload)
+
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert _raw_characters_in(out) == []
+    assert all(len(ln) <= 80 for ln in lines), [ln for ln in lines if len(ln) > 80]
+    table = lines[lines.index("  path" + " " * 64 + "  version"):][:4]
+    assert len({len(row) for row in table}) == 1, table
+    long_row = table[3]
+    assert "…" in long_row and long_row.endswith(r"x\x1b[31m.md       13")
+    held = [ln for ln in lines if ln.endswith(("  SHARED", "  EXCLUSIVE"))]
+    assert len(held) == 2
+    assert {len(ln) - len(ln.split()[-1]) for ln in held} == {4 + 64 + 2}, held
+    assert any(r"\x1b[31m.md" in ln for ln in held)
+
+
+def test_track_prints_coordinator_paths_escaped_and_a_rejected_path_quoted(
+    stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A tracked path the coordinator names prints escaped on the success line
+    and on the not-on-disk warning; printable text, spaces, quotes, backslashes
+    and non-ASCII letters included, prints unchanged, while a no-break space and
+    a zero-width joiner print escaped. A path the coordinator rejects prints in
+    the quoted ``repr`` form of the command's own rejections, with its reason
+    escaped. Prevents a coordinator's answer writing control characters to the
+    terminal through track's output."""
+    workspace, _ = stub_coordinator
+    printable = "docs/a b'c\\d\"é日.md"
+    _StubCoordinator.answers = {"/policy/track": (200, {
+        "added": [f"docs/{_HOSTILE}.md", printable, "docs/nb\u00a0sp\u200d.md"],
+        "rejected": [{"path": f"r{_HOSTILE}", "reason": f"why{_HOSTILE}"}],
+    })}
+
+    rc = coherence_track.main(["--root", str(workspace), "docs/plan.md"])
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert captured.out.splitlines() == [
+        f"agent-coherence-track: tracked docs/{_PRINTED}.md",
+        f"agent-coherence-track: tracked {printable}",
+        "agent-coherence-track: tracked docs/nb\\xa0sp\\u200d.md",
+    ]
+    assert captured.err.splitlines() == [
+        f"agent-coherence-track: warning: docs/{_PRINTED}.md does not exist on disk yet",
+        f"agent-coherence-track: warning: {printable} does not exist on disk yet",
+        "agent-coherence-track: warning: docs/nb\\xa0sp\\u200d.md does not exist on disk yet",
+        f"agent-coherence-track: rejected 'r{_PRINTED}': why{_PRINTED}",
+    ]
+
+
+def test_untrack_prints_coordinator_paths_escaped(
+    stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An untracked path the coordinator names prints escaped on the success
+    line. Prevents a coordinator's answer writing control characters to the
+    terminal through untrack's output."""
+    workspace, _ = stub_coordinator
+    _StubCoordinator.answers = {"/policy/untrack": (200, {"removed": [f"docs/{_HOSTILE}.md"]})}
+
+    rc = coherence_untrack.main(["--root", str(workspace), "docs/plan.md"])
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert captured.out == f"agent-coherence-untrack: untracked docs/{_PRINTED}.md\n"
+    assert captured.err == ""
+
+
+def test_untrack_prints_a_strict_refusal_quoted_with_its_patterns_escaped(
+    stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A strict refusal's path prints in the quoted ``repr`` form and its strict
+    patterns escaped, with the strict exit code. Prevents the refusal writing
+    control characters to the terminal."""
+    workspace, _ = stub_coordinator
+    _StubCoordinator.answers = {"/policy/untrack": (409, {
+        "reason": "untrack_strict_path",
+        "refused": [{"path": f"p{_HOSTILE}", "strict_patterns": [f"g{_HOSTILE}", "data/**"]}],
+    })}
+
+    rc = coherence_untrack.main(["--root", str(workspace), "data/a.txt"])
+
+    captured = capsys.readouterr()
+    assert rc == 3, captured.err
+    assert captured.err.splitlines()[0] == (
+        f"agent-coherence-untrack: refused 'p{_PRINTED}': enforced in strict mode by g{_PRINTED}, data/**"
+    )
+    assert _raw_characters_in(captured.err) == []
+
+
+#: Strict refusals whose ``refused`` entries do not each name a path and its
+#: strict patterns as strings.
+_UNREADABLE_STRICT_REFUSALS: dict[str, dict[str, Any]] = {
+    "refused-absent": {},
+    "refused-a-string": {"refused": "data/a.txt"},
+    "refused-empty": {"refused": []},
+    "entry-a-string": {"refused": ["data/a.txt"]},
+    "bare-string-beside-a-good-entry": {
+        "refused": ["data/a.txt", {"path": "data/b.txt", "strict_patterns": ["data/**"]}],
+    },
+    "path-a-number": {"refused": [{"path": 5, "strict_patterns": ["data/**"]}]},
+    "path-absent": {"refused": [{"strict_patterns": ["data/**"]}]},
+    "patterns-a-number": {"refused": [{"path": "data/b.txt", "strict_patterns": 5}]},
+    "patterns-a-string": {"refused": [{"path": "data/b.txt", "strict_patterns": "data/**"}]},
+    "patterns-empty": {"refused": [{"path": "data/b.txt", "strict_patterns": []}]},
+    "patterns-absent": {"refused": [{"path": "data/b.txt"}]},
+    "pattern-an-object": {"refused": [{"path": "data/b.txt", "strict_patterns": [{"p": "data/**"}]}]},
+}
+
+
+@pytest.mark.parametrize("refusal", sorted(_UNREADABLE_STRICT_REFUSALS))
+def test_untrack_reads_a_strict_refusal_of_the_wrong_shape_as_an_http_error(
+    refusal: str, stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A refusal carrying the strict-mode reason whose ``refused`` entries do
+    not each name a path and its strict patterns as strings exits 2 with the
+    one HTTP error line, the coordinator's error text escaped, as every answer
+    of the wrong shape does. Prevents such a refusal reaching exit 1 with a
+    traceback, or exit 3 with advice that names no path while the
+    coordinator's own explanation is dropped."""
+    workspace, _ = stub_coordinator
+    _StubCoordinator.answers = {"/policy/untrack": (409, {
+        "reason": "untrack_strict_path", "error": f"refusing{_HOSTILE}",
+        **_UNREADABLE_STRICT_REFUSALS[refusal],
+    })}
+
+    rc = coherence_untrack.main(["--root", str(workspace), "data/a.txt"])
+
+    captured = capsys.readouterr()
+    assert rc == 2, captured.err
+    assert captured.err == f"agent-coherence-untrack: HTTP 409: refusing{_PRINTED}\n"
+    assert captured.out == ""
+
+
+#: The commands the error path covers: each one's route, module and how it is
+#: run against a workspace (a valid path, and a session for the handoff verb).
+_ERROR_PATH_COMMANDS: dict[str, tuple[str, Any, Any]] = {
+    "status": ("/status", coherence_status, lambda ws: coherence_status.main(["--root", str(ws)])),
+    "track": ("/policy/track", coherence_track,
+              lambda ws: coherence_track.main(["--root", str(ws), "docs/plan.md"])),
+    "untrack": ("/policy/untrack", coherence_untrack,
+                lambda ws: coherence_untrack.main(["--root", str(ws), "docs/plan.md"])),
+    "withdraw": ("/handoff/withdraw", coherence_handoff, lambda ws: coherence_handoff.withdraw_main(
+        ["--root", str(ws), "--session", str(uuid.uuid4()), "plan.md"])),
+}
+
+
+@pytest.mark.parametrize(("command", "answer"), [
+    ("track", {"added": 5}),
+    ("track", {"added": "abc"}),
+    ("track", {"added": {"a.md": 1}}),
+    ("track", {"rejected": ["docs/plan.md"]}),
+    ("track", {"added": ["a.md"], "rejected": ["x"]}),
+    ("untrack", {"removed": 5}),
+    ("untrack", {"removed": "a.md"}),
+], ids=[
+    "track-added-not-a-list", "track-added-a-string", "track-added-an-object",
+    "track-rejected-entry-not-an-object", "track-good-added-beside-a-bad-rejected",
+    "untrack-removed-not-a-list", "untrack-removed-a-string",
+])
+def test_a_policy_answer_with_fields_of_the_wrong_type_exits_2_with_one_line(
+    command: str, answer: dict, stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A track or untrack answer whose lists are not lists of the expected
+    entries -- a number, a string or an object where a list belongs, or a
+    rejected entry that is not an object -- exits 2 with one line naming the
+    answer's shape and prints nothing on stdout, not even a path read before
+    the bad field. Prevents a coordinator answer reaching exit 1 with a
+    traceback, or a string printing one "tracked" line per character and
+    exiting 0."""
+    workspace, _ = stub_coordinator
+    _StubCoordinator.answers = {f"/policy/{command}": (200, answer)}
+
+    rc = _ERROR_PATH_COMMANDS[command][2](workspace)
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.err == f"agent-coherence-{command}: unexpected /policy/{command} answer shape\n"
+    assert captured.out == ""
+
+
+def test_track_reports_a_path_too_long_to_stat_as_not_on_disk(
+    stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A tracked path the coordinator names that is too long for the
+    filesystem to look up prints as tracked with the not-on-disk warning, and
+    the command exits 0: the lookup only picks the warning. Prevents an
+    over-long path in the answer reaching exit 1 with a traceback."""
+    workspace, _ = stub_coordinator
+    long_path = "a" * 5000
+    _StubCoordinator.answers = {"/policy/track": (200, {"added": [long_path]})}
+
+    rc = coherence_track.main(["--root", str(workspace), "docs/plan.md"])
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert captured.out == f"agent-coherence-track: tracked {long_path}\n"
+    assert captured.err == f"agent-coherence-track: warning: {long_path} does not exist on disk yet\n"
+
+
+@pytest.mark.parametrize(("verb", "answer", "expected_rc", "expected_line"), [
+    ("transfer", {"ok": True, "grants": [{
+        "path": "plan.md", "transferred": True, "successor": f"s{_HOSTILE}",
+        "version_at_transfer": f"v{_HOSTILE}", "hold_shape": f"h{_HOSTILE}", "status": f"st{_HOSTILE}",
+    }]}, 0, (
+        f"agent-coherence-transfer: transferred plan.md to s{_PRINTED} at version v{_PRINTED} "
+        f"(gave up h{_PRINTED}; status st{_PRINTED})"
+    )),
+    ("transfer", {"ok": False, "grants": [{
+        "path": "plan.md", "transferred": False, "reason": f"r{_HOSTILE}", "status": f"st{_HOSTILE}",
+    }]}, 2, f"agent-coherence-transfer: plan.md not transferred (r{_PRINTED}, status st{_PRINTED})"),
+    ("accept", {"ok": True, "status": f"st{_HOSTILE}", "counterparty": f"c{_HOSTILE}"}, 0, (
+        f"agent-coherence-accept: accepted the handoff of plan.md "
+        f"(status st{_PRINTED}, counterparty c{_PRINTED})"
+    )),
+    ("decline", {"ok": False, "reason": f"r{_HOSTILE}", "status": f"st{_HOSTILE}"}, 2, (
+        f"agent-coherence-decline: plan.md: refused (r{_PRINTED}, status st{_PRINTED})"
+    )),
+    ("withdraw", {"ok": False, "degraded": True, "reason": f"r{_HOSTILE}"}, 2, (
+        f"agent-coherence-withdraw: the coordinator could not confirm the withdraw (r{_PRINTED}); "
+        "its outcome is unknown: check the path's handoff in agent-coherence-status before acting again"
+    )),
+], ids=["transferred", "not-transferred", "accepted", "declined-refused", "withdraw-unconfirmed"])
+def test_a_handoff_verb_prints_the_answers_fields_escaped(
+    verb: str, answer: dict, expected_rc: int, expected_line: str,
+    stub_coordinator, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Each field a handoff verb prints from the coordinator's answer -- the
+    successor, version, hold shape, status, counterparty and reason -- prints
+    escaped, on stdout for a verb taken and stderr for one refused or
+    unconfirmed. Prevents a coordinator answer writing control characters to
+    the terminal through a handoff verb."""
+    workspace, _ = stub_coordinator
+    _StubCoordinator.answers = {f"/handoff/{verb}": (200, answer)}
+
+    rc = _VERB_RUNS[verb](["--root", str(workspace), "--session", str(uuid.uuid4()), "plan.md"])
+
+    captured = capsys.readouterr()
+    assert rc == expected_rc, captured.err
+    assert expected_line in (captured.out + captured.err).splitlines()
+    assert _raw_characters_in(captured.out + captured.err) == []
+
+
+#: Answers every command meets with exit 2 and one line: (status, body[,
+#: reason phrase]) and the line after the command's name.
+_ONE_LINE_FAILURES = {
+    "error-body-a-list": ((500, ["x"]), "HTTP 500"),
+    "error-body-a-string": ((500, "x"), "HTTP 500"),
+    "error-body-a-number": ((500, 7), "HTTP 500"),
+    "error-body-null": ((500, None), "HTTP 500"),
+    "error-body-not-json-hostile-reason-phrase": ((500, b"<html>oops</html>", "Bad\x1b[31m"), "HTTP 500"),
+    "error-string-with-esc-and-lf": ((500, {"error": "boom\x1b[31m\nsecond"}), r"HTTP 500: boom\x1b[31m\nsecond"),
+    "error-a-number": ((500, {"error": 5}), "HTTP 500"),
+    "error-a-list": ((500, {"error": ["boom"]}), "HTTP 500"),
+    "redirect": ((302, {}), "the coordinator redirected the request (HTTP 302); not followed"),
+    "ok-body-a-list": ((200, ["x"]), "the coordinator's answer is not a JSON object"),
+    "strict-reason-naming-no-path": (
+        (409, {"reason": "untrack_strict_path", "refused": ["data/a.txt"], "error": "e"}), "HTTP 409: e"
+    ),
+}
+
+
+def _assert_one_failure_line(command: str, captured: Any) -> None:
+    """Exactly one stderr line from the command; on stdout nothing, or for the
+    handoff verb only the line naming the session it acted as."""
+    assert captured.err.count("\n") == 1, captured.err
+    assert "Traceback" not in captured.err
+    if command == "withdraw":
+        assert captured.out.startswith("agent-coherence-withdraw: acting as session agent ")
+        assert captured.out.count("\n") == 1
+    else:
+        assert captured.out == ""
+
+
+@pytest.mark.parametrize("failure", sorted(_ONE_LINE_FAILURES))
+@pytest.mark.parametrize("command", sorted(_ERROR_PATH_COMMANDS))
+def test_a_coordinator_failure_exits_2_with_one_line(
+    command: str, failure: str, stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An error body that is not a JSON object (a list, string, number, null
+    or not JSON at all) or whose ``error`` is not a string (a number, a list),
+    an error string carrying ESC and LF, a redirect and a
+    200 body that is not an object each make every command exit 2 with one
+    line: ``HTTP {code}``, plus the escaped ``error`` only when it is a string
+    -- never the status line's reason phrase, which is the server's text too.
+    Prevents a coordinator answer reaching exit 1 with a traceback, or a
+    terminal escape reaching the screen through an error line."""
+    workspace, _ = stub_coordinator
+    route, _module, run = _ERROR_PATH_COMMANDS[command]
+    answer, expected = _ONE_LINE_FAILURES[failure]
+    _StubCoordinator.answers = {route: answer}
+
+    rc = run(workspace)
+
+    captured = capsys.readouterr()
+    assert rc == 2, captured.err
+    assert captured.err == f"agent-coherence-{command}: {expected}\n"
+    _assert_one_failure_line(command, captured)
+
+
+#: 200 bodies the client cannot decode: no body at all, not JSON at all, an
+#: integer past the interpreter's 4300-digit conversion limit, and arrays
+#: nested past the recursion limit.
+_UNDECODABLE_BODIES = {
+    "empty": b"",
+    "not-json": b"<html>not json</html>",
+    "integer-of-5000-digits": b'{"n": ' + b"1" * 5000 + b"}",
+    "nested-past-the-recursion-limit": b"[" * 100_000,
+}
+
+
+@pytest.mark.parametrize("body", sorted(_UNDECODABLE_BODIES))
+@pytest.mark.parametrize("command", sorted(_ERROR_PATH_COMMANDS))
+def test_a_200_answer_that_does_not_decode_exits_2_with_one_line(
+    command: str, body: str, stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A 200 answer whose body does not decode as JSON makes every command
+    exit 2 with one line; status's line says the answer is not a JSON object.
+    Prevents a running coordinator's broken answer reading as no coordinator
+    at all (status's exit 0), or the decode failure reaching exit 1 with a
+    traceback."""
+    workspace, _ = stub_coordinator
+    route, _module, run = _ERROR_PATH_COMMANDS[command]
+    _StubCoordinator.answers = {route: (200, _UNDECODABLE_BODIES[body])}
+
+    rc = run(workspace)
+
+    captured = capsys.readouterr()
+    assert rc == 2, captured.err
+    _assert_one_failure_line(command, captured)
+    if command == "status":
+        assert captured.err == "agent-coherence-status: the coordinator's answer is not a JSON object\n"
+
+
+@pytest.mark.parametrize("command", sorted(set(_ERROR_PATH_COMMANDS) - {"status"}))
+def test_an_empty_200_answer_exits_2_saying_the_answer_was_empty(
+    command: str, stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A 200 answer with no body makes track, untrack and the handoff verb
+    exit 2 with one line saying the answer was empty. Prevents an empty
+    answer reading as an empty object: track and untrack printing nothing and
+    exiting 0 as though the request had been carried out, or a handoff verb
+    reporting a refusal the coordinator never sent."""
+    workspace, _ = stub_coordinator
+    route, _module, run = _ERROR_PATH_COMMANDS[command]
+    _StubCoordinator.answers = {route: (200, b"")}
+
+    rc = run(workspace)
+
+    captured = capsys.readouterr()
+    assert rc == 2, captured.err
+    assert captured.err == f"agent-coherence-{command}: coordinator returned an empty response\n"
+    _assert_one_failure_line(command, captured)
+
+
+@pytest.mark.parametrize("command", sorted(_ERROR_PATH_COMMANDS))
+def test_a_tls_failure_exits_2_with_one_line(
+    command: str, stub_coordinator, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A TLS failure exits 2 with one line. The commands resolve a loopback
+    http endpoint today, so each is handed an https one whose CA bundle does
+    not exist, and the client's own TLS factory refuses it before any byte is
+    sent. Prevents a TLS refusal reaching exit 1 with a traceback."""
+    workspace, port = stub_coordinator
+    _route, module, run = _ERROR_PATH_COMMANDS[command]
+    https = CoordinatorEndpoint(
+        port=port, bearer="test-secret", scheme="https", ca_file=str(tmp_path / "missing-ca.pem"),
+    )
+    monkeypatch.setattr(module, "resolve_endpoint", lambda _root: https)
+
+    rc = run(workspace)
+
+    captured = capsys.readouterr()
+    assert rc == 2, captured.err
+    assert captured.err.startswith(f"agent-coherence-{command}: CCS_REMOTE_CA_FILE ")
+    _assert_one_failure_line(command, captured)
+    assert _StubCoordinator.seen == []
+
+
+#: TLS failures whose text carries :data:`_HOSTILE`: a certificate that did not
+#: verify (its detail is the TLS library's text) and an unusable TLS setup.
+_HOSTILE_TLS_FAILURES = {
+    "verification": lambda: TlsVerificationFailed("127.0.0.1", f"certificate verify failed: {_HOSTILE}"),
+    "config": lambda: TlsConfigError(f"the CA bundle is not usable: {_HOSTILE}"),
+}
+
+
+@pytest.mark.parametrize("failure", sorted(_HOSTILE_TLS_FAILURES))
+@pytest.mark.parametrize("command", sorted(_ERROR_PATH_COMMANDS))
+def test_a_tls_failure_prints_its_text_escaped_on_one_line(
+    command: str, failure: str, stub_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A TLS failure whose text carries ESC, CR and LF, a bidi override and a
+    lone surrogate exits 2 with that text escaped on one stderr line. Prevents
+    the failure's text driving or reordering the terminal, splitting the line,
+    or crashing the print."""
+    workspace, _ = stub_coordinator
+    _route, module, run = _ERROR_PATH_COMMANDS[command]
+    exc = _HOSTILE_TLS_FAILURES[failure]()
+
+    def refuse(_root: Path) -> CoordinatorEndpoint:
+        raise exc
+
+    monkeypatch.setattr(module, "resolve_endpoint", refuse)
+
+    rc = run(workspace)
+
+    captured = capsys.readouterr()
+    assert rc == 2, captured.err
+    assert captured.err == f"agent-coherence-{command}: {str(exc).replace(_HOSTILE, _PRINTED)}\n"
+    _assert_one_failure_line(command, captured)
+    assert _raw_characters_in(captured.out + captured.err) == []
+
+
+@pytest.mark.parametrize("command", sorted(_ERROR_PATH_COMMANDS))
+def test_no_coordinator_in_a_workspace_whose_path_has_control_characters_prints_it_escaped(
+    command: str, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With no coordinator running, the line naming the workspace's pid file
+    prints the path's ESC and bidi override escaped, on one stderr line: exit 0
+    for status (no coordinator is a normal state), 2 for the others. Prevents a
+    directory name driving or reordering the terminal through that line."""
+    workspace = tmp_path / "ws\x1b[31m\N{RIGHT-TO-LEFT OVERRIDE}"
+    (workspace / ".git").mkdir(parents=True)
+    _route, _module, run = _ERROR_PATH_COMMANDS[command]
+
+    rc = run(workspace)
+
+    captured = capsys.readouterr()
+    assert rc == (0 if command == "status" else 2), captured.err
+    assert "ws\\x1b[31m\\u202e" in captured.err
+    _assert_one_failure_line(command, captured)
+    assert _raw_characters_in(captured.out + captured.err) == []
+
+
+def test_a_self_test_claim_that_did_not_bind_prints_its_detail_escaped(
+    stub_coordinator, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--self-test`` stops at a caller-principal claim that did not bind and
+    prints the claim's detail escaped on one line. The detail can carry this
+    client's own transport message, which names the workspace, so a control
+    character there must not drive or reorder the terminal."""
+    workspace, _ = stub_coordinator
+    monkeypatch.setattr(coherence_status, "coordinator_backend", lambda _root: "python")
+    monkeypatch.setattr(
+        coherence_status,
+        "claim_caller_principal",
+        lambda *_args: PrincipalClaim("unconfirmed", detail=f"transport failed {_HOSTILE}"),
+    )
+
+    rc = coherence_status.main(["--root", str(workspace), "--self-test"])
+
+    captured = capsys.readouterr()
+    assert rc == 3, captured.err
+    assert f"(unconfirmed: transport failed {_PRINTED})" in captured.err
+    assert captured.err.count("\n") == 1, captured.err
+    assert _raw_characters_in(captured.out + captured.err) == []
+
+
+@pytest.mark.parametrize("step", ["resolve", "hook", "status"])
+def test_a_self_test_coordinator_failure_prints_its_text_escaped(
+    step: str, stub_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--self-test`` exits 3 printing a coordinator failure's text escaped,
+    whether finding the coordinator, a hook step or the closing ``/status``
+    read fails. Prevents that text -- a workspace path or the operating
+    system's error -- driving or reordering the terminal, or crashing the
+    print."""
+    workspace, _ = stub_coordinator
+    failure = CoordinatorUnavailable(f"unreachable {_HOSTILE}")
+
+    def fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise failure
+
+    # What a working coordinator answers each hook step: a fresh first read,
+    # an admitted edit and commit, then a stale re-read naming the path.
+    reads = iter([
+        {"status": "fresh"},
+        {"status": "stale", "hookSpecificOutput": {"additionalContext": "plan.md changed"}},
+    ])
+
+    def answer(_endpoint: Any, name: str, _body: Any, **_kwargs: Any) -> dict[str, Any]:
+        return next(reads) if name == "/hooks/pre-read" else {"ok": True}
+
+    if step == "resolve":
+        monkeypatch.setattr(coherence_status, "resolve_endpoint", fail)
+    elif step == "hook":
+        monkeypatch.setattr(coherence_status, "post", fail)
+    else:
+        monkeypatch.setattr(coherence_status, "post", answer)
+        monkeypatch.setattr(coherence_status, "get", fail)
+
+    rc = coherence_status.main(["--root", str(workspace), "--self-test"])
+
+    captured = capsys.readouterr()
+    assert rc == 3, captured.err
+    assert f"unreachable {_PRINTED}" in captured.err
+    assert captured.err.count("\n") == 1, captured.err
+    assert _raw_characters_in(captured.out + captured.err) == []
+
+
+@pytest.mark.parametrize("change", [
+    {"coordinator_uptime_seconds": "12"},
+    {"sessions": [{
+        "agent_id": _GIVER_AGENT, "agent_name": "claude-session-x", "states": {"spec.md": "SHARED"},
+        "reclaimed": {"plan.md": "reclaim_heartbeat"},
+    }]},
+    {"coordinator_uptime_seconds": 10**400},
+    {"tracked_artifacts": _status_payload(handoff=_handoff_key(created_at_unix_ts=float("-inf")))[
+        "tracked_artifacts"]},
+    {"tracked_artifacts": _status_payload(handoff=_handoff_key(created_at_unix_ts=10**400))[
+        "tracked_artifacts"]},
+], ids=[
+    "uptime-not-a-number", "reclaim-cause-not-an-object", "uptime-out-of-float-range",
+    "handoff-created-at-minus-infinity", "handoff-created-at-out-of-float-range",
+])
+def test_a_status_body_with_fields_of_the_wrong_type_exits_2_with_one_line(
+    change: dict, stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ``/status`` body whose fields have the wrong types, or numbers out of
+    the range the table can print (-Infinity, a 401-digit integer), exits 2
+    with "unexpected /status shape" and prints none of the table -- not the
+    half rendered before the bad field. Prevents a malformed answer reaching
+    exit 1 with a traceback, or a partial table reading as the workspace's
+    state."""
+    workspace, _ = stub_coordinator
+    _StubCoordinator.answers = {"/status": (200, {**_status_payload(), **change})}
+
+    rc = coherence_status.main(["--root", str(workspace)])
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.err == "agent-coherence-status: unexpected /status shape\n"
+    assert captured.out == ""
+
+
+def test_detail_help_does_not_claim_the_minimal_tier_redacts_every_absolute_path() -> None:
+    """``policy_summary.coordinator_root`` is an absolute path at the minimal
+    tier as at the full one, so the ``--detail`` help names it rather than
+    claiming the minimal tier redacts absolute paths. Prevents an operator
+    pasting a minimal-tier ``--json`` body as free of their directory
+    layout."""
+    action = next(a for a in coherence_status.build_parser()._actions if "--detail" in a.option_strings)
+
+    assert "redacts absolute paths" not in action.help
+    assert "policy_summary.coordinator_root" in action.help
+
+
+# ----------------------------------------------------------------------
+# #238 -- a degraded /status answer is "cannot tell" (exit 2)
+# ----------------------------------------------------------------------
+
+#: FROZEN duplicate of the line the status table prints on a degraded answer.
+_DEGRADED_STATUS_LINE = (
+    "agent-coherence-status: the coordinator's registry is busy (lock contention), "
+    "so tracked artifacts and sessions are unavailable; try again shortly\n"
+)
+
+
+def _degraded_status_body() -> dict:
+    """An operator-tier ``/status`` answer whose registry read timed out: the
+    normal key set, with ``policy_summary`` (counts and a user-added pattern)
+    and the counters, both lists null, and ``degraded: true``."""
+    return {
+        **_status_payload(),
+        "policy_summary": {
+            "default_pattern_count": 3, "user_added_pattern_count": 1, "ignored_pattern_count": 0,
+            "user_added_patterns": ["notes/**"],
+        },
+        "tracked_artifacts": None,
+        "sessions": None,
+        "endpoint_counters": {"pre_read_total": 4, "status_total": 2},
+        "watchdog_timeouts_total": 1,
+        "degraded": True,
+    }
+
+
+@pytest.mark.parametrize("flags", [[], ["--show-policy"], ["--detail", "minimal"]],
+                         ids=["table", "show-policy", "minimal"])
+def test_status_table_on_a_degraded_answer_exits_2_with_one_line_naming_registry_contention(
+    flags: list[str], stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A degraded ``/status`` -- the coordinator could not read its registry in
+    time, so both lists are null -- prints nothing on stdout and one stderr
+    line naming registry contention, and exits 2, with or without
+    ``--show-policy``. Prevents a busy registry reading as an empty workspace
+    ("No artifacts observed yet", "No active sessions.") or as a malformed
+    answer."""
+    workspace, _ = stub_coordinator
+    _StubCoordinator.answers = {"/status": (200, _degraded_status_body())}
+
+    rc = coherence_status.main(["--root", str(workspace), *flags])
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.err == _DEGRADED_STATUS_LINE
+    assert captured.out == ""
+    assert "No active sessions." not in captured.out
+    assert "No artifacts observed yet" not in captured.out
+
+
+@pytest.mark.parametrize("flags", [["--json"], ["--json", "--show-policy"]], ids=["json", "json-show-policy"])
+def test_status_json_on_a_degraded_answer_prints_the_body_unchanged_and_exits_2(
+    flags: list[str], stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--json`` prints a degraded body as the coordinator sent it and exits 2;
+    with ``--show-policy`` it adds no ``policy_pending_first_read``, which
+    cannot be computed without the artifact list. Prevents a script reading a
+    degraded answer as a successful one, or a pending list computed against
+    no observed paths."""
+    workspace, _ = stub_coordinator
+    body = _degraded_status_body()
+    _StubCoordinator.answers = {"/status": (200, body)}
+
+    rc = coherence_status.main(["--root", str(workspace), *flags])
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert json.loads(captured.out) == body
+    assert "policy_pending_first_read" not in captured.out
+    assert captured.err == ""
+
+
+def test_status_table_on_an_answer_without_its_lists_and_no_marker_exits_2_as_a_bad_shape(
+    stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The lists not being lists is what makes an answer "cannot tell"; the
+    ``degraded`` marker only picks the message. An answer that omits both
+    lists without the marker exits 2 with the shape line and prints no table.
+    Prevents an answer with no lists rendering as an empty workspace."""
+    workspace, _ = stub_coordinator
+    body = {k: v for k, v in _degraded_status_body().items()
+            if k not in ("tracked_artifacts", "sessions", "degraded")}
+    _StubCoordinator.answers = {"/status": (200, body)}
+
+    rc = coherence_status.main(["--root", str(workspace)])
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.err == "agent-coherence-status: unexpected /status shape\n"
+    assert captured.out == ""
+
+
+@pytest.mark.parametrize("degraded", [True, False], ids=["marked-degraded", "unmarked"])
+@pytest.mark.parametrize("lists", [
+    {"tracked_artifacts": None, "sessions": []},
+    {"tracked_artifacts": [], "sessions": None},
+], ids=["artifacts-null", "sessions-null"])
+def test_status_table_on_an_answer_with_one_list_null_exits_2(
+    lists: dict, degraded: bool, stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Either list not being a list makes an answer "cannot tell", not only
+    both: with the other list empty, the table prints nothing on stdout and
+    exits 2 with one line -- registry contention when the answer is marked
+    ``degraded``, else the shape line. Prevents one null list rendering as an
+    empty workspace ("No artifacts observed yet", "No active sessions.")."""
+    workspace, _ = stub_coordinator
+    body = {**_status_payload(), **lists, **({"degraded": True} if degraded else {})}
+    _StubCoordinator.answers = {"/status": (200, body)}
+
+    rc = coherence_status.main(["--root", str(workspace)])
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.err == (
+        _DEGRADED_STATUS_LINE if degraded else "agent-coherence-status: unexpected /status shape\n"
+    )
+    assert captured.out == ""

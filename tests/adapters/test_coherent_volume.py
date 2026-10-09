@@ -1262,6 +1262,36 @@ def test_an_unconfirmable_enforcement_answer_runs_detached_in_degrade_mode(
         stop_coordinator(tmp_path)
 
 
+def test_a_degraded_operator_view_still_confirms_enforcement_from_its_policy_summary(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pin: an operator view whose registry read timed out answers 200 with
+    both lists null and ``degraded: true``, and still carries the four glob
+    sets in ``policy_summary``. The check reads only those, so a strict volume
+    attaches and its glob reads as enforced, never "cannot tell". Prevents a
+    busy registry turning attach into a fail-closed refusal."""
+    _seed(tmp_path, content=b"v1")
+    real_get = coherent_volume_module._coordinator_get
+    served: list[dict] = []
+
+    def degraded_operator_view(endpoint, path, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        doc = real_get(endpoint, path, **kwargs)
+        if "detail=full" not in path:
+            return doc
+        served.append({**doc, "tracked_artifacts": None, "sessions": None, "degraded": True})
+        return served[-1]
+
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_get", degraded_operator_view)
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        assert vol.is_attached and not vol.is_degraded
+        assert vol.managed_glob_enforcement() == ManagedGlobEnforcement(("data/**",), (), None)
+        assert len(served) == 2, "both checks read a degraded operator view"
+        assert all(isinstance(d["policy_summary"].get("strict_mode_patterns"), list) for d in served)
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_fixed_stale_buffer_write_is_denied(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
@@ -6465,5 +6495,56 @@ def test_no_malformed_answer_text_rides_the_chain_of_a_strict_request_failure(
         rendered = _rendered(raised.value)
         assert "BadStatusLine" in rendered
         _assert_no_secret_in(rendered, principal, vol._mint_nonce)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+class _EmptyAnswer:
+    """A 200 answer with no body, read the way ``_execute`` reads one."""
+
+    def __enter__(self) -> _EmptyAnswer:
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return b""
+
+
+def test_an_empty_pre_edit_answer_fails_closed_before_the_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strict mode: a pre-edit answered 200 with no body raises
+    ``CoherenceError`` saying the answer was empty, and the file keeps its
+    bytes. Prevents an empty answer reading as a granted edit: the new bytes
+    written to disk, and the write refused only at the commit."""
+    from ccs.cli import _coherence_client
+
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        assert vol.read(rel) == b"v1"
+        real_build = _coherence_client._build_opener
+        # Plain-http openers are cached process-wide; an empty cache makes the
+        # next request build its opener through the patched seam.
+        monkeypatch.setattr(_coherence_client, "_shared_openers", {})
+
+        class _Opener:
+            def __init__(self, real: object) -> None:
+                self._real = real
+
+            def open(self, req: object, timeout: float | None = None) -> object:
+                if req.selector == "/hooks/pre-edit":  # type: ignore[attr-defined]
+                    return _EmptyAnswer()
+                return self._real.open(req, timeout=timeout)  # type: ignore[attr-defined]
+
+        monkeypatch.setattr(_coherence_client, "_build_opener", lambda ctx: _Opener(real_build(ctx)))
+
+        with pytest.raises(CoherenceError, match="empty response"):
+            vol.write(rel, b"v2")
+
+        assert target.read_bytes() == b"v1"
     finally:
         stop_coordinator(tmp_path)

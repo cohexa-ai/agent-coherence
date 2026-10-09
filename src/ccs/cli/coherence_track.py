@@ -10,25 +10,32 @@ reloads the live policy. Idempotent.
 Exit codes:
 - 0: all paths accepted (or partially accepted with warnings)
 - 1: not in a git repo / all paths rejected by validation
-- 2: coordinator unreachable / HTTP error
+- 2: coordinator unreachable / HTTP error / a refused redirect / a TLS
+  failure / an answer that is not a /policy/track answer
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import urllib.error
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli._coherence_client import (
+    NOT_A_JSON_OBJECT_LINE,
     CoordinatorUnavailable,
     err,
+    escape_nonprintable,
+    http_error_line,
     http_status_from_error,
     normalize_workspace_path,
     post,
+    redirect_refused_line,
     resolve_endpoint,
 )
+from ccs.core.exceptions import RedirectRefused, TlsConfigError, TlsVerificationFailed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -88,36 +95,57 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         endpoint = resolve_endpoint(Path(root))
         payload = post(endpoint, "/policy/track", {"paths": valid})
-    except CoordinatorUnavailable as exc:
-        err(f"agent-coherence-track: {exc}")
+    except (CoordinatorUnavailable, TlsVerificationFailed, TlsConfigError) as exc:
+        err(f"agent-coherence-track: {escape_nonprintable(exc)}")
         return 2
     except urllib.error.HTTPError as exc:
-        body = http_status_from_error(exc)
-        msg = (body or {}).get("error", str(exc))
-        err(f"agent-coherence-track: HTTP {exc.code}: {msg}")
+        err(f"agent-coherence-track: {http_error_line(exc.code, http_status_from_error(exc))}")
+        return 2
+    except RedirectRefused as exc:
+        err(f"agent-coherence-track: {redirect_refused_line(exc)}")
+        return 2
+    if not isinstance(payload, dict):
+        err(f"agent-coherence-track: {NOT_A_JSON_OBJECT_LINE}")
         return 2
 
-    added: list[str] = payload.get("added", [])
-    rejected: list[dict] = payload.get("rejected", [])
-    for p in added:
-        # Success → stdout (machine-parseable by callers). Warn-on-stderr
-        # if the path doesn't exist on disk yet (operationally fine, but
-        # worth surfacing as diagnostic info).
-        disk_path = Path(root) / p
-        if not disk_path.exists():
-            print(f"agent-coherence-track: tracked {p}", flush=True)
-            err(f"agent-coherence-track: warning: {p} does not exist on disk yet")
-        else:
-            print(f"agent-coherence-track: tracked {p}", flush=True)
-    for entry in rejected:
-        err(
-            f"agent-coherence-track: rejected {entry.get('path', '')}: "
-            f"{entry.get('reason', '')}"
-        )
+    try:
+        _report_answer(payload, Path(root))
+    except (TypeError, AttributeError):
+        err("agent-coherence-track: unexpected /policy/track answer shape")
+        return 2
     for p, reason in invalid:
         err(f"agent-coherence-track: rejected {p!r}: {reason}")
 
     return 0
+
+
+def _report_answer(payload: dict[str, Any], root: Path) -> None:
+    """Print the coordinator's ``added`` and ``rejected`` paths, its text
+    escaped (#245): a rejected path in the quoted ``repr`` form the command's
+    own rejections use. Raises TypeError, before printing anything, unless
+    ``added`` is a list of strings and ``rejected`` a list of objects."""
+    added, rejected = payload.get("added", []), payload.get("rejected", [])
+    # Checked up front: a string iterates as its characters and an object as
+    # its keys, each of which would print as a tracked path.
+    if not (isinstance(added, list) and all(isinstance(p, str) for p in added)):
+        raise TypeError("added is not a list of paths")
+    if not (isinstance(rejected, list) and all(isinstance(e, dict) for e in rejected)):
+        raise TypeError("rejected is not a list of objects")
+    for p in added:
+        # Success → stdout (machine-parseable by callers). Warn-on-stderr
+        # if the path doesn't exist on disk yet (operationally fine, but
+        # worth surfacing as diagnostic info). os.path.exists, not
+        # Path.exists: a coordinator path too long to look up raises OSError
+        # there, and the lookup only picks the warning.
+        on_disk = os.path.exists(root / p)
+        print(f"agent-coherence-track: tracked {escape_nonprintable(p)}", flush=True)
+        if not on_disk:
+            err(f"agent-coherence-track: warning: {escape_nonprintable(p)} does not exist on disk yet")
+    for entry in rejected:
+        err(
+            f"agent-coherence-track: rejected {entry.get('path', '')!r}: "
+            f"{escape_nonprintable(entry.get('reason', ''))}"
+        )
 
 
 if __name__ == "__main__":

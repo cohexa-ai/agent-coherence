@@ -60,6 +60,7 @@ from .registry_protocol import (
     TransferRecord,
     TransferRequest,
     UncoverableRun,
+    acquire_by_deadline,
     decide_transfer_grant,
     require_storable_transfer_status,
     transfer_record_live,
@@ -142,7 +143,9 @@ class ArtifactRegistry:
     """
 
     @contextmanager
-    def abort_guard(self, abort: "threading.Event | None" = None) -> Iterator[None]:
+    def abort_guard(
+        self, abort: "threading.Event | None" = None, *, deadline: float | None = None
+    ) -> Iterator[None]:
         """Hold ``self._lock`` across the caller's whole mutation, failing
         closed if the handler watchdog already timed out (finding A6). The
         same guarantee, word for word, as
@@ -161,14 +164,24 @@ class ArtifactRegistry:
         late "phantom grant" aborts before it lands. ``abort=None`` (every
         non-watchdog caller) is a plain lock acquire with no behavioural
         change.
+
+        ``deadline`` (keyword-only, #238) bounds the wait for the lock with the
+        same meaning as on the SQLite registry: past that
+        :func:`time.monotonic` instant the guard raises
+        :class:`RegistryLockTimeout` before the ``abort`` check and runs
+        nothing; a free or already-held lock is taken at once; ``None`` waits
+        as long as the lock is held.
         """
-        with self._lock:
+        acquire_by_deadline(self._lock, deadline)
+        try:
             if abort is not None and abort.is_set():
                 raise WatchdogAbandoned(
                     "handler watchdog timed out before this mutation ran; "
                     "aborting before it lands (A6)."
                 )
             yield
+        finally:
+            self._lock.release()
 
     def __init__(
         self,

@@ -528,6 +528,23 @@ def test_the_status_rows_project_the_record_on_both_tiers() -> None:
     }, "created_at_unix_ts must be in the harness's timestamp scrub set"
 
 
+@pytest.mark.parametrize("key", ["granted_at_unix_ts", "last_heartbeat_unix_ts", "reclaimed_at_unix_ts"])
+def test_the_grant_time_scrub_replaces_a_number_and_keeps_null_and_bool_literal(key: str) -> None:
+    """The operator tier's grant time, last heartbeat and reclaim time are
+    wall-clock ticks, so a number under any of those keys, at any depth, is
+    scrubbed to ``<TS>``. Null ("none on record") is a different answer from
+    any tick, and so is a bool: both come back unchanged, so an expected
+    ``<TS>`` fails against them."""
+    for number in (1791276728, 1791276728.5):
+        assert normalize_response({key: number}) == {key: "<TS>"}, number
+    row = {"sessions": [{"grants": {"plan.md": {key: 1791276728}}, key: 1791276790}]}
+    assert normalize_response(row) == {
+        "sessions": [{"grants": {"plan.md": {key: "<TS>"}}, key: "<TS>"}]
+    }
+    for literal in (None, True, False):
+        assert normalize_response({key: literal})[key] is literal, literal
+
+
 def test_no_handoff_fixture_expects_an_unreachable_body() -> None:
     """The documented-unreachable twin: honest limits, stated as assertions.
 
