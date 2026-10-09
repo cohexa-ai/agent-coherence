@@ -10366,7 +10366,9 @@ def test_status_drops_an_unnamed_reclaim_only_row_once_the_reclaim_is_old(
     from ccs.adapters.claude_code import coordinator_server as cs
 
     sid = _sid("stale-195")
-    reclaim_tick = int(time.time()) - cs._RECLAIM_ONLY_ROW_MAX_AGE_SEC - 60
+    # The documented 24-hour window as a literal, never read from the code
+    # under test: a changed constant must fail here, not move the goalposts.
+    reclaim_tick = int(time.time()) - 86_400 - 60
     first = _restart_on(tmp_path, "stale-before")
     try:
         secret = load_secret(first.coordinator_root)
@@ -10391,6 +10393,131 @@ def test_status_drops_an_unnamed_reclaim_only_row_once_the_reclaim_is_old(
 
     agent = str(session_to_agent_id(sid))
     assert [row for row in payload["sessions"] if row["agent_id"] == agent] == []
+
+
+def _reclaim_an_unnamed_holder(coordinator, agent: uuid.UUID, path: str, reclaim_tick: int) -> None:
+    """``agent`` holds ``path`` EXCLUSIVE and last heartbeated 1000 seconds
+    before ``reclaim_tick``, when the real sweep pass reclaims it. The agent
+    never calls the coordinator, so the coordinator has no name for it."""
+    artifact_id = coordinator.registry.resolve_or_register(path, content_hash="")
+    coordinator.registry.set_agent_state(
+        artifact_id, agent, MESIState.EXCLUSIVE, trigger="test_setup", tick=reclaim_tick - 1_000
+    )
+    coordinator.service.record_heartbeat(agent_id=agent, now_tick=reclaim_tick - 1_000)
+    assert _sweep(coordinator, reclaim_tick) == 1
+
+
+def test_status_lists_an_unnamed_reclaim_only_row_through_its_last_second_and_drops_it_after(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The window for an unnamed reclaim-only row is 24 hours from the
+    agent's NEWEST reclaim, inclusive: a reclaim exactly 86400 seconds old is
+    listed and one a second older is not, and an agent with an old and a
+    recent reclaim is listed, with both paths. The window is the literal
+    86400, never read from the code under test."""
+    from ccs.adapters.claude_code import coordinator_server as cs
+
+    now = int(time.time())
+    at_edge, past_edge, an_hour_ago, mixed = (uuid.uuid4() for _ in range(4))
+    _reclaim_an_unnamed_holder(coordinator, at_edge, "edge.md", now - 86_400)
+    _reclaim_an_unnamed_holder(coordinator, past_edge, "old.md", now - 86_401)
+    _reclaim_an_unnamed_holder(coordinator, an_hour_ago, "hour.md", now - 3_600)
+    _reclaim_an_unnamed_holder(coordinator, mixed, "mixed-old.md", now - 86_500)
+    _reclaim_an_unnamed_holder(coordinator, mixed, "mixed-new.md", now - 60)
+
+    monkeypatch.setattr(cs, "monotonic_seconds", lambda: now)
+    rows = {row["agent_id"]: row for row in _operator_status(client)["sessions"]}
+
+    edge_row = rows[str(at_edge)]
+    assert edge_row["agent_name"] is None
+    assert edge_row["states"] == {}
+    assert edge_row["reclaimed"] == {
+        "edge.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": now - 86_400}
+    }
+    assert str(past_edge) not in rows
+    assert rows[str(an_hour_ago)]["reclaimed"] == {
+        "hour.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": now - 3_600}
+    }
+    assert rows[str(mixed)]["reclaimed"] == {
+        "mixed-old.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": now - 86_500},
+        "mixed-new.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": now - 60},
+    }
+
+
+def _post_edit_cas(client: _Client, sid: str, expected_version: int, label: str) -> dict:
+    status, body = client.post("/hooks/post-edit-cas", {
+        "session_id": sid, "path": "plan.md", "success": True,
+        "content_hash": _hash(label), "expected_version": expected_version,
+    })
+    assert status == 200, body
+    return body
+
+
+def _plan_version(payload: dict) -> int:
+    [entry] = [a for a in payload["tracked_artifacts"] if a["path"] == "plan.md"]
+    return entry["version"]
+
+
+def test_status_keeps_a_reclaim_listed_while_the_holders_compare_and_swap_is_refused(
+    coordinator, client: _Client
+) -> None:
+    """The reclaim moved the path's ownership generation past the holder's
+    read, and over the hooks a re-read does not capture the new one, so the
+    holder's compare-and-swap is refused before and after a SHARED re-read
+    beside a peer. The entry stays listed throughout and nothing moves the
+    version. Only the holder's next pre-edit, a write grant, clears it."""
+    sid, peer = _sid("cas-refused-195"), _sid("cas-refused-peer-195")
+    assert client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})[0] == 200
+    reclaim_tick = int(time.time()) + 999_999
+    assert _sweep(coordinator, reclaim_tick) == 1
+    cause = {"plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": reclaim_tick}}
+    version = _plan_version(_operator_status(client))
+    refused = {"ok": False, "reason": "stale_read_generation", "current_version": version}
+
+    assert _post_edit_cas(client, sid, version, "cas-before-reread") == refused
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {}
+    assert row["reclaimed"] == cause
+
+    client.post("/hooks/pre-read", {"session_id": peer, "path": "plan.md", "content_hash": _hash("x")})
+    client.post("/hooks/pre-read", {"session_id": sid, "path": "plan.md", "content_hash": _hash("x")})
+    assert _post_edit_cas(client, sid, version, "cas-after-reread") == refused
+    payload = _operator_status(client)
+    assert _row_for(payload, sid)["states"] == {"plan.md": "SHARED"}
+    assert _row_for(payload, sid)["reclaimed"] == cause
+    assert _row_for(payload, peer)["states"] == {"plan.md": "SHARED"}
+    assert _plan_version(payload) == version
+
+    assert client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})[0] == 200
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {"plan.md": "EXCLUSIVE"}
+    assert row["reclaimed"] == {}
+
+
+def test_a_reclaimed_sessions_reread_with_no_other_holder_is_shared_and_stays_listed(
+    coordinator, client: _Client
+) -> None:
+    """Over the hooks a reclaimed session that re-reads a path no other
+    session holds is granted SHARED, not EXCLUSIVE: the re-read is not a write
+    grant, so the entry stays listed and its compare-and-swap stays refused
+    until it edits the path again."""
+    sid = _sid("sole-reread-195")
+    assert client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})[0] == 200
+    reclaim_tick = int(time.time()) + 999_999
+    assert _sweep(coordinator, reclaim_tick) == 1
+    version = _plan_version(_operator_status(client))
+
+    client.post("/hooks/pre-read", {"session_id": sid, "path": "plan.md", "content_hash": _hash("x")})
+    payload = _operator_status(client)
+    assert [row["agent_id"] for row in payload["sessions"]] == [str(session_to_agent_id(sid))]
+    row = _row_for(payload, sid)
+    assert row["states"] == {"plan.md": "SHARED"}
+    assert row["reclaimed"] == {
+        "plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": reclaim_tick}
+    }
+    assert _post_edit_cas(client, sid, version, "cas-sole-reread") == {
+        "ok": False, "reason": "stale_read_generation", "current_version": version,
+    }
 
 
 # ----------------------------------------------------------------------

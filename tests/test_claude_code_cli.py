@@ -1136,6 +1136,45 @@ def test_render_table_keeps_a_reread_state_beside_its_reclaim(
     assert "reclaimed (reclaim_heartbeat at 1789558656)" in line
 
 
+def test_render_table_prints_a_bare_reclaim_label_for_a_path_the_session_no_longer_holds(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A reclaimed path the session holds nothing on prints the label alone,
+    with no state ahead of it, and an entry missing its fields prints ``?``
+    for each rather than failing. A session listed only for reclaims is not
+    one that holds nothing, so neither prints the "no held grants" line."""
+    monkeypatch.setenv("COLUMNS", "120")
+    payload = {
+        "tracked_artifacts": [{"path": "docs/plan.md", "version": 2}],
+        "sessions": [
+            {
+                "agent_name": None,
+                "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
+                "states": {},
+                "reclaimed": {
+                    "docs/plan.md": {"trigger": "reclaim_max_hold", "reclaimed_at_unix_ts": 1789558656}
+                },
+            },
+            {
+                "agent_name": "claude-session-z",
+                "agent_id": "6c9625da-356c-527f-b5d7-027f181f7748",
+                "states": {},
+                "reclaimed": {"docs/spec.md": {}},
+            },
+        ],
+        "policy_summary": {},
+        "coordinator_pid": 0,
+    }
+    coherence_status._render_table(payload)
+    session_lines = capsys.readouterr().out.split("Sessions:", 1)[1].splitlines()
+
+    [line] = [ln for ln in session_lines if "docs/plan.md" in ln]
+    assert line.split() == ["docs/plan.md", "reclaimed", "(reclaim_max_hold", "at", "1789558656)"]
+    [line] = [ln for ln in session_lines if "docs/spec.md" in ln]
+    assert line.split() == ["docs/spec.md", "reclaimed", "(?", "at", "?)"]
+    assert "(no held grants)" not in "\n".join(session_lines)
+
+
 # ----------------------------------------------------------------------
 # coherence_status — the handoffs block (#185)
 # ----------------------------------------------------------------------

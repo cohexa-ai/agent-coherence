@@ -2372,6 +2372,29 @@ def test_status_snapshot_reclaim_slot_survives_the_holders_compare_and_swap_comm
         assert _reclaim_slots(reg) == {artifact.id: {agent: ("reclaim_heartbeat", 100)}}
 
 
+def test_status_snapshot_reclaim_slot_survives_the_services_compare_and_swap_commit(
+    db_path: Path,
+) -> None:
+    """The same commit through ``CoordinatorService.commit_cas``, the layer
+    the coordinator's compare-and-swap route calls: its winning path leaves the
+    committer SHARED and the slot in place, as the registry's does."""
+    with SqliteArtifactRegistry(db_path) as reg:
+        svc, artifact, agent = _swept_holder(reg)
+        svc.fetch(FetchRequest(artifact_id=artifact.id, requesting_agent_id=uuid4(), requested_at_tick=110))
+        svc.fetch(FetchRequest(artifact_id=artifact.id, requesting_agent_id=agent, requested_at_tick=120))
+        assert reg.get_agent_state(artifact.id, agent) == MESIState.SHARED
+        result = svc.commit_cas(
+            agent_id=agent,
+            artifact_id=artifact.id,
+            expected_version=artifact.version,
+            content_hash="h2",
+            issued_at_tick=150,
+        )
+        assert isinstance(result, tuple), result
+        assert reg.get_agent_state(artifact.id, agent) == MESIState.SHARED
+        assert _reclaim_slots(reg) == {artifact.id: {agent: ("reclaim_heartbeat", 100)}}
+
+
 def test_status_snapshot_reclaim_slots_name_only_the_reclaimed_pair(db_path: Path) -> None:
     """A live holder and a voluntary release carry no slot; the pair the sweep
     pulled does, keyed by artifact then agent."""
