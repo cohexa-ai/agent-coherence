@@ -172,10 +172,11 @@ class LifecycleConfig:
     spawn_self_probe_attempts: int = 50  # × 100ms = 5000ms budget
     spawn_self_probe_interval_sec: float = 0.100
 
-    #: Grant-timeout sweep thresholds. With v0.1's CrashRecoveryConfig
-    #: shipping disabled-by-default, these effectively define the sweep's
-    #: safety net for genuinely orphaned grants. Generous so a thinking
-    #: session is never reclaimed under interactive load.
+    #: Grant-timeout sweep thresholds: the sweep's safety net for genuinely
+    #: orphaned grants, passed to it directly (CrashRecoveryConfig plays no
+    #: part here). Generous so a thinking session is never reclaimed under
+    #: interactive load. #187: the coordinator reports them on ``/status``
+    #: only while a sweep enforces them (:func:`_published_sweep_thresholds`).
     grant_heartbeat_timeout_sec: int = 600
     grant_max_hold_sec: int = 1800
 
@@ -354,6 +355,12 @@ def ensure_coordinator(
                 except OSError:
                     pass
                 continue
+            # #187: before serve_in_thread(), so no request can see the
+            # thresholds unset while the sweep below is about to start.
+            (
+                coordinator.grant_heartbeat_timeout_sec,
+                coordinator.grant_max_hold_sec,
+            ) = _published_sweep_thresholds(cfg)
             _write_pidfile(fd, os.getpid(), port)
             coordinator.serve_in_thread()
             entry = _SpawnedEntry(
@@ -760,6 +767,22 @@ def _probe_with_budget(port: int, bind_host: str, attempts: int, interval_sec: f
 # ----------------------------------------------------------------------
 # Background threads — sweep + idle shutdown
 # ----------------------------------------------------------------------
+
+
+def _published_sweep_thresholds(cfg: LifecycleConfig) -> tuple[int | None, int | None]:
+    """The (heartbeat timeout, max hold) pair the coordinator reports as
+    enforced (#187), or ``(None, None)`` when no sweep enforces them.
+
+    Decides only what to publish; :func:`_start_background_threads` still
+    starts the sweep whenever ``sweep_interval_sec > 0``. A threshold below
+    1 makes every stable-grant pass raise (each pass logs it), so nothing
+    enforces the configured pair and neither value is reported.
+    """
+    if cfg.sweep_interval_sec <= 0:
+        return None, None
+    if cfg.grant_heartbeat_timeout_sec < 1 or cfg.grant_max_hold_sec < 1:
+        return None, None
+    return cfg.grant_heartbeat_timeout_sec, cfg.grant_max_hold_sec
 
 
 def _start_background_threads(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:

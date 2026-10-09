@@ -1058,6 +1058,16 @@ class CoordinatorHTTPServer:
         # constructed directly in tests.
         self.cold_start_duration_ms: float = 0.0
 
+        # #187 — the stable-grant sweep thresholds, in seconds, that the
+        # lifecycle winner path started this coordinator's sweep with. Set
+        # before serve_in_thread(), so no handler sees them change. None when
+        # no sweep enforces them: the server was constructed directly (tests,
+        # the corpus harness), or lifecycle ran no sweep or one whose
+        # thresholds fail every pass. Lifecycle hands over plain values; this
+        # module never imports lifecycle (it imports this one).
+        self.grant_heartbeat_timeout_sec: int | None = None
+        self.grant_max_hold_sec: int | None = None
+
         # KTD-J (Unit 8) — telemetry counters. CACHE, not persistent
         # state: reset to 0 on coordinator respawn (do NOT persist in
         # state.db per the plan rationale). Plain ints — CPython's

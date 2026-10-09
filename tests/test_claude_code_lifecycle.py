@@ -17,12 +17,14 @@ import socket
 import threading
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
 import pytest
 
 from ccs.adapters.claude_code import lifecycle
+from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     connect_or_spawn,
@@ -812,6 +814,84 @@ def test_l3_cold_start_duration_populated_on_winner_path(
         )
     finally:
         stop_coordinator(workspace)
+
+
+# ----------------------------------------------------------------------
+# #187 — the sweep thresholds the coordinator reports on /status
+# ----------------------------------------------------------------------
+
+
+def _published_thresholds(workspace: Path) -> tuple[int | None, int | None]:
+    coordinator = lifecycle._SPAWNED_REGISTRY[str(workspace.resolve())].coordinator
+    return coordinator.grant_heartbeat_timeout_sec, coordinator.grant_max_hold_sec
+
+
+def _sweep_threads() -> set[threading.Thread]:
+    return {t for t in threading.enumerate() if t.name == "coord-sweep"}
+
+
+@pytest.mark.parametrize(
+    ("thresholds", "expected"),
+    [
+        ({}, (600, 1800)),
+        ({"grant_heartbeat_timeout_sec": 120, "grant_max_hold_sec": 300}, (120, 300)),
+    ],
+    ids=["defaults", "configured"],
+)
+def test_coordinator_holds_the_thresholds_its_sweep_was_started_with(
+    workspace: Path, thresholds: dict[str, int], expected: tuple[int, int],
+) -> None:
+    """#187 R4: the winner path hands the coordinator the two thresholds its
+    sweep enforces, so /status reports what the sweep acts on."""
+    cfg = LifecycleConfig(idle_shutdown_sec=0, sweep_interval_sec=0.1, **thresholds)
+    assert ensure_coordinator(workspace, config=cfg) > 0
+    try:
+        assert _published_thresholds(workspace) == expected
+    finally:
+        stop_coordinator(workspace)
+
+
+def test_coordinator_holds_no_thresholds_when_no_sweep_runs(
+    workspace: Path, fast_cfg: LifecycleConfig,
+) -> None:
+    """#187 R4: with ``sweep_interval_sec=0`` nothing enforces the configured
+    thresholds, so the coordinator reports none rather than unenforced values."""
+    cfg = replace(fast_cfg, sweep_interval_sec=0)
+    assert ensure_coordinator(workspace, config=cfg) > 0
+    try:
+        assert _published_thresholds(workspace) == (None, None)
+    finally:
+        stop_coordinator(workspace)
+
+
+@pytest.mark.parametrize("field", ["grant_heartbeat_timeout_sec", "grant_max_hold_sec"])
+def test_a_threshold_below_one_publishes_none_and_the_sweep_still_starts(
+    workspace: Path, fast_cfg: LifecycleConfig, field: str,
+) -> None:
+    """#187 R4: a threshold below 1 fails every stable-grant pass, so neither
+    is reported as enforced; the sweep thread still starts as before, and its
+    per-pass failure log stays the report of the misconfiguration."""
+    cfg = replace(fast_cfg, **{field: 0})
+    sweeps_before = _sweep_threads()
+    assert ensure_coordinator(workspace, config=cfg) > 0
+    try:
+        assert _published_thresholds(workspace) == (None, None)
+        assert len(_sweep_threads() - sweeps_before) == 1
+    finally:
+        stop_coordinator(workspace)
+
+
+def test_a_coordinator_built_without_lifecycle_holds_no_thresholds(
+    tmp_path: Path,
+) -> None:
+    """#187 R4: a server constructed directly (tests, the corpus harness) runs
+    no sweep, so it reports no thresholds."""
+    coordinator = CoordinatorHTTPServer(tmp_path, port=0)
+    try:
+        assert coordinator.grant_heartbeat_timeout_sec is None
+        assert coordinator.grant_max_hold_sec is None
+    finally:
+        coordinator.shutdown()
 
 
 # ----------------------------------------------------------------------
