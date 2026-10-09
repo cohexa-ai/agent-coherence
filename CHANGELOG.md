@@ -532,6 +532,15 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **`dev` now reports version `0.15.0.dev0`, not `0.14.1` (#263).**
+  `ccs.__version__`, and with it `/status`'s `coordinator_version` and the
+  package metadata, still read `0.14.1` on `dev`, although the registry schema
+  has moved from 7 to 10 since that release and 0.14.1 refuses a store this
+  coordinator has migrated. A client that pins the coordinator by
+  `coordinator_version` could not tell a `dev` coordinator from the release it
+  was verified against. It now sees a pre-release version that matches no
+  release pin. The release sets the final `0.15.0`.
+
 - **`agent-coherence-status` asks for the operator view only when given
   `--detail full`.** With no `--detail` it used to request
   `/status?detail=full` with the `Coherence-Local-Operator: true` header, and
