@@ -13,8 +13,9 @@ from pathlib import Path
 import pytest
 
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
+from ccs.mcp.server import _STATUS_DESC
 from ccs.mcp.session import SessionConfig
-from ccs.mcp.status import _coordinator_state, _per_path, build_status
+from ccs.mcp.status import _coordinator_state, _per_path, build_status, handoff_from_status
 
 
 class _StubVolume:
@@ -118,6 +119,45 @@ def test_per_path_enforced_vs_not_registered() -> None:
 
 def test_per_path_empty_when_no_status() -> None:
     assert _per_path(SessionConfig(root=Path("/x"), managed=("data/**",)), None) == {}
+
+
+def _degraded_doc() -> dict:
+    """A default-tier ``/status`` answer whose registry read timed out: the
+    summary and counters as normal, both lists null, and ``degraded: true``."""
+    return {
+        **_doc(1),
+        "caller_principal_absent_total": 0,
+        "caller_principal_refused_total": 0,
+        "tracked_artifacts": None,
+        "sessions": None,
+        "degraded": True,
+    }
+
+
+def test_per_path_is_none_when_status_is_degraded() -> None:
+    """A degraded ``/status`` cannot say which paths are tracked, so
+    ``per_path`` is ``None``, never ``{}``; the coordinator state still comes
+    from the summary, so it stays ``on``. Prevents a busy registry reading as
+    "nothing tracked" -- with ``coordinator`` on, ``per_path`` is the only
+    signal."""
+    config = SessionConfig(root=Path("/x"), managed=("data/**",))
+
+    status = build_status(_StubVolume(True, doc=_degraded_doc()), config)
+
+    assert status["per_path"] is None
+    assert status["coordinator"] == "on"
+
+
+def test_the_status_description_says_per_path_is_null_when_status_is_degraded() -> None:
+    assert "per_path is null" in _STATUS_DESC and "degraded" in _STATUS_DESC
+
+
+def test_handoff_from_status_cannot_tell_on_a_degraded_status() -> None:
+    """Pin: a degraded ``/status`` has no artifact list, so a path's transfer
+    record cannot be told -- ``(False, None)``, never "no record"."""
+    volume = _StubVolume(True, doc=_degraded_doc())
+
+    assert handoff_from_status(volume, "data/a.txt") == (False, None)
 
 
 # --- live integration --------------------------------------------------------

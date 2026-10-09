@@ -9,8 +9,9 @@ table. Backs the ``/agent-coherence status`` slash command.
 Exit codes:
 - 0: status fetched and printed (including "no coordinator running")
 - 1: not in a git repo
-- 2: coordinator running but answered an HTTP error, a redirect (refused) or
-  a body that is not a /status answer, or TLS failed
+- 2: coordinator running but answered an HTTP error, a redirect (refused), a
+  body that is not a /status answer or a degraded one (its registry was busy,
+  #238), or TLS failed
 - 3: --self-test exercised but the smoke scenario failed
 
 KTD-J (Unit 8): ``--self-test`` runs an end-to-end smoke against a real
@@ -131,6 +132,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     payload = _fetch_status(Path(root), args.detail)
     if isinstance(payload, int):
         return payload
+    # The metrics tier carries no lists and never reads the registry.
+    if args.detail != "metrics" and _lists_unavailable(payload):
+        return _print_lists_unavailable(payload, json_mode=args.json)
     return _print_status(payload, args)
 
 
@@ -167,6 +171,36 @@ def _fetch_status(root: Path, detail: str) -> dict[str, Any] | int:
         err("agent-coherence-status: the coordinator's answer is not a JSON object")
         return 2
     return payload
+
+
+_DEGRADED_LINE = (
+    "agent-coherence-status: the coordinator's registry is busy (lock contention), "
+    "so tracked artifacts and sessions are unavailable; try again shortly"
+)
+
+
+def _lists_unavailable(payload: dict[str, Any]) -> bool:
+    """True when ``tracked_artifacts`` or ``sessions`` is not a list. A degraded
+    answer (#238) -- the coordinator could not read its registry in time --
+    carries both as null; either way the answer cannot tell what is tracked,
+    which is never "nothing tracked"."""
+    return not all(isinstance(payload.get(key), list) for key in ("tracked_artifacts", "sessions"))
+
+
+def _print_lists_unavailable(payload: dict[str, Any], *, json_mode: bool) -> int:
+    """Exit 2 on an answer without its lists (KTD8). ``--json`` prints the body
+    unchanged, so with ``--show-policy`` it carries no
+    ``policy_pending_first_read``, which needs the artifact list. The table
+    prints nothing on stdout and one stderr line: registry contention when the
+    answer is marked ``degraded``, else the shape line."""
+    if json_mode:
+        import json as _json
+        print(_json.dumps(payload, indent=2), flush=True)
+    elif payload.get("degraded") is True:
+        err(_DEGRADED_LINE)
+    else:
+        err("agent-coherence-status: unexpected /status shape")
+    return 2
 
 
 def _print_status(payload: dict[str, Any], args: argparse.Namespace) -> int:

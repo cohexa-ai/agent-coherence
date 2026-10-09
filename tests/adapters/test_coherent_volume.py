@@ -1262,6 +1262,36 @@ def test_an_unconfirmable_enforcement_answer_runs_detached_in_degrade_mode(
         stop_coordinator(tmp_path)
 
 
+def test_a_degraded_operator_view_still_confirms_enforcement_from_its_policy_summary(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pin: an operator view whose registry read timed out answers 200 with
+    both lists null and ``degraded: true``, and still carries the four glob
+    sets in ``policy_summary``. The check reads only those, so a strict volume
+    attaches and its glob reads as enforced, never "cannot tell". Prevents a
+    busy registry turning attach into a fail-closed refusal."""
+    _seed(tmp_path, content=b"v1")
+    real_get = coherent_volume_module._coordinator_get
+    served: list[dict] = []
+
+    def degraded_operator_view(endpoint, path, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        doc = real_get(endpoint, path, **kwargs)
+        if "detail=full" not in path:
+            return doc
+        served.append({**doc, "tracked_artifacts": None, "sessions": None, "degraded": True})
+        return served[-1]
+
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_get", degraded_operator_view)
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        assert vol.is_attached and not vol.is_degraded
+        assert vol.managed_glob_enforcement() == ManagedGlobEnforcement(("data/**",), (), None)
+        assert len(served) == 2, "both checks read a degraded operator view"
+        assert all(isinstance(d["policy_summary"].get("strict_mode_patterns"), list) for d in served)
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_fixed_stale_buffer_write_is_denied(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:

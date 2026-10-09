@@ -2226,3 +2226,98 @@ def test_detail_help_does_not_claim_the_minimal_tier_redacts_every_absolute_path
 
     assert "redacts absolute paths" not in action.help
     assert "policy_summary.coordinator_root" in action.help
+
+
+# ----------------------------------------------------------------------
+# #238 -- a degraded /status answer is "cannot tell" (exit 2)
+# ----------------------------------------------------------------------
+
+#: FROZEN duplicate of the line the status table prints on a degraded answer.
+_DEGRADED_STATUS_LINE = (
+    "agent-coherence-status: the coordinator's registry is busy (lock contention), "
+    "so tracked artifacts and sessions are unavailable; try again shortly\n"
+)
+
+
+def _degraded_status_body() -> dict:
+    """An operator-tier ``/status`` answer whose registry read timed out: the
+    normal key set, with ``policy_summary`` (counts and a user-added pattern)
+    and the counters, both lists null, and ``degraded: true``."""
+    return {
+        **_status_payload(),
+        "policy_summary": {
+            "default_pattern_count": 3, "user_added_pattern_count": 1, "ignored_pattern_count": 0,
+            "user_added_patterns": ["notes/**"],
+        },
+        "tracked_artifacts": None,
+        "sessions": None,
+        "endpoint_counters": {"pre_read_total": 4, "status_total": 2},
+        "watchdog_timeouts_total": 1,
+        "degraded": True,
+    }
+
+
+@pytest.mark.parametrize("flags", [[], ["--show-policy"], ["--detail", "minimal"]],
+                         ids=["table", "show-policy", "minimal"])
+def test_status_table_on_a_degraded_answer_exits_2_with_one_line_naming_registry_contention(
+    flags: list[str], stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A degraded ``/status`` -- the coordinator could not read its registry in
+    time, so both lists are null -- prints nothing on stdout and one stderr
+    line naming registry contention, and exits 2, with or without
+    ``--show-policy``. Prevents a busy registry reading as an empty workspace
+    ("No artifacts observed yet", "No active sessions.") or as a malformed
+    answer."""
+    workspace, _ = stub_coordinator
+    _StubCoordinator.answers = {"/status": (200, _degraded_status_body())}
+
+    rc = coherence_status.main(["--root", str(workspace), *flags])
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.err == _DEGRADED_STATUS_LINE
+    assert captured.out == ""
+    assert "No active sessions." not in captured.out
+    assert "No artifacts observed yet" not in captured.out
+
+
+@pytest.mark.parametrize("flags", [["--json"], ["--json", "--show-policy"]], ids=["json", "json-show-policy"])
+def test_status_json_on_a_degraded_answer_prints_the_body_unchanged_and_exits_2(
+    flags: list[str], stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--json`` prints a degraded body as the coordinator sent it and exits 2;
+    with ``--show-policy`` it adds no ``policy_pending_first_read``, which
+    cannot be computed without the artifact list. Prevents a script reading a
+    degraded answer as a successful one, or a pending list computed against
+    no observed paths."""
+    workspace, _ = stub_coordinator
+    body = _degraded_status_body()
+    _StubCoordinator.answers = {"/status": (200, body)}
+
+    rc = coherence_status.main(["--root", str(workspace), *flags])
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert json.loads(captured.out) == body
+    assert "policy_pending_first_read" not in captured.out
+    assert captured.err == ""
+
+
+def test_status_table_on_an_answer_without_its_lists_and_no_marker_exits_2_as_a_bad_shape(
+    stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The lists not being lists is what makes an answer "cannot tell"; the
+    ``degraded`` marker only picks the message. An answer that omits both
+    lists without the marker exits 2 with the shape line and prints no table.
+    Prevents an answer with no lists rendering as an empty workspace."""
+    workspace, _ = stub_coordinator
+    body = {k: v for k, v in _degraded_status_body().items()
+            if k not in ("tracked_artifacts", "sessions", "degraded")}
+    _StubCoordinator.answers = {"/status": (200, body)}
+
+    rc = coherence_status.main(["--root", str(workspace)])
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.err == "agent-coherence-status: unexpected /status shape\n"
+    assert captured.out == ""
