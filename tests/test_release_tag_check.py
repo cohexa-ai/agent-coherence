@@ -148,15 +148,45 @@ def test_main_reads_the_tag_from_release_tag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The workflow passes the tag through RELEASE_TAG, not --tag."""
+    output = tmp_path / "github_output"
+    output.touch()
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setenv("RELEASE_TAG", "v0.15.0rc1")
+    assert tool.main(["--package-init", str(_package_init(tmp_path, "0.15.0rc1"))]) == 0
+    assert output.read_text() == "prerelease=true\n"
+
+
+def test_main_refuses_a_dev_tag_given_through_release_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     monkeypatch.setenv("RELEASE_TAG", "v0.15.0.dev0")
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
-    package_init = _package_init(tmp_path, "0.15.0.dev0")
-    assert tool.main(["--package-init", str(package_init)]) == 1
+    assert tool.main(["--package-init", str(_package_init(tmp_path, "0.15.0.dev0"))]) == 1
+    assert "development version" in capsys.readouterr().err
+
+
+def test_main_accepts_a_tag_without_github_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A local dry run has no GITHUB_OUTPUT; the answer is printed instead."""
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    package_init = _package_init(tmp_path, "0.15.0")
+    assert tool.main(["--tag", "v0.15.0", "--package-init", str(package_init)]) == 0
+    assert "a final release" in capsys.readouterr().out
 
 
 def test_main_without_a_tag_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("RELEASE_TAG", raising=False)
     assert tool.main(["--package-init", str(_package_init(tmp_path, "0.15.0"))]) == 1
+
+
+def test_main_fails_when_the_package_init_has_no_version(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    package_init = tmp_path / "__init__.py"
+    package_init.write_text('"""pkg."""\n')
+    assert tool.main(["--tag", "v0.15.0", "--package-init", str(package_init)]) == 1
+    assert "Could not find __version__" in capsys.readouterr().err
 
 
 def test_repo_package_version_is_readable() -> None:
@@ -174,6 +204,11 @@ def test_repo_package_version_is_readable() -> None:
 
 def _jobs(workflow: Path) -> dict:
     return yaml.safe_load(workflow.read_text())["jobs"]
+
+
+def _needs(job: dict) -> set[str]:
+    needs = job.get("needs") or []
+    return {needs} if isinstance(needs, str) else set(needs)
 
 
 def _step(job: dict, *, step_id: str | None = None, uses: str | None = None) -> dict:
@@ -207,9 +242,20 @@ def test_release_tag_check_runs_before_anything_is_built() -> None:
 
 def test_github_release_is_marked_prerelease_from_the_tag_check() -> None:
     job = _jobs(_RELEASE_WORKFLOW)["github-release"]
-    assert "build" in job["needs"], "needs.build.outputs is empty unless build is in needs"
+    assert "build" in _needs(job), "needs.build.outputs is empty unless build is in needs"
     release_step = _step(job, uses="softprops/action-gh-release@")
     assert release_step["with"]["prerelease"] == "${{ needs.build.outputs.prerelease }}"
+
+
+def test_nothing_publishes_before_the_tag_check_passes() -> None:
+    """The tag check runs in build; both publishing jobs wait on it.
+
+    The GitHub release also waits for PyPI, so a failed or rejected PyPI
+    publish leaves no GitHub release for the registry workflow to pick up.
+    """
+    jobs = _jobs(_RELEASE_WORKFLOW)
+    assert "build" in _needs(jobs["publish"])
+    assert {"build", "publish"} <= _needs(jobs["github-release"])
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +275,16 @@ def test_every_registry_step_is_skipped_for_a_prerelease() -> None:
     assert later, "the resolve step must come before the registry steps"
     for step in later:
         assert step.get("if") == "steps.release.outputs.prerelease == 'false'", step.get("name")
+
+
+def test_resolve_step_reads_the_tag_from_the_triggering_event() -> None:
+    """The resolve tests below set these variables directly; this pins where they come from."""
+    steps = {step.get("name"): step for step in _mcp_steps()}
+    env = steps[_RESOLVE_STEP]["env"]
+    assert env["EVENT_RELEASE_TAG"] == "${{ github.event.release.tag_name }}"
+    assert env["WORKFLOW_RUN_TAG"] == "${{ github.event.workflow_run.head_branch }}"
+    sync = steps["Sync server.json version to the released tag"]
+    assert sync["env"]["RELEASE_TAG"] == "${{ steps.release.outputs.tag }}"
 
 
 _GH_STUB = textwrap.dedent(
