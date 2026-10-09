@@ -258,15 +258,17 @@ Alpha — APIs may change before `v1.0`.
   - `GET /status?detail=full` gives every `sessions[]` row a `reclaimed` map
     beside `states`: `{path: {"trigger": "reclaim_heartbeat" |
     "reclaim_max_hold", "reclaimed_at_unix_ts": <int>}}` for each path whose
-    last write grant the sweep reclaimed, with no write grant there since. It is history, not
-    current state. A session whose re-read is granted `SHARED` (another
-    session holds the path too) keeps it listed beside that state, because a
-    read does not version the edit the reclaim left on disk, and a peer
-    invalidating that read leaves the original trigger and time in place. An
-    `EXCLUSIVE` or `MODIFIED` grant on the path clears the entry, including the
-    `EXCLUSIVE` a sole reader's re-read is granted; `states` then shows the
-    path held. A path is never both held for writing and listed. A release, a peer preemption or
-    a handoff adds no entry. `states` is unchanged (held grants only), so
+    last write grant the sweep reclaimed, with no write grant there since. It
+    is history, not current state. A session that re-reads the path is
+    granted `SHARED`, even when no other session holds it, and keeps it
+    listed beside that state, because a read does not version the edit the
+    reclaim left on disk; a peer invalidating that read leaves the original
+    trigger and time in place. Until the session edits the path again, its
+    compare-and-swap commits stay refused with `stale_read_generation`, even
+    after a re-read. Editing the path again takes the write grant, which
+    clears the entry, and `states` then shows the path held. A path is never
+    both held for writing and listed. A release, a peer preemption or a
+    handoff adds no entry. `states` is unchanged (held grants only), so
     existing readers see the same body. Both maps come from one registry read,
     so a single response never shows a reclaimed grant as a clean release.
     `reclaimed_at_unix_ts` is the reclaim's time in unix seconds.

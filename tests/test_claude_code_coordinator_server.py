@@ -10073,14 +10073,16 @@ def test_a_reclaimed_path_stays_listed_through_a_reread_and_clears_on_reacquire(
     """``reclaimed`` is history: the session's last write grant on the path
     ended in a reclaim and it has held none since. A re-read does not version
     the edit the reclaim stranded, so the path stays listed beside its SHARED
-    state, and stays listed with the ORIGINAL tick when a peer invalidates
+    state, and stays listed with the ORIGINAL time when a peer invalidates
     that read. Only a new write grant clears it."""
     sid, peer = _sid("reread-195"), _sid("reread-peer-195")
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
     reclaim_tick = int(time.time()) + 999_999
     _sweep(coordinator, reclaim_tick)
     cause = {"plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": reclaim_tick}}
-    # A peer read first, so the re-read is granted SHARED rather than E.
+    # Both reads are granted SHARED. Over the hooks a reclaimed session's
+    # re-read is SHARED whether or not another session holds the path, so the
+    # peer's read is not what keeps it from being a write grant.
     client.post("/hooks/pre-read", {"session_id": peer, "path": "plan.md", "content_hash": _hash("x")})
     client.post("/hooks/pre-read", {"session_id": sid, "path": "plan.md", "content_hash": _hash("x")})
 

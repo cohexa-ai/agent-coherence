@@ -6691,10 +6691,14 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     next M/E acquire, so an entry means "this session's most recent write
     grant on this path was reclaimed and it has held none since": a re-read
     granted SHARED shows the path in ``states`` and keeps it in ``reclaimed``,
-    and a peer invalidating that read leaves the original trigger and time. A
-    sole reader's re-read is granted EXCLUSIVE, an M/E acquire that clears the
-    slot. A pair held M/E is never listed. Both maps come from one registry
-    read.
+    and a peer invalidating that read leaves the original trigger and time.
+    Over the hooks a re-read is granted SHARED even when no other session
+    holds the path: the pre-read's re-grant of a stale or held reader does
+    not capture the read generation, so the session's compare-and-swap stays
+    refused ``stale_read_generation`` and the path stays listed until its
+    next pre-edit, the M/E acquire that clears the slot. (Only the library's
+    ``CoordinatorService.fetch`` grants a sole reader EXCLUSIVE.) A pair held
+    M/E is never listed. Both maps come from one registry read.
     ``reclaimed_at_unix_ts`` is when the sweep reclaimed the grant, in whole
     unix seconds like the other ``*_unix_ts`` fields. The key is absent below
     the operator tier. An agent that is unnamed, holds nothing and is listed
@@ -6896,9 +6900,12 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # It is history, not current state: the pair's last write grant ended in
     # a sweep reclaim and it has held none since. A re-read granted SHARED does
     # not version the edit the reclaim stranded, so the path stays listed
-    # beside that SHARED state; only an M/E acquire clears the slot, including
-    # the EXCLUSIVE a sole reader's re-read is granted. A pair still write-held
-    # is never listed, so a path is never both held for writing and reclaimed.
+    # beside that SHARED state; only an M/E acquire clears the slot. Over the
+    # hooks that is the session's next pre-edit: the pre-read re-grants a
+    # stale reader SHARED even when no other session holds the path, and that
+    # re-grant is not a claim, so the compare-and-swap stays refused too. A
+    # pair still write-held is never listed, so a path is never both held for
+    # writing and reclaimed.
     reclaimed_by_agent: dict[UUID, dict[str, dict[str, Any]]] = {}
     for artifact_id, slots in reclamation_by_artifact.items():
         meta = artifact_by_id[artifact_id]

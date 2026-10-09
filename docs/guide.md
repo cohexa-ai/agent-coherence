@@ -549,16 +549,17 @@ and it has taken none since. Its edit may be on disk with no version recording
 it, so do not hand the path to another session on the strength of an empty
 `states` alone. The entry stays listed:
 
-- while the holder re-reads the path and is granted `SHARED` because another
-  session holds it too, since a read does not version the edit;
-- after a peer writes or commits the path, after the holder itself commits by
-  compare-and-swap (that leaves it `SHARED`), and after the holder's session
+- while the holder re-reads the path. A re-read is granted `SHARED`, even when
+  no other session holds the path, and a read does not version the edit;
+- while the holder's compare-and-swap commits of the path are refused with
+  `stale_read_generation`. A re-read does not lift that refusal;
+- after a peer writes or commits the path, and after the holder's session
   ends.
 
-It clears when that holder next takes the path `EXCLUSIVE` or `MODIFIED`: a
-pre-edit, or a re-read while no other session holds the path, because the
-coordinator grants a sole reader `EXCLUSIVE`. From then on `states` shows the
-holder holding the path, so it does not read as released. The map
+A reclaimed session gets its write back by editing the path again: the edit
+takes the write grant (`EXCLUSIVE`), which clears the entry, and commits like
+any other edit. `states` then shows the holder holding the path, so it does
+not read as released. The map
 tells you a reclaim happened; whether its edit has been dealt with since is
 yours to decide. One clue: if the path's `last_writer_at_unix_ts` in the same
 response is later than the entry's `reclaimed_at_unix_ts`, someone has committed
