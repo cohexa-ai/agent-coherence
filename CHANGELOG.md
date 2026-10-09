@@ -763,6 +763,17 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **A grant the coordinator reclaims can no longer look like an ordinary
+  release.** The sweep took the grant away in one write and recorded why in a
+  second. If that second write failed (another process holding the database
+  past its busy timeout, any SQLite error, or the process dying between the
+  two), the holder was left without its grant and without the record: `GET
+  /status?detail=full` showed no `reclaimed` entry, the holder's late commit
+  error carried no `reclaimed_by`, the reclaim went uncounted and unlogged,
+  and the next sweep, finding nothing left to reclaim, never repaired it. The
+  reclaim is now recorded in the same write that takes the grant away, so the
+  two land together or not at all.
+
 - **`GET /status` and the Grep hook no longer wait as long as the registry is
   busy (#238).** Both read the registry on the request thread, outside the
   handler's 4-second watchdog. While another request held the registry lock,

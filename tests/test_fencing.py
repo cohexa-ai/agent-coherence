@@ -149,18 +149,21 @@ def test_parity_pessimistic_fence_rejects_superseded_committer(registry) -> None
 
 
 def test_reclaim_trigger_constants_are_equal_across_registries() -> None:
-    """The RECLAIM_TRIGGERS / EPOCH_BUMP_TRIGGERS / CLAIM_CAPTURE_TRIGGERS
-    constants are duplicated (the registries share no base class); this pins the
-    copies equal so the bump and the capture can never silently diverge. The capture pin also
+    """The RECLAIM_TRIGGERS / EPOCH_BUMP_TRIGGERS / CLAIM_CAPTURE_TRIGGERS /
+    SWEEP_RECLAIM_TRIGGERS constants are duplicated (the registries share no
+    base class); this pins the copies equal so the bump, the capture and the
+    reclaim slot can never silently diverge. The capture pin also
     guards the service.fetch() trigger string: a rename there without updating
     the constants would silently disable read-generation capture on fetches."""
     from ccs.coordinator.registry import CLAIM_CAPTURE_TRIGGERS as MEM_CAPTURE
     from ccs.coordinator.registry import EPOCH_BUMP_TRIGGERS as MEM_BUMP
     from ccs.coordinator.registry import RECLAIM_TRIGGERS as IN_MEMORY
+    from ccs.coordinator.registry import SWEEP_RECLAIM_TRIGGERS as MEM_SWEEP
     from ccs.coordinator.registry_protocol import HANDOFF_TRIGGER
     from ccs.coordinator.sqlite_registry import CLAIM_CAPTURE_TRIGGERS as SQL_CAPTURE
     from ccs.coordinator.sqlite_registry import EPOCH_BUMP_TRIGGERS as SQL_BUMP
     from ccs.coordinator.sqlite_registry import RECLAIM_TRIGGERS as SQLITE
+    from ccs.coordinator.sqlite_registry import SWEEP_RECLAIM_TRIGGERS as SQL_SWEEP
 
     assert IN_MEMORY == SQLITE == frozenset(
         {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
@@ -177,6 +180,13 @@ def test_reclaim_trigger_constants_are_equal_across_registries() -> None:
     # without the set would leave the bump keyed on a string nothing emits.
     assert HANDOFF_TRIGGER == "handoff"
     assert MEM_CAPTURE == SQL_CAPTURE == frozenset({"fetch"})
+    # The triggers whose M/E -> INVALID transition records the pair's reclaim
+    # slot in the same write: the stable-grant sweep's two, never the transient
+    # "timeout", which /status does not report as a reclaim. Both registries
+    # must key the slot on one set, or a backend would store a reclaim without
+    # its cause.
+    assert MEM_SWEEP is SQL_SWEEP
+    assert MEM_SWEEP == frozenset({"reclaim_heartbeat", "reclaim_max_hold"})
 
 
 def test_transient_timeout_eviction_bumps_and_fences(registry) -> None:

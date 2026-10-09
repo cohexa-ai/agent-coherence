@@ -133,6 +133,7 @@ from .registry_protocol import (
     FOREIGN_WRITE_OUTCOMES,
     HANDOFF_TRIGGER,
     RECLAIM_TRIGGERS,  # noqa: F401 — re-exported; see the parity test
+    SWEEP_RECLAIM_TRIGGERS,
     CaptureResult,
     CasResult,
     CheckpointMember,
@@ -3986,12 +3987,26 @@ class SqliteArtifactRegistry:
                             ),
                         )
                     else:
+                        # A sweep reclaim writes its slot in this same UPDATE,
+                        # so the slot commits with the owner_generation bump
+                        # above or rolls back with it (see
+                        # SWEEP_RECLAIM_TRIGGERS): no later failure can leave
+                        # an INVALID pair that reads as a plain release.
+                        record_reclaim = (
+                            prev_in_me
+                            and state == MESIState.INVALID
+                            and trigger in SWEEP_RECLAIM_TRIGGERS
+                        )
                         self._conn.execute(
                             """
                             UPDATE agent_states
                             SET state = ?, granted_at_tick = ?,
                                 last_observed_version =
-                                    CASE WHEN ? THEN ? ELSE last_observed_version END
+                                    CASE WHEN ? THEN ? ELSE last_observed_version END,
+                                last_reclaim_trigger =
+                                    CASE WHEN ? THEN ? ELSE last_reclaim_trigger END,
+                                last_reclaim_tick =
+                                    CASE WHEN ? THEN ? ELSE last_reclaim_tick END
                             WHERE artifact_id = ? AND agent_id = ?
                             """,
                             (
@@ -3999,6 +4014,10 @@ class SqliteArtifactRegistry:
                                 granted_at_tick,
                                 1 if observe else 0,
                                 version,
+                                1 if record_reclaim else 0,
+                                trigger,
+                                1 if record_reclaim else 0,
+                                tick,
                                 artifact_id.hex,
                                 agent_id.hex,
                             ),

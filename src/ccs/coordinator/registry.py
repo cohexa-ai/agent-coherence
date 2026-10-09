@@ -49,6 +49,7 @@ from .registry_protocol import (
     FOREIGN_WRITE_OUTCOMES,
     HANDOFF_TRIGGER,
     RECLAIM_TRIGGERS,  # noqa: F401 — re-exported; see the parity test
+    SWEEP_RECLAIM_TRIGGERS,
     CaptureResult,
     CasResult,
     CheckpointMember,
@@ -661,6 +662,12 @@ class ArtifactRegistry:
                 # epoch (see registry_protocol.EPOCH_BUMP_TRIGGERS).
                 if trigger in EPOCH_BUMP_TRIGGERS:
                     record.owner_generation += 1
+                # A sweep reclaim records its slot here, with the transition and
+                # before the log emit, so no failure after this point can leave
+                # an INVALID pair that reads as a plain release (see
+                # SWEEP_RECLAIM_TRIGGERS).
+                if state == MESIState.INVALID and trigger in SWEEP_RECLAIM_TRIGGERS:
+                    record.last_reclamation_by_agent[agent_id] = (trigger, tick)
 
             # Read-generation fence: capture the current ownership epoch into the
             # agent's read_generation ONLY on the agent's own claim -- an E/M
