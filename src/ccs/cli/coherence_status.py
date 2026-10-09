@@ -79,21 +79,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit the raw JSON response instead of the rendered table.",
     )
     # KTD-J (Unit 8): --detail mirrors the /status three-tier disclosure
-    # model. Default 'full' so the local-operator CLI keeps surfacing pid
-    # + absolute root + session names + all counters; 'metrics' for scrapers
-    # that want only the counter block; 'minimal' for a redacted view, which
-    # still carries the absolute root in policy_summary.coordinator_root.
+    # model. With no --detail the CLI asks for the coordinator's default
+    # tier exactly as the plugin's Node CLI does: this command often runs
+    # inside an agent's shell tool, where its output lands in the transcript,
+    # and the plugin's shim runs either CLI under the same name. 'full' is
+    # the operator view (session names, absolute root, policy patterns);
+    # 'metrics' is the counter block only, for scrapers.
     parser.add_argument(
         "--detail",
         choices=["minimal", "full", "metrics"],
-        default="full",
+        default=None,
         help=(
-            "Disclosure tier (default: full). 'minimal' redacts session names "
-            "and user-added tracked patterns and reports the top-level "
-            "coordinator root as '.', but policy_summary.coordinator_root is "
-            "still an absolute path; it still reports per-session artifact "
-            "state (the process id is reported at every tier); 'metrics' "
-            "returns counters only; 'full' is the operator view."
+            "Disclosure tier (default: the coordinator's default tier, which "
+            "is minimal). 'minimal' redacts absolute paths, session names "
+            "and user-added tracked patterns, and still reports per-session "
+            "artifact state (the process id is reported at every tier); "
+            "'metrics' returns counters only; 'full' is the operator view, "
+            "requested with the Coherence-Local-Operator opt-in header."
         ),
     )
     # KTD-J (Unit 8): post-install smoke. Drives a two-session stale-read
@@ -115,14 +117,23 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Show user-added tracked paths that have not yet been observed "
             "(i.e., no pre-read hook has fired for them yet). These paths "
-            "are in the policy but absent from the artifact registry."
+            "are in the policy but absent from the artifact registry. "
+            "Requires --detail full: only the operator view carries them."
         ),
     )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    # Below the operator tier the payload carries no pattern list, so every
+    # user-added path would read as observed and the section would say "none".
+    if args.show_policy and args.detail != "full":
+        parser.error(
+            "--show-policy needs --detail full (only the operator view "
+            "carries the user-added patterns)"
+        )
 
     root = args.root if args.root is not None else find_coordinator_root()
     if root is None:
@@ -141,23 +152,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     return _print_status(payload, args)
 
 
-def _fetch_status(root: Path, detail: str) -> dict[str, Any] | int:
-    """The ``/status`` body at ``detail``, or the exit code of a failure
+def _fetch_status(root: Path, detail: str | None) -> dict[str, Any] | int:
+    """The ``/status`` body at ``detail`` (the coordinator's default tier when
+    ``None``), or the exit code of a failure
     already reported in one line: 0 when no coordinator runs; 2 for an HTTP
     error, a refused redirect, a TLS failure or a body that is not a JSON
     object (#245)."""
     try:
         endpoint = resolve_endpoint(root)
-        # R12 (Unit 6) + KTD-J (Unit 8): the detail tier is selected via
-        # --detail. Only 'full' needs the Coherence-Local-Operator opt-in
-        # header; the lower tiers degrade by design if the header is
-        # missing, but we always set it from this CLI since it's a
-        # legitimate local operator.
-        payload = get(
-            endpoint,
-            f"/status?detail={detail}",
-            extra_headers={"Coherence-Local-Operator": "true"},
-        )
+        # R12 (Unit 6) + KTD-J (Unit 8): only 'full' needs the
+        # Coherence-Local-Operator opt-in header, and only an explicit
+        # --detail full sends it. No --detail sends the bare GET /status
+        # the Node CLI sends.
+        path = "/status" if detail is None else f"/status?detail={detail}"
+        operator = {"Coherence-Local-Operator": "true"} if detail == "full" else None
+        payload = get(endpoint, path, extra_headers=operator)
     except CoordinatorMalformedAnswer:
         # Ahead of its base class: a coordinator answered, so this is not
         # the "no coordinator running" exit 0.
@@ -658,7 +667,7 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
                 print(f"    {_elide_middle(path, path_w):<{path_w}}  {state}")
 
     # KTD-J (Unit 8): counters section. Only printed when the payload
-    # actually carries counter data — the minimal tier strips them.
+    # actually carries counter data.
     _render_counter_block(payload)
 
 
@@ -710,8 +719,7 @@ def _format_age(seconds: float) -> str:
 
 def _render_counter_block(payload: dict[str, Any]) -> None:
     """KTD-J counter block, printed after the artifacts/sessions section
-    of the full-tier table. No-op if the payload doesn't carry counters
-    (e.g., minimal tier responses)."""
+    of the table. No-op if the payload doesn't carry counters."""
     endpoint_counters = payload.get("endpoint_counters") or {}
     has_endpoint_counters = any(v for v in endpoint_counters.values())
     keys_present = [

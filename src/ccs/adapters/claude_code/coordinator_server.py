@@ -6660,12 +6660,12 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     | metrics   | ?detail=metrics      | none — telemetry block only    |
     | full      | ?detail=full         | ``Coherence-Local-Operator: true`` header opt-in |
 
-    ``minimal`` is the default. It reports the top-level ``coordinator_root``
-    as the sentinel ``.`` and no session names (R6: ``agent_name`` embeds the
-    raw session id, so it is null below the operator tier; the non-reversible
-    ``agent_id`` and the per-artifact ``states`` map stay). It is NOT free of
-    absolute paths: ``policy_summary.coordinator_root`` is the absolute
-    workspace root at both the minimal and full tiers. ``metrics`` returns
+    ``minimal`` is the default and includes no absolute paths: the workspace
+    root is reported as the sentinel ``.``, both as the top-level
+    ``coordinator_root`` and as ``policy_summary.coordinator_root``. It
+    carries no session names (R6: ``agent_name`` embeds the raw session id,
+    so it is null below the operator tier; the non-reversible ``agent_id``
+    and the per-artifact ``states`` map stay). ``metrics`` returns
     only the counter block — useful for operators scraping /status into a
     dashboard without leaking workspace state; it carries no sessions at
     all and is unaffected by R6. ``full`` is the legacy
@@ -7032,11 +7032,17 @@ def _status_body(
     # them at the minimal/metrics tiers would expose the operator's directory
     # layout to non-operator callers — ask for them only at the full tier;
     # the counts are in the summary at every tier.
+    policy_summary = coordinator.policy.summary(include_patterns=detail == "full")
+    if detail != "full":
+        # The summary carries the absolute root too: below the operator tier it
+        # gets the same sentinel as the top-level key, or the default tier
+        # publishes $HOME / directory layout through it anyway.
+        policy_summary = {**policy_summary, "coordinator_root": "."}
     body: dict[str, Any] = {
         "detail": detail,
         "tracked_artifacts": None,
         "sessions": None,
-        "policy_summary": coordinator.policy.summary(include_patterns=detail == "full"),
+        "policy_summary": policy_summary,
         # P1 #7: coordinator_pid is in the minimal tier too. Process IDs
         # are public on POSIX (anyone with `ps` sees them) so this is
         # not a disclosure beyond the trust boundary the threat model
@@ -7059,8 +7065,8 @@ def _status_body(
         body["grant_heartbeat_timeout_sec"] = coordinator.grant_heartbeat_timeout_sec
         body["grant_max_hold_sec"] = coordinator.grant_max_hold_sec
     else:
-        # Minimal: the top-level root is the sentinel ".". The summary's
-        # own ``coordinator_root`` above is still the absolute path.
+        # Minimal: the top-level root is the sentinel ".", like the summary's
+        # own ``coordinator_root`` above.
         body["coordinator_root"] = "."
     return body
 

@@ -613,17 +613,145 @@ def test_status_detail_minimal_includes_pid_redacts_abs_root(
     assert str(workspace) not in captured.out
 
 
-def test_status_full_default_includes_counters_below_sessions(
+def test_status_default_table_includes_counters_below_sessions(
     live_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The default --detail=full table rendering now includes a Counters
-    section after the artifacts/sessions block."""
+    """The default table rendering includes a Counters section after the
+    artifacts/sessions block: the counters ride every tier, the default one
+    included."""
     workspace, port = live_coordinator
     rc = coherence_status.main(["--root", str(workspace)])
     captured = capsys.readouterr()
     assert rc == 0
     assert "Counters:" in captured.out
     assert "pre_read_total" in captured.out
+
+
+def _spy_status_requests(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict[str, str]]]:
+    """Record each GET the status CLI sends (path, extra headers), still
+    sending it to the live coordinator."""
+    seen: list[tuple[str, dict[str, str]]] = []
+    real_get = coherence_status.get
+
+    def spy(endpoint, path, *, extra_headers=None):
+        seen.append((path, dict(extra_headers or {})))
+        return real_get(endpoint, path, extra_headers=extra_headers)
+
+    monkeypatch.setattr(coherence_status, "get", spy)
+    return seen
+
+
+@pytest.mark.parametrize(("detail_args", "expected_path", "sends_operator_header"), [
+    ([], "/status", False),
+    (["--detail", "minimal"], "/status?detail=minimal", False),
+    (["--detail", "metrics"], "/status?detail=metrics", False),
+    (["--detail", "full"], "/status?detail=full", True),
+])
+def test_status_sends_the_operator_header_only_for_an_explicit_detail_full(
+    detail_args: list[str], expected_path: str, sends_operator_header: bool,
+    live_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A bare ``agent-coherence-status`` asks for the default tier exactly as
+    the Claude Code plugin's Node CLI does (``GET /status``, no opt-in
+    header), so the same command prints the same tier whichever CLI the
+    plugin's shim runs. Only ``--detail full`` sends
+    ``Coherence-Local-Operator: true``. Prevents the bare command printing
+    session names and the absolute workspace root into an agent's
+    transcript."""
+    workspace, _ = live_coordinator
+    seen = _spy_status_requests(monkeypatch)
+
+    rc = coherence_status.main(["--root", str(workspace), *detail_args])
+
+    capsys.readouterr()
+    assert rc == 0
+    assert seen == [(
+        expected_path,
+        {"Coherence-Local-Operator": "true"} if sends_operator_header else {},
+    )]
+
+
+def _named_session(workspace: Path) -> str:
+    """Pre-read plan.md as a fresh session, so the coordinator names it and
+    lists its read; returns the raw session id."""
+    session_id = str(uuid.uuid4())
+    post(resolve_endpoint(workspace), "/hooks/pre-read", {
+        "session_id": session_id, "path": "plan.md", "content_hash": "a" * 64,
+    })
+    return session_id
+
+
+def test_status_default_withholds_session_names_and_the_absolute_root(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no ``--detail``, neither the table nor ``--json`` carries a
+    session name (it embeds the raw session id) or the absolute workspace
+    root; the session's agent id and held states still show."""
+    workspace, _ = live_coordinator
+    session_id = _named_session(workspace)
+
+    assert coherence_status.main(["--root", str(workspace)]) == 0
+    table = capsys.readouterr().out
+    assert coherence_status.main(["--root", str(workspace), "--json"]) == 0
+    raw = capsys.readouterr().out
+
+    for out in (table, raw):
+        assert session_id not in out
+        assert "claude-session-" not in out
+        assert str(workspace) not in out
+    payload = json.loads(raw)
+    assert payload["detail"] == "minimal"
+    assert payload["coordinator_root"] == "."
+    (row,) = payload["sessions"]
+    assert row["agent_name"] is None
+    assert list(row["states"]) == ["plan.md"]
+    assert row["agent_id"][:8] in table
+
+
+def test_status_detail_full_shows_session_names_and_the_absolute_root(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--detail full`` is the operator view: the session name and the
+    absolute workspace root are in it."""
+    workspace, _ = live_coordinator
+    session_id = _named_session(workspace)
+
+    assert coherence_status.main([
+        "--root", str(workspace), "--detail", "full", "--json",
+    ]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["detail"] == "full"
+    assert payload["coordinator_root"] == str(workspace)
+    assert [row["agent_name"] for row in payload["sessions"]] == [
+        f"claude-session-{session_id}"
+    ]
+
+
+@pytest.mark.parametrize("detail_args", [
+    [], ["--detail", "minimal"], ["--detail", "metrics"],
+])
+@pytest.mark.parametrize("json_args", [[], ["--json"]])
+def test_show_policy_below_the_operator_tier_is_a_usage_error(
+    detail_args: list[str], json_args: list[str], live_coordinator,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--show-policy`` lists user-added patterns, which only the operator
+    tier carries; below it every pattern would read as observed and the CLI
+    would print "none". It exits 2 with a usage error naming
+    ``--detail full`` and sends nothing."""
+    workspace, _ = live_coordinator
+    seen = _spy_status_requests(monkeypatch)
+
+    with pytest.raises(SystemExit) as excinfo:
+        coherence_status.main([
+            "--root", str(workspace), "--show-policy", *detail_args, *json_args,
+        ])
+
+    assert excinfo.value.code == 2
+    assert "--show-policy needs --detail full" in capsys.readouterr().err
+    assert seen == []
 
 
 def test_self_test_passes_against_live_coordinator(
@@ -916,7 +1044,7 @@ def test_show_policy_renders_pending_section_when_path_not_yet_observed(
     assert path in resp.get("added", []), f"track failed: {resp}"
 
     rc = coherence_status.main([
-        "--root", str(workspace), "--show-policy",
+        "--root", str(workspace), "--detail", "full", "--show-policy",
     ])
     captured = capsys.readouterr()
     assert rc == 0
@@ -948,7 +1076,7 @@ def test_show_policy_renders_none_after_path_is_observed(
     })
 
     rc = coherence_status.main([
-        "--root", str(workspace), "--show-policy",
+        "--root", str(workspace), "--detail", "full", "--show-policy",
     ])
     captured = capsys.readouterr()
     assert rc == 0
@@ -969,7 +1097,7 @@ def test_show_policy_json_injects_pending_first_read_key(
     _post(endpoint, "/policy/track", {"paths": [path]})
 
     rc = coherence_status.main([
-        "--root", str(workspace), "--show-policy", "--json",
+        "--root", str(workspace), "--detail", "full", "--show-policy", "--json",
     ])
     captured = capsys.readouterr()
     assert rc == 0
@@ -1464,7 +1592,8 @@ def test_transfer_with_no_session_flag_acts_as_the_session_the_harness_variable_
     assert (handoff["giver"], handoff["successor"], handoff["status"]) == (
         giver_agent, successor_agent, "pending")
 
-    assert coherence_status.main(["--root", str(workspace)]) == 0
+    # The record's age is in the operator view only.
+    assert coherence_status.main(["--root", str(workspace), "--detail", "full"]) == 0
     status_out = capsys.readouterr().out
     assert f"  plan.md: {giver_agent[:8]} → {successor_agent[:8]} at version 1 (pending, " in status_out
 
@@ -1923,7 +2052,7 @@ def test_status_prints_every_coordinator_string_with_its_control_characters_esca
     monkeypatch.setenv("COLUMNS", "300")
     _StubCoordinator.answers = {"/status": (200, _hostile_status_body())}
 
-    rc = coherence_status.main(["--root", str(workspace), "--show-policy"])
+    rc = coherence_status.main(["--root", str(workspace), "--detail", "full", "--show-policy"])
 
     captured = capsys.readouterr()
     assert rc == 0, captured.err
@@ -2528,16 +2657,16 @@ def test_a_status_body_with_fields_of_the_wrong_type_exits_2_with_one_line(
     assert captured.out == ""
 
 
-def test_detail_help_does_not_claim_the_minimal_tier_redacts_every_absolute_path() -> None:
-    """``policy_summary.coordinator_root`` is an absolute path at the minimal
-    tier as at the full one, so the ``--detail`` help names it rather than
-    claiming the minimal tier redacts absolute paths. Prevents an operator
-    pasting a minimal-tier ``--json`` body as free of their directory
-    layout."""
+def test_detail_help_says_the_minimal_tier_redacts_absolute_paths() -> None:
+    """Below the operator tier the coordinator reports the workspace root as
+    ``.`` both at the top level and in ``policy_summary``, so the ``--detail``
+    help says the minimal tier redacts absolute paths and no longer warns
+    that the nested root is absolute. Prevents the help contradicting what
+    the default view now sends."""
     action = next(a for a in coherence_status.build_parser()._actions if "--detail" in a.option_strings)
 
-    assert "redacts absolute paths" not in action.help
-    assert "policy_summary.coordinator_root" in action.help
+    assert "redacts absolute paths" in action.help
+    assert "still an absolute path" not in action.help
 
 
 # ----------------------------------------------------------------------
@@ -2569,7 +2698,7 @@ def _degraded_status_body() -> dict:
     }
 
 
-@pytest.mark.parametrize("flags", [[], ["--show-policy"], ["--detail", "minimal"]],
+@pytest.mark.parametrize("flags", [[], ["--detail", "full", "--show-policy"], ["--detail", "minimal"]],
                          ids=["table", "show-policy", "minimal"])
 def test_status_table_on_a_degraded_answer_exits_2_with_one_line_naming_registry_contention(
     flags: list[str], stub_coordinator, capsys: pytest.CaptureFixture[str]
@@ -2593,7 +2722,9 @@ def test_status_table_on_a_degraded_answer_exits_2_with_one_line_naming_registry
     assert "No artifacts observed yet" not in captured.out
 
 
-@pytest.mark.parametrize("flags", [["--json"], ["--json", "--show-policy"]], ids=["json", "json-show-policy"])
+@pytest.mark.parametrize(
+    "flags", [["--json"], ["--json", "--detail", "full", "--show-policy"]], ids=["json", "json-show-policy"]
+)
 def test_status_json_on_a_degraded_answer_prints_the_body_unchanged_and_exits_2(
     flags: list[str], stub_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:

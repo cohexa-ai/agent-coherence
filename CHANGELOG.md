@@ -532,6 +532,24 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **`agent-coherence-status` asks for the operator view only when given
+  `--detail full`.** With no `--detail` it used to request
+  `/status?detail=full` with the `Coherence-Local-Operator: true` header, and
+  it sent that header for every tier. The command often runs inside an agent's
+  shell tool, where its output lands in the transcript, and the Claude Code
+  plugin runs it under the same name when it finds no Node CLI of its own, so
+  the plugin's status command printed every session's name (which embeds the
+  raw session id) and the absolute workspace root into the transcript on that
+  path, while the plugin's Node CLI printed the default view. With no
+  `--detail` the command now sends `GET /status` with no opt-in header, as the
+  Node CLI does, and the header goes only with `--detail full`. Operators who
+  want the session names, the absolute root, the policy's pattern lists, the
+  `reclaimed` map, writer attribution or a handoff record's age now pass
+  `--detail full`. `--show-policy` lists the user-added patterns, which only
+  the operator view carries, so below it every pattern read as observed and the
+  list said "none"; it now needs `--detail full` and otherwise exits 2 with a
+  usage error that says so. The process id is still reported at every tier.
+
 - **A Claude Code giver's edit no longer lands (#185).** As the giver's fence
   was first built, its `pre-edit` answer carried the typed `handed_off` reason
   and no deny, so a Claude Code session that had handed a path off could still
@@ -765,6 +783,18 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **`/status` below the operator tier no longer publishes the absolute
+  workspace root.** The default view reported `coordinator_root` as `.`, but
+  its `policy_summary` carried a `coordinator_root` of its own holding the
+  absolute path, so `/status` and `?detail=minimal` still put `$HOME` and the
+  directory layout on the wire. `policy_summary.coordinator_root` is now `.`
+  as well below the operator tier, and `?detail=full` still reports the
+  absolute path in both places. Nothing reads the nested key from the default
+  view. The protocol corpus now pins `policy_summary` at the default tier on
+  both backends instead of ignoring it, which showed the Claude Code plugin's
+  Node coordinator publishing the same absolute root; the plugin fixes it in
+  its own release.
+
 - **A grant the coordinator reclaims can no longer look like an ordinary
   release.** The sweep took the grant away in one write and recorded why in a
   second. If that second write failed (another process holding the database
@@ -861,14 +891,6 @@ Alpha — APIs may change before `v1.0`.
   `-untrack`, which run instead where they come first on the Bash tool's
   `PATH`, are separate programs and are not changed here. See the guide's
   [Status, track and untrack commands](docs/guide.md#status-track-and-untrack-commands).
-
-- **The docs no longer say the `minimal` `/status` view carries no absolute
-  path.** It reports the top-level `coordinator_root` as `.`, but
-  `policy_summary.coordinator_root` is the workspace's absolute path at that
-  view too, as it always was. The `--detail` help of `agent-coherence-status`
-  now says so, and `docs/security.md`'s advice on pasting output is corrected:
-  the `--detail minimal` table carries no absolute path, but its `--json`
-  output does. Behavior is unchanged.
 
 - **Strict mode no longer lets a session write a file it was just refused a
   read of.** A strict-mode deny of a Bash or Grep read re-grants the session's

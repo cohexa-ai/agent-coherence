@@ -580,9 +580,9 @@ Limits:
 - Only the grant sweep's two triggers are recorded. A holder the coordinator
   invalidates because it sat mid-transition past `transient_timeout_sec` gets
   no `reclaimed` entry and no count.
-- The Python console script `agent-coherence-status` asks for the operator view
-  by default and prints each reclaimed path under its session, after the held
-  state when the session has re-read it:
+- The Python console script, run as `agent-coherence-status --detail full`,
+  asks for the operator view and prints each reclaimed path under its session,
+  after the held state when the session has re-read it:
 
   ```text
   Sessions:
@@ -590,14 +590,14 @@ Limits:
       plan.md  SHARED; reclaimed (reclaim_heartbeat at 1789558656)
   ```
 
-  Where the Claude Code plugin's own `agent-coherence-status` comes first on
-  the Bash tool's `PATH`, it runs instead, and the plugin's
-  `/agent-coherence:status` command runs it too. It asks for the default view,
-  so it shows the counters but not the `reclaimed` map. In plugin releases
-  through 0.5.0 its `--detail full` does not send the operator header, so the
-  coordinator refuses it; a release that sends the header prints the map in
-  the JSON it outputs. Use the Python console script, or request
-  `GET /status?detail=full` with the header yourself.
+  Without `--detail full` it asks for the default view, which carries the
+  counters but not the `reclaimed` map. So does the Claude Code plugin's
+  `/agent-coherence:status` command, and the plugin's own
+  `agent-coherence-status` where that comes first on the Bash tool's `PATH`;
+  in plugin releases through 0.5.0 that program's `--detail full` does not
+  send the operator header, so the coordinator refuses it. Use the Python
+  console script with `--detail full`, or request `GET /status?detail=full`
+  with the header yourself.
 
 To see a reclaim coming rather than after it lands, read the grant times and
 thresholds in the same view; see
@@ -720,8 +720,8 @@ and registered again gets a new `id`, and its generation starts again at 0.
 
 None of these fields appear below the operator view; the default and `metrics`
 views are unchanged. The table that `agent-coherence-status` prints does not
-show them; `agent-coherence-status --json` prints them as the coordinator sends
-them.
+show them; `agent-coherence-status --detail full --json` prints them as the
+coordinator sends them.
 
 ### When the registry is busy
 
@@ -2488,7 +2488,7 @@ characters of their session-level agent ids; the version at transfer; and the
 record's status. `ended` follows the status when the record is no longer live,
 which matters for a record still labelled `pending` after a write ended it.
 The age, from the record's creation time, shows on the operator view only
-(`--detail full`, the default). With no record, the output is exactly what it
+(`--detail full`). With no record, the output is exactly what it
 was before. `--json` prints the `handoff` key as the coordinator sends it.
 
 This is the Python console script's view. Where the Claude Code plugin's
@@ -2516,9 +2516,10 @@ run in one workspace with the plugin's hooks and the Python coordinator.
    Running it is a tool call, so B's hooks have sent the coordinator a request
    and claimed B's principal, which is what lets the coordinator know B (see
    [Naming the successor](#naming-the-successor)). `agent-coherence-status`
-   also shows each session's agent id, cut to eight characters, beside its
-   session name, `claude-session-<session id>`; the Python console script's
-   `--json`, or the plugin's status command, gives the whole id (see
+   also shows each session's agent id, cut to eight characters, and with
+   `--detail full` the session name, `claude-session-<session id>`, beside it;
+   the Python console script's `--json`, or the plugin's status command, gives
+   the whole id (see
    [Handoffs in `agent-coherence-status`](#handoffs-in-agent-coherence-status)).
 2. **Hand the file on from A, in the turn of its edit.** Right after A edits
    `plan.md`, have it run:
@@ -2533,9 +2534,10 @@ run in one workspace with the plugin's hooks and the Python coordinator.
    ```
 
 3. **Check it.** `agent-coherence-status` lists
-   `plan.md: bd35b34c → 6e271ee6 at version 2 (pending, 0s ago)` under
-   Handoffs; through the plugin's status command, the same record is the
-   `handoff` key of `plan.md`'s `tracked_artifacts` entry.
+   `plan.md: bd35b34c → 6e271ee6 at version 2 (pending)` under Handoffs, and
+   with `--detail full` the record's age too, `(pending, 0s ago)`; through the
+   plugin's status command, the same record is the `handoff` key of
+   `plan.md`'s `tracked_artifacts` entry.
 4. **A stops.** An Edit of `plan.md` from A is now denied:
 
    ```text
