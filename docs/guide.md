@@ -3030,7 +3030,9 @@ until it does. The other values are `bound`, `unsupported` (the coordinator
 issues no principals) and `not_attempted`. `swg_status` also forwards the
 coordinator's `caller_principal_absent_total` and
 `caller_principal_refused_total`, `null` rather than `0` when the coordinator
-is unreachable or does not report them.
+is unreachable or does not report them. It forwards the coordinator's
+`registry_schema_version` under the same rule: `null` when the coordinator is
+unreachable or sends none, as an older release or the Node coordinator does.
 
 **Multiple sessions, one workspace.** Multiple `stale-write-guard-fs` instances
 pointed at the same `SWG_ROOT` attach to one coordinator, so a stale write is denied
