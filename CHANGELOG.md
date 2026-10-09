@@ -792,6 +792,20 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **The release workflow refuses a development version and publishes
+  pre-releases as pre-releases (#295).** A `v*` tag naming a development
+  version (`.devN`, which `dev` now reports) used to pass the release
+  workflow's tag check. Once approved, it would have gone to PyPI and become a
+  normal GitHub release, and the MCP Registry entry would have moved to it.
+  The check now fails such a tag before anything is built. An alpha, beta or
+  release candidate (`aN`, `bN`, `rcN`) still goes to PyPI, where pip installs
+  it only with `--pre` or an exact pin. Its GitHub release is now marked as a
+  pre-release, and the MCP Registry is left on the last final release. The
+  registry workflow now publishes the tag that started the release run, not
+  whichever release GitHub lists as latest. It acts only on a release run
+  started by a tag push in this repository, so a run from a fork cannot choose
+  the tag.
+
 - **Opening a store the Node coordinator created no longer points you at a
   switch that does not exist.** The `CrossRuntimeSchemaError` raised for a
   Node-ledger `state.db` said to "switch the store to this backend" with

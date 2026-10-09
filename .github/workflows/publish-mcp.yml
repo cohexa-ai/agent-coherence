@@ -35,7 +35,15 @@ jobs:
     name: Publish server.json to the MCP Registry
     # For workflow_run, only publish after a *successful* release run — a failed
     # or cancelled release must not push metadata for a version PyPI never got.
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    # The tag to publish is that run's head_branch, so the run must also be a
+    # tag push in this repository: a fork's pull-request run of a workflow
+    # named `release` would otherwise choose the tag.
+    if: >-
+      github.event_name != 'workflow_run' || (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      )
     runs-on: ubuntu-latest
     permissions:
       id-token: write # mints the OIDC token the registry authenticates with
@@ -43,32 +51,59 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      # The registry refuses a version it already holds, so the manifest has to
-      # track the released version rather than whatever was last committed.
-      # Both fields matter: the server version and the pypi package version.
-      # On a release event the tag rides in on the event payload; on
-      # workflow_run and workflow_dispatch it is resolved from the latest
-      # GitHub release (which a just-completed release.yml run has published).
-      - name: Sync server.json version to the released tag
+      # Which release to publish. On a release event the tag rides in on the
+      # event payload; on workflow_run it is the tag that started the
+      # release.yml run (its head_branch). Only workflow_dispatch falls back to
+      # the latest GitHub release. The latest release is never a pre-release,
+      # so resolving workflow_run that way would re-publish the previous
+      # final release after a pre-release run.
+      #
+      # Pre-releases (release.yml marks aN / bN / rcN as such) stay off the
+      # registry: the steps below are skipped for them.
+      - name: Resolve the released tag
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          WORKFLOW_RUN_TAG: ${{ github.event.workflow_run.head_branch }}
         run: |
-          tag="$EVENT_RELEASE_TAG"
+          tag="${EVENT_RELEASE_TAG:-$WORKFLOW_RUN_TAG}"
           if [ -z "$tag" ]; then
             tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
           fi
-          version="${tag#v}"
-          echo "Publishing version: $version (from tag $tag)"
+          prerelease="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isPrerelease -q .isPrerelease)"
+          if [ "$prerelease" != "true" ] && [ "$prerelease" != "false" ]; then
+            echo "Could not tell whether $tag is a pre-release (got '$prerelease')" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          if [ "$prerelease" = "true" ]; then
+            echo "::notice::$tag is a pre-release; not publishing it to the MCP Registry"
+          fi
+
+      # The registry refuses a version it already holds, so the manifest has to
+      # track the released version rather than whatever was last committed.
+      # Both fields matter: the server version and the pypi package version.
+      - name: Sync server.json version to the released tag
+        if: steps.release.outputs.prerelease == 'false'
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          echo "Publishing version: $version (from tag $RELEASE_TAG)"
           jq --arg v "$version" '.version = $v | .packages[0].version = $v' server.json > server.json.tmp
           mv server.json.tmp server.json
 
       - name: Install mcp-publisher
+        if: steps.release.outputs.prerelease == 'false'
         run: |
           curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
 
       - name: Authenticate to the registry via OIDC
+        if: steps.release.outputs.prerelease == 'false'
         run: ./mcp-publisher login github-oidc
 
       - name: Publish
+        if: steps.release.outputs.prerelease == 'false'
         run: ./mcp-publisher publish
