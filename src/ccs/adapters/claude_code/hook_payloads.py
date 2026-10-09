@@ -708,11 +708,23 @@ class StatusResponse(TypedDict):
     annotation documented ``last_writer`` and ``session_id`` keys the handler
     has never emitted; nothing in the tree type-checks against this TypedDict,
     so the drift went unnoticed.
+
+    Keys only some answers carry are comments, not annotations: a test holds
+    every annotation to a normal default-tier body.
     """
 
+    # A degraded answer (#238: the registry lock was not won within the
+    # handler budget) sends both lists as null and adds "degraded": true; the
+    # rest of its tier's keys are present. A null list means "cannot tell",
+    # never "nothing tracked". A normal answer never carries "degraded".
     tracked_artifacts: list[dict]  # [{"path": "...", "version": int, "id": "..."}, ...]
-    # The operator tier adds "reclaimed": {path: {"trigger": str, "tick": int}}.
+    # The operator tier adds per entry "owner_generation": int (#187).
+    # The operator tier adds per session "reclaimed": {path: {"trigger": str, "tick": int}},
+    # "grants": {path: {"granted_at_unix_ts": int|None}} for its EXCLUSIVE and
+    # MODIFIED paths, and "last_heartbeat_unix_ts": int|None (#187).
     sessions: list[dict]  # [{"agent_name": str|None, "agent_id": "...", "states": {path: state_name}}, ...]
+    # The operator tier adds "grant_heartbeat_timeout_sec" and
+    # "grant_max_hold_sec": int|None, the sweep's enforced thresholds (#187).
     # AC-02: canonical name follows KTD-J convention (full-word _seconds
     # suffix). ``coordinator_uptime_s`` is emitted alongside as a
     # deprecated alias for one release; consumers should migrate to the

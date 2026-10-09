@@ -2758,8 +2758,9 @@ def test_r11_ensure_secret_fails_closed_when_empty_file_persists(
 def test_r12_status_minimal_default_hides_coordinator_root(
     client: _Client,
 ) -> None:
-    """The default (no query) response is the minimal tier — coordinator_root
-    is the sentinel "." so $HOME / directory layout never leaks.
+    """The default (no query) response is the minimal tier — the top-level
+    coordinator_root is the sentinel "." (``policy_summary.coordinator_root``
+    is still the absolute root at this tier).
 
     P1 #7 (revision to R12): coordinator_pid IS included in minimal —
     pid is public on POSIX and operators rely on it. Only the absolute
@@ -8508,19 +8509,33 @@ _NEVER_MINTED_PRINCIPAL = "B" * 43
 
 class _Background:
     """One request sent from a helper thread, so a test can bound its own wait
-    for the answer and still release the lock the request is blocked on."""
+    for the answer and still release the lock the request is blocked on. A
+    request with no body is a GET (``/status``), with ``headers`` added."""
 
-    def __init__(self, client: _Client, path: str, body: dict, principal: str | None = None):
+    def __init__(
+        self,
+        client: _Client,
+        path: str,
+        body: dict | None = None,
+        principal: str | None = None,
+        *,
+        headers: dict | None = None,
+    ):
         self._done = threading.Event()
         self._response: tuple[int, dict] | None = None
         self._error: BaseException | None = None
         self._thread = threading.Thread(
-            target=self._send, args=(client, path, body, principal), daemon=True)
+            target=self._send, args=(client, path, body, principal, headers), daemon=True)
         self._thread.start()
 
-    def _send(self, client: _Client, path: str, body: dict, principal: str | None) -> None:
+    def _send(
+        self, client: _Client, path: str, body: dict | None, principal: str | None,
+        headers: dict | None,
+    ) -> None:
         try:
-            self._response = client.post(path, body, principal=principal)
+            method = "GET" if body is None else "POST"
+            self._response = client.request(
+                method, path, body, principal=principal, headers_override=headers)
         except BaseException as exc:  # re-raised on the test thread by result()
             self._error = exc
         finally:
@@ -9981,6 +9996,8 @@ def test_status_full_tier_does_not_report_a_peer_preemption_as_a_reclaim(
         "agent_id": str(session_to_agent_id(victim)),
         "states": {},
         "reclaimed": {},
+        "grants": {},
+        "last_heartbeat_unix_ts": _row_for(payload, victim)["last_heartbeat_unix_ts"],
     }
     assert _row_for(payload, peer)["states"] == {"plan.md": "EXCLUSIVE"}
 
@@ -11944,7 +11961,9 @@ def test_a_failed_handoff_read_keeps_the_notices_a_read_already_drained(
 # ----------------------------------------------------------------------
 
 _DEFAULT_ENTRY_KEYS = {"path", "version", "id"}
-_OPERATOR_ENTRY_KEYS = _DEFAULT_ENTRY_KEYS | {"last_writer_agent_id", "last_writer_at_unix_ts"}
+_OPERATOR_ENTRY_KEYS = _DEFAULT_ENTRY_KEYS | {
+    "last_writer_agent_id", "last_writer_at_unix_ts", "owner_generation",
+}
 
 
 def _status_entry(body: dict, path: str) -> dict:
@@ -12672,3 +12691,435 @@ def test_restore_progress_for_a_bound_receiver_requires_its_principal(
         route, {"session_id": receiver_sid, **request}, principal=receiver_principal
     )
     assert status == 200 and body["ok"] is True, body
+
+
+# ======================================================================
+# #238 — /status and pre-grep answer within the handler budget while the
+#        registry lock is held
+# ======================================================================
+#
+# Both read the registry on the request thread. Neither waited on a bound, so
+# while another thread held the registry lock /status waited as long as it was
+# held, past every client's timeout, and a Grep hook's client gave up and
+# handed the model ``{}``. These hold that lock the way the degraded hook
+# tests above do (``_HeldRegistryLock``, a shortened ``HANDLER_TIMEOUT_SEC``)
+# and assert on what each route answers.
+
+_OPERATOR_HEADER = {"Coherence-Local-Operator": "true"}
+#: The two tiers that read the registry, as a client requests them.
+_REGISTRY_TIERS = {
+    "minimal": ("/status", None),
+    "full": ("/status?detail=full", _OPERATOR_HEADER),
+}
+#: FROZEN wire names of the sweep thresholds the operator tier reports (#187).
+_THRESHOLD_KEYS = ("grant_heartbeat_timeout_sec", "grant_max_hold_sec")
+#: FROZEN names of the four pattern lists the volume's managed-glob check reads.
+_PATTERN_LIST_KEYS = (
+    "tracked_patterns", "user_added_patterns", "ignored_patterns", "strict_mode_patterns",
+)
+#: How long a test watches for work a degraded request left behind.
+_LATE_WORK_WATCH_SEC = 0.5
+
+
+def _assert_nothing_completes_late(client: _Client, before: dict) -> None:
+    """Watch the late-work counters for a while after the lock frees: a
+    degraded answer that left a read running in the watchdog pool shows up as
+    a late completion (or a late abort) once that read wins the lock."""
+    watch_until = time.monotonic() + _LATE_WORK_WATCH_SEC
+    while True:
+        _, after = client.get("/status?detail=metrics")
+        for key in ("watchdog_late_completion_total", "watchdog_late_aborts_total"):
+            assert after[key] == before[key], (
+                f"{key} moved from {before[key]} to {after[key]} after the lock freed: "
+                "the degraded answer left work running behind it")
+        if time.monotonic() >= watch_until:
+            return
+        time.sleep(0.05)
+
+
+@pytest.mark.parametrize("tier", list(_REGISTRY_TIERS))
+def test_status_answers_a_marked_degraded_body_in_time_while_the_registry_lock_is_held(
+    tier: str, coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the registry lock held past the handler budget, the minimal and
+    operator tiers each answer 200 at once with the body that tier normally
+    carries, its two registry lists null and ``degraded: true``, and count
+    the timeout in that same answer. Nothing runs behind the answer.
+
+    Prevents a /status that waits as long as a peer holds the lock -- past
+    the clients' timeout, which the status command reports as "could not reach
+    coordinator" and the volume's strict check as "cannot tell" -- and a
+    degraded answer that reads as "nothing tracked" (empty lists) or drops the
+    ``policy_summary`` pattern lists the volume's check needs."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    query, headers = _REGISTRY_TIERS[tier]
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": _sid("238-holder"), "path": "docs/plan.md"})
+    status, normal = client.get(query, headers_override=headers)
+    assert status == 200 and isinstance(normal["tracked_artifacts"], list), normal
+    _, before = client.get("/status?detail=metrics")
+
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(client, query, headers=headers)
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+    status, degraded = answer.result()
+
+    assert answered, f"/status ({tier}) did not answer while the registry lock was held"
+    assert status == 200
+    assert degraded["degraded"] is True
+    assert degraded["tracked_artifacts"] is None and degraded["sessions"] is None
+    assert set(degraded) == set(normal) | {"degraded"}
+    assert degraded["detail"] == normal["detail"]
+    assert degraded["coordinator_root"] == normal["coordinator_root"]
+    assert degraded["policy_summary"] == normal["policy_summary"]
+    assert degraded["watchdog_timeouts_total"] == before["watchdog_timeouts_total"] + 1, (
+        "the degraded answer does not count its own timeout")
+    if tier == "full":
+        for key in _PATTERN_LIST_KEYS:
+            assert isinstance(degraded["policy_summary"][key], list), key
+        assert "docs/plan.md" in degraded["policy_summary"]["user_added_patterns"]
+        assert {key: degraded[key] for key in _THRESHOLD_KEYS} == dict.fromkeys(_THRESHOLD_KEYS)
+    else:
+        assert not set(_THRESHOLD_KEYS) & set(degraded)
+    _assert_nothing_completes_late(client, before)
+
+
+def test_status_stops_waiting_in_time_to_read_before_the_clients_give_up(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """KTD13: the lock wait ends while a read reserve still remains before
+    the shipped clients' timeout, even when the handler budget has longer to
+    run, so a late acquire plus the read still reaches the client.
+
+    The handler budget keeps its shipped 4 s here; only the reserve can end
+    the wait inside the bound. Prevents a lock won near the end of the budget
+    whose read then lands after the client has given up, which the client
+    reports as an unreachable coordinator rather than this marked answer."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+    from ccs.cli._coherence_client import CLI_HTTP_TIMEOUT_SEC
+
+    assert mod._STATUS_CLIENT_TIMEOUT_SEC == CLI_HTTP_TIMEOUT_SEC, (
+        "the wait cap is computed against a timeout the shipped clients do not use")
+    assert mod._STATUS_READ_RESERVE_SEC >= 1.0
+    assert CLI_HTTP_TIMEOUT_SEC - mod._STATUS_READ_RESERVE_SEC >= 1.0, (
+        "the reserve leaves less than a second of lock wait")
+    assert mod.HANDLER_TIMEOUT_SEC > _GATE_ANSWER_BOUND_SEC
+    monkeypatch.setattr(
+        mod, "_STATUS_READ_RESERVE_SEC", CLI_HTTP_TIMEOUT_SEC - _DEGRADE_DEADLINE_SEC)
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(client, "/status")
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+    status, body = answer.result()
+
+    assert answered, "the lock wait ran to the handler budget, past the read reserve"
+    assert (status, body["degraded"]) == (200, True)
+
+
+def test_status_metrics_tier_and_refused_operator_tier_never_wait_on_the_registry(
+    coordinator, client: _Client
+) -> None:
+    """Neither the counters-only tier nor a refused operator request reads
+    the registry, so a held lock delays neither, even with the full handler
+    budget, and neither counts a timeout."""
+    _, before = client.get("/status?detail=metrics")
+    with _HeldRegistryLock(coordinator) as held:
+        metrics = _Background(client, "/status?detail=metrics")
+        refused = _Background(client, "/status?detail=full")
+        answered = (
+            metrics.answered_within(_GATE_ANSWER_BOUND_SEC)
+            and refused.answered_within(_GATE_ANSWER_BOUND_SEC)
+        )
+        held.release()
+
+    assert answered, "a tier that never reads the registry waited on its lock"
+    status, body = metrics.result()
+    assert status == 200 and body["detail"] == "metrics"
+    assert "degraded" not in body and "tracked_artifacts" not in body
+    assert body["watchdog_timeouts_total"] == before["watchdog_timeouts_total"]
+    assert refused.result()[0] == 403
+
+
+def test_status_answers_500_when_its_registry_read_raises_anything_but_a_lock_timeout(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a lock wait that ran out answers the degraded body; any other
+    failure of the read keeps the dispatcher's 500 and counts no timeout."""
+    import sqlite3
+
+    def _fails(**_kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    _, before = client.get("/status?detail=metrics")
+    monkeypatch.setattr(coordinator.registry, "status_snapshot", _fails)
+    assert client.get("/status") == (500, {"error": "internal: OperationalError"})
+    _, after = client.get("/status?detail=metrics")
+    assert after["watchdog_timeouts_total"] == before["watchdog_timeouts_total"]
+
+
+@pytest.mark.parametrize("search_root", ["", "src"], ids=["workspace_root", "subdirectory"])
+# ======================================================================
+# #187 — each write grant's age, its holder's last heartbeat, the artifact's
+#        ownership generation and the sweep thresholds, on the operator tier
+# ======================================================================
+#
+# The sweep reclaims a write grant from its grant tick, its holder's last
+# heartbeat and two thresholds; none of them reached any response. The
+# operator tier now carries all of them, from the one registry read that
+# yields ``states`` and ``reclaimed``. Times are pinned by patching the
+# server module's clock, the one the hooks stamp grants and heartbeats with.
+
+
+def _at_tick(monkeypatch: pytest.MonkeyPatch, tick: int, send: Any) -> Any:
+    """Send one request with the server's clock reading ``tick``."""
+    from ccs.adapters.claude_code import coordinator_server as server_mod
+
+    with monkeypatch.context() as clock:
+        clock.setattr(server_mod, "monotonic_seconds", lambda: tick)
+        return send()
+
+
+def _seed_pair(coordinator, path: str, sid: str, *, state: str, granted_at: int | None) -> None:
+    """Rewrite one ledger row the way another runtime, or an older one, could
+    have left it: a state and a grant tick no live grant path pairs."""
+    registry = coordinator.registry
+    artifact_id = registry.lookup_artifact_id_by_name(path)
+    assert artifact_id is not None
+    with registry._lock:
+        updated = registry._conn.execute(
+            "UPDATE agent_states SET state = ?, granted_at_tick = ? "
+            "WHERE artifact_id = ? AND agent_id = ?",
+            (state, granted_at, artifact_id.hex, session_to_agent_id(sid).hex),
+        ).rowcount
+    assert updated == 1
+
+
+def test_status_full_tier_reports_each_write_grants_time_and_its_holders_heartbeat(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An EXCLUSIVE holder's row lists each path it holds for writing with
+    that grant's own tick, and the holder's latest heartbeat once, all as
+    whole unix seconds; the artifact carries its ownership generation."""
+    sid = _sid("187-holder")
+    now = int(time.time())
+    first, second = now - 1_000, now - 10
+    _at_tick(monkeypatch, first, lambda: client.post(
+        "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"}))
+    _at_tick(monkeypatch, second, lambda: client.post(
+        "/hooks/pre-edit", {"session_id": sid, "path": "task.md"}))
+
+    body = _operator_status(client)
+    row = _row_for(body, sid)
+    assert row["states"] == {"plan.md": "EXCLUSIVE", "task.md": "EXCLUSIVE"}
+    assert row["grants"] == {
+        "plan.md": {"granted_at_unix_ts": first},
+        "task.md": {"granted_at_unix_ts": second},
+    }
+    assert row["last_heartbeat_unix_ts"] == second
+    assert type(row["last_heartbeat_unix_ts"]) is int
+    assert type(row["grants"]["plan.md"]["granted_at_unix_ts"]) is int
+    assert _status_entry(body, "plan.md")["owner_generation"] == 0
+    assert {key: body[key] for key in _THRESHOLD_KEYS} == dict.fromkeys(_THRESHOLD_KEYS), (
+        "a server built without lifecycle runs no sweep, so it reports no thresholds")
+
+
+def test_status_full_tier_lists_no_grant_for_a_shared_holder_and_still_reports_its_heartbeat(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row that holds only SHARED paths has an empty ``grants`` map (the
+    sweep never reclaims a read) and its holder's heartbeat."""
+    first, second = _sid("187-reader-a"), _sid("187-reader-b")
+    now = int(time.time())
+    for sid, tick in ((first, now - 300), (second, now - 200)):
+        _at_tick(monkeypatch, tick, lambda sid=sid: client.post(
+            "/hooks/pre-read", {"session_id": sid, "path": "plan.md", "content_hash": _hash("x")}))
+
+    body = _operator_status(client)
+    for sid, tick in ((first, now - 300), (second, now - 200)):
+        row = _row_for(body, sid)
+        assert row["states"] == {"plan.md": "SHARED"}
+        assert row["grants"] == {}
+        assert row["last_heartbeat_unix_ts"] == tick
+
+
+def test_status_full_tier_reports_the_heartbeat_of_a_reclaim_only_row(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A #195 reclaim-only row holds nothing, so ``grants`` is empty, and it
+    still shows the heartbeat the reclaim judged stale."""
+    sid = _sid("187-reclaimed")
+    granted = int(time.time()) - 1_000
+    _at_tick(monkeypatch, granted, lambda: client.post(
+        "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"}))
+    assert _sweep(coordinator, int(time.time()) + 999_999) == 1
+
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {}
+    assert set(row["reclaimed"]) == {"plan.md"}
+    assert row["grants"] == {}
+    assert row["last_heartbeat_unix_ts"] == granted
+
+
+def test_status_full_tier_reports_the_heartbeat_of_a_session_that_only_stopped(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A named session whose only request was a session-stop has no ledger
+    row at all; its row still shows the heartbeat that request recorded."""
+    sid = _sid("187-stop-only")
+    stopped = int(time.time()) - 42
+    _at_tick(monkeypatch, stopped, lambda: client.post("/hooks/session-stop", {"session_id": sid}))
+
+    row = _row_for(_operator_status(client), sid)
+    assert row["agent_name"] is not None
+    assert (row["states"], row["grants"]) == ({}, {})
+    assert row["last_heartbeat_unix_ts"] == stopped
+
+
+@pytest.mark.parametrize(
+    ("state", "granted_at", "grants"),
+    [
+        ("MODIFIED", None, {"plan.md": {"granted_at_unix_ts": None}}),
+        ("SHARED", 123, {}),
+    ],
+    ids=["write_grant_without_a_tick", "read_with_a_tick"],
+)
+def test_status_full_tier_lists_grants_by_state_not_by_tick(
+    coordinator, client: _Client, state: str, granted_at: int | None, grants: dict
+) -> None:
+    """``grants`` lists the paths a row holds EXCLUSIVE or MODIFIED, which
+    are what the sweep acts on, whatever the tick column says: a write grant
+    with no tick is listed with a null time (no max-hold limit applies to it),
+    and a read that carries a tick is not listed."""
+    sid = _sid(f"187-seeded-{state}")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    _seed_pair(coordinator, "plan.md", sid, state=state, granted_at=granted_at)
+
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {"plan.md": state}
+    assert row["grants"] == grants
+
+
+def test_status_full_tier_owner_generation_moves_on_a_reclaim_only(
+    coordinator, client: _Client
+) -> None:
+    """The ownership generation moves when a write grant ends without a
+    version move (a sweep reclaim here), and neither a peer's preemption nor
+    a commit moves it."""
+    holder, peer = _sid("187-gen-holder"), _sid("187-gen-peer")
+
+    def generation() -> int:
+        return _status_entry(_operator_status(client), "plan.md")["owner_generation"]
+
+    client.post("/hooks/pre-edit", {"session_id": holder, "path": "plan.md"})
+    start = generation()
+    client.post("/hooks/pre-edit", {"session_id": peer, "path": "plan.md"})
+    assert generation() == start, "a peer's preemption moved the generation"
+    assert client.post("/hooks/post-edit", {
+        "session_id": peer, "path": "plan.md", "content_hash": _hash("v2"), "success": True,
+    })[0] == 200
+    assert generation() == start, "a commit moved the generation"
+    client.post("/hooks/pre-edit", {"session_id": peer, "path": "plan.md"})
+    assert _sweep(coordinator, int(time.time()) + 999_999) == 1
+    assert generation() == start + 1
+
+
+def test_status_default_tier_keeps_its_shape_without_any_operator_field(
+    coordinator, client: _Client
+) -> None:
+    """A normal default-tier body keeps its key set and order, its entry and
+    row shapes, and carries none of the operator-tier fields or the degraded
+    marker, with a write grant, a heartbeat and a reclaim all on record."""
+    client.post("/hooks/pre-edit", {"session_id": _sid("187-minimal-reclaimed"), "path": "plan.md"})
+    _sweep(coordinator, int(time.time()) + 999_999)
+    client.post("/hooks/pre-edit", {"session_id": _sid("187-minimal-holder"), "path": "task.md"})
+
+    _, minimal = client.get("/status")
+    _, metrics = client.get("/status?detail=metrics")
+    counters = [key for key in metrics if key != "detail"]
+    assert list(minimal) == [
+        "detail", "tracked_artifacts", "sessions", "policy_summary", "coordinator_pid",
+        *counters, "coordinator_root",
+    ]
+    assert {key for entry in minimal["tracked_artifacts"] for key in entry} == _DEFAULT_ENTRY_KEYS
+    assert {key for row in minimal["sessions"] for key in row} == {"agent_name", "agent_id", "states"}
+    operator_only = {
+        "degraded", "owner_generation", "grants", "granted_at_unix_ts",
+        "last_heartbeat_unix_ts", *_THRESHOLD_KEYS,
+    }
+    assert not operator_only & _keys_anywhere(minimal)
+
+
+def test_status_asks_the_registry_for_grant_detail_at_the_operator_tier_only(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The grant-detail read (a heartbeat SELECT and two more columns, inside
+    the registry lock) is paid only by the operator tier: the default view,
+    the one dashboards poll, never asks for it (asserted on the argument)."""
+    client.post("/hooks/pre-edit", {"session_id": _sid("187-opt-in"), "path": "plan.md"})
+    calls: list[dict] = []
+    real = coordinator.registry.status_snapshot
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator.registry, "status_snapshot", recording)
+    assert client.get("/status")[0] == 200
+    assert client.get("/status?detail=metrics")[0] == 200
+    _operator_status(client)
+
+    assert [bool(kwargs.get("include_grant_detail")) for kwargs in calls] == [False, True]
+
+
+def test_status_reads_grant_detail_inside_the_snapshot_lock_hold(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5: the heartbeats and grant ticks are read in the ONE registry hold
+    that reads the artifact and agent-state rows, so a heartbeat or a grant
+    cannot move between the state a row shows and the times it lists."""
+    sid = _sid("187-one-hold")
+    granted = int(time.time()) - 60
+    _at_tick(monkeypatch, granted, lambda: client.post(
+        "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"}))
+
+    status, body, holds, unheld = _status_registry_holds(
+        coordinator, client, "/status?detail=full", headers_override=_OPERATOR_HEADER)
+    assert status == 200
+    assert _row_for(body, sid)["grants"] == {"plan.md": {"granted_at_unix_ts": granted}}
+    assert not [sql for sql in unheld if "heartbeats" in sql or "granted_at_tick" in sql]
+    detail_holds = [hold for hold in holds if any("FROM heartbeats" in sql for sql in hold)]
+    assert len(detail_holds) == 1, detail_holds
+    [hold] = detail_holds
+    assert any("owner_generation" in sql and "FROM artifacts" in sql for sql in hold), hold
+    assert any("granted_at_tick" in sql and "FROM agent_states" in sql for sql in hold), hold
+
+
+def test_status_full_tier_reports_the_thresholds_lifecycle_started_the_sweep_with(
+    tmp_path: Path,
+) -> None:
+    """Through the lifecycle winner path, the operator tier reports the two
+    thresholds the coordinator's sweep enforces: the shipped 600 and 1800."""
+    from ccs.adapters.claude_code import lifecycle
+    from ccs.adapters.claude_code.lifecycle import (
+        LifecycleConfig,
+        ensure_coordinator,
+        stop_coordinator,
+    )
+
+    port = ensure_coordinator(
+        tmp_path, config=LifecycleConfig(idle_shutdown_sec=0, sweep_interval_sec=0.1))
+    assert port > 0
+    try:
+        spawned = lifecycle._SPAWNED_REGISTRY[str(tmp_path.resolve())].coordinator
+        secret = load_secret(spawned.coordinator_root)
+        assert secret is not None
+        body = _operator_status(_Client("127.0.0.1", port, secret))
+    finally:
+        stop_coordinator(tmp_path)
+
+    assert {key: body[key] for key in _THRESHOLD_KEYS} == {
+        "grant_heartbeat_timeout_sec": 600, "grant_max_hold_sec": 1800,
+    }
