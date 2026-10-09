@@ -12,7 +12,7 @@ The coordinator binds to 127.0.0.1 with shared-secret Bearer auth
 4. Make an authenticated request with a short timeout.
 
 Failures degrade gracefully — these scripts run interactively and should
-print a one-line human message + exit 1 rather than dump a stack trace.
+print a one-line human message + exit 2 rather than dump a stack trace.
 """
 
 from __future__ import annotations
@@ -73,6 +73,22 @@ def err(message: str) -> None:
     Success output stays on stdout via plain ``print()``.
     """
     print(message, file=sys.stderr, flush=True)
+
+
+def escape_nonprintable(value: object) -> str:
+    """``value`` as text safe to print to a terminal: each character
+    :meth:`str.isprintable` accepts is kept, and any other is written as
+    ``repr`` writes it, without the quotes (ESC as ``\\x1b``, LF as ``\\n``,
+    U+202E as ``\\u202e``). A non-string is stringified first.
+
+    Every string a console script prints from a coordinator answer goes
+    through this (#245): an answer could otherwise drive the terminal with an
+    escape sequence, reorder a line with a bidi control, or crash the print on
+    a lone surrogate. Printable text, the ASCII space included, prints
+    unchanged, so a plain path's line stays byte-identical; other spaces and
+    joiners print escaped."""
+    text = value if isinstance(value, str) else str(value)
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in text)
 
 
 def validate_relative_path(p: str) -> str | None:
@@ -1180,7 +1196,8 @@ def _host_of(req: urllib.request.Request) -> str:
 
 
 def http_status_from_error(exc: urllib.error.HTTPError) -> dict[str, Any] | None:
-    """Best-effort JSON decode of an HTTPError body, for one-line user output."""
+    """Best-effort JSON decode of an HTTPError body, for one-line user output:
+    ``None`` unless the body is a JSON object."""
     try:
         raw = exc.read()
     except Exception:
@@ -1188,6 +1205,17 @@ def http_status_from_error(exc: urllib.error.HTTPError) -> dict[str, Any] | None
     if not raw:
         return None
     try:
-        return json.loads(raw.decode("utf-8"))
+        body = json.loads(raw.decode("utf-8"))
     except Exception:
         return None
+    return body if isinstance(body, dict) else None
+
+
+def http_error_line(code: int, body: dict[str, Any] | None) -> str:
+    """The one line a console script prints for an HTTP error answer:
+    ``HTTP {code}: {error}`` when the body's ``error`` is a string, escaped
+    (:func:`escape_nonprintable`), else ``HTTP {code}``. Never the status
+    line's reason phrase: that is the server's text too. ``body`` is
+    :func:`http_status_from_error`'s, read once by the caller."""
+    error = body.get("error") if body is not None else None
+    return f"HTTP {code}: {escape_nonprintable(error)}" if isinstance(error, str) else f"HTTP {code}"

@@ -9,7 +9,8 @@ table. Backs the ``/agent-coherence status`` slash command.
 Exit codes:
 - 0: status fetched and printed (including "no coordinator running")
 - 1: not in a git repo
-- 2: coordinator running but returned an error
+- 2: coordinator running but answered an HTTP error, a redirect (refused) or
+  a body that is not a /status answer, or TLS failed
 - 3: --self-test exercised but the smoke scenario failed
 
 KTD-J (Unit 8): ``--self-test`` runs an end-to-end smoke against a real
@@ -24,6 +25,8 @@ they reach a real agent session.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import secrets
 import shutil
 import time
@@ -41,14 +44,16 @@ from ccs.cli._coherence_client import (
     claim_caller_principal,
     coordinator_backend,
     err,
+    escape_nonprintable,
     get,
+    http_error_line,
     http_status_from_error,
     post,
     principal_refusal_reason,
     reportable_reason,
     resolve_endpoint,
 )
-from ccs.core.exceptions import RedirectRefused
+from ccs.core.exceptions import RedirectRefused, TlsConfigError, TlsVerificationFailed
 from ccs.core.states import MESIState
 
 
@@ -71,18 +76,20 @@ def build_parser() -> argparse.ArgumentParser:
     # KTD-J (Unit 8): --detail mirrors the /status three-tier disclosure
     # model. Default 'full' so the local-operator CLI keeps surfacing pid
     # + absolute root + session names + all counters; 'metrics' for scrapers
-    # that want only the counter block; 'minimal' for a redacted view
-    # safe to paste in bug reports.
+    # that want only the counter block; 'minimal' for a redacted view, which
+    # still carries the absolute root in policy_summary.coordinator_root.
     parser.add_argument(
         "--detail",
         choices=["minimal", "full", "metrics"],
         default="full",
         help=(
-            "Disclosure tier (default: full). 'minimal' redacts absolute paths, "
-            "session names and user-added tracked patterns, and still reports "
-            "per-session artifact state (the process id is reported at every "
-            "tier); 'metrics' returns counters only; 'full' is the operator "
-            "view used by /agent-coherence status."
+            "Disclosure tier (default: full). 'minimal' redacts session names "
+            "and user-added tracked patterns and reports the top-level "
+            "coordinator root as '.', but policy_summary.coordinator_root is "
+            "still an absolute path; it still reports per-session artifact "
+            "state (the process id is reported at every tier); 'metrics' "
+            "returns counters only; 'full' is the operator view used by "
+            "/agent-coherence status."
         ),
     )
     # KTD-J (Unit 8): post-install smoke. Drives a two-session stale-read
@@ -121,8 +128,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.self_test:
         return _run_self_test(Path(root), json_mode=args.json)
 
+    payload = _fetch_status(Path(root), args.detail)
+    if isinstance(payload, int):
+        return payload
+    return _print_status(payload, args)
+
+
+def _fetch_status(root: Path, detail: str) -> dict[str, Any] | int:
+    """The ``/status`` body at ``detail``, or the exit code of a failure
+    already reported in one line: 0 when no coordinator runs; 2 for an HTTP
+    error, a refused redirect, a TLS failure or a body that is not a JSON
+    object (#245)."""
     try:
-        endpoint = resolve_endpoint(Path(root))
+        endpoint = resolve_endpoint(root)
         # R12 (Unit 6) + KTD-J (Unit 8): the detail tier is selected via
         # --detail. Only 'full' needs the Coherence-Local-Operator opt-in
         # header; the lower tiers degrade by design if the header is
@@ -130,18 +148,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         # legitimate local operator.
         payload = get(
             endpoint,
-            f"/status?detail={args.detail}",
+            f"/status?detail={detail}",
             extra_headers={"Coherence-Local-Operator": "true"},
         )
     except CoordinatorUnavailable as exc:
         err(f"agent-coherence-status: {exc}")
         return 0  # graceful — no coordinator is a normal state
     except urllib.error.HTTPError as exc:
-        body = http_status_from_error(exc)
-        msg = (body or {}).get("error", str(exc))
-        err(f"agent-coherence-status: HTTP {exc.code}: {msg}")
+        err(f"agent-coherence-status: {http_error_line(exc.code, http_status_from_error(exc))}")
         return 2
+    except RedirectRefused as exc:
+        err(f"agent-coherence-status: the coordinator redirected the request (HTTP {exc.status}); not followed")
+        return 2
+    except (TlsVerificationFailed, TlsConfigError) as exc:
+        err(f"agent-coherence-status: {escape_nonprintable(exc)}")
+        return 2
+    if not isinstance(payload, dict):
+        err("agent-coherence-status: the coordinator's answer is not a JSON object")
+        return 2
+    return payload
 
+
+def _print_status(payload: dict[str, Any], args: argparse.Namespace) -> int:
+    """Print ``payload`` as ``--json``, the metrics block or the table: 0, or
+    2 when a field has the wrong type (#245). Rendered into a buffer first,
+    so a body that fails part-way prints one line, not half a table."""
+    rendered = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(rendered):
+            _render_payload(payload, args)
+    except (TypeError, ValueError, AttributeError, KeyError):
+        err("agent-coherence-status: unexpected /status shape")
+        return 2
+    print(rendered.getvalue(), end="", flush=True)
+    return 0
+
+
+def _render_payload(payload: dict[str, Any], args: argparse.Namespace) -> None:
     if args.json:
         import json as _json
         if args.show_policy:
@@ -150,14 +193,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 p for p in payload.get("policy_summary", {}).get("user_added_patterns", [])
                 if p not in observed
             ]
-        print(_json.dumps(payload, indent=2), flush=True)
-        return 0
-
-    if args.detail == "metrics":
+        print(_json.dumps(payload, indent=2))
+    elif args.detail == "metrics":
         _render_metrics(payload)
     else:
         _render_table(payload, show_policy=args.show_policy)
-    return 0
 
 
 def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
@@ -429,7 +469,9 @@ _STATE_NAME_W = max(len(state.name) for state in MESIState)
 
 
 def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None:
-    """Manual column alignment — stdlib only, no rich/tabulate."""
+    """Manual column alignment — stdlib only, no rich/tabulate. Every value
+    taken from the coordinator prints through :func:`escape_nonprintable`
+    (#245), and widths and elision work on that escaped text."""
     tracked = payload.get("tracked_artifacts", [])
     sessions = payload.get("sessions", [])
     policy = payload.get("policy_summary", {})
@@ -445,11 +487,11 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
 
     header_bits: list[str] = []
     if pid:
-        header_bits.append(f"pid={pid}")
+        header_bits.append(f"pid={escape_nonprintable(pid)}")
     header_bits.append(f"uptime={uptime:.0f}s")
-    header_bits.append(f"backend={backend}")
+    header_bits.append(f"backend={escape_nonprintable(backend)}")
     if version:
-        header_bits.append(f"version={version}")
+        header_bits.append(f"version={escape_nonprintable(version)}")
     print("Coordinator: " + " ".join(header_bits))
     print()
 
@@ -462,9 +504,9 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
         ignored_n = policy.get("ignored_pattern_count", 0)
         print(
             "Policy: "
-            f"{default_n} default pattern(s), "
-            f"{user_n} user-added, "
-            f"{ignored_n} ignored"
+            f"{escape_nonprintable(default_n)} default pattern(s), "
+            f"{escape_nonprintable(user_n)} user-added, "
+            f"{escape_nonprintable(ignored_n)} ignored"
         )
         print()
 
@@ -492,13 +534,15 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
         # soft-wrapped the version onto the next line. ``+1`` is a safety column.
         chrome = 2 + 2 + ver_w + 1
         max_path_w = max(len("path"), _terminal_columns() - chrome)
-        longest = max(len(a.get("path", "")) for a in tracked)
-        path_w = min(longest, max_path_w)
+        rows = [
+            (escape_nonprintable(a.get("path", "")), escape_nonprintable(a.get("version", 0)))
+            for a in tracked
+        ]
+        path_w = min(max(len(path) for path, _ in rows), max_path_w)
         print(f"  {'path':<{path_w}}  {'version':>{ver_w}}")
         print(f"  {'-' * path_w}  {'-' * ver_w}")
-        for a in tracked:
-            label = _elide_middle(a.get("path", ""), path_w)
-            print(f"  {label:<{path_w}}  {a.get('version', 0):>{ver_w}}")
+        for path, version in rows:
+            print(f"  {_elide_middle(path, path_w):<{path_w}}  {version:>{ver_w}}")
     print()
     _render_handoff_block(tracked)
 
@@ -511,7 +555,7 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
         if pending:
             print("Tracked (pending first read):")
             for p in pending:
-                print(f"  {p}")
+                print(f"  {escape_nonprintable(p)}")
         else:
             print("Tracked (pending first read): none")
         print()
@@ -534,19 +578,20 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
                 "(name unknown — redacted below the operator tier, "
                 "or a grant predating this coordinator)"
             )
-            per_artifact = dict(s.get("states", {}))
+            per_artifact = {
+                path: escape_nonprintable(state) for path, state in dict(s.get("states", {})).items()
+            }
             # #195: the operator tier names the paths this session lost to the
             # coordinator sweep. They are not held grants, so they render in
             # the same column under their own label rather than as a state. A
             # reclaimed path the session has re-read is held SHARED as well,
             # so its line keeps that state ahead of the reclaim label.
             for path, cause in (s.get("reclaimed") or {}).items():
-                label = (
-                    f"reclaimed ({cause.get('trigger', '?')} at tick {cause.get('tick', '?')})"
-                )
+                trigger, tick = (escape_nonprintable(cause.get(k, "?")) for k in ("trigger", "tick"))
+                label = f"reclaimed ({trigger} at tick {tick})"
                 held = per_artifact.get(path)
                 per_artifact[path] = f"{held}; {label}" if held else label
-            print(f"  {sid[:8]}  {name}")
+            print(f"  {escape_nonprintable(sid[:8])}  {escape_nonprintable(name)}")
             if not per_artifact:
                 print("    (no held grants)")
                 continue
@@ -554,11 +599,12 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
             # push the MESI state column off-screen onto a wrapped line. The
             # column is sized for a state name only: a reclaim label runs past
             # the line's end rather than eliding every path in the session.
-            state_w = min(max(len(s) for s in per_artifact.values()), _STATE_NAME_W)
+            held_rows = sorted((escape_nonprintable(path), state) for path, state in per_artifact.items())
+            state_w = min(max(len(state) for _, state in held_rows), _STATE_NAME_W)
             chrome = 4 + 2 + state_w + 1
             max_path_w = max(1, _terminal_columns() - chrome)
-            path_w = min(max(len(p) for p in per_artifact), max_path_w)
-            for path, state in sorted(per_artifact.items()):
+            path_w = min(max(len(path) for path, _ in held_rows), max_path_w)
+            for path, state in held_rows:
                 print(f"    {_elide_middle(path, path_w):<{path_w}}  {state}")
 
     # KTD-J (Unit 8): counters section. Only printed when the payload
@@ -580,13 +626,13 @@ def _render_handoff_block(tracked: list[dict[str, Any]]) -> None:
     print("  giver → successor, by session agent id (first 8 characters, as under Sessions)")
     now = time.time()
     for a in handed_off:
-        print(f"  {_handoff_line(a.get('path', ''), a['handoff'], now)}")
+        print(f"  {_handoff_line(escape_nonprintable(a.get('path', '')), a['handoff'], now)}")
     print()
 
 
 def _handoff_line(path: str, handoff: dict[str, Any], now: float) -> str:
     giver, successor = (_short_agent_id(handoff.get(key)) for key in ("giver", "successor"))
-    facts = [str(handoff.get("status", "?"))]
+    facts = [escape_nonprintable(handoff.get("status", "?"))]
     # A write can end a record without relabelling it, so ``pending`` alone
     # would read as a giver still fenced; say it has ended.
     if handoff.get("live") is False:
@@ -594,13 +640,13 @@ def _handoff_line(path: str, handoff: dict[str, Any], now: float) -> str:
     created = handoff.get("created_at_unix_ts")
     if isinstance(created, (int, float)) and not isinstance(created, bool):
         facts.append(f"{_format_age(now - created)} ago")
-    version = handoff.get("version_at_transfer", "?")
+    version = escape_nonprintable(handoff.get("version_at_transfer", "?"))
     return f"{path}: {giver} → {successor} at version {version} ({', '.join(facts)})"
 
 
 def _short_agent_id(agent_id: object) -> str:
     """The first 8 characters, as the Sessions block prints an agent id."""
-    return agent_id[:8] if isinstance(agent_id, str) and agent_id else "?"
+    return escape_nonprintable(agent_id[:8]) if isinstance(agent_id, str) and agent_id else "?"
 
 
 def _format_age(seconds: float) -> str:
@@ -649,13 +695,13 @@ def _render_counter_block(payload: dict[str, Any]) -> None:
             "status_total",
         ):
             value = endpoint_counters.get(name, 0)
-            print(f"  {name:<40}  {value}")
+            print(f"  {name:<40}  {escape_nonprintable(value)}")
     for name in keys_present:
         value = payload.get(name, 0)
         if isinstance(value, float):
             value_str = f"{value:.1f}"
         else:
-            value_str = str(value)
+            value_str = escape_nonprintable(value)
         print(f"  {name:<40}  {value_str}")
 
 
@@ -663,8 +709,8 @@ def _render_metrics(payload: dict[str, Any]) -> None:
     """KTD-J `--detail metrics` rendering — counter block only, no
     artifact/session detail. Used by dashboard scrapers that want a
     consistent counter format without parsing JSON."""
-    backend = payload.get("coordinator_backend", "python")
-    version = payload.get("coordinator_version", "")
+    backend = escape_nonprintable(payload.get("coordinator_backend", "python"))
+    version = escape_nonprintable(payload.get("coordinator_version", ""))
     print(f"Coordinator metrics: backend={backend} version={version}")
     _render_counter_block(payload)
 
