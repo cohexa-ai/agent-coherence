@@ -12861,6 +12861,104 @@ def test_status_answers_500_when_its_registry_read_raises_anything_but_a_lock_ti
 
 
 @pytest.mark.parametrize("search_root", ["", "src"], ids=["workspace_root", "subdirectory"])
+def test_pre_grep_answers_the_freshness_advisory_in_time_while_the_registry_lock_is_held(
+    search_root: str, coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the registry lock held past the handler budget, pre-grep answers
+    exactly the "could not verify freshness" advisory, counts one timeout, and
+    neither registers the session nor records its heartbeat.
+
+    Prevents a Grep hook whose client times out first and hands the model
+    ``{}`` -- no advisory at all -- and a lookup that runs once the lock frees
+    and touches a session the answer never reported on."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("238-reader"), "path": "src/plan.md", "content_hash": _hash("x")},
+    )
+    sid = _sid("238-grep")
+    _, before = client.get("/status?detail=metrics")
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(
+            client, "/hooks/pre-grep", {"session_id": sid, "search_root": search_root})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+
+    assert answered, "pre-grep did not answer while the registry lock was held"
+    assert answer.result() == (200, mod._DEFAULT_DEGRADED_RESPONSE)
+    _, after = client.get("/status?detail=metrics")
+    assert after["watchdog_timeouts_total"] == before["watchdog_timeouts_total"] + 1
+    agent = str(session_to_agent_id(sid))
+    assert [row for row in _operator_status(client)["sessions"] if row["agent_id"] == agent] == []
+    assert coordinator.registry.last_heartbeat_tick(session_to_agent_id(sid)) is None
+    _assert_nothing_completes_late(client, before)
+
+
+def test_a_degraded_pre_grep_lookup_leaves_the_compact_pending_flag_for_the_next_request(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lookup that timed out delivered nothing, so the session's pending
+    post-compaction re-grounding stays armed for its next request."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    sid = _sid("238-reground")
+    coordinator.mark_compact_pending(sid)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(client, "/hooks/pre-grep", {"session_id": sid, "search_root": ""})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+
+    assert answered
+    assert answer.result() == (200, mod._DEFAULT_DEGRADED_RESPONSE)
+    assert coordinator.has_compact_pending(sid) is True
+
+
+def test_pre_grep_work_body_gets_only_what_its_lookup_left_of_the_deadline(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lookup that waited most of the budget for the lock leaves its work
+    body only the rest: a work body that then stalls is answered at the ONE
+    deadline, not at the lookup's wait plus a fresh budget.
+
+    The lock is released partway through the budget, so the lookup wins it
+    and the work body runs; the work body's first call is a stand-in that
+    stalls past any budget, so only the deadline it was given ends it."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    deadline = 1.0
+    lookup_wait = 0.7 * deadline
+    client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("238-share-reader"), "path": "plan.md", "content_hash": _hash("x")},
+    )
+    real_heartbeat = coordinator.service.record_heartbeat
+
+    def _stalls(*args: Any, **kwargs: Any) -> None:
+        time.sleep(2 * deadline)
+        real_heartbeat(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator.service, "record_heartbeat", _stalls)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", deadline)
+    with _HeldRegistryLock(coordinator) as held:
+        started = time.monotonic()
+        answer = _Background(
+            client, "/hooks/pre-grep", {"session_id": _sid("238-share"), "search_root": ""})
+        time.sleep(lookup_wait)
+        held.release()
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+
+    assert answered, f"no answer within {_GATE_ANSWER_BOUND_SEC}s of the lock freeing"
+    assert answer.result() == (200, mod._DEFAULT_DEGRADED_RESPONSE)
+    # One deadline answers at ~1.0s; a fresh one for the body at ~0.7 + 1.0s.
+    assert waited < deadline + lookup_wait / 2, (
+        f"answered after {waited:.2f}s: the work body got a fresh {deadline}s after a "
+        f"{lookup_wait:.2f}s lookup, not what was left of one deadline")
+
+
 # ======================================================================
 # #187 — each write grant's age, its holder's last heartbeat, the artifact's
 #        ownership generation and the sweep thresholds, on the operator tier

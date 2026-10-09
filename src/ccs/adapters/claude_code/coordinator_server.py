@@ -35,7 +35,9 @@ Every handler:
 - Runs the coordinator call under a 4s ThreadPoolExecutor timeout
   (handler-side watchdog — keeps us under the 5s hook timeout even when
   SQLite contention exceeds busy_timeout=2000); a caller-principal gate that
-  must read the registry runs under the same deadline, before the call
+  must read the registry runs under the same deadline, before the call.
+  ``/status`` and pre-grep's registry lookup read on the request thread
+  instead, bounding their wait for the registry lock by that deadline (#238)
 - Converts ``CoherenceError`` to 200 ``{ok: false, reason}`` (NOT 500 — we
   want hooks to proceed gracefully on protocol violations, not block)
 - Logs request/response at DEBUG, errors at WARNING
@@ -4472,6 +4474,16 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     ``path`` arg, empty string for workspace root).
 
     Response shape mirrors /hooks/pre-bash.
+
+    #238: the registry lookup that decides whether anything is tracked under
+    the root runs on the request thread and waits for the registry lock only
+    until the request's watchdog deadline, which it starts (or inherits from
+    the caller-principal gate), so the lookup and everything after it -- the
+    zero-tracked fast path's delivery, the work body -- share one
+    ``HANDLER_TIMEOUT_SEC``. A lookup that runs out answers the
+    "could not verify freshness" advisory (:data:`_DEFAULT_DEGRADED_RESPONSE`,
+    as a timed-out work body does) having registered no session, recorded no
+    heartbeat and left any pending re-grounding for the next request.
     """
     body = req._read_json()
     if body is None:
@@ -4495,7 +4507,19 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # Find registry-known tracked artifacts under the search root.
     # SB-10 U4 (KTD6): advisory peek hoisted above the zero-tracked-
     # artifacts exit so a pending payload still reaches this admit.
-    tracked_paths = coordinator.registry.artifact_names_under_prefix(search_root)
+    # #238 (KTD7): only this lookup is bounded here; the work body below
+    # already runs under the watchdog, on what the lookup left of the deadline.
+    try:
+        with coordinator.registry.abort_guard(deadline=_start_watchdog_deadline(req)):
+            tracked_paths = coordinator.registry.artifact_names_under_prefix(search_root)
+    except RegistryLockTimeout:
+        coordinator.increment_watchdog_timeout()
+        logger.warning(
+            "pre-grep could not take the registry lock within %ss; degrading",
+            HANDLER_TIMEOUT_SEC,
+        )
+        req._json(200, _DEFAULT_DEGRADED_RESPONSE)
+        return
     if not tracked_paths:
         _fast_path_json(req, coordinator, session_id, body, {"status": "fresh"})
         return
@@ -6704,7 +6728,8 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     ``watchdog_timeouts_total``, which that same body shows. Nothing is left
     running behind it. ``degraded`` never appears in a normal body, and a null
     list means "cannot tell", never "nothing tracked". Any other failure of
-    the read keeps the dispatcher's 500.
+    the read keeps the dispatcher's 500. Pre-grep bounds its registry lookup
+    the same way (:func:`_handle_pre_grep`).
 
     AC-07 — metrics-tier stability contract (operator-facing):
 
