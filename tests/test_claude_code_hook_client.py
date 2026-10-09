@@ -660,6 +660,52 @@ def test_session_start_unreachable_coordinator_returns_empty(
     assert out.strip() == "{}"
 
 
+@pytest.mark.parametrize("subcommand", ["pre-read", "pre-edit"])
+def test_an_empty_coordinator_answer_still_fails_open(
+    subcommand: str, git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A coordinator that answers 200 with no body leaves the hook printing
+    ``{}`` with exit 0, after the request reached it. The shared client reads
+    an empty body as a malformed answer, which the other commands report as a
+    failure; a hook must still fail open, or one bad answer blocks the tool
+    call."""
+    import http.server
+    import threading
+
+    seen: list[str] = []
+
+    class _EmptyAnswers(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - the stdlib handler's name
+            seen.append(self.path)
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *_args: Any) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _EmptyAnswers)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        _fake_coherence_dir(git_workspace, port=server.server_address[1])
+        (git_workspace / "plan.md").write_text("plan")
+        cc_payload = {
+            "session_id": _sid(),
+            "tool_name": "Read" if subcommand == "pre-read" else "Edit",
+            "tool_input": {"file_path": str(git_workspace / "plan.md")},
+        }
+        rc, out = _drive(subcommand, cc_payload, git_workspace, monkeypatch, capsys)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert rc == 0
+    assert out.strip() == "{}"
+    assert f"/hooks/{subcommand}" in seen, seen
+
+
 def test_session_start_builder_exception_emits_empty(
     git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1097,3 +1143,41 @@ def test_a_request_without_a_principal_naming_a_claimed_session_is_refused(
     assert server.registry.get_artifact(artifact_id).version == version
     assert server.registry.last_writer_for(artifact_id) == peer_agent
     assert server.registry.get_state_map(artifact_id)[peer_agent].name == "EXCLUSIVE"
+
+
+# ----------------------------------------------------------------------
+# #238 — a Grep hook gets the freshness advisory while the registry is held
+#
+# The coordinator's pre-grep lookup waited on the registry lock with no bound,
+# so the hook client's own timeout fired first and the model got ``{}``. Driven
+# end to end, stdin through main() to stdout, against an in-process
+# coordinator whose registry lock a helper thread holds.
+# ----------------------------------------------------------------------
+
+
+def test_pre_grep_delivers_the_freshness_advisory_while_the_registry_lock_is_held(
+    inproc_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import ccs.adapters.claude_code.coordinator_server as server_mod
+    from tests.test_claude_code_coordinator_server import _HeldRegistryLock
+
+    workspace, server = inproc_coordinator
+    cc_payload = {
+        "session_id": _sid(),
+        "tool_name": "Grep",
+        "tool_input": {"pattern": "anything", "path": "docs"},
+    }
+    # The first call claims the session's principal while the lock is free, so
+    # the held lock below blocks only pre-grep's own registry lookup.
+    rc, out = _drive("pre-grep", cc_payload, workspace, monkeypatch, capsys)
+    assert (rc, json.loads(out)) == (0, {"status": "fresh"})
+
+    monkeypatch.setattr(server_mod, "HANDLER_TIMEOUT_SEC", 0.25)
+    with _HeldRegistryLock(server):
+        rc, out = _drive("pre-grep", cc_payload, workspace, monkeypatch, capsys)
+
+    assert rc == 0
+    response = json.loads(out)
+    assert response == json.loads(json.dumps(server_mod._DEFAULT_DEGRADED_RESPONSE))
+    assert "could not verify" in response["hookSpecificOutput"]["additionalContext"]

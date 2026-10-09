@@ -100,6 +100,10 @@ def test_epoch_moves_on_handoff(factory: RegistryFactory) -> None:
     kit.assert_epoch_moves_on_handoff(factory)
 
 
+def test_sweep_reclaim_records_its_cause(factory: RegistryFactory) -> None:
+    kit.assert_sweep_reclaim_records_its_cause(factory)
+
+
 def test_version_and_generation_pair_is_untearable(factory: RegistryFactory) -> None:
     kit.assert_version_and_generation_pair_is_untearable(factory)
 

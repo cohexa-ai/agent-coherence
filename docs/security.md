@@ -235,9 +235,16 @@ operator view (`?detail=full` plus the `Coherence-Local-Operator: true` header).
 enforces the globs it declared. Which paths each session lost to the
 coordinator's grant sweep, and why (`sessions[].reclaimed`), is likewise in the
 operator view only; the other views carry just the reclaim counts
-(`sweep_reclaims_total`, `sweep_reclaims_by_trigger`). The default `minimal` view reports `agent_name`
-as `null` and the pattern counts without the patterns, and the `metrics` view
-carries no sessions at all. A tracked artifact that has a handoff record
+(`sweep_reclaims_total`, `sweep_reclaims_by_trigger`). The inputs to a
+reclaim are in the operator view only too: each tracked artifact's
+`owner_generation`, the write grants each session holds and when each began
+(`sessions[].grants`), each session's last heartbeat
+(`sessions[].last_heartbeat_unix_ts`), and the sweep's two thresholds
+(`grant_heartbeat_timeout_sec`, `grant_max_hold_sec`). The default `minimal`
+view reports `agent_name` as `null`, the workspace root as `.` (both
+`coordinator_root` and `policy_summary.coordinator_root`) and the pattern
+counts without the patterns, and the `metrics` view carries no sessions at
+all. A tracked artifact that has a handoff record
 carries a `handoff` key in the default and operator views, naming the giver,
 the successor and any session that overtook the handoff by session-level agent
 id — the agent id derived from the session id alone, so for a `CoherentVolume`
@@ -251,10 +258,16 @@ it is a one-way hash of the `session_id` the same tool already returns, and
 the id a `handoff` key names that session by, so it discloses nothing new. The
 MCP tools that carry a `handoff` key (`swg_read`, `swg_status`,
 `swg_write_cas`) relay the coordinator's, so they too carry session-level agent
-ids only. The `agent-coherence-status` command is an operator tool and asks
-for the operator view by default, so its output does carry session names: run
-it with `--detail minimal` before pasting the output into a bug report, and
-point dashboards at `--detail metrics`. All of this is disclosure hygiene
+ids only. The `agent-coherence-status` command asks for the default view
+unless it is run with `--detail full`, because it often runs inside an agent's
+shell tool, where its output lands in the transcript; with `--detail full` its
+output carries session names and the absolute workspace root, so leave the flag
+off before pasting the output into a bug report, and point dashboards at
+`--detail metrics`. The Python console scripts (`agent-coherence-status`,
+`-track`, `-untrack` and the handoff commands) print every string from a
+coordinator answer with control and other non-printable characters escaped,
+so an answer cannot drive the terminal they print to. All of this is
+disclosure hygiene
 rather than a boundary: under the model above, knowing a session id grants
 nothing the secret does not already grant.
 

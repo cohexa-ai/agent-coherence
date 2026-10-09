@@ -39,9 +39,9 @@ Exit codes:
 - 0: done. Every named grant transferred, or the verb was taken.
 - 1: usage. A bad command line, a path that fails validation, not in a git
   repository, or no session to act as. Nothing is sent.
-- 2: the coordinator is unreachable or answered any other HTTP error (a
-  caller-principal refusal among them), refused the verb or a grant, or could
-  not confirm the outcome.
+- 2: the coordinator is unreachable, TLS failed, or the coordinator answered
+  any other HTTP error (a caller-principal refusal among them), refused the
+  verb or a grant, or could not confirm the outcome.
 - 4: this coordinator does not serve the verb.
 
 3 is not used: it is the status self-test's.
@@ -62,15 +62,25 @@ from ccs.adapters.claude_code.coordinator_server import caller_principal_identit
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli._coherence_client import (
     NODE_BACKEND,
+    NOT_A_JSON_OBJECT_LINE,
     CoordinatorUnavailable,
     coordinator_backend,
     err,
+    escape_nonprintable,
+    http_error_line,
     http_status_from_error,
     normalize_workspace_path,
     post_with_stored_principal,
+    redirect_refused_line,
     resolve_endpoint,
 )
-from ccs.core.exceptions import HANDOFF_NOT_HELD_REASON, CallerPrincipalRefused, RedirectRefused
+from ccs.core.exceptions import (
+    HANDOFF_NOT_HELD_REASON,
+    CallerPrincipalRefused,
+    RedirectRefused,
+    TlsConfigError,
+    TlsVerificationFailed,
+)
 
 SESSION_ENV_VAR = "CLAUDE_CODE_SESSION_ID"
 """The harness variable naming the Claude Code session whose shell runs the verb."""
@@ -240,16 +250,16 @@ def _send(verb: _Verb, root: Path, payload: dict[str, Any]) -> dict[str, Any] | 
     try:
         endpoint = resolve_endpoint(root)
         answer = post_with_stored_principal(endpoint, root, verb.route, payload, report=verb.complain)
-    except (CoordinatorUnavailable, CallerPrincipalRefused) as exc:
-        verb.complain(str(exc))
+    except (CoordinatorUnavailable, CallerPrincipalRefused, TlsVerificationFailed, TlsConfigError) as exc:
+        verb.complain(escape_nonprintable(exc))
         return EXIT_FAILED
     except RedirectRefused as exc:
-        verb.complain(f"the coordinator redirected the request (HTTP {exc.status}); not followed")
+        verb.complain(redirect_refused_line(exc))
         return EXIT_FAILED
     except urllib.error.HTTPError as exc:
         return _http_failure(verb, exc)
     if not isinstance(answer, dict):
-        verb.complain("the coordinator's answer is not a JSON object")
+        verb.complain(NOT_A_JSON_OBJECT_LINE)
         return EXIT_FAILED
     return answer
 
@@ -273,15 +283,14 @@ def _http_failure(verb: _Verb, exc: urllib.error.HTTPError) -> int:
             "check the session id, the subagent id and the paths"
         )
         return EXIT_FAILED
-    body = http_status_from_error(exc)
-    error = body.get("error") if isinstance(body, dict) else None
-    verb.complain(f"HTTP {exc.code}: {error}" if isinstance(error, str) else f"HTTP {exc.code}")
+    verb.complain(http_error_line(exc.code, http_status_from_error(exc)))
     return EXIT_FAILED
 
 
 def _field(answer: dict[str, Any], key: str) -> str:
+    """The answer's ``key``, escaped (#245), or ``?`` when absent."""
     value = answer.get(key)
-    return "?" if value is None else str(value)
+    return "?" if value is None else escape_nonprintable(value)
 
 
 def _report_unconfirmed(verb: _Verb, answer: dict[str, Any]) -> int:
@@ -305,7 +314,7 @@ def _report_grant(verb: _Verb, path: str, entry: dict[str, Any] | None) -> bool:
             f"status {_field(entry, 'status')})"
         )
         return True
-    status = f", status {entry['status']}" if entry.get("status") is not None else ""
+    status = f", status {_field(entry, 'status')}" if entry.get("status") is not None else ""
     verb.complain(f"{path} not transferred ({_field(entry, 'reason')}{status})")
     if entry.get("reason") == HANDOFF_NOT_HELD_REASON:
         verb.complain(_NOT_HELD_HINT.format(path=path))
@@ -335,7 +344,7 @@ def _report_settled(verb: _Verb, paths: list[str], answer: dict[str, Any]) -> in
     if answer.get("degraded") is True:
         return _report_unconfirmed(verb, answer)
     path = paths[0]
-    details = [f"{key} {answer[key]}" for key in ("status", "counterparty") if answer.get(key) is not None]
+    details = [f"{key} {_field(answer, key)}" for key in ("status", "counterparty") if answer.get(key) is not None]
     if answer.get("ok") is True:
         suffix = f" ({', '.join(details)})" if details else ""
         verb.say(f"{verb.taken} the handoff of {path}{suffix}")

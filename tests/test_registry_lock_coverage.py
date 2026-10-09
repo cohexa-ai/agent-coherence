@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -22,6 +23,7 @@ from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.registry_protocol import FOREIGN_WRITE_OUTCOMES
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+from ccs.core.exceptions import RegistryLockTimeout, WatchdogAbandoned
 from ccs.core.states import MESIState
 from ccs.core.types import Artifact, ConflictDetail, FetchRequest
 
@@ -303,7 +305,10 @@ class _TrackingRLock:
 
     Pattern from ``tests/test_diagnose_callback.py``: installed as the
     registry's ``_lock`` so a member body that holds the lock is observed
-    doing so.
+    doing so. Only a WON acquire is recorded: a bounded one that times out
+    (``abort_guard``'s ``deadline``, #238) takes no hold and is never
+    released, so recording it would leave every later event nested in a hold
+    that never closed.
     """
 
     def __init__(self) -> None:
@@ -311,8 +316,10 @@ class _TrackingRLock:
         self.events: list[str] = []
 
     def acquire(self, *args, **kwargs):
-        self.events.append("acquire")
-        return self._inner.acquire(*args, **kwargs)
+        won = self._inner.acquire(*args, **kwargs)
+        if won:
+            self.events.append("acquire")
+        return won
 
     def release(self) -> None:
         self.events.append("release")
@@ -621,3 +628,136 @@ def test_transient_sweep_skips_a_pair_cleared_during_the_walk(registry) -> None:
         expired = svc.enforce_transient_timeouts(current_tick=1_000, timeout_ticks=10)
         assert expired == 0
         assert registry.get_agent_state(art.id, agent) == MESIState.SHARED
+
+
+# ---------------------------------------------------------------------------
+# #238 — abort_guard's bounded wait: a deadline turns a held registry lock into
+# a typed timeout instead of a block of unbounded length
+# ---------------------------------------------------------------------------
+
+_LOCK_WAIT_SEC = 0.2
+
+
+class _LockHeldElsewhere:
+    """Hold ``lock`` on another thread from ``__enter__`` until released."""
+
+    def __init__(self, lock) -> None:
+        self._lock = lock
+        self._held = threading.Event()
+        self._release = threading.Event()
+        self._thread = threading.Thread(target=self._hold, daemon=True)
+
+    def _hold(self) -> None:
+        with self._lock:
+            self._held.set()
+            self._release.wait(timeout=30.0)
+
+    def __enter__(self) -> "_LockHeldElsewhere":
+        self._thread.start()
+        assert self._held.wait(timeout=5.0), "the holder never took the lock"
+        return self
+
+    def release(self) -> None:
+        self._release.set()
+        self._thread.join(timeout=5.0)
+        assert not self._thread.is_alive(), "the holder never let the lock go"
+
+    def __exit__(self, *exc_info) -> None:
+        self.release()
+
+
+def _free_for_another_thread(lock) -> bool:
+    """Whether a thread that holds nothing can take ``lock`` right now."""
+    taken: list[bool] = []
+
+    def _try() -> None:
+        won = lock.acquire(blocking=False)
+        if won:
+            lock.release()
+        taken.append(won)
+
+    probe = threading.Thread(target=_try, daemon=True)
+    probe.start()
+    probe.join(timeout=5.0)
+    return taken == [True]
+
+
+def test_abort_guard_deadline_times_out_on_a_lock_held_elsewhere(registry) -> None:
+    """A deadline bounds the wait: the guard gives up at the deadline with a
+    typed timeout, runs nothing, and leaves the lock with its holder."""
+    with _LockHeldElsewhere(registry._lock):
+        started = time.monotonic()
+        with pytest.raises(RegistryLockTimeout):
+            with registry.abort_guard(deadline=started + _LOCK_WAIT_SEC):
+                pytest.fail("the guarded body ran while another thread held the lock")
+        waited = time.monotonic() - started
+        assert not _free_for_another_thread(registry._lock), "the holder lost the lock"
+    assert _LOCK_WAIT_SEC - 0.05 <= waited < _LOCK_WAIT_SEC + 1.0, waited
+    assert _free_for_another_thread(registry._lock)
+
+
+def test_abort_guard_deadline_already_past_raises_without_waiting(registry) -> None:
+    """A deadline already past is one non-blocking try, never a wait (and
+    never a negative timeout handed to the lock)."""
+    with _LockHeldElsewhere(registry._lock):
+        started = time.monotonic()
+        with pytest.raises(RegistryLockTimeout):
+            with registry.abort_guard(deadline=started - 1.0):
+                pytest.fail("the guarded body ran while another thread held the lock")
+        assert time.monotonic() - started < 0.1
+
+
+def test_abort_guard_deadline_enters_a_free_lock_at_once_and_holds_it(registry) -> None:
+    """A free lock is taken at once; the body runs holding it, and leaving the
+    block lets it go."""
+    started = time.monotonic()
+    with registry.abort_guard(deadline=started + 5.0):
+        entered_after = time.monotonic() - started
+        assert not _free_for_another_thread(registry._lock), "the body ran unheld"
+    assert entered_after < 1.0, entered_after
+    assert _free_for_another_thread(registry._lock), "the guard kept the lock"
+
+
+def test_abort_guard_without_a_deadline_waits_for_the_holder(registry) -> None:
+    """No deadline is the unbounded wait it always was: the guard outlasts a
+    holder that keeps the lock well past ``_LOCK_WAIT_SEC`` and then enters."""
+    holder = _LockHeldElsewhere(registry._lock).__enter__()
+    releaser = threading.Timer(_LOCK_WAIT_SEC * 2, holder.release)
+    started = time.monotonic()
+    releaser.start()
+    try:
+        with registry.abort_guard():
+            waited = time.monotonic() - started
+    finally:
+        releaser.join(timeout=5.0)
+    assert waited >= _LOCK_WAIT_SEC * 2 - 0.05, waited
+
+
+@pytest.mark.parametrize("deadline_sec", [None, 5.0], ids=["no_deadline", "deadline"])
+def test_abort_guard_fails_closed_on_a_set_abort(registry, deadline_sec) -> None:
+    """The A6 abort check runs once the lock is won, with or without a
+    deadline, and the lock is released on the way out."""
+    abort = threading.Event()
+    abort.set()
+    bound = {} if deadline_sec is None else {"deadline": time.monotonic() + deadline_sec}
+    with pytest.raises(WatchdogAbandoned):
+        with registry.abort_guard(abort, **bound):
+            pytest.fail("the guarded body ran after the watchdog aborted it")
+    assert _free_for_another_thread(registry._lock)
+
+
+def test_tracking_lock_records_no_hold_for_a_timed_out_acquire(registry) -> None:
+    """A timed-out acquire takes no hold and is never released, so the
+    recorder must not log it as an acquire: an unmatched acquire would leave
+    every later statement nested in a hold that never closed, and the
+    hold-grouping readers (``_status_registry_holds``) would merge them."""
+    tracker = _TrackingRLock()
+    registry._lock = tracker  # noqa: SLF001 — the seam under test
+    with _LockHeldElsewhere(tracker._inner):  # noqa: SLF001 — held, not recorded
+        with pytest.raises(RegistryLockTimeout):
+            with registry.abort_guard(deadline=time.monotonic() + 0.05):
+                pass
+    with registry.abort_guard():
+        pass
+    assert tracker.events == ["acquire", "release"]
+

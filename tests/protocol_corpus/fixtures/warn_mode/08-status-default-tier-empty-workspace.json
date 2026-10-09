@@ -1,6 +1,6 @@
 {
   "name": "status-default-tier-empty-workspace",
-  "description": "GET /status on a freshly-spawned Python coordinator with no tracked artifacts and no sessions. Validates the minimal-tier wire shape including all telemetry counters. tracked_artifacts may contain policy defaults; sessions/policy_summary/coordinator_root are normalized to keep the fixture portable. This fixture is python-only because the Node coordinator emits a different /status envelope (see fixture 09). The sweep reclaim counters are part of that counter set and read zero.",
+  "description": "GET /status on a freshly-spawned Python coordinator with no tracked artifacts and no sessions. Validates the minimal-tier wire shape including all telemetry counters. tracked_artifacts may contain policy defaults; sessions and the default pattern count are normalized to keep the fixture portable. coordinator_root is the sentinel '.' both at the top level and inside policy_summary: the default tier publishes no absolute path, and no pattern list. This fixture is python-only because the Node coordinator emits a different /status envelope (see fixture 09). The sweep reclaim counters are part of that counter set and read zero.",
   "setup": {},
   "request": {
     "method": "GET",
@@ -9,9 +9,8 @@
   "ignore_keys": [
     "tracked_artifacts",
     "sessions",
-    "policy_summary",
+    "default_pattern_count",
     "endpoint_counters",
-    "coordinator_root",
     "coordinator_version"
   ],
   "expected": {
@@ -23,7 +22,7 @@
       "cold_start_duration_ms": 0,
       "coordinator_backend": "python",
       "coordinator_pid": "<PID>",
-      "coordinator_root": "<IGNORED>",
+      "coordinator_root": ".",
       "coordinator_uptime_s": "<UPTIME>",
       "coordinator_uptime_seconds": "<UPTIME>",
       "coordinator_version": "<IGNORED>",
@@ -35,7 +34,14 @@
       "handoff_giver_denials_total": 0,
       "in_flight_drain_timed_out": false,
       "intra_task_acquire_release_total": 0,
-      "policy_summary": "<IGNORED>",
+      "policy_summary": {
+        "coordinator_root": ".",
+        "default_pattern_count": "<IGNORED>",
+        "ignored_pattern_count": 0,
+        "rejected_pattern_count": 0,
+        "strict_mode_pattern_count": 0,
+        "user_added_pattern_count": 0
+      },
       "sessions": "<IGNORED>",
       "shared_foreign_lag_suppressed_total": 0,
       "stale_warning_emitted_total": 0,

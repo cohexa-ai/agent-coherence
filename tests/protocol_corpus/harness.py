@@ -160,6 +160,18 @@ _TIMESTAMP_KEYS: frozenset[str] = frozenset({
     "created_at_unix_ts",
 })
 
+# #187: the operator tier's grant time and last heartbeat are wall-clock ticks,
+# so a NUMBER under these keys is scrubbed like a timestamp. Unlike
+# _TIMESTAMP_KEYS the scrub is type-aware: null means "no heartbeat on record"
+# or "no grant time", a different answer from any tick, so it is compared
+# literally and an expected "<TS>" fails against it. A ``reclaimed`` entry's
+# time is the same wall clock, so a row that pins a reclaim pins its presence.
+_GRANT_TIME_KEYS: frozenset[str] = frozenset({
+    "granted_at_unix_ts",
+    "last_heartbeat_unix_ts",
+    "reclaimed_at_unix_ts",
+})
+
 _UPTIME_KEYS: frozenset[str] = frozenset({
     "coordinator_uptime_seconds",
     # AC-02 deprecated alias — Python emits both during the v0.1.x window so a
@@ -365,6 +377,8 @@ def normalize_response(
         # Key-driven normalization fires regardless of value type so we don't
         # care whether the coordinator emits int or float for an uptime.
         if key in _TIMESTAMP_KEYS:
+            return _TS_SENTINEL
+        if key in _GRANT_TIME_KEYS and isinstance(v, (int, float)) and not isinstance(v, bool):
             return _TS_SENTINEL
         if key in _UPTIME_KEYS:
             return _UPTIME_SENTINEL

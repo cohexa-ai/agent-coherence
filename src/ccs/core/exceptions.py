@@ -1587,3 +1587,22 @@ class WatchdogAbandoned(RuntimeError):
     clean no-op (no phantom state landed). Every non-watchdog caller
     (CoherentVolume, CCSStore, the CLI) passes ``abort=None`` and never sees it.
     """
+
+
+class RegistryLockTimeout(RuntimeError):
+    """A bounded wait for the registry lock ran out before the lock was won
+    (#238).
+
+    Raised by the registries' ``abort_guard`` when the caller passed a
+    ``deadline`` and another thread still held the registry lock when it
+    passed. The guard took no hold and ran none of the caller's body, so
+    nothing was read or written: the caller answers without the registry, as
+    ``/status`` does with its degraded body and pre-grep with its freshness
+    advisory.
+
+    Deliberately NOT a :class:`CoherenceError`, like :class:`WatchdogAbandoned`:
+    it never reaches a client as an error. Nor a :class:`TimeoutError`: since
+    Python 3.11 that is the ``concurrent.futures`` timeout, which the handler
+    watchdog catches as its own. Every caller that passes no deadline waits as
+    long as the lock is held, as before, and never sees it.
+    """

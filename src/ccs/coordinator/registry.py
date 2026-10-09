@@ -49,6 +49,7 @@ from .registry_protocol import (
     FOREIGN_WRITE_OUTCOMES,
     HANDOFF_TRIGGER,
     RECLAIM_TRIGGERS,  # noqa: F401 — re-exported; see the parity test
+    SWEEP_RECLAIM_TRIGGERS,
     CaptureResult,
     CasResult,
     CheckpointMember,
@@ -60,6 +61,7 @@ from .registry_protocol import (
     TransferRecord,
     TransferRequest,
     UncoverableRun,
+    acquire_by_deadline,
     decide_transfer_grant,
     require_storable_transfer_status,
     transfer_record_live,
@@ -142,7 +144,9 @@ class ArtifactRegistry:
     """
 
     @contextmanager
-    def abort_guard(self, abort: "threading.Event | None" = None) -> Iterator[None]:
+    def abort_guard(
+        self, abort: "threading.Event | None" = None, *, deadline: float | None = None
+    ) -> Iterator[None]:
         """Hold ``self._lock`` across the caller's whole mutation, failing
         closed if the handler watchdog already timed out (finding A6). The
         same guarantee, word for word, as
@@ -161,14 +165,24 @@ class ArtifactRegistry:
         late "phantom grant" aborts before it lands. ``abort=None`` (every
         non-watchdog caller) is a plain lock acquire with no behavioural
         change.
+
+        ``deadline`` (keyword-only, #238) bounds the wait for the lock with the
+        same meaning as on the SQLite registry: past that
+        :func:`time.monotonic` instant the guard raises
+        :class:`RegistryLockTimeout` before the ``abort`` check and runs
+        nothing; a free or already-held lock is taken at once; ``None`` waits
+        as long as the lock is held.
         """
-        with self._lock:
+        acquire_by_deadline(self._lock, deadline)
+        try:
             if abort is not None and abort.is_set():
                 raise WatchdogAbandoned(
                     "handler watchdog timed out before this mutation ran; "
                     "aborting before it lands (A6)."
                 )
             yield
+        finally:
+            self._lock.release()
 
     def __init__(
         self,
@@ -648,6 +662,12 @@ class ArtifactRegistry:
                 # epoch (see registry_protocol.EPOCH_BUMP_TRIGGERS).
                 if trigger in EPOCH_BUMP_TRIGGERS:
                     record.owner_generation += 1
+                # A sweep reclaim records its slot here, with the transition and
+                # before the log emit, so no failure after this point can leave
+                # an INVALID pair that reads as a plain release (see
+                # SWEEP_RECLAIM_TRIGGERS).
+                if state == MESIState.INVALID and trigger in SWEEP_RECLAIM_TRIGGERS:
+                    record.last_reclamation_by_agent[agent_id] = (trigger, tick)
 
             # Read-generation fence: capture the current ownership epoch into the
             # agent's read_generation ONLY on the agent's own claim -- an E/M
