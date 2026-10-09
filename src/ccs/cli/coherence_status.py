@@ -164,7 +164,7 @@ def _fetch_status(root: Path, detail: str) -> dict[str, Any] | int:
         err(f"agent-coherence-status: {NOT_A_JSON_OBJECT_LINE}")
         return 2
     except CoordinatorUnavailable as exc:
-        err(f"agent-coherence-status: {exc}")
+        err(f"agent-coherence-status: {escape_nonprintable(exc)}")
         return 0  # graceful — no coordinator is a normal state
     except urllib.error.HTTPError as exc:
         err(f"agent-coherence-status: {http_error_line(exc.code, http_status_from_error(exc))}")
@@ -272,7 +272,7 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     except CoordinatorUnavailable as exc:
         err(
             f"agent-coherence-status --self-test: coordinator unreachable "
-            f"({exc}). Spawn one first by running any hook (or "
+            f"({escape_nonprintable(exc)}). Spawn one first by running any hook (or "
             f"``agent-coherence-coordinator``)."
         )
         return 3
@@ -309,7 +309,7 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
                 err(f"--self-test: {name} returned HTTP {exc.code}")
             return None
         except CoordinatorUnavailable as exc:
-            err(f"--self-test: {name} failed: {exc}")
+            err(f"--self-test: {name} failed: {escape_nonprintable(exc)}")
             return None
         except RedirectRefused as exc:
             # Refused, never followed; reported by its status alone, since
@@ -386,7 +386,7 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
         err(f"--self-test: /status returned HTTP {exc.code}")
         return 3
     except CoordinatorUnavailable as exc:
-        err(f"--self-test: /status failed: {exc}")
+        err(f"--self-test: /status failed: {escape_nonprintable(exc)}")
         return 3
     except RedirectRefused as exc:
         err(f"--self-test: /status was redirected (HTTP {exc.status}); not followed")

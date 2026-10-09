@@ -41,6 +41,7 @@ from ccs.cli._coherence_client import (
     post_with_stored_principal,
     resolve_endpoint,
 )
+from ccs.core.exceptions import TlsConfigError, TlsVerificationFailed
 
 
 @pytest.fixture
@@ -2365,6 +2366,106 @@ def test_a_tls_failure_exits_2_with_one_line(
     assert captured.err.startswith(f"agent-coherence-{command}: CCS_REMOTE_CA_FILE ")
     _assert_one_failure_line(command, captured)
     assert _StubCoordinator.seen == []
+
+
+#: TLS failures whose text carries :data:`_HOSTILE`: a certificate that did not
+#: verify (its detail is the TLS library's text) and an unusable TLS setup.
+_HOSTILE_TLS_FAILURES = {
+    "verification": lambda: TlsVerificationFailed("127.0.0.1", f"certificate verify failed: {_HOSTILE}"),
+    "config": lambda: TlsConfigError(f"the CA bundle is not usable: {_HOSTILE}"),
+}
+
+
+@pytest.mark.parametrize("failure", sorted(_HOSTILE_TLS_FAILURES))
+@pytest.mark.parametrize("command", sorted(_ERROR_PATH_COMMANDS))
+def test_a_tls_failure_prints_its_text_escaped_on_one_line(
+    command: str, failure: str, stub_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A TLS failure whose text carries ESC, CR and LF, a bidi override and a
+    lone surrogate exits 2 with that text escaped on one stderr line. Prevents
+    the failure's text driving or reordering the terminal, splitting the line,
+    or crashing the print."""
+    workspace, _ = stub_coordinator
+    _route, module, run = _ERROR_PATH_COMMANDS[command]
+    exc = _HOSTILE_TLS_FAILURES[failure]()
+
+    def refuse(_root: Path) -> CoordinatorEndpoint:
+        raise exc
+
+    monkeypatch.setattr(module, "resolve_endpoint", refuse)
+
+    rc = run(workspace)
+
+    captured = capsys.readouterr()
+    assert rc == 2, captured.err
+    assert captured.err == f"agent-coherence-{command}: {str(exc).replace(_HOSTILE, _PRINTED)}\n"
+    _assert_one_failure_line(command, captured)
+    assert _raw_characters_in(captured.out + captured.err) == []
+
+
+@pytest.mark.parametrize("command", sorted(_ERROR_PATH_COMMANDS))
+def test_no_coordinator_in_a_workspace_whose_path_has_control_characters_prints_it_escaped(
+    command: str, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With no coordinator running, the line naming the workspace's pid file
+    prints the path's ESC and bidi override escaped, on one stderr line: exit 0
+    for status (no coordinator is a normal state), 2 for the others. Prevents a
+    directory name driving or reordering the terminal through that line."""
+    workspace = tmp_path / "ws\x1b[31m\N{RIGHT-TO-LEFT OVERRIDE}"
+    (workspace / ".git").mkdir(parents=True)
+    _route, _module, run = _ERROR_PATH_COMMANDS[command]
+
+    rc = run(workspace)
+
+    captured = capsys.readouterr()
+    assert rc == (0 if command == "status" else 2), captured.err
+    assert "ws\\x1b[31m\\u202e" in captured.err
+    _assert_one_failure_line(command, captured)
+    assert _raw_characters_in(captured.out + captured.err) == []
+
+
+@pytest.mark.parametrize("step", ["resolve", "hook", "status"])
+def test_a_self_test_coordinator_failure_prints_its_text_escaped(
+    step: str, stub_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--self-test`` exits 3 printing a coordinator failure's text escaped,
+    whether finding the coordinator, a hook step or the closing ``/status``
+    read fails. Prevents that text -- a workspace path or the operating
+    system's error -- driving or reordering the terminal, or crashing the
+    print."""
+    workspace, _ = stub_coordinator
+    failure = CoordinatorUnavailable(f"unreachable {_HOSTILE}")
+
+    def fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise failure
+
+    # What a working coordinator answers each hook step: a fresh first read,
+    # an admitted edit and commit, then a stale re-read naming the path.
+    reads = iter([
+        {"status": "fresh"},
+        {"status": "stale", "hookSpecificOutput": {"additionalContext": "plan.md changed"}},
+    ])
+
+    def answer(_endpoint: Any, name: str, _body: Any, **_kwargs: Any) -> dict[str, Any]:
+        return next(reads) if name == "/hooks/pre-read" else {"ok": True}
+
+    if step == "resolve":
+        monkeypatch.setattr(coherence_status, "resolve_endpoint", fail)
+    elif step == "hook":
+        monkeypatch.setattr(coherence_status, "post", fail)
+    else:
+        monkeypatch.setattr(coherence_status, "post", answer)
+        monkeypatch.setattr(coherence_status, "get", fail)
+
+    rc = coherence_status.main(["--root", str(workspace), "--self-test"])
+
+    captured = capsys.readouterr()
+    assert rc == 3, captured.err
+    assert f"unreachable {_PRINTED}" in captured.err
+    assert captured.err.count("\n") == 1, captured.err
+    assert _raw_characters_in(captured.out + captured.err) == []
 
 
 @pytest.mark.parametrize("change", [
