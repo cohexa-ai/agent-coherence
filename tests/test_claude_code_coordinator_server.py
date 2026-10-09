@@ -9954,7 +9954,7 @@ def test_status_full_tier_names_a_sweep_reclaim(
     row = _row_for(_operator_status(client), sid)
     # ``states`` keeps its meaning: held grants only. The cause is a sibling.
     assert row["states"] == {}
-    assert row["reclaimed"] == {"plan.md": {"trigger": "reclaim_heartbeat", "tick": now_tick}}
+    assert row["reclaimed"] == {"plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": now_tick}}
 
     # The log line: one per reclaim, naming trigger, tick, agent id and path,
     # and never the raw session id (#198 / R6).
@@ -9966,6 +9966,32 @@ def test_status_full_tier_names_a_sweep_reclaim(
     assert str(session_to_agent_id(sid)) in message
     assert "plan.md" in message
     assert sid not in message
+
+
+def test_status_cli_prints_the_reclaim_time_a_live_body_carries(
+    coordinator,
+    client: _Client,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The renderer's own tests feed it hand-built bodies, so a key renamed on
+    one side only passes all of them while the real table prints ``?`` for the
+    time. Driven off a LIVE operator-tier body after a real sweep reclaim, so
+    the key the handler emits is the key the table reads."""
+    from ccs.cli import coherence_status
+
+    monkeypatch.setenv("COLUMNS", "120")
+    sid = _sid("cli-render-195")
+    assert client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})[0] == 200
+    reclaim_tick = int(time.time()) + 999_999
+    assert _sweep(coordinator, reclaim_tick) == 1
+
+    coherence_status._render_table(_operator_status(client))
+    session_lines = capsys.readouterr().out.split("Sessions:", 1)[1].splitlines()
+
+    [line] = [ln for ln in session_lines if "plan.md" in ln]
+    assert line.split() == ["plan.md", "reclaimed", "(reclaim_heartbeat", "at", f"{reclaim_tick})"]
+    assert "?" not in line
 
 
 def test_status_full_tier_does_not_report_a_voluntary_release_as_a_reclaim(
@@ -10038,7 +10064,7 @@ def test_metrics_tier_counts_sweep_reclaims_by_trigger(coordinator, client: _Cli
     assert after["sweep_reclaims_total"] == 2
     assert after["sweep_reclaims_by_trigger"] == {"reclaim_heartbeat": 1, "reclaim_max_hold": 1}
     row = _row_for(_operator_status(client), _sid("mh-195"))
-    assert row["reclaimed"] == {"plan.md": {"trigger": "reclaim_max_hold", "tick": now_tick}}
+    assert row["reclaimed"] == {"plan.md": {"trigger": "reclaim_max_hold", "reclaimed_at_unix_ts": now_tick}}
 
 
 def test_a_reclaimed_path_stays_listed_through_a_reread_and_clears_on_reacquire(
@@ -10053,7 +10079,7 @@ def test_a_reclaimed_path_stays_listed_through_a_reread_and_clears_on_reacquire(
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
     reclaim_tick = int(time.time()) + 999_999
     _sweep(coordinator, reclaim_tick)
-    cause = {"plan.md": {"trigger": "reclaim_heartbeat", "tick": reclaim_tick}}
+    cause = {"plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": reclaim_tick}}
     # A peer read first, so the re-read is granted SHARED rather than E.
     client.post("/hooks/pre-read", {"session_id": peer, "path": "plan.md", "content_hash": _hash("x")})
     client.post("/hooks/pre-read", {"session_id": sid, "path": "plan.md", "content_hash": _hash("x")})
@@ -10108,7 +10134,7 @@ def test_status_full_tier_lists_a_reclaimed_agent_the_restarted_coordinator_neve
     row = _row_for(payload, sid)
     assert row["agent_name"] is None
     assert row["states"] == {}
-    assert row["reclaimed"] == {"plan.md": {"trigger": "reclaim_heartbeat", "tick": now_tick}}
+    assert row["reclaimed"] == {"plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": now_tick}}
     # Below the operator tier nothing changes: a row with no held grant and
     # no name is not added there.
     assert minimal["sessions"] == []
@@ -10262,7 +10288,7 @@ def test_the_sweep_loop_counts_and_logs_a_heartbeat_reclaim(
     payload = _operator_status(client)
     [cause] = _row_for(payload, stale_sid)["reclaimed"].values()
     assert cause["trigger"] == "reclaim_heartbeat"
-    assert cause["tick"] >= tick_floor
+    assert cause["reclaimed_at_unix_ts"] >= tick_floor
     # The live holder is untouched: only the stale grant was pulled.
     assert _row_for(payload, live_sid)["states"] == {"task.md": "EXCLUSIVE"}
     assert _row_for(payload, live_sid)["reclaimed"] == {}
@@ -10288,7 +10314,7 @@ def test_status_reads_the_reclaim_slots_inside_the_snapshot_lock_hold(
     )
     assert status == 200
     assert _row_for(body, sid)["reclaimed"] == {
-        "plan.md": {"trigger": "reclaim_heartbeat", "tick": reclaim_tick}
+        "plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": reclaim_tick}
     }
     assert not [sql for sql in unheld if "last_reclaim" in sql]
     reclaim_holds = [hold for hold in holds if any("last_reclaim" in sql for sql in hold)]
@@ -12168,7 +12194,7 @@ def test_status_shows_a_live_handoff_and_its_givers_reclaim_in_one_response(
     body = _operator_status(client)
     assert _status_entry(body, "plan.md")["handoff"]["live"] is True
     assert _row_for(body, giver.sid)["reclaimed"] == {
-        "task.md": {"trigger": "reclaim_heartbeat", "tick": reclaim_tick}
+        "task.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": reclaim_tick}
     }
 
 

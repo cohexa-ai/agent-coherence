@@ -632,8 +632,10 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
             # reclaimed path the session has re-read is held SHARED as well,
             # so its line keeps that state ahead of the reclaim label.
             for path, cause in (s.get("reclaimed") or {}).items():
-                trigger, tick = (escape_nonprintable(cause.get(k, "?")) for k in ("trigger", "tick"))
-                label = f"reclaimed ({trigger} at tick {tick})"
+                trigger, reclaimed_at = (
+                    escape_nonprintable(cause.get(k, "?")) for k in ("trigger", "reclaimed_at_unix_ts")
+                )
+                label = f"reclaimed ({trigger} at {reclaimed_at})"
                 held = per_artifact.get(path)
                 per_artifact[path] = f"{held}; {label}" if held else label
             print(f"  {escape_nonprintable(sid[:8])}  {escape_nonprintable(name)}")

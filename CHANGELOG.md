@@ -257,19 +257,19 @@ Alpha — APIs may change before `v1.0`.
   it, at its next commit or post-edit. Now:
   - `GET /status?detail=full` gives every `sessions[]` row a `reclaimed` map
     beside `states`: `{path: {"trigger": "reclaim_heartbeat" |
-    "reclaim_max_hold", "tick": <int>}}` for each path whose last write grant
-    the sweep reclaimed, with no write grant there since. It is history, not
+    "reclaim_max_hold", "reclaimed_at_unix_ts": <int>}}` for each path whose
+    last write grant the sweep reclaimed, with no write grant there since. It is history, not
     current state. A session whose re-read is granted `SHARED` (another
     session holds the path too) keeps it listed beside that state, because a
     read does not version the edit the reclaim left on disk, and a peer
-    invalidating that read leaves the original trigger and tick in place. An
+    invalidating that read leaves the original trigger and time in place. An
     `EXCLUSIVE` or `MODIFIED` grant on the path clears the entry, including the
     `EXCLUSIVE` a sole reader's re-read is granted; `states` then shows the
     path held. A path is never both held for writing and listed. A release, a peer preemption or
     a handoff adds no entry. `states` is unchanged (held grants only), so
     existing readers see the same body. Both maps come from one registry read,
     so a single response never shows a reclaimed grant as a clean release.
-    `tick` is wall-clock seconds.
+    `reclaimed_at_unix_ts` is the reclaim's time in unix seconds.
   - The reclaim is kept in the registry across a coordinator restart; session
     names are not. After a restart, a reclaimed session that has not sent a
     request since gets a row with a null name until 24 hours after its newest
@@ -297,7 +297,7 @@ Alpha — APIs may change before `v1.0`.
     `include_reclamations` opt-in that adds each pair's reclaim slot, read from
     the same rows as the states.
   - `agent-coherence-status` prints each reclaimed path under its session,
-    labelled with trigger and tick (after the held state when the session has
+    labelled with trigger and time (after the held state when the session has
     re-read the path), plus `sweep_reclaims_total` in its counter block.
 
   The plugin's Node coordinator runs no grant sweep and answers

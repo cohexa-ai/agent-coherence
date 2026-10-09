@@ -531,14 +531,14 @@ holder tell the two apart:
     "agent_name": "claude-session-<id>",
     "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
     "states": {},
-    "reclaimed": {"plan.md": {"trigger": "reclaim_heartbeat", "tick": 1789558656}}
+    "reclaimed": {"plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": 1789558656}}
   }
   ```
 
   `trigger` is `reclaim_heartbeat` (no coordinator call for
   `grant_heartbeat_timeout_sec`) or `reclaim_max_hold` (held past
-  `grant_max_hold_sec`), and `tick` is the reclaim's wall-clock time in
-  seconds.
+  `grant_max_hold_sec`), and `reclaimed_at_unix_ts` is when the reclaim
+  happened, in unix seconds.
 - **The counters.** Every view, the default one and `?detail=metrics`
   included, carries `sweep_reclaims_total` and `sweep_reclaims_by_trigger`.
   They name no session or path: a count that rose tells you the sweep pulled
@@ -561,8 +561,8 @@ coordinator grants a sole reader `EXCLUSIVE`. From then on `states` shows the
 holder holding the path, so it does not read as released. The map
 tells you a reclaim happened; whether its edit has been dealt with since is
 yours to decide. One clue: if the path's `last_writer_at_unix_ts` in the same
-response is later than the entry's `tick`, someone has committed the path since
-the reclaim.
+response is later than the entry's `reclaimed_at_unix_ts`, someone has committed
+the path since the reclaim.
 
 Limits:
 
@@ -584,7 +584,7 @@ Limits:
   ```text
   Sessions:
     4c9625da  claude-session-<id>
-      plan.md  SHARED; reclaimed (reclaim_heartbeat at tick 1789558656)
+      plan.md  SHARED; reclaimed (reclaim_heartbeat at 1789558656)
   ```
 
   The Claude Code plugin's status command cannot send the operator header, so

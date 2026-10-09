@@ -164,10 +164,12 @@ _TIMESTAMP_KEYS: frozenset[str] = frozenset({
 # so a NUMBER under these keys is scrubbed like a timestamp. Unlike
 # _TIMESTAMP_KEYS the scrub is type-aware: null means "no heartbeat on record"
 # or "no grant time", a different answer from any tick, so it is compared
-# literally and an expected "<TS>" fails against it.
+# literally and an expected "<TS>" fails against it. A ``reclaimed`` entry's
+# time is the same wall clock, so a row that pins a reclaim pins its presence.
 _GRANT_TIME_KEYS: frozenset[str] = frozenset({
     "granted_at_unix_ts",
     "last_heartbeat_unix_ts",
+    "reclaimed_at_unix_ts",
 })
 
 _UPTIME_KEYS: frozenset[str] = frozenset({
