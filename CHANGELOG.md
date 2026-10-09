@@ -544,6 +544,14 @@ Alpha — APIs may change before `v1.0`.
   rises with each schema step
   ([#294](https://github.com/Cohexa-ai/agent-coherence/issues/294)).
 
+- **`agent-coherence-status` shows the store format in its header.** The
+  table's `Coordinator:` line and the `--detail metrics` summary line now end
+  with `schema=N`, the coordinator's `registry_schema_version`, for example
+  `backend=python version=0.15.0.dev0 schema=10`. Against a coordinator that
+  does not send the field, such as an older release or the Claude Code
+  plugin's Node coordinator, both lines are unchanged
+  ([#294](https://github.com/Cohexa-ai/agent-coherence/issues/294)).
+
 ### Changed
 
 - **`dev` now reports version `0.15.0.dev0`, not `0.14.1` (#263).**

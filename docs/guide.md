@@ -3777,9 +3777,11 @@ against the workspace. `coordinator_version` cannot tell you this: between
 releases one version string covers several schema steps. The number counts the
 Python coordinator's own schema steps. The Claude Code plugin's Node
 coordinator does not send it, and the `schema_version` that coordinator sends
-counts a different set of steps, so the two are not comparable. The Python
-console script prints the field with `--json`; its table and its metrics
-summary do not.
+counts a different set of steps, so the two are not comparable.
+`agent-coherence-status` prints the number at the end of its `Coordinator:`
+header line, for example `schema=10`, and at the end of the summary line with
+`--detail metrics`; `--json` prints the field itself. A coordinator that does
+not send the field gets no `schema=` in either line.
 
 ### `ccs-simulate` and `ccs-compare`
 
