@@ -802,7 +802,9 @@ Alpha — APIs may change before `v1.0`.
   it only with `--pre` or an exact pin. Its GitHub release is now marked as a
   pre-release, and the MCP Registry is left on the last final release. The
   registry workflow now publishes the tag that started the release run, not
-  whichever release GitHub lists as latest.
+  whichever release GitHub lists as latest. It acts only on a release run
+  started by a tag push in this repository, so a run from a fork cannot choose
+  the tag.
 
 - **Opening a store the Node coordinator created no longer points you at a
   switch that does not exist.** The `CrossRuntimeSchemaError` raised for a

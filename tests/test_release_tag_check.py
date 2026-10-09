@@ -287,6 +287,17 @@ def test_resolve_step_reads_the_tag_from_the_triggering_event() -> None:
     assert sync["env"]["RELEASE_TAG"] == "${{ steps.release.outputs.tag }}"
 
 
+def test_workflow_run_publishes_only_after_a_tag_push_in_this_repository() -> None:
+    """The tag comes from the triggering run's head_branch, so that run must be ours."""
+    condition = " ".join(_jobs(_MCP_WORKFLOW)["publish"]["if"].split())
+    assert condition == (
+        "github.event_name != 'workflow_run' || ( "
+        "github.event.workflow_run.conclusion == 'success' && "
+        "github.event.workflow_run.event == 'push' && "
+        "github.event.workflow_run.head_repository.full_name == github.repository )"
+    )
+
+
 _GH_STUB = textwrap.dedent(
     """\
     #!/usr/bin/env bash

@@ -35,7 +35,15 @@ jobs:
     name: Publish server.json to the MCP Registry
     # For workflow_run, only publish after a *successful* release run — a failed
     # or cancelled release must not push metadata for a version PyPI never got.
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    # The tag to publish is that run's head_branch, so the run must also be a
+    # tag push in this repository: a fork's pull-request run of a workflow
+    # named `release` would otherwise choose the tag.
+    if: >-
+      github.event_name != 'workflow_run' || (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      )
     runs-on: ubuntu-latest
     permissions:
       id-token: write # mints the OIDC token the registry authenticates with
