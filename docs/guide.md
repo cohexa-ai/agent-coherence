@@ -3766,6 +3766,21 @@ These are the Python console scripts' rules. Where the Claude Code plugin's own
 comes first on the Bash tool's `PATH`, that program runs instead, with its own
 output and exit codes.
 
+**Which store format a coordinator writes.** Every `/status` view from the
+Python coordinator, `?detail=metrics` and a
+[degraded answer](#when-the-registry-is-busy) included, carries
+`registry_schema_version`: the schema version of the workspace's
+`.coherence/state.db`, an integer. The coordinator migrates the store to that
+version when it opens it, and an older release refuses a store at a newer
+version, so check this number before you run an older coordinator or library
+against the workspace. `coordinator_version` cannot tell you this: between
+releases one version string covers several schema steps. The number counts the
+Python coordinator's own schema steps. The Claude Code plugin's Node
+coordinator does not send it, and the `schema_version` that coordinator sends
+counts a different set of steps, so the two are not comparable. The Python
+console script prints the field with `--json`; its table and its metrics
+summary do not.
+
 ### `ccs-simulate` and `ccs-compare`
 
 ```bash

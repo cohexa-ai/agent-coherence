@@ -2448,6 +2448,26 @@ def test_a8_status_exposes_coordinator_backend_and_version(client: _Client) -> N
     assert b["coordinator_version"]  # non-empty
 
 
+def test_status_reports_the_store_schema_version_at_every_tier(
+    coordinator, client: _Client
+) -> None:
+    """#294: every tier carries ``registry_schema_version``, the schema
+    version of the store this coordinator serves, so a client can tell which
+    store format a coordinator writes when one ``coordinator_version`` covers
+    several schema bumps. The expectation is the store's own
+    ``PRAGMA user_version``, read from the file, not the constant the handler
+    reports, so a field wired to the wrong number cannot agree with itself.
+    The bare name ``schema_version`` is the Node coordinator's, counted on its
+    own ledger with different numbers, and never appears here. (The degraded
+    answer carries the key through its set-equality test with the normal
+    body.)"""
+    on_disk = coordinator.registry._conn.execute("PRAGMA user_version").fetchone()[0]
+    for tier, body in _status_tiers(client).items():
+        assert body.get("registry_schema_version") == on_disk, tier
+        assert type(body["registry_schema_version"]) is int, tier
+        assert "schema_version" not in body, tier
+
+
 def test_a8_counters_increment_even_when_handler_raises(
     client: _Client, coordinator, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

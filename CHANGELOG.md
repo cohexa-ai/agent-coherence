@@ -530,6 +530,20 @@ Alpha — APIs may change before `v1.0`.
   between; `root` never changes. The private attributes are unchanged
   ([#262](https://github.com/Cohexa-ai/agent-coherence/issues/262)).
 
+- **`/status` reports the store format, as `registry_schema_version`.** Every
+  view of the Python coordinator's `/status` now carries
+  `registry_schema_version`, the schema version of the workspace's
+  `.coherence/state.db` (currently `10`). That includes `?detail=metrics` and a
+  degraded answer. `coordinator_version` could not tell you this: between
+  releases one version string covers several schema steps, and an older release
+  refuses a store at a newer schema. The field names no session or path. It
+  counts the Python coordinator's own schema steps, so read it beside
+  `coordinator_backend: "python"`. The Claude Code plugin's Node coordinator
+  does not send it; the `schema_version` that coordinator sends counts a
+  different set of steps and is not comparable. The key will stay; its value
+  rises with each schema step
+  ([#294](https://github.com/Cohexa-ai/agent-coherence/issues/294)).
+
 ### Changed
 
 - **`dev` now reports version `0.15.0.dev0`, not `0.14.1` (#263).**
