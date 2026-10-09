@@ -729,6 +729,18 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **`/status` below the operator tier no longer publishes the absolute
+  workspace root.** The default view reported `coordinator_root` as `.`, but
+  its `policy_summary` carried a `coordinator_root` of its own holding the
+  absolute path, so `/status` and `?detail=minimal` still put `$HOME` and the
+  directory layout on the wire. `policy_summary.coordinator_root` is now `.`
+  as well below the operator tier, and `?detail=full` still reports the
+  absolute path in both places. Nothing reads the nested key from the default
+  view. The protocol corpus now pins `policy_summary` at the default tier on
+  both backends instead of ignoring it, which showed the Claude Code plugin's
+  Node coordinator publishing the same absolute root; the plugin fixes it in
+  its own release.
+
 - **Strict mode no longer lets a session write a file it was just refused a
   read of.** A strict-mode deny of a Bash or Grep read re-grants the session's
   SHARED read so that the retry the deny invites can run, and records no

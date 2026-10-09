@@ -236,8 +236,9 @@ enforces the globs it declared. Which paths each session lost to the
 coordinator's grant sweep, and why (`sessions[].reclaimed`), is likewise in the
 operator view only; the other views carry just the reclaim counts
 (`sweep_reclaims_total`, `sweep_reclaims_by_trigger`). The default `minimal` view reports `agent_name`
-as `null` and the pattern counts without the patterns, and the `metrics` view
-carries no sessions at all. A tracked artifact that has a handoff record
+as `null`, the workspace root as `.` (both `coordinator_root` and
+`policy_summary.coordinator_root`) and the pattern counts without the patterns,
+and the `metrics` view carries no sessions at all. A tracked artifact that has a handoff record
 carries a `handoff` key in the default and operator views, naming the giver,
 the successor and any session that overtook the handoff by session-level agent
 id — the agent id derived from the session id alone, so for a `CoherentVolume`

@@ -2772,6 +2772,21 @@ def test_r12_status_minimal_default_hides_coordinator_root(
     assert b.get("coordinator_pid") == os.getpid()
 
 
+@pytest.mark.parametrize("path", ["/status", "/status?detail=minimal", "/status?detail=fully"])
+def test_r12_status_below_the_operator_tier_publishes_the_root_nowhere(
+    client: _Client, coordinator, path: str,
+) -> None:
+    """The policy summary carries its own ``coordinator_root``. Below the
+    operator tier it is the same sentinel "." as the top-level key, and the
+    absolute root appears nowhere in the body. Prevents the default tier
+    publishing $HOME / directory layout through the nested key while the
+    top-level one is redacted."""
+    s, b = client.get(path)
+    assert s == 200
+    assert b["policy_summary"]["coordinator_root"] == "."
+    assert str(coordinator.coordinator_root) not in json.dumps(b)
+
+
 def test_r12_status_full_requires_operator_header(client: _Client) -> None:
     """?detail=full without the Coherence-Local-Operator: true opt-in header
     must be rejected with 403 — Bearer auth alone is not sufficient for
@@ -2793,6 +2808,7 @@ def test_r12_status_full_with_operator_header_exposes_root_and_pid(
     assert s == 200
     assert b["detail"] == "full"
     assert b["coordinator_root"] == str(coordinator.coordinator_root)
+    assert b["policy_summary"]["coordinator_root"] == str(coordinator.coordinator_root)
     assert isinstance(b["coordinator_pid"], int)
     # Full tier also retains the artifact/session block.
     assert "tracked_artifacts" in b

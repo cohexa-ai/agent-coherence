@@ -6848,6 +6848,11 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # layout to non-operator callers — ask for them only at the full tier;
     # the counts are in the summary at every tier.
     policy_summary = coordinator.policy.summary(include_patterns=detail == "full")
+    if detail != "full":
+        # The summary carries the absolute root too: below the operator tier it
+        # gets the same sentinel as the top-level key, or the default tier
+        # publishes $HOME / directory layout through it anyway.
+        policy_summary = {**policy_summary, "coordinator_root": "."}
     base = {
         "detail": detail,
         "tracked_artifacts": tracked,
