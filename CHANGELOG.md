@@ -321,7 +321,8 @@ Alpha — APIs may change before `v1.0`.
     rows and named rows that hold nothing;
   - on the body, `grant_heartbeat_timeout_sec` and `grant_max_hold_sec`, the
     thresholds the running sweep enforces, or null when none enforces them
-    (`sweep_interval_sec` is `0`, or either threshold is below `1`).
+    (`sweep_interval_sec` is `0`, either threshold is below `1`, or
+    `transient_timeout_sec` is below `1`).
 
   Times are whole unix seconds, the sweep's own clock, and all of it comes from
   the same registry read as `states` and `reclaimed`. A grant's earliest

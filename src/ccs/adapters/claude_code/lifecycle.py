@@ -783,11 +783,15 @@ def _published_sweep_thresholds(cfg: LifecycleConfig) -> tuple[int | None, int |
     Decides only what to publish; :func:`_start_background_threads` still
     starts the sweep whenever :func:`_sweep_enabled` holds. A threshold below
     1 makes every stable-grant pass raise (each pass logs it), so nothing
-    enforces the configured pair and neither value is reported.
+    enforces the configured pair and neither value is reported. So does a
+    transient timeout below 1: :func:`_sweep_loop` runs the transient pass
+    first in the same ``try``, it raises, and the stable-grant pass never runs.
     """
     if not _sweep_enabled(cfg):
         return None, None
     if cfg.grant_heartbeat_timeout_sec < 1 or cfg.grant_max_hold_sec < 1:
+        return None, None
+    if cfg.transient_timeout_sec < 1:
         return None, None
     return cfg.grant_heartbeat_timeout_sec, cfg.grant_max_hold_sec
 

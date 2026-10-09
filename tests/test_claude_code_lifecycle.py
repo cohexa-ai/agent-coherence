@@ -864,13 +864,17 @@ def test_coordinator_holds_no_thresholds_when_no_sweep_runs(
         stop_coordinator(workspace)
 
 
-@pytest.mark.parametrize("field", ["grant_heartbeat_timeout_sec", "grant_max_hold_sec"])
+@pytest.mark.parametrize(
+    "field", ["grant_heartbeat_timeout_sec", "grant_max_hold_sec", "transient_timeout_sec"]
+)
 def test_a_threshold_below_one_publishes_none_and_the_sweep_still_starts(
     workspace: Path, fast_cfg: LifecycleConfig, field: str,
 ) -> None:
     """#187 R4: a threshold below 1 fails every stable-grant pass, so neither
-    is reported as enforced; the sweep thread still starts as before, and its
-    per-pass failure log stays the report of the misconfiguration."""
+    is reported as enforced; so does a transient timeout below 1, whose pass
+    runs first in the same tick and raises before the stable-grant pass. The
+    sweep thread still starts as before, and its per-pass failure log stays
+    the report of the misconfiguration."""
     cfg = replace(fast_cfg, **{field: 0})
     sweeps_before = _sweep_threads()
     assert ensure_coordinator(workspace, config=cfg) > 0
@@ -879,6 +883,47 @@ def test_a_threshold_below_one_publishes_none_and_the_sweep_still_starts(
         assert len(_sweep_threads() - sweeps_before) == 1
     finally:
         stop_coordinator(workspace)
+
+
+def _a_sweep_tick_refuses(coordinator: CoordinatorHTTPServer, cfg: LifecycleConfig) -> bool:
+    """Whether the two grant passes of one sweep tick, called in
+    :func:`lifecycle._sweep_loop`'s order with ``cfg``'s values, refuse them."""
+    try:
+        coordinator.service.enforce_transient_timeouts(
+            current_tick=0, timeout_ticks=cfg.transient_timeout_sec,
+        )
+        coordinator.service.enforce_stable_grant_timeouts(
+            current_tick=0,
+            heartbeat_timeout_ticks=cfg.grant_heartbeat_timeout_sec,
+            max_hold_ticks=cfg.grant_max_hold_sec,
+        )
+    except ValueError:
+        return True
+    return False
+
+
+@pytest.mark.parametrize("value", [0, 1])
+@pytest.mark.parametrize(
+    "field", ["grant_heartbeat_timeout_sec", "grant_max_hold_sec", "transient_timeout_sec"]
+)
+def test_the_thresholds_are_withheld_exactly_when_the_service_refuses_them(
+    tmp_path: Path, fast_cfg: LifecycleConfig, field: str, value: int,
+) -> None:
+    """#187 R4: the publish rule follows the service's own refusal at each
+    boundary value: the pair is withheld exactly when the sweep's service
+    calls raise on the configured values, so a rule that drifts from the
+    service's (``< 2``, say) is red on the value the two disagree about."""
+    cfg = replace(fast_cfg, **{field: value})
+    coordinator = CoordinatorHTTPServer(tmp_path, port=0)
+    try:
+        refused = _a_sweep_tick_refuses(coordinator, cfg)
+    finally:
+        coordinator.shutdown()
+
+    published = lifecycle._published_sweep_thresholds(cfg)
+    assert (published == (None, None)) is refused
+    if not refused:
+        assert published == (cfg.grant_heartbeat_timeout_sec, cfg.grant_max_hold_sec)
 
 
 def test_a_coordinator_built_without_lifecycle_holds_no_thresholds(

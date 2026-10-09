@@ -668,12 +668,14 @@ min(last_heartbeat_unix_ts + grant_heartbeat_timeout_sec,
   caller on a skewed clock computes a skewed deadline.
 
 **When the thresholds are `null`.** Both are `null` when no sweep enforces
-them: `sweep_interval_sec` is `0`, which turns the sweep off, or either
-threshold is below `1`, which makes the sweep's grant check fail on every pass
-(each failure is logged). There is then no deadline to compute. All three are
+them: `sweep_interval_sec` is `0`, which turns the sweep off; either
+threshold is below `1`, which makes the sweep's grant check fail on every pass;
+or `transient_timeout_sec` is below `1`, which makes the transient check that
+runs before it fail on every pass, so the grant check never runs. Each failure
+is logged. There is then no deadline to compute. All four are
 `LifecycleConfig` fields (`grant_heartbeat_timeout_sec` 600,
-`grant_max_hold_sec` 1800, `sweep_interval_sec` 5 by default), applied by
-whatever starts the coordinator.
+`grant_max_hold_sec` 1800, `sweep_interval_sec` 5, `transient_timeout_sec` 60
+by default), applied by whatever starts the coordinator.
 
 **Reading `owner_generation`.** The generation goes up by one each time a write
 claim (`EXCLUSIVE` or `MODIFIED`) on the artifact ends without the version
