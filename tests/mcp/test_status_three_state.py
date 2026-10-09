@@ -209,14 +209,16 @@ def test_per_path_is_none_for_any_answer_without_an_artifact_list(artifacts) -> 
     assert _UNAVAILABLE_MARKER in " ".join(_texts(result))
 
 
-def test_the_status_description_says_null_per_path_means_the_coordinator_could_not_report() -> None:
-    """The description gives a null ``per_path`` the meaning the code gives
-    it: the coordinator could not report which paths are tracked, a busy
-    registry being one cause, and the text result names it. Prevents an agent
-    taking a busy registry's ``coordinator=on`` answer for an empty
-    workspace."""
+def test_the_status_description_says_when_per_path_is_null_and_when_it_is_empty() -> None:
+    """The description gives ``per_path`` the meanings the code gives it: null
+    when the ``/status`` answer carries no list of tracked paths, a busy
+    registry being one cause, with the text result naming it; ``{}`` when the
+    coordinator state is ``unknown``. Prevents an agent taking a busy
+    registry's ``coordinator=on`` answer for an empty workspace, or an
+    unreachable coordinator's ``{}`` for one."""
     assert "per_path is null, not {}" in _STATUS_DESC
-    assert "could not report which paths are tracked" in _STATUS_DESC
+    assert "carries no list of tracked paths" in _STATUS_DESC
+    assert "With coordinator=unknown, per_path is {} and says nothing about what is tracked" in _STATUS_DESC
     assert "registry was busy" in _STATUS_DESC
     assert "retry shortly" in _STATUS_DESC
     assert "do not treat it as nothing tracked" in _STATUS_DESC
