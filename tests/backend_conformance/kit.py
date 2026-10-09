@@ -666,6 +666,41 @@ def assert_epoch_moves_on_handoff(factory: RegistryFactory) -> None:
     assert result.reason == STALE_READ_GENERATION_REASON, result.reason
 
 
+def assert_sweep_reclaim_records_its_cause(factory: RegistryFactory) -> None:
+    """Reclaim-cause leg (MUST-MATCH). An M/E -> INVALID transition under a
+    stable-grant sweep trigger records the pair's ``(trigger, tick)``
+    reclamation slot in that SAME ``set_agent_state`` call. The sweep makes no
+    second write, so a backend that leaves the slot out records no reclaim at
+    all: ``/status`` reads every reclaim as an ordinary release, and the
+    reclaimed holder's commit error never says its grant was reclaimed.
+
+    The voluntary release revokes a write claim the same way but is not a
+    reclaim, so it must record nothing."""
+    reg = factory()
+    artifact_id = uuid4()
+    _register(reg, artifact_id, version=1)
+    holder, releaser = uuid4(), uuid4()
+
+    reg.set_agent_state(artifact_id, holder, MESIState.EXCLUSIVE, tick=1)  # type: ignore[attr-defined]
+    reg.set_agent_state(  # type: ignore[attr-defined]
+        artifact_id, holder, MESIState.INVALID, trigger=_RECLAIM_TRIGGER, tick=7
+    )
+    slot = reg.get_last_reclamation(holder, artifact_id)  # type: ignore[attr-defined]
+    assert slot == (_RECLAIM_TRIGGER, 7), (
+        f"a sweep reclaim left the pair INVALID with reclamation slot {slot!r}: "
+        "set_agent_state must record (trigger, tick) in the same write as the "
+        "reclaim, because the sweep never writes the slot separately"
+    )
+
+    reg.set_agent_state(artifact_id, releaser, MESIState.EXCLUSIVE, tick=8)  # type: ignore[attr-defined]
+    reg.set_agent_state(  # type: ignore[attr-defined]
+        artifact_id, releaser, MESIState.INVALID, trigger=_RELEASE_TRIGGER, tick=9
+    )
+    assert reg.get_last_reclamation(releaser, artifact_id) is None, (  # type: ignore[attr-defined]
+        "a voluntary release recorded a reclamation slot; only a sweep reclaim may"
+    )
+
+
 def assert_fence_admits_absent_read_generation(factory: RegistryFactory) -> None:
     """Read-generation fence — ADMIT-ON-ABSENT leg (MUST-MATCH). Reproduced EXACTLY
     per the fence-parity lesson (it has drifted once before). A plain OCC writer
