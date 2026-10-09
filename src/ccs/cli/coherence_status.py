@@ -4,7 +4,8 @@
 """``agent-coherence-status`` — print tracked artifacts × sessions × MESI states.
 
 Reads the coordinator's GET /status endpoint and renders a terminal-friendly
-table. Backs the ``/agent-coherence status`` slash command.
+table. The Claude Code plugin's ``/agent-coherence:status`` falls back to it
+when the plugin's own status program cannot run (no ``node``).
 
 Exit codes:
 - 0: status fetched and printed (including "no coordinator running")
@@ -92,8 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
             "coordinator root as '.', but policy_summary.coordinator_root is "
             "still an absolute path; it still reports per-session artifact "
             "state (the process id is reported at every tier); 'metrics' "
-            "returns counters only; 'full' is the operator view used by "
-            "/agent-coherence status."
+            "returns counters only; 'full' is the operator view."
         ),
     )
     # KTD-J (Unit 8): post-install smoke. Drives a two-session stale-read

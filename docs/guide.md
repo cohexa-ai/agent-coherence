@@ -590,9 +590,14 @@ Limits:
       plan.md  SHARED; reclaimed (reclaim_heartbeat at 1789558656)
   ```
 
-  The Claude Code plugin's status command cannot send the operator header, so
-  it shows the counters but never the `reclaimed` map. Use the Python console
-  script, or request `GET /status?detail=full` with the header yourself.
+  Where the Claude Code plugin's own `agent-coherence-status` comes first on
+  the Bash tool's `PATH`, it runs instead, and the plugin's
+  `/agent-coherence:status` command runs it too. It asks for the default view,
+  so it shows the counters but not the `reclaimed` map. In plugin releases
+  through 0.5.0 its `--detail full` does not send the operator header, so the
+  coordinator refuses it; a release that sends the header prints the map in
+  the JSON it outputs. Use the Python console script, or request
+  `GET /status?detail=full` with the header yourself.
 
 To see a reclaim coming rather than after it lands, read the grant times and
 thresholds in the same view; see
