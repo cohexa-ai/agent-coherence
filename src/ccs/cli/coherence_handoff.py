@@ -62,6 +62,7 @@ from ccs.adapters.claude_code.coordinator_server import caller_principal_identit
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli._coherence_client import (
     NODE_BACKEND,
+    NOT_A_JSON_OBJECT_LINE,
     CoordinatorUnavailable,
     coordinator_backend,
     err,
@@ -70,6 +71,7 @@ from ccs.cli._coherence_client import (
     http_status_from_error,
     normalize_workspace_path,
     post_with_stored_principal,
+    redirect_refused_line,
     resolve_endpoint,
 )
 from ccs.core.exceptions import (
@@ -252,12 +254,12 @@ def _send(verb: _Verb, root: Path, payload: dict[str, Any]) -> dict[str, Any] | 
         verb.complain(escape_nonprintable(exc))
         return EXIT_FAILED
     except RedirectRefused as exc:
-        verb.complain(f"the coordinator redirected the request (HTTP {exc.status}); not followed")
+        verb.complain(redirect_refused_line(exc))
         return EXIT_FAILED
     except urllib.error.HTTPError as exc:
         return _http_failure(verb, exc)
     if not isinstance(answer, dict):
-        verb.complain("the coordinator's answer is not a JSON object")
+        verb.complain(NOT_A_JSON_OBJECT_LINE)
         return EXIT_FAILED
     return answer
 

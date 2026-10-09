@@ -109,7 +109,6 @@ from ccs.core.exceptions import (
     STORE_SIGNAL_UNREADABLE,
     STORE_SIGNAL_WAL_RECOVERY,
     UNKNOWN_ARTIFACT_REASON,
-    RegistryLockTimeout,
     StaleReadGeneration,
     WatchdogAbandoned,
 )
@@ -146,6 +145,7 @@ from .registry_protocol import (
     TransferRecord,
     TransferRequest,
     UncoverableRun,
+    acquire_by_deadline,
     decide_transfer_grant,
     require_storable_transfer_status,
     transfer_record_live,
@@ -1113,12 +1113,7 @@ class SqliteArtifactRegistry:
         guard re-enters exactly as the unbounded form does. ``deadline=None``
         waits as long as the lock is held, as before.
         """
-        timeout = -1 if deadline is None else max(0.0, deadline - time.monotonic())
-        if not self._lock.acquire(timeout=timeout):
-            raise RegistryLockTimeout(
-                "another thread held the registry lock past the caller's "
-                "deadline; nothing was read or written (#238)."
-            )
+        acquire_by_deadline(self._lock, deadline)
         try:
             if abort is not None and abort.is_set():
                 raise WatchdogAbandoned(
@@ -3835,13 +3830,16 @@ class SqliteArtifactRegistry:
                     )
                 }
             if include_grant_detail:
-                last_heartbeat_by_agent = {
-                    UUID(hex=agent_hex): last_tick
-                    for agent_hex, last_tick in self._conn.execute(
-                        "SELECT agent_id, last_tick FROM heartbeats"
-                    ).fetchall()
-                }
+                heartbeat_rows = self._conn.execute(
+                    "SELECT agent_id, last_tick FROM heartbeats"
+                ).fetchall()
         if include_grant_detail:
+            # Parsed after the hold: the rows were read inside it, and every
+            # agent ever seen keeps a heartbeat row, so this loop need not
+            # lengthen the hold peers wait on.
+            last_heartbeat_by_agent = {
+                UUID(hex=agent_hex): last_tick for agent_hex, last_tick in heartbeat_rows
+            }
             return (
                 artifact_by_id,
                 state_by_artifact,

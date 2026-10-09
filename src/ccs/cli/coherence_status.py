@@ -39,6 +39,7 @@ from typing import Any, Sequence
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli._coherence_client import (
     NODE_BACKEND,
+    NOT_A_JSON_OBJECT_LINE,
     CoordinatorEndpoint,
     CoordinatorUnavailable,
     caller_principal_headers,
@@ -51,6 +52,7 @@ from ccs.cli._coherence_client import (
     http_status_from_error,
     post,
     principal_refusal_reason,
+    redirect_refused_line,
     reportable_reason,
     resolve_endpoint,
 )
@@ -162,16 +164,18 @@ def _fetch_status(root: Path, detail: str) -> dict[str, Any] | int:
         err(f"agent-coherence-status: {http_error_line(exc.code, http_status_from_error(exc))}")
         return 2
     except RedirectRefused as exc:
-        err(f"agent-coherence-status: the coordinator redirected the request (HTTP {exc.status}); not followed")
+        err(f"agent-coherence-status: {redirect_refused_line(exc)}")
         return 2
     except (TlsVerificationFailed, TlsConfigError) as exc:
         err(f"agent-coherence-status: {escape_nonprintable(exc)}")
         return 2
     if not isinstance(payload, dict):
-        err("agent-coherence-status: the coordinator's answer is not a JSON object")
+        err(f"agent-coherence-status: {NOT_A_JSON_OBJECT_LINE}")
         return 2
     return payload
 
+
+_SHAPE_LINE = "agent-coherence-status: unexpected /status shape"
 
 _DEGRADED_LINE = (
     "agent-coherence-status: the coordinator's registry is busy (lock contention), "
@@ -188,7 +192,7 @@ def _lists_unavailable(payload: dict[str, Any]) -> bool:
 
 
 def _print_lists_unavailable(payload: dict[str, Any], *, json_mode: bool) -> int:
-    """Exit 2 on an answer without its lists (KTD8). ``--json`` prints the body
+    """Exit 2 on an answer without its lists (#238). ``--json`` prints the body
     unchanged, so with ``--show-policy`` it carries no
     ``policy_pending_first_read``, which needs the artifact list. The table
     prints nothing on stdout and one stderr line: registry contention when the
@@ -199,7 +203,7 @@ def _print_lists_unavailable(payload: dict[str, Any], *, json_mode: bool) -> int
     elif payload.get("degraded") is True:
         err(_DEGRADED_LINE)
     else:
-        err("agent-coherence-status: unexpected /status shape")
+        err(_SHAPE_LINE)
     return 2
 
 
@@ -212,7 +216,7 @@ def _print_status(payload: dict[str, Any], args: argparse.Namespace) -> int:
         with contextlib.redirect_stdout(rendered):
             _render_payload(payload, args)
     except (TypeError, ValueError, AttributeError, KeyError):
-        err("agent-coherence-status: unexpected /status shape")
+        err(_SHAPE_LINE)
         return 2
     print(rendered.getvalue(), end="", flush=True)
     return 0

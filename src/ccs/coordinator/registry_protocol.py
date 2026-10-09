@@ -34,6 +34,7 @@ registry classes themselves (the registries import this module's Protocols under
 
 from __future__ import annotations
 
+import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from threading import Event
@@ -60,6 +61,7 @@ from ccs.core.exceptions import (
     HANDOFF_SUCCESSOR_UNKNOWN_REASON,
     HANDOFF_VERSION_UNCONFIRMED_REASON,
     CheckpointRegistrationRefused,
+    RegistryLockTimeout,
 )
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import (
@@ -477,6 +479,20 @@ def transfer_record_live(record: TransferRecord, current_version: int) -> bool:
         current_version == record.version_at_transfer
         and record.status not in TRANSFER_ENDED_STATUSES
     )
+
+
+def acquire_by_deadline(lock: Any, deadline: float | None) -> None:
+    """Take the registry ``lock`` for ``abort_guard``, waiting at most until
+    ``deadline`` (#238): a :func:`time.monotonic` instant past which this raises
+    :class:`RegistryLockTimeout` having taken nothing. ``None`` waits as long as
+    the lock is held. A free lock, or one this thread already holds, is taken
+    at once, and a deadline already past is one non-blocking try."""
+    timeout = -1 if deadline is None else max(0.0, deadline - time.monotonic())
+    if not lock.acquire(timeout=timeout):
+        raise RegistryLockTimeout(
+            "another thread held the registry lock past the caller's "
+            "deadline; nothing was read or written (#238)."
+        )
 
 
 #: ``status_snapshot``'s grant detail (#187): each pair's recorded grant tick,

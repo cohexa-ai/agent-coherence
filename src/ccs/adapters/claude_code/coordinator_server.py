@@ -193,7 +193,7 @@ command, the volume's attach checks and MCP ``swg_status`` all read it through
 pins the two equal)."""
 
 _STATUS_READ_RESERVE_SEC = 4.0
-"""KTD13 (#238): how much of :data:`_STATUS_CLIENT_TIMEOUT_SEC` ``/status``
+"""#238: how much of :data:`_STATUS_CLIENT_TIMEOUT_SEC` ``/status``
 keeps for its registry read, so a lock won late still answers before the
 client gives up: the wait for the registry lock ends this long before the
 client's timeout, or at the handler budget if that comes first. That caps the
@@ -4507,7 +4507,7 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # Find registry-known tracked artifacts under the search root.
     # SB-10 U4 (KTD6): advisory peek hoisted above the zero-tracked-
     # artifacts exit so a pending payload still reaches this admit.
-    # #238 (KTD7): only this lookup is bounded here; the work body below
+    # #238: only this lookup is bounded here; the work body below
     # already runs under the watchdog, on what the lookup left of the deadline.
     try:
         with coordinator.registry.abort_guard(deadline=_start_watchdog_deadline(req)):
@@ -6719,7 +6719,7 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     for the registry lock on the request thread, through the registry's own
     ``abort_guard(deadline=...)``, until the request's watchdog deadline
     (``HANDLER_TIMEOUT_SEC``) or until only ``_STATUS_READ_RESERVE_SEC`` of the
-    shipped clients' timeout remains, whichever comes first (KTD13). A lock
+    shipped clients' timeout remains, whichever comes first. A lock
     won in time is read in one hold as before. Past that deadline the tier
     answers 200 with the keys it normally carries -- ``policy_summary`` with
     its pattern lists at the full tier, the counters, the thresholds at the
@@ -6790,7 +6790,7 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # #238: the hold is taken through the guard, which stops waiting at the
     # wait cap; the snapshot's own lock acquire then re-enters at once, so
     # the read is still one hold. Only the wait is bounded: a lock won by the
-    # cap is read to the end, in the time the read reserve leaves (KTD13).
+    # cap is read to the end, in the time the read reserve leaves.
     operator_tier = detail == "full"
     try:
         with coordinator.registry.abort_guard(deadline=_status_wait_deadline(req)):
@@ -6800,7 +6800,7 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
                 include_grant_detail=operator_tier,
             )
     except RegistryLockTimeout:
-        # KTD6: counted BEFORE the counters are read, so the answer reports
+        # #238: counted BEFORE the counters are read, so the answer reports
         # its own timeout, and logged as a degraded hook is. The body is built
         # only now, from what needs no registry, with the two registry lists
         # null -- never empty, which a reader takes for "nothing tracked".
@@ -6866,7 +6866,7 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     # row kept arbitrating (a peer's pre-edit still collides against a holder
     # the payload never named). Build from the registry, then label.
     #
-    # #187 (KTD4): the operator tier's ``grants`` are the write grants the
+    # #187: the operator tier's ``grants`` are the write grants the
     # sweep can reclaim, projected by STATE in the same walk. The live grant
     # paths set the tick on an M/E acquire and clear it on leaving M/E, so
     # state and tick agree; a ledger another runtime wrote need not, and the
@@ -6876,14 +6876,13 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     states_by_agent: dict[UUID, dict[str, str]] = {}
     grants_by_agent: dict[UUID, dict[str, dict[str, int | None]]] = {}
     for artifact_id, meta in artifact_by_id.items():
-        ticks = granted_at_by_artifact.get(artifact_id, {})
         for agent_id, state in state_by_artifact[artifact_id].items():
             if state == MESIState.INVALID:
                 continue
             states_by_agent.setdefault(agent_id, {})[meta["name"]] = state.name
             if operator_tier and state in _M_OR_E_STATES:
                 grants_by_agent.setdefault(agent_id, {})[meta["name"]] = {
-                    "granted_at_unix_ts": ticks.get(agent_id),
+                    "granted_at_unix_ts": granted_at_by_artifact.get(artifact_id, {}).get(agent_id),
                 }
 
     # #195: the reclaim cause, operator tier only (the same disclosure call as
@@ -6998,7 +6997,7 @@ def _status_counters(coordinator: CoordinatorHTTPServer) -> dict[str, Any]:
 
 
 def _status_wait_deadline(req: _RequestProtocol) -> float:
-    """KTD13 (#238): when ``/status`` stops waiting for the registry lock --
+    """#238: when ``/status`` stops waiting for the registry lock --
     the request's watchdog deadline, or the moment only
     ``_STATUS_READ_RESERVE_SEC`` remains of the shipped clients' timeout,
     whichever comes first, so a lock won at the cap still leaves the read time

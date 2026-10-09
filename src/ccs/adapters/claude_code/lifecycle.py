@@ -769,16 +769,23 @@ def _probe_with_budget(port: int, bind_host: str, attempts: int, interval_sec: f
 # ----------------------------------------------------------------------
 
 
+def _sweep_enabled(cfg: LifecycleConfig) -> bool:
+    """Whether lifecycle runs the sweep at all: the one rule both
+    :func:`_start_background_threads` and :func:`_published_sweep_thresholds`
+    follow, so the thresholds are reported exactly when a sweep starts."""
+    return cfg.sweep_interval_sec > 0
+
+
 def _published_sweep_thresholds(cfg: LifecycleConfig) -> tuple[int | None, int | None]:
     """The (heartbeat timeout, max hold) pair the coordinator reports as
     enforced (#187), or ``(None, None)`` when no sweep enforces them.
 
     Decides only what to publish; :func:`_start_background_threads` still
-    starts the sweep whenever ``sweep_interval_sec > 0``. A threshold below
+    starts the sweep whenever :func:`_sweep_enabled` holds. A threshold below
     1 makes every stable-grant pass raise (each pass logs it), so nothing
     enforces the configured pair and neither value is reported.
     """
-    if cfg.sweep_interval_sec <= 0:
+    if not _sweep_enabled(cfg):
         return None, None
     if cfg.grant_heartbeat_timeout_sec < 1 or cfg.grant_max_hold_sec < 1:
         return None, None
@@ -787,7 +794,7 @@ def _published_sweep_thresholds(cfg: LifecycleConfig) -> tuple[int | None, int |
 
 def _start_background_threads(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
     """Start the sweep + idle-shutdown daemon threads."""
-    if cfg.sweep_interval_sec > 0:
+    if _sweep_enabled(cfg):
         sweep_thread = threading.Thread(
             target=_sweep_loop,
             args=(entry, cfg),

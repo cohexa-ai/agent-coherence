@@ -25,7 +25,6 @@ from uuid import UUID, uuid4
 from ccs.core.exceptions import (
     STALE_READ_GENERATION_REASON,
     UNKNOWN_ARTIFACT_REASON,
-    RegistryLockTimeout,
     StaleReadGeneration,
     WatchdogAbandoned,
 )
@@ -61,6 +60,7 @@ from .registry_protocol import (
     TransferRecord,
     TransferRequest,
     UncoverableRun,
+    acquire_by_deadline,
     decide_transfer_grant,
     require_storable_transfer_status,
     transfer_record_live,
@@ -172,12 +172,7 @@ class ArtifactRegistry:
         nothing; a free or already-held lock is taken at once; ``None`` waits
         as long as the lock is held.
         """
-        timeout = -1 if deadline is None else max(0.0, deadline - time.monotonic())
-        if not self._lock.acquire(timeout=timeout):
-            raise RegistryLockTimeout(
-                "another thread held the registry lock past the caller's "
-                "deadline; nothing was read or written (#238)."
-            )
+        acquire_by_deadline(self._lock, deadline)
         try:
             if abort is not None and abort.is_set():
                 raise WatchdogAbandoned(

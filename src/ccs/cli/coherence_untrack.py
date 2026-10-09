@@ -29,6 +29,7 @@ from typing import Any, Sequence
 from ccs.adapters.claude_code.policy import UNTRACK_STRICT_PATH_REASON
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli._coherence_client import (
+    NOT_A_JSON_OBJECT_LINE,
     CoordinatorUnavailable,
     err,
     escape_nonprintable,
@@ -36,6 +37,7 @@ from ccs.cli._coherence_client import (
     http_status_from_error,
     normalize_workspace_path,
     post,
+    redirect_refused_line,
     resolve_endpoint,
 )
 from ccs.core.exceptions import RedirectRefused, TlsConfigError, TlsVerificationFailed
@@ -108,10 +110,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         err(f"agent-coherence-untrack: {http_error_line(exc.code, body)}")
         return 2
     except RedirectRefused as exc:
-        err(f"agent-coherence-untrack: the coordinator redirected the request (HTTP {exc.status}); not followed")
+        err(f"agent-coherence-untrack: {redirect_refused_line(exc)}")
         return 2
     if not isinstance(payload, dict):
-        err("agent-coherence-untrack: the coordinator's answer is not a JSON object")
+        err(f"agent-coherence-untrack: {NOT_A_JSON_OBJECT_LINE}")
         return 2
 
     try:

@@ -88,7 +88,20 @@ def escape_nonprintable(value: object) -> str:
     unchanged, so a plain path's line stays byte-identical; other spaces and
     joiners print escaped."""
     text = value if isinstance(value, str) else str(value)
+    if text.isprintable():
+        return text
     return "".join(c if c.isprintable() else repr(c)[1:-1] for c in text)
+
+
+#: The one line every console script prints for a 200 answer that is not a
+#: JSON object (#245), after its own prefix.
+NOT_A_JSON_OBJECT_LINE = "the coordinator's answer is not a JSON object"
+
+
+def redirect_refused_line(exc: RedirectRefused) -> str:
+    """The one line every console script prints for a refused redirect (#245),
+    after its own prefix."""
+    return f"the coordinator redirected the request (HTTP {exc.status}); not followed"
 
 
 def validate_relative_path(p: str) -> str | None:
