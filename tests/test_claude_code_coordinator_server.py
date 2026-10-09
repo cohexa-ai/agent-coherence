@@ -13100,6 +13100,29 @@ def test_status_full_tier_lists_grants_by_state_not_by_tick(
     assert row["grants"] == grants
 
 
+def test_status_full_tier_reports_a_null_heartbeat_for_a_grant_holder_with_none_on_record(
+    coordinator, client: _Client
+) -> None:
+    """A write grant whose holder has no heartbeat on record (a ledger row no
+    request of this process came from) is listed with its grant time, and the
+    row's ``last_heartbeat_unix_ts`` is null, not a zero or a missing key: the
+    sweep counts no heartbeat as stale, which a reader can only see as null."""
+    sid = _sid("187-no-heartbeat")
+    agent_id = session_to_agent_id(sid)
+    granted = int(time.time()) - 60
+    artifact_id = coordinator.registry.resolve_or_register("plan.md", content_hash="")
+    coordinator.registry.set_agent_state(
+        artifact_id, agent_id, MESIState.EXCLUSIVE, trigger="test_setup", tick=granted,
+    )
+    assert coordinator.registry.last_heartbeat_tick(agent_id) is None
+
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {"plan.md": "EXCLUSIVE"}
+    assert row["grants"] == {"plan.md": {"granted_at_unix_ts": granted}}
+    assert "last_heartbeat_unix_ts" in row
+    assert row["last_heartbeat_unix_ts"] is None
+
+
 def test_status_full_tier_owner_generation_moves_on_a_reclaim_only(
     coordinator, client: _Client
 ) -> None:
@@ -13221,3 +13244,56 @@ def test_status_full_tier_reports_the_thresholds_lifecycle_started_the_sweep_wit
     assert {key: body[key] for key in _THRESHOLD_KEYS} == {
         "grant_heartbeat_timeout_sec": 600, "grant_max_hold_sec": 1800,
     }
+
+
+def test_status_full_tier_deadline_is_the_second_the_real_sweep_reclaims_each_grant(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The documented deadline, ``min(last_heartbeat_unix_ts +
+    grant_heartbeat_timeout_sec, granted_at_unix_ts + grant_max_hold_sec)``,
+    computed from one operator-tier body alone, is the second the real stable
+    sweep, run with the body's thresholds, reclaims each grant; one second
+    earlier it reclaims nothing. One holder's deadline is its heartbeat term
+    and the other's its grant-time term, so dropping either term is red."""
+    from ccs.adapters.claude_code.lifecycle import LifecycleConfig, _sweep_stable_grants
+
+    coordinator.grant_heartbeat_timeout_sec = 600
+    coordinator.grant_max_hold_sec = 1800
+    idle, busy = _sid("187-deadline-idle"), _sid("187-deadline-busy")
+    now = int(time.time())
+    # Idle: last heard from when it took the grant, so the heartbeat term ends first.
+    _at_tick(monkeypatch, now - 1_000, lambda: client.post(
+        "/hooks/pre-edit", {"session_id": idle, "path": "plan.md"}))
+    # Busy: still making requests long after its grant began, so the grant-time
+    # term ends first.
+    for tick in (now - 2_000, now - 100):
+        _at_tick(monkeypatch, tick, lambda: client.post(
+            "/hooks/pre-edit", {"session_id": busy, "path": "task.md"}))
+
+    body = _operator_status(client)
+    cfg = LifecycleConfig(
+        grant_heartbeat_timeout_sec=body["grant_heartbeat_timeout_sec"],
+        grant_max_hold_sec=body["grant_max_hold_sec"],
+    )
+
+    def terms(sid: str, path: str) -> tuple[int, int]:
+        row = _row_for(body, sid)
+        return (
+            row["last_heartbeat_unix_ts"] + body["grant_heartbeat_timeout_sec"],
+            row["grants"][path]["granted_at_unix_ts"] + body["grant_max_hold_sec"],
+        )
+
+    idle_heartbeat, idle_grant = terms(idle, "plan.md")
+    busy_heartbeat, busy_grant = terms(busy, "task.md")
+    assert idle_heartbeat < idle_grant and busy_grant < busy_heartbeat
+    assert idle_heartbeat < busy_grant, "the arms below assume the idle grant falls due first"
+
+    for sid, path, due, trigger in (
+        (idle, "plan.md", idle_heartbeat, "reclaim_heartbeat"),
+        (busy, "task.md", busy_grant, "reclaim_max_hold"),
+    ):
+        assert _sweep_stable_grants(coordinator, cfg, due - 1) == 0, f"{path} reclaimed early"
+        assert _sweep_stable_grants(coordinator, cfg, due) == 1, f"{path} not reclaimed when due"
+        row = _row_for(_operator_status(client), sid)
+        assert path not in row["grants"]
+        assert row["reclaimed"][path]["trigger"] == trigger
