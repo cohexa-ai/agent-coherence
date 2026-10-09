@@ -3731,7 +3731,7 @@ inside it.
 
 | Command | What it does |
 |---|---|
-| `agent-coherence-status [--detail LEVEL] [--json] [--show-policy]` | prints `/status` as a table, or with `--json` as the body itself. `LEVEL` picks the view: `full`, the operator view, by default; `minimal`, which names no session; or `metrics`, the counters only |
+| `agent-coherence-status [--detail LEVEL] [--json] [--show-policy]` | prints `/status` as a table, or with `--json` as the body itself. `LEVEL` picks the view: `minimal`, which names no session; `full`, the operator view, asked for with the `Coherence-Local-Operator: true` header; or `metrics`, the counters only. With no `--detail` it asks for the coordinator's default view, which is `minimal`, and sends no operator header. `--show-policy` adds the user-added tracked paths no hook has seen yet; it needs `--detail full`, because only the operator view carries them |
 | `agent-coherence-track path [path ...]` | adds the paths to the coordinator's tracked set (`POST /policy/track`) |
 | `agent-coherence-untrack path [path ...]` | adds the paths to the coordinator's ignored set (`POST /policy/untrack`); a path enforced in strict mode is refused, and then nothing is untracked |
 
