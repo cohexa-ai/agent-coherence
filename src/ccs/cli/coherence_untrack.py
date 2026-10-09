@@ -12,9 +12,12 @@ Exit codes:
 - 0: all paths accepted
 - 1: not in a git repo / all paths rejected by local validation
 - 2: coordinator unreachable / HTTP error / a refused redirect / a TLS
-  failure / an answer that is not a /policy/untrack answer
+  failure / an answer that is not a /policy/untrack answer, a strict
+  refusal that does not name each refused path with its strict patterns
+  among them
 - 3: refused because a path is enforced in strict mode (#261) — the
-  coordinator answered ``reason: untrack_strict_path`` and wrote nothing.
+  coordinator answered ``reason: untrack_strict_path``, named each refused
+  path with its strict patterns, and wrote nothing.
   Untracking a strict path takes a coordinator restart without its entry in
   ``.coherence/strict_mode.yaml``.
 """
@@ -103,9 +106,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     except urllib.error.HTTPError as exc:
         body = http_status_from_error(exc)
-        if body is not None and body.get("reason") == UNTRACK_STRICT_PATH_REASON:
+        refused = _strict_refusal_entries(body)
+        if refused is not None:
             # Classified by the typed reason, never by the error text.
-            _report_strict_refusal(body)
+            _report_strict_refusal(refused)
             return 3
         err(f"agent-coherence-untrack: {http_error_line(exc.code, body)}")
         return 2
@@ -131,18 +135,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _report_strict_refusal(body: dict[str, Any]) -> None:
-    """One line per path the strict refusal names -- the path in the quoted
-    ``repr`` form, its strict patterns escaped (#245) -- then what to do. An
-    entry of the wrong shape is skipped and patterns that are not a list read
-    ``?``: the refusal is the typed reason, whatever its entries hold."""
+def _strict_refusal_entries(body: dict[str, Any] | None) -> list[dict[str, Any]] | None:
+    """The refused entries of a strict refusal: the typed reason with a
+    non-empty ``refused`` list, every entry naming its path and the strict
+    patterns covering it as strings. ``None`` for any other body, which then
+    reads as the HTTP error it is: exit 2, like every answer of the wrong
+    shape, with the coordinator's own error text, which names the paths."""
+    if body is None or body.get("reason") != UNTRACK_STRICT_PATH_REASON:
+        return None
     refused = body.get("refused")
-    for entry in refused if isinstance(refused, list) else []:
-        if not isinstance(entry, dict):
-            continue
-        patterns = entry.get("strict_patterns", [])
-        named = ", ".join(map(escape_nonprintable, patterns)) if isinstance(patterns, list) else "?"
-        err(f"agent-coherence-untrack: refused {entry.get('path')!r}: enforced in strict mode by {named}")
+    if not (isinstance(refused, list) and refused and all(map(_is_refused_entry, refused))):
+        return None
+    return refused
+
+
+def _is_refused_entry(entry: object) -> bool:
+    if not (isinstance(entry, dict) and isinstance(entry.get("path"), str)):
+        return False
+    patterns = entry.get("strict_patterns")
+    return isinstance(patterns, list) and bool(patterns) and all(isinstance(p, str) for p in patterns)
+
+
+def _report_strict_refusal(refused: list[dict[str, Any]]) -> None:
+    """One line per refused path -- in the quoted ``repr`` form, its strict
+    patterns escaped (#245) -- then what to do."""
+    for entry in refused:
+        named = ", ".join(map(escape_nonprintable, entry["strict_patterns"]))
+        err(f"agent-coherence-untrack: refused {entry['path']!r}: enforced in strict mode by {named}")
     err(
         "agent-coherence-untrack: nothing was untracked. A strict path stays "
         "enforced while the coordinator runs; remove its entry from "

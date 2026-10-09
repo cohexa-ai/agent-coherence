@@ -841,7 +841,10 @@ Alpha — APIs may change before `v1.0`.
     coordinator as `unknown`. The hook client still answers `{}`.
   - exit `1` still means not in a git repository (for track and untrack, also
     every path rejected by local validation; for the handoff commands, a
-    usage error), and untrack's `3` is still the strict-mode refusal.
+    usage error), and untrack's `3` is still the strict-mode refusal. A
+    refusal that does not name each refused path with its strict patterns
+    exits `2` instead, as the HTTP error it is, with the coordinator's error
+    text.
 
   The Claude Code plugin's own `agent-coherence-status`, `-track` and
   `-untrack`, which run instead where they come first on the Bash tool's

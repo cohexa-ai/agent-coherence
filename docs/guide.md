@@ -3738,7 +3738,7 @@ inside it.
 | `0` | Done. For `agent-coherence-status` this includes no coordinator running, which it reports on standard error. A path the command rejects itself, next to paths it sends, is reported and does not change the code. |
 | `1` | Not in a git repository; for `track` and `untrack`, also every path rejected by the command's own validation. Nothing is sent. |
 | `2` | `track` or `untrack` could not reach the coordinator; the connection failed TLS verification or configuration; or the coordinator redirected the request (never followed), answered an HTTP error, or answered a body that is not a JSON object or whose fields have the wrong types. `agent-coherence-status` also exits `2` on a [degraded answer](#when-the-registry-is-busy). |
-| `3` | `agent-coherence-status --self-test` failed, or `agent-coherence-untrack` was refused because a path is enforced in strict mode and untracked nothing. |
+| `3` | `agent-coherence-status --self-test` failed, or `agent-coherence-untrack` was refused because a path is enforced in strict mode and untracked nothing. A refusal that does not name each refused path with the strict patterns covering it exits `2` instead, as the HTTP error it is, with the coordinator's error text. |
 
 An exit `2` prints one line on standard error, starting with the command's
 name, never a traceback; the one exception is `agent-coherence-status --json`

@@ -2077,28 +2077,48 @@ def test_untrack_prints_a_strict_refusal_quoted_with_its_patterns_escaped(
     assert _raw_characters_in(captured.err) == []
 
 
-def test_untrack_keeps_its_strict_exit_code_when_the_refusal_entries_are_malformed(
-    stub_coordinator, capsys: pytest.CaptureFixture[str]
+#: Strict refusals whose ``refused`` entries do not each name a path and its
+#: strict patterns as strings.
+_UNREADABLE_STRICT_REFUSALS: dict[str, dict[str, Any]] = {
+    "refused-absent": {},
+    "refused-a-string": {"refused": "data/a.txt"},
+    "refused-empty": {"refused": []},
+    "entry-a-string": {"refused": ["data/a.txt"]},
+    "bare-string-beside-a-good-entry": {
+        "refused": ["data/a.txt", {"path": "data/b.txt", "strict_patterns": ["data/**"]}],
+    },
+    "path-a-number": {"refused": [{"path": 5, "strict_patterns": ["data/**"]}]},
+    "path-absent": {"refused": [{"strict_patterns": ["data/**"]}]},
+    "patterns-a-number": {"refused": [{"path": "data/b.txt", "strict_patterns": 5}]},
+    "patterns-a-string": {"refused": [{"path": "data/b.txt", "strict_patterns": "data/**"}]},
+    "patterns-empty": {"refused": [{"path": "data/b.txt", "strict_patterns": []}]},
+    "patterns-absent": {"refused": [{"path": "data/b.txt"}]},
+    "pattern-an-object": {"refused": [{"path": "data/b.txt", "strict_patterns": [{"p": "data/**"}]}]},
+}
+
+
+@pytest.mark.parametrize("refusal", sorted(_UNREADABLE_STRICT_REFUSALS))
+def test_untrack_reads_a_strict_refusal_of_the_wrong_shape_as_an_http_error(
+    refusal: str, stub_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A strict refusal is classified by its typed reason, so entries of the
-    wrong shape -- a bare string, patterns that are not a list -- still exit
-    3 with the restart advice, printing what can be read and no traceback.
-    Prevents a malformed refusal reaching exit 1, which means local
-    validation."""
+    """A refusal carrying the strict-mode reason whose ``refused`` entries do
+    not each name a path and its strict patterns as strings exits 2 with the
+    one HTTP error line, the coordinator's error text escaped, as every answer
+    of the wrong shape does. Prevents such a refusal reaching exit 1 with a
+    traceback, or exit 3 with advice that names no path while the
+    coordinator's own explanation is dropped."""
     workspace, _ = stub_coordinator
     _StubCoordinator.answers = {"/policy/untrack": (409, {
-        "reason": "untrack_strict_path",
-        "refused": ["data/a.txt", {"path": "data/b.txt", "strict_patterns": 5}],
+        "reason": "untrack_strict_path", "error": f"refusing{_HOSTILE}",
+        **_UNREADABLE_STRICT_REFUSALS[refusal],
     })}
 
     rc = coherence_untrack.main(["--root", str(workspace), "data/a.txt"])
 
     captured = capsys.readouterr()
-    assert rc == 3, captured.err
-    lines = captured.err.splitlines()
-    assert lines[0] == "agent-coherence-untrack: refused 'data/b.txt': enforced in strict mode by ?"
-    assert lines[1].startswith("agent-coherence-untrack: nothing was untracked.")
-    assert len(lines) == 2
+    assert rc == 2, captured.err
+    assert captured.err == f"agent-coherence-untrack: HTTP 409: refusing{_PRINTED}\n"
+    assert captured.out == ""
 
 
 #: The commands the error path covers: each one's route, module and how it is
@@ -2223,6 +2243,9 @@ _ONE_LINE_FAILURES = {
     "error-a-list": ((500, {"error": ["boom"]}), "HTTP 500"),
     "redirect": ((302, {}), "the coordinator redirected the request (HTTP 302); not followed"),
     "ok-body-a-list": ((200, ["x"]), "the coordinator's answer is not a JSON object"),
+    "strict-reason-naming-no-path": (
+        (409, {"reason": "untrack_strict_path", "refused": ["data/a.txt"], "error": "e"}), "HTTP 409: e"
+    ),
 }
 
 
