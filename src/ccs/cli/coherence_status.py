@@ -445,7 +445,10 @@ def _claim_self_test_principal(
         return True, claim.principal
     if claim.outcome == "unsupported":
         return True, None
-    err(f"--self-test: caller principal not obtained ({claim.outcome}: {claim.detail})")
+    err(
+        f"--self-test: caller principal not obtained "
+        f"({claim.outcome}: {escape_nonprintable(claim.detail)})"
+    )
     return False, None
 
 

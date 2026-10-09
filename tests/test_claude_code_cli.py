@@ -34,6 +34,7 @@ from ccs.cli import (
 from ccs.cli._coherence_client import (
     CoordinatorEndpoint,
     CoordinatorUnavailable,
+    PrincipalClaim,
     caller_principal_headers,
     claim_caller_principal,
     get,
@@ -2422,6 +2423,30 @@ def test_no_coordinator_in_a_workspace_whose_path_has_control_characters_prints_
     assert rc == (0 if command == "status" else 2), captured.err
     assert "ws\\x1b[31m\\u202e" in captured.err
     _assert_one_failure_line(command, captured)
+    assert _raw_characters_in(captured.out + captured.err) == []
+
+
+def test_a_self_test_claim_that_did_not_bind_prints_its_detail_escaped(
+    stub_coordinator, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--self-test`` stops at a caller-principal claim that did not bind and
+    prints the claim's detail escaped on one line. The detail can carry this
+    client's own transport message, which names the workspace, so a control
+    character there must not drive or reorder the terminal."""
+    workspace, _ = stub_coordinator
+    monkeypatch.setattr(coherence_status, "coordinator_backend", lambda _root: "python")
+    monkeypatch.setattr(
+        coherence_status,
+        "claim_caller_principal",
+        lambda *_args: PrincipalClaim("unconfirmed", detail=f"transport failed {_HOSTILE}"),
+    )
+
+    rc = coherence_status.main(["--root", str(workspace), "--self-test"])
+
+    captured = capsys.readouterr()
+    assert rc == 3, captured.err
+    assert f"(unconfirmed: transport failed {_PRINTED})" in captured.err
+    assert captured.err.count("\n") == 1, captured.err
     assert _raw_characters_in(captured.out + captured.err) == []
 
 
