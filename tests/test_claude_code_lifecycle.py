@@ -19,6 +19,7 @@ import time
 import uuid
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 import pytest
@@ -924,6 +925,86 @@ def test_the_thresholds_are_withheld_exactly_when_the_service_refuses_them(
     assert (published == (None, None)) is refused
     if not refused:
         assert published == (cfg.grant_heartbeat_timeout_sec, cfg.grant_max_hold_sec)
+
+
+class _OneSweepTick:
+    """The coordinator as :func:`lifecycle._sweep_loop` sees it, shutting down
+    after one tick. The loop reads ``shutting_down`` before its sleep and again
+    after it, then runs a tick; the third read is the first one after it."""
+
+    def __init__(self, coordinator: CoordinatorHTTPServer) -> None:
+        self._coordinator = coordinator
+        self._reads = 0
+
+    @property
+    def shutting_down(self) -> bool:
+        self._reads += 1
+        return self._reads > 2
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._coordinator, name)
+
+
+@pytest.mark.parametrize("value", [0, 1])
+@pytest.mark.parametrize(
+    "field", ["grant_heartbeat_timeout_sec", "grant_max_hold_sec", "transient_timeout_sec"]
+)
+def test_one_sweep_loop_tick_reclaims_a_stale_grant_exactly_when_status_reports_the_thresholds(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    field: str, value: int,
+) -> None:
+    """One tick of the real sweep loop, with one setting at 0 or 1, reclaims
+    a stale write grant exactly when the operator view of /status reports the
+    thresholds the winner path published. At 0 the tick reclaims nothing and
+    both thresholds are null, a transient timeout of 0 included: its pass runs
+    first in the tick and raises before the stable-grant pass. Prevents
+    /status naming thresholds no sweep enforces, or naming none while the
+    sweep reclaims grants, when the loop's passes are reordered or split --
+    which the hand-written order in the test above cannot see."""
+    from ccs.adapters.claude_code import coordinator_server
+    from ccs.cli._coherence_client import get, post, resolve_endpoint
+
+    cfg = replace(
+        replace(fast_cfg, grant_heartbeat_timeout_sec=60, grant_max_hold_sec=999_999_999),
+        **{field: value},
+    )
+    entries: list = []
+    # The winner path publishes the thresholds as it always does; the sweep is
+    # then driven one tick at a time below, not on a background thread.
+    monkeypatch.setattr(
+        lifecycle, "_start_background_threads", lambda entry, _cfg: entries.append(entry),
+    )
+    assert ensure_coordinator(workspace, config=cfg) > 0
+    try:
+        [entry] = entries
+        endpoint = resolve_endpoint(workspace)
+        sid = str(uuid.uuid4())
+        agent_id = str(coordinator_server.session_to_agent_id(sid))
+        # The holder took its grant, and last heartbeated, 1000 seconds ago.
+        with monkeypatch.context() as clock:
+            clock.setattr(coordinator_server, "monotonic_seconds", lambda: int(time.time()) - 1_000)
+            post(endpoint, "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+
+        def operator_view() -> tuple[dict, tuple[object, object]]:
+            body = get(
+                endpoint, "/status?detail=full", extra_headers={"Coherence-Local-Operator": "true"},
+            )
+            [row] = [s for s in body["sessions"] if s["agent_id"] == agent_id]
+            return row, (body["grant_heartbeat_timeout_sec"], body["grant_max_hold_sec"])
+
+        assert operator_view()[0]["states"] == {"plan.md": "EXCLUSIVE"}
+
+        lifecycle._sweep_loop(SimpleNamespace(coordinator=_OneSweepTick(entry.coordinator)), cfg)
+
+        row, reported = operator_view()
+    finally:
+        stop_coordinator(workspace)
+    if value >= 1:
+        assert row["states"] == {} and "plan.md" in row["reclaimed"], row
+        assert reported == (cfg.grant_heartbeat_timeout_sec, cfg.grant_max_hold_sec)
+    else:
+        assert row["states"] == {"plan.md": "EXCLUSIVE"} and row["reclaimed"] == {}, row
+        assert reported == (None, None)
 
 
 def test_a_coordinator_built_without_lifecycle_holds_no_thresholds(
