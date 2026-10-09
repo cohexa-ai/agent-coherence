@@ -31,7 +31,10 @@ principal, the mint is neither.
 Every handler:
 - Verifies ``Authorization: Bearer <secret>`` (constant-time)
 - Verifies ``Host`` header is localhost / 127.0.0.1 (DNS-rebind guard)
-- Records the calling session's heartbeat (KTD-2)
+- Records the calling agent's grant heartbeat only on session-stop and on the
+  hook routes (pre-read, pre-edit, post-edit, post-edit-cas, pre-bash,
+  pre-grep) whose request reaches a tracked path; an untracked fast path,
+  session-start, ``/status`` and every other route record none
 - Runs the coordinator call under a 4s ThreadPoolExecutor timeout
   (handler-side watchdog — keeps us under the 5s hook timeout even when
   SQLite contention exceeds busy_timeout=2000); a caller-principal gate that

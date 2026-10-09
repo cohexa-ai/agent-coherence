@@ -935,8 +935,8 @@ def test_body_not_object_returns_400(client: _Client) -> None:
 # ----------------------------------------------------------------------
 
 
-def test_every_endpoint_records_heartbeat(coordinator, client: _Client) -> None:
-    """KTD-2: every hook POST records the calling session's heartbeat."""
+def test_a_tracked_hook_call_records_the_heartbeat(coordinator, client: _Client) -> None:
+    """A pre-read or pre-edit of a tracked path records the calling session's heartbeat."""
     hb_sid = _sid("hb-session")
     agent_id = session_to_agent_id(hb_sid)
     assert coordinator.registry.last_heartbeat_tick(agent_id) is None

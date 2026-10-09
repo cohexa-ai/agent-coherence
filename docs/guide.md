@@ -535,8 +535,10 @@ holder tell the two apart:
   }
   ```
 
-  `trigger` is `reclaim_heartbeat` (no coordinator call for
-  `grant_heartbeat_timeout_sec`) or `reclaim_max_hold` (held past
+  `trigger` is `reclaim_heartbeat` (no heartbeat recorded for
+  `grant_heartbeat_timeout_sec`; see
+  [which requests record one](#reading-when-the-sweep-will-reclaim-a-grant))
+  or `reclaim_max_hold` (held past
   `grant_max_hold_sec`), and `reclaimed_at_unix_ts` is when the reclaim
   happened, in unix seconds.
 - **The counters.** Every view, the default one and `?detail=metrics`
@@ -659,9 +661,24 @@ min(last_heartbeat_unix_ts + grant_heartbeat_timeout_sec,
 - The reclaim lands at the first sweep pass at or after that time. A pass runs
   every `sweep_interval_sec` (5 s by default), so it usually lands within one
   period, but there is no upper bound while the registry is busy.
-- The heartbeat term moves later as the session keeps making requests, so a
-  deadline holds only as of the read it came from. The grant-time term does
-  not move until the hold ends.
+- The heartbeat term moves later only when the session sends a request that
+  records a heartbeat, so a deadline holds only as of the read it came from.
+  These requests record one: `pre-read`, `pre-edit`, `post-edit` and
+  `post-edit-cas` on a tracked path; `pre-bash` on a command that reads a
+  tracked file; `pre-grep` on a directory holding a tracked file the
+  coordinator already knows; and `session-stop`, as it releases the session's
+  write grants.
+- No other request records one: not a hook request that reaches no tracked
+  path, `session-start`, `/status`, `POST /hooks/effect-fence`, or
+  `POST /session/heartbeat`, which keeps a snapshot session's lease, not a
+  grant. A request answered with `"degraded": true` may record its heartbeat
+  late, or not at all.
+- Each agent has its own heartbeat: a subagent's requests record the
+  subagent's, not its parent session's. So a session that holds a write grant
+  and then works only on untracked files, or only through a subagent, is
+  reclaimed at its last heartbeat plus `grant_heartbeat_timeout_sec` while it
+  is still busy.
+- The grant-time term does not move until the hold ends.
 - A grant in the middle of a state transition is governed by the transient
   timeout (`transient_timeout_sec`) instead, and `/status` does not show
   transient state.
@@ -985,8 +1002,9 @@ A `CoherentVolume` that wrote a file keeps holding it until its own next
 `atomic_publish` or `reacquire()` releases it. Closing the volume or exiting the process does not release it, and
 neither does a `session-stop` that names only `vol.session_id`, because each
 attempt holds its grants under its own `agent_id`. The coordinator
-takes the file back once the holder has made no coordinator calls for
-`grant_heartbeat_timeout_sec` (600 s by default), or has held it for
+takes the file back once the holder has recorded no heartbeat for
+`grant_heartbeat_timeout_sec` (600 s by default; only its reads, writes and
+commits of tracked files record one), or has held it for
 `grant_max_hold_sec` (1800 s by default). The operator view of `/status` then
 lists the file under that holder's `reclaimed` map (see [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status)).
 Both are `LifecycleConfig` fields, passed as `config` to the volume that starts
