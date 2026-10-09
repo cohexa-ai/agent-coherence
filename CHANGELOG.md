@@ -496,6 +496,24 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **`agent-coherence-status` asks for the operator view only when given
+  `--detail full`.** With no `--detail` it used to request
+  `/status?detail=full` with the `Coherence-Local-Operator: true` header, and
+  it sent that header for every tier. The command often runs inside an agent's
+  shell tool, where its output lands in the transcript, and the Claude Code
+  plugin runs it under the same name when it finds no Node CLI of its own, so
+  the plugin's status command printed every session's name (which embeds the
+  raw session id) and the absolute workspace root into the transcript on that
+  path, while the plugin's Node CLI printed the default view. With no
+  `--detail` the command now sends `GET /status` with no opt-in header, as the
+  Node CLI does, and the header goes only with `--detail full`. Operators who
+  want the session names, the absolute root, the policy's pattern lists, the
+  `reclaimed` map, writer attribution or a handoff record's age now pass
+  `--detail full`. `--show-policy` lists the user-added patterns, which only
+  the operator view carries, so below it every pattern read as observed and the
+  list said "none"; it now needs `--detail full` and otherwise exits 2 with a
+  usage error that says so. The process id is still reported at every tier.
+
 - **A Claude Code giver's edit no longer lands (#185).** As the giver's fence
   was first built, its `pre-edit` answer carried the typed `handed_off` reason
   and no deny, so a Claude Code session that had handed a path off could still

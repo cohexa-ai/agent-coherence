@@ -252,10 +252,12 @@ it is a one-way hash of the `session_id` the same tool already returns, and
 the id a `handoff` key names that session by, so it discloses nothing new. The
 MCP tools that carry a `handoff` key (`swg_read`, `swg_status`,
 `swg_write_cas`) relay the coordinator's, so they too carry session-level agent
-ids only. The `agent-coherence-status` command is an operator tool and asks
-for the operator view by default, so its output does carry session names: run
-it with `--detail minimal` before pasting the output into a bug report, and
-point dashboards at `--detail metrics`. All of this is disclosure hygiene
+ids only. The `agent-coherence-status` command asks for the default view
+unless it is run with `--detail full`, because it often runs inside an agent's
+shell tool, where its output lands in the transcript; with `--detail full` its
+output carries session names and the absolute workspace root, so leave the flag
+off before pasting the output into a bug report, and point dashboards at
+`--detail metrics`. All of this is disclosure hygiene
 rather than a boundary: under the model above, knowing a session id grants
 nothing the secret does not already grant.
 
