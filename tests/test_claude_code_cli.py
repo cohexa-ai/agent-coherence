@@ -1435,6 +1435,79 @@ def test_status_text_marks_a_handoff_that_has_ended_although_its_label_still_rea
 
 
 # ----------------------------------------------------------------------
+# coherence_status — the registry schema version in the header (#294)
+# ----------------------------------------------------------------------
+
+
+def test_status_text_header_shows_the_registry_schema_version_after_the_version(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A coordinator that sends ``registry_schema_version`` gets it in the
+    table's header line as ``schema=N`` right after ``version=``, and nothing
+    else in the table changes. Prevents an operator having to switch to
+    ``--json`` to see whether an older release can still open the store."""
+    monkeypatch.setenv("COLUMNS", "80")
+
+    coherence_status._render_table({**_status_payload(), "registry_schema_version": 10})
+
+    expected = _STATUS_TEXT_WITHOUT_HANDOFF.replace(
+        "version=9.9.9\n", "version=9.9.9 schema=10\n", 1
+    )
+    assert capsys.readouterr().out == expected
+
+
+def test_status_metrics_line_shows_the_registry_schema_version_after_the_version(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--detail metrics`` prints the schema number in its summary line too,
+    after the version. Prevents a scraper reading the metrics text from
+    missing the store format the JSON already carries."""
+    coherence_status._render_metrics({**_status_payload(), "registry_schema_version": 10})
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "Coordinator metrics: backend=python version=9.9.9 schema=10"
+
+
+@pytest.mark.parametrize("schema_field", [{}, {"registry_schema_version": None}], ids=["absent", "null"])
+def test_status_header_and_metrics_line_are_unchanged_without_a_schema_version(
+    schema_field: dict, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An older coordinator, or the Node one, sends no
+    ``registry_schema_version``: the table and the metrics line are byte for
+    byte what they were, with no ``schema=`` placeholder. Prevents a guessed or
+    empty schema number standing in for one the coordinator never sent."""
+    monkeypatch.setenv("COLUMNS", "80")
+    payload = {**_status_payload(), **schema_field}
+
+    coherence_status._render_table(payload)
+    assert capsys.readouterr().out == _STATUS_TEXT_WITHOUT_HANDOFF
+
+    coherence_status._render_metrics(payload)
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "Coordinator metrics: backend=python version=9.9.9"
+
+
+def test_status_header_shows_the_schema_version_a_live_coordinator_sends(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Against a real coordinator, the table header and the metrics line end
+    with the ``registry_schema_version`` the coordinator's own ``--json``
+    answer carries. Prevents the command reading a key the coordinator does
+    not send, which the stub-payload tests cannot see."""
+    workspace, _ = live_coordinator
+    assert coherence_status.main(["--root", str(workspace), "--detail", "metrics", "--json"]) == 0
+    schema = json.loads(capsys.readouterr().out)["registry_schema_version"]
+    assert type(schema) is int
+
+    assert coherence_status.main(["--root", str(workspace)]) == 0
+    [header] = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("Coordinator: ")]
+    assert header.endswith(f" schema={schema}")
+
+    assert coherence_status.main(["--root", str(workspace), "--detail", "metrics"]) == 0
+    assert capsys.readouterr().out.splitlines()[0].endswith(f" schema={schema}")
+
+
+# ----------------------------------------------------------------------
 # coherence_handoff — the four handoff verbs (#185)
 # ----------------------------------------------------------------------
 
@@ -2014,6 +2087,7 @@ def _hostile_status_body() -> dict:
         "coordinator_uptime_seconds": 12.0,
         "coordinator_backend": f"backend{_HOSTILE}",
         "coordinator_version": f"version{_HOSTILE}",
+        "registry_schema_version": f"schema{_HOSTILE}",
         "policy_summary": {
             "default_pattern_count": f"dflt{_HOSTILE}", "user_added_pattern_count": f"user{_HOSTILE}",
             "ignored_pattern_count": f"ign{_HOSTILE}",
@@ -2057,7 +2131,10 @@ def test_status_prints_every_coordinator_string_with_its_control_characters_esca
     captured = capsys.readouterr()
     assert rc == 0, captured.err
     lines = captured.out.splitlines()
-    assert f"Coordinator: pid=pid{_PRINTED} uptime=12s backend=backend{_PRINTED} version=version{_PRINTED}" in lines
+    assert (
+        f"Coordinator: pid=pid{_PRINTED} uptime=12s backend=backend{_PRINTED} version=version{_PRINTED} "
+        f"schema=schema{_PRINTED}"
+    ) in lines
     assert (
         f"Policy: dflt{_PRINTED} default pattern(s), user{_PRINTED} user-added, ign{_PRINTED} ignored"
     ) in lines
@@ -2081,8 +2158,9 @@ def test_status_prints_every_coordinator_string_with_its_control_characters_esca
 def test_status_metrics_prints_the_coordinators_backend_and_version_escaped(
     stub_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``--detail metrics`` prints the coordinator's backend and version in its
-    header line, and its counters, with their control characters escaped.
+    """``--detail metrics`` prints the coordinator's backend, version and schema
+    version in its header line, and its counters, with their control
+    characters escaped.
     Prevents a coordinator answer driving a scraper's terminal through the
     metrics header."""
     workspace, _ = stub_coordinator
@@ -2093,7 +2171,9 @@ def test_status_metrics_prints_the_coordinators_backend_and_version_escaped(
     captured = capsys.readouterr()
     assert rc == 0, captured.err
     lines = captured.out.splitlines()
-    assert lines[0] == f"Coordinator metrics: backend=backend{_PRINTED} version=version{_PRINTED}"
+    assert lines[0] == (
+        f"Coordinator metrics: backend=backend{_PRINTED} version=version{_PRINTED} schema=schema{_PRINTED}"
+    )
     assert any(ln.startswith("  pre_read_total") and ln.endswith(f"count{_PRINTED}") for ln in lines)
     assert _raw_characters_in(captured.out + captured.err) == []
 

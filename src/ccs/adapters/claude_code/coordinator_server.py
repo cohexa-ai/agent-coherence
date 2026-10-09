@@ -93,7 +93,7 @@ from ccs.coordinator.service import (
     CoordinatorService,
     mint_nonce_problem,
 )
-from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+from ccs.coordinator.sqlite_registry import SCHEMA_USER_VERSION, SqliteArtifactRegistry
 from ccs.core.clock import monotonic_seconds
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_ABSENT_REASON,
@@ -6745,13 +6745,22 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
 
       Fields PRESENT in the metrics tier are stable within a major
       version. ``coordinator_uptime_seconds``, ``coordinator_backend``,
-      ``coordinator_version``, ``watchdog_timeouts_total``,
+      ``coordinator_version``, ``registry_schema_version`` (#294),
+      ``watchdog_timeouts_total``,
       ``watchdog_queue_overflows_total``,
       ``handler_concurrency_overflows_total``,
       ``in_flight_drain_timed_out``, ``cold_start_duration_ms``,
       ``endpoint_counters``, ``intra_task_acquire_release_total``,
       ``stale_warning_emitted_total``, ``stale_warning_reread_total``,
       ``sweep_reclaims_total``, ``sweep_reclaims_by_trigger`` (#195).
+
+      ``registry_schema_version`` is an int, the registry's
+      ``SCHEMA_USER_VERSION``: the store format this coordinator writes. Its
+      VALUE moves with each schema step, which is the point of the field --
+      an older release refuses a store at a newer version -- while the KEY
+      is stable like the rest. It numbers the Python registry's own steps and
+      means something only beside ``coordinator_backend: "python"``; the Node
+      coordinator's ``schema_version`` counts a different ledger.
 
       Fields may be ADDED in minor versions (additive change is
       non-breaking for dashboards using selective key access).
@@ -7005,6 +7014,13 @@ def _status_counters(coordinator: CoordinatorHTTPServer) -> dict[str, Any]:
         "coordinator_uptime_s": _uptime,  # AC-02: deprecated alias, removed in v0.2
         "coordinator_backend": "python",
         "coordinator_version": _COORDINATOR_VERSION,
+        # #294: the store format this coordinator writes. Its registry is
+        # always the SQLite one, and opening a store either migrates it to this
+        # version or refuses it, so the constant names the served store without
+        # a registry read -- the metrics tier and the degraded answer make none.
+        # Never the bare ``schema_version``: the Node coordinator sends that
+        # from its own migration ledger, whose numbers mean different schemas.
+        "registry_schema_version": SCHEMA_USER_VERSION,
         **coordinator.counters_snapshot(),
     }
 

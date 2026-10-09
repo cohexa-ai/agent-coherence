@@ -105,6 +105,7 @@
       "in_flight_drain_timed_out": false,
       "intra_task_acquire_release_total": 0,
       "policy_summary": "<IGNORED>",
+      "registry_schema_version": 10,
       "sessions": [
         {
           "agent_id": "09f031b6-cb23-50a2-b7a8-b405ed3810f4",

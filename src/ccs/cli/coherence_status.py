@@ -541,6 +541,7 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
     pid = payload.get("coordinator_pid", 0)
     backend = payload.get("coordinator_backend", "python")
     version = payload.get("coordinator_version", "")
+    schema = payload.get("registry_schema_version")
 
     header_bits: list[str] = []
     if pid:
@@ -549,6 +550,10 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
     header_bits.append(f"backend={escape_nonprintable(backend)}")
     if version:
         header_bits.append(f"version={escape_nonprintable(version)}")
+    # An older or Node coordinator sends no schema number; print nothing
+    # rather than a placeholder an operator could mistake for one.
+    if schema is not None:
+        header_bits.append(f"schema={escape_nonprintable(schema)}")
     print("Coordinator: " + " ".join(header_bits))
     print()
 
@@ -769,7 +774,9 @@ def _render_metrics(payload: dict[str, Any]) -> None:
     consistent counter format without parsing JSON."""
     backend = escape_nonprintable(payload.get("coordinator_backend", "python"))
     version = escape_nonprintable(payload.get("coordinator_version", ""))
-    print(f"Coordinator metrics: backend={backend} version={version}")
+    schema = payload.get("registry_schema_version")
+    schema_bit = "" if schema is None else f" schema={escape_nonprintable(schema)}"
+    print(f"Coordinator metrics: backend={backend} version={version}{schema_bit}")
     _render_counter_block(payload)
 
 

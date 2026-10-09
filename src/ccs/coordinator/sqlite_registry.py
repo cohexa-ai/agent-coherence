@@ -256,6 +256,12 @@ conversion (the re-stamp trap, sixth arming): ``_migrate_v8_to_v9`` stamped the
 constant while it was the final step and now stamps its own literal 9.
 FORWARD-ONLY: once a store opens at v10, an earlier build refuses it.
 
+**On the wire.** The Claude Code coordinator's ``/status`` reports this number
+as ``registry_schema_version``, and the protocol corpus pins the literal in its
+five Python ``/status`` rows (``warn_mode/08``, ``warn_mode/27``,
+``handoff/33``, ``handoff/34``, ``harness_identity/03``), so a bump must
+update those fixtures too.
+
 **CROSS-RUNTIME LEDGER DIVERGENCE (security).** The sibling Node coordinator
 (agent-coherence-plugin) shares the SAME ``state.db`` path but keeps its OWN
 ledger: its v3 is ``ALTER TABLE agent_states ADD COLUMN deadline_tick`` — a

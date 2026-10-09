@@ -8,6 +8,7 @@ a pure function over synthetic ``/status`` docs, plus one live ``on`` check.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -86,6 +87,59 @@ def test_build_status_never_reports_an_unreported_principal_counter_as_zero(doc)
     assert status["caller_principal_absent_total"] is None
     assert status["caller_principal_refused_total"] is None
     assert status["principal_claim"] == "unconfirmed"
+
+
+@pytest.mark.parametrize("count", [1, 0], ids=["on", "off"])
+def test_build_status_forwards_the_registry_schema_version(count: int) -> None:
+    """``registry_schema_version`` is forwarded from the coordinator's
+    ``/status`` document verbatim, as the principal counters are, whether
+    strict enforcement is on or off: it describes the store, not the policy.
+    Prevents an agent having to reach the coordinator itself to learn whether
+    an older release could still open the workspace's store."""
+    config = SessionConfig(root=Path("/x"), managed=("data/**",))
+    doc = {**_doc(count), "registry_schema_version": 10}
+
+    status = build_status(_StubVolume(True, doc=doc), config)
+
+    assert status["registry_schema_version"] == 10
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [
+        None,
+        _doc(1),
+        {**_doc(1), "registry_schema_version": None},
+        {**_doc(1), "registry_schema_version": "10"},
+        {**_doc(1), "registry_schema_version": True},
+    ],
+    ids=["unreachable", "older-or-node-coordinator", "null", "not-an-integer", "bool"],
+)
+def test_build_status_never_invents_a_registry_schema_version(doc) -> None:
+    """Cannot-tell stays ``None`` (the SC5 rule): an unreachable coordinator,
+    one that sends no ``registry_schema_version`` (an older release, or the
+    Node coordinator, whose ``schema_version`` counts a different ledger), and
+    a value that is not an integer each read ``None``. Prevents an agent
+    comparing a made-up or foreign number against a release's schema."""
+    config = SessionConfig(root=Path("/x"), managed=("data/**",))
+    if doc is not None:
+        doc = {**doc, "schema_version": 5}
+
+    status = build_status(_StubVolume(True, doc=doc), config)
+
+    assert status["registry_schema_version"] is None
+
+
+def test_status_text_does_not_carry_the_registry_schema_version() -> None:
+    """Pin: the schema version is structured content only; the text result is
+    the coordinator state, as before."""
+    config = SessionConfig(root=Path("/x"), managed=("data/**",))
+    doc = {**_doc(1), "tracked_artifacts": [], "registry_schema_version": 10}
+
+    result = _do_status(_StubVolume(True, doc=doc), config)
+
+    assert result.structuredContent["registry_schema_version"] == 10
+    assert _texts(result) == ["coordinator=on"]
 
 
 def test_state_on_when_reachable_with_strict_patterns() -> None:
@@ -270,5 +324,28 @@ def test_build_status_live_reports_on(tmp_path: Path, fast_cfg: LifecycleConfig)
         assert status["principal_claim"] == "bound"
         assert status["caller_principal_absent_total"] == 0
         assert status["caller_principal_refused_total"] == 0
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_build_status_live_forwards_the_stores_schema_version(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """Against a real coordinator, ``registry_schema_version`` is the schema
+    version stamped in the workspace's own store, read from the file here
+    rather than from the code under test. Prevents the forward reading a key
+    the coordinator does not send, which the stub documents cannot see."""
+    (tmp_path / "data").mkdir()
+    config = SessionConfig(root=tmp_path.resolve(), managed=("data/**",))
+    from ccs.adapters.coherent_volume import CoherentVolume
+
+    volume = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+    try:
+        status = build_status(volume, config)
+        store = sqlite3.connect(f"{(tmp_path / '.coherence' / 'state.db').as_uri()}?mode=ro", uri=True)
+        try:
+            on_disk = store.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            store.close()
+        assert type(status["registry_schema_version"]) is int
+        assert status["registry_schema_version"] == on_disk
     finally:
         stop_coordinator(tmp_path)
