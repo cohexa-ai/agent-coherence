@@ -235,6 +235,15 @@ class CoordinatorUnavailable(Exception):
     """
 
 
+class CoordinatorMalformedAnswer(CoordinatorUnavailable):
+    """A coordinator answered 2xx with a body that does not decode as JSON.
+
+    A :class:`CoordinatorUnavailable`, so every caller that catches that keeps
+    its behaviour; one that reads "unavailable" as "no coordinator running"
+    (``agent-coherence-status``'s exit 0) catches this first (#245).
+    """
+
+
 def _read_ca_bundle(ca_file: str) -> str:
     """Read a private-CA PEM bundle with the same discipline as ``_read_secret``.
 
@@ -1192,8 +1201,11 @@ def _execute(req: urllib.request.Request) -> dict[str, Any]:
         return {}
     try:
         return json.loads(raw.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise CoordinatorUnavailable(
+    except (ValueError, RecursionError) as exc:
+        # ValueError: a JSONDecodeError, a UnicodeDecodeError, or an integer
+        # past the interpreter's digit limit; RecursionError: a body nested
+        # past the recursion limit.
+        raise CoordinatorMalformedAnswer(
             f"coordinator returned non-JSON response: {exc}"
         ) from exc
 

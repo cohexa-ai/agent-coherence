@@ -17,6 +17,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import os
 import urllib.error
 from pathlib import Path
 from typing import Any, Sequence
@@ -121,16 +122,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _report_answer(payload: dict[str, Any], root: Path) -> None:
     """Print the coordinator's ``added`` and ``rejected`` paths, its text
     escaped (#245): a rejected path in the quoted ``repr`` form the command's
-    own rejections use."""
-    for p in payload.get("added", []):
+    own rejections use. Raises TypeError, before printing anything, unless
+    ``added`` is a list of strings and ``rejected`` a list of objects."""
+    added, rejected = payload.get("added", []), payload.get("rejected", [])
+    # Checked up front: a string iterates as its characters and an object as
+    # its keys, each of which would print as a tracked path.
+    if not (isinstance(added, list) and all(isinstance(p, str) for p in added)):
+        raise TypeError("added is not a list of paths")
+    if not (isinstance(rejected, list) and all(isinstance(e, dict) for e in rejected)):
+        raise TypeError("rejected is not a list of objects")
+    for p in added:
         # Success → stdout (machine-parseable by callers). Warn-on-stderr
         # if the path doesn't exist on disk yet (operationally fine, but
-        # worth surfacing as diagnostic info).
-        on_disk = (root / p).exists()
+        # worth surfacing as diagnostic info). os.path.exists, not
+        # Path.exists: a coordinator path too long to look up raises OSError
+        # there, and the lookup only picks the warning.
+        on_disk = os.path.exists(root / p)
         print(f"agent-coherence-track: tracked {escape_nonprintable(p)}", flush=True)
         if not on_disk:
             err(f"agent-coherence-track: warning: {escape_nonprintable(p)} does not exist on disk yet")
-    for entry in payload.get("rejected", []):
+    for entry in rejected:
         err(
             f"agent-coherence-track: rejected {entry.get('path', '')!r}: "
             f"{escape_nonprintable(entry.get('reason', ''))}"

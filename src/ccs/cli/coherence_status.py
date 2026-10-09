@@ -41,6 +41,7 @@ from ccs.cli._coherence_client import (
     NODE_BACKEND,
     NOT_A_JSON_OBJECT_LINE,
     CoordinatorEndpoint,
+    CoordinatorMalformedAnswer,
     CoordinatorUnavailable,
     caller_principal_headers,
     claim_caller_principal,
@@ -157,6 +158,11 @@ def _fetch_status(root: Path, detail: str) -> dict[str, Any] | int:
             f"/status?detail={detail}",
             extra_headers={"Coherence-Local-Operator": "true"},
         )
+    except CoordinatorMalformedAnswer:
+        # Ahead of its base class: a coordinator answered, so this is not
+        # the "no coordinator running" exit 0.
+        err(f"agent-coherence-status: {NOT_A_JSON_OBJECT_LINE}")
+        return 2
     except CoordinatorUnavailable as exc:
         err(f"agent-coherence-status: {exc}")
         return 0  # graceful — no coordinator is a normal state
@@ -209,13 +215,14 @@ def _print_lists_unavailable(payload: dict[str, Any], *, json_mode: bool) -> int
 
 def _print_status(payload: dict[str, Any], args: argparse.Namespace) -> int:
     """Print ``payload`` as ``--json``, the metrics block or the table: 0, or
-    2 when a field has the wrong type (#245). Rendered into a buffer first,
-    so a body that fails part-way prints one line, not half a table."""
+    2 when a field has the wrong type or a number out of range (#245).
+    Rendered into a buffer first, so a body that fails part-way prints one
+    line, not half a table."""
     rendered = io.StringIO()
     try:
         with contextlib.redirect_stdout(rendered):
             _render_payload(payload, args)
-    except (TypeError, ValueError, AttributeError, KeyError):
+    except (TypeError, ValueError, AttributeError, KeyError, OverflowError):
         err(_SHAPE_LINE)
         return 2
     print(rendered.getvalue(), end="", flush=True)

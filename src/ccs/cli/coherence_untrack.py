@@ -116,9 +116,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         err(f"agent-coherence-untrack: {NOT_A_JSON_OBJECT_LINE}")
         return 2
 
-    try:
-        removed = list(payload.get("removed", []))
-    except TypeError:
+    removed = payload.get("removed", [])
+    # A list of paths, checked before anything prints: a string iterates as
+    # its characters and an object as its keys.
+    if not (isinstance(removed, list) and all(isinstance(p, str) for p in removed)):
         err("agent-coherence-untrack: unexpected /policy/untrack answer shape")
         return 2
     for p in removed:
