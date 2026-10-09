@@ -730,12 +730,15 @@ This is the Python coordinator's behavior.
 **`/status`.** The default and operator views read the registry before they
 answer. If another request holds the registry lock, they wait for it for about
 2 seconds at most: the wait ends at the 4-second handler budget, or earlier, so
-that a lock won late still leaves time to read and answer within the 6-second
-timeout the shipped clients use. If the lock is still held then, the answer is
-`200` with every key that view normally carries (the counters and
-`policy_summary`, and in the operator view the pattern lists and the sweep
-thresholds), plus `"degraded": true`, and with both registry lists set to
-`null` (other keys omitted here):
+that a lock won late still leaves time to read and answer within 6 seconds,
+the timeout this package's clients use: the `agent-coherence-status` console
+script, `CoherentVolume` and the MCP server's `swg_status`. A client that waits
+less can give up before the answer arrives when the lock is won at the end of
+that wait. If the lock is still held then, the answer is `200` with every key
+that view normally carries (the counters and `policy_summary`, and in the
+operator view the pattern lists and the sweep thresholds), plus
+`"degraded": true`, and with both registry lists set to `null` (other keys
+omitted here):
 
 ```json
 {"detail": "minimal", "tracked_artifacts": null, "sessions": null, "degraded": true}

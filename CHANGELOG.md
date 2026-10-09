@@ -773,11 +773,14 @@ Alpha — APIs may change before `v1.0`.
   attaching in that window could not read the operator view and failed closed
   with its globs unconfirmed. Now:
   - `/status`, in the default and operator views, waits for the registry lock
-    until the 4-second handler budget runs out or until only 4 seconds of the
-    shipped clients' 6-second timeout are left, whichever comes first: about
-    2 seconds. Past that it answers `200` with every key that view normally
-    carries, `policy_summary` and, in the operator view, the sweep thresholds
-    included, with `tracked_artifacts` and `sessions` set to `null` and
+    until the 4-second handler budget runs out or until only 4 seconds are
+    left of the 6-second timeout this package's clients use
+    (`agent-coherence-status`, `CoherentVolume`, MCP `swg_status`),
+    whichever comes first: about 2 seconds. A client that waits less can give
+    up on a lock won at the end of that wait before its answer arrives. Past
+    that it answers `200` with every key that view normally carries,
+    `policy_summary` and, in the operator view, the sweep thresholds included,
+    with `tracked_artifacts` and `sessions` set to `null` and
     `"degraded": true` added. `degraded` never appears in a normal answer.
     The timeout is counted in `watchdog_timeouts_total`, which the same answer
     reports, and logged at WARNING; nothing is left running behind it. Any
