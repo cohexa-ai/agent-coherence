@@ -31,7 +31,10 @@ principal, the mint is neither.
 Every handler:
 - Verifies ``Authorization: Bearer <secret>`` (constant-time)
 - Verifies ``Host`` header is localhost / 127.0.0.1 (DNS-rebind guard)
-- Records the calling session's heartbeat (KTD-2)
+- Records the calling agent's grant heartbeat only on session-stop and on the
+  hook routes (pre-read, pre-edit, post-edit, post-edit-cas, pre-bash,
+  pre-grep) whose request reaches a tracked path; an untracked fast path,
+  session-start, ``/status`` and every other route record none
 - Runs the coordinator call under a 4s ThreadPoolExecutor timeout
   (handler-side watchdog — keeps us under the 5s hook timeout even when
   SQLite contention exceeds busy_timeout=2000); a caller-principal gate that
@@ -186,11 +189,12 @@ class _RequestProtocol(Protocol):
 HANDLER_TIMEOUT_SEC = 4.0
 
 _STATUS_CLIENT_TIMEOUT_SEC = 6.0
-"""How long every shipped ``/status`` client waits for the answer: the status
-command, the volume's attach checks and MCP ``swg_status`` all read it through
-``ccs.cli._coherence_client``, whose ``CLI_HTTP_TIMEOUT_SEC`` this duplicates
-(that module imports this one, so the value cannot be imported back; a test
-pins the two equal)."""
+"""How long this package's ``/status`` clients wait for the answer: the
+``agent-coherence-status`` console script, the volume's attach checks and MCP
+``swg_status`` all read it through ``ccs.cli._coherence_client``, whose
+``CLI_HTTP_TIMEOUT_SEC`` this duplicates (that module imports this one, so the
+value cannot be imported back; a test pins the two equal). A client that waits
+less can give up on a lock won at the wait cap before its answer arrives."""
 
 _STATUS_READ_RESERVE_SEC = 4.0
 """#238: how much of :data:`_STATUS_CLIENT_TIMEOUT_SEC` ``/status``
@@ -6724,8 +6728,8 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     #238 — a bounded wait for the registry: the minimal and full tiers wait
     for the registry lock on the request thread, through the registry's own
     ``abort_guard(deadline=...)``, until the request's watchdog deadline
-    (``HANDLER_TIMEOUT_SEC``) or until only ``_STATUS_READ_RESERVE_SEC`` of the
-    shipped clients' timeout remains, whichever comes first. A lock
+    (``HANDLER_TIMEOUT_SEC``) or until only ``_STATUS_READ_RESERVE_SEC`` of
+    :data:`_STATUS_CLIENT_TIMEOUT_SEC` remains, whichever comes first. A lock
     won in time is read in one hold as before. Past that deadline the tier
     answers 200 with the keys it normally carries -- ``policy_summary`` with
     its pattern lists at the full tier, the counters, the thresholds at the
@@ -7008,7 +7012,7 @@ def _status_counters(coordinator: CoordinatorHTTPServer) -> dict[str, Any]:
 def _status_wait_deadline(req: _RequestProtocol) -> float:
     """#238: when ``/status`` stops waiting for the registry lock --
     the request's watchdog deadline, or the moment only
-    ``_STATUS_READ_RESERVE_SEC`` remains of the shipped clients' timeout,
+    ``_STATUS_READ_RESERVE_SEC`` remains of :data:`_STATUS_CLIENT_TIMEOUT_SEC`,
     whichever comes first, so a lock won at the cap still leaves the read time
     to answer before the client gives up. Nothing earlier in the request
     starts the deadline, so both are measured from now."""

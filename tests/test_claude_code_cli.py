@@ -34,6 +34,7 @@ from ccs.cli import (
 from ccs.cli._coherence_client import (
     CoordinatorEndpoint,
     CoordinatorUnavailable,
+    PrincipalClaim,
     caller_principal_headers,
     claim_caller_principal,
     get,
@@ -41,6 +42,7 @@ from ccs.cli._coherence_client import (
     post_with_stored_principal,
     resolve_endpoint,
 )
+from ccs.core.exceptions import TlsConfigError, TlsVerificationFailed
 
 
 @pytest.fixture
@@ -2077,28 +2079,48 @@ def test_untrack_prints_a_strict_refusal_quoted_with_its_patterns_escaped(
     assert _raw_characters_in(captured.err) == []
 
 
-def test_untrack_keeps_its_strict_exit_code_when_the_refusal_entries_are_malformed(
-    stub_coordinator, capsys: pytest.CaptureFixture[str]
+#: Strict refusals whose ``refused`` entries do not each name a path and its
+#: strict patterns as strings.
+_UNREADABLE_STRICT_REFUSALS: dict[str, dict[str, Any]] = {
+    "refused-absent": {},
+    "refused-a-string": {"refused": "data/a.txt"},
+    "refused-empty": {"refused": []},
+    "entry-a-string": {"refused": ["data/a.txt"]},
+    "bare-string-beside-a-good-entry": {
+        "refused": ["data/a.txt", {"path": "data/b.txt", "strict_patterns": ["data/**"]}],
+    },
+    "path-a-number": {"refused": [{"path": 5, "strict_patterns": ["data/**"]}]},
+    "path-absent": {"refused": [{"strict_patterns": ["data/**"]}]},
+    "patterns-a-number": {"refused": [{"path": "data/b.txt", "strict_patterns": 5}]},
+    "patterns-a-string": {"refused": [{"path": "data/b.txt", "strict_patterns": "data/**"}]},
+    "patterns-empty": {"refused": [{"path": "data/b.txt", "strict_patterns": []}]},
+    "patterns-absent": {"refused": [{"path": "data/b.txt"}]},
+    "pattern-an-object": {"refused": [{"path": "data/b.txt", "strict_patterns": [{"p": "data/**"}]}]},
+}
+
+
+@pytest.mark.parametrize("refusal", sorted(_UNREADABLE_STRICT_REFUSALS))
+def test_untrack_reads_a_strict_refusal_of_the_wrong_shape_as_an_http_error(
+    refusal: str, stub_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A strict refusal is classified by its typed reason, so entries of the
-    wrong shape -- a bare string, patterns that are not a list -- still exit
-    3 with the restart advice, printing what can be read and no traceback.
-    Prevents a malformed refusal reaching exit 1, which means local
-    validation."""
+    """A refusal carrying the strict-mode reason whose ``refused`` entries do
+    not each name a path and its strict patterns as strings exits 2 with the
+    one HTTP error line, the coordinator's error text escaped, as every answer
+    of the wrong shape does. Prevents such a refusal reaching exit 1 with a
+    traceback, or exit 3 with advice that names no path while the
+    coordinator's own explanation is dropped."""
     workspace, _ = stub_coordinator
     _StubCoordinator.answers = {"/policy/untrack": (409, {
-        "reason": "untrack_strict_path",
-        "refused": ["data/a.txt", {"path": "data/b.txt", "strict_patterns": 5}],
+        "reason": "untrack_strict_path", "error": f"refusing{_HOSTILE}",
+        **_UNREADABLE_STRICT_REFUSALS[refusal],
     })}
 
     rc = coherence_untrack.main(["--root", str(workspace), "data/a.txt"])
 
     captured = capsys.readouterr()
-    assert rc == 3, captured.err
-    lines = captured.err.splitlines()
-    assert lines[0] == "agent-coherence-untrack: refused 'data/b.txt': enforced in strict mode by ?"
-    assert lines[1].startswith("agent-coherence-untrack: nothing was untracked.")
-    assert len(lines) == 2
+    assert rc == 2, captured.err
+    assert captured.err == f"agent-coherence-untrack: HTTP 409: refusing{_PRINTED}\n"
+    assert captured.out == ""
 
 
 #: The commands the error path covers: each one's route, module and how it is
@@ -2223,6 +2245,9 @@ _ONE_LINE_FAILURES = {
     "error-a-list": ((500, {"error": ["boom"]}), "HTTP 500"),
     "redirect": ((302, {}), "the coordinator redirected the request (HTTP 302); not followed"),
     "ok-body-a-list": ((200, ["x"]), "the coordinator's answer is not a JSON object"),
+    "strict-reason-naming-no-path": (
+        (409, {"reason": "untrack_strict_path", "refused": ["data/a.txt"], "error": "e"}), "HTTP 409: e"
+    ),
 }
 
 
@@ -2264,10 +2289,11 @@ def test_a_coordinator_failure_exits_2_with_one_line(
     _assert_one_failure_line(command, captured)
 
 
-#: 200 bodies the client cannot decode: not JSON at all, an integer past the
-#: interpreter's 4300-digit conversion limit, and arrays nested past the
-#: recursion limit.
+#: 200 bodies the client cannot decode: no body at all, not JSON at all, an
+#: integer past the interpreter's 4300-digit conversion limit, and arrays
+#: nested past the recursion limit.
 _UNDECODABLE_BODIES = {
+    "empty": b"",
     "not-json": b"<html>not json</html>",
     "integer-of-5000-digits": b'{"n": ' + b"1" * 5000 + b"}",
     "nested-past-the-recursion-limit": b"[" * 100_000,
@@ -2297,6 +2323,27 @@ def test_a_200_answer_that_does_not_decode_exits_2_with_one_line(
         assert captured.err == "agent-coherence-status: the coordinator's answer is not a JSON object\n"
 
 
+@pytest.mark.parametrize("command", sorted(set(_ERROR_PATH_COMMANDS) - {"status"}))
+def test_an_empty_200_answer_exits_2_saying_the_answer_was_empty(
+    command: str, stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A 200 answer with no body makes track, untrack and the handoff verb
+    exit 2 with one line saying the answer was empty. Prevents an empty
+    answer reading as an empty object: track and untrack printing nothing and
+    exiting 0 as though the request had been carried out, or a handoff verb
+    reporting a refusal the coordinator never sent."""
+    workspace, _ = stub_coordinator
+    route, _module, run = _ERROR_PATH_COMMANDS[command]
+    _StubCoordinator.answers = {route: (200, b"")}
+
+    rc = run(workspace)
+
+    captured = capsys.readouterr()
+    assert rc == 2, captured.err
+    assert captured.err == f"agent-coherence-{command}: coordinator returned an empty response\n"
+    _assert_one_failure_line(command, captured)
+
+
 @pytest.mark.parametrize("command", sorted(_ERROR_PATH_COMMANDS))
 def test_a_tls_failure_exits_2_with_one_line(
     command: str, stub_coordinator, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -2320,6 +2367,130 @@ def test_a_tls_failure_exits_2_with_one_line(
     assert captured.err.startswith(f"agent-coherence-{command}: CCS_REMOTE_CA_FILE ")
     _assert_one_failure_line(command, captured)
     assert _StubCoordinator.seen == []
+
+
+#: TLS failures whose text carries :data:`_HOSTILE`: a certificate that did not
+#: verify (its detail is the TLS library's text) and an unusable TLS setup.
+_HOSTILE_TLS_FAILURES = {
+    "verification": lambda: TlsVerificationFailed("127.0.0.1", f"certificate verify failed: {_HOSTILE}"),
+    "config": lambda: TlsConfigError(f"the CA bundle is not usable: {_HOSTILE}"),
+}
+
+
+@pytest.mark.parametrize("failure", sorted(_HOSTILE_TLS_FAILURES))
+@pytest.mark.parametrize("command", sorted(_ERROR_PATH_COMMANDS))
+def test_a_tls_failure_prints_its_text_escaped_on_one_line(
+    command: str, failure: str, stub_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A TLS failure whose text carries ESC, CR and LF, a bidi override and a
+    lone surrogate exits 2 with that text escaped on one stderr line. Prevents
+    the failure's text driving or reordering the terminal, splitting the line,
+    or crashing the print."""
+    workspace, _ = stub_coordinator
+    _route, module, run = _ERROR_PATH_COMMANDS[command]
+    exc = _HOSTILE_TLS_FAILURES[failure]()
+
+    def refuse(_root: Path) -> CoordinatorEndpoint:
+        raise exc
+
+    monkeypatch.setattr(module, "resolve_endpoint", refuse)
+
+    rc = run(workspace)
+
+    captured = capsys.readouterr()
+    assert rc == 2, captured.err
+    assert captured.err == f"agent-coherence-{command}: {str(exc).replace(_HOSTILE, _PRINTED)}\n"
+    _assert_one_failure_line(command, captured)
+    assert _raw_characters_in(captured.out + captured.err) == []
+
+
+@pytest.mark.parametrize("command", sorted(_ERROR_PATH_COMMANDS))
+def test_no_coordinator_in_a_workspace_whose_path_has_control_characters_prints_it_escaped(
+    command: str, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With no coordinator running, the line naming the workspace's pid file
+    prints the path's ESC and bidi override escaped, on one stderr line: exit 0
+    for status (no coordinator is a normal state), 2 for the others. Prevents a
+    directory name driving or reordering the terminal through that line."""
+    workspace = tmp_path / "ws\x1b[31m\N{RIGHT-TO-LEFT OVERRIDE}"
+    (workspace / ".git").mkdir(parents=True)
+    _route, _module, run = _ERROR_PATH_COMMANDS[command]
+
+    rc = run(workspace)
+
+    captured = capsys.readouterr()
+    assert rc == (0 if command == "status" else 2), captured.err
+    assert "ws\\x1b[31m\\u202e" in captured.err
+    _assert_one_failure_line(command, captured)
+    assert _raw_characters_in(captured.out + captured.err) == []
+
+
+def test_a_self_test_claim_that_did_not_bind_prints_its_detail_escaped(
+    stub_coordinator, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--self-test`` stops at a caller-principal claim that did not bind and
+    prints the claim's detail escaped on one line. The detail can carry this
+    client's own transport message, which names the workspace, so a control
+    character there must not drive or reorder the terminal."""
+    workspace, _ = stub_coordinator
+    monkeypatch.setattr(coherence_status, "coordinator_backend", lambda _root: "python")
+    monkeypatch.setattr(
+        coherence_status,
+        "claim_caller_principal",
+        lambda *_args: PrincipalClaim("unconfirmed", detail=f"transport failed {_HOSTILE}"),
+    )
+
+    rc = coherence_status.main(["--root", str(workspace), "--self-test"])
+
+    captured = capsys.readouterr()
+    assert rc == 3, captured.err
+    assert f"(unconfirmed: transport failed {_PRINTED})" in captured.err
+    assert captured.err.count("\n") == 1, captured.err
+    assert _raw_characters_in(captured.out + captured.err) == []
+
+
+@pytest.mark.parametrize("step", ["resolve", "hook", "status"])
+def test_a_self_test_coordinator_failure_prints_its_text_escaped(
+    step: str, stub_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--self-test`` exits 3 printing a coordinator failure's text escaped,
+    whether finding the coordinator, a hook step or the closing ``/status``
+    read fails. Prevents that text -- a workspace path or the operating
+    system's error -- driving or reordering the terminal, or crashing the
+    print."""
+    workspace, _ = stub_coordinator
+    failure = CoordinatorUnavailable(f"unreachable {_HOSTILE}")
+
+    def fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise failure
+
+    # What a working coordinator answers each hook step: a fresh first read,
+    # an admitted edit and commit, then a stale re-read naming the path.
+    reads = iter([
+        {"status": "fresh"},
+        {"status": "stale", "hookSpecificOutput": {"additionalContext": "plan.md changed"}},
+    ])
+
+    def answer(_endpoint: Any, name: str, _body: Any, **_kwargs: Any) -> dict[str, Any]:
+        return next(reads) if name == "/hooks/pre-read" else {"ok": True}
+
+    if step == "resolve":
+        monkeypatch.setattr(coherence_status, "resolve_endpoint", fail)
+    elif step == "hook":
+        monkeypatch.setattr(coherence_status, "post", fail)
+    else:
+        monkeypatch.setattr(coherence_status, "post", answer)
+        monkeypatch.setattr(coherence_status, "get", fail)
+
+    rc = coherence_status.main(["--root", str(workspace), "--self-test"])
+
+    captured = capsys.readouterr()
+    assert rc == 3, captured.err
+    assert f"unreachable {_PRINTED}" in captured.err
+    assert captured.err.count("\n") == 1, captured.err
+    assert _raw_characters_in(captured.out + captured.err) == []
 
 
 @pytest.mark.parametrize("change", [

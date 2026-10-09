@@ -935,8 +935,8 @@ def test_body_not_object_returns_400(client: _Client) -> None:
 # ----------------------------------------------------------------------
 
 
-def test_every_endpoint_records_heartbeat(coordinator, client: _Client) -> None:
-    """KTD-2: every hook POST records the calling session's heartbeat."""
+def test_a_tracked_hook_call_records_the_heartbeat(coordinator, client: _Client) -> None:
+    """A pre-read or pre-edit of a tracked path records the calling session's heartbeat."""
     hb_sid = _sid("hb-session")
     agent_id = session_to_agent_id(hb_sid)
     assert coordinator.registry.last_heartbeat_tick(agent_id) is None
@@ -12946,7 +12946,7 @@ def test_status_stops_waiting_in_time_to_read_before_the_clients_give_up(
     coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """KTD13: the lock wait ends while a read reserve still remains before
-    the shipped clients' timeout, even when the handler budget has longer to
+    this package's clients' timeout, even when the handler budget has longer to
     run, so a late acquire plus the read still reaches the client.
 
     The handler budget keeps its shipped 4 s here; only the reserve can end
@@ -12957,7 +12957,7 @@ def test_status_stops_waiting_in_time_to_read_before_the_clients_give_up(
     from ccs.cli._coherence_client import CLI_HTTP_TIMEOUT_SEC
 
     assert mod._STATUS_CLIENT_TIMEOUT_SEC == CLI_HTTP_TIMEOUT_SEC, (
-        "the wait cap is computed against a timeout the shipped clients do not use")
+        "the wait cap is computed against a timeout this package's clients do not use")
     assert mod._STATUS_READ_RESERVE_SEC >= 1.0
     assert CLI_HTTP_TIMEOUT_SEC - mod._STATUS_READ_RESERVE_SEC >= 1.0, (
         "the reserve leaves less than a second of lock wait")

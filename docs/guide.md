@@ -535,8 +535,10 @@ holder tell the two apart:
   }
   ```
 
-  `trigger` is `reclaim_heartbeat` (no coordinator call for
-  `grant_heartbeat_timeout_sec`) or `reclaim_max_hold` (held past
+  `trigger` is `reclaim_heartbeat` (no heartbeat recorded for
+  `grant_heartbeat_timeout_sec`; see
+  [which requests record one](#reading-when-the-sweep-will-reclaim-a-grant))
+  or `reclaim_max_hold` (held past
   `grant_max_hold_sec`), and `reclaimed_at_unix_ts` is when the reclaim
   happened, in unix seconds.
 - **The counters.** Every view, the default one and `?detail=metrics`
@@ -588,9 +590,14 @@ Limits:
       plan.md  SHARED; reclaimed (reclaim_heartbeat at 1789558656)
   ```
 
-  The Claude Code plugin's status command cannot send the operator header, so
-  it shows the counters but never the `reclaimed` map. Use the Python console
-  script, or request `GET /status?detail=full` with the header yourself.
+  Where the Claude Code plugin's own `agent-coherence-status` comes first on
+  the Bash tool's `PATH`, it runs instead, and the plugin's
+  `/agent-coherence:status` command runs it too. It asks for the default view,
+  so it shows the counters but not the `reclaimed` map. In plugin releases
+  through 0.5.0 its `--detail full` does not send the operator header, so the
+  coordinator refuses it; a release that sends the header prints the map in
+  the JSON it outputs. Use the Python console script, or request
+  `GET /status?detail=full` with the header yourself.
 
 To see a reclaim coming rather than after it lands, read the grant times and
 thresholds in the same view; see
@@ -659,9 +666,24 @@ min(last_heartbeat_unix_ts + grant_heartbeat_timeout_sec,
 - The reclaim lands at the first sweep pass at or after that time. A pass runs
   every `sweep_interval_sec` (5 s by default), so it usually lands within one
   period, but there is no upper bound while the registry is busy.
-- The heartbeat term moves later as the session keeps making requests, so a
-  deadline holds only as of the read it came from. The grant-time term does
-  not move until the hold ends.
+- The heartbeat term moves later only when the session sends a request that
+  records a heartbeat, so a deadline holds only as of the read it came from.
+  These requests record one: `pre-read`, `pre-edit`, `post-edit` and
+  `post-edit-cas` on a tracked path; `pre-bash` on a command that reads a
+  tracked file; `pre-grep` on a directory holding a tracked file the
+  coordinator already knows; and `session-stop`, as it releases the session's
+  write grants.
+- No other request records one: not a hook request that reaches no tracked
+  path, `session-start`, `/status`, `POST /hooks/effect-fence`, or
+  `POST /session/heartbeat`, which keeps a snapshot session's lease, not a
+  grant. A request answered with `"degraded": true` may record its heartbeat
+  late, or not at all.
+- Each agent has its own heartbeat: a subagent's requests record the
+  subagent's, not its parent session's. So a session that holds a write grant
+  and then works only on untracked files, or only through a subagent, is
+  reclaimed at its last heartbeat plus `grant_heartbeat_timeout_sec` while it
+  is still busy.
+- The grant-time term does not move until the hold ends.
 - A grant in the middle of a state transition is governed by the transient
   timeout (`transient_timeout_sec`) instead, and `/status` does not show
   transient state.
@@ -708,12 +730,15 @@ This is the Python coordinator's behavior.
 **`/status`.** The default and operator views read the registry before they
 answer. If another request holds the registry lock, they wait for it for about
 2 seconds at most: the wait ends at the 4-second handler budget, or earlier, so
-that a lock won late still leaves time to read and answer within the 6-second
-timeout the shipped clients use. If the lock is still held then, the answer is
-`200` with every key that view normally carries (the counters and
-`policy_summary`, and in the operator view the pattern lists and the sweep
-thresholds), plus `"degraded": true`, and with both registry lists set to
-`null` (other keys omitted here):
+that a lock won late still leaves time to read and answer within 6 seconds,
+the timeout this package's clients use: the `agent-coherence-status` console
+script, `CoherentVolume` and the MCP server's `swg_status`. A client that waits
+less can give up before the answer arrives when the lock is won at the end of
+that wait. If the lock is still held then, the answer is `200` with every key
+that view normally carries (the counters and `policy_summary`, and in the
+operator view the pattern lists and the sweep thresholds), plus
+`"degraded": true`, and with both registry lists set to `null` (other keys
+omitted here):
 
 ```json
 {"detail": "minimal", "tracked_artifacts": null, "sessions": null, "degraded": true}
@@ -742,10 +767,11 @@ What the shipped readers do with a degraded answer:
   ```
 
   `--json` prints the body unchanged and also exits `2`.
-- The MCP server's `swg_status` reports `per_path` as `null`, not `{}`. (An
-  unreachable coordinator still gives `{}`, with `coordinator` reported as
-  `unknown`.) When `swg_read` falls back to `/status` for a handoff record, it
-  adds `handoff_unknown: true`.
+- The MCP server's `swg_status` reports `per_path` as `null`, not `{}`, and its
+  text result adds `per_path=unavailable` after the coordinator state, for
+  clients that show only text. (An unreachable coordinator still gives `{}`,
+  with `coordinator` reported as `unknown`.) When `swg_read` falls back to
+  `/status` for a handoff record, it adds `handoff_unknown: true`.
 - A `CoherentVolume` attaching meanwhile still checks its managed globs: it
   reads them from `policy_summary`, which a degraded answer carries.
 
@@ -985,8 +1011,9 @@ A `CoherentVolume` that wrote a file keeps holding it until its own next
 `atomic_publish` or `reacquire()` releases it. Closing the volume or exiting the process does not release it, and
 neither does a `session-stop` that names only `vol.session_id`, because each
 attempt holds its grants under its own `agent_id`. The coordinator
-takes the file back once the holder has made no coordinator calls for
-`grant_heartbeat_timeout_sec` (600 s by default), or has held it for
+takes the file back once the holder has recorded no heartbeat for
+`grant_heartbeat_timeout_sec` (600 s by default; only its reads, writes and
+commits of tracked files record one), or has held it for
 `grant_max_hold_sec` (1800 s by default). The operator view of `/status` then
 lists the file under that holder's `reclaimed` map (see [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status)).
 Both are `LifecycleConfig` fields, passed as `config` to the volume that starts
@@ -2969,7 +2996,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 | `swg_reacquire` | Recovery after a deny — clears the stale view + mandatory fresh read |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention. A win that completed or overtook a live handoff says which, in `handoff`; on a path this session handed off, the same `handed_off` deny as `swg_write` |
 | `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed OR a peer's write-claim preempted it (which moves neither comparand — the fence also re-checks that the grant still stands) |
-| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `principal_claim`, its `session_agent_id` (the id another session names to hand it a path), the coordinator's two caller-principal counters, and each path's handoff record. `per_path` is `null`, not `{}`, when the coordinator's `/status` answers [degraded](#when-the-registry-is-busy) because its registry was busy: which paths are tracked cannot be told then, so retry shortly and do not read it as nothing tracked |
+| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `principal_claim`, its `session_agent_id` (the id another session names to hand it a path), the coordinator's two caller-principal counters, and each path's handoff record. `per_path` is `null`, not `{}`, when the coordinator's `/status` answer carries no list of tracked paths, as a [degraded](#when-the-registry-is-busy) answer does when its registry was busy; the text result then says `per_path=unavailable`. Retry shortly and do not read it as nothing tracked. With `coordinator` `unknown`, `per_path` is `{}` and says nothing about what is tracked |
 | `swg_transfer` | Hands this session's claim on one or more paths to another session, named by that session's `session_agent_id`; see [From the MCP server](#from-the-mcp-server) |
 | `swg_accept` | As the successor, accepts a handoff without writing the path |
 | `swg_decline` | As the successor, declines a handoff; the giver may write the path again |
@@ -3711,7 +3738,7 @@ inside it.
 | `0` | Done. For `agent-coherence-status` this includes no coordinator running, which it reports on standard error. A path the command rejects itself, next to paths it sends, is reported and does not change the code. |
 | `1` | Not in a git repository; for `track` and `untrack`, also every path rejected by the command's own validation. Nothing is sent. |
 | `2` | `track` or `untrack` could not reach the coordinator; the connection failed TLS verification or configuration; or the coordinator redirected the request (never followed), answered an HTTP error, or answered a body that is not a JSON object or whose fields have the wrong types. `agent-coherence-status` also exits `2` on a [degraded answer](#when-the-registry-is-busy). |
-| `3` | `agent-coherence-status --self-test` failed, or `agent-coherence-untrack` was refused because a path is enforced in strict mode and untracked nothing. |
+| `3` | `agent-coherence-status --self-test` failed, or `agent-coherence-untrack` was refused because a path is enforced in strict mode and untracked nothing. A refusal that does not name each refused path with the strict patterns covering it exits `2` instead, as the HTTP error it is, with the coordinator's error text. |
 
 An exit `2` prints one line on standard error, starting with the command's
 name, never a traceback; the one exception is `agent-coherence-status --json`

@@ -4,7 +4,8 @@
 """``agent-coherence-status`` — print tracked artifacts × sessions × MESI states.
 
 Reads the coordinator's GET /status endpoint and renders a terminal-friendly
-table. Backs the ``/agent-coherence status`` slash command.
+table. The Claude Code plugin's ``/agent-coherence:status`` falls back to it
+when the plugin's own status program cannot run (no ``node``).
 
 Exit codes:
 - 0: status fetched and printed (including "no coordinator running")
@@ -92,8 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
             "coordinator root as '.', but policy_summary.coordinator_root is "
             "still an absolute path; it still reports per-session artifact "
             "state (the process id is reported at every tier); 'metrics' "
-            "returns counters only; 'full' is the operator view used by "
-            "/agent-coherence status."
+            "returns counters only; 'full' is the operator view."
         ),
     )
     # KTD-J (Unit 8): post-install smoke. Drives a two-session stale-read
@@ -164,7 +164,7 @@ def _fetch_status(root: Path, detail: str) -> dict[str, Any] | int:
         err(f"agent-coherence-status: {NOT_A_JSON_OBJECT_LINE}")
         return 2
     except CoordinatorUnavailable as exc:
-        err(f"agent-coherence-status: {exc}")
+        err(f"agent-coherence-status: {escape_nonprintable(exc)}")
         return 0  # graceful — no coordinator is a normal state
     except urllib.error.HTTPError as exc:
         err(f"agent-coherence-status: {http_error_line(exc.code, http_status_from_error(exc))}")
@@ -272,7 +272,7 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     except CoordinatorUnavailable as exc:
         err(
             f"agent-coherence-status --self-test: coordinator unreachable "
-            f"({exc}). Spawn one first by running any hook (or "
+            f"({escape_nonprintable(exc)}). Spawn one first by running any hook (or "
             f"``agent-coherence-coordinator``)."
         )
         return 3
@@ -309,7 +309,7 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
                 err(f"--self-test: {name} returned HTTP {exc.code}")
             return None
         except CoordinatorUnavailable as exc:
-            err(f"--self-test: {name} failed: {exc}")
+            err(f"--self-test: {name} failed: {escape_nonprintable(exc)}")
             return None
         except RedirectRefused as exc:
             # Refused, never followed; reported by its status alone, since
@@ -386,7 +386,7 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
         err(f"--self-test: /status returned HTTP {exc.code}")
         return 3
     except CoordinatorUnavailable as exc:
-        err(f"--self-test: /status failed: {exc}")
+        err(f"--self-test: /status failed: {escape_nonprintable(exc)}")
         return 3
     except RedirectRefused as exc:
         err(f"--self-test: /status was redirected (HTTP {exc.status}); not followed")
@@ -445,7 +445,10 @@ def _claim_self_test_principal(
         return True, claim.principal
     if claim.outcome == "unsupported":
         return True, None
-    err(f"--self-test: caller principal not obtained ({claim.outcome}: {claim.detail})")
+    err(
+        f"--self-test: caller principal not obtained "
+        f"({claim.outcome}: {escape_nonprintable(claim.detail)})"
+    )
     return False, None
 
 

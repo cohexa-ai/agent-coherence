@@ -784,11 +784,14 @@ Alpha — APIs may change before `v1.0`.
   attaching in that window could not read the operator view and failed closed
   with its globs unconfirmed. Now:
   - `/status`, in the default and operator views, waits for the registry lock
-    until the 4-second handler budget runs out or until only 4 seconds of the
-    shipped clients' 6-second timeout are left, whichever comes first: about
-    2 seconds. Past that it answers `200` with every key that view normally
-    carries, `policy_summary` and, in the operator view, the sweep thresholds
-    included, with `tracked_artifacts` and `sessions` set to `null` and
+    until the 4-second handler budget runs out or until only 4 seconds are
+    left of the 6-second timeout this package's clients use
+    (`agent-coherence-status`, `CoherentVolume`, MCP `swg_status`),
+    whichever comes first: about 2 seconds. A client that waits less can give
+    up on a lock won at the end of that wait before its answer arrives. Past
+    that it answers `200` with every key that view normally carries,
+    `policy_summary` and, in the operator view, the sweep thresholds included,
+    with `tracked_artifacts` and `sessions` set to `null` and
     `"degraded": true` added. `degraded` never appears in a normal answer.
     The timeout is counted in `watchdog_timeouts_total`, which the same answer
     reports, and logged at WARNING; nothing is left running behind it. Any
@@ -801,9 +804,10 @@ Alpha — APIs may change before `v1.0`.
   - `agent-coherence-status` exits `2` on a degraded answer. The table prints
     one line on standard error naming registry contention, and `--json`
     prints the body unchanged. MCP `swg_status` reports `per_path` as `null`
-    rather than `{}`, `swg_read`'s handoff fallback reports
-    `handoff_unknown`, and a volume attaching meanwhile still checks its
-    globs, from the `policy_summary` the degraded answer carries.
+    rather than `{}` and says `per_path=unavailable` in its text result,
+    `swg_read`'s handoff fallback reports `handoff_unknown`, and a volume
+    attaching meanwhile still checks its globs, from the `policy_summary` the
+    degraded answer carries.
   - `abort_guard` on both registries takes a keyword-only `deadline` that
     bounds the wait for the registry lock; past it the guard raises the new
     `RegistryLockTimeout` (in `ccs.core.exceptions`) having run nothing.
@@ -838,9 +842,20 @@ Alpha — APIs may change before `v1.0`.
     JSON object, or an answer whose fields have the wrong types. An HTTP error
     reads `HTTP <code>: <error>`, or `HTTP <code>` when the body carries no
     `error` text.
+  - a `2xx` answer with no body now counts as one that is not JSON. Neither
+    coordinator sends one. Track and untrack exit `2` with one line instead of
+    printing nothing and exiting `0`, and the handoff commands report a
+    failure instead of a refusal the coordinator never sent. The rest of the
+    library reads it the same way, as an unanswered request: a strict
+    `CoherentVolume` raises before it writes, a degrade-mode one warns, the
+    substrate session's read raises, and MCP `swg_status` reports the
+    coordinator as `unknown`. The hook client still answers `{}`.
   - exit `1` still means not in a git repository (for track and untrack, also
     every path rejected by local validation; for the handoff commands, a
-    usage error), and untrack's `3` is still the strict-mode refusal.
+    usage error), and untrack's `3` is still the strict-mode refusal. A
+    refusal that does not name each refused path with its strict patterns
+    exits `2` instead, as the HTTP error it is, with the coordinator's error
+    text.
 
   The Claude Code plugin's own `agent-coherence-status`, `-track` and
   `-untrack`, which run instead where they come first on the Bash tool's

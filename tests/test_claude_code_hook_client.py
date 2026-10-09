@@ -660,6 +660,52 @@ def test_session_start_unreachable_coordinator_returns_empty(
     assert out.strip() == "{}"
 
 
+@pytest.mark.parametrize("subcommand", ["pre-read", "pre-edit"])
+def test_an_empty_coordinator_answer_still_fails_open(
+    subcommand: str, git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A coordinator that answers 200 with no body leaves the hook printing
+    ``{}`` with exit 0, after the request reached it. The shared client reads
+    an empty body as a malformed answer, which the other commands report as a
+    failure; a hook must still fail open, or one bad answer blocks the tool
+    call."""
+    import http.server
+    import threading
+
+    seen: list[str] = []
+
+    class _EmptyAnswers(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - the stdlib handler's name
+            seen.append(self.path)
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *_args: Any) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _EmptyAnswers)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        _fake_coherence_dir(git_workspace, port=server.server_address[1])
+        (git_workspace / "plan.md").write_text("plan")
+        cc_payload = {
+            "session_id": _sid(),
+            "tool_name": "Read" if subcommand == "pre-read" else "Edit",
+            "tool_input": {"file_path": str(git_workspace / "plan.md")},
+        }
+        rc, out = _drive(subcommand, cc_payload, git_workspace, monkeypatch, capsys)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert rc == 0
+    assert out.strip() == "{}"
+    assert f"/hooks/{subcommand}" in seen, seen
+
+
 def test_session_start_builder_exception_emits_empty(
     git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

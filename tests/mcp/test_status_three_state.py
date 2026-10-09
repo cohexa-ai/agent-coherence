@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
-from ccs.mcp.server import _STATUS_DESC
+from ccs.mcp.server import _STATUS_DESC, _do_status
 from ccs.mcp.session import SessionConfig
 from ccs.mcp.status import _coordinator_state, _per_path, build_status, handoff_from_status
 
@@ -35,6 +35,11 @@ class _StubVolume:
 
     def coordinator_status(self) -> dict | None:
         return self._doc
+
+
+#: A frozen copy of the text ``swg_status`` adds when ``per_path`` is null,
+#: never imported from the code under test.
+_UNAVAILABLE_MARKER = "per_path=unavailable"
 
 
 def _doc(count: int | None) -> dict:
@@ -148,13 +153,76 @@ def test_per_path_is_none_when_status_is_degraded() -> None:
     assert status["coordinator"] == "on"
 
 
-def test_the_status_description_says_per_path_is_null_when_status_is_degraded() -> None:
-    """The description says what a null ``per_path`` means and what to do:
-    retry, never read it as nothing tracked. Prevents an agent taking a busy
-    registry's ``coordinator=on`` answer for an empty workspace."""
-    assert "per_path is null" in _STATUS_DESC and "degraded" in _STATUS_DESC
+def _texts(result) -> list[str]:
+    return [item.text for item in result.content]
+
+
+def test_status_text_says_per_path_unavailable_when_status_is_degraded() -> None:
+    """The text result of a degraded ``/status`` says the tracked paths could
+    not be told. Prevents a client that shows only the text channel taking
+    ``coordinator=on``, which reads exactly like a healthy answer, for one."""
+    config = SessionConfig(root=Path("/x"), managed=("data/**",))
+
+    result = _do_status(_StubVolume(True, doc=_degraded_doc()), config)
+
+    assert result.structuredContent["per_path"] is None
+    text = " ".join(_texts(result))
+    assert text.startswith("coordinator=on ")
+    assert _UNAVAILABLE_MARKER in text
+    assert "do not treat this as nothing tracked" in text
+
+
+@pytest.mark.parametrize(
+    ("doc", "expected"),
+    [
+        ({**_doc(1), "tracked_artifacts": []}, ["coordinator=on"]),
+        ({**_doc(1), "tracked_artifacts": [{"path": "data/a.txt", "version": 2}]}, ["coordinator=on"]),
+        ({**_doc(0), "tracked_artifacts": []}, ["coordinator=off"]),
+        (None, ["coordinator=unknown"]),
+    ],
+    ids=["on-empty", "on-tracked", "off", "unreachable"],
+)
+def test_status_text_is_unchanged_when_per_path_is_reported(doc, expected) -> None:
+    """Pin: an answer whose per-path state was reported keeps its text byte
+    for byte; only a null ``per_path`` adds the marker."""
+    config = SessionConfig(root=Path("/x"), managed=("data/**",))
+
+    assert _texts(_do_status(_StubVolume(True, doc=doc), config)) == expected
+
+
+@pytest.mark.parametrize(
+    "artifacts",
+    ["missing", None, {"data/a.txt": 1}],
+    ids=["key-missing", "null-without-degraded", "dict-not-list"],
+)
+def test_per_path_is_none_for_any_answer_without_an_artifact_list(artifacts) -> None:
+    """Any ``/status`` answer without an artifact list cannot tell what is
+    tracked, marked ``degraded`` or not, so ``per_path`` is ``None`` and the
+    text says so. Prevents keying on ``degraded`` alone, which would read a
+    malformed answer as "nothing tracked"."""
+    config = SessionConfig(root=Path("/x"), managed=("data/**",))
+    doc = _doc(1) if artifacts == "missing" else {**_doc(1), "tracked_artifacts": artifacts}
+
+    result = _do_status(_StubVolume(True, doc=doc), config)
+
+    assert result.structuredContent["per_path"] is None
+    assert _UNAVAILABLE_MARKER in " ".join(_texts(result))
+
+
+def test_the_status_description_says_when_per_path_is_null_and_when_it_is_empty() -> None:
+    """The description gives ``per_path`` the meanings the code gives it: null
+    when the ``/status`` answer carries no list of tracked paths, a busy
+    registry being one cause, with the text result naming it; ``{}`` when the
+    coordinator state is ``unknown``. Prevents an agent taking a busy
+    registry's ``coordinator=on`` answer for an empty workspace, or an
+    unreachable coordinator's ``{}`` for one."""
+    assert "per_path is null, not {}" in _STATUS_DESC
+    assert "carries no list of tracked paths" in _STATUS_DESC
+    assert "With coordinator=unknown, per_path is {} and says nothing about what is tracked" in _STATUS_DESC
+    assert "registry was busy" in _STATUS_DESC
     assert "retry shortly" in _STATUS_DESC
     assert "do not treat it as nothing tracked" in _STATUS_DESC
+    assert _UNAVAILABLE_MARKER in _STATUS_DESC
 
 
 def test_handoff_from_status_cannot_tell_on_a_degraded_status() -> None:
