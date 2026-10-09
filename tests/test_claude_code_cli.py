@@ -2264,10 +2264,11 @@ def test_a_coordinator_failure_exits_2_with_one_line(
     _assert_one_failure_line(command, captured)
 
 
-#: 200 bodies the client cannot decode: not JSON at all, an integer past the
-#: interpreter's 4300-digit conversion limit, and arrays nested past the
-#: recursion limit.
+#: 200 bodies the client cannot decode: no body at all, not JSON at all, an
+#: integer past the interpreter's 4300-digit conversion limit, and arrays
+#: nested past the recursion limit.
 _UNDECODABLE_BODIES = {
+    "empty": b"",
     "not-json": b"<html>not json</html>",
     "integer-of-5000-digits": b'{"n": ' + b"1" * 5000 + b"}",
     "nested-past-the-recursion-limit": b"[" * 100_000,
@@ -2295,6 +2296,27 @@ def test_a_200_answer_that_does_not_decode_exits_2_with_one_line(
     _assert_one_failure_line(command, captured)
     if command == "status":
         assert captured.err == "agent-coherence-status: the coordinator's answer is not a JSON object\n"
+
+
+@pytest.mark.parametrize("command", sorted(set(_ERROR_PATH_COMMANDS) - {"status"}))
+def test_an_empty_200_answer_exits_2_saying_the_answer_was_empty(
+    command: str, stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A 200 answer with no body makes track, untrack and the handoff verb
+    exit 2 with one line saying the answer was empty. Prevents an empty
+    answer reading as an empty object: track and untrack printing nothing and
+    exiting 0 as though the request had been carried out, or a handoff verb
+    reporting a refusal the coordinator never sent."""
+    workspace, _ = stub_coordinator
+    route, _module, run = _ERROR_PATH_COMMANDS[command]
+    _StubCoordinator.answers = {route: (200, b"")}
+
+    rc = run(workspace)
+
+    captured = capsys.readouterr()
+    assert rc == 2, captured.err
+    assert captured.err == f"agent-coherence-{command}: coordinator returned an empty response\n"
+    _assert_one_failure_line(command, captured)
 
 
 @pytest.mark.parametrize("command", sorted(_ERROR_PATH_COMMANDS))

@@ -6497,3 +6497,54 @@ def test_no_malformed_answer_text_rides_the_chain_of_a_strict_request_failure(
         _assert_no_secret_in(rendered, principal, vol._mint_nonce)
     finally:
         stop_coordinator(tmp_path)
+
+
+class _EmptyAnswer:
+    """A 200 answer with no body, read the way ``_execute`` reads one."""
+
+    def __enter__(self) -> _EmptyAnswer:
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return b""
+
+
+def test_an_empty_pre_edit_answer_fails_closed_before_the_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strict mode: a pre-edit answered 200 with no body raises
+    ``CoherenceError`` saying the answer was empty, and the file keeps its
+    bytes. Prevents an empty answer reading as a granted edit: the new bytes
+    written to disk, and the write refused only at the commit."""
+    from ccs.cli import _coherence_client
+
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        assert vol.read(rel) == b"v1"
+        real_build = _coherence_client._build_opener
+        # Plain-http openers are cached process-wide; an empty cache makes the
+        # next request build its opener through the patched seam.
+        monkeypatch.setattr(_coherence_client, "_shared_openers", {})
+
+        class _Opener:
+            def __init__(self, real: object) -> None:
+                self._real = real
+
+            def open(self, req: object, timeout: float | None = None) -> object:
+                if req.selector == "/hooks/pre-edit":  # type: ignore[attr-defined]
+                    return _EmptyAnswer()
+                return self._real.open(req, timeout=timeout)  # type: ignore[attr-defined]
+
+        monkeypatch.setattr(_coherence_client, "_build_opener", lambda ctx: _Opener(real_build(ctx)))
+
+        with pytest.raises(CoherenceError, match="empty response"):
+            vol.write(rel, b"v2")
+
+        assert target.read_bytes() == b"v1"
+    finally:
+        stop_coordinator(tmp_path)

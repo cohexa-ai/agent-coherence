@@ -831,6 +831,14 @@ Alpha — APIs may change before `v1.0`.
     JSON object, or an answer whose fields have the wrong types. An HTTP error
     reads `HTTP <code>: <error>`, or `HTTP <code>` when the body carries no
     `error` text.
+  - a `2xx` answer with no body now counts as one that is not JSON. Neither
+    coordinator sends one. Track and untrack exit `2` with one line instead of
+    printing nothing and exiting `0`, and the handoff commands report a
+    failure instead of a refusal the coordinator never sent. The rest of the
+    library reads it the same way, as an unanswered request: a strict
+    `CoherentVolume` raises before it writes, a degrade-mode one warns, the
+    substrate session's read raises, and MCP `swg_status` reports the
+    coordinator as `unknown`. The hook client still answers `{}`.
   - exit `1` still means not in a git repository (for track and untrack, also
     every path rejected by local validation; for the handoff commands, a
     usage error), and untrack's `3` is still the strict-mode refusal.

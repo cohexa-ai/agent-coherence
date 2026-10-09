@@ -236,7 +236,8 @@ class CoordinatorUnavailable(Exception):
 
 
 class CoordinatorMalformedAnswer(CoordinatorUnavailable):
-    """A coordinator answered 2xx with a body that does not decode as JSON.
+    """A coordinator answered 2xx with a body that is empty or does not decode
+    as JSON.
 
     A :class:`CoordinatorUnavailable`, so every caller that catches that keeps
     its behaviour; one that reads "unavailable" as "no coordinator running"
@@ -1198,7 +1199,10 @@ def _execute(req: urllib.request.Request) -> dict[str, Any]:
         raise CoordinatorUnavailable(f"coordinator sent a malformed HTTP response ({malformed})")
 
     if not raw:
-        return {}
+        # Neither coordinator answers a 2xx without a body, so an empty one is
+        # not an answer: read as {}, a track or untrack printed nothing and
+        # exited 0 as though every path had been accepted.
+        raise CoordinatorMalformedAnswer("coordinator returned an empty response")
     try:
         return json.loads(raw.decode("utf-8"))
     except (ValueError, RecursionError) as exc:
