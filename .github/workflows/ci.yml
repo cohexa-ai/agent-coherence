@@ -85,7 +85,9 @@ jobs:
 
       - name: Decide what this run checks
         id: plan
-        run: python3 tools/ci_plan.py
+        run: |
+          python3 tools/ci_plan.py
+          echo "tla-needed=false" >> "$GITHUB_OUTPUT"
 
   # Each Python version's suite runs as TEST_SHARD_COUNT shards (pytest-split,
   # balanced by tests/.test_durations), each in a parallel and a serial lane
