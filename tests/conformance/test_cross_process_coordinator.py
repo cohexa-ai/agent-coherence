@@ -34,6 +34,9 @@ from ccs.adapters.claude_code.lifecycle import (
 from ccs.core.substrate import sha256_hex
 from ccs.testing.process_harness import ContenderSpec, ProcessRaceHarness, run_in_subprocess
 
+# Spawns real processes that race each other: run with -n 0 (tests/conftest.py).
+pytestmark = pytest.mark.serial
+
 _PATH = "CLAUDE.md"  # in DEFAULT_TRACKED_PATTERNS — coordinated without extra policy files
 
 

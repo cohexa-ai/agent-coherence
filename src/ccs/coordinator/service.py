@@ -13,15 +13,24 @@ import threading
 import time
 import warnings
 from collections import OrderedDict
-from dataclasses import dataclass
-from typing import Callable, Iterable, Mapping, Optional, Sequence
+from dataclasses import dataclass, replace
+from typing import Callable, Iterable, Literal, Mapping, Optional, Sequence
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from ccs.coordinator.retention import collectible_versions
 from ccs.core.exceptions import (
+    CALLER_PRINCIPAL_ABSENT_REASON,
+    CALLER_PRINCIPAL_CLAIMED_REASON,
+    CALLER_PRINCIPAL_FOREIGN_REASON,
+    CHECKPOINT_ALREADY_REGISTERED_REASON,
+    CHECKPOINT_FINGERPRINT_MISMATCH_REASON,
+    CHECKPOINT_NOT_A_MEMBER_REASON,
     CURRENT_VERSION_REASON,
     EPOCH_MISMATCH_REASON,
     FUTURE_VERSION_REASON,
+    HANDOFF_NOT_GIVER_REASON,
+    HANDOFF_NOT_LIVE_REASON,
+    HANDOFF_NOT_SUCCESSOR_REASON,
     NOT_RETAINED_REASON,
     OCC_CALLER_TRANSIENT_REASON,
     PIN_STATES,
@@ -37,8 +46,11 @@ from ccs.core.exceptions import (
     WORKSPACE_REGISTRATION_COMMITTED,
     WORKSPACE_REGISTRATION_EMPTY,
     WORKSPACE_REGISTRATION_REFUSED,
+    CallerPrincipalRefused,
+    CheckpointRegistrationRefused,
     CheckpointUnknown,
     CoherenceError,
+    GiverFenced,
     OccCallerTransientError,
     SessionInvalidated,
     StaleReadGeneration,
@@ -48,6 +60,11 @@ from ccs.core.invariants import check_monotonic_version, check_single_writer
 from ccs.core.states import MESIState, TransientState
 from ccs.core.substrate import RestoreTier
 from ccs.core.types import (
+    TRANSFER_STATUS_COMPLETED,
+    TRANSFER_STATUS_DECLINED,
+    TRANSFER_STATUS_OVERTAKEN,
+    TRANSFER_STATUS_PENDING,
+    TRANSFER_STATUS_WITHDRAWN,
     Artifact,
     CasCorruption,
     CommitAllEntry,
@@ -63,6 +80,8 @@ from ccs.core.types import (
     SessionCommitRejection,
     SessionReadRejection,
     SnapshotSession,
+    TransferGrantOutcome,
+    TransferVerbOutcome,
     VersionedContent,
     VersionedReadRejection,
     WorkspaceRegistrationResult,
@@ -74,6 +93,8 @@ from .registry_protocol import (
     CheckpointRecord,
     RegistryBase,
     SqliteExtended,
+    TransferRecord,
+    TransferRequest,
 )
 
 # The write-claim states, as one membership set (mirrors the registries' _M_OR_E_STATES).
@@ -323,6 +344,54 @@ def looks_like_session_token(token: str) -> bool:
     )
 
 
+# Caller-principal entropy (caller-principal plan, U4): same draw as a session
+# token — 32 bytes, 43 url-safe characters. Minted here, never client-supplied.
+_CALLER_PRINCIPAL_BYTES = 32
+
+# Mint-nonce shape bounds (KTD11). The nonce is CLIENT-generated and persisted by
+# the claimant before it calls the mint; the floor keeps a buggy client's "1"
+# from standing in for a retry proof, the ceiling bounds what the store holds.
+_MINT_NONCE_MIN_LEN = 16
+_MINT_NONCE_MAX_LEN = 128
+
+
+def mint_nonce_problem(mint_nonce: object) -> str | None:
+    """Why ``mint_nonce`` cannot key a caller-principal claim, or ``None``.
+
+    A usable nonce is a string of :data:`_MINT_NONCE_MIN_LEN` to
+    :data:`_MINT_NONCE_MAX_LEN` url-safe base64 characters — the shape
+    ``secrets.token_urlsafe`` produces. A claim with no usable nonce is refused
+    outright, even for an unclaimed identity: a binding made without one could
+    never be re-established after a lost mint response (R20)."""
+    if not isinstance(mint_nonce, str):
+        return "mint_nonce is required (a client-generated url-safe string)"
+    if not _MINT_NONCE_MIN_LEN <= len(mint_nonce) <= _MINT_NONCE_MAX_LEN:
+        return (
+            f"mint_nonce must be {_MINT_NONCE_MIN_LEN}-{_MINT_NONCE_MAX_LEN} "
+            f"characters long"
+        )
+    if not all(ch in _SESSION_TOKEN_ALPHABET for ch in mint_nonce):
+        return "mint_nonce must use only url-safe base64 characters [A-Za-z0-9_-]"
+    return None
+
+
+def _same_secret(expected: str, presented: str) -> bool:
+    """Timing-safe string equality (:func:`hmac.compare_digest` over UTF-8,
+    so a non-ASCII presented value compares instead of raising)."""
+    return hmac.compare_digest(expected.encode("utf-8"), presented.encode("utf-8"))
+
+
+class CallerPrincipalUncached(Exception):
+    """A ``cached_only`` caller-principal lookup that the service's in-process
+    cache cannot answer.
+
+    Not a refusal, and never on the wire: it tells the caller that the answer
+    needs a read of the registry's durable store, so the coordinator's
+    admission gate can make that read under its handler watchdog instead of on
+    the request thread (caller-principal plan, U6). Repeating the same call
+    without ``cached_only`` resolves it. Carries no principal."""
+
+
 class SessionView:
     """A read-only view of a live snapshot session's PINNED cut, handed to the
     ``effect_gate`` ``decide`` callback (SB-17 / TX-1, Unit 6 / EO-5).
@@ -463,6 +532,28 @@ class CoordinatorService:
         # service), and this lock is never held together with
         # ``_session_lock``.
         self._workspace_mint_lock = threading.Lock()
+        # Caller-principal FAST tier (caller-principal plan, U4 and U6), in front
+        # of the registry's ``caller_principals`` store (the durable tier):
+        # ``{identity: principal}`` for a BOUND identity, and ``{identity: None}``
+        # for one the durable store answered UNBOUND — the negative tier, which
+        # is what lets a client that never claims (an older one, KTD15) be
+        # admitted by the require-class routes without a registry read on every
+        # request. Both are safe to keep because a binding is never rebound and
+        # this service is the only writer of bindings in a coordinator process
+        # (it binds only in :meth:`claim_caller_principal`): a bound entry never
+        # goes stale, and an UNBOUND one goes stale only when this service binds
+        # the identity — which replaces it (see :meth:`_record_bind_attempt`).
+        # A second writer of bindings into the same store would not be seen
+        # here; there is none. ``_caller_principal_binds`` counts finished bind
+        # attempts, so a lookup whose durable read raced one never caches the
+        # UNBOUND answer it read before that bind. Deliberately separate from
+        # every session map above and from ``_session_lock``: a principal's
+        # lifetime is independent of any snapshot session (R4). Its own lock,
+        # never held across a registry call (lock order unchanged: service →
+        # registry).
+        self._caller_principal_lock = threading.Lock()
+        self._caller_principals: dict[UUID, str | None] = {}
+        self._caller_principal_binds = 0
 
     def register_artifact(
         self,
@@ -1216,6 +1307,12 @@ class CoordinatorService:
         # lands as a phantom write behind the client's back. Every other mutating
         # path (write / write_cas) threads ``abort`` the same way; ``session_commit``
         # had silently dropped it before this fix.
+        #
+        # ``caller`` -- the owner validated above -- rides along as the caller
+        # identity while ``committer_id`` stays the agent id: the giver
+        # fence and the completion/overtake label key on who the session
+        # belongs to, never on the token-minted committer, and the
+        # admit-on-absent read-generation path is unchanged.
         return self.commit_cas(
             agent_id=committer_id,
             artifact_id=artifact_id,
@@ -1225,6 +1322,7 @@ class CoordinatorService:
             size_tokens=size_tokens,
             content=content,
             abort=abort,
+            caller=caller,
         )
 
     def _validate_session_owner(
@@ -1314,6 +1412,155 @@ class CoordinatorService:
                 "session owner mismatch: the caller is not the session's owner "
                 "(cross-agent session access is out of scope, R13)"
             )
+
+    # ------------------------------------------------------------------
+    # Caller principal — mint gate + validator (caller-principal plan, U4)
+    # ------------------------------------------------------------------
+    #
+    # The coordinator authenticates the WORKSPACE (bearer), not the caller: a
+    # request's acting identity is caller-asserted. A caller principal is a value
+    # this service mints and binds to ONE identity on that identity's first claim,
+    # so a request naming the identity can be checked against it. Accident-
+    # resistance and attributability under same-OS-user cooperative trust — not a
+    # boundary against a process that can read ``.coherence/``.
+    #
+    # Three lifetimes stay independent (R4): the binding lives in its own registry
+    # store, which the grant sweep, the session-liveness sweep, the session cap
+    # and session release never read or delete.
+
+    def claim_caller_principal(
+        self, *, identity: UUID, mint_nonce: str, abort: threading.Event | None = None
+    ) -> str:
+        """Bind a caller principal to ``identity`` on its first claim, or hand
+        the SAME principal back to a retry of that claim (R1, R2, R20 / KTD11).
+
+        The claimant generates ``mint_nonce`` and persists it BEFORE calling;
+        the nonce is stored beside the binding. A later claim presenting the
+        same nonce is the same claimant recovering a lost response and gets the
+        bound principal again; a claim presenting any other nonce does not
+        become the identity and raises :class:`CallerPrincipalRefused`
+        (``caller_principal_claimed``). A missing or malformed nonce raises
+        ``ValueError`` before anything is bound.
+
+        The bind is ONE registry step (insert-if-absent + read-back), so two
+        concurrent first claims bind one principal and the loser is refused.
+        ``abort`` is the watchdog Event (A6): a timed-out claim fails closed at
+        the registry lock; one that lands anyway is recovered by its nonce.
+
+        Returns the principal. This return value is the one place a principal
+        leaves the service; nothing here logs it or puts it in an error."""
+        problem = mint_nonce_problem(mint_nonce)
+        if problem is not None:
+            raise ValueError(problem)
+        candidate = secrets.token_urlsafe(_CALLER_PRINCIPAL_BYTES)
+        try:
+            with self.registry.abort_guard(abort):
+                principal, bound_nonce = self.registry.bind_caller_principal(
+                    identity, candidate, mint_nonce
+                )
+        except BaseException:
+            self._record_bind_attempt(identity, None)
+            raise
+        self._record_bind_attempt(identity, principal)
+        if not _same_secret(bound_nonce, mint_nonce):
+            raise CallerPrincipalRefused(
+                CALLER_PRINCIPAL_CLAIMED_REASON,
+                "the identity is already bound to a caller principal under a "
+                "different mint nonce; a claim never rebinds it, and only a retry "
+                "of the original claim (presenting its nonce) re-obtains it",
+            )
+        return principal
+
+    def _record_bind_attempt(self, identity: UUID, bound_principal: str | None) -> None:
+        """Bring the cache up to date with a finished bind attempt on
+        ``identity`` — the negative tier's one way to go stale.
+
+        ``bound_principal`` is what the store now binds to ``identity`` (this
+        claim's or an earlier one's); it REPLACES whatever is cached, above all
+        a cached UNBOUND answer, so a claimed identity's absent-principal
+        request is refused from the first request after the claim. ``None``
+        means the attempt raised, which does not prove nothing landed: a cached
+        UNBOUND answer is dropped, and the next lookup reads the store. The
+        attempt is counted either way (see ``_caller_principal_binds``)."""
+        with self._caller_principal_lock:
+            self._caller_principal_binds += 1
+            if bound_principal is not None:
+                self._caller_principals[identity] = bound_principal
+            elif identity in self._caller_principals and self._caller_principals[identity] is None:
+                del self._caller_principals[identity]
+
+    def validate_caller_principal(
+        self, *, identity: UUID, principal: object, cached_only: bool = False
+    ) -> None:
+        """Check that ``principal`` is the one bound to ``identity`` (R1).
+
+        Returns on a match. Raises :class:`CallerPrincipalRefused` with
+        ``caller_principal_absent`` when no principal is presented, and with
+        ``caller_principal_foreign`` when one is presented but does not match —
+        minted for another identity, never minted, or presented for an identity
+        nobody has claimed. The comparison is :func:`hmac.compare_digest` over
+        the encoded values, the owner-validation pattern.
+
+        Resolution has two tiers, like :meth:`_validate_session_owner`: the
+        in-process cache, then the registry's durable store — so a binding made
+        before a coordinator restart still validates after it (sqlite).
+        ``cached_only`` stops at the first tier: when the cache cannot answer it
+        raises :class:`CallerPrincipalUncached` instead of reading the store."""
+        if principal is None or principal == "":
+            raise CallerPrincipalRefused(
+                CALLER_PRINCIPAL_ABSENT_REASON,
+                "the request names an identity but presents no caller principal",
+            )
+        bound = self._bound_caller_principal(identity, cached_only=cached_only)
+        if bound is None or not isinstance(principal, str) or not _same_secret(
+            bound, principal
+        ):
+            raise CallerPrincipalRefused(
+                CALLER_PRINCIPAL_FOREIGN_REASON,
+                "the presented caller principal is not the one bound to the "
+                "identity the request names",
+            )
+
+    def is_caller_principal_bound(self, identity: UUID, *, cached_only: bool = False) -> bool:
+        """Whether ``identity`` has ever been claimed — a principal is bound to
+        it, in the cache or the durable store.
+
+        The fact the require-class routes branch on when a request presents NO
+        principal (caller-principal plan, U6 / R16): an identity nobody has
+        claimed belongs to a caller that predates the principal and is admitted
+        as before, while a bound one is refused as absent. A False answer from
+        the store is cached (the negative tier), and this service's own claim of
+        the identity replaces it, so an identity bound after a False answer
+        reads True at once. ``cached_only`` raises
+        :class:`CallerPrincipalUncached` where the store would be read. The
+        principal itself never leaves the service through here."""
+        return self._bound_caller_principal(identity, cached_only=cached_only) is not None
+
+    def _bound_caller_principal(
+        self, identity: UUID, *, cached_only: bool = False
+    ) -> str | None:
+        """The principal bound to ``identity``, or ``None`` when it is unbound:
+        the cache, else the durable store, whose answer is cached either way —
+        a bound one because bindings are never rebound, an UNBOUND one until
+        this service binds the identity (:meth:`_record_bind_attempt`)."""
+        with self._caller_principal_lock:
+            if identity in self._caller_principals:
+                return self._caller_principals[identity]
+            if cached_only:
+                raise CallerPrincipalUncached(
+                    "the caller-principal cache holds no answer for this identity"
+                )
+            binds_before = self._caller_principal_binds
+        durable = self.registry.get_caller_principal(identity)
+        with self._caller_principal_lock:
+            if durable is not None:
+                self._caller_principals[identity] = durable
+            elif self._caller_principal_binds == binds_before:
+                # setdefault, not assignment: a lookup that read the store after
+                # a bind may already have cached the bound principal, and this
+                # older UNBOUND answer must not replace it.
+                self._caller_principals.setdefault(identity, None)
+            return self._caller_principals.get(identity, durable)
 
     @staticmethod
     def _session_committer_id(session_token: str) -> UUID:
@@ -1870,16 +2117,23 @@ class CoordinatorService:
         artifact_id: UUID,
         issued_at_tick: int = 0,
         abort: threading.Event | None = None,
+        caller: UUID | None = None,
     ) -> list[InvalidationSignal]:
         """Request write ownership by invalidating peers and granting EXCLUSIVE.
 
         Wrapped in :meth:`registry.abort_guard` (finding A6): if the handler
         watchdog already timed out, the grant aborts before it lands rather than
         leaving a phantom EXCLUSIVE the agent never saw (and silently
-        invalidating its peers)."""
+        invalidating its peers).
+
+        ``caller`` is the caller's session-level identity; ``None``
+        compares ``agent_id`` itself, so a library agent is unchanged. The giver
+        of a live handoff of the path is refused with :class:`GiverFenced`
+        before anyone is invalidated; any other acquire on a live record labels
+        it completed (the successor) or overtaken (anyone else)."""
         with self.registry.abort_guard(abort):
             return self._write_impl(
-                agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=issued_at_tick
+                agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=issued_at_tick, caller=caller
             )
 
     def _write_impl(
@@ -1888,8 +2142,14 @@ class CoordinatorService:
         agent_id: UUID,
         artifact_id: UUID,
         issued_at_tick: int = 0,
+        caller: UUID | None = None,
     ) -> list[InvalidationSignal]:
         artifact = self._require_artifact(artifact_id)
+        identity = caller if caller is not None else agent_id
+        # Before the acquire: a giver's re-acquire must never invalidate
+        # the successor's read and then meet it as another holder.
+        self._refuse_handed_off_giver(artifact_id, identity)
+        admitted = self._live_transfer_record(artifact_id)
         self.registry.set_agent_transient(
             artifact_id,
             agent_id,
@@ -1921,6 +2181,7 @@ class CoordinatorService:
         self.registry.set_agent_state(artifact_id, agent_id, MESIState.EXCLUSIVE, trigger="write", tick=issued_at_tick)
         self.registry.clear_agent_transient(artifact_id, agent_id)
         self._validate_single_writer(artifact_id)
+        self._label_live_transfer(admitted, identity)
         return signals
 
     def upgrade(
@@ -1943,8 +2204,12 @@ class CoordinatorService:
         content_hash: str | None = None,
         size_tokens: int | None = None,
         abort: threading.Event | None = None,
+        caller: UUID | None = None,
     ) -> tuple[Artifact, list[InvalidationSignal]]:
-        """Commit modified content under the A6 abort guard (see _commit_impl)."""
+        """Commit modified content under the A6 abort guard (see _commit_impl).
+
+        ``caller`` is the caller's session-level identity; ``None``
+        compares ``agent_id`` itself."""
         with self.registry.abort_guard(abort):
             return self._commit_impl(
                 agent_id=agent_id,
@@ -1953,6 +2218,7 @@ class CoordinatorService:
                 issued_at_tick=issued_at_tick,
                 content_hash=content_hash,
                 size_tokens=size_tokens,
+                caller=caller,
             )
 
     def _commit_impl(
@@ -1964,10 +2230,15 @@ class CoordinatorService:
         issued_at_tick: int = 0,
         content_hash: str | None = None,
         size_tokens: int | None = None,
+        caller: UUID | None = None,
     ) -> tuple[Artifact, list[InvalidationSignal]]:
         """Commit modified content, increment version, and invalidate peers.
 
         Raises:
+            GiverFenced: the caller handed this path off and the handoff is
+                still live -- checked first, so a giver whose grant was
+                handed off is never answered commit_not_allowed, nor shown a
+                reclaim it did not suffer.
             CoherenceError: the committer does not hold M/E (e.g. its grant was
                 already reclaimed — the error names the reclaim trigger/tick).
             StaleReadGeneration: the read-generation fence fired — a sweep
@@ -1978,6 +2249,7 @@ class CoordinatorService:
                 (unlike ``write_cas``).
         """
         artifact = self._require_artifact(artifact_id)
+        self._refuse_handed_off_giver(artifact_id, caller if caller is not None else agent_id)
         agent_state = self.registry.get_agent_state(artifact_id, agent_id)
         if agent_state not in {MESIState.EXCLUSIVE, MESIState.MODIFIED}:
             reclamation = self.registry.get_last_reclamation(agent_id, artifact_id)
@@ -2070,8 +2342,12 @@ class CoordinatorService:
         size_tokens: int | None = None,
         content: bytes | str | None = None,
         abort: threading.Event | None = None,
+        caller: UUID | None = None,
     ) -> tuple[Artifact, list[InvalidationSignal]] | ConflictDetail:
-        """Optimistic-concurrency commit under the A6 abort guard (see _commit_cas_impl)."""
+        """Optimistic-concurrency commit under the A6 abort guard (see _commit_cas_impl).
+
+        ``caller`` is the caller's session-level identity; ``None``
+        compares ``agent_id`` itself, so a library agent is unchanged."""
         with self.registry.abort_guard(abort):
             return self._commit_cas_impl(
                 agent_id=agent_id,
@@ -2081,6 +2357,7 @@ class CoordinatorService:
                 issued_at_tick=issued_at_tick,
                 size_tokens=size_tokens,
                 content=content,
+                caller=caller,
             )
 
     def _commit_cas_impl(
@@ -2093,6 +2370,7 @@ class CoordinatorService:
         issued_at_tick: int = 0,
         size_tokens: int | None = None,
         content: bytes | str | None = None,
+        caller: UUID | None = None,
     ) -> tuple[Artifact, list[InvalidationSignal]] | ConflictDetail:
         """Optimistic-concurrency commit via an atomic version-checked CAS.
 
@@ -2113,7 +2391,12 @@ class CoordinatorService:
           ``None``, else ``CoherenceError``);
         - the caller's MESI state must be SHARED or INVALID — a MODIFIED/EXCLUSIVE
           holder is an *acquired* pessimistic writer and must use plain
-          :meth:`commit` (rejected with a ``CoherenceError`` pointing there).
+          :meth:`commit` (rejected with a ``CoherenceError`` pointing there);
+        - the caller must not be the giver of a live handoff of the path
+          (:class:`GiverFenced`): ``caller`` is its session-level
+          identity, or ``agent_id`` itself when none is passed. A WIN on a
+          record that was live when it was admitted then labels it completed
+          (the successor) or overtaken (anyone else), best-effort.
 
         Three-outcome discrimination of the registry result (plan R2):
 
@@ -2170,6 +2453,12 @@ class CoordinatorService:
                 f"(use commit() for an EXCLUSIVE/MODIFIED holder)"
             )
 
+        # Before the registry legs: a giver's write is refused whatever
+        # version-CAS and the read-generation fence would have answered.
+        identity = caller if caller is not None else agent_id
+        self._refuse_handed_off_giver(artifact_id, identity)
+        admitted = self._live_transfer_record(artifact_id)
+
         result = self.registry.commit_cas(
             artifact_id,
             agent_id,
@@ -2206,6 +2495,7 @@ class CoordinatorService:
             for _ in invalidated_ids
         ]
         self._validate_single_writer(artifact_id)
+        self._label_live_transfer(admitted, identity)
         return updated, signals
 
     def commit_all(
@@ -2215,6 +2505,7 @@ class CoordinatorService:
         writes: Mapping[UUID, CommitAllEntry],
         issued_at_tick: int = 0,
         abort: threading.Event | None = None,
+        caller: UUID | None = None,
     ) -> tuple[MultiCommitResult, list[InvalidationSignal]] | MultiCommitConflict:
         """Atomic multi-artifact publish (SB-18) under the A6 abort guard.
 
@@ -2224,10 +2515,15 @@ class CoordinatorService:
         precondition layer + the ``InvalidationSignal`` construction. The signals
         are RETURNED for the caller to publish to the event bus AFTER the commit
         (broadcast-after-commit — never mid-batch).
+
+        ``caller`` is the caller's session-level identity; ``None``
+        compares ``agent_id`` itself. A member the caller handed off under a live
+        record refuses the whole batch with :class:`GiverFenced`; a WIN labels
+        each member's live record completed or overtaken.
         """
         with self.registry.abort_guard(abort):
             return self._commit_all_impl(
-                agent_id=agent_id, writes=writes, issued_at_tick=issued_at_tick
+                agent_id=agent_id, writes=writes, issued_at_tick=issued_at_tick, caller=caller
             )
 
     def _commit_all_impl(
@@ -2236,9 +2532,12 @@ class CoordinatorService:
         agent_id: UUID,
         writes: Mapping[UUID, CommitAllEntry],
         issued_at_tick: int = 0,
+        caller: UUID | None = None,
     ) -> tuple[MultiCommitResult, list[InvalidationSignal]] | MultiCommitConflict:
         if not writes:
             raise CoherenceError("commit_all requires a non-empty write-set")
+        identity = caller if caller is not None else agent_id
+        admitted: dict[UUID, TransferRecord | None] = {}
         # D4 precondition layer (per member, all-or-nothing): each artifact must
         # exist, the caller must not be mid-transient, and must be SHARED/INVALID
         # (an M/E holder is a pessimistic writer — use commit()). One failing member
@@ -2257,6 +2556,8 @@ class CoordinatorService:
                     f"state={state} reason=occ_is_shared_or_invalid_only "
                     f"(use commit() for an EXCLUSIVE/MODIFIED holder)"
                 )
+            self._refuse_handed_off_giver(artifact_id, identity)
+            admitted[artifact_id] = self._live_transfer_record(artifact_id)
 
         result = self.registry.commit_all(agent_id, writes, tick=issued_at_tick)
 
@@ -2284,6 +2585,8 @@ class CoordinatorService:
                     )
                 )
             self._validate_single_writer(art_id)
+        for record in admitted.values():
+            self._label_live_transfer(record, identity)
         return result, signals
 
     def session_commit_all(
@@ -2345,8 +2648,14 @@ class CoordinatorService:
             )
             for artifact_id, (content, size_tokens) in writes.items()
         }
+        # The validated owner is the caller identity the giver fence keys on,
+        # as in session_commit.
         return self.commit_all(
-            agent_id=committer_id, writes=batch, issued_at_tick=issued_at_tick, abort=abort
+            agent_id=committer_id,
+            writes=batch,
+            issued_at_tick=issued_at_tick,
+            abort=abort,
+            caller=caller,
         )
 
     def create_workspace_checkpoint(
@@ -2359,6 +2668,7 @@ class CoordinatorService:
         window_max: float,
         issued_at_tick: int = 0,
         abort: threading.Event | None = None,
+        receiver: UUID | None = None,
     ) -> CheckpointRecord:
         """Persist ONE workspace-checkpoint manifest (WV plan Unit 3 / R1–R2).
 
@@ -2383,6 +2693,12 @@ class CoordinatorService:
         watchdog-timed-out ``/workspace/checkpoint`` request fails closed at
         the registry write lock instead of landing a manifest AFTER the client
         already received the degraded ``checkpoint_unconfirmed`` response.
+
+        ``receiver`` (#191, optional) names the ONE controller allowed to
+        register a restore of this checkpoint
+        (:meth:`register_workspace_restore` refuses any other
+        ``not_the_receiver``). ``None`` admits any controller. ``owner`` is
+        provenance only and authorizes nothing.
         """
         if not isinstance(name, str) or not name.strip():
             raise ValueError("create_workspace_checkpoint requires a non-empty name")
@@ -2410,6 +2726,7 @@ class CoordinatorService:
             created_at_tick=issued_at_tick,
             window_min=float(window_min),
             window_max=float(window_max),
+            receiver=receiver,
         )
         with self.registry.abort_guard(abort):
             self.registry.create_checkpoint(record, member_rows)
@@ -2444,6 +2761,7 @@ class CoordinatorService:
         *,
         updated_at: float,
         abort: threading.Event | None = None,
+        controller: UUID | None = None,
     ) -> None:
         """Update the checkpoint-level restore status (durable, crash-visible).
 
@@ -2454,6 +2772,15 @@ class CoordinatorService:
         ``abort`` threads into :meth:`registry.abort_guard` (the A6 lesson:
         every mutating path threads it). Raises ``KeyError`` for an unknown
         checkpoint.
+
+        ``controller`` (#191) is the caller restoring the checkpoint. When
+        given, the write is refused exactly as a registration by that
+        controller would be — :class:`CheckpointRegistrationRefused` with
+        ``not_the_receiver`` or ``already_registered`` — so the controller a
+        receiver binding or a registration claim excludes cannot drive the
+        restore's progress either (conclude it, say). It makes no claim. The
+        HTTP route always passes it; ``None`` is the trusted in-process
+        caller, whose versioner runs the same check in its pre-flight.
         """
         if status not in RESTORE_STATUSES:
             raise ValueError(
@@ -2462,6 +2789,10 @@ class CoordinatorService:
                 "would orphan crash-resume, which matches by identity)"
             )
         with self.registry.abort_guard(abort):
+            # Inside the write's hold: a claim landing between the gate's read
+            # and the write would admit a controller it has just excluded.
+            if controller is not None:
+                self._require_restore_controller(checkpoint_id, controller)
             self.registry.set_checkpoint_restore_status(
                 checkpoint_id, status, updated_at=updated_at
             )
@@ -2474,6 +2805,7 @@ class CoordinatorService:
         restore_outcome: str | None,
         deleted_at_restore: float | None = None,
         abort: threading.Event | None = None,
+        controller: UUID | None = None,
     ) -> None:
         """Record one member's durable restore progress (both columns written).
 
@@ -2485,6 +2817,13 @@ class CoordinatorService:
         non-terminal member look terminal. ``abort`` threads into
         :meth:`registry.abort_guard`. Raises ``KeyError`` for an unknown
         (checkpoint, member) pair.
+
+        ``controller`` (#191): as on
+        :meth:`set_workspace_checkpoint_restore_status` — when given, a
+        controller excluded by the receiver binding or by another
+        controller's registration claim is refused before the write. Delete
+        legs register here, so this is the delete half of the registration
+        gate.
         """
         if restore_outcome is not None and restore_outcome not in RESTORE_MEMBER_OUTCOMES:
             raise ValueError(
@@ -2493,6 +2832,10 @@ class CoordinatorService:
                 "— crash-resume classifies terminality by identity against it)"
             )
         with self.registry.abort_guard(abort):
+            # Inside the write's hold: a claim landing between the gate's read
+            # and the write would admit a controller it has just excluded.
+            if controller is not None:
+                self._require_restore_controller(checkpoint_id, controller)
             self.registry.set_checkpoint_member_restore(
                 checkpoint_id,
                 member_path,
@@ -2504,7 +2847,7 @@ class CoordinatorService:
         """Every checkpoint header, ordered ``(created_at, checkpoint_id)``.
 
         The pin engine's cross-checkpoint read (WV plan Unit 6 / R9): before
-        an internal release drops an S3 legal hold, it scans the OTHER
+        a checkpoint release drops an S3 legal hold, it scans the OTHER
         checkpoints' members for another ``held`` pin of the same
         ``(member_path, native_token)`` — a shared hold must survive the
         first checkpoint's release. Also the Unit-8 ``list`` verb's source.
@@ -2564,7 +2907,7 @@ class CoordinatorService:
         """Atomically adjust a checkpoint's pin refcount; the new value returned.
 
         The Unit-6 bookkeeping counter: +1 per pin the checkpoint establishes,
-        -1 per pin the internal release drops. The registry refuses a result
+        -1 per pin the checkpoint release drops. The registry refuses a result
         below zero (``ValueError`` — a release without a matching pin is a
         bookkeeping bug, fail-closed). ``abort`` threads into
         :meth:`registry.abort_guard`. Raises ``KeyError`` for an unknown
@@ -2637,12 +2980,45 @@ class CoordinatorService:
         bounded. ``abort`` threads into ``commit_all`` → ``abort_guard`` (the
         A6 lesson: every mutating path threads it).
 
+        **Who may register, and against what (#191).** Before anything is
+        resolved, minted or committed, in this order:
+
+        1. ``not_the_receiver`` — the checkpoint named a ``receiver`` at
+           creation and ``controller`` is not it. ``owner`` is never compared:
+           it is provenance, and the controller restoring a checkpoint is
+           routinely not the one that took it.
+        2. ``already_registered`` — another controller's registration already
+           claimed this checkpoint (the header's ``registered_by``). The
+           refusal names nobody.
+        3. ``not_a_checkpoint_member`` / ``fingerprint_mismatch`` — every write
+           must name a member of the manifest AND carry that member's captured
+           fingerprint. Checked before resolution on purpose: resolution mints
+           an artifact on first observation, so a refused path the coordinator
+           never saw must not get one.
+        4. The CLAIM — :meth:`RegistryBase.claim_checkpoint_registration`,
+           atomic first-claim-wins. A loser of a concurrent race (both passed
+           step 2) is refused ``already_registered`` here, still before any
+           resolution. The claim is sticky: a registration that then HELDs
+           (``refused``) or raises keeps it, so the same controller re-drives
+           and nobody else can take the checkpoint over mid-retry.
+
+        A controller that already held the claim gets its result with
+        ``retry_of_own_registration=True`` — "I registered this" is always
+        distinguishable from "someone else did" (which never reaches a
+        result). Over HTTP the controller is derived from the request's
+        ``session_id`` and, when that session claimed a caller principal,
+        checked against it (the route is require-class); in-process the
+        caller passes it and is trusted, like every in-process caller.
+
         Raises:
             CheckpointUnknown: ``checkpoint_id`` names no persisted manifest.
+            CheckpointRegistrationRefused: one of the four typed reasons above
+                (``reason`` matched by identity); nothing resolved or minted.
             ValueError: blank/duplicate member paths or a blank fingerprint
                 (caller bugs, refused before any resolution).
         """
-        if self.registry.get_checkpoint(checkpoint_id) is None:
+        record = self.registry.get_checkpoint(checkpoint_id)
+        if record is None:
             raise CheckpointUnknown(checkpoint_id)
         entries = list(writes)
         seen: set[str] = set()
@@ -2660,6 +3036,9 @@ class CoordinatorService:
                     f"{write.member_path!r} in the write-set"
                 )
             seen.add(write.member_path)
+        retry_of_own = self._claim_workspace_registration(
+            record, controller, entries, abort=abort
+        )
         if not entries:
             return WorkspaceRegistrationResult(
                 checkpoint_id=checkpoint_id,
@@ -2668,6 +3047,7 @@ class CoordinatorService:
                     "empty write-set: no written file members to register — "
                     "commit_all was never called (it raises on an empty set)"
                 ),
+                retry_of_own_registration=retry_of_own,
             )
 
         skipped: list[str] = []
@@ -2706,6 +3086,7 @@ class CoordinatorService:
                     "fingerprint — commit_all was never called"
                 ),
                 skipped=tuple(skipped),
+                retry_of_own_registration=retry_of_own,
             )
 
         out = self.commit_all(
@@ -2730,6 +3111,7 @@ class CoordinatorService:
                     path_by_artifact[art_id]: conflict
                     for art_id, conflict in out.per_artifact.items()
                 },
+                retry_of_own_registration=retry_of_own,
             )
         result, signals = out
         versions: dict[str, int] = {}
@@ -2750,7 +3132,80 @@ class CoordinatorService:
             versions=versions,
             skipped=tuple(skipped),
             signals=tuple(signals),
+            retry_of_own_registration=retry_of_own,
         )
+
+    def _claim_workspace_registration(
+        self,
+        record: CheckpointRecord,
+        controller: UUID,
+        entries: "Sequence[WorkspaceRestoreWrite]",
+        *,
+        abort: threading.Event | None = None,
+    ) -> bool:
+        """The #191 pre-resolution gate of :meth:`register_workspace_restore`:
+        receiver, prior claim, membership + fingerprint, then the atomic claim.
+
+        Returns ``True`` when ``controller`` already held the claim before this
+        call (a retry of its own registration), ``False`` when this call made
+        the claim. Raises :class:`CheckpointRegistrationRefused` on any of the
+        four refusals; nothing is resolved, minted or committed then. The claim is a durable
+        write, so it threads ``abort`` (A6): a watchdog-abandoned request
+        fails closed at the registry lock instead of claiming late.
+        """
+        checkpoint_id = record.checkpoint_id
+        record.require_registrable_by(controller)
+        members = {
+            row.member_path: row
+            for row in self.registry.get_checkpoint_members(checkpoint_id)
+        }
+        strangers = tuple(
+            write.member_path for write in entries if write.member_path not in members
+        )
+        if strangers:
+            raise CheckpointRegistrationRefused(
+                checkpoint_id,
+                CHECKPOINT_NOT_A_MEMBER_REASON,
+                member_paths=strangers,
+            )
+        # A member captured absent (or forward-only) has no fingerprint, so no
+        # write can match it: a restore registers captured bytes only.
+        mismatched = tuple(
+            write.member_path
+            for write in entries
+            if members[write.member_path].fingerprint != write.fingerprint
+        )
+        if mismatched:
+            raise CheckpointRegistrationRefused(
+                checkpoint_id,
+                CHECKPOINT_FINGERPRINT_MISMATCH_REASON,
+                member_paths=mismatched,
+            )
+        with self.registry.abort_guard(abort):
+            holder, newly_claimed = self.registry.claim_checkpoint_registration(
+                checkpoint_id, controller
+            )
+        if holder != controller:
+            # Lost a concurrent race after the pre-check above passed.
+            raise CheckpointRegistrationRefused(
+                checkpoint_id, CHECKPOINT_ALREADY_REGISTERED_REASON
+            )
+        # From the atomic claim, not the header read above: a concurrent
+        # retry by this same controller may have claimed in between.
+        return not newly_claimed
+
+    def _require_restore_controller(
+        self, checkpoint_id: str, controller: UUID
+    ) -> None:
+        """The #191 controller gate for the restore progress writes: the two
+        controller refusals of :meth:`register_workspace_restore`, read from
+        the header, with no claim made. ``KeyError`` for an unknown
+        checkpoint (the progress writes' existing unknown-checkpoint
+        signal)."""
+        record = self.registry.get_checkpoint(checkpoint_id)
+        if record is None:
+            raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
+        record.require_registrable_by(controller)
 
     def _resolve_workspace_member_artifact(
         self, member_path: str, fingerprint: str
@@ -2804,6 +3259,177 @@ class CoordinatorService:
             if artifact is not None and artifact.name == member_path:
                 return artifact.content_hash == fingerprint
         return False
+
+    # ------------------------------------------------------------------
+    # Targeted grant handoff (#185): transfer, accept, decline and
+    # withdraw; the giver fence every write path consults; and the
+    # completion or overtake an admitted acquire or win records.
+    # ------------------------------------------------------------------
+
+    def transfer(
+        self,
+        *,
+        giver: UUID,
+        successor: UUID,
+        holders: Mapping[UUID, UUID],
+        successor_known: bool = False,
+        issued_at_tick: int = 0,
+        abort: threading.Event | None = None,
+    ) -> list[TransferGrantOutcome]:
+        """Hand each path in ``holders`` to ``successor``.
+
+        ``giver`` is the caller's session-level identity -- what the record
+        stores and the fence keys on. ``holders`` maps each artifact to the
+        composite presented as holding the claim there: the grant given
+        up is the one that composite holds. ``successor`` arrives already
+        normalised to a session-level identity, and ``successor_known`` says
+        whether the caller resolved it through a name map this service cannot
+        see.
+
+        The registry's composite member decides every path in the order
+        :func:`~ccs.coordinator.registry_protocol.decide_transfer_grant`
+        documents and applies the admitted ones atomically; this method adds
+        no decision of its own. The abort is checked once, when the hold is won: an abort set
+        while the request waits for the lock lands nothing
+        (``WatchdogAbandoned``), and one set after the hold is taken lets every
+        admitted path land together.
+
+        Returns one :class:`TransferGrantOutcome` per path, in request order;
+        the request succeeded only if every grant transferred.
+
+        Raises:
+            CoherenceError: ``holders`` names no path -- a request with nothing
+                to hand on must not read as a success.
+        """
+        if not holders:
+            raise CoherenceError("transfer requires at least one path")
+        request = TransferRequest(
+            giver=giver, successor=successor, holders=dict(holders), successor_known=successor_known
+        )
+        with self.registry.abort_guard(abort):
+            return self.registry.transfer_grants(request, tick=issued_at_tick)
+
+    def accept_transfer(
+        self, *, artifact_id: UUID, caller: UUID, abort: threading.Event | None = None
+    ) -> TransferVerbOutcome:
+        """The successor accepts the live handoff of ``artifact_id`` without
+        writing. A pending record becomes completed; a completed one is
+        answered as it stands; an overtaken one is answered with its status and
+        counterparty and keeps its label. Completion never lifts the giver's
+        fence: only a version move, a decline or a withdraw does. ``caller``
+        is the session-level identity; with no live record the answer is not
+        live, and anyone but the successor is refused as not the successor."""
+        return self._settle_transfer(_ACCEPT, artifact_id=artifact_id, caller=caller, abort=abort)
+
+    def decline_transfer(
+        self, *, artifact_id: UUID, caller: UUID, abort: threading.Event | None = None
+    ) -> TransferVerbOutcome:
+        """The successor declines the live handoff of ``artifact_id``,
+        whatever its label: the record ends as declined and the giver's fence
+        lifts at once. Refused as for :meth:`accept_transfer`."""
+        return self._settle_transfer(_DECLINE, artifact_id=artifact_id, caller=caller, abort=abort)
+
+    def withdraw_transfer(
+        self, *, artifact_id: UUID, caller: UUID, abort: threading.Event | None = None
+    ) -> TransferVerbOutcome:
+        """The giver withdraws its live handoff of ``artifact_id``,
+        whatever its label: the record ends as withdrawn and the fence lifts.
+        Anyone but the giver is refused as not the giver. Nothing else
+        withdraws: a session stop and a failed edit never call this."""
+        return self._settle_transfer(_WITHDRAW, artifact_id=artifact_id, caller=caller, abort=abort)
+
+    def live_handoff_given_by(self, artifact_id: UUID, identity: UUID) -> TransferRecord | None:
+        """The giver predicate, the one read every write path consults: the
+        live transfer record of ``artifact_id`` whose giver is ``identity``, or
+        ``None``.
+
+        Present-record, like the read-generation fence's admit-on-absent: a path
+        with NO record fences nobody, so a plain optimistic writer is never
+        refused. ``identity`` is the session-level identity the route
+        passed, so a re-minted incarnation and a subagent of the giver are
+        fenced alike. Liveness is the registry's: a record whose
+        version moved, or that was declined or withdrawn, fences nobody.
+
+        Read-only. The write paths call it inside their abort-guard hold; a
+        handler calls it to render the giver's pre-edit deny and its failed
+        edit, which is answered not held and handed to the successor at the
+        transfer version and changes nothing."""
+        read = self.registry.get_transfer_record(artifact_id)
+        if read is None:
+            return None
+        record, live = read
+        return record if live and record.giver == identity else None
+
+    def _refuse_handed_off_giver(self, artifact_id: UUID, identity: UUID) -> None:
+        """Raise :class:`GiverFenced` when ``identity`` gave ``artifact_id``
+        away under a live record. Caller holds the abort guard."""
+        record = self.live_handoff_given_by(artifact_id, identity)
+        if record is not None:
+            raise GiverFenced(artifact_id, record.successor, record.version_at_transfer)
+
+    def _live_transfer_record(self, artifact_id: UUID) -> TransferRecord | None:
+        """The path's record if it is live now. Read inside the write path's
+        hold before its acquire or win, so it is the record that was live when
+        that write was admitted -- the only kind a write may label."""
+        read = self.registry.get_transfer_record(artifact_id)
+        return read[0] if read is not None and read[1] else None
+
+    def _label_live_transfer(self, admitted: TransferRecord | None, identity: UUID) -> None:
+        """Completion or overtake after an admitted acquire or win.
+
+        ``admitted`` is the record that was live when the write was admitted
+        (``None``: nothing to label -- an ended record is never relabelled).
+        The successor's write marks it completed; anyone else's marks it
+        overtaken with ``identity`` as counterparty, each replacing the other.
+        The registry's write is unconditional because a win has already moved
+        the version, so the decision is made here, from the read taken before.
+
+        Best-effort relative to the write's own answer: the acquire or win
+        already landed, so a failed label write must not turn it into a failure
+        the client would retry. After a win the record then reads by its
+        version -- not live, with the outcome of a write whose writer was not
+        recorded; after an acquire it keeps its previous label."""
+        if admitted is None:
+            return
+        if identity == admitted.successor:
+            status, counterparty = TRANSFER_STATUS_COMPLETED, None
+        else:
+            status, counterparty = TRANSFER_STATUS_OVERTAKEN, identity
+        try:
+            self.registry.set_transfer_status(admitted.artifact_id, status, counterparty=counterparty)
+        except Exception:  # noqa: BLE001 — any raise; the admitted write stands
+            logger.warning(
+                "handoff label %r not written for artifact %s after an admitted write; "
+                "the record now reads by its version",
+                status,
+                admitted.artifact_id,
+                exc_info=True,
+            )
+
+    def _settle_transfer(
+        self,
+        verb: "_TransferVerb",
+        *,
+        artifact_id: UUID,
+        caller: UUID,
+        abort: threading.Event | None,
+    ) -> TransferVerbOutcome:
+        """Accept, decline or withdraw: read, decide and relabel under one
+        abort-guard hold, so the answer describes the record as the verb left
+        it. The abort is checked once, when the hold is won."""
+        with self.registry.abort_guard(abort):
+            read = self.registry.get_transfer_record(artifact_id)
+            if read is None:
+                return TransferVerbOutcome(artifact_id=artifact_id, ok=False, reason=HANDOFF_NOT_LIVE_REASON)
+            record, live = read
+            refusal = verb.refusal(record, live=live, caller=caller)
+            if refusal is not None:
+                return _verb_answer(record, reason=refusal)
+            status = verb.relabel(record.status)
+            if status is None:
+                return _verb_answer(record)
+            self.registry.set_transfer_status(artifact_id, status)
+            return _verb_answer(replace(record, status=status, counterparty=None))
 
     def invalidate(
         self,
@@ -3090,6 +3716,12 @@ class CoordinatorService:
                     else:
                         continue
 
+                # One write: set_agent_state records the reclaim slot with the
+                # transition (SWEEP_RECLAIM_TRIGGERS). A separate slot write
+                # that failed after the grant was gone would leave a reclaim
+                # that /status and the holder's commit error read as a release,
+                # and the next sweep skips the INVALID pair, so it would never
+                # be repaired.
                 self.registry.set_agent_state(
                     artifact_id,
                     agent_id,
@@ -3098,8 +3730,11 @@ class CoordinatorService:
                     tick=current_tick,
                     content_hash=None,
                 )
-                self.registry.record_last_reclamation(agent_id, artifact_id, trigger, current_tick)
-                self._validate_single_writer(artifact_id)
+                # The callback fires once the reclaim is durable and BEFORE the
+                # single-writer check: a check that raises still leaves this
+                # pair reclaimed (each pair commits on its own), and a reclaim
+                # the registry records must not go without its notice, count
+                # or log line (#195).
                 if on_reclaim is not None:
                     # Best-effort: a notice-recording failure must not stop the sweep
                     # (the reclamation itself already landed in the registry).
@@ -3110,6 +3745,7 @@ class CoordinatorService:
                             "on_reclaim callback raised for agent=%s artifact=%s trigger=%s",
                             agent_id, artifact_id, trigger,
                         )
+                self._validate_single_writer(artifact_id)
                 reclaimed += 1
 
         return reclaimed
@@ -3122,6 +3758,47 @@ class CoordinatorService:
         if artifact is None:
             raise CoherenceError(f"artifact_not_found artifact={artifact_id}")
         return artifact
+
+
+@dataclass(frozen=True)
+class _TransferVerb:
+    """What tells accept, decline and withdraw apart: whose verb it is, and the
+    label it writes over the record's current one (``None``: change nothing)."""
+
+    party: Literal["giver", "successor"]
+    not_party_reason: str
+    relabel: Callable[[str], Optional[str]]
+
+    def refusal(self, record: TransferRecord, *, live: bool, caller: UUID) -> str | None:
+        """Not live is decided first: with no live record there is nothing for
+        any party to act on, and the not-giver / not-successor reasons name a
+        LIVE record's parties."""
+        if not live:
+            return HANDOFF_NOT_LIVE_REASON
+        party = record.giver if self.party == "giver" else record.successor
+        return None if caller == party else self.not_party_reason
+
+
+# An accept turns only a pending record completed; a completed one is
+# answered as it stands, and an overtaken one is never relabelled by an accept.
+_ACCEPT = _TransferVerb(
+    "successor",
+    HANDOFF_NOT_SUCCESSOR_REASON,
+    lambda status: TRANSFER_STATUS_COMPLETED if status == TRANSFER_STATUS_PENDING else None,
+)
+_DECLINE = _TransferVerb("successor", HANDOFF_NOT_SUCCESSOR_REASON, lambda _status: TRANSFER_STATUS_DECLINED)
+_WITHDRAW = _TransferVerb("giver", HANDOFF_NOT_GIVER_REASON, lambda _status: TRANSFER_STATUS_WITHDRAWN)
+
+
+def _verb_answer(record: TransferRecord, *, reason: str | None = None) -> TransferVerbOutcome:
+    """The answer carrying ``record``'s label: taken when ``reason`` is None."""
+    return TransferVerbOutcome(
+        artifact_id=record.artifact_id,
+        ok=reason is None,
+        reason=reason,
+        status=record.status,
+        counterparty=record.counterparty,
+    )
 
 
 def _invalidation_transient_for_state(state: MESIState) -> TransientState | None:

@@ -1,0 +1,81 @@
+{
+  "name": "session-commit-all-holds-the-whole-batch-on-one-conflict",
+  "description": "Peer B moves docs/spec.md after A's begin; A's batch over both members is HELD as a whole (`reason: conflict`), with the per-member typed reason under `per_artifact` naming only the member that moved. docs/plan.md is not advanced -- a torn batch is never observable.",
+  "setup": {
+    "tracked": [
+      "docs/**"
+    ],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n",
+      "docs/spec.md": "# coherence corpus fixture  \n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/session/begin",
+        "body": {
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "read_set": [
+            "docs/plan.md",
+            "docs/spec.md"
+          ]
+        },
+        "capture": {
+          "token": "session_token"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "22222222-2222-4222-8222-222222222222",
+          "path": "docs/spec.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "22222222-2222-4222-8222-222222222222",
+          "path": "docs/spec.md",
+          "success": true,
+          "content_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/session/commit_all",
+    "body": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "session_token": "${token}",
+      "writes": [
+        {
+          "path": "docs/plan.md",
+          "content": "# plan v2\n"
+        },
+        {
+          "path": "docs/spec.md",
+          "content": "# spec v2\n"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": false,
+      "reason": "conflict",
+      "per_artifact": {
+        "docs/spec.md": {
+          "reason": "version_mismatch",
+          "current_version": 2
+        }
+      }
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

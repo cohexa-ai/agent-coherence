@@ -25,7 +25,7 @@ from ccs.adapters.claude_code.lifecycle import (
     ensure_coordinator,
     stop_coordinator,
 )
-from ccs.cli import coherence_hook_client
+from ccs.cli import _coherence_client, coherence_hook_client
 
 
 @pytest.fixture
@@ -645,19 +645,68 @@ def test_session_start_unreachable_coordinator_returns_empty(
 ) -> None:
     """Port file exists but nothing is listening (stale pid file after a
     coordinator crash) → the POST raises CoordinatorUnavailable → {}."""
+    import errno
     import socket
 
-    # Bind-then-close: the freed ephemeral port is near-certainly unbound,
-    # so the client's connect gets refused instead of talking to a stranger.
+    # Port 4, not a freed ephemeral port: another test worker's port-0 bind
+    # can take a freed port before the connect, and the client would then
+    # talk to a stranger. Ports below 1024 are never handed out for port 0.
     with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        dead_port = probe.getsockname()[1]
+        probe.settimeout(2)
+        assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
+    dead_port = 4
     _fake_coherence_dir(git_workspace, port=dead_port)
 
     cc_payload = {"session_id": _sid(), "source": "compact"}
     rc, out = _drive("session-start", cc_payload, git_workspace, monkeypatch, capsys)
     assert rc == 0
     assert out.strip() == "{}"
+
+
+@pytest.mark.parametrize("subcommand", ["pre-read", "pre-edit"])
+def test_an_empty_coordinator_answer_still_fails_open(
+    subcommand: str, git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A coordinator that answers 200 with no body leaves the hook printing
+    ``{}`` with exit 0, after the request reached it. The shared client reads
+    an empty body as a malformed answer, which the other commands report as a
+    failure; a hook must still fail open, or one bad answer blocks the tool
+    call."""
+    import http.server
+    import threading
+
+    seen: list[str] = []
+
+    class _EmptyAnswers(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - the stdlib handler's name
+            seen.append(self.path)
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *_args: Any) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _EmptyAnswers)
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    try:
+        _fake_coherence_dir(git_workspace, port=server.server_address[1])
+        (git_workspace / "plan.md").write_text("plan")
+        cc_payload = {
+            "session_id": _sid(),
+            "tool_name": "Read" if subcommand == "pre-read" else "Edit",
+            "tool_input": {"file_path": str(git_workspace / "plan.md")},
+        }
+        rc, out = _drive(subcommand, cc_payload, git_workspace, monkeypatch, capsys)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert rc == 0
+    assert out.strip() == "{}"
+    assert f"/hooks/{subcommand}" in seen, seen
 
 
 def test_session_start_builder_exception_emits_empty(
@@ -676,3 +725,463 @@ def test_session_start_builder_exception_emits_empty(
     rc, out = _drive("session-start", cc_payload, git_workspace, monkeypatch, capsys)
     assert rc == 0
     assert out.strip() == "{}"
+
+
+# ----------------------------------------------------------------------
+# Caller principal (caller-principal plan, U5)
+#
+# The hook client is one process per hook event, so the principal of a
+# session lives on disk: the mint nonce (created exclusively, never replaced),
+# then the principal (replaced only by what a claim with that nonce returns),
+# each at 0600 in the existing 0700 ``.coherence/``, keyed by the PARENT
+# session's derived id. What that buys on the hook surface is
+# convention-enforcement and a detectable unbound caller — any process that
+# can read ``.coherence/`` can read these files — never caller separation.
+# The recovery of a refused principal is pinned in
+# tests/test_caller_principal_client_recovery.py.
+# ----------------------------------------------------------------------
+
+import http.server  # noqa: E402
+import os  # noqa: E402
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+import warnings  # noqa: E402
+
+from ccs.adapters.claude_code.auth import load_secret  # noqa: E402
+from ccs.adapters.claude_code.coordinator_server import (  # noqa: E402
+    CoordinatorHTTPServer,
+    caller_principal_identity,
+    session_to_agent_id,
+)
+
+_PRINCIPAL_HEADER = "Coherence-Caller-Principal"  # frozen duplicate of the wire name
+
+
+@pytest.fixture
+def inproc_coordinator(git_workspace: Path):
+    """A coordinator in this process (so the test can read its registry),
+    discoverable by the hook client through the usual pid file."""
+    server = CoordinatorHTTPServer(git_workspace, port=0, instance_id="hook-principal")
+    server.serve_in_thread()
+    assert load_secret(server.coordinator_root)
+    (git_workspace / ".coherence" / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
+    try:
+        yield git_workspace, server
+    finally:
+        server.shutdown()
+
+
+def _principal_files(workspace: Path, sid: str) -> tuple[Path, Path]:
+    key = caller_principal_identity(sid).hex
+    base = workspace / ".coherence" / f"caller-principal-{key}"
+    return base.with_name(base.name + ".nonce"), base.with_name(base.name + ".principal")
+
+
+def _claims(server: CoordinatorHTTPServer) -> int:
+    return server.endpoint_counters_snapshot()["principal_claim_total"]
+
+
+def _edit_payload(workspace: Path, sid: str, **extra: Any) -> dict[str, Any]:
+    return {"session_id": sid, "tool_input": {"file_path": str(workspace / "plan.md")}, **extra}
+
+
+def test_hook_client_claims_once_per_session_and_presents_the_stored_principal(
+    inproc_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A live workspace driven through the hook client records attribution
+    naming the acting session: the first hook of the session claims (nonce
+    persisted first, then the principal), every later hook — a subagent's
+    included, which presents its PARENT's principal — reads the stored one
+    and claims nothing, and the require-class commit and stop are admitted.
+
+    Prevents a client that re-claims per event (a round trip per hook and a
+    new nonce each time, which the first-claim gate refuses), and a client
+    that sends no principal, whose commit the coordinator now refuses."""
+    workspace, server = inproc_coordinator
+    (workspace / "plan.md").write_text("plan v1")
+    sid = _sid()
+
+    rc, out = _drive("pre-edit", _edit_payload(workspace, sid), workspace, monkeypatch, capsys)
+    assert rc == 0 and json.loads(out).get("ok") is True, out
+    (workspace / "plan.md").write_text("plan v2")
+    rc, out = _drive("post-edit", _edit_payload(workspace, sid), workspace, monkeypatch, capsys)
+    assert rc == 0 and json.loads(out).get("ok") is True, out
+    (workspace / "plan.md").write_text("plan v3 by a subagent")
+    sub = _edit_payload(workspace, sid, agent_id="sub-1")
+    rc, out = _drive("pre-edit", sub, workspace, monkeypatch, capsys)
+    rc, out = _drive("post-edit", sub, workspace, monkeypatch, capsys)
+    assert rc == 0 and json.loads(out).get("ok") is True, out
+    rc, out = _drive("session-stop", {"session_id": sid}, workspace, monkeypatch, capsys)
+    assert rc == 0 and json.loads(out).get("ok") is True, out
+
+    assert _claims(server) == 1
+    nonce_file, principal_file = _principal_files(workspace, sid)
+    stored = principal_file.read_text().strip()
+    assert server.registry.get_caller_principal(caller_principal_identity(sid)) == stored
+    for path in (nonce_file, principal_file):
+        assert path.stat().st_mode & 0o777 == 0o600, path
+    assert not list((workspace / ".coherence").glob(f"*{sid}*")), "keyed by the derived id"
+    artifact_id = server.registry.lookup_artifact_id_by_name("plan.md")
+    assert server.registry.get_artifact(artifact_id).version == 3
+    assert server.registry.last_writer_for(artifact_id) == session_to_agent_id(sid, "sub-1")
+
+
+# Racing hook processes: run with -n 0 (tests/conftest.py).
+@pytest.mark.serial
+def test_racing_hook_processes_for_a_new_session_bind_one_principal(inproc_coordinator) -> None:
+    """Two hook processes starting together for an unclaimed session produce
+    ONE binding: the loser of the exclusive nonce create adopts the winner's
+    nonce, so both claims present the same nonce and both receive the bound
+    principal. Asserted through a require-class stop in every process: a
+    loser that minted its own nonce would be refused the claim, send no
+    principal, and answer ``{}``. Real processes (the hook client's actual
+    lifetime), released onto stdin at the same instant; whether the claims
+    really overlapped is reported, never asserted."""
+    workspace, server = inproc_coordinator
+    sid = _sid()
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-m", "ccs.cli.coherence_hook_client", "session-stop",
+             "--root", str(workspace)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        )
+        for _ in range(4)
+    ]
+    time.sleep(1.5)  # every process imported and blocked on stdin
+    payload = json.dumps({"session_id": sid}).encode()
+    for proc in procs:
+        proc.stdin.write(payload)
+    for proc in procs:
+        proc.stdin.close()
+    outputs = []
+    for proc in procs:
+        proc.wait(timeout=30)
+        outputs.append((proc.stdout.read(), proc.stderr.read()))
+
+    for out, err in outputs:
+        assert json.loads(out).get("ok") is True, (out, err)
+    nonce_file, principal_file = _principal_files(workspace, sid)
+    bound = server.registry.get_caller_principal(caller_principal_identity(sid))
+    assert bound is not None and principal_file.read_text().strip() == bound
+    if _claims(server) == 1:
+        warnings.warn(
+            "the hook processes did not claim concurrently; the adopt-the-winner "
+            "path was not exercised this run", RuntimeWarning, stacklevel=2,
+        )
+
+
+def test_ensure_mint_nonce_racers_adopt_one_nonce(tmp_path: Path) -> None:
+    """The exclusive-create discipline, raced deterministically: N threads
+    aligned on a barrier all return the SAME nonce and exactly one file
+    holds it. A last-writer-wins write here would hand two concurrent hooks
+    two nonces, and the second claim would be refused (KTD11)."""
+    from ccs.adapters.claude_code import auth
+
+    (tmp_path / ".coherence").mkdir(mode=0o700)
+    key = caller_principal_identity(_sid()).hex
+    barrier = threading.Barrier(8)
+    results: list[str] = []
+    created: list[bool] = []
+    real_create = auth._create_exclusive
+
+    def spy(path: Path, value: str) -> bool:
+        won = real_create(path, value)
+        created.append(won)
+        return won
+
+    def racer() -> None:
+        barrier.wait()
+        results.append(auth.ensure_mint_nonce(tmp_path, key))
+
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        auth._create_exclusive = spy
+        threads = [threading.Thread(target=racer) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+    finally:
+        auth._create_exclusive = real_create
+        sys.setswitchinterval(previous)
+    assert len(results) == 8 and len(set(results)) == 1
+    assert created.count(True) == 1
+    if created.count(False) == 0:
+        warnings.warn("no racer lost the exclusive create this run", RuntimeWarning, stacklevel=2)
+
+
+def test_a_foreign_stored_principal_is_recovered_with_the_sessions_own_nonce(
+    inproc_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A stored principal the coordinator refuses as foreign (here: another
+    session's) is recovered by claiming again with THIS session's stored
+    nonce — never a new one, and the nonce file is left exactly as it was.
+    That claim returns this session's own binding, which replaces the stored
+    file, and the refused stop is retried once and admitted. One claim, no
+    re-mint, nothing printed — and no principal or nonce in the output."""
+    workspace, server = inproc_coordinator
+    sid, other = _sid(), _sid()
+    for session in (sid, other):
+        rc, _ = _drive("session-stop", {"session_id": session}, workspace, monkeypatch, capsys)
+        assert rc == 0
+    nonce_file, principal_file = _principal_files(workspace, sid)
+    own = principal_file.read_text().strip()
+    foreign = _principal_files(workspace, other)[1].read_text()
+    principal_file.write_text(foreign)
+    nonce_before = nonce_file.read_text()
+    claims_before = _claims(server)
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": sid})))
+    rc = coherence_hook_client.main(["session-stop", "--root", str(workspace)])
+    captured = capsys.readouterr()
+
+    assert rc == 0 and json.loads(captured.out).get("ok") is True, captured
+    assert captured.err == ""
+    assert principal_file.read_text().strip() == own
+    assert server.registry.get_caller_principal(caller_principal_identity(sid)) == own
+    assert nonce_file.read_text() == nonce_before
+    assert _claims(server) == claims_before + 1
+    for secret in (own, foreign.strip(), nonce_before.strip()):
+        assert secret not in captured.out + captured.err
+
+
+def test_a_claimed_session_is_reported_and_never_re_minted(
+    inproc_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A session another claimant bound first is refused to this client's
+    nonce. The client reports it, stores nothing, keeps its nonce (every
+    retry presents the same one), and proceeds without a principal: the
+    accept-class read is still answered, the require-class stop is not."""
+    workspace, server = inproc_coordinator
+    (workspace / "plan.md").write_text("plan v1")
+    sid = _sid()
+    server.service.claim_caller_principal(
+        identity=caller_principal_identity(sid), mint_nonce="someone-elses-nonce-0001"
+    )
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_edit_payload(workspace, sid))))
+    assert coherence_hook_client.main(["pre-read", "--root", str(workspace)]) == 0
+    first = capsys.readouterr()
+    nonce_file, principal_file = _principal_files(workspace, sid)
+    nonce = nonce_file.read_text()
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": sid})))
+    assert coherence_hook_client.main(["session-stop", "--root", str(workspace)]) == 0
+    second = capsys.readouterr()
+
+    assert "caller principal refused" in first.err and "NOT re-minting" in first.err
+    assert json.loads(first.out).get("status") in ("fresh", "stale")
+    assert second.out.strip() == "{}"
+    assert not principal_file.exists()
+    assert nonce_file.read_text() == nonce
+
+
+class _NoPrincipalCoordinator(http.server.BaseHTTPRequestHandler):
+    """Answers like a coordinator that issues no principals (the sibling Node
+    coordinator, an older Python one): 404 on the claim, 200 elsewhere."""
+
+    seen: list[tuple[str, str | None]] = []
+
+    def do_POST(self) -> None:  # noqa: N802 — stdlib name
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.seen.append((self.path, self.headers.get(_PRINCIPAL_HEADER)))
+        status, body = (404, b'{"error":"not found"}') if self.path == "/principal/claim" \
+            else (200, b'{"ok":true}')
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args: Any) -> None:
+        return
+
+
+def test_a_coordinator_that_issues_no_principals_gets_no_header(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """404 on the claim means the coordinator issues none: the hook proceeds
+    exactly as before — the request goes out WITHOUT the header, the answer
+    passes through, nothing is stored, nothing is reported."""
+    _NoPrincipalCoordinator.seen = []
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _NoPrincipalCoordinator)
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    try:
+        _fake_coherence_dir(git_workspace, port=httpd.server_address[1])
+        (git_workspace / "plan.md").write_text("plan")
+        sid = _sid()
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_edit_payload(git_workspace, sid))))
+        assert coherence_hook_client.main(["post-edit", "--root", str(git_workspace)]) == 0
+        captured = capsys.readouterr()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    assert json.loads(captured.out) == {"ok": True}
+    assert _NoPrincipalCoordinator.seen == [("/principal/claim", None), ("/hooks/post-edit", None)]
+    assert not _principal_files(git_workspace, sid)[1].exists()
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    ("backend_line", "claims"),
+    [
+        ("", True),  # the Python coordinator's own format: <pid>\n<port>\n
+        ("backend=python\n", True),
+        ("backend=node\n", False),  # the Node coordinator's: it issues no principals
+    ],
+    ids=["python-format", "backend-python", "backend-node"],
+)
+def test_the_claim_is_skipped_only_when_the_pid_file_names_the_node_backend(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], backend_line: str, claims: bool,
+) -> None:
+    """The Node coordinator writes ``<pid>\\n<port>\\nbackend=node\\n`` and
+    issues no principals, so a hook against it must not pay a claim round
+    trip (a 404) on EVERY event: the request is exactly the one it sent before
+    principals existed, and no nonce file is created. Any other pid file —
+    the Python coordinator writes no backend line; an explicit
+    ``backend=python`` — still claims, and a 404 there (an older Python
+    coordinator) keeps the no-header fallback. Requests are counted."""
+    _NoPrincipalCoordinator.seen = []
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _NoPrincipalCoordinator)
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    try:
+        _fake_coherence_dir(git_workspace, port=httpd.server_address[1])
+        pid_file = git_workspace / ".coherence" / "server.pid"
+        pid_file.write_text(pid_file.read_text() + backend_line)
+        (git_workspace / "plan.md").write_text("plan")
+        sid = _sid()
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_edit_payload(git_workspace, sid))))
+        assert coherence_hook_client.main(["post-edit", "--root", str(git_workspace)]) == 0
+        captured = capsys.readouterr()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    assert json.loads(captured.out) == {"ok": True}
+    expected = [("/hooks/post-edit", None)]
+    if claims:
+        expected = [("/principal/claim", None), *expected]
+    assert _NoPrincipalCoordinator.seen == expected
+    assert _principal_files(git_workspace, sid)[0].exists() is claims, "nonce file"
+    assert captured.err == ""
+
+
+def test_an_older_client_that_never_claims_is_admitted_and_its_write_recorded(
+    inproc_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """R16, the version-skew direction this coordinator can observe: a hook
+    client that predates the principal sends no header and never claims, so
+    the session it names stays unbound. Its require-class commit is ADMITTED
+    and recorded exactly as before — the version advances and
+    ``last_writer_id`` is its composite — rather than refused into the
+    ``{}`` the shipped client prints for any non-2xx, which would let the edit
+    proceed with coherence silently off."""
+    workspace, server = inproc_coordinator
+    (workspace / "plan.md").write_text("plan v1")
+    sid = _sid()
+    monkeypatch.setattr(
+        _coherence_client, "obtain_stored_principal", lambda *_a, **_k: None
+    )
+    payload = _edit_payload(workspace, sid, agent_id="sub-1")
+    rc, out = _drive("pre-edit", payload, workspace, monkeypatch, capsys)
+    assert rc == 0 and json.loads(out).get("ok") is True
+    artifact_id = server.registry.lookup_artifact_id_by_name("plan.md")
+    version = server.registry.get_artifact(artifact_id).version
+    absent_before = server.counters_snapshot()["caller_principal_absent_total"]
+    (workspace / "plan.md").write_text("plan v2")
+    rc, out = _drive("post-edit", payload, workspace, monkeypatch, capsys)
+
+    assert rc == 0 and json.loads(out).get("ok") is True, out
+    assert server.registry.get_artifact(artifact_id).version == version + 1
+    assert server.registry.last_writer_for(artifact_id) == session_to_agent_id(sid, "sub-1")
+    assert server.counters_snapshot()["caller_principal_absent_total"] == absent_before + 1
+    assert server.registry.get_caller_principal(caller_principal_identity(sid)) is None
+
+
+def test_a_request_without_a_principal_naming_a_claimed_session_is_refused(
+    inproc_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The #188 case through the hook client: a newer client's session is
+    CLAIMED (its hooks present the principal, it holds EXCLUSIVE after a
+    pre-edit and has committed once). A second, principal-less caller naming
+    that session — deliberately not reading the stored principal, which on
+    this surface any process that can read ``.coherence/`` could — is refused
+    on the commit and on the stop: the peer's grant stands and the recorded
+    writer and version are unchanged. Convention-enforcement and a detectable
+    unbound caller, not separation between callers of one OS user."""
+    workspace, server = inproc_coordinator
+    (workspace / "plan.md").write_text("plan v1")
+    peer = _sid()
+    payload = _edit_payload(workspace, peer)
+    rc, out = _drive("pre-edit", payload, workspace, monkeypatch, capsys)
+    (workspace / "plan.md").write_text("plan v2 by the peer")
+    rc, out = _drive("post-edit", payload, workspace, monkeypatch, capsys)
+    assert json.loads(out).get("ok") is True, out
+    rc, out = _drive("pre-edit", payload, workspace, monkeypatch, capsys)
+    artifact_id = server.registry.lookup_artifact_id_by_name("plan.md")
+    peer_agent = session_to_agent_id(peer)
+    version = server.registry.get_artifact(artifact_id).version
+    assert server.registry.get_state_map(artifact_id)[peer_agent].name == "EXCLUSIVE"
+
+    # The forger reads neither of the peer's stored files: not the principal,
+    # and not the mint nonce a stored-principal client re-claims with on a
+    # refusal (R20) — on this surface either is one read of .coherence/ away.
+    monkeypatch.setattr(
+        _coherence_client, "obtain_stored_principal", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(_coherence_client, "load_mint_nonce", lambda *_a, **_k: None)
+    (workspace / "plan.md").write_text("plan v3 by a forger")
+    rc, commit = _drive("post-edit", payload, workspace, monkeypatch, capsys)
+    rc, stop = _drive("session-stop", {"session_id": peer}, workspace, monkeypatch, capsys)
+
+    assert commit.strip() == "{}" and stop.strip() == "{}"
+    assert server.registry.get_artifact(artifact_id).version == version
+    assert server.registry.last_writer_for(artifact_id) == peer_agent
+    assert server.registry.get_state_map(artifact_id)[peer_agent].name == "EXCLUSIVE"
+
+
+# ----------------------------------------------------------------------
+# #238 — a Grep hook gets the freshness advisory while the registry is held
+#
+# The coordinator's pre-grep lookup waited on the registry lock with no bound,
+# so the hook client's own timeout fired first and the model got ``{}``. Driven
+# end to end, stdin through main() to stdout, against an in-process
+# coordinator whose registry lock a helper thread holds.
+# ----------------------------------------------------------------------
+
+
+def test_pre_grep_delivers_the_freshness_advisory_while_the_registry_lock_is_held(
+    inproc_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import ccs.adapters.claude_code.coordinator_server as server_mod
+    from tests.test_claude_code_coordinator_server import _HeldRegistryLock
+
+    workspace, server = inproc_coordinator
+    cc_payload = {
+        "session_id": _sid(),
+        "tool_name": "Grep",
+        "tool_input": {"pattern": "anything", "path": "docs"},
+    }
+    # The first call claims the session's principal while the lock is free, so
+    # the held lock below blocks only pre-grep's own registry lookup.
+    rc, out = _drive("pre-grep", cc_payload, workspace, monkeypatch, capsys)
+    assert (rc, json.loads(out)) == (0, {"status": "fresh"})
+
+    monkeypatch.setattr(server_mod, "HANDLER_TIMEOUT_SEC", 0.25)
+    with _HeldRegistryLock(server):
+        rc, out = _drive("pre-grep", cc_payload, workspace, monkeypatch, capsys)
+
+    assert rc == 0
+    response = json.loads(out)
+    assert response == json.loads(json.dumps(server_mod._DEFAULT_DEGRADED_RESPONSE))
+    assert "could not verify" in response["hookSpecificOutput"]["additionalContext"]

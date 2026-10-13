@@ -48,8 +48,9 @@ _TRACKED_EVAL_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 # Heuristic file-path token regex for eval-pattern bodies. Conservative —
 # only matches "<name>.<ext>" shapes where extension is alphanumeric.
-# False-negative bias: misses paths without extensions.
-_PATH_TOKEN_RE: re.Pattern[str] = re.compile(
+# False-negative bias: misses paths without extensions. Public: the write
+# detector scans program bodies for the same token shape.
+PATH_TOKEN_RE: re.Pattern[str] = re.compile(
     r'(?<![A-Za-z0-9_/.\-])([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+)'
 )
 
@@ -100,7 +101,7 @@ def detect_tracked_paths(
     for pattern in _TRACKED_EVAL_PATTERNS:
         for match in pattern.finditer(command):
             body = match.group(2)
-            for token in _PATH_TOKEN_RE.findall(body):
+            for token in PATH_TOKEN_RE.findall(body):
                 if is_tracked(token):
                     _add(token)
 
@@ -194,4 +195,4 @@ def _detect_in_segment(
         break
 
 
-__all__ = ["detect_tracked_paths"]
+__all__ = ["PATH_TOKEN_RE", "detect_tracked_paths"]

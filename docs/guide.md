@@ -31,21 +31,25 @@ full command-line toolset, and the API reference.
 11. [BYO substrate bindings (`CoherentRow`, `CoherentObject`)](#byo-substrate-bindings-coherentrow-coherentobject)
 12. [Workspace versioning & restore (`WorkspaceVersioner`)](#workspace-versioning--restore-workspaceversioner)
 13. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
-14. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
-15. [Inline benchmark mode](#inline-benchmark-mode)
-16. [Telemetry](#telemetry)
-17. [Graceful degradation](#graceful-degradation)
-18. [Examples](#examples)
-19. [Real-workload benchmarks](#real-workload-benchmarks)
-20. [Benchmarking your own workload](#benchmarking-your-own-workload)
-21. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-22. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
-23. [Replay (v0.8.2+)](#replay-v082)
-24. [Command-line tools](#command-line-tools)
-25. [API reference](#api-reference)
-26. [Low-level adapter API](#low-level-adapter-api)
-27. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-28. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+14. [Effect fence over HTTP](#effect-fence-over-http)
+15. [Caller principal](#caller-principal)
+16. [Targeted grant handoff](#targeted-grant-handoff)
+17. [Acquire-or-fail on `pre-edit` (specified, not yet built)](#acquire-or-fail-on-pre-edit-specified-not-yet-built)
+18. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
+19. [Inline benchmark mode](#inline-benchmark-mode)
+20. [Telemetry](#telemetry)
+21. [Graceful degradation](#graceful-degradation)
+22. [Examples](#examples)
+23. [Real-workload benchmarks](#real-workload-benchmarks)
+24. [Benchmarking your own workload](#benchmarking-your-own-workload)
+25. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+26. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
+27. [Replay (v0.8.2+)](#replay-v082)
+28. [Command-line tools](#command-line-tools)
+29. [API reference](#api-reference)
+30. [Low-level adapter API](#low-level-adapter-api)
+31. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+32. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -263,11 +267,12 @@ Each entry is a flat `dict` with exactly these eight keys:
 | `"write"` | Write request; peers are invalidated (→ INVALID), requester receives EXCLUSIVE |
 | `"commit"` | Write commit; peers are invalidated (→ INVALID), committer transitions to MODIFIED |
 | `"invalidate"` | Explicit invalidation signal; agent transitions to INVALID |
+| `"handoff"` | [Targeted grant handoff](#targeted-grant-handoff): the giver hands its claim (EXCLUSIVE, MODIFIED or a standing SHARED read) to a successor and transitions to INVALID |
 | `"timeout"` | Transient state timeout; agent force-invalidated (→ INVALID) |
 | `"reclaim_heartbeat"` | Crash recovery: agent's heartbeat older than `heartbeat_timeout_ticks` |
 | `"reclaim_max_hold"` | Crash recovery: grant held for at least `max_hold_ticks` |
 
-The last four triggers move the artifact's **ownership epoch** when they take a
+The last five triggers move the artifact's **ownership epoch** when they take a
 holder out of EXCLUSIVE/MODIFIED, because each of them ends a write claim
 *without the version moving* — the one case a version check cannot see. A later
 commit from that ex-holder is then rejected with `stale_read_generation` rather
@@ -277,6 +282,12 @@ agent's side of the check — the generation it captured — is written only by
 its own acquire or its own read; being downgraded by another agent's fetch
 never refreshes it, so an ex-holder rejected with `stale_read_generation`
 stays rejected until it re-reads or re-acquires itself.
+
+`"handoff"`, like `"invalidate"`, is the holder's own act, not a reclaim. A
+giver that hands off a write grant moves the epoch exactly as a release does; a
+giver that hands off a standing SHARED read takes no one out of
+EXCLUSIVE/MODIFIED and moves no epoch, so sessions that read the path are not
+fenced as though a writer had been reclaimed.
 
 An explicit invalidation is also **pinned**: one issued by a peer is dropped as
 obsolete if the agent it names has since observed a version at least as new as
@@ -494,6 +505,289 @@ reclaims, with structured `extra` fields `trigger`, `agent_id_short`,
 instance are silent; a companion `DEBUG` log carries the full UUIDs. Bind a
 handler to `ccs.adapters.base` to surface or ingest these events.
 
+The coordinator behind `/status` logs one line per reclaim, at `WARNING` on the
+`ccs.adapters.claude_code.lifecycle` logger:
+`sweep reclaimed grant: trigger=… tick=… agent_id=… artifact=…`. It names the
+agent id, never the session id. A coordinator started in the background (the
+detached `agent-coherence-coordinator` process) sends its stderr to
+`/dev/null`, so there the line is lost; read the reclaim from `/status`
+instead (see [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status)).
+
+### Reading a sweep reclaim from `/status`
+
+This applies to the Python coordinator. The Claude Code plugin's Node
+coordinator runs no grant sweep, so it has nothing to report.
+
+When the sweep takes a write grant back, the holder drops out of `states`
+exactly as it would after a release. Two things let anyone other than that
+holder tell the two apart:
+
+- **The operator view.** `GET /status?detail=full`, sent with the
+  `Coherence-Local-Operator: true` header, gives each `sessions[]` row a
+  `reclaimed` map beside `states`:
+
+  ```json
+  {
+    "agent_name": "claude-session-<id>",
+    "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
+    "states": {},
+    "reclaimed": {"plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": 1789558656}}
+  }
+  ```
+
+  `trigger` is `reclaim_heartbeat` (no heartbeat recorded for
+  `grant_heartbeat_timeout_sec`; see
+  [which requests record one](#reading-when-the-sweep-will-reclaim-a-grant))
+  or `reclaim_max_hold` (held past
+  `grant_max_hold_sec`), and `reclaimed_at_unix_ts` is when the reclaim
+  happened, in unix seconds.
+- **The counters.** Every view, the default one and `?detail=metrics`
+  included, carries `sweep_reclaims_total` and `sweep_reclaims_by_trigger`.
+  They name no session or path: a count that rose tells you the sweep pulled
+  something, and one operator-view read tells you what.
+
+An entry means the holder's last write grant on the path ended in a reclaim
+and it has taken none since. Its edit may be on disk with no version recording
+it, so do not hand the path to another session on the strength of an empty
+`states` alone. The entry stays listed:
+
+- while the holder re-reads the path. A re-read is granted `SHARED`, even when
+  no other session holds the path, and a read does not version the edit;
+- while the holder's compare-and-swap commits of the path are refused with
+  `stale_read_generation`. A re-read does not lift that refusal;
+- after a peer writes or commits the path, and after the holder's session
+  ends.
+
+A reclaimed session gets its write back by editing the path again: the edit
+takes the write grant (`EXCLUSIVE`), which clears the entry, and commits like
+any other edit. `states` then shows the holder holding the path, so it does
+not read as released. The map
+tells you a reclaim happened; whether its edit has been dealt with since is
+yours to decide. One clue: if the path's `last_writer_at_unix_ts` in the same
+response is later than the entry's `reclaimed_at_unix_ts`, someone has committed
+the path since the reclaim.
+
+Limits:
+
+- The counters and session names live in the coordinator process. A restart,
+  including the coordinator's own exit after 15 idle minutes
+  (`idle_shutdown_sec`), sets the counters back to zero and forgets the names.
+  The reclaim itself is kept, so after a restart the holder still gets a row,
+  with a null `agent_name`, until 24 hours after its newest reclaim. Then the
+  row is dropped.
+- A zero count does not prove the sweep is running: it reads the same when
+  there was nothing to reclaim.
+- Only the grant sweep's two triggers are recorded. A holder the coordinator
+  invalidates because it sat mid-transition past `transient_timeout_sec` gets
+  no `reclaimed` entry and no count.
+- The Python console script, run as `agent-coherence-status --detail full`,
+  asks for the operator view and prints each reclaimed path under its session,
+  after the held state when the session has re-read it:
+
+  ```text
+  Sessions:
+    4c9625da  claude-session-<id>
+      plan.md  SHARED; reclaimed (reclaim_heartbeat at 1789558656)
+  ```
+
+  Without `--detail full` it asks for the default view, which carries the
+  counters but not the `reclaimed` map. So does the Claude Code plugin's
+  `/agent-coherence:status` command, and the plugin's own
+  `agent-coherence-status` where that comes first on the Bash tool's `PATH`;
+  in plugin releases through 0.5.0 that program's `--detail full` does not
+  send the operator header, so the coordinator refuses it. Use the Python
+  console script with `--detail full`, or request `GET /status?detail=full`
+  with the header yourself.
+
+To see a reclaim coming rather than after it lands, read the grant times and
+thresholds in the same view; see
+[Reading when the sweep will reclaim a grant](#reading-when-the-sweep-will-reclaim-a-grant).
+
+### Reading when the sweep will reclaim a grant
+
+This applies to the Python coordinator. The Node coordinator answers
+`detail=full` with `501`.
+
+The operator view (`GET /status?detail=full` with the
+`Coherence-Local-Operator: true` header) also carries what the sweep decides
+from:
+
+- Each `tracked_artifacts` entry carries `owner_generation`, the artifact's
+  ownership generation, an integer (see below).
+- Each `sessions[]` row carries `grants`, one entry for each path the session
+  holds `EXCLUSIVE` or `MODIFIED`, and `last_heartbeat_unix_ts`, the session's
+  last heartbeat, or `null` when the coordinator has none on record. Every row
+  has both keys, including a row that holds only `SHARED` paths and a row that
+  lists only reclaims. A `SHARED` path is never in `grants`.
+- The body carries `grant_heartbeat_timeout_sec` and `grant_max_hold_sec`, the
+  two thresholds the running sweep enforces.
+
+Trimmed to the keys this section uses:
+
+```json
+{
+  "tracked_artifacts": [
+    {"path": "plan.md", "version": 4, "id": "9b1e6f0c-3a57-4e7e-9a43-6f5d2c8e1b70", "owner_generation": 2}
+  ],
+  "sessions": [
+    {
+      "agent_id": "4c9625da-356c-527f-b5d7-027f181f7748",
+      "states": {"plan.md": "MODIFIED"},
+      "grants": {"plan.md": {"granted_at_unix_ts": 1789558000}},
+      "last_heartbeat_unix_ts": 1789558540
+    }
+  ],
+  "grant_heartbeat_timeout_sec": 600,
+  "grant_max_hold_sec": 1800
+}
+```
+
+`granted_at_unix_ts` is when the session's current, unbroken `EXCLUSIVE` or
+`MODIFIED` hold on the path began. A commit does not reset it; the hold ends
+when the session leaves both states. A `null` time means none is on record for
+that grant, and the max-hold limit does not apply to it. All the times are
+whole unix seconds from the coordinator's clock, the clock the sweep compares
+against, and all of it comes from the same registry read as `states` and
+`reclaimed`.
+
+**The deadline.** For a path in a row's `grants`, the earliest time the sweep
+reclaims it is:
+
+```text
+min(last_heartbeat_unix_ts + grant_heartbeat_timeout_sec,
+    granted_at_unix_ts + grant_max_hold_sec)
+```
+
+- A `null` `last_heartbeat_unix_ts` on a row with grants means the grants are
+  reclaimed at the next sweep pass: no heartbeat on record counts as stale.
+- A `null` `granted_at_unix_ts` drops the second term.
+- Both comparisons are `>=`: the grant is reclaimable at that second, not after
+  it.
+- The reclaim lands at the first sweep pass at or after that time. A pass runs
+  every `sweep_interval_sec` (5 s by default), so it usually lands within one
+  period, but there is no upper bound while the registry is busy.
+- The heartbeat term moves later only when the session sends a request that
+  records a heartbeat, so a deadline holds only as of the read it came from.
+  These requests record one: `pre-read`, `pre-edit`, `post-edit` and
+  `post-edit-cas` on a tracked path; `pre-bash` on a command that reads a
+  tracked file; `pre-grep` on a directory holding a tracked file the
+  coordinator already knows; and `session-stop`, as it releases the session's
+  write grants.
+- No other request records one: not a hook request that reaches no tracked
+  path, `session-start`, `/status`, `POST /hooks/effect-fence`, or
+  `POST /session/heartbeat`, which keeps a snapshot session's lease, not a
+  grant. A request answered with `"degraded": true` may record its heartbeat
+  late, or not at all.
+- Each agent has its own heartbeat: a subagent's requests record the
+  subagent's, not its parent session's. So a session that holds a write grant
+  and then works only on untracked files, or only through a subagent, is
+  reclaimed at its last heartbeat plus `grant_heartbeat_timeout_sec` while it
+  is still busy.
+- The grant-time term does not move until the hold ends.
+- A grant in the middle of a state transition is governed by the transient
+  timeout (`transient_timeout_sec`) instead, and `/status` does not show
+  transient state.
+- Compute the deadline against the same wall clock the coordinator reads. A
+  caller on a skewed clock computes a skewed deadline.
+
+**When the thresholds are `null`.** Both are `null` when no sweep enforces
+them: `sweep_interval_sec` is `0`, which turns the sweep off; either
+threshold is below `1`, which makes the sweep's grant check fail on every pass;
+or `transient_timeout_sec` is below `1`, which makes the transient check that
+runs before it fail on every pass, so the grant check never runs. Each failure
+is logged. There is then no deadline to compute. All four are
+`LifecycleConfig` fields (`grant_heartbeat_timeout_sec` 600,
+`grant_max_hold_sec` 1800, `sweep_interval_sec` 5, `transient_timeout_sec` 60
+by default), applied by whatever starts the coordinator.
+
+**Reading `owner_generation`.** The generation goes up by one each time a write
+claim (`EXCLUSIVE` or `MODIFIED`) on the artifact ends without the version
+moving, which a version comparison cannot see. That happens on:
+
+- a sweep reclaim (`reclaim_heartbeat`, `reclaim_max_hold`);
+- the transient timeout taking a write grant back (`timeout`);
+- a voluntary release (`invalidate`): a failed post-edit, a session-stop, or
+  the release of every grant by `agent-coherence-coordinator
+  --prepare-for-migration`;
+- a handoff from a giver holding the path `EXCLUSIVE` or `MODIFIED`
+  (`handoff`).
+
+It does not move when a peer's write-acquire preempts the holder, on a commit
+(the version moves instead), or when a giver hands off a `SHARED` read. The
+names in parentheses are the [state-transition triggers](#trigger-vocabulary).
+Compare generations per artifact `id`, not per path: a path that is removed
+and registered again gets a new `id`, and its generation starts again at 0.
+
+None of these fields appear below the operator view; the default and `metrics`
+views are unchanged. The table that `agent-coherence-status` prints does not
+show them; `agent-coherence-status --detail full --json` prints them as the
+coordinator sends them.
+
+### When the registry is busy
+
+This is the Python coordinator's behavior.
+
+**`/status`.** The default and operator views read the registry before they
+answer. If another request holds the registry lock, they wait for it for about
+2 seconds at most: the wait ends at the 4-second handler budget, or earlier, so
+that a lock won late still leaves time to read and answer within 6 seconds,
+the timeout this package's clients use: the `agent-coherence-status` console
+script, `CoherentVolume` and the MCP server's `swg_status`. A client that waits
+less can give up before the answer arrives when the lock is won at the end of
+that wait. If the lock is still held then, the answer is `200` with every key
+that view normally carries (the counters and `policy_summary`, and in the
+operator view the pattern lists and the sweep thresholds), plus
+`"degraded": true`, and with both registry lists set to `null` (other keys
+omitted here):
+
+```json
+{"detail": "minimal", "tracked_artifacts": null, "sessions": null, "degraded": true}
+```
+
+A `null` list means the coordinator cannot tell you, at that moment, what is
+tracked or who holds what. It never means "nothing tracked", which is an empty
+list. `degraded` never appears in a normal answer, so check for it, or for a
+`null` list, before reading the lists.
+
+- The wait that ran out is counted in `watchdog_timeouts_total`, which the same
+  answer reports, and logged at `WARNING`. There is no separate `/status`
+  counter.
+- A client polling `/status` should back off after a degraded answer rather
+  than ask again at once.
+- Any other failure to read the registry still answers `500`. The `metrics`
+  view never reads the registry and is unaffected.
+
+What the shipped readers do with a degraded answer:
+
+- `agent-coherence-status` exits `2`. The table prints nothing on standard
+  output and one line on standard error:
+
+  ```text
+  agent-coherence-status: the coordinator's registry is busy (lock contention), so tracked artifacts and sessions are unavailable; try again shortly
+  ```
+
+  `--json` prints the body unchanged and also exits `2`.
+- The MCP server's `swg_status` reports `per_path` as `null`, not `{}`, and its
+  text result adds `per_path=unavailable` after the coordinator state, for
+  clients that show only text. (An unreachable coordinator still gives `{}`,
+  with `coordinator` reported as `unknown`.) When `swg_read` falls back to
+  `/status` for a handoff record, it adds `handoff_unknown: true`.
+- A `CoherentVolume` attaching meanwhile still checks its managed globs: it
+  reads them from `policy_summary`, which a degraded answer carries.
+
+**The Grep hook.** `POST /hooks/pre-grep` looks up the tracked paths under the
+search root under the same request deadline, and that lookup and the rest of
+the hook's work share one 4-second handler budget. When the lookup cannot take
+the registry lock in time, the hook answers `"degraded": true` with the
+advisory a read hook gives when its check times out, which reaches the model
+as added context:
+
+```text
+⚠ Coherence could not verify this file's freshness — the coordinator staleness check timed out under load. Proceeding WITHOUT a stale-read guarantee: if this file is shared with other agents or sessions, re-read it before relying on its contents.
+```
+
+It counts in `watchdog_timeouts_total` too.
+
 ### Reference
 
 For the formal protocol model (TLA+/TLC) covering single-writer, monotonic
@@ -597,22 +891,79 @@ per-file MESI state, a content hash, and a version. Point a second volume in
 another process at the same workspace and it attaches to the same coordinator, so
 every process on the host shares one coherent view.
 
+**Every volume coordinating a workspace must declare the same `managed` globs.**
+An attaching volume adds no globs to a running coordinator's policy; only the
+track and untrack commands change it. At attach, each volume checks every glob
+it declared against the glob sets the coordinator publishes in its operator
+view, by the coordinator's own rule: a glob is enforced when it is in the
+coordinator's strict set and its tracked set and not in its ignored set. A glob
+that is not fails the volume closed, naming it: under `on_error="strict"`
+construction raises, and under `"degrade"` the volume warns once and runs
+detached. When the sets cannot be read at all, because the coordinator is older
+and publishes only counts, or is the Node coordinator, the volume fails closed
+the same way and says that enforcement could not be confirmed.
+`vol.managed_glob_enforcement()` returns the same three-way answer. The
+comparison is literal and taken once, at attach, and the coordinator keeps the
+answer true while it runs. A strict path stays enforced for the coordinator's
+lifetime:
+
+- the untrack command (`POST /policy/untrack`) refuses an entry, a path or a
+  glob, that covers a path the coordinator holds in strict mode. It answers
+  HTTP 409 with `reason: "untrack_strict_path"`, names the strict pattern for
+  each refused entry under `refused`, and writes nothing; the CLI exits 3. The
+  check is bounded in time: an entry it cannot settle within that bound counts
+  as covering, so a very large or unusual request can be refused for a strict
+  pattern it does not reach. Untrack fewer entries at a time if that happens;
+- an ignored pattern never takes a strict path off the tracked set, whether it
+  was in `.coherence/ignored.yaml` at spawn or added later, and however broadly
+  it is spelled (`**`): strict wins over ignore, and the coordinator logs the
+  overridden ignore entry at load. For every non-strict path ignore still wins;
+- the reload behind the track and untrack commands never drops a strict or
+  tracked pattern, even one removed from the YAML on disk by hand.
+
+To stop enforcing a strict path, remove its entry from
+`.coherence/strict_mode.yaml` and restart the coordinator. A fleet with mixed
+globs is still unsupported; it refuses instead of running unguarded.
+
 ```python
 from ccs.adapters.coherent_volume import CoherentVolume
 
 vol = CoherentVolume(workspace_root, managed=("plans/**", "memory/**"))
 data = vol.read("plans/plan.md")            # bytes — registers a SHARED view
 vol.write("plans/plan.md", revise(data))    # stale view? denied fail-closed
-data = vol.reacquire("plans/plan.md")       # recover: fresh identity + fresh read
+data = vol.reacquire("plans/plan.md")       # recover: clear the stale view + fresh read
 ```
 
 | Parameter | Default | Meaning |
 |---|---|---|
 | `workspace_root` | — | Directory the volume manages; the coordinator's state lives in `<root>/.coherence/` |
 | `managed` | `()` | Glob patterns for the files under coordination; unmanaged paths bypass the volume |
-| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure |
+| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
+| `config` | `None` | Coordinator settings as a `LifecycleConfig` (`from ccs.adapters.claude_code.lifecycle import LifecycleConfig`); `None` uses the defaults. Only the volume that starts the coordinator applies it |
+
+`vol.session_id` is the volume's session with the coordinator, and it stays the
+same for the volume's lifetime: `reacquire()` and the retries inside `write_cas`
+clear a stale view by starting a fresh attempt under that same session. A forked
+child gets a session of its own. The fresh attempt travels in the request's
+`agent_id` field, so the volume needs a coordinator that reads it: this package's
+from 0.13.0, or the Claude Code plugin's from 0.3.0. A volume hands a file to
+another session with `vol.transfer()`; see
+[From a `CoherentVolume`](#from-a-coherentvolume).
+
+To name the attempt to something else — a registry that joins the coordinator's
+`/status` `sessions[].agent_id` against its writers, for example — read
+`vol.agent_id`: the identity the coordinator keys the volume's next request on,
+in the same string form `/status` reports. `vol.incarnation` is the per-attempt
+part of it, the value every request carries in its `agent_id` field (a
+`transfer()` also names, per path, the incarnation that holds the volume's
+claim there, which can be an earlier one). Both change
+only when an attempt starts (`reacquire()`, `write_cas_at`, `atomic_publish`, a
+`write_cas` that retries or first releases its own `write()` grant, and a forked
+child) and are stable in between, so read them after the operation whose
+attempt you are reporting. `vol.root` is the workspace root as the volume
+resolved it at construction (absolute, symlinks followed); it never changes.
 
 ### Concurrent writers: `write_cas`
 
@@ -626,11 +977,57 @@ content)`, commits against an explicit version with no retry loop. See the race
 live: `python -m examples.concurrent_writers.main` runs two threads through the
 identical update — a plain file loses one write, `write_cas` preserves both.
 
-When a commit loses its race on the volume (or MCP) path, the raised
-`CommitPreempted` is **terminal for that attempt, not a transient to retry blindly**:
-the version the write assumed no longer holds. Recover by `reacquire()`-ing,
-re-reading the fresh version, and reconciling your change onto it before committing
-again — a plain retry of the same bytes just loses the same race.
+Both return a `CasCommitResult` (importable from `ccs.adapters`): the `path`,
+the `version` the win committed, and `handoff`, what the win did to a live
+[handoff](#from-a-coherentvolume) of the path, or `None`. They used to return
+`None`, so code that ignores the return value is unaffected.
+
+A volume can `write()` a file and then commit it through the optimistic lane. A
+successful `write()` leaves the volume holding that file's write grant after it
+returns; a `write_cas` of that file, `write_cas_at`, `atomic_publish` and
+`reacquire()` release it before they go further, so the volume is not refused by
+its own grant. A `write_cas` of another file leaves it held unless it has to
+retry, because that grant cannot refuse it. The release is one extra request, made only after a `write()`:
+a volume that only reads and commits optimistically never pays for it. Each of
+these starts a fresh attempt, as `reacquire()` and every `write_cas` retry do,
+and a fresh attempt clears every refusal the volume had, not only the one on the
+file it commits. Re-read any other file before a plain `write()` of it.
+
+When the retry budget runs out, `write_cas` raises `CasRetriesExhausted`. Its
+`last_conflict_reason` says why the last attempt was refused:
+
+- `version_mismatch`: other `write_cas` callers kept committing first. A later
+  retry can win.
+- `other_holder`: another agent wrote the file with a plain `write()` and still
+  holds it. The version has not moved, so re-reading returns the same bytes.
+- `caller_in_transient_state`: another agent's plain `write()` landed between
+  your read and your commit. That agent may still hold the file, as with
+  `other_holder`.
+- `stale_read_generation`: your read was taken under a grant the coordinator has
+  since reclaimed. `reacquire()` and re-read.
+
+A `CoherentVolume` that wrote a file keeps holding it until its own next
+`write_cas` of that file or any `write_cas` retry, `write_cas_at`,
+`atomic_publish` or `reacquire()` releases it. Closing the volume or exiting the process does not release it, and
+neither does a `session-stop` that names only `vol.session_id`, because each
+attempt holds its grants under its own `agent_id`. The coordinator
+takes the file back once the holder has recorded no heartbeat for
+`grant_heartbeat_timeout_sec` (600 s by default; only its reads, writes and
+commits of tracked files record one), or has held it for
+`grant_max_hold_sec` (1800 s by default). The operator view of `/status` then
+lists the file under that holder's `reclaimed` map (see [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status)).
+Both are `LifecycleConfig` fields, passed as `config` to the volume that starts
+the coordinator. A Claude Code session releases what it holds when its turn ends.
+So after `other_holder`, retry once the holder has released, not in a tight loop,
+or use a plain `write()`, which takes the file over (the previous holder's next
+write is then refused until it re-reads).
+
+When a plain `write()` loses its commit to a peer on the volume (or MCP) path,
+the raised `CommitPreempted` is **terminal for that attempt, not a transient to
+retry blindly**: the version the write assumed no longer holds. Recover by
+`reacquire()`-ing, re-reading the fresh version, and reconciling your change onto
+it before committing again — a plain retry of the same bytes just loses the same
+race.
 
 ### Atomic multi-file publish: `atomic_publish` (v0.12.0+)
 
@@ -664,8 +1061,10 @@ disk fault fails before any rename (disk stays uniformly old) and a rename faili
 partway raises a typed `PublishMaterializationError` naming exactly which files
 landed — never a bare error implying nothing published. A crash between renames can
 still tear the on-disk set (no POSIX multi-file atomic rename exists); on that error
-the coordinator is ahead of disk, so re-read each member at its current version and
-re-materialize (don't retry the publish — it would version-mismatch). Run it:
+the coordinator is ahead of disk, so write each file that didn't land again with
+`write()`, using the bytes you published (until then, `read_with_version` refuses
+that file, because the bytes on disk are not what the coordinator recorded). Don't
+retry the publish — it would version-mismatch. Run it:
 `python -m examples.atomic_publish.main` (offline, deterministic, no keys), or add
 `--baseline` to see the file-by-file torn pair it prevents.
 
@@ -879,14 +1278,45 @@ for member in report.members:
 
 | Outcome | Meaning |
 |---|---|
-| `restored` | the captured bytes landed via the member's conditional write |
+| `restored` | the captured bytes landed via the member's conditional write — over whatever was live at that moment, including content committed after the capture; the report below says, per member, what that write discarded |
 | `converged` | the live state already matched the manifest — nothing written |
 | `conflict` | a live foreign writer won; the re-drive budget is bounded, and **the foreign writer's state survives** |
 | `target_lost` | the captured version is no longer reachable (expired retention, a vanished S3 version), or the member itself can no longer be driven safely (its path became a symlink, a hardlink with an outside co-owner, or a non-regular file) — reported, never substituted |
 | `forward_only_skipped` | a declared action surface (or an uncapturable member) — enumerated, skipped |
 | `held_unconfirmed` | a write whose outcome could not be confirmed — held, never guessed |
 
-Each member's leg rides its own backend's arbitration: S3 legs are a native conditional write (`If-Match` — the substrate arbitrates a racing foreign writer); file legs are a version-checked write whose foreign-edit signal is **detection only** (`no-arbiter`) — a foreign edit racing a file restore is detected and reported as a typed conflict, never presented as substrate arbitration. Restore progress is durable, so a restore interrupted mid-way resumes idempotently: already-terminal members are skipped, and a member whose live state already matches concludes `converged` without a second write.
+**What a restore does not promise.** A restore is not a merge, and nothing on this path refuses a write: a member whose content moved after the capture is put back over, and that later content is gone. What the run gives you is the record of it. Every leg already reads the live state to build its conditional write's comparand, and each member now carries that read as an **observation** in one of five states:
+
+| Observation | Meaning |
+|---|---|
+| `observed_differs` | a live state was read, it differed from the capture, and the write discarded it — the only state that names the version overwritten and a digest of the content overwritten |
+| `no_live_state` | the write landed on nothing (create-on-absent) — it discarded nothing |
+| `present_not_comparable` | a delete leg's probe established that live state existed and destroyed it, but read no comparand — so it names neither version nor digest |
+| `no_write_attempted` | the member reached its terminal without a write decision: converged, forward-only skipped, or absorbed before any write was issued (a wedged view, an exhausted re-drive budget). Also what a resumed member reports when its recorded outcome proves no write landed |
+| `not_recorded` | this run holds no observation for the member. Either a leg ran and its outcome was lost — an unconfirmed commit, a reconciled unknown write, or a failure absorbed from inside the leg, any of which may have destroyed live state — or no leg ran and the recorded outcome does not itself prove none ever did. Never read it as clean |
+
+Nothing was added to the substrate wire for this: the values ride the read each leg was already making, and on an S3 leg the ETag stays the comparand while the `versionId` is the pointer. The human report flags every state the exit code below can fire on, on that member's line: `overwrote-differing-content` — and, where the leg named one, `overwritten-version=<pointer>` — for `observed_differs`, `destroyed-uncompared-content` for `present_not_comparable`, and `overwritten-content-not-recorded` for `not_recorded`. The two states it does not flag are the two that exit code does not fire on, and their lines read exactly as they did before. Under `--json` each member carries a nested `observation` block (`state`, `pointer`, `fingerprint`) alongside the keys it already had. If you would rather a run like that be a failure, `restore --exit-nonzero-on-discarded-content` makes it exit `4` — see the exit codes below; it is read after the engine returns, so it reports the write and cannot prevent it. One caveat before you put it in a loop: the observation is not persisted, so re-running a restore that *did* write reports `not_recorded` for those members and exits `4` again, whatever the second run found. It answers "did this run discard anything", not "is this checkpoint settled", so it does not belong in a retry-until-zero script.
+
+Each member's leg rides its own backend's arbitration: S3 legs are a native conditional write (`If-Match` — the substrate arbitrates a racing foreign writer); file legs are a version-checked write whose foreign-edit signal is **detection only** (`no-arbiter`) — a foreign edit racing a file restore is detected and reported as a typed conflict, never presented as substrate arbitration. Restore progress is durable, so a restore interrupted mid-way resumes idempotently when the same controller resumes it (the same owner in-process, the same session over HTTP): already-terminal members are skipped, and a member whose live state already matches concludes `converged` without a second write. Once the interrupted restore's registration has claimed the checkpoint, a resume under another controller is refused, as the next section describes.
+
+### Who may restore a checkpoint, and what its registration accepts
+
+After the member legs, a restore *registers* its written file members with the coordinator (`POST /workspace/restore/register`, or `CoordinatorService.register_workspace_restore` in-process): each member's artifact moves forward to the captured fingerprint and peers holding it are invalidated. That step is checked before it resolves or mints anything, and every refusal carries a typed `reason`:
+
+| `reason` | When |
+|---|---|
+| `not_a_checkpoint_member` | a write names a path the checkpoint does not describe — typically a checkpoint id from an earlier round. `member_paths` names them |
+| `fingerprint_mismatch` | the path is a member, but the write's fingerprint is not the one captured for it. A restore registers the captured bytes only |
+| `not_the_receiver` | the checkpoint names a receiver and this controller is not it |
+| `already_registered` | another controller registered this checkpoint first. The refusal does not say who |
+
+**The owner is provenance, not permission.** A checkpoint records who took it (`owner`), and nothing checks a restore against that: the point of a checkpoint is often that someone else restores it. To restrict who may, name a **receiver** when you take it — `WorkspaceVersioner.checkpoint(name, receiver=<their owner id>)`, or `receiver_session_id` on `POST /workspace/checkpoint`. Without one, any controller may register it, as before.
+
+**The first registration claims the checkpoint.** Once a controller registers a checkpoint, a registration by any other controller is refused `already_registered`, while the same controller's retries stay idempotent and come back with `retry_of_own_registration: true` — so "I registered this" and "someone else did" never look alike. The claim is kept even when the registration's commit is refused (a live holder, a fenced controller), so the same controller re-drives and no one takes the checkpoint over mid-retry. The claim is never released, transferred or timed out. A controller that claims a checkpoint and then stops (its process dies, its session ends, or a fence it cannot clear keeps refusing its commit) leaves the checkpoint registrable by no one else: a resume under a different identity, such as a new session over HTTP or a versioner with another owner in-process, is refused `already_registered`. Resume with the same controller where you can. Otherwise take a new checkpoint, knowing what it cannot do: it captures the workspace as it is now, including any members the stopped restore already wrote, so it neither registers those bytes nor brings back the state the claimed checkpoint captured. `GET /workspace/checkpoints` shows `receiver` and `registered_by` on a checkpoint that has them; a key is absent when it is unset (no receiver named, nobody registered yet), and `retry_of_own_registration` likewise appears only when true. In-process, `WorkspaceVersioner.restore` checks both before it writes anything and raises `CheckpointRegistrationRefused`; a rival claiming the checkpoint while a restore is already running is caught at registration instead, and that restore concludes with its registration `refused`. A restore that had nothing to register (every member converged, or only deletes and S3 members) still claims the checkpoint, so another owner's restore of it is refused the same way.
+
+**The restore's progress is gated the same way.** `POST /workspace/restore/status` and `POST /workspace/restore/member` — where a restore records its status and each member's outcome, deletes included — refuse a session the checkpoint excludes with the same `not_the_receiver` / `already_registered` envelope (`{ok: false, reason, detail, member_paths: []}`), so no other session can conclude a checkpoint or record its members restored ahead of its receiver. These two routes make no claim; only a registration does.
+
+**How far this holds.** Over HTTP the controller is derived from the request's `session_id`, so the receiver binding is as strong as that identity: when the receiver's session has claimed a [caller principal](#caller-principal), a register naming it must present that principal; when it has not, anyone holding the workspace secret can name it. In-process, the controller is whatever the caller passes. This separates writers that follow the protocol; it is not a security boundary.
 
 ### The honesty model: restore tiers and pin states
 
@@ -901,6 +1331,8 @@ Every member carries a **restore tier**, derived from what its backend can actua
 The durable truth is the **pair** `(restore_tier, pin_state)`. `restorable` is backed only by `pin_state="held"`; the pair `(restorable, unpinned)` — a capture whose pin legs haven't run, or a run that died before them — is rendered as **claimed-but-not-yet-backed**, never as a plain restorable state. Pins are fail-closed and loud: an S3 member whose bucket has no Object Lock configuration is durably downgraded to `restorable-unpinned` with `pin_state="pin_unavailable"` — the tier and the pin state land in one write, never silently.
 
 **The file-member retention caveat, precisely.** File members ride the coordinator's [declared version retention](#version-retention-and-read-at-version), which is a bounded window (a count/age policy), not a per-version hold. A checkpoint pin on a file member **verifies** — it checks the captured version is currently retained and still matches its fingerprint — it **cannot extend** the window or exempt the version from the policy. If the version has aged out by restore time, the restore reports that member `target_lost` rather than restoring different content; expiry always surfaces, never silently. S3 members are the stronger case: their pin is a legal hold in *your* bucket on the captured version — the substrate's own retention, at your bucket's configuration and cost.
+
+**Dropping a pin.** `WorkspaceVersioner.release_checkpoint(checkpoint_id)` releases the pins a checkpoint holds — the S3 legal holds it placed, and file members' verification pins. The manifest survives: this releases pins, it does not delete the checkpoint. Four things to know before calling it. It is **one-way** — a released member is terminal, `pin_checkpoint` will not re-drive it, and the captured version becomes eligible for lifecycle expiry and version-targeted delete from that instant. S3 members must be **re-declared on the versioner you release from** (`add_object_member`), through the **same binding and key that placed the hold**: the pre-flight only checks that an object member is declared at that member path, so a mismatched binding or key records the member `released` while the hold quietly survives. And a hold **shared** with another checkpoint survives until the last holder releases — with two bounds worth knowing, since a legal hold is a retention control: the sharing scan walks only that versioner's registry, so a holder recorded elsewhere (another workspace, a person, another tool) is invisible to it, and the scan alone cannot cover the instant between its last check and the drop itself — that instant is handled by re-reading *after* the drop and putting the hold back if a peer claimed it, so what remains is the narrower case where putting it back also fails, which is logged. Finally, it is **idempotent but not self-healing**: the release records `released` before it drops the substrate hold, so a crash or an untyped substrate error between the two strands a live hold on an already-terminal row — retrying `release_checkpoint` will not detect or repair it, since the row already reads terminal. Calling it **concurrently** fails differently, and no longer strands: two processes releasing one checkpoint both decrement its pin refcount, and the registry fails the surplus decrement with a `ValueError` — but that raise lands after the hold has already been dropped, so it costs you bookkeeping accuracy rather than a live hold. It does abort the rest of that checkpoint's members, which stay `held` for a later call. Treat a `ValueError` as "some members may have been released", never as "nothing happened". The recovery in both cases is calling `CoherentObject.release_legal_hold` directly on the binding, by version — the released row keeps the `native_token` you need for it.
 
 **Binary members (v1 limitation).** A file member whose bytes are not UTF-8 text is refused at capture with a typed error — before anything persists. The file restore path rides a text wire, so capturing a member that could never be restored would be a silent over-claim.
 
@@ -921,16 +1353,17 @@ Exit codes:
 
 | Code | Meaning |
 |---|---|
-| `0` | the verb succeeded (restore: concluded with every member clean) |
+| `0` | the verb succeeded (restore: concluded with no member in `conflict` / `target_lost` / `held_unconfirmed`) — never a claim that nothing was overwritten: a restore that put a member back over content committed after the capture also exits `0`, and says so per member in the report |
 | `1` | not in a git repository, or a validation error (no members, a `..` traversal in a member argument), or a typed contention error |
-| `2` | a typed refusal: a non-UTF-8 member, an unknown checkpoint id, a persist failure, or a member path that fails containment at access time — a workspace escape, a symlink component, a hardlinked regular file with a co-owner outside the root, a non-regular file (FIFO, socket, device), or a `.coherence/**` self-target |
+| `2` | a typed refusal: a non-UTF-8 member, an unknown checkpoint id, a checkpoint bound to another receiver or already registered by another controller, a persist failure, or a member path that fails containment at access time — a workspace escape, a symlink component, a hardlinked regular file with a co-owner outside the root, a non-regular file (FIFO, socket, device), or a `.coherence/**` self-target |
 | `3` | the restore **concluded**, but at least one member ended in `conflict` / `target_lost` / `held_unconfirmed`, or the restore registration was refused — the per-member report on stdout is the truth; the exit code just tells you to read it |
+| `4` | opt-in, and only with `restore --exit-nonzero-on-discarded-content`: the restore concluded clean by the codes above, but at least one member's write discarded content the checkpoint did not hold, or the run holds no record of what that member's write overwrote. Without the flag the same run exits `0`, and both producers of `3` take precedence over it. It is evaluated after the engine returns, so it reports the writes and never prevents one |
 
 **Where a refusal lands.** A containment refusal at **capture** is a hard exit-`2` refusal with nothing persisted. The same refusal raised inside a **restore** leg is deliberately not: the termination contract absorbs it into that member's `target_lost` so every other member still concludes, and the refusal text becomes that member's outcome detail — exit `3`, never a checkpoint left stuck mid-restore.
 
 **S3 members and the CLI.** S3 object members are captured and restored via the Python API shown above — their bindings carry credentials the CLI cannot (and should not) reconstruct. `restore` on a checkpoint with pending S3 members refuses cleanly and points you at the Python API; `status` and `list` still render those members honestly.
 
-**The HTTP surface.** The coordinator serves the workspace verbs over local HTTP — `POST /workspace/checkpoint`, `GET /workspace/checkpoints`, `POST /workspace/restore/status`, `POST /workspace/restore/member`, and `POST /workspace/restore/register` — the same routes the Python API and the CLI ride. Pin orchestration has no HTTP route by design: pins are placed and released through the Python API only, because the substrate bindings that hold them carry your credentials, and credentials never belong on the coordinator's wire.
+**The HTTP surface.** The coordinator serves the workspace verbs over local HTTP — `POST /workspace/checkpoint`, `GET /workspace/checkpoints`, `POST /workspace/restore/status`, `POST /workspace/restore/member`, and `POST /workspace/restore/register` — the same routes the Python API and the CLI ride. Pin orchestration has no HTTP route by design: pins are placed and released through the Python API only — `pin_checkpoint` and `release_checkpoint`, described above — because the substrate bindings that hold them carry your credentials, and credentials never belong on the coordinator's wire.
 
 ### Try it
 
@@ -953,7 +1386,7 @@ The corpus's race scenarios run across real OS **process** boundaries: contender
 - Restore is over **artifacts, never effects** — files and objects come back; a sent message does not.
 - File members are detection-only (`no-arbiter`); only backends with a native conditional write arbitrate. And restore is a **forward** commit carrying old bytes — versions strictly increase, history is never rewritten.
 - Restoring file members while a live coordinator session is running bypasses that session's grants — the session learns of the change on its next read, not before. The CLI warns when it detects a live coordinator; it does not refuse.
-- Torn-cut detection has a tail window: a write landing in the final instants between the quiescence check and the manifest persisting can go undetected. And concurrent restores of the same checkpoint assume a single controller — run one restore at a time.
+- Torn-cut detection has a tail window: a write landing in the final instants between the quiescence check and the manifest persisting can go undetected. And concurrent restores assume a single controller — run one restore at a time. Two restores of the *same* checkpoint are the obvious case; the sharper one is two restores of **different** checkpoints that overlap on a member. Those are not cross-serialized: each leg compares against the state it read, so both can honestly report the member `restored` while only the last write survives on disk. The engine serializes its own runs; ordering across controllers is the operator's contract in v1.
 
 ## Multi-artifact snapshot sessions
 
@@ -1007,12 +1440,1529 @@ Semantics, precisely:
   from its own data plane.
 
 The no-torn-read property is model-checked: `NoReadSkewWithinCut` and
-`PinAlwaysRetained` in `formal/tla/Snapshot.tla`, run by `make tla-check` in CI.
+`PinAlwaysRetained` in `formal/tla/Snapshot.tla`, part of `make tla-check`, which CI runs
+as three parallel jobs.
 
 **Honesty boundary.** Snapshot sessions prevent **read-skew** — torn reads across
 artifacts. They do not add write-skew prevention: commits validate per-artifact
 against the pinned base, so two sessions that read one cut and write *different*
 artifacts can still interleave. Single coordinator, single host.
+
+## Effect fence over HTTP
+
+An agent reads a shared artifact, decides something from it, and then fires an
+effect that escapes the process — a deploy, a webhook, an opened PR, a charge.
+Between the read and the effect the input can move underneath it, or the
+authority it was read under can be taken away. The coordinator answers that
+question directly, for any client that can make an HTTP request:
+
+**`POST /hooks/effect-fence` — may this effect still fire, and if not, why?**
+
+One artifact per call, against a running coordinator (the same one
+`CoherentVolume` spawns). The route is a pure query: it grants nothing,
+registers nothing, and heals nothing it checks — so a hold is level-triggered.
+Asking again changes no state and gets the same answer until you actually
+recover.
+
+**Authentication.** This route carries the same two checks every coordinator
+route does, and both run before it: the request must come from a loopback or
+allowlisted host, and it must present the coordinator's bearer token —
+`Authorization: Bearer <secret>`, where the secret is the contents of
+`.coherence/hook.secret` in the workspace the coordinator was started for.
+That file is created `0600`, so "any client" means any client running as the
+same OS user, not any client on the network. A wrong or missing token answers
+`401` and a non-allowlisted host answers `403`; by the rule below, your caller
+treats both as a hold, so a misconfigured client fails closed rather than
+firing.
+
+### Request
+
+| Field | Type | What it is |
+|---|---|---|
+| `session_id` | UUID string | Your client identity. Grant standing is **per session**, so the fence cannot answer without it. |
+| `path` | string | The workspace-relative artifact whose state gates the effect. |
+| `expected_version` | integer | The version you captured when you read the input. Sent as a JSON number, never a string — and never `0`, which is the "could not resolve" sentinel. |
+| `expected_generation` | integer **or** `null` | The ownership generation you captured beside the version. |
+| `content_hash` | 64-character lowercase hex | The digest of the bytes you actually hold. |
+| `agent_id` | string, optional | A subagent id, as on every hook route; it makes a subagent its own coherence peer rather than part of the parent session. |
+
+All five non-optional fields are required on every call. **Name them all**: a
+client that omits one gets a `400` telling it which, not a verdict — and a
+client that omits `session_id` in particular could otherwise spend a long time
+reading holds it can never clear, because the answer depends on which session
+holds the grant.
+
+If your client has claimed a [caller principal](#caller-principal) for
+`session_id`, send it in the `Coherence-Caller-Principal` header: this route is
+require-class, so a request naming a claimed session without it answers `400`.
+
+**Omitted and `null` are different answers for `expected_generation`, and the
+difference is the point of the field.** Leaving the key out is a client that
+never captured the comparand; no number of identical retries supplies a value
+it does not have, so the route answers `400`. The key present as `null` is a
+captured *fact* — "the coordinator I read from confirmed no generation" —
+which is representable, flows through, and holds under
+`generation_unconfirmed`.
+
+**The content hash, exactly.** `content_hash` is a lowercase sha-256 hex digest
+over the exact bytes the caller holds, with no normalization — no re-encoding,
+no line-ending translation, no trailing-newline or whitespace fixup — so hash
+the byte sequence you read, exactly as you read it. The server checks only that
+it is 64 hex characters, so a client that hashes a decoded, re-encoded or
+tidied-up copy is not told it picked the wrong convention: it simply never
+matches what the coordinator recorded, and every call it makes holds wearing
+the same reason a genuine conflict would.
+
+### Response
+
+Always HTTP `200` for a protocol outcome, in one of exactly two shapes:
+
+```json
+{"verdict": "proceed"}
+{"verdict": "hold", "reason": "version_moved"}
+```
+
+`proceed` means every leg of the fence affirmatively cleared. `hold` always
+carries a `reason` drawn from the vocabulary below.
+
+Two degraded holds add `"degraded": true` and a `held_by` field naming which
+arm answered — `watchdog_timeout` (the handler was abandoned before it compared
+anything) or `handler_error` (the handler raised). Both report
+`version_unconfirmed`, because a handler that ran no comparison resolved no
+version. A client needs only `verdict`; `held_by` is for whoever is looking at
+the coordinator.
+
+A request that never reached a verdict is `400 {"error": "<what to send>"}`,
+naming each missing or malformed field in its own words (`missing
+expected_version`, `missing content_hash`, `content_hash must be 64 hex
+characters (sha-256)`, and so on). **A malformed request is never a hold.** A
+hold invites a retry, and a retry cannot supply a comparand the caller never
+captured — so the fixable and the unfixable stay different answers on the wire.
+
+### Anything that is not a verdict is a hold
+
+The fence is a safety property only because the *absence* of a `proceed` stops
+the effect. On the caller's side, every one of these is a hold and the effect
+does not fire: a connection failure or a timeout; any status other than `200`;
+a `200` body with no `verdict`; a `verdict` you do not recognise; and a `404`.
+
+A `404` is what a coordinator that does not implement this route answers, and
+one such coordinator ships today: **the sibling Node coordinator backend does
+not implement `/hooks/effect-fence`**. There is no handshake to ask first and
+none is coming — the `404` is the whole answer. An unimplemented route is a
+visible gap; two coordinators quietly disagreeing about whether an effect may
+fire would not be.
+
+### Hold reasons — the published vocabulary
+
+These strings are the wire contract, shared by every surface that answers this
+question. **Reasons may be added; an existing one is never renamed or
+repurposed.** Match on the whole value (`reason == "version_moved"`), never on
+a substring of a human-readable message, and treat a `hold` whose `reason` you
+do not recognise as a hold — a later coordinator may split a case out of the
+residual bucket, exactly as `read_denied` and `content_claim_absent` were split
+out of it.
+
+Each reason names who established it — the **coordinator**, from state only it
+can see, or the **caller**, from state only *it* can see — and each has its own
+recovery. They are not interchangeable: "re-read your bytes" and "call an
+operator" are different answers, and telling them apart is why some of these
+reasons exist.
+
+| `reason` | Established by | What it means | How you clear it |
+|---|---|---|---|
+| `version_moved` | the coordinator | a peer committed a newer version than the one the decision was derived from | re-read the input, re-decide, re-gate |
+| `read_denied` | the coordinator | it refused the re-validate read outright — this view is invalid (strict mode; on a strict-mode workspace this is how a reclaim usually surfaces) | reacquire, take a fresh read, re-decide, re-gate |
+| `grant_reclaimed` | the coordinator | both generations are confirmed and they differ: a sweep reclaimed the grant the decision was read under, while the version never moved | reacquire, re-decide, re-gate |
+| `grant_preempted` | the coordinator | neither comparand moved, yet the re-validate read was served without a standing grant — a peer's write-claim acquire took the grant with no commit behind it yet | reacquire. A bare re-ask holds again: the fence does not re-grant on the read it checks with |
+| `content_claim_absent` | the coordinator | it records no content claim for this artifact at all, so it cannot vouch that the bytes in hand are the content at the version it reports | re-read the artifact through a coordinated read; the coordinator records a claim on that observation. **Not an operator's problem** — this reason exists so this case stops arriving as `generation_unconfirmed` |
+| `input_vanished` | **the coordinator or the caller** — see below | there is no establishable current state for the input | re-establish the input, then re-gate |
+| `version_unconfirmed` | the coordinator | it resolved no version at all: a degraded read, or one of the two degraded arms above | restore the coordinator's health, then re-gate. A re-read will not clear it |
+| `generation_unconfirmed` | **the coordinator or the caller** — see below | the residual bucket: no confirmed ownership generation | reacquire and re-gate **first** — that clears the recoverable forms. A hold that survives a *successful* reacquire is the last one: check the coordinator's version and restart it |
+
+**`input_vanished` has two establishers, and both are in the contract.** They
+mean the same thing — there is no establishable current state for the input —
+and they are established from opposite sides:
+
+- **The coordinator** answers `input_vanished` over the wire when it holds no
+  record of the artifact: the path is not tracked, it is tracked but was never
+  observed, or its row vanished between the lookup and the read. Recovery is to
+  get the path tracked and read once through the coordinator, so a record
+  exists to compare against.
+- **The caller** establishes it itself when its own input no longer exists. The
+  coordinator cannot see your workspace, so it will never report this for you;
+  detect it and treat it as a hold under this same identifier. Recovery is to
+  recreate or re-point the input.
+
+**`generation_unconfirmed` likewise.** The caller establishes it by sending
+`expected_generation: null` — its own read confirmed no generation. The
+coordinator establishes it when it cannot confirm one now: a degraded read, an
+out-of-band edit it could not confirm, or a coordinator too old to report
+generations at all. The bucket is deliberately *not* a clean
+permanent-versus-transient signal, which is why the recovery is retry-first and
+persistence across a *successful* reacquire is the signal that a person is
+needed.
+
+**Which reason you get when several apply.** The legs are evaluated in a fixed
+order and the first match is the answer: `input_vanished`,
+`version_unconfirmed`, `version_moved`, `read_denied`, `content_claim_absent`,
+`generation_unconfirmed`, `grant_reclaimed`, `grant_preempted`. The order is
+part of the contract — a state that matches two legs has one right answer, and
+an implementation that reorders them answers a different question.
+
+### The same fence, three surfaces
+
+| Surface | Call | Reach |
+|---|---|---|
+| Python | `gate(volume, path, decide=…, effect=…)` | in-process; holds raise `StaleView` carrying `hold_cause` |
+| MCP | `swg_gate` | any MCP client; holds come back as a typed deny |
+| HTTP | `POST /hooks/effect-fence` | any client at all — no Python, no MCP |
+
+All three ask one classification, so a reason means the same thing on each. One
+leg is not the same on each, and it matters: **only the HTTP route can answer
+`content_claim_absent`.** The Python and MCP surfaces read a *comparison* from
+the coordinator rather than its recorded hash, so "the claim matches" and
+"there is no claim at all" arrive there as one value, and they assume a claim
+exists. If your effect matters enough to fence, that is the leg to ask for over
+HTTP.
+
+The coordinator keeps advisory counts of how many fence calls it answered and
+how many of those held, as instrumentation for whoever runs it. They are
+advisory rather than auditable, and nothing in a client's decision path should
+read them.
+
+### Scope, honestly
+
+The fence *orders* an effect; it never rolls one back. It answers before the
+effect fires and does not undo it afterwards, so for an escaping effect there
+is a residual check→fire window it narrows but cannot close. Single host,
+single coordinator, and cooperative — an effect that never asks is never held.
+
+**A narrower gate this vocabulary does not govern.** The coordinator also
+offers a session-based gate in Python — `CoordinatorService.effect_gate`, which
+pins a read-set and re-validates every member's *version* at the effect
+boundary. It checks versions only: it does not apply the grant-standing leg, so
+a peer's write-acquire that preempts the session's grant without moving any
+version lets that gate fire where this fence holds. It is in-process Python
+only — no HTTP route and no tool reaches it — and it answers in its own
+fired/held result types, not in the vocabulary above.
+
+## Caller principal
+
+The coordinator authenticates the workspace, not the caller: one bearer secret
+covers every process, and the session a request acts as is the `session_id` in
+its body. A **caller principal** is a value the coordinator issues and binds to
+one session, so that a request naming that session can be checked against it.
+For a long-lived client it turns "a writer sent the wrong session id" — a copied
+request, a stale id after a fork, a retry that picked up a peer's id — from a
+silent success into a refusal.
+
+It is not a security boundary. The bearer secret still gives full authority over
+the workspace, and every principal is stored in `.coherence/state.db`, where any
+process running as your OS user can read it. What a principal catches depends on
+the client:
+
+- A long-lived client — `CoherentVolume`, the MCP server, the substrate session —
+  is issued one principal for its own session and presents only that one, so a
+  request it sends naming any other session is refused.
+- The Claude Code hook client runs once per hook event and finds its principal
+  in `.coherence/` by the session id in the event. A hook carrying another
+  session's id can therefore find that session's principal too. On this surface
+  the principal makes a client that never claimed, or one presenting the wrong
+  principal, visible; it does not tell sessions apart. The
+  [handoff commands](#handoff-commands) find a session's principal the same
+  way, by the session id they are given.
+
+### You usually do nothing
+
+The Claude Code hook client, `CoherentVolume`, the MCP server and the substrate
+session claim a principal for their session and send it on every request. If
+the binding disappears because `state.db` was deleted, the next request the
+coordinator refuses makes each of them claim again with the nonce it kept, and
+the request is sent once more with the principal that comes back. A claim whose
+*answer* is lost is handled the way each client handles any unanswered
+coordinator request: the hook client, and a `CoherentVolume` built with
+`on_error="degrade"`, carry on and claim again with the same nonce before their
+next request; a strict `CoherentVolume` (the MCP server's is strict) and the
+substrate session fail closed at construction, so the object is never built,
+and a later attempt is a new session with a new nonce — the first binding is
+left unused. (A strict volume's forked child attaches on its first request
+instead: that request raises, and its next one claims again with the same
+nonce.) A client written before principals existed keeps working
+unchanged: its sessions never claim one, and a request naming a session that
+never claimed one is admitted exactly as before (and counted, see below).
+
+The Claude Code plugin's Node coordinator issues no principals. It answers
+`/principal/claim` with `404`, and clients proceed without one; the hook
+clients skip the request altogether when `.coherence/server.pid` names the Node
+backend.
+
+The hook client keeps a session's nonce and principal in two files under
+`.coherence/`; they are listed, with what to do about them, among the
+coordinator's other local files in
+[security.md](security.md#local-config-and-data-files).
+
+### What is checked, and where
+
+Every route that takes a `session_id` is in one of three classes:
+
+| Class | Routes | A request naming a session that has claimed a principal… |
+|---|---|---|
+| require | `/hooks/pre-edit`, `/hooks/session-stop`, `/hooks/post-edit`, `/hooks/post-edit-cas`, `/hooks/effect-fence`, `/workspace/checkpoint`, `/workspace/restore/register`, `/workspace/restore/status`, `/workspace/restore/member`, `/handoff/transfer`, `/handoff/accept`, `/handoff/decline`, `/handoff/withdraw` | …must present it. Without it, or with a different one, the answer is `400`. |
+| accept | `/hooks/pre-read`, `/hooks/pre-bash`, `/hooks/pre-grep`, `/hooks/session-start`, and the five `/session/*` routes | …is admitted without it, but refused with a different one. |
+| mint | `/principal/claim` | …is where principals come from; its gate is the mint nonce. |
+
+The require class is the routes that take, release or commit a session's
+grants, record who wrote a version, answer the effect fence about a session's
+grant, record workspace ownership, or hand a session's claims on or settle a
+[handoff](#targeted-grant-handoff) in its name — the things a caller naming the
+wrong session could do to someone else's work. `pre-edit` is among them because
+a grant taken without the principal could then be neither committed nor
+released. The accept-class reads change no grant or version, but they do
+deliver the named session's pending notices, so a read naming the wrong session
+can consume advisories meant for it. The snapshot-session routes are
+accept-class because each is already gated by the server-issued session token.
+That token is issued to whichever session `/session/begin` names, and that
+route is accept-class too, so a request that presents no principal and names a
+bound session commits as that session on `/session/commit` and
+`/session/commit_all`. Against a live handoff of the path it is therefore
+refused as that session when that session is the giver, completes the handoff
+when it is the successor, and is recorded as the counterparty of an overtake
+otherwise.
+
+A refusal is HTTP `400` with an `error` field naming the header and a `reason`
+field: `caller_principal_absent` when a claimed session is named with no
+principal, `caller_principal_foreign` when the principal presented is not the
+one bound to the named session. Branch on `reason`, not on the text. It is never
+a hold, and a refused request changes nothing, so it is safe to send again once
+the client has the right principal.
+
+`GET /status` reports two counters at every tier: `caller_principal_absent_total`,
+the requests this coordinator process admitted without a principal (a nonzero
+value means some client is not sending one yet), and
+`caller_principal_refused_total`, the requests it refused. Both are local
+diagnostics that reset when the coordinator restarts.
+
+### Writing your own HTTP client
+
+1. Generate a mint nonce — 16 to 128 characters from `[A-Za-z0-9_-]`, for
+   example `secrets.token_urlsafe(32)` — and keep it **before** you call. It is
+   what lets you recover your principal if the response is lost.
+2. `POST /principal/claim` with `{"session_id": ..., "mint_nonce": ...}`. The
+   answer is `{"ok": true, "principal": "..."}`. A retry with the same nonce gets
+   the same principal back. If the session is already bound under a different
+   nonce, the answer is `{"ok": false, "reason": "caller_principal_claimed", "detail": ...}`
+   and you do not become that session; a malformed request is `400`.
+3. Send the principal in the `Coherence-Caller-Principal` header on every
+   request that names the session. The principal appears in the claim response
+   and nowhere else: never log it.
+4. If a request is refused with `caller_principal_absent` or
+   `caller_principal_foreign` — for example because `state.db` was deleted and
+   the binding with it — claim again with the **same** nonce, and send the
+   request once more with the principal you get back. Never pick a new nonce:
+   that is what stops a client from taking over a session someone else has
+   claimed.
+
+A subagent shares its parent session's principal.
+
+### Upgrading
+
+Principals live in their own table, added by registry schema version 8. Like
+earlier schema steps it is forward-only: once a workspace's `state.db` has been
+opened by this version, an older release refuses it. Upgrade forward rather than
+rolling back.
+
+## Targeted grant handoff
+
+A session that is done with a path can hand it to one named session, the
+**successor**. The coordinator records the handoff, so afterwards it can tell a
+deliberate handoff from an abandoned claim: the giver's late write is refused
+with a reason that says it handed the path off, the successor can see that it
+was handed the path and at which version, and the state log records the
+giver's move under a trigger of its own, `handoff`, rather than as a release or
+a reclaim.
+
+Use it when one session passes its work on a file to another — a lead handing a
+plan to a worker, a session ending its task handing the file it was editing to
+the session that carries on — and the first session must not write that file
+again unless the handoff is undone.
+
+Most of this section describes the coordinator's HTTP API. Claude Code
+sessions use it through the hook client and four console scripts: the hooks
+deny the giver's edit and tell each session about the handoff in its read and
+edit answers (see [Claude Code sessions](#claude-code-sessions)), and the
+commands hand a path on and accept, decline or withdraw a handoff (see
+[Handoff commands](#handoff-commands)). `CoherentVolume` has a method for each
+verb (see [From a `CoherentVolume`](#from-a-coherentvolume)), and the MCP server
+a tool for each (see [From the MCP server](#from-the-mcp-server)). Any other
+client calls the routes over HTTP.
+
+### What a transfer does
+
+A transfer names one successor and one or more paths. For each path the giver
+must hold a claim: a write grant (EXCLUSIVE, or MODIFIED after a commit) or a
+standing SHARED read. The transfer then, for every path it admits, in one step:
+
+- moves the giver's claim to INVALID under the `handoff` trigger, giving it up
+  as a release would (see the [trigger vocabulary](#trigger-vocabulary) for
+  what that does to the ownership epoch);
+- stores one **transfer record** for the path: the giver, the successor, the
+  version at transfer, the hold shape given up, and a status;
+- fences the giver, which can no longer write the path while the record is
+  live.
+
+It grants the successor nothing. The successor reads or acquires the path
+itself, by the ordinary rules. Its acquire, its optimistic commit or its accept
+completes the handoff; a read alone does not.
+
+**A transfer does not reserve the path.** No other session is refused because
+of it: a third session's read is served, its acquire is granted and its
+compare-and-swap commits by the ordinary rules. The record labels what happened
+(see [Bystanders and overtake](#bystanders-and-overtake)); it keeps no one out.
+
+**The parties are sessions.** The giver is the session the transfer request
+names, and the successor is resolved to a session too. Every subagent and every
+fresh attempt of the giver's session is fenced alike, and a subagent of the
+successor's session accepts or declines for it. A transfer to the caller's own
+session, directly or through one of its own subagents, is refused as
+`handoff_to_self`.
+
+| Call | Who may make it | Anyone else is refused with |
+|---|---|---|
+| transfer | a session holding a claim on the path; while a live record exists, only that record's giver | a per-grant reason (see [`POST /handoff/transfer`](#post-handofftransfer)) |
+| accept | the live record's successor | `handoff_not_successor` |
+| decline | the live record's successor | `handoff_not_successor` |
+| withdraw | the live record's giver | `handoff_not_giver` |
+
+### Statuses, and when a record is live
+
+| `status` | Set when | Giver fenced |
+|---|---|---|
+| `pending` | the transfer landed and the successor has not acted | while live |
+| `completed` | the successor accepted, acquired the path, or won an optimistic commit on it (`post-edit-cas`, or a snapshot-session commit) | while live |
+| `overtaken` | a session other than the successor acquired the path or won an optimistic commit on it; the record names that session as its `counterparty` | while live |
+| `declined` | the successor declined | no |
+| `withdrawn` | the giver withdrew | no |
+| `superseded` | never stored: the answer to a re-send of a transfer the giver has since replaced with one to another successor | — |
+
+A record is **live** while the path's version still equals the version at
+transfer and the record was neither declined nor withdrawn, whatever its status
+says. The [`handoff` key](#the-handoff-key) and `/status` report `live` beside
+`status`.
+
+### The giver's fence
+
+While its record is live, every write route refuses the giver's session on that
+path, whichever subagent or attempt the request names. Nothing is granted,
+committed or invalidated:
+
+| Route | The giver's answer |
+|---|---|
+| `POST /hooks/pre-edit` | `{"ok": false, "reason": "handed_off", "successor": "<agent id>", "version_at_transfer": 7, "handoff": {…}}`, plus a deny in `hookSpecificOutput` that stops a Claude Code edit (see [Claude Code sessions](#claude-code-sessions)) |
+| `POST /hooks/pre-bash`, for a shell command that writes the path | the `pre-edit` answer, byte for byte, deny included (see [Claude Code sessions](#claude-code-sessions) for the shell writes it recognizes) |
+| `POST /hooks/post-edit` (`success: true`) | the same fields, with a context-only `PostToolUse` envelope in place of the deny |
+| `POST /hooks/post-edit-cas` | the same fields, with no `hookSpecificOutput` |
+| `POST /session/commit` | `{"ok": false, "reason": "handed_off", "successor": "<agent id>", "version_at_transfer": 7}` |
+| `POST /session/commit_all` | the same, plus `path` naming the handed-off member; no member of the batch commits |
+| `POST /workspace/restore/register` | the same, plus `path` |
+
+The fence covers writes only: a read from the giver is answered by the ordinary
+rules and carries the [`handoff` key](#the-handoff-key) with its outcome,
+unless the answer is a strict-mode deny. An admitted read also tells a Claude
+Code giver, in words, that it handed the path off (see
+[Claude Code sessions](#claude-code-sessions)).
+
+`handed_off` is not a conflict to retry. No retry, re-read or reacquire clears
+it, because the fence is keyed on the giver's session. The fence lifts only
+when the record stops being live, which happens in exactly three ways:
+
+- **the version moves**: any session commits a write to the path — the
+  successor, or a bystander;
+- **the successor declines** (`POST /handoff/decline`);
+- **the giver withdraws** (`POST /handoff/withdraw`).
+
+Nothing else lifts it. There is no timer: a handoff nobody acts on stays live,
+and its giver stays fenced, for as long as the version stays put. Completion
+does not lift it either — after the successor accepts or acquires, the giver
+stays fenced until a write moves the version, so a late write from the giver
+cannot land at the transfer version ahead of a successor that has not written
+yet. A `session-stop` from either party, and a failed edit the giver reports,
+leave the record as it is.
+
+Once the fence has lifted, the giver's writes are judged by the ordinary rules
+again. After the successor's commit, for example, the giver's compare-and-swap
+at the transfer version answers `version_mismatch`.
+
+Withdraw is the giver's own act: it needs the giver's session id and, if that
+session has claimed a [caller principal](#caller-principal), that principal. If
+the giver can no longer send it, the handoff ends only by the successor's
+decline or by the next committed write to the path. A Claude Code session's
+principal is stored under `.coherence/`, so a Claude Code giver can still
+withdraw after its session has ended: run `agent-coherence-withdraw --session
+<its session id> <path>` (see [Handoff commands](#handoff-commands)). A
+client that keeps its principal only in memory, such as a `CoherentVolume` or
+the MCP server, can withdraw only while its process is running (see
+[When a volume or MCP session stops](#when-a-volume-or-mcp-session-stops)).
+
+### Bystanders and overtake
+
+Any session other than the giver and the successor is a bystander, and a
+handoff never refuses one. A bystander's acquire (`pre-edit`) or optimistic
+commit on a live record marks it `overtaken` and stores the bystander's
+session-level agent id as the `counterparty`. That labels the record without
+ending it: an acquire does not move the version, so after it the record is
+still live and the giver still fenced. The bystander's commit moves the version
+and ends the record.
+
+While an overtaken record is live, the successor's own acquire or optimistic
+commit marks it `completed`. An accept does not: accepting an overtaken record
+answers `ok: true` with `"status": "overtaken"` and the `counterparty`, and
+changes nothing. The successor's decline and the giver's withdraw end an
+overtaken record as they end any other.
+
+Bystanders see the record in the `handoff` key of their read and edit answers,
+with `"role": "bystander"`, and a Claude Code bystander is also told in words
+(see [Claude Code sessions](#claude-code-sessions)). The key is advisory:
+nothing stops a bystander that writes past it.
+
+While a record is live, no session other than its giver can hand the path on,
+the successor included: their transfer of that path is refused as
+`handoff_in_flight`, naming the pending giver and successor, until the handoff
+ends.
+
+### Naming the successor
+
+Name the successor by its **session-level agent id**: the agent id the
+coordinator derives from the successor's session id alone, with no subagent id.
+In Python that is `session_to_agent_id(session_id)` from
+`ccs.adapters.claude_code.coordinator_server`, which computes
+`uuid.uuid5(uuid.NAMESPACE_URL, "ccs-agent:claude-session-" + session_id)`. It is the id
+`/status` lists in `sessions[]` for a Claude Code session's main thread, and the
+id every answer about the record uses for both parties. The coordinator accepts
+it hyphenated or as 32 hex digits, in either case, and answers with the
+hyphenated lower-case spelling.
+
+The coordinator must know the id, or every grant of the transfer is refused as
+`handoff_successor_unknown`:
+
+- A session-level id is known when its session has claimed a caller principal,
+  as every bundled client does against this coordinator; the binding survives
+  a coordinator restart. A session that never claimed one is known only while
+  the coordinator's in-memory name map holds it, as below.
+- A composite id — a subagent's, or the per-attempt id a `CoherentVolume` sends
+  — is resolved to its session, so naming another session's subagent hands the
+  path to that whole session. It is known only while the coordinator's
+  in-memory name map holds it. The coordinator fills that map as identities
+  make requests and loses it when its process exits, so after a restart a
+  composite id is refused as unknown, even while it still holds a grant.
+
+So name the session-level id, which needs no live name map when the successor
+has claimed a principal. Where each kind of session's id comes from:
+
+- **A Claude Code session**: derive it from the session's id, which Claude
+  Code sets as `CLAUDE_CODE_SESSION_ID` in the session's shells (see the
+  [example](#example-handing-a-file-between-claude-code-sessions)).
+- **A `CoherentVolume`**: `str(session_to_agent_id(vol.session_id))`, with the
+  function above. Do not take a volume's id from `sessions[]` on `/status`:
+  the ids listed there for a volume are its per-attempt composite ids, which a
+  restart of the coordinator forgets.
+- **An MCP session**: the `session_agent_id` its own `swg_status` reports (see
+  [From the MCP server](#from-the-mcp-server)).
+
+A volume or MCP session is known as a successor as soon as it has claimed its
+principal, which it does when it attaches to the coordinator.
+
+### `POST /handoff/transfer`
+
+All four handoff routes take JSON over `POST` and pass the same bearer-token
+and host checks as every coordinator route (see
+[Effect fence over HTTP](#effect-fence-over-http)). All four are require-class
+for the [caller principal](#caller-principal): a request naming a session that
+has claimed one must present it in the `Coherence-Caller-Principal` header.
+
+| Field | Type | What it is |
+|---|---|---|
+| `session_id` | UUID string | The giver's session. |
+| `successor` | agent id string | The session to hand the paths to; see [Naming the successor](#naming-the-successor). |
+| `grants` | list of 1 to 64 `{"path", "agent_id"}` objects | The paths to hand on, each at most once. A grant's optional `agent_id` names the subagent or attempt holding the claim on that path. |
+| `agent_id` | string, optional | The holder for every grant that names none. With neither, the claim given up is the session's own. |
+
+The answer is HTTP `200` with one entry per grant, in request order, and `ok`
+is `true` only when every grant transferred:
+
+```json
+{"ok": true, "grants": [
+  {"path": "plans/plan.md", "transferred": true,
+   "giver": "<agent id>", "successor": "<agent id>",
+   "version_at_transfer": 7, "hold_shape": "EXCLUSIVE", "status": "pending"}
+]}
+```
+
+`hold_shape` is `EXCLUSIVE`, `MODIFIED` or `SHARED`; `giver` and `successor`
+are session-level agent ids. A refused grant is
+`{"path", "transferred": false, "reason"}` and is left exactly as it was, while
+the other grants of the same request still transfer:
+
+| `reason` | What it means |
+|---|---|
+| `handoff_not_held` | the claim presented holds nothing on the path (no EXCLUSIVE or MODIFIED grant and no standing read), or the coordinator has never seen the path |
+| `handoff_version_unconfirmed` | the coordinator has no confirmed version for the path, so there is no version to fence on |
+| `handoff_other_holder` | another agent holds the path EXCLUSIVE or MODIFIED, so the claim presented is not the write authority to hand on |
+| `handoff_in_flight` | another session's handoff of the path is live. The entry adds `giver`, `successor` and a fixed `detail` saying what ends that handoff |
+| `handoff_to_self` | the successor is the caller's own session |
+| `handoff_successor_unknown` | the coordinator does not know the successor id. Every grant of the request gets it |
+| `handoff_successor_malformed` | the successor is not a well-formed agent id. Every grant of the request gets it |
+| `handoff_ended` | a re-send of a handoff that ended at an unmoved version: declined, withdrawn or superseded. The entry adds `giver`, `successor`, `version_at_transfer`, `hold_shape` and `status` |
+
+Match on the whole value; the reasons may grow, and none is ever renamed.
+
+**Sending the same transfer again is safe while its record is live.** A grant
+whose live record already names the same giver and successor answers
+`transferred: true` with the record's current status, and nothing moves. A
+request carries no version, so once the path's version has moved -- the
+successor or anyone else wrote it -- a re-send cannot be told from a new
+transfer: from a giver that holds a claim on the path again (a read registers
+one), it records a new handoff at the new version and fences the giver again. While its record is live, the giver
+naming a *different* successor for the path replaces the record: the new one is
+`pending` for the new successor, at the same version at transfer and hold
+shape. A late re-send naming the replaced successor answers `handoff_ended`
+with status `superseded` rather than switching back. Once a record has ended,
+any other transfer of the path is decided by the checks in the table, and one
+that is admitted replaces the ended record.
+
+**Requests that cannot be read** answer HTTP `400` with an `error` field, and
+nothing changes: a missing or malformed `session_id`; `grants` missing, empty,
+longer than 64, holding something other than objects, naming a path twice or a
+path that fails validation; a malformed `agent_id` at either level, which is
+refused rather than read as the main thread because the main thread's claim is
+not the one asked for; or no `successor`. A malformed successor is not a `400`:
+it is answered per grant, as above.
+
+**A timed-out transfer** answers
+`{"ok": false, "degraded": true, "reason": "handoff_transfer_unconfirmed"}`.
+The outcome is unknown: either nothing landed or every grant that would have
+transferred did. Read the path's `handoff` key on `/status` first: a transfer
+that landed shows its record there, live or ended. Send the same transfer
+again only when it shows no handoff from you to that successor; while one is
+live, the re-send answers its status and moves nothing.
+
+### Accept, decline and withdraw
+
+`POST /handoff/accept`, `POST /handoff/decline` and `POST /handoff/withdraw`
+each take `{"session_id": "<uuid>", "path": "<path>"}` and act on the path's
+record as that session.
+
+| Route | Who | What it does |
+|---|---|---|
+| `/handoff/accept` | the successor | `pending` becomes `completed` without a write. A `completed` record is answered as it stands; an `overtaken` one is answered with its status and `counterparty` and keeps them. The fence stays |
+| `/handoff/decline` | the successor | ends the record as `declined`, whatever its status. The fence lifts |
+| `/handoff/withdraw` | the giver | ends the record as `withdrawn`, whatever its status. The fence lifts |
+
+A verb that is taken answers `{"ok": true, "status": "<status after it>"}`, with
+`counterparty` on an overtaken record. A refusal is
+`{"ok": false, "reason": "...", "status": "..."}` and changes nothing:
+
+| `reason` | When |
+|---|---|
+| `handoff_not_live` | there is no live record: it ended (its `status` says how), or the path has no record at all (no `status`) |
+| `handoff_not_successor` | an accept or decline from a session that is not the live record's successor |
+| `handoff_not_giver` | a withdraw from a session that is not the live record's giver |
+
+A missing or malformed `session_id` or `path` is HTTP `400`. A timed-out call
+answers `ok: false`, `degraded: true` and `handoff_accept_unconfirmed`,
+`handoff_decline_unconfirmed` or `handoff_withdraw_unconfirmed`: the outcome is
+unknown, so read the record again before acting on it.
+
+### The `handoff` key
+
+While a path has a transfer record — live, or ended and not yet evicted — the
+answers of `POST /hooks/pre-read`, `/hooks/pre-edit`, `/hooks/post-edit` and
+`/hooks/post-edit-cas` for that path carry a top-level `handoff` key, projected
+for the caller:
+
+```json
+"handoff": {"role": "successor", "giver": "<agent id>", "successor": "<agent id>",
+            "version_at_transfer": 7, "hold_shape": "EXCLUSIVE",
+            "status": "pending", "live": true}
+```
+
+`role` is `giver`, `successor` or `bystander`. An overtaken record adds
+`counterparty`. A compare-and-swap win that labelled the record adds
+`outcome`: `completed` for the successor's win, `overtaken` for anyone else's.
+The key sits beside the answer's other fields and never inside a
+`hookSpecificOutput`. A strict-mode deny on `pre-read` or `pre-edit` carries no
+key at all: its body is byte-for-byte what it is with no record on the path.
+The giver's own `pre-edit` deny does carry the key. With no record on the
+path, none of these answers carries the key.
+Admitted `pre-read` and `pre-edit` answers also carry the record as prose for
+Claude Code; see [Claude Code sessions](#claude-code-sessions).
+
+The key is best-effort. If the coordinator cannot read the record after the
+request's work has landed, it answers without the key (and without that
+prose) and logs a warning, so a missing key does not prove the path has no
+record. Read the path on `/status` when you need to be sure.
+
+`GET /status` carries the same fields, without `role`, in the
+`tracked_artifacts` entry of each path that has a record, on the default view
+and the operator view (`?detail=full` with the `Coherence-Local-Operator: true`
+header). The operator view adds `created_at_unix_ts`, when the record was
+written. The `metrics` view carries no record. `agent-coherence-status --json` prints the key as the coordinator
+sends it, and the table view lists each record in a Handoffs block (see
+[Handoffs in `agent-coherence-status`](#handoffs-in-agent-coherence-status)).
+
+`/status` also counts calls to the four routes as `handoff_transfer_total`,
+`handoff_accept_total`, `handoff_decline_total` and `handoff_withdraw_total`
+in `endpoint_counters`. These counters are present whether or not any path has
+a record.
+
+Every id in the key, here and on `/status`, is a session-level agent id. No
+session id or session name appears in it.
+
+### Release answers, per grant
+
+A release that is a clean success answers as it always has. One that is not now
+reports each grant, so a client never drops its record of a grant the
+coordinator still holds:
+
+- **`POST /hooks/session-stop` that leaves a grant held** answers
+  `{"ok": false, "released_artifacts": [...], "grants": [...]}`, one entry per
+  grant it tried to release, in no guaranteed order (match entries by `path`):
+  `{"path", "held": false, "cause": "release"}` for a grant it released, and
+  `{"path", "held": true, "reason"}` for one still held (with `detail` when the
+  reason is a typed one). It used to answer `ok: true` and only log the
+  failure.
+- **`POST /hooks/post-edit` with `success: false` whose release is refused**
+  keeps its `ok: false` and `reason`, and adds the same `grants` list.
+- **The giver's own failed-edit report on a path it handed off** — while the
+  record is live — answers `ok: false` with `"reason": "handed_off"`, the
+  `successor` and `version_at_transfer`, and a grant entry
+  `{"path", "held": false, "cause": "handoff", "successor", "version_at_transfer"}`.
+  It changes nothing: the claim already went with the transfer, and the record
+  is not withdrawn.
+
+`CoherentVolume` reads this answer when it releases a write grant that an
+earlier attempt left held (see [Concurrent writers](#concurrent-writers-write_cas)):
+it forgets only the paths the answer reports released, and releases the rest
+again at its next fresh attempt.
+
+`session-stop` now refuses a malformed `agent_id` with HTTP `400`, before the
+principal check. It used to answer `{"ok": true, "released_artifacts": []}`,
+which reads as a release that found nothing to release.
+
+### Ended records and eviction
+
+A record that has ended is kept, so the giver's next read, edit or `/status`
+call learns how its handoff ended. The coordinator's sweep removes a record
+once it is no longer live and neither it nor its path has been updated for
+`transfer_record_evict_max_age_sec` (86400 s, one day, by default, so a giver
+left idle overnight still learns its outcome). A live record is never removed,
+however old. The setting is a `LifecycleConfig` field, passed as `config` to the
+volume that starts the coordinator.
+
+After eviction the path has no record and the answers carry no `handoff` key.
+A giver idle longer than that learns only what any out-of-date writer does: a
+compare-and-swap at the transfer version, after the version moved, answers
+`version_mismatch` with nothing saying why.
+
+### Claude Code sessions
+
+The Claude Code hook client passes the coordinator's answers to Claude Code.
+On a path with a transfer record, those answers deny the giver's edit and tell
+each session where the handoff stands. Every text below is fixed: its only
+variable parts are the path, the version at transfer, the hold shape given up,
+and agent ids cut to their first eight characters (`{successor_short}`,
+`{giver_short}`, `{counterparty_short}`, the record's session-level agent ids
+as `agent-coherence-status` shows them). The same situation always produces the
+same words.
+
+**The giver's edit is denied.** While the record is live, the giver's
+`pre-edit` on the path, an Edit or Write from the session or any of its
+subagents, is denied in strict mode and in warn mode alike. The check runs
+before the strict-mode stale check, so on a strict-mode path the giver gets
+this deny rather than the stale-view one. Claude Code shows the model:
+
+```text
+Edit denied: you handed {path} to agent {successor_short} at v{version_at_transfer}, so this session can no longer write it. The handoff ends when agent {successor_short} writes {path}, when agent {successor_short} declines it, or when you withdraw it on your user's or host's instruction. Stop and report to your user that {path} was handed off. This denial is structural; retrying the same operation will produce the same denial.
+```
+
+The text names withdraw only as a step the giver takes on instruction, and it
+never names a command: a refusal that hands the model the command that lifts
+it invites the model to run that command. The body keeps the typed
+`handed_off` reason, `successor` and `version_at_transfer` at the top level
+beside the deny (see [The giver's fence](#the-givers-fence)). Each deny adds
+one to `handoff_giver_denials_total` on `/status` (not to the strict-mode or
+stale-warning counters) and writes no audit-log line. Like a strict-mode deny,
+it is remembered for route-around detection: on a strict-mode path, a shell
+command from the same session that reads the file within 30 seconds is counted
+in `strict_mode_routed_around_via_bash_total`.
+
+**The giver's shell write is denied too.** While the record is live, a Bash
+command from the giver's session, or any of its subagents, that writes the path
+gets the same answer from `pre-bash` as the edit gets from `pre-edit`, byte for
+byte: the deny text above, the `handed_off` fields and the `handoff` key,
+counted in `handoff_giver_denials_total`. It fires in strict mode and in warn
+mode alike, and ahead of the shell read checks, so a command that reads the
+file and then appends to it gets this deny. The Bash hook recognizes the common
+shell writes:
+
+- a redirection (`>`, `>>`, `>|`, `&>`) or `tee`;
+- an in-place `sed -i` or `perl -i`, and an `ed` or `ex` script that writes;
+- `cp`, `mv`, `install`, `ln` or `rsync` onto the file, and `mv`, `rm`,
+  `truncate`, `dd of=`, `sort -o` or `patch` of it;
+- `git checkout`, `git restore`, `git rm` or `git mv` naming it;
+- a script that writes it -- opens it for writing, writes, appends to,
+  deletes, renames or copies onto it, by its name or through a variable the
+  name is assigned to -- run as a one-line `python -c`, `perl -e`, `ruby -e`,
+  `node -e` or `php -r` program or fed to one in a heredoc; a script that only
+  reads the file and writes another one is not refused;
+
+including inside `bash -c`, `sh -c` and `eval`, after a `cd` in the same
+command, and by an absolute path inside the workspace. It errs toward letting
+a command through: a path built from a variable or a command substitution
+(`"$PWD/plan.md"`, `$(git rev-parse --show-toplevel)/plan.md`) or, inside a
+program, assembled from pieces, mentioned inside a longer string or reached
+through a list, a loop, a dictionary or a function's parameter, a writer tool
+it does not know (`gsed`, `awk -i inplace`, `vim`, `curl -o`, a formatter, a
+script run from a file) and a relative path after a `pushd`, or after a `cd`
+made by an earlier command (the hook is not told the session's working
+directory, so it resolves relative paths from the workspace root), are not
+refused. A shell command that only reads the file, and every other session's
+shell write, answer as before.
+
+**How models respond (measured).** We measured how Claude Code models respond
+when a session that handed a file off tries to change it again: Haiku 4.5,
+Sonnet 5.5 and Opus 5.5 on Claude Code 2.1.291, in warn and strict mode, with
+and without the handoff commands allowlisted. Every session that met the
+coordinator's refusal of its edit stopped after that one refusal. It did not
+retry or work around it, and it told its user that the file had been handed
+off. None ran the withdraw or decline command, even where those commands were
+allowed to run without approval. A session that reads a file it handed off is
+told, on that read, that it handed the file off and must not change it by any
+route until the handoff ends; every session that saw this notice left the file
+alone and told its user, without even attempting the edit. If the handoff
+lands while an edit is already being applied, the edit stays on disk without a
+version, and Claude Code shows the model the coordinator's explanation. Sonnet
+sometimes skipped the edit and the read altogether and appended to the file
+with a shell command: in one warn-mode setup it did so in 4 of 10 runs, each
+write landed without a version, and each session reported success without
+mentioning the handoff. With the shell write denied as the edit is (above), the
+same setup changed the file in none of its 10 runs: every session whose shell
+append was denied stopped, tried no other route, and told its user that the
+file had been handed off.
+
+An earlier measurement, of the strict-mode stale-read deny on an older Claude
+Code with older models, saw sessions retry two to five times and then reach the
+file through the shell. This one saw no retries. The two setups differ in more
+than the text of the deny, so this compares the two measurements' numbers; it
+is not a controlled test of the wording.
+
+**An edit already in flight.** If the transfer lands after the giver's
+`pre-edit` was admitted and before its `post-edit`, the edit is already on
+disk. Its commit is refused, and the `post-edit` answer carries this text in a
+context-only `PostToolUse` envelope:
+
+```text
+Commit refused: you handed {path} to agent {successor_short} at v{version_at_transfer}, so this session can no longer write it. Your edit landed in your local worktree but was not given a version by the coordinator. The handoff ends when agent {successor_short} writes {path}, when agent {successor_short} declines it, or when you withdraw it on your user's or host's instruction. Stop and report to your user that {path} was handed off.
+```
+
+The file on disk then differs from the version the coordinator recorded. The
+same happens to an edit admitted while the coordinator was degraded: a
+`pre-edit` that times out answers `{"ok": true, "degraded": true}`, so the edit
+goes ahead, and its commit is refused.
+
+**What each session is told.** While a path has a transfer record, an admitted
+`pre-read` or `pre-edit` on it carries prose for the caller's role, in a
+context-only envelope after any stale warning or notice. A deny carries none of
+it: the giver's deny is the text above, and a strict-mode deny keeps its own
+bytes. The shell and search hooks (`pre-bash`, `pre-grep`) carry none of it,
+and answer as before apart from the giver's shell write, which is denied.
+
+- **The giver**, on a read while the record is live (its edit is denied
+  instead):
+
+  ```text
+  Handoff: you handed {path} to agent {successor_short} at v{version_at_transfer}, so this session can no longer write it. The handoff ends when agent {successor_short} writes {path}, when agent {successor_short} declines it, or when you withdraw it on your user's or host's instruction. Until the handoff ends, do not change {path} by any route, a shell command included. Stop and report to your user that {path} was handed off.
+  ```
+
+  On a strict-mode path this read is not admitted: the transfer left the
+  handed-off claim INVALID, so the Read of the identity that held it gets the
+  ordinary strict-mode stale-view deny, which carries no handoff text.
+- **The giver**, on a read or edit after the record ended, until the record is
+  [evicted](#ended-records-and-eviction), one of:
+
+  ```text
+  Handoff ended: your handoff of {path} to agent {successor_short} at v{version_at_transfer} was completed by agent {successor_short}.
+  Handoff ended: your handoff of {path} to agent {successor_short} at v{version_at_transfer} was overtaken by agent {counterparty_short}.
+  Handoff ended: your handoff of {path} to agent {successor_short} at v{version_at_transfer} was declined by agent {successor_short}.
+  Handoff ended: your handoff of {path} to agent {successor_short} at v{version_at_transfer} was withdrawn.
+  ```
+
+- **The successor**, on a read or edit while the record is live and not
+  overtaken:
+
+  ```text
+  Handoff: agent {giver_short} handed {path} to this session at v{version_at_transfer}; the hold it gave up was {hold_shape}.
+  ```
+
+  When the hold given up was `EXCLUSIVE`, a write claim the giver had not
+  committed, it adds:
+
+  ```text
+  Agent {giver_short} held an uncommitted write claim when it handed {path} on, so the file on disk may differ from v{version_at_transfer}; read {path} before editing it.
+  ```
+
+  On its edit, when it has not read the path at the version at transfer or
+  later, it adds a warning, and the edit is still admitted. On a strict-mode
+  path the strict-mode checks run first: a successor that is `INVALID` there,
+  or holds a standing read older than the current version, is denied, and the
+  deny carries none of this text. The warning:
+
+  ```text
+  ⚠ You have not read {path} at v{version_at_transfer} or later; read it before editing.
+  ```
+
+- **The successor**, once a bystander has overtaken the handoff, until the
+  record is evicted:
+
+  ```text
+  Handoff overtaken: the handoff of {path} to this session from agent {giver_short} at v{version_at_transfer} was overtaken by agent {counterparty_short}.
+  ```
+
+- **A bystander**, while the record is live:
+
+  ```text
+  Handoff in progress: agent {giver_short} handed {path} to agent {successor_short} at v{version_at_transfer}. This session is not a party to it; its edits are admitted and are recorded as overtaking the handoff.
+  ```
+
+- **The giver or the successor**, when the record ended while still labelled
+  `pending`: the path's version moved, but nothing recorded who wrote it, as a
+  coordinator stopping between a write and its record can leave it:
+
+  ```text
+  Handoff ended: the handoff of {path} at v{version_at_transfer} was ended by a write at a later version whose writer was not recorded.
+  ```
+
+**Which claim a Claude Code session can hand on.** A transfer needs the giver
+to hold a claim on the path when it runs (see
+[What a transfer does](#what-a-transfer-does)), and a Claude Code session's
+write grant ends with its turn:
+
+- **A file the session edited this turn.** Have the session run the transfer
+  in the same turn, right after the edit. The transfer hands on the write
+  grant (`MODIFIED` once the edit is committed).
+- **After that turn has ended**, the end-of-turn hook has released the write
+  grant, and the transfer is refused as `handoff_not_held`. On a warn-mode
+  path, have the session read the file again: the read gives it a standing
+  read, and a transfer then hands that on (`SHARED`).
+- **A file the session has only read**, and nobody has written since, is a
+  standing read that outlives the turn. The session can hand it on at any
+  time.
+- **On a strict-mode path**, a session whose write grant was released is
+  denied its `Read` of the file by the strict-mode stale-view deny, and that
+  denied read grants nothing. A shell read of the file (`cat`, for example) is
+  denied too, but its deny re-grants a standing read without recording a read
+  of the current version, and a transfer hands that on as `SHARED`. Handing
+  the path on in the same turn as the edit avoids both.
+
+### Handoff commands
+
+Four console scripts hand a path from one Claude Code session to another, each
+acting as one named session. They come with the Python package
+(`pip install agent-coherence`), which a workspace running the Python
+coordinator already has; the Claude Code plugin does not ship them.
+
+| Command | Run as | What it does |
+|---|---|---|
+| `agent-coherence-transfer --successor AGENT_ID [--subagent-id SUBAGENT_ID] path [path ...]` | the giver | hands the session's claims on the paths to the successor ([`POST /handoff/transfer`](#post-handofftransfer)) |
+| `agent-coherence-accept path` | the successor | accepts the handoff without writing the path |
+| `agent-coherence-decline path` | the successor | declines the handoff; the giver may write the path again |
+| `agent-coherence-withdraw path` | the giver | withdraws the handoff |
+
+Every command also takes `--session SESSION_ID` and `--root ROOT` (the
+coordinator's root; by default, the git root found from the current directory,
+which for a git worktree is the main checkout's). A path is relative to that
+root, or absolute inside it. `--successor` takes the successor's session-level
+agent id, hyphenated or as 32 hex digits (see
+[Naming the successor](#naming-the-successor)). As with any shell command,
+Claude Code asks before running one unless the workspace's permissions allow
+it.
+
+**Which session a command acts as.** The session named by `--session`, or
+otherwise by `CLAUDE_CODE_SESSION_ID`, which Claude Code sets in the shells its
+Bash tool runs. With neither, the command is a usage error (exit `1`) and sends
+nothing. Measured on Claude Code 2.1.291, the variable equals the session id
+the session's hooks carry: in the session's own shell; in a subagent's shell,
+where it names the parent session; after `--resume`; after a fork; after
+`/clear`; and after `/compact`. So a command the model runs through its Bash
+tool acts as the session that runs it.
+
+A fork and `/clear` give the session a new session id, and the hooks and the
+variable move to it together; `--resume` and `/compact` keep the id. A handoff
+belongs to the session id that gave the path, so after a fork or `/clear` the
+session is a different session to the coordinator: it is not fenced as the
+giver, and its edit of the path is admitted and recorded as overtaking the
+handoff.
+
+A subagent's shell names its parent session, so a command run there acts as
+the parent. A claim a subagent holds is the subagent's own, not the parent's:
+hand it on with `--subagent-id`, naming the subagent whose claim it is.
+
+**Acting as the session.** The command presents the named session's stored
+[caller principal](#caller-principal), found in `.coherence/` by that
+session's id exactly as the session's own hooks find it. For a session with no
+stored principal it creates the session's mint nonce, then claims and stores
+the principal, as the session's first hook event would. So:
+
+- A mistyped `--session` is not refused as such. The command binds a principal
+  for an id no session uses, leaving its two files in `.coherence/` (see
+  [security.md](security.md#caller-principal-files-claude-code-hook-client)
+  for removing them), and then reports the coordinator's answer; for a
+  transfer, that is `handoff_not_held`.
+- It cannot act for a `CoherentVolume` or MCP session, which keeps its
+  principal in its own process. The claim is refused because that session is
+  bound under another nonce, and the command reports the caller-principal
+  refusal and exits `2`.
+
+**What it prints.** Before it sends anything, every command prints the
+session-level agent id it acts as, and which of the two named the session. It
+never prints the session id:
+
+```text
+agent-coherence-transfer: acting as session agent bd35b34c-f785-51c6-a184-5922aee7cbea (session from CLAUDE_CODE_SESSION_ID)
+```
+
+The line ends `(session from --session)` when the flag named it. Check it: a
+shell whose variable names some other session shows up here. A transfer then
+prints one line per path, and the other commands one line. Results go to
+standard output; refusals, hints and errors go to standard error. Text taken
+from the coordinator's answer, such as a reason, a status or an error, prints
+with non-printable characters escaped, as described under
+[Status, track and untrack commands](#status-track-and-untrack-commands).
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Done: every named path transferred, or the accept, decline or withdraw was taken. |
+| `1` | Usage: a bad command line, a path that fails validation, not in a git repository, or no session to act as. Nothing is sent. |
+| `2` | The coordinator could not be reached, the connection failed TLS verification or configuration, or the coordinator redirected the request (never followed), answered an HTTP error (a caller-principal refusal among them) or a body that is not a JSON object, refused the request or any one of its paths, or could not confirm the outcome. |
+| `4` | This coordinator does not serve the handoff commands: `.coherence/server.pid` names the Node backend, which the command reads before sending anything, or the command's route answered `404`. |
+
+A transfer of several paths hands on every path it can and exits `2` if any
+was refused; its lines say which. When the coordinator could not confirm the
+outcome, the command says so and exits `2`: check the path's handoff in
+`agent-coherence-status` before acting again. Sending the same transfer again
+is safe only while the handoff it made is live: once the successor has written
+the path, a re-send from a giver session that holds the path again is a new
+handoff (see [`POST /handoff/transfer`](#post-handofftransfer)).
+
+**Not held.** A transfer refused as `handoff_not_held` prints the reason and a
+hint:
+
+```text
+agent-coherence-transfer: notes.md not transferred (handoff_not_held)
+agent-coherence-transfer: hint: a Claude Code session's write grant ends when its turn ends. If an earlier transfer of notes.md may have landed, check the path's handoff in agent-coherence-status output first: a handoff from this session to that successor made at the version it held, live or ended, means it landed, so do not transfer again, and if it shows another session's handoff, ask before transferring; otherwise have the giver session read notes.md, then transfer it again (on a strict-mode path that read is denied: hand the path on in the same turn as its edit)
+```
+
+On a strict-mode path the hint's `Read` is denied and grants nothing, as the
+hint's last clause says; see [Claude Code sessions](#claude-code-sessions) for
+what a shell read does there.
+
+**Python coordinator only.** Against the Claude Code plugin's Node coordinator
+the commands exit `4`. A plugin workspace created fresh runs the Node
+coordinator unless the Python one is selected; see "Selecting the backend" in
+the plugin README's
+[Architecture](https://github.com/Cohexa-ai/agent-coherence-plugin#architecture)
+section.
+
+### Handoffs in `agent-coherence-status`
+
+The table view of `agent-coherence-status` lists every path that has a
+transfer record in a Handoffs block after the artifacts table:
+
+```text
+Handoffs:
+  giver → successor, by session agent id (first 8 characters, as under Sessions)
+  plan.md: bd35b34c → 6e271ee6 at version 2 (pending, 4m ago)
+```
+
+Each line gives the path; the giver and the successor, as the first eight
+characters of their session-level agent ids; the version at transfer; and the
+record's status. `ended` follows the status when the record is no longer live,
+which matters for a record still labelled `pending` after a write ended it.
+The age, from the record's creation time, shows on the operator view only
+(`--detail full`). With no record, the output is exactly what it
+was before. `--json` prints the `handoff` key as the coordinator sends it.
+
+This is the Python console script's view. Where the Claude Code plugin's
+`agent-coherence-status` comes first on the Bash tool's `PATH`, the command runs
+the plugin's own status view instead: it prints the coordinator's `/status`
+JSON, has no Handoffs block, and rejects `--json`. There, a handed-off path's
+record is the `handoff` key of its `tracked_artifacts` entry, and each session's
+full agent id is in `sessions`.
+
+### Example: handing a file between Claude Code sessions
+
+Session A has been editing `plan.md`, and session B will carry on with it. Both
+run in one workspace with the plugin's hooks and the Python coordinator.
+
+1. **Find B's session-level agent id.** In session B, have Claude run:
+
+   ```bash
+   python3 -c 'import sys, uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, "ccs-agent:claude-session-" + sys.argv[1]))' "$CLAUDE_CODE_SESSION_ID"
+   ```
+
+   ```text
+   6e271ee6-5a71-5508-bedf-ffd46d8898ce
+   ```
+
+   Running it is a tool call, so B's hooks have sent the coordinator a request
+   and claimed B's principal, which is what lets the coordinator know B (see
+   [Naming the successor](#naming-the-successor)). `agent-coherence-status`
+   also shows each session's agent id, cut to eight characters, and with
+   `--detail full` the session name, `claude-session-<session id>`, beside it;
+   the Python console script's `--json`, or the plugin's status command, gives
+   the whole id (see
+   [Handoffs in `agent-coherence-status`](#handoffs-in-agent-coherence-status)).
+2. **Hand the file on from A, in the turn of its edit.** Right after A edits
+   `plan.md`, have it run:
+
+   ```bash
+   agent-coherence-transfer --successor 6e271ee6-5a71-5508-bedf-ffd46d8898ce plan.md
+   ```
+
+   ```text
+   agent-coherence-transfer: acting as session agent bd35b34c-f785-51c6-a184-5922aee7cbea (session from CLAUDE_CODE_SESSION_ID)
+   agent-coherence-transfer: transferred plan.md to 6e271ee6-5a71-5508-bedf-ffd46d8898ce at version 2 (gave up MODIFIED; status pending)
+   ```
+
+3. **Check it.** `agent-coherence-status` lists
+   `plan.md: bd35b34c → 6e271ee6 at version 2 (pending)` under Handoffs, and
+   with `--detail full` the record's age too, `(pending, 0s ago)`; through the
+   plugin's status command, the same record is the `handoff` key of
+   `plan.md`'s `tracked_artifacts` entry.
+4. **A stops.** An Edit of `plan.md` from A is now denied:
+
+   ```text
+   Edit denied: you handed plan.md to agent 6e271ee6 at v2, so this session can no longer write it. The handoff ends when agent 6e271ee6 writes plan.md, when agent 6e271ee6 declines it, or when you withdraw it on your user's or host's instruction. Stop and report to your user that plan.md was handed off. This denial is structural; retrying the same operation will produce the same denial.
+   ```
+
+   On a warn-mode path, A's next Read of `plan.md` carries the giver's read
+   notice shown in [Claude Code sessions](#claude-code-sessions).
+5. **B carries on.** B's read of `plan.md` carries
+   `Handoff: agent bd35b34c handed plan.md to this session at v2; the hold it gave up was MODIFIED.`
+   B's edit completes the handoff, and its commit, version 3, ends it and lifts
+   A's fence. A's next read of `plan.md` says
+   `Handoff ended: your handoff of plan.md to agent 6e271ee6 at v2 was completed by agent 6e271ee6.`
+6. **Or undo it.** B runs `agent-coherence-decline plan.md`, or, on your
+   instruction, A runs `agent-coherence-withdraw plan.md`. You can also run the
+   withdraw from any terminal in the workspace with `--session <A's session id>`.
+   Either ends the handoff and lifts A's fence.
+
+### From a `CoherentVolume`
+
+A `CoherentVolume` hands on its own claims and settles handoffs as its own
+session, with one method per verb:
+
+| Method | Run as | Returns |
+|---|---|---|
+| `vol.transfer(paths, *, successor)` | the giver | `HandoffTransferResult` |
+| `vol.accept(path)` | the successor | `HandoffVerbResult` |
+| `vol.decline(path)` | the successor | `HandoffVerbResult` |
+| `vol.withdraw(path)` | the giver, on its user's or host's instruction | `HandoffVerbResult` |
+| `vol.read_handoff(path)` | the giver, the successor or a bystander | the `handoff` key the volume's latest read of `path` received, as a `dict`, or `None` |
+| `vol.last_read_denied` | anyone | `True` when the coordinator refused the volume's latest read with a strict-mode deny, whose answer never carries the `handoff` key |
+
+`paths` is one path or a sequence of paths, and `successor` is the successor's
+session-level agent id (see [Naming the successor](#naming-the-successor)). The
+result types, like `CasCommitResult` and `HandoffWinOutcome` below, are frozen
+dataclasses importable from `ccs.adapters`, and every id in them is a
+session-level agent id as the coordinator answers it.
+
+- `HandoffTransferResult.grants` holds one `HandoffGrantResult` per path, in
+  the order given, and `.ok` is `True` only when every grant transferred. Each
+  grant has `path`, `transferred`, and the fields of its entry in the
+  [transfer answer](#post-handofftransfer): `reason`, `giver`, `successor`,
+  `version_at_transfer`, `hold_shape`, `status` and `detail`, each `None` when
+  the entry does not carry it.
+- `HandoffVerbResult` has `path`, `ok`, `reason`, `status` and `counterparty`.
+
+A refusal is a value, not an exception: a refused grant has
+`transferred=False` and its `reason`, and a refused verb has `ok=False` and
+`handoff_not_successor`, `handoff_not_giver` or `handoff_not_live`, with
+nothing changed. A method raises only when the answer does not settle the
+outcome, or there is no coordinator to ask:
+
+- `CommitUnconfirmed`: the coordinator answered a `handoff_*_unconfirmed`
+  reason, its answer could not be read, or the request got no answer (a
+  dropped connection, a timeout, an HTTP 5xx), in either `on_error` mode. The
+  verb may have landed: look at the path's record (`coordinator_status()`, or
+  `/status`) before acting again. Sending the same transfer again answers a
+  live record's status and moves nothing, but once the successor has written
+  the path, a re-send from a volume that holds the path again is a new
+  handoff.
+- `CoherenceError`: a request the coordinator refused outright (HTTP 4xx) with
+  `on_error="strict"`; and, in both modes, a volume with no coordinator
+  attached. With `on_error="degrade"` a 4xx warns and raises
+  `CommitUnconfirmed` instead: degrade mode does not tell a refusal from a
+  failure.
+- `HandoffPathsInvalid` (from `ccs.core.exceptions`, a `ValueError`): a
+  transfer of no path, or of one path named twice (two spellings of one file
+  count), in both modes; nothing is sent.
+
+**Which claim a transfer hands on.** For each path, the claim the volume holds
+there: the write grant a `write()` of the path left it holding (`MODIFIED`), or
+else the standing read its latest read registered (`SHARED`, which is also what
+a `write_cas` or `write_cas_at` win leaves). The volume finds that claim even
+after `reacquire()` or a `write_cas` has started a fresh attempt. A path it
+holds no claim on is refused as `handoff_not_held`. That includes a path whose
+read returned bytes from a stale view, because such a read registers nothing:
+`reacquire()` the path before you transfer it. It also includes the members of
+a multi-file `atomic_publish()`, which commits through a snapshot session and
+leaves them held by that session's commit, not by the volume: read each member
+before you hand it on. The transfer gives the claim up at the coordinator, so a
+write grant the volume held on the path ends with it.
+
+**The giver's writes.** While the handoff is live, `write()`, `write_cas()`,
+`write_cas_at()` and an `atomic_publish()` that includes the path raise
+`GiverFenced` (from `ccs.core.exceptions`), and nothing lands. It carries
+`reason` (`"handed_off"`), `successor`, `version_at_transfer` and
+`artifact_id` (the path). It is a terminal, not a conflict: the volume never
+retries it, and no `reacquire()` clears it, because the fence is keyed on the
+volume's session, which a fresh attempt keeps. Stop and report it. A
+multi-file `atomic_publish()` publishes none of its files when one of them is a
+path the volume handed off, and names that path in `artifact_id`.
+
+Once the handoff ends, the giver's writes follow the ordinary rules again. A
+withdraw lifts the fence but does not give the claim back: the transfer left
+it INVALID, so the giver's next `write()` of the path raises `StaleView` until
+it calls `reacquire()`.
+
+**The successor and bystanders.** `read_handoff(path)` returns the `handoff`
+key, with its `role`, from the answer to the volume's latest read of the path
+(every read method sets it, `reacquire()` included). It is `None` when that
+answer carried none: the path has no record, the read was denied, failed or
+went unanswered, or the coordinator could not read the record after the read
+landed (the key is best-effort), so `None` never proves the path has no record. A strict-mode deny never carries the key, so after a denied
+read (`vol.last_read_denied` is `True`) `None` says nothing about the record;
+the path's entry in `/status` has it. A compare-and-swap win's `CasCommitResult.handoff` is a
+`HandoffWinOutcome` when the win labelled a live handoff of the path, read
+best-effort like the read's key:
+`outcome` is `completed` when the volume is the successor, and `overtaken`
+when it is a bystander, which is then named as `counterparty`; `giver`,
+`successor` and `version_at_transfer` name the handoff. A successor's plain
+`write()` completes the handoff too, through its acquire, but returns nothing.
+
+```python
+from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
+from ccs.adapters.coherent_volume import CoherentVolume
+from ccs.core.exceptions import GiverFenced
+
+lead = CoherentVolume(workspace_root, managed=("plans/**",))
+worker = CoherentVolume(workspace_root, managed=("plans/**",))  # its own session
+worker_id = str(session_to_agent_id(worker.session_id))
+
+lead.read("plans/plan.md")                    # a standing read at version 1
+result = lead.transfer("plans/plan.md", successor=worker_id)
+result.ok                                     # True
+result.grants[0].hold_shape                   # 'SHARED' ('MODIFIED' after a write())
+result.grants[0].status                       # 'pending'
+
+try:
+    lead.write("plans/plan.md", b"a late edit\n")
+except GiverFenced as fenced:                 # nothing landed
+    fenced.successor, fenced.version_at_transfer   # (worker_id, 1)
+
+worker.read("plans/plan.md")
+worker.read_handoff("plans/plan.md")["role"]  # 'successor'
+won = worker.write_cas("plans/plan.md", lambda current: current + b"the worker's edit\n")
+won.version, won.handoff.outcome              # (2, 'completed'): the fence lifts
+```
+
+Instead of writing, the worker can call `worker.decline("plans/plan.md")`, or,
+on your instruction, the lead `lead.withdraw("plans/plan.md")`. Either ends
+the handoff and answers `ok=True` with the status it ended in, `declined` or
+`withdrawn`.
+
+### From the MCP server
+
+The [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server) has a
+tool for each verb. Each acts as the MCP session itself, on its own claims;
+none takes a session argument.
+
+| Tool | Run as | What it does |
+|---|---|---|
+| `swg_transfer(paths, successor)` | the giver | hands this session's claim on each path in the list `paths`, the write grant from `swg_write` or the standing read from `swg_read`, to the successor |
+| `swg_accept(path)` | the successor | accepts the live handoff without writing the path |
+| `swg_decline(path)` | the successor | declines it; the giver's fence lifts |
+| `swg_withdraw(path)` | the giver | withdraws it; the giver's fence lifts. Its description says to take it only on the user's or host's explicit instruction, and never as the way out of a `handed_off` refusal |
+
+`swg_transfer` answers `{"ok": ..., "grants": [...]}` with one entry per path,
+carrying the fields of the [transfer answer](#post-handofftransfer), and is an
+error result unless every grant transferred; its `detail` and first text item
+have one line per path. A refused grant is
+`{"path", "transferred": false, "reason", "recover", "retryable": false,
+"next_step"}`, and the error result's own `reason`, `recover`, `retryable` and
+`next_step` are those of its most restrictive refused grant (a stop before a
+record check before a successor fix); when another grant transferred, that
+`next_step` first says never to send the transferred path again, and each other
+refused reason's `next_step` follows as a text item labelled with its reason.
+The other three answer `{"path", "ok": true, "status"}`, with `counterparty` on
+an overtaken record, or, as an error result that changed nothing,
+`{"path", "ok": false, "reason", "status", "recover", "retryable": false,
+"detail", "next_step"}`, without `status` when the path has no record.
+
+| Refusal | `recover` |
+|---|---|
+| `handoff_to_self`, `handoff_successor_unknown`, `handoff_successor_malformed` | `fix_successor`: name the other session by the `session_agent_id` its own `swg_status` reports |
+| `handoff_not_held` | `check_handoff`: a transfer that already landed answers this too, so look at the path's handoff in `swg_status` before anything else |
+| `handoff_version_unconfirmed`, `handoff_in_flight`, `handoff_other_holder`, `handoff_ended`, `handoff_not_successor`, `handoff_not_giver`, `handoff_not_live` | `stop_and_report` |
+
+None is retryable: the same call gets the same answer. An answer that does not settle the outcome, a lost answer
+included, is an error result with `reason: commit_unconfirmed`,
+`recover: check_handoff`, `retryable: false` and a fixed `next_step` per tool:
+look at the path's handoff before acting again. For `swg_transfer`, a handoff
+from this session to that successor made at the version it held (its
+`version_at_transfer`), live or ended, means the transfer landed, so do not
+transfer again and do not withdraw to start over. For the other three, the
+record's status says whether the verb landed (`completed`, `declined`,
+`withdrawn`); while the handoff is still live, sending the verb again is safe,
+since a repeat changes nothing once it has landed. It is not the generic
+`read_then_retry`: once the successor has written the path, reading it and
+transferring again is a second handoff at the new version. The server's instructions and every one of these
+tools' descriptions say that a transfer fences the giver and does not reserve
+the path.
+
+**Naming the successor.** Each MCP session's `swg_status` reports
+`session_agent_id`, its own session-level agent id: the value another session
+passes to `swg_transfer` as `successor` to hand it a path. It stays the same
+when the session reacquires, and it names the session as a successor while
+`swg_status` reports `principal_claim: bound`. Do not pass `session_id`: a
+transfer naming it is refused as `handoff_successor_unknown`.
+
+**The giver's writes.** While the handoff is live, `swg_write` and
+`swg_write_cas` on the path answer this error result, and `swg_reacquire` does
+not change it:
+
+```json
+{"reason": "handed_off", "recover": "stop_and_report", "retryable": false,
+ "detail": "handed_off artifact=plans/plan.md successor=87d930e5-2201-5609-91a3-5a3ed2f44c86 version_at_transfer=1 (no write landed: this was handed off to the successor at that version. The fence ends when the successor writes it, when the successor declines, or when the giver withdraws on its user's or host's instruction; stop and report, a retry cannot clear it)",
+ "next_step": "Stop: this session handed this path off, so it can no longer write it, and no retry, reacquire or re-read changes that. Do not write it by any other route. Report to your user or host that the path was handed off to the successor named here, at the version named here.",
+ "successor": "87d930e5-2201-5609-91a3-5a3ed2f44c86", "version_at_transfer": 1}
+```
+
+`next_step` is also the result's second text item. Nothing in the answer names
+`swg_withdraw`.
+
+**Where the record shows.** When the path has a record, `swg_read` adds
+`handoff`, the key as the coordinator projected it for this session (with
+`role`). The coordinator attaches it best-effort, so a result with neither
+`handoff` nor `handoff_unknown` does not prove there is no record; `swg_status`
+lists every record. A strict-mode deny never carries the key, and the giver's own re-read
+of a path it handed off is one, so after a denied read `swg_read` takes the
+record from the coordinator's `/status` and adds the same `role`; when
+`/status` cannot be read, or answers [degraded](#when-the-registry-is-busy)
+because the coordinator's registry was busy, it adds `handoff_unknown: true`
+instead, which means the record is unknown, not absent. `swg_status` adds `handoff` (without `role`) to
+the path's `per_path` entry; and a `swg_write_cas` win that labelled a live
+handoff adds `handoff` with its `outcome` (`completed` when this session is
+the successor, `overtaken` with `counterparty` otherwise), `giver`,
+`successor` and `version_at_transfer`. Without a record none of them carries
+the key. An MCP session is not sent the prose a Claude Code session is shown.
+
+**Example.** Two MCP sessions, A and B, on one workspace:
+
+1. B calls `swg_status`, which reports
+   `"session_agent_id": "87d930e5-2201-5609-91a3-5a3ed2f44c86"` and
+   `"principal_claim": "bound"`.
+2. A calls `swg_read` on `plans/plan.md` (version 1), then `swg_transfer` with
+   `{"paths": ["plans/plan.md"], "successor": "87d930e5-2201-5609-91a3-5a3ed2f44c86"}`:
+
+   ```json
+   {"ok": true, "grants": [{"path": "plans/plan.md", "transferred": true,
+     "giver": "38fc3666-40a0-50c2-b315-ce6bdf16c3af",
+     "successor": "87d930e5-2201-5609-91a3-5a3ed2f44c86",
+     "version_at_transfer": 1, "hold_shape": "SHARED", "status": "pending"}]}
+   ```
+
+3. A's `swg_write` of `plans/plan.md` now answers the `handed_off` error above,
+   and so does its `swg_write` after `swg_reacquire`.
+4. B's `swg_read` of the file carries
+   `"handoff": {"role": "successor", "giver": "38fc3666-40a0-50c2-b315-ce6bdf16c3af", "successor": "87d930e5-2201-5609-91a3-5a3ed2f44c86", "version_at_transfer": 1, "hold_shape": "SHARED", "status": "pending", "live": true}`.
+   B's `swg_write_cas` at version 1 answers `"ok": true` with
+   `"handoff": {"outcome": "completed", …}`; its commit ends the handoff and
+   lifts A's fence. Instead, B can call `swg_decline`, or A, on your
+   instruction, `swg_withdraw`.
+
+**One model, two sessions.** A Claude Code model that has both the plugin's
+hooks and this MCP server is two sessions to the coordinator: the Claude Code
+session its hooks act as, and the MCP server's own session. A handoff fences
+only the session that gave it. After an `swg_transfer`, the same model's Edit
+or Write of the path goes through the hooks as the Claude Code session: it is
+admitted as a bystander's edit, recorded as overtaking the handoff, and told
+so in the bystander text shown in [Claude Code sessions](#claude-code-sessions).
+The other way round, a handoff command run as the Claude Code session fences
+only that session, and the model's `swg_write` of the path is a bystander's.
+The handoff commands cannot act as the MCP session (see
+[Handoff commands](#handoff-commands)). Denying the native file tools on
+managed paths, as the [MCP server section](#stale-write-guard-fs-mcp-server)
+recommends, keeps such a model's writes on the MCP session.
+
+### When a volume or MCP session stops
+
+A `CoherentVolume`'s session id and principal live only in its process, and an
+MCP session is one volume; a forked child of a volume is a new session too.
+After the process exits nothing can act as that session: the
+[handoff commands](#handoff-commands) cannot, and a writer started in its place
+is a new session. A new session cannot withdraw, accept or decline a record
+that names its predecessor (`handoff_not_giver`, `handoff_not_successor`), is
+not fenced as the giver, and its write of the path is recorded as overtaking
+the handoff, not completing it, even when it carries on the successor's work.
+
+So settle a handoff while the giver's process is still running:
+
+- **If the successor is gone**, have the giver withdraw, or transfer the path
+  again to the replacement's session-level id (while the record is live, the
+  giver's transfer to another successor replaces it), before you stop the
+  giver.
+- **A giver that stops after a transfer whose successor is still running**
+  needs nothing more: the successor writes, accepts or declines as usual.
+  The exception is a giver whose process also runs the coordinator. A volume
+  that finds no coordinator running starts one in its own process, and when
+  that process exits the coordinator stops and every volume attached to it
+  fails closed. The records stay in `.coherence/state.db` and the next
+  coordinator serves them, but a successor that was a volume or MCP session
+  attached to the stopped coordinator does not come back, and its replacement
+  is a new session. Stop that process last.
+
+If the giver is gone, its record ends when the successor declines or when any
+session commits a write to the path. Until then no other session can hand the
+path on (its transfer is refused as `handoff_in_flight`), bystanders keep
+receiving the `handoff` key, and a Claude Code bystander the bystander text,
+and `/status` and `agent-coherence-status` keep showing the pair. No write is
+refused because of it.
+
+### Scope, honestly
+
+- **No reservation.** Covered above, and worth repeating: a transfer keeps no
+  one out. A session that needs the path kept from other writers needs
+  something else.
+- **A Claude Code giver's shell write is denied only in the forms the Bash
+  hook recognizes.** The common ones are denied as an edit is, in warn and
+  strict mode: a redirection or `tee` (`echo … >> plan.md`), an in-place
+  `sed -i` or `perl -i`, a `cp` or `mv` onto the file, and a script that
+  writes it, by name or through a variable, run as a one-line program or fed
+  to one in a heredoc (see [Claude Code sessions](#claude-code-sessions)).
+  Not covered: a path built from a variable or a command substitution, or,
+  inside a script, built from pieces or reached through a list, a loop, a
+  dictionary or a function's parameter; a writer tool the hook does not know
+  (`gsed`, `awk -i inplace`, `vim`, `curl -o`, a formatter, a script run from
+  a file); and a relative path after a `cd` made by an earlier command.
+  Such a write lands on disk without a version. So does a recognized one when
+  the coordinator cannot answer the check in time (it is slow or overloaded,
+  or its registry fails): the command runs, and unlike a giver's `Edit`, whose
+  commit is then refused, nothing refuses the shell write afterwards.
+- **An edit in flight at the transfer lands without a version.** So does one
+  admitted while the coordinator was degraded. See
+  [Claude Code sessions](#claude-code-sessions).
+- **Writes that bypass the coordinator are not fenced.** An editor, a script
+  or a shell command that writes the file without passing through the hooks
+  goes around every route above;
+  [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)
+  reports it afterwards.
+- **Python coordinator only.** The four routes are served by this package's
+  coordinator. The Claude Code plugin's Node coordinator answers them `404`,
+  keeps no transfer records and answers `session-stop` as before, and the
+  [handoff commands](#handoff-commands) exit `4` against it. The routes
+  keep answering while the coordinator drains for a backend migration.
+- **One model with both the hooks and the MCP server is two sessions,** and a
+  handoff fences only the one that gave it. See
+  [From the MCP server](#from-the-mcp-server).
+- **A volume's or MCP session's handoff outlives its process,** and nothing
+  can withdraw it once the process has exited. See
+  [When a volume or MCP session stops](#when-a-volume-or-mcp-session-stops).
+- Single host, single coordinator, and cooperative.
+
+### Upgrading
+
+Transfer records live in their own table, added by registry schema version 9.
+A workspace's `state.db` at version 8, or any earlier version, migrates on first
+open, with nothing to do. Like earlier schema steps it is forward-only: once a
+workspace's `state.db` has been opened by this version, an older release
+refuses it. Upgrade forward rather than rolling back.
+
+Upgrade the library, and with it the MCP server, together with the
+coordinator. A `CoherentVolume` from an earlier release has no `transfer()`,
+but its session can still be a giver when another client sends a transfer in
+its name: a release from before [caller principals](#caller-principal) claims
+none, so any client that knows its session id can. Against a coordinator that
+answers the giver's `handed_off` reason, such a giver writes nothing on either
+route, but it reads the refusal differently on each:
+
+- **Compare-and-swap** (`write_cas`, `write_cas_at`, and so `swg_write_cas`):
+  it raises a plain `CoherenceError` whose message is `handed_off`, which an
+  older MCP server reports as `reason: internal_error`, `retryable: false`.
+- **Pre-edit** (`write()`, and so `swg_write`): it raises its ordinary
+  `StaleView`, carrying the coordinator's `Edit denied: you handed …` text,
+  which an older MCP server reports as `reason: stale_view`,
+  `recover: reacquire`, `retryable: true`. A reacquire does not clear the
+  fence, so an older MCP giver can loop on reacquire and write until its
+  client is upgraded.
+
+## Acquire-or-fail on `pre-edit` (specified, not yet built)
+
+**Nothing in this section is implemented.** It fixes the shape of an opt-in
+refusal so the change that builds it does not have to re-decide it.
+
+Today `POST /hooks/pre-edit` grants EXCLUSIVE to whoever asks, except the giver
+of a live [handoff](#targeted-grant-handoff) of the path. A session already
+holding the grant is set to INVALID — nothing is committed — and finds out on its
+next request. There is no request that declines instead, so a real mutex cannot be
+built on this route: the second session to ask always wins.
+
+**Request.** `pre-edit` with `"if_unheld": true` in the body, carrying the
+[caller principal](#caller-principal). An opted-in request without a principal is refused as a
+malformed request (HTTP 400 naming the principal), because a refusal that a
+caller could step around by naming the holder's session is not a refusal.
+
+**Refusal.** HTTP 200 with
+`{"ok": false, "reason": "other_holder", "holder_agent_id": "<agent id>"}` — the
+same reason string `post-edit-cas` already returns when a commit meets a
+session holding the write grant. The holder is named by agent id, never by
+session id. Nothing changes hands: the holder keeps its grant and the caller
+gains none.
+
+**What the refused caller does.** Back off and retry the acquire. The refusal
+carries no retry hint because none exists. Committing does not end a grant: a
+holder that commits keeps the file MODIFIED, and the optimistic lane is no way
+around it — `post-edit-cas` answers `other_holder` against a MODIFIED holder
+too. A grant ends when its holder releases it — `session-stop`, which a Claude
+Code session sends at the end of its turn, or a failed `post-edit` — or hands it
+on with a [transfer](#targeted-grant-handoff), or when the
+coordinator reclaims it from a silent holder (no heartbeat for
+`grant_heartbeat_timeout_sec`, or held longer than `grant_max_hold_sec`). Poll
+with backoff rather than wait for a signal.
+
+**Under load.** A timed-out opted-in request must not answer in a shape that
+admits the edit: the contention that makes a holder worth respecting is the
+contention that times a handler out. It answers `ok: false` with
+`"degraded": true`, and the caller treats that as a refusal. Today a timed-out
+`pre-edit` answers `{"ok": true, "degraded": true}`; a test in the coordinator
+suite fails as soon as a refusal reason is registered while that is still the
+answer.
+
+**What it does not close.**
+
+- A refused agent can still write the file with a shell command. The Bash hook
+  refuses a shell write only from the giver of a live
+  [handoff](#targeted-grant-handoff), so a write that goes around the Edit and
+  Write tools is not refused here;
+  [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)
+  reports it afterwards.
+- A new kind of deny on the edit path is shown to the model, and that changes
+  how it retries. The change that builds the refusal needs its own measurement
+  of that before it ships.
+- On the hook surface, any process that can read `.coherence/` can read another
+  session's principal. The refusal separates writers that follow the protocol;
+  it does not stop one that deliberately uses another's principal.
 
 ## `stale-write-guard-fs` MCP server
 
@@ -1044,12 +2994,17 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 
 | Tool | What it does |
 |---|---|
-| `swg_read` | Tracked read — registers the agent's view of the file |
-| `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite |
-| `swg_reacquire` | Recovery after a deny — fresh identity + mandatory fresh read |
-| `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention |
+| `swg_read` | Tracked read — registers the agent's view of the file. If the bytes on disk are not what the coordinator recorded, the read returns a `stale_view` deny with no version. Retry `swg_reacquire` + `swg_read` for a few seconds first, since a peer's commit may still be reaching disk; if it stays denied, the file was changed outside the coordinator (an out-of-band edit, or a commit whose disk write failed), so `swg_write` the reacquired content to record it. When the path has a [handoff](#from-the-mcp-server) record, the result carries its `handoff` key |
+| `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite. On a path this session handed off, a `handed_off` deny with `recover: stop_and_report` |
+| `swg_reacquire` | Recovery after a deny — clears the stale view + mandatory fresh read |
+| `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention. A win that completed or overtook a live handoff says which, in `handoff`; on a path this session handed off, the same `handed_off` deny as `swg_write` |
 | `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed OR a peer's write-claim preempted it (which moves neither comparand — the fence also re-checks that the grant still stands) |
-| `swg_status` | Three-state coordination health: `on` / `off` / `unknown` |
+| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `principal_claim`, its `session_agent_id` (the id another session names to hand it a path), the coordinator's two caller-principal counters, its `registry_schema_version` (the schema version of its store; `null` when the coordinator is unreachable, which `coordinator` `unknown` shows, or when its answer carries no such field, as a coordinator built before the field does), and each path's handoff record. `per_path` is `null`, not `{}`, when the coordinator's `/status` answer carries no list of tracked paths, as a [degraded](#when-the-registry-is-busy) answer does when its registry was busy; the text result then says `per_path=unavailable`. Retry shortly and do not read it as nothing tracked. With `coordinator` `unknown`, `per_path` is `{}` and says nothing about what is tracked |
+| `swg_transfer` | Hands this session's claim on one or more paths to another session, named by that session's `session_agent_id`; see [From the MCP server](#from-the-mcp-server) |
+| `swg_accept` | As the successor, accepts a handoff without writing the path |
+| `swg_decline` | As the successor, declines a handoff; the giver may write the path again |
+| `swg_withdraw` | As the giver, withdraws a handoff, on the user's or host's explicit instruction only |
+| `POST /hooks/effect-fence` | **Not a tool — the HTTP sibling of `swg_gate`.** The coordinator answers the same fence verdict to any client that can make an HTTP request, with no MCP and no Python in the loop, and it is the only surface that can answer the no-content-claim leg. See [Effect fence over HTTP](#effect-fence-over-http) |
 
 Denials are machine-readable: an agent parses the typed payload (for example
 `reason: stale_view`, `recover: reacquire`) and self-heals instead of retrying
@@ -1057,9 +3012,34 @@ blindly. The server validates every file URI — path traversal and any access t
 the coordinator's own state directory are rejected — and fails closed on IO
 errors. Strict-mode, managed-path scoped.
 
+**A session the coordinator refuses.** The server claims a
+[caller principal](#caller-principal) for its session at start. When a later
+request is refused for it and claiming again with the same nonce cannot cure
+that — the session is bound under another nonce, or the claim hands back the
+principal that was just refused — the tool call answers `reason:
+caller_principal_absent`, `caller_principal_foreign` or
+`caller_principal_claimed` with `recover: restart_session` and
+`retryable: false`, and so does every `swg_write`, `swg_read` and `swg_gate`
+after it: no tool call in that server session can regain coordination, and a
+new server session claims its own principal. `swg_status` says so ahead of time
+as `principal_claim: refused`. When instead the *answer* to that claim is lost
+(a transport blip), the refusal is not yet settled: the tool call answers the
+same `reason` with `recover: wait_and_retry` and `retryable: true`, the next
+tool call claims again with the same nonce by itself before it runs — and
+usually just succeeds — and `swg_status` reads `principal_claim: unconfirmed`
+until it does. The other values are `bound`, `unsupported` (the coordinator
+issues no principals) and `not_attempted`. `swg_status` also forwards the
+coordinator's `caller_principal_absent_total` and
+`caller_principal_refused_total`, `null` rather than `0` when the coordinator
+is unreachable or does not report them. It forwards the coordinator's
+`registry_schema_version` under the same rule: `null` when the coordinator is
+unreachable or its answer carries no such field.
+
 **Multiple sessions, one workspace.** Multiple `stale-write-guard-fs` instances
 pointed at the same `SWG_ROOT` attach to one coordinator, so a stale write is denied
-across sessions; if the coordinator's session exits, peers fail closed.
+across sessions; if the coordinator's session exits, peers fail closed. One
+session hands a path to another with `swg_transfer`; see
+[From the MCP server](#from-the-mcp-server).
 
 **Wiring a client to prefer `swg_*` over native file tools.** Registering the
 server exposes the `swg_*` tools, but an agent will still reach for its native
@@ -1073,8 +3053,10 @@ deny. The Claude Code adapter that wires this seam ships in
 `agent_id` alongside the parent `session_id`, the adapter folds both into the
 identity derivation, so each subagent becomes its own coherence peer rather
 than blending into the parent session. That buys two things: `last_writer`
-attribution names the subagent that actually wrote (visible in `/status` as
-`claude-session-<sid>:subagent-<aid>`), and two sibling subagents racing the
+attribution names the subagent that actually wrote (visible in the operator
+`/status` view, `?detail=full`, as `claude-session-<sid>:subagent-<aid>`; the
+default view omits the name because it embeds the raw session id), and two
+sibling subagents racing the
 same artifact are detected as a collision instead of passing as one writer.
 With no `agent_id` in the payload the derivation is unchanged, byte-for-byte —
 main-thread sessions behave exactly as before. On Claude Code's
@@ -1283,6 +3265,7 @@ Correctness demos lead; the token-savings / hit-rate demos follow.
 | Effect gate | `python -m examples.effect_gate.main` | `gate()` holds an effect on a stale input; `--baseline` shows the stale fire (offline, no keys) |
 | MCP stale-write guard | `python -m examples.mcp_stale_write_guard.main` | Red→green stale-write deny through the MCP server tools (offline, no keys) |
 | Workspace versioning & restore | `python -m examples.workspace_versioning.main` | Checkpoint a mixed file + S3 workspace, then restore it with per-member honesty (`restored` / `conflict` / delete leg / forward-only skip); `--baseline` shows the unrecoverable loss first (offline, no keys) |
+| Session handoff | `python -m examples.session_handoff.main` | Two sessions, each a real OS process, share a scratch file and hand off through a checkpoint: plain file I/O loses the second session's line with nothing raised; `CoherentVolume` denies the stale write and both lines survive; a rewind lands cleanly when the handing-off session stopped and concludes `conflict` when it is still writing (offline, no keys) |
 | Conversations stale-read | `python -m examples.conversations_stale_read.main` | Two agents share one conversation; client-cache invalidation (offline, no keys) |
 | Cross-host (experimental) | `python examples/cross_host/main.py` | Stale-write deny + effect ordering across a host boundary (local smoke; Docker runner in `examples/cross_host/`) |
 | LangGraph planner | `python -m examples.langgraph_planner.main` | 4-agent, 1 artifact, 75% hit rate |
@@ -1443,6 +3426,131 @@ plainly:**
 
 Zero is a result. *No table at all* is a different result, and the distinction
 is exactly what makes a thirty-day observation window worth running.
+
+---
+
+## Foreign-write detection — who wrote this behind my back?
+
+The coordinator sees writes that go through it. It does not see an editor, a
+script, or a second tool that writes a shared file directly — and that is the
+window where a stale value quietly spreads into everything derived from it. The
+existing guards catch such an edit at the next read and at the next write. They
+say nothing about the time in between.
+
+Detection watches that window. While a coordinator is running, once per sweep it
+asks git which of the files it coordinates have changed on disk, re-hashes just
+those, and records what it found. It never denies anything. A detection is a
+number in a report, not a refusal.
+
+Read it back offline, against a coordinator that is no longer running:
+
+```python
+from ccs.diagnose.foreign_writes import read_foreign_write_report
+
+report = read_foreign_write_report(".coherence/state.db")
+
+print(report.state)        # 'not-instrumented' | 'not-coverable' | 'instrumented-zero' | 'counts'
+for artifact, counts in sorted(report.totals.items()):
+    print(f"{artifact[:8]}  {counts}")   # {'foreign': 2, 'mediated': 5}
+
+for run in report.runs:                  # what each coordinator run watched
+    # covered_count is the files git could report on, not every file you track
+    print(run.tick_count, "checks over", run.covered_count, "files")
+
+report.covers(started_at, ended_at)      # was that period watched end to end?
+report.uncoverable                       # runs that found nothing to watch
+```
+
+Each file lands in one of three buckets:
+
+- **foreign** — the bytes on disk are not the bytes the coordinator has, and
+  nothing it knows explains that.
+- **mediated** — the file changed, and the coordinator holds exactly those
+  bytes. It was a write that went through it.
+- **lag_suppressed** — the mismatch looked like a write that was still landing
+  when the check ran. Counted separately, never as a foreign write and never as
+  a clean result, so you can see how often the benefit of the doubt was given.
+
+**The honesty rules matter more than the numbers, so they are worth stating
+plainly:**
+
+- **Zero is only zero when the detector actually ran.** A store it never ran
+  against reports `not-instrumented`, which is a different answer from
+  `instrumented-zero`. Turning the sweep off, reading a store from a coordinator
+  that never started one, or running where nothing is in scope all give you the
+  first — never a clean bill of health you did not earn. Each run also records
+  how many files were in scope, because watching five hundred and finding
+  nothing is a different result from watching none. That number counts only the
+  files git could actually report on: one your patterns name and the coordinator
+  knows, but that nobody has added to git, is not among them, because a check
+  that can never see a file must not be counted as having watched it. Read it as
+  the widest scope that run ever watched, not the scope of its last check — a
+  run whose visible files fall away keeps reporting the larger number, and the
+  run is not split when that happens. The count is therefore a subset of the
+  files you asked to have tracked, and a check that could see only some of them
+  leaves no separate mark anywhere in the report, so the report alone will not
+  tell you how far the two have drifted apart.
+- **A workspace the detector cannot watch is its own answer.** Detection can
+  only watch a git work tree, and a coordinator rooted outside one — a temp
+  directory, an unpacked archive, a directory nobody ran `git init` in — can
+  never be polled. There is a second way to arrive at the same nothing: a real
+  repository in which none of the files the coordinator knows and tracks are
+  files git tracks, so git answers and has nothing to say about any of them.
+  Either way, once the detector has at least one artifact it already knows and
+  tracks, it writes a note that it looked and found nothing it could watch, and
+  records no check for that sweep. `report.uncoverable` lists each such run,
+  why it could watch nothing, and when it looked. That note leads the report —
+  the state you read is `not-coverable` — only in a store that never recorded a
+  check; where an earlier run did record checks, those runs lead instead and
+  the note is read from `report.uncoverable`. Read it there whatever the state
+  says. `not-coverable` is neither a zero nor an outage — the detector ran and
+  correctly found nothing it could watch — and it is kept apart from
+  `not-instrumented` so a healthy instrument is not accused of never having
+  run. `covers()` is untouched by either condition: it walks recorded checks
+  alone, so a span in which nothing was watched still answers `False`. With
+  nothing in scope at all the detector never reaches git and records nothing,
+  so a store that has never been polled reads `not-instrumented`, exactly as
+  the bullet above says — that precedence is deliberate, and the state reflects
+  what the store retains rather than the latest sweep. A workspace that gains
+  a repository is watched from the next sweep, with no restart, and so is one
+  whose files reach git's index. Files you deliberately keep out of git are
+  outside the instrument by design and need no fixing; where you do want them
+  watched, the tracked set has to name files git tracks.
+- **A suppression expires.** A mismatch excused as a write still landing is
+  re-examined once the window passes. If no write ever landed, it becomes a
+  foreign write and is counted as one. The benefit of the doubt is temporary.
+- **A count is one per version of the content, not one per check.** An edit
+  nobody has reconciled is still there on the next check, and the one after
+  that. It is counted once. Change the file again and that is a second count.
+- **Detection covers files the coordinator already knows and git tracks.** A
+  file that matches your patterns but has never been touched through the
+  coordinator, one you have since stopped tracking, and one git ignores are all
+  outside it. They are not reported as clean; they are not reported at all.
+- **A broken check is never a quiet month.** If git cannot run, the check is not
+  recorded as having happened, so the gap is visible in the report rather than
+  reading as no news. A workspace with no repository at all is the one such
+  condition nothing can fix, so it is logged once at debug level instead of once
+  per sweep; the report is unaffected and still shows the gap. A repository that
+  exists but is broken is not that case — git describes the two identically, so
+  this is decided by looking for the repository, not by reading the message —
+  and it stays loud.
+- **`covers(start, end)` answers coverage, not the totals.** A coordinator that
+  was down for the middle of a period still shows a healthy count of checks. Ask
+  `covers` whether the period you care about was actually watched end to end.
+  A stretch in which nothing at all was in scope — because the tracked set was
+  emptied and later restored, say — ends the watched period too, so `covers`
+  reports it as a gap rather than reading across it. So does a stretch in which
+  git could report on none of the files in scope, because they were never added
+  or an exclude rule hides them: the tracked set was not empty, but nothing in
+  it was being watched. Narrowing the set to a smaller one git can still speak
+  about does not: those files were still being watched. And a stretch in which
+  the check did not run at all, because the machine was asleep or the
+  coordinator was stalled, ends it as well.
+- **Attribution is by file only.** A change on disk carries no author, so the
+  report names what changed and never who changed it.
+
+Reading the report never writes to the store, so you can point it at a database
+copied off a machine after the fact.
 
 ## Replay (v0.8.2+)
 
@@ -1609,9 +3717,104 @@ All bundled CLIs are installed as console scripts when you
 | `ccs-compare` | — | Compare two or more strategies on the same scenario |
 | `ccs-check-architecture` | — | Verify the four-layer architecture boundary (also runs in CI) |
 | `agent-coherence-replay` | `[langgraph]` | Replay a captured coordinator session and report invariant breaches |
+| `agent-coherence-status` | — | Print the coordinator's tracked paths, sessions, handoffs, sweep reclaims and counters; see [Status, track and untrack commands](#status-track-and-untrack-commands) and [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status) |
+| `agent-coherence-track` | — | Add paths to the coordinator's tracked set; see [Status, track and untrack commands](#status-track-and-untrack-commands) |
+| `agent-coherence-untrack` | — | Add paths to the coordinator's ignored set (a path enforced in strict mode is refused); see [Status, track and untrack commands](#status-track-and-untrack-commands) |
 | `agent-coherence-workspace` | — | Checkpoint / list / status / restore a workspace of file and forward-only members; see [Workspace versioning & restore](#workspace-versioning--restore-workspaceversioner) |
+| `agent-coherence-transfer`, `agent-coherence-accept`, `agent-coherence-decline`, `agent-coherence-withdraw` | — | Hand a path from one Claude Code session to another, and accept, decline or withdraw the handoff; see [Handoff commands](#handoff-commands) |
 
 Run any command with `--help` for the full option list.
+
+### Status, track and untrack commands
+
+Three console scripts read and change a running coordinator's view of the
+workspace. Each finds the coordinator from the git root of the current
+directory, or from `--root ROOT`; a path is relative to that root, or absolute
+inside it.
+
+| Command | What it does |
+|---|---|
+| `agent-coherence-status [--detail LEVEL] [--json] [--show-policy]` | prints `/status` as a table, or with `--json` as the body itself. `LEVEL` picks the view: `minimal`, which names no session; `full`, the operator view, asked for with the `Coherence-Local-Operator: true` header; or `metrics`, the counters only. With no `--detail` it asks for the coordinator's default view, which is `minimal`, and sends no operator header. `--show-policy` adds the user-added tracked paths no hook has seen yet; it needs `--detail full`, because only the operator view carries them |
+| `agent-coherence-track path [path ...]` | adds the paths to the coordinator's tracked set (`POST /policy/track`) |
+| `agent-coherence-untrack path [path ...]` | adds the paths to the coordinator's ignored set (`POST /policy/untrack`); a path enforced in strict mode is refused, and then nothing is untracked |
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Done. For `agent-coherence-status` this includes no coordinator running, which it reports on standard error. A path the command rejects itself, next to paths it sends, is reported and does not change the code. |
+| `1` | Not in a git repository; for `track` and `untrack`, also every path rejected by the command's own validation. Nothing is sent. |
+| `2` | `track` or `untrack` could not reach the coordinator; the connection failed TLS verification or configuration; or the coordinator redirected the request (never followed), answered an HTTP error, or answered a body that is not a JSON object or whose fields have the wrong types. `agent-coherence-status` also exits `2` on a [degraded answer](#when-the-registry-is-busy). |
+| `3` | `agent-coherence-status --self-test` failed, or `agent-coherence-untrack` was refused because a path is enforced in strict mode and untracked nothing. A refusal that does not name each refused path with the strict patterns covering it exits `2` instead, as the HTTP error it is, with the coordinator's error text. |
+
+An exit `2` prints one line on standard error, starting with the command's
+name, never a traceback; the one exception is `agent-coherence-status --json`
+on an answer without its two lists, such as a degraded one, which prints the
+body instead. An HTTP error reads `HTTP <code>: <error>`, with the
+coordinator's `error` text, or `HTTP <code>` when it sent none.
+
+**Policy files.** `track` and `untrack` add each path to
+`.coherence/tracked.yaml` or `.coherence/ignored.yaml` as a double-quoted YAML
+string (`- "*.md"`). A glob that YAML would otherwise read as something else,
+such as `*.md`, `[abc].md`, `{a,b}.md`, `yes` or `2026-10-12`, reads back
+exactly as written. When the file cannot take a new entry, the coordinator
+answers HTTP 400 naming the file, writes nothing, and the command exits `2`
+with that text. That happens when the file cannot be read, when it is not
+valid YAML or not a list, which the coordinator reads as no entries at all, or
+when an added line would break it: a `[ ... ]` list, an indented list, a `...`
+end marker or a lone `~`. Rewrite the file with one entry per line, each
+double-quoted, and retry. The coordinator replaces the file rather than
+writing into it, so a policy file kept as a symlink becomes a regular file.
+
+Releases up to 0.14.1 wrote entries without quotes. An entry starting with
+`*`, `[`, `{`, `!`, `&`, `%`, `@`, `|`, `>` or a quote, written by one of them,
+left the whole file unreadable, and the coordinator then dropped every entry
+in it without a word: tracked paths stopped being coordinated, ignored paths
+came back, and a strict path whose tracked entry was in the file lost strict
+mode at the next coordinator start. The Python coordinator now counts a policy
+file it cannot load as a rejected pattern: `/status` reports it in
+`policy_summary.rejected_pattern_count`, and `agent-coherence-status` ends its
+Policy line with `, N rejected`. If you see that, rewrite the files in
+`.coherence/` as above and restart the coordinator.
+
+**Escaping.** Every string these commands print from a coordinator answer
+(paths, session names, states, reclaim triggers, handoff statuses, counter
+values, error text) has each non-printable character written the way Python's
+`repr` writes it, without the quotes: an escape character as `\x1b`, a newline
+as `\n`, a right-to-left override as `\u202e`. So an answer cannot move the
+cursor, recolor the terminal or reorder a line. Printable text, the ASCII space
+included, prints unchanged, so ordinary output is exactly what it was. Other
+spaces and invisible joiners, such as a no-break space, U+3000 or a zero-width
+joiner, print escaped. A path the coordinator rejected or refused prints in
+quoted `repr` form, as a path the command rejects itself already did. The
+[handoff commands](#handoff-commands) escape the coordinator's text the same
+way.
+
+These are the Python console scripts' rules. Where the Claude Code plugin's own
+`agent-coherence-status`, `agent-coherence-track` or `agent-coherence-untrack`
+comes first on the Bash tool's `PATH`, that program runs instead, with its own
+output and exit codes.
+
+**Which store format a coordinator writes.** Every `/status` view from the
+Python coordinator, `?detail=metrics` and a
+[degraded answer](#when-the-registry-is-busy) included, carries
+`registry_schema_version`: the schema version of the workspace's
+`.coherence/state.db`, an integer. The coordinator migrates the store to that
+version when it opens it, and an older release refuses a store at a newer
+version, so check this number before you run an older coordinator or library
+against the workspace. v0.14.0 and v0.14.1 write schema 7 and refuse a store at
+a higher number. `coordinator_version` cannot tell you this: between releases
+one version string covers several schema steps. The number counts the Python
+coordinator's own schema steps. The Claude Code plugin's Node coordinator does
+not send it, and the `schema_version` that coordinator sends counts a
+different set of steps, so the two are not comparable.
+`agent-coherence-status` prints the number at the end of its `Coordinator:`
+header line, for example `schema=10`, and at the end of the summary line with
+`--detail metrics`; `--json` prints the field itself. A coordinator that does
+not send the field gets no `schema=` in either line. The MCP server's
+`swg_status` forwards the field as `registry_schema_version`. It is `null` when
+the coordinator is unreachable, which `coordinator` `unknown` shows, or when the
+coordinator's answer carries no such field. The MCP server does not attach to
+the Node coordinator or to a release up to v0.14.1 at all, because it cannot
+confirm their managed globs.
 
 ### `ccs-simulate` and `ccs-compare`
 
@@ -1699,19 +3902,19 @@ gate(vol, "deploy/config.txt", decide=plan_deploy, effect=run_deploy)
 
 Returns whatever `effect` returns. Raises `StaleView` — carrying `expected_version` / `current_version`, `expected_generation` / `current_generation`, and a typed `hold_cause` — if the input moved, vanished, lost the grant it was read under, or could not be confirmed.
 
-Branch on `hold_cause` rather than the message:
+Branch on `hold_cause` rather than the message. It carries one of the
+published hold reasons — the same vocabulary, with the same meanings and the
+same recoveries, that the coordinator answers with over HTTP: see
+[Hold reasons](#hold-reasons--the-published-vocabulary). Reasons may be added
+and are never renamed, so match the whole value and treat one you do not
+recognise as a hold.
 
-| `hold_cause` | Meaning | Recovery |
-|---|---|---|
-| `version_moved` | a peer committed a newer version | `reacquire()`, re-decide, re-gate |
-| `grant_reclaimed` | the grant the decision was read under was reclaimed; the version never moved | `reacquire()`, re-decide, re-gate |
-| `grant_preempted` | a peer's write-claim acquire took the grant the decision was read under; **neither** the version nor the ownership generation moved (no commit yet, no epoch bump) — the gate saw the re-read itself come back without a standing grant | `reacquire()`, re-decide, re-gate |
-| `read_denied` | the coordinator refused the re-read (strict mode; this view is INVALID) — **on a strict-mode volume this is how a reclaim usually surfaces** | `reacquire()`, re-decide, re-gate |
-| `input_vanished` | the artifact is gone at the effect boundary | re-establish the input, then re-gate |
-| `version_unconfirmed` | a degraded read returned no confirmed version | restore coordinator health, then re-gate |
-| `generation_unconfirmed` | the residual bucket: no confirmed ownership generation, from a degraded read, an out-of-band edit the coordinator could not confirm, **or** a coordinator that does not report generations at all | `reacquire()` and re-gate **first** — that clears the first two. A HOLD that survives a *successful* reacquire is the third: check the daemon's version and restart it |
-
-**What the causes do and don't tell you.** All but the last are specific and recoverable. `generation_unconfirmed` is deliberately the residual bucket and is *not* a clean permanent-vs-transient signal — a client cannot distinguish "this daemon never reports generations" from "this particular read couldn't be confirmed" without trying. So treat it as retry-first, and let *persistence across a successful reacquire* be the signal that an operator is needed. Splitting `read_denied` out is what keeps the common strict-mode reclaim from hiding in that bucket.
+One reason in that vocabulary this wrapper cannot raise: `content_claim_absent`.
+`gate()` reads a hash *comparison* from the coordinator rather than the hash it
+records, so "the claim matches" and "there is no claim at all" arrive here as
+one value and the wrapper assumes a claim exists. The
+[HTTP fence](#effect-fence-over-http) reads the coordinator's own record and is
+the surface that can answer that leg.
 
 **Fail-closed comparands.** An unconfirmed version (`0` — a degraded read) or an unconfirmed generation (`None` — a coordinator deny, a degraded read, an out-of-band edit the coordinator could not confirm, or an older coordinator daemon from before this release's generation reporting) always HOLDs. In particular, this gate against an older coordinator daemon HOLDs loudly rather than silently reverting to the generation-blind check — restart the coordinator on the current version to clear it.
 

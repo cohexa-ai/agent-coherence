@@ -443,7 +443,7 @@ def _deny_stdout(artifact: str) -> str:
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": (
-                f"Stale read denied: {artifact} was updated by session abcdef01 "
+                f"Stale read denied: {artifact} was updated by agent abcdef01 "
                 f"at 2026-05-23T12:00:00+00:00. Re-read {artifact} via the Read "
                 f"tool before proceeding."
             ),

@@ -1,0 +1,49 @@
+{
+  "name": "pre-read-grant-handover-denies-without-a-write-claim",
+  "description": "R8, and the cross-runtime form of Cohexa-ai/agent-coherence#196: A pre-reads (SHARED on v1), B pre-edits (acquires EXCLUSIVE, invalidating A) but never commits. Nothing was written and the version never moved, so A's next pre-read on the strict-tracked artifact denies with the GRANT-CHANGE reason, not the write one. The issue reported the old bytes verbatim: \"CLAUDE.md was updated by session <unknown> at <t>\" — a write that never happened, named against a writer that does not exist, at a timestamp when nothing was written. The summary is asserted too rather than ignored, because the prose alone would pass with a version the response got wrong: current_version must still be 1 and prior_version_seen_by_session must be the 1 that A actually observed, not the 0 the old current-minus-one inference reported. Both backends derive both halves the same way.",
+  "setup": {
+    "tracked": ["CLAUDE.md"],
+    "strict_mode": ["CLAUDE.md"],
+    "files": {"CLAUDE.md": "# Project rules\nv1 content\n"},
+    "preflight_requests": [
+      {"method": "POST", "path": "/hooks/pre-read",
+       "body": {"session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+                "path": "CLAUDE.md",
+                "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"}},
+      {"method": "POST", "path": "/hooks/pre-edit",
+       "body": {"session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+                "path": "CLAUDE.md"}}
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "CLAUDE.md",
+      "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+    }
+  },
+  "ignore_keys": ["last_writer_at_unix_ts", "warning_generated_at_unix_ts"],
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "Stale read denied: your grant on CLAUDE.md was revoked and no new version was committed \u2014 CLAUDE.md is still at v1. Re-read CLAUDE.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+      },
+      "status": "stale",
+      "summary": {
+        "path": "CLAUDE.md",
+        "current_version": 1,
+        "prior_version_seen_by_session": 1,
+        "last_writer_session_id": "<unknown>",
+        "last_writer_at_unix_ts": 0,
+        "warning_generated_at_unix_ts": 0,
+        "hash_differs": false
+      }
+    }
+  },
+  "backends": ["python", "node"]
+}

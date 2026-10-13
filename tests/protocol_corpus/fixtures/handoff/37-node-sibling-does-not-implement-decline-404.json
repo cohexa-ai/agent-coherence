@@ -1,0 +1,22 @@
+{
+  "name": "handoff-node-sibling-does-not-implement-decline-404",
+  "description": "THE ASYMMETRY, RECORDED. The sibling Node coordinator does not implement POST /handoff/decline and answers 404 with the shared error envelope. The bearer is the harness's VALID one: Node rejects auth before routing, so a bad bearer would answer 401 and say nothing about which routes exist. The day Node grows the route this row goes red. It must RUN, not skip: test_handoff_corpus.py fails rather than xfails when the plugin dist cannot be resolved.",
+  "setup": {},
+  "request": {
+    "method": "POST",
+    "path": "/handoff/decline",
+    "body": {
+      "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      "path": "plan.md"
+    }
+  },
+  "expected": {
+    "status": 404,
+    "body": {
+      "error": "not found"
+    }
+  },
+  "backends": [
+    "node"
+  ]
+}

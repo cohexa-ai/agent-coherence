@@ -22,8 +22,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import signal
 import subprocess
 import sys
+import textwrap
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -765,3 +768,34 @@ def test_invalid_json_in_show_payload_returns_exit_1(tmp_path: Path) -> None:
     bad.write_text("not valid json{", encoding="utf-8")
     code, _, _ = _invoke(["--show-payload", str(bad)])
     assert code == 1
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGPIPE"), reason="no SIGPIPE on this platform")
+def test_running_the_cli_in_process_leaves_sigpipe_ignored_for_later_tests(tmp_path: Path) -> None:
+    """``main()`` resets SIGPIPE to the default action for the whole process,
+    and tests/conftest.py puts it back after each test. Without that, a later
+    test in the same process that writes to a closed socket is killed with no
+    traceback: an xdist worker died this way. One real CLI test runs in a
+    nested session, and SIGPIPE's disposition is read after it."""
+    report = tmp_path / "sigpipe.txt"
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    (plugin_dir / "report_sigpipe.py").write_text(textwrap.dedent(f"""\
+        import signal
+
+        def pytest_sessionfinish(session):
+            handler = signal.getsignal(signal.SIGPIPE)
+            with open({str(report)!r}, "w") as out:
+                out.write(getattr(handler, "name", repr(handler)))
+    """))
+    cmd = [
+        sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-n", "0", "-p", "report_sigpipe",
+        "tests/test_diagnose_cli.py::test_pipeline_emits_html_and_json",
+    ]
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(plugin_dir), os.environ.get("PYTHONPATH", "")])}
+    proc = subprocess.run(cmd, cwd=_REPO_ROOT, env=env, capture_output=True, text=True, timeout=120, check=False)
+    assert "1 passed" in proc.stdout, "control: the nested CLI test ran\n" + proc.stdout + proc.stderr
+    assert report.read_text() == "SIG_IGN"

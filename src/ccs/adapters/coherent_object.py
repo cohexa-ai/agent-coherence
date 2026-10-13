@@ -692,8 +692,9 @@ class CoherentObject:
         old bytes (the restore-read guarantee); the typed result reports the
         marker and its own versionId. On an unversioned bucket the removal is
         permanent and the result says so. Version-targeted permanent deletion is
-        deliberately NOT offered here (pin release is internal-only; the GC
-        drop-half is out of scope).
+        deliberately NOT offered here (the GC drop-half is out of scope). To
+        drop a checkpoint's holds so a version can expire, use
+        ``WorkspaceVersioner.release_checkpoint``.
         """
         try:
             resp = self._active_client().delete_object(Bucket=self._bucket, Key=artifact_ref)
@@ -719,11 +720,13 @@ class CoherentObject:
         self._put_legal_hold(artifact_ref, version_id=version_id, status="ON")
 
     def release_legal_hold(self, artifact_ref: str, *, version_id: str) -> None:
-        """Release one version's legal hold (the pin's internal-only drop half).
+        """Release one version's legal hold (the pin's drop half).
 
-        Same typed error surface as :meth:`set_legal_hold`. Exposed for the
-        workspace layer's INTERNAL ref-counted release — there is no public
-        checkpoint-delete verb in v1.
+        Same typed error surface as :meth:`set_legal_hold`. Drives the
+        workspace layer's ref-counted release, which reaches it through the
+        public ``WorkspaceVersioner.release_checkpoint``; calling it directly
+        is also the documented recovery for a hold stranded by a failure
+        mid-release. There is no public checkpoint-DELETE verb in v1.
         """
         self._put_legal_hold(artifact_ref, version_id=version_id, status="OFF")
 

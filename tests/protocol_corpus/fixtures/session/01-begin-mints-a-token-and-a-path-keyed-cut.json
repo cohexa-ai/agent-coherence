@@ -1,0 +1,40 @@
+{
+  "name": "session-begin-mints-a-token-and-a-path-keyed-cut",
+  "description": "POST /session/begin over two tracked paths the coordinator has never seen. Each read-set path is seeded as a first observation (version 1, like pre-read), and the response carries the server-minted `session_token`, the PATH-keyed cut (artifact ids stay server-internal), the per-boot `coordinator_epoch`, and `retain_versions` -- false on the default coordinator, which tells the client a later /session/read answers `data_plane_deferred` rather than serving bytes. Both minted values are scrubbed by name to `<MINTED>` (#193 ask 2): the keys are asserted present, their per-run values are not compared.",
+  "setup": {
+    "tracked": [
+      "docs/**"
+    ],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n",
+      "docs/spec.md": "# coherence corpus fixture  \n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/session/begin",
+    "body": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "read_set": [
+        "docs/plan.md",
+        "docs/spec.md"
+      ]
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "session_token": "<MINTED>",
+      "cut": {
+        "docs/plan.md": 1,
+        "docs/spec.md": 1
+      },
+      "coordinator_epoch": "<MINTED>",
+      "retain_versions": false
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

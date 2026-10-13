@@ -40,7 +40,8 @@ forward-only members (actions/effects with no state to capture).
   read but BEFORE the manifest persists is NOT flagged — the cut itself stays
   internally consistent (every token and fingerprint comes from the capture
   reads) and restore never trusts the flag (every leg re-reads its live
-  comparand), so the residual under-flags the window; it never corrupts the
+  comparand, and RECORDS what that read saw — see the restore ``observation``
+  below), so the residual under-flags the window; it never corrupts the
   manifest (the safe direction).
 - **The window** — ``[window_min, window_max]`` is the min/max of the members'
   capture timestamps (whole-second wall-clock ticks; the skew is DECLARED, not
@@ -90,6 +91,24 @@ conditional leg per DURABLE member row under a TERMINATION CONTRACT:
   exists live is deleted (S3: an unconditional-latest ``delete``, minting a
   marker on a versioned bucket; the pre-delete race window is a documented
   residual).
+- **What restore does NOT promise, and what it reports instead** — restore is
+  not a merge and nothing on this path refuses a write: a member whose content
+  moved after the capture is put back OVER, and that later content is gone.
+  What the engine promises is that the run SAYS so. Each leg's comparand read
+  is also recorded, as a :class:`RestoreObservation` on that member's outcome
+  (``state`` / ``pointer`` / ``fingerprint``, from the closed
+  :data:`~ccs.core.exceptions.RESTORE_OBSERVATION_STATES` vocabulary):
+  ``observed_differs`` (a live state was read, it differed, and the write
+  discarded it — the ONLY state carrying the pointer to the version
+  overwritten and a digest of the content overwritten), ``no_live_state``
+  (create-on-absent; nothing discarded), ``present_not_comparable`` (the
+  delete leg's probe established live state EXISTED and destroyed it without
+  reading a comparand to name it by), ``no_write_attempted`` (no write
+  decision was reached — the default), and ``not_recorded`` (this run holds no
+  observation at all; never clean). The values ride the read each leg was
+  ALREADY making — no second substrate call — so the split-comparand rule
+  stands: on the S3 leg the ETag remains the comparand and is never recorded,
+  the versionId is the pointer.
 
 **Registration (WV Unit 5 / R4–R5)** — after every member is terminal and
 before ``concluded``, :meth:`WorkspaceVersioner._registration_seam` registers
@@ -158,23 +177,37 @@ re-drives pins idempotently (only ``unpinned`` members are attempted).
   skips file pin legs entirely (nothing above ``restorable-unpinned`` was
   ever claimed, so nothing needs backing).
 - **Forward-only / absent / unconfirmed members** — never pinned, untouched.
-- **Release is INTERNAL-ONLY** (``_release_checkpoint_pins``): there is no
-  public checkpoint-delete/release verb in v1. Refcount-aware across
+- **Release is PUBLIC at the checkpoint level** (:meth:`WorkspaceVersioner.
+  release_checkpoint`, over the ``_release_checkpoint_pins`` engine); there is
+  still no checkpoint-DELETE verb, and no CLI/HTTP route for either half.
+  Refcount-aware across
   checkpoints: before dropping an S3 legal hold the release scans every OTHER
   checkpoint's members for another ``held`` pin of the same ``(member_path,
   native_token)`` — a shared hold survives until the LAST holder releases.
   Each released member is recorded ``pin_state="released"`` (tier downgraded
   to ``restorable-unpinned`` where it was ``restorable``) BEFORE the substrate
   hold is dropped — a crash between the record and the drop leaves an
-  over-retained version (safe direction) whose next release attempt (any
-  checkpoint) still drops it, never an unbacked ``restorable`` claim.
+  over-retained version (safe direction), never an unbacked ``restorable``
+  claim. A SHARING peer's own release still drops it; where this checkpoint
+  was the sole holder nothing in the product does, and the recovery is
+  ``CoherentObject.release_legal_hold`` on the binding, by version.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Final, Mapping, Protocol, Sequence, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Final,
+    Mapping,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 from uuid import UUID
 
 from ccs.adapters.coherent_object import (
@@ -184,6 +217,7 @@ from ccs.adapters.coherent_object import (
     VersionedCasWritten,
     VersionPointerUnconfirmed,
 )
+from ccs.adapters.coherent_volume import denied_read_backoff_sec
 from ccs.adapters.substrate import CasConflict, ReconcileVerdict
 from ccs.coordinator.registry_protocol import CheckpointMember, CheckpointRecord
 from ccs.core.clock import monotonic_seconds
@@ -193,12 +227,20 @@ from ccs.core.exceptions import (
     PIN_STATE_UNAVAILABLE,
     PIN_STATE_UNPINNED,
     RESTORE_MEMBER_OUTCOMES,
+    RESTORE_OBSERVATION_DIFFERS,
+    RESTORE_OBSERVATION_NO_LIVE_STATE,
+    RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
+    RESTORE_OBSERVATION_NOT_RECORDED,
+    RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
+    RESTORE_OBSERVATION_STATES,
+    RESTORE_OBSERVATION_STATES_WITHOUT_COMPARAND,
     RESTORE_OUTCOME_CONFLICT,
     RESTORE_OUTCOME_CONVERGED,
     RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED,
     RESTORE_OUTCOME_HELD_UNCONFIRMED,
     RESTORE_OUTCOME_RESTORED,
     RESTORE_OUTCOME_TARGET_LOST,
+    RESTORE_OUTCOMES_PROVING_NO_WRITE,
     RESTORE_STATUS_CONCLUDED,
     RESTORE_STATUS_IN_PROGRESS,
     RESTORE_STATUS_REGISTERED,
@@ -210,15 +252,19 @@ from ccs.core.exceptions import (
     WORKSPACE_REGISTRATION_REFUSED,
     CasRetriesExhausted,
     CasVersionConflict,
+    CheckpointRegistrationRefused,
     CheckpointUnknown,
     CoherenceError,
     CommitUnconfirmed,
     OccCallerTransientError,
+    StaleView,
     ViewWedged,
 )
 from ccs.core.substrate import ArbitrationTier, RestoreTier, derive_restore_tier
 from ccs.core.substrate import sha256_hex as _sha256_hex
 from ccs.core.types import WorkspaceRegistrationResult, WorkspaceRestoreWrite
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from typing import Callable
@@ -236,6 +282,9 @@ __all__ = [
     "FileRestoreTarget",
     "MAX_RESTORE_LEG_REDRIVES",
     "MemberRestoreOutcome",
+    "OBSERVATION_NO_WRITE_ATTEMPTED",
+    "OBSERVATION_NOT_RECORDED",
+    "RestoreObservation",
     "RestoreRegistration",
     "STRUCTURAL_MEMBER_REFUSAL_REASON",
     "StructuralMemberRefused",
@@ -359,6 +408,11 @@ class FileMemberSource(Protocol):
     Raises ``FileNotFoundError`` for an absent member (the ABSENT fact).
     A version ``< 1`` means the pointer could not be resolved (no coordinator
     / degraded) — the capture treats it as UNCONFIRMED (never manifested).
+    May raise :class:`~ccs.core.exceptions.StaleView` when the bytes on disk
+    cannot be paired with a version (``CoherentVolume`` refuses that pair):
+    capture records the member UNCONFIRMED too, with no digest, and flags it
+    ``dirty_during_window``; a restore leg re-drives within its budget and then
+    concludes ``conflict`` without writing.
     May raise :class:`StructuralMemberRefused` (or a subclass) to declare THIS
     MEMBER undrivable through this surface: capture propagates it as a hard
     typed refusal, restore absorbs it into that member's ``target_lost``.
@@ -374,6 +428,9 @@ class CheckpointPersistence(Protocol):
 
     ONE call registers the whole manifest (header + owner + members) in one
     transaction via the Unit-2 registry API and returns the minted header.
+    A checkpoint taken with a ``receiver`` (#191) passes it as one more
+    keyword, ``receiver=``; one without passes nothing, so a seam that
+    predates the keyword keeps serving receiver-less checkpoints.
     """
 
     def create_workspace_checkpoint(
@@ -454,7 +511,7 @@ class CheckpointPinStore(Protocol):
     Pin legs are driven FROM the durable member rows and record their answer
     THROUGH ``set_workspace_checkpoint_member_pin`` — the pin state and any
     loud tier downgrade land in ONE registry write.
-    ``list_workspace_checkpoints`` feeds the internal release's
+    ``list_workspace_checkpoints`` feeds the checkpoint release's
     cross-checkpoint scan (a legal hold shared by another checkpoint's
     ``held`` member must survive this checkpoint's release).
     :meth:`WorkspaceVersioner.checkpoint` verifies its service speaks this
@@ -518,12 +575,14 @@ class FileRestoreTarget(FileMemberSource, Protocol):
     carve-out). A confirmed win lands ``new_content`` and advances the version
     deterministically to ``expected_version + 1``. Like the read leg it may
     raise :class:`StructuralMemberRefused` to refuse the member outright (no
-    write lands); the restore absorbs that into ``target_lost``.
+    write lands); the restore absorbs that into ``target_lost``. The restore
+    ignores the return value, so a target may return anything: a
+    ``CoherentVolume`` win returns its ``CasCommitResult``.
     """
 
     def write_cas_at(
         self, path: str, expected_version: int, new_content: bytes
-    ) -> None:
+    ) -> object:
         ...
 
 
@@ -569,9 +628,12 @@ class _Observation:
     """One member's live observation — capture pass and verify pass share it.
 
     ``token`` is the restore pointer (or ``None`` when absent/unconfirmed);
-    ``fingerprint`` is the fixed-width content digest (``None`` when absent);
-    ``restorable``/``pinnable`` feed :func:`derive_restore_tier` on the
-    capture pass (the verify pass compares only presence/token/fingerprint).
+    ``fingerprint`` is the fixed-width content digest (``None`` when absent, or
+    when the read returned no bytes); ``restorable``/``pinnable`` feed
+    :func:`derive_restore_tier` on the capture pass (the verify pass compares
+    only presence/token/fingerprint). ``confirmed`` is ``False`` when the source
+    refused to pair the member's bytes with a version, so neither a pointer nor
+    a digest was observed.
     """
 
     absent: bool
@@ -579,9 +641,70 @@ class _Observation:
     fingerprint: str | None
     versioned: bool = False
     pinnable: bool = False
+    confirmed: bool = True
 
 
 # --- the restore report (frozen facts; durably mirrored in the registry) --------
+
+
+@dataclass(frozen=True)
+class RestoreObservation:
+    """What ONE restore leg saw of the live state immediately before it wrote.
+
+    An additive REPORT value carried beside the member outcome — the outcome
+    vocabulary is unchanged, so a member restored over content committed after
+    the capture still concludes ``restored``. ``state`` is one of the closed
+    :data:`~ccs.core.exceptions.RESTORE_OBSERVATION_STATES`, matched by IDENTITY
+    (never a substring of any ``detail`` line). ``pointer`` (the live restore
+    pointer the leg read) and ``fingerprint`` (that state's content digest) are
+    lifted from the SAME read that produced the leg's CAS comparand, so no
+    second read is ever issued to populate them. Construction enforces one half
+    of that: every state that read no comparand is refused a pointer and a
+    fingerprint. It does not require them on ``observed_differs``, because a
+    source may land a write without naming a version, so the report treats both
+    as optional there.
+
+    NEVER a comparand: nothing downstream may seed a CAS, an If-Match or a
+    pinned read from a value recorded here. It describes what the leg
+    overwrote, not what the next write may overwrite.
+    """
+
+    state: str
+    pointer: str | None = None
+    fingerprint: str | None = None
+
+    def __post_init__(self) -> None:
+        # Fail closed on an unclassifiable state: every consumer branches on a
+        # named state, so an unrecognised one would fall through every arm and
+        # be read as clean — the one answer an honesty field must never give.
+        if self.state not in RESTORE_OBSERVATION_STATES:
+            raise ValueError(
+                f"unknown restore observation state {self.state!r}; the "
+                f"vocabulary is {sorted(RESTORE_OBSERVATION_STATES)} "
+                "(fail-closed: an unclassifiable state would read as clean)"
+            )
+        if self.state in RESTORE_OBSERVATION_STATES_WITHOUT_COMPARAND and (
+            self.pointer is not None or self.fingerprint is not None
+        ):
+            raise ValueError(
+                f"restore observation {self.state!r} observed no comparand, so "
+                "it carries no pointer and no fingerprint (naming one would "
+                "claim content the leg never compared)"
+            )
+
+
+# The two observations no leg's read produces, as shared immutable singletons
+# (frozen, so one instance is safe as a default). They are kept DISTINCT on
+# purpose: ``no_write_attempted`` is a fact this run established (the member
+# converged, was skipped, or was absorbed before any write), while
+# ``not_recorded`` is the absence of a fact — this run drove no leg, or drove
+# one whose outcome it could not learn.
+OBSERVATION_NO_WRITE_ATTEMPTED: Final[RestoreObservation] = RestoreObservation(
+    state=RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED
+)
+OBSERVATION_NOT_RECORDED: Final[RestoreObservation] = RestoreObservation(
+    state=RESTORE_OBSERVATION_NOT_RECORDED
+)
 
 
 @dataclass(frozen=True)
@@ -598,6 +721,17 @@ class MemberRestoreOutcome:
     is recorded via ``deleted_at_restore``, its marker id is never a content
     pointer). ``resumed_from_prior_run`` marks a member whose terminal outcome
     a crashed run already recorded durably: reported, never re-driven.
+
+    ``observation`` is what the leg SAW of the live state before writing (see
+    :class:`RestoreObservation`) — additive, run-local, and never a comparand.
+    It defaults to the no-write-attempted state, which is the truth at every
+    converged, skipped and pre-write absorbing site: a member that never
+    reached a write decision must not be reported as one whose observation was
+    lost. ``not_recorded`` is set explicitly at the two sites that hold no
+    observation: the rebuild of a terminal with no leg having run
+    (:meth:`WorkspaceVersioner._outcome_from_durable_row`), and an object write
+    whose outcome was lost and then reconciled (see
+    :meth:`WorkspaceVersioner._observation_of_overwritten`).
     """
 
     member_path: str
@@ -607,6 +741,7 @@ class MemberRestoreOutcome:
     new_native_token: str | None = None
     deleted_at_restore: float | None = None
     resumed_from_prior_run: bool = False
+    observation: RestoreObservation = OBSERVATION_NO_WRITE_ATTEMPTED
 
 
 @dataclass(frozen=True)
@@ -620,10 +755,16 @@ class RestoreRegistration:
     ``empty_write_set`` (nothing needed a commit; ``commit_all`` was never
     called), ``registered_by_prior_run`` (the durable ``registered`` marker —
     a crashed run already completed the step; nothing re-registered), or
-    ``refused`` (the batch was HELD: NOTHING registered, ``refused`` maps each
-    failing member path to its typed conflict reason — identity-matched wire
-    constants; ``stale_read_generation`` is the fence rejecting a superseded
-    controller's late apply, never retried).
+    ``refused`` (NOTHING registered; ``refused`` maps member paths to
+    identity-matched wire reasons). Two causes land here. The batch was HELD:
+    each failing member path maps to its typed conflict reason, and
+    ``stale_read_generation`` is the fence rejecting a superseded controller's
+    late apply, never retried. Or the registration itself was refused (#191),
+    past the pre-flight: the reason is one of
+    :data:`~ccs.core.exceptions.CHECKPOINT_REGISTRATION_REFUSAL_REASONS`, keyed
+    by the offending paths for the two membership reasons and repeated for
+    every write path for the two controller reasons (an empty map when the
+    write-set was empty; ``detail`` names the reason then).
 
     The per-member-class honesty surfaces: ``substrate_registered`` names the
     written S3 members whose registration is MANIFEST-SIDE by design (the
@@ -681,6 +822,31 @@ class WorkspaceRestoreReport:
     def members_by_path(self) -> "dict[str, MemberRestoreOutcome]":
         """The report keyed by member path (paths are unique per manifest)."""
         return {m.member_path: m for m in self.members}
+
+
+@dataclass(frozen=True)
+class _ObjectLiveView:
+    """What ONE versioned live read of an object member yielded.
+
+    All three fields come from the SAME ``get_object`` response (SPLIT-COMPARAND,
+    extended to the triple), and they are kept NAMED rather than positional
+    because two of them are same-typed strings that must never be swapped:
+    ``comparand`` is the ETag and the ONLY value that may arbitrate a write,
+    while ``pointer`` is the versionId, which addresses a version and arbitrates
+    nothing. ``fingerprint`` is the content digest the converged check already
+    computes.
+
+    ``pointer``/``fingerprint`` are ``None`` exactly on the create-on-absent
+    path, where ``comparand`` is the :data:`CREATE_IF_ABSENT` sentinel and the
+    read found no live state at all. A ``pointer`` present here is always a REAL
+    versionId — the ``"null"``/absent case raises ``VersionPointerUnconfirmed``
+    upstream rather than reaching this type — so no sentinel guard is needed on
+    it, and none may be invented (a sentinel must never seed a comparand).
+    """
+
+    comparand: str
+    pointer: str | None = None
+    fingerprint: str | None = None
 
 
 class _LegBudget:
@@ -802,9 +968,17 @@ class WorkspaceVersioner:
 
     # --- the capture ----------------------------------------------------------
 
-    def checkpoint(self, name: str, *, pin: bool = True) -> WorkspaceCheckpoint:
+    def checkpoint(
+        self, name: str, *, pin: bool = True, receiver: UUID | None = None
+    ) -> WorkspaceCheckpoint:
         """Capture a named checkpoint: cut → verify → persist (one registration)
         → pin (the Unit-6 GC pin legs, on by default).
+
+        ``receiver`` (#191, optional) names the one controller allowed to
+        register a restore of this checkpoint — another versioner's ``owner``
+        when the checkpoint is a handoff. ``None`` (the default) lets any
+        controller restore it, as before; this versioner's ``owner`` is
+        recorded as provenance either way and authorizes nothing.
 
         ``pin=True`` (the fail-closed default) runs the pin legs right after
         the manifest persists — module docstring, "Pins": an S3 hold lands
@@ -837,7 +1011,7 @@ class WorkspaceVersioner:
             pin_store = self._require_pin_store_for_checkpoint() if pin else None
             rows = self._capture_all(name)
             rows = self._verify_window(rows)
-            result = self._persist(name, rows)
+            result = self._persist(name, rows, receiver=receiver)
             if pin_store is None:
                 return result
             checkpoint_id = result.record.checkpoint_id
@@ -860,7 +1034,8 @@ class WorkspaceVersioner:
         backed, ``pin_unavailable`` is a structural refusal (re-attempting
         cannot change the bucket's Object Lock configuration or resurrect a
         gone version), and ``released`` was deliberately dropped by the
-        internal release. Returns the refreshed durable member rows.
+        release path (``WorkspaceVersioner.release_checkpoint``, or the
+        engine beneath it). Returns the refreshed durable member rows.
 
         Raises the typed :class:`~ccs.core.exceptions.CheckpointUnknown` for
         an unknown id, ``TypeError`` for a service without the pin surface,
@@ -875,6 +1050,80 @@ class WorkspaceVersioner:
                 raise CheckpointUnknown(checkpoint_id)
             self._pin_members(store, checkpoint_id)
             return tuple(store.get_workspace_checkpoint_members(checkpoint_id))
+
+    def release_checkpoint(self, checkpoint_id: str) -> "tuple[CheckpointMember, ...]":
+        """Release the pins this checkpoint holds — ONE-WAY (idempotent).
+
+        Every hold this checkpoint placed, and that no other checkpoint in
+        this registry still relies on, is DROPPED; every ``held`` row (an S3
+        legal hold and a file member's verification pin alike) becomes
+        ``pin_state="released"``, which is TERMINAL —
+        :meth:`pin_checkpoint` deliberately skips a released row, so nothing
+        re-establishes the hold, and from that instant the captured version is
+        eligible for lifecycle expiry AND for a version-targeted delete. The
+        MANIFEST survives: this releases pins, it does not delete the
+        checkpoint (there is no checkpoint-delete verb); the members stay
+        described, tiered honestly ``restorable-unpinned``.
+
+        PRECONDITION for S3 members: re-declare each object member on THIS
+        versioner with :meth:`add_object_member` first — through the SAME
+        binding and key that placed the hold. The pre-flight only checks that
+        an object member is declared at that member path, never that it is the
+        one that pinned the version, so a mismatched binding or key records
+        the row ``released`` WITHOUT dropping the hold, silently (the drop's
+        ``KeyError`` reads as "the version is gone, the hold is moot") —
+        leaving an un-expirable version no later call here will free.
+
+        A hold SHARED with another checkpoint survives until the LAST holder
+        releases: S3's hold is a flag, not a counter, and the cross-checkpoint
+        ``(member_path, native_token)`` scan is the counter. Two bounds on it. The
+        scan walks THIS versioner's registry only, so a holder recorded
+        elsewhere is invisible to it. And it only ever counts holds this
+        system placed: ``set_legal_hold`` writes ON unconditionally and
+        records nothing about whether a hold was already there, so a hold set
+        by a person or another tool is indistinguishable from one of ours and
+        this verb will drop it.
+
+        Separately from those bounds, the window between the last re-check and
+        the drop is covered by CONVERGING rather than by checking harder:
+        after the drop this re-reads and puts the hold back when a peer
+        claimed it in the gap. A failure to put it back is logged.
+
+        Idempotent means REPEAT calls, not concurrent ones: this instance's
+        lock does not serialize a second versioner or process releasing the
+        same checkpoint, and two that both read the same ``held`` rows will
+        both decrement the pin refcount — the registry fails closed with
+        ``ValueError`` on whichever decrement would take the count below zero.
+        That raise lands after the member's row is already ``released`` and
+        after its substrate drop has been attempted, so the hold is already
+        gone and what is left is refcount drift, not a stranded hold. The
+        call still fails; treat it as "some members were released".
+
+        Idempotent is NOT self-healing: the release RECORDS ``released``
+        before it drops the substrate hold, so a crash or an untyped substrate
+        error between the two strands a live hold on an already-terminal row.
+        The recovery is
+        :meth:`~ccs.adapters.coherent_object.CoherentObject.release_legal_hold`
+        on the binding, by version. The remaining residuals (two processes
+        releasing concurrently and both over-retaining; the refcount's
+        separate registry write) are documented on
+        :meth:`_release_checkpoint_pins`, the engine this delegates to.
+
+        Raises ``ValueError`` from three places, and only the first two are
+        before any write — do NOT read a ``ValueError`` as "nothing was
+        released": a blank/non-string id (BEFORE any store access); a ``held``
+        S3 row with no declared binding (pre-flight, before any write); and the
+        refcount decrement failing closed under a concurrent release, which
+        fires after that member is already recorded ``released`` AND after its
+        hold has been dropped — so it aborts the rest of the checkpoint's
+        members, leaving them ``held`` for a later call (see above).
+        Also raises the typed
+        :class:`~ccs.core.exceptions.CheckpointUnknown` for an unknown id, and
+        ``TypeError`` for a service without the pin surface.
+        """
+        if not isinstance(checkpoint_id, str) or not checkpoint_id.strip():
+            raise ValueError("release_checkpoint needs a non-empty checkpoint id")
+        return self._release_checkpoint_pins(checkpoint_id)
 
     # --- capture pass ---------------------------------------------------------
 
@@ -940,8 +1189,11 @@ class WorkspaceVersioner:
                 verified.append(row)
                 continue
             live = self._observe(member, refuse_binary=False)
+            # A re-read the source refused observed nothing, so the member was
+            # not verified quiescent, whatever the capture pass recorded.
             dirty = (
-                live.absent != row.absent
+                not live.confirmed
+                or live.absent != row.absent
                 or live.token != row.native_token
                 or live.fingerprint != row.fingerprint
             )
@@ -966,6 +1218,14 @@ class WorkspaceVersioner:
             data, version = member.source.read_with_version(member.member_path)
         except FileNotFoundError:
             return _Observation(absent=True, token=None, fingerprint=None)
+        except StaleView:
+            # The source refused to pair the bytes on disk with a version: they
+            # are not the content the coordinator records (a peer's commit still
+            # reaching disk, or an out-of-band edit). No pointer can be
+            # manifested, which is the unconfirmed-pointer case below (the
+            # Sentinel rule): present, never above forward_only, and described
+            # without a digest because the read returned no bytes.
+            return _Observation(absent=False, token=None, fingerprint=None, confirmed=False)
         if refuse_binary:
             self._require_utf8_text(member.member_path, data)
         if version < 1:
@@ -1019,9 +1279,18 @@ class WorkspaceVersioner:
 
     # --- persist (one registration) -------------------------------------------
 
-    def _persist(self, name: str, rows: list[CheckpointMember]) -> WorkspaceCheckpoint:
+    def _persist(
+        self,
+        name: str,
+        rows: list[CheckpointMember],
+        *,
+        receiver: UUID | None = None,
+    ) -> WorkspaceCheckpoint:
         window_min = min(row.captured_at for row in rows)
         window_max = max(row.captured_at for row in rows)
+        # Passed only when set, so a persist seam predating #191 keeps working
+        # for every checkpoint that names no receiver.
+        extra: dict[str, Any] = {} if receiver is None else {"receiver": receiver}
         try:
             record = self._service.create_workspace_checkpoint(
                 name=name,
@@ -1030,6 +1299,7 @@ class WorkspaceVersioner:
                 window_min=window_min,
                 window_max=window_max,
                 issued_at_tick=int(self._clock()),
+                **extra,
             )
         except Exception as exc:
             raise CheckpointPersistFailed(
@@ -1204,18 +1474,20 @@ class WorkspaceVersioner:
     def _release_checkpoint_pins(
         self, checkpoint_id: str
     ) -> "tuple[CheckpointMember, ...]":
-        """INTERNAL-ONLY: release every pin this checkpoint holds (idempotent).
+        """Release every pin this checkpoint holds (idempotent).
 
-        Deliberately underscore-private with NO public CLI/API verb (v1 scope:
-        the GC drop-half is v2 — this method exists so the pin lifecycle is
-        complete and testable, not as an operator surface).
+        The engine behind the public :meth:`release_checkpoint`, which adds
+        the blank/non-string id guard and the caller-facing docstring. Still
+        underscore-private and still with NO CLI or HTTP route (the bindings
+        carry credentials); checkpoint DELETION remains absent, and the GC
+        drop-half is v2.
 
         Per ``held`` member, in the fail-closed order: (1) record
         ``pin_state="released"`` — downgrading a ``restorable`` tier to
         ``restorable-unpinned`` in the SAME write, so no instant leaves an
-        unbacked ``restorable`` claim; (2) decrement the checkpoint's pin
-        refcount; (3) for an S3 member, drop the legal hold ONLY when no OTHER
-        checkpoint still holds a ``held`` pin on the same ``(member_path,
+        unbacked ``restorable`` claim; (2) for an S3 member, drop the legal
+        hold ONLY when no OTHER checkpoint still holds a ``held`` pin on the
+        same ``(member_path,
         native_token)`` — the cross-checkpoint scan: a shared hold survives
         until the LAST holder releases (S3's hold is a flag, not a counter;
         the scan is the counter). The scan runs TWICE, fresh both times: once
@@ -1225,19 +1497,33 @@ class WorkspaceVersioner:
         does not serialize it) that recorded ``held`` on the same identity
         since the first scan is seen there and the drop is SKIPPED, failing
         toward over-retention (safe: the new holder's own release drops the
-        hold last-out). A crash between (1) and (3) leaves an over-retained
-        hold — the safe direction — which the sharing peer's own release
-        still drops (its scan sees this row as ``released``).
+        hold last-out); and (3) decrement the checkpoint's pin refcount —
+        LAST, because that write fails closed below zero under a concurrent
+        release, and ordered before the drop it aborted with the row already
+        terminal and the hold still ON.
+
+        A crash between (1) and (2) leaves an over-retained hold — the safe
+        direction. Where a sharing peer exists its own release still drops it
+        (its scan sees this row as ``released``); where this checkpoint was
+        the SOLE holder nothing in the product drops it, and the recovery is
+        :meth:`~ccs.adapters.coherent_object.CoherentObject.release_legal_hold`
+        on the binding, by version — the released row keeps its
+        ``native_token`` for exactly that.
 
         Documented residuals: two checkpoints releasing CONCURRENTLY from
         different processes can each see the other still ``held`` and both
         skip the drop (over-retention, never data loss); a concurrent pin
         whose ``held`` row lands AFTER the last-instant re-check but BEFORE
-        the drop can still lose its hold (under-retention — the narrow
-        remaining window; closing it needs a registry-side transactional
-        claim spanning check-and-drop, outside v1's registry surface); the
-        refcount write is a separate registry write from the pin record, so a
-        crash between them leaves a benign bookkeeping drift.
+        the drop is no longer lost outright: the drop CONVERGES, re-reading
+        afterwards and re-placing the hold when a peer claimed it in that gap
+        (``set_legal_hold`` is idempotent, and re-placing one nobody needs is
+        over-retention, the safe direction). The residual is now the narrower
+        case where that re-place itself fails, which is logged; closing even
+        that needs a registry-side transactional claim spanning
+        check-and-drop, outside v1's registry surface. The refcount write is a
+        separate registry write from the pin record and lands AFTER the drop,
+        so neither a crash nor a fail-closed refcount between them can strand
+        a hold — what is left is benign bookkeeping drift.
         Cross-checkpoint identity is ``(member_path, native_token)`` — the
         bucket lives binding-side (real S3 version ids are unique; a
         cross-bucket collision is a documented residual of the fake's shape,
@@ -1280,36 +1566,136 @@ class WorkspaceVersioner:
                     pin_state=PIN_STATE_RELEASED,
                     restore_tier=downgrade,
                 )
-                store.adjust_workspace_checkpoint_pin_refcount(checkpoint_id, -1)
                 if (
                     row.arbitration_tier != ArbitrationTier.NATIVE_CAS.value
                     or row.native_token is None
                 ):
-                    continue  # the file verification pin has no substrate half
-                if self._pin_shared_elsewhere(store, checkpoint_id, row):
-                    continue  # another checkpoint's hold: survives (last-out drops)
-                member = declared[row.member_path]
-                assert isinstance(member, _ObjectMember)  # pre-flight guaranteed
-                if self._pin_shared_elsewhere(store, checkpoint_id, row):
-                    # LAST-INSTANT re-check (fresh registry read): a concurrent
-                    # pin_checkpoint recorded ``held`` on this (member_path,
-                    # native_token) since the scan above — dropping now would
-                    # strip the hold the sibling just claimed (under-retention,
-                    # the UNSAFE direction). Skip instead: over-retention, safe
-                    # (the new holder's own release drops it last-out). The
-                    # window between THIS read and the drop remains — see the
-                    # docstring's disclosed residual.
-                    continue
-                try:
-                    member.binding.release_legal_hold(
-                        member.key, version_id=row.native_token
-                    )
-                except (KeyError, LegalHoldUnavailable):
-                    # The hold is moot — the version (or the lock
-                    # configuration) is gone; the release's goal (no dangling
-                    # hold) already stands. The record above is the truth.
-                    continue
+                    pass  # the file verification pin has no substrate half
+                elif self._pin_shared_elsewhere(store, checkpoint_id, row):
+                    pass  # another checkpoint's hold: survives (last-out drops)
+                else:
+                    member = declared[row.member_path]
+                    assert isinstance(member, _ObjectMember)  # pre-flight guaranteed
+                    if self._pin_shared_elsewhere(store, checkpoint_id, row):
+                        # LAST-INSTANT re-check (fresh registry read): a
+                        # concurrent pin_checkpoint recorded ``held`` on this
+                        # (member_path, native_token) since the scan above —
+                        # dropping now would strip the hold the sibling just
+                        # claimed (under-retention, the UNSAFE direction).
+                        # Skip: over-retention is the safe direction, and the
+                        # new holder's own release drops it last-out.
+                        pass
+                    else:
+                        try:
+                            member.binding.release_legal_hold(
+                                member.key, version_id=row.native_token
+                            )
+                        except (KeyError, LegalHoldUnavailable) as exc:
+                            # The hold is moot — the version (or the lock
+                            # configuration) is gone; the release's goal (no
+                            # dangling hold) already stands, and the record
+                            # above is the truth. EXCEPT when the member was
+                            # re-declared through a binding or key that does
+                            # not address the pinned version: the pre-flight
+                            # cannot tell those apart (it only asks that SOME
+                            # object member is declared at the path), the hold
+                            # is then still ON, and the caller gets no
+                            # exception and no changed row. This line is the
+                            # only signal either way.
+                            logger.warning(
+                                "checkpoint pin release could not reach the "
+                                "held version, treating the hold as moot: "
+                                "checkpoint=%s member=%s version=%s cause=%r "
+                                "— if this member was re-declared through a "
+                                "different binding or key, the hold is STILL ON",
+                                checkpoint_id,
+                                row.member_path,
+                                row.native_token,
+                                exc,
+                            )
+                        except Exception:
+                            # Record-before-drop already made this row
+                            # terminal, so no later release_checkpoint or
+                            # pin_checkpoint walks it: this line is the only
+                            # record of WHICH version was stranded, and that
+                            # version id is exactly what the documented
+                            # recovery needs. Re-raise — absorbing it here
+                            # would hide the strand behind a clean return.
+                            logger.error(
+                                "checkpoint pin release STRANDED a live hold: "
+                                "checkpoint=%s member=%s version=%s — the row "
+                                "is already terminal, so recover out of band "
+                                "with CoherentObject.release_legal_hold on the "
+                                "binding, by version",
+                                checkpoint_id,
+                                row.member_path,
+                                row.native_token,
+                            )
+                            raise
+                        else:
+                            self._reclaim_hold_taken_during_drop(
+                                store, checkpoint_id, row, member
+                            )
+                # The refcount decrement is a SEPARATE registry write and it
+                # lands AFTER the substrate attempt on purpose. It fails CLOSED
+                # below zero, which is exactly what a second releaser running
+                # concurrently causes — and ordered BEFORE the drop, that raise
+                # aborted with this row already terminal and its hold still ON,
+                # permanently, because nothing walks a released row again.
+                # Ordered here the same raise leaves only refcount drift, which
+                # this engine already documents as benign. Record-before-drop,
+                # the load-bearing order, is unchanged; only bookkeeping moved.
+                store.adjust_workspace_checkpoint_pin_refcount(checkpoint_id, -1)
             return tuple(store.get_workspace_checkpoint_members(checkpoint_id))
+
+    def _reclaim_hold_taken_during_drop(
+        self,
+        store: CheckpointPinStore,
+        checkpoint_id: str,
+        row: CheckpointMember,
+        member: "_ObjectMember",
+    ) -> None:
+        """Put back a hold a peer claimed inside the drop window (CONVERGE).
+
+        The last-instant re-check is a registry read and the drop is a separate
+        substrate call, so a concurrent ``pin_checkpoint`` can record ``held``
+        between them and lose the hold it just took — under-retention, the one
+        direction this engine refuses everywhere else. No re-check can close
+        that gap; re-reading AFTER the drop can. Every outcome here is
+        acceptable: the peer's claim gets backed again, or this fails and the
+        result is exactly what it was without the call (plus a record), or it
+        re-places a hold nobody needs, which is over-retention — the safe
+        direction. ``set_legal_hold`` is idempotent, so re-placing a live hold
+        is a no-op.
+
+        Deliberately does not raise. The release itself already succeeded, and
+        the state without this call is the state with it failing, so raising
+        would turn a narrowed race into a hard error.
+        """
+        if not self._pin_shared_elsewhere(store, checkpoint_id, row):
+            return
+        try:
+            member.binding.set_legal_hold(member.key, version_id=row.native_token)
+        except Exception:
+            logger.error(
+                "checkpoint pin release dropped a hold a concurrent pin had "
+                "just claimed, and could not put it back: checkpoint=%s "
+                "member=%s version=%s — the peer checkpoint reads ``held`` "
+                "with nothing behind it; re-pin it or treat it as "
+                "restorable-unpinned",
+                checkpoint_id,
+                row.member_path,
+                row.native_token,
+            )
+        else:
+            logger.warning(
+                "checkpoint pin release re-placed a hold a concurrent pin "
+                "claimed inside the drop window: checkpoint=%s member=%s "
+                "version=%s",
+                checkpoint_id,
+                row.member_path,
+                row.native_token,
+            )
 
     @staticmethod
     def _pin_shared_elsewhere(
@@ -1345,7 +1731,11 @@ class WorkspaceVersioner:
         including the Unit-5 ``registration`` answer — is returned AND durably
         mirrored. Per-member failures are ABSORBED into the report — the only
         raises are pre-flight, before any status write: the typed
-        :class:`~ccs.core.exceptions.CheckpointUnknown` for an unknown id,
+        :class:`~ccs.core.exceptions.CheckpointUnknown` for an unknown id, the
+        typed :class:`~ccs.core.exceptions.CheckpointRegistrationRefused`
+        (#191) when the checkpoint names a receiver that is not this
+        versioner's ``owner`` (``not_the_receiver``) or another controller
+        already registered it (``already_registered``),
         ``TypeError`` for a service that lacks the restore surface, and
         ``ValueError`` for missing member bindings / a missing file resolver
         (caller misconfiguration must never mint an ``in_progress`` record it
@@ -1396,6 +1786,13 @@ class WorkspaceVersioner:
         record = store.get_workspace_checkpoint(checkpoint_id)
         if record is None:
             raise CheckpointUnknown(checkpoint_id)
+        # Refuse, before any status write or member leg, a restore whose
+        # registration could never land (#191): the checkpoint is bound to
+        # another receiver or registered by another controller. A concurrent
+        # restore that claims between this read and this run's registration is
+        # caught by the service's atomic claim instead, and concludes
+        # ``refused`` (see :meth:`_drive_registration`).
+        record.require_registrable_by(self._owner)
         rows = store.get_workspace_checkpoint_members(checkpoint_id)
         self._require_known_restore_state(record, rows)
         if record.restore_status == RESTORE_STATUS_CONCLUDED:
@@ -1484,8 +1881,9 @@ class WorkspaceVersioner:
           design — no coordinator artifact identity is ever forced);
         - delete legs → ``deleted_recorded`` (their durable
           ``deleted_at_restore`` record IS the registration);
-        - empty commit write-set → typed EMPTY, the service is never called
-          and ``commit_all`` therefore never runs.
+        - empty commit write-set → still ONE ``register_workspace_restore``
+          call (#191: registering nothing claims the checkpoint all the
+          same), answered typed EMPTY; ``commit_all`` never runs.
 
         Bounded re-drive (the leg-budget twin): a HELD batch whose reasons are
         all retry-eligible (``version_mismatch`` — a live registered writer
@@ -1530,17 +1928,11 @@ class WorkspaceVersioner:
                 substrate_registered=tuple(substrate_registered),
                 deleted_recorded=tuple(deleted_recorded),
             )
-        if not writes:
-            return RestoreRegistration(
-                status=WORKSPACE_REGISTRATION_EMPTY,
-                detail=(
-                    "no written file members: the commit write-set is empty — "
-                    "commit_all was never called (deletes are manifest-side "
-                    "records; S3 members are substrate-registered by design)"
-                ),
-                substrate_registered=tuple(substrate_registered),
-                deleted_recorded=tuple(deleted_recorded),
-            )
+        # An empty write-set still goes to the service (#191): registering
+        # nothing claims the checkpoint all the same, so another owner's
+        # restore of it is refused already_registered whether or not this run
+        # had bytes to write. The service answers empty_write_set without
+        # calling commit_all.
         return self._drive_registration(
             store,
             checkpoint_id,
@@ -1587,6 +1979,20 @@ class WorkspaceVersioner:
                 # The controller was invalidated mid-flight (a peer's commit
                 # left it mid-transient): retry-eligible, budget-bounded.
                 continue
+            except CheckpointRegistrationRefused as exc:
+                # #191, past the pre-flight: a concurrent controller claimed
+                # the checkpoint first, or the write-set disagrees with the
+                # manifest. Terminal — re-driving cannot change either — and
+                # nothing was registered. The restore still CONCLUDES.
+                paths = exc.member_paths or tuple(w.member_path for w in writes)
+                return RestoreRegistration(
+                    status=WORKSPACE_REGISTRATION_REFUSED,
+                    detail=f"{exc} — not retried",
+                    substrate_registered=substrate_registered,
+                    deleted_recorded=deleted_recorded,
+                    refused={path: exc.reason for path in paths},
+                    attempts=budget.attempts,
+                )
             if result.status in (
                 WORKSPACE_REGISTRATION_COMMITTED,
                 WORKSPACE_REGISTRATION_EMPTY,
@@ -1772,6 +2178,14 @@ class WorkspaceVersioner:
                     "succeed; the restore still concludes (termination "
                     "contract)"
                 ),
+                # This boundary catches a failure raised from ANYWHERE inside
+                # the leg, including after the live member was truncated and
+                # partially rewritten (the file target truncates before it
+                # writes). It cannot tell that from a failure raised before the
+                # leg read anything, so it must not report that no write was
+                # attempted — the one answer that would read as clean over
+                # bytes this run may have destroyed.
+                observation=OBSERVATION_NOT_RECORDED,
             )
 
     def _drive_member(self, row: CheckpointMember) -> MemberRestoreOutcome:
@@ -1858,6 +2272,14 @@ class WorkspaceVersioner:
                 "a documented residual)"
             ),
             deleted_at_restore=float(self._clock()),
+            # The state ALONE (R1's carve-out): the probe above established that
+            # live state existed and this leg destroyed it, but it compared no
+            # content and holds no versionId — the plain read is what works on
+            # an unversioned bucket, and a second call to fetch a pointer is
+            # forbidden (SPLIT-COMPARAND), so the honest answer is presence
+            # without evidence. Never ``observed_differs``: that state asserts a
+            # comparison with the capture that this leg never ran.
+            observation=RestoreObservation(state=RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE),
         )
 
     def _drive_file_absent_leg(
@@ -1875,6 +2297,10 @@ class WorkspaceVersioner:
                     "live — nothing to delete"
                 ),
             )
+        except StaleView:
+            # A refusal is about bytes that exist on disk but cannot be paired
+            # with a version, so the file IS present live: the divergence below.
+            pass
         # v1 residual: the file seam offers no delete leg, so a live file the
         # manifest records ABSENT is a divergence this engine cannot converge
         # — absorbed as conflict (detection only; no-arbiter), never a raise
@@ -1926,8 +2352,7 @@ class WorkspaceVersioner:
             view = self._object_live_view(row, member, budget)
             if isinstance(view, MemberRestoreOutcome):
                 return view
-            live_token, live_hash = view
-            if live_hash == row.fingerprint:
+            if view.fingerprint == row.fingerprint:
                 return MemberRestoreOutcome(
                     member_path=row.member_path,
                     outcome=RESTORE_OUTCOME_CONVERGED,
@@ -1942,25 +2367,32 @@ class WorkspaceVersioner:
                 if isinstance(resolved, MemberRestoreOutcome):
                     return resolved
                 pinned_bytes = resolved
-            outcome = self._object_cas_attempt(row, member, pinned_bytes, live_token, budget)
+            # The WHOLE view is handed on, re-read every iteration and never
+            # hoisted: a leg that re-drives under contention must report the
+            # state the winning attempt overwrote, not the first read's (KTD7).
+            outcome = self._object_cas_attempt(row, member, pinned_bytes, view, budget)
             if outcome is not None:
                 return outcome
 
     def _object_live_view(
         self, row: CheckpointMember, member: _ObjectMember, budget: _LegBudget
-    ) -> "MemberRestoreOutcome | tuple[str, str | None]":
-        """One live read → ``(comparand, content_hash)``, or a terminal outcome.
+    ) -> "MemberRestoreOutcome | _ObjectLiveView":
+        """One live read → a :class:`_ObjectLiveView`, or a terminal outcome.
 
-        The (bytes, ETag) pair comes from ONE response (the split-comparand
-        rule); the manifested versionId is only ever the POINTER, never the
-        comparand (the F4 split). Live-absent yields the explicit
-        :data:`CREATE_IF_ABSENT` comparand — the create leg loses to any
+        The (bytes, ETag, versionId) triple comes from ONE response (the
+        split-comparand rule); the versionId is only ever the POINTER, never the
+        comparand (the F4 split). It is KEPT rather than discarded because it is
+        the only handle that still resolves the state a restore is about to
+        overwrite, and the write arms record it (R1/KTD6) — carrying it out of
+        the read that already returned it is what keeps that report free of a
+        second call. Live-absent yields the explicit :data:`CREATE_IF_ABSENT`
+        comparand with no pointer and no digest — the create leg loses to any
         concurrent re-creation, never overwrites one.
         """
         try:
             live = member.binding.read_versioned(member.key)
         except KeyError:
-            return (CREATE_IF_ABSENT, None)
+            return _ObjectLiveView(comparand=CREATE_IF_ABSENT)
         except VersionPointerUnconfirmed:
             # The live pointer axis broke mid-restore (versioning suspended
             # since capture): what a write would mint can no longer be
@@ -1974,7 +2406,11 @@ class WorkspaceVersioner:
                     "suspended since capture) — HELD, never best-effort"
                 ),
             )
-        return (live.etag, _sha256_hex(live.data))
+        return _ObjectLiveView(
+            comparand=live.etag,
+            pointer=live.version_id,
+            fingerprint=_sha256_hex(live.data),
+        )
 
     def _resolve_pinned_object(
         self, row: CheckpointMember, member: _ObjectMember
@@ -1995,24 +2431,60 @@ class WorkspaceVersioner:
             )
         return pinned.data
 
+    @staticmethod
+    def _observation_of_overwritten(
+        view: _ObjectLiveView, *, write_confirmed: bool
+    ) -> RestoreObservation:
+        """What an object CAS arm DESTROYED, from the read that fed its comparand.
+
+        ``write_confirmed`` says whether a landing was established, and it only
+        ever matters on the live path: what a leg overwrote is settled by its
+        READ, not by whose put won. A live read that found the member absent
+        proves no writer — this run or a peer — could have destroyed content
+        that was not there, so the create-on-absent path answers
+        ``no_live_state`` either way and never fires a divergence gate.
+
+        Branching on the CREATE_IF_ABSENT comparand rather than on a missing
+        pointer is the fail-closed direction: were a live read ever to yield a
+        real ETag without a pointer, this reports a divergence with the digest
+        it has, instead of reporting that nothing was there to lose.
+        """
+        if view.comparand == CREATE_IF_ABSENT:
+            return RestoreObservation(state=RESTORE_OBSERVATION_NO_LIVE_STATE)
+        if not write_confirmed:
+            return OBSERVATION_NOT_RECORDED
+        return RestoreObservation(
+            state=RESTORE_OBSERVATION_DIFFERS,
+            # The versionId, never the ETag: the comparand arbitrates the write
+            # and addresses nothing, while this pointer is what still resolves
+            # the bytes the operator just lost (KTD5).
+            pointer=view.pointer,
+            fingerprint=view.fingerprint,
+        )
+
     def _object_cas_attempt(
         self,
         row: CheckpointMember,
         member: _ObjectMember,
         pinned_bytes: bytes,
-        live_token: str,
+        view: _ObjectLiveView,
         budget: _LegBudget,
     ) -> MemberRestoreOutcome | None:
         """One conditional put under the freshly read comparand; ``None`` = re-drive.
 
         ``row.fingerprint`` doubles as the intended hash: a pinned S3 version
         is immutable, so its bytes always hash to the captured fingerprint.
+
+        ``view`` is the caller's CURRENT read, passed per call rather than held
+        by the loop, so a re-drive re-reads it and the landed arms report the
+        iteration that WON (KTD7). Only its ``comparand`` reaches the substrate;
+        its pointer and digest reach the report and nothing else.
         """
         binding, key = member.binding, member.key
         intended_hash = row.fingerprint or _sha256_hex(pinned_bytes)
         try:
             result = binding.cas_write_versioned(
-                key, expected_token=live_token, new_bytes=pinned_bytes
+                key, expected_token=view.comparand, new_bytes=pinned_bytes
             )
         except CasRetriesExhausted:
             # The binding's OWN 409-transient budget (this leg's in-binding
@@ -2040,6 +2512,12 @@ class WorkspaceVersioner:
                     "pointer (bucket unversioned mid-restore) — the restored "
                     "state cannot be re-pinned"
                 ),
+                # What is missing here is the pointer this write MINTED, not the
+                # one it DESTROYED: the durable landing is confirmed, and the
+                # state it replaced was read, compared and overwritten like any
+                # other landed arm. Silence would leave the least recoverable
+                # member the least described one.
+                observation=self._observation_of_overwritten(view, write_confirmed=True),
             )
         if isinstance(result, VersionedCasWritten):
             return MemberRestoreOutcome(
@@ -2051,6 +2529,11 @@ class WorkspaceVersioner:
                     f"(attempt {budget.attempts})"
                 ),
                 new_native_token=result.version_id,
+                # Two versionIds sit three lines apart and mean opposite things:
+                # ``result.version_id`` is the state the operator now HAS, the
+                # observation names the state this put DESTROYED. A REPORT value
+                # only — nothing may seed a later comparand from it.
+                observation=self._observation_of_overwritten(view, write_confirmed=True),
             )
         if isinstance(result, CasConflict):
             # A foreign writer moved the comparand (412 / raced delete): the
@@ -2059,7 +2542,7 @@ class WorkspaceVersioner:
             return None
         # CasUnknown: ONE reconciliation read decides; still-unknown → HOLD.
         decision = binding.reconcile_after_unknown(
-            key, expected_token=live_token, intended_hash=intended_hash
+            key, expected_token=view.comparand, intended_hash=intended_hash
         )
         if decision.verdict is ReconcileVerdict.CONVERGE:
             return MemberRestoreOutcome(
@@ -2070,6 +2553,17 @@ class WorkspaceVersioner:
                     "unconfirmed write reconciled CONVERGE: the live object is "
                     "byte-identical to the manifest (authorship not claimed)"
                 ),
+                # ``write_confirmed=False``: a put was issued and its outcome
+                # was lost, so on the live path this run cannot say whether IT
+                # discarded the divergent state or a peer converged it first —
+                # and R2's five states hold no "attempted, outcome unknowable".
+                # ``not_recorded`` is the one that does not lie: its consumer
+                # contract is "an observation the run never made, never read as
+                # clean", which is exactly this. The default would under-claim
+                # on the QUIETEST terminal in the vocabulary — the file leg's
+                # unconfirmed arm can afford that only because it lands on
+                # ``held_unconfirmed``, which is already loud.
+                observation=self._observation_of_overwritten(view, write_confirmed=False),
             )
         if decision.verdict in (ReconcileVerdict.RE_DRIVE, ReconcileVerdict.CONFLICT):
             # Knowledge either way — an unmoved comparand (retry the intent)
@@ -2088,6 +2582,12 @@ class WorkspaceVersioner:
                 "write outcome still UNCONFIRMED after the reconciliation "
                 "read — HELD, never best-effort"
             ),
+            # Same ambiguity as the CONVERGE arm above and the same answer: a
+            # put was issued and its outcome is unknowable, so this run cannot
+            # say what it destroyed. Defaulting here would report a leg that
+            # read divergent content and wrote exactly like one that never
+            # reached a write decision.
+            observation=self._observation_of_overwritten(view, write_confirmed=False),
         )
 
     # --- the file CAS leg (no-arbiter: detection-guarded ONLY) ----------------
@@ -2101,6 +2601,7 @@ class WorkspaceVersioner:
         # retention has since expired; the resolver is consulted only when a
         # write is actually needed).
         pinned: bytes | None = None
+        refusals = 0  # refused reads so far in this leg, which set the next wait
         while True:
             if budget.try_consume() is None:
                 return MemberRestoreOutcome(
@@ -2116,6 +2617,19 @@ class WorkspaceVersioner:
                 )
             try:
                 live_bytes, live_version = member.source.read_with_version(row.member_path)
+            except StaleView:
+                # The source refused to pair the live bytes with a version (a
+                # peer's commit still reaching disk, or an out-of-band edit), so
+                # there is no comparand to CAS from. Re-drive: the transient
+                # clears once the disk write lands, and a lasting refusal spends
+                # the budget into conflict with no write, so the run concludes.
+                # WAIT between refused reads, on the schedule write_cas uses for
+                # the same transient: back-to-back reads spend the budget before
+                # a peer's disk write can land, which bounds the leg by read
+                # latency instead of by time.
+                refusals += 1
+                time.sleep(denied_read_backoff_sec(refusals))
+                continue
             except FileNotFoundError:
                 # v1 residual: recreation needs the coordinator artifact
                 # identity, which lands with Unit-5 registration — absorbed,
@@ -2130,7 +2644,14 @@ class WorkspaceVersioner:
                         "lands in Unit 5) — divergence not converged (no-arbiter)"
                     ),
                 )
-            if _sha256_hex(live_bytes) == row.fingerprint:
+            # The converged check's digest is the leg's own observation of the
+            # live content, and it is computed from the SAME read that produced
+            # the CAS comparand — keeping it is what lets the write arm report
+            # what it overwrote without a second read (R1, KTD5). Recomputed
+            # every iteration on purpose: the loop re-reads, so a hoisted
+            # digest would name a state a later attempt never saw (KTD7).
+            live_fingerprint = _sha256_hex(live_bytes)
+            if live_fingerprint == row.fingerprint:
                 return MemberRestoreOutcome(
                     member_path=row.member_path,
                     outcome=RESTORE_OUTCOME_CONVERGED,
@@ -2145,7 +2666,9 @@ class WorkspaceVersioner:
                 if isinstance(resolved, MemberRestoreOutcome):
                     return resolved
                 pinned = resolved
-            outcome = self._file_cas_attempt(row, member, pinned, live_version, budget)
+            outcome = self._file_cas_attempt(
+                row, member, pinned, live_version, live_fingerprint, budget
+            )
             if outcome is not None:
                 return outcome
 
@@ -2191,6 +2714,7 @@ class WorkspaceVersioner:
         member: _FileMember,
         pinned: bytes,
         live_version: int,
+        live_fingerprint: str,
         budget: _LegBudget,
     ) -> MemberRestoreOutcome | None:
         """One version-checked CAS write; ``None`` means re-drive.
@@ -2198,6 +2722,14 @@ class WorkspaceVersioner:
         Detection-guarded ONLY: the CAS detects a foreign edit adapter-locally
         (typed :class:`~ccs.core.exceptions.CasVersionConflict`) — nothing here
         is, or may ever be labeled, substrate arbitration (no-arbiter).
+
+        ``live_version``/``live_fingerprint`` are the caller's CURRENT read,
+        passed per call rather than held by the loop, so a re-drive re-reads
+        both and the landed arm reports the iteration that WON (KTD7). The
+        version fills two roles at once here — the CAS comparand and the
+        observation's pointer — while the fingerprint is the leg's independent
+        evidence that the content differed (a source may rewrite bytes without
+        advancing its version, which the CAS alone cannot see).
         """
         path = row.member_path
         source = member.source
@@ -2209,6 +2741,12 @@ class WorkspaceVersioner:
             # read and the CAS — re-drive from a fresh read (leg-budgeted).
             return None
         except ViewWedged:
+            # This arm DID read a live comparand, but the observation states
+            # what the leg OVERWROTE and a wedged view landed nothing — so
+            # ``no_write_attempted`` (the default) is the truthful answer, and
+            # ``observed_differs`` would report a loss that did not occur. The
+            # member still concludes ``conflict``, which is the field an
+            # operator acts on.
             return MemberRestoreOutcome(
                 member_path=path,
                 outcome=RESTORE_OUTCOME_CONFLICT,
@@ -2219,6 +2757,16 @@ class WorkspaceVersioner:
                 ),
             )
         except CommitUnconfirmed:
+            # NOT the default, and the wedged arm above is why: that one never
+            # issued a write, this one did and cannot learn the outcome. The
+            # split matters because the target decides the order. A CAS-first
+            # binding may never have touched the bytes; the file target this
+            # CLI ships writes them to disk FIRST and raises here only when the
+            # ledger commit is refused, so on that path the live content is
+            # already gone. The engine cannot tell the two apart through the
+            # seam, so it reports what it knows: no observation. Claiming a
+            # discarded version would over-claim on the first shape; claiming
+            # no write was attempted would read as clean over the second.
             return MemberRestoreOutcome(
                 member_path=path,
                 outcome=RESTORE_OUTCOME_HELD_UNCONFIRMED,
@@ -2227,6 +2775,7 @@ class WorkspaceVersioner:
                     "the version-CAS commit could not be confirmed (transport "
                     "failed mid-commit) — HELD, never best-effort"
                 ),
+                observation=OBSERVATION_NOT_RECORDED,
             )
         return MemberRestoreOutcome(
             member_path=path,
@@ -2239,6 +2788,18 @@ class WorkspaceVersioner:
                 "pinned bytes landed via the detection-guarded version-CAS "
                 f"(attempt {budget.attempts}; no-arbiter: adapter-local "
                 "detection, never substrate arbitration)"
+            ),
+            # The ONE arm with a confirmed write behind it, and the leg reached
+            # it only past the converged short-circuit — so the live content
+            # provably differed from the capture. Both halves name the state
+            # just OVERWRITTEN (``live_version``), never the one just minted
+            # (``live_version + 1``, carried separately above): conflating them
+            # would hand an operator the pointer of the state they still have.
+            # A REPORT value only — nothing may seed a later comparand from it.
+            observation=RestoreObservation(
+                state=RESTORE_OBSERVATION_DIFFERS,
+                pointer=str(live_version),
+                fingerprint=live_fingerprint,
             ),
         )
 
@@ -2257,6 +2818,19 @@ class WorkspaceVersioner:
             ),
             deleted_at_restore=row.deleted_at_restore,
             resumed_from_prior_run=True,
+            # No leg ran in THIS run and the observation is run-local, so what
+            # a prior run overwrote is unrecoverable — but the durable outcome
+            # is not silent. A row that concluded in
+            # RESTORE_OUTCOMES_PROVING_NO_WRITE proves no write landed, by any
+            # run, so no-write-attempted is established rather than assumed and
+            # the honest answer is the quiet one. Reporting not-recorded for
+            # those would make a re-restore of a workspace nothing ever touched
+            # fail under the operator's gate, on its second identical run.
+            observation=(
+                OBSERVATION_NO_WRITE_ATTEMPTED
+                if row.restore_outcome in RESTORE_OUTCOMES_PROVING_NO_WRITE
+                else OBSERVATION_NOT_RECORDED
+            ),
         )
 
     def _report_from_durable_rows(

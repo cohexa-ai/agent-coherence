@@ -191,8 +191,10 @@ class OpenAIAgentsAdapter:
             first = self._degradation_count == 0
             self._degradation_count += 1
         if first:
-            warnings.warn(f"OpenAI Agents adapter degraded: {exc}", CoherenceDegradedWarning, stacklevel=3)
+            # Log before warning: a caller that escalates the warning to an error
+            # makes warn() raise, and the log line must not depend on it.
             logger.warning("OpenAI Agents adapter degraded under on_error='degrade': %s", exc)
+            warnings.warn(f"OpenAI Agents adapter degraded: {exc}", CoherenceDegradedWarning, stacklevel=3)
 
     def _handle_coherence_error(self, exc: CoherenceError) -> None:
         """Single on_error dispatch shared by the Session wrapper and RunHooks.

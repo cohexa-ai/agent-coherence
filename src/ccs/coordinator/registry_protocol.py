@@ -34,6 +34,7 @@ registry classes themselves (the registries import this module's Protocols under
 
 from __future__ import annotations
 
+import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from threading import Event
@@ -49,14 +50,33 @@ from typing import (
 )
 from uuid import UUID
 
+from ccs.core.exceptions import (
+    CHECKPOINT_ALREADY_REGISTERED_REASON,
+    CHECKPOINT_NOT_THE_RECEIVER_REASON,
+    HANDOFF_ENDED_REASON,
+    HANDOFF_IN_FLIGHT_REASON,
+    HANDOFF_NOT_HELD_REASON,
+    HANDOFF_OTHER_HOLDER_REASON,
+    HANDOFF_SELF_REASON,
+    HANDOFF_SUCCESSOR_UNKNOWN_REASON,
+    HANDOFF_VERSION_UNCONFIRMED_REASON,
+    CheckpointRegistrationRefused,
+    RegistryLockTimeout,
+)
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import (
+    TRANSFER_STATUS_DECLINED,
+    TRANSFER_STATUS_PENDING,
+    TRANSFER_STATUS_SUPERSEDED,
+    TRANSFER_STATUS_WITHDRAWN,
+    TRANSFER_STATUSES,
     Artifact,
     CasCorruption,
     CommitAllEntry,
     ConflictDetail,
     MultiCommitConflict,
     MultiCommitResult,
+    TransferGrantOutcome,
     VersionedReadRejection,
 )
 
@@ -81,6 +101,65 @@ MultiCasResult: TypeAlias = "MultiCommitResult | MultiCommitConflict | CasCorrup
 CaptureResult: TypeAlias = "dict[UUID, int] | VersionedReadRejection"
 
 
+# Foreign-write detection outcomes (detection-substrate plan R5). Exactly three
+# classifications and nothing finer: a disk content the coordinator holds
+# (``mediated``), one it does not and cannot explain (``foreign``), and one it
+# declines to call foreign because a recent mediated commit to that artifact is
+# witnessed inside the benign commit-to-disk lag window (``lag_suppressed``, R13
+# — its own reported outcome so an operator can size the window's admitted
+# false-negative, never folded into ``mediated``).
+FOREIGN_WRITE_OUTCOMES: tuple[str, str, str] = ("foreign", "mediated", "lag_suppressed")
+
+
+@dataclass(frozen=True)
+class DetectionRun:
+    """One coordinator run's observed detection interval (plan R8, R12 / KTD6).
+
+    A cumulative tick count cannot tell a reader whether the detector observed a
+    PARTICULAR span — a coordinator down for the middle of a session still
+    presents a large count and a recent last tick. So each run records its own
+    interval, and a coverage question is answered by intersecting the session's
+    span with these intervals rather than by trusting a total.
+
+    ``run_id`` is opaque and per-writer-open. An empty run list is the
+    not-instrumented signal: the tables exist on every writer open whether or
+    not the sweep thread was created, so the TABLE cannot carry that meaning and
+    the ROW must.
+    """
+
+    run_id: str
+    first_tick_unix: float
+    last_tick_unix: float
+    tick_count: int
+    covered_count: int = 0
+    """How many artifacts were in scope during this interval. A run that
+    watched nothing and a run that watched five hundred and found nothing are
+    different answers to "was this period clean?", and a tick count alone
+    cannot tell them apart."""
+
+
+@dataclass(frozen=True)
+class UncoverableRun:
+    """One coordinator run that had nothing it could ever watch.
+
+    Deliberately NOT a :class:`DetectionRun` with a zero tick count. A detection
+    run is an interval a coverage claim may be checked against; this is the
+    absence of any such interval, plus the reason. Folding it into the same type
+    would put a row that observed nothing into the sequence
+    ``ForeignWriteReport.covers`` walks, and a workspace nothing ever polled
+    would start answering coverage questions.
+
+    ``reason`` is an opaque stable token, not a message: it is written by the
+    detector and read by the offline report across a process and a release
+    boundary, which is the one place a human-readable string turns into a
+    parsing hazard.
+    """
+
+    run_id: str
+    reason: str
+    observed_at_unix: float
+
+
 @dataclass(frozen=True)
 class CheckpointRecord:
     """One workspace-checkpoint manifest header (WV plan Unit 2 / R1, R9).
@@ -99,6 +178,21 @@ class CheckpointRecord:
     (durable because restore is crash-resumable); the vocabulary is the service
     layer's — the registry stores the string. ``pin_refcount`` is the Unit-6 GC
     pin bookkeeping (never negative; adjusted only through the registry).
+
+    ``owner`` is PROVENANCE, not authorization (#191): who took the checkpoint.
+    The restore registration never compares a controller with it, because the
+    checkpoint is the join point between two writers and the one restoring it
+    is routinely not the one that took it. Authorization reads the two fields
+    below instead (schema v10):
+
+    - ``receiver`` — the one controller allowed to register a restore of this
+      checkpoint, named at creation; ``None`` (the default) admits any
+      controller, which is the behaviour before #191;
+    - ``registered_by`` — the controller whose registration claimed this
+      checkpoint first, set once through
+      :meth:`RegistryBase.claim_checkpoint_registration` and never rebound. A
+      later registration by another controller is refused
+      ``already_registered``; a retry by this one is not.
     """
 
     checkpoint_id: str
@@ -111,6 +205,26 @@ class CheckpointRecord:
     restore_status: str = "none"
     restore_updated_at: float | None = None
     pin_refcount: int = 0
+    receiver: UUID | None = None
+    registered_by: UUID | None = None
+
+    def require_registrable_by(self, controller: UUID) -> None:
+        """Raise the controller refusal ``controller`` gets for this
+        checkpoint (#191), or return: ``not_the_receiver`` when the checkpoint
+        names another receiver, then ``already_registered`` when another
+        controller claimed it (naming nobody). The owner is never compared.
+
+        The one copy of the rule: the service's registration and progress
+        gates and ``WorkspaceVersioner.restore`` all call it, so the
+        in-process restore and the HTTP routes answer a checkpoint alike."""
+        if self.receiver is not None and self.receiver != controller:
+            raise CheckpointRegistrationRefused(
+                self.checkpoint_id, CHECKPOINT_NOT_THE_RECEIVER_REASON
+            )
+        if self.registered_by is not None and self.registered_by != controller:
+            raise CheckpointRegistrationRefused(
+                self.checkpoint_id, CHECKPOINT_ALREADY_REGISTERED_REASON
+            )
 
 
 @dataclass(frozen=True)
@@ -156,8 +270,9 @@ class CheckpointMember:
 # carrying one of these bumps the artifact's owner_generation (the
 # read-generation fence), because the claim was revoked WITHOUT a version move,
 # which version-CAS cannot see. EPOCH_BUMP_TRIGGERS immediately below is the
-# full bump set -- it adds the voluntary "invalidate" release, which ends a
-# claim at an unchanged version the same way. The peer-invalidation triggers
+# full bump set -- it adds the voluntary "invalidate" release and the
+# HANDOFF_TRIGGER, which each end a claim at an unchanged version the same way
+# without being a reclaim. The peer-invalidation triggers
 # never bump, for different reasons each: "commit" moves the version, so
 # version-CAS already catches a stale write; "write" (a peer's pessimistic
 # acquire) moves NOTHING, and is kept out anyway -- see the note under
@@ -165,6 +280,20 @@ class CheckpointMember:
 RECLAIM_TRIGGERS: frozenset[str] = frozenset(
     {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
 )
+# SWEEP_RECLAIM_TRIGGERS: the stable-grant sweep's own two triggers. An M/E ->
+# INVALID transition under one of them records the pair's reclaim slot in the
+# SAME write as the transition, so a reclaim is never stored without its cause:
+# /status tells a reclaim from a release by that slot alone, and the next sweep
+# skips an already-INVALID pair, so a slot written separately and lost would
+# stay lost. "timeout" stays out: the transient sweep records no slot.
+SWEEP_RECLAIM_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS - {"timeout"}
+# HANDOFF_TRIGGER: the trigger a transfer moves its giver INVALID under (the
+# targeted grant handoff, #185). Its own value, distinct from "invalidate", so
+# the state log records a deliberate handoff as a handoff rather than as a
+# release, and deliberately NOT a RECLAIM_TRIGGER: a handoff is the holder's own
+# act, never an eviction. Wire-stable: renaming it without EPOCH_BUMP_TRIGGERS
+# leaves the bump keyed on a string nothing emits.
+HANDOFF_TRIGGER: str = "handoff"
 # EPOCH_BUMP_TRIGGERS: the triggers whose M/E -> INVALID transition MOVES the
 # ownership epoch. The rule is not "the sweep did it" but "a write-claim was
 # revoked WITHOUT the version moving" -- the one condition version-CAS is
@@ -175,6 +304,13 @@ RECLAIM_TRIGGERS: frozenset[str] = frozenset(
 # already INVALID, so the sweep has no M/E grant left to reclaim and the epoch
 # never moves at all -- the identical end-state a sweep reclaim fences was
 # silently admitted (NoSilentRevoke, formal/tla/Fencing.tla).
+#
+# HANDOFF_TRIGGER joins for the same reason: a giver that hands a path off from
+# EXCLUSIVE or MODIFIED ends its write claim at an unchanged version exactly as
+# a release does, so its late commit must meet the fence. Because the bump keys
+# on leaving M/E, a giver handing off a standing SHARED read never moves the
+# epoch -- it revoked no write claim, and a bump there would fence every
+# bystander that read the path as though a writer had been reclaimed.
 #
 # The peer-invalidation triggers ("write" / "commit") stay OUT, unchanged.
 # "commit" moves the version, so version-CAS already arbitrates a stale write.
@@ -190,7 +326,9 @@ RECLAIM_TRIGGERS: frozenset[str] = frozenset(
 # arbitrate -- is HELD by the effect gate's standing-grant re-check
 # (adapters.effect_gate.check_fence: a stale-status re-validate read HOLDs
 # even with the (version, generation) pair unchanged).
-EPOCH_BUMP_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS | frozenset({"invalidate"})
+EPOCH_BUMP_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS | frozenset(
+    {"invalidate", HANDOFF_TRIGGER}
+)
 # CLAIM_CAPTURE_TRIGGERS: triggers under which a transition MAY be a genuine
 # content read for read-generation capture (the E/M-acquire capture is keyed
 # on the state transition, not the trigger). Membership is necessary, not
@@ -201,6 +339,430 @@ EPOCH_BUMP_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS | frozenset({"invalidate"
 # refreshes the ex-holder's captured generation. Renaming the trigger without
 # updating this would silently disable capture on reads.
 CLAIM_CAPTURE_TRIGGERS: frozenset[str] = frozenset({"fetch"})
+
+
+# ---------------------------------------------------------------------------
+# The transfer record (targeted grant handoff, #185)
+# ---------------------------------------------------------------------------
+#
+# One record per artifact, kept by both registries and exposed through four
+# base members: ``transfer_grants`` (the composite transfer), the read
+# ``get_transfer_record``, the status write ``set_transfer_status`` and the
+# eviction ``evict_transfer_records``. The decision order and the liveness
+# predicate below are shared by both registries, which share no base class:
+# each gathers a path's facts in its own critical section (one lock hold, or one
+# ``BEGIN IMMEDIATE``) and decides with the same function, so the two backends
+# cannot answer one request differently.
+
+# Why a record exists, as a closed vocabulary (stored; add, never rename). A
+# plain transfer is a ``handoff``; the giver's re-transfer of its own live
+# record is a ``supersession``, and that record also names the successor it
+# superseded, so a late re-send of the superseded tuple is recognised
+# rather than read as a fresh supersession. The cause is its own column, never
+# an id encoded into a string, so a later cause (#195's reclaim causes) adds a
+# value without re-parsing the stored ones.
+TRANSFER_CAUSE_HANDOFF = "handoff"
+TRANSFER_CAUSE_SUPERSESSION = "supersession"
+TRANSFER_CAUSES: frozenset[str] = frozenset(
+    {TRANSFER_CAUSE_HANDOFF, TRANSFER_CAUSE_SUPERSESSION}
+)
+
+# The statuses that end a record whatever its version. Every other label
+# leaves a record live while the artifact's version equals the version at
+# transfer -- an overtaken record included.
+TRANSFER_ENDED_STATUSES: frozenset[str] = frozenset(
+    {TRANSFER_STATUS_DECLINED, TRANSFER_STATUS_WITHDRAWN}
+)
+
+# The statuses a stored record may carry. ``superseded`` never persists: the
+# replacing record's cause carries it, and a stored superseded row would read as
+# live (it is neither declined nor withdrawn) and fence its giver for nothing.
+TRANSFER_STORED_STATUSES: frozenset[str] = TRANSFER_STATUSES - {
+    TRANSFER_STATUS_SUPERSEDED
+}
+
+
+def require_storable_transfer_status(status: str) -> None:
+    """Raise ``ValueError`` for a status no stored record may carry (anything
+    outside :data:`TRANSFER_STORED_STATUSES`, ``superseded`` included). Both
+    registries' ``set_transfer_status`` call it before touching any state, so
+    the closed vocabulary is checked, and its refusal worded, in one place."""
+    if status not in TRANSFER_STORED_STATUSES:
+        raise ValueError(
+            f"transfer status {status!r} cannot be stored; expected one of "
+            f"{sorted(TRANSFER_STORED_STATUSES)}"
+        )
+
+
+def require_storable_transfer_cause(cause: str) -> None:
+    """Raise ``ValueError`` for a cause outside :data:`TRANSFER_CAUSES`.
+    Checked when a record is decided for a write, never when one is read
+    back: a stored cause is add-only, so a cause a later build writes must
+    not make this build's reads, ``/status`` or eviction fail."""
+    if cause not in TRANSFER_CAUSES:
+        raise ValueError(
+            f"transfer cause {cause!r} cannot be stored; expected one of "
+            f"{sorted(TRANSFER_CAUSES)}"
+        )
+
+
+# A claim the presented composite can hand on: a write grant or a standing read.
+_HELD_STATES: frozenset[MESIState] = frozenset(
+    {MESIState.EXCLUSIVE, MESIState.MODIFIED, MESIState.SHARED}
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class TransferRecord:
+    """One path's transfer record, as both registries store and return it.
+
+    ``kw_only`` because four fields are ids of one type side by side; a
+    positional swap would record the handoff pointed the wrong way.
+
+    - ``giver`` -- the caller's session-level identity: what the fence keys on,
+      so a re-minted incarnation or a subagent of the same session is fenced
+      alike.
+    - ``holder`` -- the composite that held the claim and moved INVALID.
+    - ``successor`` -- the successor's session-level identity.
+    - ``version_at_transfer`` -- the artifact version the handoff is fenced on.
+    - ``hold_shape`` -- the grant given up: EXCLUSIVE, MODIFIED or SHARED.
+    - ``cause`` -- one of :data:`TRANSFER_CAUSES`; ``superseded_successor`` is
+      set exactly when the cause is a supersession.
+    - ``status`` -- one of :data:`TRANSFER_STORED_STATUSES`. A label, not
+      liveness: the read answers liveness beside the record.
+    - ``counterparty`` -- the bystander an overtaken label names.
+    - ``created_at`` / ``updated_at`` -- wall-clock unix seconds, since the
+      coordinator's ticks reset on a restart.
+    """
+
+    artifact_id: UUID
+    giver: UUID
+    holder: UUID
+    successor: UUID
+    version_at_transfer: int
+    hold_shape: MESIState
+    cause: str
+    superseded_successor: UUID | None
+    status: str
+    counterparty: UUID | None
+    created_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True, kw_only=True)
+class TransferRequest:
+    """One transfer request, as :meth:`RegistryBase.transfer_grants` decides it.
+
+    - ``giver`` -- the caller's session-level identity. The registry never
+      derives it: the route passes the identity it derived from the session id,
+      a library caller its own agent id.
+    - ``successor`` -- the successor's session-level identity, already
+      normalised by the caller (the registry never resolves a composite).
+    - ``holders`` -- artifact id to the composite presented as holding the
+      claim on that path (a volume presents the incarnation that holds
+      its read or write there). Keyed by artifact, so a path is decided once.
+    - ``successor_known`` -- whether the caller already resolved the successor
+      through a name map the registry cannot see (the HTTP route's live map).
+      The registry also counts a bound principal and a grant row as known.
+    """
+
+    giver: UUID
+    successor: UUID
+    holders: Mapping[UUID, UUID]
+    successor_known: bool = False
+
+
+def transfer_record_live(record: TransferRecord, current_version: int) -> bool:
+    """A record's liveness, the one predicate both registries read it from.
+
+    Live while the artifact's version still equals the version at transfer and
+    the record was neither declined nor withdrawn, whatever its label otherwise
+    says. The version leg is what a status-only reading misses: a version can
+    move with no status write (a crash, or a failed label write, between a win
+    and its completion), and such a record must read as not live everywhere at
+    once. Each registry supplies ``current_version`` from inside the same hold
+    or transaction that read the record."""
+    return (
+        current_version == record.version_at_transfer
+        and record.status not in TRANSFER_ENDED_STATUSES
+    )
+
+
+def acquire_by_deadline(lock: Any, deadline: float | None) -> None:
+    """Take the registry ``lock`` for ``abort_guard``, waiting at most until
+    ``deadline`` (#238): a :func:`time.monotonic` instant past which this raises
+    :class:`RegistryLockTimeout` having taken nothing. ``None`` waits as long as
+    the lock is held. A free lock, or one this thread already holds, is taken
+    at once, and a deadline already past is one non-blocking try."""
+    timeout = -1 if deadline is None else max(0.0, deadline - time.monotonic())
+    if not lock.acquire(timeout=timeout):
+        raise RegistryLockTimeout(
+            "another thread held the registry lock past the caller's "
+            "deadline; nothing was read or written (#238)."
+        )
+
+
+#: ``status_snapshot``'s grant detail (#187): each pair's recorded grant tick,
+#: ``{artifact_id: {agent_id: granted_at_tick}}``, then each agent's last
+#: heartbeat tick, ``{agent_id: last_tick}``. Both are ticks as their writers
+#: recorded them: whole unix seconds on the HTTP coordinator.
+GrantDetail: TypeAlias = tuple[dict[UUID, dict[UUID, int]], dict[UUID, int]]
+
+
+#: What ``SqliteExtended.status_snapshot`` answers: the artifact rows and the
+#: per-artifact state maps, then the transfer rows (#185) at ``[2]``, the
+#: reclaim slots (#195) at ``[3]`` and the grant detail (#187) at ``[4]``. Each
+#: keeps its index whatever else was asked for: a call for the reclaim slots
+#: alone answers an empty ``[2]``, and one for the grant detail alone empty
+#: ``[2]`` and ``[3]``.
+StatusSnapshot: TypeAlias = (
+    "tuple[dict[UUID, dict[str, Any]], dict[UUID, dict[UUID, MESIState]]]"
+    " | tuple[dict[UUID, dict[str, Any]], dict[UUID, dict[UUID, MESIState]],"
+    " dict[UUID, tuple[TransferRecord, bool]]]"
+    " | tuple[dict[UUID, dict[str, Any]], dict[UUID, dict[UUID, MESIState]],"
+    " dict[UUID, tuple[TransferRecord, bool]], dict[UUID, dict[UUID, ReclamationSlot]]]"
+    " | tuple[dict[UUID, dict[str, Any]], dict[UUID, dict[UUID, MESIState]],"
+    " dict[UUID, tuple[TransferRecord, bool]], dict[UUID, dict[UUID, ReclamationSlot]],"
+    " GrantDetail]"
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class TransferPathView:
+    """What one path looks like to the composite transfer, read by a registry
+    inside the hold or transaction that will also apply the decision.
+
+    ``current_version`` is None when the artifact is absent; ``record`` and
+    ``live`` come from the registry's liveness helper; ``holder_state`` is the
+    presented composite's grant (None when it has no row);
+    ``other_write_holder`` is whether any OTHER agent holds the path EXCLUSIVE
+    or MODIFIED."""
+
+    artifact_id: UUID
+    holder: UUID
+    current_version: int | None
+    record: TransferRecord | None
+    live: bool
+    holder_state: MESIState | None
+    other_write_holder: bool
+
+
+@dataclass(frozen=True)
+class TransferDecision:
+    """One path's decision: the per-grant answer, the record to store (None:
+    nothing is written), and whether the presented composite moves INVALID
+    under the handoff trigger (a supersession writes the record alone)."""
+
+    outcome: TransferGrantOutcome
+    write: TransferRecord | None = None
+    move_holder: bool = False
+
+
+def decide_transfer_grant(
+    request: TransferRequest,
+    view: TransferPathView,
+    *,
+    successor_known: bool,
+    now_unix: float,
+) -> TransferDecision:
+    """Decide one path of a transfer in the order below. Pure: it reads the view
+    and writes nothing, so a registry decides EVERY path before it applies any.
+
+    First the path's record is matched against the caller as giver:
+
+    - (a) live, same successor: answered transferred with the record's status;
+      nothing moves, so a re-send writes no second record.
+    - (b) live, the successor this record's supersession replaced: refused as
+      ended with the superseded status, so a late re-send never supersedes back.
+    - (c) live, any other successor: supersedes. The stored holder stands in for
+      the hold check only; the foreign write-holder, self and unknown refusals
+      still run, and a refused supersession changes nothing.
+    - (d) ended by decline or withdraw, same successor, unmoved version: refused
+      as ended with that status.
+    - (e) any other record naming the caller is treated as absent.
+
+    Then, with no record naming the caller, the ordinary checks run on the
+    presented composite, in order: hold, unconfirmed version, foreign write
+    holder (not held already won), another giver's live record, self, unknown.
+
+    A record decided for a write must carry a cause in :data:`TRANSFER_CAUSES`
+    (``ValueError`` otherwise), raised here, before the registry applies any
+    path.
+    """
+    record = view.record
+    decided = None
+    if record is not None and record.giver == request.giver:
+        decided = _decide_on_own_record(
+            request, view, record, successor_known=successor_known, now_unix=now_unix
+        )
+        if decided is None:
+            record = None  # arm (e)
+    if decided is None:
+        decided = _decide_ordinary(
+            request, view, record, successor_known=successor_known, now_unix=now_unix
+        )
+    if decided.write is not None:
+        require_storable_transfer_cause(decided.write.cause)
+    return decided
+
+
+def _decide_on_own_record(
+    request: TransferRequest,
+    view: TransferPathView,
+    record: TransferRecord,
+    *,
+    successor_known: bool,
+    now_unix: float,
+) -> TransferDecision | None:
+    """Arms (a) to (d); None is arm (e)."""
+    if view.live:
+        if record.successor == request.successor:
+            return TransferDecision(_transferred(record))
+        if record.superseded_successor == request.successor:
+            return TransferDecision(
+                _ended(record, successor=request.successor, status=TRANSFER_STATUS_SUPERSEDED)
+            )
+        return _supersede(request, view, record, successor_known=successor_known, now_unix=now_unix)
+    if (
+        record.status in TRANSFER_ENDED_STATUSES
+        and record.successor == request.successor
+        and view.current_version == record.version_at_transfer
+    ):
+        return TransferDecision(
+            _ended(record, successor=record.successor, status=record.status)
+        )
+    return None
+
+
+def _supersede(
+    request: TransferRequest,
+    view: TransferPathView,
+    record: TransferRecord,
+    *,
+    successor_known: bool,
+    now_unix: float,
+) -> TransferDecision:
+    """Arm (c). No INVALID move: the stored holder's row moved at the first
+    transfer, and the hold shape and version at transfer carry over."""
+    refusal = _write_holder_refusal(view) or _successor_refusal(
+        request, view, successor_known
+    )
+    if refusal is not None:
+        return TransferDecision(refusal)
+    write = TransferRecord(
+        artifact_id=view.artifact_id,
+        giver=request.giver,
+        holder=record.holder,
+        successor=request.successor,
+        version_at_transfer=record.version_at_transfer,
+        hold_shape=record.hold_shape,
+        cause=TRANSFER_CAUSE_SUPERSESSION,
+        superseded_successor=record.successor,
+        status=TRANSFER_STATUS_PENDING,
+        counterparty=None,
+        created_at=now_unix,
+        updated_at=now_unix,
+    )
+    return TransferDecision(_transferred(write), write=write)
+
+
+def _decide_ordinary(
+    request: TransferRequest,
+    view: TransferPathView,
+    record: TransferRecord | None,
+    *,
+    successor_known: bool,
+    now_unix: float,
+) -> TransferDecision:
+    """The checks on the presented composite, then a plain handoff with the
+    INVALID move; an ended record on the path is replaced."""
+    holder_state, version = view.holder_state, view.current_version
+    if holder_state is None or holder_state not in _HELD_STATES:
+        return TransferDecision(_refused(view, HANDOFF_NOT_HELD_REASON))
+    if version is None or version < 1:
+        return TransferDecision(_refused(view, HANDOFF_VERSION_UNCONFIRMED_REASON))
+    refusal = _write_holder_refusal(view)
+    if refusal is None and record is not None and view.live:
+        refusal = _refused(
+            view, HANDOFF_IN_FLIGHT_REASON, giver=record.giver, successor=record.successor
+        )
+    refusal = refusal or _successor_refusal(request, view, successor_known)
+    if refusal is not None:
+        return TransferDecision(refusal)
+    write = TransferRecord(
+        artifact_id=view.artifact_id,
+        giver=request.giver,
+        holder=view.holder,
+        successor=request.successor,
+        version_at_transfer=version,
+        hold_shape=holder_state,
+        cause=TRANSFER_CAUSE_HANDOFF,
+        superseded_successor=None,
+        status=TRANSFER_STATUS_PENDING,
+        counterparty=None,
+        created_at=now_unix,
+        updated_at=now_unix,
+    )
+    return TransferDecision(_transferred(write), write=write, move_holder=True)
+
+
+def _write_holder_refusal(view: TransferPathView) -> TransferGrantOutcome | None:
+    if view.other_write_holder:
+        return _refused(view, HANDOFF_OTHER_HOLDER_REASON)
+    return None
+
+
+def _successor_refusal(
+    request: TransferRequest, view: TransferPathView, successor_known: bool
+) -> TransferGrantOutcome | None:
+    """Self, then unknown. Self compares session-level identities only: the
+    caller normalised both, and the registry never derives one."""
+    if request.successor == request.giver:
+        return _refused(view, HANDOFF_SELF_REASON)
+    if not successor_known:
+        return _refused(view, HANDOFF_SUCCESSOR_UNKNOWN_REASON)
+    return None
+
+
+def _refused(
+    view: TransferPathView,
+    reason: str,
+    *,
+    giver: UUID | None = None,
+    successor: UUID | None = None,
+) -> TransferGrantOutcome:
+    return TransferGrantOutcome(
+        artifact_id=view.artifact_id,
+        transferred=False,
+        reason=reason,
+        giver=giver,
+        successor=successor,
+    )
+
+
+def _transferred(record: TransferRecord) -> TransferGrantOutcome:
+    return TransferGrantOutcome(
+        artifact_id=record.artifact_id,
+        transferred=True,
+        giver=record.giver,
+        successor=record.successor,
+        version_at_transfer=record.version_at_transfer,
+        hold_shape=record.hold_shape,
+        status=record.status,
+    )
+
+
+def _ended(record: TransferRecord, *, successor: UUID, status: str) -> TransferGrantOutcome:
+    return TransferGrantOutcome(
+        artifact_id=record.artifact_id,
+        transferred=False,
+        reason=HANDOFF_ENDED_REASON,
+        giver=record.giver,
+        successor=successor,
+        version_at_transfer=record.version_at_transfer,
+        hold_shape=record.hold_shape,
+        status=status,
+    )
 
 
 @runtime_checkable
@@ -221,7 +783,16 @@ class RegistryBase(Protocol):
     ``str | bytes | None``.
     """
 
-    def abort_guard(self, abort: "Event | None" = None) -> AbstractContextManager[None]:
+    def abort_guard(
+        self, abort: "Event | None" = None, *, deadline: float | None = None
+    ) -> AbstractContextManager[None]:
+        """Hold the registry lock across the caller's whole sequence, failing
+        closed with ``WatchdogAbandoned`` when ``abort`` is already set once the
+        lock is won (A6). ``deadline`` (keyword-only, #238) is a
+        :func:`time.monotonic` instant that bounds the wait: past it the guard
+        raises ``RegistryLockTimeout``, having run nothing, instead of waiting
+        on. A free or already-held lock is taken at once; ``None`` waits as long
+        as the lock is held."""
         ...
 
     def adjust_checkpoint_pin_refcount(self, checkpoint_id: str, delta: int) -> int:
@@ -235,6 +806,19 @@ class RegistryBase(Protocol):
         ...
 
     def artifact_ids(self) -> list[UUID]:
+        ...
+
+    def bind_caller_principal(
+        self, identity: UUID, principal: str, mint_nonce: str
+    ) -> tuple[str, str]:
+        """First-claim-wins bind of a caller principal to ``identity``: insert
+        ``(principal, mint_nonce)`` only if ``identity`` has no binding yet, and
+        return the BOUND pair either way — the caller's own on a first claim,
+        the earlier claimant's otherwise. Never rebinds. One atomic step, so two
+        concurrent first claims bind ONE principal. Deliberately its own store,
+        never the session-meta one: the session sweep, the session cap and
+        session release must not see it (a principal outlives both a grant and a
+        snapshot session)."""
         ...
 
     def capture_version_vector(
@@ -288,7 +872,36 @@ class RegistryBase(Protocol):
         INCLUDED, same transaction) plus every member row — atomically: all rows
         land or none do. Raises ``ValueError`` on an absent owner (fail-closed:
         an ownerless manifest is never persisted), on a duplicate
-        ``checkpoint_id``, and on duplicate member paths within the manifest."""
+        ``checkpoint_id``, on duplicate member paths within the manifest, and on
+        a header that arrives already ``registered_by`` someone (a registration
+        claim is only ever made through :meth:`claim_checkpoint_registration`)."""
+        ...
+
+    def claim_checkpoint_registration(
+        self, checkpoint_id: str, controller: UUID
+    ) -> tuple[UUID, bool]:
+        """Claim the restore registration of ``checkpoint_id`` for
+        ``controller``, first claim wins (#191).
+
+        One atomic compare-and-set: when the header's ``registered_by`` is
+        unset it becomes ``controller``; when it is set it is left alone.
+        Returns ``(holder, newly_claimed)``: the ``registered_by`` that holds
+        AFTER the call, and whether THIS call set it. Both come from inside
+        the atomic step, so the caller tells "I just claimed it", "I already
+        held it" and "another controller does" without a second read that
+        could race. Raises ``KeyError`` for an unknown checkpoint."""
+        ...
+
+    def evict_transfer_records(
+        self, *, max_age_sec: float, now_unix: float | None = None
+    ) -> int:
+        """Delete every transfer record that is NOT live and older than
+        ``max_age_sec``, and return how many went. Liveness is the read's
+        (:func:`transfer_record_live`), so a live record is never evicted
+        whatever its age. The age runs from the record's
+        ``updated_at`` -- on sqlite from the later of that and the artifact's
+        own last update, so a version-move ending survives until the giver's
+        next touch can report it. ``now_unix`` defaults to the wall clock."""
         ...
 
     @property
@@ -308,6 +921,12 @@ class RegistryBase(Protocol):
         ...
 
     def get_artifact(self, artifact_id: UUID) -> Optional[Artifact]:
+        ...
+
+    def get_caller_principal(self, identity: UUID) -> str | None:
+        """Return the caller principal bound to ``identity``, or ``None`` when
+        the identity is unclaimed. The durable tier the service's validator
+        falls back to when its in-process cache misses."""
         ...
 
     def get_checkpoint(self, checkpoint_id: str) -> CheckpointRecord | None:
@@ -343,6 +962,17 @@ class RegistryBase(Protocol):
         ...
 
     def get_state_map(self, artifact_id: UUID) -> dict[UUID, MESIState]:
+        ...
+
+    def get_transfer_record(
+        self, artifact_id: UUID
+    ) -> "tuple[TransferRecord, bool] | None":
+        """Return the artifact's transfer record together with whether it is
+        live, or None when the path has no record. Both halves come from ONE
+        read under the registry lock (sqlite: one SELECT joining the
+        artifact's version), so a concurrent version move cannot tear them:
+        this is the one place the service reads liveness from. A
+        plain read, so it serves a read-only open too."""
         ...
 
     def get_transient_map(self, artifact_id: UUID) -> dict[UUID, TransientState]:
@@ -425,7 +1055,28 @@ class RegistryBase(Protocol):
         trigger: str = "unknown",
         tick: int = 0,
         content_hash: str | None = None,
+        observed: bool = True,
     ) -> None:
+        """Set one agent's MESI state on one artifact.
+
+        ``observed`` says whether this transition certifies that the agent now
+        holds the artifact's CURRENT bytes. Default ``True``: a non-INVALID
+        target records the current version as its ``last_observed_version``.
+        ``False`` is a grant that certifies no read -- the Claude Code
+        pre-bash / pre-grep re-grant issued alongside a DENIED command, which
+        never ran -- and leaves the recorded value exactly as a transition to
+        INVALID does: the prior value kept, a never-observed pair still None.
+        It never affects the state written, the grant tick, the epoch or the
+        read-generation capture.
+
+        An M/E -> INVALID transition under a :data:`SWEEP_RECLAIM_TRIGGERS`
+        trigger also records the pair's reclaim slot, ``(trigger, tick)``, in
+        the SAME write as the state and the epoch bump (sqlite: the same
+        ``BEGIN IMMEDIATE``; in memory: the same lock hold, before the
+        state-log emit), so the slot lands exactly when the transition does.
+        The sweep makes no second write: a reclaimed pair is never left
+        INVALID without the slot that tells it from a release.
+        """
         ...
 
     def set_agent_transient(
@@ -485,7 +1136,93 @@ class RegistryBase(Protocol):
     ) -> None:
         ...
 
+    def set_transfer_status(
+        self,
+        artifact_id: UUID,
+        status: str,
+        *,
+        counterparty: UUID | None = None,
+        now_unix: float | None = None,
+    ) -> None:
+        """Write a record's label: ``status``, ``counterparty`` (None clears
+        it) and ``updated_at``, all three. Unconditional -- it never checks
+        liveness, because a win's label is written after the version already
+        moved; the service decides from the record it read under the same
+        hold. Raises ``ValueError`` for a status outside
+        :data:`TRANSFER_STORED_STATUSES` (``superseded`` included) and
+        ``KeyError`` when the path has no record; either way nothing is
+        written."""
+        ...
+
+    def transfer_grants(
+        self,
+        request: TransferRequest,
+        *,
+        tick: int = 0,
+        now_unix: float | None = None,
+    ) -> list[TransferGrantOutcome]:
+        """The composite transfer: decide every path of ``request`` with
+        :func:`decide_transfer_grant`, then apply the admitted subset -- the
+        record upsert, and for a plain handoff the presented composite's
+        INVALID move under ``HANDOFF_TRIGGER`` (moving ``owner_generation``
+        when it leaves EXCLUSIVE or MODIFIED) with one state-log entry per
+        path -- all inside ONE lock hold and ONE transaction. A refused path is
+        left untouched while the admitted ones commit; any raise mid-apply
+        rolls every path back. Returns one outcome per path, in request
+        order. The registry never derives an identity: the giver and the
+        successor arrive session-level, the holders as presented."""
+        ...
+
     def valid_holders(self, artifact_id: UUID) -> list[UUID]:
+        ...
+
+
+@runtime_checkable
+class ForeignWriteDetection(Protocol):
+    """The detection instrument's own surface, deliberately NOT part of
+    :class:`SqliteExtended`.
+
+    ``SqliteExtended`` is ``runtime_checkable`` and ``CoordinatorService`` uses
+    an ``isinstance`` against it to choose between the durable
+    ``resolve_or_register`` and a slower lock-guarded mint. A structural check
+    passes only when EVERY member is present, so folding instrumentation into
+    that protocol would silently demote a backend that implements the whole
+    coordination surface but not this one — a behaviour change no author of
+    such a backend could see coming.
+
+    The separation also matches how :mod:`ccs.coordinator.backend_contract`
+    classifies these members: observability exhaust the atomic write boundary
+    never reads. A backend may implement this surface independently, and a
+    backend that does not is simply un-instrumented.
+    """
+
+    def artifacts_with_detection_edge(self) -> set[UUID]:
+        ...
+
+    def clear_detection_edges(self, artifact_ids: list[UUID]) -> None:
+        ...
+
+    def close_detection_run(self) -> None:
+        ...
+
+    def detection_runs(self) -> list[DetectionRun]:
+        ...
+
+    def detection_uncoverable(self) -> list[UncoverableRun]:
+        ...
+
+    def foreign_write_totals(self) -> dict[UUID, dict[str, int]]:
+        ...
+
+    def record_detection_uncoverable(self, reason: str, now_unix: float) -> None:
+        ...
+
+    def record_detection_tick(self, now_unix: float, *, covered_count: int = 0) -> None:
+        ...
+
+    def record_foreign_write(
+        self, artifact_id: UUID, outcome: str, disk_hash: str
+    ) -> bool:
         ...
 
 
@@ -533,7 +1270,7 @@ class SqliteExtended(RegistryBase, Protocol):
         ...
 
     def pop_pending_notices(
-        self, agent_id: UUID
+        self, agent_id: UUID, *, consume_limit: int | None = None
     ) -> list[tuple[UUID, UUID, float]]:
         ...
 
@@ -565,8 +1302,37 @@ class SqliteExtended(RegistryBase, Protocol):
         self,
         *,
         agent_ids: Iterable[UUID] | None = None,
-    ) -> tuple[
-        dict[UUID, dict[str, Any]],
-        dict[UUID, dict[UUID, MESIState]],
-    ]:
+        include_transfers: bool = False,
+        include_reclamations: bool = False,
+        include_grant_detail: bool = False,
+    ) -> StatusSnapshot:
+        """The artifact rows and the per-artifact state maps, read under ONE
+        lock hold; ``agent_ids`` scopes the state half to the named agents.
+
+        ``include_transfers`` (keyword-only, off by default) fills element
+        ``[2]``, ``{artifact_id: (record, live)}`` for every artifact that has a
+        transfer record, read inside the same hold and judged by the same
+        liveness helper :meth:`RegistryBase.get_transfer_record` uses, so
+        ``/status`` renders each record beside the version it was judged
+        against.
+
+        ``include_reclamations`` (keyword-only, off by default; #195) fills
+        element ``[3]``, ``{artifact_id: {agent_id: (trigger, tick)}}`` for
+        every pair that carries a reclaim slot, whatever its state, read from
+        the same agent-state rows as the state maps; without
+        ``include_transfers``, ``[2]`` is an empty dict, so neither element's
+        index depends on the other flag. The slot is cleared only when the
+        pair next acquires a write grant, so it says "this pair's last write
+        grant ended in a sweep reclaim and it has held none since".
+
+        ``include_grant_detail`` (keyword-only, off by default; #187) fills
+        element ``[4]``, a :data:`GrantDetail`: every pair whose row carries a
+        grant tick, whatever its state, and every agent's last heartbeat tick,
+        read from the heartbeat rows so an agent with no state row is
+        included and one with no heartbeat on record is absent. It also adds
+        ``owner_generation`` to each artifact's metadata. ``[2]`` and ``[3]``
+        are empty dicts when their own flags were not passed, so no element's
+        index depends on another flag. All of it comes from the same hold as
+        the state maps. Without any opt-in the answer is the two-element
+        tuple, unchanged."""
         ...

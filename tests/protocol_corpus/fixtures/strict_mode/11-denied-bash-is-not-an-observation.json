@@ -1,0 +1,105 @@
+{
+  "name": "denied-bash-is-not-an-observation",
+  "description": "A strict-denied `cat plan.md` never runs, so it must not count as A having seen v2. A reads v1, B commits v2, and A's pre-bash on the strict path is denied. The deny still re-grants SHARED (it fires once), but A's observation baseline stays at v1. B then takes the grant again and commits nothing, which leaves A INVALID at an unchanged v2. A's next read must name the write A never saw (prior v1, current v2), not claim that nothing was committed since 'the version you last saw'. Before the fix, both backends credited the denied command as an observation of v2 and took the grant-change arm. The allowed twin is fixture 12. Timestamps vary per run; the reason bytes and the summary are the contract.",
+  "setup": {
+    "tracked": [
+      "plan.md"
+    ],
+    "strict_mode": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\nv1\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "plan.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md",
+          "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f",
+          "success": true
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-bash",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "command": "cat plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "plan.md"
+    }
+  },
+  "ignore_keys": [
+    "last_writer_at_unix_ts",
+    "warning_generated_at_unix_ts"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "Stale read denied: plan.md was updated by agent 814dac78 at <TS>. Re-read plan.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+      },
+      "status": "stale",
+      "summary": {
+        "path": "plan.md",
+        "current_version": 2,
+        "prior_version_seen_by_session": 1,
+        "last_writer_session_id": "814dac789b8f560d9236b12165a0b50d",
+        "last_writer_at_unix_ts": 0,
+        "warning_generated_at_unix_ts": 0,
+        "hash_differs": false
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "name": "effect-fence-hold-grant-reclaimed-generation-differs",
+  "description": "HOLD reason `grant_reclaimed`. Both generations are CONFIRMED and they differ: the coordinator's first observation records ownership generation 0, the caller captured 1. The version never moved (1 on both sides) and the content claim matches, so every earlier leg passes and leg 7 answers -- a sweep reclaimed the grant the decision was read under. Pins that a generation disagreement is NOT reported as version_moved or as the residual bucket: an agent reading `grant_reclaimed` knows the bytes are current and the AUTHORITY is not, which is a different recovery from re-reading.",
+  "setup": {
+    "tracked": ["docs/**"],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "path": "docs/plan.md",
+          "content_hash": "f9b414ed170aade26e96b08b64710e279b57971274301dc1c4c22fb63de6eec6"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/effect-fence",
+    "body": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "path": "docs/plan.md",
+      "expected_version": 1,
+      "expected_generation": 1,
+      "content_hash": "f9b414ed170aade26e96b08b64710e279b57971274301dc1c4c22fb63de6eec6"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "verdict": "hold",
+      "reason": "grant_reclaimed"
+    }
+  },
+  "backends": ["python"],
+  "_comment": "expected_generation 1 vs the recorded 0 is the disagreement. 0 is a REAL generation, not a sentinel -- 01 proceeds on it -- so this fixture also pins that the route never coerces a falsy generation to the unconfirmed sentinel."
+}

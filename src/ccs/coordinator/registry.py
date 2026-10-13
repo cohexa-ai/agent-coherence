@@ -36,6 +36,7 @@ from ccs.core.types import (
     ConflictDetail,
     MultiCommitConflict,
     MultiCommitResult,
+    TransferGrantOutcome,
     VersionedReadRejection,
 )
 
@@ -45,12 +46,25 @@ from ccs.core.types import (
 from .registry_protocol import (
     CLAIM_CAPTURE_TRIGGERS,
     EPOCH_BUMP_TRIGGERS,
+    FOREIGN_WRITE_OUTCOMES,
+    HANDOFF_TRIGGER,
     RECLAIM_TRIGGERS,  # noqa: F401 — re-exported; see the parity test
+    SWEEP_RECLAIM_TRIGGERS,
     CaptureResult,
     CasResult,
     CheckpointMember,
     CheckpointRecord,
+    DetectionRun,
     ReclamationSlot,
+    TransferDecision,
+    TransferPathView,
+    TransferRecord,
+    TransferRequest,
+    UncoverableRun,
+    acquire_by_deadline,
+    decide_transfer_grant,
+    require_storable_transfer_status,
+    transfer_record_live,
 )
 from .retention import RetentionPolicy, collectible_versions
 
@@ -108,6 +122,12 @@ class ArtifactRecord:
     # computed from. Mirrors the sqlite agent_states.last_observed_version
     # column (nullable INTEGER, schema v6).
     last_observed_version_by_agent: dict[UUID, int] = field(default_factory=dict)
+    # The grant handoff's transfer record (#185): at most one per
+    # artifact, held on the slot so dropping the slot drops it -- the in-memory
+    # mirror of the sqlite row's cascade on artifact deletion. A stored label,
+    # never liveness: liveness is read against ``artifact.version``
+    # (``ArtifactRegistry._transfer_read``).
+    transfer: TransferRecord | None = None
 
 
 class ArtifactRegistry:
@@ -124,7 +144,9 @@ class ArtifactRegistry:
     """
 
     @contextmanager
-    def abort_guard(self, abort: "threading.Event | None" = None) -> Iterator[None]:
+    def abort_guard(
+        self, abort: "threading.Event | None" = None, *, deadline: float | None = None
+    ) -> Iterator[None]:
         """Hold ``self._lock`` across the caller's whole mutation, failing
         closed if the handler watchdog already timed out (finding A6). The
         same guarantee, word for word, as
@@ -143,14 +165,24 @@ class ArtifactRegistry:
         late "phantom grant" aborts before it lands. ``abort=None`` (every
         non-watchdog caller) is a plain lock acquire with no behavioural
         change.
+
+        ``deadline`` (keyword-only, #238) bounds the wait for the lock with the
+        same meaning as on the SQLite registry: past that
+        :func:`time.monotonic` instant the guard raises
+        :class:`RegistryLockTimeout` before the ``abort`` check and runs
+        nothing; a free or already-held lock is taken at once; ``None`` waits
+        as long as the lock is held.
         """
-        with self._lock:
+        acquire_by_deadline(self._lock, deadline)
+        try:
             if abort is not None and abort.is_set():
                 raise WatchdogAbandoned(
                     "handler watchdog timed out before this mutation ran; "
                     "aborting before it lands (A6)."
                 )
             yield
+        finally:
+            self._lock.release()
 
     def __init__(
         self,
@@ -219,6 +251,13 @@ class ArtifactRegistry:
         # critical section as the session-pin capture).
         self._checkpoints: dict[str, CheckpointRecord] = {}
         self._checkpoint_members: dict[str, dict[str, CheckpointMember]] = {}
+        # Caller-principal bindings (caller-principal plan, U4): ``{identity:
+        # (principal, mint_nonce)}``, first claim wins, never rebound. The
+        # in-memory mirror of the sqlite ``caller_principals`` table — its OWN
+        # store, never ``_session_meta``, so the session sweep, cap and release
+        # cannot see it. PROCESS-SCOPED like everything here (a fresh instance
+        # has no bindings — the declared restart loss). Guarded by ``_lock``.
+        self._caller_principals: dict[UUID, tuple[str, str]] = {}
         # Conflict-outcome instrumentation (guarantee-ladder U5 / R-4): counts
         # keyed by (artifact_id, agent_id, reason) for the three typed deny
         # reasons, incremented at the SAME branch that constructs the returned
@@ -233,6 +272,15 @@ class ArtifactRegistry:
         # under the registry-wide lock below the deny branches already hold
         # self._lock, so the counter serializes there like all other state.)
         self._conflict_counts: dict[tuple[UUID, UUID, str], int] = {}
+        # Foreign-write detection state (plan U2). ``_detection_last_hash`` is
+        # KTD14's edge gate — the disk content last counted per artifact, held
+        # here and never on the canonical hash a safety check reads.
+        self._detection_counts: dict[UUID, dict[str, int]] = {}
+        self._detection_last: dict[UUID, tuple[str, str]] = {}
+        self._detection_run_id: str = uuid4().hex
+        self._detection_run: DetectionRun | None = None
+        self._detection_runs_closed: list[DetectionRun] = []
+        self._detection_uncoverable: dict[str, UncoverableRun] = {}
         self.conflict_callbacks: list[Callable[[UUID, UUID, str], None]] = []
         # THE registry lock. Started life as a capture-only lock (the
         # multi-artifact session-pin critical sections); widened to serialize
@@ -570,8 +618,12 @@ class ArtifactRegistry:
         trigger: str = "unknown",
         tick: int = 0,
         content_hash: str | None = None,
+        observed: bool = True,
     ) -> None:
-        """Set MESI state for one agent/artifact pair."""
+        """Set MESI state for one agent/artifact pair.
+
+        ``observed=False``: the grant certifies no read, so the recorded
+        ``last_observed_version`` is left as it was (see the Protocol)."""
         with self._lock:
             record = self._records[artifact_id]
             from_state = record.state_by_agent.get(agent_id, MESIState.INVALID)
@@ -600,15 +652,22 @@ class ArtifactRegistry:
                 # Read-generation fence: revoking this M/E grant WITHOUT moving the
                 # version bumps the artifact's ownership epoch, atomically (GIL)
                 # with the INVALID transition, so a commit by the ex-holder (or any
-                # pre-revocation holder) fails the generation check. Both the sweep
-                # reclaims and the voluntary release ("invalidate") qualify — see
-                # EPOCH_BUMP_TRIGGERS. The peer invalidations ("write" /
+                # pre-revocation holder) fails the generation check. The sweep
+                # reclaims, the voluntary release ("invalidate") and the handoff
+                # (HANDOFF_TRIGGER, a giver ending its write claim) all qualify —
+                # see EPOCH_BUMP_TRIGGERS. The peer invalidations ("write" /
                 # "commit") do not -- a "commit" moves the version and a
                 # "write" preemption is fenced by grant-state at the effect
                 # gate and by the M/E state check at commit, never by the
                 # epoch (see registry_protocol.EPOCH_BUMP_TRIGGERS).
                 if trigger in EPOCH_BUMP_TRIGGERS:
                     record.owner_generation += 1
+                # A sweep reclaim records its slot here, with the transition and
+                # before the log emit, so no failure after this point can leave
+                # an INVALID pair that reads as a plain release (see
+                # SWEEP_RECLAIM_TRIGGERS).
+                if state == MESIState.INVALID and trigger in SWEEP_RECLAIM_TRIGGERS:
+                    record.last_reclamation_by_agent[agent_id] = (trigger, tick)
 
             # Read-generation fence: capture the current ownership epoch into the
             # agent's read_generation ONLY on the agent's own claim -- an E/M
@@ -637,8 +696,11 @@ class ArtifactRegistry:
             # targets only -- a transition TO INVALID preserves the prior recorded
             # value (the last version actually observed, the post-compaction
             # staleness comparand) and a never-observed agent keeps no key (absent
-            # == None, never a 0-sentinel).
-            if state != MESIState.INVALID:
+            # == None, never a 0-sentinel). A grant the caller says certifies no
+            # read (``observed=False``: a denied command's re-grant) preserves
+            # the same way -- a SHARED holder can then sit BELOW the current
+            # version, which every reader treats as "behind", the safe side.
+            if state != MESIState.INVALID and observed:
                 record.last_observed_version_by_agent[agent_id] = record.artifact.version
 
             if self._state_log is not None:
@@ -693,6 +755,118 @@ class ArtifactRegistry:
         not masked: durability is the sqlite registry's job)."""
         with self._lock:
             return dict(self._conflict_counts)
+
+    # ------------------------------------------------------------------
+    # Foreign-write detection instrumentation (detection-substrate plan U2).
+    # Behavioural parity with the sqlite registry; durability is deliberately
+    # NOT claimed here, exactly as the conflict counters above declare.
+    # ------------------------------------------------------------------
+
+    def record_detection_tick(self, now_unix: float, *, covered_count: int = 0) -> None:
+        """Record that the detector observed one tick in this interval.
+
+        See :meth:`SqliteArtifactRegistry.record_detection_tick`. Only a tick
+        whose poll actually succeeded reaches here — an advancing count over a
+        broken poll would read as a quiet month."""
+        with self._lock:
+            run = self._detection_run
+            if run is None:
+                self._detection_run = DetectionRun(
+                    run_id=self._detection_run_id,
+                    first_tick_unix=now_unix,
+                    last_tick_unix=now_unix,
+                    tick_count=1,
+                    covered_count=covered_count,
+                )
+            else:
+                self._detection_run = DetectionRun(
+                    run_id=run.run_id,
+                    first_tick_unix=run.first_tick_unix,
+                    last_tick_unix=now_unix,
+                    tick_count=run.tick_count + 1,
+                    covered_count=max(run.covered_count, covered_count),
+                )
+
+    def close_detection_run(self) -> None:
+        """End the current observed interval and open a fresh one.
+
+        See :meth:`SqliteArtifactRegistry.close_detection_run` — a failed tick
+        must not let a later success extend an interval across the outage."""
+        with self._lock:
+            if self._detection_run is not None:
+                self._detection_runs_closed.append(self._detection_run)
+                self._detection_run = None
+            self._detection_run_id = uuid4().hex
+
+    def record_detection_uncoverable(self, reason: str, now_unix: float) -> None:
+        """Record that this run found nothing it could ever watch here.
+
+        See :meth:`SqliteArtifactRegistry.record_detection_uncoverable` for why
+        this is a third fact rather than a tick row with a zero count."""
+        with self._lock:
+            self._detection_uncoverable[self._detection_run_id] = UncoverableRun(
+                run_id=self._detection_run_id,
+                reason=reason,
+                observed_at_unix=now_unix,
+            )
+
+    def detection_uncoverable(self) -> list[UncoverableRun]:
+        """Runs that found no watchable workspace; empty is a real answer."""
+        with self._lock:
+            return sorted(
+                self._detection_uncoverable.values(),
+                key=lambda run: run.observed_at_unix,
+            )
+
+    def record_foreign_write(
+        self, artifact_id: UUID, outcome: str, disk_hash: str
+    ) -> bool:
+        """Count one newly observed on-disk content, edge-gated on that content.
+
+        See :meth:`SqliteArtifactRegistry.record_foreign_write` for why the gate
+        keys on content rather than on the tick, and why the suppressing value
+        lives here rather than on the canonical hash."""
+        if outcome not in FOREIGN_WRITE_OUTCOMES:
+            raise ValueError(
+                f"unknown foreign-write outcome {outcome!r}; "
+                f"expected one of {FOREIGN_WRITE_OUTCOMES}"
+            )
+        # Keyed by the outcome name directly — this backend stores a dict, so
+        # it has no column names to bind and needs no equivalent of the sqlite
+        # registry's outcome-to-column map.
+        with self._lock:
+            if self._detection_last.get(artifact_id) == (disk_hash, outcome):
+                return False
+            self._detection_last[artifact_id] = (disk_hash, outcome)
+            counts = self._detection_counts.setdefault(artifact_id, {})
+            counts[outcome] = counts.get(outcome, 0) + 1
+        return True
+
+    def artifacts_with_detection_edge(self) -> set[UUID]:
+        """Artifacts currently holding an edge-gate value."""
+        with self._lock:
+            return set(self._detection_last)
+
+    def clear_detection_edges(self, artifact_ids: list[UUID]) -> None:
+        """Re-arm detection for artifacts that are no longer diverging."""
+        with self._lock:
+            for artifact_id in artifact_ids:
+                self._detection_last.pop(artifact_id, None)
+
+    def foreign_write_totals(self) -> dict[UUID, dict[str, int]]:
+        """Return per-artifact detection counts; zero detections is an empty
+        mapping, a reportable result rather than an error."""
+        with self._lock:
+            return {art: dict(counts) for art, counts in self._detection_counts.items()}
+
+    def detection_runs(self) -> list[DetectionRun]:
+        """Return this run's observed interval, or an empty list when the
+        detector never ticked — the not-instrumented signal."""
+        with self._lock:
+            runs = list(self._detection_runs_closed)
+            if self._detection_run is not None:
+                runs.append(self._detection_run)
+            return runs
 
     def commit_cas(
         self,
@@ -1209,6 +1383,198 @@ class ArtifactRegistry:
             return dict(pins) if pins is not None else None
 
     # ------------------------------------------------------------------
+    # Caller-principal bindings (caller-principal plan, U4)
+    # ------------------------------------------------------------------
+
+    def bind_caller_principal(
+        self, identity: UUID, principal: str, mint_nonce: str
+    ) -> tuple[str, str]:
+        """First-claim-wins bind; returns the BOUND ``(principal, mint_nonce)``
+        pair. Parity with :meth:`SqliteArtifactRegistry.bind_caller_principal`:
+        the check and the insert share one ``_lock`` hold, so two concurrent
+        first claims bind one principal."""
+        with self._lock:
+            return self._caller_principals.setdefault(identity, (principal, mint_nonce))
+
+    def get_caller_principal(self, identity: UUID) -> str | None:
+        """The principal bound to ``identity``, or ``None`` when unclaimed."""
+        with self._lock:
+            bound = self._caller_principals.get(identity)
+        return bound[0] if bound is not None else None
+
+    # ------------------------------------------------------------------
+    # Transfer records (targeted grant handoff #185)
+    # ------------------------------------------------------------------
+
+    def transfer_grants(
+        self,
+        request: TransferRequest,
+        *,
+        tick: int = 0,
+        now_unix: float | None = None,
+    ) -> list[TransferGrantOutcome]:
+        """The composite transfer; see :meth:`RegistryBase.transfer_grants`.
+
+        One ``_lock`` hold covers the decisions and the apply. It STAGES: every
+        path is decided first, every state-log entry is emitted next (rolling
+        ``_seq`` back on a raise), and only then is anything mutated -- so a
+        callback raise leaves the registry exactly as it was, the in-memory
+        twin of the sqlite ROLLBACK (the ``commit_cas`` discipline)."""
+        now = time.time() if now_unix is None else now_unix
+        with self._lock:
+            known = self._successor_known(request)
+            staged = [
+                (view, decide_transfer_grant(request, view, successor_known=known, now_unix=now))
+                for view in (
+                    self._transfer_view(artifact_id, holder)
+                    for artifact_id, holder in request.holders.items()
+                )
+            ]
+            emitted_here = 0
+            try:
+                for view, decision in staged:
+                    if decision.move_holder:
+                        emitted_here += self._emit_handoff_move(view, tick=tick)
+            except Exception:
+                self._seq -= emitted_here
+                raise
+            for view, decision in staged:
+                self._apply_transfer(view, decision)
+            return [decision.outcome for _view, decision in staged]
+
+    def get_transfer_record(
+        self, artifact_id: UUID
+    ) -> tuple[TransferRecord, bool] | None:
+        """The record and its liveness, read under one ``_lock`` hold."""
+        with self._lock:
+            slot = self._records.get(artifact_id)
+            return self._transfer_read(slot) if slot is not None else None
+
+    def set_transfer_status(
+        self,
+        artifact_id: UUID,
+        status: str,
+        *,
+        counterparty: UUID | None = None,
+        now_unix: float | None = None,
+    ) -> None:
+        """Write the label unconditionally; see
+        :meth:`RegistryBase.set_transfer_status`."""
+        require_storable_transfer_status(status)
+        now = time.time() if now_unix is None else now_unix
+        with self._lock:
+            slot = self._records.get(artifact_id)
+            if slot is None or slot.transfer is None:
+                raise KeyError(f"no transfer record for artifact {artifact_id}")
+            slot.transfer = replace(
+                slot.transfer, status=status, counterparty=counterparty, updated_at=now
+            )
+
+    def evict_transfer_records(
+        self, *, max_age_sec: float, now_unix: float | None = None
+    ) -> int:
+        """Drop not-live records older than ``max_age_sec``. In memory the age
+        runs from the record's ``updated_at`` alone: the slot keeps no
+        wall-clock stamp of the artifact's last update (the sqlite registry
+        also weighs that one)."""
+        now = time.time() if now_unix is None else now_unix
+        cutoff = now - max_age_sec
+        with self._lock:
+            evicted = 0
+            for slot in self._records.values():
+                read = self._transfer_read(slot)
+                if read is None:
+                    continue
+                record, live = read
+                if not live and record.updated_at < cutoff:
+                    slot.transfer = None
+                    evicted += 1
+            return evicted
+
+    def _transfer_read(self, slot: ArtifactRecord) -> tuple[TransferRecord, bool] | None:
+        """THE in-memory liveness helper: the slot's record judged
+        against the slot's own artifact version. Every reader of liveness here
+        -- the read, the composite transfer, the eviction -- goes through it.
+        Caller holds ``_lock``."""
+        if slot.transfer is None:
+            return None
+        return slot.transfer, transfer_record_live(slot.transfer, slot.artifact.version)
+
+    def _transfer_view(self, artifact_id: UUID, holder: UUID) -> TransferPathView:
+        """One path's facts for the decision. Caller holds ``_lock``."""
+        slot = self._records.get(artifact_id)
+        if slot is None:
+            return TransferPathView(
+                artifact_id=artifact_id,
+                holder=holder,
+                current_version=None,
+                record=None,
+                live=False,
+                holder_state=None,
+                other_write_holder=False,
+            )
+        read = self._transfer_read(slot)
+        return TransferPathView(
+            artifact_id=artifact_id,
+            holder=holder,
+            current_version=slot.artifact.version,
+            record=read[0] if read is not None else None,
+            live=read[1] if read is not None else False,
+            holder_state=slot.state_by_agent.get(holder),
+            other_write_holder=any(
+                agent_id != holder and state in _M_OR_E_STATES
+                for agent_id, state in slot.state_by_agent.items()
+            ),
+        )
+
+    def _successor_known(self, request: TransferRequest) -> bool:
+        """When the registry counts a successor as known: the caller
+        resolved it, it has a bound principal, or it holds a grant row on some
+        artifact (the library caller's arm -- a row in any state means the
+        coordinator has seen the identity). Caller holds ``_lock``."""
+        return (
+            request.successor_known
+            or request.successor in self._caller_principals
+            or any(
+                request.successor in slot.state_by_agent
+                for slot in self._records.values()
+            )
+        )
+
+    def _emit_handoff_move(self, view: TransferPathView, *, tick: int) -> int:
+        """Emit the state-log entry for one path's INVALID move, before it is
+        applied. Returns the ``_seq`` reservations made (0 or 1)."""
+        slot = self._records[view.artifact_id]
+        return self._emit_state_log(
+            artifact_id=view.artifact_id,
+            agent_id=view.holder,
+            from_state=view.holder_state if view.holder_state is not None else MESIState.INVALID,
+            to_state=MESIState.INVALID,
+            trigger=HANDOFF_TRIGGER,
+            tick=tick,
+            version=slot.artifact.version,
+            content_hash=None,
+        )
+
+    def _apply_transfer(self, view: TransferPathView, decision: TransferDecision) -> None:
+        """Apply one decided path (cannot fail: dict writes only). The INVALID
+        move reproduces :meth:`set_agent_state`'s leaving-M/E bookkeeping: the
+        grant tick is dropped, and the epoch moves because the handoff trigger
+        is in ``EPOCH_BUMP_TRIGGERS`` -- keyed on the set, as at that site, so
+        the two can never disagree about which handoffs bump."""
+        if decision.write is None:
+            return
+        slot = self._records[view.artifact_id]
+        slot.transfer = decision.write
+        if not decision.move_holder:
+            return
+        slot.state_by_agent[view.holder] = MESIState.INVALID
+        if view.holder_state in _M_OR_E_STATES:
+            slot.granted_at_tick_by_agent.pop(view.holder, None)
+            if HANDOFF_TRIGGER in EPOCH_BUMP_TRIGGERS:
+                slot.owner_generation += 1
+
+    # ------------------------------------------------------------------
     # Workspace-checkpoint manifest store (WV plan Unit 2 / R1, R9)
     # ------------------------------------------------------------------
 
@@ -1232,7 +1598,15 @@ class ArtifactRegistry:
             raise ValueError(
                 "create_checkpoint requires an owner: a checkpoint manifest "
                 "without owner metadata is unrepresentable (fail-closed; the "
-                "restore path owner-validates against it)"
+                "owner is provenance — who took it — and the restore "
+                "registration's authorization reads the optional receiver "
+                "instead)"
+            )
+        if checkpoint.registered_by is not None:
+            raise ValueError(
+                "create_checkpoint: a new manifest cannot arrive already "
+                "registered — the registration claim is made only through "
+                "claim_checkpoint_registration"
             )
         with self._lock:
             if checkpoint.checkpoint_id in self._checkpoints:
@@ -1259,6 +1633,25 @@ class ArtifactRegistry:
         """Return the checkpoint header, or ``None`` when unknown."""
         with self._lock:
             return self._checkpoints.get(checkpoint_id)
+
+    def claim_checkpoint_registration(
+        self, checkpoint_id: str, controller: UUID
+    ) -> tuple[UUID, bool]:
+        """First-claim-wins registration claim (#191) — read + set in one lock
+        hold, so two concurrent claimants cannot both win. Returns ``(holder,
+        newly_claimed)`` decided inside that lock hold; raises ``KeyError``
+        for an unknown checkpoint. Parity with
+        :meth:`SqliteArtifactRegistry.claim_checkpoint_registration`."""
+        with self._lock:
+            record = self._checkpoints.get(checkpoint_id)
+            if record is None:
+                raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
+            if record.registered_by is not None:
+                return record.registered_by, False
+            self._checkpoints[checkpoint_id] = replace(
+                record, registered_by=controller
+            )
+            return controller, True
 
     def list_checkpoints(self) -> list[CheckpointRecord]:
         """Return every checkpoint header, ordered by ``(created_at,

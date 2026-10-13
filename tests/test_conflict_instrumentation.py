@@ -21,7 +21,6 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.states import MESIState
 from ccs.core.types import Artifact, CommitAllEntry, ConflictDetail, MultiCommitConflict
@@ -30,16 +29,6 @@ from ccs.diagnose.conflict_counters import read_conflict_totals
 
 def _mk_artifact() -> Artifact:
     return Artifact(name=f"{uuid4().hex}.md", version=1, content_hash="seed")
-
-
-@pytest.fixture(params=["memory", "sqlite"])
-def registry(request, tmp_path: Path):
-    if request.param == "memory":
-        yield ArtifactRegistry()
-    else:
-        reg = SqliteArtifactRegistry(tmp_path / "state.db")
-        yield reg
-        reg.close()
 
 
 def _seed(reg, artifact: Artifact, *agents: UUID) -> None:

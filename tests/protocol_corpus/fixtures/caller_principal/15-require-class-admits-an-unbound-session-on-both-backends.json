@@ -1,0 +1,41 @@
+{
+  "name": "caller-principal-require-class-admits-an-unbound-session",
+  "description": "R16 -- version skew, the direction this coordinator can observe. A client that predates the principal never claims, so the session it names is UNBOUND: its require-class commit is admitted on BOTH backends, exactly as before the principal existed. Refusing it would not surface anywhere -- the shipped hook client turns any non-2xx into {}, an allow -- so the write would go silently unrecorded. The same request naming a CLAIMED session is refused on Python (fixture 07).",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "path": "CLAUDE.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/post-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+      "path": "CLAUDE.md",
+      "success": true,
+      "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true
+    }
+  },
+  "optional_keys": [
+    "version"
+  ]
+}

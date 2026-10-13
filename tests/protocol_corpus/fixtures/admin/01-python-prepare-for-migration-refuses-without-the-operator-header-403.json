@@ -1,0 +1,19 @@
+{
+  "name": "admin-python-prepare-for-migration-refuses-without-the-operator-header-403",
+  "description": "POST /admin/prepare-for-migration without `Coherence-Local-Operator: true` is refused 403 before anything drains. Bearer alone is not enough: the header is the operator opt-in /status?detail=full also requires.",
+  "setup": {},
+  "request": {
+    "method": "POST",
+    "path": "/admin/prepare-for-migration",
+    "body": {}
+  },
+  "expected": {
+    "status": 403,
+    "body": {
+      "error": "prepare-for-migration requires the Coherence-Local-Operator: true opt-in header (operator-only endpoint)."
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

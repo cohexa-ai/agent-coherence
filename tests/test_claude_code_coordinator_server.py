@@ -12,25 +12,34 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 import os
+import sys
 import threading
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
 import pytest
+import yaml
 
+from ccs.adapters.claude_code import policy as policy_module
 from ccs.adapters.claude_code.auth import load_secret
 from ccs.adapters.claude_code.coordinator_server import (
     _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC,
     MAX_POLICY_PATHS_PER_REQUEST,
     CoordinatorHTTPServer,
+    TrackedReadDecision,
     _is_recent_self_commit_lag,
+    caller_principal_identity,
+    decide_tracked_read,
     session_to_agent_id,
 )
+from ccs.core.exceptions import HOLD_REASONS, CoherenceError
 from ccs.core.states import MESIState
 
 # Test helper: deterministic UUID4-shaped strings for short test labels.
@@ -53,6 +62,12 @@ def _hash(label: str) -> str:
 # ----------------------------------------------------------------------
 
 
+_PRINCIPAL_HEADER = "Coherence-Caller-Principal"
+"""The caller-principal request header: a FROZEN duplicate of the wire name,
+never imported from the code under test (a derived name moves with a rename
+instead of catching it)."""
+
+
 class _Client:
     """Tiny urllib-based client. Returns (status, body_dict)."""
 
@@ -71,12 +86,15 @@ class _Client:
         body: Optional[dict] = None,
         *,
         headers_override: Optional[dict] = None,
+        principal: Optional[str] = None,
     ) -> tuple[int, dict]:
         url = self.base + path
         data = json.dumps(body).encode("utf-8") if body is not None else b""
         headers = dict(self.headers)
         if headers_override:
             headers.update(headers_override)
+        if principal is not None:
+            headers[_PRINCIPAL_HEADER] = principal
         req = urlrequest.Request(url, data=data if method == "POST" else None,
                                  method=method, headers=headers)
         try:
@@ -97,8 +115,6 @@ def coordinator(tmp_path: Path):
     """A live coordinator on a random port, with secret extracted for tests."""
     server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
     server.serve_in_thread()
-    # Small delay so server is accepting before tests fire.
-    time.sleep(0.05)
     try:
         yield server
     finally:
@@ -515,13 +531,24 @@ def test_full_edit_cycle(coordinator, client: _Client) -> None:
 
 
 def test_failed_edit_releases_grant_without_bump(coordinator, client: _Client) -> None:
-    """KTD-1 release-on-failure: post-edit success:false releases E without bumping."""
-    client.post("/hooks/pre-read", {"session_id": _sid("A"), "path": "plan.md"})
-    client.post("/hooks/pre-edit", {"session_id": _sid("A"), "path": "plan.md"})
+    """KTD-1 release-on-failure: post-edit success:false releases E without bumping.
+
+    The grant check reads the agent the requests name — derived from the
+    same session id they post — and first asserts that agent HOLDS the
+    grant, so "no longer EXCLUSIVE" is measured against a grant that
+    existed. It used to read ``session_to_agent_id("A")``, an agent no
+    request touched, and the closing acquire by B succeeds whether or not
+    A released (a pre-edit preempts a holder): the test stayed green with
+    the release replaced by a no-op (#185)."""
+    sid = _sid("A")
+    agent_id = session_to_agent_id(sid)
+    client.post("/hooks/pre-read", {"session_id": sid, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
     artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    assert coordinator.registry.get_agent_state(artifact_id, agent_id) == MESIState.EXCLUSIVE
     version_before = coordinator.registry.get_artifact(artifact_id).version
     s, b = client.post("/hooks/post-edit",
-                        {"session_id": _sid("A"), "path": "plan.md",
+                        {"session_id": sid, "path": "plan.md",
                          "content_hash": _hash("ignored"), "success": False})
     assert s == 200
     assert b.get("released") is True
@@ -529,26 +556,38 @@ def test_failed_edit_releases_grant_without_bump(coordinator, client: _Client) -
     version_after = coordinator.registry.get_artifact(artifact_id).version
     assert version_after == version_before
     # Agent state is no longer EXCLUSIVE (some non-M/E state)
-    agent_id = session_to_agent_id("A")
     state = coordinator.registry.get_agent_state(artifact_id, agent_id)
     assert state not in (MESIState.EXCLUSIVE, MESIState.MODIFIED)
-    # Another session can now acquire immediately
+    # Another session's acquire is clean, with no collision warning naming A.
+    # A pre-edit takes over from a holder either way, so ``ok`` alone would
+    # pass on a release that did nothing.
     s2, b2 = client.post("/hooks/pre-edit", {"session_id": _sid("B"), "path": "plan.md"})
-    assert s2 == 200 and b2.get("ok") is True
+    assert s2 == 200 and b2 == {"ok": True}
 
 
-def test_session_stop_malformed_agent_id_does_not_release_parent(client: _Client) -> None:
+def test_session_stop_malformed_agent_id_does_not_release_parent(
+    coordinator, client: _Client
+) -> None:
     """P0 regression: a present-but-malformed agent_id on /hooks/session-stop
-    must fail closed (no-op), NOT degrade to the parent identity and release
-    the parent's live grants. The guard was briefly mis-wired into
+    must fail closed, NOT degrade to the parent identity and release the
+    parent's live grants. The guard was briefly mis-wired into
     _handle_pre_read instead of _handle_session_stop; no end-to-end test drove
-    the handler, so it shipped clean."""
-    client.post("/hooks/pre-edit", {"session_id": _sid("A"), "path": "plan.md"})  # parent holds E
-    # Every present-but-malformed JSON type → no-op; the parent's grant survives.
+    the handler, so it shipped clean.
+
+    And it is REFUSED (HTTP 400, as the effect fence refuses the same field),
+    never answered ``{ok: true, released_artifacts: []}``: that body reads as a
+    release that found nothing to release, so a client dropping its record on
+    the answer would forget a grant the coordinator still holds (#185)."""
+    sid = _sid("A")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})  # parent holds E
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    # Every present-but-malformed JSON type → refused; the parent's grant survives.
     for bad in (42, [1], {"k": 1}, True, "bad id!", "x" * 65):
-        s, b = client.post("/hooks/session-stop", {"session_id": _sid("A"), "agent_id": bad})
-        assert s == 200
-        assert b == {"ok": True, "released_artifacts": []}, f"malformed {bad!r} must be a no-op"
+        s, b = client.post("/hooks/session-stop", {"session_id": sid, "agent_id": bad})
+        assert (s, b) == (400, {"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"}), (
+            f"malformed {bad!r} must be refused")
+        assert coordinator.registry.get_agent_state(
+            artifact_id, session_to_agent_id(sid)) == MESIState.EXCLUSIVE
     # An ABSENT agent_id is a legitimate parent stop → the grant IS released.
     s, b = client.post("/hooks/session-stop", {"session_id": _sid("A")})
     assert s == 200
@@ -581,8 +620,11 @@ def test_collision_surfaces_via_additional_context(coordinator, client: _Client)
     assert out["permissionDecision"] == "allow"  # v0.1 warn only
     assert "Concurrent edit detected" in out["additionalContext"]
     assert "plan.md" in out["additionalContext"]
-    # The collision msg contains the holder's short session id (first 8 chars of A's UUID)
-    assert a_sid[:8] in out["additionalContext"]
+    # R7: the collision msg names the holder by the short form of its AGENT
+    # id -- the handle the registry keeps the grant under -- not by the
+    # session id that id was derived from.
+    assert session_to_agent_id(a_sid).hex[:8] in out["additionalContext"]
+    assert a_sid[:8] not in out["additionalContext"]
 
 
 # ----------------------------------------------------------------------
@@ -591,16 +633,27 @@ def test_collision_surfaces_via_additional_context(coordinator, client: _Client)
 
 
 def test_session_stop_releases_uncommitted_grants(coordinator, client: _Client) -> None:
-    """KTD-11: end-of-turn Stop releases any uncommitted EXCLUSIVE grants."""
-    client.post("/hooks/pre-edit", {"session_id": _sid("A"), "path": "plan.md"})
-    client.post("/hooks/pre-edit", {"session_id": _sid("A"), "path": "spec.md"})
+    """KTD-11: end-of-turn Stop releases any uncommitted EXCLUSIVE grants.
+
+    The grant check reads the agent the requests name — derived from the
+    same session id they post — and first asserts that agent HOLDS both
+    grants, so "no longer held" is measured against grants that existed. It
+    used to read ``session_to_agent_id("A")``, an agent no request touched,
+    whose state is absent whether or not the release ran: the test stayed
+    green with the release replaced by a no-op (#185)."""
+    sid = _sid("A")
+    agent_id = session_to_agent_id(sid)
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "spec.md"})
+    for path in ("plan.md", "spec.md"):
+        art_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        assert coordinator.registry.get_agent_state(art_id, agent_id) == MESIState.EXCLUSIVE
     # Stop fires
-    s, b = client.post("/hooks/session-stop", {"session_id": _sid("A")})
+    s, b = client.post("/hooks/session-stop", {"session_id": sid})
     assert s == 200 and b["ok"] is True
     released = set(b["released_artifacts"])
     assert released == {"plan.md", "spec.md"}
     # Neither artifact is held in M∪E by A anymore
-    agent_id = session_to_agent_id("A")
     for path in ("plan.md", "spec.md"):
         art_id = coordinator.registry.lookup_artifact_id_by_name(path)
         state = coordinator.registry.get_agent_state(art_id, agent_id)
@@ -663,6 +716,385 @@ def test_policy_untrack_persists_to_ignored_yaml(coordinator, client: _Client) -
     assert not coordinator.policy.is_tracked("docs/brainstorms/draft.md")
 
 
+# Entries the path validator accepts that YAML reads as something else when
+# written as a plain ``- <entry>`` line: an alias, tag, directive, block scalar,
+# flow collection, unclosed quote or stray indicator stops the whole file
+# parsing, so it loads as no entries (#284); a comment, anchor or mapping key
+# loads a different string; a bool, number, null or date loads a non-string;
+# and NEL or LS splits one entry into two lines. Plus characters a quoted
+# scalar must escape.
+_YAML_SIGNIFICANT_ENTRIES = [
+    "*.md", "**", "[abc].md", "{a,b}.md", "!x.md", "%x", "@x", "`x", "|x", ">x",
+    "'x", '"x', ",x", "a b", "x - **", "a #b", "&x data/**", "a: b", "? x",
+    "yes", "null", "010", "2026-10-12", "zz\x85- src/**", "a\u2028b", "a\x80b",
+    "\U0001f600.md", 'x"y', "a\\b", " lead", "trail ",
+]
+
+_POLICY_FILES = [
+    ("/policy/track", "tracked.yaml", "added", "user_added_patterns"),
+    ("/policy/untrack", "ignored.yaml", "removed", "ignored_patterns"),
+]
+
+
+@pytest.mark.parametrize(("file_name", "loaded_as"), [
+    ("tracked.yaml", "user_added_patterns"), ("ignored.yaml", "ignored_patterns"),
+])
+@pytest.mark.parametrize("entry", _YAML_SIGNIFICANT_ENTRIES)
+def test_the_policy_writer_appends_an_entry_that_reads_back_as_itself(
+    tmp_path: Path, file_name: str, loaded_as: str, entry: str
+) -> None:
+    """#284: the writer behind /policy/track and /policy/untrack appends an
+    entry that loads back as exactly the string it was given, and the entries
+    already in the file still load beside it. A plain ``- *.md`` line stopped
+    the file parsing, which loads as no entries, so the route answered
+    ``added`` while the coordinator dropped every entry."""
+    from ccs.adapters.claude_code.coordinator_server import _append_policy_yaml
+
+    policy_file = tmp_path / ".coherence" / file_name
+    policy_file.parent.mkdir()
+    policy_file.write_text("- runbook.md\n")
+    assert _append_policy_yaml(policy_file, [entry]) == ([entry], [])
+    assert yaml.safe_load(policy_file.read_bytes()) == ["runbook.md", entry]
+    loaded = policy_module.TrackedArtifactPolicy.load(tmp_path)
+    assert getattr(loaded, loaded_as) == ("runbook.md", entry)
+
+
+@pytest.mark.parametrize(("endpoint", "file_name", "answer_key", "loaded_as"), _POLICY_FILES)
+@pytest.mark.parametrize("entry", ["*.md", "zz\x85- src/**"])
+def test_a_policy_entry_reads_back_as_itself_beside_the_entries_already_there(
+    coordinator, client: _Client, endpoint: str, file_name: str, answer_key: str,
+    loaded_as: str, entry: str,
+) -> None:
+    """#284, on the wire: the entry a track or untrack writes loads back as
+    exactly the string it was sent, beside the entries already in the file, in
+    the live policy at once and in a fresh load as after a restart."""
+    root = coordinator.coordinator_root
+    policy_file = root / ".coherence" / file_name
+    policy_file.write_text("- runbook.md\n")
+    s, b = client.post(endpoint, {"paths": [entry]})
+    assert s == 200 and b == {"ok": True, answer_key: [entry], "rejected": []}, b
+    assert yaml.safe_load(policy_file.read_bytes()) == ["runbook.md", entry]
+    assert getattr(coordinator.policy, loaded_as) == ("runbook.md", entry)
+    loaded = policy_module.TrackedArtifactPolicy.load(root)
+    assert getattr(loaded, loaded_as) == ("runbook.md", entry)
+
+
+# A file an earlier release wrote with a plain ``*``-led line, files that hold
+# no list, files PyYAML cannot build (an impossible date, deep nesting, a core
+# tag on a value it cannot take), hand-written lists a block line cannot
+# follow, and a UTF-16 file.
+_UNAPPENDABLE_POLICY_FILES = [
+    ("- runbook.md\n- *.md\n", "is not valid YAML, so it loads as no entries"),
+    ("- runbook.md\n- 2026-13-45\n", "is not valid YAML, so it loads as no entries"),
+    ("[" * 2000 + "]" * 2000 + "\n", "is not valid YAML, so it loads as no entries"),
+    ("- runbook.md\n- !!bool x\n", "The parser stopped: KeyError: 'x'"),
+    ("- runbook.md\n- !!timestamp x\n", "The parser stopped: AttributeError: "),
+    ("- runbook.md\n- !!int\n", "The parser stopped: IndexError: "),
+    ("runbook.md\n", "holds a single string, not a list"),
+    ("{runbook.md: 1}\n", "holds a mapping, not a list"),
+    ("[runbook.md]\n", "cannot take a new line without breaking what it holds"),
+    ("  - runbook.md\n", "cannot take a new line without breaking what it holds"),
+    ("- runbook.md\n...\n", "cannot take a new line without breaking what it holds"),
+    ("~\n", "cannot take a new line without breaking what it holds"),
+    ("- runbook.md\n".encode("utf-16"), "is not UTF-8 text, so it cannot take a new line"),
+]
+
+
+@pytest.mark.parametrize("file_name", ["tracked.yaml", "ignored.yaml"])
+@pytest.mark.parametrize(("content", "says"), _UNAPPENDABLE_POLICY_FILES)
+def test_the_policy_writer_refuses_a_file_an_entry_cannot_take_effect_in(
+    tmp_path: Path, file_name: str, content: str | bytes, says: str
+) -> None:
+    """#284: when the file does not load as a list, or would stop loading as
+    its entries plus the new one, the writer raises ValueError (the routes
+    answer 400) naming the file and how to rewrite it, and writes nothing.
+    Appending to such a file answered ``ok`` for an entry that never applied,
+    again on every retry."""
+    from ccs.adapters.claude_code.coordinator_server import _append_policy_yaml
+
+    policy_file = tmp_path / ".coherence" / file_name
+    policy_file.parent.mkdir()
+    before = content if isinstance(content, bytes) else content.encode()
+    policy_file.write_bytes(before)
+    with pytest.raises(ValueError) as raised:
+        _append_policy_yaml(policy_file, ["ok.md"])
+    message = str(raised.value)
+    assert message.startswith(f".coherence/{file_name} "), message
+    assert says in message and "nothing was written" in message, message
+    assert 'double-quoted string such as - "*.md"' in message, message
+    assert policy_file.read_bytes() == before
+
+
+def _near_cap_policy_file(policy_file: Path) -> bytes:
+    """Fill ``policy_file`` with quoted entries to just under the policy YAML
+    cap, so that one more short entry crosses it. Returns the bytes written."""
+    from ccs.adapters.claude_code.coordinator_server import MAX_POLICY_YAML_BYTES
+
+    line = '- "f00000.md"\n'
+    content = "".join(
+        f'- "f{i:05d}.md"\n' for i in range(MAX_POLICY_YAML_BYTES // len(line))
+    ).encode()
+    assert MAX_POLICY_YAML_BYTES - len('- "ok.md"\n') < len(content) <= MAX_POLICY_YAML_BYTES
+    policy_file.write_bytes(content)
+    return content
+
+
+def test_the_policy_writer_refuses_an_entry_past_the_size_cap(tmp_path: Path) -> None:
+    """The policy file cap holds after the round-trip check moved ahead of it:
+    an entry that would take the file past MAX_POLICY_YAML_BYTES is refused
+    with ValueError (the routes answer 400) and nothing is written."""
+    from ccs.adapters.claude_code.coordinator_server import _append_policy_yaml
+
+    policy_file = tmp_path / ".coherence" / "tracked.yaml"
+    policy_file.parent.mkdir()
+    before = _near_cap_policy_file(policy_file)
+    with pytest.raises(ValueError, match="policy YAML cap of 65536 bytes would be exceeded"):
+        _append_policy_yaml(policy_file, ["ok.md"])
+    assert policy_file.read_bytes() == before
+
+
+def test_a_policy_route_answers_400_past_the_size_cap(coordinator, client: _Client) -> None:
+    """On the wire, the cap refusal is the 400 it always was, with the file
+    left as it was."""
+    policy_file = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
+    before = _near_cap_policy_file(policy_file)
+    s, b = client.post("/policy/track", {"paths": ["ok.md"]})
+    assert s == 400 and b == {"error": "policy YAML cap of 65536 bytes would be exceeded"}, b
+    assert policy_file.read_bytes() == before
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads a mode-000 file"
+)
+def test_the_policy_writer_refuses_a_file_it_cannot_read(tmp_path: Path) -> None:
+    """A policy file that exists but cannot be read is refused with
+    ValueError (the routes answer 400, as the Node coordinator does) and left
+    as it was. Read as empty, it would be replaced by a file holding only the
+    new entry; before, the route answered 500."""
+    from ccs.adapters.claude_code.coordinator_server import _append_policy_yaml
+
+    policy_file = tmp_path / ".coherence" / "tracked.yaml"
+    policy_file.parent.mkdir()
+    policy_file.write_text("- runbook.md\n")
+    policy_file.chmod(0)
+    try:
+        with pytest.raises(ValueError) as raised:
+            _append_policy_yaml(policy_file, ["ok.md"])
+    finally:
+        policy_file.chmod(0o600)
+    assert str(raised.value) == ".coherence/tracked.yaml could not be read (EACCES); nothing was written."
+    assert policy_file.read_text() == "- runbook.md\n"
+
+
+def test_a_coordinator_over_a_broken_policy_file_counts_it_on_status(tmp_path: Path) -> None:
+    """#284 at load time: a coordinator that starts over a tracked.yaml an
+    earlier release broke serves, and /status counts the file as rejected,
+    where it used to read as a workspace with no user patterns."""
+    (tmp_path / ".coherence").mkdir()
+    (tmp_path / ".coherence" / "tracked.yaml").write_text("- data/**\n- *.md\n")
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
+    server.serve_in_thread()
+    time.sleep(0.05)
+    try:
+        client = _Client("127.0.0.1", server.port, load_secret(tmp_path))
+        s, b = client.get("/status")
+        assert s == 200, b
+        assert b["policy_summary"]["rejected_pattern_count"] == 1, b["policy_summary"]
+        assert b["policy_summary"]["user_added_pattern_count"] == 0, b["policy_summary"]
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(("endpoint", "file_name", "answer_key", "loaded_as"), _POLICY_FILES)
+def test_a_policy_file_an_entry_cannot_take_effect_in_is_refused_untouched(
+    coordinator, client: _Client, endpoint: str, file_name: str, answer_key: str,
+    loaded_as: str,
+) -> None:
+    """#284, on the wire: a file an earlier release broke with a plain
+    ``- *.md`` line is refused with HTTP 400 naming the file, and left as it
+    was, where the route used to append to it and answer ``ok``."""
+    policy_file = coordinator.coordinator_root / ".coherence" / file_name
+    policy_file.write_text("- runbook.md\n- *.md\n")
+    s, b = client.post(endpoint, {"paths": ["ok.md"]})
+    assert s == 400, b
+    assert b["error"].startswith(f".coherence/{file_name} is not valid YAML"), b
+    assert "nothing was written" in b["error"], b
+    assert policy_file.read_text() == "- runbook.md\n- *.md\n"
+
+
+@pytest.fixture
+def strict_coordinator(tmp_path: Path):
+    """A live coordinator whose policy holds ``data/**`` tracked and strict."""
+    (tmp_path / ".coherence").mkdir()
+    (tmp_path / ".coherence" / "tracked.yaml").write_text("- data/**\n")
+    (tmp_path / ".coherence" / "strict_mode.yaml").write_text("- data/*.json\n")
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
+    server.serve_in_thread()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+
+
+@pytest.fixture
+def strict_client(strict_coordinator) -> _Client:
+    secret = load_secret(strict_coordinator.coordinator_root)
+    assert secret is not None
+    return _Client("127.0.0.1", strict_coordinator.port, secret)
+
+
+@pytest.mark.parametrize("entry", ["data/a.json", "data/*.json", "data/**", "**", "*.json"])
+def test_policy_untrack_refuses_an_entry_covering_a_strict_path(
+    strict_coordinator, strict_client: _Client, entry: str
+) -> None:
+    """#261: an untrack entry — a literal path, the strict glob itself, a
+    broader glob, or one spelled differently — that covers a path the live
+    policy holds in strict mode is refused with the typed reason, naming the
+    strict pattern, and the whole request writes nothing (the valid
+    non-strict entry beside it included). The path stays strict."""
+    s, b = strict_client.post("/policy/untrack", {"paths": [entry, "data/notes.txt", "/abs"]})
+    assert s == 409, b
+    assert b["ok"] is False
+    assert b["reason"] == "untrack_strict_path"
+    assert b["refused"] == [{"path": entry, "strict_patterns": ["data/*.json"]}]
+    assert [r["path"] for r in b["rejected"]] == ["/abs"]
+    assert "untrack_strict_path" in b["error"] and "restart" in b["error"]
+    assert not (strict_coordinator.coordinator_root / ".coherence" / "ignored.yaml").exists()
+    assert strict_coordinator.policy.is_strict_mode("data/a.json")
+    assert strict_coordinator.policy.is_tracked("data/notes.txt")
+
+
+def test_policy_untrack_decides_the_request_under_one_budget(
+    strict_coordinator, strict_client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The handler decides a request's entries under one search budget, so
+    the request answers within the CLI's timeout however many costly entries
+    it carries. Once that budget runs out, a later entry is refused (the
+    check errs toward refusing) and nothing is written."""
+    # data/[0-9] covers nothing; only a search of about 460 steps shows it.
+    monkeypatch.setattr(policy_module, "GLOB_INTERSECT_REQUEST_BUDGET", 700)
+    s, b = strict_client.post("/policy/untrack", {"paths": ["data/[0-9]", "data/[0-8]"]})
+    assert s == 409, b
+    assert b["refused"] == [{"path": "data/[0-8]", "strict_patterns": ["data/*.json"]}]
+    assert not (strict_coordinator.coordinator_root / ".coherence" / "ignored.yaml").exists()
+
+
+def test_policy_untrack_of_a_non_strict_path_round_trips_on_a_strict_coordinator(
+    strict_coordinator, strict_client: _Client
+) -> None:
+    """Control: an entry that covers no strict path untracks as before, and
+    tracking it again restores it; the strict path is untouched throughout."""
+    s, b = strict_client.post("/policy/untrack", {"paths": ["data/*.txt"]})
+    assert s == 200 and b == {"ok": True, "removed": ["data/*.txt"], "rejected": []}
+    assert not strict_coordinator.policy.is_tracked("data/notes.txt")
+    assert strict_coordinator.policy.is_strict_mode("data/a.json")
+    s, b = strict_client.post("/policy/track", {"paths": ["data/keep.txt"]})
+    assert s == 200 and b["added"] == ["data/keep.txt"]
+    # Ignore still wins over track for a non-strict path (unchanged semantics).
+    assert not strict_coordinator.policy.is_tracked("data/keep.txt")
+    assert strict_coordinator.policy.is_strict_mode("data/a.json")
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "entry"),
+    [("/policy/track", "runbook.md"), ("/policy/untrack", "data/*.txt")],
+)
+def test_a_reload_after_a_hand_edit_keeps_the_strict_path_enforced(
+    strict_coordinator, strict_client: _Client, endpoint: str, entry: str
+) -> None:
+    """The hot reload behind /policy/track and /policy/untrack never narrows
+    strict enforcement: removing the strict and tracked entries from disk and
+    then running either verb (here an untrack of a non-strict glob, which is
+    accepted) leaves the strict path tracked and strict until a restart.
+    Reverting either handler to a plain reload from disk ends enforcement."""
+    root = strict_coordinator.coordinator_root
+    (root / ".coherence" / "strict_mode.yaml").write_text("")
+    (root / ".coherence" / "tracked.yaml").write_text("")
+    s, _ = strict_client.post(endpoint, {"paths": [entry]})
+    assert s == 200
+    assert strict_coordinator.policy.is_strict_mode("data/a.json")
+    assert strict_coordinator.policy.is_tracked("data/a.json")
+    if endpoint == "/policy/track":
+        assert strict_coordinator.policy.is_tracked(entry)
+
+
+def test_a_stale_cas_on_a_strict_path_ignored_at_spawn_conflicts(tmp_path: Path) -> None:
+    """The broader-ignore case on the wire: ``ignored.yaml`` carries ``**``
+    when the coordinator starts. Strict wins over ignore, so the strict path
+    is not answered on the untracked fast path: a post-edit-cas at
+    expected_version 0 over a newer commit is a version_mismatch, not an
+    accepted overwrite."""
+    (tmp_path / ".coherence").mkdir()
+    (tmp_path / ".coherence" / "tracked.yaml").write_text("- data/**\n")
+    (tmp_path / ".coherence" / "strict_mode.yaml").write_text("- data/**\n")
+    (tmp_path / ".coherence" / "ignored.yaml").write_text("- '**'\n")
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
+    server.serve_in_thread()
+    try:
+        client = _Client("127.0.0.1", server.port, load_secret(tmp_path))
+        writer = _sid("ign-writer")
+        v = _occ_seed_shared(client, writer, "data/x.json", _hash("ign-v1"))
+        assert v >= 1, "the strict path is version-tracked despite the ignore"
+        s, b = client.post("/hooks/post-edit-cas", {
+            "session_id": writer, "path": "data/x.json", "success": True,
+            "content_hash": _hash("ign-v2"), "expected_version": v,
+        })
+        assert s == 200 and b == {"ok": True, "version": v + 1}, b
+        peer = _sid("ign-peer")
+        s, b = client.post("/hooks/post-edit-cas", {
+            "session_id": peer, "path": "data/x.json", "success": True,
+            "content_hash": _hash("ign-stale"), "expected_version": 0,
+        })
+        assert s == 200 and b.get("ok") is False, b
+        assert _artifact_version(server, "data/x.json") == v + 1
+    finally:
+        server.shutdown()
+
+
+def test_a_glob_led_track_keeps_a_strict_path_enforced_after_a_restart(tmp_path: Path) -> None:
+    """#284 + #261: tracking a ``*``-led glob on a coordinator that holds
+    ``data/**`` strict leaves the strict path enforced by the next coordinator
+    on the workspace. The plain ``- *.md`` line stopped tracked.yaml parsing,
+    so after a restart ``data/**`` was no longer tracked, strict mode (which
+    needs tracked) no longer applied, and a stale CAS at expected_version 0
+    overwrote a newer commit with nothing raised."""
+    (tmp_path / ".coherence").mkdir()
+    (tmp_path / ".coherence" / "tracked.yaml").write_text("- data/**\n")
+    (tmp_path / ".coherence" / "strict_mode.yaml").write_text("- data/**\n")
+    first = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
+    first.serve_in_thread()
+    time.sleep(0.05)
+    try:
+        client = _Client("127.0.0.1", first.port, load_secret(tmp_path))
+        s, b = client.post("/policy/track", {"paths": ["*.md"]})
+        assert s == 200 and b["added"] == ["*.md"], b
+    finally:
+        first.shutdown()
+
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
+    server.serve_in_thread()
+    time.sleep(0.05)
+    try:
+        client = _Client("127.0.0.1", server.port, load_secret(tmp_path))
+        writer = _sid("restart-writer")
+        v = _occ_seed_shared(client, writer, "data/x.json", _hash("restart-v1"))
+        s, b = client.post("/hooks/post-edit-cas", {
+            "session_id": writer, "path": "data/x.json", "success": True,
+            "content_hash": _hash("restart-v2"), "expected_version": v,
+        })
+        assert s == 200 and b == {"ok": True, "version": v + 1}, b
+        s, b = client.post("/hooks/post-edit-cas", {
+            "session_id": _sid("restart-peer"), "path": "data/x.json", "success": True,
+            "content_hash": _hash("restart-stale"), "expected_version": 0,
+        })
+        assert s == 200 and b.get("ok") is False, b
+        assert _artifact_version(server, "data/x.json") == v + 1
+        assert server.policy.is_strict_mode("data/x.json")
+        assert server.policy.is_tracked("notes.md")
+    finally:
+        server.shutdown()
+
+
 # ----------------------------------------------------------------------
 # /status
 # ----------------------------------------------------------------------
@@ -677,7 +1109,12 @@ def test_status_includes_tracked_artifacts_and_sessions(client: _Client) -> None
     restored here — pid is public on POSIX (any `ps` invocation lists
     it) so it does not exceed the threat model's accepted disclosure,
     and operators rely on it to verify "is the coordinator I think is
-    running actually mine"."""
+    running actually mine".
+
+    R6: the session row is keyed on ``agent_id`` here, not ``agent_name`` —
+    the name embeds the raw session id and is null below the operator tier.
+    The name itself is asserted at the full tier by
+    ``test_status_operator_tier_still_names_the_session``."""
     a_sid = _sid("A")
     client.post("/hooks/pre-read", {"session_id": a_sid, "path": "plan.md"})
     client.post("/hooks/pre-edit", {"session_id": a_sid, "path": "spec.md"})
@@ -686,8 +1123,8 @@ def test_status_includes_tracked_artifacts_and_sessions(client: _Client) -> None
     tracked_paths = {a["path"] for a in b["tracked_artifacts"]}
     assert "plan.md" in tracked_paths
     assert "spec.md" in tracked_paths
-    sessions = {sess["agent_name"] for sess in b["sessions"]}
-    assert f"claude-session-{a_sid}" in sessions
+    sessions = {sess["agent_id"] for sess in b["sessions"]}
+    assert str(session_to_agent_id(a_sid)) in sessions
     # AC-02: canonical field; old _s alias also present for one release.
     assert b["coordinator_uptime_seconds"] > 0
     assert b["coordinator_uptime_s"] == b["coordinator_uptime_seconds"]
@@ -745,8 +1182,8 @@ def test_body_not_object_returns_400(client: _Client) -> None:
 # ----------------------------------------------------------------------
 
 
-def test_every_endpoint_records_heartbeat(coordinator, client: _Client) -> None:
-    """KTD-2: every hook POST records the calling session's heartbeat."""
+def test_a_tracked_hook_call_records_the_heartbeat(coordinator, client: _Client) -> None:
+    """A pre-read or pre-edit of a tracked path records the calling session's heartbeat."""
     hb_sid = _sid("hb-session")
     agent_id = session_to_agent_id(hb_sid)
     assert coordinator.registry.last_heartbeat_tick(agent_id) is None
@@ -831,7 +1268,10 @@ def test_a1_preemption_surfaces_on_victim_next_pre_read(client: _Client) -> None
         f"prose should name the preemption explicitly; got: {msg}"
     )
     assert "plan.md" in msg
-    assert y[:8] in msg, f"prose should name the preempter session prefix; got: {msg}"
+    assert session_to_agent_id(y).hex[:8] in msg, (
+        f"prose should name the preempter's agent-id prefix; got: {msg}"
+    )
+    assert y[:8] not in msg, f"prose must not carry Y's session-id prefix; got: {msg}"
 
 
 def test_a1_fresh_with_notice_preserves_version_field(client: _Client) -> None:
@@ -865,7 +1305,7 @@ def test_a1_fresh_with_notice_preserves_version_field(client: _Client) -> None:
         f"fresh pre-read after a preemption must surface the notice; got {body}"
     )
     msg = body["hookSpecificOutput"]["additionalContext"]
-    assert "plan.md" in msg and y[:8] in msg, (
+    assert "plan.md" in msg and session_to_agent_id(y).hex[:8] in msg, (
         f"notice prose should name the preempted artifact + preempter; got: {msg}"
     )
     assert body.get("version") == 1, (
@@ -908,7 +1348,10 @@ def test_a1_preemption_surfaces_in_post_edit_failure_reason(client: _Client) -> 
     assert any(w in reason_lower for w in ("preempted", "revoked", "acquired by")), (
         f"failure reason must name the preemption; got: {reason}"
     )
-    assert y[:8] in reason, f"reason should name preempter session prefix; got: {reason}"
+    assert session_to_agent_id(y).hex[:8] in reason, (
+        f"reason should name the preempter's agent-id prefix; got: {reason}"
+    )
+    assert y[:8] not in reason, f"reason must not carry Y's session-id prefix; got: {reason}"
 
 
 def test_a1_preemption_notice_consumed_after_one_surface(client: _Client) -> None:
@@ -980,7 +1423,7 @@ def test_a1_stop_hook_surfaces_pending_notices(client: _Client) -> None:
     # Notice references the preempted artifact + preempter
     notice = notices[0]
     assert notice["path"] == "plan.md"
-    assert notice["preempter_session_id"].startswith(y[:8]) or notice["preempter_session_id"] == y
+    assert notice["preempter_agent_id"] == session_to_agent_id(y).hex
 
 
 def test_a1_stop_hook_consumes_notices_no_orphan(client: _Client) -> None:
@@ -999,7 +1442,16 @@ def test_a1_stop_hook_consumes_notices_no_orphan(client: _Client) -> None:
         msg = body["hookSpecificOutput"]["additionalContext"]
         # Notice was consumed at Stop; pre-read may still show stale-read
         # warning (X is INVALID) but should not contain preemption prose.
-        assert "preempted" not in msg.lower() and "revoked" not in msg.lower(), (
+        # Keyed on the notice BLOCK's own header, not on the words
+        # "preempted"/"revoked": since R8 the stale-read warning for a grant
+        # handover says "was revoked" itself, so a bare word match can no
+        # longer tell a re-surfaced notice from the ordinary stale prose --
+        # it would fail on correct behaviour and, had the wording gone the
+        # other way, would have passed on a real re-surfacing.
+        assert "Coordinator notice" not in msg, (
+            f"notice should be consumed at Stop; pre-read re-surfaced: {msg}"
+        )
+        assert "preempted/revoked by agent" not in msg, (
             f"notice should be consumed at Stop; pre-read re-surfaced: {msg}"
         )
 
@@ -1022,8 +1474,18 @@ def test_a1_prose_capped_under_10kb_with_many_notices(client: _Client) -> None:
                           {"session_id": x, "path": paths[0]})
     if "hookSpecificOutput" in body:
         msg = body["hookSpecificOutput"]["additionalContext"]
-        assert len(msg.encode("utf-8")) <= 10240, (
-            f"additionalContext should fit in 10KB cap; got {len(msg.encode('utf-8'))} bytes"
+        # 10,000, not 10240. Claude Code routes every hook's
+        # additionalContext through one helper that returns the string
+        # unchanged only while `length <= 1e4`; above that it persists the
+        # prose to a file and hands the model a ~2KB preview plus a path.
+        # 10240 is 10 KiB where the platform means 10,000, so this assertion
+        # permitted 240 bytes the platform would have offloaded. The Node
+        # sibling asserts the same figure on both its surfaces. Note the
+        # platform counts UTF-16 code units while this counts UTF-8 bytes,
+        # which is the stricter direction for prose carrying "⚠"/"•"/"—".
+        assert len(msg.encode("utf-8")) <= 10_000, (
+            f"additionalContext should fit in the 10,000-byte platform cap; "
+            f"got {len(msg.encode('utf-8'))} bytes"
         )
         # And the message should mention coalescing (e.g., "and N more")
         # so the model knows there are unsurfaced notices.
@@ -1601,6 +2063,31 @@ def test_i1_acquire_release_pair_balances_counter(tmp_path: Path) -> None:
         srv.shutdown()
 
 
+def test_a_stop_right_after_a_request_takes_well_under_the_old_half_second(tmp_path: Path) -> None:
+    """shutdown() waits for the accept loop to notice, and a served request
+    restarts the loop's wait. At the stdlib's 0.5 s poll every stop after a
+    request took about half a second; the coordinator polls every 50 ms.
+
+    The short sleep lets the loop re-enter its wait first: without it, a stop
+    can slip in before the loop goes back to sleep and return at once even at
+    0.5 s (1-3 trials in 100 on CI). Measured on ubuntu-24.04, 100 trials per
+    Python, idle and with three busy neighbours: the 50 ms poll stopped in at
+    most 0.043 s, the 0.5 s poll in no less than 0.480 s."""
+    for trial in range(3):
+        srv = CoordinatorHTTPServer(tmp_path / f"t{trial}", port=0, instance_id=f"stop-{trial}")
+        srv.serve_in_thread()
+        try:
+            secret = load_secret(srv.coordinator_root)
+            assert secret is not None
+            _Client("127.0.0.1", srv.port, secret).get("/status")
+            time.sleep(0.02)
+        finally:
+            started = time.monotonic()
+            srv.shutdown()
+            stopped_in = time.monotonic() - started
+        assert stopped_in < 0.25, f"trial {trial}: shutdown took {stopped_in:.3f} s"
+
+
 def test_i2_acquire_denied_after_shutdown_started(tmp_path: Path) -> None:
     """Once ``_shutting_down`` flips, acquire_handler_slot returns False
     so the dispatcher 503s instead of touching a closing registry."""
@@ -1623,7 +2110,6 @@ def test_i3_shutdown_waits_for_in_flight_handler(tmp_path: Path) -> None:
     returns rather than closing the registry under it."""
     srv = CoordinatorHTTPServer(tmp_path, port=0, instance_id="i3")
     srv.serve_in_thread()
-    time.sleep(0.05)
     secret = load_secret(srv.coordinator_root)
     assert secret is not None
     client = _Client("127.0.0.1", srv.port, secret)
@@ -1660,7 +2146,6 @@ def test_i4_shutdown_drain_timeout_records_flag(
     closes the registry anyway and records the timeout for observability."""
     srv = CoordinatorHTTPServer(tmp_path, port=0, instance_id="i4")
     srv.serve_in_thread()
-    time.sleep(0.05)
 
     # Keep an in-flight slot held for the duration of the test.
     assert srv.acquire_handler_slot() is True
@@ -2233,6 +2718,26 @@ def test_a8_status_exposes_coordinator_backend_and_version(client: _Client) -> N
     assert b["coordinator_version"]  # non-empty
 
 
+def test_status_reports_the_store_schema_version_at_every_tier(
+    coordinator, client: _Client
+) -> None:
+    """#294: every tier carries ``registry_schema_version``, the schema
+    version of the store this coordinator serves, so a client can tell which
+    store format a coordinator writes when one ``coordinator_version`` covers
+    several schema bumps. The expectation is the store's own
+    ``PRAGMA user_version``, read from the file, not the constant the handler
+    reports, so a field wired to the wrong number cannot agree with itself.
+    The bare name ``schema_version`` is the Node coordinator's, counted on its
+    own ledger with different numbers, and never appears here. (The degraded
+    answer carries the key through its set-equality test with the normal
+    body.)"""
+    on_disk = coordinator.registry._conn.execute("PRAGMA user_version").fetchone()[0]
+    for tier, body in _status_tiers(client).items():
+        assert body.get("registry_schema_version") == on_disk, tier
+        assert type(body["registry_schema_version"]) is int, tier
+        assert "schema_version" not in body, tier
+
+
 def test_a8_counters_increment_even_when_handler_raises(
     client: _Client, coordinator, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2323,7 +2828,12 @@ def test_r10_status_snapshot_consistent_under_churn(
     writers = [threading.Thread(target=writer) for _ in range(4)]
     for t in writers: t.start()
     try:
-        for _ in range(20):
+        # Five reads, not more: a /status that iterates the live name map
+        # fails on the first one, and each later read is slower because the
+        # writers never stop growing the table (twenty reads took 25s). A
+        # copy taken without the lock is not caught here: list(dict.items())
+        # does not release the GIL.
+        for _ in range(5):
             s, _ = client.get("/status")
             assert s == 200, "status returned non-200 under register_session churn"
     finally:
@@ -2370,9 +2880,9 @@ def test_r14_concurrent_policy_track_no_lost_writes(coordinator, client: _Client
     assert accepted, f"no requests succeeded — KTD-G cap may be too tight: {results}"
 
     yaml_path = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
-    text = yaml_path.read_text()
+    entries = yaml.safe_load(yaml_path.read_bytes())
     for p in accepted:
-        assert f"- {p}" in text, (
+        assert p in entries, (
             f"path {p!r} lost despite 200 response — fcntl.flock did not serialize"
         )
 
@@ -2387,11 +2897,15 @@ def test_r14_lock_file_created_next_to_yaml(coordinator, client: _Client) -> Non
     assert lock_path.is_file(), "tracked.yaml.lock sidecar was not created"
 
 
-def test_policy_track_idempotent_no_duplicate_entries(coordinator, client: _Client) -> None:
+@pytest.mark.parametrize("path", ["idempotent_test.md", "*.md"])
+def test_policy_track_idempotent_no_duplicate_entries(
+    coordinator, client: _Client, path: str
+) -> None:
     """Tracking the same path twice must not produce duplicate lines in
     tracked.yaml. The second call should still return 200 (idempotent) but
-    the path must appear exactly once in the YAML."""
-    path = "idempotent_test.md"
+    the path must appear exactly once in the YAML. A ``*``-led entry once
+    made the file unreadable to the dedupe, so every repeat appended again
+    and answered ``added`` again (#284)."""
     s1, b1 = client.post("/policy/track", {"paths": [path]})
     s2, b2 = client.post("/policy/track", {"paths": [path]})
     assert s1 == 200
@@ -2404,8 +2918,7 @@ def test_policy_track_idempotent_no_duplicate_entries(coordinator, client: _Clie
     )
 
     yaml_path = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
-    text = yaml_path.read_text()
-    occurrences = text.count(f"- {path}")
+    occurrences = (yaml.safe_load(yaml_path.read_bytes()) or []).count(path)
     assert occurrences == 1, (
         f"path {path!r} appears {occurrences}\xd7 in tracked.yaml after two track calls "
         f"(expected 1 \u2014 /policy/track must be idempotent)"
@@ -2413,46 +2926,117 @@ def test_policy_track_idempotent_no_duplicate_entries(coordinator, client: _Clie
 
 
 # ----------------------------------------------------------------------
-# _parse_yaml_pattern_lines unit tests
+# _read_policy_entries unit tests
 # ----------------------------------------------------------------------
 
 
-def test_parse_yaml_pattern_lines_plain_entries() -> None:
-    """Plain unquoted list items are extracted."""
-    from ccs.adapters.claude_code.coordinator_server import _parse_yaml_pattern_lines
+def test_read_policy_entries_plain_entries() -> None:
+    """Plain unquoted list items are extracted, in file order."""
+    from ccs.adapters.claude_code.coordinator_server import _read_policy_entries
     text = "- plan.md\n- src/main.py\n"
-    result = _parse_yaml_pattern_lines(text)
-    assert result == {"plan.md", "src/main.py"}
+    assert _read_policy_entries(text, ".coherence/tracked.yaml") == ["plan.md", "src/main.py"]
 
 
-def test_parse_yaml_pattern_lines_quoted_entries() -> None:
+def test_read_policy_entries_quoted_entries() -> None:
     """YAML-quoted values are extracted without the quotes."""
-    from ccs.adapters.claude_code.coordinator_server import _parse_yaml_pattern_lines
+    from ccs.adapters.claude_code.coordinator_server import _read_policy_entries
     text = '- "plan.md"\n- \'src/main.py\'\n'
-    result = _parse_yaml_pattern_lines(text)
-    assert result == {"plan.md", "src/main.py"}
+    assert _read_policy_entries(text, ".coherence/tracked.yaml") == ["plan.md", "src/main.py"]
 
 
-def test_parse_yaml_pattern_lines_empty_input() -> None:
-    """Empty or whitespace-only input returns empty set."""
-    from ccs.adapters.claude_code.coordinator_server import _parse_yaml_pattern_lines
-    assert _parse_yaml_pattern_lines("") == set()
-    assert _parse_yaml_pattern_lines("   \n  ") == set()
+def test_read_policy_entries_empty_input() -> None:
+    """Empty or whitespace-only input, and a null document, read as no entries."""
+    from ccs.adapters.claude_code.coordinator_server import _read_policy_entries
+    assert _read_policy_entries("", ".coherence/tracked.yaml") == []
+    assert _read_policy_entries("   \n  ", ".coherence/tracked.yaml") == []
+    assert _read_policy_entries("~\n", ".coherence/tracked.yaml") == []
 
 
-def test_parse_yaml_pattern_lines_non_string_items_ignored() -> None:
-    """Non-string items (numbers, null) are silently dropped."""
-    from ccs.adapters.claude_code.coordinator_server import _parse_yaml_pattern_lines
+def test_read_policy_entries_non_string_items_ignored() -> None:
+    """Non-string items (numbers, null) are dropped, as the loader drops them."""
+    from ccs.adapters.claude_code.coordinator_server import _read_policy_entries
     text = "- plan.md\n- 42\n- null\n"
-    result = _parse_yaml_pattern_lines(text)
-    assert result == {"plan.md"}
+    assert _read_policy_entries(text, ".coherence/tracked.yaml") == ["plan.md"]
 
 
-def test_parse_yaml_pattern_lines_malformed_yaml_returns_empty() -> None:
-    """Malformed YAML falls back to empty set rather than raising."""
-    from ccs.adapters.claude_code.coordinator_server import _parse_yaml_pattern_lines
-    result = _parse_yaml_pattern_lines("{not: a list}")
-    assert result == set()
+@pytest.mark.parametrize(
+    ("text", "says"),
+    [
+        ("{not: a list}", "holds a mapping, not a list"),
+        ("!!set {a}\n", "holds a mapping, not a list"),
+        ("runbook.md\n", "holds a single string, not a list"),
+        ("true\n", "holds a boolean, not a list"),
+        ("42\n", "holds a number, not a list"),
+        ("3.5\n", "holds a number, not a list"),
+        ("2026-10-12\n", "holds a date, not a list"),
+        ("2026-10-12 10:00:00\n", "holds a date, not a list"),
+        ("!!binary aGk=\n", "holds binary data, not a list"),
+        ("- a.md\n- *.md\n", "is not valid YAML"),
+        ("- a.md\n---\n- b.md\n", "more than one YAML document"),
+    ],
+)
+def test_read_policy_entries_refuses_a_file_that_loads_as_no_entries(text: str, says: str) -> None:
+    """A file that is not valid YAML, or not a list, loads as no entries: the
+    helper raises ValueError (the routes answer 400) naming the file, where it
+    once returned an empty set and the writer appended to the broken file
+    (#284)."""
+    from ccs.adapters.claude_code.coordinator_server import _read_policy_entries
+    with pytest.raises(ValueError, match="nothing was written") as raised:
+        _read_policy_entries(text, ".coherence/tracked.yaml")
+    assert str(raised.value).startswith(".coherence/tracked.yaml ")
+    assert says in str(raised.value)
+
+
+def test_read_policy_entries_blames_extra_documents_only_for_a_second_document() -> None:
+    """The refusal says the file holds more than one YAML document only when
+    it does. The parser's problem text quotes file content, so a tag that
+    decodes to "single document" in a one-document file must not be read as
+    that diagnosis."""
+    from ccs.adapters.claude_code.coordinator_server import _read_policy_entries
+    with pytest.raises(ValueError) as raised:
+        _read_policy_entries("- !single%20document x\n", ".coherence/tracked.yaml")
+    assert "single document" in str(raised.value)
+    assert "more than one YAML document" not in str(raised.value)
+    assert "An unclosed quote or bracket" in str(raised.value)
+
+
+@pytest.mark.parametrize("hidden", ["\u202e", "\u200b", "\x85", "\u2028", "\U000e0041"])
+def test_read_policy_entries_refusal_prints_no_raw_hidden_character(hidden: str) -> None:
+    """The refusal quotes the parser's reason, which quotes file content, and
+    clients print it to a terminal: a bidi override, zero-width or separator
+    character from the file appears escaped, never raw, so the printed line
+    reads as what it is."""
+    from ccs.adapters.claude_code.coordinator_server import _read_policy_entries
+    with pytest.raises(ValueError) as raised:
+        _read_policy_entries(f"- a.md\n- *{hidden}x\n", ".coherence/tracked.yaml")
+    message = str(raised.value)
+    assert "is not valid YAML" in message
+    assert hidden not in message, message
+
+
+def test_a_policy_write_that_fails_leaves_the_file_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The writer stages the new file beside the old one and renames it over:
+    a write that fails leaves the old file as it was and no temp file behind.
+    A truncating write in place could leave the file empty, which loads as no
+    entries."""
+    from ccs.adapters.claude_code.coordinator_server import _append_policy_yaml
+
+    policy_file = tmp_path / ".coherence" / "tracked.yaml"
+    policy_file.parent.mkdir()
+    policy_file.write_text("- runbook.md\n")
+
+    def fail(*_args: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "replace", fail)
+    with pytest.raises(OSError, match="No space left"):
+        _append_policy_yaml(policy_file, ["*.md"])
+    assert policy_file.read_text() == "- runbook.md\n"
+    assert sorted(p.name for p in policy_file.parent.iterdir()) == [
+        "tracked.yaml", "tracked.yaml.lock",
+    ]
 
 
 # ----------------------------------------------------------------------
@@ -2543,8 +3127,9 @@ def test_r11_ensure_secret_fails_closed_when_empty_file_persists(
 def test_r12_status_minimal_default_hides_coordinator_root(
     client: _Client,
 ) -> None:
-    """The default (no query) response is the minimal tier — coordinator_root
-    is the sentinel "." so $HOME / directory layout never leaks.
+    """The default (no query) response is the minimal tier — the top-level
+    coordinator_root is the sentinel "." (``policy_summary.coordinator_root``
+    is still the absolute root at this tier).
 
     P1 #7 (revision to R12): coordinator_pid IS included in minimal —
     pid is public on POSIX and operators rely on it. Only the absolute
@@ -2555,6 +3140,21 @@ def test_r12_status_minimal_default_hides_coordinator_root(
     assert b["coordinator_root"] == "."
     # P1 #7: pid is in minimal tier (reversion of R12 over-redaction).
     assert b.get("coordinator_pid") == os.getpid()
+
+
+@pytest.mark.parametrize("path", ["/status", "/status?detail=minimal", "/status?detail=fully"])
+def test_r12_status_below_the_operator_tier_publishes_the_root_nowhere(
+    client: _Client, coordinator, path: str,
+) -> None:
+    """The policy summary carries its own ``coordinator_root``. Below the
+    operator tier it is the same sentinel "." as the top-level key, and the
+    absolute root appears nowhere in the body. Prevents the default tier
+    publishing $HOME / directory layout through the nested key while the
+    top-level one is redacted."""
+    s, b = client.get(path)
+    assert s == 200
+    assert b["policy_summary"]["coordinator_root"] == "."
+    assert str(coordinator.coordinator_root) not in json.dumps(b)
 
 
 def test_r12_status_full_requires_operator_header(client: _Client) -> None:
@@ -2578,6 +3178,7 @@ def test_r12_status_full_with_operator_header_exposes_root_and_pid(
     assert s == 200
     assert b["detail"] == "full"
     assert b["coordinator_root"] == str(coordinator.coordinator_root)
+    assert b["policy_summary"]["coordinator_root"] == str(coordinator.coordinator_root)
     assert isinstance(b["coordinator_pid"], int)
     # Full tier also retains the artifact/session block.
     assert "tracked_artifacts" in b
@@ -2949,22 +3550,9 @@ def test_adv004_sweep_reclamation_records_preemption_notice(
     artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
     assert artifact_id is not None
 
-    # Drive the sweep manually so the heartbeat-stale path fires
-    # immediately. heartbeat_timeout_ticks=1 + current_tick well past
-    # the agent's last heartbeat triggers reclaim_heartbeat.
-    reclaimed_n = coordinator.service.enforce_stable_grant_timeouts(
-        current_tick=int(time.time()) + 999_999,
-        heartbeat_timeout_ticks=1,
-        max_hold_ticks=999_999_999,
-        on_reclaim=lambda artifact_id, agent_id, trigger: (
-            coordinator.registry.record_preemption_notice(
-                victim_agent_id=agent_id,
-                artifact_id=artifact_id,
-                preempter_agent_id=SWEEP_RECLAMATION_PREEMPTER_ID,
-                preempted_at_unix_ts=time.time(),
-            )
-        ),
-    )
+    # Drive the shipped sweep pass (the coordinator loop's own callback) with
+    # a tick well past the agent's last heartbeat, so reclaim_heartbeat fires.
+    reclaimed_n = _sweep(coordinator, int(time.time()) + 999_999)
     assert reclaimed_n == 1, "sweep should have reclaimed exactly one M/E grant"
 
     # The preemption notice for the victim must be present and tagged
@@ -2982,29 +3570,12 @@ def test_adv004_post_edit_after_reclamation_returns_reclaimed_message(
     'reclaimed by coordinator sweep' message (NOT the generic
     CoherenceError) and the response carries reclaimed=True instead of
     preempted=True."""
-    from ccs.adapters.claude_code.coordinator_server import (
-        SWEEP_RECLAMATION_PREEMPTER_ID,
-        session_to_agent_id,
-    )
-
     sid = _sid("adv004-B")
-    agent_id = session_to_agent_id(sid)
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
-    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
 
-    # Sweep reclaims agent's grant + records notice via the on_reclaim
-    # callback (same wiring the real adapter sweep uses).
-    coordinator.service.enforce_stable_grant_timeouts(
-        current_tick=int(time.time()) + 999_999,
-        heartbeat_timeout_ticks=1,
-        max_hold_ticks=999_999_999,
-        on_reclaim=lambda aid, sid_, trigger: coordinator.registry.record_preemption_notice(
-            victim_agent_id=sid_,
-            artifact_id=aid,
-            preempter_agent_id=SWEEP_RECLAMATION_PREEMPTER_ID,
-            preempted_at_unix_ts=time.time(),
-        ),
-    )
+    # The shipped sweep pass reclaims the grant and records the notice
+    # through the coordinator loop's own callback.
+    assert _sweep(coordinator, int(time.time()) + 999_999) == 1
 
     # Now post-edit fires — should fail with the reclaimed-message.
     s, body = client.post("/hooks/post-edit", {
@@ -3119,7 +3690,6 @@ def test_rel01_drain_no_deadlock_under_concurrent_dispatch(tmp_path: Path) -> No
     import threading as _t
     srv = CoordinatorHTTPServer(tmp_path, port=0, instance_id="rel01")
     srv.serve_in_thread()
-    time.sleep(0.05)
     secret = load_secret(srv.coordinator_root)
     assert secret is not None
     client = _Client("127.0.0.1", srv.port, secret)
@@ -3290,7 +3860,7 @@ def test_ac05_pre_edit_degraded_response_returns_ok_shape(
     result.get('ok') don't see None. AC-05 fix."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn, abort=None):
+    def force_timeout(fn, abort=None, deadline=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3312,7 +3882,7 @@ def test_ac05_post_edit_degraded_response_returns_ok_shape(
     include ok=True. AC-05 fix."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn, abort=None):
+    def force_timeout(fn, abort=None, deadline=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3337,7 +3907,7 @@ def test_ac05_session_stop_degraded_response_returns_ok_shape(
     must include ok=True. AC-05 fix."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn, abort=None):
+    def force_timeout(fn, abort=None, deadline=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3357,7 +3927,7 @@ def test_ac05_pre_read_degraded_response_keeps_status_fresh_shape(
     don't see ok=None. AC-05 contract preservation."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn, abort=None):
+    def force_timeout(fn, abort=None, deadline=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3381,7 +3951,7 @@ def test_a7_degraded_read_surfaces_advisory_not_silent(
     timeout cannot masquerade as a confirmed fresh read."""
     from concurrent.futures import TimeoutError as FuturesTimeout
 
-    def force_timeout(fn, abort=None):
+    def force_timeout(fn, abort=None, deadline=None):
         raise FuturesTimeout()
 
     monkeypatch.setattr(coordinator, "run_with_watchdog", force_timeout)
@@ -3397,6 +3967,218 @@ def test_a7_degraded_read_surfaces_advisory_not_silent(
     assert "timed out" in hso.get("additionalContext", "").lower(), (
         f"advisory must explain the freshness check did not run; got {hso!r}"
     )
+
+
+# ----------------------------------------------------------------------
+# Pre-edit's degraded disposition vs. the acquire-or-fail refusal (#196)
+#
+# A timed-out pre-edit is answered without its work body's decision, and the
+# body keeps running in the watchdog pool. These tests drive the REAL watchdog:
+# run_with_watchdog is not replaced. The registry's write lock is held from a
+# helper thread past a shortened deadline -- the contention that makes a
+# handler time out in production -- so the answer, and whatever the abandoned
+# body does once the lock frees, are the shipped code paths.
+# ----------------------------------------------------------------------
+
+# The held lock, not this value, is what makes the request time out; it only
+# needs to be short enough to keep the tests fast.
+#
+# Every session below CLAIMS and presents its caller principal. pre-edit is
+# require-class, and its gate runs BEFORE the work body: a presented principal
+# resolves from the service's in-process cache on the handler thread, but an
+# absent one on a never-claimed session is first looked up in the durable store
+# under the very registry lock these tests hold. That lookup is bounded by the
+# same watchdog deadline, so it would time out in the GATE and answer degraded
+# before the work body ever ran -- and these tests measure the work body. The
+# gate's own timeout is pinned in the caller-principal section below ("the gate
+# under registry contention").
+_DEGRADE_DEADLINE_SEC = 0.25
+_ABANDONED_BODY_SETTLE_SEC = 5.0
+
+
+class _HeldRegistryLock:
+    """Hold the coordinator registry's write lock from a helper thread.
+
+    A pre-edit work body's first registry call blocks on this lock, so the
+    request outlives the watchdog deadline. ``release`` lets the abandoned body
+    run, which is the moment its late effects either land or abort."""
+
+    def __init__(self, coordinator: CoordinatorHTTPServer) -> None:
+        self._lock = coordinator.registry._lock
+        self._held = threading.Event()
+        self._release = threading.Event()
+        self._thread = threading.Thread(target=self._hold, daemon=True)
+
+    def _hold(self) -> None:
+        with self._lock:
+            self._held.set()
+            self._release.wait(timeout=30.0)
+
+    def __enter__(self) -> "_HeldRegistryLock":
+        self._thread.start()
+        if not self._held.wait(timeout=5.0):
+            pytest.fail("helper thread never acquired the registry write lock")
+        return self
+
+    def release(self) -> None:
+        self._release.set()
+        self._thread.join(timeout=5.0)
+        if self._thread.is_alive():
+            pytest.fail("helper thread still holds the registry write lock after release")
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._release.set()
+        self._thread.join(timeout=5.0)
+
+
+def _await_abandoned_body_settled(
+    coordinator: CoordinatorHTTPServer, *, aborts_before: int, completions_before: int,
+) -> None:
+    """Wait until the timed-out body has finished one way or the other.
+
+    The watchdog's done-callback bumps ``watchdog_late_aborts_total`` when the
+    body aborted at the registry lock and ``watchdog_late_completion_total``
+    when it ran to the end, so either counter moving means the registry now
+    shows everything the body will ever do."""
+    deadline = time.monotonic() + _ABANDONED_BODY_SETTLE_SEC
+    while time.monotonic() < deadline:
+        if (coordinator._watchdog_late_aborts_total > aborts_before
+                or coordinator._watchdog_late_completion_total > completions_before):
+            return
+        time.sleep(0.010)
+    pytest.fail(
+        f"the timed-out pre-edit body never settled within {_ABANDONED_BODY_SETTLE_SEC}s: "
+        f"watchdog_late_aborts_total stayed {coordinator._watchdog_late_aborts_total} "
+        f"and watchdog_late_completion_total stayed "
+        f"{coordinator._watchdog_late_completion_total}"
+    )
+
+
+def _agent_state_on(coordinator: CoordinatorHTTPServer, path: str, sid: str) -> MESIState | None:
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    assert artifact_id is not None, f"{path} was never registered"
+    return coordinator.registry.get_agent_state(artifact_id, session_to_agent_id(sid, None))
+
+
+def test_pre_edit_watchdog_timeout_answers_the_named_degraded_disposition(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-edit that times out answers exactly ``_PRE_EDIT_DEGRADED_RESPONSE``.
+
+    Prevents the call site and the named constant drifting apart. The guard
+    test below holds the CONSTANT to the rule; this is the only test that ties
+    what the route actually sends to that constant, so a change that corrects
+    the constant but leaves the call site passing another envelope would ship
+    the old answer under a green guard. The AC-05 shape test cannot see that:
+    it pins ``ok: true`` itself rather than the constant, and it replaces
+    ``run_with_watchdog`` wholesale."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    sid = _sid("u8-timed-out")
+    principal = _explicit_claim(client, sid)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+
+    with _HeldRegistryLock(coordinator) as held:
+        status, body = client.post(
+            "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"}, principal=principal)
+        held.release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1, (
+        "the request did not time out, so this measured the undegraded route")
+    assert status == 200
+    assert body == mod._PRE_EDIT_DEGRADED_RESPONSE, (
+        f"a timed-out pre-edit answered {body!r}, not the named disposition")
+
+
+def test_pre_edit_late_body_after_timeout_grants_nothing_and_leaves_the_holder(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once released, a timed-out pre-edit's abandoned body must not grant the
+    caller EXCLUSIVE, and must not invalidate the peer holding it.
+
+    Prevents a late acquire contradicting the answer already written. The
+    caller was answered before any grant decision; if the body then acquired,
+    the caller would hold an EXCLUSIVE it was never told about and the holder
+    would lose a grant nobody reported taking -- the #196 displacement,
+    landing after the fact. The A6 abort at the registry lock is what stops
+    it, and this pins that the abort reaches pre-edit's acquire, in the one
+    scenario an acquire-or-fail refusal exists for: a live holder. The closing
+    undegraded call is the control: it shows the same request, not timed out,
+    does displace that holder, so the scenario really reaches the acquire."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    path = "plan.md"
+    holder, caller = _sid("u8-holder"), _sid("u8-late-caller")
+    holder_principal = _explicit_claim(client, holder)
+    caller_principal = _explicit_claim(client, caller)
+    status, _ = client.post(
+        "/hooks/pre-edit", {"session_id": holder, "path": path}, principal=holder_principal)
+    assert status == 200
+    assert _agent_state_on(coordinator, path, holder) == MESIState.EXCLUSIVE
+    assert _agent_state_on(coordinator, path, caller) is None
+
+    undegraded_deadline = mod.HANDLER_TIMEOUT_SEC
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+    with _HeldRegistryLock(coordinator) as held:
+        status, body = client.post(
+            "/hooks/pre-edit", {"session_id": caller, "path": path}, principal=caller_principal)
+        held.release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+    assert status == 200
+    assert body.get("degraded") is True, f"the request was not degraded: {body!r}"
+
+    assert _agent_state_on(coordinator, path, caller) is None, (
+        "the abandoned body granted the timed-out caller a grant it was never told about")
+    assert _agent_state_on(coordinator, path, holder) == MESIState.EXCLUSIVE, (
+        "the abandoned body invalidated the live holder after the caller was answered")
+    assert coordinator._watchdog_late_aborts_total == aborts_before + 1
+    assert coordinator._watchdog_late_completion_total == completions_before
+
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", undegraded_deadline)
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": caller, "path": path}, principal=caller_principal)
+    assert status == 200 and "degraded" not in body, body
+    assert _agent_state_on(coordinator, path, caller) == MESIState.EXCLUSIVE
+    assert _agent_state_on(coordinator, path, holder) == MESIState.INVALID
+
+
+def test_pre_edit_degraded_disposition_refuses_once_acquire_or_fail_can_refuse() -> None:
+    """While any acquire-or-fail refusal reason exists, a timed-out pre-edit
+    must answer ``ok: false``, never the admit.
+
+    Prevents the refusal asked for in #196 landing with a hole at the watchdog
+    seam. The contention that makes displacing a holder worth refusing is the
+    same contention that times a handler out; if the degraded answer were
+    still ``ok: true``, an opted-in caller would be told to proceed over the
+    holder it asked not to displace. ``ok: false`` is the shape
+    ``CoherentVolume._check_grant`` refuses in both ``on_error`` modes;
+    ``ok: true`` it lets through under ``degrade``.
+
+    Today the reason set is empty, so nothing is asserted about the
+    disposition -- deliberately: adding the first reason turns this red until
+    the disposition changes in the same change. If the refusal lands with a
+    separate disposition for opted-in requests, point this test at that one,
+    in that change. The timeout test above ties the named disposition to what
+    the route sends, so this is not a check on a constant nobody reads."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    refusal_reasons = mod._ACQUIRE_OR_FAIL_REFUSAL_REASONS
+    disposition = mod._PRE_EDIT_DEGRADED_RESPONSE
+    assert isinstance(refusal_reasons, frozenset)
+    assert all(isinstance(reason, str) and reason for reason in refusal_reasons)
+    if refusal_reasons:
+        assert disposition.get("ok") is False, (
+            f"pre-edit can refuse with {sorted(refusal_reasons)} but a timed-out "
+            f"pre-edit still answers {disposition!r}, which admits the edit"
+        )
 
 
 # ----------------------------------------------------------------------
@@ -4545,3 +5327,8507 @@ def test_deferred_reground_preset_abort_does_not_consume_flag(
     assert status == 200
     assert _reground_text_of(body) == armed_text
     assert coordinator.has_compact_pending(sid) is False
+
+
+# ======================================================================
+# Unknown-holder sentinel: the warn-mode renderers must not slice it
+# ======================================================================
+#
+# ``emit_strict_deny`` already preserves a ``<...>`` placeholder verbatim
+# (a bare ``[:8]`` yields the malformed ``<unknown``). The two warn-mode
+# renderers sliced unconditionally, so a post-restart collision — where
+# the adapter has no name for the surviving holder — reached the model as
+# "another session (<unknown) has been editing …".
+
+
+def test_warn_renderers_preserve_unknown_sentinel_verbatim() -> None:
+    """A ``<...>`` placeholder is prose, not an id: it renders whole in all
+    THREE renderers. Slicing it to 8 chars drops the closing bracket."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    collision = hp.edit_collision_warning(
+        holder_session_id="<unknown>",
+        holder_acquired_at_unix_ts=1700000000.0,
+        path="docs/plan.md",
+    )
+    assert "(<unknown>)" in collision
+    assert "(<unknown)" not in collision
+
+    stale = hp.stale_read_warning({
+        "path": "docs/plan.md",
+        "last_writer_session_id": "<unknown>",
+        "last_writer_at_unix_ts": 1700000000.0,
+        "warning_generated_at_unix_ts": 1700000001.0,
+        "hash_differs": False,
+        "prior_version_seen_by_session": 1,
+        "current_version": 2,
+        "your_version": 1,
+    })
+    assert "agent <unknown> at" in stale
+    assert "agent <unknown at" not in stale
+
+    # The guarded renderer is the reference behavior, not a third variant.
+    deny = hp.emit_strict_deny(source="test", summary={
+        "path": "docs/plan.md",
+        "last_writer_session_id": "<unknown>",
+        "last_writer_at_unix_ts": 1700000000.0,
+        "warning_generated_at_unix_ts": 1700000001.0,
+        "hash_differs": False,
+        "prior_version_seen_by_session": 1,
+        "current_version": 2,
+        "your_version": 1,
+    })
+    assert "<unknown>" in deny["permissionDecisionReason"]
+
+
+def test_real_session_ids_still_render_as_eight_char_prefixes() -> None:
+    """The sentinel guard is keyed on the ``<...>`` shape, so a real UUID
+    session id keeps its short form in both warn renderers."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    sid = "f2f7eab3-1111-4111-8111-111111111111"
+    collision = hp.edit_collision_warning(
+        holder_session_id=sid,
+        holder_acquired_at_unix_ts=1700000000.0,
+        path="docs/plan.md",
+    )
+    assert "(f2f7eab3)" in collision
+    assert sid not in collision
+
+    stale = hp.stale_read_warning({
+        "path": "docs/plan.md",
+        "last_writer_session_id": sid,
+        "last_writer_at_unix_ts": 1700000000.0,
+        "warning_generated_at_unix_ts": 1700000001.0,
+        "hash_differs": False,
+        "prior_version_seen_by_session": 1,
+        "current_version": 2,
+        "your_version": 1,
+    })
+    assert "agent f2f7eab3 at" in stale
+    assert sid not in stale
+
+
+# ``coordinator_server`` has its OWN two renderers of the same prose, and PR
+# #200 -- which added ``short_session_id`` and the three tests above -- never
+# generalized the guard to them. Its commit message says so outright. That file
+# imports ``hook_payloads as _payloads`` but never called the helper, so the
+# docstring contract at hook_payloads.py ("Every renderer that shortens an
+# identity handle for prose goes through here") was asserted and unenforced.
+#
+# Since R7 the preempter arm cannot reach the sentinel at all: the notice row
+# carries the preempter's agent id, so there is nothing to fail to look up.
+# The sentinel arm that IS still reachable is the last-writer one -- an
+# artifact with no committed writer -- and the two warn-renderer tests above
+# cover it.
+
+
+def test_preemption_prose_does_not_consult_the_agent_name_map() -> None:
+    """The preempter is named without any lookup, so a restart cannot blank it.
+
+    This test used to assert the opposite outcome: a coordinator that could
+    not name the preempter rendered ``session <unknown> at ...``, and the
+    assertion was that the sentinel kept its closing bracket. That degraded
+    state was the ORDINARY one after a restart -- pending notices live in
+    SQLite while the agent-name map is an in-process dict seeded empty on
+    every start -- so the attribution an operator most needed was the one
+    most likely to be missing.
+
+    The stub coordinator here has no ``agent_name_for`` at all. Rendering
+    still succeeds and still names the preempter, which is what proves the
+    lookup is gone rather than merely unused.
+    """
+    from uuid import UUID
+
+    from ccs.adapters.claude_code import coordinator_server as cs
+
+    class _Artifact:
+        name = "docs/plan.md"
+
+    class _Registry:
+        def get_artifact(self, artifact_id):  # noqa: ANN001, ANN201
+            return _Artifact()
+
+    class _NamelessCoordinator:
+        registry = _Registry()
+
+    preempter = UUID("22222222-2222-4222-8222-222222222222")
+    text = cs._build_preemption_text(
+        _NamelessCoordinator(),
+        [(UUID("11111111-1111-4111-8111-111111111111"), preempter, 1700000000.0)],
+    )
+    assert "preempted/revoked by agent 22222222 at" in text
+    assert "<unknown" not in text
+
+
+def test_preemption_prose_is_byte_stable_for_a_real_agent_id() -> None:
+    """Pin the WHOLE rendered string, not substrings.
+
+    This file is held at cross-backend wire parity and the sentinel fix reflowed
+    one f-string across two physical lines to stay inside ruff's limit. That
+    reflow was proved byte-neutral by executing both module versions side by
+    side -- a one-time check, which is exactly the kind that does not survive the
+    next edit. Every other test here asserts substrings, so a stray space or a
+    re-wrapped clause moves bytes and stays green.
+
+    Scoped deliberately to ``_build_preemption_text``: it is the renderer that
+    was reflowed, and its output is fully determined by its inputs. The sibling
+    renderer at ``_handle_post_edit`` closes with ``Underlying coordinator error:
+    {exc}`` over a preemption timestamp the test does not choose, so a golden
+    there would pin values that legitimately vary -- worse than the substring
+    assertions it would replace. That one keeps them.
+    """
+    from uuid import UUID
+
+    from ccs.adapters.claude_code import coordinator_server as cs
+
+    class _Artifact:
+        name = "docs/plan.md"
+
+    class _Registry:
+        def get_artifact(self, artifact_id):  # noqa: ANN001, ANN201
+            return _Artifact()
+
+    class _NamedCoordinator:
+        """A plain coordinator -- the REAL-id path, where bytes must not move."""
+
+        registry = _Registry()
+
+    text = cs._build_preemption_text(
+        _NamedCoordinator(),
+        [(
+            UUID("11111111-1111-4111-8111-111111111111"),
+            UUID("22222222-2222-4222-8222-222222222222"),
+            1700000000.0,
+        )],
+    )
+
+    assert text == (
+        "\u26a0 Coordinator notice: your EXCLUSIVE grant was preempted:\n"
+        "  \u2022 docs/plan.md \u2014 preempted/revoked by agent 22222222 at "
+        "2023-11-14T22:13:20+00:00. Any local edit you made to this file will "
+        "land in your worktree but is NOT reflected in the coordinator's version.\n"
+        "Re-read affected files before continuing if you need the latest "
+        "coordinator-tracked version, or proceed knowing your edits remain "
+        "local-only until you re-acquire and commit."
+    )
+
+
+def test_post_edit_preemption_reason_survives_a_real_restart(tmp_path: Path) -> None:
+    """The second renderer, ``_handle_post_edit``'s ``commit_not_allowed`` reason,
+    driven across an ACTUAL coordinator restart.
+
+    This used to assert the restart DEGRADED the attribution: the preemption
+    notice is durable in SQLite while the agent-name map is process-local and
+    starts empty, so the reverse lookup returned None and the reason named
+    ``session <unknown>``. Since R7 the renderer reads the preempter's agent
+    id straight off the notice row, so the restart costs nothing and the
+    reason names Y on both sides of it. That is the assertion now.
+
+    Restarting for real rather than clearing ``_agent_names`` in place keeps the
+    test off a private attribute AND proves the half the simulation had to assume:
+    that the notice actually survives the process. The agent id is a uuid5 of the
+    session id, so X's id is the same on both sides of the restart -- which is
+    exactly why the notice still finds it.
+    """
+    x = _sid("X")
+    y = _sid("Y")
+
+    before = _restart_on(tmp_path, "notice-before-restart")
+    try:
+        secret = load_secret(before.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", before.port, secret)
+        client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+        client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})  # preempts X
+    finally:
+        before.shutdown()
+
+    after = _restart_on(tmp_path, "notice-after-restart")
+    try:
+        secret = load_secret(after.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", after.port, secret)
+        status, body = client.post(
+            "/hooks/post-edit",
+            {"session_id": x, "path": "plan.md", "content_hash": _hash("h"), "success": True},
+        )
+    finally:
+        after.shutdown()
+
+    assert status == 200
+    assert body.get("ok") is False, f"post-edit on a preempted grant must fail; got {body}"
+
+    reason = body.get("reason", "")
+    assert "preempted by agent" in reason, (
+        f"the notice did not survive the restart, so this asserts nothing; got: {reason}"
+    )
+    assert f"preempted by agent {session_to_agent_id(y).hex[:8]} at" in reason, (
+        f"the restart must not cost the attribution; got: {reason}"
+    )
+    assert "<unknown" not in reason, (
+        f"there is no lookup left to fail, so nothing can degrade to a "
+        f"sentinel here; got: {reason}"
+    )
+
+
+# ======================================================================
+# /status holder set survives a coordinator restart
+# ======================================================================
+#
+# ``sessions`` used to be built by walking the adapter's in-memory
+# ``_agent_names`` map and looking each agent up in the registry snapshot.
+# That map is seeded empty on every process start and is only ever written
+# by ``register_session`` on hook traffic, so a restart erased every holder
+# from the payload while ``agent_states`` — and enforcement — kept them.
+# The registry's own holder set is the source of truth; a name is a label
+# the adapter may or may not have.
+
+
+def _restart_on(root: Path, instance_id: str) -> CoordinatorHTTPServer:
+    server = CoordinatorHTTPServer(root, port=0, instance_id=instance_id)
+    server.serve_in_thread()
+    return server
+
+
+def test_status_lists_a_grant_holder_that_predates_the_restart(
+    tmp_path: Path,
+) -> None:
+    """A holder whose grant survived a restart is reported, keyed on its raw
+    agent id with a null name — not dropped. Enforcement never stopped, so a
+    caller polling /status must not read the workspace as idle."""
+    first = _restart_on(tmp_path, "restart-before")
+    try:
+        secret = load_secret(first.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", first.port, secret)
+        sid = _sid("survivor")
+        client.post("/policy/track", {"paths": ["docs/plan.md"]})
+        client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+
+        _, before = client.get(
+            "/status?detail=full",
+            headers_override={"Coherence-Local-Operator": "true"},
+        )
+        assert [s["agent_name"] for s in before["sessions"]] == [
+            f"claude-session-{sid}"
+        ]
+        assert before["sessions"][0]["states"] == {"docs/plan.md": "EXCLUSIVE"}
+    finally:
+        first.shutdown()
+
+    second = _restart_on(tmp_path, "restart-after")
+    try:
+        secret = load_secret(second.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", second.port, secret)
+        _, after = client.get(
+            "/status?detail=full",
+            headers_override={"Coherence-Local-Operator": "true"},
+        )
+
+        assert len(after["sessions"]) == 1, (
+            "the EXCLUSIVE grant is still in agent_states and still arbitrates; "
+            "dropping it from /status makes a held file read as idle"
+        )
+        holder = after["sessions"][0]
+        assert holder["agent_id"] == str(session_to_agent_id(sid))
+        assert holder["agent_name"] is None, (
+            "the agent id is a uuid5 of the session id — unrecoverable, so the "
+            "name is honestly absent rather than guessed"
+        )
+        assert holder["states"] == {"docs/plan.md": "EXCLUSIVE"}
+
+        # The same grant that /status now reports is the one enforcement uses.
+        _, collide = client.post(
+            "/hooks/pre-edit",
+            {"session_id": _sid("peer"), "path": "docs/plan.md"},
+        )
+        assert collide["collision"] is True
+    finally:
+        second.shutdown()
+
+
+def test_post_restart_holder_is_listed_at_the_default_tier(tmp_path: Path) -> None:
+    """The unnamed holder appears at the DEFAULT tier, not only behind
+    ?detail=full + the operator header. That is the security-relevant case, so
+    it is pinned explicitly: `sessions` has always been a minimal-tier field,
+    and this row repeats an `agent_id` already emitted there while dropping the
+    session-id-bearing `agent_name` — narrower than the named row it replaces.
+    """
+    first = _restart_on(tmp_path, "tier-before")
+    try:
+        secret = load_secret(first.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", first.port, secret)
+        sid = _sid("tier-survivor")
+        client.post("/policy/track", {"paths": ["docs/plan.md"]})
+        client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+    finally:
+        first.shutdown()
+
+    second = _restart_on(tmp_path, "tier-after")
+    try:
+        secret = load_secret(second.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", second.port, secret)
+
+        # Default tier: no query string, no operator header.
+        _, minimal = client.get("/status")
+        assert minimal["detail"] == "minimal"
+        assert [s["agent_id"] for s in minimal["sessions"]] == [
+            str(session_to_agent_id(sid))
+        ]
+        assert minimal["sessions"][0]["agent_name"] is None
+        assert minimal["sessions"][0]["states"] == {"docs/plan.md": "EXCLUSIVE"}
+
+        # The metrics tier still omits the collection entirely.
+        _, metrics = client.get("/status?detail=metrics")
+        assert "sessions" not in metrics
+    finally:
+        second.shutdown()
+
+
+# ======================================================================
+# /status tracked_artifacts carries the last writer (#199 §2)
+# ======================================================================
+#
+# Writer identity reached callers only on the stale deny/warn arms; nothing a
+# caller could *ask* returned it. It now rides ``tracked_artifacts`` at the
+# operator-gated full tier, read from the same batched snapshot row.
+
+
+def _operator_status(client: _Client) -> dict:
+    s, b = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    assert s == 200
+    return b
+
+
+def test_status_full_tier_reports_last_writer(client: _Client) -> None:
+    writer = _sid("writer")
+    client.post("/hooks/pre-read", {"session_id": _sid("reader"), "path": "plan.md", "content_hash": _hash("h1")})
+    client.post("/hooks/pre-edit", {"session_id": writer, "path": "plan.md"})
+    client.post("/hooks/post-edit",
+                {"session_id": writer, "path": "plan.md",
+                 "content_hash": _hash("h2"), "success": True})
+
+    before = time.time()
+    payload = _operator_status(client)
+    [entry] = payload["tracked_artifacts"]
+    assert entry["version"] == 2
+    assert entry["last_writer_agent_id"] == str(session_to_agent_id(writer))
+    # No session id is re-derived from the agent id; the operator gets the
+    # name by joining against ``sessions[]``, which this tier already names.
+    assert "last_writer_session_id" not in entry
+    [row] = [s for s in payload["sessions"] if s["agent_id"] == entry["last_writer_agent_id"]]
+    assert writer in row["agent_name"]
+    assert isinstance(entry["last_writer_at_unix_ts"], float)
+    assert entry["last_writer_at_unix_ts"] <= before
+
+
+def test_status_full_tier_writer_is_null_before_any_commit(client: _Client) -> None:
+    """A first-observed artifact has no writer; its ``updated_at`` stamps the
+    observation, so it must not be reported as a write time."""
+    client.post("/hooks/pre-read", {"session_id": _sid("A"), "path": "plan.md", "content_hash": _hash("h1")})
+    [entry] = _operator_status(client)["tracked_artifacts"]
+    assert entry["last_writer_agent_id"] is None
+    assert entry["last_writer_at_unix_ts"] is None
+
+
+def test_status_full_tier_names_a_subagent_writer_through_sessions(client: _Client) -> None:
+    """A subagent's commit is attributed to the (session, subagent) agent, and
+    joining on ``sessions[]`` names both halves. A label re-derived from the
+    agent id instead carried only the bare subagent id ("worker-1")."""
+    sid = _sid("sub-writer")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md", "agent_id": "worker-1"})
+    client.post("/hooks/post-edit",
+                {"session_id": sid, "path": "plan.md", "agent_id": "worker-1",
+                 "content_hash": _hash("h2"), "success": True})
+
+    payload = _operator_status(client)
+    [entry] = payload["tracked_artifacts"]
+    assert entry["last_writer_agent_id"] == str(session_to_agent_id(sid, "worker-1"))
+    assert entry["last_writer_agent_id"] != str(session_to_agent_id(sid))
+    [row] = [s for s in payload["sessions"] if s["agent_id"] == entry["last_writer_agent_id"]]
+    assert row["agent_name"] == f"claude-session-{sid}:subagent-worker-1"
+
+
+def test_status_minimal_tier_omits_last_writer(client: _Client) -> None:
+    """Writer attribution names which session wrote what; below the operator
+    tier it stays out until #198 settles the default tier's disclosure."""
+    writer = _sid("writer")
+    client.post("/hooks/pre-edit", {"session_id": writer, "path": "plan.md"})
+    client.post("/hooks/post-edit",
+                {"session_id": writer, "path": "plan.md",
+                 "content_hash": _hash("h2"), "success": True})
+    _, minimal = client.get("/status")
+    [entry] = minimal["tracked_artifacts"]
+    assert set(entry) == {"path", "version", "id"}
+
+
+def test_status_last_writer_survives_a_restart(tmp_path: Path) -> None:
+    """The agent id and timestamp come from the durable row, so they outlive
+    the process that recorded them."""
+    first = _restart_on(tmp_path, "writer-before")
+    try:
+        secret = load_secret(first.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", first.port, secret)
+        sid = _sid("writer-survivor")
+        client.post("/policy/track", {"paths": ["docs/plan.md"]})
+        client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+        client.post("/hooks/post-edit",
+                    {"session_id": sid, "path": "docs/plan.md",
+                     "content_hash": _hash("h2"), "success": True})
+        [entry] = _operator_status(client)["tracked_artifacts"]
+        written_at = entry["last_writer_at_unix_ts"]
+        assert entry["last_writer_agent_id"] == str(session_to_agent_id(sid))
+    finally:
+        first.shutdown()
+
+    second = _restart_on(tmp_path, "writer-after")
+    try:
+        secret = load_secret(second.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", second.port, secret)
+        [entry] = _operator_status(client)["tracked_artifacts"]
+        assert entry["last_writer_agent_id"] == str(session_to_agent_id(sid))
+        assert entry["last_writer_at_unix_ts"] == written_at
+    finally:
+        second.shutdown()
+
+
+def test_status_omits_invalidated_holders_after_a_restart(tmp_path: Path) -> None:
+    """Only non-INVALID states count as holding. A session whose grant was
+    taken away must not reappear as a holder just because its row survives."""
+    first = _restart_on(tmp_path, "inv-before")
+    try:
+        secret = load_secret(first.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", first.port, secret)
+        loser, winner = _sid("inv-loser"), _sid("inv-winner")
+        client.post("/policy/track", {"paths": ["docs/plan.md"]})
+        client.post("/hooks/pre-edit", {"session_id": loser, "path": "docs/plan.md"})
+        client.post("/hooks/pre-edit", {"session_id": winner, "path": "docs/plan.md"})
+    finally:
+        first.shutdown()
+
+    second = _restart_on(tmp_path, "inv-after")
+    try:
+        secret = load_secret(second.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", second.port, secret)
+        _, after = client.get(
+            "/status?detail=full",
+            headers_override={"Coherence-Local-Operator": "true"},
+        )
+        by_id = {s["agent_id"]: s for s in after["sessions"]}
+        assert str(session_to_agent_id(winner)) in by_id
+        assert str(session_to_agent_id(loser)) not in by_id
+    finally:
+        second.shutdown()
+
+
+def test_status_still_lists_a_registered_session_holding_nothing(
+    client: _Client,
+) -> None:
+    """No regression on the live path: a session that registered but holds no
+    grant keeps its entry with an empty state map.
+
+    R6 split this across tiers. The row is keyed on ``agent_id`` at both, and
+    the operator tier is where the name proves the entry came from the
+    registration path rather than the registry's unnamed-holder branch — at
+    the default tier the two shapes are deliberately indistinguishable.
+    """
+    sid = _sid("named-no-grants")
+    client.post("/hooks/session-start", {"session_id": sid})
+    agent_id = str(session_to_agent_id(sid))
+
+    _, body = client.get("/status")
+    by_id = {s["agent_id"]: s for s in body["sessions"]}
+    assert agent_id in by_id
+    assert by_id[agent_id]["states"] == {}
+    assert by_id[agent_id]["agent_name"] is None
+
+    _, full = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    named = {s["agent_id"]: s for s in full["sessions"]}
+    assert named[agent_id]["agent_name"] == f"claude-session-{sid}"
+    assert named[agent_id]["states"] == {}
+
+
+def test_status_entry_keys_match_the_documented_shape(client: _Client) -> None:
+    """``StatusResponse`` documented ``last_writer``/``session_id`` keys the
+    handler has never emitted, and nothing in the tree type-checks against it,
+    so the drift was invisible. Pin the shape against a live body instead."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    sid = _sid("shape")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "spec.md"})
+    _, body = client.get("/status")
+
+    assert set(hp.StatusResponse.__annotations__) <= set(body)
+    assert {k for a in body["tracked_artifacts"] for k in a} == {
+        "path", "version", "id",
+    }
+    assert {k for s in body["sessions"] for k in s} == {
+        "agent_name", "agent_id", "states",
+    }
+
+
+# ======================================================================
+# R6 — per-artifact state below the operator tier carries no raw
+#       session identifier
+# ======================================================================
+#
+# ``agent_name`` renders ``claude-session-<session_id>`` verbatim, so every
+# tier that carried a session row also republished the raw session id beside
+# that session's per-artifact state. ``agent_id`` — a uuid5 of the same
+# session id, documented at ``session_to_agent_id`` as not reversible — is
+# already on the row and is the handle callers should attribute by. The
+# operator (full-detail) tier keeps the name; everything below it drops it
+# and renders through the null-name fallback the CLI already has.
+#
+# Each test here drives a LIVE session holding a real grant. An empty
+# workspace emits ``sessions: []``, which cannot observe any of this.
+
+
+def _session_id_appears_in(body: dict, sid: str) -> bool:
+    """True if the raw session id is reachable anywhere in the payload —
+    any key, any value, any nesting depth."""
+    return sid in json.dumps(body)
+
+
+def test_status_default_tier_reports_state_without_the_session_id(
+    client: _Client,
+) -> None:
+    """The default tier still answers "who holds what", and answers it with
+    the non-reversible ``agent_id`` only.
+
+    The control matters more than the assertion: an empty ``sessions`` list
+    would satisfy "no session id in the body" while observing nothing, so the
+    row and its per-artifact state are asserted present FIRST.
+    """
+    sid = _sid("r6-default-tier")
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+
+    _, body = client.get("/status")
+    assert body["detail"] == "minimal"
+
+    # Control: the case this test claims to inspect is actually present.
+    rows = [s for s in body["sessions"] if s["agent_id"] == str(session_to_agent_id(sid))]
+    assert len(rows) == 1, f"no row for the live session; sessions={body['sessions']}"
+    assert rows[0]["states"] == {"docs/plan.md": "EXCLUSIVE"}, (
+        "per-artifact state must still be reported — dropping the whole row "
+        "would pass the redaction assertion while telling the operator nothing"
+    )
+
+    # The requirement.
+    assert rows[0]["agent_name"] is None
+    assert not _session_id_appears_in(body, sid), (
+        f"the raw session id is still reachable in the default-tier body: "
+        f"{json.dumps(body)[:400]}"
+    )
+
+
+def test_status_operator_tier_still_names_the_session(client: _Client) -> None:
+    """The positive control for the redaction above: at the operator
+    (full-detail) tier the name is present, in full, session id included.
+
+    Without this, a handler that dropped ``agent_name`` at EVERY tier would
+    look correct.
+    """
+    sid = _sid("r6-operator-tier")
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+
+    _, body = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    assert body["detail"] == "full"
+    rows = [s for s in body["sessions"] if s["agent_id"] == str(session_to_agent_id(sid))]
+    assert len(rows) == 1
+    assert rows[0]["agent_name"] == f"claude-session-{sid}"
+    assert _session_id_appears_in(body, sid), (
+        "the operator tier keeps the name; if this is false the test above "
+        "cannot distinguish redaction from an empty payload"
+    )
+
+
+def test_status_agent_id_is_identical_across_tiers(client: _Client) -> None:
+    """``agent_id`` is the handle callers attribute by, so it must not move.
+    Same value, same row, at the default tier and the operator tier."""
+    sid = _sid("r6-stable-agent-id")
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+
+    _, minimal = client.get("/status")
+    _, full = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+
+    expected = str(session_to_agent_id(sid))
+    minimal_ids = {s["agent_id"] for s in minimal["sessions"]}
+    full_ids = {s["agent_id"] for s in full["sessions"]}
+    assert expected in minimal_ids
+    assert minimal_ids == full_ids, (
+        "redacting the display name must not change which agents are listed"
+    )
+    by_id_minimal = {s["agent_id"]: s["states"] for s in minimal["sessions"]}
+    by_id_full = {s["agent_id"]: s["states"] for s in full["sessions"]}
+    assert by_id_minimal == by_id_full
+
+
+def test_status_cli_renders_a_redacted_row_without_the_session_id(
+    client: _Client,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The redacted row is a shape the CLI already handles: it renders the
+    existing null-name fallback rather than printing "None", and the rendered
+    text carries no raw session id.
+
+    Driven off a LIVE default-tier body so the renderer sees exactly what the
+    handler emits, not a shape this test invented.
+    """
+    from ccs.cli import coherence_status
+
+    monkeypatch.setenv("COLUMNS", "100")
+    sid = _sid("r6-cli-render")
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+    _, body = client.get("/status")
+
+    coherence_status._render_table(body)
+    out = capsys.readouterr().out
+
+    assert "Sessions:" in out
+    assert "docs/plan.md" in out and "EXCLUSIVE" in out
+    assert "name unknown" in out
+    assert "None" not in out
+    assert sid not in out
+    # The fallback must not assert a cause it cannot know. This row is a
+    # redacted live session, NOT a grant that outlived its coordinator, and
+    # the renderer cannot distinguish the two — so it names both.
+    assert "redacted below the operator tier" in out, (
+        "the fallback blamed a pre-restart grant for what is a tier redaction"
+    )
+
+
+def test_detail_help_text_names_only_redactions_the_handler_performs(
+    client: _Client,
+) -> None:
+    """R9: the ``--detail`` help text claimed the minimal tier redacts
+    ``coordinator_pid``. It never has — pid is emitted at every tier on
+    purpose (it is public on POSIX and operators verify ownership with it).
+
+    Each redaction the help text names is checked against a LIVE minimal-tier
+    body, and the one it used to name falsely is checked the other way.
+    """
+    from ccs.cli import coherence_status
+
+    sid = _sid("r6-help-text")
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "docs/plan.md"})
+    _, body = client.get("/status")
+
+    action = next(
+        a for a in coherence_status.build_parser()._actions
+        if "--detail" in (a.option_strings or [])
+    )
+    help_text = action.help or ""
+
+    # The false claim is gone, and the behaviour that falsified it is pinned.
+    assert "coordinator_pid" not in help_text, (
+        "the help text must not claim a pid redaction the handler never does"
+    )
+    assert body["coordinator_pid"] == os.getpid()
+
+    # Each redaction the text now names is real at the minimal tier.
+    assert "absolute path" in help_text
+    assert body["coordinator_root"] == "."
+
+    assert "session name" in help_text
+    assert [s["agent_name"] for s in body["sessions"]] == [None]
+
+    assert "tracked pattern" in help_text
+    assert "user_added_patterns" not in body["policy_summary"]
+    _, full = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    assert "user_added_patterns" in full["policy_summary"], (
+        "control: the pattern list exists at the operator tier, so its "
+        "absence above is a redaction and not an empty policy"
+    )
+
+
+def test_policy_glob_sets_are_published_only_at_the_operator_tier(
+    client: _Client,
+) -> None:
+    """The operator view carries the coordinator's glob sets — the default
+    tracked patterns, the user-added ones, the ignored ones and the strict
+    ones — so a client can check the globs it declared against the policy the
+    coordinator actually loaded (#190). Below that tier ``policy_summary``
+    keeps its counts and no pattern list: a pattern list is the operator's
+    directory layout.
+
+    Prevents a client having only a COUNT to verify enforcement with: a
+    sibling volume whose managed globs differed from the spawner's passed on
+    the spawner's count while its own paths were untracked."""
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    pattern_lists = (
+        "tracked_patterns", "user_added_patterns", "ignored_patterns", "strict_mode_patterns",
+    )
+
+    _, minimal = client.get("/status")
+    for key in pattern_lists:
+        assert key not in minimal["policy_summary"], key
+    assert minimal["policy_summary"]["strict_mode_pattern_count"] == 0
+    assert minimal["policy_summary"]["user_added_pattern_count"] == 1
+
+    _, full = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    summary = full["policy_summary"]
+    for key in pattern_lists:
+        assert isinstance(summary[key], list), key
+    assert summary["user_added_patterns"] == ["docs/plan.md"]
+    assert "CLAUDE.md" in summary["tracked_patterns"], "the defaults are published too"
+    assert summary["strict_mode_patterns"] == []
+    assert summary["ignored_patterns"] == []
+    assert summary["strict_mode_pattern_count"] == len(summary["strict_mode_patterns"])
+
+
+# ======================================================================
+# Preemption notices past the render cap must survive, not be destroyed
+# ======================================================================
+#
+# ``pop_pending_notices`` deleted EVERY row for the agent, while the prose
+# builder rendered only ``_PREEMPTION_PROSE_VERBATIM_CAP`` of them. One
+# pre-read on one path therefore destroyed every notice the response did
+# not show, and the overflow line pointed at /status, which has never
+# carried notice data. The drain is now bounded to what is rendered.
+
+
+def _pending_count(coordinator, agent_id) -> int:
+    """How many notices are still queued for this agent (non-destructive)."""
+    artifact_by_id, _ = coordinator.registry.status_snapshot()
+    return sum(
+        1
+        for artifact_id in artifact_by_id
+        if coordinator.registry.peek_preemption_notice(agent_id, artifact_id)
+        is not None
+    )
+
+
+def _seven_notices(client: _Client, coordinator) -> tuple[str, list[str]]:
+    """Leave session A holding seven pending preemption notices."""
+    paths = [f"docs/f{n}.md" for n in range(7)]
+    a, b = _sid("notice-victim"), _sid("notice-taker")
+    client.post("/policy/track", {"paths": paths})
+    for p in paths:
+        client.post("/hooks/pre-edit", {"session_id": a, "path": p})
+    for p in paths:
+        client.post("/hooks/pre-edit", {"session_id": b, "path": p})
+    assert _pending_count(coordinator, session_to_agent_id(a)) == 7
+    return a, paths
+
+
+def test_pre_read_consumes_only_the_notices_it_renders(
+    coordinator, client: _Client
+) -> None:
+    """Seven pending, three rendered → four still queued. The four the
+    response could not show are the caller's only record of who took those
+    artifacts; deleting them made the preempters unrecoverable."""
+    a, paths = _seven_notices(client, coordinator)
+    agent_a = session_to_agent_id(a)
+
+    _, body = client.post("/hooks/pre-read", {"session_id": a, "path": paths[0]})
+    text = body["hookSpecificOutput"]["additionalContext"]
+    rendered = [ln for ln in text.splitlines() if ln.strip().startswith("•")]
+    verbatim = [ln for ln in rendered if "Plus " not in ln]
+
+    assert len(verbatim) == 3
+    assert "Plus 4 more" in text
+    assert _pending_count(coordinator, agent_a) == 4, (
+        "the four notices the response did not render must still be queued"
+    )
+
+
+def test_successive_reads_deliver_every_notice(
+    coordinator, client: _Client
+) -> None:
+    """The overflow is a deferral, not a loss: three more arrive on the next
+    tracked-file operation, and the last one after that."""
+    a, paths = _seven_notices(client, coordinator)
+    agent_a = session_to_agent_id(a)
+
+    seen: set[str] = set()
+    for expected_remaining in (4, 1, 0):
+        _, body = client.post(
+            "/hooks/pre-read", {"session_id": a, "path": paths[0]}
+        )
+        text = body["hookSpecificOutput"]["additionalContext"]
+        seen.update(p for p in paths if f"• {p} —" in text)
+        assert _pending_count(coordinator, agent_a) == expected_remaining
+
+    assert seen == set(paths), "every preempted artifact was eventually named"
+
+
+def test_overflow_line_does_not_point_at_a_surface_without_notices(
+    coordinator, client: _Client
+) -> None:
+    """/status carries no notice data at any tier, so the overflow line must
+    not send the caller there. It names the real delivery channel instead."""
+    a, paths = _seven_notices(client, coordinator)
+    _, body = client.post("/hooks/pre-read", {"session_id": a, "path": paths[0]})
+    text = body["hookSpecificOutput"]["additionalContext"]
+
+    assert "GET /status" not in text
+    assert "agent-coherence status" not in text
+
+    _, status_body = client.get(
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    assert not any(
+        "notice" in k or "preempt" in k for k in status_body
+    ), "if /status ever carries notices, this test should be the one to change"
+
+
+def test_session_stop_still_drains_every_notice(
+    coordinator, client: _Client
+) -> None:
+    """Stop returns the full structured array, so its drain is matched by its
+    render — it must keep consuming all of them."""
+    a, _paths = _seven_notices(client, coordinator)
+    agent_a = session_to_agent_id(a)
+
+    _, body = client.post("/hooks/session-stop", {"session_id": a})
+    assert len(body["notices"]) == 7
+    assert _pending_count(coordinator, agent_a) == 0
+
+
+def test_unlimited_drain_does_not_bind_one_variable_per_notice(
+    coordinator, client: _Client
+) -> None:
+    """session-stop's full drain must bind only ``agent_id``, not one variable
+    per row. An IN-list of every pending notice can exceed SQLite's
+    bound-variable ceiling on an agent with a large pending set, raising
+    mid-transaction instead of committing.
+
+    Driven against the real ceiling, lowered for the duration: with a
+    per-row IN-list this raises OperationalError; with the bulk DELETE it does
+    not. Six notices against a limit of four is the same shape as 40k notices
+    against the stock 32766.
+    """
+    import sqlite3
+
+    sid = _sid("bulk-drain")
+    agent_id = session_to_agent_id(sid)
+    peer = session_to_agent_id(_sid("bulk-peer"))
+    paths = [f"docs/bulk{n}.md" for n in range(6)]
+    client.post("/policy/track", {"paths": paths})
+    # Mint the artifacts FIRST: a pre-read drains this session's notices, so
+    # recording inside the read loop would let each read consume what the
+    # previous iterations queued.
+    artifact_ids = []
+    for path in paths:
+        client.post("/hooks/pre-read",
+                    {"session_id": sid, "path": path, "content_hash": _hash(path)})
+        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        assert artifact_id is not None
+        artifact_ids.append(artifact_id)
+    for n, artifact_id in enumerate(artifact_ids):
+        coordinator.registry.record_preemption_notice(
+            victim_agent_id=agent_id, artifact_id=artifact_id,
+            preempter_agent_id=peer, preempted_at_unix_ts=1700000000.0 + n,
+        )
+
+    conn = coordinator.registry._conn
+    previous = conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+    conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 4)
+    try:
+        drained = coordinator.registry.pop_pending_notices(agent_id)
+    finally:
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous)
+
+    assert len(drained) == 6
+    assert _pending_count(coordinator, agent_id) == 0
+
+
+def test_session_stop_overflow_prose_does_not_claim_rows_are_queued(
+    coordinator, client: _Client
+) -> None:
+    """session-stop drains UNBOUNDED and returns everything in `notices`, so the
+    overflow line must not repeat the deferral promise the bounded prose paths
+    make. "still queued — they surface on your next tracked-file operation" is
+    false twice over here: the rows were just deleted, and a stopping session
+    has no next operation. It points at the response's own array instead."""
+    a, _paths = _seven_notices(client, coordinator)
+
+    _, body = client.post("/hooks/session-stop", {"session_id": a})
+    text = body["hookSpecificOutput"]["additionalContext"]
+
+    assert len(body["notices"]) == 7, "the structured array still carries all of them"
+    assert "Plus 4 more" in text
+    assert "still queued" not in text
+    assert "next tracked-file operation" not in text
+    assert "notices" in text, "the prose names the surface that actually has them"
+
+
+def test_bounded_prose_paths_still_promise_deferral(
+    coordinator, client: _Client
+) -> None:
+    """The four admit paths DO defer — their drain is capped — so they keep the
+    deferral wording. Guards against fixing session-stop by flattening both."""
+    a, paths = _seven_notices(client, coordinator)
+
+    _, body = client.post("/hooks/pre-read", {"session_id": a, "path": paths[0]})
+    text = body["hookSpecificOutput"]["additionalContext"]
+
+    assert "Plus 4 more" in text
+    assert "still queued" in text
+    assert "next tracked-file operation" in text
+    assert _pending_count(coordinator, session_to_agent_id(a)) == 4
+
+
+# ----------------------------------------------------------------------
+# U3a — decide_tracked_read: the tracked-artifact verdict as a VALUE
+#
+# _handle_pre_read decides fresh / stale / denied for an already-tracked
+# artifact WHILE it mutates: the fresh arm bumps two counters and can return
+# the strict deny, the stale arm re-grants SHARED, marks the pair stale-warned
+# and drains notices. A surface that must answer the SAME question without
+# granting anything therefore cannot reach the answer by calling the handler.
+# These tests pin the extracted verdict: that each arm returns what the handler
+# would have reported, that the two hash-differs predicates stay DISTINCT, and
+# — the claim any verdict route rests on — that asking changes nothing.
+# ----------------------------------------------------------------------
+
+_U3A_STRICT_PATH = "CLAUDE.md"  # tracked by default AND listed in strict_mode.yaml
+_U3A_WARN_PATH = "plan.md"      # tracked by the default **/plan.md glob, never strict
+# Per-arm paths, so the seven arms below own seven DISTINCT artifacts: they are
+# seeded at different versions, and sharing one row would let the last seed
+# silently rewrite what the earlier arms assert about.
+_U3A_STRICT_GLOB = "docs/specs/**/*.md"
+
+
+def _u3a_strict_path(name: str) -> str:
+    return f"docs/specs/{name}.md"
+
+
+def _u3a_warn_path(name: str) -> str:
+    return f"docs/plans/{name}.md"
+
+
+def _u3a_write_policy(root: Path) -> None:
+    """Materialize strict_mode.yaml: CLAUDE.md and docs/specs/** are strict,
+    everything else tracked stays warn-mode.
+
+    Policy is loaded ONCE at construction, so this must run before the server
+    is built — mutating ``server.policy`` afterwards would test a shape no
+    operator can produce.
+    """
+    coherence = root / ".coherence"
+    coherence.mkdir(mode=0o700, exist_ok=True)
+    (coherence / "strict_mode.yaml").write_text(
+        f"- {_U3A_STRICT_PATH}\n- {_U3A_STRICT_GLOB}\n"
+    )
+
+
+def _u3a_assert_policy(server: CoordinatorHTTPServer) -> None:
+    """Fail loudly if the fixture paths are not the modes every test below
+    assumes — a silently warn-mode "strict" path would turn every deny
+    assertion into a vacuous fresh/stale assertion."""
+    assert server.policy.is_strict_mode(_U3A_STRICT_PATH)
+    assert server.policy.is_strict_mode(_u3a_strict_path("probe"))
+    assert server.policy.is_tracked(_U3A_WARN_PATH)
+    assert not server.policy.is_strict_mode(_U3A_WARN_PATH)
+    assert server.policy.is_tracked(_u3a_warn_path("probe"))
+    assert not server.policy.is_strict_mode(_u3a_warn_path("probe"))
+
+
+@pytest.fixture
+def decider(tmp_path: Path):
+    """A coordinator built but NOT served: decide_tracked_read is an in-process
+    call, so an accept loop would add a thread and a port to every assertion
+    and nothing else."""
+    _u3a_write_policy(tmp_path)
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="u3a-decider")
+    _u3a_assert_policy(server)
+    try:
+        yield server
+    finally:
+        server.shutdown()
+
+
+@pytest.fixture
+def served_decider(tmp_path: Path):
+    """The same policy on a LIVE coordinator, yielded with its client, so a
+    verdict can be compared against the response the real handler builds."""
+    _u3a_write_policy(tmp_path)
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="u3a-served")
+    _u3a_assert_policy(server)
+    server.serve_in_thread()
+    secret = load_secret(server.coordinator_root)
+    assert secret is not None
+    try:
+        yield server, _Client("127.0.0.1", server.port, secret)
+    finally:
+        server.shutdown()
+
+
+def _u3a_seed(
+    server: CoordinatorHTTPServer,
+    path: str,
+    *,
+    recorded_hash: str,
+    state: Optional[MESIState],
+    label: str = "s1",
+    version: Optional[int] = None,
+    last_writer: Optional[uuid.UUID] = None,
+):
+    """Park an (agent, artifact) pair in the state an arm needs.
+
+    Returns ``(session_id, agent_id, artifact_id)``. ``state=None`` leaves the
+    session with no grant at all — the "stale beliefs from somewhere else"
+    case the no-prior-grant deny gate exists for.
+    """
+    sid = _sid(label)
+    agent_id = server.register_session(sid)
+    artifact_id = server.registry.resolve_or_register(path, content_hash=recorded_hash)
+    if version is not None or last_writer is not None:
+        art = server.registry.get_artifact(artifact_id)
+        server.registry.set_artifact_and_content(
+            artifact_id,
+            dataclasses.replace(art, version=art.version if version is None else version),
+            "",
+            last_writer=last_writer,
+        )
+    if state is not None:
+        server.registry.set_agent_state(
+            artifact_id, agent_id, state,
+            trigger="u3a-test", tick=1, content_hash=recorded_hash,
+        )
+    return sid, agent_id, artifact_id
+
+
+def _u3a_decide(
+    server: CoordinatorHTTPServer,
+    artifact_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    *,
+    path: str,
+    caller_hash: Optional[str],
+    now_unix: float = 1000.0,
+) -> TrackedReadDecision:
+    """Call the verdict with exactly the values the handler has already read at
+    the point its tracked branch begins — one pair-atomic snapshot, this
+    agent's MESI state, the hash the caller offered."""
+    pair = server.registry.get_artifact_and_generation(artifact_id)
+    assert pair is not None
+    artifact, generation = pair
+    return decide_tracked_read(
+        server,
+        path=path,
+        artifact_id=artifact_id,
+        agent_id=agent_id,
+        artifact=artifact,
+        owner_generation=generation,
+        agent_state=server.registry.get_agent_state(artifact_id, agent_id),
+        caller_content_hash=caller_hash,
+        now_unix=now_unix,
+    )
+
+
+# --- one arm per state that produces it ------------------------------------
+
+
+def test_decide_fresh_for_granted_holder_whose_hash_matches(decider) -> None:
+    """The plain fresh arm: a still-SHARED holder re-reading the bytes the
+    registry recorded. Neither hash predicate fires, nothing is suppressed, and
+    the version reported is the one from the caller's own snapshot."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("v3-bytes"),
+        state=MESIState.SHARED, version=3,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("v3-bytes"))
+
+    assert d.outcome == "fresh"
+    assert d.version == 3
+    assert d.holds_valid_grant is True
+    assert d.fresh_hash_differs is False
+    assert d.stale_hash_differs is False
+    assert d.commit_lag_suppressed is False
+    # A SHARED holder was granted on the current version; that is what it saw.
+    assert d.prior_version_seen == 3
+
+
+def test_decide_fresh_with_hash_differs_in_warn_mode(decider) -> None:
+    """Warn mode never denies: the mismatch is surfaced on the verdict (the
+    handler turns it into the additive ``hash_differs`` key and one counter
+    bump) but the outcome stays fresh."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_WARN_PATH, caller_hash=_hash("out-of-band"))
+
+    assert d.outcome == "fresh"
+    assert d.fresh_hash_differs is True
+    assert d.commit_lag_suppressed is False
+
+
+def test_decide_denied_for_granted_holder_foreign_edit_in_strict_mode(decider) -> None:
+    """Survivor #6: a still-SHARED holder proves no peer commit since its
+    grant, so a differing disk hash written by SOMEONE ELSE is a foreign
+    out-of-band edit — denied, through the fresh arm."""
+    peer = decider.register_session(_sid("peer-writer"))
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2, last_writer=peer,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("foreign-edit"))
+
+    assert d.outcome == "denied"
+    assert d.holds_valid_grant is True, "the deny came through the FRESH arm"
+    assert d.fresh_hash_differs is True
+    assert d.commit_lag_suppressed is False
+    assert d.version == 2
+    assert d.prior_version_seen == 2
+
+
+def test_decide_fresh_when_the_lag_gate_withholds_the_deny(decider) -> None:
+    """The same state, except the caller IS the artifact's recent last
+    committer: the benign commit -> disk-write lag, suppressed rather than
+    denied. Two distinct facts on one value — the outcome flipped back to fresh
+    AND the suppression that flipped it, which is the counter bump a caller
+    still owes."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED,
+    )
+    # Self-commit: make the caller the writer and read one second after it.
+    art = decider.registry.get_artifact(artifact_id)
+    decider.registry.set_artifact_and_content(artifact_id, art, "", last_writer=agent_id)
+    updated_at = decider.registry.get_artifact_updated_at(artifact_id)
+    assert updated_at is not None
+
+    d = _u3a_decide(decider, artifact_id, agent_id, path=_U3A_STRICT_PATH,
+                    caller_hash=_hash("not-yet-flushed"), now_unix=updated_at + 1.0)
+
+    assert d.outcome == "fresh"
+    assert d.fresh_hash_differs is True
+    assert d.commit_lag_suppressed is True
+
+
+def test_decide_denied_outside_the_lag_window(decider) -> None:
+    """The recency clause is load-bearing: the same self-commit read LATER than
+    the window is a genuine foreign edit again. Without this the suppression
+    field could be hard-wired True and every test above would still pass."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED,
+    )
+    art = decider.registry.get_artifact(artifact_id)
+    decider.registry.set_artifact_and_content(artifact_id, art, "", last_writer=agent_id)
+    updated_at = decider.registry.get_artifact_updated_at(artifact_id)
+    assert updated_at is not None
+    late = updated_at + _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC + 0.1
+
+    d = _u3a_decide(decider, artifact_id, agent_id, path=_U3A_STRICT_PATH,
+                    caller_hash=_hash("foreign-edit"), now_unix=late)
+
+    assert d.outcome == "denied"
+    assert d.commit_lag_suppressed is False
+
+
+def test_decide_stale_for_invalidated_session_in_warn_mode(decider) -> None:
+    """A peer commit invalidated this session; warn mode allows with the stale
+    warning. ``prior_version_seen`` is one BELOW the current version — the
+    version the session last held a grant on."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.INVALID, version=4,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_WARN_PATH, caller_hash=_hash("canonical"))
+
+    assert d.outcome == "stale"
+    assert d.holds_valid_grant is False
+    assert d.version == 4
+    assert d.prior_version_seen == 3
+
+
+def test_decide_denied_for_invalidated_session_in_strict_mode(decider) -> None:
+    """True preemption under strict mode: denied on the INVALID state ALONE,
+    with no hash comparison needed — the session's context still carries the
+    beliefs the peer commit superseded."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.INVALID, version=4,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("canonical"))
+
+    assert d.outcome == "denied"
+    assert d.holds_valid_grant is False
+    assert d.stale_hash_differs is False, "the INVALID leg denies without a mismatch"
+    assert d.prior_version_seen == 3
+
+
+def test_decide_stale_for_unseen_session_whose_hash_matches(decider) -> None:
+    """No prior grant but the session is looking at the bytes the registry
+    recorded: nothing stale to act on, so strict mode falls through to the
+    warn-mode allow. ``prior_version_seen`` is None — it saw no version."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=None, version=2,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("canonical"))
+
+    assert d.outcome == "stale"
+    assert d.prior_version_seen is None
+
+
+def test_decide_denied_for_unseen_session_whose_hash_differs(decider) -> None:
+    """No prior grant AND different bytes: stale beliefs from somewhere else,
+    denied. This is the leg the launch-gate scenarios arrive through."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=None,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("stale-beliefs"))
+
+    assert d.outcome == "denied"
+    assert d.stale_hash_differs is True
+
+
+def test_decide_reports_the_generation_from_the_callers_snapshot(decider) -> None:
+    """The generation rides the SAME pair-atomic read as the version, on every
+    arm — never a second read a peer commit could overtake, and never coerced
+    to 0 when absent."""
+    for path, state, outcome in (
+        (_U3A_STRICT_PATH, MESIState.SHARED, "fresh"),
+        (_U3A_WARN_PATH, MESIState.INVALID, "stale"),
+    ):
+        _, agent_id, artifact_id = _u3a_seed(
+            decider, path, recorded_hash=_hash("canonical"), state=state,
+            label=f"gen-{outcome}",
+        )
+        pair = decider.registry.get_artifact_and_generation(artifact_id)
+        assert pair is not None
+
+        d = _u3a_decide(decider, artifact_id, agent_id,
+                        path=path, caller_hash=_hash("canonical"))
+
+        assert d.outcome == outcome
+        assert d.owner_generation == pair[1]
+        assert d.version == pair[0].version
+
+
+# --- the deliberate asymmetry between the two hash predicates --------------
+
+
+def test_sentinel_recorded_hash_differs_on_the_stale_arm_only(decider) -> None:
+    """The all-``f`` launch-gate sentinel is not a SHA-256 of anything, so the
+    coordinator holds no content claim against it.
+
+    The FRESH arm must not fire on it — denying a still-SHARED holder against
+    content the coordinator never claimed would be a false deny. The STALE arm
+    must, because the launch-gate scenarios reach their deny THROUGH that arm
+    and the sentinel is exactly what makes their hashes differ. One value
+    carries both answers; unifying the two predicates silently moves the
+    strict-deny gate whichever way the survivor points.
+    """
+    _, granted_agent, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash="f" * 64,
+        state=MESIState.SHARED, label="granted",
+    )
+    unseen_agent = decider.register_session(_sid("unseen"))
+
+    granted = _u3a_decide(decider, artifact_id, granted_agent,
+                          path=_U3A_STRICT_PATH, caller_hash=_hash("real-disk-bytes"))
+    unseen = _u3a_decide(decider, artifact_id, unseen_agent,
+                         path=_U3A_STRICT_PATH, caller_hash=_hash("real-disk-bytes"))
+
+    # Same artifact, same caller hash — the two predicates disagree on purpose.
+    assert granted.fresh_hash_differs is False
+    assert granted.outcome == "fresh", "no content claim => no foreign-edit deny"
+    assert unseen.stale_hash_differs is True
+    assert unseen.outcome == "denied", "the launch-gate deny still fires"
+
+
+def test_empty_recorded_hash_never_fires_either_predicate(decider) -> None:
+    """The OTHER no-claim seed: a KTD-9 first observation with no caller hash
+    records "" and surfaces as None. Nothing to compare against on either arm,
+    so no mismatch and — with no mismatch — no deny for a session with no
+    prior grant."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash="", state=None,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=_hash("real-disk-bytes"))
+
+    assert d.fresh_hash_differs is False
+    assert d.stale_hash_differs is False
+    assert d.outcome == "stale"
+
+
+def test_absent_caller_hash_never_fires_either_predicate(decider) -> None:
+    """A pre-read may carry no content_hash at all (the caller does not have
+    one yet). With nothing on the caller's side there is no comparison to make
+    on either arm."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"), state=None,
+    )
+
+    d = _u3a_decide(decider, artifact_id, agent_id,
+                    path=_U3A_STRICT_PATH, caller_hash=None)
+
+    assert d.fresh_hash_differs is False
+    assert d.stale_hash_differs is False
+    assert d.outcome == "stale"
+
+
+# --- R7: the call is a pure query ------------------------------------------
+
+
+def _u3a_observable(server: CoordinatorHTTPServer, agent_id, artifact_id) -> dict:
+    """Everything _handle_pre_read moves around this decision, read through
+    NON-destructive accessors only (peek, not pop).
+
+    Anything the verdict quietly granted, healed, counted or recorded shows up
+    as a difference here — which is the only thing that makes the purity claim
+    testable rather than eyeballed.
+    """
+    pair = server.registry.get_artifact_and_generation(artifact_id)
+    coherence = server.coordinator_root / ".coherence"
+    return {
+        "counters": server.counters_snapshot(),
+        "version": pair[0].version if pair else None,
+        # The coordinator-side observation baseline: the canonical content the
+        # registry vouches for. A verdict that "healed" it would absolve the
+        # very out-of-band edit it exists to report.
+        "canonical_hash": pair[0].content_hash if pair else None,
+        "owner_generation": pair[1] if pair else None,
+        "grant": server.registry.get_agent_state(artifact_id, agent_id),
+        "heartbeat": server.registry.last_heartbeat_tick(agent_id),
+        "notice": server.registry.peek_preemption_notice(agent_id, artifact_id),
+        "stale_warned": set(server._stale_warned_pairs),
+        "strict_denies": dict(server._recent_strict_denies),
+        # Names for "nothing new appeared"; sizes only for the append-only logs
+        # (a deny writes audit.log). SQLite's own db/-wal/-shm sizes are not
+        # asserted — a read can legitimately move them, and asserting on them
+        # would trade a real guard for a flaky one.
+        "coherence_files": sorted(p.name for p in coherence.iterdir()),
+        "audit_logs": sorted((p.name, p.stat().st_size) for p in coherence.glob("*.log")),
+    }
+
+
+def _u3a_arms(server: CoordinatorHTTPServer) -> dict:
+    """Every arm of the verdict, each with the call that drives it. Keyed by
+    the handler behaviour it stands in for, so a regression names itself."""
+    arms: dict[str, tuple] = {}
+    for name, strict, state, caller, version in (
+        ("fresh-granted", True, MESIState.SHARED, "canonical", 1),
+        ("fresh-mismatch-warn", False, MESIState.SHARED, "out-of-band", 1),
+        ("denied-shared-foreign", True, MESIState.SHARED, "foreign", 2),
+        ("stale-invalid-warn", False, MESIState.INVALID, "canonical", 4),
+        ("denied-invalid-strict", True, MESIState.INVALID, "canonical", 4),
+        ("stale-unseen", True, None, "canonical", 2),
+        ("denied-unseen-mismatch", True, None, "stale-beliefs", 2),
+    ):
+        path = _u3a_strict_path(name) if strict else _u3a_warn_path(name)
+        # A PEER is the last writer everywhere here, so the lag gate answers
+        # False on its own merits and no arm depends on the injected clock.
+        peer = server.register_session(_sid(f"peer-{name}"))
+        _, agent_id, artifact_id = _u3a_seed(
+            server, path, recorded_hash=_hash("canonical"), state=state,
+            label=f"arm-{name}", version=version, last_writer=peer,
+        )
+        arms[name] = (path, agent_id, artifact_id, _hash(caller))
+    return arms
+
+
+@pytest.mark.parametrize("arm", [
+    "fresh-granted",
+    "fresh-mismatch-warn",
+    "denied-shared-foreign",
+    "stale-invalid-warn",
+    "denied-invalid-strict",
+    "stale-unseen",
+    "denied-unseen-mismatch",
+])
+def test_decide_twice_changes_nothing_observable(decider, arm: str) -> None:
+    """R7, asserted as a before/after rather than by reading the source.
+
+    On every arm the handler does something here — bumps a counter, re-grants
+    SHARED, marks the pair stale-warned, records the deny, appends the audit
+    row, pops the notice. The verdict must do NONE of it, so calling it twice
+    in a row leaves version, generation, canonical hash, grant state, heartbeat
+    tick, pending notice, stale markers, deny records, the .coherence files and
+    EVERY counter exactly as they were — and answers the same both times.
+    """
+    arms = _u3a_arms(decider)
+    path, agent_id, artifact_id, caller_hash = arms[arm]
+    # Give each dimension a non-default value first: an assertion that None
+    # stayed None proves much less than one that 41 stayed 41.
+    decider.registry.record_heartbeat(agent_id, 41)
+    decider.registry.record_preemption_notice(
+        victim_agent_id=agent_id, artifact_id=artifact_id,
+        preempter_agent_id=decider.register_session(_sid("preempter")),
+        preempted_at_unix_ts=1234.0,
+    )
+    before = _u3a_observable(decider, agent_id, artifact_id)
+    assert before["heartbeat"] == 41
+    assert before["notice"] is not None
+
+    first = _u3a_decide(decider, artifact_id, agent_id,
+                        path=path, caller_hash=caller_hash)
+    second = _u3a_decide(decider, artifact_id, agent_id,
+                         path=path, caller_hash=caller_hash)
+
+    assert first == second, "the verdict is not a function of its own history"
+    assert _u3a_observable(decider, agent_id, artifact_id) == before
+
+
+def test_purity_check_covers_the_arm_that_would_deny(decider) -> None:
+    """Control for the test above: prove the parametrized arms really do reach
+    the deny and suppression legs. A purity proof over seven arms that all
+    quietly returned "stale" would be seven copies of one weak assertion."""
+    arms = _u3a_arms(decider)
+    outcomes = {
+        name: _u3a_decide(decider, artifact_id, agent_id,
+                          path=path, caller_hash=caller_hash).outcome
+        for name, (path, agent_id, artifact_id, caller_hash) in arms.items()
+    }
+    assert outcomes == {
+        "fresh-granted": "fresh",
+        "fresh-mismatch-warn": "fresh",
+        "denied-shared-foreign": "denied",
+        "stale-invalid-warn": "stale",
+        "denied-invalid-strict": "denied",
+        "stale-unseen": "stale",
+        "denied-unseen-mismatch": "denied",
+    }
+
+
+# --- every branch is drivable from the decision alone ----------------------
+
+
+def _u3a_render(d: TrackedReadDecision, *, want_generation: bool) -> dict:
+    """Rebuild the handler's response shape from the VERDICT ONLY.
+
+    No coordinator, no artifact, no agent state — if a field the handler
+    branches on were missing from the decision, this could not be written and
+    the next unit would have to re-derive it in the handler, which is the
+    duplication the extraction exists to remove.
+    """
+    if d.outcome == "denied":
+        return {
+            "source": (
+                "pre_read_shared_hash_deny" if d.holds_valid_grant
+                else "pre_read_strict_deny"
+            ),
+            "current_version": d.version,
+            "prior_version_seen_by_session": d.prior_version_seen,
+            # The fresh arm denies only ON a mismatch, so it reports True flat;
+            # the stale arm reports its own predicate (the INVALID leg denies
+            # without one).
+            "hash_differs": True if d.holds_valid_grant else d.stale_hash_differs,
+            "counter_bumps": ["strict_mode_denials_total"],
+        }
+    if d.outcome == "fresh":
+        payload: dict[str, Any] = {"status": "fresh", "version": d.version}
+        if d.fresh_hash_differs:
+            payload["hash_differs"] = True
+        if want_generation and d.owner_generation is not None:
+            payload["owner_generation"] = d.owner_generation
+        payload["counter_bumps"] = (
+            (["fresh_shared_hash_mismatch_total"] if d.fresh_hash_differs else [])
+            + (["shared_foreign_lag_suppressed_total"] if d.commit_lag_suppressed else [])
+        )
+        return payload
+    stale: dict[str, Any] = {
+        "status": "stale",
+        "current_version": d.version,
+        "prior_version_seen_by_session": d.prior_version_seen,
+        "hash_differs": d.stale_hash_differs,
+        "counter_bumps": ["stale_warning_emitted_total"],
+    }
+    if want_generation and d.owner_generation is not None:
+        stale["owner_generation"] = d.owner_generation
+    return stale
+
+
+def test_every_handler_branch_is_drivable_from_the_decision_alone(decider) -> None:
+    """Each arm rendered from its verdict and nothing else. The expectations
+    are written out literally rather than recomputed from the decision — a
+    renderer checked against itself would report green on any field set."""
+    arms = _u3a_arms(decider)
+
+    def rendered(name: str, *, want_generation: bool = False) -> dict:
+        path, agent_id, artifact_id, caller_hash = arms[name]
+        d = _u3a_decide(decider, artifact_id, agent_id,
+                        path=path, caller_hash=caller_hash)
+        return _u3a_render(d, want_generation=want_generation)
+
+    assert rendered("fresh-granted") == {
+        "status": "fresh", "version": 1, "counter_bumps": [],
+    }
+    assert rendered("fresh-mismatch-warn") == {
+        "status": "fresh", "version": 1, "hash_differs": True,
+        "counter_bumps": ["fresh_shared_hash_mismatch_total"],
+    }
+    assert rendered("denied-shared-foreign") == {
+        "source": "pre_read_shared_hash_deny",
+        "current_version": 2,
+        "prior_version_seen_by_session": 2,
+        "hash_differs": True,
+        "counter_bumps": ["strict_mode_denials_total"],
+    }
+    assert rendered("stale-invalid-warn") == {
+        "status": "stale", "current_version": 4,
+        "prior_version_seen_by_session": 3, "hash_differs": False,
+        "counter_bumps": ["stale_warning_emitted_total"],
+    }
+    assert rendered("denied-invalid-strict") == {
+        "source": "pre_read_strict_deny",
+        "current_version": 4,
+        "prior_version_seen_by_session": 3,
+        "hash_differs": False,
+        "counter_bumps": ["strict_mode_denials_total"],
+    }
+    assert rendered("denied-unseen-mismatch") == {
+        "source": "pre_read_strict_deny",
+        "current_version": 2,
+        "prior_version_seen_by_session": None,
+        "hash_differs": True,
+        "counter_bumps": ["strict_mode_denials_total"],
+    }
+    # The opt-in pair: present only when asked for, and carrying the
+    # generation the REGISTRY holds (the expectation is sourced from the
+    # registry, not from the decision being checked).
+    _path, _agent, artifact_id, _caller = arms["stale-unseen"]
+    pair = decider.registry.get_artifact_and_generation(artifact_id)
+    assert pair is not None and pair[1] is not None
+    assert rendered("stale-unseen", want_generation=True)["owner_generation"] == pair[1]
+    assert "owner_generation" not in rendered("stale-unseen")
+
+
+def test_lag_suppression_is_visible_to_the_renderer(decider) -> None:
+    """The suppression arm needs its own setup (the caller must be the recent
+    writer), and it is the one arm whose counter bump is NOT implied by the
+    outcome: a suppressed deny looks exactly like a warn-mode mismatch unless
+    the decision says otherwise."""
+    _, agent_id, artifact_id = _u3a_seed(
+        decider, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED,
+    )
+    art = decider.registry.get_artifact(artifact_id)
+    decider.registry.set_artifact_and_content(artifact_id, art, "", last_writer=agent_id)
+    updated_at = decider.registry.get_artifact_updated_at(artifact_id)
+    assert updated_at is not None
+
+    d = _u3a_decide(decider, artifact_id, agent_id, path=_U3A_STRICT_PATH,
+                    caller_hash=_hash("not-yet-flushed"), now_unix=updated_at + 1.0)
+
+    assert _u3a_render(d, want_generation=False) == {
+        "status": "fresh", "version": 1, "hash_differs": True,
+        "counter_bumps": [
+            "fresh_shared_hash_mismatch_total",
+            "shared_foreign_lag_suppressed_total",
+        ],
+    }
+
+
+# --- integration: the verdict agrees with the live handler -----------------
+
+
+@pytest.mark.parametrize("path,state,caller,expect", [
+    (_U3A_STRICT_PATH, MESIState.SHARED, "canonical", "fresh"),
+    (_U3A_WARN_PATH, MESIState.INVALID, "canonical", "stale"),
+    (_U3A_STRICT_PATH, MESIState.INVALID, "canonical", "denied"),
+])
+def test_verdict_matches_the_live_pre_read_handler(
+    served_decider, path: str, state: MESIState, caller: str, expect: str,
+) -> None:
+    """The extraction is only worth anything if it agrees with the surface it
+    was extracted from. Ask the verdict FIRST (it changes nothing), then let
+    the real handler answer over HTTP and check they say the same thing about
+    version, prior version and the stale-arm mismatch.
+    """
+    server, client = served_decider
+    sid, agent_id, artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"), state=state, version=4,
+    )
+
+    d = _u3a_decide(server, artifact_id, agent_id, path=path, caller_hash=_hash(caller))
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": sid, "path": path, "content_hash": _hash(caller)},
+    )
+
+    assert status == 200
+    assert d.outcome == expect
+    if expect == "fresh":
+        assert body == {"status": "fresh", "version": d.version}
+        return
+    # Both stale and denied carry the summary; the deny adds the permission
+    # decision the warn-mode allow does not.
+    assert body["summary"]["current_version"] == d.version
+    assert body["summary"]["prior_version_seen_by_session"] == d.prior_version_seen
+    assert body["summary"]["hash_differs"] == d.stale_hash_differs
+    decision = body["hookSpecificOutput"].get("permissionDecision")
+    assert decision == ("deny" if expect == "denied" else "allow")
+
+
+# ----------------------------------------------------------------------
+# U4 — POST /hooks/effect-fence: the verdict route
+#
+# "May this irreversible effect still fire, and if not, WHY" asked over HTTP.
+# The route reads the registry directly, so it can answer the one leg the
+# in-process fence structurally cannot: the pre-read WIRE carries only
+# ``hash_differs`` (a comparison), never the coordinator's recorded hash, so
+# in-process "the claim matches" and "there is no claim at all" are one value
+# and the wrapper passes ``content_claim_present=True`` unconditionally. This
+# route passes the real answer, which is why the AE8 arms below live here.
+#
+# Every test in this block is written against a coordinator whose state was
+# parked by hand, so each names ONE condition. The recurring hazard they exist
+# to close is the same one in every arm: the naive implementation — copy
+# pre-read's untracked fast path, let the shared wrapper own the degraded
+# arms, take the coordinator's reported generation at face value — answers
+# PROCEED on a view the coordinator never confirmed.
+# ----------------------------------------------------------------------
+
+_U4_ROUTE = "/hooks/effect-fence"
+
+
+def _u4_body(
+    sid: str,
+    path: str,
+    *,
+    version: Any,
+    generation: Any,
+    content_hash: Any,
+) -> dict:
+    """A complete, well-formed fence request. Tests that exercise a MISSING
+    field pop it from this dict, so "well-formed" stays defined in one place
+    and a malformed-input test cannot silently drift into testing two faults."""
+    return {
+        "session_id": sid,
+        "path": path,
+        "expected_version": version,
+        "expected_generation": generation,
+        "content_hash": content_hash,
+    }
+
+
+def _u4_captured(server: CoordinatorHTTPServer, artifact_id: uuid.UUID) -> tuple[int, Optional[int]]:
+    """The (version, generation) pair an honest caller captured at read time.
+
+    Sourced from the registry rather than written as a literal: an arm that
+    hard-coded the pair would keep asserting against a number the seeder no
+    longer produces, and every such arm would silently become "the caller sent
+    the wrong version" — a version_moved hold that looks like a pass.
+    """
+    pair = server.registry.get_artifact_and_generation(artifact_id)
+    assert pair is not None
+    return pair[0].version, pair[1]
+
+
+# --- AE1: nothing moved ----------------------------------------------------
+
+
+def test_ae1_nothing_moved_answers_proceed_and_repeats(served_decider) -> None:
+    """The one arm that may proceed: the caller's comparands are the
+    coordinator's, the grant still stands, and the coordinator claims the
+    content in hand. Asked twice, it answers the same — a verdict that healed
+    or consumed anything would drift on the second call."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("v3-bytes"),
+        state=MESIState.SHARED, version=3,
+    )
+    version, generation = _u4_captured(server, artifact_id)
+
+    body = _u4_body(sid, _U3A_WARN_PATH, version=version,
+                    generation=generation, content_hash=_hash("v3-bytes"))
+    first = client.post(_U4_ROUTE, body)
+    second = client.post(_U4_ROUTE, body)
+
+    assert first == (200, {"verdict": "proceed"})
+    assert second == first
+
+
+# --- AE2 / AE3 / AE4 / AE5: one hold per condition -------------------------
+
+
+def test_ae2_peer_commit_holds_naming_the_moved_input(served_decider) -> None:
+    """A peer committed after the caller's read. The value the decision was
+    derived from moved, so the hold names THAT and not some downstream
+    symptom of it."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("v3-bytes"),
+        state=MESIState.SHARED, version=3,
+    )
+    captured_version, generation = _u4_captured(server, artifact_id)
+    # The peer commit: the version the caller captured is no longer current.
+    art = server.registry.get_artifact(artifact_id)
+    server.registry.set_artifact_and_content(
+        artifact_id, dataclasses.replace(art, version=captured_version + 1), "",
+    )
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=captured_version,
+        generation=generation, content_hash=_hash("v3-bytes"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "version_moved"}
+
+
+def test_ae3_write_acquire_preemption_holds_naming_the_lost_grant(served_decider) -> None:
+    """A peer's pessimistic write-acquire ends the caller's grant while moving
+    NEITHER comparand — no commit yet, and the acquire trigger is outside the
+    epoch-bump set. A version-and-generation check structurally cannot see it,
+    so the hold must come from the grant leg. The control assertions below are
+    the point of the test: if the acquire HAD moved either comparand, the hold
+    would be real but this arm would prove nothing about the grant leg."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    captured_version, captured_generation = _u4_captured(server, artifact_id)
+
+    peer = _sid("ae3-write-acquirer")
+    acquire_status, _ = client.post(
+        "/hooks/pre-edit", {"session_id": peer, "path": _U3A_WARN_PATH},
+    )
+    assert acquire_status == 200
+
+    # Controls: neither comparand moved, and the caller really did lose the grant.
+    assert _u4_captured(server, artifact_id) == (captured_version, captured_generation)
+    assert server.registry.get_agent_state(
+        artifact_id, session_to_agent_id(sid),
+    ) != MESIState.SHARED
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=captured_version,
+        generation=captured_generation, content_hash=_hash("canonical"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "grant_preempted"}
+
+
+def test_ae4_differing_content_hash_demotes_the_generation(served_decider) -> None:
+    """The coordinator still REPORTS an integer generation here, and both
+    comparands match. Proceeding on that integer is the failure: a differing
+    content hash means the coordinator cannot vouch that the bytes in hand are
+    the content at that version, so the authority comparand is unconfirmed and
+    the fence holds."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    version, generation = _u4_captured(server, artifact_id)
+    # Control: the coordinator reports a REAL generation for this artifact, so
+    # the hold below is the demotion firing and not an absent generation.
+    assert isinstance(generation, int)
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=version, generation=generation,
+        content_hash=_hash("bytes-the-coordinator-never-recorded"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "generation_unconfirmed"}
+
+
+def test_ae5_zero_captured_version_holds_as_unconfirmed(served_decider) -> None:
+    """Zero is the "could not resolve" sentinel a degraded or pre-fence
+    coordinator hands back, never a comparable value. Comparing it is how "I
+    do not know" becomes "I know it is unchanged"."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    _version, generation = _u4_captured(server, artifact_id)
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=0, generation=generation,
+        content_hash=_hash("canonical"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "version_unconfirmed"}
+
+
+# --- AE8: the coordinator holds no content claim ---------------------------
+
+
+@pytest.mark.parametrize("recorded_hash,form", [
+    ("", "empty-string seed — what a KTD-9 first observation with no caller "
+         "hash writes, and the form eight of nine code paths produce"),
+    ("f" * 64, "the all-f launch-gate sentinel — no real SHA-256 matches it"),
+])
+def test_ae8_no_content_claim_holds_under_its_own_reason(
+    served_decider, recorded_hash: str, form: str,
+) -> None:
+    """AE8, and the reason this route exists at all.
+
+    Both comparands match, the grant stands, the read was not refused — every
+    leg the in-process fence can see says proceed. But the coordinator records
+    NO content hash, so it cannot vouch that the bytes in hand are the content
+    at that version. The in-process wrapper passes
+    ``content_claim_present=True`` unconditionally (its wire carries a
+    comparison, not the recorded hash) and therefore ADMITS here; this route
+    reads the registry and answers under ``content_claim_absent``.
+
+    The reason matters as much as the hold: falling into the residual
+    ``generation_unconfirmed`` bucket would make this byte-identical on the
+    wire to a degraded read, whose recovery is "re-read your bytes" rather
+    than "call an operator".
+    """
+    server, client = served_decider
+    path = _u3a_warn_path("ae8-no-claim")
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, path, recorded_hash=recorded_hash,
+        state=MESIState.SHARED, version=2, label=f"ae8-{len(recorded_hash)}",
+    )
+    version, generation = _u4_captured(server, artifact_id)
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, path, version=version, generation=generation,
+        content_hash=_hash("whatever-the-caller-holds"),
+    ))
+
+    assert status == 200, form
+    assert body == {"verdict": "hold", "reason": "content_claim_absent"}, form
+
+
+# --- the refused read ------------------------------------------------------
+
+
+def test_strict_refused_read_holds_with_the_refusal_reason(served_decider) -> None:
+    """A strict-mode deny with BOTH comparands matching. The refusal alone
+    must hold it: a caller that fell past the refusal leg would either
+    mislabel the hold as a lost grant or — with everything matching —
+    proceed on a view the coordinator had just refused to serve."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.INVALID, version=4,
+    )
+    version, generation = _u4_captured(server, artifact_id)
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_STRICT_PATH, version=version, generation=generation,
+        content_hash=_hash("canonical"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "read_denied"}
+
+
+# --- the artifact the coordinator does not track ---------------------------
+
+
+def test_untracked_artifact_holds_rather_than_answering_fresh(served_decider) -> None:
+    """pre-read's untracked fast path returns a fresh-shaped answer carrying
+    NO version, which a client reads as the zero sentinel. Copying that shape
+    here would turn "the coordinator knows nothing about this file" into "the
+    coordinator agrees nothing moved" — the exact admit this route exists to
+    close. It reaches its own held conclusion instead."""
+    server, client = served_decider
+    untracked = "notes/scratch.txt"
+    assert not server.policy.is_tracked(untracked)
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        _sid("untracked-caller"), untracked, version=7, generation=1,
+        content_hash=_hash("bytes"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "input_vanished"}
+
+
+def test_tracked_but_never_observed_artifact_holds(served_decider) -> None:
+    """Tracked by policy, but no row: pre-read answers this by MUTATING
+    (registering the artifact, seeding v1, granting SHARED). A verdict must
+    not mint the record it is asked to check, so it holds on the absence."""
+    server, client = served_decider
+    path = _u3a_warn_path("never-observed")
+    assert server.policy.is_tracked(path)
+    assert server.registry.lookup_artifact_id_by_name(path) is None
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        _sid("first-caller"), path, version=1, generation=0,
+        content_hash=_hash("bytes"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "input_vanished"}
+    assert server.registry.lookup_artifact_id_by_name(path) is None, (
+        "the verdict minted the artifact row it was asked to check"
+    )
+
+
+def test_unknown_agent_holds_and_no_retry_can_clear_it(served_decider) -> None:
+    """R5's sharpest case, and the reason a MISSING FIELD must not be a hold:
+    a caller resolving to an agent the coordinator has never seen legitimately
+    produces a hold that no number of identical retries can clear. If an
+    incomplete request also answered "hold", the two would be indistinguishable
+    on the wire — and only one of them is fixable by retrying."""
+    server, client = served_decider
+    path = _u3a_warn_path("unknown-agent")
+    _seeder_sid, _agent_id, artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2, label="unknown-agent-seeder",
+    )
+    version, generation = _u4_captured(server, artifact_id)
+    stranger = _sid("never-registered-stranger")
+    assert server.agent_name_for(session_to_agent_id(stranger)) is None
+
+    body = _u4_body(stranger, path, version=version, generation=generation,
+                    content_hash=_hash("canonical"))
+    first = client.post(_U4_ROUTE, body)
+    second = client.post(_U4_ROUTE, body)
+
+    assert first[0] == 200
+    assert first[1]["verdict"] == "hold"
+    assert second == first, "an identical retry cleared a hold it cannot clear"
+    # And the stranger stayed a stranger — the route derives the identity, it
+    # does not mint one (the pre-read handler registers before its work body).
+    #
+    # DO NOT DELETE THIS PAIR AS OFF-TOPIC. It is the only NON-VACUOUS pin on
+    # the agent-name map: ``test_the_fence_call_mutates_nothing`` carries that
+    # map in its before/after set too, but every one of its arms uses a session
+    # the seeder already registered, so a stray ``register_session`` there is a
+    # no-op and the dimension cannot fail. Verified by mutation: making the
+    # handler register instead of derive leaves the purity harness GREEN and
+    # turns only this test red.
+    assert server.agent_name_for(session_to_agent_id(stranger)) is None
+
+
+# --- R5: an incomplete request is a client error, never a hold -------------
+
+
+def _u4_complete(sid: str, path: str) -> dict:
+    """A request that would PROCEED if nothing were removed from it — so a
+    400 below is attributable to the removed field alone."""
+    return _u4_body(sid, path, version=2, generation=0, content_hash=_hash("canonical"))
+
+
+@pytest.mark.parametrize("drop,expected_error", [
+    ("expected_version", "missing expected_version"),
+    ("expected_generation", "missing expected_generation"),
+    ("content_hash", "missing content_hash"),
+])
+def test_ae6_omitted_input_is_a_client_error_naming_the_field(
+    served_decider, drop: str, expected_error: str,
+) -> None:
+    """AE6 and its two siblings. A hold invites a retry, and no number of
+    retries can supply a comparand the caller never captured — so an
+    incomplete request is told what to send, by name, rather than handed a
+    verdict it will bounce off forever.
+
+    Each error names a DIFFERENT field: an omitted generation and an omitted
+    content hash must not collapse into one message, or a caller cannot tell
+    which one it forgot."""
+    server, client = served_decider
+    sid, _agent_id, _artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    body = _u4_complete(sid, _U3A_WARN_PATH)
+    del body[drop]
+
+    status, resp = client.post(_U4_ROUTE, body)
+
+    assert status == 400
+    assert resp == {"error": expected_error}
+
+
+@pytest.mark.parametrize("field,value,expected_error", [
+    ("expected_version", "2", "expected_version must be an integer"),
+    ("expected_version", 2.0, "expected_version must be an integer"),
+    # bool is an int subclass: ``isinstance(True, int)`` is True, so a fence
+    # that merely type-checks accepts ``True`` as version 1 and compares it.
+    ("expected_version", True, "expected_version must be an integer"),
+    ("expected_generation", "0", "expected_generation must be an integer or null"),
+    ("expected_generation", False, "expected_generation must be an integer or null"),
+])
+def test_malformed_comparand_is_a_client_error(
+    served_decider, field: str, value: Any, expected_error: str,
+) -> None:
+    """Comparands are parsed as integers and NEVER coerced. A string "2" that
+    became 2, or a ``True`` that became 1, is a comparand the caller never
+    captured being compared as though it had been."""
+    _server, client = served_decider
+    body = _u4_complete(_sid("malformed-comparand"), _U3A_WARN_PATH)
+    body[field] = value
+
+    status, resp = client.post(_U4_ROUTE, body)
+
+    assert status == 400
+    assert resp == {"error": expected_error}
+
+
+def test_explicit_null_generation_is_the_sentinel_not_an_error(served_decider) -> None:
+    """The one asymmetry: an OMITTED generation is a client mistake, but an
+    explicit ``null`` is a captured fact — "the coordinator I read from
+    confirmed no generation". That is representable in the fence vocabulary,
+    so it is answered as the hold it is rather than as a malformed request."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    version, _generation = _u4_captured(server, artifact_id)
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=version, generation=None,
+        content_hash=_hash("canonical"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "generation_unconfirmed"}
+
+
+@pytest.mark.parametrize("session_id,expected_error", [
+    (None, "missing session_id"),
+    (42, "missing session_id"),
+    ("not-a-uuid", "session_id must be a UUID (8-4-4-4-12 hex with hyphens)"),
+])
+def test_missing_or_malformed_session_id_is_a_client_error(
+    served_decider, session_id: Any, expected_error: str,
+) -> None:
+    """Grant standing is PER SESSION: without the session identifier the route
+    cannot compute two of the six values the verdict needs. It says so rather
+    than gating on the four it can compute."""
+    _server, client = served_decider
+    body = _u4_complete(_sid("placeholder"), _U3A_WARN_PATH)
+    if session_id is None:
+        del body["session_id"]
+    else:
+        body["session_id"] = session_id
+
+    status, resp = client.post(_U4_ROUTE, body)
+
+    assert status == 400
+    assert resp == {"error": expected_error}
+
+
+@pytest.mark.parametrize("path,expected_error", [
+    ("/etc/passwd", "path must be relative (no leading /)"),
+    ("../../etc/passwd", "path contains '..' traversal"),
+    ("plan\nmd", "path contains control characters"),
+    ("", "missing or empty path"),
+])
+def test_path_gate_rejects_before_classifying(
+    served_decider, path: str, expected_error: str,
+) -> None:
+    """The route validates through the SAME server-side path gate every other
+    route uses. Skipping it would let an absolute or traversing path fall
+    through to the policy check, which answers False and therefore HOLDS — a
+    200 that looks like a safe answer while the boundary check never ran."""
+    _server, client = served_decider
+    body = _u4_complete(_sid("path-gate"), _U3A_WARN_PATH)
+    body["path"] = path
+
+    status, resp = client.post(_U4_ROUTE, body)
+
+    assert status == 400
+    assert resp == {"error": expected_error}
+
+
+def test_malformed_content_hash_is_a_client_error(served_decider) -> None:
+    """A present-but-wrong-shape hash is rejected for the same reason the
+    other routes reject it: a caller-supplied hash that is not a SHA-256 can
+    only ever mismatch, so admitting it turns every verdict into a hold with
+    no way to tell a broken client from a real divergence."""
+    _server, client = served_decider
+    body = _u4_complete(_sid("bad-hash"), _U3A_WARN_PATH)
+    body["content_hash"] = "not-a-sha"
+
+    status, resp = client.post(_U4_ROUTE, body)
+
+    assert status == 400
+    assert resp == {"error": "content_hash must be 64 hex characters (sha-256)"}
+
+
+# --- R12: neither non-normal arm may leak the wrapper's default shapes -----
+
+
+def test_watchdog_timeout_answers_hold_not_the_default_fresh_shape(served_decider) -> None:
+    """The shared wrapper's default degraded envelope is
+    ``{"status": "fresh", "degraded": true, ...}`` — a PROCEED shape, correct
+    for a pre-read whose contract is fresh/stale and catastrophic for a safety
+    verdict. This route owns its own envelope, and it reads as a hold carrying
+    a listed reason: a coordinator that timed out resolved nothing, which is
+    exactly what the "could not resolve" sentinel means."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+    from unittest.mock import patch
+
+    server, client = served_decider
+    with patch.object(server, "run_with_watchdog", side_effect=FuturesTimeout()):
+        status, body = client.post(_U4_ROUTE, _u4_complete(
+            _sid("watchdog"), _U3A_WARN_PATH,
+        ))
+
+    assert status == 200
+    assert body["verdict"] == "hold"
+    assert body["reason"] in HOLD_REASONS
+    assert body["held_by"] == "watchdog_timeout"
+    assert "status" not in body, "the wrapper's fresh-shaped default reached the wire"
+
+
+def test_handler_exception_answers_hold_not_the_wrappers_ok_false(served_decider) -> None:
+    """The wrapper's OTHER non-normal arm turns a handler exception into HTTP
+    200 ``{"ok": false, "reason": "internal: ..."}`` — a shape no
+    ``degraded_response`` parameter overrides, carrying no verdict and a
+    ``reason`` drawn from no published vocabulary. A fence client branching on
+    ``verdict`` would read that as neither proceed nor hold."""
+    from unittest.mock import patch
+
+    server, client = served_decider
+    with patch.object(
+        server.registry, "lookup_artifact_id_by_name",
+        side_effect=RuntimeError("simulated registry failure"),
+    ):
+        status, body = client.post(_U4_ROUTE, _u4_complete(
+            _sid("boom"), _U3A_WARN_PATH,
+        ))
+
+    assert status == 200
+    assert body["verdict"] == "hold"
+    assert body["reason"] in HOLD_REASONS
+    assert body["held_by"] == "handler_error"
+    assert "ok" not in body, "the wrapper's {ok: false} arm reached the wire"
+
+
+def test_an_unlisted_reason_never_reaches_the_wire(served_decider) -> None:
+    """R3, enforced rather than documented: the reason vocabulary is declared
+    protocol, so a reason outside it is a drift fault, not a verdict. It fails
+    into this route's own hold envelope instead of teaching a client a word no
+    published set contains."""
+    from unittest.mock import patch
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    _server, client = served_decider
+    with patch.object(mod, "classify_hold", return_value="reason_from_the_future"):
+        status, body = client.post(_U4_ROUTE, _u4_complete(
+            _sid("drift"), _U3A_WARN_PATH,
+        ))
+
+    assert status == 200
+    assert body["verdict"] == "hold"
+    assert body["reason"] != "reason_from_the_future"
+    assert body["reason"] in HOLD_REASONS
+
+
+def test_every_hold_reason_this_route_emits_is_published(served_decider) -> None:
+    """The closed set, checked against the reasons this suite actually drives
+    rather than against the constant module (which would check the set against
+    itself). Also pins that the route reaches MORE than one leg — a guard over
+    a single reason would pass on a route that answered ``input_vanished`` to
+    everything."""
+    server, client = served_decider
+    reasons = set()
+    for name, recorded, state, caller, strict, sent_version in (
+        ("moved", "canonical", MESIState.SHARED, "canonical", False, 1),
+        ("unconfirmed-version", "canonical", MESIState.SHARED, "canonical", False, 0),
+        ("no-claim", "", MESIState.SHARED, "canonical", False, None),
+        ("hash", "canonical", MESIState.SHARED, "other-bytes", False, None),
+        ("denied", "canonical", MESIState.INVALID, "canonical", True, None),
+    ):
+        path = _u3a_strict_path(name) if strict else _u3a_warn_path(name)
+        sid, _agent, artifact_id = _u3a_seed(
+            server, path, recorded_hash=(_hash(recorded) if recorded else ""),
+            state=state, version=3, label=f"published-{name}",
+        )
+        version, generation = _u4_captured(server, artifact_id)
+        status, body = client.post(_U4_ROUTE, _u4_body(
+            sid, path,
+            version=version if sent_version is None else sent_version,
+            generation=generation, content_hash=_hash(caller),
+        ))
+        assert status == 200
+        assert body["verdict"] == "hold", f"{name} answered {body}"
+        reasons.add(body["reason"])
+
+    assert reasons <= HOLD_REASONS
+    assert len(reasons) >= 4, f"only reached {reasons}; the legs are not separable"
+
+
+# --- the wire carries no session identifier --------------------------------
+
+
+def test_the_verdict_body_carries_no_session_identifier(served_decider) -> None:
+    """The verdict answers about an artifact, not about who asked. Echoing the
+    session id back would put a caller-supplied identifier into a body other
+    tooling logs, for no branch any client takes."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    version, generation = _u4_captured(server, artifact_id)
+
+    _status, proceed = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=version, generation=generation,
+        content_hash=_hash("canonical"),
+    ))
+    _status, held = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=version + 99, generation=generation,
+        content_hash=_hash("canonical"),
+    ))
+
+    assert proceed == {"verdict": "proceed"}
+    assert held["verdict"] == "hold"
+    for body in (proceed, held):
+        assert sid not in json.dumps(body)
+        assert "session_id" not in body
+
+
+# --- the route rides the one dispatcher seam -------------------------------
+
+
+def test_missing_bearer_is_refused(coordinator) -> None:
+    """No handler re-implements authentication: the route is registered in the
+    single table, so the central Bearer check runs before it is reached."""
+    bare = _Client("127.0.0.1", coordinator.port, "unused")
+    status, body = bare.request(
+        "POST", _U4_ROUTE, _u4_complete(_sid("noauth"), "plan.md"),
+        headers_override={"Authorization": ""},
+    )
+    assert status == 401
+    assert body == {"error": "missing or invalid bearer token"}
+
+
+def test_wrong_bearer_is_refused(coordinator) -> None:
+    wrong = _Client("127.0.0.1", coordinator.port, "not-the-secret")
+    status, body = wrong.post(_U4_ROUTE, _u4_complete(_sid("badauth"), "plan.md"))
+    assert status == 401
+    assert body == {"error": "missing or invalid bearer token"}
+
+
+def test_non_allowlisted_host_is_refused(client: _Client) -> None:
+    status, body = client.post(
+        _U4_ROUTE, _u4_complete(_sid("badhost"), "plan.md"),
+        headers_override={"Host": "evil.example.com"},
+    )
+    assert status == 403
+    assert body == {"error": "host header not allowlisted"}
+
+
+# --- the two counters ------------------------------------------------------
+
+
+def test_request_counter_counts_every_attempt_including_the_malformed(
+    served_decider,
+) -> None:
+    """The per-endpoint counter is bumped by the dispatcher BEFORE the handler
+    runs, so it counts attempts rather than successes. Registering the route in
+    the name map without also initialising the counter leaves the increment a
+    silent no-op — the name lookup fails closed — and the route becomes
+    invisible on /status while looking wired up in the source."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    version, generation = _u4_captured(server, artifact_id)
+    good = _u4_body(sid, _U3A_WARN_PATH, version=version,
+                    generation=generation, content_hash=_hash("canonical"))
+    malformed = dict(good)
+    del malformed["content_hash"]
+
+    assert server.endpoint_counters_snapshot()["effect_fence_total"] == 0
+    client.post(_U4_ROUTE, good)
+    client.post(_U4_ROUTE, malformed)
+
+    _status, metrics = client.request("GET", "/status?detail=metrics")
+    assert metrics["endpoint_counters"]["effect_fence_total"] == 2
+
+
+def test_hold_counter_moves_on_a_hold_and_stands_still_on_a_proceed(
+    served_decider,
+) -> None:
+    """The hold counter is the operator's view of how often the fence actually
+    stopped something. A counter that also ticked on a proceed would report a
+    healthy workspace and a wedged one identically."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    version, generation = _u4_captured(server, artifact_id)
+
+    def holds() -> int:
+        _s, metrics = client.request("GET", "/status?detail=metrics")
+        return metrics["effect_fence_holds_total"]
+
+    assert holds() == 0
+
+    _s, proceed = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=version, generation=generation,
+        content_hash=_hash("canonical"),
+    ))
+    assert proceed == {"verdict": "proceed"}
+    assert holds() == 0, "a proceed moved the hold counter"
+
+    _s, held = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=version + 1, generation=generation,
+        content_hash=_hash("canonical"),
+    ))
+    assert held["verdict"] == "hold"
+    assert holds() == 1
+
+    # A malformed request is not a hold: it never reached a verdict.
+    malformed = _u4_body(sid, _U3A_WARN_PATH, version=version,
+                         generation=generation, content_hash=_hash("canonical"))
+    del malformed["expected_generation"]
+    client.post(_U4_ROUTE, malformed)
+    assert holds() == 1, "a 400 was counted as a hold"
+
+
+# --- R7: the call mutates nothing -----------------------------------------
+
+
+def _u4_observable(
+    server: CoordinatorHTTPServer,
+    agent_id: uuid.UUID,
+    artifact_id: uuid.UUID,
+    session_id: str,
+) -> dict:
+    """Everything ``_handle_pre_read`` moves around this same decision, read
+    through NON-destructive accessors only, MINUS this route's own two
+    counters.
+
+    Those two are the documented exception and nothing else is: R7 forbids a
+    record that changes a LATER ANSWER, and an advisory count changes none.
+    Dropping them by name (rather than comparing whole snapshots loosely) keeps
+    every OTHER counter — the stale-warning pair, the strict-denial total, the
+    route-around total — inside the guard.
+    """
+    observable = _u3a_observable(server, agent_id, artifact_id)
+    counters = dict(observable["counters"])
+    endpoint = dict(counters["endpoint_counters"])
+    endpoint.pop("effect_fence_total", None)
+    counters["endpoint_counters"] = endpoint
+    counters.pop("effect_fence_holds_total", None)
+    observable["counters"] = counters
+    # The pre-read path registers the session BEFORE its work body, and
+    # session-start reads this map to decide whether a session was ever seen.
+    observable["agent_names"] = sorted(str(a) for a, _ in server.agent_names_snapshot())
+    # The untracked fast path CONSUMES the pending re-grounding flag.
+    observable["compact_pending"] = server.has_compact_pending(session_id)
+    return observable
+
+
+def _u4_seed_every_dimension(
+    server: CoordinatorHTTPServer, client: _Client, agent_id: uuid.UUID,
+    artifact_id: uuid.UUID, session_id: str, path: str,
+) -> None:
+    """Put a NON-DEFAULT value in every dimension before the before/after
+    snapshot. An assertion that ``None`` stayed ``None`` proves much less than
+    one that 41 stayed 41 — and a zero counter that stayed zero cannot tell a
+    route that never increments from one whose increment did not run."""
+    server.registry.record_heartbeat(agent_id, 41)
+    server.registry.record_preemption_notice(
+        victim_agent_id=agent_id, artifact_id=artifact_id,
+        preempter_agent_id=server.register_session(_sid("u4-preempter")),
+        preempted_at_unix_ts=1234.0,
+    )
+    server.mark_compact_pending(session_id)
+    server.mark_stale_warned(agent_id, artifact_id)
+    server.record_strict_deny(session_id, path)
+    for _ in range(3):
+        server.increment_stale_warning_emitted()
+    for _ in range(2):
+        server.increment_strict_mode_denial()
+    server.increment_strict_mode_routed_around_via_bash()
+    # A REAL strict deny, so audit.log exists with a non-zero size before the
+    # comparison: "no audit row appeared" is a much weaker claim against a
+    # file that does not exist yet than against one that does.
+    deny_sid, _deny_agent, _deny_artifact = _u3a_seed(
+        server, _u3a_strict_path("u4-audit-seed"), recorded_hash=_hash("canonical"),
+        state=MESIState.INVALID, version=2, label="u4-audit-seed",
+    )
+    status, _ = client.post("/hooks/pre-read", {
+        "session_id": deny_sid, "path": _u3a_strict_path("u4-audit-seed"),
+        "content_hash": _hash("canonical"),
+    })
+    assert status == 200
+
+
+@pytest.mark.parametrize("arm,sent_version_delta,expect", [
+    ("proceed", 0, "proceed"),
+    ("hold", 1, "hold"),
+])
+def test_the_fence_call_mutates_nothing(
+    served_decider, arm: str, sent_version_delta: int, expect: str,
+) -> None:
+    """R7, asserted as a before/after rather than read off the source.
+
+    The pre-read path mutates far more than it looks like: it registers the
+    session before the work body, records a heartbeat as its first statement
+    (the sweep reclaims grants on heartbeat staleness), re-grants SHARED on the
+    stale arm, marks the pair stale-warned, pops notices, fires five mutations
+    on a strict deny — one of which makes a later command increment a
+    route-around counter and writes an audit row — and consumes the pending
+    re-grounding flag on its untracked fast path.
+
+    A verdict that did ANY of it would turn a level-triggered hold into an
+    edge-triggered one: the next bare re-check would take the healed branch and
+    admit the effect whose grant a peer already revoked. This project has
+    recorded three prior instances of a read healing what it checks; this is
+    the guard that keeps the fence from being the fourth. Both arms are
+    checked, because a proceed and a hold leave through different branches.
+    """
+    server, client = served_decider
+    sid, agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    version, generation = _u4_captured(server, artifact_id)
+    _u4_seed_every_dimension(server, client, agent_id, artifact_id, sid, _U3A_WARN_PATH)
+    # A credentialed fence call (the route is require-class): claimed BEFORE the
+    # snapshot, so neither the claim nor an uncredentialed-request count is
+    # charged to the call under test — the guard stays over every other counter.
+    status, minted = client.post(
+        "/principal/claim", {"session_id": sid, "mint_nonce": uuid.uuid4().hex})
+    assert status == 200 and minted["ok"] is True, minted
+
+    before = _u4_observable(server, agent_id, artifact_id, sid)
+    # Controls for the seeding: a guard whose dimensions are all at their
+    # defaults is a guard that cannot fail.
+    assert before["heartbeat"] == 41
+    assert before["notice"] is not None
+    assert before["compact_pending"] is True
+    assert before["stale_warned"]
+    assert before["strict_denies"]
+    assert before["counters"]["strict_mode_denials_total"] > 0
+    assert before["counters"]["stale_warning_emitted_total"] > 0
+    assert before["counters"]["strict_mode_routed_around_via_bash_total"] > 0
+    assert before["audit_logs"] and all(size > 0 for _name, size in before["audit_logs"])
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_WARN_PATH, version=version + sent_version_delta,
+        generation=generation, content_hash=_hash("canonical"),
+    ), principal=minted["principal"])
+
+    assert status == 200
+    assert body["verdict"] == expect, f"the {arm} arm did not take its branch"
+    assert _u4_observable(server, agent_id, artifact_id, sid) == before
+
+
+# ----------------------------------------------------------------------
+# U6 — the PUBLISHED contract for the verdict route
+#
+# The goal these guard is derivability: a client written from the published
+# documentation alone, without reading this repository's source, reaches the
+# same verdict. Four claims carry that, and each is one a reader ACTS on:
+#
+#   * the reason vocabulary is wire-stable — added to, never renamed;
+#   * each reason names WHO establishes it and has its OWN recovery, including
+#     both senses of the vanished-input case, under the identifier it holds by;
+#   * the content hash is defined, because the server validates only its SHAPE
+#     and a client that picks the other plausible convention holds forever
+#     wearing the same reason a genuine conflict would;
+#   * every answer that is not a recognised verdict is a hold on the client's
+#     side — which is the whole of the story for a coordinator that answers 404.
+#
+# Every search runs over WHITESPACE-NORMALIZED text. The guide wraps its prose,
+# so a line-wise search for any of these sentences would report clean while the
+# sentence sat there mangled or half-deleted.
+# ----------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_GUIDE_PATH = _REPO_ROOT / "docs" / "guide.md"
+_README_PATH = _REPO_ROOT / "README.md"
+
+
+def _normalized(text: str) -> str:
+    """Collapse every run of whitespace, so a wrapped sentence still matches."""
+    return " ".join(text.split())
+
+
+# Each phrase is ONE contiguous fragment carrying a whole claim: a pin split
+# across two sentences would still pass with half the claim deleted.
+_CONTRACT_STATEMENTS: tuple[tuple[str, str], ...] = (
+    (
+        "the reason vocabulary is add-only, never renamed",
+        "Reasons may be added; an existing one is never renamed or repurposed.",
+    ),
+    (
+        "an unrecognised reason is still a hold",
+        "treat a `hold` whose `reason` you do not recognise as a hold",
+    ),
+    (
+        "each reason names its establisher and its own recovery",
+        "Each reason names who established it — the **coordinator**, from state only it "
+        "can see, or the **caller**, from state only *it* can see — and each has its own "
+        "recovery.",
+    ),
+    (
+        "the vanished input is established from BOTH sides",
+        "**`input_vanished` has two establishers, and both are in the contract.**",
+    ),
+    (
+        "the coordinator's sense of the vanished input",
+        "**The coordinator** answers `input_vanished` over the wire when it holds no "
+        "record of the artifact",
+    ),
+    (
+        "the caller's sense of the vanished input, under the same identifier",
+        "**The caller** establishes it itself when its own input no longer exists. The "
+        "coordinator cannot see your workspace, so it will never report this for you; "
+        "detect it and treat it as a hold under this same identifier.",
+    ),
+    (
+        "the content hash is defined over exact bytes, unnormalized",
+        "`content_hash` is a lowercase sha-256 hex digest over the exact bytes the caller "
+        "holds, with no normalization",
+    ),
+    (
+        "the wrong hash convention is a silent permanent hold",
+        "it simply never matches what the coordinator recorded, and every call it makes "
+        "holds wearing the same reason a genuine conflict would",
+    ),
+    (
+        "anything that is not a verdict is a hold",
+        "every one of these is a hold and the effect does not fire: a connection failure "
+        "or a timeout; any status other than `200`; a `200` body with no `verdict`; a "
+        "`verdict` you do not recognise; and a `404`",
+    ),
+    (
+        "the sibling coordinator answers 404 for this route",
+        "the sibling Node coordinator backend does not implement `/hooks/effect-fence`",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "claim,phrase", _CONTRACT_STATEMENTS, ids=[name for name, _ in _CONTRACT_STATEMENTS]
+)
+def test_guide_publishes_the_fence_contract(claim: str, phrase: str) -> None:
+    """Each claim a client is built from survives in the published guide."""
+    guide = _normalized(_GUIDE_PATH.read_text(encoding="utf-8"))
+    assert _normalized(phrase) in guide, f"the guide no longer states: {claim}"
+
+
+def _documented_hold_reasons() -> frozenset[str]:
+    """The reasons the guide's published table lists, parsed from the prose.
+
+    Parsed rather than hand-listed so the test reads what a client implementer
+    reads. A section that loses its table, or a table whose first column stops
+    being the reason, yields an empty set — which fails the comparison below
+    rather than passing vacuously.
+    """
+    guide = _GUIDE_PATH.read_text(encoding="utf-8")
+    heading = "### Hold reasons — the published vocabulary"
+    assert heading in guide, "the published reason vocabulary has no section"
+    section = guide.split(heading, 1)[1].split("\n### ", 1)[0]
+    reasons: set[str] = set()
+    in_body = False
+    for line in section.splitlines():
+        if line.startswith("|---"):
+            # Everything above the rule is the header, whose first cell is the
+            # column name, not a reason.
+            in_body = True
+        elif in_body and line.startswith("| `"):
+            reasons.add(line.split("|")[1].strip().strip("`"))
+        elif in_body and not line.startswith("|"):
+            break
+    return frozenset(reasons)
+
+
+def test_documented_reasons_are_exactly_the_published_set() -> None:
+    """The guide's table and ``HOLD_REASONS`` are the SAME set.
+
+    One side is DERIVED from the code (``HOLD_REASONS`` itself, imported at the
+    top of this module) and the other is parsed out of the published prose, so
+    neither is hand-typed here. That direction is deliberate and is the
+    opposite of this suite's frozen name-set guards: those pin a protocol
+    surface against its own source, where a derived expectation would move its
+    own goalposts. This test is a DRIFT check between two artifacts that must
+    agree — a reason added to the code and not to the guide leaves a client
+    branching on a word nothing documents, and a reason documented but never
+    published leaves one branching on a word that never arrives.
+    """
+    documented = _documented_hold_reasons()
+    assert documented == HOLD_REASONS, (
+        "the guide's hold-reason table and the published HOLD_REASONS set have "
+        f"drifted; documented-only={sorted(documented - HOLD_REASONS)}, "
+        f"published-only={sorted(HOLD_REASONS - documented)}"
+    )
+
+
+def test_tool_tables_name_the_http_fence() -> None:
+    """Neither published tool table leaves the fence looking tool-only.
+
+    The MCP tool table is where a reader decides what surfaces exist. While it
+    listed ``swg_gate`` and nothing else, the reasonable conclusion was that an
+    agent needs MCP (or Python) to reach a fence verdict at all — which is
+    exactly the reader this route exists for.
+    """
+    for doc in (_GUIDE_PATH, _README_PATH):
+        rows = [
+            line for line in doc.read_text(encoding="utf-8").splitlines()
+            if line.startswith("| `")
+        ]
+        # Control: the table this is about is still there to be read.
+        assert any(row.startswith("| `swg_gate`") for row in rows), (
+            f"{doc.name} no longer carries the tool table this guard is about"
+        )
+        assert any(row.startswith("| `POST /hooks/effect-fence`") for row in rows), (
+            f"{doc.name} lists the fence tool without its HTTP sibling"
+        )
+
+
+# ----------------------------------------------------------------------
+# U3b — the pre-read handler ANSWERS FROM the verdict
+#
+# U3a extracted decide_tracked_read; U3b rewired _handle_pre_read's tracked
+# branch to call it. The risk that rewiring carries is cosmetic
+# de-duplication: a handler that calls the verdict and then quietly re-derives
+# the same answer beside it would keep every response byte-identical and every
+# existing assertion green, while leaving two copies of the safety rule to
+# drift apart. These tests close that by DOCTORING the verdict and asserting
+# the response follows it — a handler still computing its own gate answers the
+# old way and fails here. Each doctored arm is paired with an un-doctored
+# control, so a fixture that silently stopped reaching the arm cannot pass as a
+# derivation proof.
+# ----------------------------------------------------------------------
+
+_U3B_TARGET = "ccs.adapters.claude_code.coordinator_server.decide_tracked_read"
+
+
+def _u3b_doctor(monkeypatch, **changes) -> None:
+    """Replace the verdict with the real one plus ``changes``.
+
+    Wrapping rather than fabricating keeps every field the test does not name
+    at its true value, so a response that moves can only have moved because of
+    the field under test.
+    """
+    real = decide_tracked_read
+
+    def fake(*args, **kwargs) -> TrackedReadDecision:
+        return dataclasses.replace(real(*args, **kwargs), **changes)
+
+    monkeypatch.setattr(_U3B_TARGET, fake)
+
+
+def _u3b_seed_invalid(server, path: str, label: str):
+    """A session a peer commit INVALIDated on a warn-mode path: the plain
+    stale arm, which never denies on its own."""
+    peer = server.register_session(_sid(f"u3b-peer-{label}"))
+    return _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"), state=MESIState.INVALID,
+        label=f"u3b-{label}", version=4, last_writer=peer,
+    )
+
+
+def _u3b_reset(server, artifact_id, agent_id, state) -> None:
+    """Put the pair back in its seeded state so the doctored call sees exactly
+    the input the control saw — the stale arm re-grants SHARED, so without this
+    the second call would be measuring a different scenario."""
+    server.registry.set_agent_state(
+        artifact_id, agent_id, state,
+        trigger="u3b-reset", tick=1, content_hash=_hash("canonical"),
+    )
+
+
+def _u3b_read(client: _Client, sid: str, path: str, caller_hash: str) -> dict:
+    status, body = client.post("/hooks/pre-read", {
+        "session_id": sid, "path": path, "content_hash": caller_hash,
+    })
+    # Every protocol outcome — fresh, stale and deny alike — is an HTTP 200
+    # here; a non-200 would mean the hook client degraded and the assertion
+    # below would be about a fault, not a verdict.
+    assert status == 200, body
+    return body
+
+
+def _u3b_decision_kind(body: dict) -> str:
+    hook = body.get("hookSpecificOutput") or {}
+    if hook.get("permissionDecision") == "deny":
+        return "denied"
+    return body.get("status", "?")
+
+
+def test_pre_read_deny_follows_the_verdict_not_a_second_gate(
+    served_decider, monkeypatch
+) -> None:
+    """The strict-deny GATE lives in the verdict; only the EMISSION is the
+    handler's. Doctoring a warn-mode stale into ``denied`` must turn the
+    response into the byte-stable deny and bump ``strict_mode_denials_total``.
+
+    A handler that kept its own ``is_strict_mode(...) and (INVALID or ...)``
+    test alongside the call would answer ``stale`` here and the two copies
+    could then drift — which is the failure this unit exists to make
+    impossible.
+    """
+    server, client = served_decider
+    path = _u3a_warn_path("derive-deny")
+    sid, agent_id, artifact_id = _u3b_seed_invalid(server, path, "derive-deny")
+
+    control = _u3b_read(client, sid, path, _hash("canonical"))
+    assert _u3b_decision_kind(control) == "stale", (
+        "control: a warn-mode INVALID session must reach the stale arm, or the "
+        "doctored call below proves nothing"
+    )
+
+    _u3b_reset(server, artifact_id, agent_id, MESIState.INVALID)
+    before = server.counters_snapshot()["strict_mode_denials_total"]
+    _u3b_doctor(monkeypatch, outcome="denied")
+    doctored = _u3b_read(client, sid, path, _hash("canonical"))
+
+    assert _u3b_decision_kind(doctored) == "denied"
+    assert server.counters_snapshot()["strict_mode_denials_total"] == before + 1
+
+
+def test_pre_read_arm_selection_follows_the_verdict(
+    served_decider, monkeypatch
+) -> None:
+    """Which ARM runs — fresh payload or stale envelope — is
+    ``holds_valid_grant``, not a second reading of the MESI state.
+
+    The session below really does hold SHARED throughout; only the verdict
+    says otherwise. If the handler still branched on ``agent_state`` it would
+    answer fresh and this would fail.
+    """
+    server, client = served_decider
+    path = _u3a_warn_path("derive-arm")
+    peer = server.register_session(_sid("u3b-peer-derive-arm"))
+    sid, agent_id, artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"), state=MESIState.SHARED,
+        label="u3b-derive-arm", version=4, last_writer=peer,
+    )
+
+    control = _u3b_read(client, sid, path, _hash("canonical"))
+    assert _u3b_decision_kind(control) == "fresh", "control: this is the fresh arm"
+
+    _u3b_doctor(monkeypatch, holds_valid_grant=False, outcome="stale",
+                prior_version_seen=3)
+    doctored = _u3b_read(client, sid, path, _hash("canonical"))
+
+    assert _u3b_decision_kind(doctored) == "stale"
+    assert doctored["summary"]["prior_version_seen_by_session"] == 3, (
+        "the summary's prior version is the verdict's arm-resolved value, not "
+        "a second `artifact.version - 1` computed in the handler"
+    )
+    assert server.registry.get_agent_state(artifact_id, agent_id) == MESIState.SHARED
+
+
+def test_fresh_arm_reads_only_the_fresh_hash_predicate(
+    served_decider, monkeypatch
+) -> None:
+    """The two hash predicates are NOT one predicate, and the fresh arm must
+    read its own.
+
+    ``stale_hash_differs`` keeps the no-claim recorded hashes IN (the
+    launch-gate denies reach their answer through the stale arm); the fresh arm
+    excludes them, because a still-SHARED holder must never be denied against
+    content the coordinator never claimed. A handler that folded them would
+    surface ``hash_differs`` and bump the mismatch counter here — on a read
+    whose hash MATCHES.
+    """
+    server, client = served_decider
+    path = _u3a_warn_path("derive-fresh-pred")
+    peer = server.register_session(_sid("u3b-peer-fresh-pred"))
+    sid, _agent_id, _artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"), state=MESIState.SHARED,
+        label="u3b-fresh-pred", version=2, last_writer=peer,
+    )
+
+    before = server.counters_snapshot()["fresh_shared_hash_mismatch_total"]
+    _u3b_doctor(monkeypatch, fresh_hash_differs=False, stale_hash_differs=True)
+    body = _u3b_read(client, sid, path, _hash("canonical"))
+
+    assert body == {"status": "fresh", "version": 2}, (
+        "the fresh payload read the STALE arm's predicate"
+    )
+    assert server.counters_snapshot()["fresh_shared_hash_mismatch_total"] == before
+
+    # Control for the assertion above: the fresh arm DOES follow its own
+    # predicate, so the silence just asserted is about which field was read and
+    # not about a branch that never fires.
+    _u3b_doctor(monkeypatch, fresh_hash_differs=True, stale_hash_differs=False)
+    body = _u3b_read(client, sid, path, _hash("canonical"))
+
+    assert body == {"status": "fresh", "version": 2, "hash_differs": True}
+    assert server.counters_snapshot()["fresh_shared_hash_mismatch_total"] == before + 1
+
+
+def test_stale_arm_reads_only_the_stale_hash_predicate(
+    served_decider, monkeypatch
+) -> None:
+    """The mirror of the test above: the stale summary's ``hash_differs`` is
+    ``stale_hash_differs``. Folding the two here would flip the no-prior-grant
+    deny gate, which is defined against exactly this field."""
+    server, client = served_decider
+    path = _u3a_warn_path("derive-stale-pred")
+    sid, agent_id, artifact_id = _u3b_seed_invalid(server, path, "stale-pred")
+
+    _u3b_doctor(monkeypatch, fresh_hash_differs=True, stale_hash_differs=False)
+    body = _u3b_read(client, sid, path, _hash("canonical"))
+    assert _u3b_decision_kind(body) == "stale"
+    assert body["summary"]["hash_differs"] is False, (
+        "the stale summary read the FRESH arm's predicate"
+    )
+
+    _u3b_reset(server, artifact_id, agent_id, MESIState.INVALID)
+    _u3b_doctor(monkeypatch, fresh_hash_differs=False, stale_hash_differs=True)
+    body = _u3b_read(client, sid, path, _hash("canonical"))
+    assert body["summary"]["hash_differs"] is True
+
+
+def test_the_verdict_runs_once_per_tracked_pre_read_on_the_handlers_clock(
+    served_decider, monkeypatch
+) -> None:
+    """One classification per request, on the handler's single clock read.
+
+    Two calls would mean two snapshots of a moving registry backing one
+    response; a clock read taken INSIDE the verdict would let the lag gate and
+    the deny summary's timestamps disagree within a single deny (KTD-P). The
+    untracked and first-observation arms are asserted NOT to reach the verdict
+    at all — each reaches its answer BY mutating, so neither has a
+    side-effect-free form for it to classify.
+    """
+    server, client = served_decider
+    calls: list[dict] = []
+    real = decide_tracked_read
+
+    def spy(*args, **kwargs) -> TrackedReadDecision:
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_U3B_TARGET, spy)
+
+    untracked_sid = _sid("u3b-untracked")
+    assert not server.policy.is_tracked("vendor/blob.bin")
+    client.post("/hooks/pre-read", {
+        "session_id": untracked_sid, "path": "vendor/blob.bin",
+        "content_hash": _hash("x"),
+    })
+    assert calls == [], "the untracked fast path classified through the verdict"
+
+    first_obs_sid = _sid("u3b-first-obs")
+    client.post("/hooks/pre-read", {
+        "session_id": first_obs_sid, "path": _u3a_warn_path("derive-first-obs"),
+        "content_hash": _hash("seed"),
+    })
+    assert calls == [], "first observation classified through the verdict"
+
+    path = _u3a_warn_path("derive-clock")
+    sid, _agent_id, _artifact_id = _u3b_seed_invalid(server, path, "clock")
+    wall_before = time.time()
+    _u3b_read(client, sid, path, _hash("canonical"))
+    wall_after = time.time()
+
+    assert len(calls) == 1, "the tracked branch classified more than once"
+    now_unix = calls[0]["now_unix"]
+    # A real clock read, bracketed by the request — not 0, not None, and not a
+    # constant a later refactor could freeze without anyone noticing.
+    assert wall_before <= now_unix <= wall_after
+
+
+@pytest.mark.parametrize(
+    "bad_agent_id",
+    ["has a space", "way-too-long" * 12, 42, ["a"], {"a": 1}, True],
+)
+def test_fence_refuses_a_malformed_agent_id_instead_of_answering_as_the_parent(
+    served_decider, bad_agent_id
+) -> None:
+    """A present-but-malformed subagent id must be a 400, never a verdict.
+
+    ``read_subagent_id`` resolves an out-of-shape value to ``None`` -- the
+    PARENT identity. On a read path that only changes attribution prose, which
+    is why the session-stop guard's comment scopes the allowance to read paths.
+    Here it changes WHOSE grant the verdict is about, and grant standing is the
+    one leg computed per agent: a subagent whose grant a peer preempted would
+    be answered about a parent that still holds SHARED, and told to PROCEED.
+    That is the fail-open this route exists to close, reached through an
+    identity field rather than a comparand.
+    """
+    server, client = served_decider
+    path = _u3a_warn_path("malformed-agent")
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2, label="malformed-agent-seed",
+    )
+    version, generation = _u4_captured(server, artifact_id)
+    body = _u4_body(sid, path, version=version, generation=generation,
+                    content_hash=_hash("canonical"))
+    body["agent_id"] = bad_agent_id
+
+    status, payload = client.post(_U4_ROUTE, body)
+
+    assert status == 400, f"malformed agent_id answered {status}, not a client error"
+    assert "agent_id" in payload["error"], payload
+    assert "verdict" not in payload, "a malformed identity produced a verdict"
+
+
+def test_fence_still_answers_for_an_absent_or_well_formed_agent_id(
+    served_decider,
+) -> None:
+    """The control for the refusal above. Rejecting a MALFORMED id must not
+    reject an ABSENT one -- omitting the field is the legitimate parent call
+    and every hook route accepts it -- nor a well-formed subagent id. Without
+    this, the guard could be tightened into refusing every caller and the
+    test above would still pass."""
+    server, client = served_decider
+    path = _u3a_warn_path("agent-id-controls")
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, path, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2, label="agent-id-controls-seed",
+    )
+    version, generation = _u4_captured(server, artifact_id)
+    base = _u4_body(sid, path, version=version, generation=generation,
+                    content_hash=_hash("canonical"))
+
+    absent_status, absent_payload = client.post(_U4_ROUTE, dict(base))
+    assert absent_status == 200, absent_payload
+    assert "verdict" in absent_payload
+
+    scoped = dict(base)
+    scoped["agent_id"] = "sub-agent_1"
+    scoped_status, scoped_payload = client.post(_U4_ROUTE, scoped)
+    assert scoped_status == 200, scoped_payload
+    assert "verdict" in scoped_payload
+
+
+# ======================================================================
+# Hook responses name a peer by its agent id, not by its session id (R7)
+# ======================================================================
+#
+# ``session_to_agent_id`` is a one-way uuid5 of the session id and the
+# coordinator already publishes it on /status. The disclosure-bearing hook
+# paths used to run that mapping BACKWARDS through the adapter's agent-name
+# map -- ``_agent_id_to_session`` -- and render the recovered session id, so a
+# response handed to one session republished a peer's session id (in full on
+# the session-stop notice array, and as its 8-char prefix in prose). Naming
+# the peer by the handle the coordinator already emits keeps attribution
+# intact and stops re-deriving an identifier the response has no reason to
+# carry. Nothing new is derived: the agent id is what the registry stores.
+
+
+def test_session_stop_notice_names_the_preempting_agent_id(client: _Client) -> None:
+    """The stop-drain notice array names the preempter by agent id.
+
+    The whole response body is searched for the preempter's session id,
+    because the notice carries a structured field AND prose and either would
+    republish it.
+    """
+    x = _sid("R7-X")
+    y = _sid("R7-Y")
+    client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})  # preempts X
+
+    status, body = client.post("/hooks/session-stop", {"session_id": x})
+    assert status == 200
+    notices = body.get("notices")
+    assert notices, f"the stop drain must surface X's pending notice; got {body!r}"
+
+    y_agent = session_to_agent_id(y)
+    notice = notices[0]
+    assert notice["path"] == "plan.md"
+    assert notice["preempter_agent_id"] == y_agent.hex, (
+        f"the notice must name the preempting AGENT; got {notice!r}"
+    )
+    assert notice["preempter_agent_short"] == y_agent.hex[:8]
+
+    serialized = json.dumps(body)
+    assert y not in serialized, (
+        f"the stop response still carries Y's session id verbatim: {serialized!r}"
+    )
+    assert y[:8] not in serialized, (
+        f"the stop response still carries Y's session-id prefix: {serialized!r}"
+    )
+    # The notice is only worth anything if it still ATTRIBUTES: the agent id
+    # has to be in the prose too, not merely in the structured field.
+    assert y_agent.hex[:8] in body["hookSpecificOutput"]["additionalContext"]
+
+
+def test_stale_summary_names_the_writing_agent_id(client: _Client) -> None:
+    """``summary.last_writer_session_id`` carries the writer's agent id.
+
+    End-to-end, because the value is produced by ``_last_writer_for`` reading
+    the registry's ``last_writer_id`` -- which has always been an agent id.
+    """
+    a = _sid("R7-reader")
+    b = _sid("R7-writer")
+    client.post("/hooks/pre-read", {"session_id": a, "path": "plan.md",
+                                    "content_hash": _hash("v1")})
+    client.post("/hooks/pre-edit", {"session_id": b, "path": "plan.md"})
+    client.post("/hooks/post-edit", {"session_id": b, "path": "plan.md",
+                                     "content_hash": _hash("v2"), "success": True})
+
+    status, body = client.post("/hooks/pre-read", {"session_id": a, "path": "plan.md",
+                                                   "content_hash": _hash("v2")})
+    assert status == 200
+    assert body["status"] == "stale", body
+    b_agent = session_to_agent_id(b)
+    assert body["summary"]["last_writer_session_id"] == b_agent.hex
+
+    serialized = json.dumps(body)
+    assert b not in serialized, f"the stale response carries B's session id: {serialized!r}"
+    assert b[:8] not in serialized, f"the stale response carries B's prefix: {serialized!r}"
+    assert b_agent.hex[:8] in body["hookSpecificOutput"]["additionalContext"]
+
+
+def test_edit_collision_names_the_holding_agent_id(client: _Client) -> None:
+    """The pre-edit collision notice names the incumbent holder by agent id."""
+    x = _sid("R7-holder")
+    y = _sid("R7-challenger")
+    client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    status, body = client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})
+    assert status == 200
+    assert body.get("collision") is True, body
+    context = body["hookSpecificOutput"]["additionalContext"]
+    assert f"({session_to_agent_id(x).hex[:8]})" in context, context
+    assert x[:8] not in json.dumps(body)
+
+
+def test_post_edit_preemption_reason_names_the_preempting_agent_id(
+    client: _Client,
+) -> None:
+    """The ``commit_not_allowed`` reason names the preempter by agent id."""
+    x = _sid("R7-loser")
+    y = _sid("R7-winner")
+    client.post("/hooks/pre-edit", {"session_id": x, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": y, "path": "plan.md"})  # preempts X
+    status, body = client.post("/hooks/post-edit", {
+        "session_id": x, "path": "plan.md",
+        "content_hash": _hash("v2"), "success": True,
+    })
+    assert status == 200
+    assert body.get("ok") is False, body
+    reason = body["reason"]
+    assert f"preempted by agent {session_to_agent_id(y).hex[:8]}" in reason, reason
+    assert y[:8] not in reason, reason
+
+
+def test_the_reverse_session_lookup_is_gone() -> None:
+    """``_agent_id_to_session`` is removed, not merely unused.
+
+    Left in place it is an invitation: the next renderer that wants a
+    human-ish label reaches for it and re-introduces exactly the mapping this
+    unit removed. Its absence is the enforcement.
+    """
+    from ccs.adapters.claude_code import coordinator_server as cs
+
+    assert not hasattr(cs, "_agent_id_to_session")
+
+
+# ======================================================================
+# A deny states what happened: a grant handover is not a write (R8)
+# ======================================================================
+#
+# Cohexa-ai/agent-coherence#196: a peer's pre-edit invalidates a live holder
+# WITHOUT committing anything. The holder's next read was denied with "was
+# updated by session <unknown> at <t>" -- a write that never happened, at a
+# timestamp when nothing was written. The renderers now branch on what the
+# summary can actually support: a version that moved past the one this
+# session last observed is a write; a version that did not is a grant that
+# changed hands.
+
+
+def _summary(**overrides: Any) -> dict:
+    base = {
+        "path": "docs/plan.md",
+        "current_version": 2,
+        "prior_version_seen_by_session": 1,
+        "last_writer_session_id": "aaaaaaaa11114111811111111111aaaa",
+        "last_writer_at_unix_ts": 1700000000.0,
+        "warning_generated_at_unix_ts": 1700000001.0,
+        "hash_differs": False,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_summary_reports_a_write_only_when_the_version_moved() -> None:
+    """The discriminator, stated once and asserted on both sides.
+
+    Asserting only the admitting direction would pass for a predicate that
+    always returns True, which is the shape the old prose had.
+    """
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    assert hp.summary_reports_a_write(_summary(current_version=2,
+                                               prior_version_seen_by_session=1))
+    assert not hp.summary_reports_a_write(_summary(current_version=1,
+                                                   prior_version_seen_by_session=1))
+    # Never observed: nothing to compare against, so no grant-change claim.
+    assert hp.summary_reports_a_write(_summary(prior_version_seen_by_session=None))
+    # Diverged bytes: something WAS written, in-band or not.
+    assert hp.summary_reports_a_write(_summary(current_version=1,
+                                               prior_version_seen_by_session=1,
+                                               hash_differs=True))
+
+
+def test_deny_after_a_real_commit_still_names_the_writer_and_the_version() -> None:
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    reason = hp.emit_strict_deny(
+        source="test", summary=_summary(),
+    )["permissionDecisionReason"]
+    assert reason == (
+        "Stale read denied: docs/plan.md was updated by agent aaaaaaaa at "
+        "2023-11-14T22:13:20+00:00. Re-read docs/plan.md via the Read tool "
+        "before proceeding. This denial is structural (v0.2 strict mode); "
+        "retrying the same operation will produce the same denial."
+    )
+
+
+def test_deny_after_a_grant_handover_claims_no_write_and_names_the_version() -> None:
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    reason = hp.emit_strict_deny(
+        source="test",
+        summary=_summary(current_version=1, prior_version_seen_by_session=1),
+    )["permissionDecisionReason"]
+    assert reason == (
+        "Stale read denied: your grant on docs/plan.md was revoked and no new "
+        "version was committed — docs/plan.md is still at v1. Re-read "
+        "docs/plan.md via the Read tool before proceeding. This denial is "
+        "structural (v0.2 strict mode); retrying the same operation will "
+        "produce the same denial."
+    )
+    assert "was updated by" not in reason
+
+
+def test_stale_warning_after_a_grant_handover_claims_no_write() -> None:
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    text = hp.stale_read_warning(
+        _summary(current_version=1, prior_version_seen_by_session=1)
+    )
+    assert text == (
+        "⚠ Stale read [warning emitted 2023-11-14T22:13:21+00:00]: your "
+        "grant on docs/plan.md was revoked and no new version was committed. "
+        "docs/plan.md is still at v1, the version you last saw. "
+        "Re-acquire before writing to docs/plan.md."
+    )
+    assert "was updated by" not in text
+
+
+# ----------------------------------------------------------------------
+# Caller-principal route posture (caller-principal plan, U6)
+# ----------------------------------------------------------------------
+#
+# Every route that takes a ``session_id`` is classified by the harm an ABSENT
+# principal admits there (KTD3): require-class routes refuse a request naming
+# a BOUND session without the principal ``POST /principal/claim`` bound to it
+# (a session nobody ever claimed — an older client's — is admitted and
+# counted, as before the principal existed: R16); accept-class routes admit an
+# absent principal and count it; every class refuses a foreign one; the mint
+# itself is neither. The
+# guarantee is accident-resistance and attributability under the same-OS-user
+# cooperative trust model — a caller that presents no principal, or one bound
+# to a different session, cannot end another writer's grant or have a write
+# recorded under another writer's name by mistake. It is not a boundary
+# against a process that can read ``.coherence/``: on the hook surface a
+# principal is stored there, so any process that can read it can present it.
+#
+# These tests drive the coordinator routes directly. A test that "forges" a
+# peer's identity deliberately does NOT present that peer's principal; that
+# abstention is the whole content of what the route can check.
+
+#: FROZEN duplicates of the wire refusals. Byte-stable on purpose: the two
+#: cases must stay distinguishable. A client classifies a refusal by the typed
+#: ``reason`` key, by equality — never by a substring of ``error``, which stays
+#: the prose every non-200 body carries.
+_PRINCIPAL_ABSENT_ERROR = (
+    "missing Coherence-Caller-Principal header: this route requires the caller "
+    "principal that POST /principal/claim bound to the session_id it names "
+    "(caller_principal_absent)"
+)
+_PRINCIPAL_FOREIGN_ERROR = (
+    "the Coherence-Caller-Principal header is not the caller principal bound to "
+    "the session_id this request names (caller_principal_foreign)"
+)
+_PRINCIPAL_ABSENT_REFUSAL = {
+    "error": _PRINCIPAL_ABSENT_ERROR, "reason": "caller_principal_absent",
+}
+_PRINCIPAL_FOREIGN_REFUSAL = {
+    "error": _PRINCIPAL_FOREIGN_ERROR, "reason": "caller_principal_foreign",
+}
+_PRINCIPAL_REFUSALS = (_PRINCIPAL_ABSENT_REFUSAL, _PRINCIPAL_FOREIGN_REFUSAL)
+
+
+def _principal_refused(response: tuple[int, dict]) -> bool:
+    """Whether ``response`` is a principal refusal, in EITHER body shape — so
+    an "admitted" assertion cannot pass merely because a refusal came back in
+    a shape this module no longer spells out."""
+    status, body = response
+    return status == 400 and (
+        body.get("error") in (_PRINCIPAL_ABSENT_ERROR, _PRINCIPAL_FOREIGN_ERROR)
+        or body.get("reason") in ("caller_principal_absent", "caller_principal_foreign")
+    )
+
+#: FROZEN duplicate of the posture table (route -> class). Never derived from
+#: ``_CALLER_PRINCIPAL_POSTURE``: a derived expectation moves with the edit that
+#: breaks it. Twenty-three routes: the eighteen the plan enumerates, the mint,
+#: and the four grant-handoff verbs (#185), which are require-class: each acts
+#: as the named session on a claim or a handoff record.
+#: ``pre-edit`` is require-class: a bound session's caller without its
+#: principal could take an EXCLUSIVE grant it can neither commit nor release.
+_EXPECTED_ROUTE_POSTURE: dict[tuple[str, str], str] = {
+    ("POST", "/hooks/pre-read"): "accept",
+    ("POST", "/hooks/effect-fence"): "require",
+    ("POST", "/hooks/pre-edit"): "require",
+    ("POST", "/hooks/post-edit"): "require",
+    ("POST", "/hooks/post-edit-cas"): "require",
+    ("POST", "/hooks/session-stop"): "require",
+    ("POST", "/hooks/session-start"): "accept",
+    ("POST", "/hooks/pre-bash"): "accept",
+    ("POST", "/hooks/pre-grep"): "accept",
+    ("POST", "/session/begin"): "accept",
+    ("POST", "/session/read"): "accept",
+    ("POST", "/session/commit"): "accept",
+    ("POST", "/session/commit_all"): "accept",
+    ("POST", "/session/heartbeat"): "accept",
+    ("POST", "/workspace/checkpoint"): "require",
+    ("POST", "/workspace/restore/status"): "require",
+    ("POST", "/workspace/restore/member"): "require",
+    ("POST", "/workspace/restore/register"): "require",
+    ("POST", "/principal/claim"): "mint",
+    ("POST", "/handoff/transfer"): "require",
+    ("POST", "/handoff/accept"): "require",
+    ("POST", "/handoff/decline"): "require",
+    ("POST", "/handoff/withdraw"): "require",
+}
+_EXPECTED_POSTURE_ROUTE_COUNT = 23
+
+_NEVER_MINTED_TOKEN = "A" * 43  # in session-token shape, never issued
+
+
+def _posture_body(route: tuple[str, str], sid: str) -> dict:
+    """A request body that passes every shape check on ``route`` for ``sid``,
+    so the request reaches the principal gate. Ordinary answers past the gate
+    (an untracked path, an unknown checkpoint, a never-minted token) are all
+    fine: the tests below only ask whether the GATE refused."""
+    _, path = route
+    h = _hash(f"posture:{path}")
+    member = {
+        "member_path": "posture.md", "native_token": "v1", "fingerprint": h,
+        "captured_at": 1.0, "absent": False, "dirty_during_window": False,
+        "arbitration_tier": "no-arbiter", "restore_tier": "forward_only",
+    }
+    bodies: dict[str, dict] = {
+        "/hooks/pre-read": {"path": "posture.md"},
+        "/hooks/effect-fence": {
+            "path": "posture.md", "expected_version": 1,
+            "expected_generation": 0, "content_hash": h,
+        },
+        "/hooks/pre-edit": {"path": "posture.md"},
+        "/hooks/post-edit": {"path": "posture.md", "success": False},
+        "/hooks/post-edit-cas": {
+            "path": "posture.md", "content_hash": h, "expected_version": 0,
+        },
+        "/hooks/session-stop": {},
+        "/hooks/session-start": {},
+        "/hooks/pre-bash": {"command": "cat posture.md"},
+        "/hooks/pre-grep": {"search_root": ""},
+        "/session/begin": {"read_set": ["posture.md"]},
+        "/session/read": {"session_token": _NEVER_MINTED_TOKEN, "path": "posture.md"},
+        "/session/commit": {
+            "session_token": _NEVER_MINTED_TOKEN, "path": "posture.md", "content": "x",
+        },
+        "/session/commit_all": {
+            "session_token": _NEVER_MINTED_TOKEN,
+            "writes": [{"path": "posture.md", "content": "x"}],
+        },
+        "/session/heartbeat": {"session_token": _NEVER_MINTED_TOKEN},
+        "/workspace/checkpoint": {
+            "name": "posture", "window_min": 1.0, "window_max": 1.0, "members": [member],
+        },
+        "/workspace/restore/status": {"checkpoint_id": "cp-unknown", "status": "in_progress"},
+        "/workspace/restore/member": {
+            "checkpoint_id": "cp-unknown", "member_path": "posture.md",
+            "restore_outcome": None,
+        },
+        "/workspace/restore/register": {
+            "checkpoint_id": "cp-unknown",
+            "writes": [{"member_path": "posture.md", "fingerprint": h}],
+        },
+        "/principal/claim": {"mint_nonce": uuid.uuid4().hex},
+        # A well-formed successor, so the request reaches the work body.
+        "/handoff/transfer": {
+            "successor": str(uuid.uuid4()), "grants": [{"path": "posture.md"}],
+        },
+        "/handoff/accept": {"path": "posture.md"},
+        "/handoff/decline": {"path": "posture.md"},
+        "/handoff/withdraw": {"path": "posture.md"},
+    }
+    return {"session_id": sid, **bodies[path]}
+
+
+def _explicit_claim(client: _Client, sid: str) -> str:
+    """Claim ``sid`` with a fresh random nonce, outside the auto client."""
+    status, body = client.post(
+        "/principal/claim",
+        {"session_id": sid, "mint_nonce": uuid.uuid4().hex},
+        principal=None,
+    )
+    assert status == 200 and body["ok"] is True, body
+    return body["principal"]
+
+
+def _absent_count(coordinator) -> int | None:
+    """The absent-principal counter: every ADMISSION that presents no
+    principal — any accept-class request, or a require-class request naming an
+    identity nobody claimed (KTD15). ``None`` if it is missing, so a test
+    reports its response assertions before the counter's."""
+    return coordinator.counters_snapshot().get("caller_principal_absent_total")
+
+
+def _refused_count(coordinator) -> int | None:
+    """The principal-refusal counter: every request a route REFUSED as absent
+    or foreign. ``None`` if it is missing, as :func:`_absent_count`."""
+    return coordinator.counters_snapshot().get("caller_principal_refused_total")
+
+
+def _principal_counts(coordinator) -> tuple[int | None, int | None]:
+    return _absent_count(coordinator), _refused_count(coordinator)
+
+
+@pytest.mark.parametrize(
+    "route", sorted(_EXPECTED_ROUTE_POSTURE), ids=lambda r: r[1].strip("/"),
+)
+def test_each_session_id_route_answers_its_posture_class(
+    route: tuple[str, str], coordinator, client: _Client
+) -> None:
+    """Every route in the table, in all five principal states: absent on a
+    BOUND identity, absent on an UNBOUND one, foreign on a bound one, foreign
+    on an UNBOUND one, and matching — each answer checked, and each state's
+    effect on the two counters (admitted-without-a-principal, and refused).
+
+    Prevents a route being left out of enforcement, a require-class route
+    admitting an absent principal for a claimed session (a stray caller
+    ending a claimed peer's grant), a require-class route refusing a session
+    nobody claimed (an older client's writes silently dropped, because the
+    shipped hook client turns every non-2xx into an allow), absent collapsing
+    into foreign (a phase no longer diagnosable), a refusal losing its typed
+    ``reason`` (clients classify by it), an accept-class route either not
+    counting the absent case or treating a foreign principal as absent — the
+    case that separates OPTIONAL from IGNORED — and a principal presented for a
+    session nobody claimed being waved through: nothing is bound there, so no
+    presented value can match, and it is foreign on every class."""
+    posture = _EXPECTED_ROUTE_POSTURE[route]
+    _, path = route
+    owner, other = str(uuid.uuid4()), str(uuid.uuid4())
+    owner_principal = _explicit_claim(client, owner)
+    foreign_principal = _explicit_claim(client, other)
+
+    def send(principal: str | None, sid: str = owner) -> tuple[int, dict]:
+        # The mint route needs an unclaimed session per request.
+        sid = str(uuid.uuid4()) if posture == "mint" else sid
+        return client.post(path, _posture_body(route, sid), principal=principal)
+
+    counts = [_principal_counts(coordinator)]
+    answers = {}
+    for state, principal, sid in (
+        ("absent", None, owner),
+        ("foreign", foreign_principal, owner),
+        ("valid", owner_principal, owner),
+        ("unbound", None, str(uuid.uuid4())),
+        ("foreign_unbound", foreign_principal, str(uuid.uuid4())),
+    ):
+        answers[state] = send(principal, sid=sid)
+        counts.append(_principal_counts(coordinator))
+    assert None not in counts[0], f"a principal counter is missing: {counts[0]}"
+    # Per-state movement of (absent counter, refused counter), in send order.
+    moved = {
+        state: (after[0] - prior[0], after[1] - prior[1])
+        for state, prior, after in zip(answers, counts, counts[1:])
+    }
+
+    if posture == "require":
+        assert answers["absent"] == (400, _PRINCIPAL_ABSENT_REFUSAL)
+        assert answers["foreign"] == (400, _PRINCIPAL_FOREIGN_REFUSAL)
+        assert not _principal_refused(answers["valid"]), answers["valid"]
+        assert not _principal_refused(answers["unbound"]), (
+            "a session nobody claimed is an older client's: admitted, as before",
+            answers["unbound"])
+        assert answers["foreign_unbound"] == (400, _PRINCIPAL_FOREIGN_REFUSAL)
+        assert moved == {
+            "absent": (0, 1), "foreign": (0, 1), "valid": (0, 0),
+            "unbound": (1, 0), "foreign_unbound": (0, 1),
+        }, "a refusal is counted as refused, the admitted unbound request as absent"
+    elif posture == "accept":
+        assert not _principal_refused(answers["absent"]), answers["absent"]
+        assert answers["foreign"] == (400, _PRINCIPAL_FOREIGN_REFUSAL)
+        assert not _principal_refused(answers["valid"]), answers["valid"]
+        assert not _principal_refused(answers["unbound"]), answers["unbound"]
+        assert answers["foreign_unbound"] == (400, _PRINCIPAL_FOREIGN_REFUSAL)
+        assert moved == {
+            "absent": (1, 0), "foreign": (0, 1), "valid": (0, 0),
+            "unbound": (1, 0), "foreign_unbound": (0, 1),
+        }, "only an admitted absent principal is absent; only a refusal is refused"
+    else:
+        assert posture == "mint"
+        for status, body in answers.values():
+            assert status == 200 and body["ok"] is True, body
+        assert set(moved.values()) == {(0, 0)}, "the mint is neither uncredentialed nor refused"
+
+
+def test_an_older_client_that_never_claims_still_commits_and_stops(
+    coordinator, client: _Client
+) -> None:
+    """R16, the version-skew direction this coordinator can observe: a client
+    that predates the principal sends no header and never claims, so the
+    session it names stays UNBOUND — and its require-class pre-edit, commit
+    and stop are admitted exactly as before: the version advances,
+    ``last_writer_id`` is its composite id, its grant is released, and each of
+    the four admissions is counted as uncredentialed. Refusing it would not surface anywhere: the shipped
+    hook client turns every non-2xx into ``{}``, an allow, so the edit would
+    proceed with coherence silently off."""
+    old = str(uuid.uuid4())
+    before = _absent_count(coordinator)
+    status, _ = client.post(
+        "/hooks/pre-edit", {"session_id": old, "agent_id": "sub-1", "path": "plan.md"})
+    assert status == 200
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    version = coordinator.registry.get_artifact(artifact_id).version
+
+    status, body = client.post("/hooks/post-edit", {
+        "session_id": old, "agent_id": "sub-1", "path": "plan.md",
+        "success": True, "content_hash": _hash("old-client"),
+    })
+    assert status == 200 and body["ok"] is True, body
+    assert coordinator.registry.get_artifact(artifact_id).version == version + 1
+    assert coordinator.registry.last_writer_for(artifact_id) == session_to_agent_id(old, "sub-1")
+
+    status, _ = client.post("/hooks/pre-edit", {"session_id": old, "path": "plan.md"})
+    status, body = client.post("/hooks/session-stop", {"session_id": old})
+    assert status == 200 and body["released_artifacts"] == ["plan.md"], body
+    assert _absent_count(coordinator) == before + 4
+
+
+def test_posture_table_classifies_every_session_id_route_with_no_residual() -> None:
+    """R13: one explicit table over every route that reads a ``session_id``,
+    and nothing else — no route falls to a default. A route added to
+    ``_ROUTES`` that reads a session id without a table entry fails here, and
+    so does an entry for a route that no longer exists.
+
+    ``/workspace/restore/status`` and ``/workspace/restore/member`` derive a
+    controller from the session id and gate on the checkpoint's receiver and
+    registration claim (#191), so require-class is what binds them to a
+    bound receiver's principal; the frozen expectation pins that decision."""
+    import inspect
+
+    from ccs.adapters.claude_code.coordinator_server import (
+        _CALLER_PRINCIPAL_POSTURE,
+        _ROUTES,
+    )
+
+    reads_session_id = {
+        route for route, handler in _ROUTES.items()
+        if 'body.get("session_id")' in inspect.getsource(handler)
+    }
+    assert set(_CALLER_PRINCIPAL_POSTURE) == reads_session_id
+    assert {
+        route: entry.posture.value for route, entry in _CALLER_PRINCIPAL_POSTURE.items()
+    } == _EXPECTED_ROUTE_POSTURE
+    assert len(_CALLER_PRINCIPAL_POSTURE) == _EXPECTED_POSTURE_ROUTE_COUNT
+    for route, entry in _CALLER_PRINCIPAL_POSTURE.items():
+        assert entry.harm.strip(), f"{route} states no harm for its class"
+
+
+# --- the gate under registry contention: bounded by the handler watchdog ------
+#
+# A require-class gate asks whether the named session is BOUND; for a session
+# nobody claimed (an older client's, admitted as before -- KTD15) the first
+# answer lives in the durable store, behind the registry lock. These tests hold
+# that lock the way the pre-edit degraded tests above do (_HeldRegistryLock)
+# and drive the REAL watchdog with a shortened HANDLER_TIMEOUT_SEC.
+
+#: How long a test waits for an answer while the registry lock is held -- eight
+#: times the shortened deadline, so only a request that is NOT bounded by the
+#: watchdog misses it.
+_GATE_ANSWER_BOUND_SEC = 2.0
+#: A value in principal shape that no coordinator minted.
+_NEVER_MINTED_PRINCIPAL = "B" * 43
+
+
+class _Background:
+    """One request sent from a helper thread, so a test can bound its own wait
+    for the answer and still release the lock the request is blocked on. A
+    request with no body is a GET (``/status``), with ``headers`` added."""
+
+    def __init__(
+        self,
+        client: _Client,
+        path: str,
+        body: dict | None = None,
+        principal: str | None = None,
+        *,
+        headers: dict | None = None,
+    ):
+        self._done = threading.Event()
+        self._response: tuple[int, dict] | None = None
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._send, args=(client, path, body, principal, headers), daemon=True)
+        self._thread.start()
+
+    def _send(
+        self, client: _Client, path: str, body: dict | None, principal: str | None,
+        headers: dict | None,
+    ) -> None:
+        try:
+            method = "GET" if body is None else "POST"
+            self._response = client.request(
+                method, path, body, principal=principal, headers_override=headers)
+        except BaseException as exc:  # re-raised on the test thread by result()
+            self._error = exc
+        finally:
+            self._done.set()
+
+    def answered_within(self, seconds: float) -> bool:
+        return self._done.wait(seconds)
+
+    def result(self) -> tuple[int, dict]:
+        if not self._done.wait(10.0):
+            pytest.fail("the request never answered, even with the registry lock released")
+        if self._error is not None:
+            raise self._error
+        assert self._response is not None
+        return self._response
+
+
+def _count_binding_reads(coordinator, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every durable-store read of a caller-principal binding: one entry
+    per ``registry.get_caller_principal`` call, naming the thread that made it."""
+    reads: list[str] = []
+    real = coordinator.registry.get_caller_principal
+
+    def recording(identity):
+        reads.append(threading.current_thread().name)
+        return real(identity)
+
+    monkeypatch.setattr(coordinator.registry, "get_caller_principal", recording)
+    return reads
+
+
+def test_a_never_claimed_pre_edit_answers_degraded_in_time_while_its_gate_cannot_read(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-edit from a session nobody claimed answers pre-edit's degraded
+    envelope within the handler watchdog while the registry lock is held, and
+    changes nothing.
+
+    Prevents the regression making pre-edit require-class introduced: its gate
+    asked the durable store whether the session was bound on the request
+    thread, under the registry lock and BEFORE the watchdog started, so a
+    client that never claims -- which must keep working (KTD15) -- waited on
+    registry contention with no deadline, past the hook's own budget, where it
+    used to get the degraded answer. The gate cannot decide in time here, and
+    it answers exactly what a timed-out work body answers: not a refusal
+    (nothing was refused) and not an admission (nothing was checked)."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    sid = str(uuid.uuid4())
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    principal_counts_before = _principal_counts(coordinator)
+
+    with _HeldRegistryLock(coordinator) as held:
+        started = time.monotonic()
+        answer = _Background(client, "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+        held.release()
+    response = answer.result()
+
+    assert answered, (
+        f"a pre-edit from a never-claimed session got no answer for {waited:.2f}s while "
+        f"the registry lock was held: its caller-principal gate is not bounded by the "
+        f"{_DEGRADE_DEADLINE_SEC}s handler watchdog")
+    assert response == (200, mod._PRE_EDIT_DEGRADED_RESPONSE), response
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    assert _principal_counts(coordinator) == principal_counts_before, (
+        "an undecided gate neither admitted nor refused the request")
+    assert coordinator.registry.lookup_artifact_id_by_name("plan.md") is None, (
+        "the work body ran: it seeded the artifact")
+    assert session_to_agent_id(sid) not in dict(coordinator.agent_names_snapshot()), (
+        "the handler registered the session past an undecided gate")
+
+
+def test_the_gate_degraded_table_covers_every_route_whose_gate_reads_the_registry() -> None:
+    """Every route but the mint can reach the store lookup (require-class
+    always, accept-class when a principal is presented), so each needs an
+    answer for a gate that times out. The table has no default: a route missing
+    from it would answer a 500 under exactly the contention the watchdog exists
+    for, so the key set is pinned against the FROZEN posture table here."""
+    from ccs.adapters.claude_code.coordinator_server import _CALLER_GATE_DEGRADED_RESPONSE
+
+    assert set(_CALLER_GATE_DEGRADED_RESPONSE) == {
+        route for route, posture in _EXPECTED_ROUTE_POSTURE.items() if posture != "mint"
+    }
+
+
+def test_the_gate_store_lookup_honours_the_watchdog_queue_limit(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the watchdog pool's queue past its limit, a request whose gate
+    would have to read the store answers the queue-overflow 503 at once, as a
+    work body does (A7), and reads nothing.
+
+    Prevents the gate's lookup becoming a way around the queue-depth gate:
+    queued behind an overloaded pool it would sit until the deadline and answer
+    degraded, where the route answers 503 immediately today."""
+    from unittest.mock import patch
+
+    class _OverflowingQueue:
+        @staticmethod
+        def qsize() -> int:
+            return 100  # well above the limit
+
+    reads = _count_binding_reads(coordinator, monkeypatch)
+    overflows_before = coordinator.counters_snapshot()["watchdog_queue_overflows_total"]
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with patch.object(coordinator._watchdog, "_work_queue", _OverflowingQueue()):
+        response = client.post(
+            "/hooks/pre-edit", {"session_id": str(uuid.uuid4()), "path": "plan.md"})
+    assert response == (503, {"error": "watchdog queue overloaded"})
+    assert reads == [], f"the gate read the store past a full queue: {reads}"
+    assert coordinator.counters_snapshot()["watchdog_queue_overflows_total"] == overflows_before + 1
+    assert coordinator._watchdog_timeouts_total == timeouts_before
+
+
+_GATED_ROUTES = sorted(
+    route for route, posture in _EXPECTED_ROUTE_POSTURE.items() if posture != "mint"
+)
+
+
+def _degrade_body(route: tuple[str, str], sid: str) -> dict:
+    """:func:`_posture_body`, with a TRACKED path wherever the posture body's
+    untracked one would let the handler answer before its work body runs."""
+    body = _posture_body(route, sid)
+    if body.get("path") == "posture.md":
+        body["path"] = "plan.md"
+    if body.get("command") == "cat posture.md":
+        body["command"] = "cat plan.md"
+    return body
+
+
+@pytest.mark.parametrize("route", _GATED_ROUTES, ids=lambda r: r[1].strip("/"))
+def test_a_timed_out_gate_answers_exactly_its_routes_timed_out_work_body(
+    route: tuple[str, str], coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On every route whose gate can read the registry, a gate that cannot
+    decide within the watchdog answers byte-for-byte what the same route
+    answers when its WORK BODY times out, and counts one watchdog timeout.
+
+    Prevents two things. A route whose gate waits on registry contention with
+    no deadline: the lookup runs for an identity the cache does not know -- a
+    never-claimed session presenting no principal on a require-class route, or
+    presenting one on an accept-class route. And a gate that times out
+    answering something else than the route's own degraded answer (a
+    refusal, an admission, another route's envelope): hook clients and the
+    library branch on that answer's shape. The second half is the control:
+    it times the work body out instead (``run_with_watchdog`` raising, as the
+    AC-05 tests do) for a claimed session the gate decides from the cache."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    _, path = route
+    posture = _EXPECTED_ROUTE_POSTURE[route]
+    never_claimed = str(uuid.uuid4())
+    presented = None if posture == "require" else _NEVER_MINTED_PRINCIPAL
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(client, path, _degrade_body(route, never_claimed), presented)
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+    gate_timed_out = answer.result()
+    assert answered, f"{path}: no answer while the registry lock was held"
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+
+    claimed = str(uuid.uuid4())
+    principal = _explicit_claim(client, claimed)
+    # pre-grep answers "fresh" before its work body when the store knows no
+    # tracked artifact under the search root.
+    coordinator.registry.resolve_or_register("plan.md", content_hash=_hash("seed"))
+
+    def work_times_out(fn, abort=None, deadline=None):
+        raise FuturesTimeout()
+
+    monkeypatch.setattr(coordinator, "run_with_watchdog", work_times_out)
+    work_timed_out = client.post(path, _degrade_body(route, claimed), principal=principal)
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 2, (
+        f"{path}: the control never reached its work body, so it compares nothing")
+    assert gate_timed_out == work_timed_out, (
+        f"{path}: a timed-out gate answered {gate_timed_out!r}, "
+        f"a timed-out work body {work_timed_out!r}")
+
+
+# --- the gate's store read RAISES: the route's own internal-error answer ------
+#
+# The lookup can raise something that is neither a refusal nor the watchdog's
+# timeout -- a registry read failing (``sqlite3.OperationalError`` once
+# ``busy_timeout`` elapses, a closed store). Inside a work body that exception
+# is turned into the route's HTTP 200 internal-error envelope; the gate must
+# answer the SAME thing, because a degrade-mode CoherentVolume reads a 500 as
+# an unanswered request and writes with no grant, where the typed 200 raises.
+
+#: FROZEN duplicate of the internal-error envelope every route but the effect
+#: fence answers when its work raised (the type name is the exception's).
+_INTERNAL_ERROR_ENVELOPE = {"ok": False, "reason": "internal: OperationalError"}
+#: FROZEN duplicate of the effect fence's own answer for a raise: a HOLD, so a
+#: client branching on ``verdict`` reads an answer, never a shape with none.
+_FENCE_INTERNAL_HOLD_ENVELOPE = {
+    "verdict": "hold", "reason": "version_unconfirmed", "degraded": True,
+    "held_by": "handler_error",
+}
+_FENCE_ROUTE = ("POST", "/hooks/effect-fence")
+
+
+def _fail_binding_reads(coordinator, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every durable-store read of a caller-principal binding raises the
+    registry's own transient error -- what a ``busy_timeout`` overrun raises."""
+    import sqlite3
+
+    def failing(identity):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(coordinator.registry, "get_caller_principal", failing)
+
+
+def _fail_work_body(
+    route: tuple[str, str], coordinator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Make ``route``'s WORK BODY raise the same registry error the gate's
+    lookup raises in the tests below. The effect fence catches inside its own
+    body (it owns that arm), so its verdict is what raises; every other route
+    lets the exception reach the wrapper, so the watchdog call is what raises."""
+    import sqlite3
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    def raising(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    if route == _FENCE_ROUTE:
+        monkeypatch.setattr(mod, "_effect_fence_verdict", raising)
+    else:
+        monkeypatch.setattr(coordinator, "run_with_watchdog", raising)
+
+
+@pytest.mark.parametrize("route", _GATED_ROUTES, ids=lambda r: r[1].strip("/"))
+def test_a_gate_whose_store_read_raises_answers_exactly_its_routes_failed_work_body(
+    route: tuple[str, str], coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On every route whose gate can read the registry, a lookup that RAISES a
+    non-refusal, non-timeout error answers byte-for-byte what the same route
+    answers when its WORK BODY raises that error: HTTP 200 and the route's
+    internal-error envelope, never the dispatcher's 500.
+
+    Prevents the gate and the body answering one failure in two shapes. The
+    hook client and the library read any non-200 as "no coordinator" and
+    degrade: a degrade-mode ``CoherentVolume`` answered 500 on pre-edit skips
+    its grant check and writes with no grant and no peer invalidation, where
+    the typed 200 raises ``StaleView`` in both modes. The first half drives
+    the gate: a never-claimed session on a require-class route, a never-minted
+    principal on an accept-class one, each a cold-cache lookup. The control
+    drives the body instead, for a claimed session the gate decides from the
+    cache, so the two answers come from the two arms."""
+    _, path = route
+    posture = _EXPECTED_ROUTE_POSTURE[route]
+    never_claimed = str(uuid.uuid4())
+    presented = None if posture == "require" else _NEVER_MINTED_PRINCIPAL
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with monkeypatch.context() as gate_only:
+        _fail_binding_reads(coordinator, gate_only)
+        gate_raised = client.post(path, _degrade_body(route, never_claimed), principal=presented)
+    assert gate_raised[0] == 200, f"{path}: the gate's raise reached the dispatcher: {gate_raised}"
+
+    claimed = str(uuid.uuid4())
+    principal = _explicit_claim(client, claimed)
+    # pre-grep answers "fresh" before its work body when the store knows no
+    # tracked artifact under the search root.
+    coordinator.registry.resolve_or_register("plan.md", content_hash=_hash("seed"))
+    _fail_work_body(route, coordinator, monkeypatch)
+    body_raised = client.post(path, _degrade_body(route, claimed), principal=principal)
+    assert body_raised[0] == 200 and body_raised[1] != {"ok": True}, (
+        f"{path}: the control never reached its work body, so it compares nothing")
+    assert gate_raised == body_raised, (
+        f"{path}: a raising gate answered {gate_raised!r}, "
+        f"a raising work body {body_raised!r}")
+    assert coordinator._watchdog_timeouts_total == timeouts_before, "a raise is not a timeout"
+
+
+@pytest.mark.parametrize(
+    ("route", "presented", "envelope"),
+    [
+        (("POST", "/hooks/pre-edit"), None, _INTERNAL_ERROR_ENVELOPE),
+        (("POST", "/hooks/pre-read"), _NEVER_MINTED_PRINCIPAL, _INTERNAL_ERROR_ENVELOPE),
+        (_FENCE_ROUTE, None, _FENCE_INTERNAL_HOLD_ENVELOPE),
+    ],
+    ids=["pre-edit", "pre-read-with-a-principal", "effect-fence"],
+)
+def test_a_gate_whose_store_read_raises_answers_the_typed_envelope_and_changes_nothing(
+    route: tuple[str, str], presented: str | None, envelope: dict,
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The envelope a raising gate answers, pinned as a frozen literal -- the
+    ``{ok: false, reason: "internal: <Type>"}`` a client raises on, and the
+    fence's hold -- and what it leaves behind: no artifact row, no session,
+    no grant (the request was neither admitted nor refused, so neither
+    principal counter moves), one ERROR log record carrying the traceback,
+    and no principal in the log or the body (R5). A fence hold reached this
+    way is counted as a hold, as the body's own internal hold is."""
+    import logging
+
+    _, path = route
+    sid = str(uuid.uuid4())
+    caplog.set_level(logging.ERROR, logger="ccs.adapters.claude_code.coordinator_server")
+    counts_before = _principal_counts(coordinator)
+    holds_before = coordinator.counters_snapshot()["effect_fence_holds_total"]
+    _fail_binding_reads(coordinator, monkeypatch)
+
+    response = client.post(path, _degrade_body(route, sid), principal=presented)
+
+    assert response == (200, envelope)
+    assert coordinator.registry.lookup_artifact_id_by_name("plan.md") is None, (
+        "the work body ran: it seeded the artifact")
+    assert session_to_agent_id(sid) not in dict(coordinator.agent_names_snapshot()), (
+        "the handler registered the session past a failed gate")
+    assert _principal_counts(coordinator) == counts_before, (
+        "a gate that decided nothing counted an admission or a refusal")
+    expected_holds = holds_before + (1 if route == _FENCE_ROUTE else 0)
+    assert coordinator.counters_snapshot()["effect_fence_holds_total"] == expected_holds
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and errors[0].exc_info is not None, (
+        "the failure was not logged with its traceback")
+    assert path in errors[0].getMessage(), "the log does not name the route"
+    if presented is not None:
+        assert presented not in caplog.text and presented not in json.dumps(response[1]), (
+            "a presented principal reached the log or the body")
+
+
+def test_a_never_claimed_session_is_answered_without_touching_the_registry(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the durable store has said a session is unbound, the service keeps
+    that answer: later requests naming the session read no registry at all in
+    the gate, so registry contention neither slows nor degrades an answer the
+    route itself gives without the registry -- here the untracked fast path,
+    registry-free by design (R8).
+
+    Prevents every request of a client that never claims (KTD15) paying a
+    store read in the gate: bounded by the watchdog, that read still turns the
+    fast path's own answer into a degraded one whenever the lock is busy."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    sid = str(uuid.uuid4())
+    untracked = {"session_id": sid, "path": "notes/untracked.txt"}
+    assert client.post("/hooks/pre-edit", untracked) == (200, {"ok": True})
+    reads = _count_binding_reads(coordinator, monkeypatch)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(client, "/hooks/pre-edit", untracked)
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+    assert answered, "the second request waited on the registry lock"
+    assert answer.result() == (200, {"ok": True}), (
+        "the untracked fast path's own answer, not a degraded one")
+    assert coordinator._watchdog_timeouts_total == timeouts_before
+
+    for body in (untracked, {**untracked, "success": False}):
+        route = "/hooks/pre-edit" if "success" not in body else "/hooks/post-edit"
+        assert client.post(route, body) == (200, {"ok": True})
+    assert reads == [], f"the gate read the store for a session it already knew: {reads}"
+
+
+def test_a_claim_replaces_the_cached_unbound_answer_for_its_session(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cached UNBOUND answer lasts only until the session is claimed: from
+    the first request after the claim, the same request without the principal
+    is refused as absent, and the principal is admitted.
+
+    Prevents the negative cache outliving the bind. The session's own client
+    claims it -- through this coordinator, the only writer of bindings -- and a
+    stale UNBOUND answer would keep admitting absent-principal requests naming
+    it as an older client's, the #188 case the require class exists to refuse,
+    while refusing the claimed client's own principal as foreign. The first
+    half proves the answer really was cached (a second absent request reads no
+    store), so the second half tests the replacement of a real cache entry."""
+    sid = str(uuid.uuid4())
+    reads = _count_binding_reads(coordinator, monkeypatch)
+    for _ in range(2):
+        status, body = client.post("/hooks/session-stop", {"session_id": sid})
+        assert status == 200 and body["ok"] is True, body
+    assert len(reads) == 1, f"the UNBOUND answer was not cached: {len(reads)} store reads"
+
+    principal = _explicit_claim(client, sid)
+    assert client.post("/hooks/session-stop", {"session_id": sid}) == (
+        400, _PRINCIPAL_ABSENT_REFUSAL)
+    status, body = client.post("/hooks/session-stop", {"session_id": sid}, principal=principal)
+    assert status == 200 and body["ok"] is True, body
+
+
+def test_a_refusal_the_store_lookup_decides_is_still_a_400_that_changes_nothing(
+    tmp_path: Path,
+) -> None:
+    """After a restart the service's cache is empty, so a request naming a
+    session claimed before it is decided by the store lookup -- which runs in
+    the watchdog pool, off the request thread. A refusal decided there is the
+    same HTTP 400 with its typed reason, never a hold and never degraded; the
+    refused pre-edit seeds nothing, registers nothing and times nothing out;
+    and the session's principal is then admitted.
+
+    Prevents the bounded lookup changing what it decides: a refusal turned
+    into the degraded envelope would ADMIT the edit (pre-edit degrades to
+    ``ok: true``) for the claimed session whose principal is absent -- the
+    #188 case again -- and a lookup made back on the request thread would
+    reopen the unbounded wait."""
+    sid = str(uuid.uuid4())
+    before = _restart_on(tmp_path, "gate-before-restart")
+    try:
+        secret = load_secret(before.coordinator_root)
+        assert secret is not None
+        principal = _explicit_claim(_Client("127.0.0.1", before.port, secret), sid)
+    finally:
+        before.shutdown()
+
+    after = _restart_on(tmp_path, "gate-after-restart")
+    try:
+        secret = load_secret(after.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", after.port, secret)
+        reads: list[str] = []
+        real = after.registry.get_caller_principal
+
+        def recording(identity):
+            reads.append(threading.current_thread().name)
+            return real(identity)
+
+        after.registry.get_caller_principal = recording
+        timeouts_before = after._watchdog_timeouts_total
+        body = {"session_id": sid, "path": "plan.md"}
+
+        assert client.post("/hooks/pre-edit", body) == (400, _PRINCIPAL_ABSENT_REFUSAL)
+        assert reads and all(name.startswith("coord-wd") for name in reads), (
+            f"the gate read the store on the request thread: {reads}")
+        assert after._watchdog_timeouts_total == timeouts_before
+        assert after.registry.lookup_artifact_id_by_name("plan.md") is None
+        assert session_to_agent_id(sid) not in dict(after.agent_names_snapshot())
+
+        status, admitted = client.post("/hooks/pre-edit", body, principal=principal)
+        assert (status, admitted) == (200, {"ok": True}), admitted
+    finally:
+        after.shutdown()
+
+
+def test_the_gate_and_the_work_body_share_one_watchdog_deadline(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request whose gate spent part of the watchdog budget reading the
+    store gives its work body only what is left: a work body that then blocks
+    is answered at the ONE deadline, not at the lookup's time plus a fresh one.
+
+    Prevents bounding the gate by turning a request into one that waits up to
+    twice the watchdog -- past the hook's own 5s budget, where the hook client
+    gives up on its own and a work body not yet aborted can still land state
+    the caller was never told about. The store read is made slow by a stand-in
+    that answers "unbound" after a delay WITHOUT the registry lock, so the lock
+    this test holds blocks only the work body."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    deadline = 1.0
+    lookup_delay = 0.7 * deadline
+
+    def slow_unbound(identity):
+        time.sleep(lookup_delay)
+        return None
+
+    monkeypatch.setattr(coordinator.registry, "get_caller_principal", slow_unbound)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", deadline)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with _HeldRegistryLock(coordinator) as held:
+        started = time.monotonic()
+        answer = _Background(
+            client, "/hooks/pre-edit", {"session_id": str(uuid.uuid4()), "path": "plan.md"})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+        held.release()
+
+    assert answered, f"no answer within {_GATE_ANSWER_BOUND_SEC}s"
+    assert answer.result() == (200, mod._PRE_EDIT_DEGRADED_RESPONSE)
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    # One deadline answers at ~1.0s; a fresh one for the body at ~0.7 + 1.0s.
+    assert waited < deadline + lookup_delay / 2, (
+        f"answered after {waited:.2f}s: the work body got a fresh {deadline}s "
+        f"after a {lookup_delay:.2f}s gate lookup, not what was left of one deadline")
+
+
+def test_the_fast_path_delivery_gets_only_what_the_gate_left_of_the_deadline(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The untracked fast path runs work under the watchdog too -- the deferred
+    re-grounding delivery, when the session has compact-pending armed -- and
+    that delivery also gets only what the gate's store lookup left of the ONE
+    deadline.
+
+    Prevents the fast path's call site starting a fresh deadline after the
+    gate, which the test above cannot see: it pins the tracked work body's call
+    site only. The path is reachable by a client that never claims (KTD15): its
+    session-start after a compaction arms compact-pending, and its pre-edit on
+    an untracked path then has the gate read the store and the delivery walk
+    the registry -- with two budgets, up to twice the watchdog, past the hook's
+    own 5s budget. The store read is the same lock-free slow stand-in as
+    above, so the lock this test holds blocks only the delivery."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    deadline = 1.0
+    lookup_delay = 0.7 * deadline
+
+    def slow_unbound(identity):
+        time.sleep(lookup_delay)
+        return None
+
+    sid = str(uuid.uuid4())
+    coordinator.mark_compact_pending(sid)
+    assert coordinator.has_compact_pending(sid)
+    monkeypatch.setattr(coordinator.registry, "get_caller_principal", slow_unbound)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", deadline)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with _HeldRegistryLock(coordinator) as held:
+        started = time.monotonic()
+        answer = _Background(
+            client, "/hooks/pre-edit", {"session_id": sid, "path": "notes/untracked.txt"})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+        held.release()
+
+    assert answered, f"no answer within {_GATE_ANSWER_BOUND_SEC}s"
+    assert answer.result() == (200, {"ok": True}), (
+        "the gate admitted the session and the fast path answered its bare body")
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1, (
+        "the delivery never timed out, so this measured nothing about its deadline")
+    # One deadline answers at ~1.0s; a fresh one for the delivery at ~0.7 + 1.0s.
+    assert waited < deadline + lookup_delay / 2, (
+        f"answered after {waited:.2f}s: the fast-path delivery got a fresh {deadline}s "
+        f"after a {lookup_delay:.2f}s gate lookup, not what was left of one deadline")
+
+
+def test_a_work_body_whose_deadline_has_already_passed_is_never_submitted(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the request's watchdog deadline has passed by the time its work
+    body would start, the body is not submitted at all: the request answers the
+    route's degraded envelope, counts one watchdog timeout, and nothing runs
+    afterwards.
+
+    Prevents ``run_with_watchdog`` submitting the body anyway with a token
+    wait. The caller is told "degraded" at once while the body runs with nobody
+    waiting for it -- for pre-edit it seeds the artifact and can land an
+    EXCLUSIVE grant the agent never learns of, the late completion the A6 abort
+    exists to prevent. The gate's store lookup starts the deadline (a session
+    nobody claimed, which the cache cannot answer), and a registration made
+    slow on the request thread spends the rest of it before the body."""
+    from concurrent.futures import Future
+    from concurrent.futures import wait as futures_wait
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    deadline = 0.5
+    real_register = coordinator.register_session
+
+    def register_past_the_deadline(*args, **kwargs):
+        time.sleep(deadline + 0.2)
+        return real_register(*args, **kwargs)
+
+    submitted: list[Future] = []
+    real_submit = coordinator._watchdog.submit
+
+    def recording_submit(fn, *args, **kwargs):
+        future = real_submit(fn, *args, **kwargs)
+        submitted.append(future)
+        return future
+
+    monkeypatch.setattr(coordinator, "register_session", register_past_the_deadline)
+    monkeypatch.setattr(coordinator._watchdog, "submit", recording_submit)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", deadline)
+    timeouts_before = coordinator._watchdog_timeouts_total
+
+    response = client.post(
+        "/hooks/pre-edit", {"session_id": str(uuid.uuid4()), "path": "plan.md"})
+
+    assert response == (200, mod._PRE_EDIT_DEGRADED_RESPONSE), response
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    _, still_running = futures_wait(submitted, timeout=_ABANDONED_BODY_SETTLE_SEC)
+    assert not still_running, (
+        f"timed out after {_ABANDONED_BODY_SETTLE_SEC}s waiting for the work submitted "
+        f"to the watchdog pool to finish")
+    assert coordinator.registry.lookup_artifact_id_by_name("plan.md") is None, (
+        "the work body ran after its deadline had passed: it seeded plan.md")
+    assert len(submitted) == 1, (
+        f"{len(submitted)} submissions to the watchdog pool: the gate's store lookup, "
+        f"then a work body submitted after its deadline had passed")
+
+
+def test_a_cached_identity_is_admitted_on_the_request_thread_not_in_the_watchdog_pool(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session the service's binding cache knows is decided on the request
+    thread: with every watchdog worker stuck on the registry lock, a claimed
+    session's untracked pre-edit still answers the fast path's own
+    ``{ok: true}`` at once and counts no timeout.
+
+    Prevents the gate taking every lookup through the watchdog pool. The cache
+    would still decide, but only once a worker came free, so while work bodies
+    blocked on registry contention fill the pool, a request the route answers
+    without the registry at all (the untracked fast path, R8) waits out the
+    deadline and degrades. The pool is shown to be full before the request is
+    sent -- every worker started and none free to run a no-op -- because with a
+    free worker the lookup would get through at once and this would measure
+    nothing."""
+    from concurrent.futures import wait as futures_wait
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    free_worker_grace_sec = 0.2
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    workers = mod._WATCHDOG_POOL_SIZE
+    blockers = [(s, _explicit_claim(client, s)) for s in (str(uuid.uuid4()) for _ in range(workers))]
+    sid = str(uuid.uuid4())
+    principal = _explicit_claim(client, sid)
+
+    with _HeldRegistryLock(coordinator) as held:
+        stuck = [
+            _Background(client, "/hooks/pre-edit", {"session_id": s, "path": "plan.md"}, p)
+            for s, p in blockers
+        ]
+        for request in stuck:
+            assert request.answered_within(_GATE_ANSWER_BOUND_SEC), (
+                f"timed out after {_GATE_ANSWER_BOUND_SEC}s waiting for a blocker's "
+                f"degraded answer")
+            assert request.result() == (200, mod._PRE_EDIT_DEGRADED_RESPONSE), (
+                "a blocker's work body did not time out on the registry lock")
+        no_op = coordinator._watchdog.submit(lambda: None)
+        ran, _ = futures_wait([no_op], timeout=free_worker_grace_sec)
+        assert not ran and len(coordinator._watchdog._threads) == workers, (
+            "a watchdog worker was still free, so a lookup sent through the pool "
+            "would not have waited: this measures nothing")
+        timeouts_before = coordinator._watchdog_timeouts_total
+        started = time.monotonic()
+        answer = _Background(
+            client, "/hooks/pre-edit", {"session_id": sid, "path": "notes/untracked.txt"},
+            principal)
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+        held.release()
+
+    assert answered, f"timed out after {_GATE_ANSWER_BOUND_SEC}s waiting for the answer"
+    assert answer.result() == (200, {"ok": True}), (
+        f"after {waited:.2f}s, the fast path's own answer, not a degraded one: the gate "
+        f"queued a cached identity's decision behind the stuck watchdog workers")
+    assert coordinator._watchdog_timeouts_total == timeouts_before
+    drained, _ = futures_wait([no_op], timeout=_ABANDONED_BODY_SETTLE_SEC)
+    assert drained, (
+        f"timed out after {_ABANDONED_BODY_SETTLE_SEC}s waiting for the watchdog pool "
+        f"to drain once the registry lock was released")
+
+
+def _pre_edit_with(client: _Client, sid: str, principal: str, path: str) -> None:
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": sid, "path": path}, principal=principal
+    )
+    assert status == 200 and body.get("ok") is not False, body
+
+
+def test_session_stop_without_a_principal_leaves_a_peers_grant_standing(
+    coordinator, client: _Client
+) -> None:
+    """The #188 reproduction on the route surface: a stop naming a peer's
+    session with no principal does not release the peer's EXCLUSIVE grant.
+    The forger deliberately does not present the peer's principal — on the
+    hook surface a principal is readable from ``.coherence/``, so that
+    abstention is exactly what this check can enforce. Asserts the grant
+    STANDS afterwards, not merely that an error came back; the control shows
+    the same stop with the peer's own principal does release it."""
+    peer = str(uuid.uuid4())
+    peer_principal = _explicit_claim(client, peer)
+    _pre_edit_with(client, peer, peer_principal, "plan.md")
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    peer_agent = session_to_agent_id(peer)
+    assert coordinator.registry.get_state_map(artifact_id)[peer_agent] == MESIState.EXCLUSIVE
+
+    status, body = client.post(
+        "/hooks/session-stop", {"session_id": peer}, principal=None
+    )
+    assert (status, body) == (400, _PRINCIPAL_ABSENT_REFUSAL)
+    assert coordinator.registry.get_state_map(artifact_id)[peer_agent] == MESIState.EXCLUSIVE
+
+    status, body = client.post(
+        "/hooks/session-stop", {"session_id": peer}, principal=peer_principal
+    )
+    assert status == 200 and body["released_artifacts"] == ["plan.md"]
+    assert coordinator.registry.get_state_map(artifact_id)[peer_agent] != MESIState.EXCLUSIVE
+
+
+def test_session_stop_naming_a_peer_under_the_callers_own_principal_is_refused(
+    coordinator, client: _Client
+) -> None:
+    """A caller holding a principal of its OWN cannot spend it on a peer's
+    session: the principal is bound to one identity, so naming another is
+    foreign, and the peer's grant stands."""
+    peer, caller = str(uuid.uuid4()), str(uuid.uuid4())
+    peer_principal = _explicit_claim(client, peer)
+    caller_principal = _explicit_claim(client, caller)
+    _pre_edit_with(client, peer, peer_principal, "plan.md")
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+
+    status, body = client.post(
+        "/hooks/session-stop", {"session_id": peer}, principal=caller_principal
+    )
+    assert (status, body) == (400, _PRINCIPAL_FOREIGN_REFUSAL)
+    assert (
+        coordinator.registry.get_state_map(artifact_id)[session_to_agent_id(peer)]
+        == MESIState.EXCLUSIVE
+    )
+
+
+def test_post_edit_under_a_forged_identity_records_no_attribution(
+    coordinator, client: _Client
+) -> None:
+    """A commit naming a peer's session without the peer's principal bumps
+    nothing and records no ``last_writer_id`` — neither with no principal nor
+    with the caller's own. The control commits with the peer's principal and
+    records the peer's composite writer id, so the negative assertions are
+    measured against a route that does record attribution."""
+    peer, caller = str(uuid.uuid4()), str(uuid.uuid4())
+    peer_principal = _explicit_claim(client, peer)
+    caller_principal = _explicit_claim(client, caller)
+    _pre_edit_with(client, peer, peer_principal, "plan.md")
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    before = coordinator.registry.get_artifact(artifact_id).version
+    writer_before = coordinator.registry.last_writer_for(artifact_id)
+    commit = {"session_id": peer, "path": "plan.md", "success": True,
+              "content_hash": _hash("forged")}
+
+    for principal, refusal in ((None, _PRINCIPAL_ABSENT_REFUSAL),
+                               (caller_principal, _PRINCIPAL_FOREIGN_REFUSAL)):
+        status, body = client.post("/hooks/post-edit", commit, principal=principal)
+        assert (status, body) == (400, refusal)
+        assert coordinator.registry.get_artifact(artifact_id).version == before
+        assert coordinator.registry.last_writer_for(artifact_id) == writer_before
+
+    status, body = client.post("/hooks/post-edit", commit, principal=peer_principal)
+    assert status == 200 and body["ok"] is True, body
+    assert coordinator.registry.get_artifact(artifact_id).version == before + 1
+    assert coordinator.registry.last_writer_for(artifact_id) == session_to_agent_id(peer)
+
+
+def test_post_edit_attributes_the_composite_writer_through_the_principal(
+    coordinator, client: _Client
+) -> None:
+    """Attribution on post-edit goes through the presented caller: a
+    subagent presents its PARENT session's principal (the principal's unit of
+    identity is the session) and is recorded under the COMPOSITE id (session
+    + caller-asserted subagent); the same subagent commit with no principal
+    records nothing; and a second session's commit records a different
+    writer — so the positive assertion cannot pass on a constant."""
+    sid_a, sid_b = str(uuid.uuid4()), str(uuid.uuid4())
+    principal_a = _explicit_claim(client, sid_a)
+    principal_b = _explicit_claim(client, sid_b)
+    reg = coordinator.registry
+
+    status, _ = client.post(
+        "/hooks/pre-edit", {"session_id": sid_a, "agent_id": "sub-1", "path": "a/plan.md"},
+        principal=principal_a,
+    )
+    assert status == 200
+    sub_commit = {"session_id": sid_a, "agent_id": "sub-1", "path": "a/plan.md",
+                  "success": True, "content_hash": _hash("a2")}
+    status, body = client.post("/hooks/post-edit", sub_commit, principal=None)
+    assert (status, body) == (400, _PRINCIPAL_ABSENT_REFUSAL)
+    assert reg.last_writer_for(reg.lookup_artifact_id_by_name("a/plan.md")) is None
+    status, body = client.post("/hooks/post-edit", sub_commit, principal=principal_a)
+    assert status == 200 and body["ok"] is True, body
+    _pre_edit_with(client, sid_b, principal_b, "b/plan.md")
+    status, body = client.post(
+        "/hooks/post-edit",
+        {"session_id": sid_b, "path": "b/plan.md", "success": True,
+         "content_hash": _hash("b2")},
+        principal=principal_b,
+    )
+    assert status == 200 and body["ok"] is True, body
+
+    writer_a = reg.last_writer_for(reg.lookup_artifact_id_by_name("a/plan.md"))
+    writer_b = reg.last_writer_for(reg.lookup_artifact_id_by_name("b/plan.md"))
+    assert writer_a == session_to_agent_id(sid_a, "sub-1")
+    assert writer_a != session_to_agent_id(sid_a)
+    assert writer_b == session_to_agent_id(sid_b)
+    assert writer_a != writer_b
+
+
+def test_post_edit_cas_under_a_forged_identity_bumps_nothing(
+    coordinator, client: _Client
+) -> None:
+    """The optimistic commit is require-class too: a CAS naming a peer's
+    session with no principal does not advance the version it names."""
+    peer = str(uuid.uuid4())
+    peer_principal = _explicit_claim(client, peer)
+    status, read = client.post(
+        "/hooks/pre-read",
+        {"session_id": peer, "path": "plan.md", "content_hash": _hash("v1")},
+        principal=peer_principal,
+    )
+    assert status == 200
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    version = coordinator.registry.get_artifact(artifact_id).version
+    cas = {"session_id": peer, "path": "plan.md", "success": True,
+           "content_hash": _hash("forged"), "expected_version": version}
+
+    status, body = client.post("/hooks/post-edit-cas", cas, principal=None)
+    assert (status, body) == (400, _PRINCIPAL_ABSENT_REFUSAL)
+    assert coordinator.registry.get_artifact(artifact_id).version == version
+
+    status, body = client.post("/hooks/post-edit-cas", cas, principal=peer_principal)
+    assert status == 200 and body["ok"] is True, body
+    assert coordinator.registry.get_artifact(artifact_id).version == version + 1
+
+
+def test_a_principal_refusal_is_a_client_error_never_a_hold(
+    coordinator, client: _Client
+) -> None:
+    """KTD9: a hold invites a retry, and no retry supplies a principal the
+    caller never had. The effect fence — the route whose protocol answer IS
+    the hold vocabulary — refuses an absent or foreign principal with HTTP
+    400 and no ``verdict``, and neither refusal reason is a hold reason."""
+    from ccs.core.exceptions import (
+        CALLER_PRINCIPAL_ABSENT_REASON,
+        CALLER_PRINCIPAL_FOREIGN_REASON,
+    )
+
+    sid, other = str(uuid.uuid4()), str(uuid.uuid4())
+    _explicit_claim(client, sid)
+    foreign = _explicit_claim(client, other)
+    fence = _posture_body(("POST", "/hooks/effect-fence"), sid)
+
+    for principal, reason in ((None, CALLER_PRINCIPAL_ABSENT_REASON),
+                              (foreign, CALLER_PRINCIPAL_FOREIGN_REASON)):
+        status, body = client.post("/hooks/effect-fence", fence, principal=principal)
+        assert status == 400
+        assert "verdict" not in body and set(body) == {"error", "reason"}
+        assert body["reason"] == reason
+    assert CALLER_PRINCIPAL_ABSENT_REASON not in HOLD_REASONS
+    assert CALLER_PRINCIPAL_FOREIGN_REASON not in HOLD_REASONS
+
+
+def _status_tiers(client: _Client) -> dict[str, dict]:
+    """``/status`` at every tier, the operator tier with its opt-in header."""
+    tiers = {}
+    for tier, query, headers in (
+        ("metrics", "/status?detail=metrics", None),
+        ("minimal", "/status", None),
+        ("full", "/status?detail=full", {"Coherence-Local-Operator": "true"}),
+    ):
+        status, body = client.get(query, headers_override=headers)
+        assert status == 200, (tier, body)
+        tiers[tier] = body
+    return tiers
+
+
+def test_the_principal_counters_are_status_counters_at_every_tier(
+    coordinator, client: _Client
+) -> None:
+    """KTD4: two local diagnostics an operator reads on /status, at every tier,
+    beside the other product counters. ``caller_principal_absent_total`` counts
+    every ADMISSION that presents no principal — any accept-class request, or
+    a require-class request naming an identity nobody claimed (KTD15) — and
+    never a refusal. ``caller_principal_refused_total`` counts every REFUSAL,
+    absent or foreign, on any class, and never an admission. Each step below
+    moves exactly the counter it should and pins the other unmoved, so neither
+    counter can quietly absorb the other's events; a request presenting the
+    matching principal moves neither."""
+    def counts() -> set[tuple[int, int]]:
+        return {
+            (body["caller_principal_absent_total"], body["caller_principal_refused_total"])
+            for body in _status_tiers(client).values()
+        }
+
+    assert counts() == {(0, 0)}
+    unbound = str(uuid.uuid4())
+    client.post("/hooks/pre-read", {"session_id": unbound, "path": "x.md"}, principal=None)
+    assert counts() == {(1, 0)}, "an accept-class admission without a principal"
+    client.post("/hooks/session-stop", {"session_id": unbound}, principal=None)
+    assert counts() == {(2, 0)}, "a require-class admission naming an unclaimed session"
+
+    sid, other = str(uuid.uuid4()), str(uuid.uuid4())
+    principal = _explicit_claim(client, sid)
+    foreign = _explicit_claim(client, other)
+    assert client.post("/hooks/session-stop", {"session_id": sid})[0] == 400
+    assert counts() == {(2, 1)}, "a require-class refusal of an absent principal"
+    assert client.post(
+        "/hooks/pre-read", {"session_id": sid, "path": "x.md"}, principal=foreign)[0] == 400
+    assert counts() == {(2, 2)}, "an accept-class refusal of a foreign principal"
+    status, _ = client.post(
+        "/hooks/pre-read", {"session_id": sid, "path": "x.md"}, principal=principal)
+    assert status == 200
+    assert counts() == {(2, 2)}, "a matching principal moves neither counter"
+
+
+def test_a_principal_refusal_is_logged_at_info_with_its_route_and_reason(
+    coordinator, client: _Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An operator whose session is refused sees why: each refusal leaves one
+    INFO record naming the route and the typed reason — the hook client exits 0
+    and Claude Code shows no stderr, so without it a refused session looks
+    healthy everywhere. The record never carries the principal (R5), the
+    presented one or the bound one; an admission writes no such record, so
+    ordinary traffic does not flood the log."""
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    peer, caller = str(uuid.uuid4()), str(uuid.uuid4())
+    peer_principal = _explicit_claim(client, peer)
+    caller_principal = _explicit_claim(client, caller)
+    h = _hash("logged")
+    refusals = [
+        ("/hooks/session-stop", {"session_id": peer}, None, "caller_principal_absent"),
+        ("/hooks/post-edit", {"session_id": peer, "path": "plan.md", "success": True,
+                              "content_hash": h}, caller_principal, "caller_principal_foreign"),
+        ("/hooks/pre-read", {"session_id": peer, "path": "plan.md"}, caller_principal,
+         "caller_principal_foreign"),
+    ]
+    for path, body, principal, reason in refusals:
+        status, answer = client.post(path, body, principal=principal)
+        assert (status, answer.get("reason")) == (400, reason), answer
+    status, _ = client.post(
+        "/hooks/pre-read", {"session_id": peer, "path": "plan.md"}, principal=peer_principal)
+    assert status == 200
+
+    refusal_records = [
+        r for r in caplog.records
+        if r.levelno == logging.INFO and "caller_principal_" in r.getMessage()
+    ]
+    assert len(refusal_records) == len(refusals), [r.getMessage() for r in refusal_records]
+    for record, (path, _body, _principal, reason) in zip(refusal_records, refusals):
+        message = record.getMessage()
+        assert path in message and reason in message, message
+    for record in caplog.records:
+        rendered = f"{record.getMessage()} {record.args!r} {record.exc_text or ''}"
+        for principal in (peer_principal, caller_principal):
+            assert principal not in rendered, record.name
+
+
+def test_pre_edit_without_its_principal_cannot_take_a_grant_it_could_not_release(
+    coordinator, client: _Client
+) -> None:
+    """A bound session whose caller has lost its principal — a CoherentVolume
+    whose claim landed but whose answer was lost, or a hook client whose claim
+    was refused — used to be admitted on pre-edit and take EXCLUSIVE. It could
+    then neither commit that grant nor release it: post-edit (either
+    ``success`` value) and session-stop are require-class. Its own reads kept
+    the heartbeat fresh, so only the max-hold sweep freed the grant, and every
+    optimistic peer's commit was refused ``other_holder`` meanwhile. pre-edit
+    refuses that caller now, under the same rule as the release routes (an
+    identity nobody claimed is still admitted), so the grant is never taken
+    and the peer's commit lands. Control: presenting its principal, the same
+    caller takes the grant and releases it — the refusal sits exactly where
+    the release lives."""
+    a, b = str(uuid.uuid4()), str(uuid.uuid4())
+    a_principal = _explicit_claim(client, a)
+    b_principal = _explicit_claim(client, b)
+    reg = coordinator.registry
+    status, _ = client.post(
+        "/hooks/pre-read", {"session_id": b, "path": "plan.md", "content_hash": _hash("v1")},
+        principal=b_principal,
+    )
+    assert status == 200
+    artifact_id = reg.lookup_artifact_id_by_name("plan.md")
+    version = reg.get_artifact(artifact_id).version
+    a_agent = session_to_agent_id(a)
+
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": a, "path": "plan.md"}, principal=None)
+    assert (status, body) == (400, _PRINCIPAL_ABSENT_REFUSAL)
+    assert reg.get_agent_state(artifact_id, a_agent) not in (
+        MESIState.EXCLUSIVE, MESIState.MODIFIED)
+    status, body = client.post("/hooks/post-edit-cas", {
+        "session_id": b, "path": "plan.md", "success": True,
+        "content_hash": _hash("v2"), "expected_version": version,
+    }, principal=b_principal)
+    assert status == 200 and body["ok"] is True, body
+    assert reg.get_artifact(artifact_id).version == version + 1
+
+    _pre_edit_with(client, a, a_principal, "plan.md")
+    assert reg.get_agent_state(artifact_id, a_agent) == MESIState.EXCLUSIVE
+    status, body = client.post(
+        "/hooks/post-edit", {"session_id": a, "path": "plan.md", "success": False},
+        principal=a_principal,
+    )
+    assert status == 200 and body["ok"] is True, body
+    assert reg.get_agent_state(artifact_id, a_agent) not in (
+        MESIState.EXCLUSIVE, MESIState.MODIFIED)
+
+
+def test_a_refused_pre_edit_costs_its_session_the_deny_and_says_so(served_decider) -> None:
+    """The other side of the test above, which the posture table must state
+    rather than leave out: refusing a claimed session's pre-edit that carries
+    no principal also withholds everything pre-edit does FOR that session --
+    the strict-mode deny, the grant and the invalidation of its peers -- and
+    the hook clients read a 400 like any other refusal, so the edit then
+    proceeds uncoordinated.
+
+    Each cost is shown against a control that GETS it, in a setup where
+    admission and refusal differ in that cost. A refused request that changed
+    nothing looks exactly like an admitted one that happened to change
+    nothing, and on a strict-mode path where the session was preempted an
+    admitted pre-edit is denied: it takes no grant and invalidates no peer
+    either, so there only the deny separates the two. The grant and the
+    invalidation are shown on an unpreempted path instead, where the same
+    request presenting the principal takes EXCLUSIVE and invalidates the
+    SHARED peer.
+
+    Prevents the table describing only what the refusal rules out. The
+    trade-off was chosen -- over admitting an acquire the caller could neither
+    commit nor release -- and its cost is pinned here with the words that
+    state it, the sentence stating the choice included."""
+    from ccs.adapters.claude_code.coordinator_server import _CALLER_PRINCIPAL_POSTURE
+
+    server, client = served_decider
+    reg = server.registry
+    path = _U3A_STRICT_PATH
+    editor, peer = str(uuid.uuid4()), str(uuid.uuid4())
+    editor_principal = _explicit_claim(client, editor)
+    peer_principal = _explicit_claim(client, peer)
+    editor_agent, peer_agent = session_to_agent_id(editor), session_to_agent_id(peer)
+
+    # The deny: a strict-mode path where the peer's edit preempted the editor.
+    status, _ = client.post(
+        "/hooks/pre-read", {"session_id": editor, "path": path, "content_hash": _hash("v1")},
+        principal=editor_principal)
+    assert status == 200
+    _pre_edit_with(client, peer, peer_principal, path)
+    artifact_id = reg.lookup_artifact_id_by_name(path)
+    assert reg.get_agent_state(artifact_id, editor_agent) == MESIState.INVALID
+    assert reg.get_agent_state(artifact_id, peer_agent) == MESIState.EXCLUSIVE
+    denials_before = server.counters_snapshot()["strict_mode_denials_total"]
+
+    refused = client.post("/hooks/pre-edit", {"session_id": editor, "path": path})
+    assert refused == (400, _PRINCIPAL_ABSENT_REFUSAL)
+    assert "hookSpecificOutput" not in refused[1], "a refusal relays no deny"
+    # The 400 is written before the handler returns; a side effect after it
+    # would land after this read unless the handler is waited out first.
+    _await_in_flight_drain(server)
+    assert server.counters_snapshot()["strict_mode_denials_total"] == denials_before, (
+        "no strict-mode deny")
+    # Not costs of the refusal on this path (the admitted control below is
+    # denied and changes neither): only that the refused request changed nothing.
+    assert reg.get_agent_state(artifact_id, editor_agent) == MESIState.INVALID
+    assert reg.get_agent_state(artifact_id, peer_agent) == MESIState.EXCLUSIVE
+
+    status, denied = client.post(
+        "/hooks/pre-edit", {"session_id": editor, "path": path}, principal=editor_principal)
+    assert status == 200 and denied["ok"] is False, denied
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", denied
+    assert server.counters_snapshot()["strict_mode_denials_total"] == denials_before + 1
+
+    # The grant and the invalidation: an unpreempted path, both sessions SHARED.
+    open_path = _U3A_WARN_PATH
+    for sid, principal in ((editor, editor_principal), (peer, peer_principal)):
+        status, _ = client.post(
+            "/hooks/pre-read",
+            {"session_id": sid, "path": open_path, "content_hash": _hash("v1")},
+            principal=principal)
+        assert status == 200
+    open_id = reg.lookup_artifact_id_by_name(open_path)
+    assert reg.get_agent_state(open_id, editor_agent) == MESIState.SHARED
+    assert reg.get_agent_state(open_id, peer_agent) == MESIState.SHARED
+
+    refused = client.post("/hooks/pre-edit", {"session_id": editor, "path": open_path})
+    assert refused == (400, _PRINCIPAL_ABSENT_REFUSAL)
+    _await_in_flight_drain(server)
+    assert reg.get_agent_state(open_id, editor_agent) == MESIState.SHARED, "no grant"
+    assert reg.get_agent_state(open_id, peer_agent) == MESIState.SHARED, (
+        "no peer invalidated")
+
+    _pre_edit_with(client, editor, editor_principal, open_path)
+    assert reg.get_agent_state(open_id, editor_agent) == MESIState.EXCLUSIVE, (
+        "control: the same pre-edit, admitted, takes the grant")
+    assert reg.get_agent_state(open_id, peer_agent) == MESIState.INVALID, (
+        "control: the same pre-edit, admitted, invalidates the SHARED peer")
+
+    harm = _CALLER_PRINCIPAL_POSTURE[("POST", "/hooks/pre-edit")].harm
+    for stated in ("proceeds uncoordinated", "no grant", "no strict-mode deny",
+                   "no invalidation of its peers", "neither commit nor release",
+                   "chosen over admitting an acquire"):
+        assert stated in harm, f"pre-edit's harm text does not state {stated!r}: {harm}"
+
+
+# --- a REFUSED require-class request leaves every piece of state as it was ---
+
+_REQUIRE_CLASS_ROUTES = sorted(
+    route for route, posture in _EXPECTED_ROUTE_POSTURE.items() if posture == "require"
+)
+#: FROZEN duplicate of the per-route attempt counters (``_ENDPOINT_COUNTER_NAMES``)
+#: for the require class: the one counter besides the refusal counter a refused
+#: request may move — it counts attempts by contract. The workspace routes have
+#: no attempt counter.
+_ATTEMPT_COUNTER = {
+    "/hooks/effect-fence": "effect_fence_total",
+    "/hooks/pre-edit": "pre_edit_total",
+    "/hooks/post-edit": "post_edit_total",
+    "/hooks/post-edit-cas": "post_edit_cas_total",
+    "/hooks/session-stop": "session_stop_total",
+    "/handoff/transfer": "handoff_transfer_total",
+    "/handoff/accept": "handoff_accept_total",
+    "/handoff/decline": "handoff_decline_total",
+    "/handoff/withdraw": "handoff_withdraw_total",
+}
+_REFUSED_SUBAGENT = "sub-refused"
+
+
+def _seed_a_claimed_peer(coordinator, client: _Client) -> dict:
+    """A CLAIMED peer with a non-default value in every dimension a require-
+    class handler touches once admitted: an EXCLUSIVE grant on a tracked path,
+    a heartbeat, a queued preemption notice, an armed re-grounding flag, a
+    stale-warned pair, a strict-deny memory, and a checkpoint it owns. Seeded
+    through the registry, never a hook route, so the peer's names are NOT in
+    the display-name map: a handler that registers its caller before the gate
+    shows up as a new entry."""
+    from ccs.coordinator.registry_protocol import CheckpointMember
+
+    peer, caller = str(uuid.uuid4()), str(uuid.uuid4())
+    seed = {
+        "peer": peer,
+        "peer_principal": _explicit_claim(client, peer),
+        "caller_principal": _explicit_claim(client, caller),
+        "peer_agent": session_to_agent_id(peer),
+        "caller_agent": session_to_agent_id(caller),
+    }
+    reg = coordinator.registry
+    artifact_id = reg.resolve_or_register("plan.md", content_hash=_hash("v1"))
+    coordinator.service.write(agent_id=seed["peer_agent"], artifact_id=artifact_id, issued_at_tick=1)
+    reg.record_heartbeat(seed["peer_agent"], 41)
+    reg.record_preemption_notice(
+        victim_agent_id=seed["peer_agent"], artifact_id=artifact_id,
+        preempter_agent_id=session_to_agent_id(caller), preempted_at_unix_ts=1234.0,
+    )
+    coordinator.mark_compact_pending(peer)
+    coordinator.mark_stale_warned(seed["peer_agent"], artifact_id)
+    coordinator.record_strict_deny(peer, "plan.md")
+    record = coordinator.service.create_workspace_checkpoint(
+        name="seeded", owner=seed["peer_agent"],
+        members=[CheckpointMember(
+            member_path="plan.md", artifact_id=None, native_token="v1",
+            fingerprint=_hash("v1"), captured_at=1.0,
+        )],
+        window_min=1.0, window_max=1.0, issued_at_tick=1,
+    )
+    return {**seed, "artifact_id": artifact_id, "checkpoint_id": record.checkpoint_id}
+
+
+def _refused_request_body(route: tuple[str, str], seed: dict, *, subagent: bool) -> dict:
+    """A body that passes every shape check on ``route``, names the claimed
+    peer, and — were it admitted — would move state: a TRACKED path (so no
+    untracked fast path answers before the handler's work) and the peer's real
+    checkpoint. ``subagent`` adds an ``agent_id`` field on the hook routes."""
+    from ccs.core.exceptions import RESTORE_MEMBER_OUTCOMES
+
+    _, path = route
+    h = _hash(f"refused:{path}")
+    bodies: dict[str, dict] = {
+        "/hooks/effect-fence": {
+            "path": "plan.md", "expected_version": 99, "expected_generation": 0,
+            "content_hash": h,
+        },
+        "/hooks/pre-edit": {"path": "plan.md"},
+        "/hooks/post-edit": {"path": "plan.md", "success": True, "content_hash": h},
+        "/hooks/post-edit-cas": {"path": "plan.md", "content_hash": h, "expected_version": 1},
+        "/hooks/session-stop": {},
+        "/workspace/checkpoint": {
+            "name": "refused", "window_min": 1.0, "window_max": 1.0,
+            "members": [{"member_path": "plan.md", "native_token": "v2",
+                         "fingerprint": h, "captured_at": 2.0}],
+        },
+        "/workspace/restore/status": {
+            "checkpoint_id": seed["checkpoint_id"], "status": "in_progress"},
+        "/workspace/restore/member": {
+            "checkpoint_id": seed["checkpoint_id"], "member_path": "plan.md",
+            "restore_outcome": sorted(RESTORE_MEMBER_OUTCOMES)[0],
+        },
+        "/workspace/restore/register": {
+            "checkpoint_id": seed["checkpoint_id"],
+            "writes": [{"member_path": "plan.md", "fingerprint": h}],
+        },
+        # The peer's EXCLUSIVE grant handed to the claimed caller: admitted, it
+        # moves the grant INVALID. The other three verbs find no record, so
+        # what an admitted one moves is the display name it registers.
+        "/handoff/transfer": {
+            "successor": str(seed["caller_agent"]), "grants": [{"path": "plan.md"}],
+        },
+        "/handoff/accept": {"path": "plan.md"},
+        "/handoff/decline": {"path": "plan.md"},
+        "/handoff/withdraw": {"path": "plan.md"},
+    }
+    body = {"session_id": seed["peer"], **bodies[path]}
+    if subagent:
+        body["agent_id"] = _REFUSED_SUBAGENT
+    return body
+
+
+def _refusal_observable(coordinator, seed: dict) -> dict:
+    """Everything an admitted require-class request could move, read through
+    NON-destructive accessors only. Principals appear only as digests, so a
+    failing comparison prints none."""
+    reg = coordinator.registry
+    artifacts, states = reg.status_snapshot()
+    agents = (seed["peer_agent"], session_to_agent_id(seed["peer"], _REFUSED_SUBAGENT))
+    coherence = coordinator.coordinator_root / ".coherence"
+    return {
+        "counters": coordinator.counters_snapshot(),
+        "artifacts": {str(a): dict(meta) for a, meta in artifacts.items()},
+        "grants": {
+            str(a): {str(agent): state.name for agent, state in held.items()}
+            for a, held in states.items()
+        },
+        "last_writers": {str(a): reg.last_writer_for(a) for a in artifacts},
+        "heartbeats": {str(agent): reg.last_heartbeat_tick(agent) for agent in agents},
+        "notices": {
+            str(agent): reg.peek_preemption_notice(agent, seed["artifact_id"])
+            for agent in agents
+        },
+        "agent_names": sorted((str(a), n) for a, n in coordinator.agent_names_snapshot()),
+        "compact_pending": coordinator.has_compact_pending(seed["peer"]),
+        "stale_warned": set(coordinator._stale_warned_pairs),
+        "strict_denies": set(coordinator._recent_strict_denies),
+        "bindings": [
+            hashlib.sha256(value.encode()).hexdigest()
+            for value in (
+                reg.get_caller_principal(caller_principal_identity(seed["peer"])) or "",
+            )
+        ],
+        "checkpoints": [
+            (dataclasses.asdict(record),
+             [dataclasses.asdict(m) for m in reg.get_checkpoint_members(record.checkpoint_id)])
+            for record in reg.list_checkpoints()
+        ],
+        "audit_logs": sorted((p.name, p.stat().st_size) for p in coherence.glob("*.log")),
+    }
+
+
+def _split_counters(observable: dict, path: str) -> tuple[dict, int | None, int | None]:
+    """``observable`` minus the two counters a refusal may move — the route's
+    attempt counter and the refusal counter — returned beside them."""
+    rest = dict(observable)
+    counters = dict(rest["counters"])
+    endpoint = dict(counters["endpoint_counters"])
+    attempts = endpoint.pop(_ATTEMPT_COUNTER[path]) if path in _ATTEMPT_COUNTER else None
+    counters["endpoint_counters"] = endpoint
+    refused = counters.pop("caller_principal_refused_total", None)
+    rest["counters"] = counters
+    return rest, attempts, refused
+
+
+@pytest.mark.parametrize("route", _REQUIRE_CLASS_ROUTES, ids=lambda r: r[1].strip("/"))
+def test_a_refused_require_class_request_leaves_state_untouched(
+    route: tuple[str, str], coordinator, client: _Client
+) -> None:
+    """KTD9 makes a principal refusal a client error, and the caller is told
+    to retry only once it has its principal — which is safe only if the refused
+    request changed nothing. Every require-class route is driven with an ABSENT
+    principal and with a FOREIGN one (the caller's own valid principal, spent
+    on the peer's session), in the parent and the subagent form, against a
+    claimed peer seeded with a non-default value in every dimension. Nothing
+    may move: no display name registered, no heartbeat, no re-grounding flag
+    expired, no notice drained, no grant, version, writer, checkpoint or
+    binding changed, no audit row — and no counter but the route's attempt
+    counter and the refusal counter, each by exactly one per request.
+
+    Control: the same request presenting the peer's principal IS admitted and
+    DOES move the snapshot, so the snapshot can see this route's effects and
+    the equality above is not vacuous."""
+    _, path = route
+    seed = _seed_a_claimed_peer(coordinator, client)
+    before = _refusal_observable(coordinator, seed)
+    assert before["heartbeats"][str(seed["peer_agent"])] == 41
+    assert before["notices"][str(seed["peer_agent"])] is not None
+    assert before["compact_pending"] is True
+    assert before["grants"][str(seed["artifact_id"])][str(seed["peer_agent"])] == "EXCLUSIVE"
+    assert before["checkpoints"] and before["stale_warned"] and before["strict_denies"]
+    assert not any(str(seed["peer"]) in name for _a, name in before["agent_names"])
+
+    forms = (False, True) if path.startswith("/hooks/") else (False,)
+    sent = 0
+    for principal, refusal in ((None, _PRINCIPAL_ABSENT_REFUSAL),
+                               (seed["caller_principal"], _PRINCIPAL_FOREIGN_REFUSAL)):
+        for subagent in forms:
+            body = _refused_request_body(route, seed, subagent=subagent)
+            assert client.post(path, body, principal=principal) == (400, refusal), body
+            sent += 1
+    after = _refusal_observable(coordinator, seed)
+
+    rest_before, attempts_before, refused_before = _split_counters(before, path)
+    rest_after, attempts_after, refused_after = _split_counters(after, path)
+    assert rest_after == rest_before
+    assert refused_before is not None and refused_after == refused_before + sent
+    if attempts_before is not None:
+        assert attempts_after == attempts_before + sent
+
+    status, body = client.post(
+        path, _refused_request_body(route, seed, subagent=False),
+        principal=seed["peer_principal"],
+    )
+    assert not _principal_refused((status, body)), body
+    rest_admitted, _, _ = _split_counters(_refusal_observable(coordinator, seed), path)
+    assert rest_admitted != rest_after, "the admitted request moved nothing the snapshot sees"
+
+
+# --- the accept-class notice drain, stated rather than implied --------------
+
+
+@pytest.mark.parametrize("path,extra", [
+    ("/hooks/pre-read", {"path": "plan.md"}),
+    ("/hooks/pre-bash", {"command": "cat plan.md"}),
+    ("/hooks/pre-grep", {"search_root": ""}),
+], ids=["pre-read", "pre-bash", "pre-grep"])
+def test_an_accept_class_read_naming_a_bound_peer_drains_its_notices_and_says_so(
+    path: str, extra: dict, coordinator, client: _Client
+) -> None:
+    """Accepted behaviour, pinned so the posture table cannot understate it.
+    The accept-class reads pop the NAMED identity's pending notices and deliver
+    them in their own response. A request naming a bound peer without a
+    principal — a stray or older client, or a misnamed session — therefore
+    receives the peer's "you were preempted" notice, and the peer never sees
+    it. The table's harm text for the route says so, as the require-class
+    session-stop entry does for the same effect."""
+    from ccs.adapters.claude_code.coordinator_server import _CALLER_PRINCIPAL_POSTURE
+
+    peer = str(uuid.uuid4())
+    _explicit_claim(client, peer)
+    peer_agent = session_to_agent_id(peer)
+    reg = coordinator.registry
+    artifact_id = reg.resolve_or_register("plan.md", content_hash=_hash("v1"))
+    reg.record_preemption_notice(
+        victim_agent_id=peer_agent, artifact_id=artifact_id,
+        preempter_agent_id=session_to_agent_id(str(uuid.uuid4())),
+        preempted_at_unix_ts=1234.0,
+    )
+    status, body = client.post(path, {"session_id": peer, **extra}, principal=None)
+    assert status == 200 and not _principal_refused((status, body)), body
+    assert "preempted" in json.dumps(body), "the notice went to this caller"
+    assert reg.peek_preemption_notice(peer_agent, artifact_id) is None, "and is gone"
+
+    harm = _CALLER_PRINCIPAL_POSTURE[("POST", path)].harm
+    assert "drains the named identity's pending notices" in harm, harm
+
+
+def test_session_start_shows_a_bound_peers_notices_without_draining_them(
+    coordinator, client: _Client
+) -> None:
+    """session-start is accept-class and only SHOWS the named identity's
+    notices; it does not drain them, and its harm text says what it does
+    write — the display name and, for a non-empty re-grounding, the
+    compact-pending flag the named identity's next admit delivers."""
+    from ccs.adapters.claude_code.coordinator_server import _CALLER_PRINCIPAL_POSTURE
+
+    peer = str(uuid.uuid4())
+    peer_principal = _explicit_claim(client, peer)
+    peer_agent = session_to_agent_id(peer)
+    _pre_edit_with(client, peer, peer_principal, "plan.md")
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    coordinator.registry.record_preemption_notice(
+        victim_agent_id=peer_agent, artifact_id=artifact_id,
+        preempter_agent_id=session_to_agent_id(str(uuid.uuid4())),
+        preempted_at_unix_ts=1234.0,
+    )
+    status, body = client.post("/hooks/session-start", {"session_id": peer}, principal=None)
+    assert status == 200, body
+    assert coordinator.registry.peek_preemption_notice(peer_agent, artifact_id) is not None
+    assert coordinator.has_compact_pending(peer) is True
+
+    harm = _CALLER_PRINCIPAL_POSTURE[("POST", "/hooks/session-start")].harm
+    assert "without draining them" in harm and "compact-pending" in harm, harm
+
+
+# ======================================================================
+# #195 — the sweep's reclaim cause is observable by someone other than
+# the reclaimed session
+# ======================================================================
+#
+# Every exit from M/E lands the ex-holder in INVALID, which ``states`` omits,
+# so a release and a sweep reclaim used to produce the same /status body. The
+# cause was recorded (``agent_states.last_reclaim_trigger`` / ``_tick``) with
+# no reader outside the victim's own commit and post-edit. These drive the
+# REAL sweep pass the coordinator's loop runs (``_sweep_stable_grants``), so
+# the notice, the counter and the log line are all the shipped wiring.
+
+
+def _reclaiming_cfg():
+    from ccs.adapters.claude_code.lifecycle import LifecycleConfig
+
+    return LifecycleConfig(grant_heartbeat_timeout_sec=1, grant_max_hold_sec=999_999_999)
+
+
+def _sweep(coordinator, now_tick: int) -> int:
+    from ccs.adapters.claude_code.lifecycle import _sweep_stable_grants
+
+    return _sweep_stable_grants(coordinator, _reclaiming_cfg(), now_tick)
+
+
+def _row_for(payload: dict, sid: str) -> dict:
+    [row] = [s for s in payload["sessions"] if s["agent_id"] == str(session_to_agent_id(sid))]
+    return row
+
+
+def test_status_full_tier_names_a_sweep_reclaim(
+    coordinator, client: _Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    sid = _sid("reclaim-195")
+    assert client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})[0] == 200
+    assert _row_for(_operator_status(client), sid)["states"] == {"plan.md": "EXCLUSIVE"}
+
+    now_tick = int(time.time()) + 999_999
+    with caplog.at_level(logging.WARNING, logger="ccs.adapters.claude_code.lifecycle"):
+        assert _sweep(coordinator, now_tick) == 1
+
+    row = _row_for(_operator_status(client), sid)
+    # ``states`` keeps its meaning: held grants only. The cause is a sibling.
+    assert row["states"] == {}
+    assert row["reclaimed"] == {"plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": now_tick}}
+
+    # The log line: one per reclaim, naming trigger, tick, agent id and path,
+    # and never the raw session id (#198 / R6).
+    [record] = [r for r in caplog.records if "sweep reclaimed grant" in r.getMessage()]
+    message = record.getMessage()
+    assert record.levelno == logging.WARNING
+    assert "trigger=reclaim_heartbeat" in message
+    assert f"tick={now_tick}" in message
+    assert str(session_to_agent_id(sid)) in message
+    assert "plan.md" in message
+    assert sid not in message
+
+
+def test_status_cli_prints_the_reclaim_time_a_live_body_carries(
+    coordinator,
+    client: _Client,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The renderer's own tests feed it hand-built bodies, so a key renamed on
+    one side only passes all of them while the real table prints ``?`` for the
+    time. Driven off a LIVE operator-tier body after a real sweep reclaim, so
+    the key the handler emits is the key the table reads."""
+    from ccs.cli import coherence_status
+
+    monkeypatch.setenv("COLUMNS", "120")
+    sid = _sid("cli-render-195")
+    assert client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})[0] == 200
+    reclaim_tick = int(time.time()) + 999_999
+    assert _sweep(coordinator, reclaim_tick) == 1
+
+    coherence_status._render_table(_operator_status(client))
+    session_lines = capsys.readouterr().out.split("Sessions:", 1)[1].splitlines()
+
+    [line] = [ln for ln in session_lines if "plan.md" in ln]
+    assert line.split() == ["plan.md", "reclaimed", "(reclaim_heartbeat", "at", f"{reclaim_tick})"]
+    assert "?" not in line
+
+
+def test_status_full_tier_does_not_report_a_voluntary_release_as_a_reclaim(
+    coordinator, client: _Client
+) -> None:
+    sid = _sid("release-195")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    assert client.post("/hooks/session-stop", {"session_id": sid})[0] == 200
+    # Nothing for the sweep to pull: the release already left INVALID.
+    assert _sweep(coordinator, int(time.time()) + 999_999) == 0
+
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {}
+    assert row["reclaimed"] == {}
+    _, metrics = client.get("/status?detail=metrics")
+    assert metrics["sweep_reclaims_total"] == 0
+
+
+def test_status_full_tier_does_not_report_a_peer_preemption_as_a_reclaim(
+    coordinator, client: _Client
+) -> None:
+    victim, peer = _sid("victim-195"), _sid("peer-195")
+    client.post("/hooks/pre-edit", {"session_id": victim, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": peer, "path": "plan.md"})
+    payload = _operator_status(client)
+    assert _row_for(payload, victim) == {
+        "agent_name": _row_for(payload, victim)["agent_name"],
+        "agent_id": str(session_to_agent_id(victim)),
+        "states": {},
+        "reclaimed": {},
+        "grants": {},
+        "last_heartbeat_unix_ts": _row_for(payload, victim)["last_heartbeat_unix_ts"],
+    }
+    assert _row_for(payload, peer)["states"] == {"plan.md": "EXCLUSIVE"}
+
+
+def test_reclaim_cause_is_operator_tier_only(coordinator, client: _Client) -> None:
+    sid = _sid("tier-195")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    _sweep(coordinator, int(time.time()) + 999_999)
+
+    _, minimal = client.get("/status")
+    assert minimal["detail"] == "minimal"
+    for row in minimal["sessions"]:
+        assert "reclaimed" not in row
+        assert row["agent_name"] is None
+    # The counter rides every tier (it names no session and no path).
+    assert minimal["sweep_reclaims_total"] == 1
+    _, metrics = client.get("/status?detail=metrics")
+    assert "sessions" not in metrics
+
+
+def test_metrics_tier_counts_sweep_reclaims_by_trigger(coordinator, client: _Client) -> None:
+    from ccs.adapters.claude_code.lifecycle import LifecycleConfig, _sweep_stable_grants
+
+    _, before = client.get("/status?detail=metrics")
+    assert before["sweep_reclaims_total"] == 0
+    assert before["sweep_reclaims_by_trigger"] == {"reclaim_heartbeat": 0, "reclaim_max_hold": 0}
+
+    client.post("/hooks/pre-edit", {"session_id": _sid("hb-195"), "path": "plan.md"})
+    _sweep(coordinator, int(time.time()) + 999_999)
+
+    # Max-hold: a fresh heartbeat, a grant older than the ceiling.
+    client.post("/hooks/pre-edit", {"session_id": _sid("mh-195"), "path": "plan.md"})
+    now_tick = int(time.time()) + 10
+    cfg = LifecycleConfig(grant_heartbeat_timeout_sec=999_999, grant_max_hold_sec=1)
+    assert _sweep_stable_grants(coordinator, cfg, now_tick) == 1
+
+    _, after = client.get("/status?detail=metrics")
+    assert after["sweep_reclaims_total"] == 2
+    assert after["sweep_reclaims_by_trigger"] == {"reclaim_heartbeat": 1, "reclaim_max_hold": 1}
+    row = _row_for(_operator_status(client), _sid("mh-195"))
+    assert row["reclaimed"] == {"plan.md": {"trigger": "reclaim_max_hold", "reclaimed_at_unix_ts": now_tick}}
+
+
+def test_a_reclaimed_path_stays_listed_through_a_reread_and_clears_on_reacquire(
+    coordinator, client: _Client
+) -> None:
+    """``reclaimed`` is history: the session's last write grant on the path
+    ended in a reclaim and it has held none since. A re-read does not version
+    the edit the reclaim stranded, so the path stays listed beside its SHARED
+    state, and stays listed with the ORIGINAL time when a peer invalidates
+    that read. Only a new write grant clears it."""
+    sid, peer = _sid("reread-195"), _sid("reread-peer-195")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    reclaim_tick = int(time.time()) + 999_999
+    _sweep(coordinator, reclaim_tick)
+    cause = {"plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": reclaim_tick}}
+    # Both reads are granted SHARED. Over the hooks a reclaimed session's
+    # re-read is SHARED whether or not another session holds the path, so the
+    # peer's read is not what keeps it from being a write grant.
+    client.post("/hooks/pre-read", {"session_id": peer, "path": "plan.md", "content_hash": _hash("x")})
+    client.post("/hooks/pre-read", {"session_id": sid, "path": "plan.md", "content_hash": _hash("x")})
+
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {"plan.md": "SHARED"}
+    assert row["reclaimed"] == cause
+
+    # The peer's write invalidates the re-read; the cause is unchanged.
+    client.post("/hooks/pre-edit", {"session_id": peer, "path": "plan.md"})
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {}
+    assert row["reclaimed"] == cause
+    client.post("/hooks/session-stop", {"session_id": peer})
+
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    client.post("/hooks/session-stop", {"session_id": sid})
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {}
+    assert row["reclaimed"] == {}, "a re-acquire clears the slot; the later exit was a release"
+
+
+def test_status_full_tier_lists_a_reclaimed_agent_the_restarted_coordinator_never_named(
+    tmp_path: Path,
+) -> None:
+    """The reclaim slot is durable and the name map is not: after a restart a
+    reclaimed session that has not spoken since still gets a row (null name),
+    because it is exactly the one a supervisor must not read as finished."""
+    sid = _sid("restart-195")
+    first = _restart_on(tmp_path, "reclaim-before")
+    try:
+        secret = load_secret(first.coordinator_root)
+        assert secret is not None
+        _Client("127.0.0.1", first.port, secret).post(
+            "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"}
+        )
+        now_tick = int(time.time()) + 999_999
+        assert _sweep(first, now_tick) == 1
+    finally:
+        first.shutdown()
+
+    second = _restart_on(tmp_path, "reclaim-after")
+    try:
+        secret = load_secret(second.coordinator_root)
+        assert secret is not None
+        client = _Client("127.0.0.1", second.port, secret)
+        payload = _operator_status(client)
+        _, minimal = client.get("/status")
+    finally:
+        second.shutdown()
+
+    row = _row_for(payload, sid)
+    assert row["agent_name"] is None
+    assert row["states"] == {}
+    assert row["reclaimed"] == {"plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": now_tick}}
+    # Below the operator tier nothing changes: a row with no held grant and
+    # no name is not added there.
+    assert minimal["sessions"] == []
+
+
+def test_sweep_counts_and_logs_reclaims_that_landed_before_a_mid_walk_error(
+    coordinator, client: _Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The walk commits each pair on its own. When a later pair raises, the
+    reclaims already durable must still be counted and logged: a store error
+    mid-walk must not read as a quiet tick."""
+    for name, path in (("walk-a-195", "plan.md"), ("walk-b-195", "task.md")):
+        assert client.post("/hooks/pre-edit", {"session_id": _sid(name), "path": path})[0] == 200
+
+    real = coordinator.service._validate_single_writer
+    calls = {"n": 0}
+
+    def _flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("registry hiccup")
+        return real(*args, **kwargs)
+
+    coordinator.service._validate_single_writer = _flaky
+    try:
+        with caplog.at_level(logging.WARNING, logger="ccs.adapters.claude_code.lifecycle"):
+            with pytest.raises(RuntimeError, match="registry hiccup"):
+                _sweep(coordinator, int(time.time()) + 999_999)
+    finally:
+        coordinator.service._validate_single_writer = real
+
+    payload = _operator_status(client)
+    landed = sum(len(row["reclaimed"]) for row in payload["sessions"])
+    # Both pairs are durably reclaimed: the first before the error, the second
+    # by the very pass whose post-write check raised.
+    assert landed == 2
+    assert payload["sweep_reclaims_total"] == landed
+    logged = [r for r in caplog.records if "sweep reclaimed grant" in r.getMessage()]
+    assert len(logged) == landed
+
+
+def test_sweep_counts_and_logs_a_reclaim_whose_notice_write_fails(
+    coordinator,
+    client: _Client,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The callback records the reclaim before it writes the victim's notice,
+    so a notice write that raises still leaves the reclaim counted and logged."""
+    client.post("/hooks/pre-edit", {"session_id": _sid("notice-fail-195"), "path": "plan.md"})
+
+    def _refuse(**_kwargs: Any) -> None:
+        raise RuntimeError("notice store unavailable")
+
+    monkeypatch.setattr(coordinator.registry, "record_preemption_notice", _refuse)
+    with caplog.at_level(logging.WARNING):
+        assert _sweep(coordinator, int(time.time()) + 999_999) == 1
+
+    _, metrics = client.get("/status?detail=metrics")
+    assert metrics["sweep_reclaims_total"] == 1
+    assert [r for r in caplog.records if "sweep reclaimed grant" in r.getMessage()]
+
+
+def test_sweep_reports_every_reclaim_when_one_count_update_fails(
+    coordinator,
+    client: _Client,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reporting is best-effort per reclaim: a counter update that raises for
+    one reclaim neither stops the others nor the log line for each."""
+    for name, path in (("count-a-195", "plan.md"), ("count-b-195", "task.md")):
+        client.post("/hooks/pre-edit", {"session_id": _sid(name), "path": path})
+    real_record = coordinator.record_sweep_reclaim
+    calls = {"n": 0}
+
+    def _first_fails(trigger: str) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("counter unavailable")
+        real_record(trigger)
+
+    monkeypatch.setattr(coordinator, "record_sweep_reclaim", _first_fails)
+    with caplog.at_level(logging.WARNING, logger="ccs.adapters.claude_code.lifecycle"):
+        assert _sweep(coordinator, int(time.time()) + 999_999) == 2
+
+    _, metrics = client.get("/status?detail=metrics")
+    assert metrics["sweep_reclaims_total"] == 1
+    logged = [r for r in caplog.records if "sweep reclaimed grant" in r.getMessage()]
+    assert len(logged) == 2
+
+
+class _OneSweepTick:
+    """The coordinator as ``_sweep_loop`` sees it, shutting down after one tick.
+
+    The loop reads ``shutting_down`` before its sleep and again after it, then
+    runs a tick; the third read is the first one after that tick."""
+
+    def __init__(self, coordinator) -> None:
+        self._coordinator = coordinator
+        self._reads = 0
+
+    @property
+    def shutting_down(self) -> bool:
+        self._reads += 1
+        return self._reads > 2
+
+    def __getattr__(self, name: str):
+        return getattr(self._coordinator, name)
+
+
+def test_the_sweep_loop_counts_and_logs_a_heartbeat_reclaim(
+    coordinator,
+    client: _Client,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One tick of the coordinator's own sweep loop, on its own clock, rather
+    than the sweep pass with a tick the test chooses: the loop's clock is part
+    of what is under test, and the counter, the trigger key and the log line
+    must come out of the shipped wiring."""
+    from ccs.adapters.claude_code import coordinator_server as server_mod
+    from ccs.adapters.claude_code.lifecycle import LifecycleConfig, _sweep_loop
+
+    stale_sid, live_sid = _sid("loop-stale-195"), _sid("loop-live-195")
+    # The stale holder took its grant, and last heartbeated, 1000 seconds ago.
+    real_clock = server_mod.monotonic_seconds
+    with monkeypatch.context() as clock:
+        clock.setattr(server_mod, "monotonic_seconds", lambda: real_clock() - 1_000)
+        assert client.post("/hooks/pre-edit", {"session_id": stale_sid, "path": "plan.md"})[0] == 200
+    assert client.post("/hooks/pre-edit", {"session_id": live_sid, "path": "task.md"})[0] == 200
+
+    cfg = LifecycleConfig(
+        sweep_interval_sec=0.2,
+        grant_heartbeat_timeout_sec=60,
+        grant_max_hold_sec=999_999_999,
+    )
+    tick_floor = real_clock()
+    with caplog.at_level(logging.WARNING, logger="ccs.adapters.claude_code.lifecycle"):
+        _sweep_loop(SimpleNamespace(coordinator=_OneSweepTick(coordinator)), cfg)
+
+    _, metrics = client.get("/status?detail=metrics")
+    assert metrics["sweep_reclaims_total"] == 1
+    assert metrics["sweep_reclaims_by_trigger"] == {"reclaim_heartbeat": 1, "reclaim_max_hold": 0}
+
+    [record] = [r for r in caplog.records if "sweep reclaimed grant" in r.getMessage()]
+    assert "trigger=reclaim_heartbeat" in record.getMessage()
+    assert str(session_to_agent_id(stale_sid)) in record.getMessage()
+    assert stale_sid not in record.getMessage()
+
+    payload = _operator_status(client)
+    [cause] = _row_for(payload, stale_sid)["reclaimed"].values()
+    assert cause["trigger"] == "reclaim_heartbeat"
+    assert cause["reclaimed_at_unix_ts"] >= tick_floor
+    # The live holder is untouched: only the stale grant was pulled.
+    assert _row_for(payload, live_sid)["states"] == {"task.md": "EXCLUSIVE"}
+    assert _row_for(payload, live_sid)["reclaimed"] == {}
+
+
+def test_status_reads_the_reclaim_slots_inside_the_snapshot_lock_hold(
+    coordinator, client: _Client
+) -> None:
+    """The reclaim slots are read in the ONE registry hold that reads the
+    artifact and agent-state rows. A second read after that hold lets a
+    reclaim land between the two, so one response could show a pulled grant
+    as a clean release."""
+    sid = _sid("hold-195")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    reclaim_tick = int(time.time()) + 999_999
+    _sweep(coordinator, reclaim_tick)
+
+    status, body, holds, unheld = _status_registry_holds(
+        coordinator,
+        client,
+        "/status?detail=full",
+        headers_override={"Coherence-Local-Operator": "true"},
+    )
+    assert status == 200
+    assert _row_for(body, sid)["reclaimed"] == {
+        "plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": reclaim_tick}
+    }
+    assert not [sql for sql in unheld if "last_reclaim" in sql]
+    reclaim_holds = [hold for hold in holds if any("last_reclaim" in sql for sql in hold)]
+    assert len(reclaim_holds) == 1, reclaim_holds
+    [hold] = reclaim_holds
+    assert any("FROM artifacts" in sql for sql in hold), hold
+
+
+def test_status_below_the_operator_tier_never_reads_the_reclaim_slots(
+    coordinator, client: _Client
+) -> None:
+    """Only the operator tier shows the reclaim cause, so only it pays for the
+    read: the default view, the one dashboards poll, selects no slot column."""
+    client.post("/hooks/pre-edit", {"session_id": _sid("tier-195"), "path": "plan.md"})
+    _sweep(coordinator, int(time.time()) + 999_999)
+
+    status, body, holds, unheld = _status_registry_holds(coordinator, client, "/status")
+    assert status == 200
+    assert body["sweep_reclaims_total"] == 1
+    assert not [sql for sql in [*unheld, *sum(holds, [])] if "last_reclaim" in sql]
+
+
+def test_status_never_lists_a_pair_still_held_for_writing(
+    coordinator, client: _Client
+) -> None:
+    """A write grant clears the reclaim slot, so a held pair carrying one is a
+    ledger this coordinator did not write (another runtime shares the file).
+    It still reads as the grant it is, never as a reclaim."""
+    sid = _sid("held-195")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    [artifact] = [
+        a for a in _operator_status(client)["tracked_artifacts"] if a["path"] == "plan.md"
+    ]
+    coordinator.registry.record_last_reclamation(
+        session_to_agent_id(sid), uuid.UUID(artifact["id"]), "reclaim_heartbeat", 1
+    )
+
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {"plan.md": "EXCLUSIVE"}
+    assert row["reclaimed"] == {}
+
+
+def test_status_drops_an_unnamed_reclaim_only_row_once_the_reclaim_is_old(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dead session's slot never clears (it never acquires again), so the
+    unnamed reclaim-only row is bounded by the reclaim's age: a crashed
+    session does not stay in the operator table for ever."""
+    from ccs.adapters.claude_code import coordinator_server as cs
+
+    sid = _sid("stale-195")
+    # The documented 24-hour window as a literal, never read from the code
+    # under test: a changed constant must fail here, not move the goalposts.
+    reclaim_tick = int(time.time()) - 86_400 - 60
+    first = _restart_on(tmp_path, "stale-before")
+    try:
+        secret = load_secret(first.coordinator_root)
+        assert secret is not None
+        # The grant was taken, and last heartbeated, before the reclaim.
+        with monkeypatch.context() as clock:
+            clock.setattr(cs, "monotonic_seconds", lambda: reclaim_tick - 1_000)
+            _Client("127.0.0.1", first.port, secret).post(
+                "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"}
+            )
+        assert _sweep(first, reclaim_tick) == 1
+    finally:
+        first.shutdown()
+
+    second = _restart_on(tmp_path, "stale-after")
+    try:
+        secret = load_secret(second.coordinator_root)
+        assert secret is not None
+        payload = _operator_status(_Client("127.0.0.1", second.port, secret))
+    finally:
+        second.shutdown()
+
+    agent = str(session_to_agent_id(sid))
+    assert [row for row in payload["sessions"] if row["agent_id"] == agent] == []
+
+
+def _reclaim_an_unnamed_holder(coordinator, agent: uuid.UUID, path: str, reclaim_tick: int) -> None:
+    """``agent`` holds ``path`` EXCLUSIVE and last heartbeated 1000 seconds
+    before ``reclaim_tick``, when the real sweep pass reclaims it. The agent
+    never calls the coordinator, so the coordinator has no name for it."""
+    artifact_id = coordinator.registry.resolve_or_register(path, content_hash="")
+    coordinator.registry.set_agent_state(
+        artifact_id, agent, MESIState.EXCLUSIVE, trigger="test_setup", tick=reclaim_tick - 1_000
+    )
+    coordinator.service.record_heartbeat(agent_id=agent, now_tick=reclaim_tick - 1_000)
+    assert _sweep(coordinator, reclaim_tick) == 1
+
+
+def test_status_lists_an_unnamed_reclaim_only_row_through_its_last_second_and_drops_it_after(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The window for an unnamed reclaim-only row is 24 hours from the
+    agent's NEWEST reclaim, inclusive: a reclaim exactly 86400 seconds old is
+    listed and one a second older is not, and an agent with an old and a
+    recent reclaim is listed, with both paths. The window is the literal
+    86400, never read from the code under test."""
+    from ccs.adapters.claude_code import coordinator_server as cs
+
+    now = int(time.time())
+    at_edge, past_edge, an_hour_ago, mixed = (uuid.uuid4() for _ in range(4))
+    _reclaim_an_unnamed_holder(coordinator, at_edge, "edge.md", now - 86_400)
+    _reclaim_an_unnamed_holder(coordinator, past_edge, "old.md", now - 86_401)
+    _reclaim_an_unnamed_holder(coordinator, an_hour_ago, "hour.md", now - 3_600)
+    _reclaim_an_unnamed_holder(coordinator, mixed, "mixed-old.md", now - 86_500)
+    _reclaim_an_unnamed_holder(coordinator, mixed, "mixed-new.md", now - 60)
+
+    monkeypatch.setattr(cs, "monotonic_seconds", lambda: now)
+    rows = {row["agent_id"]: row for row in _operator_status(client)["sessions"]}
+
+    edge_row = rows[str(at_edge)]
+    assert edge_row["agent_name"] is None
+    assert edge_row["states"] == {}
+    assert edge_row["reclaimed"] == {
+        "edge.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": now - 86_400}
+    }
+    assert str(past_edge) not in rows
+    assert rows[str(an_hour_ago)]["reclaimed"] == {
+        "hour.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": now - 3_600}
+    }
+    assert rows[str(mixed)]["reclaimed"] == {
+        "mixed-old.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": now - 86_500},
+        "mixed-new.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": now - 60},
+    }
+
+
+def _post_edit_cas(client: _Client, sid: str, expected_version: int, label: str) -> dict:
+    status, body = client.post("/hooks/post-edit-cas", {
+        "session_id": sid, "path": "plan.md", "success": True,
+        "content_hash": _hash(label), "expected_version": expected_version,
+    })
+    assert status == 200, body
+    return body
+
+
+def _plan_version(payload: dict) -> int:
+    [entry] = [a for a in payload["tracked_artifacts"] if a["path"] == "plan.md"]
+    return entry["version"]
+
+
+def test_status_keeps_a_reclaim_listed_while_the_holders_compare_and_swap_is_refused(
+    coordinator, client: _Client
+) -> None:
+    """The reclaim moved the path's ownership generation past the holder's
+    read, and over the hooks a re-read does not capture the new one, so the
+    holder's compare-and-swap is refused before and after a SHARED re-read
+    beside a peer. The entry stays listed throughout and nothing moves the
+    version. Only the holder's next pre-edit, a write grant, clears it."""
+    sid, peer = _sid("cas-refused-195"), _sid("cas-refused-peer-195")
+    assert client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})[0] == 200
+    reclaim_tick = int(time.time()) + 999_999
+    assert _sweep(coordinator, reclaim_tick) == 1
+    cause = {"plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": reclaim_tick}}
+    version = _plan_version(_operator_status(client))
+    refused = {"ok": False, "reason": "stale_read_generation", "current_version": version}
+
+    assert _post_edit_cas(client, sid, version, "cas-before-reread") == refused
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {}
+    assert row["reclaimed"] == cause
+
+    client.post("/hooks/pre-read", {"session_id": peer, "path": "plan.md", "content_hash": _hash("x")})
+    client.post("/hooks/pre-read", {"session_id": sid, "path": "plan.md", "content_hash": _hash("x")})
+    assert _post_edit_cas(client, sid, version, "cas-after-reread") == refused
+    payload = _operator_status(client)
+    assert _row_for(payload, sid)["states"] == {"plan.md": "SHARED"}
+    assert _row_for(payload, sid)["reclaimed"] == cause
+    assert _row_for(payload, peer)["states"] == {"plan.md": "SHARED"}
+    assert _plan_version(payload) == version
+
+    assert client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})[0] == 200
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {"plan.md": "EXCLUSIVE"}
+    assert row["reclaimed"] == {}
+
+
+def test_a_reclaimed_sessions_reread_with_no_other_holder_is_shared_and_stays_listed(
+    coordinator, client: _Client
+) -> None:
+    """Over the hooks a reclaimed session that re-reads a path no other
+    session holds is granted SHARED, not EXCLUSIVE: the re-read is not a write
+    grant, so the entry stays listed and its compare-and-swap stays refused
+    until it edits the path again."""
+    sid = _sid("sole-reread-195")
+    assert client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})[0] == 200
+    reclaim_tick = int(time.time()) + 999_999
+    assert _sweep(coordinator, reclaim_tick) == 1
+    version = _plan_version(_operator_status(client))
+
+    client.post("/hooks/pre-read", {"session_id": sid, "path": "plan.md", "content_hash": _hash("x")})
+    payload = _operator_status(client)
+    assert [row["agent_id"] for row in payload["sessions"]] == [str(session_to_agent_id(sid))]
+    row = _row_for(payload, sid)
+    assert row["states"] == {"plan.md": "SHARED"}
+    assert row["reclaimed"] == {
+        "plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": reclaim_tick}
+    }
+    assert _post_edit_cas(client, sid, version, "cas-sole-reread") == {
+        "ok": False, "reason": "stale_read_generation", "current_version": version,
+    }
+
+
+# ----------------------------------------------------------------------
+# Targeted grant handoff routes (#185)
+#
+# The four require-class verbs -- transfer, accept, decline, withdraw -- and
+# what a handoff changes on the routes that already exist: the giver's typed
+# refusal on every write route, the per-grant answer of a release that is not a
+# clean success, and the structured ``handoff`` key on the pre-read, pre-edit,
+# post-edit and compare-and-swap bodies while a record exists. Every expected
+# body is a hand-written literal; the ids in it are computed from the session
+# ids the test itself supplies, never read back from the code under test.
+# ----------------------------------------------------------------------
+
+_TRANSFER = "/handoff/transfer"
+_ACCEPT = "/handoff/accept"
+_DECLINE = "/handoff/decline"
+_WITHDRAW = "/handoff/withdraw"
+_HANDOFF_ROUTES = (_TRANSFER, _ACCEPT, _DECLINE, _WITHDRAW)
+
+#: FROZEN duplicates of the four static degraded bodies: one per verb, failed
+#: and unconfirmed, the transfer's naming no grant (every grant of an
+#: all-or-nothing transfer is equally unconfirmed).
+_HANDOFF_DEGRADED = {
+    _TRANSFER: {"ok": False, "degraded": True, "reason": "handoff_transfer_unconfirmed"},
+    _ACCEPT: {"ok": False, "degraded": True, "reason": "handoff_accept_unconfirmed"},
+    _DECLINE: {"ok": False, "degraded": True, "reason": "handoff_decline_unconfirmed"},
+    _WITHDRAW: {"ok": False, "degraded": True, "reason": "handoff_withdraw_unconfirmed"},
+}
+_MALFORMED_SUBAGENT_ERROR = {"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"}
+
+
+@dataclasses.dataclass(frozen=True)
+class _Session:
+    """A claimed session: its id and the principal it presents."""
+
+    sid: str
+    principal: str
+
+    @property
+    def agent(self) -> str:
+        """The session-level agent id, spelled as the handoff bodies spell it."""
+        return str(session_to_agent_id(self.sid))
+
+    def composite(self, subagent: str) -> uuid.UUID:
+        return session_to_agent_id(self.sid, subagent)
+
+
+def _claimed(client: _Client) -> _Session:
+    sid = str(uuid.uuid4())
+    return _Session(sid, _explicit_claim(client, sid))
+
+
+def _read(client: _Client, who: _Session, path: str, subagent: str | None = None) -> dict:
+    body: dict = {"session_id": who.sid, "path": path}
+    if subagent is not None:
+        body["agent_id"] = subagent
+    status, answer = client.post("/hooks/pre-read", body, principal=who.principal)
+    assert status == 200, answer
+    return answer
+
+
+def _transfer(
+    client: _Client, giver: _Session, successor: Any, grants: list, **extra: Any
+) -> tuple[int, dict]:
+    return client.post(
+        _TRANSFER,
+        {"session_id": giver.sid, "successor": successor, "grants": grants, **extra},
+        principal=giver.principal,
+    )
+
+
+def _verb(client: _Client, route: str, who: _Session, path: str) -> tuple[int, dict]:
+    return client.post(route, {"session_id": who.sid, "path": path}, principal=who.principal)
+
+
+def _state(coordinator, path: str, agent_id: uuid.UUID) -> MESIState | None:
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    assert artifact_id is not None, f"{path} was never registered"
+    return coordinator.registry.get_agent_state(artifact_id, agent_id)
+
+
+def _record(coordinator, path: str):
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    assert artifact_id is not None, f"{path} was never registered"
+    return coordinator.registry.get_transfer_record(artifact_id)
+
+
+def _handed(
+    giver: _Session, successor: _Session, path: str, *,
+    version: int = 1, shape: str = "SHARED", status: str = "pending",
+) -> dict:
+    """A transferred grant's per-grant entry, as a literal."""
+    return {
+        "path": path, "transferred": True, "giver": giver.agent,
+        "successor": successor.agent, "version_at_transfer": version,
+        "hold_shape": shape, "status": status,
+    }
+
+
+def _hand_off(
+    client: _Client, giver: _Session, successor: _Session, path: str, subagent: str = "inc-1"
+) -> None:
+    """``giver`` reads ``path`` under the incarnation ``subagent`` and hands it to
+    ``successor``, presenting that incarnation."""
+    _read(client, giver, path, subagent)
+    answer = _transfer(client, giver, successor.agent, [{"path": path, "agent_id": subagent}])
+    assert answer == (200, {"ok": True, "grants": [_handed(giver, successor, path)]}), answer
+
+
+def _projection(
+    giver: _Session, successor: _Session, role: str, *,
+    shape: str = "SHARED", status: str = "pending", live: bool = True, **extra: Any,
+) -> dict:
+    """The ``handoff`` key a body carries while a record exists, as a
+    literal: session-level ids only, no session id, no timestamp."""
+    return {
+        "role": role, "giver": giver.agent, "successor": successor.agent,
+        "version_at_transfer": 1, "hold_shape": shape, "status": status,
+        "live": live, **extra,
+    }
+
+
+# --- the four routes: boundary validation ------------------------------------
+
+
+@pytest.mark.parametrize("route", _HANDOFF_ROUTES, ids=lambda r: r.rsplit("/", 1)[1])
+def test_a_handoff_route_refuses_a_missing_or_malformed_session_id(
+    route: str, client: _Client
+) -> None:
+    """Each verb answers 400 for a request that names no acting session or a
+    malformed one, before the principal gate or any registry read -- the
+    sibling routes' validation, in their own words. Prevents a verb acting
+    for an identity it could not resolve."""
+    body = {"path": "plan.md", "successor": str(uuid.uuid4()), "grants": [{"path": "plan.md"}]}
+    assert client.post(route, body) == (400, {"error": "missing session_id"})
+    assert client.post(route, {**body, "session_id": "not-a-uuid"}) == (
+        400, {"error": "session_id must be a UUID (8-4-4-4-12 hex with hyphens)"})
+    if route != _TRANSFER:
+        assert client.post(route, {"session_id": _sid("no-path")}) == (
+            400, {"error": "missing or empty path"})
+
+
+@pytest.mark.parametrize(("change", "error"), [
+    ({"grants": None}, "grants must be a non-empty list of {path, agent_id}"),
+    ({"grants": []}, "grants must be a non-empty list of {path, agent_id}"),
+    ({"grants": "plan.md"}, "grants must be a non-empty list of {path, agent_id}"),
+    ({"grants": ["plan.md"]}, "each grant must be a {path, agent_id} object"),
+    ({"grants": [{"path": "/plan.md"}]}, "path must be relative (no leading /)"),
+    ({"grants": [{"path": "plan.md"}, {"path": "plan.md"}]}, "grants contains duplicate paths"),
+    ({"grants": [{"path": f"p{i}/plan.md"} for i in range(65)]}, "grants exceeds 64 paths"),
+    ({"grants": [{"path": "plan.md", "agent_id": "bad id!"}]},
+     "agent_id must be 1-64 chars of [A-Za-z0-9_-]"),
+    ({"agent_id": 42}, "agent_id must be 1-64 chars of [A-Za-z0-9_-]"),
+    ({"successor": None}, "missing successor"),
+], ids=[
+    "no-grants", "empty-grants", "grants-not-a-list", "grant-not-an-object",
+    "absolute-path", "duplicate-path", "too-many-grants", "malformed-grant-subagent",
+    "malformed-subagent", "no-successor",
+])
+def test_transfer_refuses_a_request_it_cannot_read_and_changes_nothing(
+    change: dict, error: str, coordinator, client: _Client
+) -> None:
+    """A transfer whose grant set or acting identity cannot be read is a 400
+    naming the field, and nothing moves. A malformed subagent id is refused
+    rather than read as the parent, because the parent's grant is not the one
+    the caller asked to give away (the session-stop and effect-fence rule)."""
+    giver, successor = _claimed(client), _claimed(client)
+    _read(client, giver, "plan.md", "inc-1")
+    body = {
+        "session_id": giver.sid, "successor": successor.agent,
+        "grants": [{"path": "plan.md", "agent_id": "inc-1"}], **change,
+    }
+    assert client.post(_TRANSFER, body, principal=giver.principal) == (400, {"error": error})
+    assert _state(coordinator, "plan.md", giver.composite("inc-1")) == MESIState.SHARED
+    assert _record(coordinator, "plan.md") is None
+
+
+# --- transfer: the per-grant answer and the successor id ---------------------
+
+
+def test_transfer_answers_each_grant_with_the_normalised_session_level_ids(
+    coordinator, client: _Client
+) -> None:
+    """One request, two grants: the held read is
+    transferred and reported with the SESSION-LEVEL giver and successor ids
+    although the giver presented an incarnation and named the successor by
+    the composite id of one of its subagents (in the 32-hex form a stale
+    summary publishes); the path the giver does not hold is refused as not
+    held and left exactly as it was, so the top-level answer is false.
+
+    Prevents a composite reaching the record (the fence keys on the
+    session-level id) and a mixed answer reading as success."""
+    giver, successor = _claimed(client), _claimed(client)
+    _read(client, giver, "plan.md", "inc-1")
+    _read(client, successor, "spec.md", "worker")  # registers the successor's subagent
+    named = successor.composite("worker").hex
+
+    answer = _transfer(client, giver, named, [
+        {"path": "plan.md", "agent_id": "inc-1"}, {"path": "spec.md", "agent_id": "inc-1"},
+    ])
+
+    assert answer == (200, {"ok": False, "grants": [
+        _handed(giver, successor, "plan.md"),
+        {"path": "spec.md", "transferred": False, "reason": "handoff_not_held"},
+    ]})
+    assert _state(coordinator, "plan.md", giver.composite("inc-1")) == MESIState.INVALID
+    assert _state(coordinator, "spec.md", giver.composite("inc-1")) is None
+    assert _state(coordinator, "spec.md", successor.composite("worker")) == MESIState.SHARED
+    record, live = _record(coordinator, "plan.md")
+    assert live is True
+    assert record.giver == session_to_agent_id(giver.sid)
+    assert record.successor == session_to_agent_id(successor.sid)
+    assert record.holder == giver.composite("inc-1")
+    assert _record(coordinator, "spec.md") is None
+
+
+def test_a_transfer_naming_only_unregistered_paths_answers_not_held_and_registers_nothing(
+    coordinator, client: _Client
+) -> None:
+    """A transfer whose every path was never registered answers each one
+    not held, without reaching the service (which refuses an empty
+    transfer), and leaves the paths unregistered: a handoff request never
+    mints the artifact it names."""
+    giver, successor = _claimed(client), _claimed(client)
+    _read(client, successor, "spec.md")  # registers the successor
+
+    answer = _transfer(client, giver, successor.agent, [
+        {"path": "never-registered.md"}, {"path": "also-never.md"},
+    ])
+
+    assert answer == (200, {"ok": False, "grants": [
+        {"path": "never-registered.md", "transferred": False, "reason": "handoff_not_held"},
+        {"path": "also-never.md", "transferred": False, "reason": "handoff_not_held"},
+    ]})
+    assert coordinator.registry.lookup_artifact_id_by_name("never-registered.md") is None
+    assert coordinator.registry.lookup_artifact_id_by_name("also-never.md") is None
+
+
+def test_transfer_presents_a_different_incarnation_per_path(
+    coordinator, client: _Client
+) -> None:
+    """A client presents, per path, the incarnation that holds its claim
+    there; the request-level ``agent_id`` is the default for a grant that
+    names none. Both grants transfer, and each incarnation's row is the one
+    that moved INVALID."""
+    giver, successor = _claimed(client), _claimed(client)
+    _read(client, giver, "plan.md", "inc-1")
+    _read(client, giver, "spec.md", "inc-2")
+
+    answer = _transfer(
+        client, giver, successor.agent,
+        [{"path": "plan.md", "agent_id": "inc-1"}, {"path": "spec.md"}], agent_id="inc-2",
+    )
+
+    assert answer == (200, {"ok": True, "grants": [
+        _handed(giver, successor, "plan.md"), _handed(giver, successor, "spec.md"),
+    ]})
+    assert _state(coordinator, "plan.md", giver.composite("inc-1")) == MESIState.INVALID
+    assert _state(coordinator, "spec.md", giver.composite("inc-2")) == MESIState.INVALID
+
+
+def test_transfer_to_the_callers_own_session_is_refused_as_self(
+    coordinator, client: _Client
+) -> None:
+    """A successor that normalises to the caller's own session -- its own
+    subagent's composite, or its session-level id -- is refused as self, and
+    the read is left as it was. A handoff is between sessions."""
+    giver = _claimed(client)
+    _read(client, giver, "plan.md", "inc-1")
+    _read(client, giver, "task.md", "helper")  # the giver's own subagent, now named
+    for named in (str(giver.composite("helper")), giver.agent):
+        answer = _transfer(client, giver, named, [{"path": "plan.md", "agent_id": "inc-1"}])
+        assert answer == (200, {"ok": False, "grants": [
+            {"path": "plan.md", "transferred": False, "reason": "handoff_to_self"},
+        ]}), named
+    assert _state(coordinator, "plan.md", giver.composite("inc-1")) == MESIState.SHARED
+    assert _record(coordinator, "plan.md") is None
+
+
+@pytest.mark.parametrize("named", [
+    "not-an-agent-id", "", 42, ["x"], {"id": 1}, True, "0" * 31,
+    "{11111111-1111-4111-8111-111111111111}",
+    "urn:uuid:11111111-1111-4111-8111-111111111111",
+], ids=[
+    "word", "empty", "int", "list", "object", "bool", "short-hex", "braced", "urn",
+])
+def test_a_malformed_successor_is_refused_for_every_grant_and_changes_nothing(
+    named: Any, coordinator, client: _Client
+) -> None:
+    """A successor id that is not a well-formed agent id refuses EVERY
+    grant with its own typed reason, inside an HTTP 200 -- not a 400, and
+    never a downgrade to a plain release (the stated exception to the
+    malformed-optional-field rule)."""
+    giver = _claimed(client)
+    _read(client, giver, "plan.md", "inc-1")
+    _read(client, giver, "spec.md", "inc-1")
+    answer = _transfer(client, giver, named, [
+        {"path": "plan.md", "agent_id": "inc-1"}, {"path": "spec.md", "agent_id": "inc-1"},
+    ])
+    assert answer == (200, {"ok": False, "grants": [
+        {"path": "plan.md", "transferred": False, "reason": "handoff_successor_malformed"},
+        {"path": "spec.md", "transferred": False, "reason": "handoff_successor_malformed"},
+    ]})
+    for path in ("plan.md", "spec.md"):
+        assert _state(coordinator, path, giver.composite("inc-1")) == MESIState.SHARED
+        assert _record(coordinator, path) is None
+
+
+def test_a_successor_the_coordinator_never_saw_is_refused_as_unknown(
+    coordinator, client: _Client
+) -> None:
+    """A well-formed id that is neither bound to a principal nor in the
+    live name map is refused as unknown, and the read is left alone."""
+    giver = _claimed(client)
+    _read(client, giver, "plan.md", "inc-1")
+    answer = _transfer(client, giver, str(uuid.uuid4()), [{"path": "plan.md", "agent_id": "inc-1"}])
+    assert answer == (200, {"ok": False, "grants": [
+        {"path": "plan.md", "transferred": False, "reason": "handoff_successor_unknown"},
+    ]})
+    assert _state(coordinator, "plan.md", giver.composite("inc-1")) == MESIState.SHARED
+
+
+def test_a_composite_successor_is_known_only_while_the_name_map_holds_it(
+    tmp_path: Path,
+) -> None:
+    """A composite successor id -- here a volume incarnation's -- is
+    accepted while the coordinator's live name map holds it, and normalised
+    to its session. After a restart the map is empty, and the same id is
+    refused as unknown EVEN THOUGH it still holds a SHARED row: on this
+    backend every HTTP identity binds a principal before it holds a row, so a
+    row-holding id the map does not know can only be an incarnation the map
+    lost, and the handler never hands it to the registry, whose grant-row arm
+    would count it known. The successor's session-level id stays known
+    across the restart through its principal binding (the control)."""
+    first = _restart_on(tmp_path, "handoff-before-restart")
+    try:
+        client = _Client("127.0.0.1", first.port, load_secret(first.coordinator_root))
+        giver, successor = _claimed(client), _claimed(client)
+        _read(client, successor, "task.md", "inc-b")  # the incarnation holds a SHARED row
+        _read(client, giver, "plan.md", "inc-a")
+        _read(client, giver, "spec.md", "inc-a")
+        named = str(successor.composite("inc-b"))
+        answer = _transfer(client, giver, named, [{"path": "plan.md", "agent_id": "inc-a"}])
+        assert answer == (200, {"ok": True, "grants": [_handed(giver, successor, "plan.md")]})
+    finally:
+        first.shutdown()
+
+    second = _restart_on(tmp_path, "handoff-after-restart")
+    try:
+        client = _Client("127.0.0.1", second.port, load_secret(second.coordinator_root))
+        assert _state(second, "task.md", successor.composite("inc-b")) == MESIState.SHARED
+        answer = _transfer(client, giver, named, [{"path": "spec.md", "agent_id": "inc-a"}])
+        assert answer == (200, {"ok": False, "grants": [
+            {"path": "spec.md", "transferred": False, "reason": "handoff_successor_unknown"},
+        ]})
+        assert _state(second, "spec.md", giver.composite("inc-a")) == MESIState.SHARED
+        assert _record(second, "spec.md") is None
+
+        answer = _transfer(client, giver, successor.agent, [{"path": "spec.md", "agent_id": "inc-a"}])
+        assert answer == (200, {"ok": True, "grants": [_handed(giver, successor, "spec.md")]})
+    finally:
+        second.shutdown()
+
+
+def test_a_refused_grant_carries_what_its_refusal_names(coordinator, client: _Client) -> None:
+    """Refusals rendered on the wire: a transfer of a path another session
+    handed off is refused naming the pending pair and, in static text with no
+    id, what ends that handoff; a re-send of a handoff its successor declined
+    is refused carrying the declined status. Nothing changes either time."""
+    giver, successor = _claimed(client), _claimed(client)
+    other, other_successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _read(client, other, "plan.md", "o-1")
+
+    answer = _transfer(client, other, other_successor.agent, [{"path": "plan.md", "agent_id": "o-1"}])
+    assert answer == (200, {"ok": False, "grants": [{
+        "path": "plan.md", "transferred": False, "reason": "handoff_in_flight",
+        "giver": giver.agent, "successor": successor.agent,
+        "detail": (
+            "another session's handoff of this path is live; it ends when its "
+            "successor declines, its giver withdraws, or any session writes the path"
+        ),
+    }]})
+    assert _state(coordinator, "plan.md", other.composite("o-1")) == MESIState.SHARED
+
+    assert _verb(client, _DECLINE, successor, "plan.md") == (200, {"ok": True, "status": "declined"})
+    answer = _transfer(client, giver, successor.agent, [{"path": "plan.md", "agent_id": "inc-1"}])
+    assert answer == (200, {"ok": False, "grants": [{
+        "path": "plan.md", "transferred": False, "reason": "handoff_ended",
+        "giver": giver.agent, "successor": successor.agent, "version_at_transfer": 1,
+        "hold_shape": "SHARED", "status": "declined",
+    }]})
+    assert _record(coordinator, "plan.md")[0].status == "declined"
+
+
+def test_a_name_the_registration_did_not_write_never_normalises_a_successor(
+    tmp_path: Path,
+) -> None:
+    """A composite resolves to a session only through the display name
+    ``register_session`` wrote for that very id. An id whose map entry carries
+    another session's name (seeded straight into the map here) is not
+    normalised to that session: the transfer refuses it as unknown instead of
+    handing the path to a session nobody named."""
+    stray = uuid.uuid4()
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="handoff-seeded-names")
+    server.serve_in_thread()
+    try:
+        client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
+        giver, successor = _claimed(client), _claimed(client)
+        with server._agent_names_lock:
+            server._agent_names[stray] = f"claude-session-{successor.sid}"
+        _read(client, giver, "plan.md", "inc-1")
+        answer = _transfer(client, giver, str(stray), [{"path": "plan.md", "agent_id": "inc-1"}])
+        assert answer == (200, {"ok": False, "grants": [
+            {"path": "plan.md", "transferred": False, "reason": "handoff_successor_unknown"},
+        ]})
+        assert _record(server, "plan.md") is None
+    finally:
+        server.shutdown()
+
+
+# --- accept, decline, withdraw ---------------------------------------------
+
+
+def test_accept_decline_and_withdraw_answer_their_typed_results(
+    coordinator, client: _Client
+) -> None:
+    """The three verbs on the wire: the successor accepts or declines, the giver
+    withdraws, anyone else is refused with the typed reason carrying the
+    record's status, a record that ended is refused as not live, and a path
+    with no record at all answers not live with no status."""
+    giver, successor, other = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _hand_off(client, giver, successor, "spec.md")
+
+    assert _verb(client, _ACCEPT, other, "plan.md") == (
+        200, {"ok": False, "reason": "handoff_not_successor", "status": "pending"})
+    assert _verb(client, _ACCEPT, successor, "plan.md") == (200, {"ok": True, "status": "completed"})
+    assert _verb(client, _WITHDRAW, successor, "plan.md") == (
+        200, {"ok": False, "reason": "handoff_not_giver", "status": "completed"})
+    assert _verb(client, _WITHDRAW, giver, "plan.md") == (200, {"ok": True, "status": "withdrawn"})
+    assert _verb(client, _WITHDRAW, giver, "plan.md") == (
+        200, {"ok": False, "reason": "handoff_not_live", "status": "withdrawn"})
+    assert _verb(client, _DECLINE, other, "spec.md") == (
+        200, {"ok": False, "reason": "handoff_not_successor", "status": "pending"})
+    assert _verb(client, _DECLINE, successor, "spec.md") == (200, {"ok": True, "status": "declined"})
+    _read(client, other, "task.md")
+    assert _verb(client, _ACCEPT, successor, "task.md") == (
+        200, {"ok": False, "reason": "handoff_not_live"})
+    assert _verb(client, _DECLINE, successor, "never-seen/plan.md") == (
+        200, {"ok": False, "reason": "handoff_not_live"})
+    assert _record(coordinator, "plan.md")[0].status == "withdrawn"
+    assert _record(coordinator, "spec.md")[0].status == "declined"
+
+
+@pytest.mark.parametrize("route", _HANDOFF_ROUTES, ids=lambda r: r.rsplit("/", 1)[1])
+def test_a_handoff_verb_cut_short_by_the_watchdog_answers_unconfirmed_and_lands_nothing(
+    route: str, coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A watchdog that fires while a verb waits for the lock. With the registry lock held
+    past the watchdog deadline, each verb answers its ONE static fail-closed
+    body -- failed and unconfirmed, never a success, the transfer's naming no
+    grant -- and once the lock frees, the abandoned body aborts at the
+    registry lock: no record is written or relabelled and no grant moves.
+    The real watchdog is driven; nothing is stubbed."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _read(client, giver, "spec.md", "inc-1")
+    caller, extra = {
+        _TRANSFER: (giver, {
+            "successor": successor.agent, "grants": [{"path": "spec.md", "agent_id": "inc-1"}],
+        }),
+        _ACCEPT: (successor, {"path": "plan.md"}),
+        _DECLINE: (successor, {"path": "plan.md"}),
+        _WITHDRAW: (giver, {"path": "plan.md"}),
+    }[route]
+    record_before = _record(coordinator, "plan.md")
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+
+    with _HeldRegistryLock(coordinator) as held:
+        answer = client.post(route, {"session_id": caller.sid, **extra}, principal=caller.principal)
+        held.release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+
+    assert answer == (200, _HANDOFF_DEGRADED[route])
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    assert coordinator._watchdog_late_aborts_total == aborts_before + 1
+    assert coordinator._watchdog_late_completion_total == completions_before
+    assert _record(coordinator, "plan.md") == record_before
+    assert _record(coordinator, "spec.md") is None
+    assert _state(coordinator, "spec.md", giver.composite("inc-1")) == MESIState.SHARED
+
+
+# --- the giver is refused on every write route, with the typed reason --------
+
+
+def _giver_refusal(giver: _Session, successor: _Session, *, shape: str) -> dict:
+    """What a fenced giver's write answers on the compare-and-swap route: the
+    typed reason with the successor and the version at transfer as top-level
+    fields, and the ``handoff`` key. The pre-edit and post-edit routes add
+    their hook envelope beside it (:func:`_giver_deny_envelope`,
+    :func:`_commit_arm_envelope`)."""
+    return {
+        "ok": False, "reason": "handed_off", "successor": successor.agent,
+        "version_at_transfer": 1,
+        "handoff": _projection(giver, successor, "giver", shape=shape),
+    }
+
+
+def _giver_deny_envelope(successor: _Session, path: str, version: int = 1) -> dict:
+    """The giver's pre-edit deny envelope, as a literal."""
+    s = successor.agent[:8]
+    return {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": (
+            f"Edit denied: you handed {path} to agent {s} at v{version}, so this "
+            f"session can no longer write it. The handoff ends when agent {s} "
+            f"writes {path}, when agent {s} declines it, or when you withdraw it "
+            f"on your user's or host's instruction. Stop and report to your user "
+            f"that {path} was handed off. This denial is structural; retrying "
+            f"the same operation will produce the same denial."
+        ),
+    }
+
+
+def _commit_arm_envelope(successor: _Session, path: str, version: int = 1) -> dict:
+    """The post-edit handoff arm in the post-tool context envelope, as a literal."""
+    s = successor.agent[:8]
+    return {
+        "hookEventName": "PostToolUse",
+        "additionalContext": (
+            f"Commit refused: you handed {path} to agent {s} at v{version}, so "
+            f"this session can no longer write it. Your edit landed in your local "
+            f"worktree but was not given a version by the coordinator. The "
+            f"handoff ends when agent {s} writes {path}, when agent {s} declines "
+            f"it, or when you withdraw it on your user's or host's instruction. "
+            f"Stop and report to your user that {path} was handed off."
+        ),
+    }
+
+
+def test_a_fenced_givers_pre_edit_is_refused_with_the_typed_reason(
+    coordinator, client: _Client
+) -> None:
+    """The giver's pessimistic re-acquire, from a fresh incarnation,
+    is refused with the typed reason at the top level and the deny envelope
+    beside it, and takes no grant. Without its own arm ahead of the generic
+    CoherenceError one, the refusal would be answered as the exception's
+    prose; without the envelope the hook client would let the edit proceed."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    answer = client.post(
+        "/hooks/pre-edit", {"session_id": giver.sid, "agent_id": "inc-2", "path": "plan.md"},
+        principal=giver.principal,
+    )
+    assert answer == (200, {
+        **_giver_refusal(giver, successor, shape="SHARED"),
+        "hookSpecificOutput": _giver_deny_envelope(successor, "plan.md"),
+    })
+    assert _state(coordinator, "plan.md", giver.composite("inc-2")) is None
+
+
+def test_a_transfer_landing_between_the_giver_check_and_the_acquire_is_still_denied(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The race the pre-edit's second arm covers: the handler's own giver
+    check misses (the transfer lands just after it), so the acquire raises
+    the typed refusal, and that must map to the same deny body. Without the
+    arm the giver gets the bare typed refusal with no deny envelope, and the
+    hook client lets the Edit land on disk."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    real = coordinator.service.live_handoff_given_by
+    calls = []
+
+    def missing_once(*args: Any, **kwargs: Any):
+        calls.append(args)
+        return None if len(calls) == 1 else real(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator.service, "live_handoff_given_by", missing_once)
+    answer = client.post(
+        "/hooks/pre-edit", {"session_id": giver.sid, "agent_id": "inc-2", "path": "plan.md"},
+        principal=giver.principal,
+    )
+
+    assert len(calls) >= 2, "the acquire never consulted the giver check"
+    assert answer == (200, {
+        **_giver_refusal(giver, successor, shape="SHARED"),
+        "hookSpecificOutput": _giver_deny_envelope(successor, "plan.md"),
+    })
+    assert _state(coordinator, "plan.md", giver.composite("inc-2")) is None
+
+
+def test_a_fenced_givers_post_edit_commit_is_refused_with_the_typed_reason(
+    coordinator, client: _Client
+) -> None:
+    """The giver fence on the pessimistic commit: a giver whose EXCLUSIVE grant was handed
+    off reports its edit; the commit is refused with the typed reason and the
+    version does not move. Fails if the post-edit success arm loses its giver
+    arm (the refusal would be answered as prose) or the route stops passing
+    the session-level identity."""
+    giver, successor = _claimed(client), _claimed(client)
+    _pre_edit_with(client, giver.sid, giver.principal, "plan.md")
+    answer = _transfer(client, giver, successor.agent, [{"path": "plan.md"}])
+    assert answer == (200, {"ok": True, "grants": [
+        _handed(giver, successor, "plan.md", shape="EXCLUSIVE")]})
+
+    answer = client.post("/hooks/post-edit", {
+        "session_id": giver.sid, "path": "plan.md", "success": True,
+        "content_hash": _hash("late-edit"),
+    }, principal=giver.principal)
+
+    assert answer == (200, {
+        **_giver_refusal(giver, successor, shape="EXCLUSIVE"),
+        "hookSpecificOutput": _commit_arm_envelope(successor, "plan.md"),
+    })
+    assert _artifact_version(coordinator, "plan.md") == 1
+
+
+def test_a_fenced_givers_compare_and_swap_from_a_fresh_incarnation_is_refused(
+    coordinator, client: _Client
+) -> None:
+    """The measured lost update, on the route: the giver read at v1 under one
+    incarnation and handed the path off; its compare-and-swap at v1 from a
+    re-minted incarnation -- a row the registry has never seen, which the
+    version check alone would admit -- is refused with the typed reason, and
+    the version stays 1. Fails if the route stops passing the session-level
+    identity: the fresh composite is then not the giver and the write wins."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    answer = client.post("/hooks/post-edit-cas", {
+        "session_id": giver.sid, "agent_id": "inc-2", "path": "plan.md",
+        "content_hash": _hash("late"), "expected_version": 1,
+    }, principal=giver.principal)
+    assert answer == (200, _giver_refusal(giver, successor, shape="SHARED"))
+    assert _artifact_version(coordinator, "plan.md") == 1
+
+
+def _begin(client: _Client, who: _Session, path: str, principal: str | None) -> str:
+    status, body = client.post(
+        "/session/begin", {"session_id": who.sid, "read_set": [path]}, principal=principal)
+    assert status == 200 and body["ok"] is True, body
+    return body["session_token"]
+
+
+def test_a_fenced_givers_snapshot_commits_are_refused_with_the_typed_reason(
+    coordinator, client: _Client
+) -> None:
+    """The giver fence on the two snapshot-session routes, which already pass the session
+    owner as the caller identity: each needs its own arm ahead of the generic
+    CoherenceError one, or the refusal is answered as prose. The batch names
+    the member it refused."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    token = _begin(client, giver, "plan.md", giver.principal)
+    answer = client.post("/session/commit", {
+        "session_id": giver.sid, "session_token": token, "path": "plan.md", "content": "late",
+    }, principal=giver.principal)
+    assert answer == (200, {
+        "ok": False, "reason": "handed_off", "successor": successor.agent,
+        "version_at_transfer": 1,
+    })
+    answer = client.post("/session/commit_all", {
+        "session_id": giver.sid, "session_token": token,
+        "writes": [{"path": "plan.md", "content": "late"}],
+    }, principal=giver.principal)
+    assert answer == (200, {
+        "ok": False, "reason": "handed_off", "path": "plan.md",
+        "successor": successor.agent, "version_at_transfer": 1,
+    })
+    assert _artifact_version(coordinator, "plan.md") == 1
+
+
+def test_a_fenced_givers_restore_registration_is_refused_with_the_typed_reason(
+    coordinator, client: _Client
+) -> None:
+    """The giver fence on the restore registration, whose controller is the session-level
+    identity derived from the session id: a giver registering a restored
+    member it handed off is refused like any other write -- the typed reason
+    naming the member, not the generic arm's prose -- and nothing lands."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    status, checkpoint = client.post("/workspace/checkpoint", {
+        "session_id": giver.sid, "name": "before-handoff", "window_min": 1.0,
+        "window_max": 1.0, "members": [{
+            "member_path": "plan.md", "native_token": "v1",
+            "fingerprint": _hash("restored"), "captured_at": 1.0,
+        }],
+    }, principal=giver.principal)
+    assert status == 200 and checkpoint["ok"] is True, checkpoint
+    answer = client.post("/workspace/restore/register", {
+        "session_id": giver.sid, "checkpoint_id": checkpoint["checkpoint_id"],
+        "writes": [{"member_path": "plan.md", "fingerprint": _hash("restored")}],
+    }, principal=giver.principal)
+    assert answer == (200, {
+        "ok": False, "reason": "handed_off", "path": "plan.md",
+        "successor": successor.agent, "version_at_transfer": 1,
+    })
+    assert _artifact_version(coordinator, "plan.md") == 1
+
+
+def test_a_snapshot_commit_without_a_principal_acts_as_the_bound_session_it_names(
+    coordinator, client: _Client
+) -> None:
+    """Accepted behaviour, pinned the way the accept-class reads pin theirs.
+    /session/begin and /session/commit are accept-class, so a request that
+    presents no principal and names a BOUND session commits as that session:
+    naming the live record's successor it completes the record, and naming
+    its giver it is fenced with the giver reason. The route's posture text
+    states both, and no longer claims an absent principal admits nothing."""
+    from ccs.adapters.claude_code.coordinator_server import _CALLER_PRINCIPAL_POSTURE
+
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _hand_off(client, giver, successor, "spec.md")
+
+    token = _begin(client, successor, "plan.md", None)
+    status, body = client.post("/session/commit", {
+        "session_id": successor.sid, "session_token": token, "path": "plan.md", "content": "v2",
+    })
+    assert status == 200 and body["ok"] is True and body["version"] == 2, body
+    assert _record(coordinator, "plan.md")[0].status == "completed"
+
+    token = _begin(client, giver, "spec.md", None)
+    answer = client.post("/session/commit", {
+        "session_id": giver.sid, "session_token": token, "path": "spec.md", "content": "late",
+    })
+    assert answer == (200, {
+        "ok": False, "reason": "handed_off", "successor": successor.agent,
+        "version_at_transfer": 1,
+    })
+
+    harm = _CALLER_PRINCIPAL_POSTURE[("POST", "/session/commit")].harm
+    for stated in ("presents no principal and names a bound session",
+                   "fenced as that session when it is a live record's giver",
+                   "completes the record as that session when it is the record's successor",
+                   "stored as the counterparty of an overtake otherwise"):
+        assert stated in harm, f"/session/commit's harm text does not state {stated!r}: {harm}"
+    assert "admits nothing more" not in harm, harm
+
+
+# --- the release answer: per grant only when it is not a clean success -------
+
+
+def test_a_clean_session_stop_answers_todays_exact_bytes(coordinator, client: _Client) -> None:
+    """A stop that releases every grant answers
+    the body the Node backend mirrors -- no per-grant list. The paths come
+    back in the order the registry lists the session's rows, which the
+    corpus pins on both backends (warn_mode/18); no order is promised."""
+    sid = _sid("clean-stop")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "spec.md"})
+    assert client.post("/hooks/session-stop", {"session_id": sid}) == (
+        200, {"ok": True, "released_artifacts": ["plan.md", "spec.md"]})
+
+
+def test_a_session_stop_that_keeps_a_grant_answers_per_grant(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the second release fails, the stop answers
+    top-level false with the first grant reported released (with its cause)
+    and the second still held (with its reason), and the second grant really
+    is still held. It used to answer ``ok: true`` with the failure only
+    logged, so a client dropping its record on the top-level answer forgot a
+    grant the coordinator still held."""
+    sid = _sid("partial-stop")
+    agent_id = session_to_agent_id(sid)
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "spec.md"})
+    spec_id = coordinator.registry.lookup_artifact_id_by_name("spec.md")
+    release = coordinator.service.invalidate
+
+    def failing_on_spec(**kwargs: Any):
+        if kwargs["artifact_id"] == spec_id:
+            raise CoherenceError("release refused by the test")
+        return release(**kwargs)
+
+    monkeypatch.setattr(coordinator.service, "invalidate", failing_on_spec)
+    answer = client.post("/hooks/session-stop", {"session_id": sid})
+
+    assert answer == (200, {
+        "ok": False,
+        "released_artifacts": ["plan.md"],
+        "grants": [
+            {"path": "plan.md", "held": False, "cause": "release"},
+            {"path": "spec.md", "held": True, "reason": "release refused by the test"},
+        ],
+    })
+    assert _state(coordinator, "plan.md", agent_id) == MESIState.INVALID
+    assert _state(coordinator, "spec.md", agent_id) == MESIState.EXCLUSIVE
+
+
+def test_a_failed_edit_release_that_keeps_its_grant_answers_per_grant(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The post-edit twin of the stop above: when a failed-edit report's
+    release is refused, the answer keeps its top-level false and reason and
+    adds the per-grant entry naming the grant still held, and the grant
+    really is still held. Fails if the answer falls back to the bare
+    ``{ok, reason}``, which a client dropping its record on the top-level
+    answer reads as nothing held."""
+    sid = _sid("failed-edit-held")
+    agent_id = session_to_agent_id(sid)
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+
+    def refusing(**kwargs: Any):
+        raise CoherenceError("release refused by the test")
+
+    monkeypatch.setattr(coordinator.service, "invalidate", refusing)
+    answer = client.post("/hooks/post-edit", {
+        "session_id": sid, "path": "plan.md", "success": False,
+    })
+
+    assert answer == (200, {
+        "ok": False,
+        "reason": "release refused by the test",
+        "grants": [{"path": "plan.md", "held": True, "reason": "release refused by the test"}],
+    })
+    assert _state(coordinator, "plan.md", agent_id) == MESIState.EXCLUSIVE
+
+
+def test_a_givers_failed_edit_report_is_answered_handed_off_and_changes_nothing(
+    tmp_path: Path,
+) -> None:
+    """A post-edit reporting failure from the giver of a
+    live record is not a clean success. It answers top-level false with the
+    grant reported not held and handed to the successor at the transfer
+    version, carries the typed reason, and changes nothing -- no release is
+    issued (the state log records no ``invalidate``), the record is not
+    withdrawn, and the version does not move."""
+    entries: list[dict] = []
+    server = CoordinatorHTTPServer(
+        tmp_path, port=0, instance_id="handoff-failed-edit", state_log=entries.append)
+    server.serve_in_thread()
+    try:
+        client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
+        giver, successor = _claimed(client), _claimed(client)
+        _pre_edit_with(client, giver.sid, giver.principal, "plan.md")
+        answer = _transfer(client, giver, successor.agent, [{"path": "plan.md"}])
+        assert answer == (200, {"ok": True, "grants": [
+            _handed(giver, successor, "plan.md", shape="EXCLUSIVE")]})
+        record_before = _record(server, "plan.md")
+        logged_before = len(entries)
+
+        answer = client.post("/hooks/post-edit", {
+            "session_id": giver.sid, "path": "plan.md", "success": False,
+        }, principal=giver.principal)
+
+        assert answer == (200, {
+            "ok": False, "reason": "handed_off", "successor": successor.agent,
+            "version_at_transfer": 1,
+            "grants": [{
+                "path": "plan.md", "held": False, "cause": "handoff",
+                "successor": successor.agent, "version_at_transfer": 1,
+            }],
+            "handoff": _projection(giver, successor, "giver", shape="EXCLUSIVE"),
+        })
+        assert entries[logged_before:] == [], "the failed edit moved a grant"
+        assert _record(server, "plan.md") == record_before
+        assert _artifact_version(server, "plan.md") == 1
+    finally:
+        server.shutdown()
+
+
+def test_a_failed_edit_report_off_a_handoff_keeps_todays_bytes(
+    coordinator, client: _Client
+) -> None:
+    """A failed-edit release that succeeds, on a path with no record, is
+    a clean success and answers today's exact body (corpus warn_mode/17)."""
+    sid = _sid("clean-failed-edit")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    assert client.post("/hooks/post-edit", {
+        "session_id": sid, "path": "plan.md", "success": False,
+    }) == (200, {"ok": True, "released": True})
+
+
+# --- the handoff key on the four existing bodies -----------------------------
+
+
+def test_the_read_and_edit_bodies_carry_the_handoff_key_only_while_a_record_exists(
+    coordinator, client: _Client
+) -> None:
+    """With no record the pre-read, pre-edit and post-edit bodies are
+    byte-identical to today; while a record exists each carries one
+    ``handoff`` key projecting the record for the caller's role -- the
+    successor sees its provenance, a bystander the pair it overtook, the
+    giver the outcome -- with session-level ids and no session id."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    assert _read(client, giver, "plan.md", "inc-1") == {"status": "fresh", "version": 1}
+    assert client.post(
+        "/hooks/pre-edit", {"session_id": bystander.sid, "path": "task.md"},
+        principal=bystander.principal) == (200, {"ok": True})
+    assert client.post("/hooks/post-edit", {
+        "session_id": bystander.sid, "path": "task.md", "success": True,
+        "content_hash": _hash("task-v2"),
+    }, principal=bystander.principal) == (200, {"ok": True})
+
+    answer = _transfer(client, giver, successor.agent, [{"path": "plan.md", "agent_id": "inc-1"}])
+    assert answer == (200, {"ok": True, "grants": [_handed(giver, successor, "plan.md")]})
+
+    read = _read(client, successor, "plan.md")
+    assert read["handoff"] == _projection(giver, successor, "successor")
+    assert giver.sid not in json.dumps(read) and successor.sid not in json.dumps(read)
+
+    assert client.post(
+        "/hooks/pre-edit", {"session_id": bystander.sid, "path": "plan.md"},
+        principal=bystander.principal,
+    ) == (200, {"ok": True, "handoff": _projection(
+        giver, successor, "bystander", status="overtaken", counterparty=bystander.agent),
+        "hookSpecificOutput": _context(_advisory(giver, successor, "plan.md"))})
+    assert client.post("/hooks/post-edit", {
+        "session_id": bystander.sid, "path": "plan.md", "success": True,
+        "content_hash": _hash("plan-v2"),
+    }, principal=bystander.principal) == (200, {"ok": True, "handoff": _projection(
+        giver, successor, "bystander", status="overtaken", live=False,
+        counterparty=bystander.agent)})
+
+    read = _read(client, giver, "plan.md")
+    assert read["handoff"] == _projection(
+        giver, successor, "giver", status="overtaken", live=False, counterparty=bystander.agent)
+
+
+def test_a_compare_and_swap_win_carries_its_handoff_outcome(
+    coordinator, client: _Client
+) -> None:
+    """The win outcome a volume reads off a compare-and-swap answer: with no record a win
+    answers today's bytes; the successor's win at the transfer version
+    carries ``outcome: completed`` -- from a fresh incarnation too, because the
+    route passes the session-level identity -- and a bystander's win on
+    another handed path carries ``outcome: overtaken`` naming itself."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _read(client, bystander, "task.md", "b-1")
+    assert client.post("/hooks/post-edit-cas", {
+        "session_id": bystander.sid, "agent_id": "b-1", "path": "task.md",
+        "content_hash": _hash("task-v2"), "expected_version": 1,
+    }, principal=bystander.principal) == (200, {"ok": True, "version": 2})
+
+    _hand_off(client, giver, successor, "plan.md")
+    _hand_off(client, giver, successor, "spec.md")
+
+    assert client.post("/hooks/post-edit-cas", {
+        "session_id": successor.sid, "agent_id": "s-2", "path": "plan.md",
+        "content_hash": _hash("plan-v2"), "expected_version": 1,
+    }, principal=successor.principal) == (200, {"ok": True, "version": 2, "handoff": _projection(
+        giver, successor, "successor", status="completed", live=False, outcome="completed")})
+
+    assert client.post("/hooks/post-edit-cas", {
+        "session_id": bystander.sid, "agent_id": "b-2", "path": "spec.md",
+        "content_hash": _hash("spec-v2"), "expected_version": 1,
+    }, principal=bystander.principal) == (200, {"ok": True, "version": 2, "handoff": _projection(
+        giver, successor, "bystander", status="overtaken", live=False,
+        counterparty=bystander.agent, outcome="overtaken")})
+
+    read = _read(client, giver, "plan.md")
+    assert read["handoff"] == _projection(giver, successor, "giver", status="completed", live=False)
+
+
+# --- the handoff prose on the hook envelopes ----------------------------------
+#
+# Hook clients get the handoff as prose too: provenance, the read-first
+# warning, the bystander advisory, the live giver's statement on a read and
+# the giver's outcome through the context-only PreToolUse envelope on admits,
+# and the handoff arm through the PostToolUse envelope on the giver's refused
+# commit. Every expected sentence is a hand-written literal; the short ids in
+# it are the first eight characters of the session-level ids the test computes
+# from its own session ids.
+
+
+def _context(text: str) -> dict:
+    """A context-only PreToolUse envelope: prose, and no permission decision."""
+    return {"hookEventName": "PreToolUse", "additionalContext": text}
+
+
+def _last_block(body: dict) -> str:
+    """The last paragraph of an admit's additionalContext: where the handoff
+    prose lands, after any notice or stale warning."""
+    return body["hookSpecificOutput"]["additionalContext"].split("\n\n")[-1]
+
+
+def _advisory(giver: _Session, successor: _Session, path: str, version: int = 1) -> str:
+    return (
+        f"Handoff in progress: agent {giver.agent[:8]} handed {path} to agent "
+        f"{successor.agent[:8]} at v{version}. This session is not a party to it; "
+        f"its edits are admitted and are recorded as overtaking the handoff."
+    )
+
+
+def _provenance(giver: _Session, path: str, *, version: int, shape: str) -> str:
+    g = giver.agent[:8]
+    text = (
+        f"Handoff: agent {g} handed {path} to this session at v{version}; the "
+        f"hold it gave up was {shape}."
+    )
+    if shape == "EXCLUSIVE":
+        text += (
+            f" Agent {g} held an uncommitted write claim when it handed {path} "
+            f"on, so the file on disk may differ from v{version}; read {path} "
+            f"before editing it."
+        )
+    return text
+
+
+def _read_first(path: str, version: int) -> str:
+    return f"⚠ You have not read {path} at v{version} or later; read it before editing."
+
+
+def _giver_fenced_read(successor: _Session, path: str, version: int = 1) -> str:
+    """The prose a live giver's admitted read carries, as a literal."""
+    s = successor.agent[:8]
+    return (
+        f"Handoff: you handed {path} to agent {s} at v{version}, so this session "
+        f"can no longer write it. The handoff ends when agent {s} writes {path}, "
+        f"when agent {s} declines it, or when you withdraw it on your user's or "
+        f"host's instruction. Until the handoff ends, do not change {path} by any "
+        f"route, a shell command included. Stop and report to your user that "
+        f"{path} was handed off."
+    )
+
+
+def _ended_unrecorded(path: str, version: int = 1) -> str:
+    return (
+        f"Handoff ended: the handoff of {path} at v{version} was ended by a write "
+        f"at a later version whose writer was not recorded."
+    )
+
+
+def _cas(client: _Client, who: _Session, path: str, expected: int, label: str) -> dict:
+    status, answer = client.post("/hooks/post-edit-cas", {
+        "session_id": who.sid, "path": path, "content_hash": _hash(label),
+        "expected_version": expected,
+    }, principal=who.principal)
+    assert status == 200, answer
+    return answer
+
+
+def _hand_off_shape(client: _Client, giver: _Session, successor: _Session, shape: str) -> int:
+    """``giver`` takes ``plan.md`` in ``shape`` and hands it to ``successor``;
+    answers the version at transfer."""
+    if shape == "SHARED":
+        _read(client, giver, "plan.md")
+    else:
+        _pre_edit_with(client, giver.sid, giver.principal, "plan.md")
+    if shape == "MODIFIED":
+        status, body = client.post("/hooks/post-edit", {
+            "session_id": giver.sid, "path": "plan.md", "success": True,
+            "content_hash": _hash("plan-v2"),
+        }, principal=giver.principal)
+        assert body == {"ok": True}, body
+    version = 2 if shape == "MODIFIED" else 1
+    answer = _transfer(client, giver, successor.agent, [{"path": "plan.md"}])
+    assert answer == (200, {"ok": True, "grants": [
+        _handed(giver, successor, "plan.md", version=version, shape=shape)]}), answer
+    return version
+
+
+@pytest.mark.parametrize("role", ["successor", "bystander", "giver"])
+def test_a_pending_re_grounding_rides_the_admit_that_carries_handoff_prose(
+    coordinator, client: _Client, role: str
+) -> None:
+    """After a compaction, the first admitted touch of a handed-off path
+    carries the handoff prose AND the deferred re-grounding, handoff first,
+    and consumes the flag: the successor's and a bystander's edit, and the
+    live giver's read. The prose rides a context-only envelope (no permission
+    decision), which the re-grounding seam used to refuse, so the flag stayed
+    pending past every such admit and expired with the turn. The giver's
+    case is its fresh read: its first read after the transfer is stale, and
+    a stale warning already carries an allow."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    who = {"successor": successor, "bystander": bystander, "giver": giver}[role]
+    _read(client, who, "spec.md")  # state worth re-grounding, whatever the role
+    if role == "giver":
+        # The giver's first read after the transfer is stale, and its warning
+        # already carries an allow; the next, fresh read is a bare admit.
+        _read(client, giver, "plan.md")
+    coordinator.mark_compact_pending(who.sid)
+
+    route = "/hooks/pre-read" if role == "giver" else "/hooks/pre-edit"
+    status, body = client.post(
+        route, {"session_id": who.sid, "path": "plan.md"}, principal=who.principal)
+
+    assert status == 200, body
+    envelope = body["hookSpecificOutput"]
+    assert "permissionDecision" not in envelope, envelope
+    text = envelope["additionalContext"]
+    handoff_at = text.index("Handoff")
+    reground_at = text.index("Post-compaction re-grounding (agent-coherence):")
+    assert handoff_at < reground_at, text
+    assert coordinator.has_compact_pending(who.sid) is False
+
+
+@pytest.mark.parametrize("ending", ["successor commits", "successor declines", "giver withdraws"])
+def test_once_the_handoff_ends_the_successor_and_bystanders_are_told_nothing(
+    coordinator, client: _Client, ending: str
+) -> None:
+    """A record that is no longer live keeps its ``handoff`` key, but the
+    successor is no longer told it was handed the path and a bystander is no
+    longer told a handoff is in progress. Fails if either role's prose
+    ignores liveness: the model would then act on a handoff that is over."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    if ending == "successor commits":
+        _pre_edit_with(client, successor.sid, successor.principal, "plan.md")
+        status, body = client.post("/hooks/post-edit", {
+            "session_id": successor.sid, "path": "plan.md", "success": True,
+            "content_hash": _hash("plan-v2"),
+        }, principal=successor.principal)
+        assert status == 200 and body["ok"] is True, body
+    elif ending == "successor declines":
+        assert _verb(client, _DECLINE, successor, "plan.md") == (
+            200, {"ok": True, "status": "declined"})
+    else:
+        assert _verb(client, _WITHDRAW, giver, "plan.md") == (
+            200, {"ok": True, "status": "withdrawn"})
+
+    for who in (successor, bystander):
+        read = _read(client, who, "plan.md")
+        assert read["handoff"]["live"] is False, read
+        context = (read.get("hookSpecificOutput") or {}).get("additionalContext", "")
+        assert "Handoff" not in context, (who, context)
+
+
+def test_a_refused_edit_during_a_handoff_carries_the_key_and_no_prose(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal body (``ok: false``) gets the ``handoff`` key only: the role's
+    prose is for an admit. Fails if the prose seam stops checking for one, and
+    a bystander whose edit was refused is told its edits are admitted."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+
+    def refusing(**_kwargs: Any):
+        raise CoherenceError("acquire refused by the test")
+
+    monkeypatch.setattr(coordinator.service, "write", refusing)
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": bystander.sid, "path": "plan.md"},
+        principal=bystander.principal)
+
+    assert status == 200
+    assert body["ok"] is False, body
+    assert "hookSpecificOutput" not in body, body
+    assert body["handoff"] == _projection(giver, successor, "bystander")
+
+
+def test_the_handoff_prose_templates_are_static() -> None:
+    """The successor's and bystander's prose and the ended outcomes are
+    under the deny's placeholder rule: short agent ids, the path, the version
+    at transfer and the hold shape only -- no timestamp -- so the corpus can
+    pin their bytes."""
+    import re
+
+    from ccs.adapters.claude_code import hook_payloads as payloads
+
+    def placeholders(template: str) -> set[str]:
+        return set(re.findall(r"\{([a-z_]+)\}", template))
+
+    assert placeholders(payloads.HANDOFF_PROVENANCE_TEMPLATE) == {
+        "giver_short", "path", "version_at_transfer", "hold_shape"}
+    assert placeholders(payloads.HANDOFF_UNCOMMITTED_CLAIM_TEMPLATE) == {
+        "giver_short", "path", "version_at_transfer"}
+    assert placeholders(payloads.HANDOFF_READ_FIRST_TEMPLATE) == {"path", "version_at_transfer"}
+    assert placeholders(payloads.HANDOFF_OVERTAKEN_TEMPLATE) == {
+        "path", "giver_short", "version_at_transfer", "counterparty_short"}
+    assert placeholders(payloads.HANDOFF_BYSTANDER_ADVISORY_TEMPLATE) == {
+        "giver_short", "path", "successor_short", "version_at_transfer"}
+    assert placeholders(payloads.HANDOFF_ENDED_UNRECORDED_TEMPLATE) == {
+        "path", "version_at_transfer"}
+    for template in payloads.HANDOFF_GIVER_OUTCOME_TEMPLATES.values():
+        assert placeholders(template) <= {
+            "path", "successor_short", "version_at_transfer", "counterparty_short"}, template
+
+
+def test_the_givers_post_edit_refusal_renders_the_handoff_arm_in_the_post_tool_envelope(
+    coordinator, client: _Client
+) -> None:
+    """A held ``plan.md`` EXCLUSIVE and handed it to B; A's
+    in-flight edit then reports success. The commit is refused with the typed
+    reason, and the handoff arm -- the three exits and the statement that the
+    edit is on disk without a version -- reaches the hook client through the
+    post-tool context envelope. It is not the preemption or reclaim arm: no
+    ``preempted`` or ``reclaimed`` flag, and no such wording. A second report
+    answers the same bytes."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off_shape(client, giver, successor, "EXCLUSIVE")
+    report = {
+        "session_id": giver.sid, "path": "plan.md", "success": True,
+        "content_hash": _hash("late-edit"),
+    }
+    first = client.post("/hooks/post-edit", report, principal=giver.principal)
+    second = client.post("/hooks/post-edit", report, principal=giver.principal)
+
+    assert first == (200, {
+        "ok": False, "reason": "handed_off", "successor": successor.agent,
+        "version_at_transfer": 1,
+        "hookSpecificOutput": _commit_arm_envelope(successor, "plan.md"),
+        "handoff": _projection(giver, successor, "giver", shape="EXCLUSIVE"),
+    })
+    assert second == first
+    arm = first[1]["hookSpecificOutput"]["additionalContext"]
+    assert "preempt" not in arm and "reclaim" not in arm, arm
+
+
+@pytest.mark.parametrize("shape", ["EXCLUSIVE", "MODIFIED", "SHARED"])
+def test_the_successors_provenance_reads_before_editing_only_for_an_exclusive_hold(
+    coordinator, client: _Client, shape: str
+) -> None:
+    """The successor's reads carry its provenance -- by which
+    agent, at which version, from which hold shape -- in the context-only
+    envelope, after its stale warning on the first read and alone on the
+    next, byte for byte the same. The read-before-editing sentence rides the
+    EXCLUSIVE shape only: the giver may have written without committing.
+    MODIFIED committed what it wrote and SHARED never held a write claim."""
+    giver, successor = _claimed(client), _claimed(client)
+    version = _hand_off_shape(client, giver, successor, shape)
+    expected = _provenance(giver, "plan.md", version=version, shape=shape)
+
+    first = _read(client, successor, "plan.md")
+    assert first["hookSpecificOutput"]["permissionDecision"] == "allow", first
+    assert first["hookSpecificOutput"]["additionalContext"].endswith("\n\n" + expected), first
+    second = _read(client, successor, "plan.md")
+    assert second == {
+        "status": "fresh", "version": version,
+        "handoff": _projection(giver, successor, "successor", shape=shape)
+        | {"version_at_transfer": version},
+        "hookSpecificOutput": _context(expected),
+    }
+
+
+@pytest.mark.parametrize("observed", ["never", "at_transfer", "below_transfer"])
+def test_the_successors_pre_edit_is_admitted_with_provenance_and_a_read_first_warning(
+    coordinator, client: _Client, observed: str
+) -> None:
+    """The successor's pre-edit is admitted -- never
+    denied -- and completes the handoff; its body carries the provenance in
+    the context-only envelope with no permission decision (nothing through
+    the allow emitter), plus the read-first warning exactly when the version
+    it last observed is absent or below the version at transfer."""
+    giver, successor = _claimed(client), _claimed(client)
+    if observed != "never":
+        _read(client, successor, "plan.md")
+    if observed == "below_transfer":
+        version = _hand_off_shape(client, giver, successor, "MODIFIED")
+        shape = "MODIFIED"
+    else:
+        version = _hand_off_shape(client, giver, successor, "EXCLUSIVE")
+        shape = "EXCLUSIVE"
+    expected = _provenance(giver, "plan.md", version=version, shape=shape)
+    if observed != "at_transfer":
+        expected += " " + _read_first("plan.md", version)
+
+    answer = client.post(
+        "/hooks/pre-edit", {"session_id": successor.sid, "path": "plan.md"},
+        principal=successor.principal,
+    )
+
+    assert answer == (200, {
+        "ok": True,
+        "handoff": _projection(giver, successor, "successor", shape=shape, status="completed")
+        | {"version_at_transfer": version},
+        "hookSpecificOutput": _context(expected),
+    })
+
+
+def test_a_bystander_is_advised_and_its_commit_reports_overtaken_to_the_successor(
+    coordinator, client: _Client
+) -> None:
+    """The bystander C's pre-edit on A's live handoff to B is
+    admitted with the advisory naming A and B; after C commits, B's next
+    read reports the handoff overtaken by C, and so does A's (its outcome)."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+
+    answer = client.post(
+        "/hooks/pre-edit", {"session_id": bystander.sid, "path": "plan.md"},
+        principal=bystander.principal,
+    )
+    assert answer == (200, {
+        "ok": True,
+        "handoff": _projection(
+            giver, successor, "bystander", status="overtaken", counterparty=bystander.agent),
+        "hookSpecificOutput": _context(_advisory(giver, successor, "plan.md")),
+    })
+    status, body = client.post("/hooks/post-edit", {
+        "session_id": bystander.sid, "path": "plan.md", "success": True,
+        "content_hash": _hash("plan-v2"),
+    }, principal=bystander.principal)
+    assert body["ok"] is True and "hookSpecificOutput" not in body, body
+
+    g, c = giver.agent[:8], bystander.agent[:8]
+    assert _last_block(_read(client, successor, "plan.md")) == (
+        f"Handoff overtaken: the handoff of plan.md to this session from agent {g} "
+        f"at v1 was overtaken by agent {c}."
+    )
+    assert _last_block(_read(client, giver, "plan.md", "inc-1")) == (
+        f"Handoff ended: your handoff of plan.md to agent {successor.agent[:8]} at v1 "
+        f"was overtaken by agent {c}."
+    )
+
+
+def test_a_live_givers_read_says_it_handed_the_path_off_after_the_stale_warning(
+    coordinator, client: _Client
+) -> None:
+    """A Claude Code giver whose handoff is live reads the handed path. The
+    transfer left its claim INVALID, so the first read answers the generic
+    stale warning ending "Re-acquire before writing", and the read after it
+    is fresh -- measured to read as an all-clear for a shell write, or as a
+    cue to edit. Both carry the specific statement: the giver handed the
+    path off, may not change it by any route, and should stop and report. On
+    the stale read it follows the warning in the warning's own envelope, whose
+    allow decision is the warning's; on the fresh read it rides the
+    context-only envelope with no permission decision. Fails if a live
+    giver's read is silent about the handoff."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    expected = _giver_fenced_read(successor, "plan.md")
+
+    stale = _read(client, giver, "plan.md", "inc-1")
+    assert stale["status"] == "stale", stale
+    assert stale["handoff"] == _projection(giver, successor, "giver")
+    assert stale["hookSpecificOutput"]["permissionDecision"] == "allow", stale
+    warning, handoff = stale["hookSpecificOutput"]["additionalContext"].split("\n\n")
+    assert warning.endswith("Re-acquire before writing to plan.md."), warning
+    assert handoff == expected
+
+    assert _read(client, giver, "plan.md", "inc-1") == {
+        "status": "fresh", "version": 1,
+        "handoff": _projection(giver, successor, "giver"),
+        "hookSpecificOutput": _context(expected),
+    }
+
+
+@pytest.mark.parametrize("role", ["successor", "bystander"])
+def test_only_the_giver_is_told_on_a_read_that_it_handed_the_path_off(
+    coordinator, client: _Client, role: str
+) -> None:
+    """The live giver's statement is the giver's alone: while the record is
+    live the successor's reads carry its provenance and a bystander's the
+    advisory -- after the stale warning on the first read, alone on the fresh
+    one -- and neither is told it handed the path off. Fails if the
+    statement renders for every role."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    reader = successor if role == "successor" else bystander
+    expected = (
+        _provenance(giver, "plan.md", version=1, shape="SHARED")
+        if role == "successor" else _advisory(giver, successor, "plan.md")
+    )
+
+    first = _read(client, reader, "plan.md")
+    assert _last_block(first) == expected
+    assert "you handed" not in first["hookSpecificOutput"]["additionalContext"], first
+    assert _read(client, reader, "plan.md")["hookSpecificOutput"] == _context(expected)
+
+
+@pytest.mark.parametrize("ending", ["completed", "declined", "withdrawn"])
+def test_the_givers_next_touch_after_the_handoff_ended_reports_its_outcome(
+    coordinator, client: _Client, ending: str
+) -> None:
+    """While the record is live the giver's read says it handed the
+    path off; once the record is no longer live, the giver's next touch
+    reports how its handoff ended instead, and no longer says it may not
+    write -- and, the fence lifted, a pre-edit is an admit that carries the
+    outcome too. Fails if the live statement outlives the record."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    fenced = _giver_fenced_read(successor, "plan.md")
+    assert _last_block(_read(client, giver, "plan.md", "inc-1")) == fenced
+
+    if ending == "completed":
+        _read(client, successor, "plan.md")
+        assert _cas(client, successor, "plan.md", 1, "plan-v2")["ok"] is True
+    elif ending == "declined":
+        assert _verb(client, _DECLINE, successor, "plan.md")[1]["ok"] is True
+    else:
+        assert _verb(client, _WITHDRAW, giver, "plan.md")[1]["ok"] is True
+
+    s = successor.agent[:8]
+    outcome = {
+        "completed": f"was completed by agent {s}.",
+        "declined": f"was declined by agent {s}.",
+        "withdrawn": "was withdrawn.",
+    }[ending]
+    expected = f"Handoff ended: your handoff of plan.md to agent {s} at v1 {outcome}"
+    ended_read = _read(client, giver, "plan.md", "inc-1")
+    assert _last_block(ended_read) == expected
+    assert fenced not in ended_read["hookSpecificOutput"]["additionalContext"], ended_read
+    if ending != "completed":
+        status, body = client.post(
+            "/hooks/pre-edit", {"session_id": giver.sid, "path": "plan.md"},
+            principal=giver.principal,
+        )
+        assert body["ok"] is True and body["hookSpecificOutput"] == _context(expected), body
+
+
+def test_a_record_ended_by_an_unrecorded_writer_says_so_to_giver_and_successor(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The successor's win lands but its label write fails, so the
+    version moved while the record still says pending: it is no longer live,
+    and nothing recorded who ended it. Giver and successor are both told the
+    one static sentence for that case, not a completion nobody recorded."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _read(client, successor, "plan.md")
+
+    def failing_label_write(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("injected label-write failure")
+
+    monkeypatch.setattr(coordinator.registry, "set_transfer_status", failing_label_write)
+    assert _cas(client, successor, "plan.md", 1, "plan-v2")["version"] == 2
+    record, live = _record(coordinator, "plan.md")
+    assert (record.status, live) == ("pending", False)
+
+    assert _last_block(_read(client, giver, "plan.md", "inc-1")) == _ended_unrecorded("plan.md")
+    assert _read(client, successor, "plan.md")["hookSpecificOutput"] == _context(
+        _ended_unrecorded("plan.md"))
+
+
+def test_a_later_win_by_the_successor_carries_no_outcome(
+    coordinator, client: _Client
+) -> None:
+    """Only the win that labelled the record reports an ``outcome``. The
+    successor's second win, at the version its first one made, reads the
+    same completed record back and must not claim it completed it again.
+    Fails if the outcome is read off the record's label alone."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    assert client.post("/hooks/post-edit-cas", {
+        "session_id": successor.sid, "agent_id": "s-1", "path": "plan.md",
+        "content_hash": _hash("plan-v2"), "expected_version": 1,
+    }, principal=successor.principal) == (200, {"ok": True, "version": 2, "handoff": _projection(
+        giver, successor, "successor", status="completed", live=False, outcome="completed")})
+
+    assert client.post("/hooks/post-edit-cas", {
+        "session_id": successor.sid, "agent_id": "s-1", "path": "plan.md",
+        "content_hash": _hash("plan-v3"), "expected_version": 2,
+    }, principal=successor.principal) == (200, {"ok": True, "version": 3, "handoff": _projection(
+        giver, successor, "successor", status="completed", live=False)})
+
+
+def _no_wall_clock(body: dict) -> str:
+    """``body`` serialised with every ``*_unix_ts`` value blanked: two denies
+    issued a moment apart differ only in those stamps."""
+
+    def blank(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: None if key.endswith("_unix_ts") else blank(item)
+                for key, item in value.items()
+            }
+        return value
+
+    return json.dumps(blank(body))
+
+
+def test_a_strict_deny_while_a_record_exists_keeps_its_no_record_bytes(
+    served_decider,
+) -> None:
+    """On a strict path with a record, the pre-read and pre-edit denies
+    carry no ``handoff`` key and no prose: each answer is byte-for-byte the
+    same deny a path with no record gets. The control runs the same
+    preemption on a second strict path with no record. Fails if a strict
+    deny gains the key, anywhere in its body."""
+    server, client = served_decider
+    handed, control = _U3A_STRICT_PATH, _u3a_strict_path("no-record")
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, handed)
+    for path in (handed, control):
+        _read(client, bystander, path)
+        _pre_edit_with(client, successor.sid, successor.principal, path)
+        assert _state(server, path, session_to_agent_id(bystander.sid)) == MESIState.INVALID
+
+    for route, body in (
+        ("/hooks/pre-read", {"session_id": bystander.sid}),
+        ("/hooks/pre-edit", {"session_id": bystander.sid}),
+    ):
+        status, denied = client.post(route, {**body, "path": handed}, principal=bystander.principal)
+        status_c, plain = client.post(route, {**body, "path": control}, principal=bystander.principal)
+        assert status == status_c == 200, (denied, plain)
+        assert plain["hookSpecificOutput"]["permissionDecision"] == "deny", plain
+        assert "handoff" not in plain, plain
+        assert "handoff" not in json.dumps(denied), denied
+        assert _no_wall_clock(denied) == _no_wall_clock(plain).replace(control, handed), route
+
+
+def _fail_the_handoff_key_read(
+    coordinator, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    """Make one step of the ``handoff`` key read raise. A registry read raises
+    only when the key read calls it (directly, or through ``_read_handoff``):
+    the route's own work makes the same reads (the giver fence among them),
+    and those must still succeed."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    def broken(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("injected handoff read failure")
+
+    if site in ("_handoff_projection", "_win_outcome"):
+        monkeypatch.setattr(mod, site, broken)
+        return
+    real = getattr(coordinator.registry, site)
+
+    def raising_for_the_key_read(*args: Any, **kwargs: Any) -> Any:
+        if sys._getframe(1).f_code.co_name in ("_attach_handoff_key", "_read_handoff"):
+            raise RuntimeError("injected handoff read failure")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator.registry, site, raising_for_the_key_read)
+
+
+@pytest.mark.parametrize(
+    "site", ["lookup_artifact_id_by_name", "get_transfer_record", "_handoff_projection"]
+)
+def test_a_failed_handoff_read_leaves_a_landed_acquire_answered(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    """The ``handoff`` key is read after the work landed, so a raise at any
+    step of that read answers the landed work without the key -- here the
+    successor's acquire, which holds its grant -- never an error the client
+    would read as an acquire that failed."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _fail_the_handoff_key_read(coordinator, monkeypatch, site)
+
+    answer = client.post(
+        "/hooks/pre-edit", {"session_id": successor.sid, "path": "plan.md"},
+        principal=successor.principal)
+
+    assert answer == (200, {"ok": True})
+    assert _state(coordinator, "plan.md", session_to_agent_id(successor.sid)) == MESIState.EXCLUSIVE
+
+
+def test_a_failed_handoff_read_leaves_a_landed_win_answered(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same on a compare-and-swap win: a raise while working out the
+    win's outcome answers the win, version and all, without the key."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _fail_the_handoff_key_read(coordinator, monkeypatch, "_win_outcome")
+
+    assert client.post("/hooks/post-edit-cas", {
+        "session_id": successor.sid, "agent_id": "s-1", "path": "plan.md",
+        "content_hash": _hash("plan-v2"), "expected_version": 1,
+    }, principal=successor.principal) == (200, {"ok": True, "version": 2})
+    assert _record(coordinator, "plan.md")[0].status == "completed"
+
+
+def test_a_failed_handoff_read_keeps_the_notices_a_read_already_drained(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh pre-read pops the session's preemption notices before the key
+    is read; popping is destructive, so a failed key read must still deliver
+    them in the answer rather than lose them."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _read(client, bystander, "spec.md")
+    bystander_agent = session_to_agent_id(bystander.sid)
+    spec_id = coordinator.registry.lookup_artifact_id_by_name("spec.md")
+    coordinator.registry.record_preemption_notice(
+        victim_agent_id=bystander_agent, artifact_id=spec_id,
+        preempter_agent_id=session_to_agent_id(str(uuid.uuid4())),
+        preempted_at_unix_ts=1234.0,
+    )
+    _fail_the_handoff_key_read(coordinator, monkeypatch, "get_transfer_record")
+
+    answer = _read(client, bystander, "plan.md")
+
+    assert "handoff" not in answer, answer
+    assert "spec.md" in answer["hookSpecificOutput"]["additionalContext"], answer
+    assert coordinator.registry.peek_preemption_notice(bystander_agent, spec_id) is None
+
+
+# ----------------------------------------------------------------------
+# The handoff key on /status (#185)
+#
+# The default and operator tiers render each tracked artifact's transfer
+# record while one exists, read in the same registry hold as the artifact and
+# state rows; the metrics tier and the session-start builder never see
+# it. The /status key is role-free -- the route has no caller to be a party to
+# the record -- so it is the per-path ``handoff`` key less its ``role``, plus
+# the record's created wall-clock timestamp on the operator tier only.
+# ----------------------------------------------------------------------
+
+_DEFAULT_ENTRY_KEYS = {"path", "version", "id"}
+_OPERATOR_ENTRY_KEYS = _DEFAULT_ENTRY_KEYS | {
+    "last_writer_agent_id", "last_writer_at_unix_ts", "owner_generation",
+}
+
+
+def _status_entry(body: dict, path: str) -> dict:
+    [entry] = [e for e in body["tracked_artifacts"] if e["path"] == path]
+    return entry
+
+
+def _status_handoff(
+    giver: _Session, successor: _Session, *, status: str = "pending", live: bool = True
+) -> dict:
+    """The ``handoff`` key a /status entry carries while a record exists,
+    as a literal: session-level ids, no role, no session id, no timestamp."""
+    return {
+        "giver": giver.agent, "successor": successor.agent, "version_at_transfer": 1,
+        "hold_shape": "SHARED", "status": status, "live": live,
+    }
+
+
+def _keys_anywhere(value: Any) -> set[str]:
+    """Every dict key at any nesting depth of a JSON body."""
+    if isinstance(value, dict):
+        return set(value).union(*(_keys_anywhere(v) for v in value.values()))
+    if isinstance(value, list):
+        return set().union(*(_keys_anywhere(v) for v in value))
+    return set()
+
+
+def test_status_shows_a_handoff_on_the_default_and_operator_tiers_while_a_record_exists(
+    coordinator, client: _Client
+) -> None:
+    """With no record each entry has today's keys; while a record
+    exists the default and operator tiers both carry it on the handed path's
+    entry, with session-level agent ids and no session id, and the operator
+    tier adds the record's created timestamp beside the last-writer one. An
+    ended record is still shown -- a giver's next status read learns how it
+    ended -- and once evicted the entry is back to today's keys."""
+    giver, successor = _claimed(client), _claimed(client)
+    _read(client, giver, "plan.md", "inc-1")
+    _read(client, successor, "task.md")
+    tiers = _status_tiers(client)
+    for path in ("plan.md", "task.md"):
+        assert set(_status_entry(tiers["minimal"], path)) == _DEFAULT_ENTRY_KEYS
+        assert set(_status_entry(tiers["full"], path)) == _OPERATOR_ENTRY_KEYS
+
+    transferred_from = time.time()
+    answer = _transfer(client, giver, successor.agent, [{"path": "plan.md", "agent_id": "inc-1"}])
+    transferred_by = time.time()
+    assert answer == (200, {"ok": True, "grants": [_handed(giver, successor, "plan.md")]})
+
+    tiers = _status_tiers(client)
+    default = _status_entry(tiers["minimal"], "plan.md")
+    assert set(default) == _DEFAULT_ENTRY_KEYS | {"handoff"}
+    assert default["handoff"] == _status_handoff(giver, successor)
+    for sid in (giver.sid, successor.sid):
+        assert sid not in json.dumps(tiers["minimal"])
+
+    operator = _status_entry(tiers["full"], "plan.md")
+    assert set(operator) == _OPERATOR_ENTRY_KEYS | {"handoff"}
+    assert operator["last_writer_at_unix_ts"] is None
+    handoff = dict(operator["handoff"])
+    created = handoff.pop("created_at_unix_ts")
+    assert handoff == _status_handoff(giver, successor)
+    assert isinstance(created, float) and transferred_from <= created <= transferred_by
+    for sid in (giver.sid, successor.sid):
+        assert sid not in json.dumps(operator["handoff"])
+
+    assert set(_status_entry(tiers["minimal"], "task.md")) == _DEFAULT_ENTRY_KEYS
+    assert set(_status_entry(tiers["full"], "task.md")) == _OPERATOR_ENTRY_KEYS
+
+    assert _verb(client, _DECLINE, successor, "plan.md") == (200, {"ok": True, "status": "declined"})
+    _, minimal = client.get("/status")
+    assert _status_entry(minimal, "plan.md")["handoff"] == _status_handoff(
+        giver, successor, status="declined", live=False)
+
+    assert coordinator.registry.evict_transfer_records(
+        max_age_sec=0.0, now_unix=time.time() + 60.0) == 1
+    tiers = _status_tiers(client)
+    assert set(_status_entry(tiers["minimal"], "plan.md")) == _DEFAULT_ENTRY_KEYS
+    assert set(_status_entry(tiers["full"], "plan.md")) == _OPERATOR_ENTRY_KEYS
+
+
+def test_status_metrics_tier_carries_no_handoff_record_path_or_agent_id(
+    coordinator, client: _Client
+) -> None:
+    """The counters-only tier returns before the snapshot, so a live
+    record changes none of its keys (the handoff route counters are there with
+    or without one) and puts no record, path or agent id in it. Its values
+    move per request, so the comparison is of key sets, not bytes."""
+    giver, successor = _claimed(client), _claimed(client)
+    _read(client, giver, "plan.md", "inc-1")
+    _, without = client.get("/status?detail=metrics")
+    _hand_off(client, giver, successor, "plan.md")
+    status, with_record = client.get("/status?detail=metrics")
+
+    assert status == 200
+    assert set(with_record) == set(without)
+    assert set(with_record["endpoint_counters"]) == set(without["endpoint_counters"])
+    assert "handoff" not in _keys_anywhere(with_record)
+    text = json.dumps(with_record)
+    for leaked in (
+        "plan.md", giver.agent, successor.agent,
+        uuid.UUID(giver.agent).hex, uuid.UUID(successor.agent).hex, giver.sid, successor.sid,
+    ):
+        assert leaked not in text
+
+
+def test_status_operator_tier_without_its_header_is_refused_unchanged_with_a_live_record(
+    client: _Client,
+) -> None:
+    """A live record does not open the operator tier -- the 403 answers
+    the same bytes as with no record, carrying nothing of it."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    assert client.get("/status?detail=full") == (403, {
+        "error": (
+            "detail=full requires the Coherence-Local-Operator: true opt-in "
+            "header in addition to the Bearer secret (R12)."
+        ),
+    })
+
+
+def _status_registry_holds(
+    coordinator, client: _Client, route: str, **request_kw: Any
+) -> tuple[int, Any, list[list[str]], list[str]]:
+    """GET ``route`` with every registry statement recorded, grouped by the
+    outermost lock hold it ran in (``unheld`` collects the rest)."""
+    from tests.test_registry_lock_coverage import _TrackingRLock
+
+    registry = coordinator.registry
+    tracker = _TrackingRLock()
+    real_lock, real_conn = registry._lock, registry._conn
+
+    class _RecordingConnection:
+        """Records each statement into the tracker's event stream."""
+
+        def execute(self, sql: str, *args: Any) -> Any:
+            tracker.events.append(" ".join(sql.split()))
+            return real_conn.execute(sql, *args)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_conn, name)
+
+    registry._lock, registry._conn = tracker, _RecordingConnection()
+    try:
+        status, body = client.get(route, **request_kw)
+    finally:
+        registry._lock, registry._conn = real_lock, real_conn
+
+    holds: list[list[str]] = []
+    unheld: list[str] = []
+    depth = 0
+    for event in tracker.events:
+        if event == "acquire":
+            if depth == 0:
+                holds.append([])
+            depth += 1
+        elif event == "release":
+            depth -= 1
+        elif depth == 0:
+            unheld.append(event)
+        else:
+            holds[-1].append(event)
+    return status, body, holds, unheld
+
+
+def test_status_reads_the_transfer_rows_inside_the_snapshot_lock_hold(
+    coordinator, client: _Client
+) -> None:
+    """The transfer rows are read inside the ONE registry hold that reads
+    the artifact and agent-state rows. A per-artifact read outside that hold
+    lets a concurrent version move land between the two, so an entry would
+    pair one version with a liveness judged against another -- the one-lock
+    rule reopened at the status site."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    status, body, holds, unheld = _status_registry_holds(coordinator, client, "/status")
+    assert status == 200
+    assert _status_entry(body, "plan.md")["handoff"] == _status_handoff(giver, successor)
+    assert not [sql for sql in unheld if "transfer_records" in sql]
+    transfer_holds = [hold for hold in holds if any("transfer_records" in sql for sql in hold)]
+    assert len(transfer_holds) == 1, transfer_holds
+    [hold] = transfer_holds
+    assert any("FROM artifacts" in sql and "transfer_records" not in sql for sql in hold), hold
+    assert any("FROM agent_states" in sql for sql in hold), hold
+
+
+def test_status_shows_a_live_handoff_and_its_givers_reclaim_in_one_response(
+    coordinator, client: _Client
+) -> None:
+    """#195 with #185: a giver whose handoff of one path is live and whose
+    write grant on another path the sweep reclaimed. The one operator-tier
+    response carries both the path's handoff record and the giver's reclaim."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    status, _ = client.post(
+        "/hooks/pre-edit", {"session_id": giver.sid, "path": "task.md"}, principal=giver.principal
+    )
+    assert status == 200
+    reclaim_tick = int(time.time()) + 999_999
+    assert _sweep(coordinator, reclaim_tick) == 1
+
+    body = _operator_status(client)
+    assert _status_entry(body, "plan.md")["handoff"]["live"] is True
+    assert _row_for(body, giver.sid)["reclaimed"] == {
+        "task.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": reclaim_tick}
+    }
+
+
+def test_session_start_is_byte_identical_with_a_live_handoff_on_its_path(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The session-start builder keeps the default snapshot form, so the
+    successor's re-grounding over a path handed to it answers the bytes it
+    answered before the handoff, and the builder never asks for the transfer
+    rows -- an unseen read on a hook path that runs under the registry lock
+    twice per compaction (asserted on the argument, as the SB-10 scope is)."""
+    giver, successor = _claimed(client), _claimed(client)
+    _read(client, successor, "plan.md")
+    expected = (200, {"hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": "\n".join([
+            "Post-compaction re-grounding (agent-coherence):",
+            "At compaction you held SHARED on plan.md (v1) — re-acquire before writing.",
+            _SS_CLOSING,
+        ]),
+    }})
+    session_start = {"session_id": successor.sid}
+    assert client.post("/hooks/session-start", session_start, principal=successor.principal) == expected
+
+    _hand_off(client, giver, successor, "plan.md")
+    assert _record(coordinator, "plan.md")[1] is True
+    calls: list[dict] = []
+    real = coordinator.registry.status_snapshot
+
+    def recording(*args: Any, **kwargs: Any):
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator.registry, "status_snapshot", recording)
+    assert client.post("/hooks/session-start", session_start, principal=successor.principal) == expected
+    assert [set(kwargs) for kwargs in calls] == [{"agent_ids"}]
+
+
+def test_a_coordinator_wiring_a_state_log_records_the_transfer_under_the_handoff_trigger(
+    tmp_path: Path,
+) -> None:
+    """A caller that wires the in-process state log sees the
+    giver's INVALID move logged under ``handoff`` -- never ``invalidate``, the
+    trigger a release, a failed edit or a drain is recorded under."""
+    entries: list[dict] = []
+    server = CoordinatorHTTPServer(tmp_path, port=0, state_log=entries.append, instance_id="state-log")
+    server.serve_in_thread()
+    try:
+        client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
+        giver, successor = _claimed(client), _claimed(client)
+        _read(client, giver, "plan.md", "inc-1")
+        logged = len(entries)
+        answer = _transfer(client, giver, successor.agent, [{"path": "plan.md", "agent_id": "inc-1"}])
+        assert answer == (200, {"ok": True, "grants": [_handed(giver, successor, "plan.md")]})
+        assert [
+            (e["agent_id"], e["from_state"], e["to_state"], e["trigger"])
+            for e in entries[logged:]
+        ] == [(str(giver.composite("inc-1")), "SHARED", "INVALID", "handoff")]
+    finally:
+        server.shutdown()
+
+
+# ----------------------------------------------------------------------
+# The giver's shell write: the lookup's watchdog discipline (#185)
+#
+# Pre-bash refuses a handoff giver's shell write to the path it handed off.
+# Its giver lookup reads the registry only when the pure write detector names a
+# written tracked path, and then only in the watchdog pool, starting the
+# request's one deadline -- the caller-principal gate's discipline. A lookup
+# that cannot finish in time is counted and answers as if the check did not
+# exist. What a live record changes, and what it does not, is pinned in
+# tests/integration/test_strict_mode.py.
+# ----------------------------------------------------------------------
+
+_GIVER_SHELL_APPEND = "echo '- gamma' >> plan.md"
+
+
+def _record_giver_lookups(monkeypatch: pytest.MonkeyPatch) -> tuple[list[str], threading.Event]:
+    """Wrap pre-bash's giver lookup: record the thread each call runs on, and
+    set the event when a call returns."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    threads: list[str] = []
+    returned = threading.Event()
+    real = mod._first_write_handed_off_by
+
+    def recording(*args: Any):
+        threads.append(threading.current_thread().name)
+        try:
+            return real(*args)
+        finally:
+            returned.set()
+
+    monkeypatch.setattr(mod, "_first_write_handed_off_by", recording)
+    return threads, returned
+
+
+def test_a_givers_shell_write_is_denied_from_a_lookup_on_a_watchdog_thread(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The giver's shell append is denied, and the registry read deciding it
+    ran in the watchdog pool, never on the handler thread -- where a contended
+    registry would hold the hook past its budget with no deadline."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    threads, _ = _record_giver_lookups(monkeypatch)
+    status, body = client.post(
+        "/hooks/pre-bash", {"session_id": giver.sid, "command": _GIVER_SHELL_APPEND},
+        principal=giver.principal,
+    )
+    assert (status, body.get("reason")) == (200, "handed_off"), body
+    assert len(threads) == 1 and threads[0].startswith("coord-wd"), threads
+
+
+@pytest.mark.parametrize("command", [
+    "cat plan.md",
+    "echo x >> README.md",
+    "echo x >> /tmp/plan.md",
+    "echo 'x >> plan.md'",
+])
+def test_a_bash_command_writing_no_tracked_path_runs_no_giver_lookup(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """Detection is a pure string scan: a command that writes no tracked path
+    -- a read, an untracked write, a write outside the workspace, a quoted
+    operator -- costs no registry read for the check, even from the giver of a
+    live handoff."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    threads, _ = _record_giver_lookups(monkeypatch)
+    client.post("/hooks/pre-bash", {"session_id": giver.sid, "command": command}, principal=giver.principal)
+    assert threads == []
+
+
+def test_a_givers_shell_write_whose_lookup_cannot_read_answers_as_before_and_counts_a_timeout(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the registry lock held, the giver lookup cannot finish: the shell
+    write is answered within the watchdog with what pre-bash answered before
+    the check existed, and the timeout is counted like every other. The late
+    lookup, once the lock is released, only reads, so it is not reported as a
+    late completion. Fails if the lookup runs on the handler thread (no answer
+    until the lock is released) or under the mutating watchdog runner."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _, returned = _record_giver_lookups(monkeypatch)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    late_before = coordinator.counters_snapshot()["watchdog_late_completion_total"]
+    # No principal is presented, so the gate admits without a store read and
+    # the held lock blocks only the giver lookup.
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(
+            client, "/hooks/pre-bash", {"session_id": giver.sid, "command": _GIVER_SHELL_APPEND})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+
+    assert answered, f"no answer within {_GATE_ANSWER_BOUND_SEC}s"
+    assert answer.result() == (200, {"status": "fresh"})
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    assert returned.wait(_ABANDONED_BODY_SETTLE_SEC), "the late lookup never finished"
+    time.sleep(0.05)
+    assert coordinator.counters_snapshot()["watchdog_late_completion_total"] == late_before
+
+
+def test_a_givers_shell_write_lookup_and_the_work_body_share_one_watchdog_deadline(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lookup that spent part of the budget leaves the work body only what is
+    left: a body that then blocks is answered at the ONE deadline, not at the
+    lookup's time plus a fresh one. The lookup is a lock-free stand-in that
+    finds nothing after a delay, so the held lock blocks only the work body."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    deadline = 1.0
+    lookup_delay = 0.7 * deadline
+
+    def slow_no_record(*args: Any) -> None:
+        time.sleep(lookup_delay)
+        return None
+
+    monkeypatch.setattr(mod, "_first_write_handed_off_by", slow_no_record)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", deadline)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with _HeldRegistryLock(coordinator) as held:
+        started = time.monotonic()
+        answer = _Background(client, "/hooks/pre-bash", {
+            "session_id": str(uuid.uuid4()), "command": "cat plan.md && echo x >> plan.md",
+        })
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+        held.release()
+
+    assert answered, f"no answer within {_GATE_ANSWER_BOUND_SEC}s"
+    assert answer.result() == (200, mod._DEFAULT_DEGRADED_RESPONSE)
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    # One deadline answers at ~1.0s; a fresh one for the body at ~0.7 + 1.0s.
+    assert waited < deadline + lookup_delay / 2, (
+        f"answered after {waited:.2f}s: the work body got a fresh {deadline}s "
+        f"after a {lookup_delay:.2f}s giver lookup, not what was left of one deadline")
+
+
+def test_a_givers_shell_write_lookup_that_raises_answers_the_internal_error_envelope(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raising lookup answers the route's internal-error envelope, the one
+    exception arm a request's work has -- never the dispatcher's 500, which
+    every client reads as an absent coordinator."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    def broken(*args: Any) -> None:
+        raise RuntimeError("registry unavailable")
+
+    monkeypatch.setattr(mod, "_first_write_handed_off_by", broken)
+    answer = client.post(
+        "/hooks/pre-bash", {"session_id": str(uuid.uuid4()), "command": _GIVER_SHELL_APPEND},
+    )
+    assert answer == (200, {"ok": False, "reason": "internal: RuntimeError"})
+
+
+def test_a_bash_write_to_a_tracked_path_the_registry_does_not_know_registers_nothing(
+    coordinator, client: _Client
+) -> None:
+    """The giver lookup only reads: a shell write to a tracked path no session
+    has touched leaves the registry without it. Fails if the lookup resolves
+    the path through the registering call, seeding an artifact the edit hooks
+    would then treat as observed."""
+    answer = client.post(
+        "/hooks/pre-bash", {"session_id": str(uuid.uuid4()), "command": "echo x >> spec.md"},
+    )
+    assert answer == (200, {"status": "fresh"})
+    assert coordinator.registry.lookup_artifact_id_by_name("spec.md") is None
+
+
+#: A giver's write after a write to another path: the second path is the
+#: handed-off one, so the lookup must look past the first.
+_TWO_PATH_APPEND = "echo a >> spec.md && echo b >> plan.md"
+_STRICT_READER_SID = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+_STRICT_WRITER_SID = "22222222-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+
+class _OverflowingWatchdogQueue:
+    """Stands in for the watchdog pool's work queue, reporting a depth well
+    past ``WATCHDOG_QUEUE_LIMIT``."""
+
+    @staticmethod
+    def qsize() -> int:
+        return 100
+
+
+@pytest.mark.parametrize("first_path_known", [False, True], ids=["unknown", "known-without-a-record"])
+def test_a_givers_shell_write_is_denied_when_the_handed_off_path_is_not_the_first_written(
+    coordinator, client: _Client, first_path_known: bool
+) -> None:
+    """The command writes spec.md, then the handed-off plan.md: the lookup
+    looks past a first path the registry does not know, or knows with no
+    record naming the caller, and answers the giver's pre-edit deny for
+    plan.md. Fails if the lookup stops at the first written path."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    if first_path_known:
+        _read(client, giver, "spec.md")
+    shell = client.post(
+        "/hooks/pre-bash", {"session_id": giver.sid, "command": _TWO_PATH_APPEND},
+        principal=giver.principal,
+    )
+    edit = client.post(
+        "/hooks/pre-edit", {"session_id": giver.sid, "path": "plan.md"}, principal=giver.principal,
+    )
+    assert shell[0] == 200 and shell[1].get("reason") == "handed_off", shell
+    assert shell == edit
+
+
+def test_a_givers_shell_write_under_a_foreign_principal_is_refused_before_the_giver_check(
+    coordinator, client: _Client
+) -> None:
+    """The caller-principal gate runs first: the giver's session id presented
+    with a third session's principal is refused as foreign, and no giver deny
+    is answered or counted. Fails if the giver check runs ahead of the gate --
+    a request whose identity was never checked would be answered as the giver."""
+    giver, successor, third = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    denials_before = coordinator.counters_snapshot()["handoff_giver_denials_total"]
+    status, body = client.post(
+        "/hooks/pre-bash", {"session_id": giver.sid, "command": _GIVER_SHELL_APPEND},
+        principal=third.principal,
+    )
+    assert (status, body.get("reason"), set(body)) == (400, "caller_principal_foreign", {"error", "reason"})
+    assert coordinator.counters_snapshot()["handoff_giver_denials_total"] == denials_before
+
+
+def test_a_givers_shell_write_lookup_honours_the_watchdog_queue_limit(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the watchdog pool's queue past its limit, the giver lookup is not
+    queued: the request answers the queue-overflow 503 at once, as the gate's
+    lookup and a work body do (A7), and reads nothing. No principal is
+    presented, so the gate admits without a lookup and this gate is the one
+    answering. Fails if the lookup is submitted past a full queue."""
+    from unittest.mock import patch
+
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    threads, _ = _record_giver_lookups(monkeypatch)
+    overflows_before = coordinator.counters_snapshot()["watchdog_queue_overflows_total"]
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with patch.object(coordinator._watchdog, "_work_queue", _OverflowingWatchdogQueue()):
+        response = client.post(
+            "/hooks/pre-bash", {"session_id": giver.sid, "command": _GIVER_SHELL_APPEND})
+    assert response == (503, {"error": "watchdog queue overloaded"})
+    assert threads == [], f"the giver lookup ran past a full queue: {threads}"
+    assert coordinator.counters_snapshot()["watchdog_queue_overflows_total"] == overflows_before + 1
+    assert coordinator._watchdog_timeouts_total == timeouts_before
+
+
+def _serve_strict_plan(root: Path) -> tuple[CoordinatorHTTPServer, _Client]:
+    """A coordinator whose plan.md is strict, with the reader's read grant on
+    it revoked by the writer's acquire and no new version committed -- so the
+    reader's shell read of plan.md is answered the grant-change strict deny,
+    whose bytes carry no timestamp and so match across two coordinators."""
+    root.mkdir(parents=True)
+    coherence = root / ".coherence"
+    coherence.mkdir(mode=0o700)
+    (coherence / "strict_mode.yaml").write_text("- plan.md\n")
+    server = CoordinatorHTTPServer(root, port=0, instance_id="giver-shell-strict")
+    server.serve_in_thread()
+    client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
+    assert client.post("/hooks/pre-read", {"session_id": _STRICT_READER_SID, "path": "plan.md"})[0] == 200
+    assert client.post("/hooks/pre-edit", {"session_id": _STRICT_WRITER_SID, "path": "plan.md"})[0] == 200
+    return server, client
+
+
+def _answer_without_the_giver_check(root: Path, command: str, monkeypatch: pytest.MonkeyPatch) -> tuple[int, dict]:
+    """What pre-bash answered the reader's ``command`` before the giver check
+    existed: the same scenario on its own coordinator, the check stood aside."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    server, client = _serve_strict_plan(root)
+    try:
+        with monkeypatch.context() as patched:
+            patched.setattr(mod, "_deny_giver_shell_write", lambda *args, **kwargs: False)
+            answer = client.post("/hooks/pre-bash", {"session_id": _STRICT_READER_SID, "command": command})
+    finally:
+        server.shutdown()
+    assert answer[1]["hookSpecificOutput"]["permissionDecision"] == "deny", answer
+    return answer
+
+
+@pytest.mark.parametrize("command", [
+    "cat plan.md && echo x >> plan.md",
+    "sed -i '' 's/a/b/' plan.md",
+])
+def test_a_giver_lookup_that_times_out_leaves_the_read_check_its_whole_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """No handoff anywhere; the command both writes and reads the strict
+    plan.md, so the giver lookup runs and the read check after it denies.
+    With the registry lock held the lookup times out; once that one timeout is
+    counted the lock is released, and the read check -- given back the budget
+    it had before the lookup -- answers exactly the strict deny it answered
+    before the check existed, with no second timeout. Fails if a timed-out
+    lookup leaves its spent deadline behind: the read check would then degrade
+    at once, answering fresh where it denied."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", 1.0)
+    expected = _answer_without_the_giver_check(tmp_path / "before", command, monkeypatch)
+    server, client = _serve_strict_plan(tmp_path / "now")
+    try:
+        timeouts_before = server._watchdog_timeouts_total
+        with _HeldRegistryLock(server) as held:
+            answer = _Background(
+                client, "/hooks/pre-bash", {"session_id": _STRICT_READER_SID, "command": command})
+            waited_until = time.monotonic() + _GATE_ANSWER_BOUND_SEC * 2
+            while server._watchdog_timeouts_total == timeouts_before and time.monotonic() < waited_until:
+                time.sleep(0.005)
+            held.release()
+        result = answer.result()
+        timeouts_after = server._watchdog_timeouts_total
+    finally:
+        server.shutdown()
+    assert result == expected
+    assert timeouts_after == timeouts_before + 1
+
+
+def test_a_bash_write_detection_that_raises_leaves_the_answer_as_before(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A detector bug must not cost the existing checks: with the write
+    detector raising, the reader's shell read of the strict plan.md still
+    answers the strict deny it answered before the giver check existed."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    command = "cat plan.md && echo x >> plan.md"
+    expected = _answer_without_the_giver_check(tmp_path / "before", command, monkeypatch)
+
+    def broken(*args: Any, **kwargs: Any) -> list[str]:
+        raise RuntimeError("detector bug")
+
+    monkeypatch.setattr(mod, "detect_tracked_writes", broken)
+    server, client = _serve_strict_plan(tmp_path / "now")
+    try:
+        answer = client.post("/hooks/pre-bash", {"session_id": _STRICT_READER_SID, "command": command})
+    finally:
+        server.shutdown()
+    assert answer == expected
+
+
+# #191 — the checkpoint receiver binding composes with the caller principal
+# ----------------------------------------------------------------------
+
+
+def test_checkpoint_receiver_binding_holds_as_far_as_the_principal(
+    client: _Client,
+) -> None:
+    """A checkpoint naming ``receiver_session_id`` admits only that session's
+    registration, and once the receiver session has claimed a principal a
+    register naming it must present it — a copied request naming the
+    receiver without the principal is refused before the handler, so the
+    receiver binding is exactly as strong as the require-class check."""
+    owner_sid, receiver_sid = _sid("191-owner"), _sid("191-receiver")
+    fingerprint = _hash("191-captured")
+    receiver_principal = _explicit_claim(client, receiver_sid)
+    status, body = client.post(
+        "/workspace/checkpoint",
+        {
+            "session_id": owner_sid,
+            "name": "handoff",
+            "window_min": 1.0,
+            "window_max": 1.0,
+            "members": [
+                {"member_path": "plan.md", "native_token": "v1",
+                 "fingerprint": fingerprint, "captured_at": 1.0}
+            ],
+            "receiver_session_id": receiver_sid,
+        },
+    )
+    assert status == 200 and body["ok"] is True, body
+    register = {
+        "checkpoint_id": body["checkpoint_id"],
+        "writes": [{"member_path": "plan.md", "fingerprint": fingerprint}],
+    }
+
+    # The owner's own session is not the receiver.
+    status, body = client.post(
+        "/workspace/restore/register", {"session_id": owner_sid, **register}
+    )
+    assert status == 200 and body["ok"] is False
+    assert body["reason"] == "not_the_receiver"
+
+    # Naming the receiver without its principal: refused at the gate.
+    status, body = client.post(
+        "/workspace/restore/register", {"session_id": receiver_sid, **register}
+    )
+    assert status == 400
+    assert body["reason"] == "caller_principal_absent"
+
+    status, body = client.post(
+        "/workspace/restore/register",
+        {"session_id": receiver_sid, **register},
+        principal=receiver_principal,
+    )
+    assert status == 200 and body["ok"] is True, body
+    assert "retry_of_own_registration" not in body
+
+
+@pytest.mark.parametrize(
+    "route, extra",
+    [
+        ("/workspace/restore/status", {"status": "in_progress"}),
+        (
+            "/workspace/restore/member",
+            {"member_path": "plan.md", "restore_outcome": "restored"},
+        ),
+    ],
+    ids=["status", "member"],
+)
+def test_restore_progress_for_a_bound_receiver_requires_its_principal(
+    client: _Client, route: str, extra: dict
+) -> None:
+    """The restore progress routes derive the controller from the named
+    session and gate on the checkpoint's receiver, so a request naming the
+    receiver's session drives that restore. Once the receiver session has
+    claimed a principal, such a request without it is refused at the gate:
+    require-class is what keeps a copied request from concluding or
+    recording members of the receiver's restore."""
+    owner_sid, receiver_sid = _sid("191-progress-owner"), _sid("191-progress-receiver")
+    fingerprint = _hash("191-progress-captured")
+    receiver_principal = _explicit_claim(client, receiver_sid)
+    status, body = client.post(
+        "/workspace/checkpoint",
+        {
+            "session_id": owner_sid,
+            "name": "progress",
+            "window_min": 1.0,
+            "window_max": 1.0,
+            "members": [
+                {"member_path": "plan.md", "native_token": "v1",
+                 "fingerprint": fingerprint, "captured_at": 1.0}
+            ],
+            "receiver_session_id": receiver_sid,
+        },
+    )
+    assert status == 200 and body["ok"] is True, body
+    request = {"checkpoint_id": body["checkpoint_id"], **extra}
+
+    status, body = client.post(route, {"session_id": owner_sid, **request})
+    assert status == 200 and body["ok"] is False
+    assert body["reason"] == "not_the_receiver"
+
+    status, body = client.post(route, {"session_id": receiver_sid, **request})
+    assert status == 400
+    assert body["reason"] == "caller_principal_absent"
+
+    status, body = client.post(
+        route, {"session_id": receiver_sid, **request}, principal=receiver_principal
+    )
+    assert status == 200 and body["ok"] is True, body
+
+
+# ======================================================================
+# #238 — /status and pre-grep answer within the handler budget while the
+#        registry lock is held
+# ======================================================================
+#
+# Both read the registry on the request thread. Neither waited on a bound, so
+# while another thread held the registry lock /status waited as long as it was
+# held, past every client's timeout, and a Grep hook's client gave up and
+# handed the model ``{}``. These hold that lock the way the degraded hook
+# tests above do (``_HeldRegistryLock``, a shortened ``HANDLER_TIMEOUT_SEC``)
+# and assert on what each route answers.
+
+_OPERATOR_HEADER = {"Coherence-Local-Operator": "true"}
+#: The two tiers that read the registry, as a client requests them.
+_REGISTRY_TIERS = {
+    "minimal": ("/status", None),
+    "full": ("/status?detail=full", _OPERATOR_HEADER),
+}
+#: FROZEN wire names of the sweep thresholds the operator tier reports (#187).
+_THRESHOLD_KEYS = ("grant_heartbeat_timeout_sec", "grant_max_hold_sec")
+#: FROZEN names of the four pattern lists the volume's managed-glob check reads.
+_PATTERN_LIST_KEYS = (
+    "tracked_patterns", "user_added_patterns", "ignored_patterns", "strict_mode_patterns",
+)
+#: How long a test watches for work a degraded request left behind.
+_LATE_WORK_WATCH_SEC = 0.5
+
+
+def _assert_nothing_completes_late(client: _Client, before: dict) -> None:
+    """Watch the late-work counters for a while after the lock frees: a
+    degraded answer that left a read running in the watchdog pool shows up as
+    a late completion (or a late abort) once that read wins the lock."""
+    watch_until = time.monotonic() + _LATE_WORK_WATCH_SEC
+    while True:
+        _, after = client.get("/status?detail=metrics")
+        for key in ("watchdog_late_completion_total", "watchdog_late_aborts_total"):
+            assert after[key] == before[key], (
+                f"{key} moved from {before[key]} to {after[key]} after the lock freed: "
+                "the degraded answer left work running behind it")
+        if time.monotonic() >= watch_until:
+            return
+        time.sleep(0.05)
+
+
+@pytest.mark.parametrize("tier", list(_REGISTRY_TIERS))
+def test_status_answers_a_marked_degraded_body_in_time_while_the_registry_lock_is_held(
+    tier: str, coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the registry lock held past the handler budget, the minimal and
+    operator tiers each answer 200 at once with the body that tier normally
+    carries, its two registry lists null and ``degraded: true``, and count
+    the timeout in that same answer. Nothing runs behind the answer.
+
+    Prevents a /status that waits as long as a peer holds the lock -- past
+    the clients' timeout, which the status command reports as "could not reach
+    coordinator" and the volume's strict check as "cannot tell" -- and a
+    degraded answer that reads as "nothing tracked" (empty lists) or drops the
+    ``policy_summary`` pattern lists the volume's check needs."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    query, headers = _REGISTRY_TIERS[tier]
+    client.post("/policy/track", {"paths": ["docs/plan.md"]})
+    client.post("/hooks/pre-edit", {"session_id": _sid("238-holder"), "path": "docs/plan.md"})
+    status, normal = client.get(query, headers_override=headers)
+    assert status == 200 and isinstance(normal["tracked_artifacts"], list), normal
+    _, before = client.get("/status?detail=metrics")
+
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(client, query, headers=headers)
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+    status, degraded = answer.result()
+
+    assert answered, f"/status ({tier}) did not answer while the registry lock was held"
+    assert status == 200
+    assert degraded["degraded"] is True
+    assert degraded["tracked_artifacts"] is None and degraded["sessions"] is None
+    assert set(degraded) == set(normal) | {"degraded"}
+    assert degraded["registry_schema_version"] == normal["registry_schema_version"]
+    assert degraded["detail"] == normal["detail"]
+    assert degraded["coordinator_root"] == normal["coordinator_root"]
+    assert degraded["policy_summary"] == normal["policy_summary"]
+    assert degraded["watchdog_timeouts_total"] == before["watchdog_timeouts_total"] + 1, (
+        "the degraded answer does not count its own timeout")
+    if tier == "full":
+        for key in _PATTERN_LIST_KEYS:
+            assert isinstance(degraded["policy_summary"][key], list), key
+        assert "docs/plan.md" in degraded["policy_summary"]["user_added_patterns"]
+        assert {key: degraded[key] for key in _THRESHOLD_KEYS} == dict.fromkeys(_THRESHOLD_KEYS)
+    else:
+        assert not set(_THRESHOLD_KEYS) & set(degraded)
+    _assert_nothing_completes_late(client, before)
+
+
+def test_status_stops_waiting_in_time_to_read_before_the_clients_give_up(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """KTD13: the lock wait ends while a read reserve still remains before
+    this package's clients' timeout, even when the handler budget has longer to
+    run, so a late acquire plus the read still reaches the client.
+
+    The handler budget keeps its shipped 4 s here; only the reserve can end
+    the wait inside the bound. Prevents a lock won near the end of the budget
+    whose read then lands after the client has given up, which the client
+    reports as an unreachable coordinator rather than this marked answer."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+    from ccs.cli._coherence_client import CLI_HTTP_TIMEOUT_SEC
+
+    assert mod._STATUS_CLIENT_TIMEOUT_SEC == CLI_HTTP_TIMEOUT_SEC, (
+        "the wait cap is computed against a timeout this package's clients do not use")
+    assert mod._STATUS_READ_RESERVE_SEC >= 1.0
+    assert CLI_HTTP_TIMEOUT_SEC - mod._STATUS_READ_RESERVE_SEC >= 1.0, (
+        "the reserve leaves less than a second of lock wait")
+    assert mod.HANDLER_TIMEOUT_SEC > _GATE_ANSWER_BOUND_SEC
+    monkeypatch.setattr(
+        mod, "_STATUS_READ_RESERVE_SEC", CLI_HTTP_TIMEOUT_SEC - _DEGRADE_DEADLINE_SEC)
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(client, "/status")
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+    status, body = answer.result()
+
+    assert answered, "the lock wait ran to the handler budget, past the read reserve"
+    assert (status, body["degraded"]) == (200, True)
+
+
+def test_status_metrics_tier_and_refused_operator_tier_never_wait_on_the_registry(
+    coordinator, client: _Client
+) -> None:
+    """Neither the counters-only tier nor a refused operator request reads
+    the registry, so a held lock delays neither, even with the full handler
+    budget, and neither counts a timeout."""
+    _, before = client.get("/status?detail=metrics")
+    with _HeldRegistryLock(coordinator) as held:
+        metrics = _Background(client, "/status?detail=metrics")
+        refused = _Background(client, "/status?detail=full")
+        answered = (
+            metrics.answered_within(_GATE_ANSWER_BOUND_SEC)
+            and refused.answered_within(_GATE_ANSWER_BOUND_SEC)
+        )
+        held.release()
+
+    assert answered, "a tier that never reads the registry waited on its lock"
+    status, body = metrics.result()
+    assert status == 200 and body["detail"] == "metrics"
+    assert "degraded" not in body and "tracked_artifacts" not in body
+    assert body["watchdog_timeouts_total"] == before["watchdog_timeouts_total"]
+    assert refused.result()[0] == 403
+
+
+def test_status_answers_500_when_its_registry_read_raises_anything_but_a_lock_timeout(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a lock wait that ran out answers the degraded body; any other
+    failure of the read keeps the dispatcher's 500 and counts no timeout."""
+    import sqlite3
+
+    def _fails(**_kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    _, before = client.get("/status?detail=metrics")
+    monkeypatch.setattr(coordinator.registry, "status_snapshot", _fails)
+    assert client.get("/status") == (500, {"error": "internal: OperationalError"})
+    _, after = client.get("/status?detail=metrics")
+    assert after["watchdog_timeouts_total"] == before["watchdog_timeouts_total"]
+
+
+@pytest.mark.parametrize("search_root", ["", "src"], ids=["workspace_root", "subdirectory"])
+def test_pre_grep_answers_the_freshness_advisory_in_time_while_the_registry_lock_is_held(
+    search_root: str, coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the registry lock held past the handler budget, pre-grep answers
+    exactly the "could not verify freshness" advisory, counts one timeout, and
+    neither registers the session nor records its heartbeat.
+
+    Prevents a Grep hook whose client times out first and hands the model
+    ``{}`` -- no advisory at all -- and a lookup that runs once the lock frees
+    and touches a session the answer never reported on."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("238-reader"), "path": "src/plan.md", "content_hash": _hash("x")},
+    )
+    sid = _sid("238-grep")
+    _, before = client.get("/status?detail=metrics")
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(
+            client, "/hooks/pre-grep", {"session_id": sid, "search_root": search_root})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+
+    assert answered, "pre-grep did not answer while the registry lock was held"
+    assert answer.result() == (200, mod._DEFAULT_DEGRADED_RESPONSE)
+    _, after = client.get("/status?detail=metrics")
+    assert after["watchdog_timeouts_total"] == before["watchdog_timeouts_total"] + 1
+    agent = str(session_to_agent_id(sid))
+    assert [row for row in _operator_status(client)["sessions"] if row["agent_id"] == agent] == []
+    assert coordinator.registry.last_heartbeat_tick(session_to_agent_id(sid)) is None
+    _assert_nothing_completes_late(client, before)
+
+
+def test_a_degraded_pre_grep_lookup_leaves_the_compact_pending_flag_for_the_next_request(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lookup that timed out delivered nothing, so the session's pending
+    post-compaction re-grounding stays armed for its next request."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    sid = _sid("238-reground")
+    coordinator.mark_compact_pending(sid)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(client, "/hooks/pre-grep", {"session_id": sid, "search_root": ""})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+
+    assert answered
+    assert answer.result() == (200, mod._DEFAULT_DEGRADED_RESPONSE)
+    assert coordinator.has_compact_pending(sid) is True
+
+
+def test_pre_grep_work_body_gets_only_what_its_lookup_left_of_the_deadline(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lookup that waited most of the budget for the lock leaves its work
+    body only the rest: a work body that then stalls is answered at the ONE
+    deadline, not at the lookup's wait plus a fresh budget.
+
+    The lock is released partway through the budget, so the lookup wins it
+    and the work body runs; the work body's first call is a stand-in that
+    stalls past any budget, so only the deadline it was given ends it."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    deadline = 1.0
+    lookup_wait = 0.7 * deadline
+    client.post(
+        "/hooks/pre-read",
+        {"session_id": _sid("238-share-reader"), "path": "plan.md", "content_hash": _hash("x")},
+    )
+    real_heartbeat = coordinator.service.record_heartbeat
+
+    def _stalls(*args: Any, **kwargs: Any) -> None:
+        time.sleep(2 * deadline)
+        real_heartbeat(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator.service, "record_heartbeat", _stalls)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", deadline)
+    with _HeldRegistryLock(coordinator) as held:
+        started = time.monotonic()
+        answer = _Background(
+            client, "/hooks/pre-grep", {"session_id": _sid("238-share"), "search_root": ""})
+        time.sleep(lookup_wait)
+        held.release()
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        waited = time.monotonic() - started
+
+    assert answered, f"no answer within {_GATE_ANSWER_BOUND_SEC}s of the lock freeing"
+    assert answer.result() == (200, mod._DEFAULT_DEGRADED_RESPONSE)
+    # One deadline answers at ~1.0s; a fresh one for the body at ~0.7 + 1.0s.
+    assert waited < deadline + lookup_wait / 2, (
+        f"answered after {waited:.2f}s: the work body got a fresh {deadline}s after a "
+        f"{lookup_wait:.2f}s lookup, not what was left of one deadline")
+
+
+# ======================================================================
+# #187 — each write grant's age, its holder's last heartbeat, the artifact's
+#        ownership generation and the sweep thresholds, on the operator tier
+# ======================================================================
+#
+# The sweep reclaims a write grant from its grant tick, its holder's last
+# heartbeat and two thresholds; none of them reached any response. The
+# operator tier now carries all of them, from the one registry read that
+# yields ``states`` and ``reclaimed``. Times are pinned by patching the
+# server module's clock, the one the hooks stamp grants and heartbeats with.
+
+
+def _at_tick(monkeypatch: pytest.MonkeyPatch, tick: int, send: Any) -> Any:
+    """Send one request with the server's clock reading ``tick``."""
+    from ccs.adapters.claude_code import coordinator_server as server_mod
+
+    with monkeypatch.context() as clock:
+        clock.setattr(server_mod, "monotonic_seconds", lambda: tick)
+        return send()
+
+
+def _seed_pair(coordinator, path: str, sid: str, *, state: str, granted_at: int | None) -> None:
+    """Rewrite one ledger row the way another runtime, or an older one, could
+    have left it: a state and a grant tick no live grant path pairs."""
+    registry = coordinator.registry
+    artifact_id = registry.lookup_artifact_id_by_name(path)
+    assert artifact_id is not None
+    with registry._lock:
+        updated = registry._conn.execute(
+            "UPDATE agent_states SET state = ?, granted_at_tick = ? "
+            "WHERE artifact_id = ? AND agent_id = ?",
+            (state, granted_at, artifact_id.hex, session_to_agent_id(sid).hex),
+        ).rowcount
+    assert updated == 1
+
+
+def test_status_full_tier_reports_each_write_grants_time_and_its_holders_heartbeat(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An EXCLUSIVE holder's row lists each path it holds for writing with
+    that grant's own tick, and the holder's latest heartbeat once, all as
+    whole unix seconds; the artifact carries its ownership generation."""
+    sid = _sid("187-holder")
+    now = int(time.time())
+    first, second = now - 1_000, now - 10
+    _at_tick(monkeypatch, first, lambda: client.post(
+        "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"}))
+    _at_tick(monkeypatch, second, lambda: client.post(
+        "/hooks/pre-edit", {"session_id": sid, "path": "task.md"}))
+
+    body = _operator_status(client)
+    row = _row_for(body, sid)
+    assert row["states"] == {"plan.md": "EXCLUSIVE", "task.md": "EXCLUSIVE"}
+    assert row["grants"] == {
+        "plan.md": {"granted_at_unix_ts": first},
+        "task.md": {"granted_at_unix_ts": second},
+    }
+    assert row["last_heartbeat_unix_ts"] == second
+    assert type(row["last_heartbeat_unix_ts"]) is int
+    assert type(row["grants"]["plan.md"]["granted_at_unix_ts"]) is int
+    assert _status_entry(body, "plan.md")["owner_generation"] == 0
+    assert {key: body[key] for key in _THRESHOLD_KEYS} == dict.fromkeys(_THRESHOLD_KEYS), (
+        "a server built without lifecycle runs no sweep, so it reports no thresholds")
+
+
+def test_status_full_tier_lists_no_grant_for_a_shared_holder_and_still_reports_its_heartbeat(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row that holds only SHARED paths has an empty ``grants`` map (the
+    sweep never reclaims a read) and its holder's heartbeat."""
+    first, second = _sid("187-reader-a"), _sid("187-reader-b")
+    now = int(time.time())
+    for sid, tick in ((first, now - 300), (second, now - 200)):
+        _at_tick(monkeypatch, tick, lambda sid=sid: client.post(
+            "/hooks/pre-read", {"session_id": sid, "path": "plan.md", "content_hash": _hash("x")}))
+
+    body = _operator_status(client)
+    for sid, tick in ((first, now - 300), (second, now - 200)):
+        row = _row_for(body, sid)
+        assert row["states"] == {"plan.md": "SHARED"}
+        assert row["grants"] == {}
+        assert row["last_heartbeat_unix_ts"] == tick
+
+
+def test_status_full_tier_reports_the_heartbeat_of_a_reclaim_only_row(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A #195 reclaim-only row holds nothing, so ``grants`` is empty, and it
+    still shows the heartbeat the reclaim judged stale."""
+    sid = _sid("187-reclaimed")
+    granted = int(time.time()) - 1_000
+    _at_tick(monkeypatch, granted, lambda: client.post(
+        "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"}))
+    assert _sweep(coordinator, int(time.time()) + 999_999) == 1
+
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {}
+    assert set(row["reclaimed"]) == {"plan.md"}
+    assert row["grants"] == {}
+    assert row["last_heartbeat_unix_ts"] == granted
+
+
+def test_status_full_tier_reports_the_heartbeat_of_a_session_that_only_stopped(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A named session whose only request was a session-stop has no ledger
+    row at all; its row still shows the heartbeat that request recorded."""
+    sid = _sid("187-stop-only")
+    stopped = int(time.time()) - 42
+    _at_tick(monkeypatch, stopped, lambda: client.post("/hooks/session-stop", {"session_id": sid}))
+
+    row = _row_for(_operator_status(client), sid)
+    assert row["agent_name"] is not None
+    assert (row["states"], row["grants"]) == ({}, {})
+    assert row["last_heartbeat_unix_ts"] == stopped
+
+
+@pytest.mark.parametrize(
+    ("state", "granted_at", "grants"),
+    [
+        ("MODIFIED", None, {"plan.md": {"granted_at_unix_ts": None}}),
+        ("SHARED", 123, {}),
+    ],
+    ids=["write_grant_without_a_tick", "read_with_a_tick"],
+)
+def test_status_full_tier_lists_grants_by_state_not_by_tick(
+    coordinator, client: _Client, state: str, granted_at: int | None, grants: dict
+) -> None:
+    """``grants`` lists the paths a row holds EXCLUSIVE or MODIFIED, which
+    are what the sweep acts on, whatever the tick column says: a write grant
+    with no tick is listed with a null time (no max-hold limit applies to it),
+    and a read that carries a tick is not listed."""
+    sid = _sid(f"187-seeded-{state}")
+    client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    _seed_pair(coordinator, "plan.md", sid, state=state, granted_at=granted_at)
+
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {"plan.md": state}
+    assert row["grants"] == grants
+
+
+def test_status_full_tier_reports_a_null_heartbeat_for_a_grant_holder_with_none_on_record(
+    coordinator, client: _Client
+) -> None:
+    """A write grant whose holder has no heartbeat on record (a ledger row no
+    request of this process came from) is listed with its grant time, and the
+    row's ``last_heartbeat_unix_ts`` is null, not a zero or a missing key: the
+    sweep counts no heartbeat as stale, which a reader can only see as null."""
+    sid = _sid("187-no-heartbeat")
+    agent_id = session_to_agent_id(sid)
+    granted = int(time.time()) - 60
+    artifact_id = coordinator.registry.resolve_or_register("plan.md", content_hash="")
+    coordinator.registry.set_agent_state(
+        artifact_id, agent_id, MESIState.EXCLUSIVE, trigger="test_setup", tick=granted,
+    )
+    assert coordinator.registry.last_heartbeat_tick(agent_id) is None
+
+    row = _row_for(_operator_status(client), sid)
+    assert row["states"] == {"plan.md": "EXCLUSIVE"}
+    assert row["grants"] == {"plan.md": {"granted_at_unix_ts": granted}}
+    assert "last_heartbeat_unix_ts" in row
+    assert row["last_heartbeat_unix_ts"] is None
+
+
+def test_status_full_tier_owner_generation_moves_on_a_reclaim_only(
+    coordinator, client: _Client
+) -> None:
+    """The ownership generation moves when a write grant ends without a
+    version move (a sweep reclaim here), and neither a peer's preemption nor
+    a commit moves it."""
+    holder, peer = _sid("187-gen-holder"), _sid("187-gen-peer")
+
+    def generation() -> int:
+        return _status_entry(_operator_status(client), "plan.md")["owner_generation"]
+
+    client.post("/hooks/pre-edit", {"session_id": holder, "path": "plan.md"})
+    start = generation()
+    client.post("/hooks/pre-edit", {"session_id": peer, "path": "plan.md"})
+    assert generation() == start, "a peer's preemption moved the generation"
+    assert client.post("/hooks/post-edit", {
+        "session_id": peer, "path": "plan.md", "content_hash": _hash("v2"), "success": True,
+    })[0] == 200
+    assert generation() == start, "a commit moved the generation"
+    client.post("/hooks/pre-edit", {"session_id": peer, "path": "plan.md"})
+    assert _sweep(coordinator, int(time.time()) + 999_999) == 1
+    assert generation() == start + 1
+
+
+def test_status_default_tier_keeps_its_shape_without_any_operator_field(
+    coordinator, client: _Client
+) -> None:
+    """A normal default-tier body keeps its key set and order, its entry and
+    row shapes, and carries none of the operator-tier fields or the degraded
+    marker, with a write grant, a heartbeat and a reclaim all on record."""
+    client.post("/hooks/pre-edit", {"session_id": _sid("187-minimal-reclaimed"), "path": "plan.md"})
+    _sweep(coordinator, int(time.time()) + 999_999)
+    client.post("/hooks/pre-edit", {"session_id": _sid("187-minimal-holder"), "path": "task.md"})
+
+    _, minimal = client.get("/status")
+    _, metrics = client.get("/status?detail=metrics")
+    counters = [key for key in metrics if key != "detail"]
+    assert list(minimal) == [
+        "detail", "tracked_artifacts", "sessions", "policy_summary", "coordinator_pid",
+        *counters, "coordinator_root",
+    ]
+    assert {key for entry in minimal["tracked_artifacts"] for key in entry} == _DEFAULT_ENTRY_KEYS
+    assert {key for row in minimal["sessions"] for key in row} == {"agent_name", "agent_id", "states"}
+    operator_only = {
+        "degraded", "owner_generation", "grants", "granted_at_unix_ts",
+        "last_heartbeat_unix_ts", *_THRESHOLD_KEYS,
+    }
+    assert not operator_only & _keys_anywhere(minimal)
+
+
+def test_status_asks_the_registry_for_grant_detail_at_the_operator_tier_only(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The grant-detail read (a heartbeat SELECT and two more columns, inside
+    the registry lock) is paid only by the operator tier: the default view,
+    the one dashboards poll, never asks for it (asserted on the argument)."""
+    client.post("/hooks/pre-edit", {"session_id": _sid("187-opt-in"), "path": "plan.md"})
+    calls: list[dict] = []
+    real = coordinator.registry.status_snapshot
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator.registry, "status_snapshot", recording)
+    assert client.get("/status")[0] == 200
+    assert client.get("/status?detail=metrics")[0] == 200
+    _operator_status(client)
+
+    assert [bool(kwargs.get("include_grant_detail")) for kwargs in calls] == [False, True]
+
+
+def test_status_reads_grant_detail_inside_the_snapshot_lock_hold(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5: the heartbeats and grant ticks are read in the ONE registry hold
+    that reads the artifact and agent-state rows, so a heartbeat or a grant
+    cannot move between the state a row shows and the times it lists."""
+    sid = _sid("187-one-hold")
+    granted = int(time.time()) - 60
+    _at_tick(monkeypatch, granted, lambda: client.post(
+        "/hooks/pre-edit", {"session_id": sid, "path": "plan.md"}))
+
+    status, body, holds, unheld = _status_registry_holds(
+        coordinator, client, "/status?detail=full", headers_override=_OPERATOR_HEADER)
+    assert status == 200
+    assert _row_for(body, sid)["grants"] == {"plan.md": {"granted_at_unix_ts": granted}}
+    assert not [sql for sql in unheld if "heartbeats" in sql or "granted_at_tick" in sql]
+    detail_holds = [hold for hold in holds if any("FROM heartbeats" in sql for sql in hold)]
+    assert len(detail_holds) == 1, detail_holds
+    [hold] = detail_holds
+    assert any("owner_generation" in sql and "FROM artifacts" in sql for sql in hold), hold
+    assert any("granted_at_tick" in sql and "FROM agent_states" in sql for sql in hold), hold
+
+
+def test_status_full_tier_reports_the_thresholds_lifecycle_started_the_sweep_with(
+    tmp_path: Path,
+) -> None:
+    """Through the lifecycle winner path, the operator tier reports the two
+    thresholds the coordinator's sweep enforces: the shipped 600 and 1800."""
+    from ccs.adapters.claude_code import lifecycle
+    from ccs.adapters.claude_code.lifecycle import (
+        LifecycleConfig,
+        ensure_coordinator,
+        stop_coordinator,
+    )
+
+    port = ensure_coordinator(
+        tmp_path, config=LifecycleConfig(idle_shutdown_sec=0, sweep_interval_sec=0.1))
+    assert port > 0
+    try:
+        spawned = lifecycle._SPAWNED_REGISTRY[str(tmp_path.resolve())].coordinator
+        secret = load_secret(spawned.coordinator_root)
+        assert secret is not None
+        body = _operator_status(_Client("127.0.0.1", port, secret))
+    finally:
+        stop_coordinator(tmp_path)
+
+    assert {key: body[key] for key in _THRESHOLD_KEYS} == {
+        "grant_heartbeat_timeout_sec": 600, "grant_max_hold_sec": 1800,
+    }
+
+
+def test_status_full_tier_deadline_is_the_second_the_real_sweep_reclaims_each_grant(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The documented deadline, ``min(last_heartbeat_unix_ts +
+    grant_heartbeat_timeout_sec, granted_at_unix_ts + grant_max_hold_sec)``,
+    computed from one operator-tier body alone, is the second the real stable
+    sweep, run with the body's thresholds, reclaims each grant; one second
+    earlier it reclaims nothing. One holder's deadline is its heartbeat term
+    and the other's its grant-time term, so dropping either term is red."""
+    from ccs.adapters.claude_code.lifecycle import LifecycleConfig, _sweep_stable_grants
+
+    coordinator.grant_heartbeat_timeout_sec = 600
+    coordinator.grant_max_hold_sec = 1800
+    idle, busy = _sid("187-deadline-idle"), _sid("187-deadline-busy")
+    now = int(time.time())
+    # Idle: last heard from when it took the grant, so the heartbeat term ends first.
+    _at_tick(monkeypatch, now - 1_000, lambda: client.post(
+        "/hooks/pre-edit", {"session_id": idle, "path": "plan.md"}))
+    # Busy: still making requests long after its grant began, so the grant-time
+    # term ends first.
+    for tick in (now - 2_000, now - 100):
+        _at_tick(monkeypatch, tick, lambda: client.post(
+            "/hooks/pre-edit", {"session_id": busy, "path": "task.md"}))
+
+    body = _operator_status(client)
+    cfg = LifecycleConfig(
+        grant_heartbeat_timeout_sec=body["grant_heartbeat_timeout_sec"],
+        grant_max_hold_sec=body["grant_max_hold_sec"],
+    )
+
+    def terms(sid: str, path: str) -> tuple[int, int]:
+        row = _row_for(body, sid)
+        return (
+            row["last_heartbeat_unix_ts"] + body["grant_heartbeat_timeout_sec"],
+            row["grants"][path]["granted_at_unix_ts"] + body["grant_max_hold_sec"],
+        )
+
+    idle_heartbeat, idle_grant = terms(idle, "plan.md")
+    busy_heartbeat, busy_grant = terms(busy, "task.md")
+    assert idle_heartbeat < idle_grant and busy_grant < busy_heartbeat
+    assert idle_heartbeat < busy_grant, "the arms below assume the idle grant falls due first"
+
+    for sid, path, due, trigger in (
+        (idle, "plan.md", idle_heartbeat, "reclaim_heartbeat"),
+        (busy, "task.md", busy_grant, "reclaim_max_hold"),
+    ):
+        assert _sweep_stable_grants(coordinator, cfg, due - 1) == 0, f"{path} reclaimed early"
+        assert _sweep_stable_grants(coordinator, cfg, due) == 1, f"{path} not reclaimed when due"
+        row = _row_for(_operator_status(client), sid)
+        assert path not in row["grants"]
+        assert row["reclaimed"][path]["trigger"] == trigger

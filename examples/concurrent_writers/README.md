@@ -72,7 +72,10 @@ contention approaching the commit budget (`MAX_CAS_REACQUIRES` = 8 → 9 CAS
 attempts; ~8+ writers racing the SAME key at once), a writer can exhaust the
 budget and raise `CasRetriesExhausted` — the honest fail-closed terminal, not a
 dropped update. The 2-writer demo (and fleets up to roughly the budget) converge
-cleanly.
+cleanly. `CasRetriesExhausted.last_conflict_reason` tells contention
+(`version_mismatch`) from a file another agent holds after a plain `write()`
+(`other_holder`, or `caller_in_transient_state` when that write landed
+mid-attempt), which no retry inside the call can get past.
 
 Verified by `formal/tla/OCC.tla` (`NoLostUpdate`) and `formal/tla/Fencing.tla`
 (`NoStaleApply`), both model-checked — these cover the *protocol*. The

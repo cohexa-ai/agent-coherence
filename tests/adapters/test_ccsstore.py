@@ -799,6 +799,42 @@ def test_degraded_warning_not_emitted_on_second_degradation() -> None:
     assert len(degraded_warnings) == 0
 
 
+@pytest.mark.parametrize("operation", ["get", "put"])
+def test_degradation_is_recorded_when_the_degraded_warning_is_escalated(operation: str) -> None:
+    # A caller that escalates CoherenceDegradedWarning to an error makes warn()
+    # raise. Everything the degraded operation records must already be done by
+    # then: otherwise is_degraded reports False for a store that fell back, the
+    # metric stream and the namespace index miss the operation, and because the
+    # warn-once latch never closes, every later failure raises instead of
+    # serving the fallback.
+    from ccs.adapters.ccsstore import CoherenceDegradedWarning
+    from ccs.core.exceptions import CoherenceError
+
+    events: list[StoreMetricEvent] = []
+    store = _store(on_error="degrade", on_metric=events.append)
+    _put(store, ("planner", "shared"), "plan", {"v": 1})
+    if operation == "get":
+        core_call = "read"
+        def degrade() -> None:
+            _get(store, ("reviewer", "shared"), "plan")
+    else:
+        core_call = "write"
+        def degrade() -> None:
+            _put(store, ("planner", "drafts"), "plan", {"v": 2})
+
+    with patch.object(store.core, core_call, side_effect=CoherenceError("simulated")):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", CoherenceDegradedWarning)
+            with pytest.raises(CoherenceDegradedWarning):
+                degrade()
+            assert store.is_degraded is True
+            assert [e.operation for e in events].count("degraded") == 1
+            if operation == "put":
+                assert ("planner", "drafts") in store.list_namespaces()
+            degrade()  # latch closed: the next failure falls back without raising
+    assert store.degradation_count == 2
+
+
 def test_coherence_degraded_warning_importable_from_adapters() -> None:
     from ccs.adapters import CoherenceDegradedWarning
     assert issubclass(CoherenceDegradedWarning, UserWarning)

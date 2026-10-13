@@ -7,7 +7,8 @@
 # by design (fail-closed): we never embed long-lived API tokens in repo secrets.
 #
 # Triggers on tag push matching v*. The tag itself is the publish trigger; this file
-# landing in the repo does not publish anything.
+# landing in the repo does not publish anything. A .devN version is never released;
+# aN / bN / rcN go to PyPI and become a GitHub pre-release (tools/check_release_tag.py).
 name: release
 
 on:
@@ -57,6 +58,9 @@ jobs:
     permissions:
       contents: read
 
+    outputs:
+      prerelease: ${{ steps.release-tag.outputs.prerelease }}
+
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
 
@@ -65,30 +69,17 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
+      # Fails unless the tag is v{__version__}, and refuses a .devN version
+      # outright. For aN / bN / rcN it sets prerelease=true, which the
+      # github-release job passes on and publish-mcp.yml reads back from the
+      # GitHub release to keep pre-releases off the MCP Registry.
       - name: Verify tag matches package version
+        id: release-tag
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          python - <<'PY'
-          import os
-          import re
-          from pathlib import Path
-
-          package_init = Path("src/ccs/__init__.py").read_text()
-          version_match = re.search(r'^__version__\s*=\s*"([^"]+)"', package_init, re.MULTILINE)
-          if version_match is None:
-              raise SystemExit("Could not find __version__ in src/ccs/__init__.py")
-
-          version = version_match.group(1)
-          release_tag = os.environ["RELEASE_TAG"]
-          expected_tag = f"v{version}"
-          if release_tag != expected_tag:
-              raise SystemExit(
-                  f"Release tag {release_tag} does not match package version {version} "
-                  f"(expected {expected_tag})"
-              )
-          print(f"Release tag {release_tag} matches package version {version}")
-          PY
+          python -m pip install packaging
+          python tools/check_release_tag.py
 
       - name: Install build tooling
         run: |
@@ -148,7 +139,7 @@ jobs:
   github-release:
     name: Create GitHub Release with SBOM
     runs-on: ubuntu-latest
-    needs: [publish]
+    needs: [build, publish]
 
     permissions:
       contents: write
@@ -173,3 +164,4 @@ jobs:
             dist/*
             sbom/sbom.cyclonedx.json
           generate_release_notes: true
+          prerelease: ${{ needs.build.outputs.prerelease }}

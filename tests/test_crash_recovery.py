@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,7 +14,8 @@ import pytest
 
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.service import CoordinatorService
-from ccs.core.exceptions import CoherenceError
+from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+from ccs.core.exceptions import CoherenceError, InvariantViolationError
 from ccs.core.invariants import check_monotonic_version, check_single_writer
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import FetchRequest
@@ -50,6 +52,36 @@ def test_heartbeat_stale_exclusive_is_reclaimed() -> None:
     assert last_entry["trigger"] == "reclaim_heartbeat"
     assert last_entry["content_hash"] is None
     assert last_entry["to_state"] == "INVALID"
+
+
+def test_reclaim_callback_fires_before_a_failing_single_writer_check() -> None:
+    """The reclaim is in the registry before the post-write single-writer
+    check runs, so a check that raises must not cost a direct caller the
+    ``on_reclaim`` callback for that reclaim, and the error must still reach
+    that caller."""
+    registry = ArtifactRegistry()
+    svc = CoordinatorService(registry)
+    artifact = svc.register_artifact(name="plan.md", content="v1")
+    stale, writer_b, writer_c = uuid4(), uuid4(), uuid4()
+    svc.fetch(FetchRequest(artifact_id=artifact.id, requesting_agent_id=stale, requested_at_tick=1))
+    svc.record_heartbeat(agent_id=stale, now_tick=1)
+    # Two more live writers on the same artifact: the state the check exists
+    # to catch, so it raises once the stale grant is gone.
+    for writer in (writer_b, writer_c):
+        registry.set_agent_state(artifact.id, writer, MESIState.EXCLUSIVE, trigger="test", tick=19)
+        svc.record_heartbeat(agent_id=writer, now_tick=20)
+    delivered: list[tuple] = []
+
+    with pytest.raises(InvariantViolationError, match="single_writer_violated"):
+        svc.enforce_stable_grant_timeouts(
+            current_tick=20,
+            heartbeat_timeout_ticks=10,
+            max_hold_ticks=1000,
+            on_reclaim=lambda *reclaim: delivered.append(reclaim),
+        )
+
+    assert delivered == [(artifact.id, stale, "reclaim_heartbeat")]
+    assert registry.get_agent_state(artifact.id, stale) == MESIState.INVALID
 
 
 def test_max_hold_modified_is_reclaimed_with_fresh_heartbeat() -> None:
@@ -387,6 +419,91 @@ def test_re_reclamation_after_reacquire_reflects_only_most_recent() -> None:
     assert "reclaimed_by=reclaim_max_hold" in msg
     assert "at_tick=10000" in msg
     assert "reclaim_heartbeat" not in msg
+
+
+# ---------------------------------------------------------------------------
+# The reclaim and its slot are one write
+# ---------------------------------------------------------------------------
+
+
+class _ProcessDied(BaseException):
+    """Simulated process death: a BaseException, so no ``except Exception``
+    between the reclaim and the sweep's caller can swallow it."""
+
+
+@contextmanager
+def _open_registry(backend: str, tmp_path: Path):
+    if backend == "memory":
+        yield ArtifactRegistry()
+    else:
+        with SqliteArtifactRegistry(tmp_path / "state.db") as registry:
+            yield registry
+
+
+def _stale_holder(registry):
+    """An EXCLUSIVE holder of plan.md whose last heartbeat was at tick 0."""
+    svc = CoordinatorService(registry)
+    artifact = svc.register_artifact(name="plan.md", content="v1")
+    holder = uuid4()
+    svc.fetch(FetchRequest(artifact_id=artifact.id, requesting_agent_id=holder, requested_at_tick=0))
+    svc.record_heartbeat(agent_id=holder, now_tick=0)
+    return svc, artifact, holder
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_sweep_reclaim_and_its_slot_land_in_one_write(
+    backend: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The process dies the instant the reclaim's state transition returns.
+    Whatever survived must be self-consistent: a pair the sweep left INVALID
+    carries the slot naming its cause. Without it /status and the holder's
+    commit error read the reclaim as an ordinary release, and the next sweep,
+    finding the pair already INVALID, never repairs it."""
+    with _open_registry(backend, tmp_path) as registry:
+        svc, artifact, holder = _stale_holder(registry)
+        transition = registry.set_agent_state
+
+        def _die_after_a_reclaim(*args, **kwargs) -> None:
+            transition(*args, **kwargs)
+            if kwargs.get("trigger") in {"reclaim_heartbeat", "reclaim_max_hold"}:
+                raise _ProcessDied
+
+        monkeypatch.setattr(registry, "set_agent_state", _die_after_a_reclaim)
+        with pytest.raises(_ProcessDied):
+            svc.enforce_stable_grant_timeouts(
+                current_tick=100, heartbeat_timeout_ticks=10, max_hold_ticks=10_000
+            )
+
+        state = registry.get_agent_state(artifact.id, holder)
+        slot = registry.get_last_reclamation(holder, artifact.id)
+        assert state != MESIState.INVALID or slot == ("reclaim_heartbeat", 100), (state, slot)
+        if backend == "sqlite":
+            # /status reads the slot from the same row as the state.
+            slots = registry.status_snapshot(include_reclamations=True)[3]
+            assert state != MESIState.INVALID or slots == {
+                artifact.id: {holder: ("reclaim_heartbeat", 100)}
+            }, slots
+
+
+def test_sweep_reclaim_keeps_its_slot_when_the_state_log_raises() -> None:
+    """In memory, a state_log that raises on the reclaim's entry leaves the
+    transition applied (there is nothing to roll back), so the slot must be
+    recorded before the emit, or the INVALID pair reads as a plain release."""
+
+    def _failing_sink(entry: dict) -> None:
+        if entry["trigger"] == "reclaim_heartbeat":
+            raise OSError("state log sink unavailable")
+
+    registry = ArtifactRegistry(state_log=_failing_sink, instance_id="inst-1")
+    svc, artifact, holder = _stale_holder(registry)
+
+    with pytest.raises(OSError, match="sink unavailable"):
+        svc.enforce_stable_grant_timeouts(
+            current_tick=100, heartbeat_timeout_ticks=10, max_hold_ticks=10_000
+        )
+
+    assert registry.get_agent_state(artifact.id, holder) == MESIState.INVALID
+    assert registry.get_last_reclamation(holder, artifact.id) == ("reclaim_heartbeat", 100)
 
 
 # ---------------------------------------------------------------------------

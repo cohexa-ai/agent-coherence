@@ -1,6 +1,6 @@
 {
   "name": "pre-read-subagent-attribution",
-  "description": "SB-25 R2 attribution: a subagent's commit is credited to the SUBAGENT id, not the parent session. Preflight: the parent reads (SHARED), then subagent A edits + commits v2 under the composite identity — invalidating the parent. The parent's re-read is stale and summary.last_writer_session_id MUST be the subagent id (the [:8] short form in prose then names the actual writer). Timestamps + prose are ignored (vary per run); the attribution field is the parity contract.",
+  "description": "SB-25 R2 attribution: a subagent's commit is credited to the SUBAGENT id, not the parent session. Preflight: the parent reads (SHARED), then subagent A edits + commits v2 under the composite identity — invalidating the parent. The parent's re-read is stale and summary.last_writer_session_id MUST be the SUBAGENT's composite agent id -- uuid5 of 'ccs-agent:claude-session-<sid>:subagent-<sub>', which both backends derive byte-identically -- so the [:8] short form in prose names the actual writer and not the parent. R7 changed what this field carries: it was the bare subagent id, recovered by running that derivation backwards. The 32-char hex form is deliberate and load-bearing here: the harness scrubs any 8-4-4-4-12 value in a string position, so a hyphenated spelling would normalize to <UUID> and this assertion would pass for ANY writer -- and warn_mode/ may not declare preserve_identity. Timestamps + prose are ignored (vary per run); the attribution field is the parity contract.",
   "setup": {
     "tracked": ["CLAUDE.md"],
     "files": {
@@ -58,7 +58,7 @@
         "path": "CLAUDE.md",
         "current_version": 2,
         "prior_version_seen_by_session": 1,
-        "last_writer_session_id": "a0826622451ec196f",
+        "last_writer_session_id": "accb7b8eef825b13bc7c47512263cd0b",
         "last_writer_at_unix_ts": 0,
         "warning_generated_at_unix_ts": 0,
         "hash_differs": false

@@ -1,0 +1,23 @@
+{
+  "name": "caller-principal-python-mints-on-first-claim",
+  "description": "The mint half on the Python coordinator: a first claim of an unclaimed session binds a principal and returns it. R5 -- the principal is asserted only as the <PRINCIPAL> sentinel, never by value: this response is the ONE place it crosses the wire.",
+  "setup": {},
+  "request": {
+    "method": "POST",
+    "path": "/principal/claim",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+      "mint_nonce": "corpus-mint-nonce-a"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "principal": "<PRINCIPAL>"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

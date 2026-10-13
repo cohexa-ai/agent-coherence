@@ -21,7 +21,6 @@ import hashlib
 import json
 import stat
 import threading
-import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -111,7 +110,6 @@ def strict_workspace(tmp_path: Path) -> Path:
 def coordinator(strict_workspace: Path):
     server = CoordinatorHTTPServer(strict_workspace, port=0, instance_id="unit4-test")
     server.serve_in_thread()
-    time.sleep(0.05)
     try:
         yield server
     finally:
@@ -269,7 +267,6 @@ def test_warn_mode_stale_does_not_bump_strict_counter(tmp_path: Path) -> None:
     _write_policy(tmp_path, tracked=["plan.md"], strict=[])
     server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="warn-only")
     server.serve_in_thread()
-    time.sleep(0.05)
     try:
         secret = load_secret(server.coordinator_root)
         c = _Client("127.0.0.1", server.port, secret)

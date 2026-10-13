@@ -1,0 +1,62 @@
+{
+  "name": "post-edit-cas-stale-comparand-is-a-typed-conflict",
+  "description": "B commits through the CAS after A's pre-read; A's CAS then carries the comparand it read (1) against version 2. Both coordinators answer the byte-stable typed conflict `{ok: false, reason, current_version}`, which a client maps to re-read and retry -- never a degrade.",
+  "setup": {
+    "tracked": [
+      "docs/**"
+    ],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "path": "docs/plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "22222222-2222-4222-8222-222222222222",
+          "path": "docs/plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit-cas",
+        "body": {
+          "session_id": "22222222-2222-4222-8222-222222222222",
+          "path": "docs/plan.md",
+          "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "expected_version": 1
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/post-edit-cas",
+    "body": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "path": "docs/plan.md",
+      "content_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "expected_version": 1
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": false,
+      "reason": "version_mismatch",
+      "current_version": 2
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

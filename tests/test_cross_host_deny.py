@@ -150,10 +150,10 @@ def test_remote_volume_reattaches_to_remote_coordinator_after_fork(
     coordinator (connect-only, never spawn): the child re-mints identity, takes
     the _attach_remote path, and creates NO local server.pid under its own root.
 
-    The child's first post-fork read returns its re-seeded baseline (version 0),
-    so a bare CAS write would be DENIED — fork safety, not a silent overwrite.
-    Recovery is reacquire() (re-mint + mandatory fresh read); only then does the
-    child's write land through the shared coordinator (the parent sees it)."""
+    The child's first post-fork read_with_version is what re-attaches, so it
+    returns the coordinator's version rather than a version-0 fallback. That
+    version is a live CAS comparand: the child's write against it lands through
+    the shared coordinator (the parent sees it) with no reacquire() first."""
     monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
     coord_root = tmp_path / "coord"
     coord_root.mkdir()
@@ -168,6 +168,7 @@ def test_remote_volume_reattaches_to_remote_coordinator_after_fork(
         vol = CoherentVolume(root, on_error="strict", on_stale_write="allow", remote_endpoint=remote)
         (root / "shared.txt").write_text("v0", encoding="utf-8")
         _d, v_parent = vol.read_with_version("shared.txt")  # parent attaches
+        assert v_parent > 0  # so the child's version check cannot pass on a 0 fallback
         parent_id = vol.session_id
 
         read_fd, write_fd = os.pipe()
@@ -175,17 +176,14 @@ def test_remote_volume_reattaches_to_remote_coordinator_after_fork(
         if pid == 0:  # child: first op must re-attach to the remote coordinator
             os.close(read_fd)
             try:
-                # First op post-fork: read_with_version returns the re-seeded
-                # baseline (0) and does NOT itself re-attach (documented safe
-                # fallback — a CAS against version 0 loses cleanly, never silently).
+                # First op post-fork: read_with_version re-attaches to the remote
+                # coordinator (connect-only) and returns its version. The facts
+                # are captured before any other op, so they are the first read's.
                 _dc, v_first = vol.read_with_version("shared.txt")
-                # Recovery: reacquire() re-mints identity + does a mandatory fresh
-                # read, which re-attaches to the remote coordinator (connect-only).
-                vol.reacquire("shared.txt")
                 local_pid = (root / ".coherence" / "server.pid").exists()
                 facts = f"{vol.session_id}|{vol.is_attached}|{local_pid}|{vol._endpoint.port}|{v_first}"
-                _df, v_fresh = vol.read_with_version("shared.txt")
-                vol.write_cas_at("shared.txt", v_fresh, b"from-child")
+                # The first read's version is the CAS comparand; no reacquire().
+                vol.write_cas_at("shared.txt", v_first, b"from-child")
                 msg = f"{facts}|ok"
             except Exception as exc:  # noqa: BLE001 - report any failure to the parent
                 msg = f"ERR:{exc!r}"
@@ -200,14 +198,14 @@ def test_remote_volume_reattaches_to_remote_coordinator_after_fork(
         os.close(read_fd)
         os.waitpid(pid, 0)
         assert not raw.startswith("ERR:"), raw
-        child_id, attached, local_pid, child_port, first_v, recovered = raw.split("|")
+        child_id, attached, local_pid, child_port, first_v, wrote = raw.split("|")
         assert child_id != parent_id  # re-minted identity
-        assert attached == "True"  # re-attached
+        assert attached == "True"  # the first read re-attached
         assert local_pid == "False"  # connect-only: NEVER spawned a local coordinator
         assert int(child_port) == ep.port  # to the SAME remote coordinator
-        assert int(first_v) == 0  # re-seeded baseline (fork safety: bare CAS would deny)
-        assert recovered == "ok"  # reacquire() recovery path succeeded
-        # The recovered write landed through the shared coordinator.
+        assert int(first_v) == v_parent  # the coordinator's version, nothing wrote since
+        assert wrote == "ok"  # write_cas_at against the first read's version was granted
+        # The child's write landed through the shared coordinator.
         _d2, v_after = vol.read_with_version("shared.txt")
         assert v_after > v_parent
         assert (root / "shared.txt").read_bytes() == b"from-child"
@@ -388,11 +386,16 @@ def test_main_baseline_flag_runs_negative_control_then_with_ccs(
     output contains both phases. This pins the honest contract: broken-must-lose
     AND fixed-must-prevent in one invocation.
     """
-    # main() spawns a coordinator + clients in this process; the env nudge
-    # below is the same one main() applies for the local loopback path.
+    # main() spawns a coordinator + clients in this process, and for the local
+    # loopback path it sets CCS_REMOTE_COORDINATOR itself (setdefault). Make the
+    # flag absent while main() runs, so main() is what turns it on, and register
+    # it with monkeypatch, so it is gone again afterwards: otherwise every later
+    # test in this process runs with remote-coordinator mode switched on.
     monkeypatch.delenv("CCS_REMOTE_HOST", raising=False)
     monkeypatch.delenv("CCS_REMOTE_PORT", raising=False)
     monkeypatch.delenv("CCS_REMOTE_SECRET_FILE", raising=False)
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "0")
+    monkeypatch.delenv("CCS_REMOTE_COORDINATOR")
 
     # Import lazily so the test file does not depend on the example being on
     # the import path at collection time.

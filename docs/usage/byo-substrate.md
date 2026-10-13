@@ -171,7 +171,7 @@ for the full posture):
 | You see | It means | You do |
 |---|---|---|
 | `StaleView` | a peer committed since your read; your cached view is stale | `reacquire()` for fresh bytes, recompute, retry |
-| `CasVersionConflict` | your write lost the version race at the substrate | re-read at the current version, recompute, retry |
+| `CasVersionConflict` | the CAS was refused — read `.reason` for which of the four: `version_mismatch` (you lost the version race), `other_holder` (a peer holds the grant and the version has **not** moved), `stale_read_generation` (the claim your read was taken under was reclaimed), `caller_in_transient_state` (a peer invalidated you between read and CAS) | `version_mismatch` — re-read at the current version, recompute, retry. `other_holder` — back off and retry; a re-read returns the same bytes, so recomputing changes nothing. `stale_read_generation` — `reacquire()`, then re-read. `caller_in_transient_state` — recover with a fresh identity |
 | `CommitUnconfirmed` | the write may or may not have landed (a driver/coordinator blip) | **do not blind-retry** — re-read; the binding's reconciliation decides whether it already landed |
 | `ViewWedged` | the substrate moved out of band of the coordinator (e.g. a foreign edit, or a writer that died between its two commit legs) | `reacquire()` and re-decide |
 

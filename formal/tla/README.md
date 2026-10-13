@@ -82,6 +82,11 @@ formal/tla/
 # All CI-swept specs (recommended)
 make tla-check
 
+# One of the three bins CI runs as parallel jobs (together they are tla-check)
+make tla-check-1   # EffectGate
+make tla-check-2   # Retention, Snapshot, OCC
+make tla-check-3   # Fencing, ZombieRevoke, MESI_Standalone, CrashRecovery, WorkspaceVersion
+
 # Individual models
 java -XX:+UseParallelGC -cp formal/tla/lib/tla2tools.jar tlc2.TLC \
   -config formal/tla/MESI_Standalone.cfg formal/tla/MESI_Standalone.tla -workers auto
@@ -125,7 +130,7 @@ Requires Java 17+. CI uses Temurin via `actions/setup-java`.
 | — | `ReadGenBounded` | Fencing, EffectGate, Retention, Snapshot | A captured read-generation never exceeds the artifact's current ownership epoch |
 | — | `NoStaleApply` | Fencing, EffectGate, Retention, Snapshot | No commit ever applied a write whose captured read-generation was superseded by a reclamation — the reclaim-zombie write is prevented. Re-checked in Retention to prove retention preserves the fence |
 | — | `NoZombieRevoke` | ZombieRevoke | No invalidation ever revoked a write claim it was not authority over — a signal minted at one epoch and applied to a claim established later. The dual of `NoStaleApply`: that one says a superseded claim cannot WRITE, this one says a superseded signal cannot REVOKE. Neither subsumes the other (recipe 16 gives it teeth) |
-| — | `NoSilentRevoke` | Fencing, ZombieRevoke, EffectGate, Retention, Snapshot | A write claim is never revoked without the ownership epoch moving — by the sweep OR by a voluntary release, the two operations that end a claim at an unchanged version. `NoStaleApply` structurally cannot see this failure (it is defined *relative* to the epoch that fails to move), which is why it is stated separately (recipe 17 gives it teeth) |
+| — | `NoSilentRevoke` | Fencing, ZombieRevoke, EffectGate, Retention, Snapshot | A write claim is never revoked without the ownership epoch moving — by the sweep OR by a voluntary release, the two operations that end a claim at an unchanged version (a handoff's move of its giver is the release action under another trigger). `NoStaleApply` structurally cannot see this failure (it is defined *relative* to the epoch that fails to move), which is why it is stated separately (recipe 17 gives it teeth) |
 | — | `NoUnearnedCapture` | Fencing, ZombieRevoke, EffectGate, Retention, Snapshot (action property, cfg `PROPERTY`) | `[][∀ ag, art : readGeneration'[ag][art] ≠ readGeneration[ag][art] ⇒ ClaimEstablishedOrRefreshed(ag, art)]_fenceVars` — an agent's captured read-generation changes only in that agent's own claim-establishing step: its read from INVALID, its non-M∪E→M∪E acquire, or its own `ObserveGenAction`. Nothing a peer does — the fetch that downgrades it M∪E→S or re-lists it S→S, a heartbeat, a tick — may refresh it, which is what makes a `stale_read_generation` refusal sticky. A state invariant cannot see an unearned capture (the refreshed slot is extensionally identical to a legitimate `ObserveGenAction`'s result and `NoStaleApply` then stays green), so it is an action property, like `ReadAtVersionIsProtocolNoOp` (recipe 18 gives it teeth) |
 | — | `NoStaleAdmit` | EffectGate | The effect gate never ADMITS an escaping effect whose captured `(version, ownerGeneration)` pair had moved as of the re-validate read — the reclaim-zombie *effect* (generation moved, version unchanged) is held. Scoped to the re-validate point; the admit→fire residual window is deliberately unguarded and model-visible (recipe 15 gives it teeth) |
 | — | `PairMovedScoped` | EffectGate | Canonicalization sanity: the moved-since-capture flag is FALSE outside the decided window, so the abstraction adds no spurious state |
@@ -163,7 +168,7 @@ I7 (FlagOffByteIdentity) is a code-level property and is not modelable in TLA+.
 | `NoUnearnedCapture` | the sticky-refusal regressions in `tests/test_fetch_peer_leg_fence.py` (a peer's fetch — downgrade or SHARED→SHARED — never re-arms a refused reclaim-zombie on either registry; the requester's own re-read still captures) and the service-driven conformance-kit scenario a re-capturing backend fails |
 | `FencingSweepAction` | the `owner_generation` bump on reclaim triggers in `set_agent_state` |
 | `FencingCommitAction` | the generation guard in `commit_cas` + `set_artifact_and_content(fence_agent_id=…)` |
-| `FencingInvalidateAction` | `service.invalidate` — the NoZombieRevoke pin (`_revoke_is_superseded`) plus the `owner_generation` bump the shared `EPOCH_BUMP_TRIGGERS` predicate now covers |
+| `FencingInvalidateAction` | `service.invalidate` — the NoZombieRevoke pin (`_revoke_is_superseded`) plus the `owner_generation` bump the shared `EPOCH_BUMP_TRIGGERS` predicate now covers. Also the transfer verb's move of its giver to INVALID under the `handoff` trigger (`HANDOFF_TRIGGER`, in `EPOCH_BUMP_TRIGGERS` and not in `RECLAIM_TRIGGERS`): the action keys its bump on the M∪E→I transition, never on a trigger, so a handoff from EXCLUSIVE or MODIFIED is this action's bumping case and a handoff from SHARED is its S→I case, which leaves the generation alone. No new action models the handoff; the giver's fence while its record is live is a service-level refusal outside this model |
 | `observedCurrent` | `agent_states.last_observed_version` (SB-10 R6/R7), abstracted to one bit per pair — see the spec header for why |
 | `NoStaleApply` | dual-registry parity + regression suite (`tests/test_fencing.py`) |
 | `NoZombieRevoke` / `NoSilentRevoke` | `tests/test_zombie_revoke.py` (both defects, plus the guards that keep the pin from over-reaching) |
@@ -242,8 +247,16 @@ distinct states (5,954,640 → 5,723,640), ZombieRevoke ~6% (3,902,098 → 3,648
 EffectGate ~4% (10.5M → 10,036,000) and Snapshot ~21% (1,735,500 → 1,363,115). The
 action property adds a per-transition check and no state dimension. The full
 `make tla-check` sweep measured **~11min09s** (669s) on that run; the 5-minute target
-above is historical and the workflow sets no job timeout, so this table is the only
-operational meaning "the CI budget" has.
+above is historical.
+
+Since 2026-10, CI does not run the sweep in one job. It runs the three Makefile bins
+(`tla-check-1`..`3`, same specs and configs) as parallel jobs, each capped at 20 minutes;
+each took about 4.5 minutes on a slow GitHub runner when the bins were drawn. A pull
+request that changes nothing under `formal/tla/`, the `Makefile`, `.github/` or the two
+scripts that plan and judge the run (`tools/ci_plan.py`, `tools/ci_gate_verdict.py`) skips
+them, and every other run runs all three. When a spec's time moves, rebalance the bins
+so the slowest stays near the others; `make tla-check` stays the local, sequential way
+to run everything.
 
 Retention's distinct-state count **equals** Fencing's by design: the retained history is a
 deterministic function of the version window (content abstracted as the version number)

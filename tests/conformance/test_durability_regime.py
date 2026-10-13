@@ -40,11 +40,15 @@ from ccs.testing.substrate_conformance import (
     declare_deferred_durability_exemptions,
 )
 
-pytestmark = pytest.mark.skipif(
-    not hasattr(signal, "SIGKILL"),
-    reason=f"kill primitive unavailable on {sys.platform}; the case records a "
-    "declared R-8 exemption on such platforms instead of running",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not hasattr(signal, "SIGKILL"),
+        reason=f"kill primitive unavailable on {sys.platform}; the case records a "
+        "declared R-8 exemption on such platforms instead of running",
+    ),
+    # Kills and restarts real processes: run with -n 0 (tests/conftest.py).
+    pytest.mark.serial,
+]
 
 
 # ---------------------------------------------------------------------------

@@ -146,11 +146,13 @@ def _revert_to_v4_shape(db_path: Path) -> None:
 
 
 def _revert_to_v6_shape(db_path: Path) -> None:
-    """Mutate a current (v7) db on disk back to the v6 shape: the
-    ``idx_agent_states_agent`` index ABSENT, stamped ``user_version=6`` (what
-    an SB-10-era build produced before the index migration)."""
+    """Mutate a current (v8) db on disk back to the v6 shape: the
+    ``idx_agent_states_agent`` index and the v8 ``caller_principals`` table
+    ABSENT, stamped ``user_version=6`` (what an SB-10-era build produced
+    before the index migration)."""
     conn = sqlite3.connect(str(db_path))
     try:
+        conn.execute("DROP TABLE IF EXISTS caller_principals")
         conn.execute("DROP INDEX IF EXISTS idx_agent_states_agent")
         conn.execute("PRAGMA user_version = 6")
         conn.commit()
@@ -204,7 +206,7 @@ def test_fresh_v6_init_has_column(db_path: Path) -> None:
     the ``agent_states`` DDL, ``user_version=6`` — no migration shim ever runs."""
     with SqliteArtifactRegistry(db_path) as reg:
         assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
-    assert SCHEMA_USER_VERSION == 7
+    assert SCHEMA_USER_VERSION == 10
     cols = {row[1] for row in _agent_states_shape(db_path)}
     assert "last_observed_version" in cols
 
@@ -436,6 +438,43 @@ def test_parity_refetch_after_version_move_records_new_version(registry) -> None
     assert reg.last_observed_version_for(art.id, a) == 2
 
 
+def test_parity_unobserved_grant_preserves_the_prior_value(registry) -> None:
+    """``observed=False`` grants the state but certifies no read: the reader
+    that last saw v1 stays at v1 while holding SHARED on v2. Both directions
+    are pinned -- the default on the very same transition still records v2 --
+    because asserting only the preserve side cannot tell a working flag from
+    a registry that stopped recording altogether."""
+    reg = registry
+    art = _register(reg)
+    a, writer = uuid4(), uuid4()
+    reg.set_agent_state(art.id, a, MESIState.SHARED, trigger="fetch", tick=1)
+    res = reg.commit_cas(art.id, writer, expected_version=1, content_hash="h2")
+    assert not isinstance(res, ConflictDetail)  # WIN -> version 2, a INVALID
+    assert reg.get_agent_state(art.id, a) == MESIState.INVALID
+
+    reg.set_agent_state(
+        art.id, a, MESIState.SHARED, trigger="post_stale_bash", tick=2, observed=False,
+    )
+    assert reg.get_agent_state(art.id, a) == MESIState.SHARED
+    assert reg.last_observed_version_for(art.id, a) == 1
+
+    reg.set_agent_state(art.id, a, MESIState.SHARED, trigger="post_stale_bash", tick=3)
+    assert reg.last_observed_version_for(art.id, a) == 2
+
+
+def test_parity_unobserved_grant_on_a_fresh_pair_records_nothing(registry) -> None:
+    """A never-observed pair granted without a read stays never-observed --
+    None, never a 0-sentinel and never the current version."""
+    reg = registry
+    art = _register(reg)
+    a = uuid4()
+    reg.set_agent_state(
+        art.id, a, MESIState.SHARED, trigger="first_bash_read", tick=1, observed=False,
+    )
+    assert reg.get_agent_state(art.id, a) == MESIState.SHARED
+    assert reg.last_observed_version_for(art.id, a) is None
+
+
 def test_parity_commit_cas_advances_writer_same_transaction(registry) -> None:
     """KTD4 first layer: the WIN that bumps the version also advances the
     committing agent's comparand to the NEW version — atomically (sqlite: the
@@ -516,16 +555,18 @@ def test_parity_service_commit_advances_writer(registry) -> None:
 
 
 def test_fresh_v7_init_has_agent_states_agent_index(db_path: Path) -> None:
-    """A fresh db is created at v7 directly: the ``idx_agent_states_agent``
-    index inline in the fresh DDL, ``user_version=7`` — no migration shim."""
+    """A fresh db is created at the head directly: the
+    ``idx_agent_states_agent`` index inline in the fresh DDL, stamped
+    ``SCHEMA_USER_VERSION`` — no migration shim."""
     with SqliteArtifactRegistry(db_path) as reg:
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
     assert "idx_agent_states_agent" in _indexes(db_path)
 
 
 def test_v6_db_upgrades_to_v7_and_gains_the_index(db_path: Path) -> None:
     """A v6 db (SB-10-era: column present, index absent) migrates on open:
-    index created, stamped v7, pre-migration data intact."""
+    index created, the chain walks on to the head stamp, pre-migration data
+    intact."""
     agent = uuid4()
     with SqliteArtifactRegistry(db_path, retain_versions=True) as reg:
         art = _register(reg)
@@ -535,7 +576,7 @@ def test_v6_db_upgrades_to_v7_and_gains_the_index(db_path: Path) -> None:
     assert "idx_agent_states_agent" not in _indexes(db_path)
 
     with SqliteArtifactRegistry(db_path, retain_versions=True) as reg:
-        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert reg._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_USER_VERSION
         assert reg.get_agent_state(art.id, agent) is MESIState.SHARED
         assert reg.last_observed_version_for(art.id, agent) == 1
     assert "idx_agent_states_agent" in _indexes(db_path)

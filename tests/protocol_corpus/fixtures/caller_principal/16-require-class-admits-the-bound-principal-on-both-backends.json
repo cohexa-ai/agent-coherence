@@ -1,0 +1,39 @@
+{
+  "name": "caller-principal-require-class-admits-the-bound-principal",
+  "description": "R14 for a require-class route both runtimes implement, in the PRINCIPAL-PRESENT state: session A claims (Python only -- the preflight is scoped, since Node answers 404) and its stop presents the principal. Python checks it and admits; Node gets no header (omitted where the claim was not issued, as a conforming client does after a 404). Both answer the same. The absent-and-bound state is fixture 03; absent-and-unbound is warn_mode/05.",
+  "setup": {
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "backends": [
+          "python"
+        ],
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/session-stop",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a"
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_a}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "released_artifacts": []
+    }
+  }
+}

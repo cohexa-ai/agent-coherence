@@ -1,0 +1,50 @@
+{
+  "name": "caller-principal-python-session-stop-refuses-a-foreign-principal",
+  "description": "A principal is bound to ONE session: presenting session B's principal on a request naming session A is refused with the FOREIGN error, distinguishable from the absent one (fixture 03), so which phase a caller is in is diagnosable from the refusal. Enforcement is accident-resistance under the same-OS-user cooperative trust model, not caller separation: on the hook surface the principal is stored under .coherence/.",
+  "setup": {
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/session-stop",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a"
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_b}"
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": "the Coherence-Caller-Principal header is not the caller principal bound to the session_id this request names (caller_principal_foreign)",
+      "reason": "caller_principal_foreign"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

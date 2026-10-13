@@ -1,0 +1,52 @@
+{
+  "name": "caller-principal-node-post-edit-admits-an-absent-principal",
+  "description": "KTD12 -- the Node side of fixture 07, with the identical setup and request: pre-edit, a claim Node answers 404, then the commit without a principal. Node admits the commit Python refuses. Unlike fixture 15 (no claim, so unbound on both runtimes), the claim is what separates the two answers.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "path": "CLAUDE.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "mint_nonce": "corpus-mint-nonce-a"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/post-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+      "path": "CLAUDE.md",
+      "success": true,
+      "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true
+    }
+  },
+  "optional_keys": [
+    "version"
+  ],
+  "backends": [
+    "node"
+  ]
+}

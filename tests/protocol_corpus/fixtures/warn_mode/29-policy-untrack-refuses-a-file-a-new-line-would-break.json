@@ -1,0 +1,28 @@
+{
+  "name": "policy-untrack-refuses-a-file-a-new-line-would-break",
+  "description": "#284: ignored.yaml is a valid flow list, and a block line appended after it would stop the file parsing, which loads as no entries and drops the entry already there. Both backends answer 400 with the same text and write nothing.",
+  "setup": {
+    "files": {
+      ".coherence/ignored.yaml": "[docs/old.md]\n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/policy/untrack",
+    "body": {
+      "paths": [
+        "docs/plan.md"
+      ]
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": ".coherence/ignored.yaml cannot take a new line without breaking what it holds (such as a [ ... ] list, an indented list, a \"...\" end marker or a lone ~ or null); nothing was written. Rewrite it with one entry per line, each a double-quoted string such as - \"*.md\", then retry."
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

@@ -8,18 +8,22 @@ write-set lands or none does, and a torn intermediate is never on disk.
 """
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import pytest
 
+import ccs.adapters.coherent_volume as coherent_volume_module
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     stop_coordinator,
 )
 from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.core.exceptions import (
+    COMMIT_UNCONFIRMED_REASON,
     CasVersionConflict,
     CoherenceError,
+    CommitUnconfirmed,
     PublishMaterializationError,
     StaleView,
     ViewWedged,
@@ -203,6 +207,32 @@ def test_publish_recovers_after_hold(tmp_path: Path, fast_cfg: LifecycleConfig) 
         stop_coordinator(tmp_path)
 
 
+def test_multi_publish_after_writing_a_member_on_the_same_volume_publishes(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A successful write() leaves the volume holding that member's MODIFIED grant,
+    and the publish starts as a fresh identity, to which that grant is foreign: the
+    batch was HELD as a peer conflict at the current versions with no peer
+    anywhere. The publish releases the grant its own write() left behind first."""
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.write("data/a.txt", b"a-v2")
+        _a_bytes, a_ver = vol.read_with_version("data/a.txt")
+        _b_bytes, b_ver = vol.read_with_version("data/b.txt")
+
+        versions = vol.atomic_publish(
+            [("data/a.txt", a_ver, b"a-v3"), ("data/b.txt", b_ver, b"b-v2")]
+        )
+
+        assert versions == {"data/a.txt": a_ver + 1, "data/b.txt": b_ver + 1}
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-v3"
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-v2"
+    finally:
+        stop_coordinator(tmp_path)
+
+
 # ----------------------------------------------------------------------
 # Input validation — fail loud before any coordinator I/O
 # ----------------------------------------------------------------------
@@ -310,12 +340,25 @@ def test_staging_failure_leaves_disk_uniformly_old(
             )
         assert exc.value.landed == ()
         assert set(exc.value.not_landed) == {"data/a.txt", "data/b.txt"}
+        # The message names the recovery the rest of this test performs.
+        assert "with write()" in str(exc.value)
         # NEITHER file replaced — both hold their old bytes.
         assert (tmp_path / "data/a.txt").read_bytes() == b"a-v1"
         assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"
         vol_a._stage_tmp = real_stage
-        _bytes, version = vol_a.read_with_version("data/b.txt")
-        assert isinstance(version, int)
+        # The coordinator records b-v2 at the new version while disk holds b-v1,
+        # so a versioned read cannot pair them — and reacquire() cannot clear it,
+        # because disk never catches up on its own.
+        with pytest.raises(StaleView):
+            vol_a.read_with_version("data/b.txt")
+        assert vol_a.reacquire("data/b.txt") == b"b-v1"
+        with pytest.raises(StaleView):
+            vol_a.read_with_version("data/b.txt")
+        # The documented recovery: re-materialize the member with write().
+        vol_a.write("data/b.txt", b"b-v2")
+        data, version = vol_a.read_with_version("data/b.txt")
+        assert data == b"b-v2"
+        assert version == 3
     finally:
         stop_coordinator(tmp_path)
 
@@ -370,6 +413,127 @@ def test_corruption_reason_is_non_retryable_not_staleview(
         stop_coordinator(tmp_path)
 
 
+# FROZEN duplicates of what a multi-member publish raises when its commit is
+# not confirmed: the coordinator's own unconfirmed answer, and an answer with
+# nothing this client can classify — never built from the constants under test.
+_PUBLISH_UNCONFIRMED = (
+    "atomic_publish commit was not confirmed (the coordinator answered that "
+    "its commit is unconfirmed); whether the batch landed at the coordinator "
+    "is unknown, and no file was written. Re-read every member, and retry only "
+    "if the publish is absent."
+)
+_PUBLISH_UNCLASSIFIABLE = (
+    "atomic_publish commit was answered with no outcome this client can "
+    "classify (not a win, and no reason); whether the batch landed at the "
+    "coordinator is unknown, and no file was written. Re-read every member, "
+    "and retry only if the publish is absent."
+)
+
+
+def _answer_commit_all_with(
+    monkeypatch: pytest.MonkeyPatch, body: dict, sent: list[str]
+) -> None:
+    """Answer ``/session/commit_all`` with ``body`` — what a proxy or a gateway
+    in front of the coordinator could send — and every other route for real."""
+    real_post = coherent_volume_module._coordinator_post
+
+    def answer(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        if path == "/session/commit_all":
+            sent.append(path)
+            return dict(body)
+        return real_post(endpoint, path, payload, **kwargs)
+
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_post", answer)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"ok": False, "reason": ["commit_all_corruption"]},
+        {"ok": False, "reason": {"reason": "conflict"}},
+        {"ok": False, "reason": 7},
+        {"ok": False, "reason": 1.5},
+        {"ok": False, "reason": True},
+        {"ok": False, "reason": 0},
+        {"ok": False, "reason": None},
+        {"ok": False},
+    ],
+    ids=["list", "object", "number", "float", "bool", "zero", "null", "absent"],
+)
+def test_a_commit_all_answer_whose_reason_is_not_a_string_is_unconfirmed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, body: dict
+) -> None:
+    """A non-win answer to the batch commit whose reason is not a string —
+    the coordinator's own non-win answers always carry one — says nothing
+    this client can classify: not the HELD conflict (which says nothing was
+    committed), not a rejection it can name. Whether the batch landed at the
+    coordinator is unknown, so it is ``CommitUnconfirmed`` (re-read; retry
+    only if absent), as on the single-commit paths; nothing is written to
+    disk, and the commit is sent once. Before, a number, float or bool
+    reason escaped as a ``TypeError`` from the substring test, and a falsy
+    or container one read as the HELD conflict."""
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        sent: list[str] = []
+        _answer_commit_all_with(monkeypatch, body, sent)
+
+        with pytest.raises(CommitUnconfirmed) as raised:
+            vol.atomic_publish([("data/a.txt", 1, b"a-v2"), ("data/b.txt", 1, b"b-v2")])
+
+        assert sent == ["/session/commit_all"], "sent once, never retried"
+        assert str(raised.value) == _PUBLISH_UNCLASSIFIABLE
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-v1"
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"ok": False, "degraded": True, "reason": COMMIT_UNCONFIRMED_REASON},
+        {"ok": False, "reason": COMMIT_UNCONFIRMED_REASON},
+        {"ok": True, "degraded": True, "versions": {"data/a.txt": 2, "data/b.txt": 2}},
+    ],
+    ids=["degraded-envelope", "unconfirmed-reason", "degraded-win"],
+)
+def test_an_unconfirmed_commit_all_answer_is_commit_unconfirmed_in_both_modes(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    body: dict, on_error: str,
+) -> None:
+    """The coordinator's own unconfirmed answer to the batch commit — its
+    watchdog envelope, or the bare ``commit_unconfirmed`` reason — is
+    ``CommitUnconfirmed`` in BOTH ``on_error`` modes, as on the single-commit
+    paths: an unconfirmed commit is never softened by degrade mode. Before,
+    strict raised a plain ``CoherenceError`` and degrade reported the HELD
+    conflict — "nothing was published" — for a batch that may have landed.
+    A degraded answer that claims a win is not a confirmation either: its
+    bytes, unconfirmed, never touch disk (before, degrade mode wrote them)."""
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_error=on_error, config=fast_cfg  # type: ignore[arg-type]
+    )
+    try:
+        sent: list[str] = []
+        _answer_commit_all_with(monkeypatch, body, sent)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pytest.raises(CommitUnconfirmed) as raised:
+                vol.atomic_publish([("data/a.txt", 1, b"a-v2"), ("data/b.txt", 1, b"b-v2")])
+
+        assert str(raised.value) == _PUBLISH_UNCONFIRMED
+        assert sent == ["/session/commit_all"], "sent once, never retried"
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-v1"
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"
+    finally:
+        stop_coordinator(tmp_path)
+
+
 # ----------------------------------------------------------------------
 # Foreign-edit boundary (SB-18 × SB-23) — pinned, deliberately asymmetric
 # ----------------------------------------------------------------------
@@ -378,7 +542,7 @@ def test_corruption_reason_is_non_retryable_not_staleview(
 # writes advance versions. The multi-member session path never re-reads disk
 # between the caller's read and materialization, so an out-of-band edit in that
 # window cannot version-mismatch and is NOT content-checked — the SB-23 predicate
-# (_check_foreign_edit) does not run there, even though _read_with_version seeds
+# (_check_foreign_edit) does not run there, even though the caller's read seeds
 # its baseline. This is the DOCUMENTED boundary (the API is for volume-mediated
 # writer sets only — see the docstring's foreign-edit paragraph and the guide's
 # scope note), not an accident. These tests pin both publish surfaces so any

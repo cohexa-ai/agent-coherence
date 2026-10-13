@@ -1,0 +1,33 @@
+{
+  "name": "caller-principal-python-session-stop-refuses-an-absent-principal",
+  "description": "KTD12 -- the require-class half on Python. session-stop releases every grant the named session holds. The preflight CLAIMS session A, so A is bound; a request naming A without A's principal is then refused: HTTP 400 naming the header, with the typed reason a client classifies by equality, never a hold (KTD9). (A session nobody claimed -- an older client's -- is admitted instead: fixture 15 and warn_mode/05.) Twin of the Node row that sends the SAME claim and the SAME request and admits it (04). The claim captures nothing: 04 runs it against Node, which answers 404 and has no principal to capture. Enforcement is accident-resistance under the same-OS-user cooperative trust model, not caller separation: on the hook surface the principal is stored under .coherence/.",
+  "setup": {
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "mint_nonce": "corpus-mint-nonce-a"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/session-stop",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a"
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": "missing Coherence-Caller-Principal header: this route requires the caller principal that POST /principal/claim bound to the session_id it names (caller_principal_absent)",
+      "reason": "caller_principal_absent"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

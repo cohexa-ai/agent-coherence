@@ -4,12 +4,15 @@
 """``agent-coherence-status`` — print tracked artifacts × sessions × MESI states.
 
 Reads the coordinator's GET /status endpoint and renders a terminal-friendly
-table. Backs the ``/agent-coherence status`` slash command.
+table. The Claude Code plugin's ``/agent-coherence:status`` falls back to it
+when the plugin's own status program cannot run (no ``node``).
 
 Exit codes:
 - 0: status fetched and printed (including "no coordinator running")
 - 1: not in a git repo
-- 2: coordinator running but returned an error
+- 2: coordinator running but answered an HTTP error, a redirect (refused), a
+  body that is not a /status answer or a degraded one (its registry was busy,
+  #238), or TLS failed
 - 3: --self-test exercised but the smoke scenario failed
 
 KTD-J (Unit 8): ``--self-test`` runs an end-to-end smoke against a real
@@ -24,19 +27,39 @@ they reach a real agent session.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
+import secrets
 import shutil
+import time
 import urllib.error
+import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.cli._coherence_client import (
+    NODE_BACKEND,
+    NOT_A_JSON_OBJECT_LINE,
+    CoordinatorEndpoint,
+    CoordinatorMalformedAnswer,
     CoordinatorUnavailable,
+    caller_principal_headers,
+    claim_caller_principal,
+    coordinator_backend,
     err,
+    escape_nonprintable,
     get,
+    http_error_line,
     http_status_from_error,
+    post,
+    principal_refusal_reason,
+    redirect_refused_line,
+    reportable_reason,
     resolve_endpoint,
 )
+from ccs.core.exceptions import RedirectRefused, TlsConfigError, TlsVerificationFailed
+from ccs.core.states import MESIState
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,18 +79,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit the raw JSON response instead of the rendered table.",
     )
     # KTD-J (Unit 8): --detail mirrors the /status three-tier disclosure
-    # model. Default 'full' so the local-operator CLI keeps surfacing pid
-    # + absolute root + all counters; 'metrics' for dashboard scrapers
-    # that want only the counter block; 'minimal' for a redacted view
-    # safe to paste in bug reports.
+    # model. With no --detail the CLI asks for the coordinator's default
+    # tier exactly as the plugin's Node CLI does: this command often runs
+    # inside an agent's shell tool, where its output lands in the transcript,
+    # and the plugin's shim runs either CLI under the same name. 'full' is
+    # the operator view (session names, absolute root, policy patterns);
+    # 'metrics' is the counter block only, for scrapers.
     parser.add_argument(
         "--detail",
         choices=["minimal", "full", "metrics"],
-        default="full",
+        default=None,
         help=(
-            "Disclosure tier (default: full). 'minimal' redacts coordinator_pid "
-            "and absolute paths; 'metrics' returns counters only; 'full' is the "
-            "operator view used by /agent-coherence status."
+            "Disclosure tier (default: the coordinator's default tier, which "
+            "is minimal). 'minimal' redacts absolute paths, session names "
+            "and user-added tracked patterns, and still reports per-session "
+            "artifact state (the process id is reported at every tier); "
+            "'metrics' returns counters only; 'full' is the operator view, "
+            "requested with the Coherence-Local-Operator opt-in header."
         ),
     )
     # KTD-J (Unit 8): post-install smoke. Drives a two-session stale-read
@@ -89,14 +117,23 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Show user-added tracked paths that have not yet been observed "
             "(i.e., no pre-read hook has fired for them yet). These paths "
-            "are in the policy but absent from the artifact registry."
+            "are in the policy but absent from the artifact registry. "
+            "Requires --detail full: only the operator view carries them."
         ),
     )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    # Below the operator tier the payload carries no pattern list, so every
+    # user-added path would read as observed and the section would say "none".
+    if args.show_policy and args.detail != "full":
+        parser.error(
+            "--show-policy needs --detail full (only the operator view "
+            "carries the user-added patterns)"
+        )
 
     root = args.root if args.root is not None else find_coordinator_root()
     if root is None:
@@ -106,27 +143,102 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.self_test:
         return _run_self_test(Path(root), json_mode=args.json)
 
+    payload = _fetch_status(Path(root), args.detail)
+    if isinstance(payload, int):
+        return payload
+    # The metrics tier carries no lists and never reads the registry.
+    if args.detail != "metrics" and _lists_unavailable(payload):
+        return _print_lists_unavailable(payload, json_mode=args.json)
+    return _print_status(payload, args)
+
+
+def _fetch_status(root: Path, detail: str | None) -> dict[str, Any] | int:
+    """The ``/status`` body at ``detail`` (the coordinator's default tier when
+    ``None``), or the exit code of a failure
+    already reported in one line: 0 when no coordinator runs; 2 for an HTTP
+    error, a refused redirect, a TLS failure or a body that is not a JSON
+    object (#245)."""
     try:
-        endpoint = resolve_endpoint(Path(root))
-        # R12 (Unit 6) + KTD-J (Unit 8): the detail tier is selected via
-        # --detail. Only 'full' needs the Coherence-Local-Operator opt-in
-        # header; the lower tiers degrade by design if the header is
-        # missing, but we always set it from this CLI since it's a
-        # legitimate local operator.
-        payload = get(
-            endpoint,
-            f"/status?detail={args.detail}",
-            extra_headers={"Coherence-Local-Operator": "true"},
-        )
+        endpoint = resolve_endpoint(root)
+        # R12 (Unit 6) + KTD-J (Unit 8): only 'full' needs the
+        # Coherence-Local-Operator opt-in header, and only an explicit
+        # --detail full sends it. No --detail sends the bare GET /status
+        # the Node CLI sends.
+        path = "/status" if detail is None else f"/status?detail={detail}"
+        operator = {"Coherence-Local-Operator": "true"} if detail == "full" else None
+        payload = get(endpoint, path, extra_headers=operator)
+    except CoordinatorMalformedAnswer:
+        # Ahead of its base class: a coordinator answered, so this is not
+        # the "no coordinator running" exit 0.
+        err(f"agent-coherence-status: {NOT_A_JSON_OBJECT_LINE}")
+        return 2
     except CoordinatorUnavailable as exc:
-        err(f"agent-coherence-status: {exc}")
+        err(f"agent-coherence-status: {escape_nonprintable(exc)}")
         return 0  # graceful — no coordinator is a normal state
     except urllib.error.HTTPError as exc:
-        body = http_status_from_error(exc)
-        msg = (body or {}).get("error", str(exc))
-        err(f"agent-coherence-status: HTTP {exc.code}: {msg}")
+        err(f"agent-coherence-status: {http_error_line(exc.code, http_status_from_error(exc))}")
         return 2
+    except RedirectRefused as exc:
+        err(f"agent-coherence-status: {redirect_refused_line(exc)}")
+        return 2
+    except (TlsVerificationFailed, TlsConfigError) as exc:
+        err(f"agent-coherence-status: {escape_nonprintable(exc)}")
+        return 2
+    if not isinstance(payload, dict):
+        err(f"agent-coherence-status: {NOT_A_JSON_OBJECT_LINE}")
+        return 2
+    return payload
 
+
+_SHAPE_LINE = "agent-coherence-status: unexpected /status shape"
+
+_DEGRADED_LINE = (
+    "agent-coherence-status: the coordinator's registry is busy (lock contention), "
+    "so tracked artifacts and sessions are unavailable; try again shortly"
+)
+
+
+def _lists_unavailable(payload: dict[str, Any]) -> bool:
+    """True when ``tracked_artifacts`` or ``sessions`` is not a list. A degraded
+    answer (#238) -- the coordinator could not read its registry in time --
+    carries both as null; either way the answer cannot tell what is tracked,
+    which is never "nothing tracked"."""
+    return not all(isinstance(payload.get(key), list) for key in ("tracked_artifacts", "sessions"))
+
+
+def _print_lists_unavailable(payload: dict[str, Any], *, json_mode: bool) -> int:
+    """Exit 2 on an answer without its lists (#238). ``--json`` prints the body
+    unchanged, so with ``--show-policy`` it carries no
+    ``policy_pending_first_read``, which needs the artifact list. The table
+    prints nothing on stdout and one stderr line: registry contention when the
+    answer is marked ``degraded``, else the shape line."""
+    if json_mode:
+        import json as _json
+        print(_json.dumps(payload, indent=2), flush=True)
+    elif payload.get("degraded") is True:
+        err(_DEGRADED_LINE)
+    else:
+        err(_SHAPE_LINE)
+    return 2
+
+
+def _print_status(payload: dict[str, Any], args: argparse.Namespace) -> int:
+    """Print ``payload`` as ``--json``, the metrics block or the table: 0, or
+    2 when a field has the wrong type or a number out of range (#245).
+    Rendered into a buffer first, so a body that fails part-way prints one
+    line, not half a table."""
+    rendered = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(rendered):
+            _render_payload(payload, args)
+    except (TypeError, ValueError, AttributeError, KeyError, OverflowError):
+        err(_SHAPE_LINE)
+        return 2
+    print(rendered.getvalue(), end="", flush=True)
+    return 0
+
+
+def _render_payload(payload: dict[str, Any], args: argparse.Namespace) -> None:
     if args.json:
         import json as _json
         if args.show_policy:
@@ -135,22 +247,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 p for p in payload.get("policy_summary", {}).get("user_added_patterns", [])
                 if p not in observed
             ]
-        print(_json.dumps(payload, indent=2), flush=True)
-        return 0
-
-    if args.detail == "metrics":
+        print(_json.dumps(payload, indent=2))
+    elif args.detail == "metrics":
         _render_metrics(payload)
     else:
         _render_table(payload, show_policy=args.show_policy)
-    return 0
 
 
 def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     """KTD-J (Unit 8): end-to-end smoke against a live coordinator.
 
-    Two synthetic sessions A and B drive the stale-read warning path:
+    Two synthetic sessions A and B, fresh on every run, drive the stale-read
+    warning path:
 
-    1. A pre-reads ``plan.md`` (tracked by default policy) — fresh, seeds v1.
+    1. A pre-reads ``plan.md`` (tracked by default policy) — fresh. In a new
+       workspace this read seeds v1; on a later run A is a first observer of
+       the artifact an earlier run registered, which is answered stale and
+       grants A a view, so A reads once more and that read must be fresh.
     2. B pre-edits ``plan.md`` — acquires EXCLUSIVE.
     3. B post-edits — commits v2, releases EXCLUSIVE.
     4. A pre-reads ``plan.md`` again — stale warning fires.
@@ -163,47 +276,80 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     ``agent-coherence-status --self-test``") gives the operator an
     actionable error rather than a stack trace.
     """
-    import uuid as _uuid
-
-    from ccs.cli._coherence_client import post as _post
-
     try:
         endpoint = resolve_endpoint(root)
     except CoordinatorUnavailable as exc:
         err(
             f"agent-coherence-status --self-test: coordinator unreachable "
-            f"({exc}). Spawn one first by running any hook (or "
+            f"({escape_nonprintable(exc)}). Spawn one first by running any hook (or "
             f"``agent-coherence-coordinator``)."
         )
         return 3
 
-    # Deterministic-but-distinct UUIDs so re-runs against the same
-    # workspace produce predictable agent-name surfaces.
-    ns = _uuid.UUID("11111111-2222-4333-8444-555555555555")
-    sid_a = str(_uuid.uuid5(ns, "self-test-A"))
-    sid_b = str(_uuid.uuid5(ns, "self-test-B"))
+    # Two FRESH synthetic sessions per run. One process drives both from start
+    # to finish, so each claims its caller principal once, with a nonce
+    # generated here, and holds both in memory for the run (a long-lived
+    # caller, plan KTD5): nothing is stored under .coherence/, so a run never
+    # depends on what an earlier run left there — deleting the
+    # caller-principal-* files or resetting state.db cannot break a later run
+    # — and neither value is ever printed. pre-edit and post-edit require the
+    # principal once a session is bound.
+    sid_a, sid_b = str(uuid.uuid4()), str(uuid.uuid4())
     path = "plan.md"  # part of DEFAULT_TRACKED_PATTERNS
+    principals: dict[str, str | None] = {}
+    for sid in (sid_a, sid_b):
+        claimed, principals[sid] = _claim_self_test_principal(endpoint, root, sid)
+        if not claimed:
+            return 3
 
+    # What a failure reports is built from the step, the HTTP status, the
+    # answer's known tokens and numbers (_answer_summary) — never the answer
+    # itself: a coordinator, or anything in front of it, that echoed the
+    # principal header into a field would otherwise print it here.
     def _step(name: str, body: dict[str, Any]) -> dict[str, Any] | None:
+        headers = caller_principal_headers(principals[body["session_id"]])
         try:
-            return _post(endpoint, name, body)
+            answer = post(endpoint, name, body, extra_headers=headers)
         except urllib.error.HTTPError as exc:
-            err(f"--self-test: {name} returned HTTP {exc.code}")
+            reason = principal_refusal_reason(exc)
+            if reason is not None:
+                err(f"--self-test: {name} refused the caller principal ({reason})")
+            else:
+                err(f"--self-test: {name} returned HTTP {exc.code}")
             return None
+        except CoordinatorUnavailable as exc:
+            err(f"--self-test: {name} failed: {escape_nonprintable(exc)}")
+            return None
+        except RedirectRefused as exc:
+            # Refused, never followed; reported by its status alone, since
+            # the Location is the coordinator's text.
+            err(f"--self-test: {name} was redirected (HTTP {exc.status}); not followed")
+            return None
+        if not isinstance(answer, dict):
+            err(f"--self-test: {name} answered with {_answer_summary(answer)}")
+            return None
+        return answer
 
-    # Step 1 — A's first read seeds the artifact.
+    # Step 1 — A's first read seeds the artifact, or (a later run) observes
+    # the one an earlier run seeded; either way A then holds a current view.
     r1 = _step("/hooks/pre-read", {
         "session_id": sid_a, "path": path,
         "content_hash": "a" * 64,
     })
-    if r1 is None or r1.get("status") != "fresh":
-        err(f"--self-test: expected fresh on first pre-read, got {r1!r}")
+    if r1 is not None and r1.get("status") != "fresh":
+        r1 = _step("/hooks/pre-read", {"session_id": sid_a, "path": path})
+    if r1 is None:
+        return 3
+    if r1.get("status") != "fresh":
+        err(f"--self-test: expected fresh on first pre-read, got {_answer_summary(r1)}")
         return 3
 
     # Step 2 — B pre-edits.
     r2 = _step("/hooks/pre-edit", {"session_id": sid_b, "path": path})
-    if r2 is None or not r2.get("ok", True):
-        err(f"--self-test: pre-edit failed: {r2!r}")
+    if r2 is None:
+        return 3
+    if not r2.get("ok", True):
+        err(f"--self-test: pre-edit failed: {_answer_summary(r2)}")
         return 3
 
     # Step 3 — B commits.
@@ -211,8 +357,10 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
         "session_id": sid_b, "path": path,
         "content_hash": "b" * 64, "success": True,
     })
-    if r3 is None or not r3.get("ok"):
-        err(f"--self-test: post-edit failed: {r3!r}")
+    if r3 is None:
+        return 3
+    if not r3.get("ok"):
+        err(f"--self-test: post-edit failed: {_answer_summary(r3)}")
         return 3
 
     # Step 4 — A re-reads → expect stale.
@@ -222,17 +370,18 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     if r4.get("status") != "stale":
         err(
             f"--self-test: expected stale warning on A's re-read after B's "
-            f"commit, got {r4.get('status')!r} (full response: {r4!r}). "
+            f"commit, got {_answer_summary(r4)}. "
             f"This usually means the hooks aren't wired or the coordinator "
             f"is running a stale build."
         )
         return 3
-    out = r4.get("hookSpecificOutput") or {}
-    ctx = out.get("additionalContext", "")
-    if path not in ctx:
+    out = r4.get("hookSpecificOutput")
+    ctx = out.get("additionalContext") if isinstance(out, dict) else None
+    if not isinstance(ctx, str) or path not in ctx:
+        shape = f"{len(ctx)} characters" if isinstance(ctx, str) else "absent"
         err(
-            f"--self-test: stale-warning prose did not mention {path}: "
-            f"{ctx!r}"
+            f"--self-test: stale-warning prose did not mention {path} "
+            f"(additionalContext: {shape})"
         )
         return 3
 
@@ -245,17 +394,28 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     except urllib.error.HTTPError as exc:
         err(f"--self-test: /status returned HTTP {exc.code}")
         return 3
-    if status.get("stale_warning_emitted_total", 0) < 1:
+    except CoordinatorUnavailable as exc:
+        err(f"--self-test: /status failed: {escape_nonprintable(exc)}")
+        return 3
+    except RedirectRefused as exc:
+        err(f"--self-test: /status was redirected (HTTP {exc.status}); not followed")
+        return 3
+    if not isinstance(status, dict):
+        err(f"--self-test: /status answered with {_answer_summary(status)}")
+        return 3
+    if _count(status, "stale_warning_emitted_total") < 1:
         err(
             "--self-test: stale_warning_emitted_total did not increment "
             "(coordinator KTD-J counters appear to be inert)."
         )
         return 3
-    eps = status.get("endpoint_counters") or {}
-    if eps.get("pre_read_total", 0) < 2 or eps.get("post_edit_total", 0) < 1:
+    eps = status.get("endpoint_counters")
+    eps = eps if isinstance(eps, dict) else {}
+    pre_reads, post_edits = _count(eps, "pre_read_total"), _count(eps, "post_edit_total")
+    if pre_reads < 2 or post_edits < 1:
         err(
             f"--self-test: endpoint counters did not reflect the four-step "
-            f"scenario: {eps!r}"
+            f"scenario: pre_read_total={pre_reads}, post_edit_total={post_edits}"
         )
         return 3
 
@@ -278,6 +438,70 @@ def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
     return 0
 
 
+def _claim_self_test_principal(
+    endpoint: CoordinatorEndpoint, root: Path, session_id: str
+) -> tuple[bool, str | None]:
+    """Claim ``session_id``'s caller principal for the self-test, presenting a
+    nonce generated for this claim alone: ``(True, principal)`` when bound,
+    ``(True, None)`` when the coordinator issues none (a 404, or a Node
+    coordinator, which is not asked — as the hook client does not ask it), and
+    ``(False, None)`` after reporting a claim that did not bind. The session
+    is fresh, so a refusal means something else claimed it first."""
+    if coordinator_backend(root) == NODE_BACKEND:
+        return True, None
+    claim = claim_caller_principal(endpoint, session_id, secrets.token_urlsafe(32))
+    if claim.outcome == "bound":
+        return True, claim.principal
+    if claim.outcome == "unsupported":
+        return True, None
+    err(
+        f"--self-test: caller principal not obtained "
+        f"({claim.outcome}: {escape_nonprintable(claim.detail)})"
+    )
+    return False, None
+
+
+_SELF_TEST_STATUSES: frozenset[str] = frozenset({"fresh", "stale"})
+"""The pre-read ``status`` values the self-test names; any other reads
+``unrecognised``."""
+
+
+def _answer_summary(answer: object) -> str:
+    """An answer described by what the self-test knows of it — its ``status``
+    (a known value), ``ok`` and ``degraded`` flags, and ``reason`` as a known
+    token (:func:`reportable_reason`) — never by the answer's own text."""
+    if answer is None:
+        return "no answer"
+    if not isinstance(answer, dict):
+        return "a non-object answer"
+    status = answer.get("status")
+    known_status = status if isinstance(status, str) and status in _SELF_TEST_STATUSES else None
+    parts = [
+        f"status={known_status or ('absent' if status is None else 'unrecognised')}",
+        f"ok={_flag(answer.get('ok'))}",
+    ]
+    if answer.get("degraded") is True:
+        parts.append("degraded=true")
+    if "reason" in answer:
+        parts.append(f"reason={reportable_reason(answer['reason'])}")
+    return ", ".join(parts)
+
+
+def _flag(value: object) -> str:
+    if value is None:
+        return "absent"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return "unrecognised"
+
+
+def _count(counters: dict[str, Any], key: str) -> int:
+    """A counter from a ``/status`` answer, or ``0`` when absent or not an
+    integer (so it is reported as a number, never as the answer's text)."""
+    value = counters.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
 def _terminal_columns() -> int:
     """Best-effort terminal width. Honors ``COLUMNS``; falls back to 80 when
     stdout is not a tty (the common case when this runs under an agent's shell
@@ -297,8 +521,14 @@ def _elide_middle(text: str, max_len: int) -> str:
     return f"{text[:head]}…{text[-(keep - head):]}"
 
 
+#: The widest MESI state name; a per-session line sizes its path column for it.
+_STATE_NAME_W = max(len(state.name) for state in MESIState)
+
+
 def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None:
-    """Manual column alignment — stdlib only, no rich/tabulate."""
+    """Manual column alignment — stdlib only, no rich/tabulate. Every value
+    taken from the coordinator prints through :func:`escape_nonprintable`
+    (#245), and widths and elision work on that escaped text."""
     tracked = payload.get("tracked_artifacts", [])
     sessions = payload.get("sessions", [])
     policy = payload.get("policy_summary", {})
@@ -311,14 +541,19 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
     pid = payload.get("coordinator_pid", 0)
     backend = payload.get("coordinator_backend", "python")
     version = payload.get("coordinator_version", "")
+    schema = payload.get("registry_schema_version")
 
     header_bits: list[str] = []
     if pid:
-        header_bits.append(f"pid={pid}")
+        header_bits.append(f"pid={escape_nonprintable(pid)}")
     header_bits.append(f"uptime={uptime:.0f}s")
-    header_bits.append(f"backend={backend}")
+    header_bits.append(f"backend={escape_nonprintable(backend)}")
     if version:
-        header_bits.append(f"version={version}")
+        header_bits.append(f"version={escape_nonprintable(version)}")
+    # An older or Node coordinator sends no schema number; print nothing
+    # rather than a placeholder an operator could mistake for one.
+    if schema is not None:
+        header_bits.append(f"schema={escape_nonprintable(schema)}")
     print("Coordinator: " + " ".join(header_bits))
     print()
 
@@ -329,11 +564,18 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
         default_n = policy.get("default_pattern_count", 0)
         user_n = policy.get("user_added_pattern_count", 0)
         ignored_n = policy.get("ignored_pattern_count", 0)
+        # Shown only when non-zero, so the usual line is unchanged. A policy
+        # file that loads as no entries counts here (#284): without the count,
+        # an emptied tracked.yaml read as a workspace with no user patterns.
+        rejected_n = policy.get("rejected_pattern_count", 0)
+        rejected_suffix = (
+            "" if rejected_n in (0, None) else f", {escape_nonprintable(rejected_n)} rejected"
+        )
         print(
             "Policy: "
-            f"{default_n} default pattern(s), "
-            f"{user_n} user-added, "
-            f"{ignored_n} ignored"
+            f"{escape_nonprintable(default_n)} default pattern(s), "
+            f"{escape_nonprintable(user_n)} user-added, "
+            f"{escape_nonprintable(ignored_n)} ignored{rejected_suffix}"
         )
         print()
 
@@ -361,14 +603,17 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
         # soft-wrapped the version onto the next line. ``+1`` is a safety column.
         chrome = 2 + 2 + ver_w + 1
         max_path_w = max(len("path"), _terminal_columns() - chrome)
-        longest = max(len(a.get("path", "")) for a in tracked)
-        path_w = min(longest, max_path_w)
+        rows = [
+            (escape_nonprintable(a.get("path", "")), escape_nonprintable(a.get("version", 0)))
+            for a in tracked
+        ]
+        path_w = min(max(len(path) for path, _ in rows), max_path_w)
         print(f"  {'path':<{path_w}}  {'version':>{ver_w}}")
         print(f"  {'-' * path_w}  {'-' * ver_w}")
-        for a in tracked:
-            label = _elide_middle(a.get("path", ""), path_w)
-            print(f"  {label:<{path_w}}  {a.get('version', 0):>{ver_w}}")
+        for path, version in rows:
+            print(f"  {_elide_middle(path, path_w):<{path_w}}  {version:>{ver_w}}")
     print()
+    _render_handoff_block(tracked)
 
     if show_policy:
         observed_paths = {a.get("path", "") for a in tracked}
@@ -379,7 +624,7 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
         if pending:
             print("Tracked (pending first read):")
             for p in pending:
-                print(f"  {p}")
+                print(f"  {escape_nonprintable(p)}")
         else:
             print("Tracked (pending first read): none")
         print()
@@ -390,30 +635,103 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
         print("Sessions:")
         for s in sessions:
             sid = s.get("agent_id", "?")
-            name = s.get("agent_name", "")
-            per_artifact = s.get("states", {})
-            print(f"  {sid[:8]}  {name}")
+            # A null agent_name has two causes and the renderer cannot tell
+            # them apart: the name was redacted because this response is below
+            # the operator tier (R6 — it embeds the raw session id), or the
+            # coordinator holds the grant but never knew a name for its holder
+            # (a grant that outlived the process that issued it). Either way
+            # the session id is a one-way uuid5 input and is not recoverable
+            # from agent_id, so name both causes and assert neither — and do
+            # not print "None".
+            name = s.get("agent_name") or (
+                "(name unknown — redacted below the operator tier, "
+                "or a grant predating this coordinator)"
+            )
+            per_artifact = {
+                path: escape_nonprintable(state) for path, state in dict(s.get("states", {})).items()
+            }
+            # #195: the operator tier names the paths this session lost to the
+            # coordinator sweep. They are not held grants, so they render in
+            # the same column under their own label rather than as a state. A
+            # reclaimed path the session has re-read is held SHARED as well,
+            # so its line keeps that state ahead of the reclaim label.
+            for path, cause in (s.get("reclaimed") or {}).items():
+                trigger, reclaimed_at = (
+                    escape_nonprintable(cause.get(k, "?")) for k in ("trigger", "reclaimed_at_unix_ts")
+                )
+                label = f"reclaimed ({trigger} at {reclaimed_at})"
+                held = per_artifact.get(path)
+                per_artifact[path] = f"{held}; {label}" if held else label
+            print(f"  {escape_nonprintable(sid[:8])}  {escape_nonprintable(name)}")
             if not per_artifact:
                 print("    (no held grants)")
                 continue
             # Same elision as the artifacts table so a long held path can't
-            # push the MESI state column off-screen onto a wrapped line.
-            state_w = max(len(s) for s in per_artifact.values())
+            # push the MESI state column off-screen onto a wrapped line. The
+            # column is sized for a state name only: a reclaim label runs past
+            # the line's end rather than eliding every path in the session.
+            held_rows = sorted((escape_nonprintable(path), state) for path, state in per_artifact.items())
+            state_w = min(max(len(state) for _, state in held_rows), _STATE_NAME_W)
             chrome = 4 + 2 + state_w + 1
             max_path_w = max(1, _terminal_columns() - chrome)
-            path_w = min(max(len(p) for p in per_artifact), max_path_w)
-            for path, state in sorted(per_artifact.items()):
+            path_w = min(max(len(path) for path, _ in held_rows), max_path_w)
+            for path, state in held_rows:
                 print(f"    {_elide_middle(path, path_w):<{path_w}}  {state}")
 
     # KTD-J (Unit 8): counters section. Only printed when the payload
-    # actually carries counter data — the minimal tier strips them.
+    # actually carries counter data.
     _render_counter_block(payload)
+
+
+def _render_handoff_block(tracked: list[dict[str, Any]]) -> None:
+    """#185: one line per tracked artifact whose ``/status`` entry carries
+    a transfer record (the ``handoff`` key) -- the path, giver and successor as
+    short session-level agent ids, the version at transfer, the status (marked
+    ended when the record is no longer live), and the record's age when the
+    entry carries its created timestamp (the operator tier). Prints nothing at all when no entry carries the key, so
+    the table stays byte-identical to its output before handoffs existed."""
+    handed_off = [a for a in tracked if isinstance(a.get("handoff"), dict)]
+    if not handed_off:
+        return
+    print("Handoffs:")
+    print("  giver → successor, by session agent id (first 8 characters, as under Sessions)")
+    now = time.time()
+    for a in handed_off:
+        print(f"  {_handoff_line(escape_nonprintable(a.get('path', '')), a['handoff'], now)}")
+    print()
+
+
+def _handoff_line(path: str, handoff: dict[str, Any], now: float) -> str:
+    giver, successor = (_short_agent_id(handoff.get(key)) for key in ("giver", "successor"))
+    facts = [escape_nonprintable(handoff.get("status", "?"))]
+    # A write can end a record without relabelling it, so ``pending`` alone
+    # would read as a giver still fenced; say it has ended.
+    if handoff.get("live") is False:
+        facts.append("ended")
+    created = handoff.get("created_at_unix_ts")
+    if isinstance(created, (int, float)) and not isinstance(created, bool):
+        facts.append(f"{_format_age(now - created)} ago")
+    version = escape_nonprintable(handoff.get("version_at_transfer", "?"))
+    return f"{path}: {giver} → {successor} at version {version} ({', '.join(facts)})"
+
+
+def _short_agent_id(agent_id: object) -> str:
+    """The first 8 characters, as the Sessions block prints an agent id."""
+    return escape_nonprintable(agent_id[:8]) if isinstance(agent_id, str) and agent_id else "?"
+
+
+def _format_age(seconds: float) -> str:
+    """``42s``, ``3m``, ``5h`` or ``2d``: whole units, rounded down."""
+    whole = max(0, int(seconds))
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if whole >= size:
+            return f"{whole // size}{unit}"
+    return f"{whole}s"
 
 
 def _render_counter_block(payload: dict[str, Any]) -> None:
     """KTD-J counter block, printed after the artifacts/sessions section
-    of the full-tier table. No-op if the payload doesn't carry counters
-    (e.g., minimal tier responses)."""
+    of the table. No-op if the payload doesn't carry counters."""
     endpoint_counters = payload.get("endpoint_counters") or {}
     has_endpoint_counters = any(v for v in endpoint_counters.values())
     keys_present = [
@@ -425,6 +743,7 @@ def _render_counter_block(payload: dict[str, Any]) -> None:
             "watchdog_queue_overflows_total",
             "handler_concurrency_overflows_total",
             "cold_start_duration_ms",
+            "sweep_reclaims_total",
         ) if k in payload
     ]
     if not has_endpoint_counters and not keys_present:
@@ -446,13 +765,13 @@ def _render_counter_block(payload: dict[str, Any]) -> None:
             "status_total",
         ):
             value = endpoint_counters.get(name, 0)
-            print(f"  {name:<40}  {value}")
+            print(f"  {name:<40}  {escape_nonprintable(value)}")
     for name in keys_present:
         value = payload.get(name, 0)
         if isinstance(value, float):
             value_str = f"{value:.1f}"
         else:
-            value_str = str(value)
+            value_str = escape_nonprintable(value)
         print(f"  {name:<40}  {value_str}")
 
 
@@ -460,9 +779,11 @@ def _render_metrics(payload: dict[str, Any]) -> None:
     """KTD-J `--detail metrics` rendering — counter block only, no
     artifact/session detail. Used by dashboard scrapers that want a
     consistent counter format without parsing JSON."""
-    backend = payload.get("coordinator_backend", "python")
-    version = payload.get("coordinator_version", "")
-    print(f"Coordinator metrics: backend={backend} version={version}")
+    backend = escape_nonprintable(payload.get("coordinator_backend", "python"))
+    version = escape_nonprintable(payload.get("coordinator_version", ""))
+    schema = payload.get("registry_schema_version")
+    schema_bit = "" if schema is None else f" schema={escape_nonprintable(schema)}"
+    print(f"Coordinator metrics: backend={backend} version={version}{schema_bit}")
     _render_counter_block(payload)
 
 

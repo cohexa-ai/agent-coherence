@@ -1,0 +1,22 @@
+{
+  "name": "caller-principal-node-sibling-does-not-implement-claim-404",
+  "description": "KTD12 -- THE ASYMMETRY, RECORDED (mint half). The sibling Node coordinator issues no caller principals and answers 404 on POST /principal/claim with the shared {error} envelope. A conforming client reads that 404 as 'this coordinator issues none' and proceeds without the header. The day Node grows the route this row goes red and someone decides whether the two mints agree. The bearer is the harness's VALID one: Node rejects auth before routing, so a bad bearer would answer 401 and say nothing about which routes exist.",
+  "setup": {},
+  "request": {
+    "method": "POST",
+    "path": "/principal/claim",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+      "mint_nonce": "corpus-mint-nonce-a"
+    }
+  },
+  "expected": {
+    "status": 404,
+    "body": {
+      "error": "not found"
+    }
+  },
+  "backends": [
+    "node"
+  ]
+}

@@ -12,8 +12,9 @@ shipped. Nothing here connects to, reads from, or writes to any store.
 
 It follows the :mod:`ccs.coordinator.registry_protocol` precedent (a module that
 owns Protocols + shared types the two registries re-export). Where that module
-names the registry SURFACE (the 59-member ``RegistryBase`` + ``SqliteExtended``
-Protocols), this module names the CONTRACT that surface must satisfy for a
+names the registry SURFACE (the 66-member ``RegistryBase`` + ``SqliteExtended``
+Protocols; the 9 detection members sit on their own ``ForeignWriteDetection``),
+this module names the CONTRACT that surface must satisfy for a
 backend to host the atomic boundary: which members participate in the
 single-writer atomic step (:data:`MEMBER_CLASSIFICATION`), what that atomic step
 IS (:data:`R9_ATOMIC_BOUNDARY`), the conformance tiers (:class:`Tier`), the
@@ -105,12 +106,12 @@ class MemberContract:
 
     name: str
     member_class: MemberClass
-    surface: str  # "base" | "sqlite_extended"
+    surface: str  # "base" | "sqlite_extended" | "detection"
     rationale: str
 
 
-# The 59 members of RegistryBase (45 methods + 1 property) and SqliteExtended
-# (+13 methods), classified against the CoordinatorService call sites. The
+# The 75 members of RegistryBase (52 methods + 1 property), SqliteExtended
+# (+13 methods) and ForeignWriteDetection (+9 methods), classified against the CoordinatorService call sites. The
 # ATOMIC_CLASS members are the ones the service touches INSIDE its atomic
 # mutation paths (``write`` / ``commit`` / ``commit_cas`` under ``abort_guard``;
 # ``invalidate``; the same-lock ``enforce_stable_grant_timeouts`` sweep; the
@@ -163,10 +164,16 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "Called inside every atomic mutation path (write/commit peer-invalidation "
         "+ grant, invalidate, and the same-lock sweep's M/E->INVALID reclaim). "
         "An M/E->INVALID transition that revokes the write claim WITHOUT moving "
-        "the version bumps owner_generation for the fence — the sweep reclaims "
-        "AND the voluntary invalidate release (EPOCH_BUMP_TRIGGERS); the "
+        "the version bumps owner_generation for the fence — the sweep reclaims, "
+        "the voluntary invalidate release AND the handoff trigger "
+        "(EPOCH_BUMP_TRIGGERS); the "
         "version-moving peer invalidations do not, because version-CAS already "
         "arbitrates those. Single-writer is checked after each such transition. "
+        "A sweep reclaim (SWEEP_RECLAIM_TRIGGERS) records the pair's (trigger, "
+        "tick) reclamation slot in the SAME write as the transition, so the slot "
+        "commits or rolls back with the state and the epoch bump: a reclaim is "
+        "never stored without its cause, which /status needs to tell it from a "
+        "release. "
         "The read_generation capture rides the same transition and is keyed on "
         "the agent's OWN claim: an I/S->M/E acquire, or a genuine read the agent "
         "requested (CLAIM_CAPTURE_TRIGGERS plus the not-previously-in-M/E "
@@ -208,20 +215,28 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "commit_cas / invalidate). It is the boundary's serialization + fail-shut "
         "seam: a watchdog-aborted mutation fails closed at the write lock instead "
         "of landing as a phantom write. A backend re-homing the boundary must "
-        "provide the equivalent atomic-or-abort envelope.",
+        "provide the equivalent atomic-or-abort envelope. Its keyword-only "
+        "deadline bounds the wait for that envelope (#238): past it the guard "
+        "raises RegistryLockTimeout having run nothing, so a request-thread "
+        "read answers without the registry instead of blocking on a peer's "
+        "hold. A backend must offer the same bounded wait.",
     ),
     MemberContract(
         "record_last_reclamation",
         MemberClass.INDEPENDENT,
         "base",
-        "Records the (trigger, tick) reclamation slot during the same-lock "
-        "enforce_stable_grant_timeouts sweep, in its OWN transaction — a serialized "
-        "follow-on AFTER the M/E->INVALID reclaim, NOT one atomic RMW with it "
-        "(verified: set_agent_state and record_last_reclamation each open their own "
-        "BEGIN IMMEDIATE, called consecutively by the sweep). Read back by commit "
-        "only to explain a reclaimed-grant failure — a diagnostic write a backend "
-        "makes individually durable, not part of the single-writer boundary "
-        "(cf. the heartbeat record, likewise INDEPENDENT).",
+        "Writes a (trigger, tick) reclamation slot for one pair, in its OWN "
+        "transaction. NOT the sweep's write: enforce_stable_grant_timeouts does "
+        "not call it, because set_agent_state records a sweep reclaim's slot in "
+        "the same write as the M/E->INVALID transition — a separate write that "
+        "failed or was cut short after the reclaim would leave an INVALID pair "
+        "/status reads as a plain release, and the next sweep skips an INVALID "
+        "pair, so nothing would repair it. Kept as an explicit, independent "
+        "writer of the same slot (seeding a slot, e.g. in tests); the slot is "
+        "read back by commit to explain a reclaimed-grant failure "
+        "and by /status's operator view (status_snapshot's reclaim opt-in). "
+        "Not part of the single-writer boundary (cf. the heartbeat record, "
+        "likewise INDEPENDENT).",
     ),
     # ---- ATOMIC_CLASS reads consumed INSIDE the boundary -------------------
     MemberContract(
@@ -314,6 +329,67 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "backend (one BEGIN IMMEDIATE / one lock hold) but not part of the "
         "single-writer RMW — it arbitrates pin bookkeeping, not artifact writes.",
     ),
+    MemberContract(
+        "claim_checkpoint_registration",
+        MemberClass.INDEPENDENT,
+        "base",
+        "First-claim-wins compare-and-set of a checkpoint's registered_by "
+        "(#191), returning the controller that holds the claim after the call "
+        "(service.register_workspace_restore, before any artifact resolves). A "
+        "backend must make the read and the conditional set one atomic step so "
+        "two concurrent registrants cannot both win — but it is not part of the "
+        "R9 RMW: it decides which controller may register a checkpoint, and the "
+        "registration's writes are still arbitrated by commit_all.",
+    ),
+    MemberContract(
+        "bind_caller_principal",
+        MemberClass.INDEPENDENT,
+        "base",
+        "First-claim-wins insert-if-absent of an identity's caller principal + "
+        "mint nonce, returning the BOUND pair (service.claim_caller_principal). "
+        "A backend must make the insert and the read-back one atomic step so two "
+        "concurrent first claims bind ONE principal — but it is not part of the "
+        "R9 RMW: it decides which caller may name an identity, never a write. "
+        "Its own store, never the session-meta one, so the session sweep, cap "
+        "and release cannot reach it.",
+    ),
+    MemberContract(
+        "transfer_grants",
+        MemberClass.INDEPENDENT,
+        "base",
+        "The grant handoff's composite transfer (service transfer, #185): "
+        "decides every path of a request -- the giver's own record first, then "
+        "the hold, version, write-holder, other-giver, self and unknown checks "
+        "-- and applies the admitted subset (record upsert, the presented "
+        "composite's INVALID move under the handoff trigger, the state-log "
+        "entry) in ONE serialized step (sqlite: one BEGIN IMMEDIATE; in-memory: "
+        "one _lock hold, staged then applied after every emit). A backend must "
+        "keep that decide-then-apply atomic and all-or-nothing, but it is not "
+        "part of the R9 RMW: it arbitrates no writer and moves no version -- "
+        "the caller gives up only its own claim, the release-class epoch move a "
+        "voluntary invalidate also makes.",
+    ),
+    MemberContract(
+        "set_transfer_status",
+        MemberClass.INDEPENDENT,
+        "base",
+        "Writes a transfer record's label -- status, counterparty, updated_at "
+        "-- for accept, decline, withdraw, completion and overtake. "
+        "Unconditional: the service decides from the record it read under the "
+        "same abort-guard hold, because a win's label is written after the "
+        "version moved. Individually durable; not part of the boundary (a "
+        "failed label write never changes a win's answer, and liveness reads "
+        "the version, not the label).",
+    ),
+    MemberContract(
+        "evict_transfer_records",
+        MemberClass.INDEPENDENT,
+        "base",
+        "Deletes transfer records that are not live and older than an age "
+        "(the sweep's eviction, beside the notice eviction). Liveness is the "
+        "read's, so a live record is never evicted. Durable maintenance "
+        "delete; not part of the boundary.",
+    ),
     # ---- READ_ONLY (base) --------------------------------------------------
     MemberContract(
         "coordinator_epoch",
@@ -390,8 +466,8 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         MemberClass.READ_ONLY,
         "base",
         "Reads the (trigger, tick) reclamation slot to EXPLAIN a reclaimed-grant "
-        "commit failure (commit). Non-mutating; the WRITE side "
-        "(record_last_reclamation) is ATOMIC_CLASS.",
+        "commit failure (commit). Non-mutating; the sweep WRITES it inside "
+        "set_agent_state's reclaim transition, which is ATOMIC_CLASS.",
     ),
     MemberContract(
         "get_owner_generation",
@@ -518,6 +594,30 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "Non-mutating; the cap decision is made under the SERVICE-level "
         "_session_lock, but this registry read is a plain count.",
     ),
+    MemberContract(
+        "get_caller_principal",
+        MemberClass.READ_ONLY,
+        "base",
+        "Reads the caller principal bound to an identity — the durable tier "
+        "service.validate_caller_principal falls back to when its in-process "
+        "cache misses (after a restart). Non-mutating.",
+    ),
+    MemberContract(
+        "get_transfer_record",
+        MemberClass.READ_ONLY,
+        "base",
+        "Reads an artifact's transfer record together with whether it is live "
+        "(the version at transfer still equals the artifact's version and the "
+        "record was neither declined nor withdrawn), both from one read: the "
+        "single place the service's giver check, re-send answer and "
+        "completion/overtake decisions take liveness from. "
+        "Non-mutating; a lock-only select that serves a read-only open. "
+        "The giver fence built on it is a service-layer precondition, not a "
+        "registry leg: its atomicity with the write comes from the service "
+        "reading it inside the write path's abort_guard hold, so a cross-host "
+        "backend must re-home that read into the same critical section as the "
+        "write it fences.",
+    ),
     # ---- INDEPENDENT / READ_ONLY (sqlite_extended) ------------------------
     MemberContract(
         "resolve_or_register",
@@ -546,8 +646,9 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "pop_pending_notices",
         MemberClass.INDEPENDENT,
         "sqlite_extended",
-        "Consumes all pending notices for an agent. Durable read-and-delete; not "
-        "part of the boundary.",
+        "Reads an agent's pending notices and consumes the ones the caller can "
+        "deliver (``consume_limit``). Durable read-and-delete; not part of the "
+        "boundary.",
     ),
     MemberContract(
         "evict_stale_notices",
@@ -604,7 +705,91 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         MemberClass.READ_ONLY,
         "sqlite_extended",
         "Batch read of the artifact + state maps for the /status surface, "
-        "optionally scoping the state half to named agents. Non-mutating.",
+        "optionally scoping the state half to named agents. A keyword-only "
+        "opt-in, off by default, adds each artifact's transfer record and its "
+        "liveness, read inside the same lock hold so a record is judged "
+        "against the version its row reports (#185). A second opt-in adds each "
+        "pair's reclamation slot, read from the same agent-state rows (#195). "
+        "A third adds each artifact's owner generation, each pair's grant tick "
+        "and each agent's last heartbeat, in the same hold, so a reader can "
+        "compute a grant's reclaim deadline from one consistent read (#187). "
+        "Only /status opts in, and the default answer is unchanged. "
+        "Non-mutating.",
+    ),
+    MemberContract(
+        "record_foreign_write",
+        MemberClass.INDEPENDENT,
+        "detection",
+        "Counts one newly observed on-disk content for an artifact, gated on the "
+        "disk hash last counted for it. A mutation, but observability exhaust "
+        "rather than coordination state: it decides nothing, and the boundary "
+        "never reads it. A backend makes the read-compare-upsert individually "
+        "atomic so two ticks cannot double-count one content; it must NOT fold "
+        "it into the single-writer RMW, where it would put a detector's write "
+        "on the arbitration path.",
+    ),
+    MemberContract(
+        "record_detection_tick",
+        MemberClass.INDEPENDENT,
+        "detection",
+        "Records that the detector observed one tick in this coordinator run. "
+        "Individually durable liveness exhaust, outside the boundary — the same "
+        "posture as the grant-holder heartbeat, and read only by the offline "
+        "report that distinguishes a true zero from an instrument that never ran.",
+    ),
+    MemberContract(
+        "foreign_write_totals",
+        MemberClass.READ_ONLY,
+        "detection",
+        "Reads per-artifact detection counts. Non-mutating.",
+    ),
+    MemberContract(
+        "detection_runs",
+        MemberClass.READ_ONLY,
+        "detection",
+        "Reads the observed per-run detection intervals a coverage claim is "
+        "checked against. Non-mutating.",
+    ),
+    MemberContract(
+        "record_detection_uncoverable",
+        MemberClass.INDEPENDENT,
+        "detection",
+        "Records that a coordinator run found no workspace it could ever poll — "
+        "no git work tree — so the offline report can separate that from an "
+        "instrument that broke and from one that never ran. Written once per "
+        "became-uncoverable transition, outside the boundary; a backend need "
+        "only make it individually durable. It must NOT be recorded as a "
+        "detection tick: a tick asserts the detector looked, and a coverage "
+        "claim is read off those intervals.",
+    ),
+    MemberContract(
+        "detection_uncoverable",
+        MemberClass.READ_ONLY,
+        "detection",
+        "Reads the runs that found no watchable workspace. Non-mutating.",
+    ),
+    MemberContract(
+        "close_detection_run",
+        MemberClass.INDEPENDENT,
+        "detection",
+        "Ends the current observed interval after a failed tick so a later "
+        "success cannot extend it across the outage. Process-local bookkeeping "
+        "outside the boundary; a backend need only ensure the next tick opens a "
+        "distinct interval.",
+    ),
+    MemberContract(
+        "clear_detection_edges",
+        MemberClass.INDEPENDENT,
+        "detection",
+        "Re-arms detection for artifacts no longer diverging, clearing only the "
+        "value that suppresses a repeat and never a count. Individually "
+        "durable, outside the boundary.",
+    ),
+    MemberContract(
+        "artifacts_with_detection_edge",
+        MemberClass.READ_ONLY,
+        "detection",
+        "Reads which artifacts currently hold an edge-gate value. Non-mutating.",
     ),
 )
 
@@ -612,7 +797,7 @@ MEMBER_CLASSIFICATION: dict[str, MemberContract] = {
     contract.name: contract for contract in _MEMBER_CONTRACTS
 }
 """Every ``RegistryBase`` + ``SqliteExtended`` member → its :class:`MemberContract`
-(R8). Keyed by member name. The key set must equal the 59-member Protocol surface
+(R8). Keyed by member name. The key set must equal the 75-member Protocol surface
 exactly — :mod:`tests.test_backend_contract` fails if ``registry_protocol.py``
 gains or loses a member without a matching update here (bidirectional drift
 guard). Includes the ``coordinator_epoch`` property (property-omission teeth)."""
@@ -909,6 +1094,27 @@ STATELESSNESS_INVENTORY: tuple[StateItem, ...] = (
         "shipped LOCAL epoch is an opaque uuid4 string; the backend epoch must be "
         "a monotonic-increasing integer (R12) — that str->int migration is "
         "deferred to a re-home, out of this contract's scope.",
+    ),
+    StateItem(
+        "caller-principal bindings (identity -> principal + mint nonce)",
+        Disposition.MUST_REHOME,
+        "service_with_durable_fallback",
+        "The first-claim-wins binding a request's caller principal is checked "
+        "against (sqlite schema v8, its own table). The SERVICE-level map is a "
+        "positive-only cache in front of the durable table. If not re-homed, a "
+        "failover forgets which identities are bound, so the next claimant of a "
+        "bound identity would be issued a fresh principal and first-claim-wins "
+        "would silently become last-failover-wins.",
+    ),
+    StateItem(
+        "transfer records (one per artifact: giver, holder, successor, version "
+        "at transfer, status)",
+        Disposition.MUST_REHOME,
+        "durable_registry",
+        "The grant handoff's record (sqlite schema v9, its own table), the "
+        "operand of the giver's fence. If not re-homed, a failover forgets every "
+        "live handoff, so a giver that handed a path off writes it again as "
+        "though it never had -- the lost update the handoff exists to prevent.",
     ),
     StateItem(
         "reaped-session tombstone (attribution only)",

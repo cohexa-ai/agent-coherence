@@ -1,0 +1,33 @@
+{
+  "name": "caller-principal-node-session-stop-admits-an-absent-principal",
+  "description": "KTD12 -- the Node side of fixture 03, with the identical setup and request: a claim for session A, then a session-stop naming A without a principal. Node answers the claim 404 and binds nothing, and it enforces no principal, so it admits the stop that Python refuses because its claim bound A. This row does not pin that 404; fixture 01 does. Every request here goes through urllib's default opener, which follows a 301, 302 or 303 on a POST by sending a GET to the URL the answer names, so after one of those, what the harness is handed -- and what everything below means by an answer -- is the answer that GET gets. The harness compares no preflight answer with an expectation: the claim fails this row only if its answer has a status of 500 or above, or a non-empty body that is not UTF-8 text Python's json.loads can parse, or if the exchange itself fails (a refused or dropped connection, a malformed answer, a socket timeout, which the harness sets to 10 seconds). What this row asserts is the stop's answer: status 200 and a parsed body equal to {ok: true, released_artifacts: []} under Python's ==, so another status, another key set or a non-empty list turns it red, but an ok of 1 or 1.0 in place of true does not (in Python, 1 == True), and neither does a 303 that redirects the stop to that same 200 answer. A holds no grant here, so the row shows the stop admitted, not a grant released. Unlike fixture 15 (a commit naming a session nobody claimed, admitted on both runtimes), the claim is what separates the two answers. The row goes red, for example, once Node both binds on the claim and refuses an absent principal for the session it bound, as Python does, or refuses every stop that carries no principal. Node adding only the claim route, while still enforcing nothing, leaves this row green as long as the claim's answer clears the preflight checks above; fixture 01, which pins the claim's answer, is the row that goes red when that answer's status or parsed body changes.",
+  "setup": {
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "mint_nonce": "corpus-mint-nonce-a"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/session-stop",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "released_artifacts": []
+    }
+  },
+  "backends": [
+    "node"
+  ]
+}

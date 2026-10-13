@@ -23,6 +23,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from ._state_db import open_readonly_state_db
+
 __all__ = ["read_conflict_totals"]
 
 
@@ -38,32 +40,18 @@ def read_conflict_totals(db_path: str | Path) -> dict[tuple[str, str, str], int]
     database, a hot-WAL recovery failure, disk I/O — is re-raised rather than
     swallowed, so it can never masquerade as zero conflicts.
     """
-    path = Path(db_path)
-    # mode=ro + uri=True: without the explicit uri flag sqlite3 treats the
-    # string as a literal filename and can silently fall back to read-write.
-    # No pre-check stat: connect directly and translate the failure, so a
-    # missing file cannot slip through a check-to-open race window.
+    conn = open_readonly_state_db(Path(db_path))
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        rows = conn.execute(
+            "SELECT artifact_id, agent_id, reason, count FROM conflict_counters"
+        ).fetchall()
     except sqlite3.OperationalError as exc:
-        if not path.exists():
-            raise FileNotFoundError(f"no coordinator database at {path}") from exc
+        if "no such table" in str(exc):
+            return {}  # pre-instrumentation db: no table, zero recorded.
         raise
-    try:
-        # A transient writer lock must wait, never masquerade as zero; 1500
-        # matches the registry's own budget-derived value.
-        conn.execute("PRAGMA busy_timeout=1500")
-        try:
-            rows = conn.execute(
-                "SELECT artifact_id, agent_id, reason, count FROM conflict_counters"
-            ).fetchall()
-        except sqlite3.OperationalError as exc:
-            if "no such table" in str(exc):
-                return {}  # pre-instrumentation db: no table, zero recorded.
-            raise
-        return {
-            (art_hex, agent_hex, reason): count
-            for art_hex, agent_hex, reason, count in rows
-        }
     finally:
         conn.close()
+    return {
+        (art_hex, agent_hex, reason): count
+        for art_hex, agent_hex, reason, count in rows
+    }

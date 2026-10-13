@@ -1,0 +1,123 @@
+{
+  "name": "harness-status-names-which-session-holds-what",
+  "description": "R15, DISTINGUISH HALF, over a UUID-SHAPED identity. Session A takes SHARED on docs/plan.md and peer session B takes EXCLUSIVE on docs/spec.md; GET /status then reports one row per agent, and the content of this fixture is WHICH agent holds WHICH artifact. `sessions[].agent_id` is the hyphenated 8-4-4-4-12 form (`str(session_to_agent_id(...))`), so it is hit by BOTH default scrubs -- the `_UUID_KEYS` name rule and the string-position `_UUID_RE` -- and without `preserve_identity` both rows collapse to `<UUID>`, leaving a body that reads as an attribution and cannot tell A-holds-plan from the swap. That is the difference from fixture 02, whose writer field is 32-char hex that the 8-4-4-4-12 regex never matched: 02 would pass identically with the opt-in deleted, so the opt-in was shipped unexercised. This fixture is what observes it, and `test_status_identity_fixture_distinguishes_which_session_holds_what` is where the swap is pinned. `agent_name` is null on purpose and is not noise: R6 moved the name behind the operator tier because it renders the raw session id, so the non-reversible `agent_id` is the only identity this tier carries -- which is exactly why it has to be compared verbatim. policy_summary carries the absolute workspace root and coordinator_version tracks the package version, so both are ignored for the same reasons fixture warn_mode/08 ignores them. The sweep reclaim counters read zero: nothing was reclaimed.",
+  "setup": {
+    "tracked": ["docs/**"],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n",
+      "docs/spec.md": "# coherence corpus fixture  \n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "path": "docs/plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "22222222-2222-4222-8222-222222222222",
+          "path": "docs/spec.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "GET",
+    "path": "/status"
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "audit_log_mode_drift_total": 0,
+      "auth_401_total": 0,
+      "caller_principal_absent_total": 2,
+      "caller_principal_refused_total": 0,
+      "cold_start_duration_ms": 0,
+      "coordinator_backend": "python",
+      "coordinator_pid": "<PID>",
+      "coordinator_root": ".",
+      "coordinator_uptime_s": "<UPTIME>",
+      "coordinator_uptime_seconds": "<UPTIME>",
+      "coordinator_version": "<IGNORED>",
+      "detail": "minimal",
+      "effect_fence_holds_total": 0,
+      "endpoint_counters": {
+        "effect_fence_total": 0,
+        "handoff_accept_total": 0,
+        "handoff_decline_total": 0,
+        "handoff_transfer_total": 0,
+        "handoff_withdraw_total": 0,
+        "policy_track_total": 0,
+        "policy_untrack_total": 0,
+        "post_edit_cas_total": 0,
+        "post_edit_total": 0,
+        "pre_bash_total": 0,
+        "pre_edit_total": 1,
+        "pre_grep_total": 0,
+        "pre_read_total": 1,
+        "principal_claim_total": 0,
+        "session_start_total": 0,
+        "session_stop_total": 0,
+        "status_total": 1
+      },
+      "fresh_shared_hash_mismatch_total": 0,
+      "handler_concurrency_overflows_total": 0,
+      "handoff_giver_denials_total": 0,
+      "in_flight_drain_timed_out": false,
+      "intra_task_acquire_release_total": 0,
+      "policy_summary": "<IGNORED>",
+      "registry_schema_version": 10,
+      "sessions": [
+        {
+          "agent_id": "c7f92943-10c4-51ba-ada9-df7448871e72",
+          "agent_name": null,
+          "states": {
+            "docs/plan.md": "SHARED"
+          }
+        },
+        {
+          "agent_id": "d7f57e87-6689-5239-ab8e-6446ae5be1f0",
+          "agent_name": null,
+          "states": {
+            "docs/spec.md": "EXCLUSIVE"
+          }
+        }
+      ],
+      "shared_foreign_lag_suppressed_total": 0,
+      "stale_warning_emitted_total": 0,
+      "stale_warning_reread_total": 0,
+      "strict_mode_denials_total": 0,
+      "strict_mode_routed_around_via_bash_total": 0,
+      "sweep_reclaims_by_trigger": {
+        "reclaim_heartbeat": 0,
+        "reclaim_max_hold": 0
+      },
+      "sweep_reclaims_total": 0,
+      "tracked_artifacts": [
+        {
+          "id": "<UUID>",
+          "path": "docs/plan.md",
+          "version": 1
+        },
+        {
+          "id": "<UUID>",
+          "path": "docs/spec.md",
+          "version": 1
+        }
+      ],
+      "watchdog_late_aborts_total": 0,
+      "watchdog_late_completion_total": 0,
+      "watchdog_queue_overflows_total": 0,
+      "watchdog_timeouts_total": 0
+    }
+  },
+  "ignore_keys": ["policy_summary", "coordinator_version"],
+  "preserve_identity": ["agent_id"],
+  "_comment": "The two agent ids are uuid5(NAMESPACE_URL, 'ccs-agent:claude-session-<session id>') over the two session ids this fixture supplies, so they are derived rather than observed and the same two values are recomputed in test_effect_fence_corpus.py rather than pasted. Row ORDER is the adapter's _agent_names insertion order, i.e. the preflight order: A registers on pre-read, B on pre-edit. tracked_artifacts[].id IS scrubbed -- an artifact id is minted per run and is not an identity this fixture asserts -- which doubles as the in-body control that the opt-in is scoped to the declared key and did not disable the default wholesale. python-only for the same reason fixture warn_mode/08 is: the Node /status envelope is a different shape (see warn_mode/09). caller_principal_absent_total is 2 because both preflights are sent without a caller principal and name sessions nobody claimed: pre-read (accept-class) and pre-edit (require-class, which admits an unclaimed session -- KTD15) are each admitted and counted (plan U6), and nothing else in the fixture moves it. Nothing is refused, so caller_principal_refused_total is 0. handoff_giver_denials_total (#185) is 0: no handoff exists, so no giver is denied.",
+  "backends": ["python"]
+}

@@ -1,0 +1,28 @@
+{
+  "name": "policy-track-refuses-a-file-that-holds-no-list",
+  "description": "#284: tracked.yaml holds a single string, not a list, so it loads as no entries and an entry appended to it would never apply. Both backends answer 400 with the same text, naming the file and how to rewrite it, and write nothing.",
+  "setup": {
+    "files": {
+      ".coherence/tracked.yaml": "runbook.md\n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/policy/track",
+    "body": {
+      "paths": [
+        "ok.md"
+      ]
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": ".coherence/tracked.yaml holds a single string, not a list, so it loads as no entries; nothing was written. Rewrite it with one entry per line, each a double-quoted string such as - \"*.md\", then retry."
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

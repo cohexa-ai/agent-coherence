@@ -1,0 +1,38 @@
+{
+  "name": "policy-track-of-a-glob-led-entry-is-idempotent",
+  "description": "#284: a *-led glob is written so that tracked.yaml still loads, so tracking it a second time finds it already there and adds nothing. Written as a plain `- *.md` line, the file stopped parsing and every repeat appended the entry again and reported it added.",
+  "setup": {
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/policy/track",
+        "body": {
+          "paths": [
+            "*.md"
+          ]
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/policy/track",
+    "body": {
+      "paths": [
+        "*.md"
+      ]
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "added": [],
+      "rejected": []
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

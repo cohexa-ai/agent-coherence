@@ -72,14 +72,14 @@
       "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
-        "additionalContext": "⚠ Stale read [warning emitted <TS>]: docs/notes.md was updated by session bbbbbbbb at <TS>. Current version is v2; you previously saw v1. Your worktree's content matches the last-recorded hash; the divergence is purely about version-tracking metadata. Consider re-reading docs/notes.md before acting on stale assumptions.\n\nPost-compaction re-grounding (agent-coherence):\nAt compaction you held SHARED on docs/aux.md (v1) — re-acquire before writing.\nAt compaction you held SHARED on docs/notes.md (v2) — re-acquire before writing.\nVersions are as of this re-grounding; a more recent read supersedes this notice."
+        "additionalContext": "⚠ Stale read [warning emitted <TS>]: docs/notes.md was updated by agent 814dac78 at <TS>. Current version is v2; you previously saw v1. Your worktree's content matches the last-recorded hash; the divergence is purely about version-tracking metadata. Consider re-reading docs/notes.md before acting on stale assumptions.\n\nPost-compaction re-grounding (agent-coherence):\nAt compaction you held SHARED on docs/aux.md (v1) — re-acquire before writing.\nAt compaction you held SHARED on docs/notes.md (v2) — re-acquire before writing.\nVersions are as of this re-grounding; a more recent read supersedes this notice."
       },
       "status": "stale",
       "summary": {
         "path": "docs/notes.md",
         "current_version": 2,
         "prior_version_seen_by_session": 1,
-        "last_writer_session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+        "last_writer_session_id": "814dac789b8f560d9236b12165a0b50d",
         "last_writer_at_unix_ts": 0,
         "warning_generated_at_unix_ts": 0,
         "hash_differs": false

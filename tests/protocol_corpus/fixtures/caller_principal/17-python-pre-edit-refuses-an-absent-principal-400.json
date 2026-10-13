@@ -1,0 +1,40 @@
+{
+  "name": "caller-principal-python-pre-edit-refuses-an-absent-principal",
+  "description": "pre-edit acquires EXCLUSIVE under the named session. The preflight CLAIMS session A; a pre-edit naming the bound A without its principal is refused with the typed absent reason, so a caller that lost its principal cannot take a grant it could neither commit nor release (post-edit and session-stop refuse it too). Twin of the Node row with the identical setup and request (18). Enforcement is accident-resistance under the same-OS-user cooperative trust model, not caller separation: on the hook surface the principal is stored under .coherence/.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "mint_nonce": "corpus-mint-nonce-a"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+      "path": "CLAUDE.md"
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": "missing Coherence-Caller-Principal header: this route requires the caller principal that POST /principal/claim bound to the session_id it names (caller_principal_absent)",
+      "reason": "caller_principal_absent"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

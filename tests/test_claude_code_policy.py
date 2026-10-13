@@ -13,6 +13,7 @@ Covers:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -217,6 +218,74 @@ def test_non_list_top_level_rejected(root: Path, caplog: pytest.LogCaptureFixtur
     assert policy.user_added_patterns == ()
 
 
+@pytest.mark.parametrize(
+    ("file_name", "content", "says"),
+    [
+        ("tracked.yaml", "- runbook.md\n- *.md\n", "not valid YAML"),
+        ("ignored.yaml", "- runbook.md\n- *.md\n", "not valid YAML"),
+        ("strict_mode.yaml", "- data/**\n- *.md\n", "not valid YAML"),
+        ("tracked.yaml", "just-a-string\n", "not a list"),
+        ("tracked.yaml", b"- caf\xe9.md\n", "not valid YAML"),
+        ("tracked.yaml", "- runbook.md\n- 2026-13-45\n", "not valid YAML"),
+        ("tracked.yaml", "- runbook.md\n- !!bool x\n", "not valid YAML"),
+        ("strict_mode.yaml", "- data/**\n- !!timestamp x\n", "not valid YAML"),
+        ("ignored.yaml", "- runbook.md\n- !!int\n", "not valid YAML"),
+        ("tracked.yaml", "[" * 2000 + "]" * 2000 + "\n", "not valid YAML"),
+    ],
+)
+def test_a_policy_file_that_loads_as_no_entries_is_counted_as_rejected(
+    root: Path, file_name: str, content: str | bytes, says: str
+) -> None:
+    """#284: a policy file that loads as no entries is reported as one rejected
+    entry naming the file, so /status shows a non-zero rejected_pattern_count.
+    Before, the only signal was a WARNING a detached coordinator sends to
+    /dev/null, and /status read as a healthy workspace with no user patterns.
+    Read as UTF-8 whatever the locale: bytes that are not UTF-8, an impossible
+    date, a core tag on a value it cannot take and deep nesting are a file
+    that does not load, not an exception out of the loader."""
+    target = root / ".coherence" / file_name
+    if isinstance(content, bytes):
+        target.write_bytes(content)
+    else:
+        target.write_text(content)
+    policy = TrackedArtifactPolicy.load(root)
+    assert policy.summary()["rejected_pattern_count"] == 1
+    [(pattern, reason)] = policy.rejected()
+    assert pattern == f".coherence/{file_name}"
+    assert says in reason and "loads as no entries" in reason
+
+
+def test_a_policy_file_is_decoded_by_its_bytes_not_the_locale(root: Path) -> None:
+    """The loader hands PyYAML the file's bytes, which it decodes as UTF-8, or
+    as UTF-16 by a byte-order mark, whatever the locale, so the loader reads
+    the encoding the writer writes. Reading text in the locale's encoding
+    could load a different pattern from the one written, or none."""
+    (root / ".coherence" / "tracked.yaml").write_bytes(
+        "- runbook.md\n- café.md\n".encode("utf-16")
+    )
+    policy = TrackedArtifactPolicy.load(root)
+    assert policy.user_added_patterns == ("runbook.md", "café.md")
+    assert policy.rejected() == ()
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads a mode-000 file"
+)
+def test_an_unreadable_policy_file_is_counted_as_rejected(root: Path) -> None:
+    """A policy file that exists but cannot be read loads as no entries too,
+    and is reported the same way."""
+    target = root / ".coherence" / "tracked.yaml"
+    target.write_text("- runbook.md\n")
+    target.chmod(0)
+    try:
+        policy = TrackedArtifactPolicy.load(root)
+    finally:
+        target.chmod(0o600)
+    assert policy.rejected() == (
+        (".coherence/tracked.yaml", "could not be read, so the file loads as no entries"),
+    )
+
+
 def test_non_string_pattern_in_list_rejected(root: Path) -> None:
     (root / ".coherence" / "tracked.yaml").write_text("- 42\n- runbook.md\n")
     policy = TrackedArtifactPolicy.load(root)
@@ -251,7 +320,7 @@ def test_summary_includes_counts(root: Path) -> None:
     (root / ".coherence" / "tracked.yaml").write_text("- runbook.md\n- '/etc/passwd'\n")
     (root / ".coherence" / "ignored.yaml").write_text("- docs/brainstorms/**/*.md\n")
     policy = TrackedArtifactPolicy.load(root)
-    summary = policy.summary()
+    summary = policy.summary(include_patterns=True)
     assert summary["default_pattern_count"] == len(DEFAULT_TRACKED_PATTERNS)
     assert summary["user_added_pattern_count"] == 1  # runbook.md
     assert summary["ignored_pattern_count"] == 1  # docs/brainstorms/**/*.md
@@ -261,5 +330,5 @@ def test_summary_includes_counts(root: Path) -> None:
 
 def test_summary_user_added_patterns_empty_by_default(root: Path) -> None:
     policy = TrackedArtifactPolicy.load(root)
-    summary = policy.summary()
+    summary = policy.summary(include_patterns=True)
     assert summary["user_added_patterns"] == []

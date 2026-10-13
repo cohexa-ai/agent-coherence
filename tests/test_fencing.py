@@ -149,27 +149,44 @@ def test_parity_pessimistic_fence_rejects_superseded_committer(registry) -> None
 
 
 def test_reclaim_trigger_constants_are_equal_across_registries() -> None:
-    """The RECLAIM_TRIGGERS / EPOCH_BUMP_TRIGGERS / CLAIM_CAPTURE_TRIGGERS
-    constants are duplicated (the registries share no base class); this pins the
-    copies equal so the bump and the capture can never silently diverge. The capture pin also
+    """The RECLAIM_TRIGGERS / EPOCH_BUMP_TRIGGERS / CLAIM_CAPTURE_TRIGGERS /
+    SWEEP_RECLAIM_TRIGGERS constants are duplicated (the registries share no
+    base class); this pins the copies equal so the bump, the capture and the
+    reclaim slot can never silently diverge. The capture pin also
     guards the service.fetch() trigger string: a rename there without updating
     the constants would silently disable read-generation capture on fetches."""
     from ccs.coordinator.registry import CLAIM_CAPTURE_TRIGGERS as MEM_CAPTURE
     from ccs.coordinator.registry import EPOCH_BUMP_TRIGGERS as MEM_BUMP
     from ccs.coordinator.registry import RECLAIM_TRIGGERS as IN_MEMORY
+    from ccs.coordinator.registry import SWEEP_RECLAIM_TRIGGERS as MEM_SWEEP
+    from ccs.coordinator.registry_protocol import HANDOFF_TRIGGER
     from ccs.coordinator.sqlite_registry import CLAIM_CAPTURE_TRIGGERS as SQL_CAPTURE
     from ccs.coordinator.sqlite_registry import EPOCH_BUMP_TRIGGERS as SQL_BUMP
     from ccs.coordinator.sqlite_registry import RECLAIM_TRIGGERS as SQLITE
+    from ccs.coordinator.sqlite_registry import SWEEP_RECLAIM_TRIGGERS as SQL_SWEEP
 
     assert IN_MEMORY == SQLITE == frozenset(
         {"reclaim_heartbeat", "reclaim_max_hold", "timeout"}
     )
     # EPOCH_BUMP_TRIGGERS is what the bump sites actually key on: every reclaim
-    # trigger PLUS the voluntary "invalidate" release, which also ends a write
-    # claim without moving the version. The version-moving peer
-    # invalidations ("write"/"commit") stay out.
-    assert MEM_BUMP == SQL_BUMP == IN_MEMORY | frozenset({"invalidate"})
+    # trigger PLUS the voluntary "invalidate" release and the "handoff" a
+    # transfer moves its giver INVALID under -- each ends a write claim without
+    # moving the version. The version-moving peer invalidations
+    # ("write"/"commit") stay out. The handoff is a trigger of its own, not a
+    # reclaim and not a release: the reclaim set above is unchanged.
+    assert MEM_BUMP == SQL_BUMP == IN_MEMORY | frozenset({"invalidate", "handoff"})
+    assert len(MEM_BUMP) == 5
+    # The constant the transfer path emits, pinned to the literal: renaming it
+    # without the set would leave the bump keyed on a string nothing emits.
+    assert HANDOFF_TRIGGER == "handoff"
     assert MEM_CAPTURE == SQL_CAPTURE == frozenset({"fetch"})
+    # The triggers whose M/E -> INVALID transition records the pair's reclaim
+    # slot in the same write: the stable-grant sweep's two, never the transient
+    # "timeout", which /status does not report as a reclaim. Both registries
+    # must key the slot on one set, or a backend would store a reclaim without
+    # its cause.
+    assert MEM_SWEEP is SQL_SWEEP
+    assert MEM_SWEEP == frozenset({"reclaim_heartbeat", "reclaim_max_hold"})
 
 
 def test_transient_timeout_eviction_bumps_and_fences(registry) -> None:
@@ -224,7 +241,15 @@ def test_parity_version_and_generation_is_one_pair(registry) -> None:
     """``get_artifact_and_generation`` returns the pair the effect gate compares:
     a sweep reclamation moves ONLY the generation leg (the shape a version-only
     comparand cannot see), a commit moves ONLY the version leg, and an unknown
-    artifact raises KeyError like the sibling fence accessors."""
+    artifact answers None rather than raising.
+
+    Answering None is the rule every SCALAR read follows for an artifact the
+    registry has never seen, and ``get_owner_generation`` is the sole
+    exception -- it raises KeyError instead, on both backends. The rule is
+    asserted over the whole accessor list rather than a sample, so a later
+    read that starts raising fails here instead of quietly falsifying this
+    sentence. (Container reads are outside the rule: ``get_state_map`` and
+    ``get_transient_map`` answer an empty dict, ``has_artifact`` False.)"""
     reg = registry
     art = _register(reg)
     a = uuid4()
@@ -241,7 +266,26 @@ def test_parity_version_and_generation_is_one_pair(registry) -> None:
     res = reg.commit_cas(art.id, a, expected_version=1, content_hash="new")
     assert not isinstance(res, ConflictDetail)  # WIN -> (artifact, invalidated)
     assert _pair(reg, art.id) == (2, 1)
-    assert reg.get_artifact_and_generation(uuid4()) is None
+    # Absent-artifact contract, pinned over the whole scalar-read surface so
+    # the "sole exception" claim above cannot quietly gain a second member.
+    absent = uuid4()
+    for accessor in ("get_artifact", "get_artifact_and_generation", "get_content"):
+        assert getattr(reg, accessor)(absent) is None, accessor
+    for accessor in ("get_agent_state", "get_agent_transient",
+                     "get_read_generation", "get_transient_tick",
+                     "last_observed_version_for"):
+        assert getattr(reg, accessor)(absent, a) is None, accessor
+    if isinstance(reg, SqliteArtifactRegistry):  # no in-memory counterpart
+        assert reg.get_artifact_updated_at(absent) is None
+        assert reg.last_writer_for(absent) is None
+    # get_owner_generation is the one scalar read that raises instead.
+    with pytest.raises(KeyError):
+        reg.get_owner_generation(absent)
+    # Container reads sit outside the None rule -- pinned so the docstring's
+    # carve-out is checked too, not just asserted in prose.
+    assert reg.get_state_map(absent) == {}
+    assert reg.get_transient_map(absent) == {}
+    assert reg.has_artifact(absent) is False
 
 
 def test_parity_fetch_downgrade_preserves_superseded_read_generation(registry) -> None:

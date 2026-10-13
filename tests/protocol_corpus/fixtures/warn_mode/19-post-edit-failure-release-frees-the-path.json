@@ -1,0 +1,45 @@
+{
+  "name": "post-edit-failure-release-frees-the-path",
+  "description": "KTD-1 release-on-failure, checked by its effect on both backends rather than by its answer: session A takes EXCLUSIVE on a tracked path (preflight pre-edit) and its post-edit reports the tool FAILED (success:false, no content_hash), then session B pre-edits the same path. B's acquire must be clean, the bare {ok:true} with no collision warning, because A's grant is gone. Row 17 pins the answer to the failed post-edit, which a release that did nothing would still give; this row fails instead, because B would find A still holding EXCLUSIVE and get the collision envelope of row 13. Row 15 is the same check for a subagent-scoped stop.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444",
+          "path": "CLAUDE.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444",
+          "path": "CLAUDE.md",
+          "success": false
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "66666666-6666-4666-8666-666666666666",
+      "path": "CLAUDE.md"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true
+    }
+  }
+}

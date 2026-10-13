@@ -8,7 +8,7 @@ frozen dataclasses, string constants) formalizing what a networked registry
 backend must provide to re-home the coordinator's atomic boundary. These tests
 are the DRIFT GUARDS the plan calls for:
 
-- the member-classification map covers EXACTLY the 59 ``RegistryBase`` +
+- the member-classification map covers EXACTLY the 75 ``RegistryBase`` +
   ``SqliteExtended`` members — no more, no fewer — so a Protocol member added or
   removed in ``registry_protocol.py`` without a matching contract update FAILS
   CI (bidirectional guard);
@@ -19,13 +19,15 @@ are the DRIFT GUARDS the plan calls for:
 - a classification value outside the enum is unrepresentable (typed);
 - the tier enum has exactly ``TIER_1`` and ``TIER_2``.
 
-The expected 59-member set is FROZEN here (imported from the parity test's own
+The expected 75-member set is FROZEN here (imported from the parity test's own
 frozen name-sets), NOT derived from the Protocol at runtime — so a silent
 Protocol edit cannot move the goalposts this test guards (the same discipline
 ``tests/test_registry_protocol_parity.py`` uses).
 """
 
 from __future__ import annotations
+
+import re
 
 from ccs.coordinator.backend_contract import (
     MEMBER_CLASSIFICATION,
@@ -42,41 +44,49 @@ from ccs.coordinator.backend_contract import (
     Tier,
 )
 
-# The 59-member expected surface, imported from the parity test's FROZEN
-# name-sets (45 base methods + 13 extended methods + 1 base property). Reusing
+# The 75-member expected surface, imported from the parity test's FROZEN
+# name-sets (52 base + 13 extended + 9 detection methods + 1 base property). Reusing
 # those frozensets means this contract and the Protocol parity share ONE
 # source of truth for the surface: if either the parity test or the Protocol
 # changes the surface, the two drift guards fire together.
 from tests.test_registry_protocol_parity import (  # noqa: E402
     BASE_METHODS,
     BASE_PROPERTIES,
+    DETECTION_METHODS,
     EXTENDED_ONLY_METHODS,
 )
 
-EXPECTED_MEMBERS = BASE_METHODS | EXTENDED_ONLY_METHODS | BASE_PROPERTIES
+EXPECTED_MEMBERS = (
+    BASE_METHODS | EXTENDED_ONLY_METHODS | DETECTION_METHODS | BASE_PROPERTIES
+)
 
 
 # ---------------------------------------------------------------------------
-# Member classification — exactly the 58 Protocol members, no drift
+# Member classification — exactly the 75 Protocol members, no drift
 # ---------------------------------------------------------------------------
 
 
 def test_member_map_covers_exactly_the_protocol_surface() -> None:
-    """The classification map keys equal the 59-member Protocol surface EXACTLY
+    """The classification map keys equal the 75-member Protocol surface EXACTLY
     — no more, no fewer. A member added to (or removed from) ``registry_protocol.py``
     without a matching contract update fails HERE (bidirectional drift guard)."""
     assert set(MEMBER_CLASSIFICATION) == EXPECTED_MEMBERS
 
 
-def test_member_map_has_exactly_59_members() -> None:
-    """Pin the count explicitly: 45 base methods (SB-18 ``commit_all``, the
+def test_member_map_has_exactly_75_members() -> None:
+    """Pin the count explicitly: 52 base methods (SB-18 ``commit_all``, the
     WV Unit-2 checkpoint surface — 8 members — then the effect-gate pair read
     ``get_artifact_and_generation``, then the SB-10 comparand read
-    ``last_observed_version_for`` added) + 13 extended methods + 1
-    base property = 59. Guards against a same-size add+remove that would slip
-    past the set-equality check on cardinality alone."""
-    assert len(MEMBER_CLASSIFICATION) == 59
-    assert len(EXPECTED_MEMBERS) == 59
+    ``last_observed_version_for``, then the caller-principal pair
+    ``bind_caller_principal`` / ``get_caller_principal``, then the grant
+    handoff's transfer-record four ``transfer_grants`` /
+    ``get_transfer_record`` / ``set_transfer_status`` /
+    ``evict_transfer_records``, then #191's ``claim_checkpoint_registration``
+    added) + 13 extended methods + 9 foreign-write detection methods on their
+    own Protocol + 1 base property = 75. Guards against a same-size add+remove
+    that would slip past the set-equality check on cardinality alone."""
+    assert len(MEMBER_CLASSIFICATION) == 75
+    assert len(EXPECTED_MEMBERS) == 75
 
 
 def test_coordinator_epoch_property_is_in_the_map() -> None:
@@ -95,18 +105,22 @@ def test_every_member_has_a_typed_classification() -> None:
     for name, contract in MEMBER_CLASSIFICATION.items():
         assert isinstance(contract.member_class, MemberClass), name
         assert contract.name == name
-        assert contract.surface in {"base", "sqlite_extended"}
+        assert contract.surface in {"base", "sqlite_extended", "detection"}
         assert contract.rationale  # non-empty rationale authored from service.py
 
 
 def test_member_surface_matches_the_protocol_split() -> None:
     """Each member's declared ``surface`` matches which Protocol frozenset it
-    belongs to (base methods + the base property are "base"; extended-only
-    methods are "sqlite_extended")."""
+    belongs to: base methods plus the base property are "base", extended-only
+    methods are "sqlite_extended", and the detection instrument is its own
+    "detection" surface — a backend may implement that one independently, or
+    not at all, without losing the coordination surface."""
     base_surface = BASE_METHODS | BASE_PROPERTIES
     for name, contract in MEMBER_CLASSIFICATION.items():
         if name in base_surface:
             assert contract.surface == "base", name
+        elif name in DETECTION_METHODS:
+            assert contract.surface == "detection", name
         else:
             assert contract.surface == "sqlite_extended", name
 
@@ -287,6 +301,91 @@ def test_module_states_the_never_own_the_store_non_goal() -> None:
     assert mod.__doc__ is not None
     doc = mod.__doc__.lower()
     assert "never" in doc and "store we ship" in doc
+
+
+# A surface size written as prose. The hyphenated form is the idiom both files
+# use for "a surface of N members"; the spaced form also appears for a group
+# that is NOT the surface ("the WV Unit-2 checkpoint surface - 8 members"), so
+# the two are matched separately rather than with one looser pattern.
+_HYPHENATED_CLAIM = re.compile(r"(\d+)-member\b")
+_SPACED_CLAIM = re.compile(r"(\d+) members\b")
+# The breakdown that explains a total: "(45 methods + 1 property)", "(+13
+# methods)". These are what a reader consults to learn which Protocol owns what.
+_BREAKDOWN = re.compile(r"(\d+) (?:methods|method|properties|property)\b")
+
+
+def _read(path: str) -> str:
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_every_member_count_written_in_prose_matches_the_frozen_sets() -> None:
+    """Prose counts drift because nothing reads them. This reads all of them.
+
+    The surface size has one source of truth, the frozen name sets above, and
+    it is restated in prose in both files. Nothing checked any of those
+    restatements, so a wrong one was invisible to the suite and to the linter
+    -- which is how the surface sentence came to claim the all-three-Protocol
+    total for a two-Protocol surface until a human noticed (PR #204).
+
+    Deliberately a SWEEP rather than one assertion per known sentence. The
+    first draft of this guard was per-sentence, and it silently missed a third
+    restatement and all four breakdown figures; a restatement added tomorrow would
+    have been missed the same way. Matching every occurrence means a new one is
+    covered by construction, and the ordered comparison below means an added or
+    deleted restatement fails here rather than passing unnoticed.
+
+    Two counts are in play and they are not interchangeable, which is the trap
+    that turned a stale figure into a wrong one:
+
+    * the SURFACE is ``RegistryBase`` + ``SqliteExtended``, because the
+      detection members deliberately sit on their own ``ForeignWriteDetection``;
+    * the CLASSIFICATION covers all three.
+
+    Reword past these patterns and this fails rather than quietly ceasing to
+    guard -- an unexpected match list is the failure being prevented, so make
+    the update on purpose.
+    """
+    import ccs.coordinator.backend_contract as mod
+
+    surface = len(BASE_METHODS | EXTENDED_ONLY_METHODS | BASE_PROPERTIES)
+    everything = len(EXPECTED_MEMBERS)
+
+    assert mod.__file__ is not None
+    module_src = _read(mod.__file__)
+
+    # Ordered, exhaustive: an added or removed restatement changes the list.
+    assert [int(n) for n in _HYPHENATED_CLAIM.findall(module_src)] == [
+        surface,  # the module docstring's SURFACE sentence
+        everything,  # MEMBER_CLASSIFICATION's own docstring
+    ], "a hyphenated member count in backend_contract.py is wrong or unaccounted for"
+    assert [int(n) for n in _SPACED_CLAIM.findall(module_src)] == [
+        everything  # the classification comment's total
+    ], "a spaced member count in backend_contract.py is wrong or unaccounted for"
+
+    # The breakdown that must sum to that total. Guarding only the total lets a
+    # member move between Protocols without anything noticing: the sum is
+    # unchanged and the explanation is now wrong.
+    assert [int(n) for n in _BREAKDOWN.findall(module_src)] == [
+        len(BASE_METHODS),
+        len(BASE_PROPERTIES),
+        len(EXTENDED_ONLY_METHODS),
+        len(DETECTION_METHODS),
+    ], "the per-Protocol breakdown in backend_contract.py no longer sums as written"
+
+
+def test_this_suites_own_prose_states_the_real_member_count() -> None:
+    """The guard above reads the module; this file restates the count too.
+
+    Three times, in its header, above the frozen set, and in a test docstring --
+    and the file that pins the size is the last place a reader expects to find
+    a stale one. Unordered, because every hyphenated claim here means the same
+    whole surface, so a new correct mention is not a failure.
+    """
+    claims = {int(n) for n in _HYPHENATED_CLAIM.findall(_read(__file__))}
+    assert claims == {len(EXPECTED_MEMBERS)}, (
+        f"this file's own prose claims {sorted(claims)} members"
+    )
 
 
 def test_module_imports_no_networked_code() -> None:

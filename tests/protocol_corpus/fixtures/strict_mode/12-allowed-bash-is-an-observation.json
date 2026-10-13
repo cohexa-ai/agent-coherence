@@ -1,0 +1,106 @@
+{
+  "name": "allowed-bash-is-an-observation",
+  "description": "The allowed twin of fixture 11. It pins the direction a trigger-name fix would break. docs/plans/x.md is tracked but NOT strict, so A's `cat docs/plans/x.md` is allowed: it runs and A reads v2. Crediting that as an observation of v2 is CORRECT. When B then takes the grant and commits nothing, A really is still at the version it last saw, and the grant-change wording is the true one. Keying the fix on the trigger's name (never observe on `post_stale_bash`) would turn this back into 'you previously saw v1' about bytes A just read. The summary is the contract here: prior_version_seen_by_session == current_version == 2 is the input that selects the grant-change wording in both runtimes. additionalContext is ignored because the two backends already differ there, and the difference predates this fixture. Node's acquireExclusive queues a preemption notice for every non-INVALID peer, SHARED included. Python queues one only for M/E holders. So on Node, B's second pre-edit prepends an 'EXCLUSIVE grant ... silently revoked' notice to A's read. The wording itself is pinned per runtime by test_allowed_pre_bash_advances_the_observation_baseline (Python) and 'allowed pre-bash: the command runs...' (Node).",
+  "setup": {
+    "tracked": [
+      "docs/plans/x.md"
+    ],
+    "strict_mode": [
+      "plan.md"
+    ],
+    "files": {
+      "docs/plans/x.md": "# Plan\nv1\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "docs/plans/x.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "docs/plans/x.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "docs/plans/x.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "docs/plans/x.md",
+          "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f",
+          "success": true
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-bash",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "command": "cat docs/plans/x.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "docs/plans/x.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "docs/plans/x.md"
+    }
+  },
+  "ignore_keys": [
+    "additionalContext",
+    "last_writer_at_unix_ts",
+    "warning_generated_at_unix_ts"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "additionalContext": "<IGNORED>"
+      },
+      "status": "stale",
+      "summary": {
+        "path": "docs/plans/x.md",
+        "current_version": 2,
+        "prior_version_seen_by_session": 2,
+        "last_writer_session_id": "814dac789b8f560d9236b12165a0b50d",
+        "last_writer_at_unix_ts": 0,
+        "warning_generated_at_unix_ts": 0,
+        "hash_differs": false
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

@@ -7,6 +7,7 @@ coordinator and silently split peers onto different coordinators).
 
 from __future__ import annotations
 
+import errno
 import socket
 from pathlib import Path
 
@@ -31,12 +32,19 @@ def fast_cfg() -> LifecycleConfig:
     )
 
 
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+def _refusing_port() -> int:
+    """A loopback port that refuses connections and that no other test can take.
+
+    A port freed after ``bind(("127.0.0.1", 0))`` can be handed to another
+    test worker's port-0 bind before the connect, and the connect then reaches
+    a stranger. Ports below 1024 are never handed out for port 0, and port 4
+    is unassigned, so no standard service listens on it; the assert says so
+    if something does. A socket bound without listening is no substitute: on
+    macOS a connect to it hangs until its timeout instead of being refused."""
+    with socket.socket() as probe:
+        probe.settimeout(2)
+        assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
+    return 4
 
 
 def test_remote_mode_connects_without_spawning(
@@ -72,7 +80,7 @@ def test_remote_unreachable_fails_closed_no_spawn(
     """C1 unreachable: a dead remote endpoint fails CLOSED (strict raises) and
     still does NOT fall through to spawning a local coordinator."""
     monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
-    remote = resolve_remote_endpoint("127.0.0.1", _free_port(), "deadbeef")
+    remote = resolve_remote_endpoint("127.0.0.1", _refusing_port(), "deadbeef")
     with pytest.raises(CoherenceError):
         CoherentVolume(tmp_path, config=fast_cfg, on_error="strict", remote_endpoint=remote)
     assert not (tmp_path / ".coherence" / "server.pid").exists()

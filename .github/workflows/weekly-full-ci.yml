@@ -1,0 +1,83 @@
+name: weekly full CI
+
+# Runs every check on `dev` once a week, so a break that comes from outside
+# the repository (a new dependency release, the runner image, the Java patch
+# level, the plugin's `dev` branch the corpus pairs with) shows up even in a
+# week with no merge. It dispatches ci.yml on `dev`, which runs `dev`'s own
+# job definitions with no skips, waits for that exact run and fails unless it
+# succeeded: a dispatch made with the workflow token runs as the bot, so this
+# run's own failure is what notifies the person who last edited the schedule.
+#
+# GitHub fires `schedule` only from the repository's default branch, which is
+# `dev`; `workflow_dispatch` runs it by hand.
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  full-run:
+    name: Weekly full CI on dev
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      # The tag goes into the dispatched run's name, so the run found below is
+      # this run's own and never a concurrent dispatch or push. That name is
+      # the contract with ci.yml's `run-name`.
+      - name: Dispatch ci.yml on dev and wait for that run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CI_REF: dev
+          FIND_TIMEOUT_SECONDS: "300"
+          WAIT_TIMEOUT_SECONDS: "3000"
+          POLL_SECONDS: "10"
+          WATCH_SECONDS: "60"
+        run: |
+          set -euo pipefail
+          tag="weekly-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh workflow run ci.yml --ref "$CI_REF" -f run_tag="$tag"
+          run_id=""
+          deadline=$(( $(date +%s) + FIND_TIMEOUT_SECONDS ))
+          while [ -z "$run_id" ] && [ "$(date +%s)" -lt "$deadline" ]; do
+            sleep "$POLL_SECONDS"
+            # A failed listing is retried until the deadline. The tag is matched
+            # with its parentheses, so weekly-9-1 never takes weekly-9-10's run.
+            run_id=$(gh run list --workflow ci.yml --branch "$CI_REF" --event workflow_dispatch \
+                --limit 50 --json databaseId,displayTitle 2>/dev/null \
+              | TAG="($tag)" python3 -c 'import json, os, sys; print(next((str(r["databaseId"]) for r in json.load(sys.stdin) if os.environ["TAG"] in r["displayTitle"]), ""))' \
+              || true)
+          done
+          if [ -z "$run_id" ]; then
+            echo "::error::The ci.yml run dispatched as $tag never appeared, so nothing was checked."
+            exit 1
+          fi
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run_id"
+          echo "Dispatched ci.yml on $CI_REF: $url"
+          # `gh run watch` also returns when an API call fails mid-run, so the
+          # run's own status decides whether it is over; watch again until then.
+          state=""
+          wait_deadline=$(( $(date +%s) + WAIT_TIMEOUT_SECONDS ))
+          while :; do
+            gh run watch "$run_id" --interval "$WATCH_SECONDS" > /dev/null 2>&1 || true
+            state=$(gh run view "$run_id" --json status,conclusion --jq '.status + " " + .conclusion' 2>/dev/null || true)
+            case "$state" in completed\ *) break ;; esac
+            [ "$(date +%s)" -lt "$wait_deadline" ] || break
+            sleep "$POLL_SECONDS"
+          done
+          case "$state" in
+            completed\ *) conclusion=${state#completed } ;;
+            *)
+              echo "Weekly full CI on \`$CI_REF\`: [still running or unreadable]($url)" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::The weekly ci.yml run on $CI_REF was still running or unreadable after ${WAIT_TIMEOUT_SECONDS}s: $url"
+              exit 1 ;;
+          esac
+          echo "Weekly full CI on \`$CI_REF\`: [${conclusion:-unknown}]($url)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$conclusion" != success ]; then
+            echo "::error::The weekly ci.yml run on $CI_REF ended ${conclusion:-with no readable result}: $url"
+            exit 1
+          fi

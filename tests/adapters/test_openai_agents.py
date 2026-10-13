@@ -12,6 +12,7 @@ behind ``pytest.importorskip`` to prove delegation against the actual SDK.
 from __future__ import annotations
 
 import asyncio
+import logging
 import warnings
 from unittest.mock import patch
 
@@ -170,6 +171,28 @@ def test_degrade_mode_swallows_and_warns_once_but_underlying_write_persists():
     assert items == [{"x": 1}, {"y": 2}]
     assert adapter.is_degraded is True
     assert adapter.degradation_count == 2
+
+
+def test_degrade_still_logs_when_the_degraded_warning_is_escalated(caplog):
+    # A caller that escalates CoherenceDegradedWarning to an error makes warn()
+    # raise. The log line must already be written by then, or the operator's only
+    # durable record of the degradation is lost.
+    adapter = OpenAIAgentsAdapter(on_error="degrade")
+    store: dict[str, list] = {}
+    a = adapter.wrap_session(FakeSession(store, "c"), agent_name="a", session_id="c")
+    caplog.set_level(logging.WARNING, logger="ccs.adapters.openai_agents")
+
+    async def scenario():
+        with patch.object(adapter.core, "write", side_effect=CoherenceError("boom")):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", CoherenceDegradedWarning)
+                with pytest.raises(CoherenceDegradedWarning):
+                    await a.add_items([{"x": 1}])
+
+    asyncio.run(scenario())
+    degraded_logs = [r for r in caplog.records if "degraded" in r.getMessage()]
+    assert len(degraded_logs) == 1
+    assert adapter.degradation_count == 1
 
 
 # --- shared-warning identity (regression for the dual-class export bug) ------

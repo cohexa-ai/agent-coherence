@@ -56,17 +56,24 @@ class TestReadSubagentId:
         assert read_subagent_id({"agent_id": "bad!chars"}) is None
 
 
-class TestRegistrationAndReverse:
-    def test_register_session_composite_and_reverse_attribution(self) -> None:
-        from ccs.adapters.claude_code.coordinator_server import (
-            CoordinatorHTTPServer,
-            _agent_id_to_session,
-        )
+class TestRegistrationAndAttribution:
+    def test_register_session_mints_a_distinct_composite_identity(self) -> None:
+        """SB-25 R2 attribution, restated on the id rather than on a reverse
+        lookup of it.
+
+        The reverse lookup this used to assert is gone (R7): the renderers
+        that needed it now name a peer by its agent id. What R2 actually
+        requires survives that removal — a subagent gets an id DISTINCT from
+        its parent's, so the short form in deny/warn prose still separates
+        the two — plus the parent linkage, which stays in the name map for
+        the operator tier of /status.
+        """
+        import threading
+
+        from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
 
         # Minimal object exercising just the registration/name surface.
         coordinator = CoordinatorHTTPServer.__new__(CoordinatorHTTPServer)
-        import threading
-
         coordinator._agent_names = {}
         coordinator._agent_names_lock = threading.Lock()
 
@@ -75,10 +82,14 @@ class TestRegistrationAndReverse:
         assert parent != sub
         # Idempotent.
         assert coordinator.register_session(SID, SUB_A) == sub
+        # Distinct at the length the prose actually renders, not merely as
+        # full UUIDs: an 8-char collision would re-merge them on the wire.
+        assert parent.hex[:8] != sub.hex[:8]
 
-        # R2 attribution: reverse lookup names the SUBAGENT, not the parent.
-        assert _agent_id_to_session(coordinator, parent) == SID
-        assert _agent_id_to_session(coordinator, sub) == SUB_A
+        # The parent linkage is still recoverable from the NAME map, which is
+        # what the operator tier renders.
+        assert coordinator.agent_name_for(parent) == f"claude-session-{SID}"
+        assert coordinator.agent_name_for(sub) == f"claude-session-{SID}:subagent-{SUB_A}"
 
 
 class TestClientThreading:

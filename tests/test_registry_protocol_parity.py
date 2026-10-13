@@ -11,7 +11,7 @@ module pins the WHOLE surface:
 
 - both registries are ``isinstance`` of :class:`RegistryBase`, and the SQLite one
   is additionally ``isinstance`` of :class:`SqliteExtended`;
-- the exact expected method names (45 base + 13 extended) are present + callable
+- the exact expected method names (52 base + 13 extended) are present + callable
   on each registry, and the base **property** members (e.g. ``coordinator_epoch``)
   are present as properties — the callable checks cannot see them, so they are
   pinned separately;
@@ -35,7 +35,11 @@ from uuid import uuid4
 import pytest
 
 from ccs.coordinator.registry import ArtifactRegistry
-from ccs.coordinator.registry_protocol import RegistryBase, SqliteExtended
+from ccs.coordinator.registry_protocol import (
+    ForeignWriteDetection,
+    RegistryBase,
+    SqliteExtended,
+)
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.types import Artifact, FetchRequest
@@ -49,15 +53,19 @@ BASE_METHODS = frozenset(
         "adjust_checkpoint_pin_refcount",
         "all_session_meta",
         "artifact_ids",
+        "bind_caller_principal",
         "capture_version_vector",
+        "claim_checkpoint_registration",
         "clear_agent_transient",
         "commit_all",
         "commit_cas",
         "create_checkpoint",
+        "evict_transfer_records",
         "get_agent_state",
         "get_agent_transient",
         "get_artifact",
         "get_artifact_and_generation",
+        "get_caller_principal",
         "get_checkpoint",
         "get_checkpoint_members",
         "get_content",
@@ -68,6 +76,7 @@ BASE_METHODS = frozenset(
         "get_session_cut",
         "get_session_meta",
         "get_state_map",
+        "get_transfer_record",
         "get_transient_map",
         "get_transient_tick",
         "get_version_record",
@@ -89,6 +98,8 @@ BASE_METHODS = frozenset(
         "set_checkpoint_member_pin",
         "set_checkpoint_member_restore",
         "set_checkpoint_restore_status",
+        "set_transfer_status",
+        "transfer_grants",
         "valid_holders",
     }
 )
@@ -110,6 +121,26 @@ EXTENDED_ONLY_METHODS = frozenset(
         "status_snapshot",
     }
 )
+
+DETECTION_METHODS = frozenset(
+    {
+        "artifacts_with_detection_edge",
+        "clear_detection_edges",
+        "close_detection_run",
+        "detection_runs",
+        "detection_uncoverable",
+        "foreign_write_totals",
+        "record_detection_tick",
+        "record_detection_uncoverable",
+        "record_foreign_write",
+    }
+)
+"""The foreign-write detection surface, deliberately its own Protocol.
+
+``SqliteExtended`` is runtime_checkable and the service layer isinstance-checks
+it to pick the durable resolve path, so a structural check passes only when
+every member is present. Folding instrumentation in would have silently demoted
+any backend that implements the coordination surface but not this one."""
 
 # Property members of the base contract. The method checks below filter by
 # callable(), so a ``@property`` is structurally invisible to them; pin
@@ -166,6 +197,32 @@ def test_sqlite_registry_is_sqlite_extended(
     assert isinstance(sqlite_registry, SqliteExtended)
 
 
+def test_both_registries_implement_detection(
+    inmem_registry: ArtifactRegistry, sqlite_registry: SqliteArtifactRegistry
+) -> None:
+    assert isinstance(inmem_registry, ForeignWriteDetection)
+    assert isinstance(sqlite_registry, ForeignWriteDetection)
+
+
+def test_a_backend_without_detection_is_still_sqlite_extended() -> None:
+    """The regression this split exists to prevent.
+
+    The service layer isinstance-checks SqliteExtended to choose the durable
+    resolve path over a slower mint. A backend that implements the whole
+    coordination surface but no instrumentation must keep taking that path."""
+
+    class _CoordinationOnly:
+        pass
+
+    for name in BASE_METHODS | EXTENDED_ONLY_METHODS:
+        setattr(_CoordinationOnly, name, lambda self, *a, **k: None)
+    _CoordinationOnly.coordinator_epoch = property(lambda self: 0)
+
+    backend = _CoordinationOnly()
+    assert isinstance(backend, SqliteExtended)
+    assert not isinstance(backend, ForeignWriteDetection)
+
+
 # ---------------------------------------------------------------------------
 # Full expected surface — names present + callable
 # ---------------------------------------------------------------------------
@@ -204,8 +261,18 @@ def test_protocol_surface_matches_expected_names() -> None:
         for n in dir(SqliteExtended)
         if not n.startswith("_") and callable(getattr(SqliteExtended, n))
     }
+    detection_names = {
+        n
+        for n in dir(ForeignWriteDetection)
+        if not n.startswith("_") and callable(getattr(ForeignWriteDetection, n))
+    }
     assert base_names == BASE_METHODS
     assert extended_names == BASE_METHODS | EXTENDED_ONLY_METHODS
+    assert detection_names == DETECTION_METHODS
+    assert not (extended_names & DETECTION_METHODS), (
+        "detection members must stay off SqliteExtended: it is isinstance-checked "
+        "to choose the durable resolve path, and adding members narrows what passes"
+    )
     base_props = {
         n
         for n in dir(RegistryBase)
@@ -272,6 +339,41 @@ def test_sqlite_extended_method_structure_matches_protocol(
     proto = getattr(SqliteExtended, name)
     impl = getattr(type(sqlite_registry), name)
     assert _param_structure(impl) == _param_structure(proto)
+
+
+def test_status_snapshot_opt_ins_are_keyword_only_and_off_by_default(
+    sqlite_registry: SqliteArtifactRegistry,
+) -> None:
+    """The transfer rows (#185), the reclaim slots (#195) and the grant detail
+    (#187) ride the status snapshot as keyword-only opt-ins that default off,
+    so the session-start builder's default call keeps its two-element answer.
+    Pinned as a literal on the Protocol and the implementation alike: the
+    comparison above would pass a signature both sides changed together, a
+    positional or default-on opt-in included."""
+    expected = [
+        ("agent_ids", inspect.Parameter.KEYWORD_ONLY, None),
+        ("include_transfers", inspect.Parameter.KEYWORD_ONLY, False),
+        ("include_reclamations", inspect.Parameter.KEYWORD_ONLY, False),
+        ("include_grant_detail", inspect.Parameter.KEYWORD_ONLY, False),
+    ]
+    assert _param_structure(SqliteExtended.status_snapshot) == expected
+    assert _param_structure(type(sqlite_registry).status_snapshot) == expected
+
+
+def test_abort_guard_deadline_is_keyword_only_and_off_by_default(
+    inmem_registry: ArtifactRegistry, sqlite_registry: SqliteArtifactRegistry
+) -> None:
+    """The bounded lock wait (#238) is a keyword-only ``deadline`` that
+    defaults to no bound, so every existing ``abort_guard(abort)`` call keeps
+    its unbounded wait. Pinned as a literal on the Protocol and both
+    registries, for the same reason as the status-snapshot pin above."""
+    expected = [
+        ("abort", inspect.Parameter.POSITIONAL_OR_KEYWORD, None),
+        ("deadline", inspect.Parameter.KEYWORD_ONLY, None),
+    ]
+    assert _param_structure(RegistryBase.abort_guard) == expected
+    assert _param_structure(type(inmem_registry).abort_guard) == expected
+    assert _param_structure(type(sqlite_registry).abort_guard) == expected
 
 
 # ---------------------------------------------------------------------------

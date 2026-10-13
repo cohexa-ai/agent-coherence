@@ -1,6 +1,6 @@
 {
   "name": "status-default-tier-node-backend",
-  "description": "GET /status on the Node coordinator. The Node /status envelope is structurally different from Python's — {backend, counts, schema_version, status, version, coordinator_uptime_seconds, policy_summary, sessions, tracked_artifacts} vs Python's {coordinator_backend, detail, ...counters, tracked_artifacts, sessions, policy_summary}. This is a known v0.1.1 wire-shape divergence (only partially closed by AC-02/AC-03). Unit 7a documents the Node shape so any DRIFT FROM THIS BASELINE in v0.2 surfaces immediately.",
+  "description": "GET /status on the Node coordinator. The Node /status envelope is structurally different from Python's — {backend, counts, schema_version, status, version, coordinator_uptime_seconds, policy_summary, sessions, tracked_artifacts} vs Python's {coordinator_backend, detail, ...counters, tracked_artifacts, sessions, policy_summary}. This is a known v0.1.1 wire-shape divergence (only partially closed by AC-02/AC-03). Unit 7a documents the Node shape so any DRIFT FROM THIS BASELINE in v0.2 surfaces immediately. policy_summary.coordinator_root is the sentinel '.' as on the Python default tier (fixture 08): the absolute workspace root is not published below the operator tier, which the Node coordinator does not serve.",
   "setup": {},
   "request": {
     "method": "GET",
@@ -9,7 +9,7 @@
   "ignore_keys": [
     "tracked_artifacts",
     "sessions",
-    "policy_summary",
+    "default_pattern_count",
     "counts",
     "version"
   ],
@@ -19,7 +19,13 @@
       "backend": "node",
       "counts": "<IGNORED>",
       "coordinator_uptime_seconds": "<UPTIME>",
-      "policy_summary": "<IGNORED>",
+      "policy_summary": {
+        "coordinator_root": ".",
+        "default_pattern_count": "<IGNORED>",
+        "ignored_pattern_count": 0,
+        "rejected_pattern_count": 0,
+        "user_added_pattern_count": 0
+      },
       "schema_version": 5,
       "sessions": "<IGNORED>",
       "status": "ok",

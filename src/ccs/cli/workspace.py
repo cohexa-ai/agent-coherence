@@ -39,14 +39,22 @@ Exit codes:
 - 0: verb succeeded (restore: concluded with no absorbing/hold outcome)
 - 1: not in a git repo / validation error (bad path, no members, pre-flight) /
      a typed coherence contention error (e.g. the observe-commit loop exhausted)
-- 2: typed coherence refusal (binary member, unknown checkpoint, persist
-     failure, member-path containment refusal — symlink component, hardlinked
-     regular file (external co-owner), non-regular leaf (FIFO/socket/device),
-     ``.coherence`` self-target, workspace escape, or an unreadable non-file
-     member)
+- 2: typed coherence refusal (binary member, unknown checkpoint, a checkpoint
+     bound to another receiver or registered by another controller (#191),
+     persist failure, member-path containment refusal — symlink component,
+     hardlinked regular file (external co-owner), non-regular leaf
+     (FIFO/socket/device), ``.coherence`` self-target, workspace escape, or an
+     unreadable non-file member)
 - 3: restore CONCLUDED but at least one member ended in an absorbing/hold
      outcome (``conflict`` / ``target_lost`` / ``held_unconfirmed``) or the
      registration was refused — the report on stdout carries the per-member truth
+- 4: restore CONCLUDED clean by the codes above, but the operator asked
+     (``restore --exit-nonzero-on-discarded-content``) for a run that put a
+     member back over content the capture did not hold — or that holds no
+     record of what it overwrote — to be a failure. Opt-in and never the
+     default: the same run exits 0 without the flag, and both producers of 3
+     take precedence over it. The flag is read after the engine returns, so it
+     reports the write, it never prevents one.
 
 A containment refusal is exit 2 on the CAPTURE leg (nothing persists). On the
 RESTORE leg it is NOT: the engine's termination contract absorbs it into that
@@ -67,7 +75,7 @@ import json
 import os
 import stat
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from ccs.adapters.claude_code.lifecycle import _ensure_coherence_dir
@@ -87,12 +95,16 @@ from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import (
     PIN_STATE_UNPINNED,
+    RESTORE_OBSERVATION_DIFFERS,
+    RESTORE_OBSERVATION_NOT_RECORDED,
+    RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
     RESTORE_OUTCOME_CONFLICT,
     RESTORE_OUTCOME_HELD_UNCONFIRMED,
     RESTORE_OUTCOME_TARGET_LOST,
     RESTORE_STATUS_CONCLUDED,
     WORKSPACE_REGISTRATION_REFUSED,
     CasVersionConflict,
+    CheckpointRegistrationRefused,
     CheckpointUnknown,
     CoherenceError,
     CommitUnconfirmed,
@@ -149,6 +161,39 @@ _EXIT3_OUTCOMES = frozenset(
         RESTORE_OUTCOME_HELD_UNCONFIRMED,
     }
 )
+
+#: The observations that say this run put a checkpoint back over content the
+#: capture did not hold, each mapped to the flag its member's line carries.
+#: CLI-PRIVATE and named for what it decides, following :data:`_EXIT3_OUTCOMES`.
+#:
+#: ONE mapping, two consumers: the exit gate reads its keys and the human render
+#: reads its values. They were two hand-maintained lists once, and a state that
+#: fired the gate without earning a flag was exactly the defect that produced —
+#: an operator handed a non-zero exit whose reason appeared nowhere in the
+#: printed report. Adding a state here cannot now change one without the other.
+#:
+#: - ``observed_differs`` — a live state was read and it differed, so the write
+#:   discarded content committed after the capture;
+#: - ``present_not_comparable`` — the delete leg's probe established that live
+#:   state EXISTED and destroyed it. A member captured ABSENT that is present
+#:   live was created after the capture, so this discarded post-capture content
+#:   even though the probe read no comparand to name it by;
+#: - ``not_recorded`` — the run holds no observation, which is its own answer
+#:   and never a clean one; a gate that passed it would report clean on exactly
+#:   the runs that cannot say what they overwrote.
+#:
+#: ``no_live_state`` wrote onto nothing and ``no_write_attempted`` never
+#: reached a write decision, so neither discarded anything, neither fires the
+#: gate, and neither makes its line noisier.
+_DISCARDED_CONTENT_FLAGS: Mapping[str, str] = {
+    RESTORE_OBSERVATION_DIFFERS: "overwrote-differing-content",
+    RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE: "destroyed-uncompared-content",
+    RESTORE_OBSERVATION_NOT_RECORDED: "overwritten-content-not-recorded",
+}
+
+#: The exit-code-4 observation set, derived so it can never drift from the
+#: flags above.
+_DISCARDED_POST_CAPTURE_OBSERVATIONS = frozenset(_DISCARDED_CONTENT_FLAGS)
 
 #: read_with_version's observe-commit loop bound: a racing second CLI process
 #: can move the ledger between the lookup and the CAS; three attempts absorb
@@ -705,11 +750,31 @@ def build_parser() -> argparse.ArgumentParser:
             "Drive one conditional leg per durable member row under the "
             "termination contract. Absorbing outcomes (conflict / target_lost / "
             "held_unconfirmed) are REPORT content: the restore still concludes "
-            "and the exit code distinguishes a clean restore (0) from a "
-            "concluded-with-absorbed-outcomes one (3)."
+            "and the exit code distinguishes a restore with no such outcome "
+            "(0) from a concluded-with-absorbed-outcomes one (3). Exit 0 is "
+            "not a claim that nothing was overwritten: a restore that put a "
+            "member back over content committed after the capture says so per "
+            "member in the report and still exits 0 unless the flag below "
+            "asks for its own code."
         ),
     )
     p_restore.add_argument("checkpoint_id", help="The persisted checkpoint id.")
+    # Named for what it changes — the exit code — and nothing else. A fencing
+    # name would promise a refusal this cannot deliver: the flag is read after
+    # the engine returns, when every member has already been written and the
+    # registration has already run.
+    p_restore.add_argument(
+        "--exit-nonzero-on-discarded-content",
+        action="store_true",
+        help=(
+            "Exit 4 when the report says this run put a member back over "
+            "content the checkpoint did not hold, or holds no record of what "
+            "it overwrote. Read after every member has already been written, "
+            "so it reports what happened and cannot prevent the write. A "
+            "restore that also ends with an absorbing/hold outcome or a "
+            "refused registration still exits 3."
+        ),
+    )
     return parser
 
 
@@ -758,6 +823,43 @@ def _member_line(row: CheckpointMember) -> str:
     return "  ".join(bits)
 
 
+def _restore_outcome_line(outcome: MemberRestoreOutcome) -> str:
+    """One restored member's summary line (the detail prose rides below it).
+
+    Every observation the exit gate fires on earns a flag, in the shape
+    ``resumed-from-prior-run`` already set, and it earns it by lookup rather
+    than by a branch: both this render and the gate read
+    :data:`_DISCARDED_CONTENT_FLAGS`, so a state cannot fire one and not the
+    other. The two states absent from that mapping are the two the gate does
+    not fire on — a write that landed on nothing discarded nothing, and a
+    member whose leg never reached a write decision must not be made noisier.
+    Both render exactly as they did before the observation existed.
+
+    The differing case is annotated whatever the differing content WAS. The
+    engine reads one live state and cannot separate a half-written file from a
+    peer's committed work, so a rule that flagged only the second would be
+    guessing; the flag reports what was seen, and the operator decides.
+    """
+    line = (
+        f"  {outcome.member_path}  outcome={outcome.outcome}  "
+        f"attempts={outcome.attempts}"
+    )
+    if outcome.resumed_from_prior_run:
+        line += "  resumed-from-prior-run"
+    observation = outcome.observation
+    flag = _DISCARDED_CONTENT_FLAGS.get(observation.state)
+    if flag is not None:
+        line += f"  {flag}"
+    if observation.state == RESTORE_OBSERVATION_DIFFERS and observation.pointer is not None:
+        # Only this state MAY carry a pointer, and it is not guaranteed to (a
+        # source can land a write without naming a version), so the version is
+        # appended only when there is one rather than printed as an empty
+        # claim. The digest stays off this summary line and in the JSON: 64
+        # hex characters per member would bury the line it rides on.
+        line += f"  overwritten-version={observation.pointer}"
+    return line
+
+
 def _record_payload(record: CheckpointRecord) -> dict[str, Any]:
     return {
         "checkpoint_id": record.checkpoint_id,
@@ -779,6 +881,19 @@ def _outcome_payload(outcome: MemberRestoreOutcome) -> dict[str, Any]:
         "new_native_token": outcome.new_native_token,
         "deleted_at_restore": outcome.deleted_at_restore,
         "resumed_from_prior_run": outcome.resumed_from_prior_run,
+        # Nested, mirroring how the ``registration`` block renders its own
+        # companion dataclass as one keyed object: the three values are read
+        # together and only mean anything together. Flat keys would also put
+        # ``fingerprint`` and a pointer beside ``status``'s member payload
+        # spellings, where they name the CAPTURED digest and token — the same
+        # words for the opposite state. Under this key they unambiguously
+        # describe what the restore overwrote. The block is always present,
+        # so a consumer never has to read its absence as clean.
+        "observation": {
+            "state": outcome.observation.state,
+            "pointer": outcome.observation.pointer,
+            "fingerprint": outcome.observation.fingerprint,
+        },
     }
 
 
@@ -1014,6 +1129,23 @@ def _cmd_status(stack: _Stack, args: argparse.Namespace) -> int:
     return 0
 
 
+def _discarded_post_capture_content(outcome: MemberRestoreOutcome) -> bool:
+    """Did this member's restore put the checkpoint back over content the
+    capture did not hold?
+
+    The opt-in exit gate's whole decision, over the member outcome alone — it
+    reads no rendered payload, because the exit code is computed whether or not
+    ``--json`` was asked for. Kept a named function rather than an inline
+    comprehension so the two states the command line cannot reach are still
+    decidable directly: ``restore`` refuses a checkpoint carrying a pending
+    object member before the engine runs, so only the file leg's states arrive
+    here end to end, while the delete leg's ``present_not_comparable`` and the
+    create-on-absent ``no_live_state`` are covered at the engine level and
+    through this predicate.
+    """
+    return outcome.observation.state in _DISCARDED_POST_CAPTURE_OBSERVATIONS
+
+
 def _cmd_restore(stack: _Stack, args: argparse.Namespace) -> int:
     record = stack.service.get_workspace_checkpoint(args.checkpoint_id)
     if record is None:
@@ -1061,6 +1193,13 @@ def _cmd_restore(stack: _Stack, args: argparse.Namespace) -> int:
         and report.registration.status == WORKSPACE_REGISTRATION_REFUSED
     )
     rc = 3 if absorbed or registration_refused else 0
+    # The operator's opt-in gate, evaluated ONLY on a run that would otherwise
+    # exit 0: both of exit 3's producers — an absorbing/hold outcome and a
+    # refused registration — take precedence, so a consumer reading 3 still
+    # reads exactly what it always did.
+    if rc == 0 and args.exit_nonzero_on_discarded_content:
+        if any(_discarded_post_capture_content(m) for m in report.members):
+            rc = 4
 
     if args.json:
         payload: dict[str, Any] = {
@@ -1088,10 +1227,7 @@ def _cmd_restore(stack: _Stack, args: argparse.Namespace) -> int:
     print(f"restore of checkpoint {report.checkpoint_id} {report.status.upper()}")
     print("members:")
     for outcome in report.members:
-        line = f"  {outcome.member_path}  outcome={outcome.outcome}  attempts={outcome.attempts}"
-        if outcome.resumed_from_prior_run:
-            line += "  resumed-from-prior-run"
-        print(line)
+        print(_restore_outcome_line(outcome))
         print(f"    {outcome.detail}")
     if report.registration is not None:
         print(
@@ -1156,7 +1292,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             args, exit_code=2, reason=exc.reason, message=str(exc), exc=exc
         )
         return 2
-    except CheckpointUnknown as exc:
+    except (CheckpointUnknown, CheckpointRegistrationRefused) as exc:
+        # CheckpointRegistrationRefused (#191): the checkpoint names another
+        # receiver, or another controller registered it — refused before the
+        # restore wrote anything. The CLI uses one owner per workspace root,
+        # so only a checkpoint created through another path can reach this.
         err(f"{_PROG}: refused ({exc.reason}): {exc}")
         _emit_error_envelope(
             args, exit_code=2, reason=exc.reason, message=str(exc), exc=exc

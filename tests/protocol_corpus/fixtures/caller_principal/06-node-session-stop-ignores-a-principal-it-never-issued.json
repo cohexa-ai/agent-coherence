@@ -1,0 +1,25 @@
+{
+  "name": "caller-principal-node-session-stop-ignores-a-principal",
+  "description": "KTD12: the Node coordinator ignores the header it does not read. A principal it never issued -- well-formed, bound to nothing -- changes nothing about the answer. Sent as a literal because Node mints none to capture.",
+  "setup": {},
+  "request": {
+    "method": "POST",
+    "path": "/hooks/session-stop",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a"
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "released_artifacts": []
+    }
+  },
+  "backends": [
+    "node"
+  ]
+}

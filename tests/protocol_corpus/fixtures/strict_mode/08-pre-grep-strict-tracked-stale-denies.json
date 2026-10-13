@@ -67,7 +67,7 @@
       "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": "Stale read denied: plan.md was updated by session bbbbbbbb at <TS>. Re-read plan.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+        "permissionDecisionReason": "Stale read denied: plan.md was updated by agent 814dac78 at <TS>. Re-read plan.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
       },
       "status": "stale",
       "stale_paths": "<IGNORED>"

@@ -1,4 +1,7 @@
 name: ci
+# Only a run the weekly scheduler dispatched carries a tag; for every other
+# run this is empty, and GitHub falls back to its default run name.
+run-name: ${{ inputs.run_tag && format('Weekly full CI ({0})', inputs.run_tag) || '' }}
 
 on:
   push:
@@ -8,17 +11,34 @@ on:
   pull_request:
     branches: [main, dev]
   workflow_dispatch:
+    inputs:
+      run_tag:
+        description: Set by the weekly full run so it can find the run it dispatched; leave empty.
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
 
+# A new push to a PR supersedes its running checks, so only PR runs cancel
+# each other. Every other run gets a group of its own: pushes to `main` and
+# `dev`, tag pushes and dispatches can share a commit, and a group keyed on
+# the commit would let one of them silently cancel another's pending run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   PYTHON_VERSION: "3.11"
+  # Keep equal to the length of the test-shards jobs' `shard` matrix.
+  TEST_SHARD_COUNT: "2"
 
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
@@ -36,7 +56,8 @@ jobs:
 
   architecture:
     name: Architecture Checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
@@ -54,21 +75,50 @@ jobs:
       - name: Run architecture boundary checks
         run: python tools/check_architecture.py
 
-  test:
-    name: Tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+  # Decides what the rest of the run checks. It never fails: every output
+  # is written on every run, and an empty one means "run" (tools/ci_plan.py).
+  # Jobs that read an output must list this job in `needs`; GitHub hides a
+  # job's outputs from jobs that do not.
+  plan:
+    name: Plan checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tested-tree: ${{ steps.plan.outputs.tested-tree }}
+      tla-needed: ${{ steps.plan.outputs.tla-needed }}
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          fetch-depth: 2
+
+      - name: Decide what this run checks
+        id: plan
+        run: python3 tools/ci_plan.py
+
+  # Each Python version's suite runs as TEST_SHARD_COUNT shards (pytest-split,
+  # balanced by tests/.test_durations), each in a parallel and a serial lane
+  # (tests/conftest.py). The required checks are the `Tests (Python 3.x)`
+  # gates after them, not these matrix jobs: a matrix job skipped as a whole
+  # reports an unexpanded name, so a required name there could never report.
+  test-shards-py311:
+    name: Test shard ${{ matrix.shard }} (Python 3.11)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [plan]
+    if: ${{ !cancelled() }}
 
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        shard: [1, 2]
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
 
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.11"
           cache: pip
 
       - name: Install package and test dependencies
@@ -88,21 +138,190 @@ jobs:
         working-directory: examples/refactor_demo/fixture_repo_ts
         run: npm ci
 
-      - name: Run test suite
-        run: pytest -q --junitxml=test-results.xml
+      # --node-id-dir=DIR must stay one argument: pytest reads an existing
+      # DIR given separately as a test path, and the serial lane writes into
+      # the directory the parallel lane created (tests/conftest.py).
+      - name: Run the parallel lane
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: >-
+          pytest -q -n 4 --dist worksteal --test-lane parallel
+          --splits "$TEST_SHARD_COUNT" --group "$SHARD" --durations-path tests/.test_durations
+          "--node-id-dir=lists/shard-$SHARD" "--junitxml=lists/shard-$SHARD/junit-parallel.xml"
 
-      - name: Upload test report
-        if: always()
+      # Runs after a parallel-lane failure too, but not after a cancel or a
+      # timeout, so every failure in the shard shows up in one run.
+      - name: Run the serial lane
+        if: ${{ !cancelled() }}
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: >-
+          pytest -q -n 0 --test-lane serial
+          --splits "$TEST_SHARD_COUNT" --group "$SHARD" --durations-path tests/.test_durations
+          "--node-id-dir=lists/shard-$SHARD" "--junitxml=lists/shard-$SHARD/junit-serial.xml"
+
+      - name: Upload node-id lists and test reports
+        if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: test-results-py${{ matrix.python-version }}
-          path: test-results.xml
+          name: test-results-py3.11-shard-${{ matrix.shard }}
+          path: lists/shard-${{ matrix.shard }}
+          overwrite: true
           retention-days: 14
+
+  test-shards-py312:
+    name: Test shard ${{ matrix.shard }} (Python 3.12)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [plan]
+    if: ${{ !cancelled() }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,diagnose,mcp]"
+
+      # Node toolchain for the refactor-demo's TypeScript fixture. Without
+      # this, _has_tsc() in tests/test_refactor_demo.py is False and all real
+      # tsc end-to-end tests silently skip, leaving the demo's central
+      # correctness claim unverified in CI.
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: "20"
+
+      - name: Install refactor-demo TS fixture dependencies
+        working-directory: examples/refactor_demo/fixture_repo_ts
+        run: npm ci
+
+      # --node-id-dir=DIR must stay one argument: pytest reads an existing
+      # DIR given separately as a test path, and the serial lane writes into
+      # the directory the parallel lane created (tests/conftest.py).
+      - name: Run the parallel lane
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: >-
+          pytest -q -n 4 --dist worksteal --test-lane parallel
+          --splits "$TEST_SHARD_COUNT" --group "$SHARD" --durations-path tests/.test_durations
+          "--node-id-dir=lists/shard-$SHARD" "--junitxml=lists/shard-$SHARD/junit-parallel.xml"
+
+      # Runs after a parallel-lane failure too, but not after a cancel or a
+      # timeout, so every failure in the shard shows up in one run.
+      - name: Run the serial lane
+        if: ${{ !cancelled() }}
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: >-
+          pytest -q -n 0 --test-lane serial
+          --splits "$TEST_SHARD_COUNT" --group "$SHARD" --durations-path tests/.test_durations
+          "--node-id-dir=lists/shard-$SHARD" "--junitxml=lists/shard-$SHARD/junit-serial.xml"
+
+      - name: Upload node-id lists and test reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: test-results-py3.12-shard-${{ matrix.shard }}
+          path: lists/shard-${{ matrix.shard }}
+          overwrite: true
+          retention-days: 14
+
+  # The gates carry the required check names. They run under always() and
+  # pass only when every shard succeeded and the shards' node-id lists prove
+  # each collected test ran exactly once (tools/ci_gate_verdict.py).
+  tests-py311:
+    name: Tests (Python 3.11)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [test-shards-py311]
+    if: ${{ always() }}
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - name: Download every shard's lists
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: test-results-py3.11-shard-*
+          path: shards
+
+      - name: Check that the shards ran every test exactly once
+        id: coverage
+        run: |
+          set +e
+          python3 tools/check_shard_coverage.py --root shards --shards "$TEST_SHARD_COUNT" > coverage.txt
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          cat coverage.txt
+          {
+            echo "### Test coverage across shards (Python 3.11)"
+            echo '```'
+            cat coverage.txt
+            python3 tools/summarize_junit.py shards
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Decide the verdict
+        env:
+          SHARDS: ${{ needs.test-shards-py311.result }}
+          COVERAGE_EXIT: ${{ steps.coverage.outputs.exit }}
+        run: python3 tools/ci_gate_verdict.py tests --shards "$SHARDS" --coverage-exit "$COVERAGE_EXIT"
+
+  tests-py312:
+    name: Tests (Python 3.12)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [test-shards-py312]
+    if: ${{ always() }}
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - name: Download every shard's lists
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: test-results-py3.12-shard-*
+          path: shards
+
+      - name: Check that the shards ran every test exactly once
+        id: coverage
+        run: |
+          set +e
+          python3 tools/check_shard_coverage.py --root shards --shards "$TEST_SHARD_COUNT" > coverage.txt
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          cat coverage.txt
+          {
+            echo "### Test coverage across shards (Python 3.12)"
+            echo '```'
+            cat coverage.txt
+            python3 tools/summarize_junit.py shards
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Decide the verdict
+        env:
+          SHARDS: ${{ needs.test-shards-py312.result }}
+          COVERAGE_EXIT: ${{ steps.coverage.outputs.exit }}
+        run: python3 tools/ci_gate_verdict.py tests --shards "$SHARDS" --coverage-exit "$COVERAGE_EXIT"
 
   benchmark-smoke:
     name: Benchmark Smoke
-    runs-on: ubuntu-latest
-    needs: [architecture]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [plan]
+    if: ${{ !cancelled() }}
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
@@ -122,7 +341,8 @@ jobs:
 
   benchmark-regression:
     name: Benchmark Regression
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
@@ -143,9 +363,22 @@ jobs:
       - name: Check benchmark regression
         run: python tools/benchmark_drift_check.py
 
-  tla-check:
-    name: TLA+ Model Check
-    runs-on: ubuntu-latest
+  # TLA+ runs as three bins in parallel (Makefile tla-check-1..3, which
+  # together are `make tla-check`'s nine specs with the same configs). Only a
+  # pull request that leaves every TLA+ input alone skips them: the condition
+  # needs both the pull_request event and the plan's exact `false`, so an
+  # empty or missing output runs them (tools/ci_plan.py).
+  tla-bins:
+    name: TLA+ bin ${{ matrix.bin }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: [plan]
+    if: ${{ !cancelled() && !(github.event_name == 'pull_request' && needs.plan.outputs.tla-needed == 'false') }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        bin: [1, 2, 3]
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
@@ -155,13 +388,36 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Run TLC model checker
-        run: make tla-check
+      - name: Run TLC on this bin's specs
+        env:
+          BIN: ${{ matrix.bin }}
+        run: make "tla-check-$BIN"
+
+  # Carries the required check name. Passes when every bin passed, or when
+  # a pull request's plan said in exactly `false` that no TLA+ input changed
+  # (tools/ci_gate_verdict.py); a skip on any other event fails.
+  tla-check:
+    name: TLA+ Model Check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [plan, tla-bins]
+    if: ${{ always() }}
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - name: Decide the verdict
+        env:
+          BINS: ${{ needs.tla-bins.result }}
+          EVENT: ${{ github.event_name }}
+          PLAN: ${{ needs.plan.result }}
+          TLA_NEEDED: ${{ needs.plan.outputs.tla-needed }}
+        run: python3 tools/ci_gate_verdict.py tla --bins "$BINS" --event "$EVENT" --plan "$PLAN" --tla-needed "$TLA_NEEDED"
 
   protocol-corpus:
     name: Protocol Corpus (Python ↔ Node parity)
-    runs-on: ubuntu-latest
-    needs: [architecture]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
@@ -170,10 +426,6 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
-        with:
-          node-version: "20"
 
       - name: Install library + dev dependencies
         run: |
@@ -192,10 +444,15 @@ jobs:
       # So: build the plugin branch whose name matches the branch under
       # test — the PR's head branch on pull_request (`head_ref`), the pushed
       # branch on push (`ref_name`, so a push to `dev` pairs with the
-      # plugin's `dev` and a push to `main` with its `main`) — and fall back
-      # to `main` when no same-named plugin branch exists (tags fall back
-      # too: no plugin branch is named `v*`). An absent or unreachable
-      # sibling degrades to `main` rather than failing the job.
+      # plugin's `dev` and a push to `main` with its `main`). With no
+      # same-named plugin branch, fall back to the plugin branch named like
+      # the line the change is heading for: a PR into `dev` (`base_ref`) and
+      # a hand-dispatched run on a feature branch -- stacked PRs get no PR
+      # checks, so their CI is dispatched -- pair with the plugin's `dev`,
+      # because that is what this repo's `dev` push will pair with after the
+      # merge. A PR into `main`, a dispatch on `main` and a tag fall back to
+      # the plugin's `main` (no plugin branch is named `v*`). An absent or
+      # unreachable fallback degrades to `main` rather than failing the job.
       #
       # `head_ref` is attacker-controlled on a fork PR, so it reaches the
       # script through the environment and is never interpolated into it.
@@ -203,20 +460,69 @@ jobs:
         id: plugin_ref
         env:
           SIBLING_REF: ${{ github.head_ref || github.ref_name }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           remote=https://github.com/Cohexa-ai/agent-coherence-plugin.git
           ref=main
+          # Whether we FELL BACK is a property of the path taken, not of the
+          # value landed on: a push to this repo's `main` pairs with the
+          # plugin's `main` deliberately (see above), so `$ref = main` alone
+          # cannot tell the intended pairing from a fallback.
+          fellback=yes
           if [ -n "$SIBLING_REF" ] &&
              git ls-remote --exit-code --heads "$remote" "$SIBLING_REF" \
                >/dev/null 2>&1; then
             ref="$SIBLING_REF"
+            fellback=no
+          else
+            # The fallback follows the integration line: `dev` for a PR into
+            # `dev` or a dispatch on a non-`main` branch, `main` otherwise.
+            fallback=main
+            if [ "$BASE_REF" = dev ] ||
+               { [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REF_NAME" != main ]; }; then
+              fallback=dev
+            fi
+            if [ "$fallback" != main ] &&
+               git ls-remote --exit-code --heads "$remote" "$fallback" \
+                 >/dev/null 2>&1; then
+              ref="$fallback"
+            fi
           fi
           # Record the SHA too: the sibling branch can move without a commit
           # here, so the ref name alone does not identify what was proven.
           sha=$(git ls-remote "$remote" "refs/heads/$ref" | cut -f1)
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           echo "Node backend: agent-coherence-plugin@$ref ($sha)"
-          echo "Parity proven against \`agent-coherence-plugin@$ref\` \`$sha\`." \
+          # When this is the FALLBACK, say how far behind it is. "Parity
+          # proven against `main`" is true and reads like reassurance, and a
+          # `main` trailing the plugin's own `dev` by a release is a weaker
+          # claim than it sounds -- the reader cannot tell the difference
+          # from the ref name, and this job's whole job is to be believable.
+          # Advisory only: every failure path below leaves $note empty, so a
+          # rate-limited or unreachable API never turns a passing parity run
+          # red. `|| true` is load-bearing under the default `bash -e`.
+          note=""
+          if [ "$fellback" = yes ] && [ "$ref" = dev ]; then
+            note=" — the fallback, the plugin's \`dev\` (the line this change merges into)"
+          elif [ "$fellback" = yes ]; then
+            # `.ahead_by` on a three-dot compare is how far `dev` leads, i.e.
+            # how far `main` trails. `.behind_by` would report the opposite
+            # and is wrong here -- today the two are diverged (33 / 2).
+            behind=$(curl -sS --max-time 10 -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/Cohexa-ai/agent-coherence-plugin/compare/main...dev" \
+              2>/dev/null | jq -r '.ahead_by // empty' 2>/dev/null || true)
+            # Three outcomes, kept distinct. Folding the first into the second
+            # would let a rate-limited lookup read as reassurance -- the exact
+            # bare sentence this note exists to qualify.
+            case "$behind" in
+              ''|*[!0-9]*) note=" — the fallback; staleness check unavailable" ;;
+              0)           note=" — the fallback, level with the plugin's \`dev\`" ;;
+              *)           note=" — the fallback, $behind commit(s) behind the plugin's \`dev\`" ;;
+            esac
+          fi
+          echo "Parity proven against \`agent-coherence-plugin@$ref\` \`$sha\`$note." \
             >> "$GITHUB_STEP_SUMMARY"
 
       # Check out the plugin repo INSIDE the workspace so actions/checkout
@@ -229,6 +535,15 @@ jobs:
           repository: Cohexa-ai/agent-coherence-plugin
           ref: ${{ steps.plugin_ref.outputs.ref }}
           path: _plugin_checkout
+
+      # After the plugin checkout, so its lockfile exists to key the npm
+      # cache on. Node 22 because the plugin's `engines` require it (on 20,
+      # `npm ci` warns EBADENGINE).
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: _plugin_checkout/package-lock.json
 
       - name: Build Node coordinator
         working-directory: _plugin_checkout
@@ -243,8 +558,10 @@ jobs:
 
   build:
     name: Build Package
-    runs-on: ubuntu-latest
-    needs: [lint, architecture, test, benchmark-smoke, benchmark-regression, tla-check]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [plan]
+    if: ${{ !cancelled() }}
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3

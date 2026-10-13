@@ -1,0 +1,37 @@
+{
+  "name": "workspace-restore-register-of-an-unknown-checkpoint",
+  "description": "An unknown checkpoint id on the register route answers `{ok: false, reason: checkpoint_unknown}` -- the token only, with no `detail`, unlike the status and member routes (fixture 08), which carry the registry's prose. Pinned as it stands.",
+  "setup": {
+    "tracked": [
+      "docs/**"
+    ],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n",
+      "docs/spec.md": "# coherence corpus fixture  \n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/workspace/restore/register",
+    "body": {
+      "session_id": "22222222-2222-4222-8222-222222222222",
+      "checkpoint_id": "no-such-checkpoint",
+      "writes": [
+        {
+          "member_path": "docs/plan.md",
+          "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": false,
+      "reason": "checkpoint_unknown"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

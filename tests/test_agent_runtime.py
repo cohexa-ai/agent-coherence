@@ -298,19 +298,24 @@ def test_write_cas_loop_obeys_strategy_max_retries_knob() -> None:
 
     attempts = 0
 
+    reasons = ["version_mismatch", "version_mismatch", "other_holder"]
+
     def always_conflict(**kwargs):  # type: ignore[no-untyped-def]
         nonlocal attempts
         attempts += 1
-        return ConflictDetail(reason="other_holder", current_version=1)
+        return ConflictDetail(reason=reasons[attempts - 1], current_version=1)
 
     coordinator.commit_cas = always_conflict  # type: ignore[assignment]
 
-    with pytest.raises(CasRetriesExhausted):
+    with pytest.raises(CasRetriesExhausted) as excinfo:
         runtime.write_cas(
             artifact.id, make_content=lambda entry: ("x", None), now_tick=2
         )
 
     assert attempts == 3  # max_cas_retries()=2 -> 2 + 1 attempts
+    # The terminal names the LAST refusal, not the first, and not a lost race.
+    assert excinfo.value.last_conflict_reason == "other_holder"
+    assert "lost the race" not in str(excinfo.value)
 
 
 def test_write_cas_validates_provided_content_hash() -> None:

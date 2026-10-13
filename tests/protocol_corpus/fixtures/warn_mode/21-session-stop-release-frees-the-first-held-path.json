@@ -1,0 +1,53 @@
+{
+  "name": "session-stop-release-frees-the-first-held-path",
+  "description": "Row 20's twin for the other end of the release loop: the same setup (session A takes EXCLUSIVE on plan.md, then CLAUDE.md, and stops), but session B pre-edits plan.md, the path A acquired first. B's acquire must be clean, the bare {ok:true}. Row 20 fails when the stop frees nothing or stops before the last grant; this row fails when the stop skips the first one, which row 18's answer and row 20 would both miss.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md",
+      "plan.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n",
+      "plan.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444",
+          "path": "plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444",
+          "path": "CLAUDE.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/session-stop",
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "66666666-6666-4666-8666-666666666666",
+      "path": "plan.md"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true
+    }
+  }
+}

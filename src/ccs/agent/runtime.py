@@ -186,8 +186,9 @@ class AgentRuntime:
             mirrors ``write``'s shape so the adapter publishes them unchanged.
 
         Raises:
-            CasRetriesExhausted: every allowed attempt lost the race — a typed
-                terminal, NEVER a silent drop. The cache is left at the latest
+            CasRetriesExhausted: every allowed attempt was refused — a typed
+                terminal, NEVER a silent drop, whose ``last_conflict_reason``
+                names the last refusal. The cache is left at the latest
                 refreshed version (no unconfirmed write cached).
             CoherenceError: the coordinator reported corruption
                 (``expected_version > current``) or a precondition failure
@@ -202,6 +203,7 @@ class AgentRuntime:
             self._fetch(artifact_id, now_tick=now_tick)
 
         last_current_version = -1
+        last_conflict_reason: str | None = None
         max_attempts = self.strategy.max_cas_retries() + 1
         for attempt in range(max_attempts):
             entry = self.cache.get(artifact_id)
@@ -227,6 +229,7 @@ class AgentRuntime:
 
             if isinstance(result, ConflictDetail):
                 last_current_version = result.current_version
+                last_conflict_reason = result.reason
                 # Re-read: re-fetch refreshes the cache entry to the winner's new
                 # version (SHARED, fresh local_version) so the next attempt's
                 # expected_version + make_content() see current state.
@@ -268,6 +271,7 @@ class AgentRuntime:
             artifact_id=artifact_id,
             attempts=max_attempts,
             last_current_version=last_current_version,
+            last_conflict_reason=last_conflict_reason,
         )
 
     def _resolve_content_hash(self, content: str, provided_hash: str | None) -> str:

@@ -195,6 +195,14 @@ class WorkspaceRegistrationResult:
     the idempotency filter that makes crash-resumed registration exactly-once
     — a re-run of an already-landed registration re-answers without a second
     version bump.
+
+    ``retry_of_own_registration`` (#191) is ``True`` when this controller had
+    already claimed the checkpoint's registration before this call — the call
+    is a retry of its OWN registration, so an ``empty_write_set`` with
+    ``skipped`` members reads "I registered this", never "someone else did".
+    A registration claimed by a DIFFERENT controller never reaches a result:
+    it is refused ``already_registered`` (:class:`~ccs.core.exceptions.
+    CheckpointRegistrationRefused`).
     """
 
     checkpoint_id: str
@@ -204,6 +212,7 @@ class WorkspaceRegistrationResult:
     skipped: tuple[str, ...] = ()
     signals: tuple["InvalidationSignal", ...] = ()
     refused: Mapping[str, ConflictDetail] = field(default_factory=dict)
+    retry_of_own_registration: bool = False
 
 
 @dataclass(frozen=True)
@@ -544,3 +553,152 @@ class FetchResponse:
     content: str
     state_grant: MESIState
 
+
+@dataclass(frozen=True, kw_only=True)
+class FenceComparands:
+    """Everything the effect fence classifies, as ONE named, frozen value.
+
+    The input to :func:`ccs.core.fence.classify_hold` — the branch table that
+    decides whether an irreversible effect may still fire. Both surfaces that
+    ask that question build one of these: the in-process wrapper
+    (``adapters.effect_gate``) and the coordinator route that answers the same
+    question over HTTP. One object, not six positionals: two ints, two optional
+    ints and two bools in a row is a transposition hazard, and this is the one
+    path in the product where a silently swapped pair IS the lost update the
+    fence exists to prevent. ``kw_only`` makes the swap unexpressible rather
+    than merely unlikely, and NO field carries a default — a caller that
+    forgets the grant state must fail at construction, naming the field it
+    omitted, instead of silently gating on a fabricated "nothing was wrong".
+
+    Field names come from the PROTOCOL, not from either caller's internals, so
+    core never acquires volume-shaped vocabulary and the adapter stays the only
+    place a private ``_last_read_*`` attribute is read:
+
+    - ``expected_version`` / ``current_version`` — the value comparand:
+      "is this still the version the decision was derived from". ``0`` is the
+      "could not resolve" SENTINEL on either side (a degraded or pre-fence
+      coordinator), never a comparable value; ``current_version is None`` means
+      the input VANISHED between capture and re-validate.
+    - ``expected_generation`` / ``current_generation`` — the authority
+      comparand: "is the grant it was read under still standing". ``None`` is
+      the sentinel for "the coordinator confirmed no generation" and is NEVER
+      coerced to ``0``, which is a REAL generation. A sweep reclamation moves
+      this pair while the version stays put — the drift a version-only check
+      structurally cannot see.
+    - ``read_refused`` — the coordinator REFUSED the re-validate read
+      (strict-mode deny). A distinct, recoverable answer, and on the strict
+      path it is how a sweep reclaim actually reaches a client.
+    - ``grant_did_not_stand`` — the re-validate read was served WITHOUT a
+      standing grant. A peer's pessimistic write-acquire preempts a holder
+      while moving NEITHER comparand (no commit yet, and ``trigger="write"``
+      is outside ``EPOCH_BUMP_TRIGGERS``), so this is the only leg that sees it.
+    - ``content_claim_present`` — the coordinator records SOME content claim
+      for this artifact (see
+      :func:`ccs.core.fence.coordinator_holds_content_claim`). ``False`` means
+      it holds no hash at all and therefore cannot vouch that the bytes in hand
+      are the content at the version it reports.
+    """
+
+    expected_version: int
+    current_version: int | None
+    expected_generation: int | None
+    current_generation: int | None
+    read_refused: bool
+    grant_did_not_stand: bool
+    content_claim_present: bool
+
+
+
+# ---------------------------------------------------------------------------
+# Targeted grant handoff (#185): the transfer record's status
+# vocabulary and the two typed outcomes the handoff answers with.
+# ---------------------------------------------------------------------------
+#
+# The status a transfer record carries. Wire-stable constants matched by
+# identity (add, never rename). A status is a LABEL, not liveness: a record is
+# live while the artifact's version still equals the version at transfer and
+# the status is neither declined nor withdrawn, whatever else it says.
+#
+# - ``pending`` -- the transfer landed; the successor has not acted.
+# - ``completed`` -- the successor acquired, won a compare-and-swap, or accepted.
+#   Completion alone never lifts the giver's fence.
+# - ``declined`` -- the successor declined; the fence is off.
+# - ``withdrawn`` -- the giver withdrew; the fence is off.
+# - ``overtaken`` -- a third session acquired or won a compare-and-swap; the
+#   record names it as the counterparty.
+# - ``superseded`` -- the giver transferred the path again. No stored row
+#   carries it: the replacing record's cause records the supersession, and a
+#   re-sent superseded transfer answers this status.
+TRANSFER_STATUS_PENDING = "pending"
+TRANSFER_STATUS_COMPLETED = "completed"
+TRANSFER_STATUS_DECLINED = "declined"
+TRANSFER_STATUS_WITHDRAWN = "withdrawn"
+TRANSFER_STATUS_OVERTAKEN = "overtaken"
+TRANSFER_STATUS_SUPERSEDED = "superseded"
+TRANSFER_STATUSES: frozenset[str] = frozenset(
+    {
+        TRANSFER_STATUS_PENDING,
+        TRANSFER_STATUS_COMPLETED,
+        TRANSFER_STATUS_DECLINED,
+        TRANSFER_STATUS_WITHDRAWN,
+        TRANSFER_STATUS_OVERTAKEN,
+        TRANSFER_STATUS_SUPERSEDED,
+    }
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class TransferGrantOutcome:
+    """One grant's answer to a transfer: transferred, or refused with its
+    reason. A multi-path transfer answers one of these per path, and its
+    top-level result is success only when every grant transferred.
+
+    ``kw_only`` because ``giver`` and ``successor`` are two ids of one type side
+    by side: a positional swap reports the giver as the successor, which is the
+    handoff pointed the wrong way.
+
+    - ``transferred`` -- the grant was handed off (or a re-send found its live
+      record). ``reason`` is ``None`` then; otherwise it is the typed
+      refusal reason (see
+      :data:`ccs.core.exceptions.HANDOFF_TRANSFER_REFUSAL_REASONS`), and the
+      grant was left exactly as it was.
+    - ``giver`` / ``successor`` -- session-level ids: the normalised pair of a
+      transferred grant, or the pending pair a ``handoff_in_flight`` refusal
+      names. ``None`` where the answer names no record.
+    - ``version_at_transfer`` -- the artifact version the handoff is fenced on.
+    - ``hold_shape`` -- the grant given up: EXCLUSIVE, MODIFIED or SHARED.
+    - ``status`` -- the record's status (one of :data:`TRANSFER_STATUSES`) where
+      the answer reports one: a fresh or re-sent transfer, and the
+      ``handoff_ended`` refusal.
+    """
+
+    artifact_id: UUID
+    transferred: bool
+    reason: str | None = None
+    giver: UUID | None = None
+    successor: UUID | None = None
+    version_at_transfer: int | None = None
+    hold_shape: MESIState | None = None
+    status: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class TransferVerbOutcome:
+    """The answer to an accept, a decline or a withdraw of a path's handoff.
+
+    - ``ok`` -- the verb was taken. An accept of a record a bystander overtook is
+      taken but changes nothing, so it answers ``ok`` with the ``overtaken``
+      status and its ``counterparty``; a client tells it from a completion by
+      ``status``.
+    - ``reason`` -- ``None`` when ``ok``; otherwise the typed refusal
+      (``handoff_not_successor``, ``handoff_not_giver`` or ``handoff_not_live``,
+      see :data:`ccs.core.exceptions.HANDOFF_REASONS`), and nothing changed.
+    - ``status`` / ``counterparty`` -- the record's label after the verb, or
+      the label a refusal carries. ``None`` when the path has no record at all.
+    """
+
+    artifact_id: UUID
+    ok: bool
+    reason: str | None = None
+    status: str | None = None
+    counterparty: UUID | None = None

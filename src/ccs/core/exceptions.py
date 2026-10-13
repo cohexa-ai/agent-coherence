@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from uuid import UUID
+
 # Wire-stable reason string for the retry-eligible OCC precondition where a peer
 # invalidated the caller in the window BETWEEN its fresh read and its CAS. Defined
 # ONCE here so the coordinator server's response mapping
@@ -26,14 +28,17 @@ STALE_READ_GENERATION_REASON = "stale_read_generation"
 # an agent or operator can branch.
 #
 # Honest limits of the discriminator: VERSION_MOVED, GRANT_RECLAIMED,
-# GRANT_PREEMPTED, INPUT_VANISHED and READ_DENIED are recoverable — reacquire,
-# re-decide, re-gate. GENERATION_UNCONFIRMED is the residual bucket and is NOT a clean
+# GRANT_PREEMPTED, INPUT_VANISHED, READ_DENIED and CONTENT_CLAIM_ABSENT are
+# recoverable — reacquire, re-decide, re-gate. GENERATION_UNCONFIRMED is the
+# residual bucket and is NOT a clean
 # permanent/transient signal: a degraded read, an unconfirmable foreign edit,
 # and a coordinator that predates generation reporting all land there. Treat it
 # as "reacquire and re-gate first"; a HOLD that survives a SUCCESSFUL reacquire
 # is the one that needs an operator (check the daemon's version). Splitting
 # READ_DENIED out is what keeps the common strict-mode reclaim — which reaches
-# the client as a deny, not as a missing field — from hiding in that bucket.
+# the client as a deny, not as a missing field — from hiding in that bucket, and
+# splitting CONTENT_CLAIM_ABSENT out keeps a coordinator that simply holds no
+# content claim — whose fix is a re-read, not an operator — from hiding there too.
 HOLD_VERSION_MOVED = "version_moved"
 HOLD_GRANT_RECLAIMED = "grant_reclaimed"
 # The grant the decision was read under did not STAND at the re-validate read
@@ -44,7 +49,37 @@ HOLD_GRANT_PREEMPTED = "grant_preempted"
 HOLD_INPUT_VANISHED = "input_vanished"
 HOLD_VERSION_UNCONFIRMED = "version_unconfirmed"
 HOLD_READ_DENIED = "read_denied"
+# The coordinator records NO content claim for this artifact at all — the
+# recorded hash is absent, empty, or the all-``f`` launch-gate sentinel — so it
+# cannot vouch that the bytes the decision was derived from ARE the content at
+# the version it reports. Split OUT of the residual bucket because the caller's
+# recovery differs: re-read your bytes (the coordinator will record a claim on
+# the next observation), NOT "check the daemon's version and call an operator".
+# Before this reason existed the empty-recorded-hash form did not HOLD at all:
+# ``hash_differs`` needs a TRUTHY recorded hash on both sides, so the generation
+# was never demoted and the effect fired against a value nothing backs.
+HOLD_CONTENT_CLAIM_ABSENT = "content_claim_absent"
 HOLD_GENERATION_UNCONFIRMED = "generation_unconfirmed"
+
+# The closed, published set every consumer matches against
+# (``hold_cause in HOLD_REASONS``). Same discipline as
+# :data:`READ_AT_VERSION_REASONS` below: the EXACT string values are the WIRE
+# CONTRACT, so a reason may be ADDED but is NEVER renamed or repurposed — a
+# rename silently un-matches every consumer's branch and downgrades a HOLD it
+# no longer recognises. Membership is the only legal test; never a substring of
+# the human message (the typed-signal-not-substring house rule).
+HOLD_REASONS: frozenset[str] = frozenset(
+    {
+        HOLD_VERSION_MOVED,
+        HOLD_GRANT_RECLAIMED,
+        HOLD_GRANT_PREEMPTED,
+        HOLD_INPUT_VANISHED,
+        HOLD_VERSION_UNCONFIRMED,
+        HOLD_READ_DENIED,
+        HOLD_CONTENT_CLAIM_ABSENT,
+        HOLD_GENERATION_UNCONFIRMED,
+    }
+)
 
 # ---------------------------------------------------------------------------
 # read-at-version rejection vocabulary (plan item N v1, Unit 4 / R5)
@@ -306,6 +341,188 @@ STORE_OPEN_SIGNALS: frozenset[str] = frozenset(
 CROSS_RUNTIME_SCHEMA_REASON = "cross_runtime_schema"
 
 # ---------------------------------------------------------------------------
+# caller-principal refusal reasons (coordinator caller principal, U4)
+# ---------------------------------------------------------------------------
+#
+# The coordinator authenticates the WORKSPACE (one bearer secret), not the
+# caller: a request's acting identity is a caller-asserted ``session_id``. A
+# caller principal is a coordinator-issued value bound to one acting identity on
+# the first claim of that identity, so a request naming the identity can be
+# checked against it. The point is accident-resistance and attributability under
+# the same-OS-user cooperative-trust model — bearer possession stays full
+# authority by design — never a boundary against a process that can read
+# ``.coherence/``.
+#
+# Wire-stable and ADDITIVE, matched by ``reason == CONSTANT`` (the
+# typed-signal-not-substring house rule). Deliberately DISJOINT from
+# :data:`HOLD_REASONS`: a principal refusal is a client error, never a hold — a
+# hold invites a retry, and no retry supplies a principal the caller never had.
+CALLER_PRINCIPAL_ABSENT_REASON = "caller_principal_absent"
+"""The request names an identity but presents no caller principal. On the wire
+a route sends it only for an identity that is BOUND: a request presenting none
+for an identity nobody has claimed is a client predating the principal, and is
+admitted (KTD15)."""
+
+CALLER_PRINCIPAL_FOREIGN_REASON = "caller_principal_foreign"
+"""The request presents a caller principal that is not the one bound to the
+identity it names — minted for another identity, never minted, or presented
+for an identity nobody has claimed."""
+
+CALLER_PRINCIPAL_CLAIMED_REASON = "caller_principal_claimed"
+"""A mint claim named an identity that is already bound, and did not present
+the mint nonce the binding was made with. The first claim of an identity wins;
+only a retry of THAT claim (same nonce) re-obtains its principal."""
+
+CALLER_PRINCIPAL_REASONS: frozenset[str] = frozenset(
+    {
+        CALLER_PRINCIPAL_ABSENT_REASON,
+        CALLER_PRINCIPAL_FOREIGN_REASON,
+        CALLER_PRINCIPAL_CLAIMED_REASON,
+    }
+)
+
+CALLER_PRINCIPAL_REFUSAL_REASONS: frozenset[str] = frozenset(
+    {CALLER_PRINCIPAL_ABSENT_REASON, CALLER_PRINCIPAL_FOREIGN_REASON}
+)
+"""The ``reason`` a route's principal refusal carries: HTTP 400 with the body
+``{"error": <prose>, "reason": <one of these>}``. A client classifies the
+refusal by membership here, never by a substring of ``error``. A refused request
+changed nothing — the gate runs before any mutation — so a client may retry it
+once it holds the right principal. ``caller_principal_claimed`` is not one of
+these: it answers a mint claim, in an HTTP 200 ``{ok: false}`` body."""
+
+# ---------------------------------------------------------------------------
+# targeted grant handoff vocabulary (#185)
+# ---------------------------------------------------------------------------
+#
+# A session done with a path hands it to a named successor (a transfer); the
+# giver is then fenced on that path while the handoff record is live (the
+# artifact's version still equals the version at transfer and the record was
+# neither declined nor withdrawn). Wire-stable and ADDITIVE: every value below
+# is matched by ``reason == CONSTANT`` or by membership, never by a substring of
+# a message (the typed-signal-not-substring house rule); add, never rename.
+# Disjoint from :data:`HOLD_REASONS`: none of these invites the reacquire a hold
+# does, and the giver's refusal must never be retried.
+GIVER_FENCED_REASON = "handed_off"
+"""The committer handed this path off and the handoff is still live, so its
+write is refused on every write route -- the pessimistic acquire and commit,
+the compare-and-swap commit and the batch commit. The refusal names the
+successor and the version at transfer. It ends when the successor writes the
+path, when the successor declines, or when the giver withdraws on its user's or
+host's instruction; a retry, a reacquire or a re-read never ends it. Carried by
+:class:`GiverFenced`."""
+
+# Per-grant transfer refusals. A refused grant is left exactly as it was.
+HANDOFF_SELF_REASON = "handoff_to_self"
+"""The named successor is the caller's own session-level identity, directly or
+through a composite (the caller's own subagent) that normalises to it. A
+handoff is between sessions."""
+
+HANDOFF_SUCCESSOR_UNKNOWN_REASON = "handoff_successor_unknown"
+"""The successor id is well formed but names no identity the coordinator knows:
+no bound principal, no registered session, no grant row, or a composite the
+live name map no longer holds (it is lost on a coordinator restart)."""
+
+HANDOFF_SUCCESSOR_MALFORMED_REASON = "handoff_successor_malformed"
+"""The successor id is not a well-formed agent id."""
+
+HANDOFF_NOT_HELD_REASON = "handoff_not_held"
+"""The presented identity holds no claim on the path (no EXCLUSIVE or MODIFIED
+grant and no standing SHARED read). Wins over a foreign write holder. Also the
+answer to a re-sent transfer once the artifact's version has moved past the
+version at transfer."""
+
+HANDOFF_VERSION_UNCONFIRMED_REASON = "handoff_version_unconfirmed"
+"""The path has no confirmed version (unconfirmed, or zero), so there is no
+version at transfer to fence on. A definite refusal: nothing was written. Not
+to be confused with :data:`HANDOFF_TRANSFER_UNCONFIRMED_REASON`, which says the
+transfer's own outcome is unknown."""
+
+HANDOFF_IN_FLIGHT_REASON = "handoff_in_flight"
+"""Another session's handoff of this path is live. The refusal names that
+pending giver and successor and, in static text, what ends it: the successor
+declines, the giver withdraws, or any session writes the path. Only the giver of
+a live handoff may transfer the path again (which supersedes its record)."""
+
+HANDOFF_OTHER_HOLDER_REASON = "handoff_other_holder"
+"""Another session holds this path EXCLUSIVE or MODIFIED, so the caller's claim
+is not the write authority to hand on. When the caller also holds nothing
+on the path, :data:`HANDOFF_NOT_HELD_REASON` is answered instead: the not-held
+reason wins. Its own value, not the compare-and-swap route's ``other_holder``,
+so a client can tell a refused grant of a transfer from a refused write by
+membership in :data:`HANDOFF_TRANSFER_REFUSAL_REASONS`."""
+
+HANDOFF_ENDED_REASON = "handoff_ended"
+"""A re-sent transfer (same giver, successor, path and version) whose record has
+ended at an unmoved version: declined, withdrawn, or superseded by the giver's
+later transfer of the path. The refusal carries that status; nothing is
+written."""
+
+# Accept and decline (the successor's verbs) and withdraw (the giver's verb).
+HANDOFF_NOT_SUCCESSOR_REASON = "handoff_not_successor"
+"""An accept or decline by a session that is not the live record's successor.
+The refusal carries the record's status."""
+
+HANDOFF_NOT_GIVER_REASON = "handoff_not_giver"
+"""A withdraw by a session that is not the live record's giver. The refusal
+carries the record's status."""
+
+HANDOFF_NOT_LIVE_REASON = "handoff_not_live"
+"""An accept, decline or withdraw with no live record to act on: the record was
+declined or withdrawn, or the artifact's version moved past the version at
+transfer. The refusal carries the record's status."""
+
+# One fail-closed degraded answer per verb: the coordinator could not confirm
+# the outcome in time (a watchdog timeout). The outcome is UNKNOWN -- it may
+# still land -- so a client never reads one of these as a refusal that changed
+# nothing, nor as a success.
+HANDOFF_TRANSFER_UNCONFIRMED_REASON = "handoff_transfer_unconfirmed"
+HANDOFF_ACCEPT_UNCONFIRMED_REASON = "handoff_accept_unconfirmed"
+HANDOFF_DECLINE_UNCONFIRMED_REASON = "handoff_decline_unconfirmed"
+HANDOFF_WITHDRAW_UNCONFIRMED_REASON = "handoff_withdraw_unconfirmed"
+
+HANDOFF_TRANSFER_REFUSAL_REASONS: frozenset[str] = frozenset(
+    {
+        HANDOFF_SELF_REASON,
+        HANDOFF_SUCCESSOR_UNKNOWN_REASON,
+        HANDOFF_SUCCESSOR_MALFORMED_REASON,
+        HANDOFF_NOT_HELD_REASON,
+        HANDOFF_VERSION_UNCONFIRMED_REASON,
+        HANDOFF_IN_FLIGHT_REASON,
+        HANDOFF_OTHER_HOLDER_REASON,
+        HANDOFF_ENDED_REASON,
+    }
+)
+"""The handoff-specific reasons a refused grant of a transfer carries in its
+per-grant answer."""
+
+HANDOFF_UNCONFIRMED_REASONS: frozenset[str] = frozenset(
+    {
+        HANDOFF_TRANSFER_UNCONFIRMED_REASON,
+        HANDOFF_ACCEPT_UNCONFIRMED_REASON,
+        HANDOFF_DECLINE_UNCONFIRMED_REASON,
+        HANDOFF_WITHDRAW_UNCONFIRMED_REASON,
+    }
+)
+"""The four degraded answers, one per verb: the outcome is unknown. A client
+raises on these and returns every other handoff refusal as a typed value."""
+
+HANDOFF_REASONS: frozenset[str] = (
+    frozenset(
+        {
+            GIVER_FENCED_REASON,
+            HANDOFF_NOT_SUCCESSOR_REASON,
+            HANDOFF_NOT_GIVER_REASON,
+            HANDOFF_NOT_LIVE_REASON,
+        }
+    )
+    | HANDOFF_TRANSFER_REFUSAL_REASONS
+    | HANDOFF_UNCONFIRMED_REASONS
+)
+"""Every wire reason the handoff adds -- the closed set a consumer, and the
+protocol corpus's coverage check, matches against."""
+
+# ---------------------------------------------------------------------------
 # MCP-C deny vocabulary (stale-write-guard-fs, 2026-06-18 plan, Unit 1)
 # ---------------------------------------------------------------------------
 #
@@ -320,6 +537,13 @@ STALE_VIEW_REASON = "stale_view"
 COMMIT_PREEMPTED_REASON = "commit_preempted"
 VIEW_WEDGED_REASON = "view_wedged"
 COMMIT_UNCONFIRMED_REASON = "commit_unconfirmed"
+#: The prefix of the reason in the coordinator's failure envelope, HTTP 200
+#: ``{"ok": false, "reason": "internal: <Type>"}``: what it answers when a
+#: route's work, or the caller-principal gate's store read, raised. The answer
+#: decides nothing, so a client reads the request's outcome as unknown. The
+#: exception's type follows the prefix, which is why this one reason is matched
+#: as a prefix; the prefix itself is fixed.
+HANDLER_FAILURE_REASON_PREFIX = "internal: "
 CAS_EXHAUSTED_REASON = "cas_exhausted"
 INTERNAL_CONCURRENCY_REASON = "internal_concurrency_error"
 # Option-A single-shot CAS (MCP-C Unit 5): the caller's expected_version no
@@ -390,6 +614,76 @@ class SessionInvalidated(CoherenceError):
     reason = SESSION_INVALIDATED_REASON
 
 
+class CallerPrincipalRefused(CoherenceError):
+    """A request's caller principal does not establish the identity it names,
+    or a mint claim does not become an already-bound identity.
+
+    ``reason`` is one of :data:`CALLER_PRINCIPAL_REASONS`; consumers branch on
+    it, never on the message. The message never carries a principal or a mint
+    nonce: it is written to logs and response ``detail`` fields, and a principal
+    appears on exactly one response — the mint response that issues it.
+
+    ``settled`` says whether the refusal is the session's settled state.
+    ``True`` (the default): claiming again with the session's own nonce
+    cannot cure it — the session is bound under another nonce, or the claim
+    handed back the very principal that was refused — so every later request
+    from this session meets the same answer, and only a new session claims
+    its own. ``False``: the request was refused, but the recovery claim's
+    ANSWER was lost (a transport blip, a watchdog-degraded claim), so nothing
+    is known about the session's standing; the client claims again with the
+    same nonce by itself — a long-lived volume, and a one-shot hook client
+    holding no stored principal, before the next request; the substrate
+    session, and a hook client whose stored principal is stale, when that
+    request is refused — and the request may then be admitted. A consumer that tells an
+    agent what to do next branches on this, never on the message: read as
+    settled, a lost answer sends the agent to a new session for a state its
+    next call cures.
+    """
+
+    def __init__(self, reason: str, message: str, *, settled: bool = True) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.settled = settled
+
+
+class GiverFenced(CoherenceError):
+    """The committer handed this path off, and the handoff is still live: its
+    write is refused, on the pessimistic route and the compare-and-swap route
+    alike, and nothing landed.
+
+    A terminal, never retried: no reacquire, re-read or re-merge ends the fence,
+    because it is keyed on the giver's session-level identity, which a fresh
+    incarnation keeps. It ends when the successor writes the path, when the
+    successor declines, or when the giver withdraws on its user's or host's
+    instruction -- so the giver stops and reports to its user or host.
+
+    Carries :data:`GIVER_FENCED_REASON` on the class, so a consumer classifies it
+    by type or ``.reason``, never by the message, plus ``successor`` (the
+    session-level id the path was handed to) and ``version_at_transfer``.
+    ``artifact_id`` names what was refused: the artifact id in process, a path
+    on a client. ``successor`` is the id as the raise site has it -- a ``UUID``
+    in process, the wire string on a client -- and the constructor never
+    parses it, because an exception constructor must not raise.
+    """
+
+    reason = GIVER_FENCED_REASON
+
+    def __init__(
+        self, artifact_id: object, successor: UUID | str, version_at_transfer: int
+    ) -> None:
+        super().__init__(
+            f"{GIVER_FENCED_REASON} artifact={artifact_id} successor={successor} "
+            f"version_at_transfer={version_at_transfer} (no write landed: this was "
+            "handed off to the successor at that version. The fence ends when the "
+            "successor writes it, when the successor declines, or when the giver "
+            "withdraws on its user's or host's instruction; stop and report, a "
+            "retry cannot clear it)"
+        )
+        self.artifact_id = artifact_id
+        self.successor = successor
+        self.version_at_transfer = version_at_transfer
+
+
 class CoherenceDegradedWarning(UserWarning):
     """Emitted once per adapter instance when a coherence error degrades to fallback.
 
@@ -406,6 +700,15 @@ class CoherenceTopologyWarning(UserWarning):
     multi-agent handoffs, where the SDK disables ``input_filter`` / nested handoff
     history — so handoff-history coherence is unavailable. Surfaced once, never silent.
     """
+
+
+class HandoffPathsInvalid(ValueError):
+    """A transfer named no path, or one path twice (two spellings of one file
+    count): the caller's error, raised before anything is sent. A
+    ``ValueError``, as ``atomic_publish``'s refusal of an empty or repeated
+    write-set is, and its own type so a caller catches exactly it: a broader
+    ``except ValueError`` around a transfer would also swallow a fault after
+    the request went out, which must read as an unknown outcome instead."""
 
 
 class InvalidTransitionError(CoherenceError):
@@ -426,12 +729,26 @@ class CasRetriesExhausted(CoherenceError):
     """Raised when an optimistic-concurrency commit-CAS retry loop is exhausted.
 
     The typed terminal failure for the OCC write path (plan Unit 5, R6 /
-    R-OCC-6). When ``AgentRuntime.write_cas`` has retried ``commit_cas`` the
-    strategy-allowed number of times and every attempt lost the race
-    (``ConflictDetail``), the loop surfaces THIS rather than silently dropping
-    the write. A ``CasRetriesExhausted`` therefore means *no mutation landed for
-    this caller* — the cache is left at the latest observed (refreshed) version,
-    never corrupted with an unconfirmed write.
+    R-OCC-6). When ``AgentRuntime.write_cas`` or ``CoherentVolume.write_cas`` has
+    retried ``commit_cas`` the allowed number of times and every attempt was
+    refused (``ConflictDetail``), the loop surfaces THIS rather than silently
+    dropping the write. A ``CasRetriesExhausted`` therefore means *no mutation
+    landed for this caller* — the cache is left at the latest observed
+    (refreshed) version, never corrupted with an unconfirmed write.
+
+    :attr:`last_conflict_reason` is the coordinator's reason for the LAST
+    refusal, when the raise site has it; earlier attempts may have been refused
+    for other reasons. ``version_mismatch`` is a lost race. ``other_holder`` is
+    not: another agent holds the grant at an unchanged version. Against the
+    cross-process coordinator (``CoherentVolume``) nothing the caller does
+    releases it. The holder does: a Claude Code session at its turn end, a
+    ``CoherentVolume`` at its own next ``write_cas`` of that file or any
+    ``write_cas`` retry, ``write_cas_at``, ``atomic_publish`` or
+    ``reacquire()`` (a ``session-stop`` naming only that volume's
+    ``session_id`` releases nothing). Otherwise the coordinator's reclaim
+    does. In process (``AgentRuntime``) the loop's own re-fetch
+    downgrades the holder, so ``other_holder`` there clears on the next attempt
+    unless the holder re-acquires.
 
     A subclass of :class:`CoherenceError` so the deny-always-raises consumers
     (CoherentVolume / CCSStore strict mode) already treat it as a hard failure.
@@ -442,12 +759,36 @@ class CasRetriesExhausted(CoherenceError):
     """
 
     reason = CAS_EXHAUSTED_REASON
+    #: Class default, so a subclass that bypasses ``__init__``
+    #: (``ConditionalPutRetriesExhausted``) still has the attribute.
+    last_conflict_reason: str | None = None
 
-    def __init__(self, artifact_id: object, attempts: int, last_current_version: int) -> None:
+    def __init__(
+        self,
+        artifact_id: object,
+        attempts: int,
+        last_current_version: int,
+        *,
+        last_conflict_reason: str | None = None,
+    ) -> None:
+        # isinstance, not truthiness alone: the reason arrives from a JSON body,
+        # and an exception constructor must never raise (see CasVersionConflict).
+        if isinstance(last_conflict_reason, str) and last_conflict_reason:
+            self.last_conflict_reason = last_conflict_reason
+        if self.last_conflict_reason is None:
+            # No reason known (a raise site that does not pass one): the text
+            # this message has always had.
+            outcome = "(no write landed — every commit_cas attempt lost the race)"
+        else:
+            # .get, never []: a reason the advice table has not learned yet still
+            # produces a usable terminal.
+            outcome = (
+                f"last_reason={self.last_conflict_reason} "
+                f"{_CAS_EXHAUSTED_ADVICE.get(self.last_conflict_reason, _CAS_CONFLICT_ADVICE_FALLBACK)}"
+            )
         super().__init__(
             f"cas_retries_exhausted artifact={artifact_id} attempts={attempts} "
-            f"last_current_version={last_current_version} "
-            f"(no write landed — every commit_cas attempt lost the race)"
+            f"last_current_version={last_current_version} {outcome}"
         )
         self.artifact_id = artifact_id
         self.attempts = attempts
@@ -473,6 +814,10 @@ class StaleView(CoherenceError):
     #: Version drift set by gate()'s HOLD; ``None`` on coordinator-raised instances.
     expected_version: int | None = None
     current_version: int | None = None
+    #: On a HELD batch publish, the first conflicting member's own refusal
+    #: reason (``version_mismatch`` / ``other_holder`` / ...). ``None``
+    #: everywhere else, so a generic handler reads it uniformly.
+    member_reason: str | None = None
     #: WHICH hold class fired, as a typed value (see the ``HOLD_*`` constants).
     #: ``None`` on coordinator-raised instances. Matched on this, never on the
     #: human message — and it is the difference between a HOLD ``reacquire()``
@@ -595,8 +940,10 @@ class RedirectRefused(CoherenceError):
     new hop* before application code can intervene, so the bearer would ride an
     attacker-chosen URL. The client therefore refuses ANY 3xx (both ``http`` and
     ``https`` endpoints) before a second request is made — the bearer never
-    leaves the configured endpoint. Carries the attempted ``location`` and
-    ``status``."""
+    leaves the configured endpoint. Carries the ``status``. The client never
+    passes the ``Location`` it was sent as ``location``, only a placeholder:
+    the ``Location`` is the redirector's text, and may echo a principal or a
+    mint nonce it was sent."""
 
     def __init__(self, location: str, status: int | None = None) -> None:
         status_part = f" ({status})" if status is not None else ""
@@ -626,9 +973,11 @@ class PublishMaterializationError(CoherenceError):
     disk; ``not_landed`` names the members still holding their old bytes. When
     ``landed`` is non-empty the on-disk set is TORN relative to the coordinator;
     when it is empty the disk is uniformly stale (coordinator ahead of disk).
-    Recover by re-reading each member at the coordinator's current version and
-    re-materializing from those bytes (never from bytes computed before the
-    publish)."""
+    Recover by re-materializing each ``not_landed`` member with ``write()`` of
+    the bytes this publish committed for it. Until those bytes reach disk, a
+    version-checked read of that member (``read_with_version``) raises
+    ``StaleView``: its disk bytes are not the content at the coordinator's
+    version, so no version is returned for them."""
 
     def __init__(
         self,
@@ -640,9 +989,10 @@ class PublishMaterializationError(CoherenceError):
         super().__init__(
             f"atomic_publish committed at the coordinator but disk materialization "
             f"failed{detail}: landed={list(landed)} not_landed={list(not_landed)}. "
-            "The coordinator is ahead of disk — re-read each member at its current "
-            "version and re-materialize; do NOT retry the publish (it would "
-            "version-mismatch)."
+            "The coordinator is ahead of disk — re-materialize each not_landed "
+            "member with write() of the bytes this publish committed for it (a "
+            "versioned read of it is refused until then); do NOT retry the "
+            "publish (it would version-mismatch)."
         )
         self.landed = landed
         self.not_landed = not_landed
@@ -658,12 +1008,71 @@ class InternalConcurrencyError(CoherenceError):
     reason = INTERNAL_CONCURRENCY_REASON
 
 
+#: Per-reason recovery advice for :class:`CasVersionConflict`'s message. The
+#: four reasons do not share a recovery: only a genuine lost race is fixed by
+#: re-reading and re-merging.
+_CAS_CONFLICT_ADVICE: dict[str, str] = {
+    VERSION_MISMATCH_REASON: (
+        "(no write landed; re-read at current and re-merge)"
+    ),
+    "other_holder": (
+        "(no write landed; a peer holds the grant and the version has NOT "
+        "moved — re-reading returns the same bytes, so back off and retry "
+        "rather than re-merging)"
+    ),
+    STALE_READ_GENERATION_REASON: (
+        "(no write landed; the claim this read was taken under was reclaimed "
+        "— reacquire and re-read, a merge alone does not help)"
+    ),
+    OCC_CALLER_TRANSIENT_REASON: (
+        "(no write landed; a peer invalidated this session between its read "
+        "and its CAS — recover with a fresh identity)"
+    ),
+}
+
+#: Used when the coordinator reports a reason this table does not know.
+_CAS_CONFLICT_ADVICE_FALLBACK = "(no write landed; re-read before retrying)"
+
+#: Per-reason text for :class:`CasRetriesExhausted`, keyed on the LAST refusal.
+#: It differs from the single-refusal advice above: the retry loop has already
+#: re-read and re-minted, so it says what the last refusal means for a caller
+#: deciding whether to try again. Only ``version_mismatch`` is a lost race;
+#: ``caller_in_transient_state`` also arrives when a peer's ``write()`` has
+#: acquired the file and still holds it, with the version unmoved.
+_CAS_EXHAUSTED_ADVICE: dict[str, str] = {
+    VERSION_MISMATCH_REASON: (
+        "(no write landed — the last commit_cas attempt lost the race: a peer "
+        "committed first)"
+    ),
+    "other_holder": (
+        "(no write landed — another agent still holds the grant at an unchanged "
+        "version; retry after it releases, not in a loop)"
+    ),
+    STALE_READ_GENERATION_REASON: (
+        "(no write landed — the grant the last read was taken under was "
+        "reclaimed; reacquire and re-read)"
+    ),
+    OCC_CALLER_TRANSIENT_REASON: (
+        "(no write landed — a peer's write() invalidated this caller between its "
+        "last read and its CAS; that peer may still hold the grant)"
+    ),
+}
+
+
 class CasVersionConflict(CoherenceError):
-    """Option-A CAS rejected (MCP-C Unit 5): the caller's ``expected_version`` no
-    longer matches the coordinator's current version — a peer committed in
-    between, OR the caller's comparand was stale. Typed-conflict, NOT auto-merge:
-    NO write landed; the agent re-reads at ``current_version``, re-merges, and
-    retries. Carries both versions so the client can re-CAS without another read.
+    """Option-A CAS rejected (MCP-C Unit 5). Typed-conflict, NOT auto-merge: NO
+    write landed, and both versions are carried so the client can recover
+    without another read.
+
+    WHY it was rejected is :attr:`reason`, and the four values do not share a
+    recovery. ``version_mismatch`` is the lost race the class is named for — a
+    peer committed in between, so re-read at ``current_version``, re-merge and
+    retry. ``other_holder`` means a pessimistic peer holds the grant with the
+    version UNCHANGED, so a re-read returns the same bytes and only backing off
+    makes progress. ``stale_read_generation`` means the claim this read was
+    taken under was reclaimed by the sweep: reacquire, then re-read.
+    ``caller_in_transient_state`` means a peer invalidated this session between
+    its read and its CAS: recover with a fresh identity.
 
     ``current_version`` is authoritative when the coordinator itself reported it
     (a bump-conflict). On a substrate-side CAS loss — where the coordinator was
@@ -672,12 +1081,40 @@ class CasVersionConflict(CoherenceError):
     numeric.
     """
 
+    #: Class default, kept so ``except`` clauses and consumers that read the
+    #: class attribute keep working. An instance raised from a wire refusal
+    #: SHADOWS it with the coordinator's own reason.
     reason = VERSION_MISMATCH_REASON
 
-    def __init__(self, artifact_id: object, expected_version: int, current_version: int) -> None:
+    def __init__(
+        self,
+        artifact_id: object,
+        expected_version: int,
+        current_version: int,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        """``reason`` is the coordinator's refusal reason when the raise site
+        has one. The coordinator distinguishes four — ``version_mismatch``,
+        ``other_holder``, ``stale_read_generation`` and
+        ``caller_in_transient_state`` — and each needs different recovery, so
+        collapsing them into the class default misdirected the caller. The
+        worst case is ``other_holder``: the version has NOT moved, so
+        "re-read at current and re-merge" produces a byte-identical CAS that
+        fails identically until the holder releases.
+        """
+        # isinstance, not truthiness alone: ``reason`` arrives from a JSON
+        # response body, and a non-string there (a list, a dict) would make the
+        # advice lookup below raise TypeError INSIDE an exception constructor,
+        # turning a recoverable conflict into an unhandled error at the raise
+        # site. A constructor must never raise.
+        self.reason = reason if isinstance(reason, str) and reason else VERSION_MISMATCH_REASON
         super().__init__(
-            f"version_mismatch artifact={artifact_id} expected={expected_version} "
-            f"current={current_version} (no write landed; re-read at current and re-merge)"
+            f"{self.reason} artifact={artifact_id} expected={expected_version} "
+            f"current={current_version} "
+            # .get, never []: an exception constructor must not raise. A reason
+            # this table has not learned yet still produces a usable terminal.
+            f"{_CAS_CONFLICT_ADVICE.get(self.reason, _CAS_CONFLICT_ADVICE_FALLBACK)}"
         )
         self.artifact_id = artifact_id
         self.expected_version = expected_version
@@ -829,6 +1266,90 @@ RESTORE_MEMBER_OUTCOMES: frozenset[str] = (
     RESTORE_SUCCESS_OUTCOMES | RESTORE_ABSORBING_OUTCOMES | RESTORE_HOLD_OUTCOMES
 )
 
+# The outcomes that PROVE no write landed, readable from a durable row alone.
+# ``converged`` short-circuits before every leg's write; ``forward_only_skipped``
+# is enumerated and never driven; and every ``conflict`` construction site is
+# either pre-write or says "no write landed" in its own detail (a budget
+# exhausted, a wedged view, an absent member the v1 leg cannot recreate).
+#
+# ``target_lost`` is DELIBERATELY absent: the absorbing boundary catches an
+# OSError raised from anywhere in a leg, including one raised after the live
+# file was truncated and partially rewritten, so that outcome cannot vouch for
+# the bytes. ``restored`` and ``held_unconfirmed`` wrote, or may have.
+RESTORE_OUTCOMES_PROVING_NO_WRITE: frozenset[str] = frozenset(
+    {
+        RESTORE_OUTCOME_CONVERGED,
+        RESTORE_OUTCOME_FORWARD_ONLY_SKIPPED,
+        RESTORE_OUTCOME_CONFLICT,
+    }
+)
+
+# ---------------------------------------------------------------------------
+# Workspace-Versioning restore OBSERVATION vocabulary (restore-divergence
+# signal / R1-R3)
+# ---------------------------------------------------------------------------
+#
+# What a restore leg SAW of the live state immediately before it wrote, carried
+# BESIDE the member outcome (``MemberRestoreOutcome.observation``) and never
+# folded into it: a member restored over a peer's committed content still
+# concludes ``restored``. Wire-stable constants matched by IDENTITY (add, never
+# rename); no token here is a substring of another, because a consumer must
+# never be able to classify one state by matching a fragment of a second.
+#
+# - ``observed_differs`` — the leg read a live state, compared it with the
+#   capture, and they differ: the write discarded content committed after the
+#   capture. This is the ONLY state that carries a pointer and a fingerprint,
+#   both lifted from the read that produced the leg's CAS comparand.
+# - ``no_live_state`` — the leg wrote onto nothing (create-on-absent); nothing
+#   was discarded, so this state is not a divergence.
+# - ``present_not_comparable`` — the leg established that live state EXISTED
+#   but read no comparand for it (the delete leg's presence probe verifies no
+#   content), so it reports the state alone: honest about what it destroyed,
+#   silent about what that content was.
+# - ``no_write_attempted`` — the member reached its terminal without a write
+#   decision: converged, enumerated and skipped, or absorbed before any write
+#   was issued (a wedged view, an exhausted re-drive budget). The DEFAULT,
+#   because it is the truth at every such site. It is NOT the answer for an arm
+#   that issued a write and could not learn the outcome — see ``not_recorded``.
+# - ``not_recorded`` — this run holds no observation for the member, in either
+#   of two ways. (1) No leg ran: a member resumed from a prior run, or a
+#   concluded restore rebuilt from its durable rows, where the row's outcome
+#   does not itself prove the member never wrote (see
+#   RESTORE_OUTCOMES_PROVING_NO_WRITE — the observation is run-local by
+#   decision, so a prior run's is unrecoverable). (2) A leg ran and its write
+#   outcome was lost: an unconfirmed commit, a reconciled unknown write, or a
+#   failure absorbed from anywhere inside the leg. Such a leg cannot say
+#   whether IT destroyed live state or never reached it. An observation the run
+#   never made is its own answer, never a clean one: consumers MUST NOT read it
+#   as clean.
+RESTORE_OBSERVATION_DIFFERS = "observed_differs"
+RESTORE_OBSERVATION_NO_LIVE_STATE = "no_live_state"
+RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE = "present_not_comparable"
+RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED = "no_write_attempted"
+RESTORE_OBSERVATION_NOT_RECORDED = "not_recorded"
+
+# The closed set of observation states. DELIBERATELY disjoint from
+# RESTORE_MEMBER_OUTCOMES: the observation is an additive report value and the
+# outcome vocabulary is unchanged, which is what keeps the coordinator's
+# fail-closed check and the cross-implementation kit green with no edits.
+RESTORE_OBSERVATION_STATES: frozenset[str] = frozenset(
+    {
+        RESTORE_OBSERVATION_DIFFERS,
+        RESTORE_OBSERVATION_NO_LIVE_STATE,
+        RESTORE_OBSERVATION_PRESENT_NOT_COMPARABLE,
+        RESTORE_OBSERVATION_NO_WRITE_ATTEMPTED,
+        RESTORE_OBSERVATION_NOT_RECORDED,
+    }
+)
+
+# The states that observed NO comparand, so they can never name a pointer or a
+# fingerprint: three never read one, and the delete leg's probe read presence
+# only. Enforced at construction — a state carrying values it never observed
+# would tell an operator the run compared content it never saw.
+RESTORE_OBSERVATION_STATES_WITHOUT_COMPARAND: frozenset[str] = (
+    RESTORE_OBSERVATION_STATES - {RESTORE_OBSERVATION_DIFFERS}
+)
+
 # Checkpoint-level restore status (the ``CheckpointRecord.restore_status``
 # vocabulary — the registry stores the string, THIS is its meaning). Kept
 # deliberately small: ``none`` (never restored) → ``in_progress`` (a restore
@@ -885,8 +1406,10 @@ RESTORE_STATUSES: frozenset[str] = frozenset(
 #   off / the version not retained, or retained bytes that no longer match the
 #   captured fingerprint). Always written together with the loud tier
 #   downgrade — never a silent pass.
-# - ``released`` — a previously ``held`` pin was dropped by the INTERNAL
-#   release path (there is no public checkpoint-delete/release verb in v1);
+# - ``released`` — a previously ``held`` pin was dropped by the release path
+#   (``WorkspaceVersioner.release_checkpoint``, or the engine beneath it);
+#   TERMINAL — ``pin_checkpoint`` will not re-drive it, and there is still no
+#   public checkpoint-DELETE verb in v1;
 #   written together with the tier downgrade where the tier was ``restorable``
 #   (the claim is no longer backed).
 PIN_STATE_UNPINNED = "unpinned"
@@ -935,8 +1458,9 @@ WORKSPACE_REGISTRATION_STATUSES: frozenset[str] = frozenset(
 )
 
 # Pre-flight restore refusal: the checkpoint id names no persisted manifest.
-# The ONLY typed restore exception — a restore that starts always CONCLUDES
-# with a report (failures are per-member absorbing outcomes, never raises).
+# One of the two typed restore pre-flight exceptions (the other is
+# ``CheckpointRegistrationRefused`` below) — a restore that starts always
+# CONCLUDES with a report (failures are per-member absorbing outcomes).
 CHECKPOINT_UNKNOWN_REASON = "checkpoint_unknown"
 
 
@@ -959,6 +1483,93 @@ class CheckpointUnknown(CoherenceError):
         self.checkpoint_id = checkpoint_id
 
 
+# Restore-REGISTRATION pre-flight refusals (#191). Each is a typed reason a
+# client branches on by identity, never by parsing prose; every one is raised
+# BEFORE any artifact is resolved or minted and before ``commit_all`` runs, so
+# a refused registration changes nothing.
+#
+# - ``not_a_checkpoint_member`` — a write names a path the checkpoint's
+#   manifest does not describe (the stale-id case: a write-set registered
+#   against a checkpoint from another round);
+# - ``fingerprint_mismatch`` — the path IS a member, but the write's
+#   fingerprint is not the one the manifest captured for it (a restore
+#   registers the captured bytes, never a caller-chosen hash);
+# - ``not_the_receiver`` — the checkpoint named a receiver at creation and the
+#   registering controller is not it;
+# - ``already_registered`` — another controller already registered this
+#   checkpoint. The refusal names nobody: the caller learns only that it was
+#   not first. A retry by the controller that DID register is not refused; its
+#   result carries ``retry_of_own_registration=True`` instead.
+CHECKPOINT_NOT_A_MEMBER_REASON = "not_a_checkpoint_member"
+CHECKPOINT_FINGERPRINT_MISMATCH_REASON = "fingerprint_mismatch"
+CHECKPOINT_NOT_THE_RECEIVER_REASON = "not_the_receiver"
+CHECKPOINT_ALREADY_REGISTERED_REASON = "already_registered"
+CHECKPOINT_REGISTRATION_REFUSAL_REASONS: frozenset[str] = frozenset(
+    {
+        CHECKPOINT_NOT_A_MEMBER_REASON,
+        CHECKPOINT_FINGERPRINT_MISMATCH_REASON,
+        CHECKPOINT_NOT_THE_RECEIVER_REASON,
+        CHECKPOINT_ALREADY_REGISTERED_REASON,
+    }
+)
+
+
+class CheckpointRegistrationRefused(CoherenceError):
+    """A restore registration refused before anything was resolved (#191).
+
+    ``reason`` is one of :data:`CHECKPOINT_REGISTRATION_REFUSAL_REASONS`,
+    matched by identity (the typed-signal-not-substring house rule): the
+    instance carries the module constant itself, never an equal copy.
+    ``member_paths`` names the offending writes for the two membership reasons
+    (the caller's own paths, nothing it did not send) and is empty for the two
+    controller reasons. Neither controller reason names another controller.
+
+    Raised by ``CoordinatorService.register_workspace_restore``; for the two
+    controller reasons, also by the service's restore progress writes when
+    given a ``controller`` (nothing written), and by
+    ``WorkspaceVersioner.restore`` as a pre-flight refusal before any status
+    write or member leg.
+    """
+
+    def __init__(
+        self,
+        checkpoint_id: str,
+        reason: str,
+        *,
+        member_paths: "tuple[str, ...]" = (),
+    ) -> None:
+        canonical = {r: r for r in CHECKPOINT_REGISTRATION_REFUSAL_REASONS}
+        if reason not in canonical:
+            raise ValueError(
+                f"unknown checkpoint registration refusal reason {reason!r}"
+            )
+        reason = canonical[reason]
+        paths = list(member_paths)
+        detail = {
+            CHECKPOINT_NOT_A_MEMBER_REASON: (
+                "the write-set names paths the checkpoint's manifest does not "
+                f"describe: {paths!r}"
+            ),
+            CHECKPOINT_FINGERPRINT_MISMATCH_REASON: (
+                "the write-set's fingerprints differ from the ones the manifest "
+                f"captured for: {paths!r}"
+            ),
+            CHECKPOINT_NOT_THE_RECEIVER_REASON: (
+                "the checkpoint names a receiver and this controller is not it"
+            ),
+            CHECKPOINT_ALREADY_REGISTERED_REASON: (
+                "another controller already registered this checkpoint"
+            ),
+        }[reason]
+        super().__init__(
+            f"restore registration of checkpoint {checkpoint_id!r} refused "
+            f"({reason}): {detail} — nothing was registered"
+        )
+        self.checkpoint_id = checkpoint_id
+        self.reason = reason
+        self.member_paths = tuple(member_paths)
+
+
 class WatchdogAbandoned(RuntimeError):
     """A handler's 4s watchdog fired, so its still-running work was told to abort
     before it could mutate the registry (finding A6).
@@ -975,4 +1586,23 @@ class WatchdogAbandoned(RuntimeError):
     pool future, where ``_on_watchdog_future_done_after_timeout`` treats it as a
     clean no-op (no phantom state landed). Every non-watchdog caller
     (CoherentVolume, CCSStore, the CLI) passes ``abort=None`` and never sees it.
+    """
+
+
+class RegistryLockTimeout(RuntimeError):
+    """A bounded wait for the registry lock ran out before the lock was won
+    (#238).
+
+    Raised by the registries' ``abort_guard`` when the caller passed a
+    ``deadline`` and another thread still held the registry lock when it
+    passed. The guard took no hold and ran none of the caller's body, so
+    nothing was read or written: the caller answers without the registry, as
+    ``/status`` does with its degraded body and pre-grep with its freshness
+    advisory.
+
+    Deliberately NOT a :class:`CoherenceError`, like :class:`WatchdogAbandoned`:
+    it never reaches a client as an error. Nor a :class:`TimeoutError`: since
+    Python 3.11 that is the ``concurrent.futures`` timeout, which the handler
+    watchdog catches as its own. Every caller that passes no deadline waits as
+    long as the lock is held, as before, and never sees it.
     """

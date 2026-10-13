@@ -1,10 +1,10 @@
 # Security & supply chain
 
 This document covers what end users need to know to install, configure, and run
-`agent-coherence` safely: the outbound-traffic posture, the kill switches that
-disable telemetry-shaped behavior, the local files the package writes, how to
-install with hash pinning, and how to verify the cryptographic provenance of a
-published wheel.
+`agent-coherence` safely: the outbound-traffic posture, which callers the local
+coordinator can tell apart, the kill switches that disable telemetry-shaped
+behavior, the local files the package writes, how to install with hash pinning,
+and how to verify the cryptographic provenance of a published wheel.
 
 ## Outbound network destinations
 
@@ -57,11 +57,27 @@ an insecure-https mode simply does not exist in the client's configuration. To
 trust a private certificate authority instead of the system trust store, point
 `CCS_REMOTE_CA_FILE` at a CA-bundle file; it is loaded fail-closed — a symlinked
 bundle is refused, and a group- or world-writable bundle is refused (a trust
-anchor an attacker can rewrite is not a trust anchor). The client also **refuses
+anchor an attacker can rewrite is not a trust anchor). That bundle is re-read on
+every request, so replacing it takes effect on the next one. Without it, the
+client loads the system trust store once per process, on its first https
+request. Until the process restarts, a certificate removed from that store stays
+trusted, and if the store was missing at that moment, every https request fails
+verification. The client also **refuses
 to follow redirects**: it talks to the one coordinator endpoint you configured, so
 any redirect response is rejected rather than followed with the bearer attached.
-The loopback path is unchanged — a plain `http://` loopback endpoint behaves
-exactly as before.
+TLS changes nothing for the loopback path: a plain `http://` loopback endpoint
+needs no certificate and no acknowledgement.
+
+**No coordinator request goes through an HTTP proxy.** The client ignores
+`http_proxy`, `https_proxy` and the system proxy settings for every coordinator
+endpoint, loopback or remote. On a machine with a proxy configured, honouring it
+would send loopback requests, bearer token included, to the proxy. A remote
+endpoint is the one host you configured and secured the link to, and a proxy is a
+hop that neither `CCS_REMOTE_INSECURE` nor https verification covers. A remote
+coordinator must therefore be reachable directly, for example over a tunnel or a
+VPN; one reachable only through a forward proxy fails with
+`CoordinatorUnavailable`. A TLS-terminating front is unaffected, because you point
+the client *at* it as the endpoint.
 
 **CA-profile requirements for the terminating proxy (read this before you
 provision a certificate).** Coordinator endpoints are almost always IP literals
@@ -134,8 +150,126 @@ talks to it over stdin/stdout, and the server coordinates writes through an
 in-process `CoherentVolume` on the local filesystem. There is nothing to firewall
 and no endpoint to configure on this path. See the MCP sections of the
 [README](../README.md#mcp-server-stale-write-guard-fs) and the
-[guide](guide.md#stale-write-guard-fs-mcp-server) for setup and the five `swg_*`
+[guide](guide.md#stale-write-guard-fs-mcp-server) for setup and the ten `swg_*`
 tools.
+
+## Who the coordinator can tell apart
+
+The local coordinator authenticates the **workspace**, not the individual caller.
+Every request carries the one bearer secret in `.coherence/hook.secret` (mode
+`0600`, readable only by your OS user), and every process in the workspace uses
+the same secret. The session a request acts as is a `session_id` field in the
+request body, which the coordinator checks for shape and nothing else.
+
+What follows from that:
+
+- Any process that can read the secret has full authority over the workspace.
+  This is the intended trust model — every process running as your OS user is
+  trusted alike, the same boundary as your shell history or SSH agent socket.
+- A session whose client has claimed a [caller principal](guide.md#caller-principal)
+  is refused, on the routes that release grants, commit, record who wrote, answer
+  the effect fence, record workspace ownership, or hand a session's claims to a
+  successor or accept, decline or withdraw a
+  [handoff](guide.md#targeted-grant-handoff) in its name (`/handoff/transfer`,
+  `/handoff/accept`, `/handoff/decline`, `/handoff/withdraw`), when a request
+  names it without that principal or with another. That stops one writer's mistake — a copied
+  request, a stale session id, a wrong id in a retry — from ending another
+  writer's work or writing under its name. A session that never claimed one
+  behaves as before: any holder of the secret can act as it.
+- The principal separates writers that follow the protocol, and nothing more.
+  Every principal is stored in `.coherence/state.db`, which any process running
+  as your OS user can read. `CoherentVolume`, the MCP server and the substrate
+  session present only the principal issued for their own session, so a request
+  from them naming another session is refused. The Claude Code hook client finds
+  its principal by the session id in each hook event, so on that surface a wrong
+  session id can find a matching principal; there the principal exposes a client
+  that never claimed or presents the wrong principal, but does not tell sessions
+  apart.
+- The [handoff commands](guide.md#handoff-commands) (`agent-coherence-transfer`,
+  `-accept`, `-decline`, `-withdraw`) act as the Claude Code session they name,
+  through `--session` or the `CLAUDE_CODE_SESSION_ID` variable Claude Code sets
+  in its shells. They present that session's stored principal through the hook
+  client's own helper, so they have exactly the hook client's trust: they
+  separate writers that follow the protocol, and a command given another
+  session's id acts as that session. When the named session has no stored
+  principal, the command creates that session's mint nonce and claims and
+  stores its principal, as the session's first hook event would. A wrong
+  session id typed to a command therefore binds a principal and leaves both
+  files for an identity no session uses. Under the trust model that is
+  harmless; remove the two files by hand, as
+  [Caller-principal files](#caller-principal-files-claude-code-hook-client)
+  describes. The commands cannot act for a `CoherentVolume` or MCP session,
+  which keeps its principal in its own process and has none stored on disk:
+  the command's claim is refused because the session is bound under another
+  nonce, the command exits `2`, and the attempt leaves a mint-nonce file
+  behind, as a wrong session id does. A subagent's shell names
+  its parent session, so a command run there acts as the parent.
+- `CoherentVolume` and the MCP server hand on and settle
+  [handoffs](guide.md#from-a-coherentvolume) only as their own session: they
+  present their own principal on every request, and the MCP handoff tools
+  take no session argument. So when a volume or MCP session is a handoff's
+  giver, or completes or overtakes one with its write, the record names the
+  session whose principal the coordinator checked.
+- `last_writer_id`, and the sessions listed by `/status`, record which session a
+  caller *said* it was — verified against its principal when it has one. A
+  handoff's transfer record holds ids of the same kind: its giver is the session
+  the transfer request named, checked against that session's principal when it
+  has one; its successor is whoever the giver named; and a completion or an
+  overtake is attributed to the session the writing request named, which the
+  snapshot-session routes do not check when no principal is presented. The
+  record is kept in `.coherence/state.db` and holds agent ids, versions,
+  statuses and timestamps — no file content and no session id. Treat all of
+  these as a record of cooperating writers, useful for debugging and display,
+  not as proof of who wrote.
+- The snapshot-session routes (`/session/read`, `/session/commit`,
+  `/session/commit_all`, `/session/heartbeat`) also require the token that
+  `/session/begin` returns, and attribute a commit to the session that token was
+  issued for. That stops one snapshot session committing through another's
+  token; it does not verify the `session_id` named at `/session/begin`.
+
+What the coordinator does not publish: `/status` shows session names — which
+embed the raw session id — and the policy's pattern lists (the tracked, user-added,
+ignored and strict globs, which are the operator's directory layout) only in the
+operator view (`?detail=full` plus the `Coherence-Local-Operator: true` header). A
+`CoherentVolume` reads that view once, at attach, to check that the coordinator
+enforces the globs it declared. Which paths each session lost to the
+coordinator's grant sweep, and why (`sessions[].reclaimed`), is likewise in the
+operator view only; the other views carry just the reclaim counts
+(`sweep_reclaims_total`, `sweep_reclaims_by_trigger`). The inputs to a
+reclaim are in the operator view only too: each tracked artifact's
+`owner_generation`, the write grants each session holds and when each began
+(`sessions[].grants`), each session's last heartbeat
+(`sessions[].last_heartbeat_unix_ts`), and the sweep's two thresholds
+(`grant_heartbeat_timeout_sec`, `grant_max_hold_sec`). The default `minimal`
+view reports `agent_name` as `null`, the workspace root as `.` (both
+`coordinator_root` and `policy_summary.coordinator_root`) and the pattern
+counts without the patterns, and the `metrics` view carries no sessions at
+all. A tracked artifact that has a handoff record
+carries a `handoff` key in the default and operator views, naming the giver,
+the successor and any session that overtook the handoff by session-level agent
+id — the agent id derived from the session id alone, so for a `CoherentVolume`
+the volume's session rather than the per-attempt id that holds its grants — and
+never by session name or session id; the `metrics` view carries no record. Hook
+responses identify another session by its agent id, a one-way hash of the
+session id, and the handoff commands print the session-level agent id they act
+as, never the session id. The MCP server's `swg_status` returns
+`session_agent_id`, the session's own session-level agent id, to that session:
+it is a one-way hash of the `session_id` the same tool already returns, and
+the id a `handoff` key names that session by, so it discloses nothing new. The
+MCP tools that carry a `handoff` key (`swg_read`, `swg_status`,
+`swg_write_cas`) relay the coordinator's, so they too carry session-level agent
+ids only. The `agent-coherence-status` command asks for the default view
+unless it is run with `--detail full`, because it often runs inside an agent's
+shell tool, where its output lands in the transcript; with `--detail full` its
+output carries session names and the absolute workspace root, so leave the flag
+off before pasting the output into a bug report, and point dashboards at
+`--detail metrics`. The Python console scripts (`agent-coherence-status`,
+`-track`, `-untrack` and the handoff commands) print every string from a
+coordinator answer with control and other non-printable characters escaped,
+so an answer cannot drive the terminal they print to. All of this is
+disclosure hygiene
+rather than a boundary: under the model above, knowing a session id grants
+nothing the secret does not already grant.
 
 ## Env-var kill switches
 
@@ -194,6 +328,33 @@ The capture path **refuses to start** when `<path>/manifest.json` already
 exists (`SessionDirectoryNotEmptyError`) to prevent silent multi-instance
 trace interleave. No content is read by `agent-coherence-replay` from any
 location other than the explicit `session_dir` argument.
+
+### Caller-principal files (Claude Code hook client)
+
+The Claude Code hook client runs one process per hook event, so it keeps each
+session's [caller principal](guide.md#caller-principal) on disk beside
+`hook.secret`, keyed by the session's agent id — the one-way hash of the session
+id that `/status` shows, never the raw session id. The
+[handoff commands](guide.md#handoff-commands) read and write the same two
+files for the session they act as. `CoherentVolume`, the MCP server and the
+substrate session hold theirs in memory and write neither file.
+
+| File | Path | Mode | Created when |
+|---|---|---|---|
+| Mint nonce | `<workspace>/.coherence/caller-principal-<agent-id>.nonce` | `0600` | The session's first hook event with no stored principal, or the first handoff command (`agent-coherence-transfer`, `-accept`, `-decline`, `-withdraw`) naming a session with none, unless `server.pid` names the plugin's Node backend — *before* the claim is sent, so an older Python coordinator that then answers `404` leaves the file behind too. Created exclusively (`O_CREAT` with `O_EXCL`) and never rewritten; two hook processes racing on a new session share the winner's nonce |
+| Caller principal | `<workspace>/.coherence/caller-principal-<agent-id>.principal` | `0600` | When the claim binds. Written to a private temporary file (`O_CREAT` with `O_EXCL`, `0600`) and renamed over the stored file, and replaced the same way when a refused request is recovered by claiming again |
+
+The nonce is what lets the session re-obtain its principal after a lost claim
+answer or a reset `state.db`; the principal is what every hook of the session
+presents. Treat both like `hook.secret`: any process running as your OS user can
+read them, and one that holds them together with `hook.secret` can act as that
+session on every route. The client never deletes them. Remove them only when no
+hook of that session can still run: a session whose nonce file is gone claims
+again under a new nonce, which the coordinator refuses
+(`caller_principal_claimed`), and from then on the routes that require a
+principal refuse that session. The files a handoff command leaves for a
+mistyped session id, or for a `CoherentVolume` or MCP session it could not act
+for, belong to no hook session, so you can remove them at any time.
 
 ### Durable version retention (opt-in)
 

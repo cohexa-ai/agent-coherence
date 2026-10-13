@@ -36,6 +36,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import UUID
 
 from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
 
@@ -88,6 +89,19 @@ def _reset_spawn_join_exhaustion() -> None:  # pragma: no cover - test hook
         _spawn_join_exhaustion_by_reason.clear()
 
 
+def _reset_exhaustion_lock_in_child() -> None:
+    # A fork while another thread is counting an exhaustion copies this lock
+    # held, and no thread in the child will ever release it: the child's next
+    # exhaustion (a post-fork re-attach can reach one) or counter read would
+    # block forever. Each count is a single dict store, so the child keeps them.
+    global _EXHAUSTION_LOCK
+    _EXHAUSTION_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_exhaustion_lock_in_child)
+
+
 # G8 fix (subagent finding #8): fcntl is POSIX-only. On Windows, import-time
 # failure would crash hook handlers with a stack trace on every hook event.
 # Guard the import and provide a stub that degrades gracefully — hook handlers
@@ -133,6 +147,12 @@ class LifecycleConfig:
     #: pause and come back, short enough to bound state on a dead session.
     notice_evict_max_age_sec: float = 1800.0
 
+    #: #185 — transfer records that are no longer live (declined,
+    #: withdrawn, or past a version move) are evicted by the sweep once older
+    #: than this. One day: a giver left idle overnight still learns how its
+    #: handoff ended on its next touch. A live record is never evicted.
+    transfer_record_evict_max_age_sec: float = 86_400.0
+
     #: Loser's bounded retry when reading the port file. Bumped from 30 to
     #: 60 (G9) so a 30-process thundering herd with cold Python imports
     #: and SQLite WAL setup has time to settle before losers degrade.
@@ -152,10 +172,11 @@ class LifecycleConfig:
     spawn_self_probe_attempts: int = 50  # × 100ms = 5000ms budget
     spawn_self_probe_interval_sec: float = 0.100
 
-    #: Grant-timeout sweep thresholds. With v0.1's CrashRecoveryConfig
-    #: shipping disabled-by-default, these effectively define the sweep's
-    #: safety net for genuinely orphaned grants. Generous so a thinking
-    #: session is never reclaimed under interactive load.
+    #: Grant-timeout sweep thresholds: the sweep's safety net for genuinely
+    #: orphaned grants, passed to it directly (CrashRecoveryConfig plays no
+    #: part here). Generous so a thinking session is never reclaimed under
+    #: interactive load. #187: the coordinator reports them on ``/status``
+    #: only while a sweep enforces them (:func:`_published_sweep_thresholds`).
     grant_heartbeat_timeout_sec: int = 600
     grant_max_hold_sec: int = 1800
 
@@ -334,6 +355,12 @@ def ensure_coordinator(
                 except OSError:
                     pass
                 continue
+            # #187: before serve_in_thread(), so no request can see the
+            # thresholds unset while the sweep below is about to start.
+            (
+                coordinator.grant_heartbeat_timeout_sec,
+                coordinator.grant_max_hold_sec,
+            ) = _published_sweep_thresholds(cfg)
             _write_pidfile(fd, os.getpid(), port)
             coordinator.serve_in_thread()
             entry = _SpawnedEntry(
@@ -742,9 +769,36 @@ def _probe_with_budget(port: int, bind_host: str, attempts: int, interval_sec: f
 # ----------------------------------------------------------------------
 
 
+def _sweep_enabled(cfg: LifecycleConfig) -> bool:
+    """Whether lifecycle runs the sweep at all: the one rule both
+    :func:`_start_background_threads` and :func:`_published_sweep_thresholds`
+    follow, so the thresholds are reported exactly when a sweep starts."""
+    return cfg.sweep_interval_sec > 0
+
+
+def _published_sweep_thresholds(cfg: LifecycleConfig) -> tuple[int | None, int | None]:
+    """The (heartbeat timeout, max hold) pair the coordinator reports as
+    enforced (#187), or ``(None, None)`` when no sweep enforces them.
+
+    Decides only what to publish; :func:`_start_background_threads` still
+    starts the sweep whenever :func:`_sweep_enabled` holds. A threshold below
+    1 makes every stable-grant pass raise (each pass logs it), so nothing
+    enforces the configured pair and neither value is reported. So does a
+    transient timeout below 1: :func:`_sweep_loop` runs the transient pass
+    first in the same ``try``, it raises, and the stable-grant pass never runs.
+    """
+    if not _sweep_enabled(cfg):
+        return None, None
+    if cfg.grant_heartbeat_timeout_sec < 1 or cfg.grant_max_hold_sec < 1:
+        return None, None
+    if cfg.transient_timeout_sec < 1:
+        return None, None
+    return cfg.grant_heartbeat_timeout_sec, cfg.grant_max_hold_sec
+
+
 def _start_background_threads(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
     """Start the sweep + idle-shutdown daemon threads."""
-    if cfg.sweep_interval_sec > 0:
+    if _sweep_enabled(cfg):
         sweep_thread = threading.Thread(
             target=_sweep_loop,
             args=(entry, cfg),
@@ -762,39 +816,139 @@ def _start_background_threads(entry: _SpawnedEntry, cfg: LifecycleConfig) -> Non
         idle_thread.start()
 
 
-def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
-    """Periodic sweep: transient → stable grant → notice eviction.
+def _report_sweep_reclaims(
+    coordinator: CoordinatorHTTPServer,
+    reclaims: list[tuple[UUID, UUID, str]],
+    now_tick: int,
+) -> None:
+    """Count and log each reclaim the sweep landed (#195). Best-effort per
+    entry: a failure for one never skips the rest, and never raises."""
+    for artifact_id, agent_id, trigger in reclaims:
+        try:
+            coordinator.record_sweep_reclaim(trigger)
+        except Exception:  # noqa: BLE001 — observability, best-effort
+            logger.exception("sweep reclaim counter update failed")
+        try:
+            artifact = coordinator.registry.get_artifact(artifact_id)
+            label = artifact.name if artifact is not None else str(artifact_id)
+        except Exception:  # noqa: BLE001 — a log label, best-effort
+            label = str(artifact_id)
+        # The agent id is the non-reversible uuid5 /status already publishes
+        # (R6): no session id, no session name, in the log line either.
+        logger.warning(
+            "sweep reclaimed grant: trigger=%s tick=%d agent_id=%s artifact=%s",
+            trigger,
+            now_tick,
+            agent_id,
+            label,
+        )
 
-    Order matters per R4: transient sweep first so the stable sweep does
-    not race entries that are mid-protocol. F2 notice eviction last —
-    it's a pure storage reclaim and doesn't interact with grants.
 
-    ADV-004: stable-grant reclamation records a preemption notice for
-    the reclaimed victim so the victim's eventual post-edit gets an
-    enriched "reclaimed by coordinator sweep" error instead of a
-    generic CoherenceError with no context. The sentinel preempter
-    UUID is ``SWEEP_RECLAMATION_PREEMPTER_ID`` (imported lazily to
-    avoid an import cycle at module load).
+def _sweep_stable_grants(
+    coordinator: CoordinatorHTTPServer, cfg: LifecycleConfig, now_tick: int
+) -> int:
+    """One stable-grant sweep pass, with its reclaims made observable (#195).
+
+    ADV-004: each reclaim records a preemption notice for the victim under
+    ``SWEEP_RECLAMATION_PREEMPTER_ID``, so its eventual post-edit gets the
+    "reclaimed by coordinator sweep" error instead of a bare CoherenceError.
+
+    #195: each reclaim is also logged and counted
+    (``sweep_reclaims_total`` / ``sweep_reclaims_by_trigger``), so a tick that
+    pulled a live grant no longer reads as a quiet tick. Both happen AFTER
+    ``enforce_stable_grant_timeouts`` returns: its ``on_reclaim`` runs inside
+    the per-pair registry hold (KTD7 — no blocking on other threads), so the
+    callback only records the notice and appends to a local list; the log
+    handler's lock and the counter lock are taken outside the hold. WARNING,
+    not INFO: the coordinator configures no logging, and Python's last-resort
+    handler emits WARNING and above only, so an INFO line (like the
+    reaped/evicted ones beside this) is dropped even by a host that keeps the
+    coordinator's stderr; and a reclaim pulls a grant from a possibly live
+    holder. (The detached ``agent-coherence-coordinator`` child sends stderr
+    to /dev/null, so there the counter and ``/status`` are the surface.)
+    The observability step is best-effort: a failure there is logged and never
+    costs the tick its remaining passes. It runs in a ``finally``, so reclaims
+    that landed before a mid-walk exception are still counted and logged.
+
+    Returns the reclaimed count, as ``enforce_stable_grant_timeouts`` does.
     """
-    # Lazy import — coordinator_server imports lifecycle's
-    # CoordinatorHTTPServer; importing back at module load would cycle.
     from ccs.adapters.claude_code.coordinator_server import (
         SWEEP_RECLAMATION_PREEMPTER_ID,
-        monotonic_seconds,
     )
 
-    coordinator = entry.coordinator
+    reclaims: list[tuple[UUID, UUID, str]] = []
 
-    def _record_reclamation_notice(artifact_id, agent_id, trigger) -> None:
-        """Per-reclamation callback wired into service.enforce_stable_grant_timeouts.
-        Uses float wall-clock time (the notice timestamp is operator-visible
-        via the F4 prose) rather than the integer sweep tick."""
+    def _on_reclaim(artifact_id: UUID, agent_id: UUID, trigger: str) -> None:
+        # Append FIRST: a notice-write failure below is caught and logged by
+        # the service, and must not lose the reclaim from the count.
+        reclaims.append((artifact_id, agent_id, trigger))
+        # Float wall-clock time (the notice timestamp is operator-visible via
+        # the F4 prose) rather than the integer sweep tick.
         coordinator.registry.record_preemption_notice(
             victim_agent_id=agent_id,
             artifact_id=artifact_id,
             preempter_agent_id=SWEEP_RECLAMATION_PREEMPTER_ID,
             preempted_at_unix_ts=time.time(),
         )
+
+    # try/finally: the walk commits each pair on its own, so a later pair
+    # raising (a store error mid-walk) leaves the earlier reclaims durable.
+    # They are counted and logged on the way out all the same; otherwise the
+    # tick reads as quiet in exactly the case an operator most needs it not
+    # to. The exception still propagates to the caller unchanged.
+    try:
+        reclaimed = coordinator.service.enforce_stable_grant_timeouts(
+            current_tick=now_tick,
+            heartbeat_timeout_ticks=cfg.grant_heartbeat_timeout_sec,
+            max_hold_ticks=cfg.grant_max_hold_sec,
+            on_reclaim=_on_reclaim,
+        )
+    finally:
+        _report_sweep_reclaims(coordinator, reclaims, now_tick)
+    return reclaimed
+
+
+def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
+    """Periodic sweep: transient → stable grant → notice eviction →
+    transfer-record eviction.
+
+    Order matters per R4: transient sweep first so the stable sweep does
+    not race entries that are mid-protocol. F2 notice eviction and the
+    #185 transfer-record eviction last — both are pure storage reclaims
+    and don't interact with grants (a live record is never evicted).
+
+    ADV-004: stable-grant reclamation records a preemption notice for
+    the reclaimed victim so the victim's eventual post-edit gets an
+    enriched "reclaimed by coordinator sweep" error instead of a
+    generic CoherenceError with no context. The sentinel preempter
+    UUID is ``SWEEP_RECLAMATION_PREEMPTER_ID`` (imported lazily to
+    avoid an import cycle at module load). See :func:`_sweep_stable_grants`.
+    """
+    # Lazy import — coordinator_server imports lifecycle's
+    # CoordinatorHTTPServer; importing back at module load would cycle.
+    from ccs.adapters.claude_code.coordinator_server import (
+        _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC,
+        monotonic_seconds,
+    )
+    from ccs.adapters.claude_code.foreign_write_detector import run_detection_pass
+
+    coordinator = entry.coordinator
+    # Held across ticks for this coordinator: which files the detector has
+    # already read, by size and modification time. It carries no coordination
+    # state and no safety comparand — only a hint about what is worth
+    # re-reading, so a stale entry costs one extra read and never a wrong count.
+    detection_stat_cache: dict[str, tuple[tuple[int, int], str]] = {}
+    # Also held across ticks for this coordinator: which permanent poll faults
+    # have already been reported. A workspace that is not a git repository can
+    # never be polled, and logging that once per sweep interval for the life of
+    # the coordinator buries the failures an operator can act on.
+    detection_reported_faults: set[str] = set()
+    # And when detection last recorded a tick, so a sweep that stalls — a
+    # suspended host, or the safety passes above stuck on the store — ends the
+    # observed interval instead of being interpolated across. The pass cannot
+    # see the interval in which it did not run; the distance back to the last
+    # tick is the only evidence it left.
+    detection_tick_clock: dict[str, float] = {}
 
     while not coordinator.shutting_down:
         time.sleep(cfg.sweep_interval_sec)
@@ -816,12 +970,7 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
                 current_tick=now_tick,
                 timeout_ticks=cfg.transient_timeout_sec,
             )
-            coordinator.service.enforce_stable_grant_timeouts(
-                current_tick=now_tick,
-                heartbeat_timeout_ticks=cfg.grant_heartbeat_timeout_sec,
-                max_hold_ticks=cfg.grant_max_hold_sec,
-                on_reclaim=_record_reclamation_notice,
-            )
+            _sweep_stable_grants(coordinator, cfg, now_tick)
             # SB-17 / TX-1 Unit 5 / R4: the session-liveness sweep — a SEPARATE
             # axis from the grant sweep above (a snapshot session holds no MESI
             # grant, so the grant sweep can never see it). Reaps a session whose
@@ -849,9 +998,50 @@ def _sweep_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
             )
             if evicted:
                 logger.info("sweep evicted %d stale preemption notice(s)", evicted)
+            # #185: drop transfer records no longer live and older than
+            # the knob. On sqlite the age runs from the later of the record's
+            # and its artifact's last update, so a version-move ending stays
+            # readable; the in-memory registry keeps no artifact wall-clock
+            # stamp and ages from the record's own update alone.
+            evicted_records = coordinator.registry.evict_transfer_records(
+                max_age_sec=cfg.transfer_record_evict_max_age_sec,
+            )
+            if evicted_records:
+                logger.info("sweep evicted %d ended transfer record(s)", evicted_records)
         except Exception as exc:
             # Sweep is best-effort — never crash the coordinator.
             logger.exception("sweep tick failed: %s", exc)
+        # Foreign-write detection: a sixth pass, deliberately OUTSIDE the try
+        # above rather than appended inside it. The five passes share one
+        # best-effort guard, so a detection failure inside it would cost the
+        # tick's reclamation work; and running detection only when all five
+        # succeeded would make the instrument's own liveness depend on theirs.
+        # Two separate guards keep the failure domains apart in both
+        # directions. ``run_detection_pass`` raises nothing by contract.
+        #
+        # The poll gets one sweep interval as its whole budget, not per batch:
+        # detection runs in this loop, so an instrument that overruns delays the
+        # next tick's grant reclamation. Exhausting it fails the poll honestly,
+        # which leaves the tick unrecorded and the gap visible.
+        #
+        # The window is the shipped benign commit-to-disk lag plus one tick.
+        # They are otherwise both 5.0s and the comparison is inclusive, so a
+        # mediated commit first observed on the next tick would sit exactly on
+        # the boundary and jitter would decide whether it read as foreign.
+        run_detection_pass(
+            coordinator,
+            now_unix=now_tick,
+            window_sec=_SHARED_FOREIGN_DENY_LAG_WINDOW_SEC + cfg.sweep_interval_sec,
+            poll_budget_sec=cfg.sweep_interval_sec,
+            stat_cache=detection_stat_cache,
+            reported_faults=detection_reported_faults,
+            tick_clock=detection_tick_clock,
+            # Three sweep intervals of slack: one tick that arrives late
+            # because the five passes ahead of it ran long must not fragment a
+            # healthy run, but a stall long enough to hide a write must not be
+            # read as continuously observed either.
+            max_gap_sec=cfg.sweep_interval_sec * 3,
+        )
 
 
 def _idle_shutdown_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:

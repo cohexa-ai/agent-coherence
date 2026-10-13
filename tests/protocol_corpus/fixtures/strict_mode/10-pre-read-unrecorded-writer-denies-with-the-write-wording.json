@@ -1,0 +1,63 @@
+{
+  "name": "pre-read-strict-unrecorded-writer-denies-with-the-write-wording",
+  "description": "The <unknown>-writer arm of the WRITE deny template, on BOTH backends. Fixture 09 used to carry it and no longer can: since R8 its scenario (a grant taken with no commit) takes the grant-change template instead, which names no writer at all. The arm is still reachable, and this is how: B pre-reads CLAUDE.md first, seeding v1 with B's hash and NO last_writer_id (a first observation is not a commit). A then pre-reads the same strict-tracked path for the FIRST time, offering different bytes. A has no prior grant, so nothing about a grant changed hands and the summary cannot call the version unchanged; the diverging hash says something WAS written, out of band. The deny therefore uses the write template -- and names 'agent <unknown>', preserved verbatim rather than [:8]-sliced to the malformed '<unknown'. Timestamps vary per run; the reason bytes and the summary shape are the contract.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "strict_mode": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\nv1 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "CLAUDE.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "CLAUDE.md",
+      "content_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  },
+  "ignore_keys": [
+    "last_writer_at_unix_ts",
+    "warning_generated_at_unix_ts"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "Stale read denied: CLAUDE.md was updated by agent <unknown> at <TS>. Re-read CLAUDE.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+      },
+      "status": "stale",
+      "summary": {
+        "path": "CLAUDE.md",
+        "current_version": 1,
+        "prior_version_seen_by_session": null,
+        "last_writer_session_id": "<unknown>",
+        "last_writer_at_unix_ts": 0,
+        "warning_generated_at_unix_ts": 0,
+        "hash_differs": true
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

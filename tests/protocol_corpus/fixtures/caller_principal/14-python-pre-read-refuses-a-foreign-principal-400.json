@@ -1,0 +1,57 @@
+{
+  "name": "caller-principal-python-pre-read-refuses-a-foreign-principal",
+  "description": "An accept-class route admits an ABSENT principal but refuses a FOREIGN one: a presented principal is always checked, never ignored -- the case that separates optional from ignored. Python only (Node issues and checks none).",
+  "setup": {
+    "tracked": [
+      "docs/plans/feature-x.md"
+    ],
+    "files": {
+      "docs/plans/feature-x.md": "# Feature X\n\nv1 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+      "path": "docs/plans/feature-x.md"
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_b}"
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": "the Coherence-Caller-Principal header is not the caller principal bound to the session_id this request names (caller_principal_foreign)",
+      "reason": "caller_principal_foreign"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

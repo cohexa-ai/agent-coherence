@@ -1,0 +1,29 @@
+{
+  "name": "effect-fence-hold-input-vanished-untracked-path",
+  "description": "HOLD reason `input_vanished`. The path is not in the tracked set, so the coordinator holds no record of it and builds comparands with current_version=None -- the vanish sentinel -- which the branch table answers on its FIRST leg. Pins the decision that the untracked exit is HELD and not fast-pathed: the pre-read twin answers {status: fresh} with no version here, and copying that would turn 'the coordinator knows nothing about this file' into 'the coordinator agrees nothing moved'. A regression that restored the fresh fast path, or that reached the same answer by MINTING the artifact row the way the first-observation branch does, turns this fixture red.",
+  "setup": {
+    "tracked": ["docs/**"],
+    "files": {
+      "notes/scratch.md": "# coherence corpus fixture  \n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/effect-fence",
+    "body": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "path": "notes/scratch.md",
+      "expected_version": 1,
+      "expected_generation": 0,
+      "content_hash": "f9b414ed170aade26e96b08b64710e279b57971274301dc1c4c22fb63de6eec6"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "verdict": "hold",
+      "reason": "input_vanished"
+    }
+  },
+  "backends": ["python"]
+}

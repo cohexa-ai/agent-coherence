@@ -24,32 +24,44 @@ drift apart on what a win, a conflict, or an unknown outcome means.
 from __future__ import annotations
 
 import os
+import secrets
 import urllib.error
 import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, TypeAlias, runtime_checkable
+from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeAlias, runtime_checkable
 
 import yaml
 
 from ccs.cli._coherence_client import (
+    PRINCIPAL_REFUSED_AGAIN,
     CoordinatorEndpoint,
     CoordinatorUnavailable,
+    caller_principal_headers,
+    claim_caller_principal,
+    decide_principal_recovery,
+    principal_refusal_message,
+    principal_refusal_reason,
     resolve_endpoint,
 )
 from ccs.cli._coherence_client import (
     post as _coordinator_post,
 )
 from ccs.core.exceptions import (
+    CALLER_PRINCIPAL_CLAIMED_REASON,
     COMMIT_UNCONFIRMED_REASON,
+    HANDLER_FAILURE_REASON_PREFIX,
     OCC_CALLER_TRANSIENT_REASON,
     STALE_READ_GENERATION_REASON,
     VERSION_MISMATCH_REASON,
+    CallerPrincipalRefused,
     CasVersionConflict,
     CoherenceError,
     CommitUnconfirmed,
+    RedirectRefused,
     StaleView,
+    TlsVerificationFailed,
     ViewWedged,
 )
 from ccs.core.substrate import CapabilityDescriptor
@@ -395,7 +407,12 @@ def _write_strict_policy(coherence_dir: Path, managed: tuple[str, ...]) -> None:
     for a peer commit to invalidate this reader's cached view."""
     if not managed:
         return
-    coherence_dir.mkdir(parents=True, exist_ok=True)
+    # Runs BEFORE the lifecycle creates the directory, so on a fresh workspace
+    # this is the creator: match the 0700 the lifecycle requires, or every new
+    # workspace spawns with a "tightened existing .coherence directory" warning
+    # about a directory this call made a moment earlier. An existing directory
+    # is left as-is (mkdir never chmods); re-tightening is the lifecycle's job.
+    coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     for name in ("tracked.yaml", "strict_mode.yaml"):
         _merge_yaml_list(coherence_dir / name, managed)
 
@@ -436,7 +453,15 @@ _RETRYABLE_COMMIT_REASONS: frozenset[str] = frozenset(
 def _classify_commit(resp: dict, expected_version: int) -> CoordinatorCommit:
     """Map a ``/hooks/post-edit-cas`` 200 body to win / conflict, raising the
     typed unknown on the fail-closed degrade body (deny AND degrade both raise —
-    an unconfirmed CAS must never read as success)."""
+    an unconfirmed CAS must never read as success).
+
+    A non-win answer with no string ``reason`` is the unknown too. The
+    coordinator's own non-win answers always carry one, so it is what a proxy
+    or gateway in front of it could send, and it says nothing about whether
+    the bump landed. This is the commit leg, reached only after the substrate
+    write landed, so it must take the existing unknown path — reconcile by
+    re-reading, never re-drive — and never escape as a ``TypeError`` from the
+    membership test (an unhashable reason) or read as a rejection."""
     if resp.get("ok") is True:
         return CoordinatorWin(version=_as_int(resp.get("version"), expected_version + 1))
     reason = resp.get("reason")
@@ -445,9 +470,35 @@ def _classify_commit(resp: dict, expected_version: int) -> CoordinatorCommit:
             "coordinator commit_cas was unconfirmed (degraded); reconcile by "
             "re-reading before retrying — never blind re-drive"
         )
+    if not isinstance(reason, str):
+        raise CommitUnconfirmed(
+            "coordinator commit_cas was answered with no outcome this client can "
+            "classify (not a win, and no reason); reconcile by re-reading before "
+            "retrying — never blind re-drive"
+        )
     if reason in _RETRYABLE_COMMIT_REASONS:
         return CoordinatorConflict(current_version=_maybe_int(resp.get("current_version")))
+    if reason.startswith(HANDLER_FAILURE_REASON_PREFIX):
+        # The coordinator's failure envelope: the bump's work, or the
+        # caller-principal gate's store read, raised. It decides nothing, and
+        # a body that raised may have recorded the bump first, so the outcome
+        # is unknown, never a rejection: read as one, a caller would retry a
+        # write that already landed on the substrate.
+        raise CommitUnconfirmed(
+            f"coordinator commit_cas was answered with a failure ({reason}); whether "
+            "the bump landed is unknown — reconcile by re-reading before retrying, "
+            "never blind re-drive"
+        )
     raise CoherenceError(f"coordinator commit_cas rejected (fail-closed): {reason}")
+
+
+class _Sent(NamedTuple):
+    """What one POST from :meth:`SubstrateCoordinatorSession._send` yielded: the
+    2xx body, or the typed reason of a caller-principal refusal left to the
+    caller's recovery (R20). Every other failure raised."""
+
+    body: dict | None
+    principal_refusal: str | None
 
 
 class SubstrateCoordinatorSession:
@@ -462,8 +513,12 @@ class SubstrateCoordinatorSession:
 
     Every coordinator call is fail-closed: a transport error, a non-2xx, or a
     ``{degraded: true}`` body RAISES (deny AND degrade both map to a raise) — the
-    client never silently degrades open. Two sessions over one ``root`` are two
-    distinct agents; the first spawns, the rest attach.
+    client never silently degrades open. A request refused for its caller
+    principal is first recovered with the session's own mint nonce (R20); what
+    that cannot cure raises the typed
+    :class:`~ccs.core.exceptions.CallerPrincipalRefused` on either leg. Two
+    sessions over one ``root`` are two distinct agents; the first spawns, the
+    rest attach.
     """
 
     def __init__(
@@ -503,7 +558,9 @@ class SubstrateCoordinatorSession:
             raise CoherenceError(
                 f"substrate coordinator endpoint unresolved (fail-closed): {exc}"
             ) from exc
-        self._session_id = str(uuid.uuid4())
+        session_id, mint_nonce = str(uuid.uuid4()), secrets.token_urlsafe(32)
+        principal = self._claim_principal(session_id, mint_nonce)
+        self._session_id, self._mint_nonce, self._principal = session_id, mint_nonce, principal
 
     @property
     def session_id(self) -> str:
@@ -518,20 +575,77 @@ class SubstrateCoordinatorSession:
     def reacquire(self) -> None:
         """Mint a fresh identity, shedding a sticky INVALID. The ONLY place a new
         identity is minted — read and commit always share one identity between
-        them."""
-        self._session_id = str(uuid.uuid4())
+        them. A new identity is a new session, so it claims its own caller
+        principal (the commit route requires one) under its own new nonce.
 
-    def pre_read(self, artifact_ref: str, content_hash: str | None) -> PreReadResult:
+        The claim runs for the NEW session id BEFORE anything is swapped: only a
+        claim that settles replaces the session id, nonce and principal
+        together. A claim that raises leaves the previous three exactly as they
+        were, so the session keeps working under its old identity rather than
+        naming a new session while presenting the old one's principal."""
+        session_id, mint_nonce = str(uuid.uuid4()), secrets.token_urlsafe(32)
+        principal = self._claim_principal(session_id, mint_nonce)
+        self._session_id, self._mint_nonce, self._principal = session_id, mint_nonce, principal
+
+    def _claim_principal(self, session_id: str, mint_nonce: str) -> str | None:
+        """Claim ``session_id``'s caller principal presenting ``mint_nonce``. The
+        principal and the nonce are held in memory for the session's life: a
+        long-lived caller never looks a principal up by the identity it names
+        (KTD5) — accident-resistance, not unreadability, since the coordinator
+        stores every principal in ``.coherence/state.db``. ``None`` when the
+        coordinator issues none (404). A refused or unconfirmed claim RAISES,
+        like every other coordinator failure here (fail-closed); nothing is
+        re-minted."""
+        claim = claim_caller_principal(self._endpoint, session_id, mint_nonce)
+        if claim.outcome == "bound":
+            return claim.principal
+        if claim.outcome == "unsupported":
+            return None
+        message = (
+            f"coordinator caller principal not obtained ({claim.outcome}: "
+            f"{claim.detail}; fail-closed)"
+        )
+        if claim.outcome == "refused":
+            raise CallerPrincipalRefused(CALLER_PRINCIPAL_CLAIMED_REASON, message)
+        raise CoherenceError(message)
+
+    def pre_read(
+        self,
+        artifact_ref: str,
+        content_hash: str | None,
+        *,
+        unknown: type[CoherenceError] = CoherenceError,
+    ) -> PreReadResult:
         """Register a SHARED view and return the coordinator's version + deny
         state. This is what makes a later peer commit invalidate this reader
         (pull invalidation, surfaced at THIS reader's next binding-mediated act).
+
+        A failure raises ``unknown`` — a plain ``CoherenceError`` for a read,
+        ``CommitUnconfirmed`` for a pre-read a commit sends after its
+        substrate write landed.
         """
         payload: dict[str, object] = {"session_id": self._session_id, "path": artifact_ref}
         if content_hash is not None:
             payload["content_hash"] = content_hash
-        resp = self._post("/hooks/pre-read", payload, unknown=CoherenceError)
+        resp = self._post("/hooks/pre-read", payload, unknown=unknown)
         if resp.get("degraded"):
-            raise CoherenceError("coordinator watchdog timeout on pre-read (fail-closed)")
+            raise unknown("coordinator watchdog timeout on pre-read (fail-closed)")
+        if resp.get("ok") is False:
+            # The coordinator's failure envelope, HTTP 200 ``{"ok": false,
+            # "reason": "internal: <Type>"}``: its caller-principal gate's store
+            # read or the pre-read work body raised. It decides nothing (no
+            # version, no deny, no hash comparison), so it is ``unknown`` like
+            # an unanswered request, never a clean pre-read: read as one, a
+            # commit skipped the deny and bumped from version 0, and a
+            # converged commit's hash check read "no difference". The pre-read
+            # handler never answers an ``ok`` key otherwise. Only the
+            # envelope's reason is named: the exception's type, nothing else.
+            reason = resp.get("reason")
+            named = reason if isinstance(reason, str) and reason else "no reason given"
+            raise unknown(
+                f"coordinator answered the pre-read of {artifact_ref!r} with a failure "
+                f"({named}); not confirmed (fail-closed)"
+            )
         return PreReadResult(
             version=_pre_read_version(resp),
             stale_denied=_pre_read_denied(resp),
@@ -556,27 +670,108 @@ class SubstrateCoordinatorSession:
         resp = self._post("/hooks/post-edit-cas", payload, unknown=CommitUnconfirmed)
         return _classify_commit(resp, expected_version)
 
-    def coordinator_hash_matches(self, artifact_ref: str, content_hash: str) -> bool:
+    def coordinator_hash_matches(
+        self,
+        artifact_ref: str,
+        content_hash: str,
+        *,
+        unknown: type[CoherenceError] = CoherenceError,
+    ) -> bool:
         """True iff the coordinator's recorded hash equals ``content_hash`` — the
         token-identity signal that a byte-identical peer already carried this
-        writer's intended content to the coordinator (so the bump is complete)."""
-        return not self.pre_read(artifact_ref, content_hash).hash_differs
+        writer's intended content to the coordinator (so the bump is complete).
+        A failure to tell raises ``unknown`` (see :meth:`pre_read`)."""
+        return not self.pre_read(artifact_ref, content_hash, unknown=unknown).hash_differs
 
     def _post(
         self, endpoint_path: str, payload: dict, *, unknown: type[CoherenceError]
     ) -> dict:
         """POST with fail-closed classification. A transport error / non-2xx /
         non-dict body raises ``unknown`` (``CoherenceError`` for a read leg,
-        ``CommitUnconfirmed`` for the commit leg) — never a silent degrade-open."""
+        ``CommitUnconfirmed`` for the commit leg) — never a silent degrade-open.
+
+        A refusal of the caller principal is DEFINITE — the coordinator refused
+        before any mutation — so it is never ``unknown``. It is recovered as
+        R20 describes: the session's SAME nonce claims again, and a principal
+        that differs from the one presented is adopted and the request retried
+        exactly ONCE (a 404 on the claim retries once without the header).
+        What that cannot cure raises
+        :class:`~ccs.core.exceptions.CallerPrincipalRefused` with the wire
+        reason, on either leg."""
+        sent = self._send(endpoint_path, payload, unknown=unknown)
+        if sent.principal_refusal is None:
+            return sent.body  # type: ignore[return-value]
+        reason = sent.principal_refusal
+        recovery = decide_principal_recovery(
+            claim_caller_principal(self._endpoint, self._session_id, self._mint_nonce),
+            self._principal,
+        )
+        if recovery.action == "retry":
+            self._principal = recovery.principal
+            sent = self._send(endpoint_path, payload, unknown=unknown)
+            if sent.principal_refusal is None:
+                return sent.body  # type: ignore[return-value]
+            reason, detail = sent.principal_refusal, PRINCIPAL_REFUSED_AGAIN
+        else:
+            detail = recovery.detail
+        # ``settled`` is False only when the recovery claim's answer was lost:
+        # nothing was adopted, and this session's next refused request claims
+        # again with the retained nonce by itself — so the refusal is not the
+        # session's settled state, and a consumer must not report it as one.
+        raise CallerPrincipalRefused(
+            reason, principal_refusal_message(reason, detail), settled=recovery.settled
+        )
+
+    def _send(
+        self, endpoint_path: str, payload: dict, *, unknown: type[CoherenceError]
+    ) -> _Sent:
+        """One POST presenting the current principal. A caller-principal refusal
+        is returned for :meth:`_post` to recover; anything else that is not a
+        dict body raises ``unknown``.
+
+        A rejected request raises OUTSIDE the ``except`` block, so the
+        ``HTTPError`` is not on the raised error's chain: its text is the
+        status line's reason phrase — the coordinator's — which a traceback
+        would print. This client reports a rejected request by its status
+        code only.
+
+        A redirect is a non-2xx like any other, so it raises ``unknown`` too:
+        refused and never followed, but whatever answered may have passed the
+        request on, so on the commit leg — reached only after the substrate
+        write landed — whether the bump landed is not known. Reported by its
+        status alone, outside the ``except`` block, so the ``RedirectRefused``
+        is not on the raised error's chain either: the refusal withholds the
+        ``Location`` today, and this error does not depend on it doing so."""
+        redirected = False
         try:
-            resp = _coordinator_post(self._endpoint, endpoint_path, payload)
-        except (urllib.error.HTTPError, CoordinatorUnavailable) as exc:
+            resp = _coordinator_post(
+                self._endpoint,
+                endpoint_path,
+                payload,
+                extra_headers=caller_principal_headers(self._principal),
+            )
+        except urllib.error.HTTPError as exc:
+            status, reason = exc.code, principal_refusal_reason(exc)
+        except RedirectRefused as exc:
+            status, reason, redirected = exc.status, None, True
+        except CoordinatorUnavailable as exc:
             raise unknown(
                 f"coordinator {endpoint_path} failed (fail-closed): {exc}"
             ) from exc
-        if not isinstance(resp, dict):
-            raise unknown(f"coordinator {endpoint_path} returned a non-dict body (fail-closed)")
-        return resp
+        else:
+            if not isinstance(resp, dict):
+                raise unknown(
+                    f"coordinator {endpoint_path} returned a non-dict body (fail-closed)"
+                )
+            return _Sent(resp, None)
+        if redirected:
+            raise unknown(
+                f"coordinator {endpoint_path} failed (fail-closed): HTTP {status}, "
+                "a redirect, which this client never follows"
+            )
+        if reason is not None:
+            return _Sent(None, reason)
+        raise unknown(f"coordinator {endpoint_path} failed (fail-closed): HTTP {status}")
 
 
 @dataclass(frozen=True)
@@ -770,6 +965,43 @@ class CoordinatedSubstrate:
         return self._reconcile_unknown(pending)
 
     def _drive_bump(self, pending: _PendingCommit, *, converged: bool = False) -> CommitResult:
+        """The coordinator leg, reached only after the substrate write landed.
+
+        A caller-principal refusal here is reported through the bump leg's
+        unknown, not raised bare: the refusal is definite (the refused request
+        changed nothing), but the substrate already holds the new bytes, so
+        the commit is in exactly the state Case 1 leaves — and the refusal's
+        own recovery, resending a request that "changed nothing", would
+        re-drive a landed write. ``CommitUnconfirmed`` carries the recovery
+        that is right (re-read; retry only if absent; never re-drive), its
+        message says what happened, and the typed refusal is its cause. A TLS
+        verification failure — definite too: the request was never sent — is
+        reported the same way.
+
+        Each message names what this write did not do, never the version: on
+        a converged write a byte-identical peer's bump may have advanced it,
+        and the refused request is then the pre-read that checks for it. Nor
+        does a converged write claim it "landed": attribution is disclaimed
+        (see :class:`ReconcileVerdict`)."""
+        landed = _landed_clause(pending.artifact_ref, converged=converged)
+        try:
+            return self._bump(pending, converged=converged)
+        except CallerPrincipalRefused as refusal:
+            raise CommitUnconfirmed(
+                f"{landed}, but the coordinator refused the caller principal of a "
+                f"request this commit sent ({refusal.reason}), so it recorded no bump "
+                "from this write, and this write invalidated no peer. Not re-driven; "
+                "re-read before retrying."
+            ) from refusal
+        except TlsVerificationFailed as failure:
+            raise CommitUnconfirmed(
+                f"{landed}, but a request this commit made to the coordinator failed "
+                "TLS certificate verification, so it was never sent, and the "
+                "coordinator recorded no bump from this write. Not re-driven; re-read "
+                "before retrying."
+            ) from failure
+
+    def _bump(self, pending: _PendingCommit, *, converged: bool) -> CommitResult:
         try:
             result = self._coordinator.commit_cas(
                 pending.artifact_ref,
@@ -791,9 +1023,10 @@ class CoordinatedSubstrate:
     ) -> CommitResult:
         # A converged write whose bump lost to a byte-identical peer is COMPLETE
         # if the coordinator already holds the intended hash — no re-drive, no
-        # second bump (that would be a phantom advance).
+        # second bump (that would be a phantom advance). The substrate write has
+        # landed, so a check that cannot tell is the bump leg's unknown.
         if converged and self._coordinator.coordinator_hash_matches(
-            pending.artifact_ref, pending.intended_hash
+            pending.artifact_ref, pending.intended_hash, unknown=CommitUnconfirmed
         ):
             self._observed_hash[pending.artifact_ref] = pending.intended_hash
             return CommitResult(
@@ -857,6 +1090,19 @@ class CoordinatedSubstrate:
             f"re-drive of {pending.artifact_ref!r} is again unconfirmed; reconcile by "
             "re-reading before retrying"
         )
+
+
+def _landed_clause(artifact_ref: str, *, converged: bool) -> str:
+    """How a commit's report names the substrate write once it is on the
+    substrate: "landed" for a confirmed write, and for a converged one only
+    that the substrate holds the intended bytes — a byte-identical peer may
+    have put them there."""
+    if converged:
+        return (
+            f"the substrate holds the bytes this write intended for {artifact_ref!r} "
+            "(converged: which write put them there is not claimed)"
+        )
+    return f"the substrate write to {artifact_ref!r} landed"
 
 
 def _replace_expected_version(pending: _PendingCommit, version: int) -> _PendingCommit:

@@ -1,7 +1,8 @@
 # Copyright (c) 2026 agent-coherence contributors.
 # The Coherence Protocol for AI Agents
 
-"""Pytest configuration: defensive collection-skip for optional-extra tests.
+"""Pytest configuration: collection guards, the shared ``registry`` fixture,
+and the lanes CI splits the suite into.
 
 `tests/test_diagnose_*.py` import the public surface of ``ccs.diagnose``,
 which transitively imports ``langchain_core`` and ``langgraph`` (declared
@@ -12,13 +13,30 @@ during collection.
 CI installs ``.[dev,diagnose]`` so all diagnose tests run. This guard is
 the second layer of defense for local installs and for any future CI
 matrix that exercises bare-install paths.
+
+Lanes: CI runs each Python version as several shards (pytest-split), and
+each shard as two lanes. ``--test-lane parallel`` keeps every test not
+marked ``serial`` and runs on several xdist workers; ``--test-lane serial``
+keeps only ``serial`` tests and runs with ``-n 0``. The lane is a command-line
+option, never ``-m``: a command-line ``-m`` replaces the ``addopts``
+exclusions instead of adding to them. ``--node-id-dir=DIR`` makes the run write
+what each lane collected, what this shard selected and what it ran: the
+lists a CI gate checks to prove every test ran exactly once
+(``tools/check_shard_coverage.py``); give it with ``=``, because pytest reads
+an existing DIR passed as a separate argument as a test path before this
+conftest is loaded. With neither option, nothing changes.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import signal
+from pathlib import Path
 
 import pytest
+
+SERIAL_MARKER = "serial"
+PARALLEL_LANE, SERIAL_LANE = LANES = ("parallel", "serial")
 
 collect_ignore_glob: list[str] = []
 
@@ -51,6 +69,137 @@ if not _mcp_server_available():
     collect_ignore_glob.append("test_mcp_front_door_demo.py")
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    group = parser.getgroup("lanes", "CI lanes (see tests/conftest.py)")
+    group.addoption(
+        "--test-lane",
+        choices=LANES,
+        default=None,
+        help="Run only the tests of one lane: 'parallel' (not marked serial) or 'serial'.",
+    )
+    group.addoption(
+        "--node-id-dir",
+        default=None,
+        help=(
+            "Write this run's collected, selected and run node ids to <lane>-full.txt, <lane>-split.txt and "
+            "<lane>-ran.txt in DIR. "
+            "Pass it as --node-id-dir=DIR: an existing DIR given as a separate argument is taken for a test path "
+            "before this conftest loads, and the option is then rejected."
+        ),
+    )
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Keep the chosen lane, then record it as the lane's full list.
+
+    ``trylast`` places this after the ``-m`` deselection and before
+    pytest-split, whose own ``trylast`` hook is registered later (in
+    ``pytest_configure``) and so runs after this one: the full list is the
+    lane after the ``addopts`` exclusions and before splitting."""
+    lane = config.getoption("test_lane")
+    if lane is not None:
+        want_serial = lane == SERIAL_LANE
+        kept: list[pytest.Item] = []
+        dropped: list[pytest.Item] = []
+        for item in items:
+            in_lane = (item.get_closest_marker(SERIAL_MARKER) is not None) == want_serial
+            (kept if in_lane else dropped).append(item)
+        if dropped:
+            config.hook.pytest_deselected(items=dropped)
+            items[:] = kept
+    _write_node_ids(config, "full", items)
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """Record what this run selected, after pytest-split chose its group."""
+    _write_node_ids(session.config, "split", session.items)
+
+
+def _write_node_ids(config: pytest.Config, kind: str, items: list[pytest.Item]) -> None:
+    directory = config.getoption("node_id_dir")
+    if directory is None or _is_secondary_xdist_worker(config):
+        return
+    path = Path(directory) / f"{config.getoption('test_lane') or 'all'}-{kind}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Exclusive create: a second writer for one list is a bug in this hook,
+    # and the run should fail rather than let it overwrite the evidence.
+    with path.open("x", encoding="utf-8") as out:
+        out.writelines(f"{item.nodeid}\n" for item in items)
+
+
+def _reject_serial_lane_on_workers(config: pytest.Config) -> None:
+    if config.getoption("test_lane") == SERIAL_LANE and getattr(config.option, "numprocesses", None) not in (None, 0):
+        raise pytest.UsageError(
+            "--test-lane serial runs with -n 0: its tests start real processes that race each other "
+            "and are not safe beside other workers"
+        )
+
+
+class _RanRecorder:
+    """Writes ``<lane>-ran.txt``: every test that produced a result.
+
+    The collection lists say what a shard selected; this says what it ran.
+    xdist 3.8 exits 0 with "no tests ran" when a worker dies during
+    collection, so a shard can pass with a full split list and nothing run.
+    It lives in the process that receives every report: the xdist
+    controller, or the only process under ``-n 0``."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._ran: list[str] = []
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        # One entry per test: its call, or its setup when the setup skipped
+        # or failed and no call followed.
+        if report.when == "call" or (report.when == "setup" and not report.passed):
+            self._ran.append(report.nodeid)
+
+    def pytest_sessionfinish(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._path.open("x", encoding="utf-8") as out:
+            out.writelines(f"{node_id}\n" for node_id in self._ran)
+
+
+def _register_ran_recorder(config: pytest.Config) -> None:
+    directory = config.getoption("node_id_dir")
+    if directory is None or config.getoption("collectonly") or getattr(config, "workerinput", None) is not None:
+        return
+    path = Path(directory) / f"{config.getoption('test_lane') or 'all'}-ran.txt"
+    config.pluginmanager.register(_RanRecorder(path), "lane-ran-recorder")
+
+
+def _is_secondary_xdist_worker(config: pytest.Config) -> bool:
+    """Every xdist worker collects the same items; only ``gw0`` writes them.
+    The controller collects nothing, so it never reaches the writer."""
+    workerinput = getattr(config, "workerinput", None)
+    return workerinput is not None and workerinput["workerid"] != "gw0"
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """A shard whose split selects no tests for a lane has run correctly; the
+    gate's coverage check, not pytest's exit 5, decides whether the shards
+    together covered the lane (it fails on an empty full list).
+
+    Only on evidence, though: "no tests ran" is also what xdist reports when a
+    worker dies during collection, after ``gw0`` has already written a split
+    full of tests that never ran. So exit 5 becomes 0 only when this shard's
+    split list was written and is empty."""
+    if exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED and _split_was_empty(session.config):
+        session.exitstatus = pytest.ExitCode.OK
+
+
+def _split_was_empty(config: pytest.Config) -> bool:
+    directory, lane = config.getoption("node_id_dir"), config.getoption("test_lane")
+    if directory is None or lane is None or not config.getoption("splits", None):
+        return False
+    try:
+        return (Path(directory) / f"{lane}-split.txt").stat().st_size == 0
+    except FileNotFoundError:
+        return False
+
+
 def pytest_configure(config):
     """Neutralize the v0.9.0 transitional RuntimeWarning at COLLECTION time.
 
@@ -64,6 +213,8 @@ def pytest_configure(config):
     from ccs.coordinator import service as _service
 
     _service._V090_FIRST_USE_WARNED = True
+    _reject_serial_lane_on_workers(config)
+    _register_ran_recorder(config)
 
 
 @pytest.fixture(autouse=True)
@@ -87,3 +238,51 @@ def _neutralize_v090_first_use_warning():
 
     _service._V090_FIRST_USE_WARNED = True
     yield
+
+
+@pytest.fixture(autouse=True)
+def _restore_sigpipe_disposition():
+    """Put SIGPIPE's disposition back after every test.
+
+    ``ccs.cli.diagnose.main()`` resets SIGPIPE to the default action for the
+    whole process, so ``ccs-diagnose | head`` exits quietly. Left that way, the
+    next test in the same process that writes to a closed socket kills the
+    process with no traceback; under xdist that took down a worker mid-run
+    (tests/test_diagnose_cli.py pins this)."""
+    if not hasattr(signal, "SIGPIPE"):
+        yield
+        return
+    saved = signal.getsignal(signal.SIGPIPE)
+    yield
+    if signal.getsignal(signal.SIGPIPE) != saved:
+        signal.signal(signal.SIGPIPE, saved)
+
+
+@pytest.fixture(params=["memory", "sqlite"])
+def registry(request, tmp_path: Path):
+    """Both registry implementations, identically — the parametrization IS the
+    parity harness for registry-level surfaces.
+
+    Shared here rather than per-module because the conflict-counter suite and
+    the foreign-write-counter suite that follows it assert the same contract
+    across both arms, from what had become byte-identical local copies. Modules
+    that define their own ``registry`` shadow this one, so the pre-existing
+    per-module fixtures keep their own param ids and teardown idiom;
+    ``tests/test_registry_fixture_contract.py`` pins both halves of that split.
+
+    The sqlite arm's filename is deliberately its own: consumers put their own
+    sqlite files in the same ``tmp_path``, and the tree's default ``state.db``
+    is a name two coordinator suites already reserve for raw-sqlite probes.
+    """
+    # Deferred like the ``ccs`` imports in the hooks above, so importing this
+    # conftest stays free of the package under test. Nothing here needs `ccs`
+    # until a test actually requests the fixture.
+    from ccs.coordinator.registry import ArtifactRegistry
+    from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+
+    if request.param == "memory":
+        yield ArtifactRegistry()
+    else:
+        reg = SqliteArtifactRegistry(tmp_path / "shared-registry-arm.db")
+        yield reg
+        reg.close()

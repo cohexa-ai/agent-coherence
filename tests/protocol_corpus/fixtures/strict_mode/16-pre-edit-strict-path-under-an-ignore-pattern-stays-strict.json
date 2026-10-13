@@ -1,0 +1,83 @@
+{
+  "name": "pre-edit-strict-path-under-an-ignore-pattern-stays-strict",
+  "description": "#261: strict wins over ignore. With .coherence/ignored.yaml listing the strict path itself (a leftover ignore entry, present at spawn; the harness writes unquoted YAML, so a '*'-led glob would parse as an alias), a tracked strict path is still tracked and strict: the stale pre-edit denies exactly as in fixture 05 instead of taking the untracked fast path, where a read reports version 0 and a CAS commit is accepted at any expected_version (a silent lost update). Python only: the Node coordinator's policy evaluator lives in the plugin repository (not in this tree) and still lets ignore win, so this fixture is the parity target for that follow-up rather than a Node row that would fail.",
+  "setup": {
+    "tracked": [
+      "plan.md"
+    ],
+    "strict_mode": [
+      "plan.md"
+    ],
+    "ignored": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\nv1\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "plan.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md",
+          "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f",
+          "success": true
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "plan.md"
+    }
+  },
+  "ignore_keys": [
+    "summary"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": false,
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "Stale read denied: plan.md was updated by agent 814dac78 at <TS>. Re-read plan.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+      },
+      "status": "stale",
+      "summary": "<IGNORED>"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

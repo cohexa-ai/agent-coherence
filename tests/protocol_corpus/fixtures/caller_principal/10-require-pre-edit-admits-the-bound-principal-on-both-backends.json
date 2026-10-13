@@ -1,0 +1,45 @@
+{
+  "name": "caller-principal-require-pre-edit-admits-the-bound-principal",
+  "description": "R14 for pre-edit, a require-class route both runtimes implement, in the PRINCIPAL-PRESENT state: session A claims (Python only -- the preflight is scoped, since Node answers 404) and its pre-edit presents the principal. Python checks it and admits; Node issues none, so the harness omits the header there, exactly as a conforming client does after a 404 on the claim. Both answer the same. The absent-and-bound state is fixture 17 (Python refuses) and 18 (Node admits); absent-and-unbound is warn_mode/04-pre-edit-tracked-grants-exclusive.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "backends": [
+          "python"
+        ],
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+      "path": "CLAUDE.md"
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_a}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true
+    }
+  }
+}

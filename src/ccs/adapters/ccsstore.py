@@ -240,6 +240,7 @@ class CCSStore(BaseStore):
         )
 
         degraded = False
+        degraded_warning: str | None = None
         try:
             resp = self.core.read(agent_name=agent_name, artifact_id=artifact_id, now_tick=tick)
             value = json.loads(resp.content) if resp.content else {}
@@ -255,13 +256,9 @@ class CCSStore(BaseStore):
             value = self._fallback_store.get(scope_key, {})
             degraded = True
             cache_hit = False
-            if self._degradation_count == 0:
-                warnings.warn(
-                    f"CCSStore degraded to fallback on get {namespace!r} {key!r}: {exc}",
-                    CoherenceDegradedWarning,
-                    stacklevel=4,
-                )
             self._degradation_count += 1
+            if self._degradation_count == 1:
+                degraded_warning = f"CCSStore degraded to fallback on get {namespace!r} {key!r}: {exc}"
 
         tokens = 1 if cache_hit else self._estimate_tokens(value)
         # Cache hit: no content was fetched from the coordinator, so transmission cost is 0.
@@ -283,6 +280,11 @@ class CCSStore(BaseStore):
             self._bm_ops += 1  # type: ignore[operator]
             if cache_hit:
                 self._bm_hits += 1  # type: ignore[operator]
+
+        # Warn last: a caller that escalates the warning to an error makes warn()
+        # raise, and none of the degradation's bookkeeping may depend on it.
+        if degraded_warning is not None:
+            warnings.warn(degraded_warning, CoherenceDegradedWarning, stacklevel=4)
 
         now = datetime.now(tz=timezone.utc)
         return Item(value=value, key=key, namespace=namespace, created_at=now, updated_at=now)
@@ -310,6 +312,7 @@ class CCSStore(BaseStore):
         artifact_id = self._ensure_artifact_registered(namespace, key)
 
         degraded = False
+        degraded_warning: str | None = None
         try:
             self.core.write(
                 agent_name=agent_name, artifact_id=artifact_id, content=content_str, now_tick=tick
@@ -324,13 +327,9 @@ class CCSStore(BaseStore):
             scope_key = (tuple(namespace[1:]), key)
             self._fallback_store[scope_key] = value
             degraded = True
-            if self._degradation_count == 0:
-                warnings.warn(
-                    f"CCSStore degraded to fallback on put {namespace!r} {key!r}: {exc}",
-                    CoherenceDegradedWarning,
-                    stacklevel=4,
-                )
             self._degradation_count += 1
+            if self._degradation_count == 1:
+                degraded_warning = f"CCSStore degraded to fallback on put {namespace!r} {key!r}: {exc}"
 
         full_ns = tuple(namespace)
         if full_ns not in self._namespace_index:
@@ -345,6 +344,10 @@ class CCSStore(BaseStore):
             tokens_consumed=self._estimate_tokens(value),
             cache_hit=False,
         )
+
+        # Warn last, as in _apply_get.
+        if degraded_warning is not None:
+            warnings.warn(degraded_warning, CoherenceDegradedWarning, stacklevel=4)
 
     def _apply_delete(self, namespace: tuple[str, ...], key: str, tick: int) -> None:
         if len(namespace) < 2:

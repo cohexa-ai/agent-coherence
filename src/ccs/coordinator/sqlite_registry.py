@@ -33,7 +33,12 @@ Contract divergence from in-memory ``ArtifactRegistry`` (per plan KTD-13):
   actually exercises; ``tests/test_coordinator.py`` patterns that exercise
   content-fetch semantics are NOT a v0.1 goal for this storage layer.
 
-Schema (KTD-3, applied via ``PRAGMA user_version`` on init):
+Schema: the v1 BASELINE only (KTD-3), kept for orientation. The live schema is
+``SCHEMA_USER_VERSION`` (currently 10); the ``_migrate_vN_to_vM`` chain below is
+the source of truth for everything the baseline does not show, including the
+columns later versions add to ``agent_states`` (``read_generation``,
+``last_observed_version``) and every table and index added after v1. Read a db's
+own ``sqlite_master`` rather than this block when the exact shape matters.
 
   PRAGMA user_version = 1;
   CREATE TABLE artifacts (
@@ -57,7 +62,6 @@ Schema (KTD-3, applied via ``PRAGMA user_version`` on init):
     last_reclaim_tick INTEGER,
     PRIMARY KEY (artifact_id, agent_id)
   );
-  CREATE INDEX idx_agent_states_agent ON agent_states(agent_id);
   CREATE TABLE heartbeats (
     agent_id   TEXT PRIMARY KEY,
     last_tick  INTEGER NOT NULL
@@ -116,6 +120,7 @@ from ccs.core.types import (
     ConflictDetail,
     MultiCommitConflict,
     MultiCommitResult,
+    TransferGrantOutcome,
     VersionedReadRejection,
 )
 
@@ -125,12 +130,26 @@ from ccs.core.types import (
 from .registry_protocol import (
     CLAIM_CAPTURE_TRIGGERS,
     EPOCH_BUMP_TRIGGERS,
+    FOREIGN_WRITE_OUTCOMES,
+    HANDOFF_TRIGGER,
     RECLAIM_TRIGGERS,  # noqa: F401 — re-exported; see the parity test
+    SWEEP_RECLAIM_TRIGGERS,
     CaptureResult,
     CasResult,
     CheckpointMember,
     CheckpointRecord,
+    DetectionRun,
     ReclamationSlot,
+    StatusSnapshot,
+    TransferDecision,
+    TransferPathView,
+    TransferRecord,
+    TransferRequest,
+    UncoverableRun,
+    acquire_by_deadline,
+    decide_transfer_grant,
+    require_storable_transfer_status,
+    transfer_record_live,
 )
 from .retention import RetentionPolicy, collectible_versions
 
@@ -140,7 +159,7 @@ CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 """Reuses the same schema version as in-memory registry (state_log emissions
 are interchangeable from a downstream consumer's perspective)."""
 
-SCHEMA_USER_VERSION = 7
+SCHEMA_USER_VERSION = 10
 """Schema version stamped via ``PRAGMA user_version`` on init.
 
 **v1 -> v2** (plan item N v1) added the durable ``artifact_versions`` table and
@@ -196,6 +215,52 @@ paired v4 adds an ``agent_states.last_observed_version`` of its own, so BOTH
 ledgers carry it. The disjoint load-bearing fingerprint is
 ``agent_states.deadline_tick`` (Node-only, below — this repo must never add
 that column), backed by the ``registry_meta.schema_runtime`` stamp.
+
+**v6 -> v7** (SB-10 perf follow-up) indexes ``agent_states(agent_id)``.
+Index-only; see ``_migrate_v6_to_v7``.
+
+**v7 -> v8** (coordinator caller principal, U4) adds the ``caller_principals``
+table: one row per acting identity, binding the caller principal the
+coordinator minted on that identity's first claim, with the claimant's mint
+nonce beside it (the retry proof, KTD11). Its OWN table on purpose — the
+session-liveness sweep, the session cap and session release each touch only
+``session_meta``, so a principal stored there would be reaped at the
+absolute-age ceiling and would consume a snapshot-session slot; here it is
+invisible to all three by construction (R4). Additive-only. The step carries
+the ``_V7_USER_VERSION`` literal conversion (the re-stamp trap, fourth
+arming): ``_migrate_v6_to_v7`` stamped the constant while it was the final
+step and now stamps its own literal 7. FORWARD-ONLY: once a store opens at v8,
+an earlier build refuses it (an unrecognized ``user_version`` raises; there is
+no down step).
+
+**v8 -> v9** (targeted grant handoff, #185) adds the ``transfer_records``
+table: one row per artifact holding its current transfer record (giver,
+holding composite, successor, version at transfer, hold shape, cause, status,
+counterparty, wall-clock timestamps). Keyed on the artifact id with ``ON DELETE
+CASCADE`` -- the ``pending_notices`` shape, not the ``caller_principals`` one --
+so deleting an artifact drops its record exactly as the in-memory slot removal
+does. Additive-only. The step carries the ``_V8_USER_VERSION`` literal
+conversion (the re-stamp trap, fifth arming): ``_migrate_v7_to_v8`` stamped the
+constant while it was the final step and now stamps its own literal 8.
+FORWARD-ONLY like v8: an earlier build refuses a v9 store.
+
+**v9 -> v10** (#191, the restore-registration receiver binding) adds two
+nullable columns to ``workspace_checkpoints``: ``receiver`` (the one controller
+allowed to register a restore of the checkpoint, named at creation; NULL admits
+any controller) and ``registered_by`` (the controller whose registration
+claimed the checkpoint first; set once by ``claim_checkpoint_registration``,
+never rebound). Column-only and additive; every existing manifest migrates with
+both NULL, which is exactly the pre-#191 behaviour (any controller registers,
+nothing claimed yet). The step carries the ``_V9_USER_VERSION`` literal
+conversion (the re-stamp trap, sixth arming): ``_migrate_v8_to_v9`` stamped the
+constant while it was the final step and now stamps its own literal 9.
+FORWARD-ONLY: once a store opens at v10, an earlier build refuses it.
+
+**On the wire.** The Claude Code coordinator's ``/status`` reports this number
+as ``registry_schema_version``, and the protocol corpus pins the literal in its
+five Python ``/status`` rows (``warn_mode/08``, ``warn_mode/27``,
+``handoff/33``, ``handoff/34``, ``harness_identity/03``), so a bump must
+update those fixtures too.
 
 **CROSS-RUNTIME LEDGER DIVERGENCE (security).** The sibling Node coordinator
 (agent-coherence-plugin) shares the SAME ``state.db`` path but keeps its OWN
@@ -255,6 +320,28 @@ literal for the same reason as ``_V4_USER_VERSION``/``_V5_USER_VERSION``:
 stamping the constant would mark a v5-origin db ``user_version=7`` WITHOUT
 the index, and the chained v6->v7 loser-guard would no-op (the re-stamp
 trap, third arming)."""
+
+_V7_USER_VERSION = 7
+"""``_migrate_v6_to_v7``'s guard/stamp literal: it adds the
+``agent_states(agent_id)`` index and advances to v7 — NO LONGER the final step
+once v8 (the ``caller_principals`` table) landed. Stamping the constant would
+mark a v6-origin db ``user_version=8`` WITHOUT the table, and the chained
+v7->v8 loser-guard would no-op (the re-stamp trap, fourth arming)."""
+
+_V8_USER_VERSION = 8
+"""``_migrate_v7_to_v8``'s guard/stamp literal: it adds the
+``caller_principals`` table and advances to v8 — NO LONGER the final step once
+v9 (the ``transfer_records`` table) landed. Stamping the constant would mark a
+v7-origin db ``user_version=9`` WITHOUT the transfer table, and the chained
+v8->v9 loser-guard would no-op (the re-stamp trap, fifth arming)."""
+
+_V9_USER_VERSION = 9
+"""``_migrate_v8_to_v9``'s guard/stamp literal: it adds the ``transfer_records``
+table and advances to v9 — NO LONGER the final step once v10 (the
+``workspace_checkpoints`` receiver/registration columns, #191) landed. Stamping
+the constant would mark a v8-origin db ``user_version=10`` WITHOUT the columns,
+and the chained v9->v10 loser-guard would no-op (the re-stamp trap, sixth
+arming)."""
 
 _DB_FILE_MODE = 0o600
 """state.db (and its -wal/-shm sidecars) must be owner-read/write only.
@@ -361,7 +448,9 @@ CREATE TABLE workspace_checkpoints (
     window_max         REAL NOT NULL,
     restore_status     TEXT NOT NULL DEFAULT 'none',
     restore_updated_at REAL,
-    pin_refcount       INTEGER NOT NULL DEFAULT 0
+    pin_refcount       INTEGER NOT NULL DEFAULT 0,
+    receiver           TEXT,
+    registered_by      TEXT
 )
 """
 
@@ -398,6 +487,90 @@ CREATE TABLE workspace_checkpoint_members (
     PRIMARY KEY (checkpoint_id, member_path),
     FOREIGN KEY (checkpoint_id) REFERENCES workspace_checkpoints(checkpoint_id) ON DELETE CASCADE
 )
+"""
+
+# Caller-principal bindings (schema v8; coordinator caller principal, U4). One
+# row per acting identity (the session component's agent id, hex), first claim
+# wins and a row is never rebound. ``principal`` is stored as issued because a
+# retry presenting the same ``mint_nonce`` must receive the SAME principal back
+# (R20); the nonce is stored as presented — hashing it would buy nothing while
+# the principal it guards sits beside it in the same 0600 file. Its own table,
+# never ``session_meta``: the session sweep (``all_session_meta``), the cap
+# (``session_count``) and ``release_session`` read or delete only that table,
+# so a principal here outlives every grant and snapshot session (R4). No FK:
+# an identity is not an artifact.
+_CALLER_PRINCIPALS_DDL = """
+CREATE TABLE caller_principals (
+    identity   TEXT PRIMARY KEY,
+    principal  TEXT NOT NULL,
+    mint_nonce TEXT NOT NULL
+)
+"""
+
+# Transfer records (schema v9; targeted grant handoff #185). One row per
+# artifact: the current handoff of that path. Keyed on the artifact id with ON
+# DELETE CASCADE (the ``pending_notices`` shape, not ``caller_principals``'), so
+# the library delete verb drops the record with the artifact, exactly as the
+# in-memory slot removal does. Ids are stored as UUID hex and the hold shape as
+# the MESIState name, the way ``agent_states`` stores ids and states.
+# ``cause`` is a closed vocabulary (TRANSFER_CAUSES), checked when a record is
+# decided for a write and never on read-back; ``superseded_successor`` is
+# set exactly when the cause is a supersession, so a late re-send of the
+# superseded tuple is recognised without parsing an id out of a string.
+# ``status`` is a LABEL; liveness is never stored -- it is read by joining the
+# artifact's version (``SqliteArtifactRegistry._transfer_read``). Timestamps are
+# wall-clock unix seconds (the coordinator's ticks reset on restart).
+_TRANSFER_RECORDS_DDL = """
+CREATE TABLE transfer_records (
+    artifact_id          TEXT PRIMARY KEY,
+    giver                TEXT NOT NULL,
+    holder               TEXT NOT NULL,
+    successor            TEXT NOT NULL,
+    version_at_transfer  INTEGER NOT NULL,
+    hold_shape           TEXT NOT NULL,
+    cause                TEXT NOT NULL,
+    superseded_successor TEXT,
+    status               TEXT NOT NULL,
+    counterparty         TEXT,
+    created_at           REAL NOT NULL,
+    updated_at           REAL NOT NULL,
+    FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
+)
+"""
+
+# The liveness join: a record's columns, then its artifact's version and last
+# update, read by ONE statement so the version a record is judged against is
+# the one that coexisted with it. ``_TRANSFER_READ_ALL_SQL`` serves every path
+# (the eviction, and the status snapshot's opt-in); ``_TRANSFER_READ_SQL`` one
+# path (the read, the composite transfer), the same statement narrowed by its
+# WHERE, so the two can never disagree on the column order that is
+# ``_transfer_read_from_row``'s contract.
+_TRANSFER_READ_ALL_SQL = """
+SELECT t.artifact_id, t.giver, t.holder, t.successor, t.version_at_transfer,
+       t.hold_shape, t.cause, t.superseded_successor, t.status, t.counterparty,
+       t.created_at, t.updated_at, a.version, a.updated_at
+FROM transfer_records t JOIN artifacts a ON a.id = t.artifact_id
+"""
+_TRANSFER_READ_SQL = _TRANSFER_READ_ALL_SQL + "WHERE t.artifact_id = ?\n"
+
+# The record upsert: insert, replace an ended record, or supersede a live one.
+_TRANSFER_UPSERT_SQL = """
+INSERT INTO transfer_records (
+    artifact_id, giver, holder, successor, version_at_transfer, hold_shape,
+    cause, superseded_successor, status, counterparty, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(artifact_id) DO UPDATE SET
+    giver = excluded.giver,
+    holder = excluded.holder,
+    successor = excluded.successor,
+    version_at_transfer = excluded.version_at_transfer,
+    hold_shape = excluded.hold_shape,
+    cause = excluded.cause,
+    superseded_successor = excluded.superseded_successor,
+    status = excluded.status,
+    counterparty = excluded.counterparty,
+    created_at = excluded.created_at,
+    updated_at = excluded.updated_at
 """
 
 # The CLI's ``list``/``restore <name>`` verbs resolve checkpoints by NAME, which
@@ -538,6 +711,36 @@ def classify_sqlite_operational_signal(exc: sqlite3.OperationalError) -> str:
     return STORE_SIGNAL_UNREADABLE
 
 
+# The one place the outcome vocabulary is bound to the columns that store it.
+# Both the write and the read side name their columns through this map, so a
+# reorder of either FOREIGN_WRITE_OUTCOMES or the SELECT list cannot silently
+# transpose two counts — an f-string convention on one side and a positional
+# zip on the other could, and no equal-count test would catch it.
+FOREIGN_WRITE_COLUMNS: dict[str, str] = {
+    "foreign": "foreign_count",
+    "mediated": "mediated_count",
+    "lag_suppressed": "lag_suppressed_count",
+}
+assert tuple(FOREIGN_WRITE_COLUMNS) == FOREIGN_WRITE_OUTCOMES, (
+    "the outcome vocabulary and its column map must stay in step"
+)
+
+
+def _foreign_write_column(outcome: str) -> str:
+    """Resolve an outcome to its counter column, refusing anything else.
+
+    The result is interpolated into SQL, so this is the trust boundary: only a
+    value present in the fixed map above can reach the statement, which is what
+    makes that interpolation safe from caller data."""
+    try:
+        return FOREIGN_WRITE_COLUMNS[outcome]
+    except KeyError:
+        raise ValueError(
+            f"unknown foreign-write outcome {outcome!r}; "
+            f"expected one of {FOREIGN_WRITE_OUTCOMES}"
+        ) from None
+
+
 @dataclass(frozen=True)
 class _ArtifactRow:
     """Internal row decoded from the artifacts table."""
@@ -597,6 +800,11 @@ class SqliteArtifactRegistry:
         # read-only handle too (the list simply never fires there — read-only
         # never reaches a commit path).
         self.conflict_callbacks: list[Callable[[UUID, UUID, str], None]] = []
+        # This handle's foreign-write detection run identity. Minted per open,
+        # never persisted until the first tick, so a coordinator that opened the
+        # store but never ran the detector leaves no observation row at all —
+        # which is exactly the not-instrumented signal ``detection_runs`` reads.
+        self._detection_run_id: str = uuid4().hex
 
         if read_only:
             self._open_read_only(instance_id)
@@ -664,6 +872,16 @@ class SqliteArtifactRegistry:
         # break the v7 write-free read-only open, which never runs this and
         # whose readers tolerate the table's absence).
         self._ensure_conflict_counters_table()
+        # Foreign-write detection tables (detection-substrate plan U2 / KTD6,
+        # KTD14). Same posture and the same reason as the conflict counters
+        # above: observability exhaust, idempotent writer-open ensure, outside
+        # the versioned migration chain, never run on the write-free read-only
+        # open. One difference is load-bearing — because all three tables exist after
+        # any writer open, whether or not the sweep thread was ever created
+        # (``sweep_interval_sec <= 0`` skips it), the table's PRESENCE cannot
+        # mean "the detector ran". Only an observation ROW can, which is what
+        # ``detection_runs`` reads.
+        self._ensure_foreign_write_tables()
         # Persist the retention policy on writer open (incl. the explicit
         # unbounded marker) so a read-only resolver can derive T-expiry + the
         # retention_off reason from the store, not a process-local object.
@@ -720,9 +938,10 @@ class SqliteArtifactRegistry:
 
         - ``user_version == 0`` (brand-new file) → ``_apply_v2_schema``: the
           COMPLETE current schema (v2 tables + ``session_pins`` + ``session_meta``
-          + the workspace-checkpoint tables + the v6 ``last_observed_version``
-          column + the indexes) in one atomic transaction (no shim ever runs on a
-          fresh db).
+          + the workspace-checkpoint tables (with the v10 receiver/registration
+          columns) + the v6 ``last_observed_version`` column + the indexes + the
+          v8 ``caller_principals`` table + the v9 ``transfer_records`` table) in
+          one atomic transaction (no shim ever runs on a fresh db).
         - ``user_version == 1`` (any wild v1 variant) → ``_migrate_v1_to_v2`` then
           ``_migrate_v2_to_v3`` then ``_migrate_v3_to_v4`` then
           ``_migrate_v4_to_v5`` then ``_migrate_v5_to_v6``: idempotently subsumes
@@ -743,7 +962,15 @@ class SqliteArtifactRegistry:
         - ``user_version == 4`` → ``_migrate_v4_to_v5`` then ``_migrate_v5_to_v6``.
         - ``user_version == 5`` → ``_migrate_v5_to_v6``: an existing v5 db gains
           the ``agent_states.last_observed_version`` column.
-        - ``user_version == 7`` (SCHEMA_USER_VERSION) → ``_rehydrate_meta``: the
+        - ``user_version == 6`` → ``_migrate_v6_to_v7`` (the agent_id index).
+        - ``user_version == 7`` → ``_migrate_v7_to_v8``: the ``caller_principals``
+          table.
+        - ``user_version == 8`` → ``_migrate_v8_to_v9``: the ``transfer_records``
+          table.
+        - ``user_version == 9`` → ``_migrate_v9_to_v10``: the
+          ``workspace_checkpoints.receiver`` / ``registered_by`` columns (#191).
+        - Every branch above ends at ``_migrate_v9_to_v10``, the final chain step.
+        - ``user_version == 10`` (SCHEMA_USER_VERSION) → ``_rehydrate_meta``: the
           WRITE-FREE open path (no ALTER, no IF-NOT-EXISTS) — the prerequisite for
           read-only mode.
         - anything else → :class:`SchemaVersionError` (no destructive advice).
@@ -769,6 +996,9 @@ class SqliteArtifactRegistry:
                 self._migrate_v4_to_v5(instance_id)
                 self._migrate_v5_to_v6(instance_id)
                 self._migrate_v6_to_v7(instance_id)
+                self._migrate_v7_to_v8(instance_id)
+                self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == 2:
                 # 2 → 3 → 4 → 5 → 6: session_pins, session_meta + index,
                 # checkpoints, last_observed_version.
@@ -777,6 +1007,9 @@ class SqliteArtifactRegistry:
                 self._migrate_v4_to_v5(instance_id)
                 self._migrate_v5_to_v6(instance_id)
                 self._migrate_v6_to_v7(instance_id)
+                self._migrate_v7_to_v8(instance_id)
+                self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == _V3_USER_VERSION:
                 # An existing v3 db (session_pins, NO session_meta — earlier
                 # commits of that branch stamped it) → add session_meta + index,
@@ -787,22 +1020,51 @@ class SqliteArtifactRegistry:
                 self._migrate_v4_to_v5(instance_id)
                 self._migrate_v5_to_v6(instance_id)
                 self._migrate_v6_to_v7(instance_id)
+                self._migrate_v7_to_v8(instance_id)
+                self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == _V4_USER_VERSION:
                 # An existing v4 db → the workspace-checkpoint tables (v5), then
                 # the last_observed_version column (v6).
                 self._migrate_v4_to_v5(instance_id)
                 self._migrate_v5_to_v6(instance_id)
                 self._migrate_v6_to_v7(instance_id)
+                self._migrate_v7_to_v8(instance_id)
+                self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == _V5_USER_VERSION:
                 # An existing v5 db → last_observed_version (v6), then the
                 # agent_id index (v7).
                 self._migrate_v5_to_v6(instance_id)
                 self._migrate_v6_to_v7(instance_id)
+                self._migrate_v7_to_v8(instance_id)
+                self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
             elif current == _V6_USER_VERSION:
-                # An existing v6 db (SB-10-era) → index agent_states(agent_id).
+                # An existing v6 db (SB-10-era) → index agent_states(agent_id),
+                # then the caller-principal table (v8), then the transfer
+                # records (v9).
                 self._migrate_v6_to_v7(instance_id)
+                self._migrate_v7_to_v8(instance_id)
+                self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
+            elif current == _V7_USER_VERSION:
+                # An existing v7 db → the caller-principal table (v8), then the
+                # transfer records (v9).
+                self._migrate_v7_to_v8(instance_id)
+                self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
+            elif current == _V8_USER_VERSION:
+                # An existing v8 db → the transfer-record table (v9), then the
+                # checkpoint receiver/registration columns (v10, #191).
+                self._migrate_v8_to_v9(instance_id)
+                self._migrate_v9_to_v10(instance_id)
+            elif current == _V9_USER_VERSION:
+                # An existing v9 db → the checkpoint receiver/registration
+                # columns (v10, #191).
+                self._migrate_v9_to_v10(instance_id)
             elif current == SCHEMA_USER_VERSION:
-                # Existing v7 database — rehydrate; NO writes on this path (the
+                # Existing v10 database — rehydrate; NO writes on this path (the
                 # prerequisite for read-only open mode).
                 self._rehydrate_meta(instance_id)
             else:
@@ -823,7 +1085,9 @@ class SqliteArtifactRegistry:
     # ------------------------------------------------------------------
 
     @contextmanager
-    def abort_guard(self, abort: "threading.Event | None" = None) -> Iterator[None]:
+    def abort_guard(
+        self, abort: "threading.Event | None" = None, *, deadline: float | None = None
+    ) -> Iterator[None]:
         """Acquire the registry write lock, then fail closed if the handler
         watchdog already timed out (finding A6).
 
@@ -844,14 +1108,28 @@ class SqliteArtifactRegistry:
         contention is not covered. That window is narrow — the coordinator is
         single-process, so the RLock already serializes in-process writers — and
         remains observed by ``watchdog_late_completion_total``.
+
+        ``deadline`` (keyword-only, #238) bounds the wait for the lock: a
+        :func:`time.monotonic` instant past which the guard stops waiting and
+        raises :class:`RegistryLockTimeout`, before the ``abort`` check and
+        without running the caller's body. It lets a read on a request thread
+        (``/status``, pre-grep's lookup) answer without the registry while a
+        peer holds the lock, instead of blocking for as long as it is held. A
+        deadline already past is one non-blocking try. A free lock, or one this
+        thread already holds, is taken at once whatever the deadline, so the
+        guard re-enters exactly as the unbounded form does. ``deadline=None``
+        waits as long as the lock is held, as before.
         """
-        with self._lock:
+        acquire_by_deadline(self._lock, deadline)
+        try:
             if abort is not None and abort.is_set():
                 raise WatchdogAbandoned(
                     "handler watchdog timed out while this mutation was blocked "
                     "on the registry write lock; aborting before it lands (A6)."
                 )
             yield
+        finally:
+            self._lock.release()
 
     def _has_table(self, name: str) -> bool:
         """Read-only probe: does a table exist? (sqlite_master, no writes)."""
@@ -943,6 +1221,27 @@ class SqliteArtifactRegistry:
         add that column), so probe 2 still neither misses a Node db nor
         false-positives on a Python v6 one.
 
+        6. ``user_version`` 8 or 9 WITHOUT ``caller_principals`` — the v5 probe's
+           reasoning for the v8 table: ``_migrate_v7_to_v8`` / the fresh apply
+           create it atomically with the v8 stamp (the ``_V7_USER_VERSION``
+           literal conversion makes that hold for every origin), and the Node
+           ledger stops below v8, so the state is foreign-or-corrupt either
+           way. Literals ``8``..``10`` — every Python store from v8 on carries
+           the table (the v9 and v10 steps keep it), so the probe covers all.
+        7. ``user_version`` 9 or 10 WITHOUT ``transfer_records`` — the same
+           reasoning for the v9 table: ``_migrate_v8_to_v9`` / the fresh apply
+           create it atomically with the v9 stamp (the ``_V8_USER_VERSION``
+           literal conversion makes that hold for every origin), and no ledger
+           this build recognizes stamps 9 or later without it. Literals
+           ``9``..``10`` — the v10 step keeps the table.
+        8. ``user_version == 10`` WITHOUT ``workspace_checkpoints.receiver`` or
+           ``registered_by`` — the same reasoning for the v10 columns:
+           ``_migrate_v9_to_v10`` / the fresh apply land them atomically with
+           the v10 stamp, and the Node ledger stops below v8 and has no
+           checkpoint tables. Literal ``10`` only: a v9 store legitimately
+           lacks both columns (they arrive at v10), so a v9 probe for them
+           would refuse every store a v9 build wrote.
+
         ``user_version == 1`` is deliberately NOT blocked: the Node ledger's
         v1 is a byte-for-byte mirror of this repo's v1 schema, so the two are
         indistinguishable by design — the normal v1->v2 migration proceeds
@@ -979,16 +1278,44 @@ class SqliteArtifactRegistry:
                 "it atomically with the v5 stamp; no ledger this build "
                 "recognizes stamps 5 without it)"
             )
+        if 8 <= current <= 10 and not self._has_table("caller_principals"):
+            self._raise_cross_runtime(
+                f"is user_version={current} without the caller_principals table "
+                "(a Python-v8+ store always has it — the v7->v8 migration "
+                "creates it atomically with the v8 stamp; no ledger this build "
+                f"recognizes stamps {current} without it)"
+            )
+        if 9 <= current <= 10 and not self._has_table("transfer_records"):
+            self._raise_cross_runtime(
+                f"is user_version={current} without the transfer_records table "
+                "(a Python-v9+ store always has it — the v8->v9 migration "
+                "creates it atomically with the v9 stamp; no ledger this build "
+                f"recognizes stamps {current} without it)"
+            )
+        if current == 10 and not (
+            self._has_column("workspace_checkpoints", "receiver")
+            and self._has_column("workspace_checkpoints", "registered_by")
+        ):
+            self._raise_cross_runtime(
+                "is user_version=10 without the workspace_checkpoints.receiver "
+                "and registered_by columns (a Python-v10 store always has both — "
+                "the v9->v10 migration adds them atomically with the v10 stamp; "
+                "no ledger this build recognizes stamps 10 without them)"
+            )
 
     def _raise_cross_runtime(self, detail: str) -> NoReturn:
         """Compose the single :class:`CrossRuntimeSchemaError` message shape.
 
         Wording rules: name the sibling Node coordinator as the likely writer,
-        state the fail-closed posture, and point at the Node CLI's
-        ``--prepare-for-migration`` as the supported backend-switch path. Per
-        the :class:`SchemaVersionError` rule, NEVER advise deleting the db —
-        it holds the sibling runtime's live coordination state (and possibly
-        retained content), which a delete destroys.
+        state the fail-closed posture, say that no tool converts the store,
+        and name the selection that keeps the runtime that owns it. It must
+        not offer ``--prepare-for-migration`` as a switch: that command only
+        drains and stops a running Python coordinator, the Node coordinator
+        does not serve its route, and this guard refuses the store just the
+        same afterwards. Per the :class:`SchemaVersionError` rule, NEVER
+        advise deleting the db — it holds the sibling runtime's live
+        coordination state (and possibly retained content), which a delete
+        destroys.
         """
         raise CrossRuntimeSchemaError(
             f"the database at {self._db_path} {detail}. The likely writer is "
@@ -996,17 +1323,20 @@ class SqliteArtifactRegistry:
             f"which shares this path but keeps its own migration ledger — the "
             f"two ledgers assign different meanings to the same user_version "
             f"numbers. This Python coordinator will not read or migrate a "
-            f"foreign-ledger db. To switch the store to this backend, run "
-            f"`agent-coherence-coordinator --prepare-for-migration` (the "
-            f"supported backend-switch path, which preserves the live "
-            f"coordination state the file holds)."
+            f"foreign-ledger db, and no tool converts a store between "
+            f"backends: `agent-coherence-coordinator --prepare-for-migration` "
+            f"only drains and stops a running Python coordinator. To keep "
+            f"using the runtime that owns this store, set "
+            f'coherence.coordinator_backend = "node".'
         )
 
     def _apply_v2_schema(self, instance_id: str | None) -> None:
         """Create the COMPLETE current schema (v2 tables + the v3 ``session_pins``
         table + the v4 ``session_meta`` table/index + the v5 workspace-checkpoint
-        tables + the v6 ``agent_states.last_observed_version`` column) + seed
-        registry_meta, stamping ``user_version=SCHEMA_USER_VERSION``.
+        tables + the v6 ``agent_states.last_observed_version`` column + the v7
+        index + the v8 ``caller_principals`` and v9 ``transfer_records``
+        tables) + seed registry_meta, stamping
+        ``user_version=SCHEMA_USER_VERSION``.
         Caller holds lock. (The method keeps its historical ``_apply_v2_schema``
         name; a fresh db is always built at the latest schema directly so no
         migration shim ever runs against it.)
@@ -1120,6 +1450,11 @@ class SqliteArtifactRegistry:
             c.execute(_WORKSPACE_CHECKPOINTS_DDL)
             c.execute(_WORKSPACE_CHECKPOINT_MEMBERS_DDL)
             c.execute(_WORKSPACE_CHECKPOINTS_NAME_INDEX_DDL)
+            # Caller-principal bindings (v8, caller-principal U4): same rule.
+            c.execute(_CALLER_PRINCIPALS_DDL)
+            # Transfer records (v9, grant handoff #185): same rule — the fresh
+            # store and a migrated one must carry the identical table.
+            c.execute(_TRANSFER_RECORDS_DDL)
             seed_epoch = uuid4().hex
             # schema_runtime: the cross-runtime lineage stamp, seeded inside
             # THIS creation transaction (no extra txn) so the sibling Node
@@ -1559,8 +1894,10 @@ class SqliteArtifactRegistry:
     def _migrate_v6_to_v7(self, instance_id: str | None) -> None:
         """Migrate a v6 db to v7 in ONE atomic transaction (SB-10 perf
         follow-up): index ``agent_states(agent_id)``, then stamp
-        ``user_version=7``. Caller holds lock. The FINAL step of the chain,
-        so it stamps ``SCHEMA_USER_VERSION``.
+        ``user_version=7``. Caller holds lock. Guards and stamps the
+        ``_V7_USER_VERSION`` literal — v8 (the ``caller_principals`` table)
+        made this a chained step, so stamping the constant would re-arm the
+        re-stamp trap (fourth arming).
 
         WHY: the post-compaction session-start builder reads ``agent_states``
         scoped by ``agent_id IN (...)`` (``status_snapshot(agent_ids=...)``),
@@ -1593,7 +1930,7 @@ class SqliteArtifactRegistry:
         c = self._conn
         c.execute("BEGIN IMMEDIATE")
         try:
-            if c.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_USER_VERSION:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= _V7_USER_VERSION:
                 # A racing winner already advanced to v7 — nothing to do.
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
@@ -1602,6 +1939,169 @@ class SqliteArtifactRegistry:
                 "CREATE INDEX IF NOT EXISTS idx_agent_states_agent "
                 "ON agent_states(agent_id)"
             )
+            c.execute(f"PRAGMA user_version = {_V7_USER_VERSION}")
+            c.execute("COMMIT")
+        except BaseException:
+            try:
+                c.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        # Load meta from the now-migrated db (write-free).
+        self._rehydrate_meta(instance_id)
+
+    def _migrate_v7_to_v8(self, instance_id: str | None) -> None:
+        """Migrate a v7 db to v8 in ONE atomic transaction (coordinator caller
+        principal, U4): create the ``caller_principals`` table, then stamp
+        ``user_version=8``. Caller holds lock. Guards and stamps the
+        ``_V8_USER_VERSION`` literal — v9 (the ``transfer_records`` table) made
+        this a chained step, so stamping the constant would re-arm the
+        re-stamp trap (fifth arming).
+
+        Table-only and additive: no existing table, column or index is touched.
+        ``CREATE TABLE IF NOT EXISTS`` is the half-migrated-db guard (a crash
+        after the CREATE but before the stamp rolls both back under the one
+        transaction; a re-migrate re-creates). Same atomicity discipline as
+        every other step: ONE ``BEGIN IMMEDIATE`` wrapping CREATE + stamp,
+        individual ``execute()`` calls, ``except BaseException`` ROLLBACK.
+
+        FORWARD-ONLY: an earlier build opening a v8 store raises on the
+        unrecognized ``user_version``; there is no down step.
+
+        NODE-LEDGER COORDINATION (KTD6): the sibling Node coordinator's ledger
+        stops below v8, and its guard refuses a Python-lineage store on the
+        ``schema_runtime='python'`` stamp and the ``artifact_versions`` table
+        before it interprets the integer — so this Python-only bump needs no
+        coordinated guard edit. This side adds probe 6 to
+        ``_reject_foreign_ledger_db`` (v8 stamped WITHOUT the table), the v5
+        precedent for a table-adding step.
+
+        Concurrent-loser path: both processes can read ``user_version == 7``
+        pre-lock and both land here; they serialize on ``BEGIN IMMEDIATE``,
+        and the loser re-reads the version inside its txn and no-ops.
+        """
+        c = self._conn
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= _V8_USER_VERSION:
+                # A racing winner already advanced to v8 — nothing to do.
+                c.execute("COMMIT")
+                self._rehydrate_meta(instance_id)
+                return
+            c.execute(
+                _CALLER_PRINCIPALS_DDL.replace(
+                    "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
+                )
+            )
+            c.execute(f"PRAGMA user_version = {_V8_USER_VERSION}")
+            c.execute("COMMIT")
+        except BaseException:
+            try:
+                c.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        # Load meta from the now-migrated db (write-free).
+        self._rehydrate_meta(instance_id)
+
+    def _migrate_v8_to_v9(self, instance_id: str | None) -> None:
+        """Migrate a v8 db to v9 in ONE atomic transaction (targeted grant
+        handoff, #185): create the ``transfer_records`` table, then stamp
+        ``user_version=9``. Caller holds lock. Guards and stamps the
+        ``_V9_USER_VERSION`` literal — v10 (#191's checkpoint columns) made this
+        a chained step, so stamping the constant would re-arm the re-stamp trap
+        (sixth arming).
+
+        Table-only and additive: no existing table, column or index is touched,
+        and the DDL is the very ``_TRANSFER_RECORDS_DDL`` the fresh apply runs,
+        so a migrated store and a fresh one carry the identical table (key,
+        columns and cascade). ``CREATE TABLE IF NOT EXISTS`` is the
+        half-migrated-db guard (a crash after the CREATE but before the stamp
+        rolls both back under the one transaction; a re-migrate re-creates).
+        Same atomicity discipline as every other step: ONE ``BEGIN IMMEDIATE``
+        wrapping CREATE + stamp, individual ``execute()`` calls, ``except
+        BaseException`` ROLLBACK.
+
+        FORWARD-ONLY: an earlier build opening a v9 store raises on the
+        unrecognized ``user_version``; there is no down step.
+
+        NODE-LEDGER COORDINATION: as for v8, the sibling Node coordinator's
+        ledger stops below v8 and refuses a Python-lineage store on its
+        ``schema_runtime`` stamp before it reads the integer, so this
+        Python-only bump needs no coordinated guard edit. This side adds probe 7
+        to ``_reject_foreign_ledger_db`` (v9 stamped WITHOUT the table).
+
+        Concurrent-loser path: both processes can read ``user_version == 8``
+        pre-lock and both land here; they serialize on ``BEGIN IMMEDIATE``,
+        and the loser re-reads the version inside its txn and no-ops.
+        """
+        c = self._conn
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= _V9_USER_VERSION:
+                # A racing winner already advanced to v9 — nothing to do.
+                c.execute("COMMIT")
+                self._rehydrate_meta(instance_id)
+                return
+            c.execute(
+                _TRANSFER_RECORDS_DDL.replace(
+                    "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
+                )
+            )
+            c.execute(f"PRAGMA user_version = {_V9_USER_VERSION}")
+            c.execute("COMMIT")
+        except BaseException:
+            try:
+                c.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        # Load meta from the now-migrated db (write-free).
+        self._rehydrate_meta(instance_id)
+
+    def _migrate_v9_to_v10(self, instance_id: str | None) -> None:
+        """Migrate a v9 db to v10 in ONE atomic transaction (#191, the
+        restore-registration receiver binding): add the nullable
+        ``workspace_checkpoints.receiver`` and ``registered_by`` columns, then
+        stamp ``user_version=10``. Caller holds lock. The FINAL step of the
+        chain, so it stamps ``SCHEMA_USER_VERSION``.
+
+        Column-only and additive. Every existing manifest lands with both NULL:
+        no receiver (any controller may register, the pre-#191 rule) and no
+        registration claim (the first registration after the upgrade claims
+        it). ALTER TABLE has no IF NOT EXISTS, so a ``_has_column`` probe per
+        column is the half-migrated-db guard (the ``_migrate_v5_to_v6``
+        idiom). Same atomicity discipline as every other step: ONE ``BEGIN
+        IMMEDIATE`` wrapping both ALTERs + the stamp, ``except BaseException``
+        ROLLBACK.
+
+        FORWARD-ONLY: an earlier build opening a v10 store raises on the
+        unrecognized ``user_version``; there is no down step.
+
+        NODE-LEDGER COORDINATION: the sibling Node coordinator's ledger stops
+        below v8 and has no checkpoint tables; its guard refuses a
+        Python-lineage store on the ``schema_runtime='python'`` stamp before it
+        interprets the integer, so this Python-only bump needs no coordinated
+        guard edit. This side adds probe 8 to ``_reject_foreign_ledger_db``.
+
+        Concurrent-loser path: both processes can read ``user_version == 9``
+        pre-lock and both land here; they serialize on ``BEGIN IMMEDIATE``,
+        and the loser re-reads the version inside its txn and no-ops.
+        """
+        c = self._conn
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_USER_VERSION:
+                # A racing winner already advanced to v10 — nothing to do.
+                c.execute("COMMIT")
+                self._rehydrate_meta(instance_id)
+                return
+            if not self._has_column("workspace_checkpoints", "receiver"):
+                c.execute("ALTER TABLE workspace_checkpoints ADD COLUMN receiver TEXT")
+            if not self._has_column("workspace_checkpoints", "registered_by"):
+                c.execute(
+                    "ALTER TABLE workspace_checkpoints ADD COLUMN registered_by TEXT"
+                )
             c.execute(f"PRAGMA user_version = {SCHEMA_USER_VERSION}")
             c.execute("COMMIT")
         except BaseException:
@@ -2487,6 +2987,308 @@ class SqliteArtifactRegistry:
                 self._conn.execute("SELECT COUNT(*) FROM session_meta").fetchone()[0]
             )
 
+    def bind_caller_principal(
+        self, identity: UUID, principal: str, mint_nonce: str
+    ) -> tuple[str, str]:
+        """First-claim-wins bind (coordinator caller principal, U4); returns the
+        BOUND ``(principal, mint_nonce)`` pair. The insert-if-absent and the
+        read-back share one ``BEGIN IMMEDIATE`` under ``_lock``, so two
+        concurrent first claims bind ONE principal. ``ON CONFLICT(identity) DO
+        NOTHING`` rather than ``INSERT OR IGNORE``: only the identity conflict
+        is the first-claim-wins rule — a NOT NULL violation must still raise,
+        never be silently ignored into a missing row."""
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "INSERT INTO caller_principals (identity, principal, mint_nonce) "
+                    "VALUES (?, ?, ?) ON CONFLICT(identity) DO NOTHING",
+                    (identity.hex, principal, mint_nonce),
+                )
+                row = self._conn.execute(
+                    "SELECT principal, mint_nonce FROM caller_principals "
+                    "WHERE identity = ?",
+                    (identity.hex,),
+                ).fetchone()
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        return (row[0], row[1])
+
+    def get_caller_principal(self, identity: UUID) -> str | None:
+        """The principal bound to ``identity``, or ``None`` when unclaimed.
+        A plain read, so it serves a read-only open too."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT principal FROM caller_principals WHERE identity = ?",
+                (identity.hex,),
+            ).fetchone()
+        return row[0] if row is not None else None
+
+    # ------------------------------------------------------------------
+    # Transfer records (targeted grant handoff #185)
+    # ------------------------------------------------------------------
+
+    def transfer_grants(
+        self,
+        request: TransferRequest,
+        *,
+        tick: int = 0,
+        now_unix: float | None = None,
+    ) -> list[TransferGrantOutcome]:
+        """The composite transfer; see :meth:`RegistryBase.transfer_grants`.
+
+        ONE ``BEGIN IMMEDIATE``: every path is read and decided first, then the
+        admitted subset is applied -- the record upsert, and for a plain
+        handoff the agent-state upsert and the epoch bump INLINED (each public
+        mutator opens its own transaction, so ``set_agent_state`` cannot be
+        called here), each followed by its state-log entry. Any raise rolls
+        back every path and every ``_seq`` reservation (COR-02)."""
+        now = time.time() if now_unix is None else now_unix
+        self._guard_writable()
+        with self._lock:
+            seq_incremented_count = 0
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                known = self._successor_known_in_txn(request)
+                views = [
+                    self._transfer_view_in_txn(artifact_id, holder)
+                    for artifact_id, holder in request.holders.items()
+                ]
+                decisions = [
+                    decide_transfer_grant(request, view, successor_known=known, now_unix=now)
+                    for view in views
+                ]
+                for view, decision in zip(views, decisions):
+                    seq_incremented_count += self._apply_transfer_in_txn(
+                        view, decision, tick=tick
+                    )
+                self._conn.execute("COMMIT")
+                seq_incremented_count = 0
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                if seq_incremented_count:
+                    self._seq -= seq_incremented_count
+                raise
+        return [decision.outcome for decision in decisions]
+
+    def get_transfer_record(
+        self, artifact_id: UUID
+    ) -> tuple[TransferRecord, bool] | None:
+        """The record and its liveness from ONE joined SELECT under the lock
+        (no transaction), so it serves a read-only open too."""
+        with self._lock:
+            return self._transfer_read(artifact_id)
+
+    def set_transfer_status(
+        self,
+        artifact_id: UUID,
+        status: str,
+        *,
+        counterparty: UUID | None = None,
+        now_unix: float | None = None,
+    ) -> None:
+        """Write the label unconditionally; see
+        :meth:`RegistryBase.set_transfer_status`."""
+        require_storable_transfer_status(status)
+        now = time.time() if now_unix is None else now_unix
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._conn.execute(
+                    "UPDATE transfer_records SET status = ?, counterparty = ?, "
+                    "updated_at = ? WHERE artifact_id = ?",
+                    (
+                        status,
+                        counterparty.hex if counterparty is not None else None,
+                        now,
+                        artifact_id.hex,
+                    ),
+                )
+                if cursor.rowcount == 0:
+                    raise KeyError(f"no transfer record for artifact {artifact_id}")
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def evict_transfer_records(
+        self, *, max_age_sec: float, now_unix: float | None = None
+    ) -> int:
+        """Delete not-live records older than ``max_age_sec``, aged from the
+        later of the record's ``updated_at`` and the artifact's own last
+        update: a version move stamps the artifact, so the ending it
+        caused survives the full age from the move, long enough for the
+        giver's next touch to report it."""
+        now = time.time() if now_unix is None else now_unix
+        cutoff = now - max_age_sec
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                doomed = [
+                    row[0]
+                    for row in self._conn.execute(_TRANSFER_READ_ALL_SQL).fetchall()
+                    if self._transfer_evictable(row, cutoff)
+                ]
+                for artifact_hex in doomed:
+                    self._conn.execute(
+                        "DELETE FROM transfer_records WHERE artifact_id = ?",
+                        (artifact_hex,),
+                    )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        return len(doomed)
+
+    def _transfer_read(self, artifact_id: UUID) -> tuple[TransferRecord, bool] | None:
+        """THE sqlite liveness helper: one SELECT joining the record to
+        its artifact's version, judged by :func:`transfer_record_live`. The
+        read, the composite transfer and the eviction all go through it (or
+        its row converter). Caller holds the lock -- and, for a decision, the
+        open transaction the decision's apply will commit in."""
+        row = self._conn.execute(_TRANSFER_READ_SQL, (artifact_id.hex,)).fetchone()
+        return self._transfer_read_from_row(row) if row is not None else None
+
+    @staticmethod
+    def _transfer_read_from_row(row: "tuple[Any, ...]") -> tuple[TransferRecord, bool]:
+        """Convert one ``_TRANSFER_READ_SQL`` row into ``(record, live)``."""
+        record = TransferRecord(
+            artifact_id=UUID(hex=row[0]),
+            giver=UUID(hex=row[1]),
+            holder=UUID(hex=row[2]),
+            successor=UUID(hex=row[3]),
+            version_at_transfer=int(row[4]),
+            hold_shape=MESIState[row[5]],
+            cause=row[6],
+            superseded_successor=UUID(hex=row[7]) if row[7] is not None else None,
+            status=row[8],
+            counterparty=UUID(hex=row[9]) if row[9] is not None else None,
+            created_at=float(row[10]),
+            updated_at=float(row[11]),
+        )
+        return record, transfer_record_live(record, int(row[12]))
+
+    @classmethod
+    def _transfer_evictable(cls, row: "tuple[Any, ...]", cutoff: float) -> bool:
+        record, live = cls._transfer_read_from_row(row)
+        return not live and max(record.updated_at, float(row[13])) < cutoff
+
+    def _transfer_view_in_txn(self, artifact_id: UUID, holder: UUID) -> TransferPathView:
+        """One path's facts for the decision, read inside the open transaction."""
+        version_row = self._conn.execute(
+            "SELECT version FROM artifacts WHERE id = ?", (artifact_id.hex,)
+        ).fetchone()
+        read = self._transfer_read(artifact_id)
+        state_row = self._conn.execute(
+            "SELECT state FROM agent_states WHERE artifact_id = ? AND agent_id = ?",
+            (artifact_id.hex, holder.hex),
+        ).fetchone()
+        other_write_holder = self._conn.execute(
+            "SELECT 1 FROM agent_states WHERE artifact_id = ? AND agent_id != ? "
+            "AND state IN (?, ?) LIMIT 1",
+            (artifact_id.hex, holder.hex, MESIState.MODIFIED.name, MESIState.EXCLUSIVE.name),
+        ).fetchone()
+        return TransferPathView(
+            artifact_id=artifact_id,
+            holder=holder,
+            current_version=version_row[0] if version_row is not None else None,
+            record=read[0] if read is not None else None,
+            live=read[1] if read is not None else False,
+            holder_state=MESIState[state_row[0]] if state_row is not None else None,
+            other_write_holder=other_write_holder is not None,
+        )
+
+    def _successor_known_in_txn(self, request: TransferRequest) -> bool:
+        """When the registry counts a successor as known: the caller resolved
+        it, it has a bound principal, or it holds a grant row on some artifact
+        (the library caller's arm --
+        a row in any state means the coordinator has seen the identity; the
+        lookup rides ``idx_agent_states_agent``)."""
+        if request.successor_known:
+            return True
+        successor_hex = request.successor.hex
+        if self._conn.execute(
+            "SELECT 1 FROM caller_principals WHERE identity = ?", (successor_hex,)
+        ).fetchone() is not None:
+            return True
+        return self._conn.execute(
+            "SELECT 1 FROM agent_states WHERE agent_id = ? LIMIT 1", (successor_hex,)
+        ).fetchone() is not None
+
+    def _apply_transfer_in_txn(
+        self, view: TransferPathView, decision: TransferDecision, *, tick: int
+    ) -> int:
+        """Apply one decided path inside the open transaction; return the
+        ``_seq`` reservations its state-log entry made (0 or 1)."""
+        record = decision.write
+        if record is None:
+            return 0
+        self._conn.execute(
+            _TRANSFER_UPSERT_SQL,
+            (
+                record.artifact_id.hex,
+                record.giver.hex,
+                record.holder.hex,
+                record.successor.hex,
+                record.version_at_transfer,
+                record.hold_shape.name,
+                record.cause,
+                record.superseded_successor.hex if record.superseded_successor else None,
+                record.status,
+                record.counterparty.hex if record.counterparty else None,
+                record.created_at,
+                record.updated_at,
+            ),
+        )
+        if not decision.move_holder:
+            return 0
+        return self._move_holder_invalid_in_txn(view, tick=tick)
+
+    def _move_holder_invalid_in_txn(self, view: TransferPathView, *, tick: int) -> int:
+        """The presented composite's INVALID move under the handoff trigger,
+        inlined from :meth:`set_agent_state`'s leaving-M/E branch: the grant
+        tick is dropped, the epoch moves because the trigger is in
+        ``EPOCH_BUMP_TRIGGERS`` (keyed on the set, as at that site), the
+        recorded ``last_observed_version`` and ``read_generation`` are left as
+        they were, and the state-log entry follows the mutation."""
+        trigger = HANDOFF_TRIGGER
+        from_state = (
+            view.holder_state if view.holder_state is not None else MESIState.INVALID
+        )
+        leaving_write_claim = from_state in _M_OR_E_STATES
+        self._conn.execute(
+            "UPDATE agent_states SET state = ?, granted_at_tick = "
+            "CASE WHEN ? THEN NULL ELSE granted_at_tick END "
+            "WHERE artifact_id = ? AND agent_id = ?",
+            (
+                MESIState.INVALID.name,
+                1 if leaving_write_claim else 0,
+                view.artifact_id.hex,
+                view.holder.hex,
+            ),
+        )
+        if leaving_write_claim and trigger in EPOCH_BUMP_TRIGGERS:
+            self._conn.execute(
+                "UPDATE artifacts SET owner_generation = owner_generation + 1 "
+                "WHERE id = ?",
+                (view.artifact_id.hex,),
+            )
+        return self._emit_state_log(
+            artifact_id=view.artifact_id,
+            agent_id=view.holder,
+            from_state=from_state,
+            to_state=MESIState.INVALID,
+            trigger=trigger,
+            tick=tick,
+            version=view.current_version or 0,
+            content_hash=None,
+        )
+
     def get_session_cut(self, session_token: str) -> dict[UUID, int] | None:
         """Return the pinned cut ``{artifact_id: version}`` for ``session_token``,
         or ``None`` if the token has no live pin rows (SB-17 / TX-1, Unit 3 / R2).
@@ -2546,7 +3348,15 @@ class SqliteArtifactRegistry:
             raise ValueError(
                 "create_checkpoint requires an owner: a checkpoint manifest "
                 "without owner metadata is unrepresentable (fail-closed; the "
-                "restore path owner-validates against it)"
+                "owner is provenance — who took it — and the restore "
+                "registration's authorization reads the optional receiver "
+                "instead)"
+            )
+        if checkpoint.registered_by is not None:
+            raise ValueError(
+                "create_checkpoint: a new manifest cannot arrive already "
+                "registered — the registration claim is made only through "
+                "claim_checkpoint_registration"
             )
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -2556,8 +3366,8 @@ class SqliteArtifactRegistry:
                     INSERT INTO workspace_checkpoints
                         (checkpoint_id, name, owner, created_at, created_at_tick,
                          window_min, window_max, restore_status,
-                         restore_updated_at, pin_refcount)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         restore_updated_at, pin_refcount, receiver)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         checkpoint.checkpoint_id,
@@ -2570,6 +3380,9 @@ class SqliteArtifactRegistry:
                         checkpoint.restore_status,
                         checkpoint.restore_updated_at,
                         checkpoint.pin_refcount,
+                        checkpoint.receiver.hex
+                        if checkpoint.receiver is not None
+                        else None,
                     ),
                 )
                 for member in members:
@@ -2616,10 +3429,45 @@ class SqliteArtifactRegistry:
             row = self._conn.execute(
                 "SELECT checkpoint_id, name, owner, created_at, created_at_tick, "
                 "window_min, window_max, restore_status, restore_updated_at, "
-                "pin_refcount FROM workspace_checkpoints WHERE checkpoint_id = ?",
+                "pin_refcount, receiver, registered_by "
+                "FROM workspace_checkpoints WHERE checkpoint_id = ?",
                 (checkpoint_id,),
             ).fetchone()
         return self._checkpoint_record_from_row(row) if row is not None else None
+
+    def claim_checkpoint_registration(
+        self, checkpoint_id: str, controller: UUID
+    ) -> tuple[UUID, bool]:
+        """First-claim-wins registration claim (#191): read + conditional set
+        in ONE ``BEGIN IMMEDIATE``, so two concurrent claimants (in this
+        process or another) cannot both win. Returns ``(holder, newly_claimed)``
+        decided inside that transaction; raises ``KeyError`` for an unknown
+        checkpoint.
+        Parity with :meth:`ArtifactRegistry.claim_checkpoint_registration`."""
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT registered_by FROM workspace_checkpoints "
+                    "WHERE checkpoint_id = ?",
+                    (checkpoint_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
+                if row[0] is not None:
+                    self._conn.execute("COMMIT")
+                    return UUID(hex=row[0]), False
+                self._conn.execute(
+                    "UPDATE workspace_checkpoints SET registered_by = ? "
+                    "WHERE checkpoint_id = ? AND registered_by IS NULL",
+                    (controller.hex, checkpoint_id),
+                )
+                self._conn.execute("COMMIT")
+                return controller, True
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def list_checkpoints(self) -> list[CheckpointRecord]:
         """Return every checkpoint header, ordered by ``(created_at,
@@ -2628,7 +3476,7 @@ class SqliteArtifactRegistry:
             rows = self._conn.execute(
                 "SELECT checkpoint_id, name, owner, created_at, created_at_tick, "
                 "window_min, window_max, restore_status, restore_updated_at, "
-                "pin_refcount FROM workspace_checkpoints "
+                "pin_refcount, receiver, registered_by FROM workspace_checkpoints "
                 "ORDER BY created_at, checkpoint_id"
             ).fetchall()
         return [self._checkpoint_record_from_row(r) for r in rows]
@@ -2803,6 +3651,8 @@ class SqliteArtifactRegistry:
             restore_status=row[7],
             restore_updated_at=float(row[8]) if row[8] is not None else None,
             pin_refcount=int(row[9]),
+            receiver=UUID(hex=row[10]) if row[10] is not None else None,
+            registered_by=UUID(hex=row[11]) if row[11] is not None else None,
         )
 
     # ------------------------------------------------------------------
@@ -2822,14 +3672,19 @@ class SqliteArtifactRegistry:
         self,
         *,
         agent_ids: Iterable[UUID] | None = None,
-    ) -> tuple[
-        dict[UUID, dict[str, Any]],
-        dict[UUID, dict[UUID, MESIState]],
-    ]:
+        include_transfers: bool = False,
+        include_reclamations: bool = False,
+        include_grant_detail: bool = False,
+    ) -> StatusSnapshot:
         """PERF-1 single-query batch for /status. Returns:
 
-        - ``artifact_by_id``: ``{artifact_id: {"name", "version"}}`` — every
-          known artifact, one entry per row.
+        - ``artifact_by_id``: ``{artifact_id: {"name", "version",
+          "last_writer_id", "updated_at"}}`` — every known artifact, one
+          entry per row. ``last_writer_id`` is the committing agent's UUID
+          (None until a commit lands); ``updated_at`` is the row's
+          wall-clock stamp. Both ride the same SELECT so /status can
+          attribute writers without re-opening the per-artifact N+1
+          (``last_writer_for`` + ``get_artifact_updated_at`` per row).
         - ``state_by_artifact``: ``{artifact_id: {agent_id: MESIState}}`` —
           the per-artifact state map for every artifact (empty inner dict
           for artifacts no agent has ever held).
@@ -2850,36 +3705,117 @@ class SqliteArtifactRegistry:
         means no agents, never all of them: the artifact half is still read,
         so the workspace-level emptiness signal is unaffected either way.
 
-        The predicate is NOT index-backed: ``agent_states`` is keyed
-        ``(artifact_id, agent_id)`` and nothing indexes ``agent_id`` alone,
-        so SQLite walks the table either way (``EXPLAIN QUERY PLAN`` reports
-        ``SCAN`` for both forms). What the scope removes is the per-row cost
-        — a ``UUID(hex=...)`` and a ``MESIState`` lookup for every row the
-        caller would then discard. Measured on a 500k-row table with a
-        four-agent session: 2804ms unscoped, 174ms scoped. An index on
-        ``agent_id`` would turn the remaining constant into a bound, but it
-        needs a migration in BOTH backends (a one-sided ``user_version`` bump
-        trips the cross-runtime schema guard), so it is deliberately not done
-        here.
+        The predicate IS index-backed. ``agent_states`` is keyed
+        ``(artifact_id, agent_id)``, whose leftmost prefix does not serve
+        ``agent_id`` alone, so ``idx_agent_states_agent`` covers that column:
+        created with the table on a fresh db, and added to existing ones by
+        ``_migrate_v6_to_v7`` (see that method for the KTD9 coordination with
+        the sibling Node coordinator). The scoped form plans as a SEARCH
+        through that index and only the unscoped form still reports ``SCAN
+        agent_states`` --
+        ``test_status_snapshot_scoped_query_is_index_backed`` in
+        ``tests/test_sqlite_registry.py`` is what holds that, asserting the
+        index name and the absence of ``SCAN`` rather than a full
+        ``EXPLAIN QUERY PLAN`` rendering, which SQLite is free to reword
+        between versions.
+
+        That index is the only one this predicate needs; it is NOT a
+        precedent for adding others freely. Any FURTHER index still needs the
+        two-sided migration ``_migrate_v6_to_v7`` performed, because a
+        one-sided ``user_version`` bump leaves a ledger the sibling runtime
+        rejects as foreign (``_reject_foreign_ledger_db``, the
+        ``registry_meta.schema_runtime`` stamp).
+
+        What scoping bounds is the ``agent_states`` half, on both of its legs:
+
+        - the SQL leg, which the index turned from a walk of every page into
+          a lookup — 61ms -> 1.5ms on a 500k-row ledger with a four-agent
+          session (measured in ``_migrate_v6_to_v7``); and
+        - the per-row Python cost — a ``UUID(hex=...)`` and a ``MESIState``
+          lookup for every row the caller would then discard — which stays
+          the dominant term and is what the whole-call figure on that same
+          ledger measures: 2804ms unscoped, 174ms scoped. That pair was
+          recorded when neither form was index-backed, so its unscoped side
+          is unchanged (still a SCAN) while its scoped side now carries the
+          cheaper SQL leg underneath.
+
+        The artifact half is NOT bounded by the scope: it always reads every
+        artifact row and mints a ``UUID(hex=...)`` per artifact, so a scoped
+        call on an artifact-heavy workspace stays O(all artifacts) however
+        small the session is.
+
+        ``include_transfers`` (#185) fills element ``[2]``,
+        ``{artifact_id: (TransferRecord, live)}`` for every artifact that has
+        a transfer record, read by a third query inside the same lock hold and
+        judged by the one liveness helper, so each record's liveness matches
+        the version its artifact row reports. Off by default: the default call
+        answers the two-element tuple, and the session-start builder, which
+        renders no record, never pays for the read. Only ``/status`` opts in.
+
+        ``include_reclamations`` (#195) fills element ``[3]``,
+        ``{artifact_id: {agent_id: (trigger, tick)}}`` for every pair carrying
+        a reclaim slot, and always answers four elements: without
+        ``include_transfers``, ``[2]`` is an empty dict, so neither element's
+        index depends on the other flag. The slot columns ride the agent-state
+        SELECT itself, so each pair's slot and state come from the same row
+        and no second read lets a reclaim land between them. Off by default,
+        like the transfer rows; only ``/status`` opts in.
+
+        ``include_grant_detail`` (#187) fills element ``[4]``, a
+        :data:`GrantDetail` pair, and always answers five elements, with
+        ``[2]`` and ``[3]`` empty when their flags were not passed. Its first
+        map is ``{artifact_id: {agent_id: granted_at_tick}}`` for every pair
+        whose row carries a grant tick, whatever its state, from one more
+        column on the agent-state SELECT. The caller projects by state: the
+        live grant paths set the tick on an M/E acquire and clear it on leaving
+        M/E, but a migrated or externally written ledger need not, and the
+        state is what the sweep acts on. Its second map is ``{agent_id:
+        last_tick}`` from one SELECT over the heartbeat rows, so it covers
+        agents with no agent-state row and, like the artifact half, is not
+        narrowed by ``agent_ids``; an agent with no heartbeat on record is
+        absent. The flag also adds ``owner_generation`` to each artifact's
+        metadata. All of it is read in the same hold as the state maps, and
+        the default and scoped statements are unchanged. Off by default; only
+        ``/status``'s operator tier opts in.
         """
         artifact_by_id: dict[UUID, dict[str, Any]] = {}
         state_by_artifact: dict[UUID, dict[UUID, MESIState]] = {}
+        reclamation_by_artifact: dict[UUID, dict[UUID, ReclamationSlot]] = {}
+        transfer_by_artifact: dict[UUID, tuple[TransferRecord, bool]] = {}
+        granted_at_by_artifact: dict[UUID, dict[UUID, int]] = {}
+        last_heartbeat_by_agent: dict[UUID, int] = {}
+        artifact_columns = "id, name, version, last_writer_id, updated_at"
+        columns = "artifact_id, agent_id, state"
+        if include_reclamations:
+            columns += ", last_reclaim_trigger, last_reclaim_tick"
+        if include_grant_detail:
+            artifact_columns += ", owner_generation"
+            columns += ", granted_at_tick"
+        # The grant tick follows the reclaim pair when that pair was selected.
+        granted_at_column = 5 if include_reclamations else 3
         scoped_hexes = None if agent_ids is None else [a.hex for a in agent_ids]
         with self._lock:
             for row in self._conn.execute(
-                "SELECT id, name, version FROM artifacts"
+                f"SELECT {artifact_columns} FROM artifacts"
             ).fetchall():
                 aid = UUID(hex=row[0])
-                artifact_by_id[aid] = {"name": row[1], "version": row[2]}
+                artifact_by_id[aid] = {
+                    "name": row[1],
+                    "version": row[2],
+                    "last_writer_id": UUID(hex=row[3]) if row[3] else None,
+                    "updated_at": float(row[4]),
+                }
+                if include_grant_detail:
+                    artifact_by_id[aid]["owner_generation"] = row[5]
                 state_by_artifact[aid] = {}
             if scoped_hexes is None:
                 state_rows = self._conn.execute(
-                    "SELECT artifact_id, agent_id, state FROM agent_states"
+                    f"SELECT {columns} FROM agent_states"
                 ).fetchall()
             elif scoped_hexes:
                 placeholders = ", ".join("?" * len(scoped_hexes))
                 state_rows = self._conn.execute(
-                    "SELECT artifact_id, agent_id, state FROM agent_states "
+                    f"SELECT {columns} FROM agent_states "
                     f"WHERE agent_id IN ({placeholders})",
                     scoped_hexes,
                 ).fetchall()
@@ -2893,6 +3829,40 @@ class SqliteArtifactRegistry:
                 if aid not in state_by_artifact:
                     continue
                 state_by_artifact[aid][gid] = MESIState[row[2]]
+                if include_reclamations and row[3] is not None:
+                    reclamation_by_artifact.setdefault(aid, {})[gid] = (row[3], row[4])
+                if include_grant_detail and row[granted_at_column] is not None:
+                    granted_at_by_artifact.setdefault(aid, {})[gid] = row[granted_at_column]
+            if include_transfers:
+                transfer_by_artifact = {
+                    record.artifact_id: (record, live)
+                    for record, live in map(
+                        self._transfer_read_from_row,
+                        self._conn.execute(_TRANSFER_READ_ALL_SQL).fetchall(),
+                    )
+                }
+            if include_grant_detail:
+                heartbeat_rows = self._conn.execute(
+                    "SELECT agent_id, last_tick FROM heartbeats"
+                ).fetchall()
+        if include_grant_detail:
+            # Parsed after the hold: the rows were read inside it, and every
+            # agent ever seen keeps a heartbeat row, so this loop need not
+            # lengthen the hold peers wait on.
+            last_heartbeat_by_agent = {
+                UUID(hex=agent_hex): last_tick for agent_hex, last_tick in heartbeat_rows
+            }
+            return (
+                artifact_by_id,
+                state_by_artifact,
+                transfer_by_artifact,
+                reclamation_by_artifact,
+                (granted_at_by_artifact, last_heartbeat_by_agent),
+            )
+        if include_reclamations:
+            return (artifact_by_id, state_by_artifact, transfer_by_artifact, reclamation_by_artifact)
+        if include_transfers:
+            return artifact_by_id, state_by_artifact, transfer_by_artifact
         return artifact_by_id, state_by_artifact
 
     def get_agent_state(self, artifact_id: UUID, agent_id: UUID) -> MESIState | None:
@@ -2913,6 +3883,7 @@ class SqliteArtifactRegistry:
         trigger: str = "unknown",
         tick: int = 0,
         content_hash: str | None = None,
+        observed: bool = True,
     ) -> None:
         """Set MESI state for one agent/artifact pair.
 
@@ -2920,6 +3891,9 @@ class SqliteArtifactRegistry:
         contract (registry.py:115-173). On state_log exception, the SQL is
         rolled back AND _seq is decremented so the next successful emission
         does not create a phantom gap.
+
+        ``observed=False``: the grant certifies no read, so the recorded
+        ``last_observed_version`` is left as it was (see the Protocol).
         """
         self._guard_writable()
         with self._lock:
@@ -2966,10 +3940,11 @@ class SqliteArtifactRegistry:
 
                 # Read-generation fence: when an M/E -> INVALID transition
                 # revokes the write claim WITHOUT moving the version (a sweep
-                # reclaim or the voluntary "invalidate" release — see
-                # EPOCH_BUMP_TRIGGERS), bump the artifact's ownership epoch
-                # atomically with the state transition in this BEGIN IMMEDIATE,
-                # so a commit by the ex-holder fails the generation check.
+                # reclaim, the voluntary "invalidate" release, or a handoff
+                # under HANDOFF_TRIGGER — see EPOCH_BUMP_TRIGGERS), bump the
+                # artifact's ownership epoch atomically with the state
+                # transition in this BEGIN IMMEDIATE, so a commit by the
+                # ex-holder fails the generation check.
                 if prev_in_me and not new_in_me and trigger in EPOCH_BUMP_TRIGGERS:
                     self._conn.execute(
                         "UPDATE artifacts SET owner_generation = owner_generation + 1 "
@@ -2983,8 +3958,9 @@ class SqliteArtifactRegistry:
                 # this agent now holds -- the post-compaction staleness
                 # comparand), a transition TO INVALID preserves the prior
                 # recorded value via the CASE guard, and a never-observed row
-                # keeps NULL (never a 0-sentinel).
-                observe = state != MESIState.INVALID
+                # keeps NULL (never a 0-sentinel). ``observed=False`` (a grant
+                # that certifies no read) takes the same preserving branch.
+                observe = state != MESIState.INVALID and observed
                 if prior_row is None:
                     self._conn.execute(
                         """
@@ -3022,12 +3998,26 @@ class SqliteArtifactRegistry:
                             ),
                         )
                     else:
+                        # A sweep reclaim writes its slot in this same UPDATE,
+                        # so the slot commits with the owner_generation bump
+                        # above or rolls back with it (see
+                        # SWEEP_RECLAIM_TRIGGERS): no later failure can leave
+                        # an INVALID pair that reads as a plain release.
+                        record_reclaim = (
+                            prev_in_me
+                            and state == MESIState.INVALID
+                            and trigger in SWEEP_RECLAIM_TRIGGERS
+                        )
                         self._conn.execute(
                             """
                             UPDATE agent_states
                             SET state = ?, granted_at_tick = ?,
                                 last_observed_version =
-                                    CASE WHEN ? THEN ? ELSE last_observed_version END
+                                    CASE WHEN ? THEN ? ELSE last_observed_version END,
+                                last_reclaim_trigger =
+                                    CASE WHEN ? THEN ? ELSE last_reclaim_trigger END,
+                                last_reclaim_tick =
+                                    CASE WHEN ? THEN ? ELSE last_reclaim_tick END
                             WHERE artifact_id = ? AND agent_id = ?
                             """,
                             (
@@ -3035,6 +4025,10 @@ class SqliteArtifactRegistry:
                                 granted_at_tick,
                                 1 if observe else 0,
                                 version,
+                                1 if record_reclaim else 0,
+                                trigger,
+                                1 if record_reclaim else 0,
+                                tick,
                                 artifact_id.hex,
                                 agent_id.hex,
                             ),
@@ -3410,6 +4404,310 @@ class SqliteArtifactRegistry:
             )
             """
         )
+
+    def _ensure_foreign_write_tables(self) -> None:
+        """Create the foreign-write detection tables if absent (writer open only).
+
+        Three tables, matching the detector's three facts and R9's bound on what
+        it may mutate.
+
+        ``foreign_write_counters`` is ONE ROW PER ARTIFACT rather than one per
+        (artifact, outcome). KTD10 drops the agent dimension the conflict
+        counters carry, and KTD14 requires the last-counted disk hash to live in
+        this table; a composite (artifact, outcome) key would replicate that
+        single per-artifact fact across three rows and invite them to drift, so
+        the outcome moves into a column each and the hash stays unique.
+
+        ``foreign_write_observations`` is one row per coordinator run, not a
+        single upserted marker: R12 asks whether the detector observed a
+        particular SPAN, which a cumulative count cannot answer across a
+        restart. Idempotent, single DDL statements under autocommit."""
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS foreign_write_counters (
+                artifact_id           TEXT NOT NULL PRIMARY KEY,
+                foreign_count         INTEGER NOT NULL DEFAULT 0,
+                mediated_count        INTEGER NOT NULL DEFAULT 0,
+                lag_suppressed_count  INTEGER NOT NULL DEFAULT 0,
+                last_counted_hash     TEXT NOT NULL,
+                last_counted_outcome  TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS foreign_write_observations (
+                run_id           TEXT NOT NULL PRIMARY KEY,
+                first_tick_unix  REAL NOT NULL,
+                last_tick_unix   REAL NOT NULL,
+                tick_count       INTEGER NOT NULL DEFAULT 0,
+                covered_count    INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS foreign_write_uncoverable (
+                run_id            TEXT NOT NULL PRIMARY KEY,
+                reason            TEXT NOT NULL,
+                observed_at_unix  REAL NOT NULL
+            )
+            """
+        )
+
+    def record_detection_tick(self, now_unix: float, *, covered_count: int = 0) -> None:
+        """Record that the detector observed one tick in THIS observed interval.
+
+        Written on every tick the poll completed, including a tick that found
+        nothing — that is precisely what makes a later zero readable as zero. A
+        tick whose poll RAISED must not reach here: an advancing count over a
+        broken poll is the false-clean outcome the whole liveness row exists to
+        prevent, so the caller records the tick only after the poll succeeded,
+        and closes the interval when it did not.
+
+        ``covered_count`` is how many artifacts were actually in scope. Without
+        it a reader cannot tell a run that watched five hundred artifacts and
+        found nothing from one that watched none, and those are very different
+        answers to "was this period clean?".
+
+        One statement, so no explicit transaction: the connection is opened
+        autocommit, and this runs on every tick against the same lock and
+        busy-timeout budget the request handlers share. Wrapping a lone
+        statement would cost three sqlite round-trips per tick for no added
+        atomicity."""
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO foreign_write_observations
+                    (run_id, first_tick_unix, last_tick_unix, tick_count,
+                     covered_count)
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT (run_id) DO UPDATE SET
+                    last_tick_unix = excluded.last_tick_unix,
+                    tick_count     = tick_count + 1,
+                    covered_count  = MAX(covered_count, excluded.covered_count)
+                """,
+                (self._detection_run_id, now_unix, now_unix, covered_count),
+            )
+
+    def close_detection_run(self) -> None:
+        """End the current observed interval and open a fresh one.
+
+        Called when a tick failed. The interval a run row describes is read as
+        continuously observed, so a run that ticked, went blind for a week, then
+        ticked again would otherwise answer a coverage question for that whole
+        week. Rotating the identity leaves the completed interval intact and
+        lets the next success start a new one, so the hole is visible.
+
+        Purely local: nothing is written until the next successful tick, so a
+        coordinator that fails forever leaves no misleading row behind."""
+        with self._lock:
+            self._detection_run_id = uuid4().hex
+
+    def record_detection_uncoverable(self, reason: str, now_unix: float) -> None:
+        """Record that this run found nothing it could ever watch here.
+
+        A THIRD table rather than a tick row or a column on one, because this is
+        a third fact. An observation row means "the detector looked", and
+        ``covers()`` reads a span of them as continuously watched; a row written
+        here would make a workspace nothing ever polled answer a coverage
+        question. A zero-tick row would be worse — the same claim with the
+        evidence removed.
+
+        One row per became-uncoverable transition, not per tick. The detector
+        never stops polling; its caller gates this on the latch that gates the
+        log, and closes that latch only once the note is durable — so a refused
+        write (a locked store, no disk) is retried on the next tick. That retry
+        lands on a FRESH run id: the caller closes the observed run before
+        every attempt, and a close rotates the id. ``ON CONFLICT DO UPDATE``
+        is therefore not the retry path. It is the sqlite counterpart of the
+        in-memory twin's dict-key overwrite — an in-process re-call with no
+        close between lands on the same id, and overwriting is cheaper than
+        reasoning about whether one can happen. Single statement under
+        autocommit, like every other write on this instrument."""
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO foreign_write_uncoverable
+                    (run_id, reason, observed_at_unix)
+                VALUES (?, ?, ?)
+                ON CONFLICT (run_id) DO UPDATE SET
+                    reason           = excluded.reason,
+                    observed_at_unix = excluded.observed_at_unix
+                """,
+                (self._detection_run_id, reason, now_unix),
+            )
+
+    def detection_uncoverable(self) -> list[UncoverableRun]:
+        """Runs that found no watchable workspace. Empty is a real answer.
+
+        Absence of the table is tolerated on a READ-ONLY handle only, exactly as
+        :meth:`detection_runs` does it: a store written before this shipped has
+        no such table, and a read-only open never creates one. On a writer
+        handle the table is created at open, so its absence is a fault in the
+        store — reporting empty there would answer a question about the
+        workspace with news about the schema."""
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT run_id, reason, observed_at_unix "
+                    "FROM foreign_write_uncoverable ORDER BY observed_at_unix"
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if self._read_only and "no such table" in str(exc):
+                    return []
+                raise
+        return [
+            UncoverableRun(
+                run_id=run_id, reason=reason, observed_at_unix=float(observed_at)
+            )
+            for run_id, reason, observed_at in rows
+        ]
+
+    def record_foreign_write(
+        self, artifact_id: UUID, outcome: str, disk_hash: str
+    ) -> bool:
+        """Count one newly observed on-disk content for ``artifact_id``.
+
+        Returns ``True`` when the observation was counted and ``False`` when it
+        was suppressed as already-counted. The gate is the edge trigger: git
+        reports a path dirty against the index on EVERY invocation until it is
+        staged and committed, and the canonical hash only advances on a mediated
+        commit, so a level-triggered count would record one foreign edit on
+        every tick for as long as it persists.
+
+        The gate keys on content AND outcome. Content alone would freeze a
+        classification that is allowed to change while the bytes do not: a
+        mismatch suppressed as a commit-still-landing is re-examined once the
+        window expires, and if no commit ever landed it becomes foreign. Keyed
+        on content alone, that first benefit of the doubt would be permanent —
+        the instrument would have recorded a real foreign write as benign and
+        never revisited it.
+
+        The suppressing values live HERE, in the detector's own table, never on
+        ``artifacts.content_hash``: healing the comparand a safety check reads
+        is the repeated defect this repo has already shipped three times."""
+        column = _foreign_write_column(outcome)
+        # One guarded upsert, no read-then-write: the WHERE clause on the
+        # DO UPDATE arm turns a repeat of the same observation into a no-op, so
+        # ``rowcount`` reports whether this observation was new. Same shape as
+        # ``record_preemption_notice``'s guarded upsert. Single statement under
+        # autocommit, so no explicit transaction and no read-modify-write
+        # window for a concurrent tick to interleave into.
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""
+                INSERT INTO foreign_write_counters
+                    (artifact_id, {column}, last_counted_hash,
+                     last_counted_outcome)
+                VALUES (?, 1, ?, ?)
+                ON CONFLICT (artifact_id) DO UPDATE SET
+                    {column}             = {column} + 1,
+                    last_counted_hash    = excluded.last_counted_hash,
+                    last_counted_outcome = excluded.last_counted_outcome
+                WHERE foreign_write_counters.last_counted_hash
+                          != excluded.last_counted_hash
+                   OR foreign_write_counters.last_counted_outcome
+                          != excluded.last_counted_outcome
+                """,
+                (artifact_id.hex, disk_hash, outcome),
+            )
+        return cursor.rowcount > 0
+
+    def artifacts_with_detection_edge(self) -> set[UUID]:
+        """Artifacts currently holding an edge-gate value.
+
+        Small by construction — only artifacts the detector has ever counted —
+        so the caller can decide which clean artifacts need clearing without
+        issuing a statement per clean artifact per tick."""
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT artifact_id FROM foreign_write_counters "
+                    "WHERE last_counted_hash != ''"
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if self._read_only and "no such table" in str(exc):
+                    return set()
+                raise
+        return {UUID(hex=row[0]) for row in rows}
+
+    def clear_detection_edges(self, artifact_ids: list[UUID]) -> None:
+        """Re-arm detection for artifacts that are no longer diverging.
+
+        Counts are untouched — this clears only the value that suppresses a
+        repeat. An artifact reconciled back to the index has no live divergence,
+        so holding its old content would make an identical later edit look
+        already-counted and go unrecorded."""
+        if not artifact_ids:
+            return
+        placeholders = ", ".join("?" for _ in artifact_ids)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE foreign_write_counters "
+                f"SET last_counted_hash = '', last_counted_outcome = '' "
+                f"WHERE artifact_id IN ({placeholders})",
+                [artifact_id.hex for artifact_id in artifact_ids],
+            )
+
+    def foreign_write_totals(self) -> dict[UUID, dict[str, int]]:
+        """Return per-artifact detection counts, omitting zero buckets.
+
+        Zero detections is an empty mapping — a reportable result, not an error.
+        Tolerates a missing table ONLY on a read-only open of a store that
+        predates the instrument; on a writer handle the ensure guarantees it, so
+        an ``OperationalError`` there is a real failure and is re-raised."""
+        # Name every column through the same mapping the write side uses, so a
+        # reordering of either the outcome vocabulary or this SELECT cannot
+        # silently transpose two labels — a positional zip would.
+        outcomes = tuple(FOREIGN_WRITE_COLUMNS)
+        selected = ", ".join(FOREIGN_WRITE_COLUMNS[name] for name in outcomes)
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    f"SELECT artifact_id, {selected} FROM foreign_write_counters"
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if self._read_only and "no such table" in str(exc):
+                    return {}
+                raise
+        totals: dict[UUID, dict[str, int]] = {}
+        for art_hex, *values in rows:
+            counts = {
+                name: value for name, value in zip(outcomes, values) if value
+            }
+            if counts:
+                totals[UUID(hex=art_hex)] = counts
+        return totals
+
+    def detection_runs(self) -> list[DetectionRun]:
+        """Return every recorded run interval, oldest first.
+
+        An EMPTY list is the not-instrumented signal. It cannot be inferred from
+        the table's absence: all three tables exist after any writer open, including
+        one where ``sweep_interval_sec <= 0`` meant the sweep thread was never
+        created and the detector never ran."""
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT run_id, first_tick_unix, last_tick_unix, tick_count, "
+                    "covered_count FROM foreign_write_observations "
+                    "ORDER BY first_tick_unix"
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if self._read_only and "no such table" in str(exc):
+                    return []
+                raise
+        return [
+            DetectionRun(
+                run_id=run_id,
+                first_tick_unix=float(first),
+                last_tick_unix=float(last),
+                tick_count=int(count),
+                covered_count=int(covered),
+            )
+            for run_id, first, last, count, covered in rows
+        ]
 
     def _count_conflict_in_txn(
         self, artifact_id: UUID, agent_id: UUID, reason: str
@@ -4110,6 +5408,23 @@ class SqliteArtifactRegistry:
         more recent fact about the world. The WHERE clause makes the
         update conditional on excluded.preempted_at_unix_ts being strictly
         greater than the existing row's.
+
+        WHY THIS STAYS STRICT WHILE NODE'S IS `>=`. The Node coordinator
+        relaxed the identical guard to `>=` (plugin PR #152). Not a parity
+        drift to reconcile -- the two backends feed this comparison different
+        clocks. Node stamps `Math.floor(Date.now() / 1000)`, so two
+        preemptions of one (victim, artifact) pair inside the same second tie
+        exactly, and a strict `>` there declines the second and leaves the row
+        naming a session that no longer holds the grant. Here the caller
+        passes float `time.time()`, so two preemptions arriving on separate
+        requests do not produce an equal timestamp and the strict form does
+        what this docstring says it does.
+
+        The tripwire is the clock, not the operator. If anything ever floors
+        or coarsens the timestamps this method is handed, Python inherits
+        Node's bug and this guard must move to `>=` with it. No fixture can
+        catch that -- a same-second race is not something the cross-backend
+        corpus can express -- so this comment is the only warning there is.
         """
         self._guard_writable()
         with self._lock:
@@ -4142,11 +5457,25 @@ class SqliteArtifactRegistry:
                 raise
 
     def pop_pending_notices(
-        self, agent_id: UUID
+        self, agent_id: UUID, *, consume_limit: int | None = None
     ) -> list[tuple[UUID, UUID, float]]:
-        """Atomically SELECT and DELETE all pending notices for ``agent_id``.
-        Returns list of ``(artifact_id, preempter_agent_id, preempted_at_unix_ts)``.
-        Empty list if no pending notices."""
+        """Atomically SELECT every pending notice for ``agent_id``, DELETE the
+        ones the caller commits to consuming, and return ALL of them
+        newest-first as ``(artifact_id, preempter_agent_id,
+        preempted_at_unix_ts)``. Empty list if no pending notices.
+
+        ``consume_limit`` is how many the CALLER can actually deliver.
+        ``None`` (the default) means all of them — the ``session-stop`` drain,
+        which returns the full structured array and so renders everything it
+        removes. A prose caller passes its render cap instead: it renders the
+        newest N, coalesces the rest into a count, and those rest stay queued
+        for its next call. Deleting rows the response never showed destroyed
+        the caller's only record of who preempted those artifacts, and the
+        overflow count alone cannot drive a retry or a merge.
+
+        The returned list is ordered newest-first so the caller's own cap
+        selects the SAME rows this method deleted.
+        """
         self._guard_writable()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -4155,14 +5484,30 @@ class SqliteArtifactRegistry:
                     """
                     SELECT artifact_id, preempter_agent_id, preempted_at_unix_ts
                     FROM pending_notices WHERE agent_id = ?
+                    ORDER BY preempted_at_unix_ts DESC, artifact_id DESC
                     """,
                     (agent_id.hex,),
                 ).fetchall()
-                if rows:
-                    self._conn.execute(
-                        "DELETE FROM pending_notices WHERE agent_id = ?",
-                        (agent_id.hex,),
-                    )
+                if consume_limit is None:
+                    consumed = rows
+                    if rows:
+                        # Unlimited drain keeps the bulk DELETE: an IN-list of
+                        # every row would bind one variable per notice and can
+                        # exceed SQLITE_LIMIT_VARIABLE_NUMBER on an agent with
+                        # a large pending set, raising instead of committing.
+                        self._conn.execute(
+                            "DELETE FROM pending_notices WHERE agent_id = ?",
+                            (agent_id.hex,),
+                        )
+                else:
+                    consumed = rows[:consume_limit]
+                    if consumed:
+                        placeholders = ", ".join("?" * len(consumed))
+                        self._conn.execute(
+                            "DELETE FROM pending_notices WHERE agent_id = ? "
+                            f"AND artifact_id IN ({placeholders})",
+                            (agent_id.hex, *(r[0] for r in consumed)),
+                        )
                 self._conn.execute("COMMIT")
             except BaseException:
                 # P2 ce-review fix #14 (kieran-python): BaseException catches

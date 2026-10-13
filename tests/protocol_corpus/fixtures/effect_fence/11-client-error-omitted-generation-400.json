@@ -1,0 +1,28 @@
+{
+  "name": "effect-fence-client-error-omitted-generation-400",
+  "description": "A MALFORMED REQUEST IS NEVER A HOLD. expected_generation is OMITTED -- the client never captured the comparand -- and the answer is HTTP 400 naming that field, not a 200 hold. A hold invites a retry, and no number of identical retries supplies a value the caller does not have; if an incomplete request also answered 'hold', the fixable and the unfixable would be one answer on the wire. Pins the OMITTED/null asymmetry against 07, whose request differs only in carrying the key as an explicit null and which HOLDS. Also pins that the field is named DISTINCTLY -- 'missing expected_generation', not a generic 'missing field' -- so a caller can tell which one it forgot; 12 is the same contract for content_hash.",
+  "setup": {
+    "tracked": ["docs/**"],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/effect-fence",
+    "body": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "path": "docs/plan.md",
+      "expected_version": 1,
+      "content_hash": "f9b414ed170aade26e96b08b64710e279b57971274301dc1c4c22fb63de6eec6"
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": "missing expected_generation"
+    }
+  },
+  "backends": ["python"],
+  "_comment": "Single-key {error: <lowercase phrase>} envelope, the adapter-wide non-200 body shape and the CLI's parse contract. Same shape as warn_mode/06-pre-read-missing-session-id-400.json."
+}

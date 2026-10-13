@@ -753,6 +753,8 @@ def test_cas_write_versioned_409_budget_exhausts_typed_terminal() -> None:
     # deny mapper, via the inherited reason) classify it without change.
     assert isinstance(exc_info.value, CasRetriesExhausted)
     assert exc_info.value.attempts == MAX_RETRYABLE_PUT_ATTEMPTS + 1
+    # It bypasses the parent __init__, so the reason comes from the class default.
+    assert exc_info.value.last_conflict_reason is None
     assert client.attempts == MAX_RETRYABLE_PUT_ATTEMPTS + 1  # initial + budget, never spins
 
 

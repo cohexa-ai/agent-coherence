@@ -1,0 +1,45 @@
+{
+  "name": "caller-principal-accept-pre-bash-with-a-principal",
+  "description": "R14 -- the accept-class /hooks/pre-bash in the PRINCIPAL-PRESENT state, on both backends. The principal-absent state of the same request is pinned by strict_mode/06-pre-bash-strict-tracked-stale-denies (its principal-free main request). Python checks the principal it minted and admits; Node issues none, so the harness omits the header there (the claim preflight is Python-scoped), exactly as a conforming client does after a 404 on the claim. Both answer the same.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "backends": [
+          "python"
+        ],
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-bash",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+      "command": "ls -la"
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_a}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "status": "fresh"
+    }
+  }
+}

@@ -17,14 +17,30 @@ shared-secret Bearer auth + Host-header check (KTD-12):
 - ``POST /policy/track``        — Unit 6 CLI hot-add to tracked.yaml
 - ``POST /policy/untrack``      — Unit 6 CLI hot-add to ignored.yaml
 - ``GET  /status``              — Unit 6 status CLI
+- ``POST /principal/claim``     — caller-principal mint (plan U4; Python-only)
+- ``POST /handoff/transfer``    — hand claims to a named successor (#185;
+  Python-only, like ``/handoff/accept``, ``/handoff/decline`` and
+  ``/handoff/withdraw``)
+
+Every route that names an acting identity (``session_id``) has a caller-
+principal posture in :data:`_CALLER_PRINCIPAL_POSTURE` (plan U6): require-class
+routes refuse a request naming a CLAIMED identity without the principal minted
+for it, accept-class routes admit and count one, every class refuses a foreign
+principal, the mint is neither.
 
 Every handler:
 - Verifies ``Authorization: Bearer <secret>`` (constant-time)
 - Verifies ``Host`` header is localhost / 127.0.0.1 (DNS-rebind guard)
-- Records the calling session's heartbeat (KTD-2)
+- Records the calling agent's grant heartbeat only on session-stop and on the
+  hook routes (pre-read, pre-edit, post-edit, post-edit-cas, pre-bash,
+  pre-grep) whose request reaches a tracked path; an untracked fast path,
+  session-start, ``/status`` and every other route record none
 - Runs the coordinator call under a 4s ThreadPoolExecutor timeout
   (handler-side watchdog — keeps us under the 5s hook timeout even when
-  SQLite contention exceeds busy_timeout=2000)
+  SQLite contention exceeds busy_timeout=2000); a caller-principal gate that
+  must read the registry runs under the same deadline, before the call.
+  ``/status`` and pre-grep's registry lookup read on the request thread
+  instead, bounding their wait for the registry lock by that deadline (#238)
 - Converts ``CoherenceError`` to 200 ``{ok: false, reason}`` (NOT 500 — we
   want hooks to proceed gracefully on protocol violations, not block)
 - Logs request/response at DEBUG, errors at WARNING
@@ -36,25 +52,32 @@ Lifecycle (spawn, port-file, idle-shutdown, sweep) lives in :mod:`lifecycle`
 from __future__ import annotations
 
 import base64
+import errno
 import http.server
 import json
 import logging
 import os
 import re
+import secrets
 import socketserver
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol, runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
+
+import yaml
 
 from ccs.adapters.claude_code import audit_log as _audit_log
 from ccs.adapters.claude_code import hook_payloads as _payloads
 from ccs.adapters.claude_code import session_audit_log as _session_audit
 from ccs.adapters.claude_code.auth import (
+    CALLER_PRINCIPAL_HEADER,
     assert_serve_transport_acknowledged,
     build_host_allowlist,
     ensure_secret,
@@ -62,34 +85,78 @@ from ccs.adapters.claude_code.auth import (
     verify_host,
 )
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
-from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
-from ccs.coordinator.registry_protocol import CheckpointMember
-from ccs.coordinator.service import CoordinatorService
-from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+from ccs.adapters.claude_code.bash_write_detector import detect_tracked_writes
+from ccs.adapters.claude_code.policy import (
+    POLICY_LOAD_ERRORS,
+    UNTRACK_STRICT_PATH_REASON,
+    TrackedArtifactPolicy,
+    policy_file_name,
+)
+from ccs.coordinator.registry_protocol import (
+    RECLAIM_TRIGGERS,
+    CheckpointMember,
+    TransferRecord,
+)
+from ccs.coordinator.service import (
+    CallerPrincipalUncached,
+    CoordinatorService,
+    mint_nonce_problem,
+)
+from ccs.coordinator.sqlite_registry import SCHEMA_USER_VERSION, SqliteArtifactRegistry
 from ccs.core.clock import monotonic_seconds
 from ccs.core.exceptions import (
+    CALLER_PRINCIPAL_ABSENT_REASON,
+    CALLER_PRINCIPAL_FOREIGN_REASON,
     CHECKPOINT_UNKNOWN_REASON,
+    GIVER_FENCED_REASON,
+    HANDLER_FAILURE_REASON_PREFIX,
+    HANDOFF_ACCEPT_UNCONFIRMED_REASON,
+    HANDOFF_DECLINE_UNCONFIRMED_REASON,
+    HANDOFF_IN_FLIGHT_REASON,
+    HANDOFF_NOT_HELD_REASON,
+    HANDOFF_NOT_LIVE_REASON,
+    HANDOFF_SUCCESSOR_MALFORMED_REASON,
+    HANDOFF_SUCCESSOR_UNKNOWN_REASON,
+    HANDOFF_TRANSFER_UNCONFIRMED_REASON,
+    HANDOFF_WITHDRAW_UNCONFIRMED_REASON,
+    HOLD_REASONS,
+    HOLD_VERSION_UNCONFIRMED,
     OCC_CALLER_TRANSIENT_REASON,
     RESTORE_MEMBER_OUTCOMES,
     RESTORE_STATUSES,
     SESSION_INVALIDATED_REASON,
     STALE_READ_GENERATION_REASON,
+    CallerPrincipalRefused,
+    CheckpointRegistrationRefused,
     CheckpointUnknown,
     CoherenceError,
+    GiverFenced,
     OccCallerTransientError,
+    RegistryLockTimeout,
     SessionInvalidated,
     StaleReadGeneration,
     WatchdogAbandoned,
 )
+from ccs.core.fence import (
+    classify_hold,
+    confirmed_generation,
+    coordinator_holds_content_claim,
+)
 from ccs.core.states import MESIState
 from ccs.core.substrate import ArbitrationTier, RestoreTier
 from ccs.core.types import (
+    TRANSFER_STATUS_COMPLETED,
+    TRANSFER_STATUS_OVERTAKEN,
+    Artifact,
     ConflictDetail,
     DataPlaneDeferredRead,
+    FenceComparands,
     MultiCommitConflict,
     SessionCommitRejection,
     SessionReadRejection,
     SnapshotSession,
+    TransferGrantOutcome,
+    TransferVerbOutcome,
     VersionedContent,
     VersionedReadRejection,
     WorkspaceRestoreWrite,
@@ -109,6 +176,15 @@ class _RequestProtocol(Protocol):
 
     headers: Any  # http.client.HTTPMessage (Mapping-like)
     path: str
+    #: ``(method, route path)`` the dispatcher matched in ``_ROUTES``, set
+    #: before the handler runs; keys the caller-principal posture lookup.
+    _route_key: tuple[str, str]
+    #: ``time.monotonic()`` instant this request's handler watchdog expires, or
+    #: ``None`` while nothing has started it. The dispatcher resets it; the
+    #: caller-principal gate starts it when it must read the registry, as does
+    #: pre-bash's giver lookup (which puts it back when it times out), and the
+    #: work body then waits only for what is left (:func:`_watchdog_deadline`).
+    _watchdog_deadline: float | None
 
     def _read_json(self) -> dict | None:
         """Read + parse the request body as JSON. Returns None on error."""
@@ -120,6 +196,29 @@ class _RequestProtocol(Protocol):
 
 
 HANDLER_TIMEOUT_SEC = 4.0
+
+_STATUS_CLIENT_TIMEOUT_SEC = 6.0
+"""How long this package's ``/status`` clients wait for the answer: the
+``agent-coherence-status`` console script, the volume's attach checks and MCP
+``swg_status`` all read it through ``ccs.cli._coherence_client``, whose
+``CLI_HTTP_TIMEOUT_SEC`` this duplicates (that module imports this one, so the
+value cannot be imported back; a test pins the two equal). A client that waits
+less can give up on a lock won at the wait cap before its answer arrives."""
+
+_STATUS_READ_RESERVE_SEC = 4.0
+"""#238: how much of :data:`_STATUS_CLIENT_TIMEOUT_SEC` ``/status``
+keeps for its registry read, so a lock won late still answers before the
+client gives up: the wait for the registry lock ends this long before the
+client's timeout, or at the handler budget if that comes first. That caps the
+wait at 2.0 s, which a held lock now spends before ``/status`` answers its
+marked degraded body.
+
+Sized from the slower of the two reads on a 500k-row ``agent_states`` ledger
+(the size behind ``status_snapshot``'s 2804 ms figure), across four
+artifact x agent shapes from 5000 x 100 to 100 x 5000, eight runs each on an
+Intel Mac: the operator-tier read took 2.56-3.07 s and the default-tier read
+2.34-2.53 s, and the whole operator-tier answer, read plus projection and
+encoding, at most 3.19 s. The reserve is that answer plus a quarter."""
 
 # v0.2 Unit 4: window for the "Read strict-deny → Bash cat strict-deny on
 # same (session, path)" route-around detector. Phase 0 saw the model
@@ -150,6 +249,12 @@ the deadline, any still-running handlers are abandoned — they may raise
 ``sqlite3.ProgrammingError`` and return HTTP 500 to their clients. Better
 a 500 than a wedged shutdown (silent hang vs observable failure)."""
 
+SERVE_POLL_INTERVAL_SEC = 0.05
+"""How often the accept loop checks for a shutdown request. ``shutdown()``
+blocks until the loop notices, and every request restarts the loop's wait,
+so a stop that follows a request waits close to one full interval. The
+stdlib default of 0.5s made every coordinator stop take half a second."""
+
 # ADV-004: a sentinel preempter UUID the stable-grant sweep uses when
 # recording a preemption notice for an agent whose M/E grant it just
 # reclaimed. The F4 enrichment in ``_handle_post_edit`` compares against
@@ -161,6 +266,27 @@ a 500 than a wedged shutdown (silent hang vs observable failure)."""
 SWEEP_RECLAMATION_PREEMPTER_ID: UUID = uuid5(
     NAMESPACE_URL, "ccs-coordinator-sweep:stable-grant-reclamation"
 )
+
+#: #195: the triggers the STABLE-grant sweep reclaims under
+#: (``CoordinatorService.enforce_stable_grant_timeouts``). The keys of the
+#: ``sweep_reclaims_by_trigger`` counter and the values ``/status?detail=full``
+#: reports under ``sessions[].reclaimed[path].trigger``: every reclaim trigger
+#: but the transient sweep's ``timeout``, which records no reclamation slot.
+_SWEEP_RECLAIM_TRIGGERS: tuple[str, ...] = tuple(sorted(RECLAIM_TRIGGERS - {"timeout"}))
+
+#: #195: how long a reclaim keeps an otherwise-empty, unnamed agent listed in
+#: ``/status?detail=full`` ``sessions[]``. The slot itself is durable and
+#: clears only on that agent's next M/E acquire, and the commonest heartbeat
+#: reclaim is a dead session that never acquires again, so without a bound
+#: every crashed session would add a row that no restart and no operator
+#: action removes. Past this age (the slot's tick is wall-clock seconds over
+#: the HTTP transport) the row is dropped; a named session, or one that still
+#: holds a grant, keeps its row and its ``reclaimed`` map regardless.
+_RECLAIM_ONLY_ROW_MAX_AGE_SEC: int = 24 * 60 * 60
+
+#: The states a write grant holds a pair in. ``/status``'s ``reclaimed`` map
+#: never lists a pair in one of them (#195): a write grant clears the slot.
+_M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
 
 MAX_POLICY_PATHS_PER_REQUEST = 20
 """Cap on the number of paths /policy/track and /policy/untrack accept
@@ -211,7 +337,7 @@ abuse vector (Adv #13)."""
 
 _CONTENT_HASH_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 """SHA-256 hex shape. Rejecting malformed hashes closes the
-caller-supplied-hash abuse vector (Adv #6) where an authenticated client
+caller-supplied-hash abuse vector (Adv #6) where a bearer-holding client
 could mint v1 with attacker-chosen hash strings."""
 
 
@@ -242,13 +368,436 @@ def session_to_agent_id(session_id: str, subagent_id: str | None = None) -> UUID
     return uuid5(NAMESPACE_URL, f"ccs-agent:claude-session-{session_id}")
 
 
+_AGENT_NAME_PREFIX = "claude-session-"
+_SUBAGENT_NAME_INFIX = ":subagent-"
+
+
 def session_to_agent_name(session_id: str, subagent_id: str | None = None) -> str:
     """Human-readable agent name for state_log and status display. SB-25:
     a subagent identity renders as ``claude-session-<sid>:subagent-<aid>``
     so /status keeps the parent linkage visible."""
     if subagent_id:
-        return f"claude-session-{session_id}:subagent-{subagent_id}"
-    return f"claude-session-{session_id}"
+        return f"{_AGENT_NAME_PREFIX}{session_id}{_SUBAGENT_NAME_INFIX}{subagent_id}"
+    return f"{_AGENT_NAME_PREFIX}{session_id}"
+
+
+def caller_principal_identity(session_id: str) -> UUID:
+    """The identity a caller principal binds to: the SESSION component of the
+    acting identity, i.e. the parent session's agent id.
+
+    A subagent carries its parent's ``session_id``, so it presents its parent's
+    principal: the principal's unit of identity is the session, and it cannot
+    separate a subagent from its parent (the subagent component stays
+    caller-asserted and unverified — plan R3). Keyed by the uuid5 rather than
+    the raw ``session_id`` so the store holds no raw session identifier."""
+    return session_to_agent_id(session_id)
+
+
+@dataclass(frozen=True)
+class PresentedCaller:
+    """The acting identity as ONE request presents it.
+
+    ``session_id`` is body-supplied and caller-asserted — validated for UUID
+    shape only; the coordinator authenticates the workspace bearer, not the
+    caller. ``subagent_id`` is caller-asserted and unverified. ``principal`` is
+    the caller principal the request carries, or ``None``. This value is what
+    lets a route check the SESSION component of the acting identity against the
+    principal the coordinator minted for it (plan U4 / R1, R3)."""
+
+    session_id: str
+    subagent_id: str | None
+    principal: str | None
+
+    def attributed_agent_id(
+        self, service: CoordinatorService, *, cached_only: bool = False
+    ) -> UUID:
+        """The composite agent id a write by this caller is attributed to
+        (``artifacts.last_writer_id``), with its SESSION component verified
+        against the caller principal first.
+
+        ``cached_only`` decides from the service's in-process binding cache and
+        raises :class:`~ccs.coordinator.service.CallerPrincipalUncached` where
+        the durable store would have to be read — the admission gate's way of
+        keeping that read off the request thread (:func:`_admit_caller`).
+
+        Raises :class:`~ccs.core.exceptions.CallerPrincipalRefused` when a
+        principal is presented and does not match the session's binding
+        (``caller_principal_foreign`` — including one presented for a session
+        nobody claimed), or when none is presented for a session that IS bound
+        (``caller_principal_absent``), so a refused caller never reaches a
+        write. A caller presenting none for a session nobody ever claimed is a
+        client that predates the principal: it is attributed under the plain
+        composite, as before the principal existed (plan U6 / R16) — refusing
+        it would only turn its writes silently unrecorded, since the shipped
+        hook client reads any non-2xx as an allow. The composite over session
+        and subagent is unchanged — two subagents of one session keep distinct
+        writer ids, which the self-commit-lag comparison depends on."""
+        identity = caller_principal_identity(self.session_id)
+        if self.principal is None and not service.is_caller_principal_bound(
+            identity, cached_only=cached_only
+        ):
+            return session_to_agent_id(self.session_id, self.subagent_id)
+        service.validate_caller_principal(
+            identity=identity, principal=self.principal, cached_only=cached_only
+        )
+        return session_to_agent_id(self.session_id, self.subagent_id)
+
+
+# ----------------------------------------------------------------------
+# Caller-principal route posture (caller-principal plan, U6)
+# ----------------------------------------------------------------------
+#
+# Every route that reads a ``session_id`` is classified by the harm an ABSENT
+# principal admits on it (KTD3) — not by retryability: a principal is an
+# authorization operand, and no downstream invariant catches a request that
+# acted as someone else. What the principal buys is accident-resistance and
+# attributability under the same-OS-user cooperative trust model; on the hook
+# surface it is stored under ``.coherence/``, so there it is convention-
+# enforcement and a detectable unbound caller, never caller separation (KTD5).
+#
+# Enforcement is THIS coordinator's only: the sibling Node coordinator issues
+# no principals, answers 404 on ``/principal/claim`` and ignores the header
+# (KTD12). The protocol corpus pins that asymmetry.
+
+
+class PrincipalPosture(Enum):
+    """How a route treats the caller principal of the identity it names."""
+
+    #: Refuse a foreign principal, and an absent one for an identity that is
+    #: BOUND (HTTP 400 naming the header, with a typed ``reason``; never a
+    #: hold — KTD9). An absent principal for an identity nobody ever claimed is
+    #: an older client's: admitted and counted, as before the principal
+    #: existed (R16, KTD15).
+    REQUIRE = "require"
+    #: Admit an absent principal, bound identity or not, and count it (a local
+    #: diagnostic, not a flip trigger — KTD4); refuse a foreign one, so a
+    #: presented principal is always CHECKED, never ignored.
+    ACCEPT = "accept"
+    #: The route that issues principals. It cannot require one (that would be
+    #: circular); its gate is the mint nonce (KTD11). The header is not read.
+    MINT = "mint"
+
+
+@dataclass(frozen=True)
+class RoutePrincipalPosture:
+    """One route's posture and the harm that places it there."""
+
+    posture: PrincipalPosture
+    harm: str
+
+
+_REQUIRE = PrincipalPosture.REQUIRE
+_ACCEPT = PrincipalPosture.ACCEPT
+
+_CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
+    # -- the nine hook routes ------------------------------------------------
+    ("POST", "/hooks/pre-read"): RoutePrincipalPosture(_ACCEPT, (
+        "a read: registers or refreshes the named identity's SHARED view and "
+        "records no attribution; strict mode never re-grants on a stale read, "
+        "so a strict-mode write route still catches a stale writer. Accepted "
+        "behaviour for an absent principal, whether the identity is unbound or "
+        "bound: the read drains the named identity's pending notices into its "
+        "own response, and in warn mode a stale read re-grants the identity "
+        "SHARED and uses up its stale warning, so a caller naming a bound peer "
+        "without its principal takes the peer's notices and warning and the "
+        "peer never sees them")),
+    ("POST", "/hooks/effect-fence"): RoutePrincipalPosture(_REQUIRE, (
+        "gates an escaping effect on the named identity's grant standing: a "
+        "caller naming a claimed peer without its principal would be answered "
+        "about the PEER's grant and told an irreversible effect may fire")),
+    ("POST", "/hooks/pre-edit"): RoutePrincipalPosture(_REQUIRE, (
+        "acquires EXCLUSIVE under the named identity, preempting its holders, "
+        "and drains its pending notices: a caller without a claimed identity's "
+        "principal could take a grant it can then neither commit nor release "
+        "(post-edit, either success value, and session-stop refuse it), so the "
+        "grant would stand until the max-hold sweep while optimistic peers are "
+        "refused other_holder. The trade-off, accepted: a claimed session whose "
+        "client cannot present its principal (and cannot recover it by "
+        "re-claiming with its stored nonce) has its pre-edit refused, and a "
+        "hook client then proceeds uncoordinated, as on any other refusal: the "
+        "edit gets no grant, no strict-mode deny and no invalidation of its "
+        "peers. That was chosen over admitting an acquire the caller could "
+        "neither commit nor release. The class does not stop preemption "
+        "itself: a fresh, principal-bearing identity preempts identically "
+        "until the acquire-or-fail contract lands")),
+    ("POST", "/hooks/post-edit"): RoutePrincipalPosture(_REQUIRE, (
+        "commits a version and records artifacts.last_writer_id under the "
+        "named identity (or, on success:false, releases its grant): a caller "
+        "without a claimed peer's principal could write under the peer's name "
+        "or drop the peer's grant")),
+    ("POST", "/hooks/post-edit-cas"): RoutePrincipalPosture(_REQUIRE, (
+        "the optimistic commit: bumps a version and records last_writer_id "
+        "under the named identity")),
+    ("POST", "/hooks/session-stop"): RoutePrincipalPosture(_REQUIRE, (
+        "releases every EXCLUSIVE/MODIFIED grant the named identity holds and "
+        "drains its notices: a caller without a claimed peer's principal could "
+        "end the peer's work")),
+    ("POST", "/hooks/session-start"): RoutePrincipalPosture(_ACCEPT, (
+        "re-grounding of the named session; names peers only by agent id (R7). "
+        "It shows the named identity's pending notices without draining them "
+        "and writes only advisory state: the session's display name and, when "
+        "the re-grounding is non-empty, its compact-pending flag, which the "
+        "named identity's next admit delivers. Accepted behaviour for an "
+        "absent principal: a caller naming a bound peer without its principal "
+        "can arm that delivery; nothing a later check depends on changes")),
+    ("POST", "/hooks/pre-bash"): RoutePrincipalPosture(_ACCEPT, (
+        "a read, as pre-read: stale-read detection for paths a shell command "
+        "names. Accepted behaviour for an absent principal, as pre-read's: it "
+        "drains the named identity's pending notices into its own response, so "
+        "a caller naming a bound peer without its principal takes the peer's "
+        "notices")),
+    ("POST", "/hooks/pre-grep"): RoutePrincipalPosture(_ACCEPT, (
+        "a read, as pre-read: stale-read detection for a search root. Accepted "
+        "behaviour for an absent principal, as pre-read's: it drains the named "
+        "identity's pending notices into its own response, so a caller naming "
+        "a bound peer without its principal takes the peer's notices")),
+    # -- the five snapshot-session routes (KTD3's own exemption) -------------
+    ("POST", "/session/begin"): RoutePrincipalPosture(_ACCEPT, (
+        "opens a snapshot session owned by the named identity; the session "
+        "token it returns is server-minted and reaches only this caller, and "
+        "every later session route is gated by that token's owner binding")),
+    ("POST", "/session/read"): RoutePrincipalPosture(_ACCEPT, (
+        "gated by the server-minted session token's owner binding, which the "
+        "caller cannot assert; an absent principal admits nothing more")),
+    ("POST", "/session/commit"): RoutePrincipalPosture(_ACCEPT, (
+        "writes attribution, but only through a server-minted session token "
+        "bound to its owner, and /session/begin, which mints one for the "
+        "session it names, is accept-class too. Accepted behaviour for an "
+        "absent principal: a request that presents no principal and names a "
+        "bound session commits as that session, so against a live handoff of "
+        "the path it is fenced as that session when it is a live record's "
+        "giver, completes the record as that session when it is the record's "
+        "successor, and is stored as the counterparty of an overtake "
+        "otherwise")),
+    ("POST", "/session/commit_all"): RoutePrincipalPosture(_ACCEPT, (
+        "as /session/commit, over a write-set")),
+    ("POST", "/session/heartbeat"): RoutePrincipalPosture(_ACCEPT, (
+        "keeps a snapshot session alive; the token's owner binding already "
+        "refuses a request naming another session")),
+    # -- the four workspace checkpoint-and-restore routes --------------------
+    ("POST", "/workspace/checkpoint"): RoutePrincipalPosture(_REQUIRE, (
+        "records durable checkpoint-manifest ownership under the named "
+        "identity: a caller without a claimed identity's principal could "
+        "record a manifest as that identity's. The body's optional "
+        "receiver_session_id names a second identity, the one controller "
+        "allowed to register a restore of the checkpoint (#191); it is "
+        "recorded, not acted as, so the check applies to session_id only")),
+    ("POST", "/workspace/restore/status"): RoutePrincipalPosture(_REQUIRE, (
+        "writes durable restore progress that crash-resume acts on, as a "
+        "controller derived from the named session: the checkpoint's receiver "
+        "binding and registration claim (#191) refuse any other controller, "
+        "so a caller without a claimed receiver's principal could conclude "
+        "that receiver's restore. A caller naming an unclaimed identity is "
+        "admitted as that identity, so the gate binds a controller only as "
+        "far as its session claimed a principal")),
+    ("POST", "/workspace/restore/member"): RoutePrincipalPosture(_REQUIRE, (
+        "writes a member's durable restore terminal (the delete half of a "
+        "registration), gated on the derived controller as "
+        "/workspace/restore/status is")),
+    ("POST", "/workspace/restore/register"): RoutePrincipalPosture(_REQUIRE, (
+        "a version-bumping write registered under a controller identity "
+        "derived from the named session: a caller without a claimed session's "
+        "principal could register a restore as that session's")),
+    # -- the mint itself -----------------------------------------------------
+    ("POST", "/principal/claim"): RoutePrincipalPosture(PrincipalPosture.MINT, (
+        "issues principals; requiring one would be circular, and its gate is "
+        "the mint nonce (first claim wins, a retry must present the same nonce)")),
+    # -- the four grant-handoff verbs (#185) ---------------------------------
+    ("POST", "/handoff/transfer"): RoutePrincipalPosture(_REQUIRE, (
+        "hands the claims the named identity presents to a successor and "
+        "records the named session as the giver, fenced from writing those "
+        "paths until the handoff ends: a caller without a claimed session's "
+        "principal could give away that session's claim and leave it unable "
+        "to write the path")),
+    ("POST", "/handoff/accept"): RoutePrincipalPosture(_REQUIRE, (
+        "marks a live handoff to the named session completed: a caller "
+        "without the successor's principal could accept a handoff in its "
+        "name")),
+    ("POST", "/handoff/decline"): RoutePrincipalPosture(_REQUIRE, (
+        "ends a live handoff to the named session and lifts its giver's "
+        "fence: a caller without the successor's principal could refuse a "
+        "handoff in its name and reopen the path to the giver")),
+    ("POST", "/handoff/withdraw"): RoutePrincipalPosture(_REQUIRE, (
+        "ends the named session's live handoff and lifts its fence: a caller "
+        "without the giver's principal could withdraw the handoff, so the "
+        "giver's late write would land where its successor was told to "
+        "write")),
+}
+"""Route -> caller-principal posture, over EVERY route that reads a
+``session_id`` and no other. The require-class harm is what an absent
+principal admits for an identity a client has CLAIMED; a request naming an
+identity nobody claimed (a client predating the principal) is admitted and
+counted on every class, as it was before. An accept-class entry states what an
+absent principal is nonetheless ALLOWED to do there — the accepted behaviour,
+not only the harm it rules out. The lookup in :func:`_admit_caller` has no
+default: a route missing here fails loudly (500) rather than falling to a
+residual class, and a test pins the key set to the routes that read one."""
+
+# Sent only for a session that IS bound; a session nobody claimed is admitted
+# without a principal (KTD15).
+_CALLER_PRINCIPAL_ABSENT_ERROR = (
+    f"missing {CALLER_PRINCIPAL_HEADER} header: this route requires the caller "
+    f"principal that POST /principal/claim bound to the session_id it names "
+    f"({CALLER_PRINCIPAL_ABSENT_REASON})"
+)
+# Sent on every class for a presented principal that is not the one bound to the
+# named session — including one presented for a session nobody claimed, where
+# nothing is bound and so no presented value can match.
+_CALLER_PRINCIPAL_FOREIGN_ERROR = (
+    f"the {CALLER_PRINCIPAL_HEADER} header is not the caller principal bound to "
+    f"the session_id this request names ({CALLER_PRINCIPAL_FOREIGN_REASON})"
+)
+_CALLER_PRINCIPAL_ERRORS: dict[str, str] = {
+    CALLER_PRINCIPAL_ABSENT_REASON: _CALLER_PRINCIPAL_ABSENT_ERROR,
+    CALLER_PRINCIPAL_FOREIGN_REASON: _CALLER_PRINCIPAL_FOREIGN_ERROR,
+}
+"""The ``error`` text of a principal refusal, keyed by its reason. The 400 body
+is ``{"error": <text>, "reason": <reason>}``: ``error`` keeps the key every
+non-200 body carries (the CLI reads it), and ``reason`` is the typed key a
+client classifies the refusal by — by equality against
+:data:`~ccs.core.exceptions.CALLER_PRINCIPAL_REFUSAL_REASONS`, never by a
+substring of ``error``. Each text names the header and ends with its reason, so
+an absent principal and a foreign one stay distinguishable from either key (a
+phase is diagnosable from the refusal alone). Neither carries a principal."""
+
+
+def _admit_caller(
+    req: _RequestProtocol,
+    coordinator: CoordinatorHTTPServer,
+    presented: PresentedCaller,
+) -> UUID | None:
+    """Apply the dispatched route's posture to ``presented``.
+
+    Returns the composite agent id the request acts as, or ``None`` after
+    writing the HTTP 400 refusal. On a require-class route, and whenever a
+    principal IS presented, the id comes from
+    :meth:`PresentedCaller.attributed_agent_id`, which owns the rule: a
+    presented principal must be the bound one; none may be presented only for
+    an identity nobody has claimed. An accept-class request presenting none is
+    admitted under the unverified derivation. Every admission without a
+    principal — accept-class, or require-class on an unbound identity — is
+    counted (a local diagnostic, KTD4); every refusal is counted separately and
+    logged, by :func:`_refuse_caller`.
+
+    The gate runs BEFORE any handler mutation — the display-name registration,
+    the heartbeat, the re-grounding flag, a notice drain, a grant — so a
+    refused request has changed nothing, and a client may retry it once it
+    holds the right principal.
+
+    It never waits longer than the handler watchdog: see
+    :func:`_attributed_within_deadline`. A gate that cannot decide in time
+    writes the route's degraded envelope (past a full watchdog queue, the 503)
+    and returns ``None`` too — neither admitted nor refused, so it is counted
+    by neither principal counter."""
+    posture = _CALLER_PRINCIPAL_POSTURE[req._route_key].posture
+    unverified = session_to_agent_id(presented.session_id, presented.subagent_id)
+    if posture is PrincipalPosture.MINT:
+        return unverified
+    if posture is PrincipalPosture.ACCEPT and presented.principal is None:
+        coordinator.increment_caller_principal_absent()
+        return unverified
+    try:
+        agent_id = _attributed_within_deadline(req, coordinator, presented)
+    except CallerPrincipalRefused as exc:
+        _refuse_caller(req, coordinator, exc.reason)
+        return None
+    if agent_id is None:
+        return None
+    if presented.principal is None:
+        # Require-class, admitted without a principal: the identity is unbound.
+        coordinator.increment_caller_principal_absent()
+    return agent_id
+
+
+def _attributed_within_deadline(
+    req: _RequestProtocol,
+    coordinator: CoordinatorHTTPServer,
+    presented: PresentedCaller,
+) -> UUID | None:
+    """:meth:`PresentedCaller.attributed_agent_id`, decided without waiting
+    past the handler watchdog.
+
+    The service's binding cache answers on this thread, touching no registry:
+    a bound identity, and — after one read of the store — an unbound one
+    (the negative tier, so a client that never claims stops costing a registry
+    read per request). Only a cache miss reads the durable store, and that read
+    waits on the registry lock, so it runs in the watchdog pool and STARTS this
+    request's watchdog deadline: the work body later gets only what the lookup
+    left of it (:func:`_watchdog_deadline`), and gate plus body stay inside one
+    ``HANDLER_TIMEOUT_SEC``. Were the read made here instead, a client that
+    never claims (KTD15) would wait on registry contention with no deadline on
+    every require-class route — pre-edit included.
+
+    Returns the agent id, or ``None`` after writing the answer itself, one of
+    three: the watchdog pool's queue-overflow 503; when the lookup is not done
+    by the deadline, exactly the route's degraded envelope
+    (:data:`_CALLER_GATE_DEGRADED_RESPONSE`), counted as a watchdog timeout
+    like a timed-out work body; and when the lookup RAISED anything but a
+    refusal — the registry read failing once ``busy_timeout`` elapsed, say —
+    exactly the route's internal-error envelope, logged as a failed work body
+    is (:func:`_answer_handler_error`). That last arm is what keeps the gate
+    and the body on one error contract: were the raise left to the
+    dispatcher's 500, a degrade-mode ``CoherentVolume`` would read the answer
+    as "no coordinator" and write with no grant, where the typed 200 raises in
+    both of its modes. Raises :class:`CallerPrincipalRefused` for a refusal
+    decided within the deadline, which stays an HTTP 400."""
+    service = coordinator.service
+    try:
+        return presented.attributed_agent_id(service, cached_only=True)
+    except CallerPrincipalUncached:
+        pass
+    if _watchdog_queue_overflowed(req, coordinator):
+        return None
+    deadline = _start_watchdog_deadline(req)
+    method, path = req._route_key
+    try:
+        return coordinator.run_admission_lookup(
+            lambda: presented.attributed_agent_id(service), deadline=deadline
+        )
+    except CallerPrincipalRefused:
+        raise
+    except FuturesTimeout:
+        coordinator.increment_watchdog_timeout()
+        logger.warning(
+            "caller-principal lookup on %s %s timed out after %ss; degrading",
+            method, path, HANDLER_TIMEOUT_SEC,
+        )
+        req._json(200, _CALLER_GATE_DEGRADED_RESPONSE[req._route_key])
+        return None
+    except Exception as exc:
+        # Ordered after the refusal and the timeout: both are Exceptions too
+        # (the futures timeout is the builtin TimeoutError since 3.11). The
+        # lookup only reads, so nothing landed; the request was neither
+        # admitted nor refused, so neither principal counter moves.
+        _answer_handler_error(
+            req, coordinator, exc, failed=f"caller-principal lookup on {method} {path}"
+        )
+        return None
+
+
+def _refuse_caller(
+    req: _RequestProtocol, coordinator: CoordinatorHTTPServer, reason: str
+) -> None:
+    """Answer a principal refusal: HTTP 400 ``{"error", "reason"}``.
+
+    Counted and logged at INFO with the route and the reason BEFORE the answer
+    goes out, so an operator can see a session being refused — the hook client
+    exits 0 on a refusal and Claude Code shows no stderr, so nothing else
+    would. Only the reason is read: neither the presented principal nor the
+    bound one reaches the log, the counter or the body (R5)."""
+    coordinator.increment_caller_principal_refused()
+    method, path = req._route_key
+    logger.info("caller principal refused on %s %s (%s)", method, path, reason)
+    req._json(400, {"error": _CALLER_PRINCIPAL_ERRORS[reason], "reason": reason})
+
+
+def _presented_caller(
+    req: _RequestProtocol, session_id: str, subagent_id: str | None = None
+) -> PresentedCaller:
+    """The acting identity this request presents: the body's ``session_id``
+    and subagent id, and the header's principal (an empty header is absent)."""
+    principal = req.headers.get(CALLER_PRINCIPAL_HEADER) or None
+    return PresentedCaller(session_id=session_id, subagent_id=subagent_id, principal=principal)
 
 
 # ``monotonic_seconds`` moved to ``ccs.core.clock`` (WV plan Unit 3) so the
@@ -306,6 +855,31 @@ def has_subagent_id_field(body: dict) -> bool:
     degrading to parent attribution there is benign."""
     raw = _raw_subagent_id_value(body)
     return raw is not None and raw != ""
+
+
+_MALFORMED_SUBAGENT_ERROR = "agent_id must be 1-64 chars of [A-Za-z0-9_-]"
+"""The 400 ``error`` for a present-but-malformed subagent id on a route that
+refuses one rather than reading it as the parent (session-stop, the transfer)
+-- the effect fence's wording, so a client sees one phrase for one fault."""
+
+_AGENT_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32}",
+    re.IGNORECASE,
+)
+"""The two spellings the coordinator publishes an agent id in: the hyphenated
+form ``/status`` lists (``str(uuid)``) and the 32-hex form a stale summary
+names a writer by (``uuid.hex``). Matched with ``fullmatch``; nothing else
+``uuid.UUID`` would parse (braces, a ``urn:uuid:`` prefix) is accepted."""
+
+
+def parse_agent_id(value: Any) -> UUID | None:
+    """A successor id named on the wire, as a UUID; ``None`` when it is not a
+    well-formed agent id in one of the two published spellings
+    (:data:`_AGENT_ID_RE`). A transfer refuses every grant of a request whose
+    successor is ``None`` here (``handoff_successor_malformed``)."""
+    if not isinstance(value, str) or _AGENT_ID_RE.fullmatch(value) is None:
+        return None
+    return UUID(value)
 
 
 def validate_session_id(
@@ -528,6 +1102,17 @@ class CoordinatorHTTPServer:
         # constructed directly in tests.
         self.cold_start_duration_ms: float = 0.0
 
+        # #187 — the stable-grant sweep thresholds, in seconds, that the
+        # lifecycle winner path started this coordinator's sweep with. Set
+        # before serve_in_thread(), so no handler sees them change. None when
+        # no sweep enforces them: the server was constructed directly (tests,
+        # the corpus harness), or lifecycle ran no sweep or one whose passes
+        # all fail (a threshold or the transient timeout below 1). Lifecycle
+        # hands over plain values; this module never imports lifecycle (it
+        # imports this one).
+        self.grant_heartbeat_timeout_sec: int | None = None
+        self.grant_max_hold_sec: int | None = None
+
         # KTD-J (Unit 8) — telemetry counters. CACHE, not persistent
         # state: reset to 0 on coordinator respawn (do NOT persist in
         # state.db per the plan rationale). Plain ints — CPython's
@@ -550,6 +1135,19 @@ class CoordinatorHTTPServer:
             "policy_track_total": 0,
             "policy_untrack_total": 0,
             "status_total": 0,
+            # Registered in _ENDPOINT_COUNTER_NAMES *and* here, in one edit:
+            # increment_endpoint_counter ignores an unknown name by contract,
+            # so a route named there but missing here is counted nowhere while
+            # still looking wired up at both call sites.
+            "effect_fence_total": 0,
+            # Same rule as effect_fence_total above: registered in
+            # _ENDPOINT_COUNTER_NAMES too, or the mint is counted nowhere.
+            "principal_claim_total": 0,
+            # The four grant-handoff verbs (#185), on the same rule.
+            "handoff_transfer_total": 0,
+            "handoff_accept_total": 0,
+            "handoff_decline_total": 0,
+            "handoff_withdraw_total": 0,
         }
         self._endpoint_counters_lock = threading.Lock()
 
@@ -603,12 +1201,51 @@ class CoordinatorHTTPServer:
         # plugin path is fail-open); this counter sizes the
         # false-positive rate before any strict-mode deny knob is added.
         self._fresh_shared_hash_mismatch_total: int = 0
+        # effect_fence_holds_total: how often the /hooks/effect-fence verdict
+        # answered HOLD. The denominator is the endpoint counter
+        # ``effect_fence_total``; the ratio is what tells an operator whether
+        # their agents are gating on state the coordinator can confirm.
+        self._effect_fence_holds_total: int = 0
+        # sweep_reclaims_total / sweep_reclaims_by_trigger (#195): how many M/E
+        # grants the stable-grant sweep pulled, and why. Answers "did the sweep
+        # pull anything" without the operator tier, and without being the
+        # reclaimed session (the only reader of the cause until #195). Bumped by
+        # the sweep loop (lifecycle._sweep_stable_grants) once per reclaim, AFTER
+        # the registry hold is released. Process-local like every counter here:
+        # it resets on respawn, so the durable answer for one pair is the
+        # registry slot the operator tier reads, not this count. Keys are the
+        # stable sweep's two triggers, seeded at 0 so a dashboard sees a stable
+        # shape before the first reclaim.
+        self._sweep_reclaims_total: int = 0
+        self._sweep_reclaims_by_trigger: dict[str, int] = {
+            trigger: 0 for trigger in _SWEEP_RECLAIM_TRIGGERS
+        }
+        # caller_principal_absent_total: requests admitted without a caller
+        # principal — on an accept-class route, or on a require-class route for
+        # an identity nobody claimed (plan U6 / KTD4). A LOCAL diagnostic an
+        # operator reads on one workspace — "some caller here is not yet sending
+        # a principal". Never a trigger for making a route require one: like
+        # every counter here it is process-local, resets on respawn and on idle
+        # shutdown, so a zero proves nothing about the callers out there.
+        self._caller_principal_absent_total: int = 0
+        # caller_principal_refused_total: requests a route REFUSED for their
+        # caller principal — an absent one naming a bound identity, or a
+        # foreign one on any class (plan U6). The operator-visible trace of a
+        # session being refused: the endpoint counters count attempts, so a
+        # refused request looks like any other there. Process-local like
+        # every counter here.
+        self._caller_principal_refused_total: int = 0
         # Survivor #6 v1 (R2) observability: how often a SHARED-holder hash
         # mismatch on a strict path was SUPPRESSED as the benign
         # commit→disk-write lag (this session's own recent commit) rather than
         # denied as a foreign edit. Pairs with strict_mode_denials_total to let
         # an operator size the lag-window (5s) false-negative exposure.
         self._shared_foreign_lag_suppressed_total: int = 0
+        # handoff_giver_denials_total (#185): denies to the giver of a live
+        # handoff, on pre-edit or on pre-bash for a shell write. Its own
+        # counter, not the strict-mode one: the deny is not a stale-view deny
+        # and fires in warn mode too.
+        self._handoff_giver_denials_total: int = 0
         # Per-(session, path) "recent strict-deny" memory for route-around
         # detection. Bounded by the registry's own (session, artifact)
         # cardinality at worst — same upper bound as _stale_warned_pairs.
@@ -676,7 +1313,10 @@ class CoordinatorHTTPServer:
         if self._serve_thread is not None:
             return
         self._serve_thread = threading.Thread(
-            target=self._server.serve_forever, name="coord-http", daemon=True
+            target=self._server.serve_forever,
+            kwargs={"poll_interval": SERVE_POLL_INTERVAL_SEC},
+            name="coord-http",
+            daemon=True,
         )
         self._serve_thread.start()
 
@@ -851,6 +1491,32 @@ class CoordinatorHTTPServer:
                 )
         return agent_id
 
+    def session_identity_for(self, agent_id: UUID) -> UUID | None:
+        """The session-level identity of ``agent_id`` while the live name map
+        holds it -- itself for a session-level id, its session's for a
+        subagent's or a volume incarnation's composite -- else ``None``.
+
+        How a transfer normalises a successor named by a composite id (#185:
+        the parties to a handoff are sessions). Read back from the display
+        name :meth:`register_session` wrote (:func:`session_to_agent_name`'s
+        scheme, the SB-25 source of truth :meth:`agents_for_session` also
+        reads), and kept only when that name re-derives ``agent_id``, so a
+        name written any other way never resolves. Process-local like the map: after a restart a composite id
+        is unknown here even while it still holds a grant row, and a
+        session-level id stays known only through its principal binding. The
+        session id itself never leaves this method."""
+        name = self.agent_name_for(agent_id)
+        if name is None or not name.startswith(_AGENT_NAME_PREFIX):
+            return None
+        session_id, _, subagent_id = name[len(_AGENT_NAME_PREFIX):].partition(
+            _SUBAGENT_NAME_INFIX
+        )
+        if validate_session_id(session_id) is not None:
+            return None
+        if session_to_agent_id(session_id, subagent_id or None) != agent_id:
+            return None
+        return caller_principal_identity(session_id)
+
     def agent_names_snapshot(self) -> list[tuple[UUID, str]]:
         """R10 (Unit 6): return a stable list snapshot of (agent_id, name)
         pairs taken under the lock — callers iterate over the snapshot
@@ -879,7 +1545,7 @@ class CoordinatorHTTPServer:
         (A3 validation), so one session's prefix can never be a prefix of
         another's. Restart-empty maps are an accepted degradation (KTD5):
         subagents re-enter on their next hook call."""
-        subagent_prefix = f"claude-session-{session_id}:subagent-"
+        subagent_prefix = f"{_AGENT_NAME_PREFIX}{session_id}{_SUBAGENT_NAME_INFIX}"
         with self._agent_names_lock:
             subagents = [
                 (agent_id, name[len(subagent_prefix):])
@@ -979,6 +1645,52 @@ class CoordinatorHTTPServer:
         :meth:`increment_strict_mode_denial`."""
         self._fresh_shared_hash_mismatch_total += 1
 
+    def increment_effect_fence_hold(self) -> None:
+        """Bumped when ``/hooks/effect-fence`` answers HOLD rather than
+        proceed. Counts VERDICTS THE HANDLER REACHED: a watchdog-degraded hold
+        is returned by ``_run_or_degrade`` after the work body was abandoned
+        and is counted by ``watchdog_timeouts_total`` instead, and a 400 never
+        reached a verdict at all.
+
+        Paired with ``effect_fence_total`` it is the operator's hold RATE — how
+        often the fence actually stopped something. A counter that also ticked
+        on a proceed would report a healthy workspace and a wedged one
+        identically. Same GIL-atomicity contract as
+        :meth:`increment_strict_mode_denial`."""
+        self._effect_fence_holds_total += 1
+
+    def record_sweep_reclaim(self, trigger: str) -> None:
+        """#195: count one stable-grant reclaim by its trigger
+        (``reclaim_heartbeat`` / ``reclaim_max_hold``). Called by the sweep
+        loop after ``enforce_stable_grant_timeouts`` returns, never from inside
+        its per-pair registry hold. A trigger outside the seeded pair is still
+        counted (in the total and under its own key) rather than dropped: a
+        reclaim the counter cannot name is still a reclaim."""
+        with self._reliability_counter_lock:
+            self._sweep_reclaims_total += 1
+            self._sweep_reclaims_by_trigger[trigger] = (
+                self._sweep_reclaims_by_trigger.get(trigger, 0) + 1
+            )
+
+    def increment_caller_principal_absent(self) -> None:
+        """Bumped when a route ADMITS a request that names an identity but
+        presents no caller principal (plan U6): any accept-class route, and a
+        require-class route naming an identity nobody has claimed (a client
+        that predates the principal). A refusal is not counted here (it
+        answered 400 and is counted by :meth:`increment_caller_principal_refused`),
+        nor is a foreign principal (refused on every class). A local
+        diagnostic, not a flip trigger (KTD4). Same GIL-atomicity contract as
+        :meth:`increment_strict_mode_denial`."""
+        self._caller_principal_absent_total += 1
+
+    def increment_caller_principal_refused(self) -> None:
+        """Bumped when a route REFUSES a request for its caller principal:
+        absent for a bound identity, or foreign on any class (plan U6). Never
+        bumped by an admission. Surfaced at every /status tier beside
+        ``caller_principal_absent_total``. Same GIL-atomicity contract as
+        :meth:`increment_strict_mode_denial`."""
+        self._caller_principal_refused_total += 1
+
     def increment_shared_foreign_lag_suppressed(self) -> None:
         """Survivor #6 v1 (R2): bumped when a SHARED-holder hash mismatch on a
         strict path is suppressed as the benign commit→disk-write lag (this
@@ -987,11 +1699,19 @@ class CoordinatorHTTPServer:
         :meth:`increment_strict_mode_denial`."""
         self._shared_foreign_lag_suppressed_total += 1
 
+    def increment_handoff_giver_denial(self) -> None:
+        """#185: bumped once per deny to the giver of a live handoff, on
+        pre-edit or on pre-bash for a shell write. The strict-mode denial and
+        stale-warning counters are not bumped for it. Same GIL-atomicity contract as
+        :meth:`increment_strict_mode_denial`."""
+        self._handoff_giver_denials_total += 1
+
     def record_strict_deny(self, session_id: str, path: str) -> None:
         """v0.2 Unit 4 route-around tracker — store the (session, path)
         pair with monotonic timestamp so a subsequent pre-bash deny on
         the same pair within STRICT_DENY_ROUTE_AROUND_WINDOW_SEC can be
-        recognized as a route-around."""
+        recognized as a route-around. #185: the giver's pre-edit deny is
+        recorded here too, so a shell read routing around it is counted."""
         with self._recent_strict_denies_lock:
             self._recent_strict_denies[(session_id, path)] = time.monotonic()
 
@@ -1063,6 +1783,12 @@ class CoordinatorHTTPServer:
         ``_handle_status`` uses this instead of reaching into private attrs,
         giving a single source-of-truth for the counter set.
         """
+        # The sweep bumps the reclaim total and its by-trigger entry under one
+        # lock hold; reading them under that hold too keeps the pair
+        # consistent, so a total never counts a reclaim its map does not.
+        with self._reliability_counter_lock:
+            sweep_reclaims_total = self._sweep_reclaims_total
+            sweep_reclaims_by_trigger = dict(self._sweep_reclaims_by_trigger)
         return {
             "watchdog_timeouts_total": self._watchdog_timeouts_total,
             "watchdog_queue_overflows_total": self._watchdog_queue_overflows_total,
@@ -1083,6 +1809,12 @@ class CoordinatorHTTPServer:
             "stale_warning_reread_total": self._stale_warning_reread_total,
             "fresh_shared_hash_mismatch_total": self._fresh_shared_hash_mismatch_total,
             "shared_foreign_lag_suppressed_total": self._shared_foreign_lag_suppressed_total,
+            "handoff_giver_denials_total": self._handoff_giver_denials_total,
+            "effect_fence_holds_total": self._effect_fence_holds_total,
+            "sweep_reclaims_total": sweep_reclaims_total,
+            "sweep_reclaims_by_trigger": sweep_reclaims_by_trigger,
+            "caller_principal_absent_total": self._caller_principal_absent_total,
+            "caller_principal_refused_total": self._caller_principal_refused_total,
             "auth_401_total": self._auth_401_total,
         }
 
@@ -1147,10 +1879,20 @@ class CoordinatorHTTPServer:
             self._compact_pending.discard(session_id)
 
     def run_with_watchdog(
-        self, fn: Callable[[], Any], abort: threading.Event | None = None
+        self,
+        fn: Callable[[], Any],
+        abort: threading.Event | None = None,
+        *,
+        deadline: float | None = None,
     ) -> Any:
         """Run a callable under the 4s handler-side timeout. Raises
         :class:`FuturesTimeout` on timeout (caller decides degradation).
+
+        ``deadline`` is the request's watchdog deadline when something earlier
+        in the request already started it (a ``time.monotonic()`` instant, see
+        :func:`_watchdog_deadline`): ``fn`` then gets only the time left, and
+        none at all — it is not submitted — once the deadline has passed.
+        ``None`` gives ``fn`` the whole ``HANDLER_TIMEOUT_SEC``.
 
         A6 mitigation: when the future times out, ``cancel_futures`` is not
         set so the underlying work keeps running in the pool. If the caller
@@ -1167,14 +1909,32 @@ class CoordinatorHTTPServer:
         cleanly bumps ``watchdog_late_aborts_total`` so operators can see the
         mitigation working.
         """
+        timeout = HANDLER_TIMEOUT_SEC if deadline is None else deadline - time.monotonic()
+        if timeout <= 0:
+            raise FuturesTimeout()
         future = self._watchdog.submit(fn)
         try:
-            return future.result(timeout=HANDLER_TIMEOUT_SEC)
+            return future.result(timeout=timeout)
         except FuturesTimeout:
             if abort is not None:
                 abort.set()
             future.add_done_callback(self._on_watchdog_future_done_after_timeout)
             raise
+
+    def run_admission_lookup(self, fn: Callable[[], Any], *, deadline: float) -> Any:
+        """Run the caller-principal gate's durable-store lookup in the watchdog
+        pool, waiting until ``deadline`` (a ``time.monotonic()`` instant) at
+        most. Raises :class:`FuturesTimeout` when it is not done by then, and
+        re-raises whatever ``fn`` raised — a refusal included. Pre-bash's giver
+        lookup (:func:`_deny_giver_shell_write`) runs here too, for the same
+        reason: it only reads.
+
+        Unlike :meth:`run_with_watchdog` there is no abort and no late-completion
+        accounting: the lookup only READS, so a late one lands no coordinator
+        state (it can only fill the service's binding cache), and counting it as
+        a late completion would report a phantom mutation that never happened."""
+        future = self._watchdog.submit(fn)
+        return future.result(timeout=max(0.0, deadline - time.monotonic()))
 
     def _on_watchdog_future_done_after_timeout(self, future: Any) -> None:
         """Callback wired by :meth:`run_with_watchdog` when its future
@@ -1411,6 +2171,14 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
                     counter_name = _ENDPOINT_COUNTER_NAMES.get((method, route_path))
                     if counter_name is not None:
                         coordinator.increment_endpoint_counter(counter_name)
+                    # The route this request dispatched to, for the handler's
+                    # caller-principal posture lookup (_admit_caller).
+                    self._route_key = (method, route_path)
+                    # No watchdog deadline yet: the caller-principal gate starts
+                    # one only when it has to read the registry, and pre-bash's
+                    # giver lookup only when the command writes a tracked path
+                    # (a lookup that times out puts the deadline back).
+                    self._watchdog_deadline = None
                     handler(self, coordinator)
                 except Exception as exc:
                     logger.exception("unhandled error in handler for %s %s", method, route_path)
@@ -1552,6 +2320,8 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         req._json(400, {"error": err})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
     # Tracked-policy gate: untracked paths fast-path to {fresh} without
     # touching SQLite (R8 false-positive budget protection). SB-10 U4
     # (KTD6): the advisory compact-pending peek — a process-local dict
@@ -1564,6 +2334,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
+    caller = caller_principal_identity(session_id)
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -1619,11 +2390,35 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         owner_generation = artifact_pair[1] if artifact_pair else None
         agent_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
 
-        if agent_state is not None and agent_state != MESIState.INVALID:
+        # ONE clock read for the whole decision, handed IN rather than taken
+        # inside, so the lag gate and every timestamp stamped from this verdict
+        # share an instant — no intra-block skew, and the deny reason stays
+        # stable within the call (KTD-P).
+        _now = _payloads.now_unix()
+        # THE classification, not a second copy of it. Everything below keys off
+        # a field of this value; the mutations the handler owes each branch —
+        # the two hash-mismatch counters, the strict-deny emission, the SHARED
+        # re-grant, the stale-warned marker and the notice drain — stay here,
+        # because the verdict must stay a pure query for the surfaces that ask
+        # it WITHOUT granting anything (``/hooks/effect-fence``). The handler
+        # decides what to DO; the decision only says which way.
+        decision = decide_tracked_read(
+            coordinator,
+            path=path,
+            artifact_id=artifact_id,
+            agent_id=agent_id,
+            artifact=artifact,
+            owner_generation=owner_generation,
+            agent_state=agent_state,
+            caller_content_hash=content_hash,
+            now_unix=_now,
+        )
+
+        if decision.holds_valid_grant:
             # Reader has a valid grant on the current version. Unit 6:
             # include the version so an OCC writer can source
             # ``expected_version`` (additive — status clients ignore it).
-            fresh: dict[str, Any] = {"status": "fresh", "version": artifact.version}
+            fresh: dict[str, Any] = {"status": "fresh", "version": decision.version}
             # Defense-in-depth (PR #108 follow-up): a SHARED holder whose
             # supplied disk hash mismatches the recorded content is
             # anomalous — a peer commit would have left it INVALID — so a
@@ -1634,14 +2429,13 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # allow — the plugin path is fail-open by design; a
             # strict-mode deny knob waits on this counter proving a
             # ~zero false-positive rate. Sentinel recorded hashes carry
-            # no content claim and must not fire ("" seeds surface as
-            # None; the truthiness check covers them).
-            if (
-                content_hash
-                and artifact.content_hash
-                and artifact.content_hash != _F_SENTINEL_CONTENT_HASH
-                and content_hash != artifact.content_hash
-            ):
+            # no content claim and must not fire — ``fresh_hash_differs``
+            # is the arm-specific predicate that already excludes them
+            # (``None``, ``""`` and the all-``f`` launch-gate sentinel);
+            # the STALE arm's ``stale_hash_differs`` deliberately keeps
+            # them in, so reading either field on both arms would move the
+            # strict-deny gate.
+            if decision.fresh_hash_differs:
                 coordinator.increment_fresh_shared_hash_mismatch()
                 # Survivor #6 v1: promote the SHARED-holder mismatch from a
                 # fail-open allow to a strict-mode deny. A still-SHARED reader
@@ -1651,84 +2445,85 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 # lag, R2 — suppress) or a foreign out-of-band edit (deny).
                 # reacquire() forces the fresh re-read; KTD-T leaves the grant
                 # untouched so retries re-deny byte-stably (no INVALID needed).
-                if coordinator.policy.is_strict_mode(path):
-                    # Capture one clock read for the whole deny decision so the
-                    # lag gate and every summary timestamp share an instant —
-                    # no intra-block skew, and the deny reason stays stable
-                    # within the call (KTD-P).
-                    _now = _payloads.now_unix()
-                    if _is_recent_self_commit_lag(
-                        coordinator, artifact_id, agent_id, now_unix=_now,
-                    ):
-                        # Benign commit→disk-write lag (R2): count the
-                        # suppression so operators can size the lag-window
-                        # false-negative rate, then fall through to the
-                        # warn-mode hash_differs allow.
-                        coordinator.increment_shared_foreign_lag_suppressed()
-                    else:
-                        shared_summary: _payloads.StaleSummary = {
-                            "path": path,
-                            "current_version": artifact.version,
-                            # A SHARED holder was granted on the current
-                            # version; that is the version it last saw.
-                            "prior_version_seen_by_session": artifact.version,
-                            "last_writer_session_id": (
-                                _last_writer_for(coordinator, artifact_id)
-                                or "<unknown>"
-                            ),
-                            "last_writer_at_unix_ts": (
-                                _last_writer_unix_ts(coordinator, artifact_id)
-                                or _now
-                            ),
-                            "warning_generated_at_unix_ts": _now,
-                            "hash_differs": True,
-                        }
-                        return _emit_pre_read_strict_deny(
-                            coordinator,
-                            agent_id=agent_id,
-                            session_id=session_id,
-                            artifact_id=artifact_id,
-                            path=path,
-                            summary=shared_summary,
-                            source="pre_read_shared_hash_deny",
-                        )
+                # Warn mode reaches neither field: the verdict consults the
+                # strict-mode gate before either can be set.
+                if decision.commit_lag_suppressed:
+                    # Benign commit→disk-write lag (R2): count the
+                    # suppression so operators can size the lag-window
+                    # false-negative rate, then fall through to the
+                    # warn-mode hash_differs allow.
+                    coordinator.increment_shared_foreign_lag_suppressed()
+                elif decision.outcome == "denied":
+                    shared_summary: _payloads.StaleSummary = {
+                        "path": path,
+                        "current_version": decision.version,
+                        # A SHARED holder was granted on the current
+                        # version; that is the version it last saw — the
+                        # verdict resolved that per-arm already.
+                        "prior_version_seen_by_session": decision.prior_version_seen,
+                        "last_writer_session_id": (
+                            _last_writer_for(coordinator, artifact_id)
+                            or "<unknown>"
+                        ),
+                        "last_writer_at_unix_ts": (
+                            _last_writer_unix_ts(coordinator, artifact_id)
+                            or _now
+                        ),
+                        "warning_generated_at_unix_ts": _now,
+                        # Flat True, not a re-read of the predicate: this arm
+                        # denies only ON a mismatch, so the enclosing branch
+                        # has already established it.
+                        "hash_differs": True,
+                    }
+                    return _emit_pre_read_strict_deny(
+                        coordinator,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        artifact_id=artifact_id,
+                        path=path,
+                        summary=shared_summary,
+                        source="pre_read_shared_hash_deny",
+                    )
                 fresh["hash_differs"] = True
-            if want_generation and owner_generation is not None:
-                fresh["owner_generation"] = owner_generation
+            # The read is allowed. A SHARED grant that a denied Bash / Grep
+            # command re-armed certifies no read, so this one is the read to
+            # record. A verify_only fence read discards its bytes and must not.
+            if not verify_only and agent_state == MESIState.SHARED:
+                _record_held_read(
+                    coordinator, artifact_id, agent_id, trigger="held_read", tick=now,
+                )
+            if want_generation and decision.owner_generation is not None:
+                fresh["owner_generation"] = decision.owner_generation
             return fresh
 
         # Stale: either first time this session sees the artifact OR they
-        # were invalidated by a peer commit.
-        prior_seen = None
-        if agent_state == MESIState.INVALID:
-            prior_seen = artifact.version - 1 if artifact.version > 0 else 0
-
-        # Compute hash_differs against the caller's last-observed hash, if any.
-        # Per KTD-9 we track filesystem-state; a content_hash from the caller's
-        # current Read attempt could differ from what's persisted.
-        hash_differs = bool(
-            content_hash
-            and artifact.content_hash
-            and content_hash != artifact.content_hash
-        )
-
-        last_writer_id = _last_writer_for(coordinator, artifact_id)
+        # were invalidated by a peer commit. ``prior_version_seen`` is the
+        # arm-resolved value (one below current for an INVALIDated session,
+        # ``None`` for one with no prior grant), and ``stale_hash_differs`` is
+        # this arm's predicate — the caller's bytes against whatever the
+        # registry recorded, no-claim seeds INCLUDED, which is exactly how the
+        # launch-gate scenarios reach their deny.
+        #
         # last_writer_at_unix_ts is REAL — from the artifact's updated_at
         # in the registry (semantically honest, A5). warning_generated_at
         # is now() to guarantee per-invocation variation (A5 + structural
         # defense for v0.2 strict-mode flip).
+        last_writer_id = _last_writer_for(coordinator, artifact_id)
         last_writer_ts = _last_writer_unix_ts(coordinator, artifact_id) or _payloads.now_unix()
         summary: _payloads.StaleSummary = {
             "path": path,
-            "current_version": artifact.version,
-            "prior_version_seen_by_session": prior_seen,
+            "current_version": decision.version,
+            "prior_version_seen_by_session": decision.prior_version_seen,
             "last_writer_session_id": last_writer_id or "<unknown>",
             "last_writer_at_unix_ts": last_writer_ts,
             "warning_generated_at_unix_ts": _payloads.now_unix(),
-            "hash_differs": hash_differs,
+            "hash_differs": decision.stale_hash_differs,
         }
 
-        # v0.2 KTD-O / KTD-P: strict-mode deny branch.
+        # v0.2 KTD-O / KTD-P: strict-mode deny branch. The gate itself lives in
+        # ``decide_tracked_read`` (the fence route answers off the same rule);
+        # what stays here is the EMISSION, which records the deny, bumps the
+        # counter and writes the audit row.
         #
         # Gate (refined 2026-05-24 per launch-gate finding): strict-deny
         # fires when the artifact is in strict mode AND the session
@@ -1776,13 +2571,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # attempts and routes to alternative behavior; the deny IS the
         # signal. Re-granting would let the second retry get fresh and
         # silently downgrade the operator's hard guardrail.
-        if (
-            coordinator.policy.is_strict_mode(path)
-            and (
-                agent_state == MESIState.INVALID
-                or (agent_state is None and hash_differs)
-            )
-        ):
+        if decision.outcome == "denied":
             return _emit_pre_read_strict_deny(
                 coordinator,
                 agent_id=agent_id,
@@ -1807,13 +2596,14 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 trigger="post_stale_read", tick=now, content_hash=content_hash,
             )
         resp = _payloads.build_stale_response(summary)
-        if want_generation and owner_generation is not None:
+        if want_generation and decision.owner_generation is not None:
             # The effect gate re-validates through THIS path after a sweep
             # reclaim (the zombie's re-read is warn-stale with the version
             # unchanged) — the attached generation is what lets it see the epoch
-            # moved even though the version did not. It shares the snapshot that
-            # produced summary.current_version, so the pair cannot disagree.
-            resp["owner_generation"] = owner_generation
+            # moved even though the version did not. It rides the SAME snapshot
+            # the verdict classified from, which is what produced
+            # summary.current_version, so the pair cannot disagree.
+            resp["owner_generation"] = decision.owner_generation
         if not verify_only:
             # KTD-J (Unit 8): bump the stale-warning emission counter +
             # mark the pair so a follow-up pre-read counts as a re-read. A
@@ -1826,7 +2616,9 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # alongside the stale-read warning. A verify_only read must NOT pop
             # them — the fence discards the body, so a destructive pop here
             # would drop the notice the agent needs on its next real read.
-            notices = coordinator.registry.pop_pending_notices(agent_id)
+            notices = coordinator.registry.pop_pending_notices(
+                agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+            )
             if notices:
                 notice_text = _build_preemption_text(coordinator, notices)
                 resp["hookSpecificOutput"]["additionalContext"] = (
@@ -1855,7 +2647,9 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             and result.get("status") == "fresh"
             and "hookSpecificOutput" not in result
         ):
-            notices = coordinator.registry.pop_pending_notices(agent_id)
+            notices = coordinator.registry.pop_pending_notices(
+                agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+            )
             if notices:
                 notice_text = _build_preemption_text(coordinator, notices)
                 # Spread work()'s payload so additive fresh-path keys
@@ -1868,6 +2662,11 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                         additional_context=notice_text,
                     ),
                 }
+        # #185: only while the path has a transfer record, the structured
+        # handoff key on every arm but a strict deny (whose bytes stay the
+        # corpus's), and on an admit the handoff prose in the context-only
+        # envelope, after the notices.
+        result = _attach_hook_handoff(coordinator, result, path=path, caller=caller)
         # SB-10 U4 (KTD6): the deferred re-grounding seam sits AFTER the
         # deny decision inside work() — a strict deny returns untouched and
         # keeps the flag pending — and AFTER the notice drain above, so
@@ -1887,6 +2686,441 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     _run_or_degrade(req, coordinator, work_with_notice_surfacing, abort=abort)
 
 
+# ----------------------------------------------------------------------
+# The effect fence, as a route
+# ----------------------------------------------------------------------
+#
+# "May this irreversible effect still fire, and if not, WHY" asked over HTTP,
+# for ONE artifact, from the five things only the caller knows: which session
+# it is, which artifact it named, the version and the ownership generation it
+# captured at read time, and the content hash of the bytes it actually holds.
+#
+# ON A ROUTE OF ITS OWN, not a flag on ``/hooks/pre-read``: that response
+# already varies by freshness, and hanging a safety verdict off a shape with
+# two forms invites the same misreading that produced the problem. A fence
+# answer has exactly two forms and one vocabulary.
+#
+# THE LEG THIS SURFACE EXISTS FOR. The in-process wrapper
+# (``adapters.effect_gate``) passes ``content_claim_present=True``
+# unconditionally and says so at the site: the pre-read WIRE carries
+# ``hash_differs`` -- a comparison -- and never the coordinator's RECORDED
+# hash, so "the claim matches" and "there is no claim at all" arrive there as
+# one value. This route reads the registry, so it can tell them apart, and
+# ``coordinator_holds_content_claim`` is what it asks. Passing ``True`` here
+# would silently reproduce the very admit this route was built to close, on
+# the one surface able to close it.
+#
+# PURE QUERY (R7). Nothing below grants, re-grants, registers, heartbeats,
+# marks, pops or records. The pre-read path does all six around the same
+# decision -- it registers the session BEFORE its work body (and session-start
+# reads that map to decide whether a session was ever seen), records a
+# heartbeat as the work body's first statement (the sweep reclaims grants on
+# heartbeat staleness), re-grants SHARED on the stale arm, fires five
+# mutations on a strict deny, and consumes the pending re-grounding flag on
+# its untracked fast path. A verdict that did any of it would heal exactly the
+# grant loss it is being asked about, turning a level-triggered HOLD into an
+# edge-triggered one. This codebase has recorded three instances of a read on
+# the safety path healing what it checks; this comment is here so the fence
+# does not become the fourth.
+
+_EFFECT_FENCE_VERDICT_PROCEED = "proceed"
+"""The ONE affirmative answer: every leg of the fence confirmed."""
+
+_EFFECT_FENCE_VERDICT_HOLD = "hold"
+"""The other answer. Always carries ``reason``, drawn from
+:data:`~ccs.core.exceptions.HOLD_REASONS`."""
+
+_EFFECT_FENCE_VERSION_FIELD = "expected_version"
+_EFFECT_FENCE_GENERATION_FIELD = "expected_generation"
+_EFFECT_FENCE_HASH_FIELD = "content_hash"
+
+_EFFECT_FENCE_DEGRADED_RESPONSE: dict = {
+    "verdict": _EFFECT_FENCE_VERDICT_HOLD,
+    "reason": HOLD_VERSION_UNCONFIRMED,
+    "degraded": True,
+    "held_by": "watchdog_timeout",
+}
+"""Watchdog-timeout envelope for ``/hooks/effect-fence``.
+
+``_run_or_degrade``'s default is :data:`_DEFAULT_DEGRADED_RESPONSE` --
+``{"status": "fresh", "degraded": true, ...}``, a PROCEED shape. That is the
+right answer for a pre-read whose contract is fresh/stale and a catastrophic
+one for a safety verdict: a handler that timed out ran no comparison at all,
+so "fresh" would be a claim about state nothing looked at. The precedent is
+:data:`_OCC_DEGRADED_RESPONSE`, which reads as failure for the same reason.
+
+``version_unconfirmed`` is the honest reason rather than a new vocabulary
+entry: ``FenceComparands`` already documents version ``0`` as the "could not
+resolve" sentinel produced by *a degraded or pre-fence coordinator*, and a
+watchdog timeout is precisely a coordinator that resolved nothing."""
+
+_EFFECT_FENCE_INTERNAL_HOLD_RESPONSE: dict = {
+    "verdict": _EFFECT_FENCE_VERDICT_HOLD,
+    "reason": HOLD_VERSION_UNCONFIRMED,
+    "degraded": True,
+    "held_by": "handler_error",
+}
+"""Handler-exception envelope for ``/hooks/effect-fence``.
+
+``_run_or_degrade``'s OTHER non-normal arm turns a handler exception into HTTP
+200 ``{"ok": false, "reason": "internal: <Type>"}`` -- a shape carrying no
+verdict and a ``reason`` from no published vocabulary, and one that NO
+``degraded_response`` argument overrides. A client branching on ``verdict``
+reads it as neither answer. The route therefore catches inside its own work
+body and returns this, so the exception arm is a hold like every other
+unconfirmed state. ``held_by`` is what distinguishes the two degraded arms for
+an operator; a client needs only ``verdict``."""
+
+
+def _read_expected_version(body: dict) -> tuple[int | None, str | None]:
+    """Parse ``expected_version``. Returns ``(value, error)``.
+
+    The comparand is parsed as an integer and NEVER coerced: no ``or 0``, no
+    ``int(x or 0)``. A string ``"2"`` silently becoming ``2`` is a comparand
+    the caller never captured being compared as though it had been, and ``0``
+    is the "could not resolve" sentinel -- manufacturing one turns "I do not
+    know" into a value the branch table then compares.
+
+    ``bool`` is excluded explicitly because it IS an ``int`` subclass:
+    ``isinstance(True, int)`` is ``True``, so a bare type check accepts
+    ``True`` as version 1.
+    """
+    if _EFFECT_FENCE_VERSION_FIELD not in body:
+        return None, f"missing {_EFFECT_FENCE_VERSION_FIELD}"
+    raw = body[_EFFECT_FENCE_VERSION_FIELD]
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None, f"{_EFFECT_FENCE_VERSION_FIELD} must be an integer"
+    return raw, None
+
+
+def _read_expected_generation(body: dict) -> tuple[int | None, str | None]:
+    """Parse ``expected_generation``. Returns ``(value, error)``.
+
+    OMITTED and NULL are deliberately different answers, and the distinction is
+    the whole point of the field:
+
+    - the key ABSENT is a client that never captured the comparand. A hold
+      would invite a retry, and no number of identical retries can supply a
+      value the caller does not have -- so it is a 400 naming the field.
+    - the key present as ``null`` is a captured FACT: "the coordinator I read
+      from confirmed no generation" (one too old to report them, a strict deny,
+      a degraded read). That is representable in the fence vocabulary, so it
+      flows through as the sentinel and lands on ``generation_unconfirmed``.
+
+    ``None`` is never coerced to ``0``, which is a REAL generation.
+    """
+    if _EFFECT_FENCE_GENERATION_FIELD not in body:
+        return None, f"missing {_EFFECT_FENCE_GENERATION_FIELD}"
+    raw = body[_EFFECT_FENCE_GENERATION_FIELD]
+    if raw is None:
+        return None, None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None, f"{_EFFECT_FENCE_GENERATION_FIELD} must be an integer or null"
+    return raw, None
+
+
+def _effect_fence_no_record(
+    expected_version: int, expected_generation: int | None,
+) -> FenceComparands:
+    """Comparands for "the coordinator holds no record of this artifact".
+
+    Three ways to get here, one answer: the path is not tracked, it is tracked
+    but was never observed, or the row vanished between the lookup and the
+    read. ``current_version=None`` is the VANISH sentinel, so the branch table
+    answers ``input_vanished`` on its first leg.
+
+    Reached through the same classification as every other state rather than by
+    returning a literal reason: the untracked case is exactly where pre-read
+    answers with a fresh SHAPE carrying no version -- which a client reads as
+    the zero sentinel -- and where the handler's first-observation branch
+    answers by MUTATING (registering the row, seeding v1, granting SHARED). A
+    verdict may do neither, so it holds on the absence instead of minting the
+    record it was asked to check.
+    """
+    return FenceComparands(
+        expected_version=expected_version,
+        current_version=None,
+        expected_generation=expected_generation,
+        # No row means no generation and no claim; the read was not refused
+        # (there was nothing to refuse) and no grant stood.
+        current_generation=None,
+        read_refused=False,
+        grant_did_not_stand=True,
+        content_claim_present=False,
+    )
+
+
+def _effect_fence_comparands(
+    coordinator: CoordinatorHTTPServer,
+    *,
+    path: str,
+    agent_id: UUID,
+    expected_version: int,
+    expected_generation: int | None,
+    caller_content_hash: str,
+    now_unix: float,
+) -> FenceComparands:
+    """Assemble the seven fence inputs from the registry and the request.
+
+    Every registry call here is a READ through a non-mutating accessor:
+    ``lookup_artifact_id_by_name`` (never ``resolve_or_register``, which mints
+    a row), the pair-atomic ``get_artifact_and_generation``, and
+    ``get_agent_state``. ``decide_tracked_read`` is the extracted pre-read
+    classification with the handler's mutations left behind.
+    """
+    # The untracked exit is HELD, not fast-pathed. pre-read's twin returns
+    # ``{"status": "fresh"}`` with no version here; copying that would turn
+    # "the coordinator knows nothing about this file" into "the coordinator
+    # agrees nothing moved".
+    if not coordinator.policy.is_tracked(path):
+        return _effect_fence_no_record(expected_version, expected_generation)
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    if artifact_id is None:
+        return _effect_fence_no_record(expected_version, expected_generation)
+    # ONE pair-atomic read backs the version, the canonical content hash and
+    # the generation reported beside them -- reading them separately is what
+    # lets a peer commit slip between the two and pair a fresh version with
+    # bytes it never described.
+    pair = coordinator.registry.get_artifact_and_generation(artifact_id)
+    if pair is None:
+        return _effect_fence_no_record(expected_version, expected_generation)
+    artifact, owner_generation = pair
+
+    decision = decide_tracked_read(
+        coordinator,
+        path=path,
+        artifact_id=artifact_id,
+        agent_id=agent_id,
+        artifact=artifact,
+        owner_generation=owner_generation,
+        agent_state=coordinator.registry.get_agent_state(artifact_id, agent_id),
+        caller_content_hash=caller_content_hash,
+        # ONE instant for the whole request: the lag gate inside the verdict
+        # and anything else stamped from it must share a clock read (KTD-P).
+        now_unix=now_unix,
+    )
+
+    # The mismatch the coordinator WOULD HAVE REPORTED on the wire for this
+    # read, which is what the demotion rule is defined against: the fresh shape
+    # carries ``fresh_hash_differs`` (no-claim recorded hashes excluded, so a
+    # still-SHARED holder is never denied against content the coordinator never
+    # claimed) and the stale shape carries ``stale_hash_differs`` (they are
+    # kept IN). THE TWO ARE NOT ONE PREDICATE -- picking either one for both
+    # arms moves the demotion in whichever direction the survivor points.
+    hash_differs = (
+        decision.fresh_hash_differs if decision.holds_valid_grant
+        else decision.stale_hash_differs
+    )
+
+    return FenceComparands(
+        expected_version=expected_version,
+        current_version=decision.version,
+        expected_generation=expected_generation,
+        # The demotion normaliser, not a local rule: a real integer generation
+        # is worth nothing as an AUTHORITY comparand when the coordinator
+        # cannot vouch that the bytes in hand are the content at that version.
+        current_generation=confirmed_generation(
+            decision.owner_generation, content_hash_differs=hash_differs,
+        ),
+        # A strict-mode deny is a REFUSED re-validate read. It holds on the
+        # refusal alone -- this route is precisely the caller the fence
+        # docstring warns about, one holding the registry's real generation,
+        # which would otherwise fall past that leg and either mislabel its hold
+        # or proceed on a view the coordinator had just refused to serve.
+        read_refused=decision.outcome == "denied",
+        # A peer's pessimistic write-acquire ends a holder's grant while moving
+        # NEITHER comparand, so this is the only leg that can see it.
+        grant_did_not_stand=not decision.holds_valid_grant,
+        # THE LEG ONLY THIS SURFACE CAN ANSWER. ``None``, ``""`` and the all-f
+        # launch-gate sentinel are three spellings of "nothing was recorded";
+        # the core normaliser owns which is which. Hard-coding ``True`` here
+        # (the honest in-process limit) would admit every no-claim artifact.
+        content_claim_present=coordinator_holds_content_claim(artifact.content_hash),
+    )
+
+
+def _effect_fence_verdict(
+    coordinator: CoordinatorHTTPServer,
+    *,
+    path: str,
+    agent_id: UUID,
+    expected_version: int,
+    expected_generation: int | None,
+    caller_content_hash: str,
+    now_unix: float,
+) -> dict:
+    """Classify, then serialise. ONE classification, shared with the in-process
+    wrapper -- a second implementation of a safety rule is what
+    ``ccs.core.fence`` exists to remove.
+
+    Raises:
+        AssertionError: ``classify_hold`` produced a reason outside the
+            published set. The vocabulary is declared protocol (R3), so an
+            unlisted reason is a drift fault, not a verdict; raising sends it
+            into this route's own hold envelope rather than teaching a client a
+            word no published set contains. Written as an explicit raise rather
+            than ``assert`` so ``python -O`` cannot strip the check.
+    """
+    comparands = _effect_fence_comparands(
+        coordinator,
+        path=path,
+        agent_id=agent_id,
+        expected_version=expected_version,
+        expected_generation=expected_generation,
+        caller_content_hash=caller_content_hash,
+        now_unix=now_unix,
+    )
+    reason = classify_hold(comparands)
+    if reason is None:
+        return {"verdict": _EFFECT_FENCE_VERDICT_PROCEED}
+    if reason not in HOLD_REASONS:
+        raise AssertionError(
+            f"internal: classify_hold() returned {reason!r}, which is not a "
+            f"member of HOLD_REASONS -- the published reason vocabulary and "
+            f"the branch table have drifted; refusing to put it on the wire"
+        )
+    return {"verdict": _EFFECT_FENCE_VERDICT_HOLD, "reason": reason}
+
+
+def _handle_effect_fence(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /hooks/effect-fence — may this irreversible effect still fire?
+
+    Request (every field required; one artifact per call)::
+
+        {"session_id": "<uuid>",          # grant standing is PER SESSION
+         "path": "<repo-relative path>",
+         "expected_version": <int>,       # the caller's captured comparands
+         "expected_generation": <int|null>,
+         "content_hash": "<64 hex>",      # the bytes the caller actually holds
+         "agent_id": "<subagent id>"}     # optional, as on every hook route
+
+    Response, always HTTP 200 for a protocol outcome::
+
+        {"verdict": "proceed"}
+        {"verdict": "hold", "reason": "<one of HOLD_REASONS>"}
+
+    and HTTP 400 ``{"error": "<what to send>"}`` for a request that never
+    reached a verdict. A MALFORMED REQUEST IS NEVER A HOLD: a hold invites a
+    retry, and no number of retries supplies a comparand the caller never
+    captured. The sharpest case is why it matters -- a caller resolving to an
+    agent the coordinator has never seen legitimately produces a hold that no
+    identical retry can clear, so if an incomplete request also answered
+    "hold", the fixable and the unfixable would be one answer on the wire.
+
+    THE PYTHON COORDINATOR ONLY. The sibling Node backend does not implement
+    this route and answers 404 for it -- an unimplemented route is a visible
+    gap, whereas two coordinators disagreeing about whether an effect may fire
+    is a silent one.
+
+    Stays OUT of ``_MIGRATION_REJECTED_ROUTES``: it initiates no write, and a
+    drained fence would degrade to a hold for readers that have nothing to do
+    with the migration.
+    """
+    body = req._read_json()
+    if body is None:
+        return
+
+    session_id = body.get("session_id")
+    path = body.get("path", "")
+
+    # Validated in the order the sibling hook routes use, through the SAME
+    # server-side gates: identity, then path, then the comparands, then the
+    # hash. Skipping the path gate here would let an absolute or traversing
+    # path fall through to the policy check, which answers False and therefore
+    # HOLDS -- a 200 that looks like a safe answer while the boundary check
+    # never ran.
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    path_err = validate_path(path)
+    if path_err:
+        # Mirror the sibling routes' message shape for empty/missing.
+        msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
+        req._json(400, {"error": msg})
+        return
+
+    expected_version, version_err = _read_expected_version(body)
+    if version_err:
+        req._json(400, {"error": version_err})
+        return
+    expected_generation, generation_err = _read_expected_generation(body)
+    if generation_err:
+        req._json(400, {"error": generation_err})
+        return
+
+    # REQUIRED here, unlike on pre-read where the caller may not have it yet.
+    # Without the caller's own content hash the generation demotion can never
+    # fire, and the fence silently loses the one leg that catches a decision
+    # derived from superseded bytes. Named as missing in its own words so a
+    # caller can tell WHICH field it forgot.
+    if body.get(_EFFECT_FENCE_HASH_FIELD) is None:
+        req._json(400, {"error": f"missing {_EFFECT_FENCE_HASH_FIELD}"})
+        return
+    hash_err = validate_content_hash(body[_EFFECT_FENCE_HASH_FIELD], required=True)
+    if hash_err:
+        req._json(400, {"error": hash_err})
+        return
+    content_hash: str = body[_EFFECT_FENCE_HASH_FIELD]
+
+    # DERIVED, never registered. ``register_session`` is a mutation the
+    # pre-read path performs before its work body, and session-start reads the
+    # resulting map to decide whether a session was ever seen -- so registering
+    # here would let a verdict answer a LATER question about its own caller.
+    # The derivation is deterministic, so an unknown session resolves to an
+    # agent with no grant and holds, which is the correct answer.
+    # A malformed subagent id is REFUSED here, not degraded to the parent.
+    # ``read_subagent_id`` resolves an out-of-shape value to ``None`` -- the
+    # parent identity -- and the session-stop guard's comment scopes that
+    # allowance to "read paths (where degrading to parent attribution is
+    # benign)". This is not one: grant standing is the single leg computed
+    # PER AGENT, so answering about the parent would tell a preempted
+    # subagent to proceed while the parent still holds SHARED. Every other
+    # malformed field on this route answers 400; so does this one.
+    if read_subagent_id(body) is None and has_subagent_id_field(body):
+        req._json(400, {"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"})
+        return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
+    agent_id = session_to_agent_id(session_id, read_subagent_id(body))
+
+    def work() -> dict:
+        try:
+            verdict = _effect_fence_verdict(
+                coordinator,
+                path=path,
+                agent_id=agent_id,
+                expected_version=expected_version,
+                expected_generation=expected_generation,
+                caller_content_hash=content_hash,
+                # ONE clock read for the whole request.
+                now_unix=_payloads.now_unix(),
+            )
+        except Exception as exc:
+            # The wrapper's exception arm answers ``{"ok": false, "reason":
+            # "internal: ..."}`` and no parameter overrides it, so the route
+            # owns this arm itself. See _EFFECT_FENCE_INTERNAL_HOLD_RESPONSE.
+            logger.exception("effect fence verdict failed: %s", exc)
+            verdict = dict(_EFFECT_FENCE_INTERNAL_HOLD_RESPONSE)
+        if verdict["verdict"] == _EFFECT_FENCE_VERDICT_HOLD:
+            # Advisory, and the ONE thing a fence call moves. It counts
+            # verdicts the handler REACHED: a watchdog-degraded hold is
+            # returned by the wrapper after this body was abandoned, and is
+            # counted by ``watchdog_timeouts_total`` instead.
+            coordinator.increment_effect_fence_hold()
+        return verdict
+
+    # No abort Event: the work body performs no REGISTRY write, so a late
+    # completion cannot land coordinator state after the degraded response.
+    # It can still land the advisory hold counter above, which is deliberate
+    # -- that counter's contract is "verdicts the handler REACHED", and a
+    # late completion did reach one. The degraded hold the caller actually
+    # received is counted by ``watchdog_timeouts_total``.
+    _run_or_degrade(
+        req, coordinator, work, degraded_response=_EFFECT_FENCE_DEGRADED_RESPONSE,
+    )
+
+
 def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /hooks/pre-edit — acquire EXCLUSIVE (KTD-1) + KTD-9 collision surfacing."""
     body = req._read_json()
@@ -1903,6 +3137,8 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
         req._json(400, {"error": msg})
         return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
     # SB-10 U4 (KTD6): advisory peek hoisted above the untracked exit —
     # see the pre-read twin for the no-flag byte/behavior guarantee.
     if not coordinator.policy.is_tracked(path):
@@ -1910,14 +3146,37 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
+    caller = caller_principal_identity(session_id)
     now = monotonic_seconds()
+    # #185: the version this agent last observed on the path, read BEFORE
+    # the acquire (which records the current version as observed), so the
+    # successor's admit can warn when it never read the version it was handed.
+    observed_before_acquire: int | None = None
 
     def work() -> dict:
+        nonlocal observed_before_acquire
         coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
         # Seed the artifact row if this is the first Edit on a fresh path.
         artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
         if artifact_id is None:
             artifact_id = coordinator.registry.resolve_or_register(path, content_hash="")
+
+        # #185: the giver of a live handoff is denied AHEAD of the
+        # strict-mode stale branch, and in warn mode too. The transfer left
+        # the giver's claim INVALID, so on a strict path the stale branch
+        # would otherwise answer first -- and in warn mode nothing would deny,
+        # letting the giver re-take the path one turn later. The service's
+        # one liveness member picks the envelope; this handler owns only the
+        # ordering.
+        handed = coordinator.service.live_handoff_given_by(artifact_id, caller)
+        if handed is not None:
+            return _giver_deny_response(
+                coordinator, handed, session_id=session_id, path=path, caller=caller,
+                source=_PRE_EDIT_GIVER_DENY_SOURCE,
+            )
+        observed_before_acquire = coordinator.registry.last_observed_version_for(
+            artifact_id, agent_id
+        )
 
         # v0.2 KTD-O / KTD-P: strict-mode stale-edit deny branch. If the
         # artifact is opted into strict mode AND the editor's prior state
@@ -1946,7 +3205,28 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # The original Unit 2 design — INVALID-only — is the right
             # gate for the Edit/Write surface: pre-edit strict-deny
             # fires after a session has been explicitly preempted.
-            editor_stale = editor_state == MESIState.INVALID
+            #
+            # A preempted session can also hold SHARED without having read
+            # the current version: a strict Bash / Grep deny re-arms SHARED
+            # so the retry it invites goes through, and records no
+            # observation because the command never ran (see
+            # ``_apply_bash_grep_regrants``). Admitting that grant lets a
+            # whole-file write from the copy read before the peer's commit
+            # overwrite the commit (#275), so it is stale too until a retried
+            # Bash command or a Read records the current version (a retried
+            # Grep records none: it never showed the file). A SHARED holder
+            # with no observation at all has acted on no version and is
+            # admitted like a first-time editor.
+            observed = (
+                coordinator.registry.last_observed_version_for(artifact_id, agent_id)
+                if editor_state == MESIState.SHARED else None
+            )
+            unobserved_shared = (
+                artifact is not None
+                and observed is not None
+                and observed < artifact.version
+            )
+            editor_stale = editor_state == MESIState.INVALID or unobserved_shared
             if artifact is not None and artifact.version > 0 and editor_stale:
                 last_writer_id = _last_writer_for(coordinator, artifact_id)
                 last_writer_ts = (
@@ -1955,8 +3235,10 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 summary: _payloads.StaleSummary = {
                     "path": path,
                     "current_version": artifact.version,
-                    "prior_version_seen_by_session": (
-                        artifact.version - 1 if editor_state == MESIState.INVALID else None
+                    "prior_version_seen_by_session": observed if unobserved_shared else _prior_version_observed(
+                        coordinator, artifact_id, agent_id,
+                        agent_state=editor_state,
+                        current_version=artifact.version,
                     ),
                     "last_writer_session_id": last_writer_id or "<unknown>",
                     "last_writer_at_unix_ts": last_writer_ts,
@@ -1988,8 +3270,22 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         holder_id, holder_ts = _exclusive_holder(coordinator, artifact_id, exclude_agent=agent_id)
 
         # Acquire EXCLUSIVE — this invalidates peers (KTD-1 single-writer).
+        # ``caller`` is the session-level identity the giver fence keys on
+        # (#185): the giver of a live handoff is refused whichever subagent or
+        # incarnation it sends.
         try:
-            coordinator.service.write(agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=now, abort=abort)
+            coordinator.service.write(
+                agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=now,
+                abort=abort, caller=caller,
+            )
+        except GiverFenced as exc:
+            # Ahead of the generic arm, which would answer the refusal as prose.
+            # A transfer that landed between the check above and this acquire:
+            # the typed error maps to the same deny.
+            return _giver_deny_response(
+                coordinator, exc, session_id=session_id, path=path, caller=caller,
+                source=_PRE_EDIT_GIVER_DENY_SOURCE,
+            )
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
 
@@ -2007,15 +3303,18 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # Pop any notices for THIS session (the caller of pre-edit) and
         # merge into the response (A1: surface on the victim's next hook
         # of any kind).
-        notices = coordinator.registry.pop_pending_notices(agent_id)
+        notices = coordinator.registry.pop_pending_notices(
+            agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+        )
         notice_text = _build_preemption_text(coordinator, notices) if notices else None
 
         if holder_id is not None:
             # Existing collision surfacing path. If we also have preemption
             # notices for this session, prepend them.
-            holder_session = _agent_id_to_session(coordinator, holder_id)
+            # R7: name the incumbent by the agent id the registry holds it
+            # under, not by the session id that id was derived from.
             resp = _payloads.build_collision_response(
-                holder_session_id=holder_session or "<unknown>",
+                holder_session_id=holder_id.hex,
                 holder_acquired_at_unix_ts=float(holder_ts or _payloads.now_unix()),
                 path=path,
             )
@@ -2042,19 +3341,39 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # inside work(); notices are already merged into the result's
         # additionalContext, so the re-grounding block always lands last.
         # The abort token rides along so a timed-out request never
-        # consumes the compact-pending flag.
+        # consumes the compact-pending flag. #185: while a record exists the
+        # handoff key rides every arm but a deny (the giver's deny carries its
+        # own), and an admit gets the handoff prose before the re-grounding
+        # block. work() runs first, on its own line: it is what sets
+        # ``observed_before_acquire``, which the attach then reads.
+        produced = work()
+        result = _attach_hook_handoff(
+            coordinator, produced, path=path, caller=caller,
+            acquired=True, observed=observed_before_acquire,
+        )
         return _deliver_pending_reground(
-            coordinator, session_id, body, work(), abort=abort
+            coordinator, session_id, body, result, abort=abort
         )
 
-    # AC-05: pre-edit's wire contract is {ok: bool}, not {status: ...}.
-    # On watchdog timeout, return the ok-shape degraded envelope so a
-    # client doing result.get("ok") sees True rather than None.
+    # On watchdog timeout this route ADMITS. _PRE_EDIT_DEGRADED_RESPONSE is
+    # {ok: true, degraded: true}: no hookSpecificOutput, so the hook client
+    # relays no deny and no advisory and the edit proceeds. The answer is
+    # chosen without the work body's decision, so it admits the strict-mode
+    # stale editor the body above would have denied. See the constant for the
+    # rule a future acquire-or-fail refusal must keep.
     # A6: abort threaded into service.write so a late acquire aborts at the
     # registry lock instead of granting a phantom EXCLUSIVE (and silently
-    # invalidating peers) the agent never saw.
+    # invalidating peers) the agent never saw. The abort covers the acquire
+    # only: a late body that takes the strict-deny branch never reaches it,
+    # so it completes and records a deny (counter, route-around marker,
+    # audit line) for an edit the caller was already told to proceed with.
+    # The giver's deny (#185) is the same: a timed-out giver is admitted, its
+    # late body records the deny, and its commit is refused by the fence.
     abort = threading.Event()
-    _run_or_degrade(req, coordinator, work_with_reground, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
+    _run_or_degrade(
+        req, coordinator, work_with_reground,
+        degraded_response=_PRE_EDIT_DEGRADED_RESPONSE, abort=abort,
+    )
 
 
 def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -2081,11 +3400,21 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
     if err:
         req._json(400, {"error": err})
         return
+    # Require-class: the write is attributed to the id _admit_caller returns —
+    # PresentedCaller.attributed_agent_id, the session component checked
+    # against its caller principal (plan U6 / R3).
+    agent_id = _admit_caller(
+        req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))
+    )
+    if agent_id is None:
+        return
     if not coordinator.policy.is_tracked(path):
         req._json(200, {"ok": True})
         return
 
-    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
+    # Records the display name for /status; the attributed id is agent_id above.
+    coordinator.register_session(session_id, read_subagent_id(body))
+    caller = caller_principal_identity(session_id)
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -2099,6 +3428,13 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
             # Tool failure path — release the EXCLUSIVE grant without bumping version.
             artifact = coordinator.registry.get_artifact(artifact_id)
             if artifact is not None:
+                # #185: the giver of a live handoff reporting a failed edit
+                # holds nothing here -- its grant went to the successor -- so
+                # this is not a clean release. Read BEFORE any release, and
+                # change nothing: never a release, never a withdraw.
+                handed = coordinator.service.live_handoff_given_by(artifact_id, caller)
+                if handed is not None:
+                    return _handed_off_release(path, handed)
                 try:
                     coordinator.service.invalidate(
                         agent_id=agent_id,
@@ -2109,10 +3445,12 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
                         abort=abort,
                     )
                 except CoherenceError as exc:
-                    return {"ok": False, "reason": str(exc)}
+                    # Still held: not a clean success, so it answers per grant.
+                    return {"ok": False, "reason": str(exc), "grants": [_held_grant(path, exc)]}
             return {"ok": True, "released": True}
 
-        # Success path — commit and bump version.
+        # Success path — commit and bump version. ``caller`` is the session-
+        # level identity the giver fence keys on (#185).
         try:
             coordinator.service.commit(
                 agent_id=agent_id,
@@ -2121,7 +3459,14 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
                 issued_at_tick=now,
                 content_hash=content_hash,
                 abort=abort,
+                caller=caller,
             )
+        except GiverFenced as exc:
+            # Ahead of the generic arm, which would read a preemption notice
+            # into it and answer the refusal as prose. The giver's edit was
+            # in flight when the transfer landed: the handoff arm, never the
+            # preemption or reclaim one, reaches it in the post-tool envelope.
+            return _giver_commit_refused_body(exc, path=path)
         except StaleReadGeneration:
             # Read-generation fence: a sweep reclaimed this committer in the race
             # window between its grant and this commit. Surface the STABLE machine
@@ -2163,10 +3508,10 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
                         f"retry. Underlying coordinator error: {exc}"
                     )
                     return {"ok": False, "reason": reason, "reclaimed": True}
-                preempter_session = _agent_id_to_session(coordinator, preempter_id) or "<unknown>"
+                # R7: the popped notice carries the preempter's agent id.
                 reason = (
                     f"commit_not_allowed: your EXCLUSIVE grant on {path} was "
-                    f"preempted by session {preempter_session[:8]} at "
+                    f"preempted by agent {_payloads.short_session_id(preempter_id.hex)} at "
                     f"{_iso_utc(preempted_at)}. Your edit landed in your local "
                     f"worktree but will not be reflected in the coordinator's "
                     f"version. Underlying coordinator error: {exc}"
@@ -2179,12 +3524,18 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
         coordinator.increment_intra_task_acquire_release()
         return {"ok": True}
 
+    def work_with_handoff() -> dict:
+        # #185: the handoff key on every arm while the path has a record.
+        return _attach_handoff_key(coordinator, work(), path=path, caller=caller)
+
     # AC-05: post-edit's wire contract is {ok: bool}; ok-shape degraded
     # envelope keeps clients reading result.get("ok") safe on timeout.
     # A6: abort threaded into invalidate/commit so a late post-edit aborts at
     # the registry lock instead of landing a phantom version bump/invalidation.
     abort = threading.Event()
-    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
+    _run_or_degrade(
+        req, coordinator, work_with_handoff, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort
+    )
 
 
 def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -2253,11 +3604,21 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
     if not isinstance(expected_version, int) or isinstance(expected_version, bool) or expected_version < 0:
         req._json(400, {"error": "expected_version must be a non-negative integer"})
         return
+    # Require-class: the write is attributed to the id _admit_caller returns —
+    # PresentedCaller.attributed_agent_id, the session component checked
+    # against its caller principal (plan U6 / R3).
+    agent_id = _admit_caller(
+        req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))
+    )
+    if agent_id is None:
+        return
     if not coordinator.policy.is_tracked(path):
         req._json(200, {"ok": True})
         return
 
-    agent_id = coordinator.register_session(session_id, read_subagent_id(body))
+    # Records the display name for /status; the attributed id is agent_id above.
+    coordinator.register_session(session_id, read_subagent_id(body))
+    caller = caller_principal_identity(session_id)
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -2270,7 +3631,10 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
 
         # OCC commit — version-checked CAS. Does NOT take EXCLUSIVE: the
         # caller is S (from pre-read) or I (preempted); commit_cas rejects an
-        # M/E caller (D4) by raising CoherenceError.
+        # M/E caller (D4) by raising CoherenceError. ``caller`` is the
+        # session-level identity the giver fence keys on (#185): a giver's
+        # re-minted incarnation is refused, and a successor's completes the
+        # record, not overtakes it.
         try:
             result = coordinator.service.commit_cas(
                 agent_id=agent_id,
@@ -2279,7 +3643,11 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
                 content_hash=content_hash,
                 issued_at_tick=now,
                 abort=abort,
+                caller=caller,
             )
+        except GiverFenced as exc:
+            # Ahead of the generic arm, which would answer the refusal as prose.
+            return _giver_fenced_body(exc)
         except OccCallerTransientError:
             # Retry-eligible (AC2): a peer invalidated the caller between its
             # read and this CAS. Surface a STABLE machine reason decoupled from
@@ -2316,6 +3684,19 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
         coordinator.increment_intra_task_acquire_release()
         return {"ok": True, "version": updated.version}
 
+    def work_with_handoff() -> dict:
+        # #185: the handoff key on every arm while the path has a record; a
+        # WIN's carries the outcome it gave that record (completed for the
+        # successor's win, overtaken for anyone else's). commit_cas does not
+        # return it, so it is read back: the win moved the version, so
+        # the record it labelled is never relabelled and the read is stable.
+        result = work()
+        won = result.get("ok") is True and "version" in result
+        return _attach_handoff_key(
+            coordinator, result, path=path, caller=caller,
+            won_at=expected_version if won else None,
+        )
+
     # Fail-closed: the OCC commit degrades to a body that reads as FAILURE.
     # A timed-out commit_cas whose future the watchdog does NOT cancel may
     # still run to completion later. A6: the abort token (below) makes the
@@ -2331,7 +3712,9 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
     # mistake a degraded CAS for success — hence _OCC_DEGRADED_RESPONSE
     # ({ok: false, …}), never _OK_DEGRADED_RESPONSE.
     abort = threading.Event()
-    _run_or_degrade(req, coordinator, work, degraded_response=_OCC_DEGRADED_RESPONSE, abort=abort)
+    _run_or_degrade(
+        req, coordinator, work_with_handoff, degraded_response=_OCC_DEGRADED_RESPONSE, abort=abort
+    )
 
 
 def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -2350,11 +3733,20 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     # agent_id must NOT silently degrade to the parent identity — that would
     # release the PARENT's live grants. Absent agent_id = a legitimate parent
     # Stop (release the parent's own grants, unchanged). Present-but-invalid =
-    # refuse (no-op), since the caller intended a scoped subagent release the
-    # server can't resolve. The read paths (where degrading to parent
-    # attribution is benign) deliberately do NOT carry this guard.
+    # refuse, since the caller intended a scoped subagent release the server
+    # can't resolve. The read paths (where degrading to parent attribution is
+    # benign) deliberately do NOT carry this guard.
+    #
+    # #185: REFUSED (HTTP 400, the effect fence's answer to the same field,
+    # before the principal gate as there), never ``{ok: true,
+    # released_artifacts: []}`` -- that body reads as a release that found
+    # nothing to release, so a client dropping its record on the answer would
+    # forget a grant the coordinator still holds. Python-only: the Node
+    # backend still answers the empty success.
     if subagent_id is None and has_subagent_id_field(body):
-        req._json(200, {"ok": True, "released_artifacts": []})
+        req._json(400, {"error": _MALFORMED_SUBAGENT_ERROR})
+        return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, subagent_id)) is None:
         return
 
     # SB-10 U4 (R2): the deferred re-grounding flag lives at most one
@@ -2376,6 +3768,11 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
             agent_id, {MESIState.EXCLUSIVE, MESIState.MODIFIED}
         )
         released: list[str] = []
+        # One entry per grant asked for, in no guaranteed order (the held
+        # rows come back unordered; a client matches entries by path):
+        # answered only when a grant is still held (#185). A stop never withdraws or
+        # declines a handoff: it releases EXCLUSIVE/MODIFIED rows alone.
+        grants: list[dict] = []
         for artifact_id in held:
             artifact = coordinator.registry.get_artifact(artifact_id)
             if artifact is None:
@@ -2389,9 +3786,12 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
                     issued_at_tick=now,
                     abort=abort,
                 )
-                released.append(artifact.name)
             except CoherenceError as exc:
                 logger.warning("session-stop release failed for %s: %s", artifact_id, exc)
+                grants.append(_held_grant(artifact.name, exc))
+                continue
+            released.append(artifact.name)
+            grants.append(_released_grant(artifact.name))
 
         # F1 (P0): pop any pending preemption notices for the ending session.
         # The phpmac canonical case: X was preempted, but X's next action was
@@ -2406,22 +3806,41 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         notices_payload: list[dict] = []
         for art_id, preempter_id, ts in pending:
             art = coordinator.registry.get_artifact(art_id)
-            preempter_session = _agent_id_to_session(coordinator, preempter_id) or ""
+            # R7: this was the most reachable of the two paths — a structured
+            # field carrying the preempter's session id in FULL, not just its
+            # prose prefix. The keys are RENAMED rather than aliased, against
+            # the module's usual additive-evolution rule: keeping
+            # ``preempter_session_id`` alive would either go on emitting the
+            # session id or hand a consumer that parses by exact shape an
+            # agent id under a name promising a session id, which is the
+            # worse of the two. The value is never absent now — the notice
+            # row carries the agent id, so there is no unnamed-preempter arm
+            # left to sentinel.
             notices_payload.append({
                 "path": art.name if art else "<unknown-artifact>",
-                "preempter_session_id": preempter_session,
-                "preempter_session_short": (preempter_session[:8] if preempter_session else "<unknown>"),
+                "preempter_agent_id": preempter_id.hex,
+                "preempter_agent_short": preempter_id.hex[:8],
                 "preempted_at_unix_ts": ts,
                 "preempted_at_iso": _iso_utc(ts),
             })
 
-        response: dict = {"ok": True, "released_artifacts": released}
+        # A clean release keeps today's bytes, which the Node backend mirrors
+        # (corpus warn_mode/18); only a stop that left a grant held answers
+        # top-level false with the per-grant list (#185).
+        clean = len(released) == len(grants)
+        response: dict = {"ok": clean, "released_artifacts": released}
+        if not clean:
+            response["grants"] = grants
         if notices_payload:
             response["notices"] = notices_payload
             # Render prose for stream-json consumers / human inspection.
             response["hookSpecificOutput"] = {
                 "hookEventName": "Stop",
-                "additionalContext": _build_preemption_text(coordinator, pending),
+                # Unbounded drain + full structured array in this same
+                # response: the overflow is not deferred anywhere.
+                "additionalContext": _build_preemption_text(
+                    coordinator, pending, overflow_deferred=False
+                ),
             }
         return response
 
@@ -2467,6 +3886,8 @@ def _handle_session_start(
         req._json(400, {"error": sid_err[1]})
         return
     subagent_id = read_subagent_id(body)
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, subagent_id)) is None:
+        return
 
     # R8 breadcrumb precondition: sample seen-ness BEFORE registration
     # erases it — registration below makes this session "seen" for every
@@ -2525,12 +3946,15 @@ def _handle_policy_track(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     P2 ce-review fixes:
     - #4 (security YAML injection): every path passes validate_path() which
       rejects control chars (newlines), absolute paths, and ../ traversal
-      before being appended to tracked.yaml. Without this, an authenticated
+      before being appended to tracked.yaml. Without this, a bearer-holding
       caller could POST {"paths":["real.md\\n- injected.yaml"]} and inject
-      additional patterns.
+      additional patterns. Rejecting newlines is not the whole defense: NEL,
+      LS and PS are YAML line breaks too. The writer quotes every entry
+      (#284), so no character can end an entry's line.
     - #11 (correctness 500→400): _append_policy_yaml's ValueError on YAML
-      cap overflow is caught and returned as HTTP 400 instead of falling
-      through the catch-all as a 500.
+      cap overflow, or on a file an entry could not take effect in, is
+      caught and returned as HTTP 400 instead of falling through the
+      catch-all as a 500.
     """
     body = req._read_json()
     if body is None:
@@ -2564,18 +3988,33 @@ def _handle_policy_track(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     # Reload the live policy so subsequent hook calls see the additions.
     #
     # COR-05: this is an atomic-swap-via-local-variable pattern. The RHS
-    # evaluates fully (TrackedArtifactPolicy.load returns a new object)
+    # evaluates fully (policy.reloaded() returns a new object)
     # before the attribute assignment fires. Single PyObject* write is
     # atomic on CPython, and even on free-threading builds the per-object
     # lock makes the swap visible to other threads as a single edge.
     # Handlers reading coordinator.policy bind it to a local at entry
     # (see pre-read / pre-edit / pre-bash / pre-grep) so a mid-handler
     # swap can't change which policy object the handler reasons about.
-    new_policy = TrackedArtifactPolicy.load(coordinator.coordinator_root)
+    #
+    # #261: ``reloaded`` never narrows strict enforcement mid-run (a strict or
+    # user-added pattern hand-removed from disk is kept until restart).
+    new_policy = coordinator.policy.reloaded()
     coordinator.policy = new_policy
     req._json(200, {
         "ok": True, "added": added, "rejected": rejected + pre_rejected,
     })
+
+
+def _untrack_strict_error(refused: list[dict]) -> str:
+    named = "; ".join(
+        f"{r['path']} (strict: {', '.join(r['strict_patterns'])})" for r in refused
+    )
+    return (
+        f"refusing to untrack paths the coordinator enforces in strict mode: {named}. "
+        "A strict path stays enforced while the coordinator runs; to untrack it, "
+        "remove its entry from .coherence/strict_mode.yaml and restart the "
+        f"coordinator ({UNTRACK_STRICT_PATH_REASON})"
+    )
 
 
 def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -2583,6 +4022,18 @@ def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
 
     Same hardening as /policy/track: per-path validate_path call + ValueError
     → HTTP 400 mapping.
+
+    #261: an entry (path or glob) that covers a path the live policy puts in
+    strict mode is refused, and the whole request with it — HTTP 409
+    ``{"ok": false, "error": <text>, "reason": "untrack_strict_path",
+    "refused": [{"path", "strict_patterns"}], "rejected": [...]}`` — with
+    nothing written to ignored.yaml. Untracking a strict path after a
+    ``CoherentVolume`` (or any CAS writer) attached put it on the untracked
+    fast path, where a CAS commit at any expected version is accepted: a
+    silent lost update. Strict wins over ignore in the policy anyway
+    (:meth:`TrackedArtifactPolicy.is_tracked`), so the refusal is what tells
+    the operator the entry would not take effect; the way to stop enforcing a
+    strict path is a coordinator restart without its strict entry.
     """
     body = req._read_json()
     if body is None:
@@ -2606,14 +4057,122 @@ def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
             safe_paths.append(p)
         else:
             pre_rejected.append({"path": p, "reason": v_err})
+    # Read without a lock, like every reload here (COR-05). That is safe only
+    # because a reload keeps every strict pattern of the policy it reloads
+    # (TrackedArtifactPolicy.reloaded), so the spawn-time strict set is never
+    # dropped: a reload racing this check can add a strict pattern, which
+    # strict-wins in is_tracked then enforces anyway. Two racing reloads are
+    # last-writer-wins on coordinator.policy, so a pattern hand-added to
+    # strict_mode.yaml inside that window can be lost; strict-wins still holds
+    # for every pattern that survives. A change that lets a reload drop a
+    # spawn-time strict pattern must make this check-then-append atomic with it.
+    policy = coordinator.policy
+    coverage = policy.strict_patterns_covering_each(safe_paths)
+    refused = [
+        {"path": p, "strict_patterns": list(covering)}
+        for p, covering in zip(safe_paths, coverage)
+        if covering
+    ]
+    if refused:
+        req._json(409, {
+            "ok": False,
+            "error": _untrack_strict_error(refused),
+            "reason": UNTRACK_STRICT_PATH_REASON,
+            "refused": refused,
+            "rejected": pre_rejected,
+        })
+        return
     yaml_path = coordinator.coordinator_root / ".coherence" / "ignored.yaml"
     try:
         added, yaml_rejected = _append_policy_yaml(yaml_path, safe_paths)
     except ValueError as exc:
         req._json(400, {"error": str(exc)})
         return
-    coordinator.policy = TrackedArtifactPolicy.load(coordinator.coordinator_root)
+    coordinator.policy = coordinator.policy.reloaded()
     req._json(200, {"ok": True, "removed": added, "rejected": yaml_rejected + pre_rejected})
+
+
+def _record_held_read(
+    coordinator: CoordinatorHTTPServer,
+    artifact_id: UUID,
+    agent_id: UUID,
+    *,
+    trigger: str,
+    tick: int,
+) -> None:
+    """Record a read by a session that already holds SHARED on the path.
+
+    A held grant usually certifies the current bytes already, which makes this
+    a no-op. After a strict Bash / Grep deny it does not: that re-grant records
+    no observation (see ``_apply_bash_grep_regrants``), so a retried Bash
+    command -- or the Read the session takes instead -- finds the grant held,
+    answers fresh, and is the session's first read at this version. Left
+    unrecorded, the baseline stays at the version before the deny (never
+    observed, on a first touch), and every message computed from it errs
+    toward "nothing moved": a peer's commit loses its post-compaction flag and
+    a later grant handover is reported as a write the session already read.
+
+    The row is re-read under the registry lock because the caller classified
+    the path before its deny decision: a peer's pre-edit or commit landing
+    since leaves the row INVALID, and writing SHARED over it would clear a
+    stale flag the session has not seen. Only SHARED is credited, so an E/M
+    holder's grant is never touched, and the SHARED-to-SHARED write uses a
+    trigger outside ``CLAIM_CAPTURE_TRIGGERS``, so the one thing it moves is
+    ``last_observed_version``.
+    """
+    registry = coordinator.registry
+    with registry.abort_guard():
+        if registry.get_agent_state(artifact_id, agent_id) != MESIState.SHARED:
+            return
+        artifact = registry.get_artifact(artifact_id)
+        observed = registry.last_observed_version_for(artifact_id, agent_id)
+        if artifact is None or (observed is not None and observed >= artifact.version):
+            return
+        registry.set_agent_state(
+            artifact_id, agent_id, MESIState.SHARED, trigger=trigger, tick=tick,
+        )
+
+
+def _apply_bash_grep_regrants(
+    coordinator: CoordinatorHTTPServer,
+    agent_id: UUID,
+    regrants: list[tuple[UUID, str]],
+    *,
+    held: list[tuple[UUID, str]],
+    command_runs: bool,
+    tick: int,
+) -> None:
+    """Grant SHARED on every path a Bash / Grep command named, AFTER the deny
+    decision, and record an observation only if the command will run.
+
+    The grant is the same either way: strict pre-bash / pre-grep deny once and
+    re-arm the session (Node's ``pre_bash.ts`` pins the same contract), so a
+    retry of the command goes through. What depends on the decision is the
+    OBSERVATION. ``set_agent_state`` records the current version as the
+    agent's ``last_observed_version`` for any non-INVALID grant, and a denied
+    command never ran -- crediting it told a session that a later grant
+    handover left it at "the version you last saw", a version it was refused.
+    An allowed command does run and does read the current bytes, exactly like
+    pre-read's ``post_stale_read`` re-grant, so it must keep recording.
+
+    ``held`` lists the paths the session already held SHARED going in. They
+    need no grant, but a Bash command that runs reads them too, and the retry of
+    a denied command is exactly that run -- see ``_record_held_read``. Grep
+    passes none: its path set is every tracked file under its root, not what it
+    showed, so crediting a held file would advance a baseline the session was
+    just told to re-read.
+
+    Keyed on the COMMAND's outcome, not the trigger and not the path's own
+    strictness: a warn-only path inside a denied command was not read either.
+    """
+    for artifact_id, trigger in regrants:
+        coordinator.registry.set_agent_state(
+            artifact_id, agent_id, MESIState.SHARED,
+            trigger=trigger, tick=tick, observed=command_runs,
+        )
+    if command_runs:
+        for artifact_id, trigger in held:
+            _record_held_read(coordinator, artifact_id, agent_id, trigger=trigger, tick=tick)
 
 
 def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -2633,8 +4192,16 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     negatives are acceptable (adversarial obfuscation, command
     substitution, etc. are OUT of scope per KTD-N).
 
+    First, though, a command that WRITES a path this session handed off
+    under a live record (#185) gets the giver's pre-edit deny, byte for byte
+    (:func:`_deny_giver_shell_write`); without such a record every answer
+    below is unchanged.
+
     Request: ``{session_id, command}``.
     Response:
+      - the giver's deny (``{ok: false, reason: "handed_off", ...}`` with a
+        ``hookSpecificOutput`` deny) if the command writes a path this
+        session handed off under a live record
       - ``{status: "fresh"}`` if no tracked paths detected (fast path)
       - ``{status: "fresh"}`` if all detected paths are fresh
       - ``{status: "stale", hookSpecificOutput: {...}, stale_paths: [...]}``
@@ -2661,6 +4228,14 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         req._json(413, {"error": "command too long"})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
+    # #185: ahead of the read detection, which never looks for a write -- a
+    # giver denied its Edit would otherwise append through the shell. Answers
+    # only when a live record names this session as giver of a path the
+    # command writes; otherwise nothing below changes by a byte.
+    if _deny_giver_shell_write(req, coordinator, session_id=session_id, command=command):
+        return
     # Detect tracked paths the command would read. is_tracked is the
     # policy gate — handler never touches SQLite for an untracked workspace.
     # SB-10 U4 (KTD6): advisory peek hoisted above the zero-tracked-reads
@@ -2681,21 +4256,27 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # stale match in the path set triggers deny per the plan's edge-case
         # contract (cat a.md b.md where a.md is strict → deny).
         strict_stale_first: dict | None = None
+        # The SHARED grants this command earns, and the SHARED grants it
+        # already holds, both applied only once the deny decision is known --
+        # see _apply_bash_grep_regrants.
+        regrants: list[tuple[UUID, str]] = []
+        held: list[tuple[UUID, str]] = []
         for path in tracked_paths:
             artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
             if artifact_id is None:
                 # First observation per KTD-9 — seed v1 + grant SHARED so
-                # subsequent reads see fresh.
+                # subsequent reads see fresh. ``detect_tracked_paths``
+                # deduplicates, so deferring the grant cannot make a later
+                # iteration read this path as stale.
                 artifact_id = coordinator.registry.resolve_or_register(
                     path, content_hash=""
                 )
-                coordinator.registry.set_agent_state(
-                    artifact_id, agent_id, MESIState.SHARED,
-                    trigger="first_bash_read", tick=now,
-                )
+                regrants.append((artifact_id, "first_bash_read"))
                 continue
             agent_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
             if agent_state is not None and agent_state != MESIState.INVALID:
+                if agent_state == MESIState.SHARED:
+                    held.append((artifact_id, "held_bash_read"))
                 continue  # fresh on this path
             # Stale. Record summary; re-grant SHARED to suppress repeat fires.
             artifact = coordinator.registry.get_artifact(artifact_id)
@@ -2714,18 +4295,22 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 strict_stale_first = {
                     "path": path,
                     "current_version": artifact.version,
-                    "prior_version_seen_by_session": (
-                        artifact.version - 1 if agent_state == MESIState.INVALID else None
+                    "prior_version_seen_by_session": _prior_version_observed(
+                        coordinator, artifact_id, agent_id,
+                        agent_state=agent_state,
+                        current_version=artifact.version,
                     ),
                     "last_writer_session_id": last_writer_id or "<unknown>",
                     "last_writer_at_unix_ts": last_writer_ts,
                     "warning_generated_at_unix_ts": _payloads.now_unix(),
                     "hash_differs": False,
                 }
-            coordinator.registry.set_agent_state(
-                artifact_id, agent_id, MESIState.SHARED,
-                trigger="post_stale_bash", tick=now,
-            )
+            regrants.append((artifact_id, "post_stale_bash"))
+
+        _apply_bash_grep_regrants(
+            coordinator, agent_id, regrants,
+            held=held, command_runs=strict_stale_first is None, tick=now,
+        )
 
         # v0.2 KTD-Q strict-mode deny short-circuit. If any detected path in
         # the bash command is strict + stale, deny the whole command. The
@@ -2759,7 +4344,9 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "stale_paths": [s["path"] for s in stale_summaries],
             }
 
-        notices = coordinator.registry.pop_pending_notices(agent_id)
+        notices = coordinator.registry.pop_pending_notices(
+            agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+        )
 
         if not stale_summaries and not notices:
             return {"status": "fresh"}
@@ -2816,6 +4403,90 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     _run_or_degrade(req, coordinator, work_with_reground, abort=abort)
 
 
+def _deny_giver_shell_write(
+    req: _RequestProtocol,
+    coordinator: CoordinatorHTTPServer,
+    *,
+    session_id: str,
+    command: str,
+) -> bool:
+    """Answer the giver's deny when ``command`` writes a path this session
+    handed off under a live record (#185); return whether it answered.
+
+    Detection is a pure string scan, so a command that writes no tracked path
+    touches no registry (nor does one the detector fails on). Otherwise the
+    giver lookup -- a read: no grant, no registration, no pop -- runs in the
+    watchdog pool and STARTS the request's deadline, as the caller-principal
+    gate's lookup does. A lookup that finishes in time keeps that deadline, so
+    the lookup and whatever answers after it share one ``HANDLER_TIMEOUT_SEC``:
+    a hit answers the giver's pre-edit deny through the guarded path, and no
+    hit returns False. A lookup that times out is counted like every timeout,
+    puts the deadline back as it found it and returns False, so the caller
+    answers exactly what it answered before this check existed, on the budget
+    it had then. A full watchdog queue answers the 503 and a raising lookup the
+    internal-error envelope -- the gate's two other exits."""
+    written = _tracked_writes(coordinator, command)
+    if not written:
+        return False
+    caller = caller_principal_identity(session_id)
+    if _watchdog_queue_overflowed(req, coordinator):
+        return True
+    prior_deadline = _watchdog_deadline(req)
+    try:
+        handed = coordinator.run_admission_lookup(
+            lambda: _first_write_handed_off_by(coordinator, written, caller),
+            deadline=_start_watchdog_deadline(req),
+        )
+    except FuturesTimeout:
+        # The check stands aside: the read check after it must not inherit a
+        # deadline the lookup spent, and degrade where it would have answered.
+        req._watchdog_deadline = prior_deadline
+        coordinator.increment_watchdog_timeout()
+        logger.warning("pre-bash giver lookup timed out after %ss; answering without it", HANDLER_TIMEOUT_SEC)
+        return False
+    except Exception as exc:
+        _answer_handler_error(req, coordinator, exc, failed="pre-bash giver lookup")
+        return True
+    if handed is None:
+        return False
+    path, record = handed
+    _run_or_degrade(req, coordinator, lambda: _giver_deny_response(
+        coordinator, record, session_id=session_id, path=path, caller=caller,
+        source=_PRE_BASH_GIVER_DENY_SOURCE,
+    ))
+    return True
+
+
+def _tracked_writes(coordinator: CoordinatorHTTPServer, command: str) -> list[str]:
+    """The tracked paths ``command`` writes, or none when the detector raises:
+    a bug in the giver check must never take the read checks after it -- the
+    strict-mode shell-read deny among them -- down with it."""
+    try:
+        return detect_tracked_writes(
+            command, coordinator.policy.is_tracked, root=str(coordinator.coordinator_root)
+        )
+    except Exception:
+        logger.warning("pre-bash write detection raised; answering without the giver check", exc_info=True)
+        return []
+
+
+def _first_write_handed_off_by(
+    coordinator: CoordinatorHTTPServer, written: list[str], caller: UUID
+) -> tuple[str, TransferRecord] | None:
+    """The first of the ``written`` paths whose live transfer record names
+    ``caller`` as giver, with that record, or ``None``. A read only: a path the
+    registry does not know is looked up, never registered (a shell write must
+    not seed an artifact the edit hooks would then treat as observed)."""
+    for path in written:
+        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        if artifact_id is None:
+            continue
+        record = coordinator.service.live_handoff_given_by(artifact_id, caller)
+        if record is not None:
+            return path, record
+    return None
+
+
 def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /hooks/pre-grep — KTD-N H4 mitigation, Grep variant.
 
@@ -2829,6 +4500,16 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     ``path`` arg, empty string for workspace root).
 
     Response shape mirrors /hooks/pre-bash.
+
+    #238: the registry lookup that decides whether anything is tracked under
+    the root runs on the request thread and waits for the registry lock only
+    until the request's watchdog deadline, which it starts (or inherits from
+    the caller-principal gate), so the lookup and everything after it -- the
+    zero-tracked fast path's delivery, the work body -- share one
+    ``HANDLER_TIMEOUT_SEC``. A lookup that runs out answers the
+    "could not verify freshness" advisory (:data:`_DEFAULT_DEGRADED_RESPONSE`,
+    as a timed-out work body does) having registered no session, recorded no
+    heartbeat and left any pending re-grounding for the next request.
     """
     body = req._read_json()
     if body is None:
@@ -2847,10 +4528,24 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             req._json(400, {"error": v})
             return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
     # Find registry-known tracked artifacts under the search root.
     # SB-10 U4 (KTD6): advisory peek hoisted above the zero-tracked-
     # artifacts exit so a pending payload still reaches this admit.
-    tracked_paths = coordinator.registry.artifact_names_under_prefix(search_root)
+    # #238: only this lookup is bounded here; the work body below
+    # already runs under the watchdog, on what the lookup left of the deadline.
+    try:
+        with coordinator.registry.abort_guard(deadline=_start_watchdog_deadline(req)):
+            tracked_paths = coordinator.registry.artifact_names_under_prefix(search_root)
+    except RegistryLockTimeout:
+        coordinator.increment_watchdog_timeout()
+        logger.warning(
+            "pre-grep could not take the registry lock within %ss; degrading",
+            HANDLER_TIMEOUT_SEC,
+        )
+        req._json(200, _DEFAULT_DEGRADED_RESPONSE)
+        return
     if not tracked_paths:
         _fast_path_json(req, coordinator, session_id, body, {"status": "fresh"})
         return
@@ -2864,6 +4559,7 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # v0.2 KTD-Q: track the first strict + stale path encountered so we
         # can emit strict-mode deny on the whole grep command. Mirrors pre-bash.
         strict_stale_first: dict | None = None
+        regrants: list[tuple[UUID, str]] = []
         for path in tracked_paths:
             artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
             if artifact_id is None:
@@ -2887,18 +4583,24 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 strict_stale_first = {
                     "path": path,
                     "current_version": artifact.version,
-                    "prior_version_seen_by_session": (
-                        artifact.version - 1 if agent_state == MESIState.INVALID else None
+                    "prior_version_seen_by_session": _prior_version_observed(
+                        coordinator, artifact_id, agent_id,
+                        agent_state=agent_state,
+                        current_version=artifact.version,
                     ),
                     "last_writer_session_id": last_writer_id or "<unknown>",
                     "last_writer_at_unix_ts": last_writer_ts,
                     "warning_generated_at_unix_ts": _payloads.now_unix(),
                     "hash_differs": False,
                 }
-            coordinator.registry.set_agent_state(
-                artifact_id, agent_id, MESIState.SHARED,
-                trigger="post_stale_grep", tick=now,
-            )
+            regrants.append((artifact_id, "post_stale_grep"))
+
+        # No held paths: a Grep over a root does not read every file under it
+        # -- see _apply_bash_grep_regrants.
+        _apply_bash_grep_regrants(
+            coordinator, agent_id, regrants,
+            held=[], command_runs=strict_stale_first is None, tick=now,
+        )
 
         # v0.2 KTD-Q strict-mode deny short-circuit. Same shape as pre-bash.
         if strict_stale_first is not None:
@@ -2923,7 +4625,9 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "stale_paths": [s["path"] for s in stale_summaries],
             }
 
-        notices = coordinator.registry.pop_pending_notices(agent_id)
+        notices = coordinator.registry.pop_pending_notices(
+            agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+        )
 
         if not stale_summaries and not notices:
             return {"status": "fresh"}
@@ -2983,18 +4687,23 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 # Four ADDITIVE routes — registered in the central ``_ROUTES`` table so they
 # ride the SAME ``verify_bearer`` + ``verify_host`` seam every other endpoint
 # uses (the dispatcher applies auth before any handler runs; there is NO
-# parallel router). All four derive the CALLER/OWNER identity SERVER-SIDE from
-# the authenticated ``session_id`` via :func:`session_to_agent_id` — the same
-# agent-identity mechanism the hook endpoints use — and NEVER from a
-# client-supplied identity field. This is the R9 server-capture boundary lock:
+# parallel router). All four derive the CALLER/OWNER identity from the request
+# body's ``session_id`` via :func:`session_to_agent_id` — the same derivation the
+# hook endpoints use. That ``session_id`` is caller-asserted and validated for
+# UUID shape only: the dispatcher authenticates the workspace bearer, not the
+# caller, so the owner is whichever identity the request NAMES. (A caller
+# principal, minted by ``POST /principal/claim``, is what a route can check the
+# named identity against — plan U4; which routes require it is U6.) What the
+# lock guarantees is narrower: no OTHER client-supplied identity field sets the
+# owner. This is the R9 server-capture boundary lock:
 #
 #   * ``begin_session`` captures the cut SERVER-SIDE; the client cannot supply a
 #     cut / pinned versions.
 #   * ``/session/read`` and ``/session/commit`` carry ONLY the ``session_token``
 #     (+ artifact path / content). Any client-supplied ``cut`` / ``pinned_*`` /
 #     ``owner`` / ``caller`` field is IGNORED — the server reads the pinned cut
-#     from the registry by token and derives the owner from the authenticated
-#     session. A forged / replayed token CANNOT forge or bypass the server-side
+#     from the registry by token and derives the owner from the request's
+#     ``session_id``. A forged / replayed token CANNOT forge or bypass the server-side
 #     capture: a token with no live cut fails closed (``session_invalidated`` /
 #     ``session_not_found``), and a foreign caller raises ``SessionInvalidated``.
 #   * The day a client legitimately carries the cut is CROSS-HOST — out of scope
@@ -3004,13 +4713,18 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 def _session_owner_from_request(
     coordinator: CoordinatorHTTPServer, session_id: str
 ) -> UUID:
-    """Derive the session OWNER/CALLER identity SERVER-SIDE from the
-    authenticated ``session_id`` (R9 / R13). Reuses the SAME
-    :func:`session_to_agent_id` derivation the hook endpoints use via
-    ``register_session`` — the identity comes from AUTH (the validated
-    ``session_id``), NEVER a client-supplied ``owner``/``caller`` field. Also
-    registers the session so status/name lookups stay consistent with the hook
-    surface."""
+    """Derive the session OWNER/CALLER identity from the request's
+    ``session_id`` (R9 / R13), via the SAME :func:`session_to_agent_id`
+    derivation the hook endpoints use through ``register_session``.
+
+    The ``session_id`` is body-supplied and caller-asserted — validated for UUID
+    shape only, never authenticated: the bearer authenticates the workspace,
+    not the caller, so this returns whichever identity the request names. The
+    guarantee is narrower than "the identity comes from auth": no client-supplied
+    ``owner``/``caller`` field is ever consulted. Checking the named identity
+    against its caller principal is :meth:`PresentedCaller.attributed_agent_id`
+    (plan U4); which routes require that check is U6. Also registers the session
+    so status/name lookups stay consistent with the hook surface."""
     return coordinator.register_session(session_id)
 
 
@@ -3037,9 +4751,10 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
 
     Request: ``{session_id, read_set: [<repo-rel path>, ...]}``.
 
-    The CALLER/OWNER is derived SERVER-SIDE from ``session_id`` (R9/R13) — the
-    client does NOT supply an owner. The server resolves each read-set PATH to
-    an artifact id (seeding first-observations like pre-read), captures the cut
+    The CALLER/OWNER is derived from the caller-asserted ``session_id``
+    (R9/R13) — the client does NOT supply a separate owner field. The server
+    resolves each read-set PATH to an artifact id (seeding first-observations
+    like pre-read), captures the cut
     via ``service.begin_session``, and returns the server-minted
     ``session_token`` plus the INSPECTABLE path-keyed cut. The bytes are never
     captured here (version-map only); ``retain_versions`` tells the client which
@@ -3071,7 +4786,9 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
             req._json(400, {"error": path_err})
             return
 
-    # OWNER derived from AUTH, never a client field (R9/R13).
+    # OWNER derived from the caller-asserted session_id, never an owner field (R9/R13).
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     owner = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -3138,7 +4855,7 @@ def _handle_session_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     R9 boundary lock: the request carries ONLY the ``session_token`` + ``path``
     — NO client-supplied cut / pinned version / owner. The server reads the
     pinned version from the registry by token and derives the caller from the
-    authenticated ``session_id``. A forged/replayed token or a foreign caller
+    caller-asserted ``session_id``. A forged/replayed token or a foreign caller
     cannot forge or bypass the server-side capture.
 
     Responses:
@@ -3169,6 +4886,8 @@ def _handle_session_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         req._json(400, {"error": path_err})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     caller = _session_owner_from_request(coordinator, session_id)
 
     def work() -> dict:
@@ -3231,7 +4950,7 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     owner. The pinned ``expected_version`` is read SERVER-SIDE from the cut
     (``service.session_commit`` sources it from ``cut[artifact_id]``); a client
     cannot drive the CAS with a forged comparand. The caller is derived from the
-    authenticated ``session_id``.
+    caller-asserted ``session_id``.
 
     Responses (preserving the shipped ``commit_cas`` taxonomy):
       - WIN → ``{ok: true, version: N+1, coordinator_epoch}``
@@ -3262,6 +4981,8 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
         req._json(400, {"error": "content must be a string"})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     caller = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -3278,6 +4999,10 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
                 session_token, artifact_id, content, caller=caller, issued_at_tick=now,
                 abort=abort,
             )
+        except GiverFenced as exc:
+            # The session owner is the caller identity the fence keys on
+            # (#185); ahead of the generic arm, which answers prose.
+            return _giver_fenced_body(exc)
         except SessionInvalidated as exc:
             _session_audit.append_session_invalidate(
                 coordinator.coordinator_root,
@@ -3340,7 +5065,7 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
     owner. Each member's ``expected_version`` is read SERVER-SIDE from the pinned
     cut (``service.session_commit_all`` sources it from ``cut[artifact_id]``), so
     a client cannot drive any member's CAS with a forged comparand. The caller is
-    derived from the authenticated ``session_id``.
+    derived from the caller-asserted ``session_id``.
 
     Responses (the batch generalization of ``/session/commit``):
       - WIN → ``{ok: true, versions: {path: N+1, ...}, coordinator_epoch}``
@@ -3391,6 +5116,8 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
         req._json(400, {"error": "writes contains duplicate paths"})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     caller = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -3413,6 +5140,10 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
                 session_token, writes_map, caller=caller, issued_at_tick=now,
                 abort=abort,
             )
+        except GiverFenced as exc:
+            # One handed-off member refuses the whole batch (#185); the
+            # body names which, ahead of the generic arm's prose.
+            return _giver_fenced_body(exc, path=path_by_id.get(exc.artifact_id))
         except SessionInvalidated as exc:
             _session_audit.append_session_invalidate(
                 coordinator.coordinator_root,
@@ -3477,10 +5208,11 @@ def _handle_session_heartbeat(req: _RequestProtocol, coordinator: CoordinatorHTT
 
     Request: ``{session_id, session_token}``.
 
-    The OWNER is derived from the authenticated ``session_id`` — a foreign
-    caller cannot keep another agent's session alive (the service enforces the
-    timing-safe owner-binding and returns False on mismatch; the response does
-    NOT reveal whether the token exists). ``{ok: true, refreshed: bool}``.
+    The OWNER is derived from the caller-asserted ``session_id`` — a request
+    naming a different session cannot keep another agent's session alive (the
+    service enforces the timing-safe owner-binding and returns False on
+    mismatch; the response does NOT reveal whether the token exists).
+    ``{ok: true, refreshed: bool}``.
     """
     body = req._read_json()
     if body is None:
@@ -3495,6 +5227,8 @@ def _handle_session_heartbeat(req: _RequestProtocol, coordinator: CoordinatorHTT
         req._json(400, {"error": "missing or invalid session_token"})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     owner = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -3508,14 +5242,737 @@ def _handle_session_heartbeat(req: _RequestProtocol, coordinator: CoordinatorHTT
 
 
 # ----------------------------------------------------------------------
+# Caller-principal mint (coordinator caller principal plan, U4)
+# ----------------------------------------------------------------------
+#
+# The coordinator authenticates the WORKSPACE bearer, not the caller: the
+# acting identity every route reads is the body-supplied ``session_id``. The
+# mint binds a coordinator-issued caller principal to that identity on its
+# first claim, so a route can later check a request naming the identity
+# against it. Accident-resistance and attributability under same-OS-user
+# cooperative trust: a process that can read ``.coherence/`` can read whatever
+# a hook client stores there. Which routes REQUIRE the principal is U6's
+# posture table, not this route's concern.
+
+_PRINCIPAL_CLAIM_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": "claim_unconfirmed",
+}
+"""Fail-closed degrade envelope for ``POST /principal/claim``: a timed-out claim
+must NOT read as success and carries no principal. The watchdog abort fails a
+late bind closed at the registry lock; if one lands anyway, the claimant
+recovers it by retrying with the SAME mint nonce (R20)."""
+
+
+def _handle_principal_claim(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /principal/claim — bind a caller principal to the acting identity
+    on its first claim, or hand it back to a retry of that claim (U4 / R1, R2,
+    R5, R20).
+
+    Request: ``{session_id, mint_nonce}``. ``mint_nonce`` is generated by the
+    claimant and persisted BEFORE this call (KTD11); it is the only thing that
+    tells a retry of a claim whose response was lost from a second claimant.
+
+    Responses:
+      - bound → ``{ok: true, principal}`` — the ONLY response a principal ever
+        crosses the wire in (R5). A retry presenting the same nonce gets the
+        same principal.
+      - identity already bound under a different nonce → ``{ok: false, reason:
+        "caller_principal_claimed", detail}`` — the claimant does not become
+        the identity (R2). Never a hold.
+      - malformed ``session_id`` / ``mint_nonce`` → HTTP 400 naming the field.
+      - watchdog degrade → :data:`_PRINCIPAL_CLAIM_DEGRADED_RESPONSE`.
+    """
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    mint_nonce = body.get("mint_nonce")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    nonce_err = mint_nonce_problem(mint_nonce)
+    if nonce_err:
+        req._json(400, {"error": nonce_err})
+        return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
+    identity = caller_principal_identity(session_id)
+
+    def work() -> dict:
+        try:
+            principal = coordinator.service.claim_caller_principal(
+                identity=identity, mint_nonce=mint_nonce, abort=abort,
+            )
+        except CallerPrincipalRefused as exc:
+            return _typed_reason_response(exc)
+        return {"ok": True, "principal": principal}
+
+    abort = threading.Event()
+    _run_or_degrade(
+        req, coordinator, work, degraded_response=_PRINCIPAL_CLAIM_DEGRADED_RESPONSE, abort=abort
+    )
+
+
+# ----------------------------------------------------------------------
+# Targeted grant handoff (#185)
+# ----------------------------------------------------------------------
+#
+# A session done with a path hands it to a named successor: the four verbs
+# below, and what a handoff changes on the routes that already exist -- the
+# giver's typed refusal on every write route, the per-grant answer of a
+# release that is not a clean success, and the structured ``handoff`` key on
+# the pre-read, pre-edit, post-edit and compare-and-swap bodies while a record
+# exists. The service decides everything; these helpers only render it.
+#
+# PYTHON-ONLY, like the effect fence and the mint: the Node backend answers
+# the four routes 404, and every body it mirrors stays byte-identical whenever
+# no transfer record exists. A clean release keeps today's bytes.
+#
+# Identity: the giver, the successor and the record are SESSION-level agent
+# ids -- ``caller_principal_identity(session_id)`` -- while the grant given up
+# is the one the presented composite holds. Every route that reaches a
+# write path passes that session-level identity to the service as ``caller``.
+#
+# Every id below is rendered ``str(uuid)``, the hyphenated spelling ``/status``
+# lists agent ids in. A successor may be NAMED in either published spelling
+# (:func:`parse_agent_id`).
+
+MAX_TRANSFER_GRANTS = MAX_SESSION_READ_SET_PATHS
+"""Cap on the grants one transfer names: the snapshot read-set's and the batch
+publish's bound, for the same defense-in-depth reason."""
+
+#: The caller's role in a record, as the ``handoff`` key's ``role`` says it.
+#: Wire values, defined once beside the prose that renders each role.
+_HANDOFF_ROLE_GIVER = _payloads.HANDOFF_ROLE_GIVER
+_HANDOFF_ROLE_SUCCESSOR = _payloads.HANDOFF_ROLE_SUCCESSOR
+_HANDOFF_ROLE_BYSTANDER = _payloads.HANDOFF_ROLE_BYSTANDER
+
+#: Why a grant a release answer reports is no longer held. Wire values:
+#: add, never rename. ``release`` is this request's own release, recorded under
+#: the ``invalidate`` trigger as before; ``handoff`` is a grant its holder
+#: handed to a successor earlier, which this request did not touch.
+_GRANT_CAUSE_RELEASE = "release"
+_GRANT_CAUSE_HANDOFF = "handoff"
+
+_HANDOFF_IN_FLIGHT_DETAIL = (
+    "another session's handoff of this path is live; it ends when its "
+    "successor declines, its giver withdraws, or any session writes the path"
+)
+"""Static text beside a ``handoff_in_flight`` refusal, which also names the
+pending giver and successor. No id, path or timestamp: byte-stable."""
+
+_HANDOFF_TRANSFER_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": HANDOFF_TRANSFER_UNCONFIRMED_REASON,
+}
+"""What ``/handoff/transfer`` answers when the watchdog cuts it short, whether
+its caller-principal gate or its work body timed out: failed and UNCONFIRMED,
+never a success. It names no grant: the transfer is all-or-nothing and
+checks the watchdog abort once, when its registry hold is won, so a body cut
+short while waiting lands nothing and one cut short inside the hold lands
+every admitted path -- every grant is equally unconfirmed either way, and one
+static body is what the gate's table can hold."""
+
+_HANDOFF_ACCEPT_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": HANDOFF_ACCEPT_UNCONFIRMED_REASON,
+}
+"""``/handoff/accept`` cut short by the watchdog: failed and unconfirmed.
+A late body aborts at the registry lock, so the record is left as it was."""
+
+_HANDOFF_DECLINE_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": HANDOFF_DECLINE_UNCONFIRMED_REASON,
+}
+"""``/handoff/decline`` cut short by the watchdog: failed and unconfirmed."""
+
+_HANDOFF_WITHDRAW_DEGRADED_RESPONSE: dict = {
+    "ok": False,
+    "degraded": True,
+    "reason": HANDOFF_WITHDRAW_UNCONFIRMED_REASON,
+}
+"""``/handoff/withdraw`` cut short by the watchdog: failed and unconfirmed."""
+
+
+def _giver_fenced_body(
+    fence: GiverFenced | TransferRecord, *, path: str | None = None
+) -> dict:
+    """A fenced giver's refusal on a write route (#185): the typed reason
+    with the successor and the version at transfer as top-level fields, so a
+    client classifies it by ``reason`` and never by prose. ``path`` names the
+    refused member of a multi-member write. ``fence`` is the raised
+    :class:`GiverFenced`, or the live record a handler read the fence from:
+    both carry the two facts, so no handler builds an exception to carry them.
+
+    The hook routes add their envelope beside it: the pre-edit deny
+    (:func:`_giver_deny_response`) and the post-edit handoff arm
+    (:func:`_giver_commit_refused_body`). The compare-and-swap and snapshot
+    routes answer it bare, and the giver's failed-edit report
+    (:func:`_handed_off_release`) adds its per-grant list."""
+    body: dict = {"ok": False, "reason": GIVER_FENCED_REASON}
+    if path is not None:
+        body["path"] = path
+    body["successor"] = str(fence.successor)
+    body["version_at_transfer"] = fence.version_at_transfer
+    return body
+
+
+_PRE_EDIT_GIVER_DENY_SOURCE = "pre_edit_handoff_giver_deny"
+_PRE_BASH_GIVER_DENY_SOURCE = "pre_bash_handoff_giver_deny"
+"""The routes' labels for the giver's deny (pre-bash answers it for a shell
+write). Neither reaches a wire byte: both routes answer the same deny."""
+
+
+def _giver_deny_response(
+    coordinator: CoordinatorHTTPServer,
+    fence: GiverFenced | TransferRecord,
+    *,
+    session_id: str,
+    path: str,
+    caller: UUID,
+    source: str,
+) -> dict:
+    """The giver's pre-edit deny: the typed reason at the top
+    level, the third byte-stable template in the deny envelope beside it, and
+    the path's ``handoff`` key -- a deny's body is fixed by its emitter, so
+    the key is attached here rather than by the route's wrapper. Pre-bash
+    answers the same bytes for a shell write; ``source`` names the route and
+    reaches no byte of the body.
+
+    Bookkeeping copied from the strict block, minus what does not fit: the
+    giver-deny counter only (this deny is neither a strict-mode nor a
+    stale-view deny, and it fires in warn mode), the route-around detector's
+    map so a shell read routing around it is counted, and no audit line (the
+    strict appender would label it a strict deny with a raw session id)."""
+    coordinator.increment_handoff_giver_denial()
+    coordinator.record_strict_deny(session_id, path)
+    body = {
+        **_giver_fenced_body(fence),
+        "hookSpecificOutput": _payloads.emit_handoff_giver_deny(
+            source=source,
+            path=path,
+            successor_id=str(fence.successor),
+            version_at_transfer=fence.version_at_transfer,
+        ),
+    }
+    return _attach_handoff_key(coordinator, body, path=path, caller=caller)
+
+
+def _giver_commit_refused_body(exc: GiverFenced, *, path: str) -> dict:
+    """The giver's post-edit refusal: the typed reason, and the
+    handoff arm -- the three exits and the statement that the edit is on disk
+    without a version -- through the post-tool context envelope. Rendered
+    from the record the fence raised from, never from a notice row: notices
+    carry no cause and are overwritten newest-wins."""
+    return {
+        **_giver_fenced_body(exc),
+        "hookSpecificOutput": _payloads.emit_posttooluse_context(
+            additional_context=_payloads.handoff_commit_refused_text(
+                path=path,
+                successor_id=str(exc.successor),
+                version_at_transfer=exc.version_at_transfer,
+            ),
+        ),
+    }
+
+
+def _handoff_record_fields(record: TransferRecord, *, live: bool) -> dict:
+    """The caller-independent half of the ``handoff`` key: who handed the path
+    to whom, at which version, from which hold shape, how the record stands,
+    and the bystander an overtaken label names. Session-level agent ids only
+    -- no session id, no composite, no timestamp -- so the corpus can
+    pin it. ``live`` is the registry's liveness, judged in one place per
+    backend from the artifact's version and the status: a record whose
+    version moved, or that was declined or withdrawn, is reported until the
+    sweep evicts it, so the giver's next touch learns how it ended."""
+    fields: dict = {
+        "giver": str(record.giver),
+        "successor": str(record.successor),
+        "version_at_transfer": record.version_at_transfer,
+        "hold_shape": record.hold_shape.name,
+        "status": record.status,
+        "live": live,
+    }
+    if record.counterparty is not None:
+        fields["counterparty"] = str(record.counterparty)
+    return fields
+
+
+def _handoff_projection(record: TransferRecord, *, live: bool, caller: UUID) -> dict:
+    """The ``handoff`` key: ``record`` projected for ``caller``'s role.
+
+    The successor reads its provenance (who handed it the path, at which
+    version, from which hold shape), a bystander the pair it is writing past,
+    the giver its outcome -- the role first, then the record's fields."""
+    if caller == record.giver:
+        role = _HANDOFF_ROLE_GIVER
+    elif caller == record.successor:
+        role = _HANDOFF_ROLE_SUCCESSOR
+    else:
+        role = _HANDOFF_ROLE_BYSTANDER
+    return {"role": role, **_handoff_record_fields(record, live=live)}
+
+
+def _status_handoff_projection(
+    record: TransferRecord, *, live: bool, operator_tier: bool
+) -> dict:
+    """The ``handoff`` key on a ``/status`` entry: the record's fields
+    with no ``role``, because ``/status`` has no caller to be a party to the
+    record -- it describes the workspace, and each party tells its own role by
+    its session-level id. The operator tier adds the record's created
+    wall-clock timestamp beside the entry's last-writer one; the default tier
+    carries ids only."""
+    projection = _handoff_record_fields(record, live=live)
+    if operator_tier:
+        projection["created_at_unix_ts"] = record.created_at
+    return projection
+
+
+def _win_outcome(record: TransferRecord, *, caller: UUID, won_at: int) -> str | None:
+    """What a compare-and-swap win at ``won_at`` did to ``record``: completed
+    (the successor's win) or overtaken (anyone else's), or ``None`` when the
+    win labelled nothing -- the record was not live when it was admitted, or
+    the label write failed, or a later transfer has since replaced it.
+
+    The service labels only a record live at admission, whose version at
+    transfer is the win's expected version, and the win then moved the
+    version, so nothing relabels that record afterwards: the label read
+    back here is the one the win wrote, when it names this caller."""
+    if record.version_at_transfer != won_at:
+        return None
+    if record.status == TRANSFER_STATUS_COMPLETED and caller == record.successor:
+        return TRANSFER_STATUS_COMPLETED
+    if record.status == TRANSFER_STATUS_OVERTAKEN and record.counterparty == caller:
+        return TRANSFER_STATUS_OVERTAKEN
+    return None
+
+
+def _attach_handoff_key(
+    coordinator: CoordinatorHTTPServer,
+    result: dict,
+    *,
+    path: str,
+    caller: UUID,
+    won_at: int | None = None,
+) -> dict:
+    """``result`` with the ``handoff`` key added while ``path`` has a transfer
+    record, else ``result`` itself, unchanged (byte-identical whenever no
+    record exists). ``won_at`` is a compare-and-swap win's expected version;
+    the key then also carries the win's ``outcome`` when it labelled the
+    record.
+
+    A read only -- nothing is granted, popped or marked -- so it may ride the
+    safety-path reads too. The key is top-level: it never enters a
+    ``hookSpecificOutput``.
+
+    Best-effort: ``result`` is the answer to work that already landed (a
+    grant, a win, notices popped), so a failed read answers ``result``
+    without the key rather than turning that work into an error the client
+    would act on. A missing key is therefore not proof the path has no
+    record."""
+    try:
+        read = _read_handoff(coordinator, path)
+        if read is None:
+            return result
+        record, live = read
+        projection = _handoff_projection(record, live=live, caller=caller)
+        if won_at is not None:
+            outcome = _win_outcome(record, caller=caller, won_at=won_at)
+            if outcome is not None:
+                projection["outcome"] = outcome
+    except Exception:  # noqa: BLE001 — any raise; the landed answer stands
+        logger.warning(
+            "handoff key not attached for %r after the answer was decided", path, exc_info=True
+        )
+        return result
+    return {**result, "handoff": projection}
+
+
+def _read_handoff(
+    coordinator: CoordinatorHTTPServer, path: str
+) -> tuple[TransferRecord, bool] | None:
+    """``path``'s transfer record and its liveness, or ``None`` when the path
+    is unknown or has no record. A read only."""
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    if artifact_id is None:
+        return None
+    return coordinator.registry.get_transfer_record(artifact_id)
+
+
+def _is_deny(result: dict) -> bool:
+    """Does ``result`` carry a deny envelope (a strict deny or the giver's)?"""
+    hso = result.get("hookSpecificOutput")
+    return hso is not None and hso.get("permissionDecision") == "deny"
+
+
+def _attach_hook_handoff(
+    coordinator: CoordinatorHTTPServer,
+    result: dict,
+    *,
+    path: str,
+    caller: UUID,
+    acquired: bool = False,
+    observed: int | None = None,
+) -> dict:
+    """The pre-read and pre-edit seam for a handoff, from ONE
+    read of the record: :func:`_attach_handoff_key`'s, best-effort like it,
+    so a failed read answers ``result`` with neither the key nor the prose.
+
+    A deny is returned untouched: a strict deny keeps the corpus's bytes, and
+    the giver's deny carries its own key. Every other arm gets the
+    ``handoff`` key while the path has a record, and an admit also gets the
+    role's prose through the context-only envelope -- never the allow
+    emitter, which would widen a permission decision. ``acquired`` marks the
+    pre-edit's acquire, where ``observed`` (this agent's last observed
+    version before it) decides the successor's read-first warning."""
+    if _is_deny(result):
+        return result
+    result = _attach_handoff_key(coordinator, result, path=path, caller=caller)
+    projection = result.get("handoff")
+    # No key, or a refusal body (``ok: false``), which gets the key only: the
+    # admit test is the one the re-grounding attach uses.
+    if projection is None or not _reground_qualifies(result):
+        return result
+    unread = acquired and (observed is None or observed < projection["version_at_transfer"])
+    text = _payloads.handoff_context_text(projection, path=path, unread=unread)
+    return result if text is None else _attach_pretooluse_context(result, text)
+
+
+def _released_grant(path: str) -> dict:
+    """A release answer's entry for a grant this request released."""
+    return {"path": path, "held": False, "cause": _GRANT_CAUSE_RELEASE}
+
+
+def _held_grant(path: str, exc: CoherenceError) -> dict:
+    """A release answer's entry for a grant still held, with why: the typed
+    reason (and the prose as ``detail``) when the error carries one, the
+    error's text otherwise -- the release routes' existing reason."""
+    fields = _typed_reason_response(exc)
+    del fields["ok"]
+    return {"path": path, "held": True, **fields}
+
+
+def _handed_off_grant(path: str, record: TransferRecord) -> dict:
+    """A release answer's entry for a grant its holder handed off: not
+    held, handed to the successor at the version at transfer."""
+    return {
+        "path": path,
+        "held": False,
+        "cause": _GRANT_CAUSE_HANDOFF,
+        "successor": str(record.successor),
+        "version_at_transfer": record.version_at_transfer,
+    }
+
+
+def _handed_off_release(path: str, record: TransferRecord) -> dict:
+    """The giver's failed-edit report on its live record: not a clean
+    success. The typed giver reason and the per-grant entry, and nothing
+    changed -- no release, and never a withdraw."""
+    return {**_giver_fenced_body(record), "grants": [_handed_off_grant(path, record)]}
+
+
+def _refused_transfer_grant(path: str, reason: str) -> dict:
+    return {"path": path, "transferred": False, "reason": reason}
+
+
+def _transfer_grant_entry(path: str, outcome: TransferGrantOutcome) -> dict:
+    """One grant of a transfer answer, from the service's outcome: the
+    normalised session-level ids, the version at transfer and the hold shape
+    given up for a transferred grant; the typed reason, and whatever the
+    refusal names (the pending pair, an ended record's status), otherwise."""
+    entry: dict = {"path": path, "transferred": outcome.transferred}
+    if outcome.reason is not None:
+        entry["reason"] = outcome.reason
+    if outcome.giver is not None:
+        entry["giver"] = str(outcome.giver)
+    if outcome.successor is not None:
+        entry["successor"] = str(outcome.successor)
+    if outcome.version_at_transfer is not None:
+        entry["version_at_transfer"] = outcome.version_at_transfer
+    if outcome.hold_shape is not None:
+        entry["hold_shape"] = outcome.hold_shape.name
+    if outcome.status is not None:
+        entry["status"] = outcome.status
+    if outcome.reason == HANDOFF_IN_FLIGHT_REASON:
+        entry["detail"] = _HANDOFF_IN_FLIGHT_DETAIL
+    return entry
+
+
+def _transfer_answer(entries: list[dict]) -> dict:
+    """The transfer's answer: success only when every named grant transferred,
+    with one entry per grant in request order."""
+    return {"ok": all(entry["transferred"] for entry in entries), "grants": entries}
+
+
+def _parse_transfer_grants(grants: Any) -> "list[tuple[str, str | None]] | str":
+    """The transfer's ``grants`` as ``(path, subagent id or None)`` pairs, or
+    the 400 ``error`` naming what is wrong.
+
+    A grant's ``agent_id`` names the incarnation (a subagent component) that
+    holds the claim on that path, so a client presents a DIFFERENT composite
+    per path; absent, the request's own ``agent_id`` applies. A
+    malformed one is refused rather than read as the parent: the parent's
+    grant is not the one the caller asked to give away."""
+    if not isinstance(grants, list) or not grants:
+        return "grants must be a non-empty list of {path, agent_id}"
+    if len(grants) > MAX_TRANSFER_GRANTS:
+        return f"grants exceeds {MAX_TRANSFER_GRANTS} paths"
+    parsed: list[tuple[str, str | None]] = []
+    for item in grants:
+        if not isinstance(item, dict):
+            return "each grant must be a {path, agent_id} object"
+        path = item.get("path", "")
+        path_err = validate_path(path)
+        if path_err:
+            return path_err
+        subagent = read_subagent_id(item)
+        if subagent is None and has_subagent_id_field(item):
+            return _MALFORMED_SUBAGENT_ERROR
+        parsed.append((path, subagent))
+    # A duplicate path would collapse in the artifact-keyed request.
+    if len({path for path, _ in parsed}) != len(parsed):
+        return "grants contains duplicate paths"
+    return parsed
+
+
+def _handle_handoff_transfer(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /handoff/transfer — hand claims to a named successor (#185).
+
+    Request::
+
+        {"session_id": "<uuid>",            # the giver's session
+         "agent_id": "<subagent id>",       # optional: the default holder
+         "successor": "<agent id>",         # hyphenated or 32-hex
+         "grants": [{"path": "<repo-relative path>",
+                     "agent_id": "<subagent id>"},   # optional, per path
+                    ...]}
+
+    Each grant gives up the claim the composite
+    ``session_to_agent_id(session_id, <grant agent_id or request agent_id>)``
+    holds on its path -- a volume names, per path, the incarnation that holds
+    its claim there. The giver recorded and fenced is the SESSION.
+
+    The successor is named by a coordinator-published agent id. A
+    composite the live name map holds is normalised to its session; an id the
+    map does not hold is known only when a principal is bound to it (it is
+    then a session-level id); anything else -- a composite the map lost on a
+    restart, even one still holding a grant row -- is refused as unknown, and
+    is never handed to the service, whose grant-row arm (for library callers
+    with no name map) would count it known.
+
+    Responses, HTTP 200 for every protocol outcome::
+
+        {"ok": <every grant transferred>,
+         "grants": [{"path", "transferred": true, "giver", "successor",
+                     "version_at_transfer", "hold_shape", "status"} |
+                    {"path", "transferred": false, "reason", ...}, ...]}
+
+    in request order; a refused grant is left exactly as it was. A
+    malformed successor refuses every grant (``handoff_successor_malformed``),
+    an unknown one likewise (``handoff_successor_unknown``); a path the
+    coordinator has never seen is not held. HTTP 400 for a request whose
+    session, grant set or subagent id cannot be read; the principal gate's 400
+    as on every require-class route; the watchdog's
+    :data:`_HANDOFF_TRANSFER_DEGRADED_RESPONSE`.
+
+    Stays OUT of ``_MIGRATION_REJECTED_ROUTES``: a transfer initiates no
+    write, and the epoch move it makes is the release-class bump the drain
+    performs itself."""
+    body = req._read_json()
+    if body is None:
+        return
+    session_id = body.get("session_id")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    grants = _parse_transfer_grants(body.get("grants"))
+    if isinstance(grants, str):
+        req._json(400, {"error": grants})
+        return
+    if body.get("successor") is None:
+        req._json(400, {"error": "missing successor"})
+        return
+    default_subagent = read_subagent_id(body)
+    if default_subagent is None and has_subagent_id_field(body):
+        req._json(400, {"error": _MALFORMED_SUBAGENT_ERROR})
+        return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, default_subagent)) is None:
+        return
+    coordinator.register_session(session_id, default_subagent)
+
+    successor = parse_agent_id(body["successor"])
+    if successor is None:
+        # A malformed successor is refused per grant inside a 200, never a 400
+        # and never a plain release -- the stated exception to the
+        # malformed-optional rule.
+        req._json(200, _transfer_answer([
+            _refused_transfer_grant(path, HANDOFF_SUCCESSOR_MALFORMED_REASON)
+            for path, _ in grants
+        ]))
+        return
+    giver = caller_principal_identity(session_id)
+    named_session = coordinator.session_identity_for(successor)
+    now = monotonic_seconds()
+
+    def work() -> dict:
+        resolved = named_session
+        if resolved is None and coordinator.service.is_caller_principal_bound(successor):
+            resolved = successor
+        if resolved is None:
+            return _transfer_answer([
+                _refused_transfer_grant(path, HANDOFF_SUCCESSOR_UNKNOWN_REASON)
+                for path, _ in grants
+            ])
+        entries: dict[str, dict] = {}
+        holders: dict[UUID, UUID] = {}
+        path_by_id: dict[UUID, str] = {}
+        for path, subagent in grants:
+            artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+            if artifact_id is None:
+                entries[path] = _refused_transfer_grant(path, HANDOFF_NOT_HELD_REASON)
+                continue
+            holders[artifact_id] = session_to_agent_id(session_id, subagent or default_subagent)
+            path_by_id[artifact_id] = path
+        if holders:
+            # One registry hold decides and applies every path; the abort is
+            # checked once, when the hold is won, so a watchdog abort lands
+            # either nothing or every admitted path, never some of them.
+            for outcome in coordinator.service.transfer(
+                giver=giver,
+                successor=resolved,
+                holders=holders,
+                successor_known=True,
+                issued_at_tick=now,
+                abort=abort,
+            ):
+                path = path_by_id[outcome.artifact_id]
+                entries[path] = _transfer_grant_entry(path, outcome)
+        return _transfer_answer([entries[path] for path, _ in grants])
+
+    abort = threading.Event()
+    _run_or_degrade(
+        req, coordinator, work, degraded_response=_HANDOFF_TRANSFER_DEGRADED_RESPONSE, abort=abort
+    )
+
+
+def _verb_body(outcome: TransferVerbOutcome) -> dict:
+    """An accept's, decline's or withdraw's answer: ``ok``, and the typed
+    reason, the record's status and its counterparty where there are any."""
+    body: dict = {"ok": outcome.ok}
+    if outcome.reason is not None:
+        body["reason"] = outcome.reason
+    if outcome.status is not None:
+        body["status"] = outcome.status
+    if outcome.counterparty is not None:
+        body["counterparty"] = str(outcome.counterparty)
+    return body
+
+
+def _settle_handoff(
+    req: _RequestProtocol,
+    coordinator: CoordinatorHTTPServer,
+    body: dict,
+    session_id: Any,
+    *,
+    settle: Callable[..., TransferVerbOutcome],
+    degraded_response: dict,
+) -> None:
+    """The shared body of accept, decline and withdraw: validate, admit,
+    register, then run ``settle`` (the service verb) for the path's record as
+    the SESSION-level identity -- the parties to a handoff are sessions, so a
+    subagent of the successor accepts for it.
+
+    Request: ``{session_id, path}`` (an ``agent_id`` is read for the principal
+    gate only). Responses: ``{ok, status?, counterparty?}``, or ``{ok: false,
+    reason, status?}`` naming the typed refusal; a path with no record, or one
+    the coordinator has never seen, answers ``handoff_not_live`` with no
+    status; the watchdog answers ``degraded_response``. Out of the migration
+    set like the transfer: none of the three initiates a write."""
+    path = body.get("path", "")
+    sid_err = validate_session_id(session_id)
+    if sid_err:
+        req._json(400, {"error": sid_err[1]})
+        return
+    path_err = validate_path(path)
+    if path_err:
+        msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
+        req._json(400, {"error": msg})
+        return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+        return
+    coordinator.register_session(session_id, read_subagent_id(body))
+    caller = caller_principal_identity(session_id)
+
+    def work() -> dict:
+        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        if artifact_id is None:
+            return {"ok": False, "reason": HANDOFF_NOT_LIVE_REASON}
+        return _verb_body(settle(artifact_id=artifact_id, caller=caller, abort=abort))
+
+    abort = threading.Event()
+    _run_or_degrade(req, coordinator, work, degraded_response=degraded_response, abort=abort)
+
+
+def _handle_handoff_accept(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /handoff/accept — the successor accepts a live handoff without
+    writing: a pending record becomes completed and the giver's fence
+    stands; an overtaken one is answered as it stands. See
+    :func:`_settle_handoff`."""
+    body = req._read_json()
+    if body is None:
+        return
+    _settle_handoff(
+        req, coordinator, body, body.get("session_id"),
+        settle=coordinator.service.accept_transfer,
+        degraded_response=_HANDOFF_ACCEPT_DEGRADED_RESPONSE,
+    )
+
+
+def _handle_handoff_decline(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /handoff/decline — the successor declines a live handoff:
+    the record ends declined and the giver's fence lifts at once. See
+    :func:`_settle_handoff`."""
+    body = req._read_json()
+    if body is None:
+        return
+    _settle_handoff(
+        req, coordinator, body, body.get("session_id"),
+        settle=coordinator.service.decline_transfer,
+        degraded_response=_HANDOFF_DECLINE_DEGRADED_RESPONSE,
+    )
+
+
+def _handle_handoff_withdraw(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
+    """POST /handoff/withdraw — the giver withdraws its live handoff:
+    the record ends withdrawn and the fence lifts. Nothing else withdraws: a
+    session stop and a failed edit never do. See
+    :func:`_settle_handoff`."""
+    body = req._read_json()
+    if body is None:
+        return
+    _settle_handoff(
+        req, coordinator, body, body.get("session_id"),
+        settle=coordinator.service.withdraw_transfer,
+        degraded_response=_HANDOFF_WITHDRAW_DEGRADED_RESPONSE,
+    )
+
+
+# ----------------------------------------------------------------------
 # Workspace-checkpoint endpoints (WV plan Unit 3 — R1/R2/R8)
 # ----------------------------------------------------------------------
 #
 # Registered in the central ``_ROUTES`` table so they ride the SAME
 # ``verify_bearer`` + ``verify_host`` seam as every other endpoint (no parallel
-# router). The OWNER is derived SERVER-SIDE from the authenticated
-# ``session_id`` (the R9/R13 boundary lock — a client-supplied ``owner`` field
-# is ignored), and the ``checkpoint_id`` is minted SERVER-SIDE by the service.
+# router). The OWNER is derived from the caller-asserted ``session_id`` (the
+# R9/R13 boundary lock — a client-supplied ``owner`` field is ignored), and the
+# ``checkpoint_id`` is minted SERVER-SIDE by the service.
 # The member rows themselves are CLIENT-captured facts (tokens, fingerprints,
 # timestamps — the capture engine runs client-side against ITS substrates, the
 # coordinator never sees the bytes); the boundary validates their SHAPE
@@ -3635,10 +6092,18 @@ def _handle_workspace_checkpoint(
 
     Request: ``{session_id, name, window_min, window_max, members: [{
     member_path, native_token?, fingerprint?, captured_at, absent?,
-    dirty_during_window?, arbitration_tier?, restore_tier?}, ...]}``.
+    dirty_during_window?, arbitration_tier?, restore_tier?}, ...],
+    receiver_session_id?}``.
 
-    The OWNER is derived from the authenticated ``session_id`` (R9/R13); the
-    ``checkpoint_id`` is minted server-side. The registration is ONE registry
+    The OWNER is derived from the caller-asserted ``session_id`` (R9/R13); the
+    ``checkpoint_id`` is minted server-side. The OPTIONAL
+    ``receiver_session_id`` (#191) names the one session allowed to register a
+    restore of this checkpoint: its controller identity is derived with the
+    same function ``/workspace/restore/register`` applies to ITS
+    ``session_id``, so the binding holds exactly as far as that derivation
+    does — when the receiver session claims a caller principal, a register
+    naming it must present that principal (the route is require-class). Absent
+    or null admits any session, the pre-#191 behaviour. The registration is ONE registry
     transaction (header + owner + every member — the Unit-2 API), so a typed
     failure means NO partial manifest.
 
@@ -3649,7 +6114,8 @@ def _handle_workspace_checkpoint(
 
     Responses:
       - WIN → ``{ok: true, checkpoint_id, name, window_min, window_max,
-        coordinator_epoch}``
+        coordinator_epoch}``, plus ``receiver`` (the derived controller id as
+        a string) only when the request named a ``receiver_session_id``
       - validation / registry rejection → ``{ok: false, reason}``; a typed
         ``CoherenceError`` carries its identity-stable ``reason`` token with
         the prose in ``detail``
@@ -3665,10 +6131,16 @@ def _handle_workspace_checkpoint(
     window_min = body.get("window_min")
     window_max = body.get("window_max")
     members = body.get("members")
+    receiver_session_id = body.get("receiver_session_id")
     sid_err = validate_session_id(session_id)
     if sid_err:
         req._json(400, {"error": sid_err[1]})
         return
+    if receiver_session_id is not None:
+        rsid_err = validate_session_id(receiver_session_id)
+        if rsid_err:
+            req._json(400, {"error": f"receiver_session_id: {rsid_err[1]}"})
+            return
     if not isinstance(name, str) or not name.strip():
         req._json(400, {"error": "name must be a non-empty string"})
         return
@@ -3702,7 +6174,16 @@ def _handle_workspace_checkpoint(
         req._json(400, {"error": "members contains duplicate member_path values"})
         return
 
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     owner = _session_owner_from_request(coordinator, session_id)
+    # The receiver is derived, never registered: naming a session as the
+    # receiver is not that session acting.
+    receiver = (
+        session_to_agent_id(receiver_session_id)
+        if receiver_session_id is not None
+        else None
+    )
     now = monotonic_seconds()
 
     def work() -> dict:
@@ -3715,6 +6196,7 @@ def _handle_workspace_checkpoint(
                 window_max=float(window_max),
                 issued_at_tick=now,
                 abort=abort,
+                receiver=receiver,
             )
         except ValueError as exc:
             # Service/registry validation (defense-in-depth behind the
@@ -3724,7 +6206,7 @@ def _handle_workspace_checkpoint(
             # Typed domain failure: identity-stable reason token on the wire
             # (the restore/register posture), prose preserved in "detail".
             return _typed_reason_response(exc)
-        return {
+        body = {
             "ok": True,
             "checkpoint_id": record.checkpoint_id,
             "name": record.name,
@@ -3732,6 +6214,10 @@ def _handle_workspace_checkpoint(
             "window_max": record.window_max,
             "coordinator_epoch": coordinator.registry.coordinator_epoch,
         }
+        # #191: present only when the request named a receiver.
+        if record.receiver is not None:
+            body["receiver"] = str(record.receiver)
+        return body
 
     # Fail-closed degrade + abort threading (the A6 session-commit lesson):
     # a timed-out registration must NOT read as success, and the abort Event
@@ -3779,21 +6265,27 @@ def _handle_workspace_checkpoints(
         checkpoints = []
         for record in coordinator.registry.list_checkpoints():
             members = coordinator.registry.get_checkpoint_members(record.checkpoint_id)
-            checkpoints.append(
-                {
-                    "checkpoint_id": record.checkpoint_id,
-                    "name": record.name,
-                    "owner": str(record.owner),
-                    "created_at": record.created_at,
-                    "created_at_tick": record.created_at_tick,
-                    "window_min": record.window_min,
-                    "window_max": record.window_max,
-                    "restore_status": record.restore_status,
-                    "restore_updated_at": record.restore_updated_at,
-                    "pin_refcount": record.pin_refcount,
-                    "members": [_render_checkpoint_member(m) for m in members],
-                }
-            )
+            entry = {
+                "checkpoint_id": record.checkpoint_id,
+                "name": record.name,
+                "owner": str(record.owner),
+                "created_at": record.created_at,
+                "created_at_tick": record.created_at_tick,
+                "window_min": record.window_min,
+                "window_max": record.window_max,
+                "restore_status": record.restore_status,
+                "restore_updated_at": record.restore_updated_at,
+                "pin_refcount": record.pin_refcount,
+            }
+            # #191: who may register a restore and who did, each present only
+            # when set (absent: anyone may; nobody has yet). Both are
+            # controller ids of the same class as ``owner``.
+            if record.receiver is not None:
+                entry["receiver"] = str(record.receiver)
+            if record.registered_by is not None:
+                entry["registered_by"] = str(record.registered_by)
+            entry["members"] = [_render_checkpoint_member(m) for m in members]
+            checkpoints.append(entry)
         return {
             "ok": True,
             "checkpoints": checkpoints,
@@ -3836,6 +6328,12 @@ timed-out registration must read as FAILURE (the ``_OCC_DEGRADED_RESPONSE``
 posture — it is a version-bumping commit path), never as success."""
 
 
+def _restore_controller_refused_response(exc: CheckpointRegistrationRefused) -> dict:
+    """The typed #191 refusal envelope shared by the restore routes:
+    ``{ok: false, reason, detail, member_paths}``."""
+    return {**_typed_reason_response(exc), "member_paths": list(exc.member_paths)}
+
+
 def _validate_checkpoint_id(checkpoint_id: Any) -> str | None:
     """Boundary shape check for a wire checkpoint id (reason, or None if ok)."""
     if not isinstance(checkpoint_id, str) or not checkpoint_id.strip():
@@ -3861,6 +6359,12 @@ def _handle_workspace_restore_status(
     durable metadata with no version bump — it lands durably or fails typed.
     An unknown checkpoint answers ``{ok: false, reason: "checkpoint_unknown",
     detail}`` — the register route's stable token, matched by identity.
+
+    Who may write it (#191): the controller derived from ``session_id``, as
+    on the register route. A checkpoint naming another receiver answers
+    ``{ok: false, reason: "not_the_receiver", detail, member_paths: []}``;
+    one another controller registered answers ``already_registered``. No
+    claim is made here.
     """
     body = req._read_json()
     if body is None:
@@ -3879,16 +6383,26 @@ def _handle_workspace_restore_status(
     if status not in RESTORE_STATUSES:
         req._json(400, {"error": f"status must be one of {sorted(RESTORE_STATUSES)}"})
         return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
+    # #191: the same controller the register route derives, gated the same way.
+    controller = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
     def work() -> dict:
         try:
             coordinator.service.set_workspace_checkpoint_restore_status(
-                checkpoint_id, status, updated_at=float(now), abort=abort
+                checkpoint_id,
+                status,
+                updated_at=float(now),
+                abort=abort,
+                controller=controller,
             )
         except KeyError as exc:
             # Unknown checkpoint — the register route's stable token, not prose.
             return _unknown_checkpoint_response(exc)
+        except CheckpointRegistrationRefused as exc:
+            return _restore_controller_refused_response(exc)
         except ValueError as exc:
             return {"ok": False, "reason": str(exc)}
         return {
@@ -3922,6 +6436,9 @@ def _handle_workspace_restore_member(
     never through ``commit_all`` (which has no delete semantics). An unknown
     (checkpoint, member) pair answers ``{ok: false, reason:
     "checkpoint_unknown", detail}`` — the stable token, prose in ``detail``.
+    Gated like ``/workspace/restore/status`` (#191): ``not_the_receiver`` /
+    ``already_registered`` for a controller the checkpoint excludes, so the
+    delete half of a registration has the same gate as the commit half.
     """
     body = req._read_json()
     if body is None:
@@ -3960,6 +6477,10 @@ def _handle_workspace_restore_member(
     ):
         req._json(400, {"error": "deleted_at_restore must be null or a number"})
         return
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
+    # #191: the same controller the register route derives, gated the same way.
+    controller = _session_owner_from_request(coordinator, session_id)
 
     def work() -> dict:
         try:
@@ -3971,11 +6492,14 @@ def _handle_workspace_restore_member(
                     float(deleted_at_restore) if deleted_at_restore is not None else None
                 ),
                 abort=abort,
+                controller=controller,
             )
         except KeyError as exc:
             # Unknown (checkpoint, member) pair — same stable token as the
             # register route's unknown-checkpoint class; "detail" says which.
             return _unknown_checkpoint_response(exc)
+        except CheckpointRegistrationRefused as exc:
+            return _restore_controller_refused_response(exc)
         except ValueError as exc:
             return {"ok": False, "reason": str(exc)}
         return {
@@ -4004,8 +6528,8 @@ def _handle_workspace_restore_register(
     Request: ``{session_id, checkpoint_id, writes: [{member_path,
     fingerprint}, ...]}`` — the restore run's WRITTEN file members, hash-only
     (fingerprints, never content bytes; the boundary enforces 64-hex). The
-    CONTROLLER identity derives from the authenticated ``session_id``
-    server-side (R9/R13), never a client field. One
+    CONTROLLER identity derives from the caller-asserted ``session_id``
+    (R9/R13), never a separate client field. One
     ``register_workspace_restore`` call → at most one all-or-nothing
     ``commit_all``; an empty ``writes`` answers the typed ``empty_write_set``
     (``commit_all`` never called, by contract).
@@ -4019,12 +6543,26 @@ def _handle_workspace_restore_register(
     In ``_MIGRATION_REJECTED_ROUTES``: this is a version-bumping write
     initiation (the post-edit-cas strand hazard applies mid-drain).
 
+    Who may register, and what (#191): the write-set must name members of
+    the checkpoint at their captured fingerprints, the controller must be the
+    checkpoint's receiver when it names one, and the first registering
+    controller claims the checkpoint — see
+    ``CoordinatorService.register_workspace_restore``.
+
     Responses:
       - WIN → ``{ok: true, status, detail, versions: {path: v}, skipped,
         refused: {path: reason}, invalidated, coordinator_epoch}`` (``status``
         from the closed WORKSPACE_REGISTRATION set; ``refused`` non-empty only
-        on ``status == "refused"`` — nothing mutated then, all-or-nothing)
+        on ``status == "refused"`` — nothing mutated then, all-or-nothing),
+        plus ``retry_of_own_registration: true`` only when this session's
+        controller had already claimed the checkpoint
       - unknown checkpoint → ``{ok: false, reason: "checkpoint_unknown"}``
+      - registration refused → ``{ok: false, reason, detail, member_paths}``
+        with ``reason`` one of ``not_a_checkpoint_member`` /
+        ``fingerprint_mismatch`` (``member_paths`` names the offending writes)
+        or ``not_the_receiver`` / ``already_registered`` (``member_paths``
+        empty; neither names another controller). Nothing resolved, minted or
+        committed.
       - watchdog degrade → fail-closed
         :data:`_RESTORE_REGISTER_DEGRADED_RESPONSE`
     """
@@ -4071,7 +6609,9 @@ def _handle_workspace_restore_register(
             WorkspaceRestoreWrite(member_path=member_path, fingerprint=fingerprint)
         )
 
-    # CONTROLLER derived from AUTH, never a client field (R9/R13).
+    # CONTROLLER derived from the caller-asserted session_id, never a separate field (R9/R13).
+    if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
+        return
     controller = _session_owner_from_request(coordinator, session_id)
     now = monotonic_seconds()
 
@@ -4086,15 +6626,23 @@ def _handle_workspace_restore_register(
             )
         except CheckpointUnknown as exc:
             return {"ok": False, "reason": exc.reason}
+        except CheckpointRegistrationRefused as exc:
+            return _restore_controller_refused_response(exc)
         except ValueError as exc:
             return {"ok": False, "reason": str(exc)}
         except OccCallerTransientError:
             # Retry-eligible: the controller is mid-transient (a peer's commit
             # invalidated it between read and CAS). Byte-stable reason.
             return {"ok": False, "reason": OCC_CALLER_TRANSIENT_REASON}
+        except GiverFenced as exc:
+            # The controller is the session-level identity, so a giver's
+            # registration of a path it handed off is refused (#185);
+            # ahead of the generic arm, which would answer it as prose.
+            fenced = coordinator.registry.get_artifact(exc.artifact_id)
+            return _giver_fenced_body(exc, path=fenced.name if fenced else None)
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
-        return {
+        body = {
             "ok": True,
             "checkpoint_id": checkpoint_id,
             "status": result.status,
@@ -4107,6 +6655,10 @@ def _handle_workspace_restore_register(
             "invalidated": len(result.signals),
             "coordinator_epoch": coordinator.registry.coordinator_epoch,
         }
+        # #191: present only when this controller had already claimed.
+        if result.retry_of_own_registration:
+            body["retry_of_own_registration"] = True
+        return body
 
     abort = threading.Event()
     _run_or_degrade(
@@ -4129,27 +6681,108 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     | metrics   | ?detail=metrics      | none — telemetry block only    |
     | full      | ?detail=full         | ``Coherence-Local-Operator: true`` header opt-in |
 
-    ``minimal`` is the default and includes no absolute paths (workspace
-    root is reported as a sentinel ``.``). ``metrics`` returns only the
-    counter block — useful for operators scraping /status into a
-    dashboard without leaking workspace state. ``full`` is the legacy
-    everything-block plus absolute ``coordinator_root`` and ``coordinator_pid``,
+    ``minimal`` is the default and includes no absolute paths: the workspace
+    root is reported as the sentinel ``.``, both as the top-level
+    ``coordinator_root`` and as ``policy_summary.coordinator_root``. It
+    carries no session names (R6: ``agent_name`` embeds the raw session id,
+    so it is null below the operator tier; the non-reversible ``agent_id``
+    and the per-artifact ``states`` map stay). ``metrics`` returns
+    only the counter block — useful for operators scraping /status into a
+    dashboard without leaking workspace state; it carries no sessions at
+    all and is unaffected by R6. ``full`` is the legacy
+    everything-block plus the absolute top-level ``coordinator_root``
+    (``coordinator_pid`` is at the minimal tier too, P1 #7),
     gated by the explicit ``Coherence-Local-Operator: true`` header so a
     same-user adversary (Adversary 1 in auth.py) cannot trivially grab
     the operator's home-directory path. Bearer auth is enforced by the
     dispatcher; the header is a SECOND factor specifically for the
     elevated tier.
 
+    #185: while a tracked artifact has a transfer record, its
+    ``tracked_artifacts`` entry carries a ``handoff`` key at the minimal and
+    full tiers, with session-level agent ids only; the full tier's key adds
+    the record's ``created_at_unix_ts``. An entry with no record, and the
+    metrics tier always, keep today's bytes.
+
+    #195 — reclaim cause at the operator tier: every ``sessions[]`` row at
+    ``detail=full`` carries ``reclaimed``, a map SIBLING to ``states``:
+    ``{path: {"trigger": "reclaim_heartbeat" | "reclaim_max_hold", "reclaimed_at_unix_ts": int}}``
+    for each artifact whose last write grant the stable-grant sweep pulled
+    from this agent (the registry's ``last_reclaim_trigger`` /
+    ``last_reclaim_tick`` slot). ``states`` keeps its meaning — held grants
+    only, INVALID omitted — so a consumer that never reads ``reclaimed`` sees
+    exactly today's body. A voluntary release, a peer preemption and a commit
+    record no slot and leave ``reclaimed`` empty. The slot clears only on the
+    next M/E acquire, so an entry means "this session's most recent write
+    grant on this path was reclaimed and it has held none since": a re-read
+    granted SHARED shows the path in ``states`` and keeps it in ``reclaimed``,
+    and a peer invalidating that read leaves the original trigger and time.
+    Over the hooks a re-read is granted SHARED even when no other session
+    holds the path: the pre-read's re-grant of a stale or held reader does
+    not capture the read generation, so the session's compare-and-swap stays
+    refused ``stale_read_generation`` and the path stays listed until its
+    next pre-edit, the M/E acquire that clears the slot. (Only the library's
+    ``CoordinatorService.fetch`` grants a sole reader EXCLUSIVE.) A pair held
+    M/E is never listed. Both maps come from one registry read.
+    ``reclaimed_at_unix_ts`` is when the sweep reclaimed the grant, in whole
+    unix seconds like the other ``*_unix_ts`` fields. The key is absent below
+    the operator tier. An agent that is unnamed, holds nothing and is listed
+    only for a reclaim gets a row only while its newest reclaim is younger
+    than ``_RECLAIM_ONLY_ROW_MAX_AGE_SEC`` (24h), so dead sessions do not pile
+    up.
+
+    #187 — the inputs to a reclaim, at the operator tier: each
+    ``tracked_artifacts`` entry carries ``owner_generation`` (an int), and
+    each ``sessions[]`` row, reclaim-only rows included, carries ``grants``,
+    ``{path: {"granted_at_unix_ts": int | None}}`` for exactly the paths the
+    row holds EXCLUSIVE or MODIFIED, and ``last_heartbeat_unix_ts``, the
+    agent's last heartbeat, or null with none on record. The state decides
+    what ``grants`` lists, because the state is what the sweep acts on: a
+    write grant with no tick on record is listed with a null time (no
+    max-hold limit applies to it), and a read is never listed. The body also
+    carries ``grant_heartbeat_timeout_sec`` and ``grant_max_hold_sec``, the
+    thresholds the running sweep enforces, null when lifecycle started none.
+    All of it comes from the same registry read as ``states`` and
+    ``reclaimed``; the times are the sweep's tick basis, whole unix seconds.
+    None of it appears below the operator tier.
+
+    #238 — a bounded wait for the registry: the minimal and full tiers wait
+    for the registry lock on the request thread, through the registry's own
+    ``abort_guard(deadline=...)``, until the request's watchdog deadline
+    (``HANDLER_TIMEOUT_SEC``) or until only ``_STATUS_READ_RESERVE_SEC`` of
+    :data:`_STATUS_CLIENT_TIMEOUT_SEC` remains, whichever comes first. A lock
+    won in time is read in one hold as before. Past that deadline the tier
+    answers 200 with the keys it normally carries -- ``policy_summary`` with
+    its pattern lists at the full tier, the counters, the thresholds at the
+    full tier -- with ``tracked_artifacts`` and ``sessions`` null and
+    ``"degraded": true`` added, and counts the timeout in
+    ``watchdog_timeouts_total``, which that same body shows. Nothing is left
+    running behind it. ``degraded`` never appears in a normal body, and a null
+    list means "cannot tell", never "nothing tracked". Any other failure of
+    the read keeps the dispatcher's 500. Pre-grep bounds its registry lookup
+    the same way (:func:`_handle_pre_grep`).
+
     AC-07 — metrics-tier stability contract (operator-facing):
 
       Fields PRESENT in the metrics tier are stable within a major
       version. ``coordinator_uptime_seconds``, ``coordinator_backend``,
-      ``coordinator_version``, ``watchdog_timeouts_total``,
+      ``coordinator_version``, ``registry_schema_version`` (#294),
+      ``watchdog_timeouts_total``,
       ``watchdog_queue_overflows_total``,
       ``handler_concurrency_overflows_total``,
       ``in_flight_drain_timed_out``, ``cold_start_duration_ms``,
       ``endpoint_counters``, ``intra_task_acquire_release_total``,
-      ``stale_warning_emitted_total``, ``stale_warning_reread_total``.
+      ``stale_warning_emitted_total``, ``stale_warning_reread_total``,
+      ``sweep_reclaims_total``, ``sweep_reclaims_by_trigger`` (#195).
+
+      ``registry_schema_version`` is an int, the registry's
+      ``SCHEMA_USER_VERSION``: the store format this coordinator writes. Its
+      VALUE moves with each schema step, which is the point of the field --
+      an older release refuses a store at a newer version -- while the KEY
+      is stable like the rest. It numbers the Python registry's own steps, and
+      only this coordinator sends it: the Node coordinator's body carries
+      neither it nor ``coordinator_backend``, and its ``schema_version``
+      counts a different ledger.
 
       Fields may be ADDED in minor versions (additive change is
       non-breaking for dashboards using selective key access).
@@ -4162,7 +6795,9 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
 
       Fields EXPLICITLY OMITTED from metrics tier vs. full tier:
       ``tracked_artifacts``, ``sessions``, ``policy_summary``,
-      ``coordinator_root``, ``coordinator_pid``. Operators wanting
+      ``coordinator_root``, ``coordinator_pid``,
+      ``grant_heartbeat_timeout_sec``, ``grant_max_hold_sec`` (#187),
+      ``degraded`` (#238). Operators wanting
       these for a dashboard must call ``?detail=full`` with the
       ``Coherence-Local-Operator: true`` header.
     """
@@ -4177,64 +6812,274 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
             })
             return
 
-    # Counter block — present at every tier so the telemetry-only
-    # consumer (?detail=metrics) doesn't pay for the artifact/session
-    # walk. KTD-J (Unit 8) adds per-endpoint + product-signal counters
-    # alongside the existing watchdog/concurrency counters.
-    # M-03 / finding #31: use counters_snapshot() instead of reaching into
-    # private attrs directly — single source of truth for the counter set.
-    # AC-02 cross-backend parity: KTD-J naming convention locks the
-    # full-word ``_seconds`` suffix for duration fields. Node emits
-    # ``coordinator_uptime_seconds``; Python now matches. The old
-    # ``coordinator_uptime_s`` field is emitted ALONGSIDE the new one
-    # for one release as a backward-compat alias (consumers can detect
-    # which field to read by checking which is present, or just read
-    # the canonical name). Deprecation note in docs/metrics.md (TODO).
-    _uptime = coordinator.uptime_s
-    counters = {
-        "coordinator_uptime_seconds": _uptime,
-        "coordinator_uptime_s": _uptime,  # AC-02: deprecated alias, removed in v0.2
-        "coordinator_backend": "python",
-        "coordinator_version": _COORDINATOR_VERSION,
-        **coordinator.counters_snapshot(),
-    }
+    counters = _status_counters(coordinator)
     if detail == "metrics":
         req._json(200, {"detail": "metrics", **counters})
         return
 
     # PERF-1: single batched snapshot — replaces 2N SELECTs (one
     # get_artifact + one get_state_map per artifact) with 2 SELECTs total
-    # held under one registry lock so the view is consistent.
-    artifact_by_id, state_by_artifact = coordinator.registry.status_snapshot()
-    agent_names_snapshot = coordinator.agent_names_snapshot()
+    # held under one registry lock so the view is consistent. #185: the
+    # transfer rows ride the same hold as a third SELECT, so each record's
+    # liveness is judged against the version its entry shows. #195: at the
+    # operator tier, the only one that shows them, the reclaim slots ride the
+    # agent-state SELECT itself, so a reclaim cannot land between the state a
+    # row shows and the cause it lists. #187: the grant detail (each pair's
+    # grant tick, each agent's heartbeat, each artifact's generation) rides
+    # the same hold, at the operator tier only.
+    #
+    # #238: the hold is taken through the guard, which stops waiting at the
+    # wait cap; the snapshot's own lock acquire then re-enters at once, so
+    # the read is still one hold. Only the wait is bounded: a lock won by the
+    # cap is read to the end, in the time the read reserve leaves.
+    operator_tier = detail == "full"
+    try:
+        with coordinator.registry.abort_guard(deadline=_status_wait_deadline(req)):
+            snapshot = coordinator.registry.status_snapshot(
+                include_transfers=True,
+                include_reclamations=operator_tier,
+                include_grant_detail=operator_tier,
+            )
+    except RegistryLockTimeout:
+        # #238: counted BEFORE the counters are read, so the answer reports
+        # its own timeout, and logged as a degraded hook is. The body is built
+        # only now, from what needs no registry, with the two registry lists
+        # null -- never empty, which a reader takes for "nothing tracked".
+        coordinator.increment_watchdog_timeout()
+        logger.warning(
+            "/status could not take the registry lock within its budget; "
+            "answering without the registry"
+        )
+        degraded = _status_body(coordinator, detail, _status_counters(coordinator))
+        degraded["degraded"] = True
+        req._json(200, degraded)
+        return
+    artifact_by_id, state_by_artifact, transfer_by_artifact = snapshot[:3]
+    reclamation_by_artifact = snapshot[3] if operator_tier else {}
+    granted_at_by_artifact, last_heartbeat_by_agent = (
+        snapshot[4] if operator_tier else ({}, {})
+    )
+    named_agents = coordinator.agent_names_snapshot()
 
-    tracked: list[dict] = [
-        {"path": meta["name"], "version": meta["version"], "id": str(artifact_id)}
-        for artifact_id, meta in artifact_by_id.items()
-    ]
+    tracked: list[dict] = []
+    for artifact_id, meta in artifact_by_id.items():
+        entry: dict[str, Any] = {
+            "path": meta["name"],
+            "version": meta["version"],
+            "id": str(artifact_id),
+        }
+        if detail == "full":
+            # #199 §2: writer attribution is workspace-state disclosure (it
+            # names which session wrote what), so it rides the operator-gated
+            # tier only — the minimal-tier question is #198's to settle.
+            # Read from the same status_snapshot row, not per-artifact
+            # last_writer_for calls, which would reopen the PERF-1 N+1.
+            # ``last_writer_agent_id`` is the registry's own handle: it joins
+            # against ``sessions[].agent_id`` (whose ``agent_name`` this tier
+            # already shows) and survives a restart. No session id is derived
+            # from it: the only way back from an agent id to a session is the
+            # process-local name map, which the ``sessions[]`` join already
+            # consults, and which is empty for a writer from before a restart.
+            # The timestamp is null when nothing has committed: ``updated_at``
+            # then stamps the first observation, not a write.
+            writer = meta.get("last_writer_id")
+            entry["last_writer_agent_id"] = str(writer) if writer else None
+            entry["last_writer_at_unix_ts"] = meta.get("updated_at") if writer else None
+            # #187: the ownership generation moves when a write claim ends
+            # without a version move (a reclaim, a release, a handoff from
+            # M/E), the one change a version comparison cannot see.
+            entry["owner_generation"] = meta["owner_generation"]
+        # #185: the path's transfer record, only while one exists, so an
+        # entry with no record keeps today's bytes at every tier.
+        transfer = transfer_by_artifact.get(artifact_id)
+        if transfer is not None:
+            record, live = transfer
+            entry["handoff"] = _status_handoff_projection(
+                record, live=live, operator_tier=detail == "full"
+            )
+        tracked.append(entry)
+
+    # The HOLDER set comes from the registry; a NAME comes from the adapter.
+    # They are not the same set. ``_agent_names`` is process-local, seeded
+    # empty, and written only by ``register_session`` on hook traffic — so
+    # walking it as the outer loop dropped every grant that outlived the
+    # coordinator process that issued it, while the durable ``agent_states``
+    # row kept arbitrating (a peer's pre-edit still collides against a holder
+    # the payload never named). Build from the registry, then label.
+    #
+    # #187: the operator tier's ``grants`` are the write grants the
+    # sweep can reclaim, projected by STATE in the same walk. The live grant
+    # paths set the tick on an M/E acquire and clear it on leaving M/E, so
+    # state and tick agree; a ledger another runtime wrote need not, and the
+    # sweep acts on the state. So an M/E pair is listed even with no tick
+    # (null: the max-hold limit does not apply to it) and a pair in any other
+    # state is not, whatever tick it carries.
+    states_by_agent: dict[UUID, dict[str, str]] = {}
+    grants_by_agent: dict[UUID, dict[str, dict[str, int | None]]] = {}
+    for artifact_id, meta in artifact_by_id.items():
+        for agent_id, state in state_by_artifact[artifact_id].items():
+            if state == MESIState.INVALID:
+                continue
+            states_by_agent.setdefault(agent_id, {})[meta["name"]] = state.name
+            if operator_tier and state in _M_OR_E_STATES:
+                grants_by_agent.setdefault(agent_id, {})[meta["name"]] = {
+                    "granted_at_unix_ts": granted_at_by_artifact.get(artifact_id, {}).get(agent_id),
+                }
+
+    # #195: the reclaim cause, operator tier only (the same disclosure call as
+    # #199's writer attribution: it says which session lost which path, and
+    # when). A SIBLING map, never folded into ``states``: ``states`` is "what
+    # this session holds", and every consumer that reads it (the status CLI,
+    # dashboards, the corpus) keeps that answer byte-for-byte.
+    #
+    # It is history, not current state: the pair's last write grant ended in
+    # a sweep reclaim and it has held none since. A re-read granted SHARED does
+    # not version the edit the reclaim stranded, so the path stays listed
+    # beside that SHARED state; only an M/E acquire clears the slot. Over the
+    # hooks that is the session's next pre-edit: the pre-read re-grants a
+    # stale reader SHARED even when no other session holds the path, and that
+    # re-grant is not a claim, so the compare-and-swap stays refused too. A
+    # pair still write-held is never listed, so a path is never both held for
+    # writing and reclaimed.
+    reclaimed_by_agent: dict[UUID, dict[str, dict[str, Any]]] = {}
+    for artifact_id, slots in reclamation_by_artifact.items():
+        meta = artifact_by_id[artifact_id]
+        snap_states = state_by_artifact[artifact_id]
+        for agent_id, (trigger, tick) in slots.items():
+            # Defensive: a write grant clears the slot, so this runtime never
+            # leaves one on a held pair; a ledger another writer touched might.
+            if snap_states.get(agent_id) in _M_OR_E_STATES:
+                continue
+            reclaimed_by_agent.setdefault(agent_id, {})[meta["name"]] = {
+                "trigger": trigger,
+                "reclaimed_at_unix_ts": tick,
+            }
+
+    # R6: ``agent_name`` renders the raw session id verbatim
+    # (``session_to_agent_name`` → ``claude-session-<sid>``, and the SB-25
+    # subagent form carries it too), so every tier that listed a session row
+    # republished that session's identifier alongside its per-artifact state.
+    # Below the operator tier the row keeps ``agent_id`` — already a uuid5 of
+    # the session id and documented at ``session_to_agent_id`` as not
+    # reversible — and drops the name. Nothing new is derived here: a second
+    # derivation would duplicate the one the Node backend is parity-pinned to.
+    # The null-name row is the shape the unnamed-holder branch below already
+    # emits and the status CLI already renders.
+    name_visible = detail == "full"
     sessions: list[dict] = []
-    for agent_id, name in agent_names_snapshot:
-        per_artifact: dict[str, str] = {}
-        for artifact_id, meta in artifact_by_id.items():
-            state = state_by_artifact[artifact_id].get(agent_id)
-            if state is not None and state != MESIState.INVALID:
-                per_artifact[meta["name"]] = state.name
-        sessions.append({
+    named_ids: set[UUID] = set()
+    def _row(agent_id: UUID, name: str | None) -> dict[str, Any]:
+        row: dict[str, Any] = {
             "agent_name": name,
             "agent_id": str(agent_id),
-            "states": per_artifact,
-        })
+            "states": states_by_agent.get(agent_id, {}),
+        }
+        if operator_tier:
+            row["reclaimed"] = reclaimed_by_agent.get(agent_id, {})
+            # #187: on every operator row, reclaim-only ones included -- a
+            # heartbeat is per agent, and an agent with no ledger row (one
+            # that only stopped) still has one on record.
+            row["grants"] = grants_by_agent.get(agent_id, {})
+            row["last_heartbeat_unix_ts"] = last_heartbeat_by_agent.get(agent_id)
+        return row
 
-    policy_summary = coordinator.policy.summary()
+    for agent_id, name in named_agents:
+        named_ids.add(agent_id)
+        sessions.append(_row(agent_id, name if name_visible else None))
+    # ``agent_name`` is null rather than a guess: ``session_to_agent_id`` is a
+    # uuid5 of the session id, so the session id is NOT recoverable from the
+    # row. An entry keyed on the raw agent id is the honest answer, and it is
+    # strictly more than the empty list these holders used to render as.
+    # #195: at the operator tier an agent whose ONLY entry is a reclaim gets a
+    # row too — a reclaimed session that never re-registered after a restart
+    # is exactly the one a supervisor must not mistake for a clean finish.
+    # ``reclaimed_by_agent`` is empty below that tier, so those rows are
+    # unchanged.
+    # The reclaim-only rows are bounded by the age of the agent's newest
+    # reclaim (``_RECLAIM_ONLY_ROW_MAX_AGE_SEC``) so dead sessions do not
+    # accumulate in the table for ever.
+    reclaim_row_cutoff = monotonic_seconds() - _RECLAIM_ONLY_ROW_MAX_AGE_SEC
+    recently_reclaimed = {
+        agent_id
+        for agent_id, paths in reclaimed_by_agent.items()
+        if max(slot["reclaimed_at_unix_ts"] for slot in paths.values()) >= reclaim_row_cutoff
+    }
+    for agent_id in sorted(
+        (states_by_agent.keys() | recently_reclaimed) - named_ids, key=str
+    ):
+        sessions.append(_row(agent_id, None))
+
+    body = _status_body(coordinator, detail, counters)
+    body["tracked_artifacts"] = tracked
+    body["sessions"] = sessions
+    req._json(200, body)
+
+
+def _status_counters(coordinator: CoordinatorHTTPServer) -> dict[str, Any]:
+    """The ``/status`` counter block, at every tier.
+
+    Present at every tier so the telemetry-only consumer (?detail=metrics)
+    doesn't pay for the artifact/session walk. KTD-J (Unit 8) adds
+    per-endpoint + product-signal counters alongside the existing
+    watchdog/concurrency counters. M-03 / finding #31: use
+    counters_snapshot() instead of reaching into private attrs directly —
+    single source of truth for the counter set. AC-02 cross-backend parity:
+    KTD-J naming convention locks the full-word ``_seconds`` suffix for
+    duration fields. Node emits ``coordinator_uptime_seconds``; Python now
+    matches. The old ``coordinator_uptime_s`` field is emitted ALONGSIDE the
+    new one for one release as a backward-compat alias (consumers can detect
+    which field to read by checking which is present, or just read the
+    canonical name). Deprecation note in docs/metrics.md (TODO)."""
+    _uptime = coordinator.uptime_s
+    return {
+        "coordinator_uptime_seconds": _uptime,
+        "coordinator_uptime_s": _uptime,  # AC-02: deprecated alias, removed in v0.2
+        "coordinator_backend": "python",
+        "coordinator_version": _COORDINATOR_VERSION,
+        # #294: the store format this coordinator writes. Its registry is
+        # always the SQLite one, and opening a store either migrates it to this
+        # version or refuses it, so the constant names the served store without
+        # a registry read -- the metrics tier and the degraded answer make none.
+        # Never the bare ``schema_version``: the Node coordinator sends that
+        # from its own migration ledger, whose numbers mean different schemas.
+        "registry_schema_version": SCHEMA_USER_VERSION,
+        **coordinator.counters_snapshot(),
+    }
+
+
+def _status_wait_deadline(req: _RequestProtocol) -> float:
+    """#238: when ``/status`` stops waiting for the registry lock --
+    the request's watchdog deadline, or the moment only
+    ``_STATUS_READ_RESERVE_SEC`` remains of :data:`_STATUS_CLIENT_TIMEOUT_SEC`,
+    whichever comes first, so a lock won at the cap still leaves the read time
+    to answer before the client gives up. Nothing earlier in the request
+    starts the deadline, so both are measured from now."""
+    reserve_cap = time.monotonic() + _STATUS_CLIENT_TIMEOUT_SEC - _STATUS_READ_RESERVE_SEC
+    return min(_start_watchdog_deadline(req), reserve_cap)
+
+
+def _status_body(
+    coordinator: CoordinatorHTTPServer, detail: str, counters: dict[str, Any]
+) -> dict[str, Any]:
+    """A minimal- or full-tier ``/status`` body with everything but its two
+    registry lists, ``tracked_artifacts`` and ``sessions``, which it leaves
+    null: the caller fills them from the snapshot, or a degraded answer (#238)
+    sends them null. One builder, so the degraded body carries exactly the
+    keys, in the order, the normal body of its tier does."""
+    # The pattern lists are workspace-relative paths and globs. Publishing
+    # them at the minimal/metrics tiers would expose the operator's directory
+    # layout to non-operator callers — ask for them only at the full tier;
+    # the counts are in the summary at every tier.
+    policy_summary = coordinator.policy.summary(include_patterns=detail == "full")
     if detail != "full":
-        # user_added_patterns is a list of workspace-relative paths.
-        # Leaking it at minimal/metrics tiers would expose the operator's
-        # directory layout to non-operator callers — keep it full-tier only.
-        policy_summary = {k: v for k, v in policy_summary.items() if k != "user_added_patterns"}
-    base = {
+        # The summary carries the absolute root too: below the operator tier it
+        # gets the same sentinel as the top-level key, or the default tier
+        # publishes $HOME / directory layout through it anyway.
+        policy_summary = {**policy_summary, "coordinator_root": "."}
+    body: dict[str, Any] = {
         "detail": detail,
-        "tracked_artifacts": tracked,
-        "sessions": sessions,
+        "tracked_artifacts": None,
+        "sessions": None,
         "policy_summary": policy_summary,
         # P1 #7: coordinator_pid is in the minimal tier too. Process IDs
         # are public on POSIX (anyone with `ps` sees them) so this is
@@ -4251,12 +7096,17 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
         # Full tier still adds the absolute workspace root — that DOES
         # leak $HOME / directory layout and stays gated behind the
         # Coherence-Local-Operator: true header.
-        base["coordinator_root"] = str(coordinator.coordinator_root)
+        body["coordinator_root"] = str(coordinator.coordinator_root)
+        # #187 R4: the thresholds the running sweep enforces, so an operator
+        # can compute when it reclaims each listed grant. None (null) when
+        # lifecycle started no sweep, or one that cannot enforce them.
+        body["grant_heartbeat_timeout_sec"] = coordinator.grant_heartbeat_timeout_sec
+        body["grant_max_hold_sec"] = coordinator.grant_max_hold_sec
     else:
-        # Minimal: replace absolute workspace path with sentinel "." so the
-        # default tier never leaks $HOME or directory layout.
-        base["coordinator_root"] = "."
-    req._json(200, base)
+        # Minimal: the top-level root is the sentinel ".", like the summary's
+        # own ``coordinator_root`` above.
+        body["coordinator_root"] = "."
+    return body
 
 
 def _parse_detail_query(query: str) -> str:
@@ -4437,6 +7287,13 @@ def _handle_prepare_for_migration(req: _RequestProtocol, coordinator: Coordinato
 
 _ROUTES: dict[tuple[str, str], Callable] = {
     ("POST", "/hooks/pre-read"): _handle_pre_read,
+    # The effect fence: "may this irreversible effect still fire, and if not,
+    # WHY". A route of its own rather than a flag on pre-read, whose response
+    # already varies by freshness. Registered HERE so it rides the one
+    # dispatcher seam (Host -> Bearer -> migration gate -> endpoint counter ->
+    # handler) like every other route; read-only toward the registry, so it
+    # stays out of _MIGRATION_REJECTED_ROUTES.
+    ("POST", "/hooks/effect-fence"): _handle_effect_fence,
     ("POST", "/hooks/pre-edit"): _handle_pre_edit,
     ("POST", "/hooks/post-edit"): _handle_post_edit,
     # Unit 6: OCC commit. Version-checked CAS that bypasses the pre-edit
@@ -4464,6 +7321,23 @@ _ROUTES: dict[tuple[str, str], Callable] = {
     ("POST", "/session/commit"): _handle_session_commit,
     ("POST", "/session/commit_all"): _handle_session_commit_all,
     ("POST", "/session/heartbeat"): _handle_session_heartbeat,
+    # Caller-principal plan U4 — the mint. Registered HERE so it rides the one
+    # dispatcher seam (Host -> Bearer -> migration gate -> counter -> handler).
+    # Out of _MIGRATION_REJECTED_ROUTES: a binding is durable metadata with no
+    # version bump and no grant (the checkpoint-create rationale), and a
+    # claimant that loses its response to a restart recovers it by nonce.
+    # Python-only: the sibling Node coordinator answers 404 here; U6 declares
+    # that asymmetry with a corpus fixture rather than leaving it silent.
+    ("POST", "/principal/claim"): _handle_principal_claim,
+    # #185 — the four grant-handoff verbs, require-class. Registered HERE so
+    # they ride the one dispatcher seam. Out of _MIGRATION_REJECTED_ROUTES: a
+    # transfer initiates no write, and its epoch move is the release-class
+    # bump the drain performs itself; accept, decline and withdraw only
+    # relabel a record. Python-only: the Node backend answers them 404.
+    ("POST", "/handoff/transfer"): _handle_handoff_transfer,
+    ("POST", "/handoff/accept"): _handle_handoff_accept,
+    ("POST", "/handoff/decline"): _handle_handoff_decline,
+    ("POST", "/handoff/withdraw"): _handle_handoff_withdraw,
     # WV plan Unit 3 — workspace-checkpoint endpoints. Registered HERE so they
     # ride the central verify_bearer + verify_host seam like every route. The
     # POST threads a watchdog abort Event into the service's abort_guard (the
@@ -4520,6 +7394,7 @@ _MIGRATION_REJECTED_ROUTES: set[tuple[str, str]] = {
 # exception still shows up in operator-visible /status output).
 _ENDPOINT_COUNTER_NAMES: dict[tuple[str, str], str] = {
     ("POST", "/hooks/pre-read"): "pre_read_total",
+    ("POST", "/hooks/effect-fence"): "effect_fence_total",
     ("POST", "/hooks/pre-edit"): "pre_edit_total",
     ("POST", "/hooks/post-edit"): "post_edit_total",
     ("POST", "/hooks/post-edit-cas"): "post_edit_cas_total",
@@ -4530,6 +7405,11 @@ _ENDPOINT_COUNTER_NAMES: dict[tuple[str, str], str] = {
     ("POST", "/policy/track"): "policy_track_total",
     ("POST", "/policy/untrack"): "policy_untrack_total",
     ("GET", "/status"): "status_total",
+    ("POST", "/principal/claim"): "principal_claim_total",
+    ("POST", "/handoff/transfer"): "handoff_transfer_total",
+    ("POST", "/handoff/accept"): "handoff_accept_total",
+    ("POST", "/handoff/decline"): "handoff_decline_total",
+    ("POST", "/handoff/withdraw"): "handoff_withdraw_total",
     # /admin/prepare-for-migration intentionally not counted — it
     # initiates shutdown, so counting it would never be observable via
     # subsequent /status calls (coordinator is already down).
@@ -4564,13 +7444,52 @@ _DEFAULT_DEGRADED_RESPONSE: dict = {
 because their wire contract uses ``{status: "fresh"|"stale"}``. A7: the envelope
 now carries a ``hookSpecificOutput`` advisory so a watchdog-degraded read is
 visible to the model rather than silently passing as a confirmed fresh read.
-Endpoints whose contract is ``{ok: bool}`` (pre-edit, post-edit, session-stop)
-pass ``OK_DEGRADED_RESPONSE`` instead so the client doesn't see ``None`` from
+Endpoints whose contract is ``{ok: bool}`` pass an ok-shape envelope instead
+(:data:`_OK_DEGRADED_RESPONSE`; pre-edit its own
+:data:`_PRE_EDIT_DEGRADED_RESPONSE`) so the client doesn't see ``None`` from
 ``result.get("ok")``."""
 
 _OK_DEGRADED_RESPONSE: dict = {"ok": True, "degraded": True}
-"""AC-05: degraded envelope for {ok: bool}-shape endpoints (pre-edit,
-post-edit, session-stop). Pairs with ``_DEFAULT_DEGRADED_RESPONSE``."""
+"""AC-05: degraded envelope for {ok: bool}-shape endpoints (post-edit,
+session-stop, and the snapshot-session begin/read/heartbeat routes). Pairs with
+``_DEFAULT_DEGRADED_RESPONSE``. Pre-edit has its own
+:data:`_PRE_EDIT_DEGRADED_RESPONSE`, equal in value today."""
+
+_PRE_EDIT_DEGRADED_RESPONSE: dict = {"ok": True, "degraded": True}
+"""What ``/hooks/pre-edit`` answers when the watchdog times out: an ADMIT.
+
+The rule this constant carries: a timed-out acquire must not answer in a shape
+that admits an edit the route would refuse when it is not degraded. The
+acquire-or-fail refusal asked for in Cohexa-ai/agent-coherence#196 (an opt-in
+answering ``{"ok": false, "reason": "other_holder"}`` instead of displacing a
+live holder) is not built; :data:`_ACQUIRE_OR_FAIL_REFUSAL_REASONS` is where it
+will register its reasons, and a guard test fails while that set is non-empty
+and this envelope is still ``ok: true``. A timed-out request never looked for a
+holder: admitting it lets the caller edit over a holder the refusal would have
+reported, and answering ``other_holder`` would report a holder nobody observed.
+
+The rule is already broken by a refusal that exists today. Undegraded, a
+strict-mode editor whose grant a peer invalidated gets the strict deny; on a
+timeout it gets this envelope, which carries no ``hookSpecificOutput``, so the
+hook client relays no deny and no advisory -- unlike the read path's
+:data:`_DEFAULT_DEGRADED_RESPONSE`, which at least says freshness was not
+checked. That degrade-to-admit is shipped behaviour (a hook must not block a
+tool call on coordinator load) and this constant does not change it. Library
+callers are stricter: ``CoherentVolume`` with ``on_error="strict"`` (its
+default) raises on ``degraded: true``.
+
+Its own name, rather than a share of :data:`_OK_DEGRADED_RESPONSE`, so that
+changing what a timed-out acquire answers cannot silently change what a
+timed-out post-edit or session-stop answers."""
+
+_ACQUIRE_OR_FAIL_REFUSAL_REASONS: frozenset[str] = frozenset()
+"""Reasons an opted-in acquire-or-fail ``/hooks/pre-edit`` may refuse with.
+
+Empty: that refusal is not built (see :data:`_PRE_EDIT_DEGRADED_RESPONSE`). The
+change that builds it adds its reasons here -- ``other_holder`` first -- and
+that same change must give a timed-out opted-in request a non-admitting
+answer, or the guard test on this pair goes red. The strict-mode deny is not
+listed: it is not opt-in and its reason travels in ``hookSpecificOutput``."""
 
 _SESSION_START_DEGRADED_RESPONSE: dict = {}
 """SB-10 U2 (KTD7): degrade envelope for ``/hooks/session-start`` — the
@@ -4597,6 +7516,83 @@ fail-closed client to raise. The residual is a phantom version bump, NOT a
 lost update — full fencing is deferred to the cross-host follow-on (see
 ``_handle_post_edit_cas``)."""
 
+_CALLER_GATE_DEGRADED_RESPONSE: dict[tuple[str, str], dict] = {
+    ("POST", "/hooks/pre-read"): _DEFAULT_DEGRADED_RESPONSE,
+    ("POST", "/hooks/effect-fence"): _EFFECT_FENCE_DEGRADED_RESPONSE,
+    ("POST", "/hooks/pre-edit"): _PRE_EDIT_DEGRADED_RESPONSE,
+    ("POST", "/hooks/post-edit"): _OK_DEGRADED_RESPONSE,
+    ("POST", "/hooks/post-edit-cas"): _OCC_DEGRADED_RESPONSE,
+    ("POST", "/hooks/session-stop"): _OK_DEGRADED_RESPONSE,
+    ("POST", "/hooks/session-start"): _SESSION_START_DEGRADED_RESPONSE,
+    ("POST", "/hooks/pre-bash"): _DEFAULT_DEGRADED_RESPONSE,
+    ("POST", "/hooks/pre-grep"): _DEFAULT_DEGRADED_RESPONSE,
+    ("POST", "/session/begin"): _OK_DEGRADED_RESPONSE,
+    ("POST", "/session/read"): _OK_DEGRADED_RESPONSE,
+    ("POST", "/session/commit"): _OCC_DEGRADED_RESPONSE,
+    ("POST", "/session/commit_all"): _OCC_DEGRADED_RESPONSE,
+    ("POST", "/session/heartbeat"): _OK_DEGRADED_RESPONSE,
+    ("POST", "/workspace/checkpoint"): _CHECKPOINT_DEGRADED_RESPONSE,
+    ("POST", "/workspace/restore/status"): _RESTORE_PROGRESS_DEGRADED_RESPONSE,
+    ("POST", "/workspace/restore/member"): _RESTORE_PROGRESS_DEGRADED_RESPONSE,
+    ("POST", "/workspace/restore/register"): _RESTORE_REGISTER_DEGRADED_RESPONSE,
+    ("POST", "/handoff/transfer"): _HANDOFF_TRANSFER_DEGRADED_RESPONSE,
+    ("POST", "/handoff/accept"): _HANDOFF_ACCEPT_DEGRADED_RESPONSE,
+    ("POST", "/handoff/decline"): _HANDOFF_DECLINE_DEGRADED_RESPONSE,
+    ("POST", "/handoff/withdraw"): _HANDOFF_WITHDRAW_DEGRADED_RESPONSE,
+}
+"""What a route answers when its caller-principal gate cannot decide within the
+handler watchdog: exactly what its handler passes ``_run_or_degrade`` for a
+timed-out work body. The request was neither admitted nor refused, so it gets
+the route's ordinary degraded answer — never a principal refusal (nothing was
+refused) and never an admission (nothing was checked). Keyed like
+:data:`_CALLER_PRINCIPAL_POSTURE`, over every route whose gate can read the
+registry, i.e. all but the mint; no default, so a missing route fails loudly. A
+test compares each entry with the route's own timed-out work body, so the two
+cannot drift."""
+
+
+def _watchdog_deadline(req: _RequestProtocol) -> float | None:
+    """The request's watchdog deadline, if a read ahead of the work body
+    started one -- the caller-principal gate's store lookup, or pre-bash's
+    giver lookup that finished in time -- and ``None`` (the full
+    ``HANDLER_TIMEOUT_SEC``) otherwise."""
+    return getattr(req, "_watchdog_deadline", None)
+
+
+def _start_watchdog_deadline(req: _RequestProtocol) -> float:
+    """The request's watchdog deadline, started now when nothing earlier in the
+    request started it: a read made ahead of the work body then shares one
+    ``HANDLER_TIMEOUT_SEC`` with it (see :func:`_attributed_within_deadline`)."""
+    deadline = _watchdog_deadline(req)
+    if deadline is None:
+        deadline = time.monotonic() + HANDLER_TIMEOUT_SEC
+        req._watchdog_deadline = deadline
+    return deadline
+
+
+def _watchdog_queue_overflowed(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> bool:
+    """KTD-G item 1: the queue-depth gate in front of the watchdog pool. When
+    the pool's work queue is past :data:`WATCHDOG_QUEUE_LIMIT`, count it, write
+    the 503 and return True — the caller submits nothing. Shared by
+    :func:`_run_or_degrade` and the caller-principal gate's registry lookup, so
+    neither path queues work the other would have refused."""
+    # A defensive try because ThreadPoolExecutor's _work_queue attribute is
+    # technically private — guard against future stdlib changes.
+    try:
+        qsize = coordinator._watchdog._work_queue.qsize()  # type: ignore[attr-defined]
+    except AttributeError:
+        qsize = 0
+    if qsize <= WATCHDOG_QUEUE_LIMIT:
+        return False
+    coordinator.increment_watchdog_queue_overflow()  # finding #31
+    logger.warning(
+        "watchdog queue at %d items (limit %d); rejecting with 503",
+        qsize,
+        WATCHDOG_QUEUE_LIMIT,
+    )
+    req._json(503, {"error": "watchdog queue overloaded"})
+    return True
+
 
 def _run_or_degrade(
     req: _RequestProtocol,
@@ -4610,11 +7606,12 @@ def _run_or_degrade(
     and return 200 with ``degraded_response`` (or the default fresh-shape
     envelope) so the user's tool call proceeds.
 
-    AC-05: callers from ``{ok: bool}``-shape endpoints (pre-edit,
-    post-edit, session-stop) pass ``degraded_response=_OK_DEGRADED_RESPONSE``
-    so clients reading ``result.get("ok")`` see ``True`` rather than
-    ``None``. Callers from ``{status: ...}``-shape endpoints (pre-read,
-    pre-bash, pre-grep) accept the default fresh-shape envelope.
+    AC-05: callers from ``{ok: bool}``-shape endpoints (post-edit,
+    session-stop) pass ``degraded_response=_OK_DEGRADED_RESPONSE`` -- and
+    pre-edit its own :data:`_PRE_EDIT_DEGRADED_RESPONSE` -- so clients
+    reading ``result.get("ok")`` see ``True`` rather than ``None``. Callers
+    from ``{status: ...}``-shape endpoints (pre-read, pre-bash, pre-grep)
+    accept the default fresh-shape envelope.
 
     v0.1.1 KTD-G:
       - Item 1: queue-depth gate. Reject with HTTP 503 if the watchdog
@@ -4629,26 +7626,20 @@ def _run_or_degrade(
     Item 2 (handler concurrency semaphore) lives in
     _ThreadingHTTPServer.process_request — gates BEFORE this function
     is reached.
+
+    The watchdog deadline is the REQUEST's: when a registry read ahead of the
+    work body already started it -- the caller-principal gate's lookup, or
+    pre-bash's giver lookup when it finished in time -- ``work`` gets only what
+    is left (:func:`_watchdog_deadline`). A giver lookup that timed out put the
+    deadline back, so the work after it runs on the budget it always had.
     """
-    # KTD-G item 1: queue-depth gate. Use a defensive try because
-    # ThreadPoolExecutor's _work_queue attribute is technically private
-    # — guard against future stdlib changes that would break this.
-    try:
-        qsize = coordinator._watchdog._work_queue.qsize()  # type: ignore[attr-defined]
-    except AttributeError:
-        qsize = 0
-    if qsize > WATCHDOG_QUEUE_LIMIT:
-        coordinator.increment_watchdog_queue_overflow()  # finding #31
-        logger.warning(
-            "watchdog queue at %d items (limit %d); rejecting with 503",
-            qsize,
-            WATCHDOG_QUEUE_LIMIT,
-        )
-        req._json(503, {"error": "watchdog queue overloaded"})
+    if _watchdog_queue_overflowed(req, coordinator):
         return
 
     try:
-        result = coordinator.run_with_watchdog(work, abort=abort)
+        result = coordinator.run_with_watchdog(
+            work, abort=abort, deadline=_watchdog_deadline(req)
+        )
     except FuturesTimeout:
         # KTD-G item 3: surface watchdog degradation via /status counter.
         coordinator.increment_watchdog_timeout()  # finding #31
@@ -4656,10 +7647,50 @@ def _run_or_degrade(
         req._json(200, degraded_response if degraded_response is not None else _DEFAULT_DEGRADED_RESPONSE)
         return
     except Exception as exc:
-        logger.exception("handler work failed: %s", exc)
-        req._json(200, {"ok": False, "reason": f"internal: {type(exc).__name__}"})
+        _answer_handler_error(req, coordinator, exc, failed="handler work")
         return
     req._json(200, result)
+
+
+_EFFECT_FENCE_ROUTE: tuple[str, str] = ("POST", "/hooks/effect-fence")
+"""The one route whose work body owns its own exception arm (a hold, see
+:data:`_EFFECT_FENCE_INTERNAL_HOLD_RESPONSE`), keyed as ``_ROUTES`` keys it."""
+
+
+def _answer_handler_error(
+    req: _RequestProtocol,
+    coordinator: CoordinatorHTTPServer,
+    exc: BaseException,
+    *,
+    failed: str,
+) -> None:
+    """The ONE exception arm for a request's work, whether the caller-principal
+    gate's registry lookup raised or the handler's work body did: log the
+    failure with its traceback and answer HTTP 200 with the route's
+    internal-error envelope — ``{"ok": false, "reason": "internal: <Type>"}``,
+    a shape the library types as a refused request (``StaleView`` on pre-edit)
+    and no client reads as an absent coordinator.
+
+    Why one arm and not two: every client reads a non-200 as "no coordinator
+    available" and degrades, so a raise the gate let reach the dispatcher's
+    500 would have a degrade-mode ``CoherentVolume`` write with no grant and
+    no peer invalidation, while the same raise inside the work body answered
+    the typed 200 it raises ``StaleView`` on. The effect fence is the one
+    route whose body catches inside itself and answers a HOLD rather than
+    this shape (a client branching on ``verdict`` must read an answer), so on
+    that route the gate answers, and counts, the same hold the body would.
+    Nothing else is counted: a raise is not a watchdog timeout, and a gate
+    that decided nothing is neither an admission nor a refusal.
+
+    ``failed`` names what raised, for the log. Only the exception's own text
+    reaches the log and only its TYPE reaches the body; the lookup's operands
+    (a presented principal) are in neither."""
+    logger.exception("%s failed: %s", failed, exc)
+    if req._route_key == _EFFECT_FENCE_ROUTE:
+        coordinator.increment_effect_fence_hold()
+        req._json(200, dict(_EFFECT_FENCE_INTERNAL_HOLD_RESPONSE))
+        return
+    req._json(200, {"ok": False, "reason": f"{HANDLER_FAILURE_REASON_PREFIX}{type(exc).__name__}"})
 
 
 def _exclusive_holder(
@@ -4722,6 +7753,8 @@ _SESSION_START_ARTIFACT_VERBATIM_CAP = 3
 def _build_preemption_text(
     coordinator: CoordinatorHTTPServer,
     notices: list[tuple[UUID, UUID, float]],
+    *,
+    overflow_deferred: bool = True,
 ) -> str:
     """A1 + F3: render pending preemption notices as additionalContext prose.
 
@@ -4730,14 +7763,30 @@ def _build_preemption_text(
     + the session-id prefixes.
 
     F3 hardening: render newest-first up to ``_PREEMPTION_PROSE_VERBATIM_CAP``
-    notices in full. If more remain, coalesce them into a single overflow line
-    pointing at the ``/agent-coherence status`` console for the full list.
-    This bounds the prose to a constant-size block regardless of N, sidesteps
-    Claude Code's 10KB additionalContext cap, and uses the status surface as
-    the overflow channel rather than silently truncating.
+    notices in full. If more remain, coalesce them into a single overflow line.
+    This bounds the prose to a constant-size block regardless of N and sidesteps
+    Claude Code's 10KB additionalContext cap.
+
+    On the four admit paths the overflow is a DEFERRAL, not a truncation:
+    they pass that same cap as ``pop_pending_notices(consume_limit=...)``, so
+    only the rendered rows are consumed and the rest surface on the session's
+    next tracked-file operation (or age out via ``evict_stale_notices``). The
+    overflow line used to name ``/agent-coherence status`` / ``GET /status`` as
+    the place to read the rest — neither has ever carried notice data, and the
+    rows had already been deleted by the call that under-reported them.
+
+    ``overflow_deferred=False`` is for ``session-stop``, whose drain is
+    UNBOUNDED and whose response returns every notice in its ``notices`` array.
+    Nothing is queued there — the rows are gone and a stopping session has no
+    next operation — so repeating the deferral promise would be false twice
+    over. It names the response's own array instead, which is where they are.
     """
     # Sort newest first — the most recent preemption is the most informative
-    # signal for the agent's next decision.
+    # signal for the agent's next decision. The registry already returns rows
+    # newest-first (ts DESC, artifact_id DESC) and this sort is STABLE, so the
+    # verbatim slice below picks exactly the rows the drain consumed; the rest
+    # are still queued. Changing either ordering without the other re-opens the
+    # drop (rows deleted that this never renders).
     sorted_notices = sorted(notices, key=lambda n: n[2], reverse=True)
     verbatim = sorted_notices[:_PREEMPTION_PROSE_VERBATIM_CAP]
     overflow = sorted_notices[_PREEMPTION_PROSE_VERBATIM_CAP:]
@@ -4757,17 +7806,33 @@ def _build_preemption_text(
                 f"Re-fetch via pre-read and retry."
             )
             continue
-        preempter_session = _agent_id_to_session(coordinator, preempter_id) or "<unknown>"
+        # R7: the notice row already carries the preempter's agent id, which
+        # is what the registry stores and what /status publishes. Rendering
+        # it directly also removes the restart degradation the reverse
+        # lookup had — the agent-name map is process-local and starts empty,
+        # so a preempter that survived a restart used to render "<unknown>".
         lines.append(
-            f"  • {path} — preempted/revoked by session {preempter_session[:8]} "
+            f"  • {path} — preempted/revoked by agent "
+            f"{_payloads.short_session_id(preempter_id.hex)} "
             f"at {_iso_utc(ts)}. Any local edit you made to this file will land "
             f"in your worktree but is NOT reflected in the coordinator's version."
         )
     if overflow:
+        # Say where the unrendered notices actually ARE, which differs by
+        # caller. The bounded admit paths leave them in the table, so they
+        # surface on the next tracked-file operation. session-stop consumed
+        # them all and hands them back structurally in the same response —
+        # claiming they are "still queued" there would be false twice over
+        # (deleted rows, and no next operation for a stopping session). The
+        # line used to point at /status, which carries no notice data at any
+        # disclosure tier, while the rows it named had just been deleted.
+        if overflow_deferred:
+            where = "still queued — they surface on your next tracked-file operation."
+        else:
+            where = "listed in full in the `notices` array of this response."
         lines.append(
-            f"  • Plus {len(overflow)} more preemptions since your last activity; "
-            f"run `/agent-coherence status` (or query GET /status on the coordinator) "
-            f"for the full list."
+            f"  • Plus {len(overflow)} more preemptions since your last "
+            f"activity, {where}"
         )
     lines.append(
         "Re-read affected files before continuing if you need the latest "
@@ -4931,10 +7996,15 @@ def _reground_qualifies(result: dict) -> bool:
     (AE3). An envelope-less response qualifies iff it is an admit body —
     ``{ok: true}`` (pre-edit) or ``{status: "fresh"}`` (pre-read /
     pre-bash / pre-grep). A service-refusal body (``{ok: false, ...}``)
-    is neither a deny envelope nor an admit: no attach, no consume."""
+    is neither a deny envelope nor an admit: no attach, no consume.
+
+    A CONTEXT-ONLY envelope (no permission decision; the handoff prose
+    puts one on a bare admit) decides nothing, so it qualifies exactly as
+    the body under it would: otherwise prose on an admit would hold the
+    re-grounding back past every touch of a handed-off path."""
     hso = result.get("hookSpecificOutput")
-    if hso is not None:
-        return hso.get("permissionDecision") == "allow"
+    if hso is not None and "permissionDecision" in hso:
+        return hso["permissionDecision"] == "allow"
     return result.get("ok") is True or result.get("status") == "fresh"
 
 
@@ -4988,14 +8058,15 @@ def _claim_reground_context(
         return None
 
 
-def _attach_reground(result: dict, text: str) -> dict:
-    """SB-10 U4: merge the claimed re-grounding prose into a qualifying
-    admit response. An existing envelope keeps its text AND its existing
-    permission decision, and gets the block appended AFTER it (notices and
-    stale warnings render first — KTD6 ordering); a bare admit body gains
-    a CONTEXT-ONLY PreToolUse envelope. The deferred path rides the
-    PreToolUse shape — never the SessionStart ``hookSpecificOutput``
-    shape."""
+def _attach_pretooluse_context(result: dict, text: str) -> dict:
+    """Merge advisory prose into an admit response: appended after an
+    existing envelope's text, keeping its permission decision, or carried by
+    a CONTEXT-ONLY PreToolUse envelope on a bare admit body. The one merge
+    rule the deferred re-grounding (SB-10 U4) and the handoff prose (#185)
+    share. Appending is what orders the blocks (KTD6): notices and stale
+    warnings render first, then the handoff prose, then the re-grounding,
+    which is attached last. Always the PreToolUse shape, never the
+    SessionStart ``hookSpecificOutput`` shape."""
     hso = result.get("hookSpecificOutput")
     if hso is None:
         # WHY context-only rather than emit_allow: re-grounding is
@@ -5054,7 +8125,9 @@ def _fast_path_json(
             )
 
         try:
-            base = coordinator.run_with_watchdog(deliver, abort=abort)
+            base = coordinator.run_with_watchdog(
+                deliver, abort=abort, deadline=_watchdog_deadline(req)
+            )
         except FuturesTimeout:
             # KTD-G item 3 mirror of _run_or_degrade: surface the
             # degradation via the /status counter, then fall through to
@@ -5091,11 +8164,11 @@ def _deliver_pending_reground(
     text = _claim_reground_context(coordinator, session_id, body, abort=abort)
     if text is None:
         return result
-    return _attach_reground(result, text)
+    return _attach_pretooluse_context(result, text)
 
 
 def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> str | None:
-    """Return the session_id (not agent UUID) of the artifact's last writer, if any.
+    """Return the AGENT id (hex) of the artifact's last writer, if any.
 
     COR-09 (fixed): authoritative source is ``artifacts.last_writer_id``
     in the registry — set by the commit path on successful post-edit and
@@ -5105,11 +8178,23 @@ def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> s
     successful commit). The previous state-map fallback could attribute
     the write to the very session receiving the warning (agent appears
     in state_map as SHARED, becomes the "first known agent").
+
+    R7: this used to run ``session_to_agent_id`` backwards through the
+    adapter's agent-name map and return the recovered session id, so the
+    stale/deny response handed to one session named a peer by that peer's
+    session id. It returns the registry's own handle instead. Nothing new is
+    derived — the agent id is a uuid5 of the session id that ``/status``
+    already emits, and a second derivation here would duplicate the one the
+    Node backend is parity-pinned to.
+
+    The hex form (32 lowercase chars, no hyphens) rather than ``str(uuid)``:
+    it is byte-identical to what Node's ``sessionToAgentId`` returns, and the
+    value lands in a corpus field compared verbatim across both backends.
     """
     # COR-09 primary path: authoritative last_writer_id from the registry.
     committed_writer = coordinator.registry.last_writer_for(artifact_id)
     if committed_writer is not None:
-        return _agent_id_to_session(coordinator, committed_writer)
+        return committed_writer.hex
     # Fallback for artifacts that exist but never had a successful commit
     # (first-observation seeding with no post-edit yet). Best signal: an
     # agent currently in MODIFIED state (mid-commit, in case the write
@@ -5117,12 +8202,56 @@ def _last_writer_for(coordinator: CoordinatorHTTPServer, artifact_id: UUID) -> s
     state_map = coordinator.registry.get_state_map(artifact_id)
     for agent_id, state in state_map.items():
         if state == MESIState.MODIFIED:
-            return _agent_id_to_session(coordinator, agent_id)
+            return agent_id.hex
     # No committed writer + no MODIFIED holder → genuinely unknown.
     # Return None rather than the misleading "first state-map entry"
     # which could be the querying agent itself.
     return None
-    return None
+
+
+def _prior_version_observed(
+    coordinator: CoordinatorHTTPServer,
+    artifact_id: UUID,
+    agent_id: UUID,
+    *,
+    agent_state: MESIState | None,
+    current_version: int,
+) -> int | None:
+    """The version this agent last ACTUALLY observed, for the stale summary.
+
+    ``None`` for an agent that has never held a grant on the artifact — there
+    is no observation to report, and a 0-sentinel would read as "saw v0".
+
+    R8. Every stale summary used to compute this as ``current_version - 1``,
+    which is only correct if the invalidation came from a commit. When a peer
+    merely TAKES the grant (Cohexa-ai/agent-coherence#196) the version does
+    not move, so the inference reported a version the session never saw and
+    made an unchanged version look changed — which is also what hid the false
+    "was updated by" claim, because ``current > prior`` held unconditionally.
+
+    ``agent_states.last_observed_version`` is the durable per-agent record
+    (SB-10 R6/R7), written GIL-atomically with every non-INVALID grant and
+    deliberately PRESERVED across the transition to INVALID: the last version
+    whose bytes the agent actually held. The Node backend keeps the same
+    column and reads it the same way.
+
+    The old inference survives as the fallback for a NULL value, which two
+    rows produce: a row that predates the column (a v5 database migrated
+    forward leaves it NULL), and a row whose only grant certified no read
+    (``observed=False``: the agent's first grant on the path came from a
+    DENIED Bash/Grep command, see ``_apply_bash_grep_regrants``). That
+    degrades to the old behaviour rather than to a worse one: ``current - 1``
+    is always below current, so the summary takes the write wording and asks
+    for a re-read.
+    It cannot silently become the normal path, because both cases need an
+    INVALID agent that never recorded an observation.
+    """
+    if agent_state != MESIState.INVALID:
+        return None
+    observed = coordinator.registry.last_observed_version_for(artifact_id, agent_id)
+    if observed is not None:
+        return observed
+    return current_version - 1 if current_version > 0 else 0
 
 
 def _last_writer_unix_ts(
@@ -5209,47 +8338,372 @@ def _is_recent_self_commit_lag(
     return (now_unix - updated_at) <= _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC
 
 
-def _agent_id_to_session(coordinator: CoordinatorHTTPServer, agent_id: UUID) -> str | None:
-    """Reverse the session_to_agent_id mapping via agent_names. R10 (Unit 6):
-    routes through the lock-aware public accessor instead of reaching into
-    the private dict directly."""
-    name = coordinator.agent_name_for(agent_id)
-    if name and name.startswith("claude-session-"):
-        rest = name[len("claude-session-"):]
-        # SB-25 (R2 attribution): a subagent identity attributes to the
-        # SUBAGENT id, not the parent session — the [:8] short form in
-        # deny/warn prose must name the actual writer. The parent linkage
-        # stays visible via the full agent_name on /status.
-        if ":subagent-" in rest:
-            return rest.split(":subagent-", 1)[1]
-        return rest
-    return None
+# ----------------------------------------------------------------------
+# The tracked-artifact pre-read decision, as a value
+# ----------------------------------------------------------------------
 
 
-def _parse_yaml_pattern_lines(text: str) -> set[str]:
-    """Extract pattern strings already present in a YAML list file.
+@dataclass(frozen=True, kw_only=True)
+class TrackedReadDecision:
+    """The fresh / stale / denied verdict for an ALREADY-TRACKED artifact.
 
-    Used to detect already-present entries before appending, keeping
-    /policy/track idempotent. Uses yaml.safe_load so quoted values
-    (``- "plan.md"``) and inline comments are handled correctly.
-    Returns empty set on empty input or malformed YAML — the caller
-    re-appends, which is safe (MAX_POLICY_YAML_BYTES caps growth)."""
-    if not text.strip():
-        return set()
-    import yaml as _yaml
+    ``_handle_pre_read`` answers this question today by interleaving the
+    decision with the mutations it triggers — the fresh arm bumps two counters
+    and can return a strict deny; the stale arm re-grants SHARED, marks the
+    session stale-warned and drains notices — so a surface that must answer
+    the SAME question WITHOUT granting anything cannot reach the answer by
+    calling the handler. This type is that answer with the mutations left
+    behind, so two surfaces branch off one classification rather than off two
+    copies of a safety rule.
+
+    Every field keys a branch a caller still has to take:
+
+    ``outcome``
+        which response to build: the fresh payload, the stale envelope, or
+        the byte-stable strict deny.
+    ``version``
+        the fresh payload's ``version`` and the stale summary's
+        ``current_version`` — both from the SAME pair-atomic snapshot the
+        caller read, never a second read a peer commit could overtake.
+    ``owner_generation``
+        the effect-gate opt-in pair member. ``None`` means the snapshot
+        carried none and the key is omitted rather than coerced to ``0``.
+    ``fresh_hash_differs``
+        the FRESH arm's mismatch: bumps ``fresh_shared_hash_mismatch_total``
+        and sets ``hash_differs`` on the fresh payload.
+    ``stale_hash_differs``
+        the STALE arm's mismatch: the summary's ``hash_differs``, and half
+        the no-prior-grant deny gate.
+    ``commit_lag_suppressed``
+        the fresh arm's deny was WITHHELD as the benign commit→disk-write lag
+        (Survivor #6 R2); bumps ``shared_foreign_lag_suppressed_total``.
+    ``holds_valid_grant``
+        which arm produced the verdict, and therefore which ``source`` a deny
+        carries (``pre_read_shared_hash_deny`` vs ``pre_read_strict_deny``) —
+        ``denied`` alone cannot tell the two deny arms apart.
+    ``prior_version_seen``
+        the summary's ``prior_version_seen_by_session``, already resolved for
+        the arm that ran: the current version for a still-granted holder, the
+        registry's recorded ``last_observed_version`` for an INVALIDated one
+        (R8 — see :func:`_prior_version_observed`; it used to be inferred as
+        one below current, which is wrong whenever a peer took the grant
+        without committing), ``None`` for a session with no prior grant.
+
+    THE TWO HASH PREDICATES ARE NOT ONE PREDICATE, and folding them into one
+    field silently moves the strict-deny gate in whichever direction the
+    survivor points. ``fresh_hash_differs`` excludes the no-claim recorded
+    hashes (``None``, ``""``, the all-``f`` launch-gate sentinel) because a
+    still-SHARED holder must never be denied against content the coordinator
+    never claimed. ``stale_hash_differs`` keeps them IN, because the
+    launch-gate scenarios reach their deny THROUGH the stale arm and the
+    sentinel is precisely what makes their hashes differ.
+    """
+
+    outcome: Literal["fresh", "stale", "denied"]
+    version: int
+    owner_generation: int | None
+    fresh_hash_differs: bool
+    stale_hash_differs: bool
+    commit_lag_suppressed: bool
+    holds_valid_grant: bool
+    prior_version_seen: int | None
+
+
+def decide_tracked_read(
+    coordinator: CoordinatorHTTPServer,
+    *,
+    path: str,
+    artifact_id: UUID,
+    agent_id: UUID,
+    artifact: Artifact,
+    owner_generation: int | None,
+    agent_state: MESIState | None,
+    caller_content_hash: str | None,
+    now_unix: float,
+) -> TrackedReadDecision:
+    """Classify a pre-read of an already-tracked artifact. PURE QUERY.
+
+    Takes the values the caller has ALREADY read — the pair-atomic
+    ``(artifact, owner_generation)`` snapshot, this agent's MESI state, the
+    hash the caller offered — and reads nothing further except
+    ``policy.is_strict_mode``, the INVALIDated arm's ``last_observed_version``
+    lookup, and, on the one arm that consults it, the lag gate's two registry
+    lookups. All three are READS. It grants nothing, re-grants nothing,
+    advances no observation baseline, bumps no counter, records no heartbeat,
+    marks no stale pair, records no deny and pops no notice. That is the whole
+    point: a read on the safety path must not mutate or heal what it checks,
+    so a verdict surface can ANSWER without also committing to the effects
+    ``_handle_pre_read`` performs around the same decision — a verdict that
+    healed a grant would turn a level-triggered HOLD into an edge-triggered
+    one.
+
+    ``now_unix`` is the CALLER's single clock read (KTD-P): the lag gate and
+    every summary timestamp stamped from this verdict must share one instant,
+    so the clock is an argument rather than a call inside.
+
+    The classification mirrors ``_handle_pre_read``'s tracked branch exactly.
+    The untracked and first-observation branches are deliberately NOT covered:
+    each reaches its answer BY mutating (registering the artifact, seeding v1,
+    granting SHARED), so neither has a side-effect-free form to extract.
+
+    Args:
+        artifact: the artifact from the caller's snapshot. Non-optional —
+            a vanished row is the caller's branch to take, as it is today.
+    """
+    # A grant that is present and not INVALID is the fresh arm's admission
+    # ticket: the holder was granted on the current version, and a peer commit
+    # would have invalidated it.
+    holds_valid_grant = agent_state is not None and agent_state != MESIState.INVALID
+
+    # The FRESH arm's mismatch predicate. ``coordinator_holds_content_claim``
+    # is the core fence's own no-claim normalisation — the same three spellings
+    # of "nothing was recorded" (``None``, ``""``, the all-``f`` sentinel) that
+    # the in-process fence refuses to treat as a content claim — so this
+    # surface asks the shared rule instead of restating it against a local copy
+    # of the sentinel literal.
+    fresh_hash_differs = bool(
+        caller_content_hash
+        and coordinator_holds_content_claim(artifact.content_hash)
+        and caller_content_hash != artifact.content_hash
+    )
+    # The STALE arm's mismatch predicate: the same comparison MINUS the
+    # no-claim exclusion. Kept separate on purpose (see TrackedReadDecision).
+    stale_hash_differs = bool(
+        caller_content_hash
+        and artifact.content_hash
+        and caller_content_hash != artifact.content_hash
+    )
+
+    if holds_valid_grant:
+        # Survivor #6 v1: a still-SHARED holder whose disk hash mismatches the
+        # canonical content is this session's own disk diverging — either its
+        # own un-flushed recent commit (benign lag, suppress) or a foreign
+        # out-of-band edit (deny). Warn mode never denies here.
+        commit_lag_suppressed = False
+        outcome: Literal["fresh", "stale", "denied"] = "fresh"
+        if fresh_hash_differs and coordinator.policy.is_strict_mode(path):
+            if _is_recent_self_commit_lag(
+                coordinator, artifact_id, agent_id, now_unix=now_unix,
+            ):
+                commit_lag_suppressed = True
+            else:
+                outcome = "denied"
+        return TrackedReadDecision(
+            outcome=outcome,
+            version=artifact.version,
+            owner_generation=owner_generation,
+            fresh_hash_differs=fresh_hash_differs,
+            stale_hash_differs=stale_hash_differs,
+            commit_lag_suppressed=commit_lag_suppressed,
+            holds_valid_grant=True,
+            # A SHARED holder was granted on the current version; that is the
+            # version it last saw.
+            prior_version_seen=artifact.version,
+        )
+
+    # No valid grant: either a peer commit INVALIDated this session, or it has
+    # never seen this artifact.
+    prior_version_seen = _prior_version_observed(
+        coordinator, artifact_id, agent_id,
+        agent_state=agent_state, current_version=artifact.version,
+    )
+
+    # v0.2 KTD-O / KTD-P deny gate, unchanged: strict mode AND the session
+    # demonstrably lacks a fresh view — a true preemption (INVALID), or no
+    # prior grant at all while the bytes it just hashed differ from the
+    # canonical. Matching hashes mean the session is observing what the
+    # registry recorded, so there is nothing stale to act on: warn-mode allow.
+    denied = coordinator.policy.is_strict_mode(path) and (
+        agent_state == MESIState.INVALID
+        or (agent_state is None and stale_hash_differs)
+    )
+    return TrackedReadDecision(
+        outcome="denied" if denied else "stale",
+        version=artifact.version,
+        owner_generation=owner_generation,
+        fresh_hash_differs=fresh_hash_differs,
+        stale_hash_differs=stale_hash_differs,
+        # The lag gate belongs to the fresh arm only: it answers "is this
+        # holder's OWN un-flushed commit", and a caller with no standing grant
+        # has no such commit to be waiting on.
+        commit_lag_suppressed=False,
+        holds_valid_grant=False,
+        prior_version_seen=prior_version_seen,
+    )
+
+
+# R7: ``_agent_id_to_session`` used to live here — it reversed
+# ``session_to_agent_id`` through the agent-name map so the five renderers
+# below could print a session id. Every one of them now prints the agent id
+# the registry already holds, and the helper is DELETED rather than left
+# unused: kept around, the next renderer that wants a friendlier label reaches
+# for it and re-introduces the mapping. SB-25 attribution is unaffected — a
+# subagent's composite agent id is distinct per (session, subagent), so the
+# short form still names the actual writer, and the parent linkage stays
+# visible via ``agent_name`` on /status's operator tier.
+
+
+_POLICY_REWRITE_HINT = (
+    'Rewrite it with one entry per line, each a double-quoted string such as - "*.md", then retry.'
+)
+
+
+def _read_policy_entries(text: str | bytes, name: str) -> list[str]:
+    """The string entries the policy loader reads from a policy YAML body, in
+    file order; an empty or null document reads as none. Non-string items are
+    dropped, as the loader drops them.
+
+    Raises ValueError, which the policy routes answer as HTTP 400, naming the
+    file when the body loads as no entries because it is not valid YAML or not
+    a list: an entry appended to it would never apply (#284). Mirrors the
+    Node coordinator's ``readPolicyEntries``, and the refusal text matches
+    its own except for the parser's words."""
     try:
-        parsed = _yaml.safe_load(text)
-    except _yaml.YAMLError:
-        return set()
-    if not isinstance(parsed, list):
-        return set()
-    return {item for item in parsed if isinstance(item, str)}
+        raw = yaml.safe_load(text)
+    except POLICY_LOAD_ERRORS as exc:
+        raise ValueError(_invalid_policy_yaml_message(name, exc)) from None
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"{name} holds {_describe_yaml_value(raw)}, not a list, so it loads as no "
+            f"entries; nothing was written. {_POLICY_REWRITE_HINT}"
+        )
+    return [item for item in raw if isinstance(item, str)]
+
+
+def _invalid_policy_yaml_message(name: str, exc: Exception) -> str:
+    mark = getattr(exc, "problem_mark", None)
+    where = f" near line {mark.line + 1}, column {mark.column + 1}" if mark is not None else ""
+    # PyYAML quotes file content in its problem text with repr(), which escapes
+    # every control, format and separator character, so the line a client
+    # prints to a terminal reads as what it is.
+    problem = getattr(exc, "problem", None)
+    if problem is None:
+        first_line = (str(exc).splitlines() or [""])[0]
+        # A safe constructor's own error (KeyError 'x' for ``!!bool x``) reads
+        # as nothing without its type.
+        problem = first_line if isinstance(exc, yaml.YAMLError) else f"{type(exc).__name__}: {first_line}"
+    # PyYAML says "expected a single document in the stream" for a second ---,
+    # in the context, which (unlike the problem) never quotes the file.
+    if "single document" in (getattr(exc, "context", None) or ""):
+        cause = "The file holds more than one YAML document; remove the extra --- separators."
+    else:
+        cause = "An unclosed quote or bracket on an earlier line can cause this."
+    return (
+        f"{name} is not valid YAML, so it loads as no entries; nothing was written. "
+        f"The parser stopped{where}: {problem}. "
+        f"{cause} {_POLICY_REWRITE_HINT}"
+    )
+
+
+def _describe_yaml_value(value: object) -> str:
+    if isinstance(value, date):
+        return "a date"
+    if isinstance(value, bytes):
+        return "binary data"
+    if isinstance(value, (dict, set)):
+        return "a mapping"
+    if isinstance(value, str):
+        return "a single string"
+    if isinstance(value, bool):
+        return "a boolean"
+    if isinstance(value, (int, float)):
+        return "a number"
+    return f"a {type(value).__name__}"
+
+
+def _append_policy_entries(yaml_path: Path, candidates: list[str]) -> list[str]:
+    """Append each of ``candidates`` not already in the file, as a
+    double-quoted YAML scalar, and return the ones appended. Called with the
+    file's lock held, where there is one.
+
+    Quoted, never plain (#284): a plain ``- <entry>`` line lets YAML read the
+    entry as an alias, tag, comment, anchor, mapping, non-string or two lines
+    (NEL, LS and PS are YAML line breaks), and one such entry stops the whole
+    file parsing, which loads as no entries. PyYAML's own emitter is the one
+    quoting that loads back exactly for every entry ``validate_path`` admits;
+    ``json.dumps`` does not (it writes a surrogate pair for a character past
+    the BMP, and with ``ensure_ascii=False`` leaves NEL raw)."""
+    name = policy_file_name(yaml_path)
+    data = _read_policy_bytes(yaml_path, name)
+    current = _read_policy_entries(data, name)
+    already_present = set(current)
+    truly_new = [p for p in candidates if p not in already_present]
+    if not truly_new:
+        return []
+    new_lines = yaml.safe_dump(
+        truly_new, default_style='"', default_flow_style=False,
+        allow_unicode=True, width=float("inf"),
+    )
+    try:
+        existing = data.decode("utf-8")
+    except UnicodeDecodeError:
+        # PyYAML also reads UTF-16 by its byte-order mark; a UTF-8 line cannot
+        # be appended to that.
+        raise ValueError(
+            f"{name} is not UTF-8 text, so it cannot take a new line; nothing was "
+            f"written. {_POLICY_REWRITE_HINT}"
+        ) from None
+    new_content = existing.rstrip("\n") + "\n" + new_lines if existing else new_lines
+    if _entries_or_none(new_content, name) != current + truly_new:
+        raise ValueError(
+            f"{name} cannot take a new line without breaking what it holds (such as a "
+            '[ ... ] list, an indented list, a "..." end marker or a lone ~ or null); '
+            f"nothing was written. {_POLICY_REWRITE_HINT}"
+        )
+    if len(new_content.encode("utf-8")) > MAX_POLICY_YAML_BYTES:
+        raise ValueError(
+            f"policy YAML cap of {MAX_POLICY_YAML_BYTES} bytes would be exceeded"
+        )
+    _replace_policy_file(yaml_path, new_content)
+    return truly_new
+
+
+def _read_policy_bytes(yaml_path: Path, name: str) -> bytes:
+    """The policy file's bytes (PyYAML decodes them as the writer encodes,
+    whatever the locale), or none for a missing file. Raises ValueError (the
+    routes answer 400) for any other read failure: reading it as empty would
+    replace a file holding every pattern with one holding only the new ones.
+    The text matches the Node coordinator's."""
+    try:
+        return yaml_path.read_bytes()
+    except FileNotFoundError:
+        return b""
+    except OSError as exc:
+        code = errno.errorcode.get(exc.errno, str(exc)) if exc.errno else str(exc)
+        raise ValueError(f"{name} could not be read ({code}); nothing was written.") from None
+
+
+def _entries_or_none(text: str, name: str) -> list[str] | None:
+    """The entries ``text`` loads as, or None when it loads as no entries."""
+    try:
+        return _read_policy_entries(text, name)
+    except ValueError:
+        return None
+
+
+def _replace_policy_file(yaml_path: Path, content: str) -> None:
+    """Write ``content`` to a fresh temp file beside ``yaml_path`` and rename
+    it over the file, so a failed write (an encoding error, a full disk)
+    leaves the old file whole where a truncating write left it empty. The
+    temp name is random and created exclusively, so a symlink planted at a
+    predictable name is never followed. Same pattern as the Node writer."""
+    tmp = yaml_path.with_name(f"{yaml_path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp, yaml_path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str], list[dict]]:
     """Append valid patterns to a YAML file. Returns (added, rejected).
-    Honors MAX_POLICY_YAML_BYTES — raises ValueError if the resulting file
-    would exceed the cap.
+    Raises ValueError, which the routes answer as HTTP 400, when the file
+    would exceed MAX_POLICY_YAML_BYTES or an entry could not take effect in
+    it (see :func:`_append_policy_entries`); nothing is written then.
 
     R14 (Unit 6): the read-modify-write is wrapped in an ``fcntl.flock``
     exclusive lock on a sidecar ``<yaml_path>.lock`` file so two concurrent
@@ -5292,59 +8746,23 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
     if not added:
         return added, rejected
 
-    lock_path = yaml_path.with_suffix(yaml_path.suffix + ".lock")
     try:
         import fcntl as _fcntl
-        lock_fd: int | None = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
-            try:
-                existing = yaml_path.read_text()
-            except FileNotFoundError:
-                existing = ""
-            already_present = _parse_yaml_pattern_lines(existing)
-            truly_new = [p for p in added if p not in already_present]
-            if not truly_new:
-                return [], rejected
-            new_lines = "\n".join(f"- {p}" for p in truly_new)
-            new_content = (
-                (existing.rstrip("\n") + "\n" + new_lines + "\n") if existing
-                else (new_lines + "\n")
-            )
-            if len(new_content.encode("utf-8")) > MAX_POLICY_YAML_BYTES:
-                raise ValueError(
-                    f"policy YAML cap of {MAX_POLICY_YAML_BYTES} bytes would be exceeded"
-                )
-            yaml_path.write_text(new_content)
-            return truly_new, rejected
-        finally:
-            try:
-                _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
-            except OSError:
-                pass
-            try:
-                os.close(lock_fd)
-            except OSError:
-                pass
     except ImportError:
         # Windows fallback: no fcntl. Lifecycle already disables the
         # coordinator on Windows, but degrade defensively if reached.
+        return _append_policy_entries(yaml_path, added), rejected
+    lock_path = yaml_path.with_suffix(yaml_path.suffix + ".lock")
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+        return _append_policy_entries(yaml_path, added), rejected
+    finally:
         try:
-            existing = yaml_path.read_text()
-        except FileNotFoundError:
-            existing = ""
-        already_present = _parse_yaml_pattern_lines(existing)
-        truly_new = [p for p in added if p not in already_present]
-        if not truly_new:
-            return [], rejected
-        new_lines = "\n".join(f"- {p}" for p in truly_new)
-        new_content = (
-            (existing.rstrip("\n") + "\n" + new_lines + "\n") if existing
-            else (new_lines + "\n")
-        )
-        if len(new_content.encode("utf-8")) > MAX_POLICY_YAML_BYTES:
-            raise ValueError(
-                f"policy YAML cap of {MAX_POLICY_YAML_BYTES} bytes would be exceeded"
-            )
-        yaml_path.write_text(new_content)
-        return truly_new, rejected
+            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass

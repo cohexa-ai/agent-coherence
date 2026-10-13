@@ -570,10 +570,10 @@ def assert_never_ship_a_store_wire(
     captured: list[dict] = []
     real_post = substrate_module._coordinator_post
 
-    def spy(endpoint, path, payload):  # noqa: ANN001, ANN202
+    def spy(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
         if path == "/hooks/post-edit-cas":
             captured.append(dict(payload))
-        return real_post(endpoint, path, payload)
+        return real_post(endpoint, path, payload, **kwargs)
 
     substrate_module._coordinator_post = spy
     try:
