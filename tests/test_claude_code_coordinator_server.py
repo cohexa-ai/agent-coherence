@@ -2709,6 +2709,80 @@ def test_occ_late_completion_residual_contended_is_noop_not_lost_update(
     assert _artifact_version(coordinator, "plan.md") == v2
 
 
+def _hold_first_observation(
+    monkeypatch: pytest.MonkeyPatch, registry: Any, hold_point: str
+) -> tuple[threading.Event, threading.Event]:
+    """Pause the FIRST first-observation pre-read at ``hold_point`` until the
+    returned ``release`` is set; ``in_window`` is set once it is paused there.
+    Later calls (a peer's own first observation) pass straight through."""
+    in_window, release = threading.Event(), threading.Event()
+    method = "set_agent_state" if hold_point == "after_grant" else "resolve_or_register"
+    real = getattr(registry, method)
+    held: list[bool] = []
+
+    def hold() -> None:
+        held.append(True)
+        in_window.set()
+        assert release.wait(3.0), "the held reader was never released"
+
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        is_target = not held and (
+            method == "resolve_or_register" or kwargs.get("trigger") == "first_read"
+        )
+        if is_target and hold_point == "before_register":
+            hold()
+        result = real(*args, **kwargs)
+        if is_target and hold_point != "before_register":
+            hold()
+        return result
+
+    monkeypatch.setattr(registry, method, wrapper)
+    return in_window, release
+
+
+@pytest.mark.parametrize("hold_point", ["before_register", "after_register", "after_grant"])
+def test_first_observation_read_is_refused_when_a_peer_commit_lands_inside_it(
+    strict_coordinator, strict_client: _Client, monkeypatch: pytest.MonkeyPatch,
+    hold_point: str,
+) -> None:
+    """#322: a first-observation pre-read is several registry calls (lookup,
+    register, grant SHARED, snapshot), and other requests' work bodies run
+    between them. A peer that registers, reads and wins a CAS inside that span
+    advanced the version past the bytes this reader hashed. The reader must be
+    refused, never answered ``fresh`` at the peer's version: write_cas takes
+    that version as its comparand, derives from the pre-commit bytes, wins, and
+    silently overwrites the peer's update. Each hold point is one place the
+    peer's commit can land: before the row exists, after it exists but before
+    the reader's grant, and after the grant."""
+    path = "data/tally.json"
+    reader, peer = _sid("first-obs-reader"), _sid("first-obs-peer")
+    in_window, release = _hold_first_observation(
+        monkeypatch, strict_coordinator.registry, hold_point
+    )
+    answers: dict[str, tuple[int, dict]] = {}
+    read = {"session_id": reader, "path": path, "content_hash": _hash("0")}
+    held_reader = threading.Thread(
+        target=lambda: answers.update(reader=strict_client.post("/hooks/pre-read", read))
+    )
+    held_reader.start()
+    try:
+        assert in_window.wait(3.0), "the reader never reached the held point"
+        peer_version = _occ_seed_shared(strict_client, peer, path, _hash("0"))
+        _, won = strict_client.post("/hooks/post-edit-cas", {
+            "session_id": peer, "path": path, "success": True,
+            "content_hash": _hash("1"), "expected_version": peer_version,
+        })
+        assert won == {"ok": True, "version": peer_version + 1}, "control: the peer won"
+    finally:
+        release.set()
+        held_reader.join(5.0)
+
+    status, body = answers["reader"]
+    assert status == 200, body
+    # The reader hashed "0"; the coordinator records "1" at the peer's version.
+    assert body.get("hookSpecificOutput", {}).get("permissionDecision") == "deny", body
+
+
 def test_a8_status_exposes_coordinator_backend_and_version(client: _Client) -> None:
     """KTD-J: /status shape includes coordinator_backend + coordinator_version
     for cross-implementation operator observability."""

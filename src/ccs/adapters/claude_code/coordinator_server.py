@@ -2357,18 +2357,32 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # Unit 6: surface the version so an OCC writer can source
             # ``expected_version`` for a later ``post-edit-cas`` (additive —
             # status-based clients ignore it). First observation seeds v1.
+            #
+            # #322: the lookup, register, grant and this snapshot are separate
+            # registry calls, and other requests' work bodies run between them.
+            # A peer can register the path, read it and win a CAS in that span;
+            # resolve_or_register then returns the peer's row as it is, and the
+            # snapshot holds a version newer than the bytes this caller hashed.
+            # Answering fresh at that version hands an OCC writer a comparand
+            # its bytes do not match, so its CAS wins over the peer's update.
+            # Hence grant FIRST, snapshot second: a commit that landed before
+            # the grant shows here as a recorded hash other than the seed, and
+            # one that lands after it invalidates the grant. Only a snapshot
+            # still recording the seed is this caller's first observation; any
+            # other is classified below as a read of a tracked artifact.
             seeded_pair = coordinator.registry.get_artifact_and_generation(
                 artifact_id
             )
-            seeded_version = seeded_pair[0].version if seeded_pair else 1
-            first: dict[str, Any] = {"status": "fresh", "version": seeded_version}
-            # The generation rides the SAME snapshot as the version it is
-            # reported beside (opt-in only, so shipped shapes stay
-            # byte-identical) — never a second read a peer commit could
-            # overtake.
-            if want_generation and seeded_pair is not None:
-                first["owner_generation"] = seeded_pair[1]
-            return first
+            if seeded_pair is None or seeded_pair[0].content_hash == seed_hash:
+                seeded_version = seeded_pair[0].version if seeded_pair else 1
+                first: dict[str, Any] = {"status": "fresh", "version": seeded_version}
+                # The generation rides the SAME snapshot as the version it is
+                # reported beside (opt-in only, so shipped shapes stay
+                # byte-identical) — never a second read a peer commit could
+                # overtake.
+                if want_generation and seeded_pair is not None:
+                    first["owner_generation"] = seeded_pair[1]
+                return first
 
         # KTD-J (Unit 8): if a prior pre-read on this exact (agent,
         # artifact) pair emitted a stale warning, count THIS call as the

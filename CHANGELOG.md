@@ -834,6 +834,25 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **`CoherentVolume.write_cas` no longer loses a concurrent update on a path's
+  first read (#322).** The Python coordinator answers the first `pre-read` of a
+  path in four separate registry steps: look the path up, register it, grant
+  the reader SHARED, and read the version it reports. Other requests run
+  between those steps. If a peer registered the path, read it and won a
+  `post-edit-cas` in between, the reader was answered `fresh` at the peer's
+  new version, paired with bytes it had read before that commit, and no
+  content-hash check ran. `write_cas` uses that version as its comparand, so
+  it derived its update from the old bytes, won the CAS, and overwrote the
+  peer's update with no exception raised. Several writers making their first
+  read of the same path at once, under load, could hit this. The coordinator
+  now grants SHARED before it reads the version, and answers `fresh` only
+  while the registry still records the hash the reader sent. Otherwise the
+  read is classified as a read of an already-tracked path: under strict mode
+  it is denied, and `write_cas` re-reads and retries from the current bytes.
+  A peer commit that lands after the grant invalidates the reader. The Claude
+  Code plugin's Node coordinator answers a first read without interleaving
+  other requests and reports no version on it, so it was not affected.
+
 - **Tracking or untracking a glob such as `*.md` no longer empties the policy
   file (#284).** `POST /policy/track` and `/policy/untrack` (the track and
   untrack commands) wrote each entry as a plain YAML line. An entry the path

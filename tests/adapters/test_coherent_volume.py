@@ -4795,6 +4795,63 @@ def test_a_degrade_mode_write_lands_no_bytes_when_the_gates_store_read_fails(
         server.shutdown()
 
 
+def test_write_cas_keeps_a_peer_update_that_lands_inside_its_first_read(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#322: two writers each add 1 to a counter nobody has read yet. Writer A
+    has read ``0`` from disk and its pre-read is still inside the coordinator's
+    first-observation branch when writer B registers the path, reads ``0`` and
+    commits ``1``. Both ``write_cas`` calls must leave ``2`` on disk (or one
+    must raise). A returning while the file holds ``1`` is the silent lost
+    update: A was answered fresh at B's version, so its CAS over ``0`` won.
+
+    The coordinator runs in this process so A's pre-read can be held at the
+    point the race needs; the scheduling gap it stands in for is real."""
+    rel = "data/tally.txt"
+    target = _seed(tmp_path, rel, content=b"0")
+    server = _serve_in_process(tmp_path, "first-read-race")
+    in_window, release = threading.Event(), threading.Event()
+    real_register = server.registry.resolve_or_register
+    held: list[bool] = []
+
+    def held_register(*args, **kwargs):
+        if not held:  # only A's first observation; B's own passes through
+            held.append(True)
+            in_window.set()
+            assert release.wait(3.0), "writer A's read was never released"
+        return real_register(*args, **kwargs)
+
+    def add_one(current: bytes) -> bytes:
+        return str(int(current.decode()) + 1).encode()
+
+    monkeypatch.setattr(server.registry, "resolve_or_register", held_register)
+    errors: list[BaseException] = []
+    try:
+        vol_a = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+        vol_b = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+
+        def writer_a() -> None:
+            try:
+                vol_a.write_cas(rel, add_one)
+            except BaseException as exc:  # noqa: BLE001 — re-checked below
+                errors.append(exc)
+
+        thread_a = threading.Thread(target=writer_a)
+        thread_a.start()
+        try:
+            assert in_window.wait(3.0), "writer A never reached its first read"
+            vol_b.write_cas(rel, add_one)
+            assert target.read_bytes() == b"1", "control: B's update landed first"
+        finally:
+            release.set()
+            thread_a.join(10.0)
+
+        assert not errors, errors
+        assert target.read_bytes() == b"2", "a write_cas returned but B's update is gone"
+    finally:
+        server.shutdown()
+
+
 # --- the coordinator answers a pre-read with a failure envelope ----------------
 #
 # Two coordinator-side failures answer a pre-read as HTTP 200 ``{ok: false,
