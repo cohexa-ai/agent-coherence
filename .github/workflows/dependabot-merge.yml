@@ -1,0 +1,181 @@
+# Merge qualifying Dependabot pull requests into dev, one per run.
+#
+# WHAT MERGES. A Dependabot PR whose head carries the `dependabot-gate` status
+# "qualifies" (dependabot-gate.yml; the rules are tools/dependabot_gate.py),
+# whose checks all pass, and which is up to date with dev. It is squash-merged,
+# pinned to the head the gate judged. tools/dependabot_merger.py re-checks the
+# branch and the changed files itself, so a status forged on any other PR merges
+# nothing, and GitHub still refuses the merge unless dev's required checks
+# passed on an up-to-date head. Everything else waits for a person.
+#
+# WHY A SCHEDULE, NOT GITHUB AUTO-MERGE. Auto-merge stays armed through a
+# Dependabot force-push, so a refreshed head could merge before the gate judged
+# it. A merge made here is pinned to the head the gate judged.
+#
+# WHY THE APP. A merge made with the workflow token creates no push event, so
+# ci.yml would never run on dev for it; a merge made with the forward-merge
+# App's token does. A branch update made with the App's token also starts the
+# PR's checks, where one made with the workflow token would not.
+#
+# BEHIND. Every merge leaves the other PRs behind dev. Dependabot refreshes its
+# open PRs in the same ecosystem within a few minutes after one merges. A PR
+# still behind once ten minutes have passed since both its gate verdict and
+# dev's last move, with every check passing, is brought up to date with a merge
+# of dev: one PR per run, and never while another eligible PR's checks are
+# running or a Dependabot head awaits its verdict. Dependabot stops rebasing a
+# PR once anyone else pushes to it, so this is the fallback, not the first
+# move. The merged uv.lock is one no resolver wrote, so the gate judges it
+# again, including that every dependency it names is locked. A PR with a
+# failed check or a conflict is left alone, with a warning in the run.
+#
+# THE KEY. The App's private key is secret BOT_KEY in the `dependabot-merge`
+# environment, which only the dev branch may use, so no pull request run can
+# read it, and `plan` refuses to run while a repository- or organization-level
+# copy exists. The job that holds the key checks out nothing and runs one
+# third-party action, actions/create-github-app-token, pinned by SHA. The token
+# carries `workflows` only for a branch update, which GitHub refuses without it
+# whenever dev has workflow changes the branch lacks. Setup:
+# install the App on this repository, set repository variable
+# FORWARD_MERGE_APP_CLIENT_ID, and add BOT_KEY to the environment. A manual run
+# always mints the token, so a green dispatch proves the setup.
+name: dependabot-merge
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+# The workflow token only reads; every write goes through the App token.
+# `checks: read`, `statuses: read` and `actions: read` let `gh pr list` read
+# each PR's check rollup.
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+  actions: read
+
+# Runs queue rather than cancel: a cancelled run could leave a merge or an
+# update half-decided.
+concurrency:
+  group: dependabot-merge
+  cancel-in-progress: false
+
+# The default `bash -e` has no pipefail, so a failing command before a pipe
+# would pass unnoticed.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: Pick the next Dependabot merge
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      number: ${{ steps.plan.outputs.number }}
+      head: ${{ steps.plan.outputs.head }}
+    steps:
+      # `plan` names no environment, so the only secrets it can see are
+      # repository and organization secrets, the copies any branch can read.
+      # Only a yes or no reaches the shell, never the value.
+      - name: Refuse a repository- or organization-level copy of the key
+        env:
+          KEY_OUTSIDE_ENVIRONMENT: ${{ secrets.BOT_KEY != '' }}
+        run: |
+          if [ "$KEY_OUTSIDE_ENVIRONMENT" = "true" ]; then
+            echo "::error::BOT_KEY is stored as a repository or organization secret, which a workflow on any branch can read. Delete it there, rotate the App's private key, and keep it only in the dependabot-merge environment."
+            exit 1
+          fi
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Pick the next step
+        id: plan
+        run: |
+          prs="$RUNNER_TEMP/prs.json"
+          gates="$RUNNER_TEMP/gates.json"
+          gh pr list --base dev --state open --author app/dependabot --limit 50 \
+            --json number,headRefName,headRefOid,mergeStateStatus,isDraft,isCrossRepository,files,statusCheckRollup \
+            > "$prs"
+          jq -r '.[].headRefOid' "$prs" | while read -r sha; do
+            # Newest first; the creator shows whether a workflow wrote it.
+            gh api "repos/$GH_REPO/commits/$sha/statuses?per_page=100" \
+              --jq "{sha: \"$sha\", gate: ([.[] | select(.context == \"dependabot-gate\")] | first)}"
+          done | jq -s . > "$gates"
+          dev_moved_at=$(gh api "repos/$GH_REPO/commits/dev" --jq .commit.committer.date)
+          python3 tools/dependabot_merger.py --prs "$prs" --gates "$gates" \
+            --now "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" --dev-moved-at "$dev_moved_at" \
+            --github-output "$GITHUB_OUTPUT" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  act:
+    name: Merge or update the picked Dependabot PR
+    needs: plan
+    if: needs.plan.outputs.action != 'none' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: dependabot-merge
+    env:
+      GH_REPO: ${{ github.repository }}
+      ACTION: ${{ needs.plan.outputs.action }}
+      PR: ${{ needs.plan.outputs.number }}
+      HEAD_SHA: ${{ needs.plan.outputs.head }}
+    steps:
+      - name: Require the forward-merge App
+        env:
+          CLIENT_ID: ${{ vars.FORWARD_MERGE_APP_CLIENT_ID }}
+          HAS_KEY: ${{ secrets.BOT_KEY != '' }}
+        run: |
+          if [ -z "$CLIENT_ID" ] || [ "$HAS_KEY" != "true" ]; then
+            echo "::error::The forward-merge GitHub App is not configured. Set repository variable FORWARD_MERGE_APP_CLIENT_ID and, in the dependabot-merge environment, secret BOT_KEY."
+            exit 1
+          fi
+
+      - name: Mint the App token
+        id: app-token
+        if: env.ACTION != 'update'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          client-id: ${{ vars.FORWARD_MERGE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Mint the App token for a branch update
+        id: update-token
+        if: env.ACTION == 'update'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          client-id: ${{ vars.FORWARD_MERGE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      # An empty head would unpin the merge: gh drops an empty
+      # --match-head-commit.
+      - name: Merge or update the PR
+        if: env.ACTION != 'none'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || steps.update-token.outputs.token }}
+        run: |
+          if ! [[ "$PR" =~ ^[0-9]+$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::refusing to act on PR '$PR' at head '$HEAD_SHA'"
+            exit 1
+          fi
+          case "$ACTION" in
+            merge)
+              gh pr merge "$PR" --squash --match-head-commit "$HEAD_SHA" ;;
+            update)
+              gh api -X PUT "repos/$GH_REPO/pulls/$PR/update-branch" -f expected_head_sha="$HEAD_SHA" > /dev/null ;;
+            *)
+              echo "::error::unknown action '$ACTION'"
+              exit 1 ;;
+          esac
+          echo "$ACTION #$PR at $HEAD_SHA" >> "$GITHUB_STEP_SUMMARY"

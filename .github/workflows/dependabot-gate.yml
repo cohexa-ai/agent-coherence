@@ -1,0 +1,143 @@
+# Judge each Dependabot pull request into dev, for dependabot-merge.yml.
+#
+# Records a commit status `dependabot-gate` on the PR's head:
+#   success "qualifies"                  dependabot-merge.yml may merge this head
+#   success "waits for a person: ..."    a major, a grouped update, a change
+#                                        outside the lockfile and manifest, or a
+#                                        lock update that drops a package
+#   failure "..."                        uv.lock lowers a package or depends on
+#                                        one it does not lock, or the gate could
+#                                        not tell; the judge job is red too, so a
+#                                        person merging by hand sees it
+# The rules are tools/dependabot_gate.py. It runs as dev has it at the PR's merge
+# base, never as the PR has it.
+#
+# NO GITHUB ACTIONS BUMPS. A pull request runs this workflow as the PR has it,
+# so a PR that bumps an action pinned below would run the new action's code
+# here before anyone reviewed it. Such PRs are not judged at all; with no
+# status they wait for a person, like every other Actions bump.
+#
+# TWO JOBS. `judge` runs the third-party actions and the rules with a read-only
+# token. `record` holds `statuses: write`, runs no action, and writes only to
+# this PR's own head, so nothing the judge runs can write a verdict onto
+# another PR. A pull request run started by Dependabot gets a read-only token
+# unless `permissions` raises it, and reads no secret.
+name: dependabot-gate
+
+on:
+  pull_request:
+    branches: [dev]
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+concurrency:
+  group: dependabot-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# The default `bash -e` has no pipefail, so a failing command before a pipe
+# would pass unnoticed.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  judge:
+    name: Judge the Dependabot update
+    # The PR's author, not the actor: a later push to a Dependabot PR by anyone
+    # else is judged too.
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      !startsWith(github.head_ref, 'dependabot/github_actions/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      state: ${{ steps.judge.outputs.state }}
+      description: ${{ steps.judge.outputs.description }}
+    steps:
+      - name: Read the update's metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98  # v3.1.0
+
+      # Full history: the gate compares the PR's head with its merge base.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Metadata reaches the shell through env, never through ${{ }} inside
+      # `run`. The gate script comes from the merge base, so a PR cannot change
+      # the rules it is judged by.
+      - name: Judge the update
+        id: judge
+        env:
+          ECOSYSTEM: ${{ steps.metadata.outputs.package-ecosystem }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          GROUP: ${{ steps.metadata.outputs.dependency-group }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          gate="$RUNNER_TEMP/dependabot_gate.py"
+          git show "${merge_base}:tools/dependabot_gate.py" > "$gate"
+          verdict=0
+          reason=$(python3 "$gate" --base "$merge_base" --head "$HEAD_SHA" \
+            --ecosystem "$ECOSYSTEM" --update-type "$UPDATE_TYPE" --group "$GROUP") || verdict=$?
+          # One line: a line break in the reason could add lines of its own
+          # to GITHUB_OUTPUT, a state among them.
+          reason=${reason//$'\n'/ }
+          reason=${reason//$'\r'/ }
+          echo "$reason" | tee -a "$GITHUB_STEP_SUMMARY"
+          case "$verdict" in
+            0 | 10) state=success ;;
+            *) state=failure ;;
+          esac
+          {
+            echo "state=$state"
+            echo "description=${reason:0:140}"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$state" != success ]; then
+            echo "::error::$reason"
+            exit 1
+          fi
+
+  record:
+    name: Record the Dependabot verdict
+    needs: judge
+    if: >-
+      always() &&
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      !startsWith(github.head_ref, 'dependabot/github_actions/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    steps:
+      # A judge that died before deciding records a failure, never a pass, and
+      # a success counts only when the judge job itself succeeded.
+      - name: Record the verdict on the PR's head
+        env:
+          JUDGE_RESULT: ${{ needs.judge.result }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          STATE: ${{ needs.judge.outputs.state }}
+          DESCRIPTION: ${{ needs.judge.outputs.description }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          case "$STATE" in
+            success | failure) ;;
+            *)
+              STATE=failure
+              DESCRIPTION="the gate could not run; see the run" ;;
+          esac
+          if [ "$STATE" = success ] && [ "$JUDGE_RESULT" != success ]; then
+            STATE=failure
+            DESCRIPTION="the gate could not run; see the run"
+          fi
+          gh api "repos/$GH_REPO/statuses/$HEAD_SHA" -f state="$STATE" -f context=dependabot-gate \
+            -f description="${DESCRIPTION:0:140}" -f target_url="$RUN_URL" > /dev/null

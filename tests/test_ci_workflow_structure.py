@@ -209,7 +209,13 @@ REQUIRED_CHECKS = frozenset(
 REQUIRED_CHECK_COUNT = 9
 TEST_GATES = {"tests-py311": "test-shards-py311", "tests-py312": "test-shards-py312"}
 TEST_GATE_PYTHON = {"tests-py311": "3.11", "tests-py312": "3.12"}
-OTHER_WORKFLOWS = ("publish-mcp.yml", "release.yml", "weekly-full-ci.yml")
+OTHER_WORKFLOWS = (
+    "dependabot-gate.yml",
+    "dependabot-merge.yml",
+    "publish-mcp.yml",
+    "release.yml",
+    "weekly-full-ci.yml",
+)
 COVERAGE_STEP = "Check that the shards ran every test exactly once"
 VERDICT_STEP = "Decide the verdict"
 TESTS_VERDICT_RUN = 'python3 tools/ci_gate_verdict.py tests --shards "$SHARDS" --coverage-exit "$COVERAGE_EXIT"'
