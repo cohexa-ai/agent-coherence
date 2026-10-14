@@ -1,7 +1,7 @@
 # Publishes server.json to the Official MCP Registry (registry.modelcontextprotocol.io).
 #
 # Auth is GitHub OIDC rather than `mcp-publisher login github`. OIDC proves THIS
-# repository's identity, which is what grants the `io.github.Cohexa-ai/*`
+# repository's identity, which is what grants the `io.github.cohexa-ai/*`
 # namespace. The device flow cannot: it authenticates a user through the
 # registry's GitHub App, which has no visibility into org membership, so it only
 # ever grants the personal namespace — regardless of org role or membership

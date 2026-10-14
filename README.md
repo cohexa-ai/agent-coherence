@@ -12,7 +12,7 @@ Two agents share an artifact — a `plan.md`, a store key, a `memory.json`. One 
 [![Discussions](https://img.shields.io/github/discussions/Cohexa-ai/agent-coherence)](https://github.com/Cohexa-ai/agent-coherence/discussions)
 
 <!-- MCP Registry — PyPI ownership tag for the stale-write-guard-fs server -->
-`mcp-name: io.github.Cohexa-ai/stale-write-guard-fs`
+`mcp-name: io.github.cohexa-ai/stale-write-guard-fs`
 
 ```bash
 # Requires Python 3.11+

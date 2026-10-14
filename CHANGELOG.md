@@ -4,6 +4,20 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
+## [Unreleased]
+
+### Changed
+
+- **The MCP Registry lists the `stale-write-guard-fs` server as
+  `io.github.cohexa-ai/stale-write-guard-fs`.** The GitHub organization is now
+  `cohexa-ai`, and the registry grants publishing rights to the namespace as
+  GitHub reports it, case included, so `io.github.Cohexa-ai/...` can no longer
+  be published. The README's `mcp-name:` marker, which the registry matches
+  case-sensitively against the server name, changes with it. Versions up to
+  0.14.1 stay listed under the old name; 0.15.0 was not listed, because its
+  package README carries the old marker. Install commands are unchanged: the
+  PyPI package is still `agent-coherence`.
+
 ## [0.15.0] - 2026-10-14
 
 **Sessions can hand a held path to a named successor, a caller principal keeps protocol-following clients from acting as each other's sessions, and the effect fence answers over HTTP; `/status` reports sweep reclaims, grant ages, each artifact's last writer and the store's schema version; and a run of fixes closes ways a stale read, a refused read or a policy edit let a write overwrite newer work.**
