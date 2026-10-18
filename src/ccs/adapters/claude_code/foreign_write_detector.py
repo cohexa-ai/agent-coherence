@@ -97,9 +97,11 @@ from pathlib import Path
 from typing import Iterable, Protocol
 from uuid import UUID
 
-from ccs.adapters.claude_code.coordinator_server import _F_SENTINEL_CONTENT_HASH
+from ccs.adapters.claude_code.coordinator_server import (
+    _F_SENTINEL_CONTENT_HASH,
+    _a_write_is_in_flight,
+)
 from ccs.adapters.claude_code.disk_content import hash_regular_file
-from ccs.core.states import MESIState
 
 logger = logging.getLogger(__name__)
 
@@ -207,14 +209,6 @@ _WALK_BUDGET_SEC = 2.0
 # already "present", so a second one would buy nothing.
 _walk_lock = threading.Lock()
 _walk_in_flight: threading.Thread | None = None
-
-# An acquired, uncommitted write claim is the registry's own evidence that a
-# mediated write is in flight, which the timestamp alone cannot supply — see
-# _classify_mismatch. Only EXCLUSIVE: a pre-edit acquire sets it, and the commit
-# turns it MODIFIED, which says the write already landed (#278). A MODIFIED row
-# stands until release or reclaim, up to half an hour, and excusing on it hid
-# every out-of-band change made after a commit for that long.
-_WRITE_IN_FLIGHT_STATE = MESIState.EXCLUSIVE
 
 
 class DetectionTarget(Protocol):
@@ -680,7 +674,7 @@ def _classify_mismatch(
     *,
     updated_at: float | None,
     has_mediated_writer: bool,
-    has_write_grant: bool,
+    has_write_in_flight: bool,
     now_unix: float,
     window_sec: float,
 ) -> str:
@@ -698,8 +692,9 @@ def _classify_mismatch(
     artifact untouched for an hour would read as foreign. An acquired write
     claim not yet committed, held by a session active within the window, is the
     registry's own evidence that a write is in flight right now, and it covers
-    exactly the case the timestamp misses (``has_write_grant``; see
-    :func:`_a_write_is_in_flight`).
+    exactly the case the timestamp misses (``has_write_in_flight``; see
+    :func:`~ccs.adapters.claude_code.coordinator_server._a_write_is_in_flight`,
+    the rule pre-edit's out-of-band check shares).
 
     The timestamp leg additionally requires a witnessed writer: ``updated_at``
     is also stamped by first-observation registration, with no writer behind it,
@@ -709,7 +704,7 @@ def _classify_mismatch(
     What either leg admits is not hidden — a suppression is its own counted
     outcome, so an operator can size the exposure rather than trust it.
     """
-    if has_write_grant:
+    if has_write_in_flight:
         return "lag_suppressed"
     if (
         has_mediated_writer
@@ -1122,28 +1117,6 @@ def _release_clean_edges(
         registry.clear_detection_edges(to_clear)
 
 
-def _a_write_is_in_flight(
-    registry, artifact_id: UUID, *, now_unix: float, window_sec: float
-) -> bool:
-    """Whether a session holds a write it acquired and has not committed, and
-    was active within the window (#278).
-
-    EXCLUSIVE alone, never MODIFIED: see ``_WRITE_IN_FLIGHT_STATE``. And the
-    holder's last heartbeat must be recent, because a claim whose holder went
-    quiet -- a handoff successor that ran pre-edit and stopped, a client that
-    died before its commit -- explains nothing on disk, and its row stands until
-    the sweep reclaims it. A holder with no heartbeat on record is given the
-    benefit of the doubt, as every holder was before: only a recorded silence
-    longer than the window ends it."""
-    for agent_id, state in registry.get_state_map(artifact_id).items():
-        if state != _WRITE_IN_FLIGHT_STATE:
-            continue
-        last_heartbeat = registry.last_heartbeat_tick(agent_id)
-        if last_heartbeat is None or (now_unix - last_heartbeat) <= window_sec:
-            return True
-    return False
-
-
 def _observe(
     registry,
     root: Path,
@@ -1195,7 +1168,7 @@ def _observe(
         outcome = _classify_mismatch(
             updated_at=registry.get_artifact_updated_at(artifact_id),
             has_mediated_writer=registry.last_writer_for(artifact_id) is not None,
-            has_write_grant=_a_write_is_in_flight(
+            has_write_in_flight=_a_write_is_in_flight(
                 registry, artifact_id, now_unix=now_unix, window_sec=window_sec
             ),
             now_unix=now_unix,

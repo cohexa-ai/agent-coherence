@@ -15949,3 +15949,47 @@ def test_a_successor_about_to_overwrite_its_givers_out_of_band_change_is_warned(
     assert context.startswith("Handoff: agent "), context
     assert context.endswith(hp.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(path="plan.md", version=1))
     assert "permissionDecision" not in body["hookSpecificOutput"]
+
+
+@pytest.mark.parametrize("peer", ["writing", "committed", "gone-quiet"])
+def test_pre_edit_behind_a_peer_flags_only_what_no_write_in_flight_explains(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, peer: str,
+) -> None:
+    """#278: a peer that acquired the file and is still active has a write in
+    flight, and its bytes can reach the disk before its commit does. That is
+    the coordinator's own concurrent write, which the collision warning
+    already names, not a change made outside it -- the rule the foreign-write
+    detector applies. A peer that committed (its write landed) or went quiet
+    explains nothing, so the check still runs behind it. Fails if pre-edit
+    calls a peer's in-flight write out-of-band, or stops checking behind a
+    committed or quiet peer."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    original = b"# plan\n- a\n"
+    _seed_with_disk(coordinator, client, "plan.md", original)
+    holder, editor = str(uuid.uuid4()), str(uuid.uuid4())
+    acquired = client.post("/hooks/pre-edit", {"session_id": holder, "path": "plan.md"})
+    assert acquired == (200, {"ok": True}), acquired
+    peer_bytes = original + b"- the peer's edit\n"
+    (coordinator.coordinator_root / "plan.md").write_bytes(peer_bytes)
+    version = 1
+    if peer == "committed":
+        committed = client.post("/hooks/post-edit", {
+            "session_id": holder, "path": "plan.md",
+            "content_hash": _bytes_hash(peer_bytes), "success": True})
+        assert committed[0] == 200, committed
+        version = 2
+        (coordinator.coordinator_root / "plan.md").write_bytes(peer_bytes + b"- out of band\n")
+    if peer == "gone-quiet":
+        later = time.time() + 60
+        monkeypatch.setattr(hp, "now_unix", lambda: later)
+
+    status, body = client.post("/hooks/pre-edit", {"session_id": editor, "path": "plan.md"})
+
+    assert status == 200 and body["ok"] is True and body["collision"] is True, body
+    notice = hp.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(path="plan.md", version=version)
+    context = body["hookSpecificOutput"]["additionalContext"]
+    if peer == "writing":
+        assert "disk_differs" not in body and notice not in context, body
+    else:
+        assert body["disk_differs"] is True and context.endswith(notice), body

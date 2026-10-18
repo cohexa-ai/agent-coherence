@@ -3825,10 +3825,14 @@ no commit of its own to explain them, is told so:
   not told this; that writer went through the coordinator, and the deny says
   the grant was revoked, as before;
 - its `pre-edit` reads the file itself and, when it no longer holds the recorded
-  content, adds `"disk_differs": true` and the same sentence. It never denies,
-  in strict mode either: a read is already denied there until a commit lands,
-  and a write is the one way to commit the change. A client that writes whole
-  files should re-read before it writes when it sees the key.
+  content, adds `"disk_differs": true` and the same sentence. It skips the check
+  while another session holds a write it has not committed and was active in
+  the last few seconds, the case the detector excuses too: that write can
+  reach the disk before its commit, and the collision warning already names
+  it. It never denies, in strict mode either: a read is already denied there
+  until a commit lands, and a write is the one way to commit the change. A
+  client that writes whole files should re-read before it writes when it sees
+  the key.
 
 **Reading the counts while the coordinator runs.** `/status?detail=full` adds
 `foreign_writes` to each tracked file the detector has counted anything for,

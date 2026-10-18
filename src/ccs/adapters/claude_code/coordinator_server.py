@@ -3382,6 +3382,16 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         peers_in_me = _peers_in_me_excluding(coordinator, artifact_id, agent_id)
         # Detect collision BEFORE acquiring: is any other session in M∪E?
         holder_id, holder_ts = _exclusive_holder(coordinator, artifact_id, exclude_agent=agent_id)
+        # #278: also before the acquire, which revokes every peer's claim: a
+        # peer's write still landing explains a mismatch on disk, by the rule
+        # the foreign-write detector applies. Its bytes can reach the disk
+        # before its commit does, and the collision warning already names it.
+        peer_write_in_flight = _a_write_is_in_flight(
+            coordinator.registry, artifact_id,
+            now_unix=_payloads.now_unix(),
+            window_sec=_SHARED_FOREIGN_DENY_LAG_WINDOW_SEC,
+            exclude_agent=agent_id,
+        )
 
         # Acquire EXCLUSIVE — this invalidates peers (KTD-1 single-writer).
         # ``caller`` is the session-level identity the giver fence keys on
@@ -3411,9 +3421,10 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # the caller's write lands. It warns and never denies: in strict mode
         # a read is already refused until a commit lands, so a write is the
         # one way out.
-        out_of_band_version = _recorded_content_missing_from_disk(
-            coordinator, artifact_id, agent_id, path=path, now_unix=_payloads.now_unix()
-        )
+        if not peer_write_in_flight:
+            out_of_band_version = _recorded_content_missing_from_disk(
+                coordinator, artifact_id, agent_id, path=path, now_unix=_payloads.now_unix()
+            )
 
         # A1: record preemption notices for the agents whose M∪E grants we
         # just silently revoked via the write() side effect. The victims
@@ -8757,6 +8768,44 @@ def _is_recent_self_commit_lag(
     if updated_at is None:
         return False
     return (now_unix - updated_at) <= _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC
+
+
+# An acquired, uncommitted write claim is the registry's own evidence that a
+# mediated write is in flight, which the commit timestamp cannot supply. Only
+# EXCLUSIVE: a pre-edit acquire sets it, and the commit turns it MODIFIED, which
+# says the write already landed (#278). A MODIFIED row stands until release or
+# reclaim, up to half an hour, and excusing on it hid every out-of-band change
+# made after a commit for that long.
+_WRITE_IN_FLIGHT_STATE = MESIState.EXCLUSIVE
+
+
+def _a_write_is_in_flight(
+    registry,
+    artifact_id: UUID,
+    *,
+    now_unix: float,
+    window_sec: float,
+    exclude_agent: UUID | None = None,
+) -> bool:
+    """Whether a session other than ``exclude_agent`` holds a write it acquired
+    and has not committed, and was active within the window (#278).
+
+    The one rule for "a write still landing explains this mismatch", shared by
+    the sweep's foreign-write detection pass and pre-edit's out-of-band check.
+    EXCLUSIVE alone, never MODIFIED: see ``_WRITE_IN_FLIGHT_STATE``. And the
+    holder's last heartbeat must be recent, because a claim whose holder went
+    quiet -- a handoff successor that ran pre-edit and stopped, a client that
+    died before its commit -- explains nothing on disk, and its row stands until
+    the sweep reclaims it. A holder with no heartbeat on record is given the
+    benefit of the doubt, as every holder was before: only a recorded silence
+    longer than the window ends it."""
+    for agent_id, state in registry.get_state_map(artifact_id).items():
+        if state != _WRITE_IN_FLIGHT_STATE or agent_id == exclude_agent:
+            continue
+        last_heartbeat = registry.last_heartbeat_tick(agent_id)
+        if last_heartbeat is None or (now_unix - last_heartbeat) <= window_sec:
+            return True
+    return False
 
 
 def _recorded_content_missing_from_disk(

@@ -54,7 +54,8 @@ Alpha — APIs may change before `v1.0`.
     an earlier read, so the change was replaced and the record looked clean.
     `pre-edit` now reads the file itself. When the file no longer holds the
     recorded content, it answers `"disk_differs": true` and the same
-    sentence. It still admits, in strict mode too.
+    sentence, unless another session's write is still landing. It still
+    admits, in strict mode too.
 
   `/status?detail=full` now lists each file's detector counts as
   `foreign_writes`. `agent-coherence-status` prints them, along with the two
