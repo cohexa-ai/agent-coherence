@@ -72,6 +72,10 @@ def repo(tmp_path: Path) -> Path:
         ["--test-lane", "serial"],
         ["--node-id-dir=/tmp/x"],
         ["--splits", "2", "--group", "1"],
+        ["-mnot slow"],
+        ["-pno:xdist"],
+        ["-oaddopts="],
+        ["-cx.ini"],
     ],
 )
 def test_options_that_override_ci_selection_or_runner_settings_are_refused(argv: list[str]) -> None:
@@ -134,9 +138,13 @@ def test_option_values_are_never_read_as_test_paths(argv: list[str], is_full: bo
     assert runner.split_args(argv).is_full is is_full
 
 
-def test_an_unknown_option_followed_by_a_path_must_be_written_with_an_equals_sign() -> None:
-    with pytest.raises(runner.Refused, match="--some-plugin-option=value"):
-        runner.split_args(["--some-plugin-option", "tests/test_x.py"])
+def test_an_unknown_option_keeps_its_value_unless_the_value_is_a_test_path() -> None:
+    assert runner.split_args(["--junitxml", "out.xml"]).option_tokens() == ["--junitxml", "out.xml"]
+    assert runner.split_args(["--junitxml", "out.xml"]).is_full
+    logged = runner.split_args(["--log-level", "DEBUG", "tests/test_x.py"])
+    assert logged.paths == ("tests/test_x.py",) and logged.option_tokens() == ["--log-level", "DEBUG"]
+    flagged = runner.split_args(["--cache-clear", "tests/test_x.py::test_y"])
+    assert flagged.paths == ("tests/test_x.py::test_y",) and flagged.option_tokens() == ["--cache-clear"]
 
 
 def test_bundled_short_flags_are_flags_not_unknown_options() -> None:
@@ -360,6 +368,20 @@ rlt.release_turn(fd)
 """
 
 
+_INTERRUPTED_RUNNER = """
+import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("rlt", sys.argv[1])
+rlt = importlib.util.module_from_spec(spec)
+sys.modules["rlt"] = rlt
+spec.loader.exec_module(rlt)
+try:
+    rlt.run_lane([sys.executable, "-c", sys.argv[2]], dict(os.environ), Path.cwd(), None)
+except KeyboardInterrupt:
+    sys.exit(130)
+"""
+
+
 def _wait_for(predicate, timeout: float = 10.0) -> bool:
     import time
 
@@ -453,8 +475,9 @@ class _FakeLanes:
     """Stands in for ``run_lane``: records each command and whether the turn was
     held, and writes the ran list a real lane would leave in --node-id-dir."""
 
-    def __init__(self, codes: list[int], lock: Path, ran: int = 3) -> None:
+    def __init__(self, codes: list[int], lock: Path, ran: int = 3, serial_selected: int = 1) -> None:
         self.codes, self.lock, self.ran, self.calls = list(codes), lock, ran, []
+        self.serial_selected = serial_selected
         self.lock_held: list[bool] = []
         self.envs: list = []
         self.cwds: list = []
@@ -468,6 +491,9 @@ class _FakeLanes:
         node_dir = next(token.split("=", 1)[1] for token in command if token.startswith("--node-id-dir="))
         Path(node_dir).mkdir(parents=True, exist_ok=True)
         Path(node_dir, f"{lane}-ran.txt").write_text("".join(f"t::{i}\n" for i in range(self.ran)))
+        if "--co" in command:  # the targeted run's probe of which serial tests it selected
+            Path(node_dir, "serial-full.txt").write_text("".join(f"s::{i}\n" for i in range(self.serial_selected)))
+            return 0 if self.serial_selected else 5
         return self.codes.pop(0)
 
 
@@ -500,6 +526,12 @@ def test_a_full_run_fails_when_its_parallel_lane_exits_0_having_run_nothing(tmp_
     assert any("parallel lane ran no tests" in line for line in said)
 
 
+def test_a_collect_only_full_run_is_not_reported_as_running_nothing(tmp_path: Path) -> None:
+    said: list[str] = []
+    assert runner.execute(_spec(tmp_path, ["--co"]), _FakeLanes([0, 0], tmp_path / runner.LOCK_NAME, ran=0), said.append) == 0
+    assert not any("ran no tests" in line for line in said)
+
+
 def test_a_targeted_run_of_a_plain_module_never_takes_the_turn(tmp_path: Path) -> None:
     lanes = _FakeLanes([0], tmp_path / runner.LOCK_NAME)
     assert runner.execute(_spec(tmp_path, [PLAIN_MODULE]), lanes, lambda line: None) == 0
@@ -515,6 +547,17 @@ def test_a_targeted_run_takes_the_turn_only_for_its_serial_tests(tmp_path: Path)
     assert not parallel_held and serial_held
     assert lanes.lock_held == [False, True]
     assert serial[-1] == SERIAL_MODULE
+
+
+def test_a_test_id_in_a_serial_module_takes_the_turn_only_if_it_selects_serial_tests(tmp_path: Path) -> None:
+    """Six modules mix serial and parallel tests; naming one parallel test in
+    them must not wait behind another worktree's full run."""
+    not_serial = _FakeLanes([0], tmp_path / runner.LOCK_NAME, serial_selected=0)
+    assert runner.execute(_spec(tmp_path, [f"{SERIAL_MODULE}::test_a"]), not_serial, lambda line: None) == 0
+    assert not_serial.lock_held == [False, False] and len(not_serial.calls) == 2
+    serial = _FakeLanes([0, 0], tmp_path / runner.LOCK_NAME, serial_selected=1)
+    assert runner.execute(_spec(tmp_path, ["-k", "race", SERIAL_MODULE]), serial, lambda line: None) == 0
+    assert serial.lock_held == [False, False, True]
 
 
 def test_a_worker_count_on_a_targeted_run_reaches_only_its_parallel_part(tmp_path: Path) -> None:
@@ -579,3 +622,33 @@ def test_a_real_targeted_run_reports_each_lane_and_a_summary(tmp_path: Path) -> 
     assert runner.execute(spec, runner.run_lane, said.append) == 0
     assert any("parallel lane" in line and "targeted run" in line for line in said)
     assert any(re.search(r"done .* parallel lane exit 0, [1-9]\d* ran", line) for line in said)
+
+
+@pytest.mark.serial
+def test_ctrl_c_lets_the_lane_finish_its_own_interrupt_handling(tmp_path: Path) -> None:
+    """A terminal Ctrl-C reaches the runner and its pytest together; the runner
+    must wait for pytest's teardown instead of killing it mid-way."""
+    import signal
+
+    ready, finished = tmp_path / "ready", tmp_path / "finished"
+    lane = (
+        "import signal, sys, time\n"
+        "def stop(*_):\n"
+        f"    time.sleep(1.0); open({str(finished)!r}, 'w').write('done'); sys.exit(2)\n"
+        "signal.signal(signal.SIGINT, stop)\n"
+        f"open({str(ready)!r}, 'w').write('ok')\n"
+        "time.sleep(30)\n"
+    )
+    # A session of its own, so the interrupt reaches only this test's processes.
+    runner_proc = subprocess.Popen(
+        [sys.executable, "-c", _INTERRUPTED_RUNNER, str(REPO_ROOT / "tools" / "run_local_tests.py"), lane],
+        start_new_session=True,
+    )
+    try:
+        assert _wait_for(ready.exists)
+        os.killpg(runner_proc.pid, signal.SIGINT)
+        assert runner_proc.wait(timeout=20) == 130
+        assert finished.read_text() == "done"
+    finally:
+        if runner_proc.poll() is None:
+            os.killpg(runner_proc.pid, signal.SIGKILL)

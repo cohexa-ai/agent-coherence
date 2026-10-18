@@ -50,16 +50,16 @@ SERIAL_MARK = re.compile(r"\bpytest\.mark\.serial\b")  # must match the pattern 
 SERIAL_NEEDLE = b"pytest.mark.serial"
 
 # Options whose value may follow as a separate token, so it is never read as a test path.
+# -m -p -c -o stay here although they are refused: the table is what splits -mfoo into -m.
 VALUE_OPTIONS = frozenset(
     "-k -m -n -p -c -o -r -W --tb --maxfail --deselect --ignore --ignore-glob --durations --durations-min "
-    "--basetemp --dist --numprocesses --rootdir --confcutdir --import-mode --capture --color --override-ini "
-    "--config-file --splits --group --durations-path --splitting-algorithm --test-lane --node-id-dir".split()
+    "--basetemp --dist --numprocesses --confcutdir --import-mode --capture --color".split()
 )
 FLAG_OPTIONS = frozenset(
-    "-x -v -vv -vvv -q -qq -s -l --exitfirst --verbose --quiet --showlocals --lf --last-failed --ff "
-    "--failed-first --nf --new-first --sw --stepwise --sw-skip --pdb --trace --runxfail --setup-show "
-    "--full-trace --no-header --no-summary --strict-markers --collect-only --co --store-durations "
-    "--clean-durations".split()
+    "-x -v -q -s -l --exitfirst --verbose --quiet --showlocals --lf --last-failed --ff --failed-first "
+    "--nf --new-first --sw --stepwise --sw-skip --pdb --trace --runxfail --setup-show --setup-only "
+    "--setup-plan --full-trace --no-header --no-summary --strict-markers --collect-only --co --fixtures "
+    "--markers --cache-clear --disable-warnings --continue-on-collection-errors".split()
 )
 REFUSED = frozenset(
     "-m -p -c -o --rootdir --override-ini --config-file --test-lane --node-id-dir --store-durations "
@@ -68,6 +68,7 @@ REFUSED = frozenset(
 WORKER_OPTIONS = frozenset({"-n", "--numprocesses", "--dist"})
 NARROWING = ("-k", "--lf", "--last-failed", "--deselect", "--ignore", "--ignore-glob", "--sw", "--stepwise")
 STOP_EARLY = frozenset({"-x", "--exitfirst", "--maxfail"})
+NO_RUN = frozenset({"--co", "--collect-only", "--setup-plan", "--fixtures", "--markers"})  # start no tests
 BUNDLE_LETTERS = frozenset("xvsql")  # short flags that may be bundled, as in -xvs
 
 
@@ -124,8 +125,18 @@ def _option_name(token: str) -> str:
     return token
 
 
-def _looks_like_path(token: str) -> bool:
-    return "/" in token or "::" in token or token.endswith(".py")
+def _is_test_path(token: str) -> bool:
+    return "::" in token or token.endswith(".py") or token.rstrip("/") == "tests" or token.startswith("tests/")
+
+
+def _takes_value(name: str, following: str) -> bool:
+    if name in VALUE_OPTIONS:
+        return True
+    if name in FLAG_OPTIONS or _unbundle(name) != [name]:
+        return False
+    # An option this table does not know, such as --junitxml or --log-level, keeps
+    # its value unless what follows is another option or a test path.
+    return not following.startswith("-") and not _is_test_path(following)
 
 
 def _take_option(argv: Sequence[str], index: int) -> Tuple[Option, int]:
@@ -133,12 +144,8 @@ def _take_option(argv: Sequence[str], index: int) -> Tuple[Option, int]:
     name = _option_name(token)
     if name in REFUSED:
         raise Refused(f"{name} changes which tests CI's lanes select or a setting this command owns; use plain pytest")
-    if name in VALUE_OPTIONS and token == name and index + 1 < len(argv):
+    if token == name and index + 1 < len(argv) and _takes_value(name, argv[index + 1]):
         return Option(name, (token, argv[index + 1])), index + 2
-    known = name in VALUE_OPTIONS or name in FLAG_OPTIONS or _unbundle(name) != [name]
-    unknown = not known and "=" not in token
-    if unknown and index + 1 < len(argv) and _looks_like_path(argv[index + 1]):
-        raise Refused(f"write {name} as {name}=value so its value is not read as a test path, or use plain pytest")
     return Option(name, (token,)), index + 1
 
 
@@ -332,7 +339,23 @@ def run_lane(command: Sequence[str], env: Mapping[str, str], cwd: Path, turn_fd:
     """Run one pytest lane. The child inherits the turn's descriptor, so the turn
     lasts exactly as long as the lane does, even if this process is killed."""
     pass_fds = (turn_fd,) if turn_fd is not None else ()
-    return subprocess.run(list(command), env=dict(env), cwd=cwd, pass_fds=pass_fds, check=False).returncode
+    lane = subprocess.Popen(list(command), env=dict(env), cwd=cwd, pass_fds=pass_fds)
+    try:
+        return lane.wait()
+    except KeyboardInterrupt:
+        # The terminal's Ctrl-C reached the lane too; subprocess.run would kill it
+        # 0.25 s later, before pytest's own teardown stops the processes it started.
+        _wait_through_interrupts(lane)
+        raise
+
+
+def _wait_through_interrupts(lane: "subprocess.Popen[bytes]") -> None:
+    while True:
+        try:
+            lane.wait()
+            return
+        except KeyboardInterrupt:
+            continue
 
 
 # --- lanes ------------------------------------------------------------------
@@ -398,11 +421,19 @@ class RunSpec:
 Executor = Callable[[Sequence[str], Mapping[str, str], Path, Optional[int]], int]
 
 
-def _ran_count(node_dir: Path, lane: str) -> int:
+def _line_count(path: Path) -> int:
     try:
-        return len((node_dir / f"{lane}-ran.txt").read_text(encoding="utf-8").splitlines())
+        return len(path.read_text(encoding="utf-8").splitlines())
     except FileNotFoundError:
         return 0
+
+
+def _ran_count(node_dir: Path, lane: str) -> int:
+    return _line_count(node_dir / f"{lane}-ran.txt")
+
+
+def _may_skip_serial_tests(args: Args, targets: Sequence[str]) -> bool:
+    return any("::" in target for target in targets) or bool(args.narrowing())
 
 
 @dataclass
@@ -424,6 +455,17 @@ class _Run:
         base = [str(self.spec.interpreter), "-m", "pytest", "-q", *self.worker_flags(lane)]
         return base + ["--test-lane", lane, f"--node-id-dir={self.node_dir}", *forwarded, *targets]
 
+    def selects_serial_tests(self, targets: Sequence[str]) -> bool:
+        """Collect, without the turn, whether the targets still select a serial test."""
+        probe_dir = self.node_dir / "probe"  # the real serial lane writes its own lists later
+        forwarded = self.spec.args.option_tokens(drop=WORKER_OPTIONS)
+        command = [str(self.spec.interpreter), "-m", "pytest", "-q", "-n", "0", "--co", "--test-lane", SERIAL_LANE]
+        command += [f"--node-id-dir={probe_dir}", *forwarded, *targets]
+        code = self.executor(command, self.spec.env, self.spec.roots.tree, None)
+        if code not in (0, NO_TESTS):
+            return True  # let the real serial lane report the error
+        return _line_count(probe_dir / f"{SERIAL_LANE}-full.txt") > 0
+
     def lane(self, lane: str, targets: Sequence[str], turn_fd: Optional[int]) -> int:
         mode = "full run" if self.spec.args.is_full else "targeted run"
         flags = self.worker_flags(lane)
@@ -436,7 +478,8 @@ def _run_full(run: _Run) -> LaneCodes:
     spec = run.spec
     with holding_turn(spec.lock_path, spec.holder("full run"), run.say) as fd:
         parallel = run.lane(PARALLEL_LANE, (), fd)
-        nothing = parallel == 0 and _ran_count(run.node_dir, PARALLEL_LANE) == 0
+        starts_tests = not NO_RUN.intersection(spec.args.names())
+        nothing = parallel == 0 and starts_tests and _ran_count(run.node_dir, PARALLEL_LANE) == 0
         modules = serial_modules(spec.roots.tree) if should_run_serial(parallel, spec.args) else []
         serial = run.lane(SERIAL_LANE, modules, fd) if modules else None
     return LaneCodes(parallel, serial, nothing)
@@ -449,6 +492,8 @@ def _run_targeted(run: _Run) -> LaneCodes:
         return LaneCodes(parallel, None, False)
     targets = serial_targets(spec.args.paths, serial_modules(spec.roots.tree))
     if not targets:
+        return LaneCodes(parallel, None, False)
+    if _may_skip_serial_tests(spec.args, targets) and not run.selects_serial_tests(targets):
         return LaneCodes(parallel, None, False)
     with holding_turn(spec.lock_path, spec.holder("serial tests"), run.say) as fd:
         return LaneCodes(parallel, run.lane(SERIAL_LANE, targets, fd), False)
