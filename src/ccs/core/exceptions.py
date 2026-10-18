@@ -610,6 +610,41 @@ class StaleReadGeneration(CoherenceError):
             self.captured_generation, self.owner_generation = pair
 
 
+class CommitNotAllowed(CoherenceError):
+    """The coordinator refused a pessimistic commit because the committer does
+    not hold the artifact's write grant (M or E): a sweep reclaimed it, a peer
+    preempted it, or it never held one. Nothing landed.
+
+    Raised by ``CoordinatorService.commit``. The message is the refusal's
+    prose, ``commit_not_allowed ...`` (naming the reclaim trigger and tick
+    when a sweep reclaimed the grant), and is unchanged from the plain
+    :class:`CoherenceError` this refusal used to be.
+
+    :attr:`captured_generation` is the read_generation the coordinator
+    recorded at the committer's last claim; :attr:`owner_generation` is the
+    artifact's ownership generation. Both are read in the same decision as
+    the refusal. ``captured < owner`` means some write claim on the artifact
+    ended without a version move after the committer's claim was recorded (a
+    release, a reclaim or a handoff); it does not say why this committer
+    lost, and the two are not ordered otherwise. Both are ``None`` (the class
+    default) when the committer has no recorded claim. Keyword-only, never in
+    the message; recovery follows the refusal, never the pair."""
+
+    captured_generation: int | None = None
+    owner_generation: int | None = None
+
+    def __init__(
+        self,
+        *args: object,
+        captured_generation: object = None,
+        owner_generation: object = None,
+    ) -> None:
+        super().__init__(*args)
+        pair = _generation_pair(captured_generation, owner_generation)
+        if pair is not None:
+            self.captured_generation, self.owner_generation = pair
+
+
 class OccCallerTransientError(CoherenceError):
     """Retry-eligible OCC precondition: the caller is mid-transient at CAS time.
 

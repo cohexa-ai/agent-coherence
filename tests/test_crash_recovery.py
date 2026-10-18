@@ -15,7 +15,7 @@ import pytest
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
-from ccs.core.exceptions import CoherenceError, InvariantViolationError
+from ccs.core.exceptions import CoherenceError, CommitNotAllowed, InvariantViolationError
 from ccs.core.invariants import check_monotonic_version, check_single_writer
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import FetchRequest
@@ -326,6 +326,11 @@ def test_commit_after_heartbeat_reclamation_includes_diagnostic_message() -> Non
     msg = str(exc_info.value)
     assert "reclaimed_by=reclaim_heartbeat" in msg
     assert "at_tick=100" in msg
+    # The refusal names the token A lost: its claim was recorded before the
+    # reclaim ended it, so it is older than the artifact's generation now.
+    refusal = exc_info.value
+    assert isinstance(refusal, CommitNotAllowed)
+    assert refusal.captured_generation < refusal.owner_generation
 
 
 def test_commit_after_max_hold_reclamation_then_shared_fetch_still_diagnostic() -> None:
@@ -380,6 +385,49 @@ def test_commit_on_unrelated_invalid_uses_original_message_format() -> None:
     assert "commit_not_allowed" in msg
     assert "reclaimed_by=" not in msg
     assert "at_tick=" not in msg
+
+
+def test_never_held_commit_refusal_names_no_generation_pair() -> None:
+    """A committer that never took a claim is refused with the typed carrier,
+    and the carrier names no token: there is no recorded claim to name."""
+    svc = _service()
+    artifact = svc.register_artifact(name="plan.md", content="v1")
+    a = uuid4()
+
+    with pytest.raises(CommitNotAllowed) as exc_info:
+        svc.commit(agent_id=a, artifact_id=artifact.id, content="v2")
+
+    refusal = exc_info.value
+    assert "reclaimed_by=" not in str(refusal)
+    assert (refusal.captured_generation, refusal.owner_generation) == (None, None)
+
+
+def test_preempted_commit_refusal_pair_reads_equal_until_a_claim_ends() -> None:
+    """A peer's write-acquire preempts A but ends no claim at an unchanged
+    version, so A's refusal reads captured == owner. Once that peer releases,
+    a claim has ended since A's was recorded, and it reads captured < owner."""
+    svc = _service()
+    artifact = svc.register_artifact(name="plan.md", content="v1")
+    a, b = uuid4(), uuid4()
+    svc.write(agent_id=a, artifact_id=artifact.id, issued_at_tick=1)
+    svc.write(agent_id=b, artifact_id=artifact.id, issued_at_tick=2)
+
+    with pytest.raises(CommitNotAllowed) as preempted:
+        svc.commit(agent_id=a, artifact_id=artifact.id, content="v2", issued_at_tick=3)
+    assert preempted.value.captured_generation is not None
+    assert preempted.value.captured_generation == preempted.value.owner_generation
+
+    svc.invalidate(
+        agent_id=b,
+        artifact_id=artifact.id,
+        new_version=artifact.version,
+        issuer_agent_id=b,
+        issued_at_tick=4,
+    )
+
+    with pytest.raises(CommitNotAllowed) as released:
+        svc.commit(agent_id=a, artifact_id=artifact.id, content="v2", issued_at_tick=5)
+    assert released.value.captured_generation < released.value.owner_generation
 
 
 # ---------------------------------------------------------------------------
