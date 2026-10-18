@@ -1581,7 +1581,7 @@ class WatchdogAbandoned(RuntimeError):
     is what stops the late "phantom grant" / grant-revocation from landing.
 
     The Claude Code coordinator's deny bodies raise it too, from
-    ``_defer_to_answer``, when the watchdog answered before the deny was
+    ``_AnswerEffects.defer``, when the watchdog answered before the deny was
     decided (#236). There it means no deny was recorded, not that nothing
     mutated: registry work the body did before deciding (a pre-bash or
     pre-grep re-grant, for one) has already landed.

@@ -14368,3 +14368,14 @@ def test_a_strict_deny_whose_audit_line_does_not_land_counts_mode_drift(
     after = _deny_records(coordinator)
     assert after["audit_log_mode_drift_total"] == before["audit_log_mode_drift_total"] + 1
     assert after["strict_mode_denials_total"] == before["strict_mode_denials_total"] + 1
+
+
+def test_a_hook_run_refuses_an_abort_beside_effects_that_carry_one() -> None:
+    """#236: a request's effects carry the event the watchdog sets on a
+    timeout. A second event passed beside them would leave the work body
+    checking one the watchdog never sets, so the run refuses the pair."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    with pytest.raises(TypeError, match="not both"):
+        mod._run_or_degrade(
+            None, None, lambda: {}, abort=threading.Event(), effects=mod._AnswerEffects())
