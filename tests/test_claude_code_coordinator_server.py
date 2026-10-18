@@ -7916,6 +7916,53 @@ def test_hold_counter_moves_on_a_hold_and_stands_still_on_a_proceed(
     assert holds() == 1, "a 400 was counted as a hold"
 
 
+@pytest.mark.parametrize("late_verdict", ["hold", "proceed"])
+def test_a_timed_out_fence_counts_a_hold_only_when_its_late_body_reaches_one(
+    served_decider, monkeypatch: pytest.MonkeyPatch, late_verdict: str,
+) -> None:
+    """#224: the hold counter counts verdicts the handler REACHED. A fence
+    answered on its watchdog sends the degraded hold, which
+    ``watchdog_timeouts_total`` counts, so at that moment the hold counter has
+    not moved. The abandoned body keeps running: a hold it then reaches is
+    counted, together with the late completion, and a proceed is not. Fails if
+    the degraded answer is counted as a hold -- a coordinator that is merely
+    slow would read on ``/status`` as a workspace full of conflicts."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    version, generation = _u4_captured(server, artifact_id)
+    sent_version = version if late_verdict == "proceed" else version + 1
+    delayed = _DelayedCall(monkeypatch, mod, "_effect_fence_comparands", lambda *a, **kw: True)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    holds_before = server.counters_snapshot()["effect_fence_holds_total"]
+    timeouts_before = server._watchdog_timeouts_total
+    aborts_before = server._watchdog_late_aborts_total
+    completions_before = server._watchdog_late_completion_total
+    try:
+        answer = client.post(_U4_ROUTE, _u4_body(
+            sid, _U3A_WARN_PATH, version=sent_version, generation=generation,
+            content_hash=_hash("canonical"),
+        ))
+        holds_at_answer = server.counters_snapshot()["effect_fence_holds_total"]
+    finally:
+        delayed.release()
+    _await_abandoned_body_settled(
+        server, aborts_before=aborts_before, completions_before=completions_before)
+
+    assert delayed.entered.is_set(), "the fence body never started"
+    assert answer == (200, mod._EFFECT_FENCE_DEGRADED_RESPONSE)
+    assert holds_at_answer == holds_before, (
+        "the degraded hold was counted as a verdict the handler reached")
+    assert server._watchdog_timeouts_total == timeouts_before + 1
+    assert server._watchdog_late_completion_total == completions_before + 1
+    late_holds = 1 if late_verdict == "hold" else 0
+    assert server.counters_snapshot()["effect_fence_holds_total"] == holds_before + late_holds
+
+
 # --- R7: the call mutates nothing -----------------------------------------
 
 
@@ -8130,6 +8177,18 @@ _CONTRACT_STATEMENTS: tuple[tuple[str, str], ...] = (
         "the sibling coordinator answers 404 for this route",
         "the sibling Node coordinator backend does not implement `/hooks/effect-fence`",
     ),
+    (
+        "an HTTP client captures the comparands through pre-read",
+        "add `\"want_owner_generation\": true` to a `POST /hooks/pre-read` for the file",
+    ),
+    (
+        "where the comparands sit in a stale-read answer",
+        "`summary.current_version` and `owner_generation`",
+    ),
+    (
+        "a first read without a hash leaves no content claim, and a read does not record one",
+        "A later read does not record a claim, even one that sends the hash",
+    ),
 )
 
 
@@ -8209,6 +8268,69 @@ def test_tool_tables_name_the_http_fence() -> None:
         assert any(row.startswith("| `POST /hooks/effect-fence`") for row in rows), (
             f"{doc.name} lists the fence tool without its HTTP sibling"
         )
+
+
+def _captured_over_http(answer: dict) -> tuple[int, int]:
+    """The comparand pair as the guide tells an HTTP client to read it from a
+    pre-read answer: top-level ``version`` on a fresh answer,
+    ``summary.current_version`` on a stale-read warning, and
+    ``owner_generation`` at the top level of both."""
+    version = answer["version"] if answer["status"] == "fresh" else answer["summary"]["current_version"]
+    return version, answer["owner_generation"]
+
+
+def test_the_documented_http_capture_recipe_reaches_proceed(coordinator, client: _Client) -> None:
+    """#224: a client built from the guide alone reaches ``proceed``. It
+    captures through ``/hooks/pre-read`` with ``want_owner_generation`` and its
+    content hash, reads the pair where the guide says each answer carries it,
+    and fences with that pair, the same session and the same hash -- on a
+    first read's fresh answer, and on the stale-read warning a peer's commit
+    leaves behind."""
+    reader, writer = str(uuid.uuid4()), str(uuid.uuid4())
+
+    def capture_then_fence(content_hash: str) -> tuple[str, dict]:
+        status, answer = client.post("/hooks/pre-read", {
+            "session_id": reader, "path": "plan.md", "content_hash": content_hash,
+            "want_owner_generation": True,
+        })
+        assert status == 200, answer
+        version, generation = _captured_over_http(answer)
+        return answer["status"], client.post(_U4_ROUTE, _u4_body(
+            reader, "plan.md", version=version, generation=generation, content_hash=content_hash,
+        ))[1]
+
+    assert capture_then_fence(_hash("v1")) == ("fresh", {"verdict": "proceed"})
+    assert client.post("/hooks/pre-edit", {"session_id": writer, "path": "plan.md"})[1].get("ok") is True
+    assert client.post("/hooks/post-edit", {
+        "session_id": writer, "path": "plan.md", "content_hash": _hash("v2"), "success": True,
+    })[1].get("ok") is True
+    assert capture_then_fence(_hash("v2")) == ("stale", {"verdict": "proceed"})
+
+
+@pytest.mark.parametrize("want_generation", [False, True], ids=["plain", "want-generation"])
+def test_a_pre_read_whose_row_vanishes_mid_read_admits_with_no_version(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, want_generation: bool,
+) -> None:
+    """#224: pre-read finds the artifact by name, then reads its version and
+    generation as one pair. A row removed between the two leaves nothing to
+    classify, and the answer is the admit an untracked path gets --
+    ``{"status": "fresh"}`` with no version and no generation -- never the
+    ``internal: AttributeError`` envelope the missing row's dereference
+    produced. No shipped route deletes a row today; the registry's
+    ``remove_artifact`` is called inside the window to stand in for one."""
+    request = {"session_id": str(uuid.uuid4()), "path": "plan.md", "content_hash": _hash("v1")}
+    assert client.post("/hooks/pre-read", request)[0] == 200
+    registry = coordinator.registry
+    real = registry.get_artifact_and_generation
+
+    def removed_first(artifact_id: uuid.UUID):
+        registry.remove_artifact(artifact_id)
+        return real(artifact_id)
+
+    monkeypatch.setattr(registry, "get_artifact_and_generation", removed_first)
+    if want_generation:
+        request = {**request, "want_owner_generation": True}
+    assert client.post("/hooks/pre-read", request) == (200, {"status": "fresh"})
 
 
 # ----------------------------------------------------------------------
