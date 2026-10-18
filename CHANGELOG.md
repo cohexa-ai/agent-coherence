@@ -56,7 +56,9 @@ Alpha — APIs may change before `v1.0`.
   recorded only when the deny is the answer sent, and the late work counts in
   `watchdog_late_aborts_total`. A deny whose audit append is slow or fails is
   now still answered as a deny; a slow append used to time the request out
-  and admit the call.
+  and admit the call. An append slower than the hook client's own request
+  timeout (6 seconds for the Python client) still reaches the client too
+  late, and the client admits the call as before.
 
 ## [0.15.0] - 2026-10-14
 

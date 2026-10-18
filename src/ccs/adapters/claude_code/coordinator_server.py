@@ -1080,7 +1080,10 @@ class CoordinatorHTTPServer:
         self._watchdog_late_completion_total: int = 0
         # A6: a watchdog-timed-out future that aborted cleanly at the registry
         # write lock (abort_guard) before mutating — the mitigation working.
-        # Distinct from late_completion (which is an UNmitigated phantom).
+        # Also a deny body that reached its decision after the watchdog
+        # answered (#236): that abort means no deny was recorded, not that
+        # nothing mutated. Distinct from late_completion (which is an
+        # UNmitigated phantom).
         self._watchdog_late_aborts_total: int = 0
 
         # KTD-I (Unit 5 L2) — in-flight handler counter. Incremented at
@@ -1745,7 +1748,10 @@ class CoordinatorHTTPServer:
     def increment_watchdog_late_abort(self) -> None:
         """A6: a watchdog-timed-out future aborted at the registry write lock
         (``abort_guard``) before mutating — the late-completion mitigation
-        working as intended. No phantom state landed. Operator-visible via
+        working as intended. No phantom state landed. A deny body that
+        reached its decision after the watchdog answered also lands here
+        (#236, ``_defer_to_answer``): no deny was recorded, though registry
+        work the body did before deciding may have landed. Operator-visible via
         ``/status?detail=metrics`` so the abort rate is distinguishable from
         the unmitigated ``watchdog_late_completion_total`` residual."""
         self._watchdog_late_aborts_total += 1
@@ -1949,7 +1955,8 @@ class CoordinatorHTTPServer:
             future.result(timeout=0)
         except WatchdogAbandoned:
             # A6 mitigation fired: the late work aborted at the registry write
-            # lock before mutating. Clean no-op (no phantom state landed) —
+            # lock before mutating (no phantom state landed), or a late deny
+            # body stopped before recording a deny nobody was sent (#236) —
             # counted separately so operators can see the guard working,
             # distinct from an unmitigated late completion.
             self.increment_watchdog_late_abort()
