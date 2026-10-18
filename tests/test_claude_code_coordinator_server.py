@@ -13031,8 +13031,6 @@ def test_a_bash_command_writing_no_tracked_path_runs_no_giver_lookup(
 
 
 def _giver_check_unverified_answer(coordinator_module: Any) -> dict:
-    """What a bare pre-bash admit becomes when the giver lookup timed out: a
-    literal, so the test does not move with the constant it checks."""
     return {
         "status": "fresh",
         "degraded": True,

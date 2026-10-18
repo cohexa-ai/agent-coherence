@@ -1078,10 +1078,9 @@ class CoordinatorHTTPServer:
         # without invasive cancel-token plumbing through service.write,
         # but we CAN detect it: every timed-out future gets a
         # done_callback that bumps this counter if the future eventually
-        # finished without exception, and logs CRITICAL when it won
-        # ``abort_guard`` with the request's :class:`WatchdogAbort` first
-        # (#338) -- WARNING otherwise, since it then landed no guarded
-        # mutation. Operators see
+        # finished without exception, and logs it at the level
+        # :func:`_late_work_may_have_landed_a_guarded_mutation` picks
+        # (#338). Operators see
         # the symptom via ``/status?detail=metrics`` even when the
         # cause is rare (4s deadline + 1.5s busy_timeout = real-world
         # only hits with a wedged SQLite or contended drive).
@@ -1925,10 +1924,9 @@ class CoordinatorHTTPServer:
 
         Either way we attach a done_callback for the residual: a future that
         slips past the abort window and completes successfully bumps
-        ``watchdog_late_completion_total``, and logs CRITICAL when it won
-        ``abort_guard`` with ``abort`` before the deadline (#338: it may then
-        have landed a guarded mutation the caller was not told about), WARNING
-        when it did not; one that aborts cleanly bumps
+        ``watchdog_late_completion_total`` and is logged at the level
+        :func:`_late_work_may_have_landed_a_guarded_mutation` picks for
+        ``abort`` (#338); one that aborts cleanly bumps
         ``watchdog_late_aborts_total`` so operators can see the mitigation
         working.
         """
@@ -1962,7 +1960,7 @@ class CoordinatorHTTPServer:
         return future.result(timeout=max(0.0, deadline - time.monotonic()))
 
     def _on_watchdog_future_done_after_timeout(
-        self, future: Any, abort: threading.Event | None = None
+        self, future: Any, abort: threading.Event | None
     ) -> None:
         """Callback wired by :meth:`run_with_watchdog` when its future
         timed out. Fires later (microseconds to many seconds) when the
@@ -1970,8 +1968,7 @@ class CoordinatorHTTPServer:
         the late completion produced state — i.e., the future finished
         without raising. A future that ultimately raised was a no-op
         in the registry; nothing phantom there. ``abort`` is the request's
-        token: the CRITICAL is for a body that won ``abort_guard`` with it
-        before the deadline, the rest log WARNING (#338)."""
+        token, which decides the log level (#338)."""
         if future.cancelled():
             return
         try:
@@ -2689,11 +2686,9 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # alongside the stale-read warning. A verify_only read must NOT pop
             # them — the fence discards the body, so a destructive pop here
             # would drop the notice the agent needs on its next real read.
-            notices = _consume_for_answer(
-                coordinator, abort,
-                lambda: coordinator.registry.pop_pending_notices(
-                    agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP),
-            ) or []
+            notices = _pop_notices_for_answer(
+                coordinator, abort, agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+            )
             if notices:
                 notice_text = _build_preemption_text(coordinator, notices)
                 resp["hookSpecificOutput"]["additionalContext"] = (
@@ -2722,11 +2717,9 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             and result.get("status") == "fresh"
             and "hookSpecificOutput" not in result
         ):
-            notices = _consume_for_answer(
-                coordinator, abort,
-                lambda: coordinator.registry.pop_pending_notices(
-                    agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP),
-            ) or []
+            notices = _pop_notices_for_answer(
+                coordinator, abort, agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+            )
             if notices:
                 notice_text = _build_preemption_text(coordinator, notices)
                 # Spread work()'s payload so additive fresh-path keys
@@ -3385,11 +3378,9 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # Pop any notices for THIS session (the caller of pre-edit) and
         # merge into the response (A1: surface on the victim's next hook
         # of any kind).
-        notices = _consume_for_answer(
-            coordinator, abort,
-            lambda: coordinator.registry.pop_pending_notices(
-                agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP),
-        ) or []
+        notices = _pop_notices_for_answer(
+            coordinator, abort, agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+        )
         notice_text = _build_preemption_text(coordinator, notices) if notices else None
 
         if holder_id is not None:
@@ -3884,9 +3875,7 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         # stream-json `--include-hook-events`) AND, opportunistically, as
         # `additionalContext` so any post-Stop processing or human-readable
         # log still carries the signal.
-        pending = _consume_for_answer(
-            coordinator, abort, lambda: coordinator.registry.pop_pending_notices(agent_id),
-        ) or []
+        pending = _pop_notices_for_answer(coordinator, abort, agent_id)
         notices_payload: list[dict] = []
         for art_id, preempter_id, ts in pending:
             art = coordinator.registry.get_artifact(art_id)
@@ -4473,11 +4462,9 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "stale_paths": [s["path"] for s in stale_summaries],
             }
 
-        notices = _consume_for_answer(
-            coordinator, abort,
-            lambda: coordinator.registry.pop_pending_notices(
-                agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP),
-        ) or []
+        notices = _pop_notices_for_answer(
+            coordinator, abort, agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+        )
 
         if not stale_summaries and not notices:
             return {"status": "fresh"}
@@ -4543,13 +4530,13 @@ class _GiverShellCheck(Enum):
     lookup that timed out found no record AND did not look, and answering it as
     "no record" is what let a giver's shell write through unannounced (#341)."""
 
+    #: It wrote the answer: the giver's deny, the 503 or the error envelope.
     ANSWERED = "answered"
-    """It wrote the answer: the giver's deny, the 503 or the error envelope."""
+    #: No written path is tracked, or none is handed off by this session.
     CLEAR = "clear"
-    """No written path is tracked, or none is handed off by this session."""
+    #: The lookup timed out: whether the command writes a handed-off path is
+    #: not known.
     UNVERIFIED = "unverified"
-    """The lookup timed out: whether the command writes a handed-off path is
-    not known."""
 
 
 def _deny_giver_shell_write(
@@ -4803,11 +4790,9 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "stale_paths": [s["path"] for s in stale_summaries],
             }
 
-        notices = _consume_for_answer(
-            coordinator, abort,
-            lambda: coordinator.registry.pop_pending_notices(
-                agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP),
-        ) or []
+        notices = _pop_notices_for_answer(
+            coordinator, abort, agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
+        )
 
         if not stale_summaries and not notices:
             return {"status": "fresh"}
@@ -7646,10 +7631,7 @@ _DEFAULT_DEGRADED_RESPONSE: dict = {
 because their wire contract uses ``{status: "fresh"|"stale"}``. A7: the envelope
 now carries a ``hookSpecificOutput`` advisory so a watchdog-degraded read is
 visible to the model rather than silently passing as a confirmed fresh read.
-The advisory carries no ``permissionDecision`` (#337), as
-:data:`_PRE_EDIT_DEGRADED_RESPONSE`'s does not: the timed-out call is admitted,
-not approved, so Claude Code asks about it as it otherwise would. Endpoints
-whose contract is ``{ok: bool}`` pass an ok-shape envelope instead
+Endpoints whose contract is ``{ok: bool}`` pass an ok-shape envelope instead
 (:data:`_OK_DEGRADED_RESPONSE`; pre-edit its own
 :data:`_PRE_EDIT_DEGRADED_RESPONSE`) so the client doesn't see ``None`` from
 ``result.get("ok")``."""
@@ -8139,21 +8121,46 @@ def _consume_for_answer(
         return None
 
 
+def _pop_notices_for_answer(
+    coordinator: CoordinatorHTTPServer,
+    abort: threading.Event,
+    agent_id: UUID,
+    *,
+    consume_limit: int | None = None,
+) -> list[tuple[UUID, UUID, float]]:
+    """The caller's pending preemption notices, popped for this answer through
+    :func:`_consume_for_answer`: none when the request was already answered,
+    which leaves them queued for the session's next hook (#339)."""
+    return _consume_for_answer(
+        coordinator, abort,
+        lambda: coordinator.registry.pop_pending_notices(agent_id, consume_limit=consume_limit),
+    ) or []
+
+
 @contextmanager
-def _abort_guard_without_mark(registry: Any, abort: threading.Event | None) -> Iterator[None]:
+def _abort_guard_without_mark(
+    registry: SqliteArtifactRegistry, abort: threading.Event | None
+) -> Iterator[None]:
     """``registry.abort_guard`` for a pass that reads or only consumes what it
     returns: the registry lock held across it, failing closed with
     :class:`WatchdogAbandoned` the instant the lock is won if the request
     already timed out (A6) -- but without marking ``abort`` as having won the
     guard, which tells the watchdog the late body may have landed a mutation
-    the caller was not told about (#338)."""
+    the caller was not told about (#338). A request already abandoned fails
+    before it waits for the lock: nothing clears an abort, so the wait could
+    only end in the same raise."""
+    _raise_if_abandoned(abort)
     with registry.abort_guard():
-        if abort is not None and abort.is_set():
-            raise WatchdogAbandoned(
-                "handler watchdog timed out before this pass ran; "
-                "aborting before it touches the registry (A6)."
-            )
+        _raise_if_abandoned(abort)
         yield
+
+
+def _raise_if_abandoned(abort: threading.Event | None) -> None:
+    if abort is not None and abort.is_set():
+        raise WatchdogAbandoned(
+            "handler watchdog timed out before this pass ran; "
+            "aborting before it touches the registry (A6)."
+        )
 
 
 def _build_session_start_context(
@@ -8195,9 +8202,6 @@ def _build_session_start_context(
     # registry lock so the two locks never nest in names→registry order.
     agents = coordinator.agents_for_session(session_id)
 
-    # The pass only reads, so winning the guard must not mark the request as
-    # having landed a guarded mutation (#338), while a doomed request still
-    # fails closed the instant it wins the lock (A6).
     with _abort_guard_without_mark(coordinator.registry, abort):
         # Scoped to THIS session's agents (SB-10 review): the walk below can
         # only render rows belonging to `agents`, this runs on a hook path
