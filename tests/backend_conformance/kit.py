@@ -1173,19 +1173,21 @@ _MUTATOR_ROUND_CAP = 100_000
 
 # Below this many distinct decision snapshots the mutator barely ran while the
 # actor did, so a clean run would prove nothing. An actor that has made its
-# attempts keeps going until its refusals reach the floor, up to this many
-# times its attempts: on a loaded runner the mutator can start late or be
-# descheduled for a while, and a fixed budget then ends the run before the
-# race has happened.
+# attempts keeps going until its refusals reach the floor. It gives up only
+# after this many times its attempts AND a minimum run time: on a loaded runner
+# the mutator thread can start late or be descheduled for a while, and an
+# in-memory actor makes ten thousand attempts in tens of milliseconds, so a
+# budget counted in attempts alone ends the run before the mutator has run.
 MIN_DISTINCT_SNAPSHOTS = 20
 _ATTEMPT_CAP_FACTOR = 10
+_MIN_RACE_SECONDS = 3.0
 
 # A degraded binding fails on nearly every refusal; a few examples are enough
 # to name the fault, and stopping early keeps its run short.
 _VIOLATIONS_KEPT = 5
 
 SNAPSHOT_VIOLATION = "NOT read from its decision snapshot"
-STARVED_RACE = "race was STARVED"
+STARVED_RACE = "was STARVED"
 
 
 @dataclass
@@ -1195,6 +1197,8 @@ class _RaceTally:
 
     snapshots: set[tuple[object, ...]] = field(default_factory=set)
     violations: list[str] = field(default_factory=list)
+    attempts: int = 0
+    seconds: float = 0.0
 
     def is_full(self) -> bool:
         return len(self.violations) >= _VIOLATIONS_KEPT
@@ -1216,10 +1220,12 @@ class _Race(Protocol):
         ...
 
 
-def _actor_is_done(race: _Race, index: int) -> bool:
-    if race.tally.is_full() or index >= race.attempts * _ATTEMPT_CAP_FACTOR:
+def _actor_is_done(race: _Race, index: int, elapsed: float) -> bool:
+    if race.tally.is_full():
         return True
-    return index >= race.attempts and len(race.tally.snapshots) >= MIN_DISTINCT_SNAPSHOTS
+    if index >= race.attempts and len(race.tally.snapshots) >= MIN_DISTINCT_SNAPSHOTS:
+        return True
+    return index >= race.attempts * _ATTEMPT_CAP_FACTOR and elapsed >= _MIN_RACE_SECONDS
 
 
 def _run_race(race: _Race) -> None:
@@ -1241,9 +1247,9 @@ def _run_race(race: _Race) -> None:
             mutator_failed.set()
 
     def act() -> None:
+        started, index = time.monotonic(), 0
         try:
-            index = 0
-            while not mutator_failed.is_set() and not _actor_is_done(race, index):
+            while not mutator_failed.is_set() and not _actor_is_done(race, index, time.monotonic() - started):
                 race.attempt(index)
                 index += 1
                 # Without this the actor re-takes the store's lock before the
@@ -1252,6 +1258,7 @@ def _run_race(race: _Race) -> None:
         except BaseException as exc:  # pragma: no cover - surfaced below
             errors.append(exc)
         finally:
+            race.tally.attempts, race.tally.seconds = index, time.monotonic() - started
             actor_done.set()
 
     _join_with_fine_switching(
@@ -1288,8 +1295,8 @@ def _assert_race_outcome(race: _Race) -> None:
         )
     if len(tally.snapshots) < MIN_DISTINCT_SNAPSHOTS:
         raise AssertionError(
-            f"{race.name} {STARVED_RACE}: in {race.attempts * _ATTEMPT_CAP_FACTOR} "
-            f"attempts its refusals landed on only {len(tally.snapshots)} distinct "
+            f"{race.name} {STARVED_RACE}: in {tally.attempts} attempts over {tally.seconds:.1f} s "
+            f"its refusals landed on only {len(tally.snapshots)} distinct "
             f"decision snapshots (floor {MIN_DISTINCT_SNAPSHOTS}). The mutator "
             "barely ran while the actor did, so this run proved nothing about the pair's "
             "snapshot either way; it is not a snapshot violation. Rerun it on a less loaded runner"
@@ -1491,8 +1498,8 @@ class _FenceRace:
         self.tally = _RaceTally()
 
     def advance(self, round_index: int) -> None:
-        """An unrelated agent's reclaim (owner + 1), then the zombie's own read
-        (claim := owner): owner - claim alternates between 1 and 0."""
+        """An unrelated agent's reclaim (owner + 1), a yield, then the zombie's
+        own read (claim := owner): owner - claim alternates between 1 and 0."""
         reg, artifact_id = self.reg, self.artifact_id
         reg.set_agent_state(artifact_id, self.unrelated, MESIState.EXCLUSIVE, tick=round_index)  # type: ignore[attr-defined]
         reg.set_agent_state(  # type: ignore[attr-defined]
@@ -1500,6 +1507,10 @@ class _FenceRace:
         )
         self.owner += 1
         self._recheck(self.owner - 1, round_index)
+        # The fence raises only between the reclaim and the zombie's own read.
+        # Yield inside that window, or a busy runner almost never schedules the
+        # zombie there and the run starves.
+        time.sleep(0)
         reg.set_agent_state(artifact_id, self.zombie, MESIState.SHARED, trigger="fetch", tick=round_index)  # type: ignore[attr-defined]
         self._recheck(self.owner, round_index)
 
@@ -1544,12 +1555,13 @@ def assert_fenced_persist_raise_pair_comes_from_the_decision_snapshot(factory: R
 
     A mutator alternates an unrelated agent's sweep-class reclaim
     (``owner_generation`` + 1) with the zombie's own ``"fetch"`` read (claim :=
-    owner), yielding each round. Every state the schedule passes through then
-    has ``owner_generation - captured_generation`` in {0, 1}, and the fence
-    raises only at 1, so every raise must carry exactly 1. A pair re-read after
-    the decision reports 0 once the zombie's next read has landed, or 2 or more
-    once the next reclaim has. One store handle, and the starved-run floor, as
-    in :func:`assert_commit_refusal_pairs_come_from_the_decision_snapshot`."""
+    owner), yielding after each reclaim and after each round. Every state the
+    schedule passes through then has ``owner_generation - captured_generation``
+    in {0, 1}, and the fence raises only at 1, so every raise must carry
+    exactly 1. A pair re-read after the decision reports 0 once the zombie's
+    next read has landed, or 2 or more once the next reclaim has. One store
+    handle, and the starved-run floor, as in
+    :func:`assert_commit_refusal_pairs_come_from_the_decision_snapshot`."""
     _run_race(_FenceRace(factory()))
 
 
