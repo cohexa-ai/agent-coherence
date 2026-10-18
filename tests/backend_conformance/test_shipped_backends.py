@@ -124,6 +124,14 @@ def test_fenced_persist_raise_carries_the_generation_pair(factory: RegistryFacto
     kit.assert_fenced_persist_raise_carries_the_generation_pair(factory)
 
 
+def test_commit_refusal_pairs_come_from_the_decision_snapshot(factory: RegistryFactory) -> None:
+    kit.assert_commit_refusal_pairs_come_from_the_decision_snapshot(factory)
+
+
+def test_fenced_persist_raise_pair_comes_from_the_decision_snapshot(factory: RegistryFactory) -> None:
+    kit.assert_fenced_persist_raise_pair_comes_from_the_decision_snapshot(factory)
+
+
 def test_session_fail_closed_on_foreign_and_reaped(factory: RegistryFactory) -> None:
     kit.assert_session_fail_closed_on_foreign_and_reaped(factory)
 

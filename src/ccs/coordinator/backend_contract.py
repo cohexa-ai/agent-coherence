@@ -138,7 +138,10 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "artifact's owner_generation, both read in the same step that decided "
         "the refusal, and neither value when the committer has no recorded "
         "claim. That pair widens what the conformance kit certifies for an "
-        "outside backend: the kit fails a binding that drops it.",
+        "outside backend: the kit fails a binding that drops it, and a race in "
+        "the kit fails one that reads the pair in a second step after deciding, "
+        "by checking every refusal against the states a concurrent reclaim, "
+        "peer commit and re-capture pass through.",
     ),
     MemberContract(
         "commit_all",
@@ -154,7 +157,8 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "ConflictDetail carries that member's own captured_generation and "
         "owner_generation from the CHECK snapshot, as on commit_cas, and neither "
         "value for a member the committer holds no recorded claim on; the "
-        "conformance kit certifies the pair per member.",
+        "conformance kit certifies the pair per member, sequentially and under "
+        "the same concurrent race as commit_cas.",
     ),
     MemberContract(
         "set_artifact_and_content",
@@ -167,7 +171,10 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "window — part of the boundary, not a plain write. The raise carries "
         "the two values the fence compared, the committer's read_generation as "
         "captured_generation and the artifact's owner_generation, with its "
-        "message unchanged; the conformance kit certifies the pair on the raise.",
+        "message unchanged; the conformance kit certifies the pair on the raise, "
+        "and a race in the kit, which alternates a concurrent reclaim with the "
+        "committer's own re-capture, fails a raise whose pair was read after "
+        "the fence decided.",
     ),
     MemberContract(
         "set_agent_state",
