@@ -9008,23 +9008,30 @@ def test_summary_reports_an_out_of_band_change_only_when_bytes_moved_without_a_v
 def test_deny_for_bytes_changed_outside_the_coordinator_names_no_writer() -> None:
     """#278: the strict deny no longer attributes an out-of-band change to the
     last committer at the time of its commit -- a write that did not make the
-    change, at a time it was not made. It names what happened and what clears
-    it, from per-artifact fields only, so it stays byte-stable."""
+    change, at a time it was not made. It names what happened, tells the
+    session to leave the file alone and tell its user -- a re-read is denied
+    again, and putting the old bytes back would discard the change -- from
+    per-artifact fields only, so it stays byte-stable. Only a caller denying a
+    reader that holds a valid grant asks for it; the same summary without that
+    flag keeps the write template."""
     from ccs.adapters.claude_code import hook_payloads as hp
 
+    summary = _summary(current_version=1, prior_version_seen_by_session=1, hash_differs=True)
     reason = hp.emit_strict_deny(
-        source="test",
-        summary=_summary(current_version=1, prior_version_seen_by_session=1, hash_differs=True),
+        source="test", summary=summary, out_of_band=True,
     )["permissionDecisionReason"]
     assert reason == (
         "Stale read denied: docs/plan.md on disk no longer matches v1, the "
         "version you last read, and no session committed the change, so it was "
-        "made outside the coordinator. The read stays denied until the change "
-        "is committed through the coordinator or docs/plan.md is restored to "
-        "v1. This denial is structural (v0.2 strict mode); retrying the same "
-        "operation will produce the same denial."
+        "made outside the coordinator. Do not restore or overwrite docs/plan.md: "
+        "the change may be your user's work. Tell your user that docs/plan.md "
+        "changed outside the coordinator; the read stays denied until the change "
+        "is committed through the coordinator. This denial is structural (v0.2 "
+        "strict mode); retrying the same operation will produce the same denial."
     )
     assert "was updated by" not in reason
+    unflagged = hp.emit_strict_deny(source="test", summary=summary)["permissionDecisionReason"]
+    assert "outside the coordinator" not in unflagged
 
 
 def test_deny_after_a_real_commit_still_names_the_writer_and_the_version() -> None:
@@ -15758,6 +15765,37 @@ def test_a_strict_reader_whose_file_changed_outside_the_coordinator_is_denied_na
     retry = client.post(
         "/hooks/pre-read", {"session_id": reader, "path": "plan.md", "content_hash": after})
     assert retry[1]["hookSpecificOutput"] == body["hookSpecificOutput"]
+
+
+def test_a_strict_reader_a_peer_invalidated_without_a_commit_keeps_the_grant_change_deny(
+    strict_plan_coordinator, strict_plan_client: _Client,
+) -> None:
+    """#278: the out-of-band wording belongs to a reader that still holds a
+    valid grant. A reader whose grant a peer's pre-edit revoked -- no commit,
+    so the version is unchanged -- and who then hashes the peer's bytes is
+    denied with the text its summary picked before #278: that writer went
+    through the coordinator. Fails if the out-of-band template answers this
+    arm."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    client = strict_plan_client
+    reader, writer = str(uuid.uuid4()), str(uuid.uuid4())
+    first = client.post("/hooks/pre-read", {"session_id": reader, "path": "plan.md", "content_hash": _hash("v1")})
+    assert first[0] == 200 and first[1]["status"] == "fresh", first
+    edit = client.post("/hooks/pre-edit", {"session_id": writer, "path": "plan.md"})
+    assert edit[0] == 200 and edit[1]["ok"] is True, edit
+
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": reader, "path": "plan.md", "content_hash": _hash("the writer's bytes")})
+
+    assert status == 200 and body["status"] == "stale", body
+    summary = body["summary"]
+    assert (summary["current_version"], summary["prior_version_seen_by_session"]) == (1, 1), summary
+    reason = body["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "outside the coordinator" not in reason, reason
+    assert reason == hp.emit_strict_deny(source="pre_read_strict_deny", summary=summary)[
+        "permissionDecisionReason"]
 
 
 # ----------------------------------------------------------------------

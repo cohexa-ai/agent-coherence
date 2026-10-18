@@ -3818,8 +3818,12 @@ no commit of its own to explain them, is told so:
   sentence, as added context only, saying the file changed outside the
   coordinator and not to write it from an earlier read;
 - in strict mode that read is denied, and the deny names the change rather
-  than the last session that committed: the read stays denied until the change
-  is committed through the coordinator or the file is restored to that version;
+  than the last session that committed. It tells the session not to restore or
+  overwrite the file, since the change may be its user's work, and to tell its
+  user: the read stays denied until the change is committed through the
+  coordinator. A session whose grant another session's `pre-edit` revoked is
+  not told this; that writer went through the coordinator, and the deny says
+  the grant was revoked, as before;
 - its `pre-edit` reads the file itself and, when it no longer holds the recorded
   content, adds `"disk_differs": true` and the same sentence. It never denies,
   in strict mode either: a read is already denied there until a commit lands,

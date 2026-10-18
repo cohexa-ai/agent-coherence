@@ -2565,6 +2565,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                         summary=shared_summary,
                         source="pre_read_shared_hash_deny",
                         effects=effects,
+                        out_of_band=True,
                     )
                 fresh["hash_differs"] = True
                 # #278: unless the caller's own commit explains it, the
@@ -8688,6 +8689,7 @@ def _emit_pre_read_strict_deny(
     summary: _payloads.StaleSummary,
     source: str,
     effects: _AnswerEffects,
+    out_of_band: bool = False,
 ) -> dict:
     """Single source of truth for emitting a pre-read strict-mode deny, used by
     both deny arms: the INVALID/None-grant path and the Survivor #6
@@ -8697,7 +8699,10 @@ def _emit_pre_read_strict_deny(
     audit row (counting mode drift on failure), and returns the byte-stable
     deny payload. Keeping both arms here means their telemetry and KTD-T
     byte-stable deny text cannot drift apart. The bookkeeping is queued on
-    ``effects`` and recorded only when this deny is the answer sent (#236)."""
+    ``effects`` and recorded only when this deny is the answer sent (#236).
+    ``out_of_band`` is the SHARED-holder arm's alone (#278): only a reader
+    that still holds a valid grant is told its file changed outside the
+    coordinator."""
     def record_deny() -> None:
         coordinator.increment_stale_warning_emitted()
         coordinator.mark_stale_warned(agent_id, artifact_id)
@@ -8710,7 +8715,7 @@ def _emit_pre_read_strict_deny(
     effects.defer(record_deny)
     return {
         "hookSpecificOutput": _payloads.emit_strict_deny(
-            source=source, summary=summary,
+            source=source, summary=summary, out_of_band=out_of_band,
         ),
         "status": "stale",
         "summary": summary,

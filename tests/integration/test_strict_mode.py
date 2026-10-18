@@ -222,8 +222,8 @@ def test_pre_read_strict_shared_foreign_edit_denies(strict_client: _Client) -> N
     out = body["hookSpecificOutput"]
     assert out["permissionDecision"] == "deny"
     assert out["hookEventName"] == "PreToolUse"
-    # #278: named as a change made outside the coordinator, with the two ways
-    # out -- a re-read is denied again, so the text does not offer one.
+    # #278: named as a change made outside the coordinator. A re-read is
+    # denied again, so the text does not offer one; it says to tell the user.
     from ccs.adapters.claude_code.hook_payloads import OUT_OF_BAND_DENY_REASON_TEMPLATE
 
     assert out["permissionDecisionReason"] == OUT_OF_BAND_DENY_REASON_TEMPLATE.format(

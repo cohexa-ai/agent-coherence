@@ -44,7 +44,10 @@ Alpha — APIs may change before `v1.0`.
     never sees. It now adds a sentence, as added context only, saying the
     file changed outside the coordinator. In strict mode the read is still
     denied, and the deny now names that change instead of the last session
-    that committed. The deny was byte-mirrored by the Claude Code plugin's
+    that committed, and tells the session to tell its user rather than
+    restore or overwrite the file. A reader whose grant another session's
+    `pre-edit` revoked keeps its old deny. The deny was byte-mirrored by the
+    Claude Code plugin's
     Node coordinator; the new wording reaches it with
     cohexa-ai/agent-coherence-plugin#205.
   - **Writes.** `pre-edit` admitted a session about to write the file from

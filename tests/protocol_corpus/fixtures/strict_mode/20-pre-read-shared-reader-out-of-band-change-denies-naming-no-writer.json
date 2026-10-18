@@ -1,6 +1,6 @@
 {
   "name": "pre-read-shared-reader-out-of-band-change-denies-naming-no-writer",
-  "description": "The out-of-band arm of the strict deny (#278). Session A's first read of CLAUDE.md seeds v1 with A's hash and grants A SHARED. A then reads again offering different bytes: the version A saw is still the current one and nothing committed, so the change was made outside the coordinator. The deny says so and names the two ways out -- a re-read is denied again -- instead of the write template, which named the last committer at its commit time ('agent <unknown>' here, since nothing ever committed). Per-artifact placeholders only, so the reason is byte-stable. Python-only until the Node coordinator mirrors it (cohexa-ai/agent-coherence-plugin#205).",
+  "description": "The out-of-band arm of the strict deny (#278). Session A's first read of CLAUDE.md seeds v1 with A's hash and grants A SHARED. A then reads again offering different bytes: the version A saw is still the current one and nothing committed, so the change was made outside the coordinator. The deny says so and tells the session to leave the file alone and tell its user -- a re-read is denied again, and putting the old bytes back would discard a change that may be the user's -- instead of the write template, which named the last committer at its commit time ('agent <unknown>' here, since nothing ever committed). Per-artifact placeholders only, so the reason is byte-stable. Python-only until the Node coordinator mirrors it (cohexa-ai/agent-coherence-plugin#205).",
   "setup": {
     "tracked": [
       "CLAUDE.md"
@@ -42,7 +42,7 @@
       "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": "Stale read denied: CLAUDE.md on disk no longer matches v1, the version you last read, and no session committed the change, so it was made outside the coordinator. The read stays denied until the change is committed through the coordinator or CLAUDE.md is restored to v1. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+        "permissionDecisionReason": "Stale read denied: CLAUDE.md on disk no longer matches v1, the version you last read, and no session committed the change, so it was made outside the coordinator. Do not restore or overwrite CLAUDE.md: the change may be your user's work. Tell your user that CLAUDE.md changed outside the coordinator; the read stays denied until the change is committed through the coordinator. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
       },
       "status": "stale",
       "summary": {
