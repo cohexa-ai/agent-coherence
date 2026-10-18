@@ -297,11 +297,12 @@ def acquire_turn(lock_path: Path, holder: Mapping[str, object], say: Callable[[s
     announced = False
     while not _try_lock(fd):
         if not announced:
-            say(f"waiting for the test turn: held by {_describe_holder(read_holder(lock_path), holder.get('tree'))}")
+            who = _describe_holder(read_holder(lock_path), holder.get("tree"))
+            say(f"{PREFIX} waiting for the test turn: held by {who}")
             announced = True
         time.sleep(POLL_SECONDS)
     if announced:
-        say(f"got the test turn after {time.monotonic() - started:.0f}s")
+        say(f"{PREFIX} got the test turn after {time.monotonic() - started:.0f}s")
     os.ftruncate(fd, 0)
     os.pwrite(fd, (json.dumps(dict(holder)) + "\n").encode("utf-8"), 0)
     return fd
