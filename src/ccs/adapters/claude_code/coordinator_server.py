@@ -2698,11 +2698,8 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # the re-grounding delivery, whose pop is NOT idempotent: a zombie that
     # outlives the degraded response must not claim the flag out from under
     # the next live admit.
-    # The strict deny's bookkeeping goes on on_answer, applied only when the
-    # deny is the answer sent; a late deny body raises at _raise_if_abandoned
-    # so the watchdog counts a late abort (#236).
     abort = threading.Event()
-    on_answer: list[Callable[[], None]] = []
+    on_answer: _AnswerEffects = []
     _run_or_degrade(
         req, coordinator, work_with_notice_surfacing, abort=abort, on_answer=on_answer,
     )
@@ -3277,8 +3274,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                         agent_id=session_id, path=path, tool="Edit",
                     ):
                         coordinator.increment_audit_log_mode_drift()
-                on_answer.append(record_deny)
-                _raise_if_abandoned(abort)
+                _defer_to_answer(abort, on_answer, record_deny)
                 return {
                     "ok": False,
                     "hookSpecificOutput": _payloads.emit_strict_deny(
@@ -3387,12 +3383,9 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # for the rule a future acquire-or-fail refusal must keep.
     # A6: abort threaded into service.write so a late acquire aborts at the
     # registry lock instead of granting a phantom EXCLUSIVE (and silently
-    # invalidating peers) the agent never saw. A deny's bookkeeping (counters,
-    # route-around marker, audit line) goes on on_answer, which _run_or_degrade
-    # applies only when the deny is the answer it sends, so a late body that
-    # takes a deny branch records nothing the caller was not told (#236).
+    # invalidating peers) the agent never saw.
     abort = threading.Event()
-    on_answer: list[Callable[[], None]] = []
+    on_answer: _AnswerEffects = []
     _run_or_degrade(
         req, coordinator, work_with_reground,
         degraded_response=_PRE_EDIT_DEGRADED_RESPONSE, abort=abort, on_answer=on_answer,
@@ -4394,8 +4387,7 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                     agent_id=session_id, path=denied_path, tool="Bash",
                 ):
                     coordinator.increment_audit_log_mode_drift()
-            on_answer.append(record_deny)
-            _raise_if_abandoned(abort)
+            _defer_to_answer(abort, on_answer, record_deny)
             summary_typed: _payloads.StaleSummary = strict_stale_first  # type: ignore[assignment]
             return {
                 "hookSpecificOutput": _payloads.emit_strict_deny(
@@ -4460,11 +4452,8 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # the re-grounding delivery, whose pop is NOT idempotent: a zombie that
     # outlives the degraded response must not claim the flag out from under
     # the next live admit.
-    # The strict deny's bookkeeping goes on on_answer, applied only when the
-    # deny is the answer sent; a late deny body raises at _raise_if_abandoned
-    # so the watchdog counts a late abort (#236).
     abort = threading.Event()
-    on_answer: list[Callable[[], None]] = []
+    on_answer: _AnswerEffects = []
     _run_or_degrade(req, coordinator, work_with_reground, abort=abort, on_answer=on_answer)
 
 
@@ -4516,11 +4505,15 @@ def _deny_giver_shell_write(
         return False
     path, record = handed
     abort = threading.Event()
-    on_answer: list[Callable[[], None]] = []
-    _run_or_degrade(req, coordinator, lambda: _giver_deny_response(
-        coordinator, record, session_id=session_id, path=path, caller=caller,
-        source=_PRE_BASH_GIVER_DENY_SOURCE, abort=abort, on_answer=on_answer,
-    ), abort=abort, on_answer=on_answer)
+    on_answer: _AnswerEffects = []
+
+    def work() -> dict:
+        return _giver_deny_response(
+            coordinator, record, session_id=session_id, path=path, caller=caller,
+            source=_PRE_BASH_GIVER_DENY_SOURCE, abort=abort, on_answer=on_answer,
+        )
+
+    _run_or_degrade(req, coordinator, work, abort=abort, on_answer=on_answer)
     return True
 
 
@@ -4685,8 +4678,7 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                     agent_id=session_id, path=denied_path, tool="Grep",
                 ):
                     coordinator.increment_audit_log_mode_drift()
-            on_answer.append(record_deny)
-            _raise_if_abandoned(abort)
+            _defer_to_answer(abort, on_answer, record_deny)
             summary_typed: _payloads.StaleSummary = strict_stale_first  # type: ignore[assignment]
             return {
                 "hookSpecificOutput": _payloads.emit_strict_deny(
@@ -4747,11 +4739,8 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # the re-grounding delivery, whose pop is NOT idempotent: a zombie that
     # outlives the degraded response must not claim the flag out from under
     # the next live admit.
-    # The strict deny's bookkeeping goes on on_answer, applied only when the
-    # deny is the answer sent; a late deny body raises at _raise_if_abandoned
-    # so the watchdog counts a late abort (#236).
     abort = threading.Event()
-    on_answer: list[Callable[[], None]] = []
+    on_answer: _AnswerEffects = []
     _run_or_degrade(req, coordinator, work_with_reground, abort=abort, on_answer=on_answer)
 
 
@@ -5512,8 +5501,8 @@ def _giver_deny_response(
     path: str,
     caller: UUID,
     source: str,
-    abort: threading.Event | None,
-    on_answer: list[Callable[[], None]],
+    abort: threading.Event,
+    on_answer: _AnswerEffects,
 ) -> dict:
     """The giver's pre-edit deny: the typed reason at the top
     level, the third byte-stable template in the deny envelope beside it, and
@@ -5534,7 +5523,6 @@ def _giver_deny_response(
     def record_deny() -> None:
         coordinator.increment_handoff_giver_denial()
         coordinator.record_strict_deny(session_id, path)
-    on_answer.append(record_deny)
     body = {
         **_giver_fenced_body(fence),
         "hookSpecificOutput": _payloads.emit_handoff_giver_deny(
@@ -5545,9 +5533,7 @@ def _giver_deny_response(
         ),
     }
     answer = _attach_handoff_key(coordinator, body, path=path, caller=caller)
-    # Last, after the registry read above: a body that outlived its deadline
-    # anywhere in here is counted as a late abort, not a late completion.
-    _raise_if_abandoned(abort)
+    _defer_to_answer(abort, on_answer, record_deny)
     return answer
 
 
@@ -7515,10 +7501,8 @@ DEGRADED_FRESHNESS_ADVISORY = (
     "re-read it before relying on its contents."
 )
 """What a hook answered on a watchdog timeout tells the model: the coherence
-check did not run. One string for every route that degrades to an admit
-(pre-read, pre-bash and pre-grep through :data:`_DEFAULT_DEGRADED_RESPONSE`,
-pre-edit through :data:`_PRE_EDIT_DEGRADED_RESPONSE`), so a reader of the
-transcript sees the same words whichever check timed out."""
+check did not run. One string, so every route that degrades to an admit says it
+in the same words."""
 
 _DEFAULT_DEGRADED_RESPONSE: dict = {
     "status": "fresh",
@@ -7552,9 +7536,6 @@ session-stop, and the snapshot-session begin/read/heartbeat routes). Pairs with
 _PRE_EDIT_DEGRADED_RESPONSE: dict = {
     "ok": True,
     "degraded": True,
-    # Context-only, never emit_allow: a permissionDecision "allow" would skip
-    # Claude Code's own permission prompt for the Edit or Write exactly when
-    # the coherence check did not run (#236).
     "hookSpecificOutput": _payloads.emit_pretooluse_context(
         additional_context=DEGRADED_FRESHNESS_ADVISORY,
     ),
@@ -7698,6 +7679,11 @@ def _watchdog_queue_overflowed(req: _RequestProtocol, coordinator: CoordinatorHT
     return True
 
 
+_AnswerEffects = list[Callable[[], None]]
+"""What a work body queues for the answer it returns: a deny's bookkeeping,
+applied by :func:`_apply_answer_effects` only when that answer is sent."""
+
+
 def _run_or_degrade(
     req: _RequestProtocol,
     coordinator: CoordinatorHTTPServer,
@@ -7705,7 +7691,7 @@ def _run_or_degrade(
     *,
     degraded_response: dict | None = None,
     abort: threading.Event | None = None,
-    on_answer: list[Callable[[], None]] | None = None,
+    on_answer: _AnswerEffects | None = None,
 ) -> None:
     """Run ``work`` under the handler-side watchdog. On timeout, log WARNING
     and return 200 with ``degraded_response`` (or the default fresh-shape
@@ -7763,7 +7749,7 @@ def _run_or_degrade(
     req._json(200, result)
 
 
-def _apply_answer_effects(on_answer: list[Callable[[], None]] | None) -> None:
+def _apply_answer_effects(on_answer: _AnswerEffects | None) -> None:
     """Record what a work body queued for the answer it returned: a deny's
     counters, route-around marker and audit line (#236).
 
@@ -8394,19 +8380,22 @@ def _last_writer_unix_ts(
     return coordinator.registry.get_artifact_updated_at(artifact_id)
 
 
-def _raise_if_abandoned(abort: threading.Event | None) -> None:
-    """Raise :class:`WatchdogAbandoned` when the request this deny body serves
-    already timed out (#236).
+def _defer_to_answer(
+    abort: threading.Event, on_answer: _AnswerEffects, record: Callable[[], None]
+) -> None:
+    """Queue a deny's ``record`` for :func:`_apply_answer_effects`, which runs
+    it only if this deny is the answer sent (#236). Raises
+    :class:`WatchdogAbandoned` when the request already timed out.
 
-    Accounting only: a deny's records are queued on ``on_answer`` and are never
-    applied for a timed-out body, so a late body records nothing either way.
-    Raising lets the watchdog count it as a late abort rather than a late
-    completion, whose CRITICAL sends an operator looking for orphaned grants.
-    Call it last before returning, after any registry read the body makes. A
-    deadline that passes after this check still ends as a late completion with
-    nothing recorded."""
-    if abort is not None and abort.is_set():
-        raise WatchdogAbandoned("strict deny abandoned: the watchdog already answered")
+    The raise is accounting only: the queue of a timed-out body is never
+    applied, so a late body records nothing either way. Raising lets the
+    watchdog count it as a late abort rather than a late completion, whose
+    CRITICAL sends an operator looking for orphaned grants. Call it last before
+    returning, after any registry read the body makes. A deadline that passes
+    after this call still ends as a late completion with nothing recorded."""
+    if abort.is_set():
+        raise WatchdogAbandoned("deny abandoned: the watchdog already answered")
+    on_answer.append(record)
 
 
 def _emit_pre_read_strict_deny(
@@ -8418,8 +8407,8 @@ def _emit_pre_read_strict_deny(
     path: str,
     summary: _payloads.StaleSummary,
     source: str,
-    abort: threading.Event | None,
-    on_answer: list[Callable[[], None]],
+    abort: threading.Event,
+    on_answer: _AnswerEffects,
 ) -> dict:
     """Single source of truth for emitting a pre-read strict-mode deny, used by
     both deny arms: the INVALID/None-grant path and the Survivor #6
@@ -8439,8 +8428,7 @@ def _emit_pre_read_strict_deny(
             coordinator.coordinator_root, agent_id=session_id, path=path, tool="Read",
         ):
             coordinator.increment_audit_log_mode_drift()
-    on_answer.append(record_deny)
-    _raise_if_abandoned(abort)
+    _defer_to_answer(abort, on_answer, record_deny)
     return {
         "hookSpecificOutput": _payloads.emit_strict_deny(
             source=source, summary=summary,
