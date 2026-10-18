@@ -233,8 +233,9 @@ A 0.15.0 coordinator reports the schema of the store it serves as
   `content_claim_absent`. Only the coordinator's fence over HTTP,
   `POST /hooks/effect-fence`, new in this release, gives it; `gate()` and
   `swg_gate` cannot. It holds an effect against an artifact whose content the
-  coordinator has never recorded, a case no surface held before: re-read the
-  artifact through a coordinated read and ask again. Code that matches the
+  coordinator has never recorded, a case no surface held before: commit the
+  artifact through the coordinator and ask again (a re-read does not record a
+  claim). Code that matches the
   reasons one by one must accept the new one, and should treat any reason it
   does not recognise as a hold. See
   [Hold reasons](#hold-reasons--the-published-vocabulary).
@@ -1771,6 +1772,57 @@ tidied-up copy is not told it picked the wrong convention: it simply never
 matches what the coordinator recorded, and every call it makes holds wearing
 the same reason a genuine conflict would.
 
+### Capturing the comparands
+
+The fence compares what you captured when you read the input with what the
+coordinator holds now, so the capture comes first. When you read the file the
+decision is derived from, hash the bytes you read and add
+`"want_owner_generation": true` to a `POST /hooks/pre-read` for the file:
+
+```json
+{"session_id": "<uuid>", "path": "plan.md",
+ "content_hash": "<sha-256 of the bytes you read>",
+ "want_owner_generation": true}
+```
+
+`/hooks/pre-read` takes the same bearer token as the fence. A first read of a
+tracked file answers:
+
+```json
+{"status": "fresh", "version": 1, "owner_generation": 0}
+```
+
+Send `version` as `expected_version`, `owner_generation` as
+`expected_generation`, and the same hash as `content_hash`. Where the pair sits
+depends on the answer:
+
+| `/hooks/pre-read` answers | `expected_version` | `expected_generation` |
+|---|---|---|
+| `"status": "fresh"` with a `version` | `version` | `owner_generation` |
+| `"status": "stale"`, a stale-read warning | `summary.current_version` | `owner_generation` |
+| `{"status": "fresh"}` with no `version` | none: the coordinator holds no record of the path (usually because it is not tracked), and the fence holds on it with `input_vanished` | none |
+| a strict-mode deny | none: the read was refused; recover as the deny says, then capture again | none |
+
+Without `want_owner_generation`, no answer carries `owner_generation`. A stale
+answer carries `summary.current_version` and `owner_generation` from one
+snapshot, so the pair always describes the same state.
+
+- **Send the same `session_id` on both calls**, and the same `agent_id` if you
+  send one. Grant standing is per session, so a fence call under another
+  identity answers about a grant you do not hold.
+- **Send `content_hash` on every pre-read.** The coordinator records a file's
+  content claim from the hash on the pre-read that first registers the file.
+  A file first registered some other way holds no claim: by a pre-read with no
+  hash, by a Bash command that reads it in a Claude Code session, by an edit
+  before the file's first commit, or by a `/session/begin` read set that names
+  it. For such a file the fence holds with
+  `content_claim_absent`. A later read does not record a claim, even one that
+  sends the hash; a commit through the coordinator does.
+- **Optionally, claim a [caller principal](#caller-principal)** if you want the
+  fence to refuse a request that names your session without your principal,
+  such as one carrying a copied session id. Then send the
+  `Coherence-Caller-Principal` header on both calls.
+
 ### Response
 
 Always HTTP `200` for a protocol outcome, in one of exactly two shapes:
@@ -1833,7 +1885,7 @@ reasons exist.
 | `read_denied` | the coordinator | it refused the re-validate read outright — this view is invalid (strict mode; on a strict-mode workspace this is how a reclaim usually surfaces) | reacquire, take a fresh read, re-decide, re-gate |
 | `grant_reclaimed` | the coordinator | both generations are confirmed and they differ: a sweep reclaimed the grant the decision was read under, while the version never moved | reacquire, re-decide, re-gate |
 | `grant_preempted` | the coordinator | neither comparand moved, yet the re-validate read was served without a standing grant — a peer's write-claim acquire took the grant with no commit behind it yet | reacquire. A bare re-ask holds again: the fence does not re-grant on the read it checks with |
-| `content_claim_absent` | the coordinator | it records no content claim for this artifact at all, so it cannot vouch that the bytes in hand are the content at the version it reports | re-read the artifact through a coordinated read; the coordinator records a claim on that observation. **Not an operator's problem** — this reason exists so this case stops arriving as `generation_unconfirmed` |
+| `content_claim_absent` | the coordinator | it records no content claim for this artifact at all, so it cannot vouch that the bytes in hand are the content at the version it reports | commit the artifact through the coordinator (`/hooks/pre-edit`, then `/hooks/post-edit` with the new bytes' hash), which records a claim; a re-read does not, so re-reading leaves the hold in place. Which first reads leave a file without a claim is listed under [Capturing the comparands](#capturing-the-comparands). **Not an operator's problem** — this reason exists so this case stops arriving as `generation_unconfirmed` |
 | `input_vanished` | **the coordinator or the caller** — see below | there is no establishable current state for the input | re-establish the input, then re-gate |
 | `version_unconfirmed` | the coordinator | it resolved no version at all: a degraded read, or one of the two degraded arms above | restore the coordinator's health, then re-gate. A re-read will not clear it |
 | `generation_unconfirmed` | **the coordinator or the caller** — see below | the residual bucket: no confirmed ownership generation | reacquire and re-gate **first** — that clears the recoverable forms. A hold that survives a *successful* reacquire is the last one: check the coordinator's version and restart it |
