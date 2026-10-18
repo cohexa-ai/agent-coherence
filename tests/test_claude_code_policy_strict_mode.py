@@ -726,7 +726,7 @@ _DISTINCT_CHARACTERS_STEP_BOUND = 200_000
 
 
 def test_an_untrack_entry_of_many_distinct_characters_is_decided_quickly(
-    root: Path, monkeypatch: pytest.MonkeyPatch
+    root: Path, automaton_steps: _StepCount
 ) -> None:
     """Literal characters join the search alphabet too, and each explored
     state is charged for every character it tries. Charged per new state
@@ -738,20 +738,12 @@ def test_an_untrack_entry_of_many_distinct_characters_is_decided_quickly(
     (root / ".coherence" / "strict_mode.yaml").write_text("- 'data/*.json'\n")
     policy = TrackedArtifactPolicy.load(root)
     entry = "*" + "".join(chr(0x4E00 + i) for i in range(400)) + "*"
-    steps = 0
-    advance = policy_module._advance
 
-    def counted_advance(states: frozenset[int], tokens: list[tuple], ch: str | None) -> frozenset[int]:
-        nonlocal steps
-        steps += 1
-        return advance(states, tokens, ch)
-
-    monkeypatch.setattr(policy_module, "_advance", counted_advance)
     covering = policy.strict_patterns_covering(entry)
 
     assert covering == ("data/*.json",)
     # Zero would mean the count no longer sees the search, not that it is fast.
-    assert 0 < steps < _DISTINCT_CHARACTERS_STEP_BOUND, f"{steps} automaton steps"
+    assert 0 < automaton_steps.taken < _DISTINCT_CHARACTERS_STEP_BOUND, f"{automaton_steps.taken} automaton steps"
 
 
 #: FROZEN: automaton steps the ``*ab*ab*...`` entry may take. Healthy code
