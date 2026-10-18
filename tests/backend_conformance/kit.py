@@ -1184,7 +1184,7 @@ _ATTEMPT_CAP_FACTOR = 10
 # to name the fault, and stopping early keeps its run short.
 _VIOLATIONS_KEPT = 5
 
-R2_VIOLATION = "NOT read from its decision snapshot"
+SNAPSHOT_VIOLATION = "NOT read from its decision snapshot"
 STARVED_RACE = "race was STARVED"
 
 
@@ -1281,7 +1281,7 @@ def _assert_race_outcome(race: _Race) -> None:
     tally = race.tally
     if tally.violations:
         raise AssertionError(
-            f"{race.name}: a refusal carried a generation pair {R2_VIOLATION}; "
+            f"{race.name}: a refusal carried a generation pair {SNAPSHOT_VIOLATION}; "
             + "; ".join(tally.violations)
             + ". A backend must read captured_generation and owner_generation in "
             "the same step that decides the refusal, never in a second read after it"

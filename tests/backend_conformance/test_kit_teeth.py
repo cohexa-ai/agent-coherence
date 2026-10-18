@@ -619,7 +619,7 @@ def test_follow_up_read_stub_fails_its_race(entry: str, legs: str) -> None:
     with pytest.raises(AssertionError) as excinfo:
         _RACES[entry](factory)
     message = str(excinfo.value)
-    assert kit.R2_VIOLATION in message, message
+    assert kit.SNAPSHOT_VIOLATION in message, message
     assert _ENTRY_IN_MESSAGE[entry] in message, message
     assert kit.STARVED_RACE not in message
 
@@ -674,7 +674,7 @@ def test_starved_race_fails_as_starved_not_as_a_snapshot_violation(race: str) ->
         _RACES[race](_OneStoreFactory(_StarvedMutatorRegistry))
     message = str(excinfo.value)
     assert kit.STARVED_RACE in message, message
-    assert kit.R2_VIOLATION not in message
+    assert kit.SNAPSHOT_VIOLATION not in message
 
 
 def test_degraded_stub_fails_single_writer_scenario() -> None:
