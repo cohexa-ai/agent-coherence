@@ -20,6 +20,8 @@ uses only the standard library and must still run on Python 3.9.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import datetime
 import errno
 import fcntl
@@ -32,7 +34,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 USAGE_ERROR = 4  # pytest's own code for a usage error
 PREFLIGHT_FAILED = 6  # pytest never exits with this
@@ -42,7 +44,10 @@ PREFIX = "[run_local_tests]"
 CI_EXTRAS = ("dev", "diagnose", "mcp")
 LOCK_NAME = "ccs-local-tests.lock"
 POLL_SECONDS = 0.5
-SERIAL_MARK = re.compile(r"\bpytest\.mark\.serial\b")  # the pattern tests/test_shard_lanes.py pins
+PARALLEL_LANE, SERIAL_LANE = "parallel", "serial"  # the --test-lane values tests/conftest.py defines
+SERIAL_MARK = re.compile(r"\bpytest\.mark\.serial\b")  # must match the pattern tests/test_shard_lanes.py pins
+# The \b-led regex defeats re's literal search; this substring gate is ~300x faster.
+SERIAL_NEEDLE = b"pytest.mark.serial"
 
 # Options whose value may follow as a separate token, so it is never read as a test path.
 VALUE_OPTIONS = frozenset(
@@ -108,7 +113,7 @@ def _option_name(token: str) -> str:
     if token.startswith("--"):
         return token.split("=", 1)[0]
     if len(token) > 2 and token[:2] in VALUE_OPTIONS:
-        return token[:2]  # -kfoo, -n4
+        return token[:2]
     return token
 
 
@@ -121,8 +126,7 @@ def _take_option(argv: Sequence[str], index: int) -> Tuple[Option, int]:
     name = _option_name(token)
     if name in REFUSED:
         raise Refused(f"{name} changes which tests CI's lanes select or a setting this command owns; use plain pytest")
-    attached = "=" in token or (name != token and not token.startswith("--"))
-    if name in VALUE_OPTIONS and not attached and index + 1 < len(argv):
+    if name in VALUE_OPTIONS and token == name and index + 1 < len(argv):
         return Option(name, (token, argv[index + 1])), index + 2
     unknown = name not in VALUE_OPTIONS and name not in FLAG_OPTIONS and "=" not in token
     if unknown and index + 1 < len(argv) and _looks_like_path(argv[index + 1]):
@@ -131,7 +135,6 @@ def _take_option(argv: Sequence[str], index: int) -> Tuple[Option, int]:
 
 
 def split_args(argv: Sequence[str]) -> Args:
-    """Split command-line arguments into test paths and forwarded pytest options."""
     paths: List[str] = []
     options: List[Option] = []
     index = 0
@@ -146,22 +149,20 @@ def split_args(argv: Sequence[str]) -> Args:
 
 
 def check_mode(args: Args) -> None:
-    """A full run sets its own worker count; a targeted run may choose one."""
     if args.is_full and WORKER_OPTIONS.intersection(args.names()):
         raise Refused("a full run sets its own worker count; pass test paths to choose one, or use plain pytest")
 
 
 def resolve_test_paths(paths: Sequence[str], cwd: Path, tree: Path) -> List[str]:
-    """Rewrite paths and node ids relative to the tree root; each must sit under tests/."""
-    tests_dir = (tree / "tests").resolve()
+    root = tree.resolve()
+    tests_dir = root / "tests"
     resolved = []
     for path in paths:
         file_part, sep, rest = path.partition("::")
         absolute = (cwd / file_part).resolve()
         if absolute != tests_dir and tests_dir not in absolute.parents:
             raise Refused(f"{path} is outside tests/; use plain pytest to run it")
-        relative = absolute.relative_to(tree.resolve()).as_posix()
-        resolved.append(relative + sep + rest)
+        resolved.append(absolute.relative_to(root).as_posix() + sep + rest)
     return resolved
 
 
@@ -169,7 +170,6 @@ def resolve_test_paths(paths: Sequence[str], cwd: Path, tree: Path) -> List[str]
 
 
 def find_roots(cwd: Path) -> Roots:
-    """The tree this command runs in, the main checkout, and the shared git directory."""
     proc = subprocess.run(
         ["git", "rev-parse", "--show-toplevel", "--git-common-dir"],
         cwd=cwd, capture_output=True, text=True, check=False,
@@ -182,19 +182,27 @@ def find_roots(cwd: Path) -> Roots:
 
 
 def find_interpreter(roots: Roots) -> Path:
-    for root in (roots.tree, roots.main):
-        candidate = root / ".venv" / "bin" / "python"
-        if candidate.exists():
-            return candidate
-    return roots.main / ".venv" / "bin" / "python"
+    candidates = [root / ".venv" / "bin" / "python" for root in (roots.tree, roots.main)]
+    return next((candidate for candidate in candidates if candidate.exists()), candidates[-1])
 
 
+# Reads installed names from *.dist-info / *.egg-info directories rather than
+# importing importlib.metadata, which costs about half a second per run.
 _PREFLIGHT_PROBE = r"""
-import json, re, sys, tomllib
-from importlib import metadata
+import json, os, re, sys, tomllib
 
 def canon(name):
     return re.sub(r"[-_.]+", "-", name).lower()
+
+installed = set()
+for entry in sys.path:
+    try:
+        names = os.listdir(entry or ".")
+    except OSError:
+        continue
+    for name in names:
+        if name.endswith((".dist-info", ".egg-info")):
+            installed.add(canon(name.rsplit(".", 1)[0].split("-", 1)[0]))
 
 project = tomllib.load(open(sys.argv[1], "rb"))["project"]
 extras, own, wanted = project.get("optional-dependencies", {}), canon(project["name"]), set()
@@ -213,14 +221,7 @@ while todo:
         else:
             wanted.add(match.group(1))
 
-def installed(name):
-    try:
-        metadata.distribution(name)
-        return True
-    except metadata.PackageNotFoundError:
-        return False
-
-print(json.dumps(sorted(name for name in wanted if not installed(name))))
+print(json.dumps(sorted(name for name in wanted if canon(name) not in installed)))
 """
 
 
@@ -244,12 +245,11 @@ def preflight(interpreter: Path, tree: Path) -> Optional[str]:
 def reinstall_command(interpreter: Path) -> str:
     """The venv's own checkout by absolute path: a relative path run from a worktree
     would point the shared editable install at that worktree."""
-    owner = interpreter.parent.parent.parent
+    owner = interpreter.parents[2]  # <owner>/.venv/bin/python
     return f"{interpreter} -m pip install -e '{owner}[{','.join(CI_EXTRAS)}]'"
 
 
 def child_env(base: Mapping[str, str], venv_bin: Path, tree: Path) -> Dict[str, str]:
-    """The environment every pytest this command starts runs with."""
     env = dict(base)
     env.pop("PYTHONDONTWRITEBYTECODE", None)  # agent shells set it; it keeps every run cold
     env["PATH"] = os.pathsep.join(filter(None, [str(venv_bin), base.get("PATH", "")]))
@@ -261,7 +261,6 @@ def child_env(base: Mapping[str, str], venv_bin: Path, tree: Path) -> Dict[str, 
 
 
 def read_holder(lock_path: Path) -> Optional[Dict[str, object]]:
-    """The record the current or last holder wrote, if it can be read."""
     try:
         record = json.loads(lock_path.read_text(encoding="utf-8") or "null")
     except (OSError, ValueError):
@@ -289,9 +288,9 @@ def _try_lock(fd: int) -> bool:
 def acquire_turn(lock_path: Path, holder: Mapping[str, object], say: Callable[[str], None]) -> int:
     """Wait for the turn and return the descriptor that holds it.
 
-    Polls instead of blocking so Ctrl-C ends the wait at once. The file is
-    never deleted: the lock lives on the open descriptor, so a leftover file
-    from a finished or killed run is harmless."""
+    The file is never deleted: the lock lives on the open descriptor, so a
+    leftover file from a finished or killed run is harmless, while deleting it
+    could let two waiters lock two different files."""
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
     started = time.monotonic()
     announced = False
@@ -312,6 +311,15 @@ def release_turn(fd: int) -> None:
     os.close(fd)
 
 
+@contextlib.contextmanager
+def holding_turn(lock_path: Path, holder: Mapping[str, object], say: Callable[[str], None]) -> Iterator[int]:
+    fd = acquire_turn(lock_path, holder, say)
+    try:
+        yield fd
+    finally:
+        release_turn(fd)
+
+
 def run_lane(command: Sequence[str], env: Mapping[str, str], cwd: Path, turn_fd: Optional[int]) -> int:
     """Run one pytest lane. The child inherits the turn's descriptor, so the turn
     lasts exactly as long as the lane does, even if this process is killed."""
@@ -323,13 +331,15 @@ def run_lane(command: Sequence[str], env: Mapping[str, str], cwd: Path, turn_fd:
 
 
 def serial_modules(tree: Path) -> List[str]:
-    """Modules that mark tests serial, found the way tests/test_shard_lanes.py pins them."""
-    found = (path for path in (tree / "tests").rglob("*.py") if SERIAL_MARK.search(path.read_text(encoding="utf-8")))
-    return sorted(path.relative_to(tree).as_posix() for path in found)
+    found = []
+    for path in (tree / "tests").rglob("*.py"):
+        data = path.read_bytes()
+        if SERIAL_NEEDLE in data and SERIAL_MARK.search(data.decode("utf-8", "replace")):
+            found.append(path.relative_to(tree).as_posix())
+    return sorted(found)
 
 
 def serial_targets(paths: Sequence[str], modules: Sequence[str]) -> List[str]:
-    """The named paths that are, or contain, a serial module."""
     targets: List[str] = []
     for path in paths:
         file_part = path.partition("::")[0].rstrip("/")
@@ -341,10 +351,15 @@ def serial_targets(paths: Sequence[str], modules: Sequence[str]) -> List[str]:
 
 
 def should_run_serial(parallel_code: int, args: Args) -> bool:
-    """The serial lane still runs after failures, so one run shows all of them."""
     if parallel_code not in (0, 1, NO_TESTS):
         return False  # interrupted, internal error or usage error
     return not (parallel_code == 1 and STOP_EARLY.intersection(args.names()))
+
+
+class LaneCodes(NamedTuple):
+    parallel: int
+    serial: Optional[int]
+    parallel_ran_nothing: bool
 
 
 def combine_exit_codes(parallel: int, serial: Optional[int], parallel_ran_nothing: bool) -> int:
@@ -375,15 +390,11 @@ class RunSpec:
 Executor = Callable[[Sequence[str], Mapping[str, str], Path, Optional[int]], int]
 
 
-def _lane_command(spec: RunSpec, lane: str, workers: List[str], node_dir: Path) -> List[str]:
-    base = [str(spec.interpreter), "-m", "pytest", "-q", *workers, "--test-lane", lane, f"--node-id-dir={node_dir}"]
-    forwarded = spec.args.option_tokens(drop=WORKER_OPTIONS if lane == "serial" else frozenset())
-    return base + forwarded
-
-
 def _ran_count(node_dir: Path, lane: str) -> int:
-    ran = node_dir / f"{lane}-ran.txt"
-    return len(ran.read_text(encoding="utf-8").splitlines()) if ran.exists() else 0
+    try:
+        return len((node_dir / f"{lane}-ran.txt").read_text(encoding="utf-8").splitlines())
+    except FileNotFoundError:
+        return 0
 
 
 @dataclass
@@ -393,61 +404,63 @@ class _Run:
     say: Callable[[str], None]
     node_dir: Path
 
-    def lane(self, lane: str, workers: List[str], targets: Sequence[str], turn_fd: Optional[int]) -> int:
+    def worker_flags(self, lane: str) -> List[str]:
+        if lane == SERIAL_LANE:
+            return ["-n", "0"]  # serial tests start real processes that race each other
+        if self.spec.args.is_full:
+            return ["-n", str(self.spec.workers), "--dist", "worksteal"]
+        return [] if WORKER_OPTIONS.intersection(self.spec.args.names()) else ["-n", "0"]
+
+    def command(self, lane: str, targets: Sequence[str]) -> List[str]:
+        forwarded = self.spec.args.option_tokens(drop=WORKER_OPTIONS if lane == SERIAL_LANE else frozenset())
+        base = [str(self.spec.interpreter), "-m", "pytest", "-q", *self.worker_flags(lane)]
+        return base + ["--test-lane", lane, f"--node-id-dir={self.node_dir}", *forwarded, *targets]
+
+    def lane(self, lane: str, targets: Sequence[str], turn_fd: Optional[int]) -> int:
         mode = "full run" if self.spec.args.is_full else "targeted run"
-        self.say(f"{PREFIX} {mode} · {lane} lane · {workers[1] if workers else 'chosen'} workers")
-        command = _lane_command(self.spec, lane, workers, self.node_dir) + list(targets)
-        return self.executor(command, self.spec.env, self.spec.roots.tree, turn_fd)
-
-    def serial_under_turn(self, targets: Sequence[str]) -> int:
-        fd = acquire_turn(self.spec.lock_path, self.spec.holder("serial tests"), self.say)
-        try:
-            return self.lane("serial", ["-n", "0"], targets, fd)
-        finally:
-            release_turn(fd)
+        flags = self.worker_flags(lane)
+        workers = "workers as given" if not flags else "1 process" if flags[1] == "0" else f"{flags[1]} workers"
+        self.say(f"{PREFIX} {mode} · {lane} lane · {workers}")
+        return self.executor(self.command(lane, targets), self.spec.env, self.spec.roots.tree, turn_fd)
 
 
-def _run_full(run: _Run) -> Tuple[int, Optional[int], bool]:
+def _run_full(run: _Run) -> LaneCodes:
     spec = run.spec
-    fd = acquire_turn(spec.lock_path, spec.holder("full run"), run.say)
-    try:
-        parallel = run.lane("parallel", ["-n", str(spec.workers), "--dist", "worksteal"], (), fd)
-        nothing = parallel == 0 and _ran_count(run.node_dir, "parallel") == 0
-        modules = serial_modules(spec.roots.tree)
-        serial = None
-        if modules and should_run_serial(parallel, spec.args):
-            serial = run.lane("serial", ["-n", "0"], modules, fd)
-    finally:
-        release_turn(fd)
-    return parallel, serial, nothing
+    with holding_turn(spec.lock_path, spec.holder("full run"), run.say) as fd:
+        parallel = run.lane(PARALLEL_LANE, (), fd)
+        nothing = parallel == 0 and _ran_count(run.node_dir, PARALLEL_LANE) == 0
+        modules = serial_modules(spec.roots.tree) if should_run_serial(parallel, spec.args) else []
+        serial = run.lane(SERIAL_LANE, modules, fd) if modules else None
+    return LaneCodes(parallel, serial, nothing)
 
 
-def _run_targeted(run: _Run) -> Tuple[int, Optional[int], bool]:
-    args = run.spec.args
-    workers = [] if WORKER_OPTIONS.intersection(args.names()) else ["-n", "0"]
-    parallel = run.lane("parallel", workers, args.paths, None)
-    targets = serial_targets(args.paths, serial_modules(run.spec.roots.tree))
-    serial = run.serial_under_turn(targets) if targets and should_run_serial(parallel, args) else None
-    return parallel, serial, False
+def _run_targeted(run: _Run) -> LaneCodes:
+    spec = run.spec
+    parallel = run.lane(PARALLEL_LANE, spec.args.paths, None)
+    if not should_run_serial(parallel, spec.args):
+        return LaneCodes(parallel, None, False)
+    targets = serial_targets(spec.args.paths, serial_modules(spec.roots.tree))
+    if not targets:
+        return LaneCodes(parallel, None, False)
+    with holding_turn(spec.lock_path, spec.holder("serial tests"), run.say) as fd:
+        return LaneCodes(parallel, run.lane(SERIAL_LANE, targets, fd), False)
 
 
-def _summarize(run: _Run, codes: Tuple[int, Optional[int], bool], elapsed: float) -> None:
-    parallel, serial, nothing = codes
-    ran = _ran_count(run.node_dir, "parallel")
-    parts = [f"parallel lane exit {parallel}, {ran} ran"]
-    if nothing:
+def _summarize(run: _Run, codes: LaneCodes, elapsed: float) -> None:
+    parts = [f"parallel lane exit {codes.parallel}, {_ran_count(run.node_dir, PARALLEL_LANE)} ran"]
+    if codes.parallel_ran_nothing:
         parts.append("the parallel lane ran no tests although pytest exited 0")
-    if serial is None:
+    if codes.serial is None:
         parts.append("serial lane not run")
     else:
-        parts.append(f"serial lane exit {serial}, {_ran_count(run.node_dir, 'serial')} ran")
-    if run.spec.args.narrowing():
-        parts.append(f"selection narrowed by {' '.join(run.spec.args.narrowing())}")
+        parts.append(f"serial lane exit {codes.serial}, {_ran_count(run.node_dir, SERIAL_LANE)} ran")
+    narrowing = run.spec.args.narrowing()
+    if narrowing:
+        parts.append(f"selection narrowed by {' '.join(narrowing)}")
     run.say(f"{PREFIX} done in {elapsed:.0f}s · " + " · ".join(parts))
 
 
-def execute(spec: RunSpec, executor: Executor = run_lane, say: Callable[[str], None] = print) -> int:
-    """Run the lanes a full or targeted run needs and return one exit code."""
+def execute(spec: RunSpec, executor: Executor, say: Callable[[str], None]) -> int:
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="ccs-local-tests-") as node_dir:
         run = _Run(spec, executor, say, Path(node_dir))
@@ -468,7 +481,7 @@ def prepare(argv: Sequence[str], cwd: Path) -> RunSpec:
     args = split_args(argv)
     check_mode(args)
     roots = find_roots(cwd)
-    args = Args(tuple(resolve_test_paths(args.paths, cwd, roots.tree)), args.options)
+    args = dataclasses.replace(args, paths=tuple(resolve_test_paths(args.paths, cwd, roots.tree)))
     interpreter = find_interpreter(roots)
     problem = preflight(interpreter, roots.tree)
     if problem:
@@ -478,7 +491,7 @@ def prepare(argv: Sequence[str], cwd: Path) -> RunSpec:
 
 
 def _say(line: str) -> None:
-    print(line, flush=True)
+    print(line, flush=True)  # flushed so a backgrounded run's log shows progress
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
