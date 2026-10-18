@@ -4880,6 +4880,8 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
       - WIN → ``{ok: true, session_token, cut: {path: version}, coordinator_epoch,
         retain_versions}``
       - typed rejection (unknown id / caps) → ``{ok: false, reason, ...}``
+      - watchdog timeout → ``{ok: true, degraded: true}`` with no token; the
+        late body stops at the registry lock before opening a session (#340)
     """
     body = req._read_json()
     if body is None:
@@ -4914,7 +4916,7 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
         # client speaks paths; artifact UUIDs stay server-internal).
         id_to_path = {aid: path for aid, path in zip(read_set_ids, read_set)}
         result = coordinator.service.begin_session(
-            read_set=read_set_ids, owner=owner, created_at_tick=now,
+            read_set=read_set_ids, owner=owner, created_at_tick=now, abort=abort,
         )
         if isinstance(result, VersionedReadRejection):
             # Typed cap / unknown-id rejection — NO session opened, no pins.
@@ -4938,7 +4940,10 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
             "retain_versions": result.retain_versions,
         }
 
-    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE)
+    # A6 (#340): a begin answered degraded carries no token, so its late body
+    # must not open a session; it aborts at the registry lock instead.
+    abort = threading.Event()
+    _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
 
 
 def _session_read_content_fields(content: bytes | str) -> dict:

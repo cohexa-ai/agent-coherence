@@ -833,6 +833,7 @@ class CoordinatorService:
         read_set: Iterable[UUID],
         owner: UUID,
         created_at_tick: int = 0,
+        abort: threading.Event | None = None,
     ) -> SnapshotSession | VersionedReadRejection:
         """Open a consistent multi-artifact snapshot session (SB-17 / TX-1,
         Unit 2 / R1, R13). Pins a coherent CUT of ``read_set`` at one
@@ -866,6 +867,12 @@ class CoordinatorService:
             read_set: The artifact ids to pin into the consistent cut.
             owner: The creating caller's identity (the MESI agent/process label),
                 bound to the minted token for R13 owner-binding.
+            abort: Optional handler-watchdog abort Event (A6, #340). Checked by
+                ``registry.abort_guard`` once the session and registry locks
+                are won, before any token is minted or cut pinned: a begin whose
+                request was already answered degraded (with no token) raises
+                ``WatchdogAbandoned`` instead of opening a session its caller
+                could neither use nor release.
 
         Returns:
             A :class:`SnapshotSession` on success, else a
@@ -900,7 +907,9 @@ class CoordinatorService:
         # across the capture also serializes begin against the sweep — both
         # acquire ``_session_lock`` first, then the registry lock, so there is no
         # deadlock and a begin never races a reap of the same maps.
-        with self._session_lock:
+        # ``abort_guard`` is taken INSIDE ``_session_lock`` for the same order
+        # (#340): a guard taken around this call by the handler would invert it.
+        with self._session_lock, self.registry.abort_guard(abort):
             # The many-sessions GC-starvation bound (threat-model #2). Count ALL
             # live sessions via the durable session_meta (one row per open session
             # — in-memory OR a durable-only restart survivor), NOT just the

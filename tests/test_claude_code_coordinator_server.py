@@ -14625,3 +14625,106 @@ def test_no_degraded_hook_envelope_carries_a_permission_decision() -> None:
         if "permissionDecision" in (envelope.get("hookSpecificOutput") or {})
     }
     assert decided == {}, f"degraded envelopes that decide: {decided!r}"
+
+
+# ----------------------------------------------------------------------
+# #340 -- a timed-out /session/begin must not open a session its caller
+# holds no token for
+# ----------------------------------------------------------------------
+
+
+def _open_sessions(coordinator: CoordinatorHTTPServer) -> dict:
+    """Everywhere an open snapshot session shows: the session rows the session
+    cap counts and the liveness sweep walks, the service's owner bindings, and
+    the session-audit lines."""
+    audit = coordinator.coordinator_root / ".coherence" / "session-audit.log"
+    with coordinator.service._session_lock:
+        owners = frozenset(coordinator.service._session_owners)
+    return {
+        "session_rows": frozenset(coordinator.registry.all_session_meta()),
+        "owner_bindings": owners,
+        "audit_lines": len(audit.read_text().splitlines()) if audit.exists() else 0,
+    }
+
+
+def _begin_late_or_control(client: _Client, who: _Session, request: dict) -> tuple[int, dict]:
+    return client.post(
+        "/session/begin", {"session_id": who.sid, **request}, principal=who.principal)
+
+
+@pytest.mark.parametrize(
+    "held_at", ["before begin_session", "on the session lock inside begin_session"])
+def test_a_timed_out_session_begin_opens_no_session_its_caller_cannot_use(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, held_at: str,
+) -> None:
+    """#340: a ``/session/begin`` answered on a watchdog timeout carries no
+    session token, so a session its late body opened could be neither used nor
+    released by the caller: it held its pins and a session-cap slot until the
+    liveness sweep reaped it, and the watchdog logged a CRITICAL late
+    completion about orphaned grants. The late body now aborts at the registry
+    lock before it mints a token, and counts as a late abort.
+
+    ``on the session lock`` holds the late begin INSIDE ``begin_session``,
+    behind ``_session_lock`` (as the liveness sweep or a peer begin holds it),
+    after it entered with the abort still unset: only a check made once the
+    lock is won can stop it there.
+
+    The first begin is the control: the same request from another session,
+    answered in time, opens a session that shows in every place measured."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    late, control = _claimed(client), _claimed(client)
+    request = {"read_set": ["plan.md"]}
+    caplog.set_level(logging.CRITICAL, logger=mod.__name__)
+
+    before = _open_sessions(coordinator)
+    status, body = _begin_late_or_control(client, control, request)
+    assert status == 200 and body.get("ok") is True, body
+    token = body["session_token"]
+    after_control = _open_sessions(coordinator)
+    assert after_control["session_rows"] - before["session_rows"] == {token}
+    assert after_control["owner_bindings"] - before["owner_bindings"] == {token}
+    assert after_control["audit_lines"] == before["audit_lines"] + 1
+
+    late_agent = session_to_agent_id(late.sid, None)
+
+    def is_late(*args: Any, **kwargs: Any) -> bool:
+        return kwargs.get("owner") == late_agent
+
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+    if held_at == "before begin_session":
+        delayed = _DelayedCall(monkeypatch, coordinator.service, "begin_session", is_late)
+        status, body = _begin_late_or_control(client, late, request)
+        assert delayed.entered.is_set(), "the late session's begin body never started"
+        delayed.release()
+    else:
+        aborted_on_entry: list[bool] = []
+        real_begin = coordinator.service.begin_session
+
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            if is_late(*args, **kwargs):
+                abort = kwargs.get("abort")
+                aborted_on_entry.append(abort is not None and abort.is_set())
+            return real_begin(*args, **kwargs)
+
+        monkeypatch.setattr(coordinator.service, "begin_session", spy)
+        with coordinator.service._session_lock:
+            status, body = _begin_late_or_control(client, late, request)
+        assert aborted_on_entry == [False], (
+            "the late begin did not enter begin_session before its deadline, "
+            "so this did not measure a check made at the lock")
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1, (
+        "the request did not time out, so this measured the undegraded route")
+    assert (status, body) == (200, mod._OK_DEGRADED_RESPONSE), body
+    assert _open_sessions(coordinator) == after_control, (
+        "the abandoned begin opened a session its caller holds no token for")
+    assert coordinator._watchdog_late_aborts_total == aborts_before + 1
+    assert coordinator._watchdog_late_completion_total == completions_before
+    assert _late_completion_criticals(caplog) == 0
