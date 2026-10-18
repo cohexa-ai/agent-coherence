@@ -1010,11 +1010,12 @@ them. Work that had already taken the notices when the time ran out still
 loses them.
 
 A `POST /session/begin` answered `{"ok": true, "degraded": true}` carries no
-`session_token` and opens no session, so retry it. A begin still waiting for
-the coordinator when that answer goes out stops before it opens a session and
-counts in `watchdog_late_aborts_total`. One that was already opening the
-session when the deadline passed can still open it; it shows in
-`watchdog_late_completion_total`, and the liveness sweep reaps it.
+`session_token`, so retry it. A begin still waiting for the coordinator when
+that answer goes out stops before it opens a session and counts in
+`watchdog_late_aborts_total`. One that was already opening the session when
+the deadline passed can still open it; it shows in
+`watchdog_late_completion_total`, holds a `max_sessions` slot, and the
+liveness sweep reaps it.
 
 Late work that finishes normally counts in `watchdog_late_completion_total`.
 The coordinator logs it at `CRITICAL` only when that work had already won the
@@ -1676,10 +1677,12 @@ Semantics, precisely:
   single-artifact optimistic commit: it wins only if the artifact's version still
   equals the cut's pinned version, and returns a typed, retryable conflict
   otherwise.
-- **A begin that times out opens nothing.** A `/session/begin` the coordinator
-  could not answer within its 4-second budget answers
-  `{"ok": true, "degraded": true}` with no `session_token`. No session was
-  opened for you, so retry the begin (see
+- **A begin that times out gives you no session.** A `/session/begin` the
+  coordinator could not answer within its 4-second budget answers
+  `{"ok": true, "degraded": true}` with no `session_token`, so retry the
+  begin. Usually nothing was opened. A begin that was already opening its
+  session when the deadline passed can still open one you cannot use; it
+  holds a `max_sessions` slot until the liveness sweep reaps it (see
   [When the registry is busy](#when-the-registry-is-busy)).
 - **Sessions fail closed.** Pins have a bounded lifetime backed by a heartbeat
   lease. A session whose heartbeat lapses — or that is lost to a coordinator

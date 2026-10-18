@@ -820,7 +820,12 @@ class RegistryBase(Protocol):
         :func:`time.monotonic` instant that bounds the wait: past it the guard
         raises ``RegistryLockTimeout``, having run nothing, instead of waiting
         on. A free or already-held lock is taken at once; ``None`` waits as long
-        as the lock is held."""
+        as the lock is held.
+
+        Once the abort check passes, and before yielding, an implementation
+        must call :func:`note_guard_won` with ``abort``: the watchdog logs a
+        late body as CRITICAL only when its token won this guard (#338), so a
+        guard that skips the call reports every late mutation at WARNING."""
         ...
 
     def adjust_checkpoint_pin_refcount(self, checkpoint_id: str, delta: int) -> int:

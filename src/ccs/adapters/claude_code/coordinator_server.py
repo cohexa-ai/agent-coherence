@@ -2005,7 +2005,8 @@ class CoordinatorHTTPServer:
             "refused or conflicting attempt lands nothing. Check "
             "/status?detail=metrics for watchdog_late_completion_total and run "
             "agent-coherence-status --detail=full to look for orphaned M/E "
-            "grants. Counter total now: %d.",
+            "grants; a snapshot session opened this way is not listed there, "
+            "and the liveness sweep reaps it. Counter total now: %d.",
             self._watchdog_late_completion_total,
         )
 
@@ -4001,9 +4002,11 @@ def _handle_session_start(
             )
         }
 
-    # A6 pattern: abort threads into the builder's abort_guard so a
-    # watchdog-timed-out request fails closed at the registry lock instead
-    # of arming the flag after the client already saw the degraded `{}`.
+    # A6 pattern: abort threads into the builder's registry guard
+    # (_abort_guard_without_mark, which leaves the token unmarked: the build
+    # only reads) so a watchdog-timed-out request fails closed at the
+    # registry lock instead of arming the flag after the client already saw
+    # the degraded `{}`.
     _run_or_degrade(
         req,
         coordinator,
@@ -7691,8 +7694,8 @@ empty payload. Re-grounding is advisory (KD3): a watchdog timeout must look
 exactly like "nothing to say", never block, and never claim state it could
 not read. The compact-pending flag is armed INSIDE the timed work only
 after a successful non-empty build (with the A6 abort threaded into the
-builder's ``abort_guard``), so a degraded response also means the deferred
-path stays unarmed."""
+builder's registry guard, :func:`_abort_guard_without_mark`), so a degraded
+response also means the deferred path stays unarmed."""
 
 _OCC_DEGRADED_RESPONSE: dict = {
     "ok": False,
@@ -8177,9 +8180,10 @@ def _build_session_start_context(
 
     KTD2: the payload is rebuilt from registry truth on EVERY delivery, from
     ONE consistent read pass — the whole registry walk happens under a single
-    ``abort_guard`` hold (a plain re-entrant lock acquire for the inner read
-    calls), so a peer commit cannot tear the view between the snapshot and
-    the per-row last-observed / last-writer reads. The pass is read-only:
+    registry-lock hold (:func:`_abort_guard_without_mark`; a plain re-entrant
+    lock acquire for the inner read calls), so a peer commit cannot tear the
+    view between the snapshot and the per-row last-observed / last-writer
+    reads. The pass is read-only:
     R6 forbids this endpoint from recording observations, and the pending
     preemption notices are PEEKED, never popped — consumption ownership
     stays with the admit-endpoint drains.
