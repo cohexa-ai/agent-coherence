@@ -64,11 +64,12 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Literal, Protocol, runtime_checkable
+from typing import Any, Callable, Iterator, Literal, Protocol, runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import yaml
@@ -96,6 +97,7 @@ from ccs.coordinator.registry_protocol import (
     RECLAIM_TRIGGERS,
     CheckpointMember,
     TransferRecord,
+    WatchdogAbort,
 )
 from ccs.coordinator.service import (
     CallerPrincipalUncached,
@@ -1040,8 +1042,9 @@ class CoordinatorHTTPServer:
         # because the GIL serializes bytecode execution. Under Python
         # 3.13+ free-threaded builds (PEP 703) and on PyPy, that
         # guarantee is gone — concurrent threads can read-modify-write
-        # the same counter and tear increments. These three counters
-        # are operator-facing reliability signals (a missed bump means
+        # the same counter and tear increments. These counters (and the
+        # watchdog late-completion / late-abort pair, #338) are
+        # operator-facing reliability signals (a missed bump means
         # an under-reported degradation event in a bug report), so
         # protect their mutation with a lock. Product-signal counters
         # (intra_task_acquire_release_total, stale_warning_*_total)
@@ -1072,8 +1075,11 @@ class CoordinatorHTTPServer:
         # agent will never post-edit. We can't cancel the future
         # without invasive cancel-token plumbing through service.write,
         # but we CAN detect it: every timed-out future gets a
-        # done_callback that bumps this counter + logs CRITICAL if the
-        # future eventually finished without exception. Operators see
+        # done_callback that bumps this counter if the future eventually
+        # finished without exception, and logs CRITICAL when it won
+        # ``abort_guard`` with the request's :class:`WatchdogAbort` first
+        # (#338) -- WARNING otherwise, since it then landed no guarded
+        # mutation. Operators see
         # the symptom via ``/status?detail=metrics`` even when the
         # cause is rare (4s deadline + 1.5s busy_timeout = real-world
         # only hits with a wedged SQLite or contended drive).
@@ -1742,8 +1748,12 @@ class CoordinatorHTTPServer:
         agent's knowledge, since the handler had already returned a
         degraded response. Operator-visible via
         ``/status?detail=metrics`` so a phantom-grant cluster is
-        diagnosable from a bug report."""
-        self._watchdog_late_completion_total += 1
+        diagnosable from a bug report. Counts every such completion, whether
+        or not it may have changed state the caller was not told about; the
+        log line says which (#338). REL-03: locked, as it is bumped from
+        concurrent pool threads."""
+        with self._reliability_counter_lock:
+            self._watchdog_late_completion_total += 1
 
     def increment_watchdog_late_abort(self) -> None:
         """A6: a watchdog-timed-out future aborted at the registry write lock
@@ -1753,8 +1763,10 @@ class CoordinatorHTTPServer:
         (#236, ``_AnswerEffects.defer``): no deny was recorded, though registry
         work the body did before deciding may have landed. Operator-visible via
         ``/status?detail=metrics`` so the abort rate is distinguishable from
-        the unmitigated ``watchdog_late_completion_total`` residual."""
-        self._watchdog_late_aborts_total += 1
+        the unmitigated ``watchdog_late_completion_total`` residual. REL-03:
+        locked, as it is bumped from concurrent pool threads."""
+        with self._reliability_counter_lock:
+            self._watchdog_late_aborts_total += 1
 
     def record_401(self) -> None:
         """P1 #6: bump ``auth_401_total`` and (deduped to once per 60s)
@@ -1911,9 +1923,12 @@ class CoordinatorHTTPServer:
 
         Either way we attach a done_callback for the residual: a future that
         slips past the abort window and completes successfully bumps
-        ``watchdog_late_completion_total`` + logs CRITICAL; one that aborts
-        cleanly bumps ``watchdog_late_aborts_total`` so operators can see the
-        mitigation working.
+        ``watchdog_late_completion_total``, and logs CRITICAL when it won
+        ``abort_guard`` with ``abort`` before the deadline (#338: it may then
+        have landed a guarded mutation the caller was not told about), WARNING
+        when it did not; one that aborts cleanly bumps
+        ``watchdog_late_aborts_total`` so operators can see the mitigation
+        working.
         """
         timeout = HANDLER_TIMEOUT_SEC if deadline is None else deadline - time.monotonic()
         if timeout <= 0:
@@ -1924,7 +1939,9 @@ class CoordinatorHTTPServer:
         except FuturesTimeout:
             if abort is not None:
                 abort.set()
-            future.add_done_callback(self._on_watchdog_future_done_after_timeout)
+            future.add_done_callback(
+                lambda done: self._on_watchdog_future_done_after_timeout(done, abort)
+            )
             raise
 
     def run_admission_lookup(self, fn: Callable[[], Any], *, deadline: float) -> Any:
@@ -1942,13 +1959,17 @@ class CoordinatorHTTPServer:
         future = self._watchdog.submit(fn)
         return future.result(timeout=max(0.0, deadline - time.monotonic()))
 
-    def _on_watchdog_future_done_after_timeout(self, future: Any) -> None:
+    def _on_watchdog_future_done_after_timeout(
+        self, future: Any, abort: threading.Event | None = None
+    ) -> None:
         """Callback wired by :meth:`run_with_watchdog` when its future
         timed out. Fires later (microseconds to many seconds) when the
         underlying work actually completes. We only count + log when
         the late completion produced state — i.e., the future finished
         without raising. A future that ultimately raised was a no-op
-        in the registry; nothing phantom there."""
+        in the registry; nothing phantom there. ``abort`` is the request's
+        token: the CRITICAL is for a body that won ``abort_guard`` with it
+        before the deadline, the rest log WARNING (#338)."""
         if future.cancelled():
             return
         try:
@@ -1965,16 +1986,43 @@ class CoordinatorHTTPServer:
             # Late failure — no phantom state landed in the registry.
             return
         self.increment_watchdog_late_completion()
+        if not _late_work_may_have_landed_a_guarded_mutation(abort):
+            logger.warning(
+                "watchdog late completion: a handler future timed out and its "
+                "work finished afterwards without winning the registry write "
+                "guard with its request's token, so it left no write grant "
+                "(M/E), commit, release, handoff, checkpoint record or snapshot "
+                "session the caller was not told about (a read grant or a "
+                "consumed notice may still have landed). Counter total now: %d.",
+                self._watchdog_late_completion_total,
+            )
+            return
         logger.critical(
-            "watchdog late completion: a handler future timed out but the "
-            "underlying work completed successfully afterwards. Any state "
-            "it mutated (e.g., an EXCLUSIVE grant) is in the registry "
-            "without the agent's knowledge. Check /status?detail=metrics "
-            "for watchdog_late_completion_total and consider running "
-            "agent-coherence-status --detail=full to inspect orphaned "
-            "M/E grants. Counter total now: %d.",
+            "watchdog late completion: a handler future timed out and its work "
+            "finished afterwards, having won the registry write guard before the "
+            "deadline. A mutation it made under that guard (a write grant, commit, "
+            "release, handoff, checkpoint record, principal bind or snapshot "
+            "session) may be in the registry without the caller's knowledge; a "
+            "refused or conflicting attempt lands nothing. Check "
+            "/status?detail=metrics for watchdog_late_completion_total and run "
+            "agent-coherence-status --detail=full to look for orphaned M/E "
+            "grants. Counter total now: %d.",
             self._watchdog_late_completion_total,
         )
+
+
+def _late_work_may_have_landed_a_guarded_mutation(abort: threading.Event | None) -> bool:
+    """Whether a watchdog-abandoned body that completed may have landed a
+    mutation under ``abort_guard`` with its request's ``abort`` (#338). Yes
+    when its :class:`WatchdogAbort` won the guard; no when it never did, or
+    when the body had no token to thread; cannot tell for a plain ``Event``,
+    which records nothing -- answered yes, so the CRITICAL errs toward
+    firing."""
+    if abort is None:
+        return False
+    if isinstance(abort, WatchdogAbort):
+        return abort.guard_won
+    return True
 
 
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -3555,7 +3603,7 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
     # envelope keeps clients reading result.get("ok") safe on timeout.
     # A6: abort threaded into invalidate/commit so a late post-edit aborts at
     # the registry lock instead of landing a phantom version bump/invalidation.
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(
         req, coordinator, work_with_handoff, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort
     )
@@ -3734,7 +3782,7 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
     # cross-host follow-on. v1's only obligation: the client must never
     # mistake a degraded CAS for success — hence _OCC_DEGRADED_RESPONSE
     # ({ok: false, …}), never _OK_DEGRADED_RESPONSE.
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(
         req, coordinator, work_with_handoff, degraded_response=_OCC_DEGRADED_RESPONSE, abort=abort
     )
@@ -3871,7 +3919,7 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     # envelope keeps clients reading result.get("ok") safe on timeout.
     # A6: abort threaded into the per-artifact invalidate so a late release
     # aborts before revoking a grant the registry handed to the next session.
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
 
 
@@ -3921,7 +3969,7 @@ def _handle_session_start(
     if subagent_id is not None:
         coordinator.register_session(session_id, subagent_id)
 
-    abort = threading.Event()
+    abort = WatchdogAbort()
 
     def work() -> dict:
         text, workspace_has_state = _build_session_start_context(
@@ -4942,7 +4990,7 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
 
     # A6 (#340): a begin answered degraded carries no token, so its late body
     # must not open a session; it aborts at the registry lock instead.
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
 
 
@@ -5170,7 +5218,7 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
 
     # Fail-closed degrade: a timed-out session.commit must NOT read as success
     # (mirror the OCC commit endpoint — a degraded commit is a definite reject).
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(req, coordinator, work, degraded_response=_OCC_DEGRADED_RESPONSE, abort=abort)
 
 
@@ -5320,7 +5368,7 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
 
     # Fail-closed degrade: a timed-out batch commit must NOT read as success —
     # same posture as /session/commit (a degraded commit is a definite reject).
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(req, coordinator, work, degraded_response=_OCC_DEGRADED_RESPONSE, abort=abort)
 
 
@@ -5431,7 +5479,7 @@ def _handle_principal_claim(req: _RequestProtocol, coordinator: CoordinatorHTTPS
             return _typed_reason_response(exc)
         return {"ok": True, "principal": principal}
 
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(
         req, coordinator, work, degraded_response=_PRINCIPAL_CLAIM_DEGRADED_RESPONSE, abort=abort
     )
@@ -5985,7 +6033,7 @@ def _handle_handoff_transfer(req: _RequestProtocol, coordinator: CoordinatorHTTP
                 entries[path] = _transfer_grant_entry(path, outcome)
         return _transfer_answer([entries[path] for path, _ in grants])
 
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(
         req, coordinator, work, degraded_response=_HANDOFF_TRANSFER_DEGRADED_RESPONSE, abort=abort
     )
@@ -6045,7 +6093,7 @@ def _settle_handoff(
             return {"ok": False, "reason": HANDOFF_NOT_LIVE_REASON}
         return _verb_body(settle(artifact_id=artifact_id, caller=caller, abort=abort))
 
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(req, coordinator, work, degraded_response=degraded_response, abort=abort)
 
 
@@ -6351,7 +6399,7 @@ def _handle_workspace_checkpoint(
     # Fail-closed degrade + abort threading (the A6 session-commit lesson):
     # a timed-out registration must NOT read as success, and the abort Event
     # fails the late write closed at the registry lock.
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(
         req, coordinator, work, degraded_response=_CHECKPOINT_DEGRADED_RESPONSE, abort=abort
     )
@@ -6541,7 +6589,7 @@ def _handle_workspace_restore_status(
             "coordinator_epoch": coordinator.registry.coordinator_epoch,
         }
 
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(
         req,
         coordinator,
@@ -6639,7 +6687,7 @@ def _handle_workspace_restore_member(
             "coordinator_epoch": coordinator.registry.coordinator_epoch,
         }
 
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(
         req,
         coordinator,
@@ -6789,7 +6837,7 @@ def _handle_workspace_restore_register(
             body["retry_of_own_registration"] = True
         return body
 
-    abort = threading.Event()
+    abort = WatchdogAbort()
     _run_or_degrade(
         req,
         coordinator,
@@ -7749,7 +7797,7 @@ class _AnswerEffects:
     deny is the answer sent."""
 
     def __init__(self) -> None:
-        self.abort = threading.Event()
+        self.abort = WatchdogAbort()
         self._queued: list[Callable[[], None]] = []
 
     def defer(self, record: Callable[[], None]) -> None:
@@ -8046,6 +8094,23 @@ def _build_preemption_text(
     return "\n".join(lines)
 
 
+@contextmanager
+def _abort_guard_without_mark(registry: Any, abort: threading.Event | None) -> Iterator[None]:
+    """``registry.abort_guard`` for a pass that reads or only consumes what it
+    returns: the registry lock held across it, failing closed with
+    :class:`WatchdogAbandoned` the instant the lock is won if the request
+    already timed out (A6) -- but without marking ``abort`` as having won the
+    guard, which tells the watchdog the late body may have landed a mutation
+    the caller was not told about (#338)."""
+    with registry.abort_guard():
+        if abort is not None and abort.is_set():
+            raise WatchdogAbandoned(
+                "handler watchdog timed out before this pass ran; "
+                "aborting before it touches the registry (A6)."
+            )
+        yield
+
+
 def _build_session_start_context(
     coordinator: CoordinatorHTTPServer,
     session_id: str,
@@ -8085,7 +8150,10 @@ def _build_session_start_context(
     # registry lock so the two locks never nest in names→registry order.
     agents = coordinator.agents_for_session(session_id)
 
-    with coordinator.registry.abort_guard(abort):
+    # The pass only reads, so winning the guard must not mark the request as
+    # having landed a guarded mutation (#338), while a doomed request still
+    # fails closed the instant it wins the lock (A6).
+    with _abort_guard_without_mark(coordinator.registry, abort):
         # Scoped to THIS session's agents (SB-10 review): the walk below can
         # only render rows belonging to `agents`, this runs on a hook path
         # twice per compaction, and nothing garbage-collects `agent_states` —
@@ -8321,7 +8389,7 @@ def _fast_path_json(
     payload nobody will read; a zombie that already won the pop forfeits
     the delivery (R2 permits at-most-once → zero)."""
     if coordinator.has_compact_pending(session_id):
-        abort = threading.Event()
+        abort = WatchdogAbort()
 
         def deliver() -> dict:
             return _deliver_pending_reground(

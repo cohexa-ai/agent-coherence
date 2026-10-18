@@ -488,6 +488,34 @@ def transfer_record_live(record: TransferRecord, current_version: int) -> bool:
     )
 
 
+class WatchdogAbort(Event):
+    """A hook request's watchdog abort token that also records whether the
+    request's work won ``abort_guard`` with it (#338).
+
+    Every mutation a hook body makes that can leave state the caller was not
+    told about (a ``service.write``, ``commit``, ``invalidate``, ``transfer``
+    and the rest) runs under ``abort_guard`` with this token. A body that won
+    that guard before its deadline and then outlived the deadline MAY have left
+    that mutation in the registry without the caller's knowledge (a refused or
+    conflicting attempt wins the guard and lands nothing); one that never won
+    it landed no guarded mutation. ``guard_won`` is how the watchdog tells the
+    two apart when the body finishes late. It is set on the body's own thread
+    before the body returns, so the done-callback, which runs once the future
+    has completed, reads it settled."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.guard_won = False
+
+
+def note_guard_won(abort: Event | None) -> None:
+    """Record on ``abort`` that ``abort_guard`` admitted the caller with it:
+    the abort was not set when the guard won the registry lock (#338). Only a
+    :class:`WatchdogAbort` records it; a plain ``Event`` carries no record."""
+    if isinstance(abort, WatchdogAbort):
+        abort.guard_won = True
+
+
 def acquire_by_deadline(lock: Any, deadline: float | None) -> None:
     """Take the registry ``lock`` for ``abort_guard``, waiting at most until
     ``deadline`` (#238): a :func:`time.monotonic` instant past which this raises

@@ -148,6 +148,7 @@ from .registry_protocol import (
     UncoverableRun,
     acquire_by_deadline,
     decide_transfer_grant,
+    note_guard_won,
     require_storable_transfer_status,
     transfer_record_live,
 )
@@ -1127,6 +1128,7 @@ class SqliteArtifactRegistry:
                     "handler watchdog timed out while this mutation was blocked "
                     "on the registry write lock; aborting before it lands (A6)."
                 )
+            note_guard_won(abort)
             yield
         finally:
             self._lock.release()

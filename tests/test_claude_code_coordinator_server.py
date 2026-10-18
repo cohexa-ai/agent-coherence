@@ -3553,7 +3553,8 @@ def test_p1_5_watchdog_late_completion_increments_counter(
 ) -> None:
     """When run_with_watchdog times out and the underlying future
     later completes successfully, the late-completion counter must
-    increment and a CRITICAL log line fires."""
+    increment (the log line is CRITICAL only when the body won its
+    request's abort guard, #338; this one has no token)."""
     import threading as _t
     from concurrent.futures import TimeoutError as _FuturesTimeout
 
@@ -14728,3 +14729,261 @@ def test_a_timed_out_session_begin_opens_no_session_its_caller_cannot_use(
     assert coordinator._watchdog_late_aborts_total == aborts_before + 1
     assert coordinator._watchdog_late_completion_total == completions_before
     assert _late_completion_criticals(caplog) == 0
+
+
+# ----------------------------------------------------------------------
+# #338 -- a late completion is CRITICAL only when it took the request's guard
+# ----------------------------------------------------------------------
+#
+# The watchdog's done-callback logs CRITICAL about orphaned M/E grants when a
+# timed-out body returns normally. Every mutation that can leave an M/E grant
+# behind runs under ``abort_guard`` with the request's abort token, so a late
+# body that never won that guard with its token landed none: it is still
+# counted in ``watchdog_late_completion_total`` (the pool slot outlived the
+# answer), but logged at WARNING, not as a phantom-grant alarm.
+
+
+def _late_completion_warnings(caplog: pytest.LogCaptureFixture) -> int:
+    return sum(
+        1 for record in caplog.records
+        if record.levelno == logging.WARNING and "late completion" in record.getMessage()
+    )
+
+
+def _late_pre_read(coordinator: CoordinatorHTTPServer, client: _Client,
+                   monkeypatch: pytest.MonkeyPatch) -> tuple[Callable[[], tuple[int, dict]], _DelayedCall, Callable[[], None]]:
+    """A new session's pre-read of ``plan.md`` whose bytes are current: its late
+    body grants SHARED (a read grant, under a guard that takes no token)."""
+    current = {"path": "plan.md", "content_hash": _hash("plan v1")}
+    first = _claimed(client)
+    status, _ = client.post(
+        "/hooks/pre-read", {"session_id": first.sid, **current}, principal=first.principal)
+    assert status == 200
+    late = _claimed(client)
+    late_agent = session_to_agent_id(late.sid, None)
+    delayed = _DelayedCall(
+        monkeypatch, coordinator.service, "record_heartbeat",
+        lambda *a, **kw: kw.get("agent_id") == late_agent,
+    )
+
+    def landed() -> None:
+        # The late body ran to its end: the SHARED grant it makes landed.
+        assert _agent_state_on(coordinator, "plan.md", late.sid) == MESIState.SHARED
+
+    return (lambda: client.post(
+        "/hooks/pre-read", {"session_id": late.sid, **current}, principal=late.principal)
+    ), delayed, landed
+
+
+def _late_effect_fence(coordinator: CoordinatorHTTPServer, client: _Client,
+                       monkeypatch: pytest.MonkeyPatch) -> tuple[Callable[[], tuple[int, dict]], _DelayedCall, Callable[[], None]]:
+    """An effect-fence verdict: it reads the registry and writes nothing."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    who = _claimed(client)
+    seen = _read(client, who, "plan.md")
+    delayed = _DelayedCall(monkeypatch, mod, "_effect_fence_verdict", lambda *a, **kw: True)
+    request = {
+        "session_id": who.sid, "path": "plan.md", "expected_version": seen["version"],
+        "expected_generation": None, "content_hash": _hash("x"),
+    }
+    return (lambda: client.post("/hooks/effect-fence", request, principal=who.principal)), delayed, lambda: None
+
+
+def _late_checkpoint_list(coordinator: CoordinatorHTTPServer, client: _Client,
+                          monkeypatch: pytest.MonkeyPatch) -> tuple[Callable[[], tuple[int, dict]], _DelayedCall, Callable[[], None]]:
+    """``GET /workspace/checkpoints``: a list, no write."""
+    delayed = _DelayedCall(monkeypatch, coordinator.registry, "list_checkpoints", lambda *a, **kw: True)
+    return (lambda: client.get("/workspace/checkpoints")), delayed, lambda: None
+
+
+def _late_session_start(coordinator: CoordinatorHTTPServer, client: _Client,
+                        monkeypatch: pytest.MonkeyPatch) -> tuple[Callable[[], tuple[int, dict]], _DelayedCall, Callable[[], None]]:
+    """A session-start whose re-grounding read won the registry lock before the
+    deadline and ran past it: the registry pass only reads (the late body still
+    arms compact-pending, a separate late effect)."""
+    who = _claimed(client)
+    _read(client, who, "plan.md")
+    delayed = _DelayedCall(monkeypatch, coordinator.registry, "status_snapshot", lambda *a, **kw: True)
+    return (lambda: client.post(
+        "/hooks/session-start", {"session_id": who.sid}, principal=who.principal)
+    ), delayed, lambda: None
+
+
+@pytest.mark.parametrize(
+    "late_request",
+    [_late_pre_read, _late_effect_fence, _late_checkpoint_list, _late_session_start],
+    ids=["pre-read", "effect-fence", "checkpoint-list", "session-start"])
+def test_a_late_body_that_took_no_guarded_write_is_not_reported_as_an_orphaned_grant(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, late_request: Callable[..., Any],
+) -> None:
+    """#338: a body that finishes after its request timed out, having taken no
+    write under the request's abort guard, left no M/E grant behind. It is
+    counted as a late completion, and logged at WARNING; the CRITICAL that sends
+    an operator looking for orphaned M/E grants is not logged. Before, every
+    late return logged it, so a late read, fence verdict or checkpoint list
+    raised an alarm about grants that did not exist."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    send, delayed, landed = late_request(coordinator, client, monkeypatch)
+    caplog.set_level(logging.WARNING, logger=mod.__name__)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+    status, body = send()
+    assert delayed.entered.is_set(), "the late request's work body never started"
+    delayed.release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1, (
+        "the request did not time out, so this measured the undegraded route")
+    assert status == 200, body
+    assert coordinator._watchdog_late_completion_total == completions_before + 1
+    assert coordinator._watchdog_late_aborts_total == aborts_before
+    landed()
+    assert _late_completion_criticals(caplog) == 0, (
+        "a late body that took no guarded write was reported as orphaning M/E grants")
+    assert _late_completion_warnings(caplog) == 1
+
+
+def test_a_late_pre_edit_whose_grant_landed_is_still_reported_as_an_orphaned_grant(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#338, the case the CRITICAL exists for: a pre-edit whose EXCLUSIVE grant
+    landed before the deadline, and whose body then ran past it, left a grant
+    the caller was never told about. It is still logged CRITICAL."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    editor = _claimed(client)
+    _read(client, editor, "plan.md")
+    editor_agent = session_to_agent_id(editor.sid, None)
+    # The body's first registry call after its acquire: the grant has landed.
+    delayed = _DelayedCall(
+        monkeypatch, coordinator.registry, "pop_pending_notices",
+        lambda *a, **kw: a[0] == editor_agent,
+    )
+    caplog.set_level(logging.WARNING, logger=mod.__name__)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": editor.sid, "path": "plan.md"}, principal=editor.principal)
+    assert delayed.entered.is_set(), "the pre-edit body never reached its acquire"
+    delayed.release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    assert status == 200 and body.get("degraded") is True, body
+    assert _agent_state_on(coordinator, "plan.md", editor.sid) == MESIState.EXCLUSIVE
+    assert coordinator._watchdog_late_completion_total == completions_before + 1
+    assert _late_completion_criticals(caplog) == 1
+    assert _late_completion_warnings(caplog) == 0
+
+
+@pytest.mark.parametrize("registry_kind", ["memory", "sqlite"])
+@pytest.mark.parametrize("took_guard", [True, False], ids=["took-guard", "no-guard"])
+def test_a_late_completion_is_critical_exactly_when_it_took_the_requests_guard(
+    coordinator, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch, registry_kind: str, took_guard: bool,
+) -> None:
+    """#338 on either registry: the watchdog reports a late completion as an
+    orphaned grant only when the body won ``abort_guard`` with the request's
+    own abort token before the deadline."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+    from ccs.coordinator.registry import ArtifactRegistry
+    from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+
+    registry: Any = (
+        ArtifactRegistry() if registry_kind == "memory"
+        else SqliteArtifactRegistry(tmp_path / "guard.db")
+    )
+    effects = mod._AnswerEffects()
+    release = threading.Event()
+
+    def work() -> dict:
+        if took_guard:
+            with registry.abort_guard(effects.abort):
+                pass
+        release.wait(timeout=5.0)
+        return {"ok": True}
+
+    caplog.set_level(logging.WARNING, logger=mod.__name__)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    completions_before = coordinator._watchdog_late_completion_total
+    try:
+        with pytest.raises(FuturesTimeout):
+            coordinator.run_with_watchdog(work, abort=effects.abort)
+        release.set()
+        _await_abandoned_body_settled(
+            coordinator, aborts_before=coordinator._watchdog_late_aborts_total,
+            completions_before=completions_before)
+    finally:
+        release.set()
+        if registry_kind == "sqlite":
+            registry.close()
+
+    assert _late_completion_criticals(caplog) == (1 if took_guard else 0)
+    assert _late_completion_warnings(caplog) == (0 if took_guard else 1)
+
+
+@pytest.mark.parametrize(
+    "bump", ["increment_watchdog_late_completion", "increment_watchdog_late_abort"])
+def test_the_late_watchdog_counters_count_under_the_timeout_counters_lock(
+    coordinator, bump: str,
+) -> None:
+    """#338: the late-completion and late-abort counters are bumped from pool
+    threads, concurrently; they take the lock ``watchdog_timeouts_total`` takes
+    (REL-03), so a free-threaded build does not tear them."""
+    counted = threading.Event()
+
+    def count() -> None:
+        getattr(coordinator, bump)()
+        counted.set()
+
+    with coordinator._reliability_counter_lock:
+        threading.Thread(target=count, daemon=True).start()
+        assert not counted.wait(0.2), f"{bump} counted without the reliability counter lock"
+    assert counted.wait(5.0), f"{bump} never counted once the lock was free"
+
+
+def test_a_late_completion_whose_token_records_nothing_is_still_critical(
+    coordinator, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#338, the cannot-tell case: a plain ``threading.Event`` token records
+    nothing about the guard, so a late completion under it cannot be shown to
+    have landed no mutation and is still logged CRITICAL."""
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    abort = threading.Event()
+    release = threading.Event()
+
+    def work() -> dict:
+        release.wait(timeout=5.0)
+        return {"ok": True}
+
+    caplog.set_level(logging.WARNING, logger=mod.__name__)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    completions_before = coordinator._watchdog_late_completion_total
+    try:
+        with pytest.raises(FuturesTimeout):
+            coordinator.run_with_watchdog(work, abort=abort)
+        release.set()
+        _await_abandoned_body_settled(
+            coordinator, aborts_before=coordinator._watchdog_late_aborts_total,
+            completions_before=completions_before)
+    finally:
+        release.set()
+
+    assert coordinator._watchdog_late_completion_total == completions_before + 1
+    assert _late_completion_criticals(caplog) == 1
+    assert _late_completion_warnings(caplog) == 0
