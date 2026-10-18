@@ -44,9 +44,9 @@ The follow-up-read stub (:class:`_FollowUpReadRegistry`) gives the two
 refusal-pair races their teeth. It decides every refusal on the right snapshot,
 then re-reads the owner leg alone, or both legs, after a 0.5 ms window at one
 entry point. The sequential scenarios cannot see that; the race for its entry
-point MUST FAIL it as an R2 violation. A starving stub
+point MUST FAIL it as a snapshot violation. A starving stub
 (:class:`_StarvedMutatorRegistry`) keeps a race's mutator from running beside
-its actor, and the race MUST FAIL it as starved, not as an R2 violation.
+its actor, and the race MUST FAIL it as starved, not as a snapshot violation.
 """
 
 from __future__ import annotations
@@ -611,9 +611,9 @@ _ENTRY_IN_MESSAGE = {
 @pytest.mark.parametrize("legs", [_OWNER_LEG, _BOTH_LEGS])
 @pytest.mark.parametrize("entry", [_CAS, _BATCH, _FENCE])
 def test_follow_up_read_stub_fails_its_race(entry: str, legs: str) -> None:
-    """THE TEETH for R2. A binding that refuses correctly but reads the pair
-    after the decision MUST FAIL the race for its entry point (D-ext for the
-    two commit routes, E for the fenced persist), as an R2 violation naming
+    """THE TEETH for the snapshot rule. A binding that refuses correctly but reads the pair
+    after the decision MUST FAIL the race for its entry point (the commit race for the
+    two commit routes, the fence race for the fenced persist), as a snapshot violation naming
     that entry point, never as a starved run."""
     factory: RegistryFactory = _OneStoreFactory(partial(_FollowUpReadRegistry, entry, legs))  # type: ignore[arg-type]
     with pytest.raises(AssertionError) as excinfo:
@@ -640,8 +640,8 @@ def test_follow_up_read_stub_passes_the_sequential_pair_scenarios() -> None:
 
 # The thread each race's actor runs in, by the name of its mutator's thread.
 _ACTOR_OF_MUTATOR = {
-    kit.D_EXT_MUTATOR_THREAD: kit.D_EXT_COMMITTER_THREAD,
-    kit.E_MUTATOR_THREAD: kit.E_ZOMBIE_THREAD,
+    kit.COMMIT_RACE_MUTATOR_THREAD: kit.COMMIT_RACE_COMMITTER_THREAD,
+    kit.FENCE_RACE_MUTATOR_THREAD: kit.FENCE_RACE_ZOMBIE_THREAD,
 }
 
 
@@ -664,11 +664,11 @@ class _StarvedMutatorRegistry:
         self._inner.set_agent_state(*args, **kwargs)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("race", [_CAS, _FENCE], ids=["d_ext", "e"])
-def test_starved_race_fails_as_starved_not_as_an_r2_violation(race: str) -> None:
+@pytest.mark.parametrize("race", [_CAS, _FENCE], ids=["commit_race", "fence_race"])
+def test_starved_race_fails_as_starved_not_as_a_snapshot_violation(race: str) -> None:
     """A run whose mutator never ran beside the actor proves nothing, so it
     must FAIL rather than pass, and with its own message: a correct backend
-    reported as an R2 violation would send its author after a bug it does not
+    reported as a snapshot violation would send its author after a bug it does not
     have."""
     with pytest.raises(AssertionError) as excinfo:
         _RACES[race](_OneStoreFactory(_StarvedMutatorRegistry))

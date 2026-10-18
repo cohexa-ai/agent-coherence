@@ -36,15 +36,15 @@ what the reason implies: only ``stale_read_generation`` implies
 
 Two races then check that the pair comes from the decision snapshot while the
 state it was read from keeps moving, which no sequential scenario can see:
-:func:`assert_commit_refusal_pairs_come_from_the_decision_snapshot` (D-ext, both
+:func:`assert_commit_refusal_pairs_come_from_the_decision_snapshot` (the commit race, both
 commit routes) and
-:func:`assert_fenced_persist_raise_pair_comes_from_the_decision_snapshot` (E, the
+:func:`assert_fenced_persist_raise_pair_comes_from_the_decision_snapshot` (the fence race, the
 fenced persist). This widens the kit further. An earlier decision kept
 concurrent arbitration races out of it (``tests/test_registry_lock_coverage.py``
 holds those), so as not to widen what it certifies for an outside backend; these
 two are in it because a binding that reads the pair in a second step after
 deciding passes every sequential check. Each race fails a starved run, one that covered too few
-decision states to prove anything, with its own message, never as an R2
+decision states to prove anything, with its own message, never as a snapshot
 violation.
 
 **BACKEND-DEFINED** (``assert_declared_*`` functions taking a
@@ -1151,7 +1151,7 @@ def assert_fenced_persist_raise_carries_the_generation_pair(factory: RegistryFac
 
 
 # ---------------------------------------------------------------------------
-# The refusal-pair races (R2): the pair comes from the decision snapshot even
+# The refusal-pair races: the pair comes from the decision snapshot even
 # while the state it was read from keeps moving. The sequential scenarios above
 # cannot see a binding that decides correctly and then reads the pair again.
 # ---------------------------------------------------------------------------
@@ -1162,13 +1162,13 @@ _RACE_SWITCH_INTERVAL = 1e-6
 
 # The races name their threads. A teeth stub that starves the mutator finds the
 # thread it must wait for by these names.
-D_EXT_COMMITTER_THREAD = "d-ext-committer"
-D_EXT_MUTATOR_THREAD = "d-ext-mutator"
-E_ZOMBIE_THREAD = "e-zombie"
-E_MUTATOR_THREAD = "e-mutator"
+COMMIT_RACE_COMMITTER_THREAD = "commit-race-committer"
+COMMIT_RACE_MUTATOR_THREAD = "commit-race-mutator"
+FENCE_RACE_ZOMBIE_THREAD = "fence-race-zombie"
+FENCE_RACE_MUTATOR_THREAD = "fence-race-mutator"
 
-_D_EXT_ATTEMPTS = 400
-_E_ATTEMPTS = 1000
+_COMMIT_RACE_ATTEMPTS = 400
+_FENCE_RACE_ATTEMPTS = 1000
 _MUTATOR_ROUND_CAP = 100_000
 
 # Below this many distinct decision snapshots the mutator barely ran while the
@@ -1276,7 +1276,7 @@ def _join_with_fine_switching(*threads: threading.Thread) -> None:
 
 
 def _assert_race_outcome(race: _Race) -> None:
-    """An R2 violation first: a wrong pair is evidence however few states the
+    """A snapshot violation first: a wrong pair is evidence however few states the
     run covered. Only a clean run is judged on coverage."""
     tally = race.tally
     if tally.violations:
@@ -1291,13 +1291,13 @@ def _assert_race_outcome(race: _Race) -> None:
             f"{race.name} {STARVED_RACE}: in {race.attempts * _ATTEMPT_CAP_FACTOR} "
             f"attempts its refusals landed on only {len(tally.snapshots)} distinct "
             f"decision snapshots (floor {MIN_DISTINCT_SNAPSHOTS}). The mutator "
-            "barely ran while the actor did, so this run proved nothing about R2 "
-            "either way; it is not an R2 violation. Rerun it on a less loaded runner"
+            "barely ran while the actor did, so this run proved nothing about the pair's "
+            "snapshot either way; it is not a snapshot violation. Rerun it on a less loaded runner"
         )
 
 
-def _d_ext_problem(reason: str, expected: int, current: int, pair: tuple[int | None, int | None]) -> str | None:
-    """What makes one D-ext refusal impossible for a decision taken on a state
+def _commit_race_problem(reason: str, expected: int, current: int, pair: tuple[int | None, int | None]) -> str | None:
+    """What makes one commit-race refusal impossible for a decision taken on a state
     the schedule passes through, or ``None``."""
     captured, owner = pair
     if captured is None or owner is None:
@@ -1316,13 +1316,13 @@ def _d_ext_problem(reason: str, expected: int, current: int, pair: tuple[int | N
     return None
 
 
-class _DExtRace:
-    """The D-ext race's two artifacts, three agents and true state. See
+class _CommitRace:
+    """The commit race's two artifacts, three agents and true state. See
     :func:`assert_commit_refusal_pairs_come_from_the_decision_snapshot`."""
 
-    name = "D-ext"
-    attempts = _D_EXT_ATTEMPTS
-    thread_names = (D_EXT_COMMITTER_THREAD, D_EXT_MUTATOR_THREAD)
+    name = "commit race"
+    attempts = _COMMIT_RACE_ATTEMPTS
+    thread_names = (COMMIT_RACE_COMMITTER_THREAD, COMMIT_RACE_MUTATOR_THREAD)
 
     def __init__(self, reg: object) -> None:
         self.reg = reg
@@ -1365,7 +1365,7 @@ class _DExtRace:
 
     def _recheck(self, round_index: int) -> None:
         # Single-value accessors, so a backend whose transitions differ fails
-        # here as a precondition rather than as a phantom R2 violation.
+        # here as a precondition rather than as a phantom snapshot violation.
         for artifact_id in self.artifacts:
             version, owner = self.truth[artifact_id]
             seen = (
@@ -1418,7 +1418,7 @@ class _DExtRace:
         artifact_id, expected = target
         pair = _pair_on(detail)
         self.tally.snapshots.add((artifact_id, detail.current_version, *pair))
-        problem = _d_ext_problem(detail.reason, expected, detail.current_version, pair)
+        problem = _commit_race_problem(detail.reason, expected, detail.current_version, pair)
         if problem is not None:
             self.tally.violations.append(
                 f"{entry}'s {detail.reason} refusal at expected_version={expected} "
@@ -1428,7 +1428,7 @@ class _DExtRace:
 
 
 def assert_commit_refusal_pairs_come_from_the_decision_snapshot(factory: RegistryFactory) -> None:
-    """Refusal pair under concurrency — the D-ext race (MUST-MATCH). R2: the
+    """Refusal pair under concurrency — the commit race (MUST-MATCH). The
     pair a refusal carries comes from the snapshot that decided it, never from
     a later read, on ``commit_cas`` and per ``commit_all`` member.
 
@@ -1457,26 +1457,26 @@ def assert_commit_refusal_pairs_come_from_the_decision_snapshot(factory: Registr
     One departure from the kit's usual concurrency pattern: both threads share
     ONE store handle. A second SQLite handle for the mutator flakes with
     ``database is locked`` at this write rate, which would fail the race for a
-    reason that is not R2.
+    reason unrelated to the pair's snapshot.
 
     A starved run, whose refusals landed on fewer than
     :data:`MIN_DISTINCT_SNAPSHOTS` distinct decision snapshots, fails with its
-    own message rather than as an R2 violation: the mutator barely ran, so the
+    own message rather than as a snapshot violation: the mutator barely ran, so the
     run proved nothing either way."""
-    race = _DExtRace(factory())
+    race = _CommitRace(factory())
     # One sequential round first: the committer then holds a superseded claim,
     # and its first commit, expecting version 1, is refused.
     race.advance(0)
     _run_race(race)
 
 
-class _ERace:
-    """The E race's artifact, two agents and true owner generation. See
+class _FenceRace:
+    """The fence race's artifact, two agents and true owner generation. See
     :func:`assert_fenced_persist_raise_pair_comes_from_the_decision_snapshot`."""
 
-    name = "E"
-    attempts = _E_ATTEMPTS
-    thread_names = (E_ZOMBIE_THREAD, E_MUTATOR_THREAD)
+    name = "fence race"
+    attempts = _FENCE_RACE_ATTEMPTS
+    thread_names = (FENCE_RACE_ZOMBIE_THREAD, FENCE_RACE_MUTATOR_THREAD)
 
     def __init__(self, reg: object) -> None:
         self.reg = reg
@@ -1537,7 +1537,7 @@ class _ERace:
 
 
 def assert_fenced_persist_raise_pair_comes_from_the_decision_snapshot(factory: RegistryFactory) -> None:
-    """Refusal pair under concurrency — the E race (MUST-MATCH). R2 at the
+    """Refusal pair under concurrency — the fence race (MUST-MATCH). At the
     fenced persist: the :class:`StaleReadGeneration` raised by
     ``set_artifact_and_content(fence_agent_id=...)`` carries the two values the
     fence compared, never a later read of them.
@@ -1550,7 +1550,7 @@ def assert_fenced_persist_raise_pair_comes_from_the_decision_snapshot(factory: R
     the decision reports 0 once the zombie's next read has landed, or 2 or more
     once the next reclaim has. One store handle, and the starved-run floor, as
     in :func:`assert_commit_refusal_pairs_come_from_the_decision_snapshot`."""
-    _run_race(_ERace(factory()))
+    _run_race(_FenceRace(factory()))
 
 
 def assert_session_fail_closed_on_foreign_and_reaped(factory: RegistryFactory) -> None:

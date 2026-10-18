@@ -627,7 +627,7 @@ def run_park_after_ack(
     if not hasattr(signal, "SIGSTOP"):
         raise HarnessFailure(
             f"park primitive unavailable on this platform (no SIGSTOP); declare "
-            f"an R-8 exemption instead of running the case (os.name={os.name!r})"
+            f"an exemption instead of running the case (os.name={os.name!r})"
         )
     ctx = multiprocessing.get_context("spawn")
     queue = ctx.Queue()
