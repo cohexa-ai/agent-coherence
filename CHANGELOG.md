@@ -6,6 +6,16 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- **`tools/run_local_tests.py` runs the test suite locally the way CI does,
+  from the main checkout or any git worktree.** It uses the main checkout's
+  virtual environment, keeps bytecode caches on, and runs the parallel tests
+  and then the `serial` tests without collecting the suite twice. Full runs
+  from different worktrees take turns instead of competing for the machine.
+  `CONTRIBUTING.md` describes it. This is contributor tooling; the package is
+  unchanged.
+
 ### Changed
 
 - **The MCP Registry lists the `stale-write-guard-fs` server as
