@@ -139,6 +139,12 @@ def test_an_unknown_option_followed_by_a_path_must_be_written_with_an_equals_sig
         runner.split_args(["--some-plugin-option", "tests/test_x.py"])
 
 
+def test_bundled_short_flags_are_flags_not_unknown_options() -> None:
+    args = runner.split_args(["-xvs", "tests/test_x.py"])
+    assert args.paths == ("tests/test_x.py",)
+    assert not runner.should_run_serial(1, runner.split_args(["-xv"]))
+
+
 def test_narrowing_options_are_named_so_the_summary_can_report_them() -> None:
     assert runner.split_args(["-k", "foo", "--lf", "-x"]).narrowing() == ["-k", "--lf"]
 

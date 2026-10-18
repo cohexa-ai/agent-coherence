@@ -68,6 +68,7 @@ REFUSED = frozenset(
 WORKER_OPTIONS = frozenset({"-n", "--numprocesses", "--dist"})
 NARROWING = ("-k", "--lf", "--last-failed", "--deselect", "--ignore", "--ignore-glob", "--sw", "--stepwise")
 STOP_EARLY = frozenset({"-x", "--exitfirst", "--maxfail"})
+BUNDLE_LETTERS = frozenset("xvsql")  # short flags that may be bundled, as in -xvs
 
 
 class Refused(Exception):
@@ -90,7 +91,7 @@ class Args:
         return not self.paths
 
     def names(self) -> List[str]:
-        return [option.name for option in self.options]
+        return [name for option in self.options for name in _unbundle(option.name)]
 
     def option_tokens(self, drop: frozenset = frozenset()) -> List[str]:
         return [token for option in self.options if option.name not in drop for token in option.tokens]
@@ -107,6 +108,12 @@ class Roots:
 
 
 # --- arguments --------------------------------------------------------------
+
+
+def _unbundle(name: str) -> List[str]:
+    if len(name) > 2 and name[1] != "-" and BUNDLE_LETTERS.issuperset(name[1:]):
+        return [f"-{letter}" for letter in name[1:]]
+    return [name]
 
 
 def _option_name(token: str) -> str:
@@ -128,7 +135,8 @@ def _take_option(argv: Sequence[str], index: int) -> Tuple[Option, int]:
         raise Refused(f"{name} changes which tests CI's lanes select or a setting this command owns; use plain pytest")
     if name in VALUE_OPTIONS and token == name and index + 1 < len(argv):
         return Option(name, (token, argv[index + 1])), index + 2
-    unknown = name not in VALUE_OPTIONS and name not in FLAG_OPTIONS and "=" not in token
+    known = name in VALUE_OPTIONS or name in FLAG_OPTIONS or _unbundle(name) != [name]
+    unknown = not known and "=" not in token
     if unknown and index + 1 < len(argv) and _looks_like_path(argv[index + 1]):
         raise Refused(f"write {name} as {name}=value so its value is not read as a test path, or use plain pytest")
     return Option(name, (token,)), index + 1
