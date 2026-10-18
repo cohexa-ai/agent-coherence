@@ -14987,3 +14987,278 @@ def test_a_late_completion_whose_token_records_nothing_is_still_critical(
     assert coordinator._watchdog_late_completion_total == completions_before + 1
     assert _late_completion_criticals(caplog) == 1
     assert _late_completion_warnings(caplog) == 0
+
+
+# ----------------------------------------------------------------------
+# #339 -- a timed-out hook leaves the caller's preemption notices queued
+#
+# A pending preemption notice is delivered once: the hook that pops it
+# deletes it. A hook answered on a watchdog timeout is answered without its
+# work body, and the body keeps running. A pop it then makes deletes notices
+# the caller was never sent, and no later hook can deliver them. These tests
+# drive the REAL watchdog, let the body run on after the degraded answer, and
+# check that the notice is still queued and that the session's next hook,
+# answered in time, delivers it. Each first answers the same request in time
+# for another session as the control: that request does deliver and consume
+# its notice, so a body that skipped its pop for another reason would fail
+# the control instead of passing the check.
+# ----------------------------------------------------------------------
+
+
+def _queue_notice(coordinator: CoordinatorHTTPServer, who: _Session) -> tuple[uuid.UUID, str]:
+    """Queue one preemption notice for ``who`` on ``plan.md``. Returns the
+    artifact id and the short preempter id the notice's prose names."""
+    artifact_id = coordinator.registry.resolve_or_register("plan.md", content_hash=_hash("v1"))
+    preempter = uuid.uuid4()
+    coordinator.registry.record_preemption_notice(
+        victim_agent_id=session_to_agent_id(who.sid), artifact_id=artifact_id,
+        preempter_agent_id=preempter, preempted_at_unix_ts=time.time(),
+    )
+    return artifact_id, preempter.hex[:8]
+
+
+def _notice_queued(coordinator: CoordinatorHTTPServer, who: _Session, artifact_id: uuid.UUID) -> bool:
+    return coordinator.registry.peek_preemption_notice(
+        session_to_agent_id(who.sid), artifact_id) is not None
+
+
+def _plan_sessions(client: _Client, state: str) -> tuple[_Session, _Session]:
+    """A control session and a late one, both stale on ``plan.md``, both fresh
+    readers of it, or merely claimed."""
+    if state == "stale":
+        control, late = _stale_readers(client, 2)
+        return control, late
+    control, late = _claimed(client), _claimed(client)
+    if state == "fresh":
+        for who in (control, late):
+            status, _ = client.post(
+                "/hooks/pre-read",
+                {"session_id": who.sid, "path": "plan.md", "content_hash": _hash("v1")},
+                principal=who.principal)
+            assert status == 200
+    return control, late
+
+
+# Every arm whose work body pops the caller's notices before it answers.
+# Pre-edit and post-edit pop after a registry mutation; they are below.
+_NOTICE_DRAINING_ARMS: dict[str, tuple[str, str, dict]] = {
+    "session-stop": ("session-stop", "claimed", {}),
+    "pre-read-warn": ("pre-read", "stale", {"path": "plan.md", "content_hash": _hash("v1")}),
+    "pre-read-fresh": ("pre-read", "fresh", {"path": "plan.md", "content_hash": _hash("v1")}),
+    "pre-bash": ("pre-bash", "fresh", {"command": "cat plan.md"}),
+    "pre-grep": ("pre-grep", "fresh", {"search_root": ""}),
+}
+
+
+def _answer_late(
+    coordinator: CoordinatorHTTPServer, client: _Client, who: _Session, route: str,
+    request: dict, release: Any,
+) -> tuple[int, dict]:
+    """Send ``request`` while ``who``'s work body is held, answer it on the
+    watchdog's degraded path, then let the body finish."""
+    timeouts_before = coordinator._watchdog_timeouts_total
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+    status, body = client.post(
+        f"/hooks/{route}", {"session_id": who.sid, **request}, principal=who.principal)
+    release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1, (
+        "the request did not time out, so this measured the undegraded route")
+    assert status == 200 and body.get("degraded") is True, body
+    return status, body
+
+
+@pytest.mark.parametrize("arm", sorted(_NOTICE_DRAINING_ARMS))
+def test_a_timed_out_hook_leaves_the_callers_notices_for_its_next_hook(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, arm: str,
+) -> None:
+    """#339: a hook whose body finishes after its request timed out does not
+    consume the caller's pending preemption notices. The caller got the
+    degraded answer, which carries none of them, so the notice stays queued
+    and the session's next hook delivers it."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    route, state, request = _NOTICE_DRAINING_ARMS[arm]
+    control, late = _plan_sessions(client, state)
+    artifact_id, preempter = _queue_notice(coordinator, control)
+    status, body = client.post(
+        f"/hooks/{route}", {"session_id": control.sid, **request}, principal=control.principal)
+    assert status == 200 and preempter in json.dumps(body), body
+    assert not _notice_queued(coordinator, control, artifact_id), "the control did not consume"
+
+    artifact_id, preempter = _queue_notice(coordinator, late)
+    late_agent = session_to_agent_id(late.sid, None)
+    delayed = _DelayedCall(
+        monkeypatch, coordinator.service, "record_heartbeat",
+        lambda *a, **kw: kw.get("agent_id") == late_agent,
+    )
+    handler_timeout = mod.HANDLER_TIMEOUT_SEC
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    _, body = _answer_late(coordinator, client, late, route, request, delayed.release)
+    assert delayed.entered.is_set(), "the late session's work body never started"
+    assert preempter not in json.dumps(body), body
+    assert _notice_queued(coordinator, late, artifact_id), (
+        "the abandoned body consumed a notice the caller was never sent")
+
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", handler_timeout)
+    status, body = client.post(
+        f"/hooks/{route}", {"session_id": late.sid, **request}, principal=late.principal)
+    assert status == 200 and preempter in json.dumps(body), (
+        f"the session's next hook did not deliver the notice: {body!r}")
+
+
+def _hold_the_registry_after(
+    monkeypatch: pytest.MonkeyPatch, coordinator: CoordinatorHTTPServer, name: str,
+    agent: uuid.UUID,
+) -> _HeldRegistryLock:
+    """Once ``coordinator.service.<name>`` returns or raises for ``agent``,
+    hold the registry write lock from a helper thread, as a peer's request
+    would: the body's next registry call, its notice pop, waits on the lock
+    past the deadline."""
+    held = _HeldRegistryLock(coordinator)
+    real = getattr(coordinator.service, name)
+    first = threading.Event()
+
+    def then_hold(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return real(*args, **kwargs)
+        finally:
+            if kwargs.get("agent_id") == agent and not first.is_set():
+                first.set()
+                held.__enter__()
+
+    monkeypatch.setattr(coordinator.service, name, then_hold)
+    return held
+
+
+def test_a_pre_edit_timed_out_after_its_acquire_leaves_the_callers_notices(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#339 for pre-edit, whose pop comes after its acquire. The acquire's
+    abort covers only a deadline that passed before the acquire took the
+    registry lock. Here the acquire lands in time and the registry is busy
+    when the body pops: the request times out with the pop waiting on the
+    lock, and the late pop must leave the notice queued. The abort is
+    checked once the pop has the lock, not before it waits: a check made
+    first passes, the pop then waits out the deadline and consumes. The late
+    EXCLUSIVE is the late completion the watchdog reports."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    control, late = _claimed(client), _claimed(client)
+    artifact_id, preempter = _queue_notice(coordinator, control)
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": control.sid, "path": "plan.md"},
+        principal=control.principal)
+    assert status == 200 and preempter in json.dumps(body), body
+    assert not _notice_queued(coordinator, control, artifact_id)
+    # The control's release leaves no peer in M or E, so the late body's
+    # first registry call after its acquire is the pop itself.
+    status, body = client.post(
+        "/hooks/session-stop", {"session_id": control.sid}, principal=control.principal)
+    assert status == 200 and body.get("released_artifacts") == ["plan.md"], body
+
+    artifact_id, preempter = _queue_notice(coordinator, late)
+    held = _hold_the_registry_after(
+        monkeypatch, coordinator, "write", session_to_agent_id(late.sid, None))
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+    handler_timeout = mod.HANDLER_TIMEOUT_SEC
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    _, body = _answer_late(
+        coordinator, client, late, "pre-edit", {"path": "plan.md"}, held.release)
+    assert preempter not in json.dumps(body), body
+    assert coordinator.registry.get_agent_state(
+        artifact_id, session_to_agent_id(late.sid, None)) is MESIState.EXCLUSIVE, (
+        "the acquire did not land, so the body never reached its pop")
+    # The late EXCLUSIVE is in the registry: the watchdog must report it as a
+    # late completion. A notice pop that raised out of the body would turn it
+    # into a late abort and hide the orphaned grant.
+    assert coordinator._watchdog_late_completion_total == completions_before + 1
+    assert coordinator._watchdog_late_aborts_total == aborts_before
+    assert _notice_queued(coordinator, late, artifact_id), (
+        "the abandoned body consumed a notice the caller was never sent")
+
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", handler_timeout)
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": late.sid, "path": "plan.md"},
+        principal=late.principal)
+    assert status == 200 and preempter in json.dumps(body), body
+
+
+def test_a_refused_post_edit_timed_out_leaves_its_preemption_notice(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#339 for post-edit: a commit refused because a peer took the grant
+    consumes the preemption notice to explain the refusal. When the request
+    times out with that pop waiting on a busy registry, the caller gets
+    ``{"ok": true, "degraded": true}`` and no explanation, so the late pop
+    must leave the notice queued for the session's next hook."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    def preempted_editor() -> tuple[_Session, uuid.UUID, _Session]:
+        editor, peer = _claimed(client), _claimed(client)
+        for who in (editor, peer):
+            status, body = client.post(
+                "/hooks/pre-edit", {"session_id": who.sid, "path": "plan.md"},
+                principal=who.principal)
+            assert status == 200 and body.get("ok") is True, body
+        artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+        assert _notice_queued(coordinator, editor, artifact_id)
+        return editor, artifact_id, peer
+
+    commit = {"path": "plan.md", "content_hash": _hash("v2"), "success": True}
+    control, artifact_id, _ = preempted_editor()
+    status, body = client.post(
+        "/hooks/post-edit", {"session_id": control.sid, **commit}, principal=control.principal)
+    assert status == 200 and body.get("preempted") is True, body
+    assert not _notice_queued(coordinator, control, artifact_id)
+
+    late, artifact_id, peer = preempted_editor()
+    held = _hold_the_registry_after(
+        monkeypatch, coordinator, "commit", session_to_agent_id(late.sid, None))
+    handler_timeout = mod.HANDLER_TIMEOUT_SEC
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    _, body = _answer_late(coordinator, client, late, "post-edit", commit, held.release)
+    assert "preempted" not in body, body
+    assert _notice_queued(coordinator, late, artifact_id), (
+        "the abandoned body consumed the notice that explains the refused commit")
+
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", handler_timeout)
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": late.sid, "path": "plan.md", "content_hash": _hash("v1")},
+        principal=late.principal)
+    assert status == 200 and "preempted" in json.dumps(body), body
+    assert session_to_agent_id(peer.sid, None).hex[:8] in json.dumps(body), (
+        f"the next hook did not deliver the notice the late body left: {body!r}")
+
+
+def test_a_late_pre_read_whose_notice_drain_ran_in_time_is_not_reported_as_an_orphaned_grant(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#338 x #339: the notice drain takes the registry lock to fail closed, but
+    a drain cannot orphan an M/E grant. A pre-read that drained in time and
+    then outlived its deadline is logged at WARNING, not CRITICAL."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    reader = _claimed(client)
+    request = {"path": "plan.md", "content_hash": _hash("v1")}
+    _read(client, reader, "plan.md")
+    delayed = _DelayedCall(monkeypatch, mod, "_attach_hook_handoff", lambda *a, **kw: True)
+    caplog.set_level(logging.WARNING, logger=mod.__name__)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+    client.post("/hooks/pre-read", {"session_id": reader.sid, **request}, principal=reader.principal)
+    assert delayed.entered.is_set(), "the body never got past its notice drain"
+    delayed.release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    assert coordinator._watchdog_late_completion_total == completions_before + 1
+    assert _late_completion_criticals(caplog) == 0
+    assert _late_completion_warnings(caplog) == 1

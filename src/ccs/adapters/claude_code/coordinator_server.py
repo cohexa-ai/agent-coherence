@@ -69,7 +69,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal, Protocol, runtime_checkable
+from typing import Any, Callable, Iterator, Literal, Protocol, TypeVar, runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import yaml
@@ -165,6 +165,8 @@ from ccs.core.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 # Finding #30 — typed interface for the `req` parameter passed to all
@@ -2687,9 +2689,11 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # alongside the stale-read warning. A verify_only read must NOT pop
             # them — the fence discards the body, so a destructive pop here
             # would drop the notice the agent needs on its next real read.
-            notices = coordinator.registry.pop_pending_notices(
-                agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
-            )
+            notices = _consume_for_answer(
+                coordinator, abort,
+                lambda: coordinator.registry.pop_pending_notices(
+                    agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP),
+            ) or []
             if notices:
                 notice_text = _build_preemption_text(coordinator, notices)
                 resp["hookSpecificOutput"]["additionalContext"] = (
@@ -2718,9 +2722,11 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             and result.get("status") == "fresh"
             and "hookSpecificOutput" not in result
         ):
-            notices = coordinator.registry.pop_pending_notices(
-                agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
-            )
+            notices = _consume_for_answer(
+                coordinator, abort,
+                lambda: coordinator.registry.pop_pending_notices(
+                    agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP),
+            ) or []
             if notices:
                 notice_text = _build_preemption_text(coordinator, notices)
                 # Spread work()'s payload so additive fresh-path keys
@@ -2750,9 +2756,9 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 
     # A6: pre-read never threaded an abort into its grants — its SHARED
     # re-grants are idempotent, so a late one is harmless. The token serves
-    # the re-grounding delivery, whose pop is NOT idempotent: a zombie that
-    # outlives the degraded response must not claim the flag out from under
-    # the next live admit.
+    # the two pops that are NOT idempotent, the notice drain (#339) and the
+    # re-grounding delivery: a zombie that outlives the degraded response
+    # must not consume what the next live admit delivers.
     effects = _AnswerEffects()
     abort = effects.abort
     _run_or_degrade(
@@ -3379,9 +3385,11 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # Pop any notices for THIS session (the caller of pre-edit) and
         # merge into the response (A1: surface on the victim's next hook
         # of any kind).
-        notices = coordinator.registry.pop_pending_notices(
-            agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
-        )
+        notices = _consume_for_answer(
+            coordinator, abort,
+            lambda: coordinator.registry.pop_pending_notices(
+                agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP),
+        ) or []
         notice_text = _build_preemption_text(coordinator, notices) if notices else None
 
         if holder_id is not None:
@@ -3560,7 +3568,10 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
             # the same preemption prose. The subagent flagged this as a
             # double-emit hazard — the post-edit-failure response IS the
             # surfacing channel for this specific case.
-            popped = coordinator.registry.pop_preemption_notice(agent_id, artifact_id)
+            popped = _consume_for_answer(
+                coordinator, abort,
+                lambda: coordinator.registry.pop_preemption_notice(agent_id, artifact_id),
+            )
             if popped is not None:
                 preempter_id, preempted_at = popped
                 # ADV-004: distinguish sweep reclamation from peer preemption.
@@ -3873,7 +3884,9 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         # stream-json `--include-hook-events`) AND, opportunistically, as
         # `additionalContext` so any post-Stop processing or human-readable
         # log still carries the signal.
-        pending = coordinator.registry.pop_pending_notices(agent_id)
+        pending = _consume_for_answer(
+            coordinator, abort, lambda: coordinator.registry.pop_pending_notices(agent_id),
+        ) or []
         notices_payload: list[dict] = []
         for art_id, preempter_id, ts in pending:
             art = coordinator.registry.get_artifact(art_id)
@@ -4460,9 +4473,11 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "stale_paths": [s["path"] for s in stale_summaries],
             }
 
-        notices = coordinator.registry.pop_pending_notices(
-            agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
-        )
+        notices = _consume_for_answer(
+            coordinator, abort,
+            lambda: coordinator.registry.pop_pending_notices(
+                agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP),
+        ) or []
 
         if not stale_summaries and not notices:
             return {"status": "fresh"}
@@ -4515,9 +4530,9 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 
     # A6: pre-bash never threaded an abort into its grants — its SHARED
     # re-grants are idempotent, and a late one still lands. The token serves
-    # the re-grounding delivery, whose pop is NOT idempotent: a zombie that
-    # outlives the degraded response must not claim the flag out from under
-    # the next live admit.
+    # the two pops that are NOT idempotent, the notice drain (#339) and the
+    # re-grounding delivery: a zombie that outlives the degraded response
+    # must not consume what the next live admit delivers.
     effects = _AnswerEffects()
     abort = effects.abort
     _run_or_degrade(req, coordinator, work_with_reground, effects=effects)
@@ -4788,9 +4803,11 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "stale_paths": [s["path"] for s in stale_summaries],
             }
 
-        notices = coordinator.registry.pop_pending_notices(
-            agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP
-        )
+        notices = _consume_for_answer(
+            coordinator, abort,
+            lambda: coordinator.registry.pop_pending_notices(
+                agent_id, consume_limit=_PREEMPTION_PROSE_VERBATIM_CAP),
+        ) or []
 
         if not stale_summaries and not notices:
             return {"status": "fresh"}
@@ -4836,9 +4853,9 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 
     # A6: pre-grep never threaded an abort into its grants — its SHARED
     # re-grants are idempotent, and a late one still lands. The token serves
-    # the re-grounding delivery, whose pop is NOT idempotent: a zombie that
-    # outlives the degraded response must not claim the flag out from under
-    # the next live admit.
+    # the two pops that are NOT idempotent, the notice drain (#339) and the
+    # re-grounding delivery: a zombie that outlives the degraded response
+    # must not consume what the next live admit delivers.
     effects = _AnswerEffects()
     abort = effects.abort
     _run_or_degrade(req, coordinator, work_with_reground, effects=effects)
@@ -8092,6 +8109,34 @@ def _build_preemption_text(
         "local-only until you re-acquire and commit."
     )
     return "\n".join(lines)
+
+
+def _consume_for_answer(
+    coordinator: CoordinatorHTTPServer,
+    abort: threading.Event,
+    consume: Callable[[], _T],
+) -> _T | None:
+    """Run ``consume`` -- a pop of the caller's pending preemption notices --
+    for the answer this request is building, or return None without running
+    it when the watchdog already answered the request (#339).
+
+    A notice is delivered once: the pop deletes what it returns. A body that
+    outlived its deadline returns into nothing, so a pop it made would delete
+    notices no caller is ever sent. ``abort`` is checked under the registry
+    lock the pop runs under, so a body abandoned before its pop leaves every
+    notice queued for the session's next hook. The guard does not mark the
+    token: a drain cannot leave a grant behind, so it must not make a late
+    read-only body look like one that may have (#338). The abandoned body is
+    not raised out of either: it may already have landed a grant or a release,
+    which the watchdog must still count as a late completion.
+
+    A deadline that passes after the pop, while the body still renders its
+    answer, still loses what it popped."""
+    try:
+        with _abort_guard_without_mark(coordinator.registry, abort):
+            return consume()
+    except WatchdogAbandoned:
+        return None
 
 
 @contextmanager
