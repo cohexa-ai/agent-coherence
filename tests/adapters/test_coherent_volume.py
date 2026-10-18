@@ -3109,6 +3109,51 @@ def test_compare_and_swap_refusals_over_http_carry_no_pair(
         stop_coordinator(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("sent", "exposed"),
+    [
+        ({"captured_generation": 2, "owner_generation": 3}, (2, 3)),
+        ({"captured_generation": True, "owner_generation": 3}, (None, None)),
+    ],
+)
+def test_compare_and_swap_terminals_expose_the_pair_a_refusal_body_names(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    sent: dict[str, object],
+    exposed: tuple[int | None, int | None],
+) -> None:
+    """Both compare-and-swap terminals expose the pair the refusal body
+    names, and a malformed pair is dropped whole. This package's coordinator
+    never sends a volume's compare-and-swap refusal a pair (see the test
+    above), so only the commit's answer is stood in; every other call reaches
+    the real coordinator."""
+    import ccs.adapters.coherent_volume as cv_mod
+
+    monkeypatch.setattr(cv_mod, "time", SimpleNamespace(sleep=lambda _sec: None))
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    real_post = vol._post
+
+    def refuse_the_commit(endpoint_path: str, payload: dict, **kwargs: object) -> dict | None:
+        if endpoint_path == "/hooks/post-edit-cas":
+            return {"ok": False, "reason": "stale_read_generation", "current_version": 1, **sent}
+        return real_post(endpoint_path, payload, **kwargs)
+
+    monkeypatch.setattr(vol, "_post", refuse_the_commit)
+    try:
+        with pytest.raises(CasRetriesExhausted) as exhausted:
+            vol.write_cas("data/shared.txt", lambda current: current + b"\nB")
+        assert (exhausted.value.captured_generation, exhausted.value.owner_generation) == exposed
+
+        with pytest.raises(CasVersionConflict) as conflict:
+            vol.write_cas_at("data/shared.txt", 1, b"B")
+        assert conflict.value.reason == "stale_read_generation"
+        assert (conflict.value.captured_generation, conflict.value.owner_generation) == exposed
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_install_forwards_on_stale_write(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:

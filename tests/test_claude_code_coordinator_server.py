@@ -39,7 +39,12 @@ from ccs.adapters.claude_code.coordinator_server import (
     decide_tracked_read,
     session_to_agent_id,
 )
-from ccs.core.exceptions import HOLD_REASONS, CoherenceError
+from ccs.core.exceptions import (
+    HOLD_REASONS,
+    CoherenceError,
+    InvariantViolationError,
+    StaleReadGeneration,
+)
 from ccs.core.states import MESIState
 
 # Test helper: deterministic UUID4-shaped strings for short test labels.
@@ -11456,6 +11461,62 @@ def test_the_post_edit_fence_refusal_carries_the_pair_from_its_exception(
         "ok": False, "reason": "stale_read_generation", "current_version": before,
         "captured_generation": 0, "owner_generation": 1,
     }
+
+
+def test_the_post_edit_fence_refusal_reports_the_raised_pair_not_a_later_read(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fence arm answers with the pair the raise carried, never one read
+    when the arm runs, which could postdate the decision. A stand-in raise
+    names (5, 9) while the registry still reads owner generation 0."""
+    sid = _sid("lost-token-fence-raised")
+    assert client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})[0] == 200
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    version = coordinator.registry.get_artifact(artifact_id).version
+
+    def fenced(**_kwargs: object) -> None:
+        raise StaleReadGeneration("fenced", captured_generation=5, owner_generation=9)
+
+    monkeypatch.setattr(coordinator.service, "commit", fenced)
+
+    assert coordinator.registry.get_owner_generation(artifact_id) == 0
+    assert _post_edit(client, sid, "lost-token-fence-raised-late") == {
+        "ok": False, "reason": "stale_read_generation", "current_version": version,
+        "captured_generation": 5, "owner_generation": 9,
+    }
+
+
+def test_a_post_edit_refusal_of_another_kind_carries_no_pair(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the typed not-held refusal is read for a pair. Any other
+    CoherenceError from the commit has no pair attributes and keeps the plain
+    fail-closed body."""
+    sid = _sid("lost-token-other-error")
+    assert client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})[0] == 200
+
+    def broken(**_kwargs: object) -> None:
+        raise InvariantViolationError("invariant broken")
+
+    monkeypatch.setattr(coordinator.service, "commit", broken)
+
+    assert _post_edit(client, sid, "lost-token-other-error-late") == {
+        "ok": False, "reason": "invariant broken",
+    }
+
+
+def test_a_claimless_sessions_lease_commit_refusal_carries_no_pair(
+    coordinator, client: _Client
+) -> None:
+    """A session that only pre-read the path recorded no claim, so its
+    lease-route refusal has neither key, never a null."""
+    sid = _sid("lost-token-claimless")
+    client.post("/hooks/pre-read", {"session_id": sid, "path": "plan.md", "content_hash": _hash("x")})
+
+    body = _post_edit(client, sid, "lost-token-claimless-late")
+    reason = body.pop("reason")
+    assert body == {"ok": False}
+    assert reason.startswith("commit_not_allowed agent=")
 
 
 def test_a_pre_read_only_sessions_compare_and_swap_conflict_carries_no_pair(
