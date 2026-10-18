@@ -14119,18 +14119,22 @@ class _DelayedCall:
 
 
 def _deny_records(coordinator: CoordinatorHTTPServer) -> dict:
-    """Everything a deny's bookkeeping moves: the counters, the audit lines
-    and the route-around detector's map."""
+    """Everything a deny's bookkeeping moves: the counters, the audit lines,
+    the route-around detector's map and pre-read's warned-once set."""
     counters = coordinator.counters_snapshot()
     audit = coordinator.coordinator_root / ".coherence" / "audit.log"
     with coordinator._recent_strict_denies_lock:
         marker = dict(coordinator._recent_strict_denies)
+    with coordinator._stale_warned_pairs_lock:
+        warned = frozenset(coordinator._stale_warned_pairs)
     return {
         "strict_mode_denials_total": counters["strict_mode_denials_total"],
         "stale_warning_emitted_total": counters["stale_warning_emitted_total"],
         "handoff_giver_denials_total": counters["handoff_giver_denials_total"],
+        "audit_log_mode_drift_total": counters["audit_log_mode_drift_total"],
         "audit_lines": len(audit.read_text().splitlines()) if audit.exists() else 0,
         "route_around_marker": marker,
+        "stale_warned_pairs": warned,
     }
 
 
@@ -14168,7 +14172,16 @@ def test_a_timed_out_strict_deny_records_nothing_the_caller_was_not_told(
     assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
     after_control = _deny_records(coordinator)
     assert after_control["strict_mode_denials_total"] == before["strict_mode_denials_total"] + 1
+    assert after_control["stale_warning_emitted_total"] == before["stale_warning_emitted_total"] + 1
     assert after_control["audit_lines"] == before["audit_lines"] + 1
+    assert after_control["audit_log_mode_drift_total"] == before["audit_log_mode_drift_total"]
+    assert (set(after_control["route_around_marker"]) - set(before["route_around_marker"])
+            == {(control.sid, "plan.md")}), after_control["route_around_marker"]
+    if route == "pre-read":
+        # Pre-read's entry consumes the session's warned-once mark, so the
+        # mark is there afterwards only if the deny set it again.
+        control_agent = session_to_agent_id(control.sid, None)
+        assert any(agent == control_agent for agent, _ in after_control["stale_warned_pairs"])
 
     late_agent = session_to_agent_id(late.sid, None)
     delayed = _DelayedCall(
@@ -14222,6 +14235,7 @@ def test_a_timed_out_giver_deny_records_nothing_the_caller_was_not_told(
     assert (status, body.get("reason")) == (200, "handed_off"), body
     after_control = _deny_records(coordinator)
     assert after_control["handoff_giver_denials_total"] == before["handoff_giver_denials_total"] + 1
+    assert (giver.sid, "plan.md") in after_control["route_around_marker"], after_control
 
     with coordinator._recent_strict_denies_lock:
         coordinator._recent_strict_denies.clear()
@@ -14328,3 +14342,29 @@ def test_a_strict_deny_whose_audit_write_misbehaves_is_still_the_answer(
     if failure == "raises":
         assert any("audit log unavailable" in r.getMessage() or r.exc_info for r in caplog.records
                    if r.levelno >= logging.ERROR), "the failed bookkeeping was not logged"
+
+
+@pytest.mark.parametrize("route", ["pre-edit", "pre-read", "pre-bash", "pre-grep"])
+def test_a_strict_deny_whose_audit_line_does_not_land_counts_mode_drift(
+    strict_plan_coordinator, strict_plan_client: _Client,
+    monkeypatch: pytest.MonkeyPatch, route: str,
+) -> None:
+    """#236: each deny's bookkeeping, now applied when the deny is answered,
+    still counts an audit append that did not land, so an operator can see
+    that a strict deny left no audit line."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    coordinator, client = strict_plan_coordinator, strict_plan_client
+    (stale,) = _stale_readers(client, 1)
+    monkeypatch.setattr(mod._audit_log, "append_strict_deny", lambda *a, **kw: False)
+    before = _deny_records(coordinator)
+
+    status, body = client.post(
+        f"/hooks/{route}", {"session_id": stale.sid, **_strict_deny_request(route)},
+        principal=stale.principal)
+
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+    after = _deny_records(coordinator)
+    assert after["audit_log_mode_drift_total"] == before["audit_log_mode_drift_total"] + 1
+    assert after["strict_mode_denials_total"] == before["strict_mode_denials_total"] + 1
