@@ -1218,15 +1218,72 @@ def test_a_write_landing_on_a_long_idle_artifact_is_not_called_foreign(
 
     art = _register(coordinator, "notes.md", "v1\n")
     holder = __import__("uuid").uuid4()
+    # A write in flight: the holder's pre-edit acquire set EXCLUSIVE and its
+    # commit, which would turn the row MODIFIED, has not landed. The holder
+    # is active -- its acquire recorded a heartbeat moments ago.
     coordinator.registry.set_agent_state(
-        art, holder, MESIState.MODIFIED, trigger="write", tick=0
+        art, holder, MESIState.EXCLUSIVE, trigger="write", tick=0
     )
     (repo / "notes.md").write_text("bytes on disk, commit not yet landed\n")
     updated_at = coordinator.registry.get_artifact_updated_at(art)
+    now = updated_at + 100_000.0
+    coordinator.registry.record_heartbeat(holder, int(now) - 1)
 
-    _tick(coordinator, now_unix=updated_at + 100_000.0)
+    _tick(coordinator, now_unix=now)
 
     assert _totals(coordinator, art) == {"lag_suppressed": 1}
+
+
+def test_a_committed_write_grant_does_not_excuse_a_later_out_of_band_change(
+    coordinator, repo: Path
+) -> None:
+    """#278: a commit leaves its writer MODIFIED, and the row stands until the
+    writer releases it or the sweep reclaims it -- up to half an hour. A
+    MODIFIED row says the write already landed; any later write by the same
+    session re-acquires EXCLUSIVE first. So once the window after the commit
+    has passed, a mismatch is foreign even while the committer's session is
+    still active. Fails if a standing MODIFIED row keeps excusing it."""
+    from ccs.core.states import MESIState
+
+    art = _register(coordinator, "notes.md", "v1\n")
+    committer = __import__("uuid").uuid4()
+    coordinator.registry.set_agent_state(
+        art, committer, MESIState.MODIFIED, trigger="commit", tick=0
+    )
+    (repo / "notes.md").write_text("written by a script the coordinator never saw\n")
+    updated_at = coordinator.registry.get_artifact_updated_at(art)
+    now = updated_at + 600.0
+    coordinator.registry.record_heartbeat(committer, int(now) - 1)
+
+    _tick(coordinator, now_unix=now)
+
+    assert _totals(coordinator, art) == {"foreign": 1}
+
+
+def test_an_uncommitted_write_claim_whose_holder_went_quiet_stops_excusing(
+    coordinator, repo: Path
+) -> None:
+    """#278: an EXCLUSIVE row excuses a mismatch only while its holder is
+    active. A session that acquired a write and then went quiet for longer
+    than the window -- a handoff successor that ran pre-edit and stopped, a
+    client that died before its commit -- no longer explains the bytes, and
+    the mismatch is foreign. Fails if a quiet holder's claim excuses it
+    until the sweep reclaims the grant."""
+    from ccs.core.states import MESIState
+
+    art = _register(coordinator, "notes.md", "v1\n")
+    holder = __import__("uuid").uuid4()
+    coordinator.registry.set_agent_state(
+        art, holder, MESIState.EXCLUSIVE, trigger="write", tick=0
+    )
+    (repo / "notes.md").write_text("bytes nobody committed\n")
+    updated_at = coordinator.registry.get_artifact_updated_at(art)
+    now = updated_at + 600.0
+    coordinator.registry.record_heartbeat(holder, int(now - WINDOW) - 5)
+
+    _tick(coordinator, now_unix=now)
+
+    assert _totals(coordinator, art) == {"foreign": 1}
 
 
 def test_a_reconciled_artifact_re_arms_for_an_identical_later_edit(

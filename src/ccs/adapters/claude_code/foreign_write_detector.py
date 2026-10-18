@@ -209,9 +209,13 @@ _WALK_BUDGET_SEC = 2.0
 _walk_lock = threading.Lock()
 _walk_in_flight: threading.Thread | None = None
 
-# An outstanding write grant is the registry's own evidence that a mediated
-# write is in flight, which the timestamp alone cannot supply — see _classify.
-_WRITE_GRANT_STATES = (MESIState.MODIFIED, MESIState.EXCLUSIVE)
+# An acquired, uncommitted write claim is the registry's own evidence that a
+# mediated write is in flight, which the timestamp alone cannot supply — see
+# _classify_mismatch. Only EXCLUSIVE: a pre-edit acquire sets it, and the commit
+# turns it MODIFIED, which says the write already landed (#278). A MODIFIED row
+# stands until release or reclaim, up to half an hour, and excusing on it hid
+# every out-of-band change made after a commit for that long.
+_WRITE_IN_FLIGHT_STATE = MESIState.EXCLUSIVE
 
 
 class DetectionTarget(Protocol):
@@ -729,9 +733,11 @@ def _classify_mismatch(
     lands, so a commit caught mid-flight looks like a divergence. The timestamp
     catches that only when a PREVIOUS commit happens to be recent — during the
     gap it still holds the previous commit's time, so a mediated write to an
-    artifact untouched for an hour would read as foreign. An outstanding write
-    grant is the registry's own evidence that a write is in flight right now,
-    and it covers exactly the case the timestamp misses.
+    artifact untouched for an hour would read as foreign. An acquired write
+    claim not yet committed, held by a session active within the window, is the
+    registry's own evidence that a write is in flight right now, and it covers
+    exactly the case the timestamp misses (``has_write_grant``; see
+    :func:`_a_write_is_in_flight`).
 
     The timestamp leg additionally requires a witnessed writer: ``updated_at``
     is also stamped by first-observation registration, with no writer behind it,
@@ -1154,6 +1160,28 @@ def _release_clean_edges(
         registry.clear_detection_edges(to_clear)
 
 
+def _a_write_is_in_flight(
+    registry, artifact_id: UUID, *, now_unix: float, window_sec: float
+) -> bool:
+    """Whether a session holds a write it acquired and has not committed, and
+    was active within the window (#278).
+
+    EXCLUSIVE alone, never MODIFIED: see ``_WRITE_IN_FLIGHT_STATE``. And the
+    holder's last heartbeat must be recent, because a claim whose holder went
+    quiet -- a handoff successor that ran pre-edit and stopped, a client that
+    died before its commit -- explains nothing on disk, and its row stands until
+    the sweep reclaims it. A holder with no heartbeat on record is given the
+    benefit of the doubt, as every holder was before: only a recorded silence
+    longer than the window ends it."""
+    for agent_id, state in registry.get_state_map(artifact_id).items():
+        if state != _WRITE_IN_FLIGHT_STATE:
+            continue
+        last_heartbeat = registry.last_heartbeat_tick(agent_id)
+        if last_heartbeat is None or (now_unix - last_heartbeat) <= window_sec:
+            return True
+    return False
+
+
 def _observe(
     registry,
     root: Path,
@@ -1202,11 +1230,12 @@ def _observe(
     if disk_hash == canonical:
         outcome = "mediated"
     else:
-        states = registry.get_state_map(artifact_id).values()
         outcome = _classify_mismatch(
             updated_at=registry.get_artifact_updated_at(artifact_id),
             has_mediated_writer=registry.last_writer_for(artifact_id) is not None,
-            has_write_grant=any(state in _WRITE_GRANT_STATES for state in states),
+            has_write_grant=_a_write_is_in_flight(
+                registry, artifact_id, now_unix=now_unix, window_sec=window_sec
+            ),
             now_unix=now_unix,
             window_sec=window_sec,
         )
