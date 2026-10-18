@@ -7518,8 +7518,11 @@ _DEFAULT_DEGRADED_RESPONSE: dict = {
     # straight through) instead of an empty allow. ``status`` stays "fresh" for
     # wire back-compat (clients branch on it); the advisory + ``degraded`` flag
     # are the honest signal that freshness is UNVERIFIED, not confirmed.
-    "hookSpecificOutput": _payloads.emit_allow(
-        source="watchdog_degraded_read",
+    # #337: context-only -- no ``permissionDecision``. An ``allow`` would skip
+    # Claude Code's own permission prompt for the Read, Bash or Grep call
+    # exactly when the check did not run, and in time a tracked fresh path is
+    # answered with no decision at all.
+    "hookSpecificOutput": _payloads.emit_pretooluse_context(
         additional_context=DEGRADED_FRESHNESS_ADVISORY,
     ),
 }
@@ -7527,7 +7530,10 @@ _DEFAULT_DEGRADED_RESPONSE: dict = {
 because their wire contract uses ``{status: "fresh"|"stale"}``. A7: the envelope
 now carries a ``hookSpecificOutput`` advisory so a watchdog-degraded read is
 visible to the model rather than silently passing as a confirmed fresh read.
-Endpoints whose contract is ``{ok: bool}`` pass an ok-shape envelope instead
+The advisory carries no ``permissionDecision`` (#337), as
+:data:`_PRE_EDIT_DEGRADED_RESPONSE`'s does not: the timed-out call is admitted,
+not approved, so Claude Code asks about it as it otherwise would. Endpoints
+whose contract is ``{ok: bool}`` pass an ok-shape envelope instead
 (:data:`_OK_DEGRADED_RESPONSE`; pre-edit its own
 :data:`_PRE_EDIT_DEGRADED_RESPONSE`) so the client doesn't see ``None`` from
 ``result.get("ok")``."""

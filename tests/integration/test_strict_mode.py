@@ -646,7 +646,10 @@ ALLOW_EMISSION_SOURCES: list[str] = [
     "pre_edit_notice_only",          # coordinator_server._handle_pre_edit
     "pre_bash_stale_warn",           # coordinator_server._handle_pre_bash
     "pre_grep_stale_warn",           # coordinator_server._handle_pre_grep
-    "watchdog_degraded_read",        # coordinator_server._DEFAULT_DEGRADED_RESPONSE (A7)
+    # NOT listed: coordinator_server._DEFAULT_DEGRADED_RESPONSE. A timed-out
+    # read hook admits with a CONTEXT-ONLY advisory since #337, as a timed-out
+    # pre-edit has since #236: an allow would skip Claude Code's own permission
+    # prompt exactly when the check did not run.
     # NOT listed: coordinator_server._attach_pretooluse_context. The SB-10 deferred
     # re-grounding attach no longer emits an allow — a bare admit body now
     # gains a CONTEXT-ONLY PreToolUse envelope (hookEventName +
@@ -1565,9 +1568,10 @@ def test_emit_allow_refuses_the_handoff_giver_denial_class(source: str) -> None:
 def test_the_allow_emission_roster_is_unchanged_by_the_handoff_prose() -> None:
     """The handoff provenance, warning, advisory and outcome ride the
     context-only envelopes, never the allow emitter: the roster stays at the
-    seven sites it had before the handoff, so a new allow path for them would
-    have to change this count deliberately."""
-    assert len(ALLOW_EMISSION_SOURCES) == 7, ALLOW_EMISSION_SOURCES
+    six sites it has had since the timed-out read hooks stopped emitting allow
+    (#337), so a new allow path for them would have to change this count
+    deliberately."""
+    assert len(ALLOW_EMISSION_SOURCES) == 6, ALLOW_EMISSION_SOURCES
 
 
 @pytest.mark.parametrize("strict", [True, False], ids=["strict", "warn"])

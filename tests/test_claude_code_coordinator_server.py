@@ -14379,3 +14379,171 @@ def test_a_hook_run_refuses_an_abort_beside_effects_that_carry_one() -> None:
     with pytest.raises(TypeError, match="not both"):
         mod._run_or_degrade(
             None, None, lambda: {}, abort=threading.Event(), effects=mod._AnswerEffects())
+
+
+# ----------------------------------------------------------------------
+# #337 -- a timed-out read hook admits without approving
+#
+# pre-read, pre-bash and pre-grep answer ``_DEFAULT_DEGRADED_RESPONSE`` when
+# they cannot decide in time: a work body past the watchdog, the
+# caller-principal gate's store lookup, pre-grep's search-root lookup (#238)
+# and the handoff giver's shell-write deny (#185). In time, a tracked fresh
+# path is answered with no permission decision at all and a giver's shell
+# write with a deny. A timed-out answer must not decide MORE than either:
+# ``permissionDecision: "allow"`` skips Claude Code's own permission prompt
+# for the call, so the advisory travels context-only, as pre-edit's has since
+# #236.
+# ----------------------------------------------------------------------
+
+
+def _assert_admits_without_deciding(body: dict) -> None:
+    """The read routes' timed-out answer: fresh-shape, degraded, the
+    could-not-verify advisory, and no permission decision."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    assert body.get("status") == "fresh" and body.get("degraded") is True, body
+    hso = body.get("hookSpecificOutput")
+    assert isinstance(hso, dict), f"a timed-out read hook carried no advisory: {body!r}"
+    assert hso.get("hookEventName") == "PreToolUse", hso
+    assert "permissionDecision" not in hso, (
+        f"the advisory must not widen the permission decision: {hso!r}")
+    assert hso.get("additionalContext") == mod.DEGRADED_FRESHNESS_ADVISORY, hso
+
+
+@pytest.mark.parametrize("route", ["pre-read", "pre-bash", "pre-grep"])
+def test_a_timed_out_read_hook_decides_no_more_than_its_answer_in_time(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, route: str,
+) -> None:
+    """#337: a session holding a fresh grant on tracked ``plan.md`` is answered
+    in time with no permission decision. The same request whose work body
+    outlives the watchdog is admitted with the could-not-verify advisory, and
+    still with no decision: before, it was answered ``allow``, which turned a
+    call Claude Code would prompt about into an approved one."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    reader = _claimed(client)
+    request = {
+        "pre-read": {"path": "plan.md", "content_hash": _hash("v1")},
+        "pre-bash": {"command": "cat plan.md"},
+        "pre-grep": {"search_root": ""},
+    }[route]
+    _read(client, reader, "plan.md")
+    status, body = client.post(
+        f"/hooks/{route}", {"session_id": reader.sid, **request}, principal=reader.principal)
+    assert status == 200 and body.get("status") == "fresh", body
+    assert "permissionDecision" not in (body.get("hookSpecificOutput") or {}), (
+        f"the control decided something in time, so it compares nothing: {body!r}")
+
+    reader_agent = session_to_agent_id(reader.sid, None)
+    delayed = _DelayedCall(
+        monkeypatch, coordinator.service, "record_heartbeat",
+        lambda *a, **kw: kw.get("agent_id") == reader_agent,
+    )
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+    status, body = client.post(
+        f"/hooks/{route}", {"session_id": reader.sid, **request}, principal=reader.principal)
+    assert delayed.entered.is_set(), "the reader's work body never started"
+    delayed.release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1, (
+        "the request did not time out, so this measured the undegraded route")
+    assert status == 200
+    _assert_admits_without_deciding(body)
+
+
+def test_a_timed_out_giver_shell_write_is_admitted_not_approved(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#337: the giver's shell write to a handed-off path is denied in time.
+    When the deny body outlives the watchdog the hook cannot deny, so it
+    admits with the advisory -- but it must not approve: before, the timed-out
+    answer was ``allow``, the opposite of the in-time deny, and Claude Code
+    skipped its own prompt for the Bash call."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    request = {"session_id": giver.sid, "command": _GIVER_SHELL_APPEND}
+    status, body = client.post("/hooks/pre-bash", request, principal=giver.principal)
+    assert (status, body.get("reason")) == (200, "handed_off"), body
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+
+    delayed = _DelayedCall(monkeypatch, mod, "_giver_fenced_body", lambda *a, **kw: True)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+    status, body = client.post("/hooks/pre-bash", request, principal=giver.principal)
+    assert delayed.entered.is_set(), "the giver's deny body never started"
+    delayed.release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1, (
+        "the request did not time out, so this measured the undegraded route")
+    assert status == 200
+    _assert_admits_without_deciding(body)
+
+
+@pytest.mark.parametrize(
+    ("route", "principal"),
+    [("pre-grep", None), ("pre-read", _NEVER_MINTED_PRINCIPAL),
+     ("pre-bash", _NEVER_MINTED_PRINCIPAL), ("pre-grep", _NEVER_MINTED_PRINCIPAL)],
+    ids=["pre-grep-search-root-lookup", "pre-read-gate", "pre-bash-gate", "pre-grep-gate"],
+)
+def test_a_read_hook_that_cannot_look_up_in_time_is_admitted_not_approved(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+    route: str, principal: str | None,
+) -> None:
+    """#337 for the two lookups that degrade before any work body runs, with
+    the registry lock held past the deadline: the caller-principal gate's
+    store read (a principal no coordinator minted, on an accept-class route)
+    and pre-grep's search-root lookup (no principal, so the gate admits from
+    the cache). Both answer the read routes' degraded envelope, which must
+    carry no permission decision."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    _read(client, _claimed(client), "plan.md")
+    body = {
+        "pre-read": {"path": "plan.md", "content_hash": _hash("v1")},
+        "pre-bash": {"command": "cat plan.md"},
+        "pre-grep": {"search_root": ""},
+    }[route]
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(
+            client, f"/hooks/{route}", {"session_id": str(uuid.uuid4()), **body}, principal)
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+
+    assert answered, f"{route}: no answer while the registry lock was held"
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    status, response = answer.result()
+    assert status == 200
+    _assert_admits_without_deciding(response)
+
+
+def test_no_degraded_hook_envelope_carries_a_permission_decision() -> None:
+    """#337: a hook that could not decide in time decides nothing. Every
+    envelope a timed-out route answers -- the gate's table covers each gated
+    route, the default covers every ``_run_or_degrade`` caller that names none
+    -- carries at most a context-only advisory, never ``allow`` (which skips
+    Claude Code's own permission prompt) nor ``deny`` (which a check that did
+    not run cannot justify)."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    envelopes = {"default": mod._DEFAULT_DEGRADED_RESPONSE} | {
+        path: envelope for (_, path), envelope in mod._CALLER_GATE_DEGRADED_RESPONSE.items()
+    }
+    decided = {
+        name: envelope["hookSpecificOutput"]
+        for name, envelope in envelopes.items()
+        if "permissionDecision" in (envelope.get("hookSpecificOutput") or {})
+    }
+    assert decided == {}, f"degraded envelopes that decide: {decided!r}"
