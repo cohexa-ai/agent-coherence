@@ -1014,8 +1014,8 @@ A `POST /session/begin` answered `{"ok": true, "degraded": true}` carries no
 that answer goes out stops before it opens a session and counts in
 `watchdog_late_aborts_total`. One that was already opening the session when
 the deadline passed can still open it; it shows in
-`watchdog_late_completion_total`, holds a `max_sessions` slot, and the
-liveness sweep reaps it.
+`watchdog_late_completion_total`, keeps its versions pinned and counts against
+the coordinator's open-session cap until the liveness sweep reaps it.
 
 Late work that finishes normally counts in `watchdog_late_completion_total`.
 The coordinator logs it at `CRITICAL` only when that work had already won the
@@ -1682,7 +1682,8 @@ Semantics, precisely:
   `{"ok": true, "degraded": true}` with no `session_token`, so retry the
   begin. Usually nothing was opened. A begin that was already opening its
   session when the deadline passed can still open one you cannot use; it
-  holds a `max_sessions` slot until the liveness sweep reaps it (see
+  counts against the coordinator's open-session cap until the liveness sweep
+  reaps it (see
   [When the registry is busy](#when-the-registry-is-busy)).
 - **Sessions fail closed.** Pins have a bounded lifetime backed by a heartbeat
   lease. A session whose heartbeat lapses — or that is lost to a coordinator

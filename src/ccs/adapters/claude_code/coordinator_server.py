@@ -2005,8 +2005,9 @@ class CoordinatorHTTPServer:
             "refused or conflicting attempt lands nothing. Check "
             "/status?detail=metrics for watchdog_late_completion_total and run "
             "agent-coherence-status --detail=full to look for orphaned M/E "
-            "grants; a snapshot session opened this way is not listed there, "
-            "and the liveness sweep reaps it. Counter total now: %d.",
+            "grants; a snapshot session opened this way is not listed there "
+            "(its session_begin event is in .coherence/session-audit.log), and "
+            "the liveness sweep reaps it. Counter total now: %d.",
             self._watchdog_late_completion_total,
         )
 
@@ -3993,8 +3994,10 @@ def _handle_session_start(
         if text is None:
             return {}
         # Non-empty payload → arm deferred delivery (KTD5). Ordering matters:
-        # the flag is set only AFTER a successful build, so a degraded or
-        # failed request leaves the deferred path unarmed.
+        # the flag is set only AFTER a successful build, so a failed request,
+        # or one that timed out before its build won the registry lock,
+        # leaves the deferred path unarmed. A build already past the lock when
+        # the deadline passes still arms it, and the next admit delivers it.
         coordinator.mark_compact_pending(session_id)
         return {
             "hookSpecificOutput": _payloads.emit_session_start(
@@ -4004,9 +4007,9 @@ def _handle_session_start(
 
     # A6 pattern: abort threads into the builder's registry guard
     # (_abort_guard_without_mark, which leaves the token unmarked: the build
-    # only reads) so a watchdog-timed-out request fails closed at the
-    # registry lock instead of arming the flag after the client already saw
-    # the degraded `{}`.
+    # only reads) so a request that timed out before its build won the
+    # registry lock fails closed there instead of arming the flag after the
+    # client already saw the degraded `{}`.
     _run_or_degrade(
         req,
         coordinator,
@@ -4933,8 +4936,10 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
       - WIN → ``{ok: true, session_token, cut: {path: version}, coordinator_epoch,
         retain_versions}``
       - typed rejection (unknown id / caps) → ``{ok: false, reason, ...}``
-      - watchdog timeout → ``{ok: true, degraded: true}`` with no token; the
-        late body stops at the registry lock before opening a session (#340)
+      - watchdog timeout → ``{ok: true, degraded: true}`` with no token; a
+        late body still waiting for the registry lock stops there before
+        opening a session (#340), and one already past it can still open
+        one, which the liveness sweep reaps
     """
     body = req._read_json()
     if body is None:
@@ -4994,7 +4999,9 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
         }
 
     # A6 (#340): a begin answered degraded carries no token, so its late body
-    # must not open a session; it aborts at the registry lock instead.
+    # must not open a session: one still waiting for the registry lock aborts
+    # there. One already past the lock when the deadline passes still opens
+    # its session, and the liveness sweep reaps it.
     abort = WatchdogAbort()
     _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
 
@@ -7694,8 +7701,10 @@ empty payload. Re-grounding is advisory (KD3): a watchdog timeout must look
 exactly like "nothing to say", never block, and never claim state it could
 not read. The compact-pending flag is armed INSIDE the timed work only
 after a successful non-empty build (with the A6 abort threaded into the
-builder's registry guard, :func:`_abort_guard_without_mark`), so a degraded
-response also means the deferred path stays unarmed."""
+builder's registry guard, :func:`_abort_guard_without_mark`), so a request
+that timed out before its build won the registry lock leaves the deferred
+path unarmed. A build already past the lock when the deadline passes still
+arms it, and the session's next qualifying admit delivers the re-grounding."""
 
 _OCC_DEGRADED_RESPONSE: dict = {
     "ok": False,

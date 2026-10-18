@@ -73,11 +73,12 @@ Alpha — APIs may change before `v1.0`.
   strict-mode deny from the shell-read check is unchanged.
 
 - **A `/session/begin` that times out no longer opens a session its caller
-  cannot use (#340).** When the coordinator could not answer within its
-  4-second handler budget, it answered `{"ok": true, "degraded": true}` with
-  no `session_token`, and the request kept running in the background. That
-  work then opened the snapshot session anyway: the session held its pinned
-  versions and a `max_sessions` slot until the liveness sweep reaped it, and
+  cannot use, unless it was already opening one (#340).** When the
+  coordinator could not answer within its 4-second handler budget, it
+  answered `{"ok": true, "degraded": true}` with no `session_token`, and the
+  request kept running in the background. That work then opened the snapshot
+  session anyway: the session held its pinned versions and counted against
+  the coordinator's open-session cap until the liveness sweep reaped it, and
   the caller could neither use nor close it. A begin still waiting for the
   coordinator when its answer goes out now stops before opening a session and
   counts in `watchdog_late_aborts_total`. One that was already opening the
