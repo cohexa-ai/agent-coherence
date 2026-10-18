@@ -12,10 +12,27 @@ demands be MECHANICAL, not a naming convention:
 contract behaviors that MUST be identical on every conforming arm — CAS
 arbitration, the read-generation fence (including admit-on-absent and the
 verdict staying sticky across a peer's fetch), single-writer under
-barrier-forced contention, and session fail-closed refusals. Each
+barrier-forced contention, the generation pair every commit refusal carries,
+and session fail-closed refusals. Each
 hard-asserts the SAME correctness property regardless of arm. There is no arm
 parameter and no expected-outcome parameter — the property is universal, so a
 must-match function CANNOT express "arm X may differ".
+
+The refusal-pair scenarios widen what the kit certifies for an outside backend:
+beyond refusing the right commits with the right reason, a binding must report
+the committer's recorded ``read_generation`` as ``captured_generation`` and the
+artifact's ``owner_generation`` on every refusal, read from the snapshot that
+decided it, and neither value when the committer has no recorded claim. One
+scenario per entry point, each read by explicit attribute access:
+:func:`assert_commit_cas_refusals_carry_the_generation_pair` (every reason,
+including a ``version_mismatch`` that hides a superseded claim, and the
+claimless case), :func:`assert_commit_all_refusals_carry_each_members_generation_pair`
+(per member of one refused batch), and
+:func:`assert_fenced_persist_raise_carries_the_generation_pair` (the
+:class:`StaleReadGeneration` raised by ``set_artifact_and_content`` with
+``fence_agent_id``). No check assumes an ordering between the two values beyond
+what the reason implies: only ``stale_read_generation`` implies
+``captured_generation < owner_generation``.
 
 **BACKEND-DEFINED** (``assert_declared_*`` functions taking a
 :class:`RegistryFactory` AND a :class:`RestartDeclaration`): behaviors the
@@ -57,12 +74,15 @@ from ccs.core.exceptions import (
     STALE_READ_GENERATION_REASON,
     VERSION_MISMATCH_REASON,
     SessionInvalidated,
+    StaleReadGeneration,
 )
 from ccs.core.states import MESIState
 from ccs.core.types import (
     Artifact,
+    CommitAllEntry,
     ConflictDetail,
     FetchRequest,
+    MultiCommitConflict,
     SessionReadRejection,
     SnapshotSession,
     VersionedContent,
@@ -860,6 +880,259 @@ def assert_version_and_generation_pair_is_untearable(factory: RegistryFactory) -
         "backend must serve this member as ONE atomic snapshot (a single row "
         "read under the write lock, or an equivalent seqlock), never two reads."
     )
+
+
+def _bump_owner_generation(reg: object, artifact_id: UUID, *, times: int) -> None:
+    """Move ``owner_generation`` up ``times`` steps at an unchanged version, each
+    step an unrelated agent's E-acquire and sweep-class reclaim. The refusal-pair
+    scenarios start from a non-zero epoch so a reported pair cannot pass as a
+    zero default or a constant."""
+    for _ in range(times):
+        other = uuid4()
+        reg.set_agent_state(artifact_id, other, MESIState.EXCLUSIVE, tick=1)  # type: ignore[attr-defined]
+        reg.set_agent_state(  # type: ignore[attr-defined]
+            artifact_id, other, MESIState.INVALID, trigger=_RECLAIM_TRIGGER, tick=1
+        )
+
+
+def _reclaim_holder(reg: object, artifact_id: UUID, holder: UUID) -> None:
+    """``holder`` acquires EXCLUSIVE, capturing the current epoch, and a
+    sweep-class reclaim drives it to INVALID, moving the epoch past that claim
+    at an unchanged version: the reclaim-zombie the fence exists for."""
+    reg.set_agent_state(artifact_id, holder, MESIState.EXCLUSIVE, tick=2)  # type: ignore[attr-defined]
+    captured = reg.get_read_generation(artifact_id, holder)  # type: ignore[attr-defined]
+    assert captured is not None, "an M/E acquire must capture a read_generation"
+    reg.set_agent_state(  # type: ignore[attr-defined]
+        artifact_id, holder, MESIState.INVALID, trigger=_RECLAIM_TRIGGER, tick=3
+    )
+    assert reg.get_owner_generation(artifact_id) > captured, (  # type: ignore[attr-defined]
+        "a sweep-class reclaim must bump owner_generation past the captured "
+        "read_generation, else the fence has nothing to reject"
+    )
+
+
+def _claim_of(reg: object, artifact_id: UUID, agent: UUID) -> tuple[int | None, int | None]:
+    """The pair a refusal of ``agent`` must report, read through the single-value
+    accessors just before the commit (the scenarios are sequential, so nothing
+    moves between this read and the decision). No recorded claim reads as
+    ``(None, None)``: an owner generation alone names no lost token."""
+    captured = reg.get_read_generation(artifact_id, agent)  # type: ignore[attr-defined]
+    if captured is None:
+        return None, None
+    return captured, reg.get_owner_generation(artifact_id)  # type: ignore[attr-defined]
+
+
+def _assert_pair_reported(
+    got: tuple[int | None, int | None], expected: tuple[int | None, int | None], refusal: str
+) -> None:
+    """Fail unless ``refusal`` carried exactly the pair its decision read. Exact
+    values only: no ordering between the two is assumed here."""
+    if got == expected:
+        return
+    verdict = "DROPPED the generation pair" if got == (None, None) else "carried the WRONG generation pair"
+    raise AssertionError(
+        f"{refusal} {verdict}: the decision read captured_generation={expected[0]}, "
+        f"owner_generation={expected[1]}; the refusal carried "
+        f"captured_generation={got[0]}, owner_generation={got[1]}. A backend must "
+        "report the committer's recorded read_generation and the artifact's "
+        "owner_generation, from the snapshot the refusal was decided against, on "
+        "every refusal reason, and neither value when the committer has no "
+        "recorded claim"
+    )
+
+
+def _pair_on(detail: ConflictDetail) -> tuple[int | None, int | None]:
+    return detail.captured_generation, detail.owner_generation
+
+
+def assert_commit_cas_refusals_carry_the_generation_pair(factory: RegistryFactory) -> None:
+    """Refusal pair — ``commit_cas`` leg (MUST-MATCH). Every refusal carries the
+    committer's recorded ``read_generation`` as ``captured_generation`` and the
+    artifact's ``owner_generation``, both from the snapshot the refusal was
+    decided against, whatever the reason; both are ``None`` exactly when the
+    committer has no recorded claim. Four refusals, one artifact each:
+
+    1. ``stale_read_generation``: a reclaimed holder at the unchanged version.
+    2. ``other_holder``: a reader whose claim is current, so the pair reads equal.
+    3. ``version_mismatch`` with a superseded claim: a reclaimed holder whose
+       peer has since committed. Version-CAS decides first, so the reason hides
+       the lost token and only the pair names it.
+    4. ``version_mismatch`` with no claim: a plain SHARED writer, ``None``/``None``.
+
+    Every epoch is moved twice before the scenario starts, so a zero default or
+    a constant fails, and in 1 and 3 so does a swapped pair. The pair is
+    compared to the single-value accessors, never to an ordering: only
+    ``stale_read_generation`` implies one."""
+    reg = factory()
+    fenced, held, overtaken, plain = uuid4(), uuid4(), uuid4(), uuid4()
+    for name, artifact_id in (
+        ("fenced.md", fenced), ("held.md", held), ("overtaken.md", overtaken), ("plain.md", plain),
+    ):
+        _register(reg, artifact_id, version=1, name=name)
+        _bump_owner_generation(reg, artifact_id, times=2)
+    agent, peer = uuid4(), uuid4()
+
+    # (1) stale_read_generation: reclaimed, re-granted SHARED without a capture.
+    _reclaim_holder(reg, fenced, agent)
+    reg.set_agent_state(fenced, agent, MESIState.SHARED, trigger="peer_regrant", tick=4)  # type: ignore[attr-defined]
+    expected = _claim_of(reg, fenced, agent)
+    result = reg.commit_cas(  # type: ignore[attr-defined]
+        fenced, agent, expected_version=1, content_hash=_hash("fenced"), tick=5
+    )
+    assert isinstance(result, ConflictDetail), result
+    assert result.reason == STALE_READ_GENERATION_REASON, result.reason
+    _assert_pair_reported(_pair_on(result), expected, f"commit_cas's {result.reason} refusal")
+
+    # (2) other_holder: the agent's own read captures the current epoch, then a
+    # pessimistic peer takes MODIFIED; the agent commits at the correct version.
+    reg.set_agent_state(held, agent, MESIState.SHARED, trigger="fetch", tick=6)  # type: ignore[attr-defined]
+    reg.set_agent_state(held, peer, MESIState.MODIFIED, tick=7)  # type: ignore[attr-defined]
+    expected = _claim_of(reg, held, agent)
+    assert expected[0] is not None, "the agent's own fetch read must capture a read_generation"
+    result = reg.commit_cas(  # type: ignore[attr-defined]
+        held, agent, expected_version=1, content_hash=_hash("held"), tick=8
+    )
+    assert isinstance(result, ConflictDetail), result
+    assert result.reason == OTHER_HOLDER_REASON, result.reason
+    _assert_pair_reported(_pair_on(result), expected, f"commit_cas's {result.reason} refusal")
+
+    # (3) version_mismatch over a superseded claim: reclaimed, then a peer wins.
+    _reclaim_holder(reg, overtaken, agent)
+    _seed_shared_writer(reg, overtaken, peer, tick=9)
+    won = reg.commit_cas(  # type: ignore[attr-defined]
+        overtaken, peer, expected_version=1, content_hash=_hash("peer"), tick=10
+    )
+    assert isinstance(won, tuple), f"scenario precondition: the peer's commit must win, got {won!r}"
+    reg.set_agent_state(overtaken, agent, MESIState.SHARED, trigger="peer_regrant", tick=11)  # type: ignore[attr-defined]
+    expected = _claim_of(reg, overtaken, agent)
+    result = reg.commit_cas(  # type: ignore[attr-defined]
+        overtaken, agent, expected_version=1, content_hash=_hash("overtaken"), tick=12
+    )
+    assert isinstance(result, ConflictDetail), result
+    assert result.reason == VERSION_MISMATCH_REASON, result.reason
+    _assert_pair_reported(
+        _pair_on(result), expected, f"commit_cas's {result.reason} refusal over a superseded claim"
+    )
+
+    # (4) version_mismatch with no claim: a plain SHARED writer behind a peer.
+    _seed_shared_writer(reg, plain, peer, tick=13)
+    won = reg.commit_cas(  # type: ignore[attr-defined]
+        plain, peer, expected_version=1, content_hash=_hash("peer"), tick=14
+    )
+    assert isinstance(won, tuple), f"scenario precondition: the peer's commit must win, got {won!r}"
+    _seed_shared_writer(reg, plain, agent, tick=15)
+    assert reg.get_read_generation(plain, agent) is None, (  # type: ignore[attr-defined]
+        "scenario precondition: a SHARED grant must not capture a read_generation"
+    )
+    result = reg.commit_cas(  # type: ignore[attr-defined]
+        plain, agent, expected_version=1, content_hash=_hash("plain"), tick=16
+    )
+    assert isinstance(result, ConflictDetail), result
+    assert result.reason == VERSION_MISMATCH_REASON, result.reason
+    _assert_pair_reported(
+        _pair_on(result), (None, None), f"commit_cas's {result.reason} refusal with no claim"
+    )
+
+
+def assert_commit_all_refusals_carry_each_members_generation_pair(factory: RegistryFactory) -> None:
+    """Refusal pair — ``commit_all`` leg (MUST-MATCH). A refused batch names every
+    failing member's own ``ConflictDetail``, and each carries THAT member's pair
+    from the batch's CHECK snapshot, as :func:`assert_commit_cas_refusals_carry_the_generation_pair`
+    requires of a single commit. One batch, three members:
+
+    - fenced: the committer's claim was superseded at an unchanged version
+      (``stale_read_generation``);
+    - overtaken: the committer's claim is current but a peer has since committed
+      (``version_mismatch``, the pair reads equal);
+    - plain: no recorded claim, and a peer has since committed
+      (``version_mismatch``, ``None``/``None``).
+
+    The members' epochs differ, so a backend that reports one member's pair on
+    another fails, as does one that reports the pair for one reason only."""
+    reg = factory()
+    fenced, overtaken, plain = uuid4(), uuid4(), uuid4()
+    for name, artifact_id, bumps in (
+        ("fenced.md", fenced, 2), ("overtaken.md", overtaken, 3), ("plain.md", plain, 2),
+    ):
+        _register(reg, artifact_id, version=1, name=name)
+        _bump_owner_generation(reg, artifact_id, times=bumps)
+    agent, peer = uuid4(), uuid4()
+
+    _reclaim_holder(reg, fenced, agent)
+    reg.set_agent_state(fenced, agent, MESIState.SHARED, trigger="peer_regrant", tick=4)  # type: ignore[attr-defined]
+
+    # The agent's own read captures the epoch; the peer's win invalidates the
+    # agent at a version move, which leaves the epoch and the claim alone.
+    reg.set_agent_state(overtaken, agent, MESIState.SHARED, trigger="fetch", tick=5)  # type: ignore[attr-defined]
+    for artifact_id in (overtaken, plain):
+        _seed_shared_writer(reg, artifact_id, peer, tick=6)
+        won = reg.commit_cas(  # type: ignore[attr-defined]
+            artifact_id, peer, expected_version=1, content_hash=_hash("peer"), tick=7
+        )
+        assert isinstance(won, tuple), f"scenario precondition: the peer's commit must win, got {won!r}"
+    reg.set_agent_state(overtaken, agent, MESIState.SHARED, trigger="peer_regrant", tick=8)  # type: ignore[attr-defined]
+    _seed_shared_writer(reg, plain, agent, tick=8)
+
+    expected = {artifact_id: _claim_of(reg, artifact_id, agent) for artifact_id in (fenced, overtaken, plain)}
+    assert expected[overtaken][0] is not None, "the agent's own fetch read must capture a read_generation"
+    assert expected[plain] == (None, None), (
+        "scenario precondition: a SHARED grant must not capture a read_generation"
+    )
+    result = reg.commit_all(  # type: ignore[attr-defined]
+        agent,
+        {
+            artifact_id: CommitAllEntry(expected_version=1, content_hash=_hash(f"batch-{artifact_id}"))
+            for artifact_id in (fenced, overtaken, plain)
+        },
+        tick=9,
+    )
+    assert isinstance(result, MultiCommitConflict), result
+    assert set(result.per_artifact) == {fenced, overtaken, plain}, (
+        f"a refused batch must name every failing member, got {set(result.per_artifact)}"
+    )
+    for label, artifact_id, reason in (
+        ("fenced", fenced, STALE_READ_GENERATION_REASON),
+        ("overtaken", overtaken, VERSION_MISMATCH_REASON),
+        ("plain", plain, VERSION_MISMATCH_REASON),
+    ):
+        detail = result.per_artifact[artifact_id]
+        assert detail.reason == reason, f"{label}: {detail.reason}"
+        _assert_pair_reported(
+            _pair_on(detail), expected[artifact_id],
+            f"commit_all's {reason} refusal for the {label} member",
+        )
+
+
+def assert_fenced_persist_raise_carries_the_generation_pair(factory: RegistryFactory) -> None:
+    """Refusal pair — fenced-persist leg (MUST-MATCH). The pessimistic commit's
+    persist, ``set_artifact_and_content(fence_agent_id=...)``, raises
+    :class:`StaleReadGeneration` for a committer whose claim was superseded, and
+    the raise carries the two values the fence compared as
+    ``captured_generation`` and ``owner_generation``. Inside the shipped service
+    the decision hold covers this persist, so the raise is reachable only at
+    registry level or through a second writer on the same store; the scenario
+    drives it at registry level, and the version must not move."""
+    reg = factory()
+    artifact_id = uuid4()
+    _register(reg, artifact_id, version=1)
+    _bump_owner_generation(reg, artifact_id, times=2)
+    holder = uuid4()
+    _reclaim_holder(reg, artifact_id, holder)
+    expected = _claim_of(reg, artifact_id, holder)
+
+    late = Artifact(id=artifact_id, name="plan.md", version=2, content_hash=_hash("late"))
+    try:
+        reg.set_artifact_and_content(artifact_id, late, "late", fence_agent_id=holder)  # type: ignore[attr-defined]
+    except StaleReadGeneration as exc:
+        got = (exc.captured_generation, exc.owner_generation)
+    else:
+        raise AssertionError(
+            "the fence FAILED to refuse a reclaim-zombie's persist: "
+            "set_artifact_and_content(fence_agent_id=...) persisted over a "
+            "superseded read_generation"
+        )
+    _assert_pair_reported(got, expected, "set_artifact_and_content's StaleReadGeneration raise")
+    assert reg.get_artifact(artifact_id).version == 1  # type: ignore[attr-defined]
 
 
 def assert_session_fail_closed_on_foreign_and_reaped(factory: RegistryFactory) -> None:
