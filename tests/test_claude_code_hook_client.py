@@ -1185,3 +1185,37 @@ def test_pre_grep_delivers_the_freshness_advisory_while_the_registry_lock_is_hel
     response = json.loads(out)
     assert response == json.loads(json.dumps(server_mod._DEFAULT_DEGRADED_RESPONSE))
     assert "could not verify" in response["hookSpecificOutput"]["additionalContext"]
+
+
+def test_pre_edit_delivers_the_freshness_advisory_when_the_coordinator_times_out(
+    inproc_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#236, end to end: an Edit whose pre-edit times out on registry
+    contention is admitted -- a hook does not block a tool call on coordinator
+    load -- and the model is told the coherence check did not run. The
+    advisory reaches stdout context-only: no ``permissionDecision``, so Claude
+    Code still asks the user about the Edit as it would have. It used to print
+    a bare ``{"ok": true, "degraded": true}``: an admit with no warning."""
+    import ccs.adapters.claude_code.coordinator_server as server_mod
+    from tests.test_claude_code_coordinator_server import _HeldRegistryLock
+
+    workspace, server = inproc_coordinator
+    (workspace / "plan.md").write_text("plan v1")
+    payload = _edit_payload(workspace, _sid())
+    # The first call claims the session's principal while the lock is free, so
+    # the held lock below blocks only pre-edit's work body.
+    rc, out = _drive("pre-edit", payload, workspace, monkeypatch, capsys)
+    assert rc == 0 and json.loads(out).get("ok") is True, out
+
+    monkeypatch.setattr(server_mod, "HANDLER_TIMEOUT_SEC", 0.25)
+    with _HeldRegistryLock(server):
+        rc, out = _drive("pre-edit", payload, workspace, monkeypatch, capsys)
+
+    assert rc == 0
+    response = json.loads(out)
+    assert response == json.loads(json.dumps(server_mod._PRE_EDIT_DEGRADED_RESPONSE))
+    hso = response["hookSpecificOutput"]
+    assert hso["hookEventName"] == "PreToolUse"
+    assert "permissionDecision" not in hso
+    assert "could not verify" in hso["additionalContext"]

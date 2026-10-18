@@ -20,7 +20,7 @@ import time
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -4058,6 +4058,11 @@ def test_ac05_pre_edit_degraded_response_returns_ok_shape(
         f"pre-edit degraded envelope must include ok=True; got {body!r}"
     )
     assert body.get("degraded") is True
+    # #236: the admit says the check did not run, context-only -- an "allow"
+    # would skip Claude Code's own permission prompt for the Edit or Write.
+    hso = body.get("hookSpecificOutput")
+    assert isinstance(hso, dict) and "permissionDecision" not in hso, body
+    assert "could not verify" in hso.get("additionalContext", ""), body
 
 
 def test_ac05_post_edit_degraded_response_returns_ok_shape(
@@ -14016,3 +14021,310 @@ def test_status_full_tier_deadline_is_the_second_the_real_sweep_reclaims_each_gr
         row = _row_for(_operator_status(client), sid)
         assert path not in row["grants"]
         assert row["reclaimed"][path]["trigger"] == trigger
+
+
+# ----------------------------------------------------------------------
+# #236 -- a timed-out deny: what the caller is told vs what is recorded
+#
+# A hook answered on a watchdog timeout is answered without its work body's
+# decision, and the body keeps running. These tests drive the REAL watchdog
+# and delay one session's body past a shortened deadline, then let it finish:
+# whatever it records afterwards contradicts the answer already sent unless
+# the deny's bookkeeping is applied only when the deny is the answer.
+#
+# The body is delayed at its own first call, not by holding the registry
+# lock: pre-grep's search-root lookup runs ahead of the watchdog under its own
+# bound (#238), so a held lock degrades that request before its body starts,
+# and a "nothing recorded" assertion would pass without the body ever running.
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def strict_plan_coordinator(tmp_path: Path):
+    """A live coordinator with ``plan.md`` (a default tracked pattern) in
+    strict mode."""
+    (tmp_path / ".coherence").mkdir()
+    (tmp_path / ".coherence" / "strict_mode.yaml").write_text("- plan.md\n")
+    (tmp_path / "plan.md").write_text("v1\n")
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
+    server.serve_in_thread()
+    time.sleep(0.05)
+    try:
+        yield server
+    finally:
+        server.shutdown()
+
+
+@pytest.fixture
+def strict_plan_client(strict_plan_coordinator) -> _Client:
+    secret = load_secret(strict_plan_coordinator.coordinator_root)
+    assert secret is not None
+    return _Client("127.0.0.1", strict_plan_coordinator.port, secret)
+
+
+def _stale_readers(client: _Client, count: int) -> list[_Session]:
+    """``count`` claimed sessions that read ``plan.md`` before a peer committed
+    over it, so each holds INVALID on the strict path."""
+    readers = [_claimed(client) for _ in range(count)]
+    writer = _claimed(client)
+    for who in (*readers, writer):
+        status, _ = client.post(
+            "/hooks/pre-read",
+            {"session_id": who.sid, "path": "plan.md", "content_hash": _hash("v1")},
+            principal=who.principal,
+        )
+        assert status == 200
+    for route, body in (
+        ("/hooks/pre-edit", {"path": "plan.md"}),
+        ("/hooks/post-edit", {"path": "plan.md", "content_hash": _hash("v2"), "success": True}),
+    ):
+        status, answer = client.post(
+            route, {"session_id": writer.sid, **body}, principal=writer.principal)
+        assert status == 200 and answer.get("ok") is not False, answer
+    return readers
+
+
+def _strict_deny_request(route: str) -> dict:
+    """The request each strict-deny route denies for a session INVALID on
+    ``plan.md``."""
+    return {
+        "pre-edit": {"path": "plan.md"},
+        "pre-read": {"path": "plan.md", "content_hash": _hash("v1")},
+        "pre-bash": {"command": "cat plan.md"},
+        "pre-grep": {"search_root": ""},
+    }[route]
+
+
+class _DelayedCall:
+    """Block calls to ``owner.name`` that ``matches`` accepts until
+    ``release``, so one request's work body outlives the watchdog deadline
+    while every other request runs normally."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, owner: Any, name: str,
+                 matches: Callable[..., bool]) -> None:
+        self._release = threading.Event()
+        self.entered = threading.Event()
+        real = getattr(owner, name)
+
+        def delayed(*args: Any, **kwargs: Any) -> Any:
+            if matches(*args, **kwargs):
+                self.entered.set()
+                self._release.wait(timeout=30.0)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, delayed)
+
+    def release(self) -> None:
+        self._release.set()
+
+
+def _deny_records(coordinator: CoordinatorHTTPServer) -> dict:
+    """Everything a deny's bookkeeping moves: the counters, the audit lines
+    and the route-around detector's map."""
+    counters = coordinator.counters_snapshot()
+    audit = coordinator.coordinator_root / ".coherence" / "audit.log"
+    with coordinator._recent_strict_denies_lock:
+        marker = dict(coordinator._recent_strict_denies)
+    return {
+        "strict_mode_denials_total": counters["strict_mode_denials_total"],
+        "stale_warning_emitted_total": counters["stale_warning_emitted_total"],
+        "handoff_giver_denials_total": counters["handoff_giver_denials_total"],
+        "audit_lines": len(audit.read_text().splitlines()) if audit.exists() else 0,
+        "route_around_marker": marker,
+    }
+
+
+def _late_completion_criticals(caplog: pytest.LogCaptureFixture) -> int:
+    return sum(
+        1 for record in caplog.records
+        if record.levelno == logging.CRITICAL and "late completion" in record.getMessage()
+    )
+
+
+@pytest.mark.parametrize("route", ["pre-edit", "pre-read", "pre-bash", "pre-grep"])
+def test_a_timed_out_strict_deny_records_nothing_the_caller_was_not_told(
+    strict_plan_coordinator, strict_plan_client: _Client,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, route: str,
+) -> None:
+    """#236: a strict-deny body that finishes after its request timed out
+    records no deny. The caller got the degraded answer; the deny counters,
+    the audit line and the route-around marker must not say it was denied,
+    and the watchdog counts a late abort, not a CRITICAL late completion
+    about orphaned grants that do not exist.
+
+    The first call is the control: the same request from another stale
+    session, not timed out, is denied and records exactly that."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    coordinator, client = strict_plan_coordinator, strict_plan_client
+    late, control = _stale_readers(client, 2)
+    request = _strict_deny_request(route)
+    caplog.set_level(logging.CRITICAL, logger=mod.__name__)
+
+    before = _deny_records(coordinator)
+    status, body = client.post(
+        f"/hooks/{route}", {"session_id": control.sid, **request}, principal=control.principal)
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+    after_control = _deny_records(coordinator)
+    assert after_control["strict_mode_denials_total"] == before["strict_mode_denials_total"] + 1
+    assert after_control["audit_lines"] == before["audit_lines"] + 1
+
+    late_agent = session_to_agent_id(late.sid, None)
+    delayed = _DelayedCall(
+        monkeypatch, coordinator.service, "record_heartbeat",
+        lambda *a, **kw: kw.get("agent_id") == late_agent,
+    )
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+    status, body = client.post(
+        f"/hooks/{route}", {"session_id": late.sid, **request}, principal=late.principal)
+    assert delayed.entered.is_set(), "the late session's work body never started"
+    delayed.release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1, (
+        "the request did not time out, so this measured the undegraded route")
+    assert status == 200 and body.get("degraded") is True, body
+    assert (body.get("hookSpecificOutput") or {}).get("permissionDecision") != "deny", body
+    assert _deny_records(coordinator) == after_control, (
+        "the abandoned body recorded a deny the caller was never sent")
+    assert coordinator._watchdog_late_aborts_total == aborts_before + 1
+    assert coordinator._watchdog_late_completion_total == completions_before
+    assert _late_completion_criticals(caplog) == 0
+
+
+@pytest.mark.parametrize("route", ["pre-edit", "pre-bash"])
+def test_a_timed_out_giver_deny_records_nothing_the_caller_was_not_told(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, route: str,
+) -> None:
+    """#236 for the handoff giver's deny (#185), which fires in warn mode
+    too: a giver whose deny body finishes after the request timed out records
+    no giver denial and sets no route-around marker. The control is the same
+    request answered in time."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    request = (
+        {"path": "plan.md", "agent_id": "inc-2"} if route == "pre-edit"
+        else {"command": _GIVER_SHELL_APPEND}
+    )
+    caplog.set_level(logging.CRITICAL, logger=mod.__name__)
+
+    before = _deny_records(coordinator)
+    status, body = client.post(
+        f"/hooks/{route}", {"session_id": giver.sid, **request}, principal=giver.principal)
+    assert (status, body.get("reason")) == (200, "handed_off"), body
+    after_control = _deny_records(coordinator)
+    assert after_control["handoff_giver_denials_total"] == before["handoff_giver_denials_total"] + 1
+
+    with coordinator._recent_strict_denies_lock:
+        coordinator._recent_strict_denies.clear()
+    after_control = _deny_records(coordinator)
+    delayed = _DelayedCall(monkeypatch, mod, "_giver_fenced_body", lambda *a, **kw: True)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+    status, body = client.post(
+        f"/hooks/{route}", {"session_id": giver.sid, **request}, principal=giver.principal)
+    assert delayed.entered.is_set(), "the giver's deny body never started"
+    delayed.release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1, (
+        "the request did not time out, so this measured the undegraded route")
+    assert status == 200 and body.get("degraded") is True, body
+    assert _deny_records(coordinator) == after_control, (
+        "the abandoned giver body recorded a deny the caller was never sent")
+    assert coordinator._watchdog_late_aborts_total == aborts_before + 1
+    assert coordinator._watchdog_late_completion_total == completions_before
+    assert _late_completion_criticals(caplog) == 0
+
+
+def test_a_timed_out_pre_edit_tells_the_caller_the_check_did_not_run(
+    strict_plan_coordinator, strict_plan_client: _Client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#236: a strict-mode editor whose grant a peer invalidated, answered on
+    a watchdog timeout, is still admitted -- a hook must not block a tool call
+    on coordinator load -- but is told the coherence check did not run. The
+    advisory travels context-only: a ``permissionDecision`` of ``allow`` would
+    skip Claude Code's own permission prompt for the Edit or Write exactly
+    when the check did not run. Before, the answer was a bare
+    ``{"ok": true, "degraded": true}`` the hook client relayed as an admit
+    with no warning."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    coordinator, client = strict_plan_coordinator, strict_plan_client
+    (late,) = _stale_readers(client, 1)
+    late_agent = session_to_agent_id(late.sid, None)
+    delayed = _DelayedCall(
+        monkeypatch, coordinator.service, "record_heartbeat",
+        lambda *a, **kw: kw.get("agent_id") == late_agent,
+    )
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": late.sid, "path": "plan.md"}, principal=late.principal)
+    delayed.release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+
+    assert status == 200
+    assert body.get("ok") is True and body.get("degraded") is True, body
+    hso = body.get("hookSpecificOutput")
+    assert isinstance(hso, dict), f"a timed-out pre-edit carried no advisory: {body!r}"
+    assert hso.get("hookEventName") == "PreToolUse", hso
+    assert "permissionDecision" not in hso, (
+        f"the advisory must not widen the permission decision: {hso!r}")
+    assert "could not verify" in hso.get("additionalContext", ""), hso
+
+
+@pytest.mark.parametrize("failure", ["stalls", "raises"])
+def test_a_strict_deny_whose_audit_write_misbehaves_is_still_the_answer(
+    strict_plan_coordinator, strict_plan_client: _Client, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, failure: str,
+) -> None:
+    """#236: the deny's bookkeeping runs after the decision, on the request's
+    own thread, so it cannot change the decision. An audit append slower than
+    the watchdog deadline still answers the deny (it used to time the request
+    out, and the strict deny became the degraded admit); one that raises is
+    logged and the deny is still answered (it used to become the internal
+    error envelope, which the hook clients read as no coordinator)."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    coordinator, client = strict_plan_coordinator, strict_plan_client
+    (stale,) = _stale_readers(client, 1)
+    real_append = mod._audit_log.append_strict_deny
+    calls: list[str] = []
+
+    def misbehaving_append(*args: Any, **kwargs: Any) -> bool:
+        calls.append(failure)
+        if failure == "raises":
+            raise OSError("audit log unavailable")
+        time.sleep(_DEGRADE_DEADLINE_SEC * 2)
+        return real_append(*args, **kwargs)
+
+    monkeypatch.setattr(mod._audit_log, "append_strict_deny", misbehaving_append)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    caplog.set_level(logging.ERROR, logger=mod.__name__)
+    timeouts_before = coordinator._watchdog_timeouts_total
+
+    status, body = client.post(
+        "/hooks/pre-edit", {"session_id": stale.sid, "path": "plan.md"}, principal=stale.principal)
+
+    assert status == 200, body
+    assert body.get("ok") is False, body
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+    assert calls == [failure]
+    assert coordinator._watchdog_timeouts_total == timeouts_before
+    if failure == "raises":
+        assert any("audit log unavailable" in r.getMessage() or r.exc_info for r in caplog.records
+                   if r.levelno >= logging.ERROR), "the failed bookkeeping was not logged"

@@ -2497,6 +2497,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                         path=path,
                         summary=shared_summary,
                         source="pre_read_shared_hash_deny",
+                        abort=abort, on_answer=on_answer,
                     )
                 fresh["hash_differs"] = True
             # The read is allowed. A SHARED grant that a denied Bash / Grep
@@ -2594,6 +2595,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 path=path,
                 summary=summary,
                 source="pre_read_strict_deny",
+                abort=abort, on_answer=on_answer,
             )
 
         # Re-grant SHARED so this read doesn't re-fire stale on every call.
@@ -2691,13 +2693,19 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             coordinator, session_id, body, result, abort=abort
         )
 
-    # A6: pre-read never threaded an abort into work() — its SHARED
-    # re-grants are idempotent, so a late one is harmless. The token is
-    # introduced here solely for the re-grounding delivery, whose pop is
-    # NOT idempotent: a zombie that outlives the degraded response must not
-    # claim the flag out from under the next live admit.
+    # A6: pre-read never threaded an abort into its grants — its SHARED
+    # re-grants are idempotent, so a late one is harmless. The token serves
+    # the re-grounding delivery, whose pop is NOT idempotent: a zombie that
+    # outlives the degraded response must not claim the flag out from under
+    # the next live admit.
+    # The strict deny's bookkeeping goes on on_answer, applied only when the
+    # deny is the answer sent; a late deny body raises at _raise_if_abandoned
+    # so the watchdog counts a late abort (#236).
     abort = threading.Event()
-    _run_or_degrade(req, coordinator, work_with_notice_surfacing, abort=abort)
+    on_answer: list[Callable[[], None]] = []
+    _run_or_degrade(
+        req, coordinator, work_with_notice_surfacing, abort=abort, on_answer=on_answer,
+    )
 
 
 # ----------------------------------------------------------------------
@@ -3186,7 +3194,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         if handed is not None:
             return _giver_deny_response(
                 coordinator, handed, session_id=session_id, path=path, caller=caller,
-                source=_PRE_EDIT_GIVER_DENY_SOURCE,
+                source=_PRE_EDIT_GIVER_DENY_SOURCE, abort=abort, on_answer=on_answer,
             )
         observed_before_acquire = coordinator.registry.last_observed_version_for(
             artifact_id, agent_id
@@ -3259,15 +3267,18 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                     "warning_generated_at_unix_ts": _payloads.now_unix(),
                     "hash_differs": False,  # pre-edit doesn't carry content_hash
                 }
-                coordinator.increment_stale_warning_emitted()
-                # v0.2 Unit 4 telemetry.
-                coordinator.increment_strict_mode_denial()
-                coordinator.record_strict_deny(session_id, path)
-                if not _audit_log.append_strict_deny(
-                    coordinator.coordinator_root,
-                    agent_id=session_id, path=path, tool="Edit",
-                ):
-                    coordinator.increment_audit_log_mode_drift()
+                def record_deny() -> None:
+                    coordinator.increment_stale_warning_emitted()
+                    # v0.2 Unit 4 telemetry.
+                    coordinator.increment_strict_mode_denial()
+                    coordinator.record_strict_deny(session_id, path)
+                    if not _audit_log.append_strict_deny(
+                        coordinator.coordinator_root,
+                        agent_id=session_id, path=path, tool="Edit",
+                    ):
+                        coordinator.increment_audit_log_mode_drift()
+                on_answer.append(record_deny)
+                _raise_if_abandoned(abort)
                 return {
                     "ok": False,
                     "hookSpecificOutput": _payloads.emit_strict_deny(
@@ -3298,7 +3309,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # the typed error maps to the same deny.
             return _giver_deny_response(
                 coordinator, exc, session_id=session_id, path=path, caller=caller,
-                source=_PRE_EDIT_GIVER_DENY_SOURCE,
+                source=_PRE_EDIT_GIVER_DENY_SOURCE, abort=abort, on_answer=on_answer,
             )
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
@@ -3369,24 +3380,22 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             coordinator, session_id, body, result, abort=abort
         )
 
-    # On watchdog timeout this route ADMITS. _PRE_EDIT_DEGRADED_RESPONSE is
-    # {ok: true, degraded: true}: no hookSpecificOutput, so the hook client
-    # relays no deny and no advisory and the edit proceeds. The answer is
-    # chosen without the work body's decision, so it admits the strict-mode
-    # stale editor the body above would have denied. See the constant for the
-    # rule a future acquire-or-fail refusal must keep.
+    # On watchdog timeout this route ADMITS, with the could-not-verify
+    # advisory (_PRE_EDIT_DEGRADED_RESPONSE). The answer is chosen without the
+    # work body's decision, so it admits the strict-mode stale editor, or the
+    # giver of a live handoff, the body would have denied. See the constant
+    # for the rule a future acquire-or-fail refusal must keep.
     # A6: abort threaded into service.write so a late acquire aborts at the
     # registry lock instead of granting a phantom EXCLUSIVE (and silently
-    # invalidating peers) the agent never saw. The abort covers the acquire
-    # only: a late body that takes the strict-deny branch never reaches it,
-    # so it completes and records a deny (counter, route-around marker,
-    # audit line) for an edit the caller was already told to proceed with.
-    # The giver's deny (#185) is the same: a timed-out giver is admitted, its
-    # late body records the deny, and its commit is refused by the fence.
+    # invalidating peers) the agent never saw. A deny's bookkeeping (counters,
+    # route-around marker, audit line) goes on on_answer, which _run_or_degrade
+    # applies only when the deny is the answer it sends, so a late body that
+    # takes a deny branch records nothing the caller was not told (#236).
     abort = threading.Event()
+    on_answer: list[Callable[[], None]] = []
     _run_or_degrade(
         req, coordinator, work_with_reground,
-        degraded_response=_PRE_EDIT_DEGRADED_RESPONSE, abort=abort,
+        degraded_response=_PRE_EDIT_DEGRADED_RESPONSE, abort=abort, on_answer=on_answer,
     )
 
 
@@ -4367,22 +4376,26 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # the next path's reason as the model resolves them one by one
         # (bounded by the model's own retry-loop per Phase 0 finding).
         if strict_stale_first is not None:
-            coordinator.increment_stale_warning_emitted()
-            # v0.2 Unit 4 telemetry: count the deny, check for route-around,
-            # append audit-log line.
-            coordinator.increment_strict_mode_denial()
             denied_path = strict_stale_first["path"]
-            if coordinator.check_strict_deny_route_around(session_id, denied_path):
-                # H4 routing pattern observed in live operation — Read got
-                # strict-denied earlier on this (session, path), and now
-                # Bash is hitting the same artifact within the window.
-                coordinator.increment_strict_mode_routed_around_via_bash()
-            coordinator.record_strict_deny(session_id, denied_path)
-            if not _audit_log.append_strict_deny(
-                coordinator.coordinator_root,
-                agent_id=session_id, path=denied_path, tool="Bash",
-            ):
-                coordinator.increment_audit_log_mode_drift()
+
+            def record_deny() -> None:
+                coordinator.increment_stale_warning_emitted()
+                # v0.2 Unit 4 telemetry: count the deny, check for route-around,
+                # append audit-log line.
+                coordinator.increment_strict_mode_denial()
+                if coordinator.check_strict_deny_route_around(session_id, denied_path):
+                    # H4 routing pattern observed in live operation — Read got
+                    # strict-denied earlier on this (session, path), and now
+                    # Bash is hitting the same artifact within the window.
+                    coordinator.increment_strict_mode_routed_around_via_bash()
+                coordinator.record_strict_deny(session_id, denied_path)
+                if not _audit_log.append_strict_deny(
+                    coordinator.coordinator_root,
+                    agent_id=session_id, path=denied_path, tool="Bash",
+                ):
+                    coordinator.increment_audit_log_mode_drift()
+            on_answer.append(record_deny)
+            _raise_if_abandoned(abort)
             summary_typed: _payloads.StaleSummary = strict_stale_first  # type: ignore[assignment]
             return {
                 "hookSpecificOutput": _payloads.emit_strict_deny(
@@ -4442,13 +4455,17 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             coordinator, session_id, body, work(), abort=abort
         )
 
-    # A6: pre-bash never threaded an abort into work() — its SHARED
-    # re-grants are idempotent. The token is introduced here solely for the
-    # re-grounding delivery, whose pop is NOT idempotent: a zombie that
+    # A6: pre-bash never threaded an abort into its grants — its SHARED
+    # re-grants are idempotent, and a late one still lands. The token serves
+    # the re-grounding delivery, whose pop is NOT idempotent: a zombie that
     # outlives the degraded response must not claim the flag out from under
     # the next live admit.
+    # The strict deny's bookkeeping goes on on_answer, applied only when the
+    # deny is the answer sent; a late deny body raises at _raise_if_abandoned
+    # so the watchdog counts a late abort (#236).
     abort = threading.Event()
-    _run_or_degrade(req, coordinator, work_with_reground, abort=abort)
+    on_answer: list[Callable[[], None]] = []
+    _run_or_degrade(req, coordinator, work_with_reground, abort=abort, on_answer=on_answer)
 
 
 def _deny_giver_shell_write(
@@ -4498,10 +4515,12 @@ def _deny_giver_shell_write(
     if handed is None:
         return False
     path, record = handed
+    abort = threading.Event()
+    on_answer: list[Callable[[], None]] = []
     _run_or_degrade(req, coordinator, lambda: _giver_deny_response(
         coordinator, record, session_id=session_id, path=path, caller=caller,
-        source=_PRE_BASH_GIVER_DENY_SOURCE,
-    ))
+        source=_PRE_BASH_GIVER_DENY_SOURCE, abort=abort, on_answer=on_answer,
+    ), abort=abort, on_answer=on_answer)
     return True
 
 
@@ -4652,18 +4671,22 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 
         # v0.2 KTD-Q strict-mode deny short-circuit. Same shape as pre-bash.
         if strict_stale_first is not None:
-            coordinator.increment_stale_warning_emitted()
-            # v0.2 Unit 4 telemetry — Grep does NOT contribute to the
-            # route-around-via-bash counter (that's bash-specific by the
-            # plan's KTD-J extension; Grep is a separate H4 surface).
-            coordinator.increment_strict_mode_denial()
             denied_path = strict_stale_first["path"]
-            coordinator.record_strict_deny(session_id, denied_path)
-            if not _audit_log.append_strict_deny(
-                coordinator.coordinator_root,
-                agent_id=session_id, path=denied_path, tool="Grep",
-            ):
-                coordinator.increment_audit_log_mode_drift()
+
+            def record_deny() -> None:
+                coordinator.increment_stale_warning_emitted()
+                # v0.2 Unit 4 telemetry — Grep does NOT contribute to the
+                # route-around-via-bash counter (that's bash-specific by the
+                # plan's KTD-J extension; Grep is a separate H4 surface).
+                coordinator.increment_strict_mode_denial()
+                coordinator.record_strict_deny(session_id, denied_path)
+                if not _audit_log.append_strict_deny(
+                    coordinator.coordinator_root,
+                    agent_id=session_id, path=denied_path, tool="Grep",
+                ):
+                    coordinator.increment_audit_log_mode_drift()
+            on_answer.append(record_deny)
+            _raise_if_abandoned(abort)
             summary_typed: _payloads.StaleSummary = strict_stale_first  # type: ignore[assignment]
             return {
                 "hookSpecificOutput": _payloads.emit_strict_deny(
@@ -4719,13 +4742,17 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             coordinator, session_id, body, work(), abort=abort
         )
 
-    # A6: pre-grep never threaded an abort into work() — its SHARED
-    # re-grants are idempotent. The token is introduced here solely for the
-    # re-grounding delivery, whose pop is NOT idempotent: a zombie that
+    # A6: pre-grep never threaded an abort into its grants — its SHARED
+    # re-grants are idempotent, and a late one still lands. The token serves
+    # the re-grounding delivery, whose pop is NOT idempotent: a zombie that
     # outlives the degraded response must not claim the flag out from under
     # the next live admit.
+    # The strict deny's bookkeeping goes on on_answer, applied only when the
+    # deny is the answer sent; a late deny body raises at _raise_if_abandoned
+    # so the watchdog counts a late abort (#236).
     abort = threading.Event()
-    _run_or_degrade(req, coordinator, work_with_reground, abort=abort)
+    on_answer: list[Callable[[], None]] = []
+    _run_or_degrade(req, coordinator, work_with_reground, abort=abort, on_answer=on_answer)
 
 
 # ----------------------------------------------------------------------
@@ -5485,6 +5512,8 @@ def _giver_deny_response(
     path: str,
     caller: UUID,
     source: str,
+    abort: threading.Event | None,
+    on_answer: list[Callable[[], None]],
 ) -> dict:
     """The giver's pre-edit deny: the typed reason at the top
     level, the third byte-stable template in the deny envelope beside it, and
@@ -5497,9 +5526,15 @@ def _giver_deny_response(
     giver-deny counter only (this deny is neither a strict-mode nor a
     stale-view deny, and it fires in warn mode), the route-around detector's
     map so a shell read routing around it is counted, and no audit line (the
-    strict appender would label it a strict deny with a raw session id)."""
-    coordinator.increment_handoff_giver_denial()
-    coordinator.record_strict_deny(session_id, path)
+    strict appender would label it a strict deny with a raw session id).
+
+    The bookkeeping is queued on ``on_answer``, recorded only when this deny is
+    the answer sent (#236): a giver answered on a timeout is admitted, and must
+    not be counted as denied."""
+    def record_deny() -> None:
+        coordinator.increment_handoff_giver_denial()
+        coordinator.record_strict_deny(session_id, path)
+    on_answer.append(record_deny)
     body = {
         **_giver_fenced_body(fence),
         "hookSpecificOutput": _payloads.emit_handoff_giver_deny(
@@ -5509,7 +5544,11 @@ def _giver_deny_response(
             version_at_transfer=fence.version_at_transfer,
         ),
     }
-    return _attach_handoff_key(coordinator, body, path=path, caller=caller)
+    answer = _attach_handoff_key(coordinator, body, path=path, caller=caller)
+    # Last, after the registry read above: a body that outlived its deadline
+    # anywhere in here is counted as a late abort, not a late completion.
+    _raise_if_abandoned(abort)
+    return answer
 
 
 def _giver_commit_refused_body(exc: GiverFenced, *, path: str) -> dict:
@@ -7469,6 +7508,18 @@ _ENDPOINT_COUNTER_NAMES: dict[tuple[str, str], str] = {
 # ----------------------------------------------------------------------
 
 
+DEGRADED_FRESHNESS_ADVISORY = (
+    "⚠ Coherence could not verify this file's freshness — the coordinator "
+    "staleness check timed out under load. Proceeding WITHOUT a stale-read "
+    "guarantee: if this file is shared with other agents or sessions, "
+    "re-read it before relying on its contents."
+)
+"""What a hook answered on a watchdog timeout tells the model: the coherence
+check did not run. One string for every route that degrades to an admit
+(pre-read, pre-bash and pre-grep through :data:`_DEFAULT_DEGRADED_RESPONSE`,
+pre-edit through :data:`_PRE_EDIT_DEGRADED_RESPONSE`), so a reader of the
+transcript sees the same words whichever check timed out."""
+
 _DEFAULT_DEGRADED_RESPONSE: dict = {
     "status": "fresh",
     "degraded": True,
@@ -7480,12 +7531,7 @@ _DEFAULT_DEGRADED_RESPONSE: dict = {
     # are the honest signal that freshness is UNVERIFIED, not confirmed.
     "hookSpecificOutput": _payloads.emit_allow(
         source="watchdog_degraded_read",
-        additional_context=(
-            "⚠ Coherence could not verify this file's freshness — the coordinator "
-            "staleness check timed out under load. Proceeding WITHOUT a stale-read "
-            "guarantee: if this file is shared with other agents or sessions, "
-            "re-read it before relying on its contents."
-        ),
+        additional_context=DEGRADED_FRESHNESS_ADVISORY,
     ),
 }
 """AC-05 / A7: pre-read / pre-bash / pre-grep degrade to a fresh-shape envelope
@@ -7501,9 +7547,18 @@ _OK_DEGRADED_RESPONSE: dict = {"ok": True, "degraded": True}
 """AC-05: degraded envelope for {ok: bool}-shape endpoints (post-edit,
 session-stop, and the snapshot-session begin/read/heartbeat routes). Pairs with
 ``_DEFAULT_DEGRADED_RESPONSE``. Pre-edit has its own
-:data:`_PRE_EDIT_DEGRADED_RESPONSE`, equal in value today."""
+:data:`_PRE_EDIT_DEGRADED_RESPONSE`, which also carries an advisory."""
 
-_PRE_EDIT_DEGRADED_RESPONSE: dict = {"ok": True, "degraded": True}
+_PRE_EDIT_DEGRADED_RESPONSE: dict = {
+    "ok": True,
+    "degraded": True,
+    # Context-only, never emit_allow: a permissionDecision "allow" would skip
+    # Claude Code's own permission prompt for the Edit or Write exactly when
+    # the coherence check did not run (#236).
+    "hookSpecificOutput": _payloads.emit_pretooluse_context(
+        additional_context=DEGRADED_FRESHNESS_ADVISORY,
+    ),
+}
 """What ``/hooks/pre-edit`` answers when the watchdog times out: an ADMIT.
 
 The rule this constant carries: a timed-out acquire must not answer in a shape
@@ -7516,15 +7571,16 @@ and this envelope is still ``ok: true``. A timed-out request never looked for a
 holder: admitting it lets the caller edit over a holder the refusal would have
 reported, and answering ``other_holder`` would report a holder nobody observed.
 
-The rule is already broken by a refusal that exists today. Undegraded, a
-strict-mode editor whose grant a peer invalidated gets the strict deny; on a
-timeout it gets this envelope, which carries no ``hookSpecificOutput``, so the
-hook client relays no deny and no advisory -- unlike the read path's
-:data:`_DEFAULT_DEGRADED_RESPONSE`, which at least says freshness was not
-checked. That degrade-to-admit is shipped behaviour (a hook must not block a
-tool call on coordinator load) and this constant does not change it. Library
-callers are stricter: ``CoherentVolume`` with ``on_error="strict"`` (its
-default) raises on ``degraded: true``.
+The rule bends for one refusal that exists today. Undegraded, a strict-mode
+editor whose grant a peer invalidated gets the strict deny; on a timeout it is
+admitted, because a hook must not block a tool call on coordinator load and
+the answer is chosen without the body's decision. It is not admitted silently
+(#236): the envelope carries :data:`DEGRADED_FRESHNESS_ADVISORY`, the words
+the read routes use, so the model is told the check did not run. The advisory
+is context-only -- no ``permissionDecision`` -- because an ``allow`` would skip
+Claude Code's own permission prompt for the Edit or Write. Library callers are
+stricter: ``CoherentVolume`` with ``on_error="strict"`` (its default) raises on
+``degraded: true``.
 
 Its own name, rather than a share of :data:`_OK_DEGRADED_RESPONSE`, so that
 changing what a timed-out acquire answers cannot silently change what a
@@ -7649,6 +7705,7 @@ def _run_or_degrade(
     *,
     degraded_response: dict | None = None,
     abort: threading.Event | None = None,
+    on_answer: list[Callable[[], None]] | None = None,
 ) -> None:
     """Run ``work`` under the handler-side watchdog. On timeout, log WARNING
     and return 200 with ``degraded_response`` (or the default fresh-shape
@@ -7680,6 +7737,11 @@ def _run_or_degrade(
     pre-bash's giver lookup when it finished in time -- ``work`` gets only what
     is left (:func:`_watchdog_deadline`). A giver lookup that timed out put the
     deadline back, so the work after it runs on the budget it always had.
+
+    ``on_answer`` is where ``work`` queues the bookkeeping of the answer it
+    returns (a deny's counters, marker and audit line). It is applied by
+    :func:`_apply_answer_effects` only when that answer is the one sent, never
+    for a body that timed out (#236).
     """
     if _watchdog_queue_overflowed(req, coordinator):
         return
@@ -7697,7 +7759,25 @@ def _run_or_degrade(
     except Exception as exc:
         _answer_handler_error(req, coordinator, exc, failed="handler work")
         return
+    _apply_answer_effects(on_answer)
     req._json(200, result)
+
+
+def _apply_answer_effects(on_answer: list[Callable[[], None]] | None) -> None:
+    """Record what a work body queued for the answer it returned: a deny's
+    counters, route-around marker and audit line (#236).
+
+    Runs on the request's own thread once :meth:`run_with_watchdog` returned
+    the body's answer, and before that answer is sent, so a client that has
+    the answer also sees its records. A body that timed out never gets here,
+    however late it finishes, so nothing records a decision the caller was
+    not sent. The records cannot change the decision either: one that fails
+    is logged, and the answer is still sent."""
+    for effect in on_answer or ():
+        try:
+            effect()
+        except Exception:
+            logger.exception("recording a hook answer's bookkeeping failed; answering anyway")
 
 
 _EFFECT_FENCE_ROUTE: tuple[str, str] = ("POST", "/hooks/effect-fence")
@@ -8314,6 +8394,21 @@ def _last_writer_unix_ts(
     return coordinator.registry.get_artifact_updated_at(artifact_id)
 
 
+def _raise_if_abandoned(abort: threading.Event | None) -> None:
+    """Raise :class:`WatchdogAbandoned` when the request this deny body serves
+    already timed out (#236).
+
+    Accounting only: a deny's records are queued on ``on_answer`` and are never
+    applied for a timed-out body, so a late body records nothing either way.
+    Raising lets the watchdog count it as a late abort rather than a late
+    completion, whose CRITICAL sends an operator looking for orphaned grants.
+    Call it last before returning, after any registry read the body makes. A
+    deadline that passes after this check still ends as a late completion with
+    nothing recorded."""
+    if abort is not None and abort.is_set():
+        raise WatchdogAbandoned("strict deny abandoned: the watchdog already answered")
+
+
 def _emit_pre_read_strict_deny(
     coordinator: CoordinatorHTTPServer,
     *,
@@ -8323,6 +8418,8 @@ def _emit_pre_read_strict_deny(
     path: str,
     summary: _payloads.StaleSummary,
     source: str,
+    abort: threading.Event | None,
+    on_answer: list[Callable[[], None]],
 ) -> dict:
     """Single source of truth for emitting a pre-read strict-mode deny, used by
     both deny arms: the INVALID/None-grant path and the Survivor #6
@@ -8331,15 +8428,19 @@ def _emit_pre_read_strict_deny(
     records the (session, path) for pre-bash/pre-grep route-around, appends the
     audit row (counting mode drift on failure), and returns the byte-stable
     deny payload. Keeping both arms here means their telemetry and KTD-T
-    byte-stable deny text cannot drift apart."""
-    coordinator.increment_stale_warning_emitted()
-    coordinator.mark_stale_warned(agent_id, artifact_id)
-    coordinator.increment_strict_mode_denial()
-    coordinator.record_strict_deny(session_id, path)
-    if not _audit_log.append_strict_deny(
-        coordinator.coordinator_root, agent_id=session_id, path=path, tool="Read",
-    ):
-        coordinator.increment_audit_log_mode_drift()
+    byte-stable deny text cannot drift apart. The bookkeeping is queued on
+    ``on_answer`` and recorded only when this deny is the answer sent (#236)."""
+    def record_deny() -> None:
+        coordinator.increment_stale_warning_emitted()
+        coordinator.mark_stale_warned(agent_id, artifact_id)
+        coordinator.increment_strict_mode_denial()
+        coordinator.record_strict_deny(session_id, path)
+        if not _audit_log.append_strict_deny(
+            coordinator.coordinator_root, agent_id=session_id, path=path, tool="Read",
+        ):
+            coordinator.increment_audit_log_mode_drift()
+    on_answer.append(record_deny)
+    _raise_if_abandoned(abort)
     return {
         "hookSpecificOutput": _payloads.emit_strict_deny(
             source=source, summary=summary,
