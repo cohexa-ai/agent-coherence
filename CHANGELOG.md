@@ -17,7 +17,7 @@ Alpha — APIs may change before `v1.0`.
   unchanged.
 
 - **A refused commit now says which generation the committer's claim was taken
-  under and which generation owns the artifact now.** Until now a refusal said
+  under and which generation owns the artifact now (#361).** Until now a refusal said
   why the commit lost, but not which claim it was decided against. Every
   commit refusal decided against the registry now carries
   `captured_generation`, the ownership generation the coordinator recorded at
