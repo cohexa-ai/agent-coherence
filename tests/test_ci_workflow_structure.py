@@ -623,7 +623,8 @@ def _dispatched_title_format() -> str:
 FAKE_GH = """#!/usr/bin/env python3
 # Stands in for gh. Each call must have the exact shape the step uses, or
 # the fake exits 2. The dispatched run is in progress until a `run watch`
-# succeeds; a watch listed as failing in FAKE_WATCH_EXITS leaves it running.
+# succeeds; a watch listed as failing in FAKE_WATCH_EXITS leaves it running,
+# and with FAKE_RUN_NEVER_ENDS=1 every watch fails, however many fit the wait.
 import json, os, sys
 
 args = sys.argv[1:]
@@ -665,6 +666,8 @@ if args[:2] == ["run", "watch"]:
     exits = [int(code) for code in os.environ.get("FAKE_WATCH_EXITS", "").split(",") if code]
     call = bump("watch-calls")
     code = exits[call - 1] if call <= len(exits) else 0
+    if os.environ.get("FAKE_RUN_NEVER_ENDS") == "1":
+        code = 1
     if code == 0 and args[2] == "4242":
         with open(state_file, "w") as out:
             out.write("completed")
@@ -751,12 +754,14 @@ def test_the_weekly_run_keeps_waiting_when_a_watch_ends_early(tmp_path: Path) ->
 
 def test_the_weekly_run_says_so_when_its_run_is_still_going_at_the_deadline(tmp_path: Path) -> None:
     """A run that never completes inside the wait is not reported as failed:
-    the message says it was still running, and the weekly run still fails."""
+    the message says it was still running, and the weekly run still fails.
+    The run never ends, rather than ending after a fixed number of watches,
+    so a fast runner cannot finish them all inside the wait."""
     proc, _, _ = _run_weekly_step(
         tmp_path,
         FAKE_RUN_APPEARS="1",
         FAKE_CONCLUSION="success",
-        FAKE_WATCH_EXITS=",".join(["1"] * 50),
+        FAKE_RUN_NEVER_ENDS="1",
         WAIT_TIMEOUT_SECONDS="2",
     )
     assert proc.returncode != 0
