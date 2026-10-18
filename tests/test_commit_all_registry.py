@@ -203,6 +203,81 @@ def test_commit_all_stale_read_generation_holds_whole_batch(registry):
     assert registry.get_artifact(b.id).version == 1
 
 
+def _reclaim(reg, art_id, holder, tick):
+    """A sweep-style reclaim of ``holder``'s fresh grant: owner_generation +1,
+    version unmoved."""
+    reg.set_agent_state(art_id, holder, MESIState.EXCLUSIVE, trigger="write", tick=tick)
+    reg.set_agent_state(art_id, holder, MESIState.INVALID, trigger="reclaim_heartbeat", tick=tick + 1)
+
+
+def _peer_commit(reg, art_id):
+    won = reg.commit_cas(art_id, uuid4(), expected_version=1, content_hash="peer")
+    assert isinstance(won, tuple), won
+
+
+def _refused_pairs(result):
+    return {
+        art_id: (detail.reason, detail.captured_generation, detail.owner_generation)
+        for art_id, detail in result.per_artifact.items()
+    }
+
+
+def test_commit_all_each_refused_member_carries_its_own_pair(registry):
+    """Every refused member reports the pair its own check read: the fenced
+    member its superseded claim (2, 3); the member behind on version the claim
+    it holds (1, 1); the claimless member nothing. Distinct pairs and owner
+    generations per member, so a value leaked from one member to another, a
+    swapped field or a hard-coded one fails."""
+    fenced = _register(registry, "fenced.md", 1)
+    behind = _register(registry, "behind.md", 1)
+    claimless = _register(registry, "claimless.md", 1)
+    writer = uuid4()
+    _reclaim(registry, fenced.id, uuid4(), tick=1)
+    _reclaim(registry, fenced.id, uuid4(), tick=3)
+    _reclaim(registry, fenced.id, writer, tick=5)  # writer's claim 2, owner 3
+    _reclaim(registry, behind.id, uuid4(), tick=1)
+    registry.set_agent_state(behind.id, writer, MESIState.SHARED, trigger="fetch", tick=7)  # claim 1
+    _peer_commit(registry, behind.id)
+    _peer_commit(registry, claimless.id)
+
+    result = registry.commit_all(
+        writer,
+        {
+            fenced.id: CommitAllEntry(expected_version=1, content_hash="f2"),
+            behind.id: CommitAllEntry(expected_version=1, content_hash="b2"),
+            claimless.id: CommitAllEntry(expected_version=1, content_hash="c2"),
+        },
+        tick=9,
+    )
+
+    assert isinstance(result, MultiCommitConflict)
+    assert _refused_pairs(result) == {
+        fenced.id: ("stale_read_generation", 2, 3),
+        behind.id: ("version_mismatch", 1, 1),
+        claimless.id: ("version_mismatch", None, None),
+    }
+    assert registry.get_owner_generation(fenced.id) == 3
+    assert registry.get_owner_generation(behind.id) == 1
+
+
+def test_commit_all_other_holder_member_carries_an_equal_pair(registry):
+    """A member refused because a pessimistic peer holds it reports the
+    writer's current claim equal to that member's owner generation."""
+    a = _register(registry, "a.md", 1)
+    writer, holder = uuid4(), uuid4()
+    _reclaim(registry, a.id, uuid4(), tick=1)
+    _reclaim(registry, a.id, uuid4(), tick=3)
+    registry.set_agent_state(a.id, writer, MESIState.SHARED, trigger="fetch", tick=5)  # claim 2
+    registry.set_agent_state(a.id, holder, MESIState.EXCLUSIVE, trigger="write", tick=6)
+
+    result = registry.commit_all(
+        writer, {a.id: CommitAllEntry(expected_version=1, content_hash="a2")}, tick=7
+    )
+
+    assert isinstance(result, MultiCommitConflict)
+    assert _refused_pairs(result) == {a.id: ("other_holder", 2, 2)}
+
+
 def test_commit_all_win_retains_prior_versions(retaining_registry):
     """A WIN under retain_versions=True captures each member's committed version
     into retention history (retrievable byte-for-byte)."""

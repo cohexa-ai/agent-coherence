@@ -65,10 +65,23 @@ class ConflictDetail:
     detected, so the caller can re-seed its retry. Corruption
     (``expected_version > current``) is signalled separately (it is never a
     ``ConflictDetail``) and the service layer raises ``CoherenceError`` for it.
+
+    ``captured_generation`` is the committer's recorded read_generation and
+    ``owner_generation`` the artifact's, both read from the snapshot the
+    refusal was decided against, for every reason. Both are ``None`` exactly
+    when the committer has no recorded read_generation. ``captured <
+    owner`` means a write claim on the artifact ended without a version move
+    after the committer's claim was recorded; the reason, not the pair, says
+    why this commit lost, and no ordering between the two is guaranteed.
+    Keyword-only so positional construction is unchanged; out of repr so a
+    message that embeds one is unchanged; compared, so an exact assertion
+    sees a dropped or over-filled pair.
     """
 
     reason: Literal["version_mismatch", "other_holder", "stale_read_generation"]
     current_version: int
+    captured_generation: Optional[int] = field(default=None, kw_only=True, repr=False)
+    owner_generation: Optional[int] = field(default=None, kw_only=True, repr=False)
 
 
 @dataclass(frozen=True)

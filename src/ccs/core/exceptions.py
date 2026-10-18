@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from typing import TypeGuard
 from uuid import UUID
 
 # Wire-stable reason string for the retry-eligible OCC precondition where a peer
@@ -559,6 +560,25 @@ class CoherenceError(Exception):
     """Base error for coherence domain failures."""
 
 
+def _is_generation(value: object) -> TypeGuard[int]:
+    # bool is an int subclass, and True is no generation.
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _generation_pair(captured: object, owner: object) -> tuple[int, int] | None:
+    """A commit refusal's ``(captured_generation, owner_generation)``, or
+    ``None`` when the pair is absent or malformed.
+
+    Generations start at 0 and only grow, so a negative, a bool, a non-int or
+    a lone value is no generation, and half a pair names no lost token: the
+    pair is kept or dropped whole. The one rule for every place that parses or
+    emits the pair, so they cannot disagree. Never raises, because exception
+    constructors call it with whatever a response body held."""
+    if _is_generation(captured) and _is_generation(owner):
+        return captured, owner
+    return None
+
+
 class StaleReadGeneration(CoherenceError):
     """The read-generation fence rejected a commit: the committer's
     read_generation is older than the artifact's current owner_generation --
@@ -568,7 +588,26 @@ class StaleReadGeneration(CoherenceError):
     ``commit_cas`` path returns a :class:`ConflictDetail` with the same reason
     instead. Retry-eligible: ``reacquire()`` + fresh read + re-commit. Carries
     ``STALE_READ_GENERATION_REASON`` so the client classifier matches it
-    exactly (never on the human message)."""
+    exactly (never on the human message).
+
+    :attr:`captured_generation` and :attr:`owner_generation` are the two values
+    the fence compared, as on :class:`ConflictDetail`. They are keyword-only
+    and never enter the message, which stays whatever the raise site wrote;
+    both are ``None`` (the class default) when no valid pair was passed."""
+
+    captured_generation: int | None = None
+    owner_generation: int | None = None
+
+    def __init__(
+        self,
+        *args: object,
+        captured_generation: object = None,
+        owner_generation: object = None,
+    ) -> None:
+        super().__init__(*args)
+        pair = _generation_pair(captured_generation, owner_generation)
+        if pair is not None:
+            self.captured_generation, self.owner_generation = pair
 
 
 class OccCallerTransientError(CoherenceError):

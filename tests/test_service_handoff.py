@@ -503,8 +503,8 @@ def test_a_write_shape_giver_stays_stale_until_a_fresh_generation(service) -> No
     still_stale = _cas(service, handoff.path, handoff.giver_read, caller=handoff.giver)
     reminted = _cas(service, handoff.path, uuid4(), caller=handoff.giver)
 
-    assert stale == ConflictDetail("stale_read_generation", 1)
-    assert still_stale == ConflictDetail("stale_read_generation", 1)
+    assert stale == ConflictDetail("stale_read_generation", 1, captured_generation=0, owner_generation=1)
+    assert still_stale == ConflictDetail("stale_read_generation", 1, captured_generation=0, owner_generation=1)
     assert isinstance(reminted, tuple), reminted
 
 
