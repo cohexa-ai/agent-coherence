@@ -37,6 +37,27 @@ Alpha — APIs may change before `v1.0`.
   with the bytes and version it was classified at. `write_cas`, `write_cas_at`
   and Claude Code hook clients were not affected.
 
+- **A `pre-edit` that times out now says the check did not run, and a check
+  that finishes late no longer records a deny nobody was sent (#236).** When
+  the coordinator could not answer `pre-edit` within its 4-second handler
+  budget, it admitted the edit with a bare `{"ok": true, "degraded": true}`.
+  The hook client relayed that as an ordinary admit, so a strict-mode session
+  whose view a peer had overtaken could Edit or Write with no warning. The
+  answer now carries the same "could not verify" advisory the read hooks give
+  on a timeout, as added context only. It has no `permissionDecision`, so
+  Claude Code still asks about the Edit or Write as it otherwise would. The
+  edit is still admitted: a hook does not block a tool call because the
+  coordinator is under load.
+  The check itself kept running after the answer. When it then reached a
+  strict-mode deny on `pre-edit`, `pre-read`, `pre-bash` or `pre-grep`, or the
+  giver's deny on a handed-off path, it recorded that deny anyway: a denial
+  counted, an `audit.log` line, the route-around marker, and a CRITICAL log
+  about orphaned grants that did not exist. A deny's bookkeeping is now
+  recorded only when the deny is the answer sent, and the late work counts in
+  `watchdog_late_aborts_total`. A deny whose audit append is slow or fails is
+  now still answered as a deny; a slow append used to time the request out
+  and admit the call.
+
 ## [0.15.0] - 2026-10-14
 
 **Sessions can hand a held path to a named successor, a caller principal keeps protocol-following clients from acting as each other's sessions, and the effect fence answers over HTTP; `/status` reports sweep reclaims, grant ages, each artifact's last writer and the store's schema version; and a run of fixes closes ways a stale read, a refused read or a policy edit let a write overwrite newer work.**

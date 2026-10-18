@@ -977,6 +977,21 @@ as added context:
 
 It counts in `watchdog_timeouts_total` too.
 
+**The Edit and Write hook.** When `POST /hooks/pre-edit` cannot finish its
+check within the same 4-second budget, it admits the edit, as every hook does
+when the coordinator is under load, and says so: it answers
+`"ok": true, "degraded": true` with the same advisory, as added context only.
+The answer carries no `permissionDecision`, so Claude Code asks about the Edit
+or Write exactly as it otherwise would. A strict-mode edit the check would have
+denied is admitted this way too, because the check did not run. If the edit
+goes ahead over a peer's newer commit, its `post-edit` is refused.
+
+**A check that finishes late records nothing.** A hook answered on a timeout
+keeps working in the background. When that work reaches a deny afterwards, it
+records nothing: no strict-mode denial, no audit line, no route-around marker.
+The `/status` counters and `audit.log` show only denies a caller was sent. The
+late work counts in `watchdog_late_aborts_total`.
+
 ### Reference
 
 For the formal protocol model (TLA+/TLC) covering single-writer, monotonic
@@ -2479,8 +2494,9 @@ Commit refused: you handed {path} to agent {successor_short} at v{version_at_tra
 
 The file on disk then differs from the version the coordinator recorded. The
 same happens to an edit admitted while the coordinator was degraded: a
-`pre-edit` that times out answers `{"ok": true, "degraded": true}`, so the edit
-goes ahead, and its commit is refused.
+`pre-edit` that times out admits the edit with the
+[could-not-verify advisory](#when-the-registry-is-busy), so the edit goes
+ahead, and its commit is refused.
 
 **What each session is told.** While a path has a transfer record, an admitted
 `pre-read` or `pre-edit` on it carries prose for the caller's role, in a
@@ -3158,9 +3174,9 @@ with backoff rather than wait for a signal.
 admits the edit: the contention that makes a holder worth respecting is the
 contention that times a handler out. It answers `ok: false` with
 `"degraded": true`, and the caller treats that as a refusal. Today a timed-out
-`pre-edit` answers `{"ok": true, "degraded": true}`; a test in the coordinator
-suite fails as soon as a refusal reason is registered while that is still the
-answer.
+`pre-edit` admits, answering `{"ok": true, "degraded": true}` with the
+could-not-verify advisory; a test in the coordinator suite fails as soon as a
+refusal reason is registered while that is still the answer.
 
 **What it does not close.**
 
