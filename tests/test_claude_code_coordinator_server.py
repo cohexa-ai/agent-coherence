@@ -12963,8 +12963,9 @@ def test_a_coordinator_wiring_a_state_log_records_the_transfer_under_the_handoff
 # Its giver lookup reads the registry only when the pure write detector names a
 # written tracked path, and then only in the watchdog pool, starting the
 # request's one deadline -- the caller-principal gate's discipline. A lookup
-# that cannot finish in time is counted and answers as if the check did not
-# exist. What a live record changes, and what it does not, is pinned in
+# that cannot finish in time is counted, and the admit the hook then answers
+# says the check did not run (#341); a deny is sent as it is. What a live
+# record changes, and what it does not, is pinned in
 # tests/integration/test_strict_mode.py.
 # ----------------------------------------------------------------------
 
@@ -13028,19 +13029,38 @@ def test_a_bash_command_writing_no_tracked_path_runs_no_giver_lookup(
     assert threads == []
 
 
-def test_a_givers_shell_write_whose_lookup_cannot_read_answers_as_before_and_counts_a_timeout(
+def _giver_check_unverified_answer(coordinator_module: Any) -> dict:
+    """What a bare pre-bash admit becomes when the giver lookup timed out: a
+    literal, so the test does not move with the constant it checks."""
+    return {
+        "status": "fresh",
+        "degraded": True,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": coordinator_module.DEGRADED_FRESHNESS_ADVISORY,
+        },
+    }
+
+
+def test_a_givers_shell_write_whose_lookup_cannot_read_answers_degraded_and_counts_a_timeout(
     coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With the registry lock held, the giver lookup cannot finish: the shell
-    write is answered within the watchdog with what pre-bash answered before
-    the check existed, and the timeout is counted like every other. The late
-    lookup, once the lock is released, only reads, so it is not reported as a
-    late completion. Fails if the lookup runs on the handler thread (no answer
-    until the lock is released) or under the mutating watchdog runner."""
+    """#341: with the registry lock held, the giver lookup cannot finish. The
+    giver's shell append, a command that reads no tracked path, is answered
+    within the watchdog as a degraded admit carrying the could-not-verify
+    advisory as context only -- never the bare ``{status: fresh}`` that reads as
+    "checked, nothing handed off", and never a ``permissionDecision`` that would
+    skip Claude Code's own prompt. The timeout is counted like every other, and
+    the late lookup, which only reads, is no late completion. The control is
+    the same request with the lookup in time: the giver's deny. Fails if the
+    lookup runs on the handler thread (no answer until the lock is released)."""
     import ccs.adapters.claude_code.coordinator_server as mod
 
     giver, successor = _claimed(client), _claimed(client)
     _hand_off(client, giver, successor, "plan.md")
+    request = {"session_id": giver.sid, "command": _GIVER_SHELL_APPEND}
+    control = client.post("/hooks/pre-bash", request, principal=giver.principal)
+    assert (control[0], control[1].get("reason")) == (200, "handed_off"), control
     _, returned = _record_giver_lookups(monkeypatch)
     monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
     timeouts_before = coordinator._watchdog_timeouts_total
@@ -13048,13 +13068,12 @@ def test_a_givers_shell_write_whose_lookup_cannot_read_answers_as_before_and_cou
     # No principal is presented, so the gate admits without a store read and
     # the held lock blocks only the giver lookup.
     with _HeldRegistryLock(coordinator) as held:
-        answer = _Background(
-            client, "/hooks/pre-bash", {"session_id": giver.sid, "command": _GIVER_SHELL_APPEND})
+        answer = _Background(client, "/hooks/pre-bash", request)
         answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
         held.release()
 
     assert answered, f"no answer within {_GATE_ANSWER_BOUND_SEC}s"
-    assert answer.result() == (200, {"status": "fresh"})
+    assert answer.result() == (200, _giver_check_unverified_answer(mod))
     assert coordinator._watchdog_timeouts_total == timeouts_before + 1
     assert returned.wait(_ABANDONED_BODY_SETTLE_SEC), "the late lookup never finished"
     time.sleep(0.05)
@@ -13236,7 +13255,7 @@ def _answer_without_the_giver_check(root: Path, command: str, monkeypatch: pytes
     server, client = _serve_strict_plan(root)
     try:
         with monkeypatch.context() as patched:
-            patched.setattr(mod, "_deny_giver_shell_write", lambda *args, **kwargs: False)
+            patched.setattr(mod, "_deny_giver_shell_write", lambda *args, **kwargs: mod._GiverShellCheck.CLEAR)
             answer = client.post("/hooks/pre-bash", {"session_id": _STRICT_READER_SID, "command": command})
     finally:
         server.shutdown()
@@ -13279,6 +13298,65 @@ def test_a_giver_lookup_that_times_out_leaves_the_read_check_its_whole_budget(
         server.shutdown()
     assert result == expected
     assert timeouts_after == timeouts_before + 1
+
+
+@pytest.mark.parametrize("read", ["fresh", "stale"])
+def test_a_giver_lookup_that_times_out_says_so_on_the_admit_the_read_check_answers(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, read: str
+) -> None:
+    """#341: the command reads spec.md and appends to plan.md, so the giver
+    lookup runs and the read check after it answers an admit: fresh, or the
+    warn-mode stale warning once a peer's acquire revoked the reader's grant.
+    Two sessions in the same state send it; the first's lookup finishes in time
+    (the control), the second's is held past the deadline. The second gets the
+    first's answer with ``degraded: true`` and the advisory, appended after the
+    stale warning or as context only on the bare admit -- and with no
+    permission decision: a giver's write to a handed-off path is denied in
+    time, so an admit from a lookup that did not finish must not approve it.
+    Fails if the timed-out lookup is answered as "no record" on the read-check
+    path, or if the stale warning's ``allow`` survives it."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    command = "cat spec.md && echo x >> plan.md"
+    control_session, timed_out = _claimed(client), _claimed(client)
+    for who in (control_session, timed_out):
+        _read(client, who, "spec.md")
+    if read == "stale":
+        peer = _claimed(client)
+        assert _verb(client, "/hooks/pre-edit", peer, "spec.md")[1].get("ok") is True
+    held_caller = mod.caller_principal_identity(timed_out.sid)
+    delayed = _DelayedCall(
+        monkeypatch, mod, "_first_write_handed_off_by",
+        lambda _coordinator, _written, caller: caller == held_caller,
+    )
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", 1.0)
+    # No principal is presented, so the gate starts no deadline and the work
+    # body gets back the whole budget the timed-out lookup restores.
+    try:
+        status, expected = client.post(
+            "/hooks/pre-bash", {"session_id": control_session.sid, "command": command})
+        assert status == 200 and expected.get("status") == read, expected
+        timeouts_before = coordinator._watchdog_timeouts_total
+        answer = client.post("/hooks/pre-bash", {"session_id": timed_out.sid, "command": command})
+    finally:
+        delayed.release()
+
+    assert delayed.entered.is_set(), "the timed-out session's lookup never ran"
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    if "hookSpecificOutput" in expected:
+        context = expected["hookSpecificOutput"]["additionalContext"]
+        expected_hso = {
+            key: value for key, value in expected["hookSpecificOutput"].items()
+            if key != "permissionDecision"
+        }
+        expected_hso["additionalContext"] = context + "\n\n" + mod.DEGRADED_FRESHNESS_ADVISORY
+    else:
+        expected_hso = {
+            "hookEventName": "PreToolUse",
+            "additionalContext": mod.DEGRADED_FRESHNESS_ADVISORY,
+        }
+    assert answer == (200, {**expected, "degraded": True, "hookSpecificOutput": expected_hso})
+    assert "permissionDecision" not in answer[1]["hookSpecificOutput"], answer
 
 
 def test_a_bash_write_detection_that_raises_leaves_the_answer_as_before(

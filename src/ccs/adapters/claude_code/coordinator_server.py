@@ -4252,7 +4252,9 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     First, though, a command that WRITES a path this session handed off
     under a live record (#185) gets the giver's pre-edit deny, byte for byte
     (:func:`_deny_giver_shell_write`); without such a record every answer
-    below is unchanged.
+    below is unchanged. When that check cannot tell -- its lookup timed out --
+    an admit below says so (#341): ``degraded: true`` and the could-not-verify
+    advisory, as context only; a deny goes out as it is.
 
     Request: ``{session_id, command}``.
     Response:
@@ -4290,16 +4292,22 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # #185: ahead of the read detection, which never looks for a write -- a
     # giver denied its Edit would otherwise append through the shell. Answers
     # only when a live record names this session as giver of a path the
-    # command writes; otherwise nothing below changes by a byte.
-    if _deny_giver_shell_write(req, coordinator, session_id=session_id, command=command):
+    # command writes. #341: a lookup that timed out decided nothing, so every
+    # admit below carries the could-not-verify advisory.
+    giver_check = _deny_giver_shell_write(req, coordinator, session_id=session_id, command=command)
+    if giver_check is _GiverShellCheck.ANSWERED:
         return
+    giver_unverified = giver_check is _GiverShellCheck.UNVERIFIED
     # Detect tracked paths the command would read. is_tracked is the
     # policy gate — handler never touches SQLite for an untracked workspace.
     # SB-10 U4 (KTD6): advisory peek hoisted above the zero-tracked-reads
     # exit — see the pre-read twin for the no-flag byte/behavior guarantee.
     tracked_paths = detect_tracked_paths(command, coordinator.policy.is_tracked)
     if not tracked_paths:
-        _fast_path_json(req, coordinator, session_id, body, {"status": "fresh"})
+        base: dict = {"status": "fresh"}
+        if giver_unverified:
+            base = _with_giver_check_unverified(base)
+        _fast_path_json(req, coordinator, session_id, body, base)
         return
 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
@@ -4450,8 +4458,11 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # decision inside work(); notices/stale prose render first. The
         # abort token rides along so a timed-out request never consumes
         # the compact-pending flag.
+        result = work()
+        if giver_unverified:
+            result = _with_giver_check_unverified(result)
         return _deliver_pending_reground(
-            coordinator, session_id, body, work(), abort=abort
+            coordinator, session_id, body, result, abort=abort
         )
 
     # A6: pre-bash never threaded an abort into its grants — its SHARED
@@ -4464,15 +4475,29 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     _run_or_degrade(req, coordinator, work_with_reground, effects=effects)
 
 
+class _GiverShellCheck(Enum):
+    """What :func:`_deny_giver_shell_write` did. Three states, not a bool: a
+    lookup that timed out found no record AND did not look, and answering it as
+    "no record" is what let a giver's shell write through unannounced (#341)."""
+
+    ANSWERED = "answered"
+    """It wrote the answer: the giver's deny, the 503 or the error envelope."""
+    CLEAR = "clear"
+    """No written path is tracked, or none is handed off by this session."""
+    UNVERIFIED = "unverified"
+    """The lookup timed out: whether the command writes a handed-off path is
+    not known."""
+
+
 def _deny_giver_shell_write(
     req: _RequestProtocol,
     coordinator: CoordinatorHTTPServer,
     *,
     session_id: str,
     command: str,
-) -> bool:
+) -> _GiverShellCheck:
     """Answer the giver's deny when ``command`` writes a path this session
-    handed off under a live record (#185); return whether it answered.
+    handed off under a live record (#185); return what it did.
 
     Detection is a pure string scan, so a command that writes no tracked path
     touches no registry (nor does one the detector fails on). Otherwise the
@@ -4481,17 +4506,18 @@ def _deny_giver_shell_write(
     gate's lookup does. A lookup that finishes in time keeps that deadline, so
     the lookup and whatever answers after it share one ``HANDLER_TIMEOUT_SEC``:
     a hit answers the giver's pre-edit deny through the guarded path, and no
-    hit returns False. A lookup that times out is counted like every timeout,
-    puts the deadline back as it found it and returns False, so the caller
-    answers exactly what it answered before this check existed, on the budget
-    it had then. A full watchdog queue answers the 503 and a raising lookup the
-    internal-error envelope -- the gate's two other exits."""
+    hit returns ``CLEAR``. A lookup that times out is counted like every
+    timeout, puts the deadline back as it found it and returns ``UNVERIFIED``:
+    the caller runs the checks after it on the budget they had before this one
+    existed, and its admit says the check did not run (#341). A full watchdog
+    queue answers the 503 and a raising lookup the internal-error envelope --
+    the gate's two other exits."""
     written = _tracked_writes(coordinator, command)
     if not written:
-        return False
+        return _GiverShellCheck.CLEAR
     caller = caller_principal_identity(session_id)
     if _watchdog_queue_overflowed(req, coordinator):
-        return True
+        return _GiverShellCheck.ANSWERED
     prior_deadline = _watchdog_deadline(req)
     try:
         handed = coordinator.run_admission_lookup(
@@ -4504,12 +4530,12 @@ def _deny_giver_shell_write(
         req._watchdog_deadline = prior_deadline
         coordinator.increment_watchdog_timeout()
         logger.warning("pre-bash giver lookup timed out after %ss; answering without it", HANDLER_TIMEOUT_SEC)
-        return False
+        return _GiverShellCheck.UNVERIFIED
     except Exception as exc:
         _answer_handler_error(req, coordinator, exc, failed="pre-bash giver lookup")
-        return True
+        return _GiverShellCheck.ANSWERED
     if handed is None:
-        return False
+        return _GiverShellCheck.CLEAR
     path, record = handed
     effects = _AnswerEffects()
 
@@ -4520,7 +4546,27 @@ def _deny_giver_shell_write(
         )
 
     _run_or_degrade(req, coordinator, work, effects=effects)
-    return True
+    return _GiverShellCheck.ANSWERED
+
+
+def _with_giver_check_unverified(result: dict) -> dict:
+    """``result`` as pre-bash answers it when its giver lookup timed out
+    (#341). An admit says the check did not run: ``degraded: true`` and
+    :data:`DEGRADED_FRESHNESS_ADVISORY`, appended after any stale warning or
+    notice, or as context only on a bare admit. It decides nothing: the check
+    that could have denied a giver's write did not run, so an ``allow`` the
+    read check put on a stale warning is dropped -- in time that write is
+    denied, and an admit that skipped Claude Code's own prompt for it would
+    widen the decision (#337). A deny -- the strict-mode shell-read deny --
+    goes out byte for byte. The admit test is the re-grounding seam's, which
+    attaches after this."""
+    if not _reground_qualifies(result):
+        return result
+    hso = result.get("hookSpecificOutput")
+    if hso is not None:
+        result = {**result, "hookSpecificOutput": {
+            key: value for key, value in hso.items() if key != "permissionDecision"}}
+    return {**_attach_pretooluse_context(result, DEGRADED_FRESHNESS_ADVISORY), "degraded": True}
 
 
 def _tracked_writes(coordinator: CoordinatorHTTPServer, command: str) -> list[str]:
