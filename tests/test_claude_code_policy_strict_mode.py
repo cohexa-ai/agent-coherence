@@ -719,21 +719,39 @@ def test_an_entry_of_many_unterminated_brackets_is_tokenized_quickly() -> None:
     assert ratio < _UNTERMINATED_BRACKETS_CPU_RATIO_BOUND, f"{ratio:.1f}x the reference"
 
 
+#: FROZEN: automaton steps (``_advance`` calls) the 400-character entry below
+#: may take. Healthy code takes 68,170, where the strict glob's budget runs
+#: out; charged per new state only, the search took 1,656,430 (over 3 s).
+_DISTINCT_CHARACTERS_STEP_BOUND = 200_000
+
+
 def test_an_untrack_entry_of_many_distinct_characters_is_decided_quickly(
-    root: Path,
+    root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Literal characters join the search alphabet too, and each explored
     state is charged for every character it tries. Charged per new state
-    only, an entry of 400 distinct characters took over 3 s."""
+    only, an entry of 400 distinct characters took over 3 s.
+
+    The search is counted in automaton steps, not timed: a 1 s wall-clock
+    budget failed at 2.9 s on a loaded machine with the search unchanged."""
     (root / ".coherence" / "tracked.yaml").write_text("- data/**\n")
     (root / ".coherence" / "strict_mode.yaml").write_text("- 'data/*.json'\n")
     policy = TrackedArtifactPolicy.load(root)
     entry = "*" + "".join(chr(0x4E00 + i) for i in range(400)) + "*"
+    steps = 0
+    advance = policy_module._advance
 
-    started = time.monotonic()
-    policy.strict_patterns_covering(entry)
+    def counted_advance(states: frozenset[int], tokens: list[tuple], ch: str | None) -> frozenset[int]:
+        nonlocal steps
+        steps += 1
+        return advance(states, tokens, ch)
 
-    assert time.monotonic() - started < 1.0
+    monkeypatch.setattr(policy_module, "_advance", counted_advance)
+    covering = policy.strict_patterns_covering(entry)
+
+    assert covering == ("data/*.json",)
+    # Zero would mean the count no longer sees the search, not that it is fast.
+    assert 0 < steps < _DISTINCT_CHARACTERS_STEP_BOUND, f"{steps} automaton steps"
 
 
 #: FROZEN: automaton steps the ``*ab*ab*...`` entry may take. Healthy code
