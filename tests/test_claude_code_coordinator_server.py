@@ -15767,6 +15767,25 @@ def test_a_strict_reader_whose_file_changed_outside_the_coordinator_is_denied_na
     assert retry[1]["hookSpecificOutput"] == body["hookSpecificOutput"]
 
 
+def test_a_verify_only_fence_read_of_a_changed_file_carries_no_out_of_band_notice(
+    coordinator, client: _Client,
+) -> None:
+    """#278: a verify_only read is the effect fence comparing comparands; it
+    discards its bytes and is not a read the model acts on, so the notice
+    meant for a reader stays off it. Fails if the notice reaches a fence read."""
+    reader = str(uuid.uuid4())
+    seeded = client.post(
+        "/hooks/pre-read", {"session_id": reader, "path": "plan.md", "content_hash": _hash("v1")})
+    assert seeded[0] == 200 and seeded[1]["status"] == "fresh", seeded
+
+    status, body = client.post("/hooks/pre-read", {
+        "session_id": reader, "path": "plan.md",
+        "content_hash": _hash("changed outside the coordinator"), "verify_only": True})
+
+    assert status == 200 and body["status"] == "fresh", body
+    assert "outside the coordinator" not in json.dumps(body), body
+
+
 def test_a_strict_reader_a_peer_invalidated_without_a_commit_keeps_the_grant_change_deny(
     strict_plan_coordinator, strict_plan_client: _Client,
 ) -> None:
@@ -15949,6 +15968,45 @@ def test_a_successor_about_to_overwrite_its_givers_out_of_band_change_is_warned(
     assert context.startswith("Handoff: agent "), context
     assert context.endswith(hp.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(path="plan.md", version=1))
     assert "permissionDecision" not in body["hookSpecificOutput"]
+
+
+def test_a_strict_stale_editor_of_a_changed_file_gets_its_deny_unchanged(
+    strict_plan_coordinator, strict_plan_client: _Client,
+) -> None:
+    """#278: the disk check runs after an admitted acquire only, so a refused
+    editor's answer keeps its bytes -- no disk_differs, no notice -- even when
+    the file also changed out of band. Fails if the check moves ahead of the
+    strict stale-edit deny."""
+    client = strict_plan_client
+    root = strict_plan_coordinator.coordinator_root
+    reader = _seed_with_disk(strict_plan_coordinator, client, "plan.md", b"v1\n")
+    writer = str(uuid.uuid4())
+    assert client.post("/hooks/pre-edit", {"session_id": writer, "path": "plan.md"})[1]["ok"] is True
+    (root / "plan.md").write_bytes(b"v2\n")
+    client.post("/hooks/post-edit", {
+        "session_id": writer, "path": "plan.md", "content_hash": _bytes_hash(b"v2\n"), "success": True})
+    (root / "plan.md").write_bytes(b"v2\nchanged by a script\n")
+
+    status, body = client.post("/hooks/pre-edit", {"session_id": reader, "path": "plan.md"})
+
+    assert status == 200 and body["ok"] is False and body["status"] == "stale", body
+    assert "disk_differs" not in body and "outside the coordinator" not in json.dumps(body), body
+
+
+def test_the_giver_of_a_live_handoff_editing_a_changed_file_gets_its_deny_unchanged(
+    coordinator, client: _Client,
+) -> None:
+    """#278: the giver's pre-edit deny answers before any acquire, so it never
+    reaches the disk check. Fails if a refused giver is told disk_differs."""
+    _seed_with_disk(coordinator, client, "plan.md", b"# plan\n")
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    (coordinator.coordinator_root / "plan.md").write_bytes(b"# plan\n- the giver's shell append\n")
+
+    status, body = _verb(client, "/hooks/pre-edit", giver, "plan.md")
+
+    assert status == 200 and body["ok"] is False, body
+    assert "disk_differs" not in body and "outside the coordinator" not in json.dumps(body), body
 
 
 @pytest.mark.parametrize("peer", ["writing", "committed", "gone-quiet"])
