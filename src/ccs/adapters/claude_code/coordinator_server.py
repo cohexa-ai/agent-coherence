@@ -6995,6 +6995,13 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     ``reclaimed``; the times are the sweep's tick basis, whole unix seconds.
     None of it appears below the operator tier.
 
+    #278 — what the foreign-write detector found, at the operator tier: a
+    ``tracked_artifacts`` entry the detector has counted anything for carries
+    ``foreign_writes``, ``{"foreign": n, "lag_suppressed": n, "mediated": n}``
+    with zero buckets omitted -- the store's per-file totals, which the offline
+    report reads too. An entry with no counts, and every tier below, keep
+    today's bytes.
+
     #238 — a bounded wait for the registry: the minimal and full tiers wait
     for the registry lock on the request thread, through the registry's own
     ``abort_guard(deadline=...)``, until the request's watchdog deadline
@@ -7089,6 +7096,12 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
                 include_reclamations=operator_tier,
                 include_grant_detail=operator_tier,
             )
+            # #278: the foreign-write detector's per-file counts, at the
+            # operator tier only (they say which files changed behind the
+            # coordinator's back), in the same hold as the rows they annotate.
+            foreign_writes_by_artifact = (
+                coordinator.registry.foreign_write_totals() if operator_tier else {}
+            )
     except RegistryLockTimeout:
         # #238: counted BEFORE the counters are read, so the answer reports
         # its own timeout, and logged as a degraded hook is. The body is built
@@ -7138,6 +7151,11 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
             # without a version move (a reclaim, a release, a handoff from
             # M/E), the one change a version comparison cannot see.
             entry["owner_generation"] = meta["owner_generation"]
+            # #278: only on an entry the detector has counted something for,
+            # so every other entry keeps its bytes.
+            foreign_writes = foreign_writes_by_artifact.get(artifact_id)
+            if foreign_writes:
+                entry["foreign_writes"] = dict(foreign_writes)
         # #185: the path's transfer record, only while one exists, so an
         # entry with no record keeps today's bytes at every tier.
         transfer = transfer_by_artifact.get(artifact_id)

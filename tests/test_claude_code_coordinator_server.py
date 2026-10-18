@@ -15776,6 +15776,30 @@ def _bytes_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def test_status_full_tier_reports_each_files_foreign_write_counts(
+    coordinator, client: _Client,
+) -> None:
+    """#278: the foreign-write detector's per-file counts reach /status at the
+    operator tier as a ``foreign_writes`` key -- only on an entry with counts,
+    so every other entry keeps its bytes -- and nowhere below it. They used to
+    be readable only through the offline report. Fails if the key is missing
+    at the full tier, or leaks to the default tier."""
+    _seed_with_disk(coordinator, client, "plan.md", b"v1\n")
+    _seed_with_disk(coordinator, client, "spec.md", b"spec\n")
+    plan = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    coordinator.registry.record_foreign_write(plan, "lag_suppressed", _bytes_hash(b"v2\n"))
+    coordinator.registry.record_foreign_write(plan, "foreign", _bytes_hash(b"v2\n"))
+
+    _status, full = client.get(
+        "/status?detail=full", headers_override={"Coherence-Local-Operator": "true"})
+    entries = {entry["path"]: entry for entry in full["tracked_artifacts"]}
+    assert entries["plan.md"]["foreign_writes"] == {"foreign": 1, "lag_suppressed": 1}
+    assert "foreign_writes" not in entries["spec.md"]
+
+    _status, minimal = client.get("/status")
+    assert all("foreign_writes" not in entry for entry in minimal["tracked_artifacts"])
+
+
 def _seed_with_disk(coordinator, client: _Client, path: str, data: bytes) -> str:
     """Write ``data`` to ``path`` and record it through a hashed first read, so
     the coordinator's content claim is exactly those bytes. Answers the
