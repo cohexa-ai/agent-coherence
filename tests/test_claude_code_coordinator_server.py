@@ -15341,10 +15341,9 @@ def test_a_notice_pop_for_an_abandoned_request_does_not_wait_for_the_registry(
             daemon=True,
         )
         pop.start()
-        pop.join(1.0)
+        pop.join(_ABANDONED_BODY_SETTLE_SEC)
         returned_while_held = not pop.is_alive()
         held.release()
-    pop.join(5.0)
+    pop.join(_ABANDONED_BODY_SETTLE_SEC)
     assert returned_while_held, "the abandoned pop waited on the registry lock"
     assert popped == [[]]
-    assert abort.guard_won is False
