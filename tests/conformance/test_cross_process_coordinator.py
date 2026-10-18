@@ -20,24 +20,44 @@ which is the fence's whole job. Both variants are asserted.
 
 from __future__ import annotations
 
+import os
+import threading
 import time
+import urllib.error
 import uuid
+from functools import partial
 from pathlib import Path
+from typing import Any, Callable
 
 import pytest
 
+from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     ensure_coordinator,
     stop_coordinator,
 )
+from ccs.cli._coherence_client import (
+    CoordinatorEndpoint,
+    CoordinatorUnavailable,
+    get,
+    post,
+    resolve_endpoint,
+)
 from ccs.core.substrate import sha256_hex
-from ccs.testing.process_harness import ContenderSpec, ProcessRaceHarness, run_in_subprocess
+from ccs.testing.process_harness import (
+    ContenderSpec,
+    ParkContext,
+    ProcessRaceHarness,
+    run_in_subprocess,
+    run_park_after_ack,
+)
 
 # Spawns real processes that race each other: run with -n 0 (tests/conftest.py).
 pytestmark = pytest.mark.serial
 
 _PATH = "CLAUDE.md"  # in DEFAULT_TRACKED_PATTERNS — coordinated without extra policy files
+_SIBLING_PATH = "AGENTS.md"  # also in DEFAULT_TRACKED_PATTERNS
 
 
 # ---------------------------------------------------------------------------
@@ -140,18 +160,151 @@ def _child_commit_expect_unavailable(ctx, workspace_str: str, session_id: str) -
 
 
 # ---------------------------------------------------------------------------
+# Parked-live-holder children (run under run_park_after_ack). The holder is
+# LIVE: a background thread heartbeats its grant until the parent resumes it,
+# so only the stop, or the holder ending its own beats, can let the heartbeat
+# the sweep reads go stale.
+# ---------------------------------------------------------------------------
+
+_BEAT_INTERVAL_SEC = 0.4
+_LIVE_BEATS_WAIT_SEC = 15.0
+
+
+class _GrantHeartbeat:
+    """The holder's own grant heartbeat: a ``verify_only`` pre-read of the held
+    path every ``_BEAT_INTERVAL_SEC``, until the parent resumes the holder or
+    the holder ends it.
+
+    ``verify_only`` refreshes the agent's heartbeat and changes nothing else:
+    the holder stays EXCLUSIVE, and after a reclaim a beat neither re-grants
+    the path nor pops the sweep's notice, so the lease refusal is always the
+    reclaimed arm.
+    """
+
+    def __init__(self, ctx: ParkContext, endpoint: CoordinatorEndpoint, session_id: str) -> None:
+        self._ctx = ctx
+        self._endpoint = endpoint
+        self._body = {"session_id": session_id, "path": _PATH, "verify_only": True}
+        self._ended = threading.Event()
+        self.beat_seconds: list[int] = []
+        self.live_errors: list[str] = []
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not (self._ctx.resumed or self._ended.is_set()):
+            sent_second = int(time.time())
+            try:
+                post(self._endpoint, "/hooks/pre-read", self._body)
+            except (CoordinatorUnavailable, urllib.error.HTTPError) as exc:
+                # A beat in flight across the stop may fail once resumed: a
+                # straggler, ignored. A failure while live is the holder's own.
+                if not self._ctx.resumed:
+                    self.live_errors.append(repr(exc))
+            else:
+                self.beat_seconds.append(sent_second)
+            self._ended.wait(_BEAT_INTERVAL_SEC)
+
+    def await_live_beats(self, granted_by_second: int) -> int:
+        """Return the beat count once two beats have landed, the latest sent in
+        a later whole second than the grant: /status keeps whole unix seconds,
+        so only then can it show a heartbeat newer than the grant."""
+        deadline = time.monotonic() + _LIVE_BEATS_WAIT_SEC
+        while time.monotonic() < deadline:
+            self._raise_on_live_error()
+            beats = list(self.beat_seconds)
+            if len(beats) >= 2 and beats[-1] > granted_by_second:
+                return len(beats)
+            time.sleep(0.05)
+        raise RuntimeError(f"no two beats landed past second {granted_by_second}: {self.beat_seconds}")
+
+    def end(self) -> None:
+        self._ended.set()
+        self.join()
+
+    def join(self) -> None:
+        self._thread.join(timeout=10.0)
+        if self._thread.is_alive():
+            raise RuntimeError("the holder's heartbeat thread did not stop")
+        self._raise_on_live_error()
+
+    def _raise_on_live_error(self) -> None:
+        if self.live_errors:
+            raise RuntimeError(f"the holder's heartbeat failed while live: {self.live_errors}")
+
+
+def _acquire_and_beat(
+    ctx: ParkContext, workspace_str: str, session_id: str
+) -> tuple[CoordinatorEndpoint, int, _GrantHeartbeat, dict[str, Any]]:
+    """Read the held path, take it EXCLUSIVE through pre-edit, and heartbeat
+    until two beats past the grant have landed. Also returns the ack facts."""
+    endpoint = resolve_endpoint(Path(workspace_str))
+    version = _version_of(post(endpoint, "/hooks/pre-read", {"session_id": session_id, "path": _PATH}))
+    post(endpoint, "/hooks/pre-edit", {"session_id": session_id, "path": _PATH})
+    # The coordinator stamps the grant no later than this second (one clock).
+    granted_by_second = int(time.time())
+    beat = _GrantHeartbeat(ctx, endpoint, session_id)
+    beats = beat.await_live_beats(granted_by_second)
+    return endpoint, version, beat, {"version": version, "pid": os.getpid(), "beats_at_ack": beats}
+
+
+def _child_parked_holder(ctx: ParkContext, workspace_str: str, session_id: str) -> dict[str, Any]:
+    """Heartbeat until the parent stops this process at the ack; once resumed,
+    commit once through each route as the same process and session."""
+    endpoint, version, beat, facts = _acquire_and_beat(ctx, workspace_str, session_id)
+    ctx.ack(facts)
+    beat.join()  # the resume flag gates the beats off before the commits
+    content_hash = sha256_hex(b"parked holder edit")
+    lease = post(
+        endpoint,
+        "/hooks/post-edit",
+        {"session_id": session_id, "path": _PATH, "content_hash": content_hash, "success": True},
+    )
+    cas = post(
+        endpoint,
+        "/hooks/post-edit-cas",
+        {"session_id": session_id, "path": _PATH, "content_hash": content_hash, "expected_version": version},
+    )
+    return {"lease": lease, "cas": cas}
+
+
+def _child_beating_holder(ctx: ParkContext, workspace_str: str, session_id: str) -> dict[str, Any]:
+    """Control: keep heartbeating through the parent's window until resumed,
+    then return without committing."""
+    _endpoint, _version, beat, facts = _acquire_and_beat(ctx, workspace_str, session_id)
+    ctx.ack(facts)
+    beat.join()
+    return {"beats": len(beat.beat_seconds)}
+
+
+def _child_holder_ending_beats_at_ack(ctx: ParkContext, workspace_str: str, session_id: str) -> dict[str, Any]:
+    """Control: end the heartbeat at the ack and wait there, running, until
+    resumed; then return without committing."""
+    _endpoint, _version, beat, facts = _acquire_and_beat(ctx, workspace_str, session_id)
+    beat.end()
+    ctx.ack(facts)
+    return {"beats": len(beat.beat_seconds)}
+
+
+# ---------------------------------------------------------------------------
 # Coordinator fixture: parent-hosted, test-scale timings (plan U3 approach).
 # ---------------------------------------------------------------------------
 
 
-def _spawn(tmp_path: Path, *, sweep_interval_sec: float, heartbeat_timeout_sec: int) -> Path:
+def _spawn(
+    tmp_path: Path,
+    *,
+    sweep_interval_sec: float,
+    heartbeat_timeout_sec: int,
+    max_hold_sec: int | None = None,
+) -> Path:
     (tmp_path / ".git").mkdir()
     (tmp_path / _PATH).write_text("seed\n")
     cfg = LifecycleConfig(
         idle_shutdown_sec=0,
         sweep_interval_sec=sweep_interval_sec,
         grant_heartbeat_timeout_sec=heartbeat_timeout_sec,
-        grant_max_hold_sec=heartbeat_timeout_sec * 5,
+        grant_max_hold_sec=heartbeat_timeout_sec * 5 if max_hold_sec is None else max_hold_sec,
         port_file_retry_attempts=10,
         port_file_retry_interval_sec=0.05,
         connect_retry_attempts=10,
@@ -177,6 +330,29 @@ def coordinator_workspace_no_sweep(tmp_path: Path):
     with more than one sequential child outlives a 1 s heartbeat window — the
     other_holder case needs the grant to survive, so the sweep stays off."""
     yield _spawn(tmp_path, sweep_interval_sec=0, heartbeat_timeout_sec=600)
+    stop_coordinator(tmp_path)
+
+
+_PARK_HEARTBEAT_TIMEOUT_SEC = 3
+_PARK_SWEEP_INTERVAL_SEC = 0.2
+# Far past any run, so the heartbeat is the only trigger the sweep can fire.
+_PARK_MAX_HOLD_SEC = 60
+
+
+@pytest.fixture
+def parked_holder_workspace(tmp_path: Path):
+    """A coordinator per run for the parked-holder tests. The 1 s window of
+    ``coordinator_workspace`` reclaims a live holder: the sweep compares whole
+    seconds, so the first second boundary after a beat reads as a full window.
+    At 3 s a holder beating every 0.4 s keeps its grant, and the 0.2 s sweep
+    still reclaims a stopped one within seconds."""
+    (tmp_path / _SIBLING_PATH).write_text("seed\n")
+    yield _spawn(
+        tmp_path,
+        sweep_interval_sec=_PARK_SWEEP_INTERVAL_SEC,
+        heartbeat_timeout_sec=_PARK_HEARTBEAT_TIMEOUT_SEC,
+        max_hold_sec=_PARK_MAX_HOLD_SEC,
+    )
     stop_coordinator(tmp_path)
 
 
@@ -306,3 +482,275 @@ def test_coordinator_killed_mid_run_yields_typed_unavailable(
     stop_coordinator(coordinator_workspace)
     verdict = run_in_subprocess(ContenderSpec(_child_commit_expect_unavailable, args=(ws, sid)))
     assert verdict == "typed-unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Parked live holder: out-of-band witnesses. The parent reads
+# /status?detail=full while the holder is stopped (or, in the controls,
+# running) and never acts for the holder.
+# ---------------------------------------------------------------------------
+
+_OPERATOR_HEADERS = {"Coherence-Local-Operator": "true"}
+_STATUS_POLL_SEC = 0.1
+_RECLAIM_WAIT_SEC = 15.0
+# Two heartbeat windows plus sweeps: longer than the parked test's stop lasts.
+_CONTROL_WINDOW_SEC = 2 * _PARK_HEARTBEAT_TIMEOUT_SEC + 3 * _PARK_SWEEP_INTERVAL_SEC
+
+
+def _read_operator_status(endpoint: CoordinatorEndpoint) -> dict[str, Any]:
+    return get(endpoint, "/status?detail=full", extra_headers=_OPERATOR_HEADERS)
+
+
+def _readable(body: dict[str, Any]) -> bool:
+    """A degraded answer carries null registry lists. It cannot tell held from
+    not held, so a witness reads again rather than taking it for either."""
+    return (
+        not body.get("degraded")
+        and body.get("sessions") is not None
+        and body.get("tracked_artifacts") is not None
+    )
+
+
+def _poll_status(
+    read: Callable[[], dict[str, Any]],
+    decide: Callable[[dict[str, Any]], Any],
+    *,
+    timeout_sec: float,
+    what: str,
+) -> Any:
+    """Read /status until ``decide`` answers (not None) on a readable body."""
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        body = read()
+        if _readable(body):
+            verdict = decide(body)
+            if verdict is not None:
+                return verdict
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"could not witness {what} within {timeout_sec}s; last /status body: {body}")
+        time.sleep(_STATUS_POLL_SEC)
+
+
+def _session_row(body: dict[str, Any], session_id: str) -> dict[str, Any] | None:
+    agent_id = str(session_to_agent_id(session_id))
+    return next((row for row in body["sessions"] if row["agent_id"] == agent_id), None)
+
+
+def _artifact_entry(body: dict[str, Any], path: str) -> dict[str, Any]:
+    return next(entry for entry in body["tracked_artifacts"] if entry["path"] == path)
+
+
+def _held_witness(body: dict[str, Any], *, session_id: str) -> dict[str, Any]:
+    """The holder's grant, still EXCLUSIVE, with the times the sweep reads. A
+    reclaim that landed first means the grant could not be witnessed held."""
+    row = _session_row(body, session_id)
+    if row is not None and _PATH in row["reclaimed"]:
+        raise AssertionError(f"could not witness the held grant: the sweep reclaimed it first: {row}")
+    assert row is not None and row["states"].get(_PATH) == "EXCLUSIVE", f"holder does not hold {_PATH}: {row}"
+    artifact = _artifact_entry(body, _PATH)
+    return {
+        "granted_at": row["grants"][_PATH]["granted_at_unix_ts"],
+        "last_heartbeat": row["last_heartbeat_unix_ts"],
+        "version": artifact["version"],
+        "owner_generation": artifact["owner_generation"],
+    }
+
+
+def _reclaim_witness(body: dict[str, Any], *, session_id: str) -> dict[str, Any] | None:
+    """The sweep's reclaim of the holder's grant, once /status lists it."""
+    row = _session_row(body, session_id)
+    slot = row["reclaimed"].get(_PATH) if row is not None else None
+    if slot is None:
+        return None
+    artifact = _artifact_entry(body, _PATH)
+    return {
+        "trigger": slot["trigger"],
+        "max_hold_reclaims": body["sweep_reclaims_by_trigger"]["reclaim_max_hold"],
+        "version": artifact["version"],
+        "owner_generation": artifact["owner_generation"],
+    }
+
+
+def _assert_stopped(pid: int) -> None:
+    # WNOWAIT leaves the stop report in place for the harness's own wait.
+    report = os.waitid(os.P_PID, pid, os.WSTOPPED | os.WNOHANG | os.WNOWAIT)
+    assert report is not None and report.si_code == os.CLD_STOPPED, f"holder {pid} is not stopped: {report}"
+
+
+def _assert_lost_token(refusal: dict[str, Any]) -> None:
+    """The refusal names the generation the claim was taken under, below the
+    one that owns the path now."""
+    assert {"captured_generation", "owner_generation"} <= refusal.keys(), refusal
+    assert refusal["captured_generation"] < refusal["owner_generation"], refusal
+
+
+def _assert_still_held(body: dict[str, Any], session_id: str) -> None:
+    row = _session_row(body, session_id)
+    assert row is not None and row["states"].get(_PATH) == "EXCLUSIVE", f"beating holder lost {_PATH}: {row}"
+    assert _PATH not in row["reclaimed"], f"the sweep reclaimed a beating holder: {row}"
+
+
+def _sibling_ordering(body: dict[str, Any], holder_sid: str, sibling_sid: str) -> dict[str, Any] | None:
+    """The sibling's reclaim beside the holder's grant time, both from ``body``."""
+    sibling = _session_row(body, sibling_sid)
+    slot = sibling["reclaimed"].get(_SIBLING_PATH) if sibling is not None else None
+    if slot is None:
+        return None
+    holder = _session_row(body, holder_sid)
+    assert holder is not None, body
+    return {
+        "sibling_trigger": slot["trigger"],
+        "sibling_reclaimed_at": slot["reclaimed_at_unix_ts"],
+        "holder_granted_at": holder["grants"][_PATH]["granted_at_unix_ts"],
+        "heartbeat_timeout": body["grant_heartbeat_timeout_sec"],
+    }
+
+
+def _watch_beating_holder(endpoint: CoordinatorEndpoint, holder_sid: str) -> dict[str, Any] | None:
+    """Over the control window, the beating holder keeps its grant on every
+    readable read, while a second session takes a grant after the holder's and
+    never beats again. Returns the ordering from the latest body that lists the
+    sibling's reclaim, or None when none did."""
+    sibling_sid = _sid()
+    post(endpoint, "/hooks/pre-read", {"session_id": sibling_sid, "path": _SIBLING_PATH})
+    post(endpoint, "/hooks/pre-edit", {"session_id": sibling_sid, "path": _SIBLING_PATH})
+    window_end = time.monotonic() + _CONTROL_WINDOW_SEC
+    ordering = None
+    while True:
+        read_at = time.monotonic()
+        body = _read_operator_status(endpoint)
+        if _readable(body):
+            _assert_still_held(body, holder_sid)
+            ordering = _sibling_ordering(body, holder_sid, sibling_sid) or ordering
+            if read_at >= window_end:
+                return ordering
+        elif read_at >= window_end + _PARK_HEARTBEAT_TIMEOUT_SEC:
+            raise AssertionError(f"cannot tell whether the holder kept its grant to the window's end: {body}")
+        time.sleep(_STATUS_POLL_SEC)
+
+
+# ---------------------------------------------------------------------------
+# Parked live holder: scenarios
+# ---------------------------------------------------------------------------
+
+
+def test_parked_live_holder_is_reclaimed_and_refused_naming_its_lost_token(
+    parked_holder_workspace: Path,
+) -> None:
+    """A live lease holder, heartbeating as itself on the held path, is stopped
+    right after its ack. While it is stopped the sweep reclaims its grant on
+    the stale heartbeat, moving the owner generation and not the version. The
+    same process and session, resumed, commits once per route, and each
+    refusal names the generation its claim was taken under and the one that
+    owns the path now.
+
+    What this does not prove: one machine only; the stall it models is not a
+    network partition; and there is no cross-host fencing token.
+    """
+    endpoint = resolve_endpoint(parked_holder_workspace)
+    sid = _sid()
+    read = partial(_read_operator_status, endpoint)
+
+    def while_parked(acked: dict[str, Any]) -> dict[str, Any]:
+        _assert_stopped(acked["pid"])
+        held = _poll_status(
+            read, partial(_held_witness, session_id=sid),
+            timeout_sec=_PARK_HEARTBEAT_TIMEOUT_SEC, what="the held grant",
+        )
+        reclaim = _poll_status(
+            read, partial(_reclaim_witness, session_id=sid),
+            timeout_sec=_RECLAIM_WAIT_SEC, what="the heartbeat reclaim",
+        )
+        return {"held": held, "reclaim": reclaim}
+
+    result = run_park_after_ack(
+        ContenderSpec(_child_parked_holder, args=(str(parked_holder_workspace), sid)), while_parked
+    )
+
+    version, held, reclaim = result.acked["version"], result.window["held"], result.window["reclaim"]
+    assert held["last_heartbeat"] > held["granted_at"], held
+    assert reclaim["trigger"] == "reclaim_heartbeat", reclaim
+    assert reclaim["max_hold_reclaims"] == 0, reclaim
+    assert reclaim["version"] == version == held["version"], (held, reclaim)
+    assert reclaim["owner_generation"] > held["owner_generation"], (held, reclaim)
+
+    lease, cas = result.value["lease"], result.value["cas"]
+    assert lease["ok"] is False and lease.get("reclaimed") is True, lease
+    assert "reclaimed_by=reclaim_heartbeat" in lease["reason"], lease
+    _assert_lost_token(lease)
+    assert cas["ok"] is False and cas["reason"] == "stale_read_generation", cas
+    assert cas["current_version"] == version, cas
+    _assert_lost_token(cas)
+
+
+def test_beating_holder_is_not_reclaimed_without_the_stop(parked_holder_workspace: Path) -> None:
+    """Control, stop switch off: the same holder beats on through two heartbeat
+    windows and keeps its grant. A sibling grant, taken after the holder's by a
+    session that never beats, is reclaimed no earlier than one window past the
+    holder's grant, so the sweep was running all the while the holder held.
+
+    What this does not prove: one machine only; the stall it models is not a
+    network partition; and there is no cross-host fencing token.
+    """
+    endpoint = resolve_endpoint(parked_holder_workspace)
+    sid = _sid()
+    result = run_park_after_ack(
+        ContenderSpec(_child_beating_holder, args=(str(parked_holder_workspace), sid)),
+        lambda _acked: _watch_beating_holder(endpoint, sid),
+        stop=False,
+    )
+    ordering = result.window
+    assert ordering is not None, "no readable /status body listed the sibling's reclaim within the window"
+    assert ordering["sibling_trigger"] == "reclaim_heartbeat", ordering
+    assert ordering["sibling_reclaimed_at"] >= ordering["holder_granted_at"] + ordering["heartbeat_timeout"], ordering
+
+
+def test_holder_ending_its_beats_is_reclaimed_without_the_stop(parked_holder_workspace: Path) -> None:
+    """Control, stop switch off: the holder ends its own beats at the ack and
+    waits there, running. The sweep reclaims it on the stale heartbeat before
+    the parent resumes it.
+
+    What this does not prove: one machine only; the stall it models is not a
+    network partition; and there is no cross-host fencing token.
+    """
+    endpoint = resolve_endpoint(parked_holder_workspace)
+    sid = _sid()
+    result = run_park_after_ack(
+        ContenderSpec(_child_holder_ending_beats_at_ack, args=(str(parked_holder_workspace), sid)),
+        lambda _acked: _poll_status(
+            partial(_read_operator_status, endpoint), partial(_reclaim_witness, session_id=sid),
+            timeout_sec=_RECLAIM_WAIT_SEC, what="the heartbeat reclaim",
+        ),
+        stop=False,
+    )
+    assert result.window["trigger"] == "reclaim_heartbeat", result.window
+    assert result.window["max_hold_reclaims"] == 0, result.window
+
+
+def test_degraded_status_read_is_cannot_tell_and_read_again() -> None:
+    """A degraded /status answer (null registry lists) is neither held nor not
+    held: the witness reads again and answers from the next readable body, and
+    nothing but degraded answers fails as could-not-witness."""
+    sid = _sid()
+    degraded = {"detail": "full", "degraded": True, "tracked_artifacts": None, "sessions": None}
+    held = {
+        "detail": "full",
+        "tracked_artifacts": [{"path": _PATH, "version": 1, "owner_generation": 0}],
+        "sessions": [
+            {
+                "agent_id": str(session_to_agent_id(sid)),
+                "states": {_PATH: "EXCLUSIVE"},
+                "reclaimed": {},
+                "grants": {_PATH: {"granted_at_unix_ts": 100}},
+                "last_heartbeat_unix_ts": 101,
+            }
+        ],
+    }
+    reads = iter([degraded, degraded, held])
+    witness = partial(_held_witness, session_id=sid)
+
+    verdict = _poll_status(lambda: next(reads), witness, timeout_sec=5.0, what="the held grant")
+
+    assert verdict == {"granted_at": 100, "last_heartbeat": 101, "version": 1, "owner_generation": 0}
+    with pytest.raises(AssertionError, match="could not witness the held grant within"):
+        _poll_status(lambda: degraded, witness, timeout_sec=0.3, what="the held grant")
