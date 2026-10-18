@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -78,9 +79,36 @@ def test_options_that_override_ci_selection_or_runner_settings_are_refused(argv:
         runner.split_args(argv)
 
 
-def test_a_refused_option_exits_with_pytests_usage_code_before_anything_runs(capsys) -> None:
+def test_a_refused_option_exits_with_pytests_usage_code_before_anything_runs(repo: Path, monkeypatch, capsys) -> None:
+    # From a throwaway repo, a guard that stopped refusing fails fast on the
+    # missing venv instead of starting a full run on this checkout's turn.
+    monkeypatch.chdir(repo)
     assert runner.main(["-m", "not slow"]) == runner.USAGE_ERROR == 4
     assert "plain pytest" in capsys.readouterr().err
+
+
+def test_a_missing_venv_stops_the_command_with_the_preflight_code(repo: Path, monkeypatch, capsys) -> None:
+    monkeypatch.chdir(repo)
+    assert runner.main([]) == runner.PREFLIGHT_FAILED == 6
+    assert str(repo.resolve() / ".venv" / "bin" / "python") in capsys.readouterr().err
+
+
+def test_a_worktree_run_uses_the_main_venv_and_its_own_tree(repo: Path, tmp_path: Path) -> None:
+    """The venv is shared, but pytest, its imports and its config are the worktree's."""
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "agent-coherence"\n[project.optional-dependencies]\ndev = ["pytest"]\ndiagnose = []\nmcp = []\n'
+    )
+    venv_bin = repo / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv_bin / "python").chmod(0o755)
+    worktree = tmp_path / "wt"
+    _git(repo, "worktree", "add", "-q", "--detach", str(worktree))
+    (worktree / "pyproject.toml").write_text((repo / "pyproject.toml").read_text())
+    spec = runner.prepare(["tests/test_x.py"], worktree)
+    assert spec.interpreter == repo.resolve() / ".venv" / "bin" / "python"
+    assert spec.roots.tree == worktree.resolve()
+    assert spec.env["PYTHONPATH"].split(os.pathsep)[0] == str(worktree.resolve() / "src")
 
 
 def test_a_worker_count_is_refused_on_a_full_run_and_forwarded_on_a_targeted_one() -> None:
@@ -297,7 +325,7 @@ def test_a_waiter_says_when_its_own_tree_holds_the_turn(tmp_path: Path, monkeypa
 
 def test_a_leftover_lock_file_is_taken_at_once_and_its_record_replaced(tmp_path: Path) -> None:
     lock = tmp_path / "turn.lock"
-    lock.write_text('{"tree": "/gone", "pid": 1, "mode": "full run", "started": "2026-01-01T00:00:00"}\n')
+    lock.write_text('{"tree": "/gone/with/a/much/longer/path", "pid": 1, "mode": "full run", "started": "x"}\n')
     said: list[str] = []
     fd = runner.acquire_turn(lock, _holder("/new", pid=7), said.append)
     try:
@@ -305,6 +333,12 @@ def test_a_leftover_lock_file_is_taken_at_once_and_its_record_replaced(tmp_path:
         assert runner.read_holder(lock)["tree"] == "/new"
     finally:
         runner.release_turn(fd)
+
+
+def test_a_lane_runs_with_the_environment_and_directory_it_is_given(tmp_path: Path) -> None:
+    check = "import os, sys; sys.exit(0 if os.environ.get('CCS_LANE_PROBE') == '1' and os.getcwd() == sys.argv[1] else 1)"
+    env = {"CCS_LANE_PROBE": "1", "PATH": os.environ["PATH"]}
+    assert runner.run_lane([sys.executable, "-c", check, os.path.realpath(tmp_path)], env, tmp_path, None) == 0
 
 
 _TURN_HOLDER = """
@@ -413,11 +447,17 @@ class _FakeLanes:
     """Stands in for ``run_lane``: records each command and whether the turn was
     held, and writes the ran list a real lane would leave in --node-id-dir."""
 
-    def __init__(self, codes: list[int], ran: int = 3) -> None:
-        self.codes, self.ran, self.calls = list(codes), ran, []
+    def __init__(self, codes: list[int], lock: Path, ran: int = 3) -> None:
+        self.codes, self.lock, self.ran, self.calls = list(codes), lock, ran, []
+        self.lock_held: list[bool] = []
+        self.envs: list = []
+        self.cwds: list = []
 
     def __call__(self, command, env, cwd, turn_fd):
         self.calls.append((list(command), turn_fd is not None))
+        self.lock_held.append(_probe_is_held(self.lock))
+        self.envs.append(env)
+        self.cwds.append(cwd)
         lane = command[command.index("--test-lane") + 1]
         node_dir = next(token.split("=", 1)[1] for token in command if token.startswith("--node-id-dir="))
         Path(node_dir).mkdir(parents=True, exist_ok=True)
@@ -432,8 +472,9 @@ def _spec(tmp_path: Path, argv: list[str]):
 
 
 def test_a_full_run_holds_the_turn_for_both_lanes_and_releases_it(tmp_path: Path) -> None:
-    lanes = _FakeLanes([0, 0])
-    assert runner.execute(_spec(tmp_path, []), lanes, lambda line: None) == 0
+    lanes = _FakeLanes([0, 0], tmp_path / runner.LOCK_NAME)
+    spec = _spec(tmp_path, [])
+    assert runner.execute(spec, lanes, lambda line: None) == 0
     (parallel, parallel_held), (serial, serial_held) = lanes.calls
     assert parallel_held and serial_held
     assert parallel[parallel.index("-n") + 1] == "8"
@@ -441,33 +482,37 @@ def test_a_full_run_holds_the_turn_for_both_lanes_and_releases_it(tmp_path: Path
     assert parallel[parallel.index("--test-lane") + 1] == "parallel"
     assert serial[serial.index("-n") + 1] == "0" and serial[serial.index("--test-lane") + 1] == "serial"
     assert [token for token in serial if token.startswith("tests/")] == runner.serial_modules(REPO_ROOT)
+    assert lanes.lock_held == [True, True]  # held at <git common dir>/<LOCK_NAME>, shared by every worktree
+    assert lanes.envs == [spec.env, spec.env] and lanes.cwds == [REPO_ROOT, REPO_ROOT]
     assert not _probe_is_held(tmp_path / runner.LOCK_NAME)
 
 
 def test_a_full_run_fails_when_its_parallel_lane_exits_0_having_run_nothing(tmp_path: Path) -> None:
     """xdist 3.8 exits 0 with "no tests ran" when a worker dies in collection."""
     said: list[str] = []
-    assert runner.execute(_spec(tmp_path, []), _FakeLanes([0, 0], ran=0), said.append) == 1
+    assert runner.execute(_spec(tmp_path, []), _FakeLanes([0, 0], tmp_path / runner.LOCK_NAME, ran=0), said.append) == 1
     assert any("parallel lane ran no tests" in line for line in said)
 
 
 def test_a_targeted_run_of_a_plain_module_never_takes_the_turn(tmp_path: Path) -> None:
-    lanes = _FakeLanes([0])
+    lanes = _FakeLanes([0], tmp_path / runner.LOCK_NAME)
     assert runner.execute(_spec(tmp_path, [PLAIN_MODULE]), lanes, lambda line: None) == 0
     [(command, held)] = lanes.calls
+    assert lanes.lock_held == [False]
     assert not held and PLAIN_MODULE in command and command[command.index("-n") + 1] == "0"
 
 
 def test_a_targeted_run_takes_the_turn_only_for_its_serial_tests(tmp_path: Path) -> None:
-    lanes = _FakeLanes([0, 0])
+    lanes = _FakeLanes([0, 0], tmp_path / runner.LOCK_NAME)
     assert runner.execute(_spec(tmp_path, [SERIAL_MODULE]), lanes, lambda line: None) == 0
     (parallel, parallel_held), (serial, serial_held) = lanes.calls
     assert not parallel_held and serial_held
+    assert lanes.lock_held == [False, True]
     assert serial[-1] == SERIAL_MODULE
 
 
 def test_a_worker_count_on_a_targeted_run_reaches_only_its_parallel_part(tmp_path: Path) -> None:
-    lanes = _FakeLanes([0, 0])
+    lanes = _FakeLanes([0, 0], tmp_path / runner.LOCK_NAME)
     runner.execute(_spec(tmp_path, ["-n", "2", SERIAL_MODULE]), lanes, lambda line: None)
     (parallel, parallel_held), (serial, _) = lanes.calls
     assert not parallel_held
@@ -491,6 +536,31 @@ def test_lane_exit_codes_combine_into_one(parallel, serial, expected) -> None:
     assert runner.combine_exit_codes(parallel, serial, parallel_ran_nothing=False) == expected
 
 
+@pytest.mark.parametrize(
+    ("argv", "codes", "lanes_run", "expected"),
+    [
+        ([], [1, 0], 2, 1),
+        ([], [0, 1], 2, 1),
+        ([], [2], 1, 2),
+        ([], [4], 1, 4),
+        (["-x"], [1], 1, 1),
+        ([SERIAL_MODULE], [1, 0], 2, 1),
+        ([SERIAL_MODULE], [2], 1, 2),
+        ([SERIAL_MODULE], [0, 1], 2, 1),
+    ],
+)
+def test_a_run_combines_its_lanes_into_one_exit_code(tmp_path: Path, argv, codes, lanes_run, expected) -> None:
+    lanes = _FakeLanes(codes, tmp_path / runner.LOCK_NAME)
+    assert runner.execute(_spec(tmp_path, argv), lanes, lambda line: None) == expected
+    assert len(lanes.calls) == lanes_run
+
+
+def test_the_summary_says_when_options_narrowed_the_selection(tmp_path: Path) -> None:
+    said: list[str] = []
+    runner.execute(_spec(tmp_path, ["-k", "foo", "--lf"]), _FakeLanes([0, 0], tmp_path / runner.LOCK_NAME), said.append)
+    assert any("selection narrowed by -k --lf" in line for line in said)
+
+
 def test_a_real_targeted_run_reports_each_lane_and_a_summary(tmp_path: Path) -> None:
     said: list[str] = []
     spec = runner.RunSpec(
@@ -502,4 +572,4 @@ def test_a_real_targeted_run_reports_each_lane_and_a_summary(tmp_path: Path) -> 
     )
     assert runner.execute(spec, runner.run_lane, said.append) == 0
     assert any("parallel lane" in line and "targeted run" in line for line in said)
-    assert any(line.startswith(f"{runner.PREFIX} done") for line in said)
+    assert any(re.search(r"done .* parallel lane exit 0, [1-9]\d* ran", line) for line in said)
