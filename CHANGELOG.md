@@ -118,10 +118,13 @@ Alpha — APIs may change before `v1.0`.
   The guide documented neither the flag nor that read, so a client written from
   the guide alone could not reach `proceed`. A new "Capturing the comparands"
   section shows the request, where each kind of pre-read answer carries the
-  pair, and which first reads leave a file with no content claim. The
-  recovery the guide gave for `content_claim_absent`, re-reading the artifact,
-  was wrong: a later read never adds a claim that the record lacks, while a
-  commit through the coordinator does.
+  pair, how to recognize a degraded answer or a strict-mode deny and capture
+  again after one, and which first touches leave a file with no content claim.
+  The recovery the guide gave for `content_claim_absent`, re-reading the
+  artifact, was wrong: a later read never adds a claim that the record lacks.
+  A commit through the coordinator does, but it moves the version, so the
+  caller and every other reader of the file have to capture again; the guide
+  now leads with prevention, a hashed pre-read as the file's first touch.
 
 - **A `pre-read` whose artifact record disappears mid-request admits instead
   of answering an internal error (#224).** `pre-read` finds the artifact by
