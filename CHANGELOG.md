@@ -141,6 +141,31 @@ Alpha — APIs may change before `v1.0`.
   session's next hook delivers them. Work that had already taken a notice when
   the time ran out still loses it.
 
+- **The guide now says how an HTTP client captures the effect fence's
+  comparands, and how to clear `content_claim_absent` (#224).**
+  `POST /hooks/effect-fence` needs an `expected_version` and an
+  `expected_generation`, and the only way an HTTP client can get the
+  generation is a `POST /hooks/pre-read` with `"want_owner_generation": true`.
+  The guide documented neither the flag nor that read, so a client written from
+  the guide alone could not reach `proceed`. A new "Capturing the comparands"
+  section shows the request, where each kind of pre-read answer carries the
+  pair, how to recognize a degraded answer or a strict-mode deny and capture
+  again after one, and which first touches leave a file with no content claim.
+  The recovery the guide gave for `content_claim_absent`, re-reading the
+  artifact, was wrong: a later read never adds a claim that the record lacks.
+  A commit through the coordinator does, but it moves the version, so the
+  caller and every other reader of the file have to capture again; the guide
+  now leads with prevention, a hashed pre-read as the file's first touch.
+
+- **A `pre-read` whose artifact record disappears mid-request admits instead
+  of answering an internal error (#224).** `pre-read` finds the artifact by
+  name and then reads its version and generation. When the record was removed
+  between those two steps, the handler answered
+  `{"ok": false, "reason": "internal: AttributeError"}`. It now answers
+  `{"status": "fresh"}` with no version, the answer for an untracked path,
+  because there is nothing left to check. No shipped route removes an artifact
+  record, so only an embedding that deletes one could reach this.
+
 - **A `pre-edit` that times out now says the check did not run, and a check
   that finishes late no longer records a deny nobody was sent (#236).** When
   the coordinator could not answer `pre-edit` within its 4-second handler

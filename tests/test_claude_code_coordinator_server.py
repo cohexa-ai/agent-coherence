@@ -7916,6 +7916,53 @@ def test_hold_counter_moves_on_a_hold_and_stands_still_on_a_proceed(
     assert holds() == 1, "a 400 was counted as a hold"
 
 
+@pytest.mark.parametrize("late_verdict", ["hold", "proceed"])
+def test_a_timed_out_fence_counts_a_hold_only_when_its_late_body_reaches_one(
+    served_decider, monkeypatch: pytest.MonkeyPatch, late_verdict: str,
+) -> None:
+    """#224: the hold counter counts verdicts the handler REACHED. A fence
+    answered on its watchdog sends the degraded hold, which
+    ``watchdog_timeouts_total`` counts, so at that moment the hold counter has
+    not moved. The abandoned body keeps running: a hold it then reaches is
+    counted, together with the late completion, and a proceed is not. Fails if
+    the degraded answer is counted as a hold -- a coordinator that is merely
+    slow would read on ``/status`` as a workspace full of conflicts."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_WARN_PATH, recorded_hash=_hash("canonical"),
+        state=MESIState.SHARED, version=2,
+    )
+    version, generation = _u4_captured(server, artifact_id)
+    sent_version = version if late_verdict == "proceed" else version + 1
+    delayed = _DelayedCall(monkeypatch, mod, "_effect_fence_comparands", lambda *a, **kw: True)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    holds_before = server.counters_snapshot()["effect_fence_holds_total"]
+    timeouts_before = server._watchdog_timeouts_total
+    aborts_before = server._watchdog_late_aborts_total
+    completions_before = server._watchdog_late_completion_total
+    try:
+        answer = client.post(_U4_ROUTE, _u4_body(
+            sid, _U3A_WARN_PATH, version=sent_version, generation=generation,
+            content_hash=_hash("canonical"),
+        ))
+        holds_at_answer = server.counters_snapshot()["effect_fence_holds_total"]
+    finally:
+        delayed.release()
+    _await_abandoned_body_settled(
+        server, aborts_before=aborts_before, completions_before=completions_before)
+
+    assert delayed.entered.is_set(), "the fence body never started"
+    assert answer == (200, mod._EFFECT_FENCE_DEGRADED_RESPONSE)
+    assert holds_at_answer == holds_before, (
+        "the degraded hold was counted as a verdict the handler reached")
+    assert server._watchdog_timeouts_total == timeouts_before + 1
+    assert server._watchdog_late_completion_total == completions_before + 1
+    late_holds = 1 if late_verdict == "hold" else 0
+    assert server.counters_snapshot()["effect_fence_holds_total"] == holds_before + late_holds
+
+
 # --- R7: the call mutates nothing -----------------------------------------
 
 
@@ -8130,6 +8177,48 @@ _CONTRACT_STATEMENTS: tuple[tuple[str, str], ...] = (
         "the sibling coordinator answers 404 for this route",
         "the sibling Node coordinator backend does not implement `/hooks/effect-fence`",
     ),
+    (
+        "an HTTP client captures the comparands through pre-read",
+        "add `\"want_owner_generation\": true` to a `POST /hooks/pre-read` for the file",
+    ),
+    (
+        "where the comparands sit in a stale-read answer",
+        "`summary.current_version` and `owner_generation`",
+    ),
+    (
+        "a read does not record a missing content claim",
+        "A later read does not record a claim, even one that sends the hash",
+    ),
+    (
+        "the first touches that leave a file with no content claim",
+        "by a pre-read with no hash, by a Bash command that reads it in a Claude Code "
+        "session, by an edit before the file's first commit, or by a `/session/begin` "
+        "read set that names it",
+    ),
+    (
+        "a degraded capture is retried, not read as no record",
+        "| `\"degraded\": true` | none: the check did not run; capture nothing and send the "
+        "pre-read again | none |",
+    ),
+    (
+        "a strict deny is told apart from a stale warning by its permission decision",
+        "`hookSpecificOutput.permissionDecision` is `\"deny\"`",
+    ),
+    (
+        "a strict deny is recovered under a new identity",
+        "capture again under a new `agent_id` with the same `session_id`",
+    ),
+    (
+        "the content-claim recovery is a commit, which moves the version",
+        "a commit through the coordinator records one, and it moves the version",
+    ),
+    (
+        "the hold-reason row: a re-read does not clear content_claim_absent, a commit "
+        "does and forces a fresh capture",
+        "Once a file has no claim, a re-read does not add one. A commit through the "
+        "coordinator does (`/hooks/pre-edit`, then `/hooks/post-edit` with the bytes' "
+        "hash), but it moves the version: capture the comparands again before you re-gate",
+    ),
 )
 
 
@@ -8209,6 +8298,165 @@ def test_tool_tables_name_the_http_fence() -> None:
         assert any(row.startswith("| `POST /hooks/effect-fence`") for row in rows), (
             f"{doc.name} lists the fence tool without its HTTP sibling"
         )
+
+
+def _captured_over_http(answer: dict) -> tuple[int, int]:
+    """The comparand pair as the guide tells an HTTP client to read it from a
+    pre-read answer: top-level ``version`` on a fresh answer,
+    ``summary.current_version`` on a stale-read warning, and
+    ``owner_generation`` at the top level of both."""
+    version = answer["version"] if answer["status"] == "fresh" else answer["summary"]["current_version"]
+    return version, answer["owner_generation"]
+
+
+def test_the_documented_http_capture_recipe_reaches_proceed(coordinator, client: _Client) -> None:
+    """#224: a client built from the guide alone reaches ``proceed``. It
+    captures through ``/hooks/pre-read`` with ``want_owner_generation`` and its
+    content hash, reads the pair where the guide says each answer carries it,
+    and fences with that pair, the same session and the same hash -- on a
+    first read's fresh answer, and on the stale-read warning a peer's commit
+    leaves behind."""
+    reader, writer = str(uuid.uuid4()), str(uuid.uuid4())
+
+    def capture_then_fence(content_hash: str) -> tuple[str, dict]:
+        status, answer = client.post("/hooks/pre-read", {
+            "session_id": reader, "path": "plan.md", "content_hash": content_hash,
+            "want_owner_generation": True,
+        })
+        assert status == 200, answer
+        version, generation = _captured_over_http(answer)
+        return answer["status"], client.post(_U4_ROUTE, _u4_body(
+            reader, "plan.md", version=version, generation=generation, content_hash=content_hash,
+        ))[1]
+
+    assert capture_then_fence(_hash("v1")) == ("fresh", {"verdict": "proceed"})
+    assert client.post("/hooks/pre-edit", {"session_id": writer, "path": "plan.md"})[1].get("ok") is True
+    assert client.post("/hooks/post-edit", {
+        "session_id": writer, "path": "plan.md", "content_hash": _hash("v2"), "success": True,
+    })[1].get("ok") is True
+    assert capture_then_fence(_hash("v2")) == ("stale", {"verdict": "proceed"})
+
+
+def _commit_over_http(client: _Client, session_id: str, path: str, content_hash: str) -> None:
+    """Commit ``path`` through the coordinator: a write claim, then the commit."""
+    assert client.post("/hooks/pre-edit", {"session_id": session_id, "path": path})[1].get("ok") is True
+    assert client.post("/hooks/post-edit", {
+        "session_id": session_id, "path": path, "content_hash": content_hash, "success": True,
+    })[1].get("ok") is True
+
+
+def test_the_documented_capture_recovers_from_a_strict_deny_under_a_new_agent_id(
+    strict_plan_coordinator, strict_plan_client: _Client,
+) -> None:
+    """#224: on a strict-mode file a peer's commit invalidates the reader, and
+    every later pre-read under that identity is denied -- a deny never
+    re-grants. The deny is the answer whose permissionDecision is "deny"; it
+    also says "status": "stale" and carries a summary, but no
+    owner_generation. As the guide says, a capture under a new agent_id with
+    the same session_id (what CoherentVolume.reacquire() does) reaches
+    proceed, fencing under that same agent_id. Fails if the denied identity
+    can capture again, or if the new one cannot."""
+    client = strict_plan_client
+    reader, writer = str(uuid.uuid4()), str(uuid.uuid4())
+
+    def capture(content_hash: str, agent_id: str | None = None) -> dict:
+        request = {"session_id": reader, "path": "plan.md", "content_hash": content_hash,
+                   "want_owner_generation": True}
+        if agent_id is not None:
+            request["agent_id"] = agent_id
+        status, answer = client.post("/hooks/pre-read", request)
+        assert status == 200, answer
+        return answer
+
+    first = capture(_hash("v1"))
+    assert first["status"] == "fresh" and "owner_generation" in first, first
+    _commit_over_http(client, writer, "plan.md", _hash("v2"))
+    for _ in range(2):
+        denied = capture(_hash("v2"))
+        assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", denied
+        assert denied["status"] == "stale" and "owner_generation" not in denied, denied
+
+    recaptured = capture(_hash("v2"), agent_id="reacquired-1")
+    assert recaptured.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", recaptured
+    version, generation = _captured_over_http(recaptured)
+    fence = {**_u4_body(reader, "plan.md", version=version, generation=generation,
+                        content_hash=_hash("v2")), "agent_id": "reacquired-1"}
+    assert client.post(_U4_ROUTE, fence) == (200, {"verdict": "proceed"})
+
+
+_CLAIMLESS_FIRST_TOUCHES: dict[str, tuple[str, dict]] = {
+    "pre-read-without-a-hash": ("/hooks/pre-read", {"path": "plan.md"}),
+    "pre-bash-read": ("/hooks/pre-bash", {"command": "cat plan.md"}),
+    "pre-edit-before-a-commit": ("/hooks/pre-edit", {"path": "plan.md"}),
+    "session-begin-read-set": ("/session/begin", {"read_set": ["plan.md"]}),
+}
+
+
+@pytest.mark.parametrize("first_touch", sorted(_CLAIMLESS_FIRST_TOUCHES))
+def test_a_file_first_registered_without_a_hash_holds_content_claim_absent_until_a_commit(
+    coordinator, client: _Client, first_touch: str,
+) -> None:
+    """#224: the guide's content-claim recovery, driven over HTTP. A file first
+    registered by any of the four claimless first touches holds the fence on
+    content_claim_absent for a hashed capture, and a second hashed capture
+    still holds -- a read never adds the claim. A commit through the
+    coordinator records it: after one, a fresh capture reaches proceed, and
+    the pair captured before the commit holds version_moved, because the
+    commit moved the version. Fails if a read starts recording the claim, or
+    a commit stops recording it, without the guide changing too."""
+    route, request = _CLAIMLESS_FIRST_TOUCHES[first_touch]
+    assert client.post(route, {"session_id": str(uuid.uuid4()), **request})[0] == 200
+    assert coordinator.registry.lookup_artifact_id_by_name("plan.md") is not None, (
+        "the first touch did not register the file")
+    reader = str(uuid.uuid4())
+
+    def capture_then_fence(content_hash: str) -> tuple[tuple[int, int], dict]:
+        status, answer = client.post("/hooks/pre-read", {
+            "session_id": reader, "path": "plan.md", "content_hash": content_hash,
+            "want_owner_generation": True,
+        })
+        assert status == 200, answer
+        pair = _captured_over_http(answer)
+        return pair, client.post(_U4_ROUTE, _u4_body(
+            reader, "plan.md", version=pair[0], generation=pair[1], content_hash=content_hash,
+        ))[1]
+
+    claimless = {"verdict": "hold", "reason": "content_claim_absent"}
+    before_commit, verdict = capture_then_fence(_hash("v1"))
+    assert verdict == claimless
+    assert capture_then_fence(_hash("v1"))[1] == claimless, "a hashed re-read recorded the claim"
+
+    _commit_over_http(client, str(uuid.uuid4()), "plan.md", _hash("v1"))
+    stale_pair_fence = _u4_body(reader, "plan.md", version=before_commit[0],
+                                generation=before_commit[1], content_hash=_hash("v1"))
+    assert client.post(_U4_ROUTE, stale_pair_fence)[1] == {"verdict": "hold", "reason": "version_moved"}
+    assert capture_then_fence(_hash("v1"))[1] == {"verdict": "proceed"}
+
+
+@pytest.mark.parametrize("want_generation", [False, True], ids=["plain", "want-generation"])
+def test_a_pre_read_whose_row_vanishes_mid_read_admits_with_no_version(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, want_generation: bool,
+) -> None:
+    """#224: pre-read finds the artifact by name, then reads its version and
+    generation as one pair. A row removed between the two leaves nothing to
+    classify, and the answer is the admit an untracked path gets --
+    ``{"status": "fresh"}`` with no version and no generation -- never the
+    ``internal: AttributeError`` envelope the missing row's dereference
+    produced. No shipped route deletes a row today; the registry's
+    ``remove_artifact`` is called inside the window to stand in for one."""
+    request = {"session_id": str(uuid.uuid4()), "path": "plan.md", "content_hash": _hash("v1")}
+    assert client.post("/hooks/pre-read", request)[0] == 200
+    registry = coordinator.registry
+    real = registry.get_artifact_and_generation
+
+    def removed_first(artifact_id: uuid.UUID):
+        registry.remove_artifact(artifact_id)
+        return real(artifact_id)
+
+    monkeypatch.setattr(registry, "get_artifact_and_generation", removed_first)
+    if want_generation:
+        request = {**request, "want_owner_generation": True}
+    assert client.post("/hooks/pre-read", request) == (200, {"status": "fresh"})
 
 
 # ----------------------------------------------------------------------

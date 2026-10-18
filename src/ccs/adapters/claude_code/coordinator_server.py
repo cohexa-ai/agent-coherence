@@ -2458,8 +2458,14 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # peer commit slip between the two and hand back a version newer than
         # the bytes and grant the response answers for.
         artifact_pair = coordinator.registry.get_artifact_and_generation(artifact_id)
-        artifact = artifact_pair[0] if artifact_pair else None
-        owner_generation = artifact_pair[1] if artifact_pair else None
+        if artifact_pair is None:
+            # #224: the row vanished between the lookup and this read, so there
+            # is nothing to classify and no version or generation to report.
+            # Answer the admit an untracked path gets: pre-read never blocks on
+            # a missing record. The fence holds on the same absence with
+            # ``input_vanished``.
+            return {"status": "fresh"}
+        artifact, owner_generation = artifact_pair
         agent_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
 
         # ONE clock read for the whole decision, handed IN rather than taken
@@ -8818,7 +8824,10 @@ def decide_tracked_read(
 
     Args:
         artifact: the artifact from the caller's snapshot. Non-optional —
-            a vanished row is the caller's branch to take, as it is today.
+            a row that vanished before the snapshot is the caller's branch to
+            take, and both callers take it before calling: the fence holds
+            with ``input_vanished`` and pre-read admits with no version
+            (#224).
     """
     # A grant that is present and not INVALID is the fresh arm's admission
     # ticket: the holder was granted on the current version, and a peer commit
