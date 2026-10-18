@@ -508,6 +508,23 @@ class WatchdogAbort(Event):
         self.guard_won = False
 
 
+def refusal_with_generation_pair(
+    reason: str, current: int, generation_pair: tuple[int | None, int]
+) -> ConflictDetail:
+    """One commit refusal, carrying the generation pair its decision read.
+
+    ``generation_pair`` is the committer's ``(read_generation,
+    owner_generation)`` from the same snapshot as ``current``. A committer with
+    no recorded read_generation reports neither value: an owner generation
+    alone names no lost token."""
+    read_gen, owner_gen = generation_pair
+    if read_gen is None:
+        return ConflictDetail(reason, current)
+    return ConflictDetail(
+        reason, current, captured_generation=read_gen, owner_generation=owner_gen
+    )
+
+
 def note_guard_won(abort: Event | None) -> None:
     """Record on ``abort`` that ``abort_guard`` admitted the caller with it:
     the abort was not set when the guard won the registry lock (#338). Only a

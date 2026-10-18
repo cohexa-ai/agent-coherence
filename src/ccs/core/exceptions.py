@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import TypeGuard
+from typing import Protocol, TypeGuard
 from uuid import UUID
 
 # Wire-stable reason string for the retry-eligible OCC precondition where a peer
@@ -579,7 +579,50 @@ def _generation_pair(captured: object, owner: object) -> tuple[int, int] | None:
     return None
 
 
-class StaleReadGeneration(CoherenceError):
+class _PairCarrier(Protocol):
+    @property
+    def captured_generation(self) -> int | None: ...
+
+    @property
+    def owner_generation(self) -> int | None: ...
+
+
+def _generation_pair_fields(refusal: _PairCarrier) -> dict[str, int]:
+    """A refusal's pair as two body or result keys, both or neither, so a
+    response never carries a null or half a pair."""
+    pair = _generation_pair(refusal.captured_generation, refusal.owner_generation)
+    if pair is None:
+        return {}
+    captured, owner = pair
+    return {"captured_generation": captured, "owner_generation": owner}
+
+
+class _CarriesGenerationPair:
+    """The keyword-only ``captured_generation`` / ``owner_generation`` a commit
+    refusal carries, kept or dropped whole by :func:`_generation_pair` and
+    never part of the message. Not an exception base, so it changes no
+    ``except`` clause; the class defaults keep both attributes on a subclass
+    that bypasses ``__init__``."""
+
+    captured_generation: int | None = None
+    owner_generation: int | None = None
+
+    def __init__(
+        self,
+        *args: object,
+        captured_generation: object = None,
+        owner_generation: object = None,
+    ) -> None:
+        super().__init__(*args)
+        self._adopt_generation_pair(captured_generation, owner_generation)
+
+    def _adopt_generation_pair(self, captured: object, owner: object) -> None:
+        pair = _generation_pair(captured, owner)
+        if pair is not None:
+            self.captured_generation, self.owner_generation = pair
+
+
+class StaleReadGeneration(_CarriesGenerationPair, CoherenceError):
     """The read-generation fence rejected a commit: the committer's
     read_generation is older than the artifact's current owner_generation --
     its captured ownership/read-claim was superseded by a sweep reclamation.
@@ -595,30 +638,15 @@ class StaleReadGeneration(CoherenceError):
     and never enter the message, which stays whatever the raise site wrote;
     both are ``None`` (the class default) when no valid pair was passed."""
 
-    captured_generation: int | None = None
-    owner_generation: int | None = None
 
-    def __init__(
-        self,
-        *args: object,
-        captured_generation: object = None,
-        owner_generation: object = None,
-    ) -> None:
-        super().__init__(*args)
-        pair = _generation_pair(captured_generation, owner_generation)
-        if pair is not None:
-            self.captured_generation, self.owner_generation = pair
-
-
-class CommitNotAllowed(CoherenceError):
+class CommitNotAllowed(_CarriesGenerationPair, CoherenceError):
     """The coordinator refused a pessimistic commit because the committer does
     not hold the artifact's write grant (M or E): a sweep reclaimed it, a peer
     preempted it, or it never held one. Nothing landed.
 
     Raised by ``CoordinatorService.commit``. The message is the refusal's
     prose, ``commit_not_allowed ...`` (naming the reclaim trigger and tick
-    when a sweep reclaimed the grant), and is unchanged from the plain
-    :class:`CoherenceError` this refusal used to be.
+    when a sweep reclaimed the grant).
 
     :attr:`captured_generation` is the read_generation the coordinator
     recorded at the committer's last claim; :attr:`owner_generation` is the
@@ -629,20 +657,6 @@ class CommitNotAllowed(CoherenceError):
     lost, and the two are not ordered otherwise. Both are ``None`` (the class
     default) when the committer has no recorded claim. Keyword-only, never in
     the message; recovery follows the refusal, never the pair."""
-
-    captured_generation: int | None = None
-    owner_generation: int | None = None
-
-    def __init__(
-        self,
-        *args: object,
-        captured_generation: object = None,
-        owner_generation: object = None,
-    ) -> None:
-        super().__init__(*args)
-        pair = _generation_pair(captured_generation, owner_generation)
-        if pair is not None:
-            self.captured_generation, self.owner_generation = pair
 
 
 class OccCallerTransientError(CoherenceError):
@@ -799,7 +813,7 @@ class InvariantViolationError(CoherenceError):
     """Raised when a runtime invariant check fails."""
 
 
-class CasRetriesExhausted(CoherenceError):
+class CasRetriesExhausted(_CarriesGenerationPair, CoherenceError):
     """Raised when an optimistic-concurrency commit-CAS retry loop is exhausted.
 
     The typed terminal failure for the OCC write path (plan Unit 5, R6 /
@@ -843,8 +857,6 @@ class CasRetriesExhausted(CoherenceError):
     #: Class defaults, so a subclass that bypasses ``__init__``
     #: (``ConditionalPutRetriesExhausted``) still has the attributes.
     last_conflict_reason: str | None = None
-    captured_generation: int | None = None
-    owner_generation: int | None = None
 
     def __init__(
         self,
@@ -860,9 +872,7 @@ class CasRetriesExhausted(CoherenceError):
         # and an exception constructor must never raise (see CasVersionConflict).
         if isinstance(last_conflict_reason, str) and last_conflict_reason:
             self.last_conflict_reason = last_conflict_reason
-        pair = _generation_pair(captured_generation, owner_generation)
-        if pair is not None:
-            self.captured_generation, self.owner_generation = pair
+        self._adopt_generation_pair(captured_generation, owner_generation)
         if self.last_conflict_reason is None:
             # No reason known (a raise site that does not pass one): the text
             # this message has always had.
@@ -918,7 +928,7 @@ class StaleView(CoherenceError):
     current_generation: int | None = None
 
 
-class CommitPreempted(CoherenceError):
+class CommitPreempted(_CarriesGenerationPair, CoherenceError):
     """Post-edit deny (MCP-C Unit 1): the EXCLUSIVE grant was preempted /
     sweep-reclaimed AFTER the atomic disk write but BEFORE the commit landed, so
     the bytes may already be on disk *un-versioned* (disk ahead of the
@@ -935,19 +945,6 @@ class CommitPreempted(CoherenceError):
     recovery above holds whatever they say."""
 
     reason = COMMIT_PREEMPTED_REASON
-    captured_generation: int | None = None
-    owner_generation: int | None = None
-
-    def __init__(
-        self,
-        *args: object,
-        captured_generation: object = None,
-        owner_generation: object = None,
-    ) -> None:
-        super().__init__(*args)
-        pair = _generation_pair(captured_generation, owner_generation)
-        if pair is not None:
-            self.captured_generation, self.owner_generation = pair
 
 
 class ViewWedged(CoherenceError):
@@ -1167,7 +1164,7 @@ _CAS_EXHAUSTED_ADVICE: dict[str, str] = {
 }
 
 
-class CasVersionConflict(CoherenceError):
+class CasVersionConflict(_CarriesGenerationPair, CoherenceError):
     """Option-A CAS rejected (MCP-C Unit 5). Typed-conflict, NOT auto-merge: NO
     write landed, and both versions are carried so the client can recover
     without another read.
@@ -1198,8 +1195,6 @@ class CasVersionConflict(CoherenceError):
     #: class attribute keep working. An instance raised from a wire refusal
     #: SHADOWS it with the coordinator's own reason.
     reason = VERSION_MISMATCH_REASON
-    captured_generation: int | None = None
-    owner_generation: int | None = None
 
     def __init__(
         self,
@@ -1236,9 +1231,7 @@ class CasVersionConflict(CoherenceError):
         self.artifact_id = artifact_id
         self.expected_version = expected_version
         self.current_version = current_version
-        pair = _generation_pair(captured_generation, owner_generation)
-        if pair is not None:
-            self.captured_generation, self.owner_generation = pair
+        self._adopt_generation_pair(captured_generation, owner_generation)
 
 
 class ScenarioValidationError(CoherenceError):

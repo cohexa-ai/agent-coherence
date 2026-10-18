@@ -64,6 +64,7 @@ from .registry_protocol import (
     acquire_by_deadline,
     decide_transfer_grant,
     note_guard_won,
+    refusal_with_generation_pair,
     require_storable_transfer_status,
     transfer_record_live,
 )
@@ -74,21 +75,6 @@ CCS_STATE_LOG_SCHEMA_VERSION = "ccs.state_log.v2"
 logger = logging.getLogger(__name__)
 
 _M_OR_E_STATES: frozenset[MESIState] = frozenset({MESIState.MODIFIED, MESIState.EXCLUSIVE})
-
-
-def _refusal(reason: str, current: int, claim: tuple[Optional[int], int]) -> ConflictDetail:
-    """One commit refusal, carrying the pair its decision read.
-
-    ``claim`` is the committer's ``(read_generation, owner_generation)`` from
-    the same locked snapshot as ``current``. A committer with no recorded
-    read_generation reports neither value: an owner generation alone names no
-    lost token."""
-    read_gen, owner_gen = claim
-    if read_gen is None:
-        return ConflictDetail(reason, current)
-    return ConflictDetail(
-        reason, current, captured_generation=read_gen, owner_generation=owner_gen
-    )
 
 
 @dataclass
@@ -945,12 +931,12 @@ class ArtifactRegistry:
             # here, under the same hold and before the first early return, and
             # the fence below decides on these same values.
             read_gen = record.read_generation_by_agent.get(agent_id)
-            claim = (read_gen, record.owner_generation)
+            generation_pair = (read_gen, record.owner_generation)
 
             if expected_version > current:
                 return CasCorruption(current_version=current)
             if expected_version < current:
-                detail = _refusal("version_mismatch", current, claim)
+                detail = refusal_with_generation_pair("version_mismatch", current, generation_pair)
                 self._note_conflict(artifact_id, agent_id, detail.reason)
                 return detail
             other_holder = any(
@@ -958,7 +944,7 @@ class ArtifactRegistry:
                 for peer_id, state in record.state_by_agent.items()
             )
             if other_holder:
-                detail = _refusal("other_holder", current, claim)
+                detail = refusal_with_generation_pair("other_holder", current, generation_pair)
                 self._note_conflict(artifact_id, agent_id, detail.reason)
                 return detail
 
@@ -971,7 +957,7 @@ class ArtifactRegistry:
             # protection is version-CAS (checked above), so it is admitted. Strict->;
             # equality admits. Server-side; no commit_cas signature change.
             if read_gen is not None and read_gen < record.owner_generation:
-                detail = _refusal("stale_read_generation", current, claim)
+                detail = refusal_with_generation_pair("stale_read_generation", current, generation_pair)
                 self._note_conflict(artifact_id, agent_id, detail.reason)
                 return detail
 
@@ -1119,22 +1105,22 @@ class ArtifactRegistry:
                 current = record.artifact.version
                 # Per member, as in commit_cas: one snapshot decides and is reported.
                 read_gen = record.read_generation_by_agent.get(agent_id)
-                claim = (read_gen, record.owner_generation)
+                generation_pair = (read_gen, record.owner_generation)
                 if entry.expected_version > current:
                     # Corruption aborts the whole batch (all-or-nothing); non-retryable.
                     return CasCorruption(current_version=current)
                 if entry.expected_version < current:
-                    conflicts[art_id] = _refusal("version_mismatch", current, claim)
+                    conflicts[art_id] = refusal_with_generation_pair("version_mismatch", current, generation_pair)
                     continue
                 other_holder = any(
                     peer_id != agent_id and state in _M_OR_E_STATES
                     for peer_id, state in record.state_by_agent.items()
                 )
                 if other_holder:
-                    conflicts[art_id] = _refusal("other_holder", current, claim)
+                    conflicts[art_id] = refusal_with_generation_pair("other_holder", current, generation_pair)
                     continue
                 if read_gen is not None and read_gen < record.owner_generation:
-                    conflicts[art_id] = _refusal("stale_read_generation", current, claim)
+                    conflicts[art_id] = refusal_with_generation_pair("stale_read_generation", current, generation_pair)
                     continue
 
             if conflicts:

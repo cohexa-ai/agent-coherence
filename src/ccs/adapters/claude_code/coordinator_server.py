@@ -139,7 +139,7 @@ from ccs.core.exceptions import (
     SessionInvalidated,
     StaleReadGeneration,
     WatchdogAbandoned,
-    _generation_pair,
+    _generation_pair_fields,
 )
 from ccs.core.fence import (
     classify_hold,
@@ -3456,21 +3456,6 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     )
 
 
-def _generation_pair_keys(
-    refusal: ConflictDetail | StaleReadGeneration | CommitNotAllowed,
-) -> dict[str, int]:
-    """A commit refusal's lost token as two body keys, both or neither.
-
-    Neither when the committer has no recorded claim, or when the pair is
-    malformed: the same rule the library applies when it parses the keys
-    back, so a body never carries a null or half a pair."""
-    pair = _generation_pair(refusal.captured_generation, refusal.owner_generation)
-    if pair is None:
-        return {}
-    captured, owner = pair
-    return {"captured_generation": captured, "owner_generation": owner}
-
-
 def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /hooks/post-edit — commit on success, release on failure (KTD-1)."""
     body = req._read_json()
@@ -3574,7 +3559,7 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
             body: dict = {"ok": False, "reason": STALE_READ_GENERATION_REASON}
             if current_artifact is not None:
                 body["current_version"] = current_artifact.version
-            return {**body, **_generation_pair_keys(exc)}
+            return {**body, **_generation_pair_fields(exc)}
         except CoherenceError as exc:
             # A1 + F4: if this commit failed because the grant was preempted
             # silently, enrich the reason with the preemption context so
@@ -3589,7 +3574,7 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
             #
             # Only the typed not-held refusal carries the pair, read in its own
             # decision; no other CoherenceError is probed for one.
-            pair_keys = _generation_pair_keys(exc) if isinstance(exc, CommitNotAllowed) else {}
+            pair_keys = _generation_pair_fields(exc) if isinstance(exc, CommitNotAllowed) else {}
             popped = _consume_for_answer(
                 coordinator, abort,
                 lambda: coordinator.registry.pop_preemption_notice(agent_id, artifact_id),
@@ -3779,7 +3764,7 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
                 "ok": False,
                 "reason": result.reason,
                 "current_version": result.current_version,
-                **_generation_pair_keys(result),
+                **_generation_pair_fields(result),
             }
 
         updated, _signals = result
@@ -5235,7 +5220,7 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
                 "ok": False,
                 "reason": result.reason,
                 "current_version": result.current_version,
-                **_generation_pair_keys(result),
+                **_generation_pair_fields(result),
             }
         if isinstance(result, SessionCommitRejection):
             if result.reason == SESSION_INVALIDATED_REASON:
@@ -5381,7 +5366,7 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
                     path_by_id[aid]: {
                         "reason": detail.reason,
                         "current_version": detail.current_version,
-                        **_generation_pair_keys(detail),
+                        **_generation_pair_fields(detail),
                     }
                     for aid, detail in result.per_artifact.items()
                 },

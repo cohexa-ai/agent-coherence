@@ -67,7 +67,7 @@ from ccs.core.exceptions import (
     InternalConcurrencyError,
     StaleView,
     ViewWedged,
-    _generation_pair,
+    _generation_pair_fields,
 )
 
 
@@ -385,7 +385,7 @@ def deny_result(exc: BaseException) -> CallToolResult:
             {
                 "expected_version": exc.expected_version,
                 "current_version": exc.current_version,
-                **_generation_fields(exc),
+                **_generation_pair_fields(exc),
             },
         )
     if type(exc) is CallerPrincipalRefused and exc.reason in CALLER_PRINCIPAL_REASONS:
@@ -407,7 +407,7 @@ def deny_result(exc: BaseException) -> CallToolResult:
     elif type(exc) in (CasRetriesExhausted, CommitPreempted):
         # The two commit terminals add the refusal's lost token beside their
         # unchanged recover verb. Diagnostic only: it changes no recovery.
-        extra = _generation_fields(exc)
+        extra = _generation_pair_fields(exc)
     return _result(terminal, str(exc), extra)
 
 
@@ -486,18 +486,6 @@ def _with_row(grant: dict, row: _Terminal) -> dict:
     if row.next_step is not None:
         entry["next_step"] = row.next_step
     return entry
-
-
-def _generation_fields(exc: CasVersionConflict | CasRetriesExhausted | CommitPreempted) -> dict:
-    """The refusal's ``captured_generation`` and ``owner_generation``, both
-    or neither: neither unless both are generations, by the same rule the
-    coordinator emits them under, so a result never carries a null or half
-    a pair."""
-    pair = _generation_pair(exc.captured_generation, exc.owner_generation)
-    if pair is None:
-        return {}
-    captured, owner = pair
-    return {"captured_generation": captured, "owner_generation": owner}
 
 
 def _giver_fields(exc: GiverFenced) -> dict:

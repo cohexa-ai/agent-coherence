@@ -149,6 +149,7 @@ from .registry_protocol import (
     acquire_by_deadline,
     decide_transfer_grant,
     note_guard_won,
+    refusal_with_generation_pair,
     require_storable_transfer_status,
     transfer_record_live,
 )
@@ -752,21 +753,6 @@ _DECISION_SNAPSHOT_SQL = (
     "WHERE s.artifact_id = a.id AND s.agent_id = ?) "
     "FROM artifacts a WHERE a.id = ?"
 )
-
-
-def _refusal(reason: str, current: int, claim: tuple[Optional[int], int]) -> ConflictDetail:
-    """One commit refusal, carrying the pair its decision read.
-
-    ``claim`` is the committer's ``(read_generation, owner_generation)`` from
-    the same statement as ``current``. A committer with no recorded
-    read_generation reports neither value: an owner generation alone names no
-    lost token."""
-    read_gen, owner_gen = claim
-    if read_gen is None:
-        return ConflictDetail(reason, current)
-    return ConflictDetail(
-        reason, current, captured_generation=read_gen, owner_generation=owner_gen
-    )
 
 
 @dataclass(frozen=True)
@@ -4898,7 +4884,7 @@ class SqliteArtifactRegistry:
                 if version_row is None:
                     raise KeyError(f"artifact {artifact_id} not in registry")
                 current, current_size_tokens, owner_gen, read_gen = version_row
-                claim = (read_gen, owner_gen)
+                generation_pair = (read_gen, owner_gen)
 
                 # 3-outcome discrimination. Each ConflictDetail branch resolves
                 # via _deny (U5 instrumentation; see its docstring for the
@@ -4910,7 +4896,9 @@ class SqliteArtifactRegistry:
                     return CasCorruption(current_version=current)
                 if expected_version < current:
                     return self._deny(
-                        artifact_id, agent_id, _refusal("version_mismatch", current, claim)
+                        artifact_id,
+                        agent_id,
+                        refusal_with_generation_pair("version_mismatch", current, generation_pair),
                     )
                 # Version matches. Holder check is the OCC-vs-pessimistic guard;
                 # exclude the committer itself (it is S/I, but be defensive).
@@ -4929,7 +4917,7 @@ class SqliteArtifactRegistry:
                 ).fetchone()
                 if other_holder is not None:
                     return self._deny(
-                        artifact_id, agent_id, _refusal("other_holder", current, claim)
+                        artifact_id, agent_id, refusal_with_generation_pair("other_holder", current, generation_pair)
                     )
 
                 # Read-generation fence: reject a committer whose CAPTURED
@@ -4944,7 +4932,7 @@ class SqliteArtifactRegistry:
                     return self._deny(
                         artifact_id,
                         agent_id,
-                        _refusal("stale_read_generation", current, claim),
+                        refusal_with_generation_pair("stale_read_generation", current, generation_pair),
                     )
 
                 # ---- WIN: mutate atomically ----
@@ -5156,13 +5144,13 @@ class SqliteArtifactRegistry:
                     if row is None:
                         raise KeyError(f"artifact {art_id} not in registry")
                     current, size_tokens, owner_gen, read_gen = row
-                    claim = (read_gen, owner_gen)
+                    generation_pair = (read_gen, owner_gen)
                     current_by[art_id] = (current, size_tokens)
                     if entry.expected_version > current:
                         self._conn.execute("COMMIT")  # nothing mutated
                         return CasCorruption(current_version=current)
                     if entry.expected_version < current:
-                        conflicts[art_id] = _refusal("version_mismatch", current, claim)
+                        conflicts[art_id] = refusal_with_generation_pair("version_mismatch", current, generation_pair)
                         continue
                     other_holder = self._conn.execute(
                         "SELECT 1 FROM agent_states WHERE artifact_id = ? AND agent_id != ? "
@@ -5170,10 +5158,12 @@ class SqliteArtifactRegistry:
                         (art_id.hex, agent_id.hex, MESIState.MODIFIED.name, MESIState.EXCLUSIVE.name),
                     ).fetchone()
                     if other_holder is not None:
-                        conflicts[art_id] = _refusal("other_holder", current, claim)
+                        conflicts[art_id] = refusal_with_generation_pair("other_holder", current, generation_pair)
                         continue
                     if read_gen is not None and read_gen < owner_gen:
-                        conflicts[art_id] = _refusal("stale_read_generation", current, claim)
+                        conflicts[art_id] = refusal_with_generation_pair(
+                            "stale_read_generation", current, generation_pair
+                        )
                         continue
 
                 if conflicts:
