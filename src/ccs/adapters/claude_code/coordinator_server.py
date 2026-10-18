@@ -132,12 +132,14 @@ from ccs.core.exceptions import (
     CheckpointRegistrationRefused,
     CheckpointUnknown,
     CoherenceError,
+    CommitNotAllowed,
     GiverFenced,
     OccCallerTransientError,
     RegistryLockTimeout,
     SessionInvalidated,
     StaleReadGeneration,
     WatchdogAbandoned,
+    _generation_pair,
 )
 from ccs.core.fence import (
     classify_hold,
@@ -3448,6 +3450,21 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     )
 
 
+def _generation_pair_keys(
+    refusal: ConflictDetail | StaleReadGeneration | CommitNotAllowed,
+) -> dict[str, int]:
+    """A commit refusal's lost token as two body keys, both or neither.
+
+    Neither when the committer has no recorded claim, or when the pair is
+    malformed: the same rule the library applies when it parses the keys
+    back, so a body never carries a null or half a pair."""
+    pair = _generation_pair(refusal.captured_generation, refusal.owner_generation)
+    if pair is None:
+        return {}
+    captured, owner = pair
+    return {"captured_generation": captured, "owner_generation": owner}
+
+
 def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /hooks/post-edit — commit on success, release on failure (KTD-1)."""
     body = req._read_json()
@@ -3539,17 +3556,19 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
             # in flight when the transfer landed: the handoff arm, never the
             # preemption or reclaim one, reaches it in the post-tool envelope.
             return _giver_commit_refused_body(exc, path=path)
-        except StaleReadGeneration:
+        except StaleReadGeneration as exc:
             # Read-generation fence: a sweep reclaimed this committer in the race
             # window between its grant and this commit. Surface the STABLE machine
             # reason (not str(exc)) so the client classifier matches exactly. The
             # reclaim already released the grant, so there is nothing to release
             # here. The {ok: false} body reads as a definite reject (fail-closed).
+            # The pair is the one the fence compared, taken from the exception:
+            # a registry read here could postdate the decision.
             current_artifact = coordinator.registry.get_artifact(artifact_id)
             body: dict = {"ok": False, "reason": STALE_READ_GENERATION_REASON}
             if current_artifact is not None:
                 body["current_version"] = current_artifact.version
-            return body
+            return {**body, **_generation_pair_keys(exc)}
         except CoherenceError as exc:
             # A1 + F4: if this commit failed because the grant was preempted
             # silently, enrich the reason with the preemption context so
@@ -3561,6 +3580,10 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
             # the same preemption prose. The subagent flagged this as a
             # double-emit hazard — the post-edit-failure response IS the
             # surfacing channel for this specific case.
+            #
+            # Only the typed not-held refusal carries the pair, read in its own
+            # decision; no other CoherenceError is probed for one.
+            pair_keys = _generation_pair_keys(exc) if isinstance(exc, CommitNotAllowed) else {}
             popped = _consume_for_answer(
                 coordinator, abort,
                 lambda: coordinator.registry.pop_preemption_notice(agent_id, artifact_id),
@@ -3582,7 +3605,7 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
                         f"not bumped. Re-fetch the latest via pre-read and "
                         f"retry. Underlying coordinator error: {exc}"
                     )
-                    return {"ok": False, "reason": reason, "reclaimed": True}
+                    return {"ok": False, "reason": reason, "reclaimed": True, **pair_keys}
                 # R7: the popped notice carries the preempter's agent id.
                 reason = (
                     f"commit_not_allowed: your EXCLUSIVE grant on {path} was "
@@ -3591,8 +3614,8 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
                     f"worktree but will not be reflected in the coordinator's "
                     f"version. Underlying coordinator error: {exc}"
                 )
-                return {"ok": False, "reason": reason, "preempted": True}
-            return {"ok": False, "reason": str(exc)}
+                return {"ok": False, "reason": reason, "preempted": True, **pair_keys}
+            return {"ok": False, "reason": str(exc), **pair_keys}
         # KTD-J (Unit 8): successful commit means an EXCLUSIVE grant was
         # acquired (pre-edit) and released (post-edit) within this same
         # turn → sizes the hosted-tier upsell case.
@@ -3632,6 +3655,8 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
       current_version: N}`` — a clean typed conflict, NOT a degrade. The client
       re-reads + retries. ``stale_read_generation`` is the read-generation
       fence: the caller's captured claim was superseded by a sweep reclamation.
+      When the caller has a recorded claim the body also carries
+      ``captured_generation`` and ``owner_generation``; otherwise neither key.
     - retry-eligible transient precondition
       (:class:`~ccs.core.exceptions.OccCallerTransientError`: a peer
       invalidated the caller between its read and this CAS) → ``{ok: false,
@@ -3748,6 +3773,7 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
                 "ok": False,
                 "reason": result.reason,
                 "current_version": result.current_version,
+                **_generation_pair_keys(result),
             }
 
         updated, _signals = result
@@ -5135,7 +5161,9 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
 
     Responses (preserving the shipped ``commit_cas`` taxonomy):
       - WIN → ``{ok: true, version: N+1, coordinator_epoch}``
-      - retry-eligible ``ConflictDetail`` (HELD) → ``{ok: false, reason, current_version}``
+      - retry-eligible ``ConflictDetail`` (HELD) → ``{ok: false, reason, current_version}``,
+        plus ``captured_generation`` and ``owner_generation`` only when the committer
+        has a recorded claim
       - typed validation rejection → ``{ok: false, reason, coordinator_epoch}``
       - corruption / foreign caller / dead session → ``{ok: false, reason}`` (raised
         ``CoherenceError`` / ``SessionInvalidated`` mapped to a fail-closed body)
@@ -5201,6 +5229,7 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
                 "ok": False,
                 "reason": result.reason,
                 "current_version": result.current_version,
+                **_generation_pair_keys(result),
             }
         if isinstance(result, SessionCommitRejection):
             if result.reason == SESSION_INVALIDATED_REASON:
@@ -5251,7 +5280,9 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
     Responses (the batch generalization of ``/session/commit``):
       - WIN → ``{ok: true, versions: {path: N+1, ...}, coordinator_epoch}``
       - retry-eligible batch conflict (HELD, nothing mutated) → ``{ok: false,
-        reason: "conflict", per_artifact: {path: {reason, current_version}}}``
+        reason: "conflict", per_artifact: {path: {reason, current_version}}}``; a
+        member whose committer has a recorded claim also carries
+        ``captured_generation`` and ``owner_generation``
       - typed session rejection → ``{ok: false, reason, coordinator_epoch}``
       - corruption / foreign caller / dead session → ``{ok: false, reason}``
     """
@@ -5344,6 +5375,7 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
                     path_by_id[aid]: {
                         "reason": detail.reason,
                         "current_version": detail.current_version,
+                        **_generation_pair_keys(detail),
                     }
                     for aid, detail in result.per_artifact.items()
                 },

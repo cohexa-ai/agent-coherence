@@ -11047,7 +11047,12 @@ def test_status_keeps_a_reclaim_listed_while_the_holders_compare_and_swap_is_ref
     assert _sweep(coordinator, reclaim_tick) == 1
     cause = {"plan.md": {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": reclaim_tick}}
     version = _plan_version(_operator_status(client))
-    refused = {"ok": False, "reason": "stale_read_generation", "current_version": version}
+    # The holder's claim was taken at generation 0 and the reclaim moved the
+    # path to 1, so the refusal names that lost token.
+    refused = {
+        "ok": False, "reason": "stale_read_generation", "current_version": version,
+        "captured_generation": 0, "owner_generation": 1,
+    }
 
     assert _post_edit_cas(client, sid, version, "cas-before-reread") == refused
     row = _row_for(_operator_status(client), sid)
@@ -11092,7 +11097,209 @@ def test_a_reclaimed_sessions_reread_with_no_other_holder_is_shared_and_stays_li
     }
     assert _post_edit_cas(client, sid, version, "cas-sole-reread") == {
         "ok": False, "reason": "stale_read_generation", "current_version": version,
+        "captured_generation": 0, "owner_generation": 1,
     }
+
+
+# ----------------------------------------------------------------------
+# The lost token on commit refusals
+#
+# A refusal names the committer's recorded claim and the path's ownership
+# generation as two body keys, both or neither: neither when the committer
+# never recorded a claim. Generation 0 is a new path's; a sweep reclaim moves
+# it to 1 and a peer's acquire does not move it. Every expected body is a
+# hand-written literal.
+# ----------------------------------------------------------------------
+
+_PAIR_KEYS = ("captured_generation", "owner_generation")
+
+
+def _post_edit(client: _Client, sid: str, label: str, path: str = "plan.md") -> dict:
+    status, body = client.post("/hooks/post-edit", {
+        "session_id": sid, "path": path, "content_hash": _hash(label), "success": True,
+    })
+    assert status == 200, body
+    return body
+
+
+def _commit_over_the_lease(client: _Client, sid: str, path: str, label: str) -> None:
+    assert client.post("/hooks/pre-edit", {"session_id": sid, "path": path})[0] == 200
+    assert _post_edit(client, sid, label, path) == {"ok": True}
+
+
+def _session_token(client: _Client, sid: str, paths: list[str]) -> str:
+    status, body = client.post("/session/begin", {"session_id": sid, "read_set": paths})
+    assert status == 200 and body["ok"] is True, body
+    return body["session_token"]
+
+
+def test_a_reclaimed_lease_holders_commit_names_the_lost_token(
+    coordinator, client: _Client
+) -> None:
+    """The reclaimed arm keeps its prose and ``reclaimed: true`` and adds the
+    pair: the claim taken at generation 0 against the reclaim's 1."""
+    sid = _sid("lost-token-reclaimed")
+    assert client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})[0] == 200
+    assert _sweep(coordinator, int(time.time()) + 999_999) == 1
+
+    body = _post_edit(client, sid, "lost-token-reclaimed-late")
+    reason = body.pop("reason")
+    assert body == {
+        "ok": False, "reclaimed": True, "captured_generation": 0, "owner_generation": 1,
+    }
+    assert reason.startswith("commit_not_allowed: your M/E grant on plan.md was reclaimed by the coordinator sweep")
+    assert "Underlying coordinator error: commit_not_allowed agent=" in reason
+
+
+def test_a_reclaimed_lease_holders_commit_names_the_lost_token_after_the_notice_was_read(
+    coordinator, client: _Client
+) -> None:
+    """A plain pre-read surfaces the reclaim notice first, so the commit's
+    refusal is the bare one, ``{ok, reason}``; it gains the same pair. The
+    re-read records no claim over the hooks, so the claim is still 0."""
+    sid = _sid("lost-token-bare")
+    assert client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})[0] == 200
+    assert _sweep(coordinator, int(time.time()) + 999_999) == 1
+    client.post("/hooks/pre-read", {"session_id": sid, "path": "plan.md", "content_hash": _hash("x")})
+
+    body = _post_edit(client, sid, "lost-token-bare-late")
+    reason = body.pop("reason")
+    assert body == {"ok": False, "captured_generation": 0, "owner_generation": 1}
+    assert reason.startswith("commit_not_allowed agent=")
+    assert "state=MESIState.SHARED reclaimed_by=reclaim_heartbeat" in reason
+
+
+def test_a_preempted_lease_holders_commit_carries_the_pair(
+    coordinator, client: _Client
+) -> None:
+    """The preempted arm gains the pair too. A peer's acquire ends the claim
+    without moving the generation, so here the pair is equal: it says the
+    claim is current, and ``preempted: true`` says why the commit lost."""
+    editor, peer = _sid("lost-token-editor"), _sid("lost-token-peer")
+    for who in (editor, peer):
+        assert client.post("/hooks/pre-edit", {"session_id": who, "path": "plan.md"})[0] == 200
+
+    body = _post_edit(client, editor, "lost-token-preempted-late")
+    reason = body.pop("reason")
+    assert body == {
+        "ok": False, "preempted": True, "captured_generation": 0, "owner_generation": 0,
+    }
+    assert reason.startswith("commit_not_allowed: your EXCLUSIVE grant on plan.md was preempted by agent ")
+
+
+def test_the_post_edit_fence_refusal_carries_the_pair_from_its_exception(
+    coordinator, client: _Client
+) -> None:
+    """MANUFACTURED STATE: the generation is bumped directly while the grant
+    stays EXCLUSIVE, as in ``tests/test_fencing.py``. The shipped commit
+    decides under one hold, which closes the window a live sweep would need,
+    so this is the only way to reach the fence arm. Its body carries the pair
+    the fenced persist raised with."""
+    sid = _sid("lost-token-fence")
+    assert client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})[0] == 200
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    coordinator.registry._conn.execute(
+        "UPDATE artifacts SET owner_generation = owner_generation + 1 WHERE id = ?",
+        (artifact_id.hex,),
+    )
+    before = coordinator.registry.get_artifact(artifact_id).version
+
+    assert _post_edit(client, sid, "lost-token-fence-late") == {
+        "ok": False, "reason": "stale_read_generation", "current_version": before,
+        "captured_generation": 0, "owner_generation": 1,
+    }
+
+
+def test_a_pre_read_only_sessions_compare_and_swap_conflict_carries_no_pair(
+    coordinator, client: _Client
+) -> None:
+    """A hook pre-read records no claim, so the session's conflict body has
+    neither key, never a null. The reader reads after the peer's commit and
+    sends the version before it."""
+    reader, writer = _sid("lost-token-reader"), _sid("lost-token-writer")
+    _commit_over_the_lease(client, writer, "plan.md", "lost-token-writer-v2")
+    client.post("/hooks/pre-read", {"session_id": reader, "path": "plan.md", "content_hash": _hash("x")})
+
+    assert _post_edit_cas(client, reader, 1, "lost-token-reader-late") == {
+        "ok": False, "reason": "version_mismatch", "current_version": 2,
+    }
+
+
+def test_snapshot_session_refusals_carry_no_pair(coordinator, client: _Client) -> None:
+    """A snapshot session commits as an identity minted from its token, which
+    records no claim, so neither route's refusal carries a key. The owner's
+    own claim on the path, taken by its pre-edit, does not leak in."""
+    owner, writer = _sid("lost-token-snapshot-owner"), _sid("lost-token-snapshot-writer")
+    _commit_over_the_lease(client, owner, "plan.md", "lost-token-snapshot-v2")
+    token = _session_token(client, owner, ["plan.md"])
+    _commit_over_the_lease(client, writer, "plan.md", "lost-token-snapshot-v3")
+
+    assert client.post("/session/commit", {
+        "session_id": owner, "session_token": token, "path": "plan.md", "content": "late",
+    }) == (200, {"ok": False, "reason": "version_mismatch", "current_version": 3})
+    assert client.post("/session/commit_all", {
+        "session_id": owner, "session_token": token,
+        "writes": [{"path": "plan.md", "content": "late"}],
+    }) == (200, {
+        "ok": False, "reason": "conflict",
+        "per_artifact": {"plan.md": {"reason": "version_mismatch", "current_version": 3}},
+    })
+
+
+def test_snapshot_refusals_carry_the_pair_only_for_a_member_with_a_claim(
+    coordinator, client: _Client
+) -> None:
+    """MANUFACTURED STATE: no shipped path records a claim for a snapshot
+    session's token-minted committer, so one is planted on ``plan.md`` with
+    the registry's own claim-recording read. The batch names the pair on that
+    member only, and the single-artifact route names it as well."""
+    owner, writer = _sid("lost-token-planted-owner"), _sid("lost-token-planted-writer")
+    for path in ("plan.md", "task.md"):
+        client.post("/hooks/pre-read", {"session_id": owner, "path": path, "content_hash": _hash("x")})
+    token = _session_token(client, owner, ["plan.md", "task.md"])
+    for path in ("plan.md", "task.md"):
+        _commit_over_the_lease(client, writer, path, f"lost-token-planted-{path}")
+    committer = uuid.uuid5(uuid.NAMESPACE_URL, token)
+    plan_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    coordinator.registry.set_agent_state(plan_id, committer, MESIState.SHARED, trigger="fetch", tick=1)
+
+    assert client.post("/session/commit_all", {
+        "session_id": owner, "session_token": token,
+        "writes": [{"path": "plan.md", "content": "late"}, {"path": "task.md", "content": "late"}],
+    }) == (200, {
+        "ok": False, "reason": "conflict",
+        "per_artifact": {
+            "plan.md": {
+                "reason": "version_mismatch", "current_version": 2,
+                "captured_generation": 0, "owner_generation": 0,
+            },
+            "task.md": {"reason": "version_mismatch", "current_version": 2},
+        },
+    })
+    assert client.post("/session/commit", {
+        "session_id": owner, "session_token": token, "path": "plan.md", "content": "late",
+    }) == (200, {
+        "ok": False, "reason": "version_mismatch", "current_version": 2,
+        "captured_generation": 0, "owner_generation": 0,
+    })
+
+
+def test_no_pre_edit_or_pre_read_deny_carries_the_pair(
+    strict_coordinator, strict_client: _Client
+) -> None:
+    """A reclaimed session with a claim on a strict path is denied both hooks
+    while a peer holds it. A deny is no commit refusal: neither key appears
+    anywhere in the body."""
+    holder, peer, path = _sid("lost-token-deny-holder"), _sid("lost-token-deny-peer"), "data/a.json"
+    assert strict_client.post("/hooks/pre-edit", {"session_id": holder, "path": path})[0] == 200
+    assert _sweep(strict_coordinator, int(time.time()) + 999_999) == 1
+    assert strict_client.post("/hooks/pre-edit", {"session_id": peer, "path": path})[0] == 200
+
+    for hook, extra in (("pre-edit", {}), ("pre-read", {"content_hash": _hash("x")})):
+        status, body = strict_client.post(f"/hooks/{hook}", {"session_id": holder, "path": path, **extra})
+        assert status == 200, body
+        assert body["hookSpecificOutput"]["permissionDecision"] == "deny", (hook, body)
+        assert not any(key in json.dumps(body) for key in _PAIR_KEYS), (hook, body)
 
 
 # ----------------------------------------------------------------------
