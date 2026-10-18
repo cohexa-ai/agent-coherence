@@ -6,6 +6,16 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- **`tools/run_local_tests.py` runs the test suite locally the way CI does,
+  from the main checkout or any git worktree.** It uses the main checkout's
+  virtual environment, keeps bytecode caches on, and runs the parallel tests
+  and then the `serial` tests without collecting the suite twice. Full runs
+  from different worktrees take turns instead of competing for the machine.
+  `CONTRIBUTING.md` describes it. This is contributor tooling; the package is
+  unchanged.
+
 ### Changed
 
 - **The MCP Registry lists the `stale-write-guard-fs` server as
@@ -17,6 +27,48 @@ Alpha — APIs may change before `v1.0`.
   0.14.1 stay listed under the old name; 0.15.0 was not listed, because its
   package README carries the old marker. Install commands are unchanged: the
   PyPI package is still `agent-coherence`.
+
+### Fixed
+
+- **A `CoherentVolume.write()` after a read that raced a peer's commit is
+  refused again (#335).** A pre-read by a session with no grant on a tracked
+  path is classified from one snapshot, and the SHARED grant comes after it.
+  A peer commit that landed in between invalidated only rows that already
+  existed, so the reader's new SHARED row stood at the peer's version while
+  the reader held the bytes from before that commit. Its next `write()` was
+  admitted at pre-edit, which refuses only INVALID holders. With
+  `on_stale_write="allow"`, that write replaced the peer's update and neither
+  call raised. With the default, the volume's own content check raised
+  `StaleView` and described the peer's commit as a foreign edit. The
+  coordinator now checks the version and grants as one step under the
+  registry lock that every commit also takes. If the version moved, the
+  reader is left INVALID, as if the commit had come right after its read, and
+  its next `write()` is refused at pre-edit. The read itself still answers
+  with the bytes and version it was classified at. `write_cas`, `write_cas_at`
+  and Claude Code hook clients were not affected.
+
+- **A `pre-edit` that times out now says the check did not run, and a check
+  that finishes late no longer records a deny nobody was sent (#236).** When
+  the coordinator could not answer `pre-edit` within its 4-second handler
+  budget, it admitted the edit with a bare `{"ok": true, "degraded": true}`.
+  The hook client relayed that as an ordinary admit, so a strict-mode session
+  whose view a peer had overtaken could Edit or Write with no warning. The
+  answer now carries the same "could not verify" advisory the read hooks give
+  on a timeout, as added context only. It has no `permissionDecision`, so
+  Claude Code still asks about the Edit or Write as it otherwise would. The
+  edit is still admitted: a hook does not block a tool call because the
+  coordinator is under load.
+  The check itself kept running after the answer. When it then reached a
+  strict-mode deny on `pre-edit`, `pre-read`, `pre-bash` or `pre-grep`, or the
+  giver's deny on a handed-off path, it recorded that deny anyway: a denial
+  counted, an `audit.log` line, the route-around marker, and a CRITICAL log
+  about orphaned grants that did not exist. A deny's bookkeeping is now
+  recorded only when the deny is the answer sent, and the late work counts in
+  `watchdog_late_aborts_total`. A deny whose audit append is slow or fails is
+  now still answered as a deny; a slow append used to time the request out
+  and admit the call. An append slower than the hook client's own request
+  timeout (6 seconds for the Python client) still reaches the client too
+  late, and the client admits the call as before.
 
 ## [0.15.0] - 2026-10-14
 
