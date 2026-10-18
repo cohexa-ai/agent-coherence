@@ -16,6 +16,37 @@ Alpha — APIs may change before `v1.0`.
   `CONTRIBUTING.md` describes it. This is contributor tooling; the package is
   unchanged.
 
+- **A refused commit now says which generation the committer's claim was taken
+  under and which generation owns the artifact now.** Until now a refusal said
+  why the commit lost, but not which claim it was decided against. Every
+  commit refusal decided against the registry now carries
+  `captured_generation`, the ownership generation the coordinator recorded at
+  the committer's last claim, and `owner_generation`, the artifact's, both
+  read in the same decision as the refusal. They are two integer keys on the
+  refusal bodies of `post-edit-cas`, `/session/commit`, each `per_artifact`
+  member of `/session/commit_all`, and `post-edit`, both its
+  `stale_read_generation` refusal and its refusal of a committer that no
+  longer holds the write grant. Both keys are left out, never sent as `null`,
+  when the committer has no recorded claim; over HTTP only a `pre-edit`
+  records one, so a `CoherentVolume`'s `write_cas`, `swg_write_cas` and
+  snapshot-session commits never carry them. `ConflictDetail`,
+  `StaleReadGeneration`, `CasVersionConflict`, `CasRetriesExhausted` and
+  `CommitPreempted` expose the pair as attributes, `None` when absent, and
+  `swg_write`'s `commit_preempted` result carries it in `structuredContent`.
+  `CoordinatorService.commit` now raises its not-held refusal as
+  `CommitNotAllowed`, a `CoherenceError` with the same message.
+  `captured_generation < owner_generation` means some write claim on the
+  artifact ended without a version move after the committer's claim was
+  recorded; the reason, not the pair, says why the commit lost, and recovery
+  still follows the reason. Existing keys, reasons and messages are unchanged,
+  and `swg_gate`'s hold keeps its shape. `ccs.testing.process_harness` gains
+  `run_park_after_ack`, which stops a contender after it acks, runs a step in
+  the parent while the contender is frozen, then resumes it and returns what
+  it produces. A cross-process test uses it to freeze a live, heartbeating
+  lease holder until the sweep reclaims it, then shows both commit routes
+  refusing it with the pair. The guide's "Reading a commit refusal's
+  generation pair" section has the details.
+
 ### Changed
 
 - **The MCP Registry lists the `stale-write-guard-fs` server as

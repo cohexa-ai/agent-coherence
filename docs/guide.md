@@ -912,6 +912,102 @@ views are unchanged. The table that `agent-coherence-status` prints does not
 show them; `agent-coherence-status --detail full --json` prints them as the
 coordinator sends them.
 
+### Reading a commit refusal's generation pair
+
+This applies to the Python coordinator.
+
+A refused commit can say which generation the committer's claim was taken
+under and which generation owns the artifact now, as two values beside its
+`reason`:
+
+- `captured_generation` is the artifact's ownership generation (see
+  **Reading `owner_generation`** above) as the coordinator recorded it when the
+  committer last claimed the artifact. It is always the coordinator's own
+  record, never a value the client sent.
+- `owner_generation` is the artifact's ownership generation when the refusal
+  was decided.
+
+Both come from the same registry read the refusal was decided on, never from a
+later one. A holder that stalled past `grant_heartbeat_timeout_sec`, was
+reclaimed by the sweep and then committed is refused with, for example,
+`captured_generation` `0` and `owner_generation` `1`.
+
+**What the pair means.** `captured_generation < owner_generation` means that,
+after the committer's claim was recorded, some write claim on the artifact
+ended without the version moving: a release, a reclaim (by the sweep or the
+transient timeout) or a handoff. It does not say whose claim ended, or why
+this commit lost. The `reason` says that, with the `reclaimed` and `preempted`
+flags where a body has them:
+
+- a peer's write-acquire takes a holder's grant without moving the
+  generation, so a preempted commit can carry two equal values;
+- a commit refused `version_mismatch` can still carry
+  `captured_generation < owner_generation`: the version check answered, and
+  the pair shows that a claim ended as well;
+- beyond what the reason says (a `stale_read_generation` refusal is the
+  coordinator finding the captured generation older than the owner's), no
+  order between the two values is guaranteed.
+
+Recover by the `reason`, as each surface documents it, never by the pair.
+
+**Where it appears.** The keys are integers on the wire and attributes in the
+library:
+
+| Surface | Where the pair is |
+|---|---|
+| `POST /hooks/post-edit-cas` | two top-level keys on a refusal, beside `reason` and `current_version` |
+| `POST /hooks/post-edit` (`success: true`) | two top-level keys on the not-held refusal (below) and on the `stale_read_generation` refusal |
+| `POST /session/commit` | two top-level keys beside `reason` and `current_version` |
+| `POST /session/commit_all` | two keys inside each `per_artifact` member, for each artifact the committer has a claim on |
+| `ConflictDetail`, `StaleReadGeneration`, `CommitNotAllowed` | attributes, in process: `CoordinatorService.commit_cas` returns a `ConflictDetail`, and `commit_all` a `MultiCommitConflict` with one in `per_artifact` per member |
+| `CasVersionConflict`, `CasRetriesExhausted`, `CommitPreempted` | attributes; see [Concurrent writers](#concurrent-writers-write_cas) |
+| the MCP server's `swg_write` | `structuredContent` keys on `commit_preempted`; see [the MCP server](#stale-write-guard-fs-mcp-server) |
+
+No other answer carries them: not a `pre-edit` or `pre-read` deny, a
+`caller_in_transient_state` refusal, the [giver's refusal](#the-givers-fence),
+a snapshot-session rejection such as `session_invalidated`, a `post-edit` with
+`success: false`, a `/workspace/restore/register` refusal, or the holds of
+`atomic_publish` and `swg_gate`.
+
+**When the keys are absent.** The two keys come together or not at all: a
+body never carries `null` or one key alone, and the library reads a malformed
+pair as absent, `None` on both attributes. Absent means one of two things:
+
+- The committer has no recorded claim on the artifact. Over HTTP only a
+  `pre-edit` that takes the write grant records one. A `pre-read` records
+  none, and a snapshot session commits as an identity minted from its token,
+  which records none either. So a `CoherentVolume.write()`, an `swg_write` or a
+  Claude Code edit refused at `post-edit` carries the pair, as does a
+  `post-edit-cas` from an agent that went through `pre-edit` earlier. A
+  `CoherentVolume` `write_cas` or `write_cas_at`, an `swg_write_cas`, a
+  `post-edit-cas` after only a `pre-read`, and a snapshot-session commit carry
+  none.
+- The coordinator predates the keys: this package's coordinator through
+  0.15.0, or the Claude Code plugin's Node coordinator, which records no
+  claims.
+
+Absent keys say nothing about the claim either way.
+
+**The not-held refusal.** A `post-edit` with `success: true` from a committer
+that no longer holds the path's write grant is refused in one of three forms.
+Nothing is committed: the edit is on disk and the version has not moved. Each
+form keeps the prose and flags it had before, adds the pair when the
+committer has a claim, and carries the [`handoff` key](#the-handoff-key) while
+the path has a handoff record:
+
+| Form | When | Body |
+|---|---|---|
+| reclaimed | the sweep reclaimed the grant, and this answer is the first to tell the session | `{"ok": false, "reason": "commit_not_allowed: your M/E grant on plan.md was reclaimed by the coordinator sweep (heartbeat timeout or max-hold ceiling) at <time>. … Underlying coordinator error: commit_not_allowed agent=<id> artifact=<id> state=<state> reclaimed_by=<trigger> at_tick=<tick>", "reclaimed": true, "captured_generation": 0, "owner_generation": 1}` |
+| preempted | a peer's write-acquire took the grant, and this answer is the first to tell the session | `{"ok": false, "reason": "commit_not_allowed: your EXCLUSIVE grant on plan.md was preempted by agent <short id> at <time>. …", "preempted": true, "captured_generation": 0, "owner_generation": 0}` |
+| bare | an earlier answer, such as a `pre-read`, already told the session, or there was nothing to tell | `{"ok": false, "reason": "commit_not_allowed agent=<id> artifact=<id> state=<state>", "captured_generation": 0, "owner_generation": 1}`, the reason adding `reclaimed_by=<trigger> at_tick=<tick>` when the coordinator has a sweep reclaim of the committer's grant on record, and neither key when the committer has no claim |
+
+In process, `CoordinatorService.commit` raises this refusal as
+`CommitNotAllowed` (`ccs.core.exceptions`), so an `AgentRuntime.write()`
+whose grant is gone raises it too. It is a `CoherenceError`, so
+`except CoherenceError` still catches it, and its message is the bare form's
+`commit_not_allowed agent=…` text, unchanged. Its `captured_generation` and
+`owner_generation` are `None` when the committer has no claim.
+
 ### When the registry is busy
 
 This is the Python coordinator's behavior.
@@ -1241,6 +1337,18 @@ When the retry budget runs out, `write_cas` raises `CasRetriesExhausted`. Its
 - `stale_read_generation`: your read was taken under a grant the coordinator has
   since reclaimed. `reacquire()` and re-read.
 
+`CasRetriesExhausted` and `write_cas_at`'s `CasVersionConflict` also have
+`captured_generation` and `owner_generation` attributes: the
+[generation pair](#reading-a-commit-refusals-generation-pair) of the
+coordinator's refusal, the last one for `CasRetriesExhausted`. Both are `None`
+when the refusal carried none, and on a conflict the volume decided itself,
+with no refusal from the coordinator. A volume's compare-and-swap commits
+always read `None` against this package's coordinator: each commits from a
+fresh attempt whose read records no claim. In process,
+`AgentRuntime.write_cas` raises a `CasRetriesExhausted` carrying its last
+refusal's pair. Recover by `last_conflict_reason` (or `reason`), never by the
+pair.
+
 A `CoherentVolume` that wrote a file keeps holding it until its own next
 `write_cas` of that file or any `write_cas` retry, `write_cas_at`,
 `atomic_publish` or `reacquire()` releases it. Closing the volume or exiting the process does not release it, and
@@ -1267,7 +1375,12 @@ the raised `CommitPreempted` is **terminal for that attempt, not a transient to
 retry blindly**: the version the write assumed no longer holds. Recover by
 `reacquire()`-ing, re-reading the fresh version, and reconciling your change onto
 it before committing again — a plain retry of the same bytes just loses the same
-race.
+race. Its message is the `reason` of the coordinator's `post-edit` refusal,
+usually the [not-held refusal](#reading-a-commit-refusals-generation-pair),
+which says whether the sweep reclaimed the grant or a peer took it. Its
+`captured_generation` and `owner_generation` are that refusal's pair: after a
+reclaim, for example, `0` and `1`. Both are `None` when the refusal carried
+none. The recovery is the same whatever they say.
 
 ### Atomic multi-file publish: `atomic_publish` (v0.12.0+)
 
@@ -1630,6 +1743,48 @@ The workspace family ships in the packaged conformance corpus (`ccs.testing.subs
 
 The corpus's race scenarios run across real OS **process** boundaries: contenders are spawned processes rendezvoused at a barrier before their racing section, so a binding whose "compare-and-swap" is a read-then-write under an in-process lock is caught rather than false-greened — in-process serialization satisfies no clause of the contract. A binding that genuinely cannot be raced across processes (an in-memory fake) is not silently skipped; it declares the reason and the run report prints the exemption. Two further axes ship with the corpus. **Durability**: a binding's `CapabilityDescriptor` can declare the regime an acknowledged write survives (`in-process`, `process-crash`, or `os-crash`) together with the configuration facts the claim rides on; the corpus verifies the process-crash grade locally by SIGKILLing a writer after its acknowledged commit and reading the store back, while fsync-grade discrimination and managed-cluster failover runs are recorded as declared exemptions with their reasons rather than skipped. **The claim ladder** (`ccs.testing.claim_ladder`): every guarantee this project claims is a rung pairing its guarantee text with the exact README claim-phrases it backs and the tests that would fail without it — the repo's own suite resolves every named test at collection time and drift-guards the README in both directions, so a claim cannot outlive its proof, and no cross-host rung exists to claim.
 
+**Freezing a live contender.** The same process harness
+(`ccs.testing.process_harness`) can stop a contender mid-life and resume it,
+which models a holder that stalls while still alive, such as one paused past
+its heartbeat timeout. `run_park_after_ack(spec, while_parked, *, stop=True,
+timeout_sec=60.0)` runs one contender, a top-level picklable function in a
+`ContenderSpec`, which receives a `ParkContext` and calls `ctx.ack(value)`
+exactly once. When the ack arrives the parent sends the child `SIGSTOP`,
+confirms the stop, and calls `while_parked(value)` while the child cannot run.
+It then sets the resume flag and sends `SIGCONT`; the child's `ctx.ack()`
+returns, and what the contender returns comes back as `ParkResult.value`,
+beside `acked` and `window` (what `while_parked` returned):
+
+```python
+from ccs.testing.process_harness import ContenderSpec, run_park_after_ack
+
+def holder(ctx, root: str) -> dict:
+    ...                   # take a write grant; heartbeat until ctx.resumed
+    ctx.ack("holding")    # returns only once the parent resumes this process
+    ...                   # commit, and return the answer as plain data
+    return answer
+
+result = run_park_after_ack(
+    ContenderSpec(holder, args=(str(root),)),
+    lambda acked: wait_for_the_reclaim(),  # yours; runs while the child is stopped
+)
+result.value  # the holder's post-resume answer
+```
+
+- `ctx.resumed` is safe to poll from the child's other threads, a heartbeat
+  loop for example: it is already true when the child runs again.
+- `stop=False` skips the two signals and the stop check and keeps the rest
+  (the ack, the window, the resume flag), so a negative control runs the same
+  steps without the freeze.
+- The child is killed with `SIGKILL` on every exit. A raise in the child
+  re-raises as `ContenderError`; a contender that returns without acking, or
+  an ack, stop or post-resume value that does not arrive within `timeout_sec`,
+  is a `HarnessFailure`. `while_parked` is yours to bound.
+- Values cross a process boundary, so pass plain data: exception objects such
+  as `CasVersionConflict` do not pickle.
+- On a platform without `SIGSTOP` it raises `HarnessFailure`. A stop is a
+  stall on one machine, not a network partition.
+
 **Scope, honestly.**
 
 - Single-host coordinator: checkpoints, pins, and restore progress live in local coordinator state and make no cross-host claims.
@@ -1677,6 +1832,17 @@ Semantics, precisely:
   single-artifact optimistic commit: it wins only if the artifact's version still
   equals the cut's pinned version, and returns a typed, retryable conflict
   otherwise.
+- **A conflict carries the generation pair only when there is a claim.** The
+  conflict body of `/session/commit`, and each `per_artifact` member of a
+  `/session/commit_all` conflict, carries `captured_generation` and
+  `owner_generation` only when the committer has a recorded claim on the
+  artifact (see
+  [Reading a commit refusal's generation pair](#reading-a-commit-refusals-generation-pair)).
+  A snapshot session commits as an identity minted from its token, which
+  records no claim, so in practice its conflicts carry neither key. The keys
+  are never sent as `null`: absent keys mean no recorded claim, or a
+  coordinator through 0.15.0, which sends neither, and say nothing about the
+  claim.
 - **A begin that times out gives you no session.** A `/session/begin` the
   coordinator could not answer within its 4-second budget answers
   `{"ok": true, "degraded": true}` with no `session_token`, so retry the
@@ -3281,6 +3447,23 @@ Denials are machine-readable: an agent parses the typed payload (for example
 blindly. The server validates every file URI — path traversal and any access to
 the coordinator's own state directory are rejected — and fails closed on IO
 errors. Strict-mode, managed-path scoped.
+
+**A refused commit carries the generation pair.** When `swg_write`'s commit is
+refused after its bytes reached disk (`reason: commit_preempted`,
+`recover: reacquire_and_reconcile`, `retryable: false`), `structuredContent`
+also carries `captured_generation` and `owner_generation`, the
+[generation pair](#reading-a-commit-refusals-generation-pair) of the
+coordinator's refusal: `0` and `1` after a sweep reclaim, for example. They
+are diagnostic. `reason`, `recover` and `retryable` are unchanged, and the
+recovery follows them, never the pair. Both keys are absent, never `null`,
+when the refusal carried no pair: the coordinator recorded no claim for the
+write, or predates the keys (through 0.15.0). Over HTTP only
+`commit_preempted` carries them. `swg_write_cas`'s conflict results would
+carry them the same way, but each `swg_write_cas` commits from a fresh attempt
+whose read records no claim, so its results never do. These two keys are not
+the `owner_generation` that `swg_read` returns for `swg_gate`: a `null` there
+means the coordinator does not report generations at all. `swg_gate`'s
+`stale_view` hold is unchanged.
 
 **A session the coordinator refuses.** The server claims a
 [caller principal](#caller-principal) for its session at start. When a later
