@@ -969,13 +969,25 @@ search root under the same request deadline, and that lookup and the rest of
 the hook's work share one 4-second handler budget. When the lookup cannot take
 the registry lock in time, the hook answers `"degraded": true` with the
 advisory a read hook gives when its check times out, which reaches the model
-as added context:
+as added context only:
 
 ```text
 ⚠ Coherence could not verify this file's freshness — the coordinator staleness check timed out under load. Proceeding WITHOUT a stale-read guarantee: if this file is shared with other agents or sessions, re-read it before relying on its contents.
 ```
 
-It counts in `watchdog_timeouts_total` too.
+It counts in `watchdog_timeouts_total` too. The answer carries no
+`permissionDecision`, and neither does the same advisory from the Read, Bash or
+Grep hook when its check times out, so Claude Code asks about the call exactly
+as it would if the hook had not answered.
+
+**The Bash hook.** When a command writes a tracked path, `POST /hooks/pre-bash`
+first looks up whether this session handed that path off, under the same
+4-second budget. When that lookup times out, the hook still runs its
+shell-read checks. If the command is let through, the answer carries
+`"degraded": true` and the same advisory, after any stale-read warning, as
+added context only, with no `permissionDecision`: the check that could have
+denied a handed-off write did not run. A strict-mode deny from the shell-read
+check is sent unchanged. The timeout counts in `watchdog_timeouts_total`.
 
 **The Edit and Write hook.** When `POST /hooks/pre-edit` cannot finish its
 check within the same 4-second budget, it admits the edit, as every hook does
@@ -991,6 +1003,24 @@ keeps working in the background. When that work reaches a deny afterwards, it
 records nothing: no strict-mode denial, no audit line, no route-around marker.
 The `/status` counters and `audit.log` show only denies a caller was sent. The
 late work counts in `watchdog_late_aborts_total`.
+
+Late work also leaves the session's pending preemption notices queued: an
+answer given on a timeout carries none, so the session's next hook delivers
+them. Work that had already taken the notices when the time ran out still
+loses them.
+
+A `POST /session/begin` answered `{"ok": true, "degraded": true}` carries no
+`session_token` and opens no session, so retry it. A begin still waiting for
+the coordinator when that answer goes out stops before it opens a session and
+counts in `watchdog_late_aborts_total`. One that was already opening the
+session when the deadline passed can still open it; it shows in
+`watchdog_late_completion_total`, and the liveness sweep reaps it.
+
+Late work that finishes normally counts in `watchdog_late_completion_total`.
+The coordinator logs it at `CRITICAL` only when that work had already won the
+registry write lock for a change, so a grant, commit or release it made may be
+in the registry without the caller knowing. Other late work is logged at
+`WARNING`.
 
 ### Reference
 
@@ -1646,6 +1676,11 @@ Semantics, precisely:
   single-artifact optimistic commit: it wins only if the artifact's version still
   equals the cut's pinned version, and returns a typed, retryable conflict
   otherwise.
+- **A begin that times out opens nothing.** A `/session/begin` the coordinator
+  could not answer within its 4-second budget answers
+  `{"ok": true, "degraded": true}` with no `session_token`. No session was
+  opened for you, so retry the begin (see
+  [When the registry is busy](#when-the-registry-is-busy)).
 - **Sessions fail closed.** Pins have a bounded lifetime backed by a heartbeat
   lease. A session whose heartbeat lapses — or that is lost to a coordinator
   restart — is invalidated: later reads return a typed `session_invalidated`
@@ -3086,8 +3121,10 @@ refused because of it.
   a file); and a relative path after a `cd` made by an earlier command.
   Such a write lands on disk without a version. So does a recognized one when
   the coordinator cannot answer the check in time (it is slow or overloaded,
-  or its registry fails): the command runs, and unlike a giver's `Edit`, whose
-  commit is then refused, nothing refuses the shell write afterwards.
+  or its registry fails): the command runs, with the
+  [could-not-verify advisory](#when-the-registry-is-busy) when the check timed
+  out, and unlike a giver's `Edit`, whose commit is then refused, nothing
+  refuses the shell write afterwards.
 - **An edit in flight at the transfer lands without a version.** So does one
   admitted while the coordinator was degraded. See
   [Claude Code sessions](#claude-code-sessions).

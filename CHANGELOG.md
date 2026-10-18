@@ -47,6 +47,68 @@ Alpha — APIs may change before `v1.0`.
   with the bytes and version it was classified at. `write_cas`, `write_cas_at`
   and Claude Code hook clients were not affected.
 
+- **A Read, Bash or Grep hook that times out no longer approves the call
+  (#337).** When `pre-read`, `pre-bash` or `pre-grep` could not answer within
+  the coordinator's 4-second handler budget, its "could not verify" advisory
+  came with `permissionDecision: "allow"`, which tells Claude Code to skip its
+  own permission prompt for the call. Answered in time, the same call on a
+  fresh tracked path carries no decision, and a shell write by the giver of a
+  handed-off path is denied; under load both were approved. The same answer
+  went out when the caller-principal check or `pre-grep`'s search-root lookup
+  timed out. The advisory now travels as added context only, as a timed-out
+  `pre-edit`'s does. The call is still admitted, `status` stays `"fresh"` and
+  `degraded` stays `true`.
+
+- **A shell write whose handoff check times out now says the check did not
+  run (#341).** Before a Bash command that writes a tracked file runs,
+  `pre-bash` checks whether the session handed that file off. When the check
+  could not finish within the 4-second handler budget, the hook answered as if
+  it had found nothing: a command that only wrote, such as
+  `echo x >> plan.md`, got a plain `{"status": "fresh"}`, so the giver of a
+  live handoff could append to the handed-off file under load with no warning.
+  The answer now carries `"degraded": true` and the "could not verify"
+  advisory as added context only, after any stale-read warning, and no
+  `permissionDecision`: an `allow` the stale-read warning carried is dropped,
+  because in time that write would be denied. The command still runs. A
+  strict-mode deny from the shell-read check is unchanged.
+
+- **A `/session/begin` that times out no longer opens a session its caller
+  cannot use (#340).** When the coordinator could not answer within its
+  4-second handler budget, it answered `{"ok": true, "degraded": true}` with
+  no `session_token`, and the request kept running in the background. That
+  work then opened the snapshot session anyway: the session held its pinned
+  versions and a `max_sessions` slot until the liveness sweep reaped it, and
+  the caller could neither use nor close it. A begin still waiting for the
+  coordinator when its answer goes out now stops before opening a session and
+  counts in `watchdog_late_aborts_total`. One that was already opening the
+  session when the deadline passed can still open it; that shows in
+  `watchdog_late_completion_total`, and the liveness sweep reaps it.
+
+- **The coordinator's CRITICAL about orphaned grants fires only for late work
+  that may have left one (#338).** A hook request answered on its 4-second
+  watchdog keeps working in the background. When that work finished, the
+  coordinator logged a CRITICAL saying any state it changed, such as an
+  EXCLUSIVE grant, was in the registry without the agent's knowledge, and to
+  look for orphaned M/E grants. It did this for every request, including a
+  `pre-read`, an effect-fence verdict, a checkpoint list or a session-start
+  re-grounding read, none of which can leave such a grant. It now logs
+  CRITICAL only when the late work had won the registry write lock for a
+  change before its deadline, so a grant, commit or release it made may have
+  landed; other late work is logged at WARNING. `watchdog_late_completion_total`
+  still counts both. The late-completion and late-abort counters are now
+  updated under the same lock as `watchdog_timeouts_total`.
+
+- **A hook that times out no longer uses up the session's preemption notices
+  (#339).** A preemption notice tells a session that a peer took its write
+  grant, and it is delivered once. When `session-stop`, `pre-read`,
+  `pre-bash`, `pre-grep`, `pre-edit` or a refused `post-edit` could not answer
+  within the 4-second handler budget, the coordinator answered
+  `"degraded": true` with no notices. The work kept running, though, and could
+  still take the notices off the queue, so the session never saw them and no
+  later hook could deliver them. That work now leaves them queued, and the
+  session's next hook delivers them. Work that had already taken a notice when
+  the time ran out still loses it.
+
 - **A `pre-edit` that times out now says the check did not run, and a check
   that finishes late no longer records a deny nobody was sent (#236).** When
   the coordinator could not answer `pre-edit` within its 4-second handler
