@@ -4852,6 +4852,59 @@ def test_write_cas_keeps_a_peer_update_that_lands_inside_its_first_read(
         server.shutdown()
 
 
+def test_write_after_a_read_a_peer_commit_overtook_is_denied(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#335: the reader reads ``0``; while its pre-read sits between the
+    coordinator's classification and its SHARED re-grant, a peer writes ``1``.
+    The reader's ``write()`` of a value derived from ``0`` must be refused by
+    the coordinator, as it is when the peer commits after the read completes.
+
+    ``on_stale_write="allow"`` turns off the volume's own disk-content check,
+    so the coordinator's grant is the only guard left; with the default the
+    content check raises too, which is why this needs the opt-out to show the
+    grant was wrong. The coordinator runs in this process so the read can be
+    held at that point."""
+    rel = "data/x.txt"
+    target = _seed(tmp_path, rel, content=b"0")
+    server = _serve_in_process(tmp_path, "overtaken-read")
+    in_window, release = threading.Event(), threading.Event()
+    real_decide = coordinator_server_module.decide_tracked_read
+    held: list[bool] = []
+
+    def hold_after_classifying(*args, **kwargs):
+        decision = real_decide(*args, **kwargs)
+        if not held and decision.outcome == "stale":
+            held.append(True)
+            in_window.set()
+            assert release.wait(3.0), "the reader's read was never released"
+        return decision
+
+    try:
+        peer = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+        reader = CoherentVolume(
+            tmp_path, managed=("data/**",), config=fast_cfg, on_stale_write="allow"
+        )
+        assert peer.read(rel) == b"0", "control: the peer registers the path"
+        monkeypatch.setattr(coordinator_server_module, "decide_tracked_read", hold_after_classifying)
+        got: list[bytes] = []
+        thread = threading.Thread(target=lambda: got.append(reader.read(rel)))
+        thread.start()
+        try:
+            assert in_window.wait(3.0), "the reader never reached its re-grant"
+            peer.write(rel, b"1")
+        finally:
+            release.set()
+            thread.join(10.0)
+        assert got == [b"0"], "control: the reader read before the peer's commit"
+
+        with pytest.raises(StaleView):
+            reader.write(rel, b"10")
+        assert target.read_bytes() == b"1", "the reader's write landed over the peer's"
+    finally:
+        server.shutdown()
+
+
 # --- the coordinator answers a pre-read with a failure envelope ----------------
 #
 # Two coordinator-side failures answer a pre-read as HTTP 200 ``{ok: false,

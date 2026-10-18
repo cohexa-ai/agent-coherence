@@ -2605,9 +2605,9 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # reacquire() re-mints a live grant — matching the strict leg (KTD-T
         # never re-grants on a deny). The client discards this read's bytes.
         if not verify_only:
-            coordinator.registry.set_agent_state(
-                artifact_id, agent_id, MESIState.SHARED,
-                trigger="post_stale_read", tick=now, content_hash=content_hash,
+            _regrant_unless_overtaken(
+                coordinator, artifact_id, agent_id,
+                classified_version=decision.version, tick=now, content_hash=content_hash,
             )
         resp = _payloads.build_stale_response(summary)
         if want_generation and decision.owner_generation is not None:
@@ -4104,6 +4104,40 @@ def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
         return
     coordinator.policy = coordinator.policy.reloaded()
     req._json(200, {"ok": True, "removed": added, "rejected": yaml_rejected + pre_rejected})
+
+
+def _regrant_unless_overtaken(
+    coordinator: CoordinatorHTTPServer,
+    artifact_id: UUID,
+    agent_id: UUID,
+    *,
+    classified_version: int,
+    tick: int,
+    content_hash: str | None,
+) -> None:
+    """Grant SHARED for a stale-arm read the handler allowed, unless a peer
+    commit landed after the read was classified (#335).
+
+    The read was classified from one snapshot and the grant comes after it. A
+    commit in between invalidates only rows that already exist, so a SHARED
+    row created afterwards would stand at the peer's version while the caller
+    holds bytes from before it, and the caller's next pre-edit, which refuses
+    only INVALID, would be admitted over the peer's update. The check and the
+    grant run under the registry lock every commit also takes, so no commit
+    can land between them: a moved version leaves the caller INVALID instead,
+    exactly as if the commit had come right after the grant, and records no
+    observation of a version it never read.
+    """
+    registry = coordinator.registry
+    with registry.abort_guard():
+        artifact = registry.get_artifact(artifact_id)
+        overtaken = artifact is not None and artifact.version != classified_version
+        registry.set_agent_state(
+            artifact_id, agent_id,
+            MESIState.INVALID if overtaken else MESIState.SHARED,
+            trigger="post_stale_read_overtaken" if overtaken else "post_stale_read",
+            tick=tick, content_hash=content_hash,
+        )
 
 
 def _record_held_read(

@@ -2783,6 +2783,117 @@ def test_first_observation_read_is_refused_when_a_peer_commit_lands_inside_it(
     assert body.get("hookSpecificOutput", {}).get("permissionDecision") == "deny", body
 
 
+def test_stale_read_overtaken_by_a_peer_commit_leaves_the_reader_invalid(
+    strict_coordinator, strict_client: _Client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#335: a read by a session with no grant on a tracked path is classified
+    from one snapshot and only then re-granted SHARED. A peer commit landing
+    between the two invalidates only rows that already exist, so the reader's
+    SHARED row, created after it, would stand at the peer's version while the
+    reader holds the bytes from before it, and its next pre-edit would be
+    admitted over the peer's update. The read itself stays a valid answer at
+    the version it was classified at; what must not stand is the grant."""
+    import ccs.adapters.claude_code.coordinator_server as server_module
+
+    path = "data/tally.json"
+    reader, peer = _sid("overtaken-reader"), _sid("overtaken-peer")
+    peer_version = _occ_seed_shared(strict_client, peer, path, _hash("0"))
+    in_window, release = threading.Event(), threading.Event()
+    real_decide = server_module.decide_tracked_read
+    held: list[bool] = []
+
+    def hold_after_classifying(*args: Any, **kwargs: Any) -> TrackedReadDecision:
+        decision = real_decide(*args, **kwargs)
+        if not held and decision.outcome == "stale":
+            held.append(True)
+            in_window.set()
+            assert release.wait(3.0), "the held reader was never released"
+        return decision
+
+    monkeypatch.setattr(server_module, "decide_tracked_read", hold_after_classifying)
+    answers: dict[str, tuple[int, dict]] = {}
+    read = {"session_id": reader, "path": path, "content_hash": _hash("0")}
+    held_reader = threading.Thread(
+        target=lambda: answers.update(reader=strict_client.post("/hooks/pre-read", read))
+    )
+    held_reader.start()
+    try:
+        assert in_window.wait(3.0), "the reader never reached its re-grant"
+        _, acquired = strict_client.post("/hooks/pre-edit", {"session_id": peer, "path": path})
+        assert acquired.get("ok") is True, acquired
+        _, committed = strict_client.post("/hooks/post-edit", {
+            "session_id": peer, "path": path, "success": True, "content_hash": _hash("1"),
+        })
+        assert committed.get("ok") is True, committed
+    finally:
+        release.set()
+        held_reader.join(5.0)
+
+    status, body = answers["reader"]
+    assert status == 200, body
+    assert body.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", body
+    assert body["summary"]["current_version"] == peer_version, "the read answers at v1"
+    artifact_id = strict_coordinator.registry.lookup_artifact_id_by_name(path)
+    state = strict_coordinator.registry.get_agent_state(artifact_id, session_to_agent_id(reader))
+    assert state == MESIState.INVALID, f"reader left {state} at the peer's version"
+    _, edit = strict_client.post("/hooks/pre-edit", {"session_id": reader, "path": path})
+    assert edit.get("ok") is False and edit.get("status") == "stale", edit
+
+
+def test_stale_read_regrant_and_its_version_check_admit_no_commit_between(
+    strict_coordinator, strict_client: _Client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#335: the stale-arm re-grant checks that the version has not moved and
+    then grants, as one step under the registry lock. Held after the check and
+    before the grant, the reader keeps a peer's commit waiting; the commit then
+    invalidates the grant it finds. A check and grant a commit could land
+    between would leave the reader SHARED at the peer's version."""
+    path = "data/tally.json"
+    reader, peer = _sid("regrant-step-reader"), _sid("regrant-step-peer")
+    _occ_seed_shared(strict_client, peer, path, _hash("0"))
+    registry = strict_coordinator.registry
+    in_window, release = threading.Event(), threading.Event()
+    real_set = registry.set_agent_state
+    held: list[bool] = []
+
+    def hold_before_granting(*args: Any, **kwargs: Any) -> Any:
+        if not held and str(kwargs.get("trigger", "")).startswith("post_stale_read"):
+            held.append(True)
+            in_window.set()
+            assert release.wait(3.0), "the held reader was never released"
+        return real_set(*args, **kwargs)
+
+    committed = threading.Event()
+
+    def peer_commits() -> None:
+        strict_client.post("/hooks/pre-edit", {"session_id": peer, "path": path})
+        strict_client.post("/hooks/post-edit", {
+            "session_id": peer, "path": path, "success": True, "content_hash": _hash("1"),
+        })
+        committed.set()
+
+    monkeypatch.setattr(registry, "set_agent_state", hold_before_granting)
+    read = {"session_id": reader, "path": path, "content_hash": _hash("0")}
+    held_reader = threading.Thread(target=lambda: strict_client.post("/hooks/pre-read", read))
+    committer = threading.Thread(target=peer_commits)
+    held_reader.start()
+    try:
+        assert in_window.wait(3.0), "the reader never reached its re-grant"
+        committer.start()
+        # A commit not kept waiting finishes well inside this window.
+        assert not committed.wait(0.5), "the peer committed between the check and the grant"
+    finally:
+        release.set()
+        held_reader.join(5.0)
+        committer.join(5.0)
+
+    assert committed.is_set(), "control: the peer's commit ran once the reader was released"
+    artifact_id = registry.lookup_artifact_id_by_name(path)
+    assert registry.get_artifact(artifact_id).version == 2, "control: the peer committed"
+    state = registry.get_agent_state(artifact_id, session_to_agent_id(reader))
+    assert state == MESIState.INVALID, f"reader left {state} at the peer's version"
+
+
 def test_a8_status_exposes_coordinator_backend_and_version(client: _Client) -> None:
     """KTD-J: /status shape includes coordinator_backend + coordinator_version
     for cross-implementation operator observability."""

@@ -18,6 +18,25 @@ Alpha — APIs may change before `v1.0`.
   package README carries the old marker. Install commands are unchanged: the
   PyPI package is still `agent-coherence`.
 
+### Fixed
+
+- **A `CoherentVolume.write()` after a read that raced a peer's commit is
+  refused again (#335).** A pre-read by a session with no grant on a tracked
+  path is classified from one snapshot, and the SHARED grant comes after it.
+  A peer commit that landed in between invalidated only rows that already
+  existed, so the reader's new SHARED row stood at the peer's version while
+  the reader held the bytes from before that commit. Its next `write()` was
+  admitted at pre-edit, which refuses only INVALID holders. With
+  `on_stale_write="allow"`, that write replaced the peer's update and neither
+  call raised. With the default, the volume's own content check raised
+  `StaleView` and described the peer's commit as a foreign edit. The
+  coordinator now checks the version and grants as one step under the
+  registry lock that every commit also takes. If the version moved, the
+  reader is left INVALID, as if the commit had come right after its read, and
+  its next `write()` is refused at pre-edit. The read itself still answers
+  with the bytes and version it was classified at. `write_cas`, `write_cas_at`
+  and Claude Code hook clients were not affected.
+
 ## [0.15.0] - 2026-10-14
 
 **Sessions can hand a held path to a named successor, a caller principal keeps protocol-following clients from acting as each other's sessions, and the effect fence answers over HTTP; `/status` reports sweep reclaims, grant ages, each artifact's last writer and the store's schema version; and a run of fixes closes ways a stale read, a refused read or a policy edit let a write overwrite newer work.**
