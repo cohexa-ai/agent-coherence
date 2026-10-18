@@ -15758,3 +15758,132 @@ def test_a_strict_reader_whose_file_changed_outside_the_coordinator_is_denied_na
     retry = client.post(
         "/hooks/pre-read", {"session_id": reader, "path": "plan.md", "content_hash": after})
     assert retry[1]["hookSpecificOutput"] == body["hookSpecificOutput"]
+
+
+# ----------------------------------------------------------------------
+# #278 -- a writer about to overwrite a change made outside the coordinator
+#
+# Pre-edit carries no content hash, and post-edit records whatever hash it is
+# sent, so a session that writes a whole file from an earlier read replaced a
+# change made out of band with nothing on the wire to notice: the version
+# moved, the record looked clean, and the change was gone. Pre-edit now hashes
+# the file on disk itself -- the coordinator runs on the workspace's host -- and
+# compares it with the recorded content before the write lands.
+# ----------------------------------------------------------------------
+
+
+def _bytes_hash(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _seed_with_disk(coordinator, client: _Client, path: str, data: bytes) -> str:
+    """Write ``data`` to ``path`` and record it through a hashed first read, so
+    the coordinator's content claim is exactly those bytes. Answers the
+    reader's session id."""
+    (coordinator.coordinator_root / path).parent.mkdir(parents=True, exist_ok=True)
+    (coordinator.coordinator_root / path).write_bytes(data)
+    reader = str(uuid.uuid4())
+    status, body = client.post(
+        "/hooks/pre-read", {"session_id": reader, "path": path, "content_hash": _bytes_hash(data)})
+    assert status == 200 and body["status"] == "fresh", body
+    return reader
+
+
+def test_pre_edit_on_a_file_changed_outside_the_coordinator_flags_it_and_warns(
+    coordinator, client: _Client,
+) -> None:
+    """#278: the file on disk no longer holds the recorded content and no
+    commit explains it. Pre-edit still admits -- a write is the one way out of
+    an out-of-band change -- but answers disk_differs for a client that reads
+    keys, and the out-of-band notice as context only for the model. Fails if
+    the acquire answers a bare ok."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    writer = _seed_with_disk(coordinator, client, "plan.md", b"# plan\n- a\n")
+    (coordinator.coordinator_root / "plan.md").write_bytes(b"# plan\n- a\n- appended out of band\n")
+
+    status, body = client.post("/hooks/pre-edit", {"session_id": writer, "path": "plan.md"})
+
+    assert status == 200
+    assert body == {
+        "ok": True,
+        "disk_differs": True,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": hp.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(path="plan.md", version=1),
+        },
+    }
+
+
+@pytest.mark.parametrize("case", ["unchanged", "no-claim", "missing", "own-commit-landing"])
+def test_pre_edit_answers_a_bare_ok_when_the_disk_explains_nothing_new(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    """#278: the controls. Disk matching the record, a record with no content
+    claim, a file that is not there to hash, and the caller's own commit
+    still reaching the disk all answer exactly {"ok": true}, as before. Fails
+    if the check fires on any of them."""
+    data = b"# plan\n- a\n"
+    if case == "no-claim":
+        (coordinator.coordinator_root / "plan.md").write_bytes(data)
+        writer = str(uuid.uuid4())
+        assert client.post("/hooks/pre-read", {"session_id": writer, "path": "plan.md"})[0] == 200
+        (coordinator.coordinator_root / "plan.md").write_bytes(data + b"- later\n")
+    else:
+        writer = _seed_with_disk(coordinator, client, "plan.md", data)
+    if case == "missing":
+        (coordinator.coordinator_root / "plan.md").unlink()
+    if case == "own-commit-landing":
+        (coordinator.coordinator_root / "plan.md").write_bytes(data + b"- mine, not yet flushed\n")
+        _patch_last_writer(monkeypatch, coordinator,
+                           writer=session_to_agent_id(writer), ts=time.time())
+
+    assert client.post("/hooks/pre-edit", {"session_id": writer, "path": "plan.md"}) == (
+        200, {"ok": True})
+
+
+def test_pre_edit_in_strict_mode_warns_about_an_out_of_band_change_and_admits(
+    strict_plan_coordinator, strict_plan_client: _Client,
+) -> None:
+    """#278: strict mode admits too. A strict read is already denied until a
+    commit lands, so denying the write as well would leave the file with no
+    way out through the hooks. Fails if the out-of-band check denies."""
+    writer = _seed_with_disk(strict_plan_coordinator, strict_plan_client, "plan.md", b"v1\n")
+    (strict_plan_coordinator.coordinator_root / "plan.md").write_bytes(b"v1\nchanged by a script\n")
+
+    status, body = strict_plan_client.post(
+        "/hooks/pre-edit", {"session_id": writer, "path": "plan.md"})
+
+    assert status == 200 and body["ok"] is True and body["disk_differs"] is True, body
+    assert "permissionDecision" not in body["hookSpecificOutput"]
+
+
+def test_a_successor_about_to_overwrite_its_givers_out_of_band_change_is_warned(
+    coordinator, client: _Client,
+) -> None:
+    """#278, the reported scenario: the successor read plan.md, the giver then
+    appended to it out of band, and the successor is about to write the whole
+    file from its earlier read. Its pre-edit answers disk_differs, and the
+    notice follows the handoff prose. Fails if the successor's acquire tells it
+    nothing about the change it is about to replace."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    original = b"# plan\n- a\n"
+    _seed_with_disk(coordinator, client, "plan.md", original)
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    for _ in range(2):
+        status, _body = client.post(
+            "/hooks/pre-read",
+            {"session_id": successor.sid, "path": "plan.md", "content_hash": _bytes_hash(original)},
+            principal=successor.principal)
+        assert status == 200
+    (coordinator.coordinator_root / "plan.md").write_bytes(original + b"- x giver appended\n")
+
+    status, body = _verb(client, "/hooks/pre-edit", successor, "plan.md")
+
+    assert status == 200 and body["ok"] is True and body["disk_differs"] is True, body
+    context = body["hookSpecificOutput"]["additionalContext"]
+    assert context.startswith("Handoff: agent "), context
+    assert context.endswith(hp.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(path="plan.md", version=1))
+    assert "permissionDecision" not in body["hookSpecificOutput"]

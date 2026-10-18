@@ -87,6 +87,7 @@ from ccs.adapters.claude_code.auth import (
 )
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.bash_write_detector import detect_tracked_writes
+from ccs.adapters.claude_code.disk_content import hash_regular_file
 from ccs.adapters.claude_code.policy import (
     POLICY_LOAD_ERRORS,
     UNTRACK_STRICT_PATH_REASON,
@@ -3258,9 +3259,13 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # the acquire (which records the current version as observed), so the
     # successor's admit can warn when it never read the version it was handed.
     observed_before_acquire: int | None = None
+    # #278: the recorded version whose content the file on disk no longer
+    # holds, when no commit explains it -- set by an admitted acquire, read by
+    # the wrapper that attaches the notice.
+    out_of_band_version: int | None = None
 
     def work() -> dict:
-        nonlocal observed_before_acquire
+        nonlocal observed_before_acquire, out_of_band_version
         coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
         # Seed the artifact row if this is the first Edit on a fresh path.
         artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
@@ -3397,6 +3402,18 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
 
+        # #278: pre-edit carries no content hash, and post-edit records
+        # whatever it is sent, so a write built from an earlier read replaced a
+        # change made outside the coordinator with nothing to notice it. The
+        # coordinator runs on the workspace's host, so it reads the file
+        # itself, after the acquire (a refused editor is not told) and before
+        # the caller's write lands. It warns and never denies: in strict mode
+        # a read is already refused until a commit lands, so a write is the
+        # one way out.
+        out_of_band_version = _recorded_content_missing_from_disk(
+            coordinator, artifact_id, agent_id, path=path, now_unix=_payloads.now_unix()
+        )
+
         # A1: record preemption notices for the agents whose M∪E grants we
         # just silently revoked via the write() side effect. The victims
         # will see these on their next pre-read / pre-edit hook.
@@ -3459,6 +3476,18 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             coordinator, produced, path=path, caller=caller,
             acquired=True, observed=observed_before_acquire,
         )
+        # #278: after the notices and the handoff prose, as context only, plus
+        # a key for a client that reads keys rather than prose.
+        if out_of_band_version is not None and produced.get("ok") is True:
+            result = {
+                **_attach_pretooluse_context(
+                    result,
+                    _payloads.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(
+                        path=path, version=out_of_band_version
+                    ),
+                ),
+                "disk_differs": True,
+            }
         return _deliver_pending_reground(
             coordinator, session_id, body, result, abort=abort
         )
@@ -8705,6 +8734,33 @@ def _is_recent_self_commit_lag(
     if updated_at is None:
         return False
     return (now_unix - updated_at) <= _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC
+
+
+def _recorded_content_missing_from_disk(
+    coordinator: CoordinatorHTTPServer,
+    artifact_id: UUID,
+    caller_agent_id: UUID,
+    *,
+    path: str,
+    now_unix: float,
+) -> int | None:
+    """The recorded version whose content the file on disk no longer holds,
+    when nothing the coordinator recorded explains it (#278); ``None`` otherwise.
+
+    ``None`` when the record carries no content claim (a first edit's seed, the
+    sentinels), when the file is not an observable regular file within the
+    foreign-write detector's size cap, when the bytes match, and when the
+    mismatch is the caller's own recent commit still reaching the disk. The read
+    is the detector's: raw bytes, no symlink leaf, no blocking on a named pipe."""
+    artifact = coordinator.registry.get_artifact(artifact_id)
+    if artifact is None or not coordinator_holds_content_claim(artifact.content_hash):
+        return None
+    disk_hash = hash_regular_file(Path(coordinator.coordinator_root) / path)
+    if disk_hash is None or disk_hash == artifact.content_hash:
+        return None
+    if _is_recent_self_commit_lag(coordinator, artifact_id, caller_agent_id, now_unix=now_unix):
+        return None
+    return artifact.version
 
 
 # ----------------------------------------------------------------------

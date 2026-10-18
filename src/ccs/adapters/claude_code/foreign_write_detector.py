@@ -89,7 +89,6 @@ from __future__ import annotations
 
 import logging
 import os
-import stat
 import subprocess
 import sys
 import threading
@@ -99,8 +98,8 @@ from typing import Iterable, Protocol
 from uuid import UUID
 
 from ccs.adapters.claude_code.coordinator_server import _F_SENTINEL_CONTENT_HASH
+from ccs.adapters.claude_code.disk_content import hash_regular_file
 from ccs.core.states import MESIState
-from ccs.core.substrate import sha256_hex
 
 logger = logging.getLogger(__name__)
 
@@ -646,48 +645,11 @@ def _argv_encodable(name: str) -> bool:
 
 
 def _disk_hash(path: Path) -> str | None:
-    """Hash the file's raw bytes, or return None when it is not observable.
-
-    Raw bytes and the one canonical helper: no decode, no newline translation,
-    no git filter. A normalization here would be the first in the system and
-    would diverge this comparison from every writer that produced a stored hash.
-
-    One descriptor answers every question, which closes three gaps a
-    stat-then-open sequence leaves open. ``O_NOFOLLOW`` refuses a symlink leaf,
-    so a coordinated name cannot be pointed at a file outside the workspace.
-    ``O_NONBLOCK`` means a path replaced by a named pipe fails instead of
-    blocking this thread forever. And checking the size on the open descriptor,
-    then reading one byte past the cap, means a file that grows between the
-    check and the read is still refused rather than read unbounded.
-
-    None covers every way an artifact can stop being an observable regular file
-    — deleted, renamed away, replaced by a directory or a link, permission
-    revoked, or oversized. All of those are coverage gaps, not detections.
-    """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    try:
-        fd = os.open(path, flags)
-    except OSError:
-        return None
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            return None
-        if info.st_size > _MAX_HASH_BYTES:
-            logger.debug("detection: %s exceeds the per-tick hash cap; skipped", path)
-            return None
-        with os.fdopen(fd, "rb", closefd=True) as handle:
-            fd = -1  # ownership moved to the file object
-            data = handle.read(_MAX_HASH_BYTES + 1)
-        if len(data) > _MAX_HASH_BYTES:
-            logger.debug("detection: %s grew past the per-tick hash cap; skipped", path)
-            return None
-        return sha256_hex(data)
-    except OSError:
-        return None
-    finally:
-        if fd >= 0:
-            os.close(fd)
+    """Hash the file's raw bytes, or return None when it is not observable --
+    :func:`~ccs.adapters.claude_code.disk_content.hash_regular_file`, the read
+    pre-edit's out-of-band check shares (#278), under this pass's own cap. None
+    is a coverage gap, not a detection."""
+    return hash_regular_file(path, max_bytes=_MAX_HASH_BYTES)
 
 
 def _stat_signature(path: Path) -> tuple[int, int] | None:
