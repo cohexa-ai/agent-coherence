@@ -8186,8 +8186,38 @@ _CONTRACT_STATEMENTS: tuple[tuple[str, str], ...] = (
         "`summary.current_version` and `owner_generation`",
     ),
     (
-        "a first read without a hash leaves no content claim, and a read does not record one",
+        "a read does not record a missing content claim",
         "A later read does not record a claim, even one that sends the hash",
+    ),
+    (
+        "the first touches that leave a file with no content claim",
+        "by a pre-read with no hash, by a Bash command that reads it in a Claude Code "
+        "session, by an edit before the file's first commit, or by a `/session/begin` "
+        "read set that names it",
+    ),
+    (
+        "a degraded capture is retried, not read as no record",
+        "| `\"degraded\": true` | none: the check did not run; capture nothing and send the "
+        "pre-read again | none |",
+    ),
+    (
+        "a strict deny is told apart from a stale warning by its permission decision",
+        "`hookSpecificOutput.permissionDecision` is `\"deny\"`",
+    ),
+    (
+        "a strict deny is recovered under a new identity",
+        "capture again under a new `agent_id` with the same `session_id`",
+    ),
+    (
+        "the content-claim recovery is a commit, which moves the version",
+        "a commit through the coordinator records one, and it moves the version",
+    ),
+    (
+        "the hold-reason row: a re-read does not clear content_claim_absent, a commit "
+        "does and forces a fresh capture",
+        "Once a file has no claim, a re-read does not add one. A commit through the "
+        "coordinator does (`/hooks/pre-edit`, then `/hooks/post-edit` with the bytes' "
+        "hash), but it moves the version: capture the comparands again before you re-gate",
     ),
 )
 
@@ -8305,6 +8335,102 @@ def test_the_documented_http_capture_recipe_reaches_proceed(coordinator, client:
         "session_id": writer, "path": "plan.md", "content_hash": _hash("v2"), "success": True,
     })[1].get("ok") is True
     assert capture_then_fence(_hash("v2")) == ("stale", {"verdict": "proceed"})
+
+
+def _commit_over_http(client: _Client, session_id: str, path: str, content_hash: str) -> None:
+    """Commit ``path`` through the coordinator: a write claim, then the commit."""
+    assert client.post("/hooks/pre-edit", {"session_id": session_id, "path": path})[1].get("ok") is True
+    assert client.post("/hooks/post-edit", {
+        "session_id": session_id, "path": path, "content_hash": content_hash, "success": True,
+    })[1].get("ok") is True
+
+
+def test_the_documented_capture_recovers_from_a_strict_deny_under_a_new_agent_id(
+    strict_plan_coordinator, strict_plan_client: _Client,
+) -> None:
+    """#224: on a strict-mode file a peer's commit invalidates the reader, and
+    every later pre-read under that identity is denied -- a deny never
+    re-grants. The deny is the answer whose permissionDecision is "deny"; it
+    also says "status": "stale" and carries a summary, but no
+    owner_generation. As the guide says, a capture under a new agent_id with
+    the same session_id (what CoherentVolume.reacquire() does) reaches
+    proceed, fencing under that same agent_id. Fails if the denied identity
+    can capture again, or if the new one cannot."""
+    client = strict_plan_client
+    reader, writer = str(uuid.uuid4()), str(uuid.uuid4())
+
+    def capture(content_hash: str, agent_id: str | None = None) -> dict:
+        request = {"session_id": reader, "path": "plan.md", "content_hash": content_hash,
+                   "want_owner_generation": True}
+        if agent_id is not None:
+            request["agent_id"] = agent_id
+        status, answer = client.post("/hooks/pre-read", request)
+        assert status == 200, answer
+        return answer
+
+    first = capture(_hash("v1"))
+    assert first["status"] == "fresh" and "owner_generation" in first, first
+    _commit_over_http(client, writer, "plan.md", _hash("v2"))
+    for _ in range(2):
+        denied = capture(_hash("v2"))
+        assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", denied
+        assert denied["status"] == "stale" and "owner_generation" not in denied, denied
+
+    recaptured = capture(_hash("v2"), agent_id="reacquired-1")
+    assert recaptured.get("hookSpecificOutput", {}).get("permissionDecision") != "deny", recaptured
+    version, generation = _captured_over_http(recaptured)
+    fence = {**_u4_body(reader, "plan.md", version=version, generation=generation,
+                        content_hash=_hash("v2")), "agent_id": "reacquired-1"}
+    assert client.post(_U4_ROUTE, fence) == (200, {"verdict": "proceed"})
+
+
+_CLAIMLESS_FIRST_TOUCHES: dict[str, tuple[str, dict]] = {
+    "pre-read-without-a-hash": ("/hooks/pre-read", {"path": "plan.md"}),
+    "pre-bash-read": ("/hooks/pre-bash", {"command": "cat plan.md"}),
+    "pre-edit-before-a-commit": ("/hooks/pre-edit", {"path": "plan.md"}),
+    "session-begin-read-set": ("/session/begin", {"read_set": ["plan.md"]}),
+}
+
+
+@pytest.mark.parametrize("first_touch", sorted(_CLAIMLESS_FIRST_TOUCHES))
+def test_a_file_first_registered_without_a_hash_holds_content_claim_absent_until_a_commit(
+    coordinator, client: _Client, first_touch: str,
+) -> None:
+    """#224: the guide's content-claim recovery, driven over HTTP. A file first
+    registered by any of the four claimless first touches holds the fence on
+    content_claim_absent for a hashed capture, and a second hashed capture
+    still holds -- a read never adds the claim. A commit through the
+    coordinator records it: after one, a fresh capture reaches proceed, and
+    the pair captured before the commit holds version_moved, because the
+    commit moved the version. Fails if a read starts recording the claim, or
+    a commit stops recording it, without the guide changing too."""
+    route, request = _CLAIMLESS_FIRST_TOUCHES[first_touch]
+    assert client.post(route, {"session_id": str(uuid.uuid4()), **request})[0] == 200
+    assert coordinator.registry.lookup_artifact_id_by_name("plan.md") is not None, (
+        "the first touch did not register the file")
+    reader = str(uuid.uuid4())
+
+    def capture_then_fence(content_hash: str) -> tuple[tuple[int, int], dict]:
+        status, answer = client.post("/hooks/pre-read", {
+            "session_id": reader, "path": "plan.md", "content_hash": content_hash,
+            "want_owner_generation": True,
+        })
+        assert status == 200, answer
+        pair = _captured_over_http(answer)
+        return pair, client.post(_U4_ROUTE, _u4_body(
+            reader, "plan.md", version=pair[0], generation=pair[1], content_hash=content_hash,
+        ))[1]
+
+    claimless = {"verdict": "hold", "reason": "content_claim_absent"}
+    before_commit, verdict = capture_then_fence(_hash("v1"))
+    assert verdict == claimless
+    assert capture_then_fence(_hash("v1"))[1] == claimless, "a hashed re-read recorded the claim"
+
+    _commit_over_http(client, str(uuid.uuid4()), "plan.md", _hash("v1"))
+    stale_pair_fence = _u4_body(reader, "plan.md", version=before_commit[0],
+                                generation=before_commit[1], content_hash=_hash("v1"))
+    assert client.post(_U4_ROUTE, stale_pair_fence)[1] == {"verdict": "hold", "reason": "version_moved"}
+    assert capture_then_fence(_hash("v1"))[1] == {"verdict": "proceed"}
 
 
 @pytest.mark.parametrize("want_generation", [False, True], ids=["plain", "want-generation"])
