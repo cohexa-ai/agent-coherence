@@ -99,9 +99,10 @@ class AgentRuntime:
                 acquire and commit (``ccs.core.exceptions``). Retry-eligible,
                 but THIS path has no built-in retry loop (unlike ``write_cas``):
                 the caller re-acquires / re-reads and calls ``write()`` again.
-            CoherenceError: the grant was already reclaimed before commit (the
-                error names the reclaim trigger and tick), or another protocol
-                precondition failed.
+            CommitNotAllowed: the grant was already reclaimed or preempted
+                before commit (the error names the reclaim trigger and tick),
+                carrying the generation pair read in that decision.
+            CoherenceError: another protocol precondition failed.
         """
         if content_hash is not None:
             computed = compute_content_hash(content)

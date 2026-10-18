@@ -39,7 +39,12 @@ Alpha — APIs may change before `v1.0`.
   artifact ended without a version move after the committer's claim was
   recorded; the reason, not the pair, says why the commit lost, and recovery
   still follows the reason. Existing keys, reasons and messages are unchanged,
-  and `swg_gate`'s hold keeps its shape. `ccs.testing.process_harness` gains
+  and `swg_gate`'s hold keeps its shape. `ConflictDetail` compares the pair
+  too, so an exact `==` against `ConflictDetail(reason, version)` no longer
+  matches a refusal for a committer with a recorded claim. The backend
+  conformance kit now requires a registry backend to report the pair, so a
+  backend that passed the kit before must add it.
+  `ccs.testing.process_harness` gains
   `run_park_after_ack`, which stops a contender after it acks, runs a step in
   the parent while the contender is frozen, then resumes it and returns what
   it produces. A cross-process test uses it to freeze a live, heartbeating
