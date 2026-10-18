@@ -30,6 +30,33 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **A file changed outside the coordinator no longer goes unnoticed while a
+  session holds it (#278).** A change that reaches the disk without a commit
+  -- a script, an editor, a shell write the hooks do not recognise, including
+  a handoff giver's -- was hidden in three places.
+  - **Detection.** The foreign-write detector treated any write grant as a
+    write still landing, and a commit leaves its writer holding the file for
+    up to half an hour. So a change made after any commit was counted as
+    excused, not foreign, for that long. Now only a write claim not yet
+    committed, by a session active in the last few seconds, is excused.
+  - **Reads.** A session reading the file with a valid grant was told
+    nothing: warn mode answered `"hash_differs": true`, a key the model
+    never sees. It now adds a sentence, as added context only, saying the
+    file changed outside the coordinator. In strict mode the read is still
+    denied, and the deny now names that change instead of the last session
+    that committed. The deny was byte-mirrored by the Claude Code plugin's
+    Node coordinator; the new wording reaches it with
+    cohexa-ai/agent-coherence-plugin#205.
+  - **Writes.** `pre-edit` admitted a session about to write the file from
+    an earlier read, so the change was replaced and the record looked clean.
+    `pre-edit` now reads the file itself. When the file no longer holds the
+    recorded content, it answers `"disk_differs": true` and the same
+    sentence. It still admits, in strict mode too.
+
+  `/status?detail=full` now lists each file's detector counts as
+  `foreign_writes`. `agent-coherence-status` prints them, along with the two
+  hash-mismatch counters that used to reach only `--json`.
+
 - **A `CoherentVolume.write()` after a read that raced a peer's commit is
   refused again (#335).** A pre-read by a session with no grant on a tracked
   path is classified from one snapshot, and the SHARED grant comes after it.

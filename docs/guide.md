@@ -3801,8 +3801,37 @@ Each file lands in one of three buckets:
 - **mediated** — the file changed, and the coordinator holds exactly those
   bytes. It was a write that went through it.
 - **lag_suppressed** — the mismatch looked like a write that was still landing
-  when the check ran. Counted separately, never as a foreign write and never as
-  a clean result, so you can see how often the benefit of the doubt was given.
+  when the check ran: a commit landed in the last few seconds, or a session
+  holds a write claim it has not committed yet and was active in that time.
+  Counted separately, never as a foreign write and never as a clean result, so
+  you can see how often the benefit of the doubt was given. A write that has
+  already committed excuses nothing: a session that committed a file and still
+  holds it does not hide a later change someone else makes outside the
+  coordinator.
+
+**What sessions are told.** Detection itself never denies, but the hooks look
+at the same thing when a session touches the file. A session that holds a valid
+grant on a file whose bytes on disk no longer match the version it read, with
+no commit of its own to explain them, is told so:
+
+- its next read is admitted in warn mode with `"hash_differs": true` and a
+  sentence, as added context only, saying the file changed outside the
+  coordinator and not to write it from an earlier read;
+- in strict mode that read is denied, and the deny names the change rather
+  than the last session that committed: the read stays denied until the change
+  is committed through the coordinator or the file is restored to that version;
+- its `pre-edit` reads the file itself and, when it no longer holds the recorded
+  content, adds `"disk_differs": true` and the same sentence. It never denies,
+  in strict mode either: a read is already denied there until a commit lands,
+  and a write is the one way to commit the change. A client that writes whole
+  files should re-read before it writes when it sees the key.
+
+**Reading the counts while the coordinator runs.** `/status?detail=full` adds
+`foreign_writes` to each tracked file the detector has counted anything for,
+for example `{"foreign": 1, "lag_suppressed": 1}`, and
+`agent-coherence-status --detail full` lists the files with a foreign or an
+excused change under "Changes made outside the coordinator". The offline report
+below reads the same counts.
 
 **The honesty rules matter more than the numbers, so they are worth stating
 plainly:**
@@ -4247,6 +4276,9 @@ these differences:
   `last_writer_at_unix_ts` (the agent that last committed the path, and when;
   both `null` until a commit) and `owner_generation`, and its `handoff` key
   adds `created_at_unix_ts`;
+- an entry the foreign-write detector has counted anything for adds
+  `foreign_writes`, its counts by outcome with zero ones left out (see
+  [Foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back));
 - each `sessions[]` row adds `reclaimed`, `grants` and
   `last_heartbeat_unix_ts`, and an agent listed only for a reclaim gets a row
   too, for 24 hours after its newest reclaim (see
