@@ -25,6 +25,7 @@ from ccs.core.exceptions import (
     HANDOFF_UNCONFIRMED_REASONS,
     CallerPrincipalRefused,
     CasRetriesExhausted,
+    CasVersionConflict,
     CoherenceError,
     CommitPreempted,
     CommitUnconfirmed,
@@ -299,6 +300,112 @@ def test_cas_conflict_constructor_never_raises_on_a_malformed_wire_reason():
         exc = CasVersionConflict("data/f.txt", 1, 1, reason=bogus)
         assert exc.reason == "version_mismatch"
         assert deny_result(exc).structuredContent["reason"] == "version_mismatch"
+
+
+# ----------------------------------------------------------------------
+# The lost token on the library refusals and their MCP results
+#
+# The three commit refusals a library caller meets carry the refusal's
+# ``captured_generation`` and ``owner_generation`` as keyword-only values,
+# ``None`` when the refusal carried none. The MCP result adds both keys only
+# when both are valid generations; recovery never changes with them.
+# ----------------------------------------------------------------------
+
+_PAIR_KEYS = ("captured_generation", "owner_generation")
+
+#: Each refusal type, built with the arguments its raise sites pass.
+_PAIR_CARRIERS = {
+    "cas_version_conflict": lambda **pair: CasVersionConflict(
+        "data/f.txt", 1, 1, reason="stale_read_generation", **pair
+    ),
+    "cas_retries_exhausted": lambda **pair: CasRetriesExhausted(
+        "data/f.txt", 4, 1, last_conflict_reason="stale_read_generation", **pair
+    ),
+    "commit_preempted": lambda **pair: CommitPreempted("preempt prose", **pair),
+}
+
+
+def _pair_of(exc) -> tuple:
+    return exc.captured_generation, exc.owner_generation
+
+
+@pytest.mark.parametrize("build", _PAIR_CARRIERS.values(), ids=_PAIR_CARRIERS.keys())
+def test_a_refusals_pair_rides_its_exception_and_mcp_result_without_changing_recovery(build):
+    """Generation 2 against 3, so a swapped, zeroed or dropped value fails.
+    The result is the pairless one plus exactly the two keys."""
+    exc = build(captured_generation=2, owner_generation=3)
+    assert _pair_of(exc) == (2, 3)
+
+    with_pair = deny_result(exc).structuredContent
+    without_pair = deny_result(build()).structuredContent
+    assert with_pair == {**without_pair, "captured_generation": 2, "owner_generation": 3}
+
+
+_MALFORMED_PAIRS = {
+    "nothing": {},
+    "bool-captured": {"captured_generation": True, "owner_generation": 3},
+    "bool-owner": {"captured_generation": 2, "owner_generation": False},
+    "string": {"captured_generation": "1", "owner_generation": 3},
+    "negative": {"captured_generation": -1, "owner_generation": 3},
+    "dict": {"captured_generation": 2, "owner_generation": {}},
+    "lone-captured": {"captured_generation": 2},
+    "lone-owner": {"owner_generation": 3},
+    "null-captured": {"captured_generation": None, "owner_generation": 3},
+}
+
+
+@pytest.mark.parametrize("pair", _MALFORMED_PAIRS.values(), ids=_MALFORMED_PAIRS.keys())
+@pytest.mark.parametrize("build", _PAIR_CARRIERS.values(), ids=_PAIR_CARRIERS.keys())
+def test_a_malformed_pair_reads_as_absent_and_never_raises(build, pair):
+    """The pair comes off a JSON body, so a constructor given anything keeps
+    building the refusal: half a pair, or a value that is no generation, is
+    no pair at all, and the MCP result carries neither key."""
+    exc = build(**pair)
+    assert _pair_of(exc) == (None, None)
+    assert not set(_PAIR_KEYS) & set(deny_result(exc).structuredContent)
+
+
+@pytest.mark.parametrize("build", _PAIR_CARRIERS.values(), ids=_PAIR_CARRIERS.keys())
+def test_the_pair_leaves_message_repr_and_args_unchanged(build):
+    """The pair is never in the text a model or a log reads, and positional
+    construction is what it was."""
+    plain, paired = build(), build(captured_generation=2, owner_generation=3)
+    assert str(paired) == str(plain)
+    assert repr(paired) == repr(plain)
+    assert paired.args == plain.args
+
+
+def test_positional_construction_is_unchanged_and_names_no_pair():
+    preempted = CommitPreempted("preempt prose")
+    assert preempted.args == ("preempt prose",)
+    assert repr(preempted) == "CommitPreempted('preempt prose')"
+    conflict = CasVersionConflict("data/f.txt", 4, 7)
+    assert str(conflict).startswith("version_mismatch artifact=data/f.txt expected=4 current=7")
+    exhausted = CasRetriesExhausted("data/x", 9, 3)
+    assert str(exhausted) == (
+        "cas_retries_exhausted artifact=data/x attempts=9 last_current_version=3 "
+        "(no write landed — every commit_cas attempt lost the race)"
+    )
+    for exc in (preempted, conflict, exhausted):
+        assert _pair_of(exc) == (None, None)
+    for cls in (CommitPreempted, CasVersionConflict, CasRetriesExhausted):
+        assert (cls.captured_generation, cls.owner_generation) == (None, None)
+
+
+def test_a_subclass_that_skips_the_constructor_still_reads_no_pair():
+    """``ConditionalPutRetriesExhausted`` never calls its parent's
+    constructor, so only class defaults give it the two attributes."""
+    from ccs.adapters.coherent_object import ConditionalPutRetriesExhausted
+
+    assert _pair_of(ConditionalPutRetriesExhausted("bucket/key", 3)) == (None, None)
+
+
+def test_the_mcp_result_reapplies_the_pair_rule_to_the_exceptions_values():
+    """The result adds the keys only when both values are generations, read
+    off the instance as it is when mapped."""
+    exc = CommitPreempted("preempt prose", captured_generation=2, owner_generation=3)
+    exc.owner_generation = True
+    assert not set(_PAIR_KEYS) & set(deny_result(exc).structuredContent)
 
 
 def test_held_publish_member_reason_is_allowlisted_not_just_typed():

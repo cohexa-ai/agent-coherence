@@ -67,6 +67,7 @@ from ccs.core.exceptions import (
     InternalConcurrencyError,
     StaleView,
     ViewWedged,
+    _generation_pair,
 )
 
 
@@ -381,7 +382,11 @@ def deny_result(exc: BaseException) -> CallToolResult:
         return _result(
             terminal,
             str(exc),
-            {"expected_version": exc.expected_version, "current_version": exc.current_version},
+            {
+                "expected_version": exc.expected_version,
+                "current_version": exc.current_version,
+                **_generation_fields(exc),
+            },
         )
     if type(exc) is CallerPrincipalRefused and exc.reason in CALLER_PRINCIPAL_REASONS:
         # Exact type, like ``_TERMINALS``; the reason by exact membership, so
@@ -396,11 +401,13 @@ def deny_result(exc: BaseException) -> CallToolResult:
     # The giver terminal also carries who the path went to and at which version
     # as values the agent can report (the detail says both in prose). Only
     # through its own row: without one it fails closed like any unknown type.
-    extra = (
-        _giver_fields(exc)
-        if isinstance(exc, GiverFenced) and terminal is not _UNRECOGNIZED
-        else None
-    )
+    extra: dict | None = None
+    if isinstance(exc, GiverFenced) and terminal is not _UNRECOGNIZED:
+        extra = _giver_fields(exc)
+    elif type(exc) in (CasRetriesExhausted, CommitPreempted):
+        # The two commit terminals add the refusal's lost token beside their
+        # unchanged recover verb. Diagnostic only: it changes no recovery.
+        extra = _generation_fields(exc)
     return _result(terminal, str(exc), extra)
 
 
@@ -479,6 +486,18 @@ def _with_row(grant: dict, row: _Terminal) -> dict:
     if row.next_step is not None:
         entry["next_step"] = row.next_step
     return entry
+
+
+def _generation_fields(exc: CasVersionConflict | CasRetriesExhausted | CommitPreempted) -> dict:
+    """The refusal's ``captured_generation`` and ``owner_generation``, both
+    or neither: neither unless both are generations, by the same rule the
+    coordinator emits them under, so a result never carries a null or half
+    a pair."""
+    pair = _generation_pair(exc.captured_generation, exc.owner_generation)
+    if pair is None:
+        return {}
+    captured, owner = pair
+    return {"captured_generation": captured, "owner_generation": owner}
 
 
 def _giver_fields(exc: GiverFenced) -> dict:

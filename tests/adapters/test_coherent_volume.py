@@ -26,6 +26,7 @@ import time
 import warnings
 import weakref
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -59,6 +60,7 @@ from ccs.core.exceptions import (
     CasVersionConflict,
     CoherenceDegradedWarning,
     CoherenceError,
+    CommitPreempted,
     StaleView,
     ViewWedged,
 )
@@ -3015,6 +3017,94 @@ def test_post_edit_preempt_still_advances_observed_baseline(
         # Bytes landed AND the observed baseline advanced to hash(v2).
         assert (tmp_path / "data/x.txt").read_bytes() == b"v2"
         assert vol._last_observed_hash["data/x.txt"] == vol._sha256_bytes(b"v2")
+    finally:
+        stop_coordinator(tmp_path)
+
+
+#: The coordinator reclaims a write grant whose holder sent nothing for this
+#: long. Its ticks are whole seconds, so a reclaim lands between one and two
+#: seconds after the grant: never before the paused write has seen it held.
+_RECLAIM_AFTER_SEC = 2
+_RECLAIM_DEADLINE_SEC = 30.0
+
+
+def _pause_after_the_disk_write_until_reclaimed(
+    vol: CoherentVolume, monkeypatch: pytest.MonkeyPatch, rel: str
+) -> None:
+    """Hold ``vol.write`` between its disk write and its post-edit until the
+    coordinator's sweep has reclaimed the grant. The write sends nothing
+    meanwhile, so its holder stops heartbeating; ``/status`` names no
+    session, so polling it heartbeats no one."""
+    real_atomic_write = vol._atomic_write
+    holder = _agent_id(vol)
+
+    def write_then_wait_for_the_reclaim(abs_path: Path, data: bytes) -> None:
+        real_atomic_write(abs_path, data)
+        assert _held(vol, holder).get(rel) == "EXCLUSIVE", "the write took no grant to lose"
+        deadline = time.monotonic() + _RECLAIM_DEADLINE_SEC
+        while _held(vol, holder).get(rel) == "EXCLUSIVE":
+            assert time.monotonic() < deadline, "the sweep never reclaimed the paused write's grant"
+            time.sleep(0.05)
+
+    monkeypatch.setattr(vol, "_atomic_write", write_then_wait_for_the_reclaim)
+
+
+def test_a_write_reclaimed_before_its_commit_names_the_lost_token(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real write, paused after its bytes reach disk until the sweep
+    reclaims its grant, is refused at commit. ``CommitPreempted`` keeps the
+    coordinator's prose and carries the pair: the claim its pre-edit recorded
+    at the new path's generation 0, against the reclaim's 1."""
+    _seed_file(tmp_path, content=b"v1")
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",),
+        config=replace(fast_cfg, grant_heartbeat_timeout_sec=_RECLAIM_AFTER_SEC),
+    )
+    try:
+        vol.read("data/x.txt")
+        _pause_after_the_disk_write_until_reclaimed(vol, monkeypatch, "data/x.txt")
+
+        with pytest.raises(CommitPreempted) as refused:
+            vol.write("data/x.txt", b"v2")
+
+        assert "reclaimed by the coordinator sweep" in str(refused.value)
+        assert (refused.value.captured_generation, refused.value.owner_generation) == (0, 1)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_compare_and_swap_refusals_over_http_carry_no_pair(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each compare-and-swap commits from a fresh incarnation whose hook
+    read records no claim, so its refusals name no lost token: the loop's
+    terminal and the single-shot conflict both read ``None``. A holds the
+    grant after its write, so B is refused ``other_holder`` at version 2."""
+    import ccs.adapters.coherent_volume as cv_mod
+
+    monkeypatch.setattr(cv_mod, "time", SimpleNamespace(sleep=lambda _sec: None))
+    _seed(tmp_path, content=b"v1")
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        vol_a.read("data/shared.txt")
+        calls = {"n": 0}
+
+        def make(current: bytes) -> bytes:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                vol_a.write("data/shared.txt", b"v2-from-A")  # A now holds MODIFIED
+            return current + b"\nB"
+
+        with pytest.raises(CasRetriesExhausted) as exhausted:
+            vol_b.write_cas("data/shared.txt", make)
+        assert exhausted.value.last_conflict_reason == "other_holder"
+        assert (exhausted.value.captured_generation, exhausted.value.owner_generation) == (None, None)
+
+        with pytest.raises(CasVersionConflict) as conflict:
+            vol_b.write_cas_at("data/shared.txt", 2, b"B")
+        assert (conflict.value.reason, conflict.value.current_version) == ("other_holder", 2)
+        assert (conflict.value.captured_generation, conflict.value.owner_generation) == (None, None)
     finally:
         stop_coordinator(tmp_path)
 

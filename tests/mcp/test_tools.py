@@ -9,10 +9,13 @@ surface (SC4).
 
 from __future__ import annotations
 
+import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.mcp.server import (
@@ -23,6 +26,7 @@ from ccs.mcp.server import (
     _do_reacquire,
     _do_read,
     _do_write,
+    _do_write_cas,
 )
 from ccs.mcp.session import SessionConfig
 
@@ -399,5 +403,77 @@ def test_write_os_error_fails_closed(tmp_path: Path, fast_cfg: LifecycleConfig, 
         result = _do_write(vol, config, "data/shared.txt", "x")
         assert result.isError is True
         assert result.structuredContent["reason"] == "io_error"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- the lost token on commit refusals ----------------------------------------
+
+_PAIR_KEYS = ("captured_generation", "owner_generation")
+
+
+def _holds_exclusive(vol: CoherentVolume, holder: str, path: str) -> bool:
+    status = vol.coordinator_status()
+    assert status is not None, "the coordinator must be reachable to read its grant rows"
+    rows = [row["states"] for row in status["sessions"] if row["agent_id"] == holder]
+    return bool(rows) and rows[0].get(path) == "EXCLUSIVE"
+
+
+def test_write_reclaimed_before_its_commit_is_commit_preempted_naming_the_lost_token(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch
+) -> None:
+    """swg_write's write is paused after its bytes reach disk until the sweep
+    reclaims its grant (it sends nothing meanwhile, and ``/status`` heartbeats
+    no one). The refusal keeps its recovery and adds the pair: the claim the
+    pre-edit recorded at generation 0, against the reclaim's 1."""
+    _seed(tmp_path, content=b"v1")
+    config = _config(tmp_path)
+    # Whole-second ticks: a 2 s timeout reclaims 1-2 s after the grant, never
+    # before the paused write has seen it held.
+    vol = _vol(tmp_path, replace(fast_cfg, grant_heartbeat_timeout_sec=2))
+    try:
+        _do_read(vol, config, "data/shared.txt")
+        holder = str(session_to_agent_id(vol.session_id, vol._incarnation))
+        real_atomic_write = vol._atomic_write
+
+        def write_then_wait_for_the_reclaim(abs_path: Path, data: bytes) -> None:
+            real_atomic_write(abs_path, data)
+            assert _holds_exclusive(vol, holder, "data/shared.txt"), "the write took no grant to lose"
+            deadline = time.monotonic() + 30.0
+            while _holds_exclusive(vol, holder, "data/shared.txt"):
+                assert time.monotonic() < deadline, "the sweep never reclaimed the paused write's grant"
+                time.sleep(0.05)
+
+        monkeypatch.setattr(vol, "_atomic_write", write_then_wait_for_the_reclaim)
+        result = _do_write(vol, config, "data/shared.txt", "v2")
+
+        assert result.isError is True
+        sc = result.structuredContent
+        assert (sc["reason"], sc["recover"], sc["retryable"]) == (
+            "commit_preempted", "reacquire_and_reconcile", False,
+        )
+        assert (sc["captured_generation"], sc["owner_generation"]) == (0, 1)
+        assert "reclaimed by the coordinator sweep" in sc["detail"]
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_write_cas_refusal_carries_no_pair_keys(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:
+    """swg_write_cas commits from a fresh incarnation whose read records no
+    claim, so its refusal from the coordinator carries neither key, never a
+    null. A holds the grant after its write, so B is refused other_holder."""
+    _seed(tmp_path, content=b"v1")
+    config = _config(tmp_path)
+    vol_a, vol_b = _vol(tmp_path, fast_cfg), _vol(tmp_path, fast_cfg)
+    try:
+        _do_read(vol_a, config, "data/shared.txt")
+        assert _do_write(vol_a, config, "data/shared.txt", "v2-from-a").isError is False
+
+        result = _do_write_cas(vol_b, config, {}, "data/shared.txt", 2, "v3-from-b")
+
+        assert result.isError is True
+        sc = result.structuredContent
+        assert (sc["reason"], sc["current_version"]) == ("other_holder", 2)
+        assert not set(_PAIR_KEYS) & set(sc)
     finally:
         stop_coordinator(tmp_path)

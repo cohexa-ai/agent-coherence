@@ -830,12 +830,21 @@ class CasRetriesExhausted(CoherenceError):
     Carries :data:`CAS_EXHAUSTED_REASON` (MCP-C Unit 1) so the deny mapper
     classifies it by type; the wire reason ``cas_exhausted`` is deliberately
     distinct from the ``cas_retries_exhausted`` prose token in the message.
+
+    :attr:`captured_generation` and :attr:`owner_generation` are the LAST
+    refusal's pair, as on :class:`ConflictDetail`: the committer's recorded
+    claim and the artifact's ownership generation, read in that refusal's
+    decision. Both are ``None`` when that refusal carried none (no recorded
+    claim, or a coordinator that does not report them). Keyword-only and never
+    in the message; recovery follows the reason, never the pair.
     """
 
     reason = CAS_EXHAUSTED_REASON
-    #: Class default, so a subclass that bypasses ``__init__``
-    #: (``ConditionalPutRetriesExhausted``) still has the attribute.
+    #: Class defaults, so a subclass that bypasses ``__init__``
+    #: (``ConditionalPutRetriesExhausted``) still has the attributes.
     last_conflict_reason: str | None = None
+    captured_generation: int | None = None
+    owner_generation: int | None = None
 
     def __init__(
         self,
@@ -844,11 +853,16 @@ class CasRetriesExhausted(CoherenceError):
         last_current_version: int,
         *,
         last_conflict_reason: str | None = None,
+        captured_generation: object = None,
+        owner_generation: object = None,
     ) -> None:
         # isinstance, not truthiness alone: the reason arrives from a JSON body,
         # and an exception constructor must never raise (see CasVersionConflict).
         if isinstance(last_conflict_reason, str) and last_conflict_reason:
             self.last_conflict_reason = last_conflict_reason
+        pair = _generation_pair(captured_generation, owner_generation)
+        if pair is not None:
+            self.captured_generation, self.owner_generation = pair
         if self.last_conflict_reason is None:
             # No reason known (a raise site that does not pass one): the text
             # this message has always had.
@@ -911,9 +925,29 @@ class CommitPreempted(CoherenceError):
     coordinator version). NOT only a concurrent edge — a lone sequential writer's
     grant can age out mid-write (crash-recovery sweep, default-on). Recover by
     re-reading fresh bytes and reconciling the pending buffer (agent-driven; v1
-    has no server reconcile primitive). Carries :data:`COMMIT_PREEMPTED_REASON`."""
+    has no server reconcile primitive). Carries :data:`COMMIT_PREEMPTED_REASON`.
+
+    :attr:`captured_generation` and :attr:`owner_generation` are the commit
+    refusal's pair, as on :class:`CommitNotAllowed`: ``captured < owner`` means
+    some write claim on the artifact ended without a version move after this
+    writer's claim was recorded (a sweep reclaim, for one). Both are ``None``
+    when the refusal carried none. Keyword-only and never in the message; the
+    recovery above holds whatever they say."""
 
     reason = COMMIT_PREEMPTED_REASON
+    captured_generation: int | None = None
+    owner_generation: int | None = None
+
+    def __init__(
+        self,
+        *args: object,
+        captured_generation: object = None,
+        owner_generation: object = None,
+    ) -> None:
+        super().__init__(*args)
+        pair = _generation_pair(captured_generation, owner_generation)
+        if pair is not None:
+            self.captured_generation, self.owner_generation = pair
 
 
 class ViewWedged(CoherenceError):
@@ -1153,12 +1187,19 @@ class CasVersionConflict(CoherenceError):
     not re-read — it is best-effort (the version observed at pre-read time); a
     caller keys recovery on ``reacquire()`` (which re-reads fresh), not on the
     numeric.
+
+    :attr:`captured_generation` and :attr:`owner_generation` are the
+    coordinator refusal's pair, as on :class:`ConflictDetail`. Both are
+    ``None`` when the refusal carried none, and on a conflict the client
+    decided itself (no refusal body). Keyword-only and never in the message.
     """
 
     #: Class default, kept so ``except`` clauses and consumers that read the
     #: class attribute keep working. An instance raised from a wire refusal
     #: SHADOWS it with the coordinator's own reason.
     reason = VERSION_MISMATCH_REASON
+    captured_generation: int | None = None
+    owner_generation: int | None = None
 
     def __init__(
         self,
@@ -1167,6 +1208,8 @@ class CasVersionConflict(CoherenceError):
         current_version: int,
         *,
         reason: str | None = None,
+        captured_generation: object = None,
+        owner_generation: object = None,
     ) -> None:
         """``reason`` is the coordinator's refusal reason when the raise site
         has one. The coordinator distinguishes four — ``version_mismatch``,
@@ -1193,6 +1236,9 @@ class CasVersionConflict(CoherenceError):
         self.artifact_id = artifact_id
         self.expected_version = expected_version
         self.current_version = current_version
+        pair = _generation_pair(captured_generation, owner_generation)
+        if pair is not None:
+            self.captured_generation, self.owner_generation = pair
 
 
 class ScenarioValidationError(CoherenceError):
