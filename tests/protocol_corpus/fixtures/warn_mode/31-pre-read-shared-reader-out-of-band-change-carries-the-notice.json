@@ -1,0 +1,47 @@
+{
+  "name": "pre-read-shared-reader-out-of-band-change-carries-the-notice",
+  "description": "The warn-mode counterpart of the out-of-band deny (#278). Session A's first read of CLAUDE.md seeds v1 with A's hash and grants A SHARED; A's next read offers different bytes with the version unchanged and no commit of A's own to explain them. The read is still admitted with hash_differs, and the change is named in a context-only hookSpecificOutput -- no permissionDecision -- because hash_differs is a top-level key the model never sees. Python-only until the Node coordinator mirrors it (cohexa-ai/agent-coherence-plugin#205): today Node emits no hash_differs in warn mode at all.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\nv1 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "CLAUDE.md",
+          "content_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "CLAUDE.md",
+      "content_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "status": "fresh",
+      "version": 1,
+      "hash_differs": true,
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "additionalContext": "⚠ CLAUDE.md on disk differs from v1, the last content committed through the coordinator, and no session committed the change: it was made outside the coordinator. Read CLAUDE.md before relying on it, and do not write it from an earlier read; that write would replace the change."
+      }
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

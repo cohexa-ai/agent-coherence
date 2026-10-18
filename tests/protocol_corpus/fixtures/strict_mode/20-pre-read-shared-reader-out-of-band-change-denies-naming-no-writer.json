@@ -1,0 +1,62 @@
+{
+  "name": "pre-read-shared-reader-out-of-band-change-denies-naming-no-writer",
+  "description": "The out-of-band arm of the strict deny (#278). Session A's first read of CLAUDE.md seeds v1 with A's hash and grants A SHARED. A then reads again offering different bytes: the version A saw is still the current one and nothing committed, so the change was made outside the coordinator. The deny says so and names the two ways out -- a re-read is denied again -- instead of the write template, which named the last committer at its commit time ('agent <unknown>' here, since nothing ever committed). Per-artifact placeholders only, so the reason is byte-stable. Python-only until the Node coordinator mirrors it (cohexa-ai/agent-coherence-plugin#205).",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "strict_mode": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\nv1 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "CLAUDE.md",
+          "content_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "CLAUDE.md",
+      "content_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  },
+  "ignore_keys": [
+    "last_writer_at_unix_ts",
+    "warning_generated_at_unix_ts"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "Stale read denied: CLAUDE.md on disk no longer matches v1, the version you last read, and no session committed the change, so it was made outside the coordinator. The read stays denied until the change is committed through the coordinator or CLAUDE.md is restored to v1. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+      },
+      "status": "stale",
+      "summary": {
+        "path": "CLAUDE.md",
+        "current_version": 1,
+        "prior_version_seen_by_session": 1,
+        "last_writer_session_id": "<unknown>",
+        "last_writer_at_unix_ts": 0,
+        "warning_generated_at_unix_ts": 0,
+        "hash_differs": true
+      }
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

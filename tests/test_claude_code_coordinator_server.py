@@ -302,12 +302,55 @@ def test_pre_read_fresh_shared_hash_mismatch_sets_hash_differs(client: _Client) 
     have left the session INVALID, so the mismatch implies an
     out-of-band write — surfaced additively, never denied (the plugin
     path stays fail-open)."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
     client.post("/hooks/pre-read",
                 {"session_id": _sid("s1"), "path": "CLAUDE.md",
                  "content_hash": _hash("on-disk-v1")})
     status, body = client.post("/hooks/pre-read",
                                 {"session_id": _sid("s1"), "path": "CLAUDE.md",
                                  "content_hash": _hash("out-of-band-edit")})
+    assert status == 200
+    # #278: the flag is a top-level key the model never sees, so the change is
+    # also named in a context-only envelope -- never a permission decision.
+    assert body == {
+        "status": "fresh", "version": 1, "hash_differs": True,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": hp.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(
+                path="CLAUDE.md", version=1),
+        },
+    }
+
+
+def test_out_of_band_change_notice_wording_is_pinned() -> None:
+    """#278: the bytes a model reads when its file changed outside the
+    coordinator. Pinned literally, so a reword is a reviewed change."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    assert hp.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(path="plan.md", version=3) == (
+        "⚠ plan.md on disk differs from v3, the last content committed through "
+        "the coordinator, and no session committed the change: it was made "
+        "outside the coordinator. Read plan.md before relying on it, and do not "
+        "write it from an earlier read; that write would replace the change."
+    )
+
+
+def test_pre_read_of_its_own_commit_still_landing_carries_no_out_of_band_notice(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#278: a mismatch the caller's own recent commit explains -- the registry
+    took the new hash before the bytes reached disk -- is not a change made
+    outside the coordinator, and the reader is not told it is. The flag stays,
+    as before. Fails if the notice ignores the self-commit lag exclusion."""
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                 "content_hash": _hash("on-disk-v1")})
+    agent_id = session_to_agent_id(_sid("s1"))
+    _patch_last_writer(monkeypatch, coordinator, writer=agent_id, ts=time.time())
+    status, body = client.post("/hooks/pre-read",
+                                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                                 "content_hash": _hash("not-yet-flushed")})
     assert status == 200
     assert body == {"status": "fresh", "version": 1, "hash_differs": True}
 
@@ -8630,7 +8673,12 @@ def test_fresh_arm_reads_only_the_fresh_hash_predicate(
     _u3b_doctor(monkeypatch, fresh_hash_differs=True, stale_hash_differs=False)
     body = _u3b_read(client, sid, path, _hash("canonical"))
 
-    assert body == {"status": "fresh", "version": 2, "hash_differs": True}
+    # #278: a mismatch the fresh arm reports also carries the out-of-band
+    # notice as context; the payload keys are what this test is about.
+    assert {key: body[key] for key in body if key != "hookSpecificOutput"} == {
+        "status": "fresh", "version": 2, "hash_differs": True,
+    }
+    assert "permissionDecision" not in body["hookSpecificOutput"]
     assert server.counters_snapshot()["fresh_shared_hash_mismatch_total"] == before + 1
 
 
@@ -8940,6 +8988,43 @@ def test_summary_reports_a_write_only_when_the_version_moved() -> None:
     assert hp.summary_reports_a_write(_summary(current_version=1,
                                                prior_version_seen_by_session=1,
                                                hash_differs=True))
+
+
+def test_summary_reports_an_out_of_band_change_only_when_bytes_moved_without_a_version() -> None:
+    """#278: the version this session saw is still current, yet its bytes
+    differ -- so no commit explains them. Asserted on both sides."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    assert hp.summary_reports_an_out_of_band_change(
+        _summary(current_version=1, prior_version_seen_by_session=1, hash_differs=True))
+    assert not hp.summary_reports_an_out_of_band_change(
+        _summary(current_version=2, prior_version_seen_by_session=1, hash_differs=True))
+    assert not hp.summary_reports_an_out_of_band_change(
+        _summary(current_version=1, prior_version_seen_by_session=1, hash_differs=False))
+    assert not hp.summary_reports_an_out_of_band_change(
+        _summary(prior_version_seen_by_session=None, hash_differs=True))
+
+
+def test_deny_for_bytes_changed_outside_the_coordinator_names_no_writer() -> None:
+    """#278: the strict deny no longer attributes an out-of-band change to the
+    last committer at the time of its commit -- a write that did not make the
+    change, at a time it was not made. It names what happened and what clears
+    it, from per-artifact fields only, so it stays byte-stable."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    reason = hp.emit_strict_deny(
+        source="test",
+        summary=_summary(current_version=1, prior_version_seen_by_session=1, hash_differs=True),
+    )["permissionDecisionReason"]
+    assert reason == (
+        "Stale read denied: docs/plan.md on disk no longer matches v1, the "
+        "version you last read, and no session committed the change, so it was "
+        "made outside the coordinator. The read stays denied until the change "
+        "is committed through the coordinator or docs/plan.md is restored to "
+        "v1. This denial is structural (v0.2 strict mode); retrying the same "
+        "operation will produce the same denial."
+    )
+    assert "was updated by" not in reason
 
 
 def test_deny_after_a_real_commit_still_names_the_writer_and_the_version() -> None:
@@ -15595,3 +15680,81 @@ def test_a_notice_pop_for_an_abandoned_request_does_not_wait_for_the_registry(
     pop.join(_ABANDONED_BODY_SETTLE_SEC)
     assert returned_while_held, "the abandoned pop waited on the registry lock"
     assert popped == [[]]
+
+
+# ----------------------------------------------------------------------
+# #278 -- a reader whose file changed outside the coordinator is told so
+#
+# A change that reaches the disk without a commit -- a script, an editor, a
+# shell write the giver check does not recognise -- leaves the recorded
+# version and hash where they were. A reader holding a valid grant then reads
+# bytes the coordinator never recorded. Its answer used to carry only a
+# top-level hash_differs flag the model never sees (warn mode), or a deny that
+# named the last committer at the time of its commit (strict mode).
+# ----------------------------------------------------------------------
+
+
+def test_a_successor_reading_a_file_changed_outside_the_coordinator_is_told_after_its_provenance(
+    coordinator, client: _Client,
+) -> None:
+    """#278: the giver of a live handoff changes plan.md out of band. The
+    successor's next read carries its handoff provenance and then the
+    out-of-band notice, in one context-only envelope -- no permission
+    decision. Fails if the notice is missing, comes first, or widens the
+    answer to an allow."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    before, after = _hash("v1"), _hash("v1 and a line the giver appended")
+    seeded = client.post("/hooks/pre-read",
+                         {"session_id": str(uuid.uuid4()), "path": "plan.md", "content_hash": before})
+    assert seeded[0] == 200, seeded
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+
+    def read(content_hash: str) -> tuple[int, dict]:
+        return client.post(
+            "/hooks/pre-read",
+            {"session_id": successor.sid, "path": "plan.md", "content_hash": content_hash},
+            principal=successor.principal,
+        )
+
+    read(before)
+    status, clean = read(before)
+    assert status == 200 and clean["status"] == "fresh" and "hash_differs" not in clean, clean
+    provenance = clean["hookSpecificOutput"]["additionalContext"]
+
+    status, body = read(after)
+    assert status == 200 and body["status"] == "fresh" and body["hash_differs"] is True, body
+    assert body["hookSpecificOutput"] == {
+        "hookEventName": "PreToolUse",
+        "additionalContext": provenance + "\n\n"
+        + hp.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(path="plan.md", version=1),
+    }
+
+
+def test_a_strict_reader_whose_file_changed_outside_the_coordinator_is_denied_naming_no_writer(
+    strict_plan_coordinator, strict_plan_client: _Client,
+) -> None:
+    """#278: in strict mode the same read is denied, and the deny says the
+    file changed outside the coordinator rather than naming the last
+    committer -- here no session has committed at all, so the old text named
+    'agent <unknown>' at the file's registration time. The retry is
+    byte-identical. Fails if the out-of-band arm falls back to the write
+    template."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    client = strict_plan_client
+    reader = str(uuid.uuid4())
+    before, after = _hash("v1"), _hash("changed outside the coordinator")
+    first = client.post("/hooks/pre-read", {"session_id": reader, "path": "plan.md", "content_hash": before})
+    assert first[0] == 200 and first[1]["status"] == "fresh", first
+
+    status, body = client.post(
+        "/hooks/pre-read", {"session_id": reader, "path": "plan.md", "content_hash": after})
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+    assert body["hookSpecificOutput"]["permissionDecisionReason"] == (
+        hp.OUT_OF_BAND_DENY_REASON_TEMPLATE.format(path="plan.md", current_version=1))
+    retry = client.post(
+        "/hooks/pre-read", {"session_id": reader, "path": "plan.md", "content_hash": after})
+    assert retry[1]["hookSpecificOutput"] == body["hookSpecificOutput"]

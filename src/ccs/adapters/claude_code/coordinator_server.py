@@ -2392,6 +2392,10 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     caller = caller_principal_identity(session_id)
     now = monotonic_seconds()
+    # #278: set by work() on an admitted read whose bytes changed outside the
+    # coordinator -- the version they no longer match -- and read by the
+    # wrapper, which attaches the notice once the notice drain has run.
+    out_of_band_change: dict[str, int] = {}
 
     def work() -> dict:
         coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
@@ -2562,6 +2566,18 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                         effects=effects,
                     )
                 fresh["hash_differs"] = True
+                # #278: unless the caller's own commit explains it, the
+                # mismatch is a change made outside the coordinator, and the
+                # flag above is a key the model never sees. The notice is
+                # attached after the notice drain, which only fires on a body
+                # with no envelope yet.
+                if not (
+                    decision.commit_lag_suppressed
+                    or _is_recent_self_commit_lag(
+                        coordinator, artifact_id, agent_id, now_unix=_now
+                    )
+                ):
+                    out_of_band_change["version"] = decision.version
             # The read is allowed. A SHARED grant that a denied Bash / Grep
             # command re-armed certifies no read, so this one is the read to
             # record. A verify_only fence read discards its bytes and must not.
@@ -2745,6 +2761,15 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # corpus's), and on an admit the handoff prose in the context-only
         # envelope, after the notices.
         result = _attach_hook_handoff(coordinator, result, path=path, caller=caller)
+        # #278: an admitted read whose bytes changed outside the coordinator
+        # says so, after the notices and the handoff prose, as context only.
+        if "version" in out_of_band_change and not verify_only:
+            result = _attach_pretooluse_context(
+                result,
+                _payloads.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(
+                    path=path, version=out_of_band_change["version"]
+                ),
+            )
         # SB-10 U4 (KTD6): the deferred re-grounding seam sits AFTER the
         # deny decision inside work() — a strict deny returns untouched and
         # keeps the flag pending — and AFTER the notice drain above, so
