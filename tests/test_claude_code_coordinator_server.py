@@ -13358,6 +13358,64 @@ def test_a_giver_lookup_that_times_out_says_so_on_the_admit_the_read_check_answe
     assert "permissionDecision" not in answer[1]["hookSpecificOutput"], answer
 
 
+@pytest.mark.parametrize("read", ["none", "fresh", "stale"])
+def test_a_giver_lookup_that_times_out_puts_its_advisory_ahead_of_a_pending_re_grounding(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, read: str
+) -> None:
+    """#341 x the deferred re-grounding: a session that compacted has its
+    re-grounding pending when its giver lookup times out. A fresh admit --
+    the zero-read fast path, or the read check's fresh answer -- carries the
+    could-not-verify advisory first and the re-grounding after it, and
+    consumes the delivery once. The warn-mode stale warning, whose ``allow``
+    the timed-out lookup drops, is no admit the re-grounding rides: the
+    delivery stays pending, and the session's next admit carries it. Fails if
+    the re-grounding attaches before the advisory, if a fresh admit leaves the
+    delivery pending, or if the stale answer consumes it."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    command = _GIVER_SHELL_APPEND if read == "none" else "cat spec.md && echo x >> plan.md"
+    session = _claimed(client)
+    if read != "none":
+        _read(client, session, "spec.md")
+    if read == "stale":
+        peer = _claimed(client)
+        assert _verb(client, "/hooks/pre-edit", peer, "spec.md")[1].get("ok") is True
+    armed_text = _arm_reground(client, session.sid)
+    held_caller = mod.caller_principal_identity(session.sid)
+    delayed = _DelayedCall(
+        monkeypatch, mod, "_first_write_handed_off_by",
+        lambda _coordinator, _written, caller: caller == held_caller,
+    )
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", 1.0)
+    try:
+        timeouts_before = coordinator._watchdog_timeouts_total
+        status, body = client.post("/hooks/pre-bash", {"session_id": session.sid, "command": command})
+    finally:
+        delayed.release()
+
+    assert delayed.entered.is_set(), "the giver lookup never ran"
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+    assert status == 200 and body.get("degraded") is True, body
+    hso = body["hookSpecificOutput"]
+    assert "permissionDecision" not in hso, body
+    if read != "stale":
+        assert body["status"] == "fresh", body
+        assert hso["additionalContext"] == mod.DEGRADED_FRESHNESS_ADVISORY + "\n\n" + armed_text
+        assert coordinator.has_compact_pending(session.sid) is False
+        return
+    assert body["status"] == "stale", body
+    assert hp.SESSION_START_HEADER not in hso["additionalContext"], body
+    assert hso["additionalContext"].endswith(mod.DEGRADED_FRESHNESS_ADVISORY), body
+    assert coordinator.has_compact_pending(session.sid) is True
+    status, next_admit = client.post(
+        "/hooks/pre-read",
+        {"session_id": session.sid, "path": "CLAUDE.md", "content_hash": _hash("rg1")})
+    assert status == 200
+    assert hp.SESSION_START_HEADER in (_reground_text_of(next_admit) or ""), next_admit
+    assert coordinator.has_compact_pending(session.sid) is False
+
+
 def test_a_bash_write_detection_that_raises_leaves_the_answer_as_before(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -15260,3 +15318,33 @@ def test_a_late_pre_read_whose_notice_drain_ran_in_time_is_not_reported_as_an_or
     assert coordinator._watchdog_late_completion_total == completions_before + 1
     assert _late_completion_criticals(caplog) == 0
     assert _late_completion_warnings(caplog) == 1
+
+
+def test_a_notice_pop_for_an_abandoned_request_does_not_wait_for_the_registry(
+    coordinator,
+) -> None:
+    """A body whose request the watchdog already answered pops nothing, and
+    says so before it queues for the registry lock: nothing clears an abort,
+    so the wait could only end in the same refusal, and meanwhile it holds a
+    watchdog worker a live request needs. With a peer holding the registry,
+    the pop returns no notices at once. Fails if the abort is checked only once
+    the lock is won: the pop then waits as long as the peer holds it."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+    from ccs.coordinator.registry_protocol import WatchdogAbort
+
+    abort = WatchdogAbort()
+    abort.set()
+    popped: list[list] = []
+    with _HeldRegistryLock(coordinator) as held:
+        pop = threading.Thread(
+            target=lambda: popped.append(mod._pop_notices_for_answer(coordinator, abort, uuid.uuid4())),
+            daemon=True,
+        )
+        pop.start()
+        pop.join(1.0)
+        returned_while_held = not pop.is_alive()
+        held.release()
+    pop.join(5.0)
+    assert returned_while_held, "the abandoned pop waited on the registry lock"
+    assert popped == [[]]
+    assert abort.guard_won is False
