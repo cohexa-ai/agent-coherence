@@ -64,6 +64,16 @@ Alpha — APIs may change before `v1.0`.
   package README carries the old marker. Install commands are unchanged: the
   PyPI package is still `agent-coherence`.
 
+- **The protocol corpus runs its #261 strict-path rows on the Claude Code
+  plugin's Node coordinator too.** One row refuses an untrack of a strict path;
+  the other keeps a strict path strict under a broader ignore pattern (`**`).
+  Both ran on the Python coordinator only, as did three older strict rows that
+  now run on both. Plugin releases after 0.6.0 carry the fix for
+  cohexa-ai/agent-coherence-plugin#177, which lifts the 0.15.0 known
+  limitation that the Node coordinator let an untrack or an ignore pattern
+  take a path out of strict mode; the guide's section on the policy routes now
+  says the Node coordinator refuses too. The package is unchanged.
+
 ### Fixed
 
 - **A file changed outside the coordinator no longer goes unnoticed while a

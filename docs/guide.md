@@ -4340,7 +4340,8 @@ way until then; branch on `reason`, not on the text. To untrack the path,
 remove its entry from `.coherence/strict_mode.yaml` and restart the
 coordinator. `agent-coherence-untrack` exits `3` on it, and so does the Claude
 Code plugin's own `agent-coherence-untrack` from plugin 0.6.0. The plugin's
-Node coordinator has no such refusal.
+Node coordinator refuses the same way in plugin releases after 0.6.0; up to
+0.6.0 it has no such refusal.
 
 **Policy files.** `track` and `untrack` add each path to
 `.coherence/tracked.yaml` or `.coherence/ignored.yaml` as a double-quoted YAML
