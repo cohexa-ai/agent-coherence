@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import builtins
 import contextlib
-import errno
 import gc
 import http.server
 import io
@@ -67,6 +66,7 @@ from ccs.core.exceptions import (
     StaleView,
     ViewWedged,
 )
+from tests.loopback_helpers import refused_endpoint, refusing_port
 
 
 @pytest.fixture
@@ -373,26 +373,6 @@ def _raise_once(real: Callable[..., object], error: BaseException) -> Callable[.
         return real(*args, **kwargs)
 
     return flaky
-
-
-def _refusing_port() -> int:
-    """A loopback port that refuses connections and that no other test can take.
-
-    Port 4, not a freed ephemeral port: another test worker's port-0 bind can
-    take a freed port before the connect, and the client would then talk to a
-    stranger. Ports below 1024 are never handed out for port 0, and port 4 is
-    unassigned, so no standard service listens on it; the assert says so if
-    something does."""
-    with socket.socket() as probe:
-        probe.settimeout(2)
-        assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
-    return 4
-
-
-def _refused(endpoint: CoordinatorEndpoint) -> CoordinatorEndpoint:
-    """``endpoint`` moved to a port that refuses connections, so the real client
-    fails exactly as it does against a coordinator that is gone."""
-    return replace(endpoint, port=_refusing_port())
 
 
 def _fail_first_resolve(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -851,12 +831,13 @@ def test_an_endpoint_that_cannot_be_resolved_at_attach_is_unreachable(
     its pid file with it before the endpoint was read. The real
     ``resolve_endpoint`` raises ``CoordinatorUnavailable``; the strict attach
     raises ``CoordinatorUnreachable`` with its message, chained to it."""
-    monkeypatch.setattr(coherent_volume_module, "connect_or_spawn", lambda *_a, **_k: _refusing_port())
+    monkeypatch.setattr(coherent_volume_module, "connect_or_spawn", lambda *_a, **_k: refusing_port())
 
     with pytest.raises(CoordinatorUnreachable, match="no coordinator running for this workspace") as raised:
         CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
 
     assert isinstance(raised.value.__cause__, CoordinatorUnavailable), repr(raised.value.__cause__)
+
 
 def _fail_strict_construction(root: Path, cfg: LifecycleConfig) -> list[CoherentVolume]:
     """Construct a strict volume over a coordinator it did not spawn, so ``_attach``
@@ -1271,7 +1252,7 @@ def test_a_coordinator_that_does_not_publish_its_glob_sets_cannot_confirm_enforc
         if sets in ("refused", "refused-node"):
             raise urllib.error.HTTPError(path, 501, "Not Implemented", {}, None)  # type: ignore[arg-type]
         if sets == "transport":
-            return real_get(_refused(endpoint), path, **kwargs)
+            return real_get(refused_endpoint(endpoint), path, **kwargs)
         doc = real_get(endpoint, path, **kwargs)
         summary = dict(doc["policy_summary"])
         for key in ("tracked_patterns", "strict_mode_patterns", "ignored_patterns"):
@@ -3684,7 +3665,7 @@ def test_write_cas_at_commits_over_a_grant_its_own_write_left_standing(
                 raise CoordinatorUnavailable("simulated: the acquire's answer was lost")
             if lost == "post-edit" and path == "/hooks/post-edit":
                 # The commit, and the success:false release after it.
-                return real_post(_refused(endpoint), path, payload, **kwargs)
+                return real_post(refused_endpoint(endpoint), path, payload, **kwargs)
             return real_post(endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", strand_the_grant)
@@ -4199,7 +4180,7 @@ def test_failed_release_is_kept_and_retried_at_the_next_re_mint(
         ) -> object:
             if path == "/hooks/session-stop" and failures["left"]:
                 failures["left"] -= 1
-                return real_post(_refused(endpoint), path, payload, **kwargs)
+                return real_post(refused_endpoint(endpoint), path, payload, **kwargs)
             return real_post(endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", release_fails_once)
@@ -4616,7 +4597,7 @@ def test_a_claim_with_no_answer_at_attach_is_unreachable_and_an_answered_one_kee
 
     def claim_elsewhere(endpoint: CoordinatorEndpoint, session_id: str, nonce: str) -> object:
         answering = replace(endpoint, port=httpd.server_address[1])
-        return real_claim(_refused(endpoint) if claim == "refused" else answering, session_id, nonce)
+        return real_claim(refused_endpoint(endpoint) if claim == "refused" else answering, session_id, nonce)
 
     monkeypatch.setattr(coherent_volume_module, "claim_caller_principal", claim_elsewhere)
     try:
@@ -5547,7 +5528,7 @@ def test_a_principal_refusal_whose_re_claim_gets_no_answer_is_unreachable_in_str
         with monkeypatch.context() as unreachable:
             unreachable.setattr(
                 coherent_volume_module, "claim_caller_principal",
-                lambda endpoint, sid, n: real_claim(_refused(endpoint), sid, n),
+                lambda endpoint, sid, n: real_claim(refused_endpoint(endpoint), sid, n),
             )
             vol._principal = "X" * 43  # no longer the bound one, as after a store reset
             with pytest.raises(CoherenceError) as raised:
@@ -5996,7 +5977,7 @@ def _answer_the_second_pre_read(
         if path == "/hooks/pre-read" and len(answers) == 1:
             answers.append(answer)
             if answer is None:
-                return real_post(_refused(endpoint), path, payload, **kwargs)
+                return real_post(refused_endpoint(endpoint), path, payload, **kwargs)
             return answer
         got = real_post(endpoint, path, payload, **kwargs)
         if path == "/hooks/pre-read":
@@ -6990,7 +6971,7 @@ def test_a_read_and_a_cas_after_the_coordinator_stops_answering_are_unreachable(
         assert not vol._grant_incarnations, "control: no grant, so no release precedes the read"
         sent: list[tuple[str, str | None]] = []
         _record_principals(monkeypatch, sent)
-        vol._endpoint = _refused(vol._endpoint)
+        vol._endpoint = refused_endpoint(vol._endpoint)
 
         with pytest.raises(CoordinatorUnreachable, match="/hooks/pre-read") as read_raised:
             vol.read(rel)
@@ -7083,7 +7064,7 @@ def test_the_status_helpers_answer_unknown_against_a_coordinator_that_refuses(
     vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
     try:
         assert vol.coordinator_status() is not None, "control: it answers while reachable"
-        vol._endpoint = _refused(vol._endpoint)
+        vol._endpoint = refused_endpoint(vol._endpoint)
 
         assert vol.coordinator_status() is None
         assert vol.strict_mode_active() is False
@@ -7104,7 +7085,7 @@ def test_a_degrade_volume_whose_coordinator_refuses_warns_once_and_counts_each_f
     _seed(tmp_path, content=b"v1")
     vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
     try:
-        vol._endpoint = _refused(vol._endpoint)
+        vol._endpoint = refused_endpoint(vol._endpoint)
         with warnings.catch_warnings(record=True) as warned:
             warnings.simplefilter("always")
             assert vol.read(rel) == b"v1"
@@ -7213,11 +7194,7 @@ def test_a_write_whose_commit_gets_no_answer_releases_its_grant_and_never_return
     disk, and ONE best-effort ``success:false`` release names the incarnation
     holding the grant, bounded by its own short timeout rather than the
     client's default. The release is answered here, so the grant is gone at
-    the coordinator and from the volume's record.
-
-    Before, a strict write() raised ``CoordinatorUnreachable`` for both, with
-    nothing about the bytes it left, and released nothing: the grant stood
-    until a later re-mint, blocking every peer's write of the path."""
+    the coordinator and from the volume's record."""
     from ccs.cli._coherence_client import CLI_HTTP_TIMEOUT_SEC
     from ccs.core.exceptions import CommitUnconfirmed
 
@@ -7229,7 +7206,7 @@ def test_a_write_whose_commit_gets_no_answer_releases_its_grant_and_never_return
         vol.read(rel)
         holder = vol._incarnation
         calls: list[tuple[str, dict, dict]] = []
-        moved = _refused if commit == "refused" else (lambda e: replace(e, port=silent.port))
+        moved = refused_endpoint if commit == "refused" else (lambda e: replace(e, port=silent.port))
         _route_one_commit(monkeypatch, _is_write_commit, moved, calls)
 
         with pytest.raises(CoherenceError) as raised:
@@ -7278,7 +7255,7 @@ def test_a_write_keeps_its_grant_on_record_until_a_release_is_answered(
         holder_row = str(session_to_agent_id(vol.session_id, holder))
         calls: list[tuple[str, dict, dict]] = []
         moved = _is_write_commit if release == "answered" else (lambda path, _b: path == "/hooks/post-edit")
-        _route_one_commit(monkeypatch, moved, _refused, calls)
+        _route_one_commit(monkeypatch, moved, refused_endpoint, calls)
 
         with pytest.raises(CoordinatorUnreachable):
             vol.write(rel, b"v2")
@@ -7311,9 +7288,7 @@ def test_a_write_whose_commit_is_refused_for_its_principal_and_whose_re_claim_ge
     settle the principal, so the write takes the never-sent arm of a commit
     with no answer: one release attempt, then ``CoordinatorUnreachable``
     saying the bytes are on disk and the coordinator did not record the
-    write. Before, ``CoordinatorUnreachable`` escaped straight from the
-    request, saying nothing of the bytes, and nothing was released. No
-    principal or nonce reaches the error."""
+    write. No principal or nonce reaches the error."""
     rel = "data/shared.txt"
     target = _seed(tmp_path, content=b"v1")
     caplog.set_level(logging.DEBUG)
@@ -7337,7 +7312,7 @@ def test_a_write_whose_commit_is_refused_for_its_principal_and_whose_re_claim_ge
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", lose_principal_after_the_grant)
         monkeypatch.setattr(
             coherent_volume_module, "claim_caller_principal",
-            lambda endpoint, sid, n: real_claim(_refused(endpoint), sid, n),
+            lambda endpoint, sid, n: real_claim(refused_endpoint(endpoint), sid, n),
         )
         with pytest.raises(CoherenceError) as raised:
             vol.write(rel, b"v2")
@@ -7358,8 +7333,7 @@ def test_a_write_whose_commit_is_refused_for_its_principal_and_whose_re_claim_ge
 #: The commit legs that never write to disk before a confirmed win, each run
 #: once with an expected version read just before.
 _CAS_COMMIT_SURFACES = {
-    "write_cas": lambda vol, rel, version: vol.write_cas(rel, lambda cur: cur + b"+mine"),
-    "write_cas_at": lambda vol, rel, version: vol.write_cas_at(rel, version, b"mine"),
+    **_CAS_ONCE,
     "atomic_publish": lambda vol, rel, version: vol.atomic_publish([(rel, version, b"mine")]),
 }
 
@@ -7388,7 +7362,7 @@ def test_a_cas_with_no_answer_is_unreachable_when_never_sent_and_unconfirmed_whe
     try:
         _data, version = vol.read_with_version(rel)
         calls: list[tuple[str, dict, dict]] = []
-        moved = _refused if commit == "refused" else (lambda e: replace(e, port=silent.port))
+        moved = refused_endpoint if commit == "refused" else (lambda e: replace(e, port=silent.port))
         _route_one_commit(monkeypatch, lambda path, _b: path == "/hooks/post-edit-cas", moved, calls)
 
         with pytest.raises(CoherenceError) as raised:

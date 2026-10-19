@@ -8,10 +8,7 @@ write-set lands or none does, and a torn intermediate is never on disk.
 """
 from __future__ import annotations
 
-import errno
-import socket
 import warnings
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -34,6 +31,7 @@ from ccs.core.exceptions import (
     StaleView,
     ViewWedged,
 )
+from tests.loopback_helpers import refused_endpoint
 
 
 @pytest.fixture
@@ -549,16 +547,6 @@ def test_an_unconfirmed_commit_all_answer_is_commit_unconfirmed_in_both_modes(
 # respawns (attach-leg respawn is unchanged); the Node coordinator is untouched.
 
 
-def _refusing_port() -> int:
-    """A loopback port that refuses connections and that no other test can take
-    (port 4: ports below 1024 are never handed out for port 0, so no other
-    worker's bind can take it before the connect)."""
-    with socket.socket() as probe:
-        probe.settimeout(2)
-        assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
-    return 4
-
-
 def _fail_route(monkeypatch: pytest.MonkeyPatch, route: str, how: str, sent: list[str]) -> None:
     """Fail every request to ``route`` the way the real client fails it:
     ``refused`` sends it to a port that refuses (never sent); ``lost``
@@ -571,7 +559,7 @@ def _fail_route(monkeypatch: pytest.MonkeyPatch, route: str, how: str, sent: lis
         if path != route:
             return real_post(endpoint, path, payload, **kwargs)
         if how == "refused":
-            return real_post(replace(endpoint, port=_refusing_port()), path, payload, **kwargs)
+            return real_post(refused_endpoint(endpoint), path, payload, **kwargs)
         real_post(endpoint, path, payload, **kwargs)
         try:
             raise TimeoutError("timed out")
@@ -602,8 +590,7 @@ def test_a_publish_whose_request_gets_no_answer_raises_by_delivery_and_writes_no
     answer lost, it may have: ``CommitUnconfirmed``, saying the outcome is
     unknown and to re-read. A session that never opened committed nothing:
     ``CoordinatorUnreachable``, and no commit is sent. No member is written
-    in any case. Before, the commit raised ``CoordinatorUnreachable`` either
-    way."""
+    in any case."""
     _seed(tmp_path, "data/a.txt", b"a-v1")
     _seed(tmp_path, "data/b.txt", b"b-v1")
     vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)

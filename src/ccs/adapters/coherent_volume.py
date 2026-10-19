@@ -1753,18 +1753,7 @@ class CoherentVolume:
             # must not mask it. It names the incarnation that holds the grant: a
             # release without one addresses the session's parent row, which holds
             # nothing, and releases nothing.
-            with contextlib.suppress(Exception):
-                _coordinator_post(
-                    self._endpoint,
-                    "/hooks/post-edit",
-                    {
-                        "session_id": self._session_id,
-                        "agent_id": self._incarnation,
-                        "path": rel,
-                        "success": False,
-                    },
-                    extra_headers=caller_principal_headers(self._principal),
-                )
+            self._send_grant_release(rel)
             raise
 
         redirect_status: int | None = None
@@ -1823,6 +1812,26 @@ class CoherentVolume:
             self._check_grant(post_resp, rel, phase="post-edit")
         self._last_committed_hash[rel] = new_hash
 
+    def _send_grant_release(self, rel: str, **post_kwargs: object) -> object:
+        """One raw ``success: false`` post-edit releasing ``rel``'s grant, naming
+        the incarnation that holds it; the answer, or ``None`` when the post
+        raised. Best-effort: it never raises, so it cannot mask the error its
+        caller raises next. ``post_kwargs`` reach the client only when given."""
+        with contextlib.suppress(Exception):
+            return _coordinator_post(
+                self._endpoint,
+                "/hooks/post-edit",
+                {
+                    "session_id": self._session_id,
+                    "agent_id": self._incarnation,
+                    "path": rel,
+                    "success": False,
+                },
+                extra_headers=caller_principal_headers(self._principal),
+                **post_kwargs,
+            )
+        return None
+
     def _release_unconfirmed_grant(self, rel: str) -> None:
         """write()'s one best-effort release of its grant on ``rel`` after its
         commit got no answer (R9): ``success: false`` naming the incarnation
@@ -1838,15 +1847,7 @@ class CoherentVolume:
         :meth:`_release_abandoned_grants`); otherwise the next re-mint
         releases it."""
         incarnation = self._incarnation
-        answer: object = None
-        with contextlib.suppress(Exception):
-            answer = _coordinator_post(
-                self._endpoint,
-                "/hooks/post-edit",
-                {"session_id": self._session_id, "agent_id": incarnation, "path": rel, "success": False},
-                extra_headers=caller_principal_headers(self._principal),
-                timeout=_GRANT_RELEASE_TIMEOUT_SEC,
-            )
+        answer = self._send_grant_release(rel, timeout=_GRANT_RELEASE_TIMEOUT_SEC)
         if not (isinstance(answer, dict) and answer.get("ok") is True and not answer.get("degraded")):
             return
         # Only this path: the incarnation may still hold grants that earlier
@@ -2219,16 +2220,6 @@ class CoherentVolume:
             # writes between pre-edit (EXCLUSIVE held) and post-edit.
             cas_attempts += 1
             resp = self._post_cas(rel, new_hash, expected_version)
-            if resp is None:
-                # Degrade mode swallowed a mid-operation transport/infra failure
-                # in _post and returned None — the CAS was NOT confirmed. An OCC
-                # writer holds NO grant (S/I), so unconfirmed bytes must NEVER
-                # touch disk: writing them would re-open the very lost-update this
-                # guards. Fail closed in BOTH on_error modes — identical to how
-                # the {ok:false, degraded:true, commit_unconfirmed} degrade BODY
-                # is handled below ("raise"). Strict reaches no None here: a
-                # commit with no answer raised in _post_cas, by delivery.
-                raise CommitUnconfirmed(_unanswered_cas_message(rel))
 
             outcome = self._classify_cas_response(resp)
             if outcome == "win":
@@ -2292,14 +2283,15 @@ class CoherentVolume:
                 raise StaleView(self._deny_reason(resp))
             raise CoherenceError(self._deny_reason(resp))
 
-    def _post_cas(self, rel: str, new_hash: str, expected_version: int) -> dict | None:
-        """Send one OCC commit of ``rel``. A strict commit that got no usable
-        answer raises by what the client knows of its delivery: never sent
-        is :class:`~ccs.core.exceptions.CoordinatorUnreachable` (it did not
-        land), anything else :class:`~ccs.core.exceptions.CommitUnconfirmed`
-        (it may have). The caller writes nothing to disk on either."""
+    def _post_cas(self, rel: str, new_hash: str, expected_version: int) -> dict:
+        """Send one OCC commit of ``rel`` and return its answer. A commit that
+        got no answer raises in BOTH ``on_error`` modes, because an OCC writer
+        holds no grant (S/I): unconfirmed bytes must NEVER touch disk, or the
+        very lost update this guards reopens. Strict raises by what the client
+        knows of the request's delivery; degrade already warned, so whether it
+        landed is unknown."""
         try:
-            return self._post(
+            resp = self._post(
                 "/hooks/post-edit-cas",
                 {
                     "session_id": self._session_id,
@@ -2315,6 +2307,9 @@ class CoherentVolume:
                     _cas_not_recorded_message(rel, no_answer.detail)
                 ) from no_answer.__cause__
             raise CommitUnconfirmed(_unanswered_cas_message(rel)) from no_answer.__cause__
+        if resp is None:
+            raise CommitUnconfirmed(_unanswered_cas_message(rel))
+        return resp
 
     def write_cas_at(
         self,
@@ -2389,9 +2384,6 @@ class CoherentVolume:
             raise CasVersionConflict(rel, expected_version, current_version)
         new_hash = self._sha256_bytes(new_content)
         resp = self._post_cas(rel, new_hash, expected_version)
-        if resp is None:
-            # Degrade mode only (it already warned); never a write to disk.
-            raise CommitUnconfirmed(_unanswered_cas_message(rel))
         outcome = self._classify_cas_response(resp)
         if outcome == "win":
             self._atomic_write(abs_path, new_content)  # confirmed → persist
@@ -2634,8 +2626,6 @@ class CoherentVolume:
                 },
             )
         except _CommitNotAnswered as no_answer:
-            # Strict, no answer: a batch that was never sent did not land; one
-            # that may have reached the coordinator may have.
             if no_answer.never_sent:
                 raise CoordinatorUnreachable(
                     _publish_not_recorded_message(no_answer.detail)

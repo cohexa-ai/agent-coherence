@@ -17,9 +17,6 @@ its own session with a bound caller principal.
 
 from __future__ import annotations
 
-import errno
-import socket
-from dataclasses import replace
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -44,6 +41,7 @@ from ccs.mcp.server import (
 )
 from ccs.mcp.session import SessionConfig
 from ccs.mcp.status import build_status, handoff_from_status
+from tests.loopback_helpers import refused_endpoint
 
 PLAN = "data/plan.md"
 OTHER = "data/other.md"
@@ -889,16 +887,6 @@ def test_a_status_lookup_tells_no_record_from_cannot_tell() -> None:
 _NEVER_SENT = object()
 
 
-def _refusing_port() -> int:
-    """A loopback port that refuses connections and that no other test can take
-    (port 4: ports below 1024 are never handed out for port 0, so no other
-    worker's bind can take it before the connect)."""
-    with socket.socket() as probe:
-        probe.settimeout(2)
-        assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
-    return 4
-
-
 def _answer_lost_after_forwarding(route: str, answer: object) -> object:
     """``_coordinator_post`` that forwards ``route`` and then loses its answer
     (``answer`` None) or hands back ``answer`` in its place; for
@@ -910,7 +898,7 @@ def _answer_lost_after_forwarding(route: str, answer: object) -> object:
         if path != route:
             return real_post(endpoint, path, payload, **kwargs)
         if answer is _NEVER_SENT:
-            return real_post(replace(endpoint, port=_refusing_port()), path, payload, **kwargs)
+            return real_post(refused_endpoint(endpoint), path, payload, **kwargs)
         real_post(endpoint, path, payload, **kwargs)
         if answer is None:
             raise CoordinatorUnavailable("simulated: the answer was lost")

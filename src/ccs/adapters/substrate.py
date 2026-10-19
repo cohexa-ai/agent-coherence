@@ -743,7 +743,7 @@ class SubstrateCoordinatorSession:
             # refusal either until a coordinator answers again. After the
             # substrate write landed the refusal instead goes on to the bump
             # leg's CommitUnconfirmed wrap: reconcile, never retry.
-            if claim.transport_failed and not issubclass(unknown, CommitUnconfirmed):
+            if claim.transport_failed and _no_answer_type(unknown) is CoordinatorUnreachable:
                 raise CoordinatorUnreachable(principal_refusal_message(reason, detail))
         # ``settled`` is False only when the recovery claim's answer was lost:
         # nothing was adopted, and this session's next refused request claims

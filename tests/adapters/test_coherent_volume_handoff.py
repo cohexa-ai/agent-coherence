@@ -20,13 +20,10 @@ other volume sibling-attaches to it, so each volume is its own session.
 
 from __future__ import annotations
 
-import errno
 import io
 import json
-import socket
 import urllib.error
 import warnings
-from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -53,6 +50,7 @@ from ccs.core.exceptions import (
     GiverFenced,
     HandoffPathsInvalid,
 )
+from tests.loopback_helpers import refused_endpoint
 
 _MANAGED = ("data/**",)
 _PLAN = "data/plan.md"
@@ -767,16 +765,6 @@ def _http_error(code: int, body: dict) -> urllib.error.HTTPError:
     )
 
 
-def _refusing_port() -> int:
-    """A loopback port that refuses connections and that no other test can take
-    (port 4: ports below 1024 are never handed out for port 0, so no other
-    worker's bind can take it before the connect)."""
-    with socket.socket() as probe:
-        probe.settimeout(2)
-        assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
-    return 4
-
-
 #: The failures after which the verb cannot have landed.
 _NEVER_FORWARDED = ("http_503_before_forwarding", "refused_before_sending")
 
@@ -794,7 +782,7 @@ def _fail_on(route: str, kind: str) -> object:
         if kind == "http_503_before_forwarding":
             raise _http_error(503, {"error": "handler concurrency exceeded"})
         if kind == "refused_before_sending":
-            return real_post(replace(endpoint, port=_refusing_port()), path, payload, **kwargs)
+            return real_post(refused_endpoint(endpoint), path, payload, **kwargs)
         real_post(endpoint, path, payload, **kwargs)
         if kind == "reset_after_forwarding":
             raise CoordinatorUnavailable("simulated: the answer was lost")

@@ -238,8 +238,7 @@ class CoordinatorUnavailable(Exception):
     leaves it ``False`` — a timeout or reset after the request went out, a
     malformed answer, a raise with no request at all — and a caller deciding
     whether a commit may have landed must treat that as delivered: only
-    positive evidence counts as "not delivered". Keyword-only and defaulted,
-    so every existing construction, message and repr is unchanged.
+    positive evidence counts as "not delivered".
     """
 
     never_sent: bool = False
