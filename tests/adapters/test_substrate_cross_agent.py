@@ -49,6 +49,7 @@ from ccs.core.exceptions import (
     CasVersionConflict,
     CoherenceError,
     CommitUnconfirmed,
+    CoordinatorUnreachable,
     StaleView,
     ViewWedged,
 )
@@ -1014,7 +1015,9 @@ def test_a_redirected_bump_after_the_substrate_write_is_the_bump_legs_unknown(
             assert store.get(REF)[0] == b"v2", "control: the substrate write landed"
             assert len(fake_a.cas_calls) == 1, "a landed write is never re-driven"
         else:
-            assert not isinstance(raised.value, CommitUnconfirmed), "nothing landed to be unknown"
+            # A redirect is an answer from whatever was reached, so the read
+            # leg keeps its plain error: not the unknown, not "unreachable".
+            assert type(raised.value) is CoherenceError, type(raised.value)
             assert store.get(REF)[0] == b"v1" and fake_a.cas_calls == []
         assert f"HTTP {code}" in str(raised.value)
         rendered = "".join(traceback.format_exception(raised.value))
@@ -1270,8 +1273,11 @@ def test_a_claim_that_does_not_bind_fails_closed(
 ) -> None:
     """Fail-closed like every other coordinator failure on this client: a claim
     that did not bind raises at construction instead of running a session
-    whose commits the coordinator would refuse."""
+    whose commits the coordinator would refuse. Both are answers, so neither
+    is "coordinator unreachable": a refusal is typed as one, and an answered
+    "unconfirmed" keeps the plain error."""
     from ccs.cli._coherence_client import PrincipalClaim
+    from ccs.core.exceptions import CallerPrincipalRefused
 
     monkeypatch.setattr(
         substrate_module, "claim_caller_principal",
@@ -1279,8 +1285,10 @@ def test_a_claim_that_does_not_bind_fails_closed(
         raising=False,
     )
     try:
-        with pytest.raises(CoherenceError, match="caller principal"):
+        with pytest.raises(CoherenceError, match="caller principal") as raised:
             _session(tmp_path, fast_cfg)
+        expected = CallerPrincipalRefused if outcome == "refused" else CoherenceError
+        assert type(raised.value) is expected, type(raised.value)
     finally:
         stop_coordinator(tmp_path)
 
@@ -1319,9 +1327,10 @@ def test_a_reacquire_whose_claim_fails_keeps_the_previous_session_and_principal(
             substrate_module, "claim_caller_principal",
             lambda *_a: PrincipalClaim("unconfirmed", detail="simulated"),
         )
-        with pytest.raises(CoherenceError, match="caller principal"):
+        with pytest.raises(CoherenceError, match="caller principal") as raised:
             sa.reacquire()
         monkeypatch.setattr(substrate_module, "claim_caller_principal", real)
+        assert type(raised.value) is CoherenceError, "an answered 'unconfirmed' is not unreachable"
 
         assert (sa.session_id, sa._principal, getattr(sa, "_mint_nonce", None)) == before
         result = a.commit(REF, expected_token=tok, new_bytes=b"v2")
@@ -1918,3 +1927,264 @@ def test_a_bump_answered_with_the_failure_envelope_after_the_write_landed_is_unc
         assert store.get(REF)[0] == b"v2", "control: the substrate write landed"
     finally:
         server.shutdown()
+
+
+# --- no usable answer from the coordinator -------------------------------------
+#
+# The session has no degrade mode: a request that gets no usable answer — no
+# coordinator to spawn or attach, a refused connect, an empty, unparseable or
+# non-object reply — raises the typed ``CoordinatorUnreachable`` on every leg
+# that commits nothing. After the substrate write landed it stays
+# ``CommitUnconfirmed``: the bytes are on the substrate either way, so the
+# recovery is to reconcile, never to retry. An ANSWER that decides nothing (a
+# redirect, an error status, the failure envelope) keeps today's error.
+#
+# What these do not prove: one machine and loopback only; no partition; the
+# coordinator is made unreachable by pointing a request at a port that
+# refuses, not by killing a coordinator process.
+
+
+def _claims_reach_a_refusing_port(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Send every claim from now on to a loopback port that refuses, through
+    the REAL claim, so the claim itself reports that it got no answer.
+    Returns the session id each claim named."""
+    real = substrate_module.claim_caller_principal
+    dead = _refusing_port()
+    named: list[str] = []
+
+    def unreachable(endpoint, session_id, nonce):  # noqa: ANN001, ANN202
+        named.append(session_id)
+        claim = real(dataclasses.replace(endpoint, port=dead), session_id, nonce)
+        assert claim.transport_failed, "control: the claim got no answer at all"
+        return claim
+
+    monkeypatch.setattr(substrate_module, "claim_caller_principal", unreachable)
+    return named
+
+
+@pytest.mark.parametrize("missing", ["coordinator", "endpoint"])
+def test_a_session_that_finds_no_coordinator_at_start_is_unreachable(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    """Covers AE5 for the substrate session. Spawn-or-attach finding no
+    coordinator (``-1``), or an endpoint that cannot be resolved, raises
+    ``CoordinatorUnreachable`` — nothing will answer — where both raised the
+    plain ``CoherenceError``. The strict policy is still written first."""
+    from ccs.adapters.claude_code import lifecycle
+
+    if missing == "coordinator":
+        monkeypatch.setattr(lifecycle, "connect_or_spawn", lambda *_a, **_k: -1)
+    else:
+        def unresolved(_root):  # noqa: ANN001, ANN202
+            raise substrate_module.CoordinatorUnavailable("coordinator port file missing")
+
+        monkeypatch.setattr(substrate_module, "resolve_endpoint", unresolved)
+    try:
+        with pytest.raises(CoordinatorUnreachable) as raised:
+            _session(tmp_path, fast_cfg)
+
+        if missing == "coordinator":
+            assert "could not spawn or attach" in str(raised.value)
+        else:
+            assert "endpoint unresolved" in str(raised.value)
+            assert isinstance(raised.value.__cause__, substrate_module.CoordinatorUnavailable)
+        assert (tmp_path / ".coherence" / "strict_mode.yaml").is_file(), "the policy is written first"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("when", ["start", "reacquire"])
+def test_a_claim_that_gets_no_answer_is_unreachable_and_a_reacquire_keeps_its_identity(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, when: str
+) -> None:
+    """Covers AE5 for the substrate session. The caller-principal claim's
+    connect is refused, at start and at a reacquire: ``CoordinatorUnreachable``,
+    not the plain error an answered "unconfirmed" keeps. The reacquire claims
+    before it swaps anything, so after the raise the session still names its
+    old id, nonce and principal, and its next request lands under them."""
+    try:
+        if when == "start":
+            named = _claims_reach_a_refusing_port(monkeypatch)
+            with pytest.raises(CoordinatorUnreachable) as raised:
+                _session(tmp_path, fast_cfg)
+            assert len(named) == 1, "control: the start made its claim"
+        else:
+            sa = _session(tmp_path, fast_cfg)
+            before = (sa.session_id, sa._mint_nonce, sa._principal)
+            named = _claims_reach_a_refusing_port(monkeypatch)
+            with pytest.raises(CoordinatorUnreachable) as raised:
+                sa.reacquire()
+            assert len(named) == 1 and named[0] != before[0], "control: claimed for a NEW id"
+            assert (sa.session_id, sa._mint_nonce, sa._principal) == before
+            assert sa.pre_read(REF, None).stale_denied is False, "the old identity still works"
+        assert "caller principal not obtained" in str(raised.value)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_read_refused_for_its_principal_whose_re_claim_gets_no_answer_is_unreachable(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Covers AE11 on the read leg. The read is refused for its principal and
+    the recovery's re-claim with the held nonce gets no answer: that is
+    ``CoordinatorUnreachable``, not an unsettled ``CallerPrincipalRefused``
+    whose own recovery (claim again on the next request) cannot succeed with
+    nothing answering. Nothing is adopted from the failed claim."""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, _fake = _agent(store, sa)
+        sa._principal = "X" * 43  # not the bound one: the coordinator refuses it as foreign
+        named = _claims_reach_a_refusing_port(monkeypatch)
+
+        with pytest.raises(CoherenceError) as raised:
+            a.read(REF)
+
+        assert not isinstance(raised.value, CallerPrincipalRefused), raised.value
+        assert type(raised.value) is CoordinatorUnreachable, type(raised.value)
+        assert named == [sa.session_id], "control: the refusal was recovered with one re-claim"
+        assert "caller_principal_foreign" in str(raised.value)
+        assert sa._principal == "X" * 43, "a principal was adopted from a claim that got no answer"
+        assert REF not in a._observed_hash
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_bump_refused_for_its_principal_whose_re_claim_gets_no_answer_stays_the_bump_legs_unknown(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Covers AE11 on the bump leg (R5). The substrate write landed; the bump
+    is refused for its principal and the re-claim gets no answer. The
+    substrate holds the new bytes either way, so this stays the bump leg's
+    existing ``CommitUnconfirmed`` wrap of the refusal (reconcile, never
+    retry), with the typed refusal as its cause — not ``CoordinatorUnreachable``,
+    whose recovery is to rebuild and retry."""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, fake_a = _agent(store, sa)
+        _bytes, tok = a.read(REF)
+        # No principal: the read leg (accept class) is admitted, the bump
+        # (require class) is refused as absent.
+        sa._principal = None
+        named = _claims_reach_a_refusing_port(monkeypatch)
+
+        with pytest.raises(CoherenceError) as raised:
+            a.commit(REF, expected_token=tok, new_bytes=b"v2")
+
+        assert type(raised.value) is CommitUnconfirmed, type(raised.value)
+        assert str(raised.value) == _PRINCIPAL_REFUSED_AFTER.format(
+            landed=_LANDED.format(ref=REF), reason="caller_principal_absent"
+        )
+        assert isinstance(raised.value.__cause__, CallerPrincipalRefused)
+        assert named == [sa.session_id], "control: the bump's refusal was recovered with one re-claim"
+        assert store.get(REF)[0] == b"v2", "control: the substrate write landed"
+        assert len(fake_a.cas_calls) == 1, "a landed write is never re-driven"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("op", ["read", "commit"])
+def test_a_read_or_commit_whose_pre_read_is_refused_is_unreachable_and_writes_nothing(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, op: str
+) -> None:
+    """The coordinator is gone: the port the session attached to refuses
+    connections. A read's pre-read, and a commit's step-1 pre-read, raise
+    ``CoordinatorUnreachable`` with today's message and the transport failure
+    as the cause; a commit never reaches the substrate, so the substrate
+    token is unchanged."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, fake = _agent(store, sa)
+        _bytes, tok = a.read(REF)
+        monkeypatch.setattr(sa, "_endpoint", dataclasses.replace(sa._endpoint, port=_refusing_port()))
+
+        with pytest.raises(CoherenceError) as raised:
+            if op == "read":
+                a.read(REF)
+            else:
+                a.commit(REF, expected_token=tok, new_bytes=b"v2")
+
+        assert type(raised.value) is CoordinatorUnreachable, type(raised.value)
+        assert str(raised.value).startswith("coordinator /hooks/pre-read failed (fail-closed): ")
+        assert isinstance(raised.value.__cause__, substrate_module.CoordinatorUnavailable)
+        assert fake.cas_calls == [], "the substrate was written with no coordinator answer"
+        assert store.get(REF) == (b"v1", tok), "the substrate token moved"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+class _NotAnObject(http.server.BaseHTTPRequestHandler):
+    """Answers every POST 200 with ``body``: empty, not JSON, or JSON that is
+    not an object — none of which a coordinator sends, though a stranger on a
+    reused port could."""
+
+    body = b""
+    seen: list[str] = []
+
+    def do_POST(self) -> None:  # noqa: N802 — stdlib name
+        type(self).seen.append(self.path)
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(type(self).body)))
+        self.end_headers()
+        self.wfile.write(type(self).body)
+
+    def log_message(self, *_args: object) -> None:
+        return
+
+
+@pytest.mark.parametrize("body", [b"", b"not json", b"[]"], ids=["empty", "non-json", "non-object"])
+@pytest.mark.parametrize("leg", ["read", "bump"])
+def test_a_2xx_that_is_not_an_object_is_unreachable_on_a_read_and_unconfirmed_on_the_bump(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, leg: str, body: bytes,
+) -> None:
+    """Covers AE6 for the substrate. A 2xx that is empty, not JSON, or not a
+    JSON object is no usable answer. On a read it is ``CoordinatorUnreachable``;
+    on the bump, after the substrate write landed, it stays ``CommitUnconfirmed``
+    and the write is never re-driven."""
+    from ccs.cli._coherence_client import CoordinatorEndpoint
+
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    _NotAnObject.body, _NotAnObject.seen = body, []
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _NotAnObject)
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    real_post = substrate_module._coordinator_post
+    answered = "/hooks/post-edit-cas" if leg == "bump" else "/hooks/pre-read"
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, fake = _agent(store, sa)
+        _bytes, tok = a.read(REF)
+        stranger = CoordinatorEndpoint(port=httpd.server_address[1], bearer=sa._endpoint.bearer)
+
+        def answer_one_leg(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            return real_post(stranger if path == answered else endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(substrate_module, "_coordinator_post", answer_one_leg)
+        with pytest.raises(CoherenceError) as raised:
+            if leg == "read":
+                a.read(REF)
+            else:
+                a.commit(REF, expected_token=tok, new_bytes=b"v2")
+
+        assert _NotAnObject.seen == [answered], "control: that leg got this answer"
+        if leg == "read":
+            assert type(raised.value) is CoordinatorUnreachable, type(raised.value)
+        else:
+            assert type(raised.value) is CommitUnconfirmed, type(raised.value)
+            assert store.get(REF)[0] == b"v2", "control: the substrate write landed"
+            assert len(fake.cas_calls) == 1, "a landed write is never re-driven"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        stop_coordinator(tmp_path)

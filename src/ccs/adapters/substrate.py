@@ -59,6 +59,7 @@ from ccs.core.exceptions import (
     CasVersionConflict,
     CoherenceError,
     CommitUnconfirmed,
+    CoordinatorUnreachable,
     RedirectRefused,
     StaleView,
     TlsVerificationFailed,
@@ -503,6 +504,16 @@ class _Sent(NamedTuple):
     principal_refusal: str | None
 
 
+def _no_answer_type(unknown: type[CoherenceError]) -> type[CoherenceError]:
+    """What a request that got no usable answer raises, on a leg whose answered
+    failures raise ``unknown``. A leg sent after the substrate write landed
+    (``unknown`` is ``CommitUnconfirmed``) keeps it: the bytes are on the
+    substrate whether or not the coordinator was reached, so the recovery is
+    to reconcile, not to retry. Every other leg commits nothing, so no answer
+    there is :class:`~ccs.core.exceptions.CoordinatorUnreachable`."""
+    return unknown if issubclass(unknown, CommitUnconfirmed) else CoordinatorUnreachable
+
+
 class SubstrateCoordinatorSession:
     """A single agent's client to the SHIPPED coordinator, for a substrate binding.
 
@@ -515,7 +526,11 @@ class SubstrateCoordinatorSession:
 
     Every coordinator call is fail-closed: a transport error, a non-2xx, or a
     ``{degraded: true}`` body RAISES (deny AND degrade both map to a raise) — the
-    client never silently degrades open. A request refused for its caller
+    client never silently degrades open. A call that gets no usable answer, at
+    start or after, raises the typed
+    :class:`~ccs.core.exceptions.CoordinatorUnreachable`, except after the
+    substrate write landed, where it stays ``CommitUnconfirmed``; an answer
+    that decides nothing keeps the plain error. A request refused for its caller
     principal is first recovered with the session's own mint nonce (R20); what
     that cannot cure raises the typed
     :class:`~ccs.core.exceptions.CallerPrincipalRefused` on either leg. Two
@@ -550,14 +565,16 @@ class SubstrateCoordinatorSession:
         # Only the SPAWNER writes policy (load-once); a sibling must not clobber it.
         if not pre_existing:
             _write_strict_policy(coherence_dir, self._managed)
+        # No coordinator to spawn or attach, or none to name, is the same fact
+        # to this caller as one that will not answer: nothing will.
         if connect_or_spawn(self._root, config=cfg, bind_host=bind_host) == -1:
-            raise CoherenceError(
+            raise CoordinatorUnreachable(
                 "substrate coordinator unavailable (could not spawn or attach; fail-closed)"
             )
         try:
             self._endpoint: CoordinatorEndpoint = resolve_endpoint(self._root)
         except CoordinatorUnavailable as exc:
-            raise CoherenceError(
+            raise CoordinatorUnreachable(
                 f"substrate coordinator endpoint unresolved (fail-closed): {exc}"
             ) from exc
         session_id, mint_nonce = str(uuid.uuid4()), secrets.token_urlsafe(32)
@@ -597,7 +614,9 @@ class SubstrateCoordinatorSession:
         stores every principal in ``.coherence/state.db``. ``None`` when the
         coordinator issues none (404). A refused or unconfirmed claim RAISES,
         like every other coordinator failure here (fail-closed); nothing is
-        re-minted."""
+        re-minted. A claim that got no answer at all raises
+        :class:`~ccs.core.exceptions.CoordinatorUnreachable`; an answered
+        "unconfirmed" keeps the plain error."""
         claim = claim_caller_principal(self._endpoint, session_id, mint_nonce)
         if claim.outcome == "bound":
             return claim.principal
@@ -609,6 +628,8 @@ class SubstrateCoordinatorSession:
         )
         if claim.outcome == "refused":
             raise CallerPrincipalRefused(CALLER_PRINCIPAL_CLAIMED_REASON, message)
+        if claim.transport_failed:
+            raise CoordinatorUnreachable(message)
         raise CoherenceError(message)
 
     def pre_read(
@@ -624,7 +645,8 @@ class SubstrateCoordinatorSession:
 
         A failure raises ``unknown`` — a plain ``CoherenceError`` for a read,
         ``CommitUnconfirmed`` for a pre-read a commit sends after its
-        substrate write landed.
+        substrate write landed — except that a read that gets no usable
+        answer raises ``CoordinatorUnreachable``.
         """
         payload: dict[str, object] = {"session_id": self._session_id, "path": artifact_ref}
         if content_hash is not None:
@@ -688,9 +710,11 @@ class SubstrateCoordinatorSession:
     def _post(
         self, endpoint_path: str, payload: dict, *, unknown: type[CoherenceError]
     ) -> dict:
-        """POST with fail-closed classification. A transport error / non-2xx /
-        non-dict body raises ``unknown`` (``CoherenceError`` for a read leg,
-        ``CommitUnconfirmed`` for the commit leg) — never a silent degrade-open.
+        """POST with fail-closed classification. A non-2xx answer raises
+        ``unknown`` (``CoherenceError`` for a read leg, ``CommitUnconfirmed``
+        for the commit leg) — never a silent degrade-open — and so does no
+        usable answer after the substrate write landed; on a read leg no
+        usable answer raises ``CoordinatorUnreachable`` (see :meth:`_send`).
 
         A refusal of the caller principal is DEFINITE — the coordinator refused
         before any mutation — so it is never ``unknown``. It is recovered as
@@ -699,15 +723,14 @@ class SubstrateCoordinatorSession:
         exactly ONCE (a 404 on the claim retries once without the header).
         What that cannot cure raises
         :class:`~ccs.core.exceptions.CallerPrincipalRefused` with the wire
-        reason, on either leg."""
+        reason, on either leg — except a re-claim that got no answer at all on
+        a read leg, which raises ``CoordinatorUnreachable``."""
         sent = self._send(endpoint_path, payload, unknown=unknown)
         if sent.principal_refusal is None:
             return sent.body  # type: ignore[return-value]
         reason = sent.principal_refusal
-        recovery = decide_principal_recovery(
-            claim_caller_principal(self._endpoint, self._session_id, self._mint_nonce),
-            self._principal,
-        )
+        claim = claim_caller_principal(self._endpoint, self._session_id, self._mint_nonce)
+        recovery = decide_principal_recovery(claim, self._principal)
         if recovery.action == "retry":
             self._principal = recovery.principal
             sent = self._send(endpoint_path, payload, unknown=unknown)
@@ -716,6 +739,12 @@ class SubstrateCoordinatorSession:
             reason, detail = sent.principal_refusal, PRINCIPAL_REFUSED_AGAIN
         else:
             detail = recovery.detail
+            # Nothing answered the re-claim, so the next one cannot cure the
+            # refusal either until a coordinator answers again. After the
+            # substrate write landed the refusal instead goes on to the bump
+            # leg's CommitUnconfirmed wrap: reconcile, never retry.
+            if claim.transport_failed and not issubclass(unknown, CommitUnconfirmed):
+                raise CoordinatorUnreachable(principal_refusal_message(reason, detail))
         # ``settled`` is False only when the recovery claim's answer was lost:
         # nothing was adopted, and this session's next refused request claims
         # again with the retained nonce by itself — so the refusal is not the
@@ -729,7 +758,13 @@ class SubstrateCoordinatorSession:
     ) -> _Sent:
         """One POST presenting the current principal. A caller-principal refusal
         is returned for :meth:`_post` to recover; anything else that is not a
-        dict body raises ``unknown``.
+        dict body raises ``unknown``, except no usable answer — a transport
+        failure, a malformed reply, a 2xx that is not an object — which raises
+        :func:`_no_answer_type`: ``CoordinatorUnreachable`` on a read leg,
+        still ``unknown`` after the substrate write landed. A status or a
+        redirect is an answer from whatever was reached, so it keeps
+        ``unknown``, as do the degraded body and the failure envelope that
+        this method's callers refuse.
 
         A rejected request raises OUTSIDE the ``except`` block, so the
         ``HTTPError`` is not on the raised error's chain: its text is the
@@ -757,12 +792,12 @@ class SubstrateCoordinatorSession:
         except RedirectRefused as exc:
             status, reason, redirected = exc.status, None, True
         except CoordinatorUnavailable as exc:
-            raise unknown(
+            raise _no_answer_type(unknown)(
                 f"coordinator {endpoint_path} failed (fail-closed): {exc}"
             ) from exc
         else:
             if not isinstance(resp, dict):
-                raise unknown(
+                raise _no_answer_type(unknown)(
                     f"coordinator {endpoint_path} returned a non-dict body (fail-closed)"
                 )
             return _Sent(resp, None)
