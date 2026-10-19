@@ -8,6 +8,25 @@ Alpha — APIs may change before `v1.0`.
 
 ### Added
 
+- **A strict surface that gets no usable answer from its coordinator raises
+  `CoordinatorUnreachable` (#376).** Until now a strict `CoherentVolume` or a
+  `CoordinatedSubstrate` whose coordinator was gone raised a bare
+  `CoherenceError`, and the `stale-write-guard-fs` server reported it as
+  `internal_error`. `CoordinatorUnreachable` is a `CoherenceError` whose
+  `reason` is `coordinator_unavailable`. Both surfaces raise it when the
+  coordinator cannot be started or attached, when the connection is refused or
+  times out, and when a request that commits nothing gets no usable answer,
+  including the caller-principal claim and the strict-glob check at attach. A
+  coordinator that answers with a refusal raises what it raised before. The
+  MCP server maps it to `coordinator_unavailable` with `recover:
+  stop_and_report`, not retryable, because an attached volume never reaches a
+  coordinator started after the old one went away; a server whose volume never
+  attached keeps answering `retry_later`. The client's own
+  `CoordinatorUnavailable` is unchanged, and so is the Claude Code hook client.
+  A cross-process test SIGKILLs a coordinator started with
+  `agent-coherence-coordinator` and checks the refusal on both surfaces. The
+  guide's "When the coordinator does not answer" section has the details.
+
 - **`tools/run_local_tests.py` runs the test suite locally the way CI does,
   from the main checkout or any git worktree.** It uses the main checkout's
   virtual environment, keeps bytecode caches on, and runs the parallel tests
@@ -53,6 +72,26 @@ Alpha — APIs may change before `v1.0`.
   generation pair" section has the details.
 
 ### Changed
+
+- **A strict commit whose request was sent but got no answer raises
+  `CommitUnconfirmed` (#376).** The CAS of `write_cas` and `write_cas_at`, the
+  commit of `atomic_publish`, and the post-edit of a plain `write()` raised a
+  bare `CoherenceError` in strict mode when the coordinator's answer was lost;
+  they now raise `CommitUnconfirmed`, because the commit may have landed, and
+  `CoordinatorUnreachable` when the request never left. `swg_write` and
+  `swg_write_cas` answer `commit_unconfirmed` where they answered
+  `internal_error`. A plain `write()` whose post-edit fails this way says its
+  bytes are on disk, makes one short best-effort request to release its write
+  grant, and never returns normally.
+
+- **`agent-coherence-migrate-rules --apply` refuses when it cannot take its
+  lock (#376).** It used to print "proceeding without it" and rewrite
+  `.claude/settings.local.json` unprotected whenever opening or locking the
+  sidecar lock file failed. An interrupted or would-block attempt is now
+  retried, up to three times; any other error, or running out of attempts,
+  prints the error, the lock path and what to do, and exits 2 without reading
+  or writing the settings. A platform without `fcntl` still proceeds without a
+  lock.
 
 - **The MCP Registry lists the `stale-write-guard-fs` server as
   `io.github.cohexa-ai/stale-write-guard-fs`.** The GitHub organization is now

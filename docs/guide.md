@@ -1271,7 +1271,7 @@ data = vol.reacquire("plans/plan.md")       # recover: clear the stale view + fr
 |---|---|---|
 | `workspace_root` | — | Directory the volume manages; the coordinator's state lives in `<root>/.coherence/` |
 | `managed` | `()` | Glob patterns for the files under coordination; unmanaged paths bypass the volume |
-| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
+| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
 | `config` | `None` | Coordinator settings as a `LifecycleConfig` (`from ccs.adapters.claude_code.lifecycle import LifecycleConfig`); `None` uses the defaults. Only the volume that starts the coordinator applies it |
@@ -1383,6 +1383,50 @@ which says whether the sweep reclaimed the grant or a peer took it. Its
 `captured_generation` and `owner_generation` are that refusal's pair: after a
 reclaim, for example, `0` and `1`. Both are `None` when the refusal carried
 none. The recovery is the same whatever they say.
+
+### When the coordinator does not answer
+
+In strict mode, a volume that gets no usable answer from its coordinator raises
+`CoordinatorUnreachable`, a `CoherenceError` whose `reason` is
+`coordinator_unavailable` (import it from `ccs.core.exceptions`). That covers a
+coordinator that cannot be started or attached, a refused or timed-out
+connection, a reset, a listener that never answers, and an empty or unreadable
+reply, on every request that commits nothing. A coordinator that answers with a
+refusal, such as an HTTP error status, a watchdog `degraded` body or its
+`internal:` failure envelope, raises the error it raised before.
+
+A commit is different, because its request may have reached the coordinator
+before the answer was lost. When the CAS of `write_cas` or `write_cas_at`, the
+commit of `atomic_publish`, or the post-edit of a plain `write()` was sent and
+got no usable answer, the volume raises `CommitUnconfirmed`: the commit may or
+may not have landed, so re-read before retrying. When the request never left,
+because the connection was refused, it raises `CoordinatorUnreachable`.
+`CommitUnconfirmed` does not by itself mean the request was delivered: the
+handoff verbs raise it even when nothing was sent, and so does a
+`CoordinatedSubstrate` after its substrate write landed.
+
+A plain `write()` has already put its bytes on disk when its post-edit fails.
+Its error says so, and says whether the coordinator certainly did not record
+the write or may have. Before raising, the volume sends one short, best-effort
+request to release its write grant, so peers are not held off until the sweep
+takes the file back.
+
+To recover, keep in mind that a volume keeps the endpoint it attached to, so
+it never finds a coordinator started after the old one went away:
+
+- If the coordinator stalled and comes back on the same port, the next call
+  goes through.
+- Otherwise build a new `CoherentVolume`. It attaches to the running
+  coordinator, or starts one.
+- If the release was answered, the volume gave up its own grant as well, so
+  `reacquire()` and re-read before writing that file again.
+
+A coordinator goes away when it is killed or crashes, when the session or
+process hosting it exits, or after `idle_shutdown_sec` (900 s by default) with
+no requests. During a graceful stop it answers `503` for a moment before it
+stops listening, and requests in that moment raise the error an HTTP status
+raised before. `on_error="degrade"` is unchanged: it warns once, counts every
+failure and falls back to plain IO.
 
 ### Atomic multi-file publish: `atomic_publish` (v0.12.0+)
 
@@ -3551,6 +3595,23 @@ is unreachable or does not report them. It forwards the coordinator's
 `registry_schema_version` under the same rule: `null` when the coordinator is
 unreachable or its answer carries no such field.
 
+**A coordinator that stops answering.** When the server's volume gets no
+usable answer from its coordinator, the tool call answers `reason:
+coordinator_unavailable` with `recover: stop_and_report` and
+`retryable: false`, and a `next_step` that tells the agent to stop, not to
+write the managed files by any other route, and to report that the server must
+be restarted. Every later tool call in that server session answers the same
+way: the volume keeps the endpoint it attached to and never reaches a
+coordinator started after the old one went away. Restarting the server
+attaches it again; if it will not start, stop the workspace's coordinator
+process first. The same `reason` with `recover: retry_later` comes only from a
+server whose volume never attached, so branch on `recover`, not on `reason`. A
+commit that was sent and got no answer answers `commit_unconfirmed` with
+`recover: read_then_retry`, where `swg_write` and `swg_write_cas` answered
+`internal_error` before. During a graceful stop the coordinator answers `503`
+for a moment before it stops listening, and calls in that moment still answer
+`internal_error`.
+
 **Multiple sessions, one workspace.** Multiple `stale-write-guard-fs` instances
 pointed at the same `SWG_ROOT` attach to one coordinator, so a stale write is denied
 across sessions; if the coordinator's session exits, peers fail closed. One
@@ -4255,6 +4316,7 @@ All bundled CLIs are installed as console scripts when you
 | `agent-coherence-status` | — | Print the coordinator's tracked paths, sessions, handoffs, sweep reclaims and counters; see [Status, track and untrack commands](#status-track-and-untrack-commands) and [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status) |
 | `agent-coherence-track` | — | Add paths to the coordinator's tracked set; see [Status, track and untrack commands](#status-track-and-untrack-commands) |
 | `agent-coherence-untrack` | — | Add paths to the coordinator's ignored set (a path enforced in strict mode is refused); see [Status, track and untrack commands](#status-track-and-untrack-commands) |
+| `agent-coherence-migrate-rules` | — | Propose `permissions.deny` entries from prose rules in `CLAUDE.md`. `--apply` writes them into `.claude/settings.local.json` under a lock file, and exits 2 without touching the settings when it cannot take that lock |
 | `agent-coherence-workspace` | — | Checkpoint / list / status / restore a workspace of file and forward-only members; see [Workspace versioning & restore](#workspace-versioning--restore-workspaceversioner) |
 | `agent-coherence-transfer`, `agent-coherence-accept`, `agent-coherence-decline`, `agent-coherence-withdraw` | — | Hand a path from one Claude Code session to another, and accept, decline or withdraw the handoff; see [Handoff commands](#handoff-commands) |
 
