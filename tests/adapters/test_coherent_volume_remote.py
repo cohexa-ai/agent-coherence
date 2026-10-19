@@ -9,14 +9,16 @@ from __future__ import annotations
 
 import errno
 import socket
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import ccs.adapters.coherent_volume as coherent_volume_module
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
-from ccs.cli._coherence_client import resolve_endpoint, resolve_remote_endpoint
-from ccs.core.exceptions import CoherenceError
+from ccs.cli._coherence_client import CoordinatorEndpoint, resolve_endpoint, resolve_remote_endpoint
+from ccs.core.exceptions import CoordinatorUnreachable
 
 
 @pytest.fixture
@@ -77,13 +79,48 @@ def test_remote_mode_connects_without_spawning(
 def test_remote_unreachable_fails_closed_no_spawn(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """C1 unreachable: a dead remote endpoint fails CLOSED (strict raises) and
-    still does NOT fall through to spawning a local coordinator."""
+    """C1 unreachable: a dead remote endpoint fails CLOSED (strict raises the
+    typed ``CoordinatorUnreachable``, AE5) and still does NOT fall through to
+    spawning a local coordinator.
+
+    Does not prove: anything off loopback, or a partition."""
     monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
     remote = resolve_remote_endpoint("127.0.0.1", _refusing_port(), "deadbeef")
-    with pytest.raises(CoherenceError):
+    with pytest.raises(CoordinatorUnreachable, match="remote coordinator unreachable"):
         CoherentVolume(tmp_path, config=fast_cfg, on_error="strict", remote_endpoint=remote)
     assert not (tmp_path / ".coherence" / "server.pid").exists()
+
+
+def test_remote_claim_with_no_answer_is_unreachable(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AE5, remote attach: the coordinator answers the attach-time ``/status``
+    but the caller-principal claim goes to a port that refuses, so the real
+    client reports it got no answer. The strict attach raises
+    ``CoordinatorUnreachable``, not the plain error an answered claim keeps.
+
+    Does not prove: anything off loopback, or a partition."""
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    root_a = tmp_path / "a"
+    root_a.mkdir()
+    root_b = tmp_path / "b"
+    root_b.mkdir()
+    vol_a = CoherentVolume(root_a, config=fast_cfg)  # spawns the "remote" coordinator
+    real_claim = coherent_volume_module.claim_caller_principal
+
+    def claim_refused(endpoint: CoordinatorEndpoint, session_id: str, nonce: str) -> object:
+        return real_claim(replace(endpoint, port=_refusing_port()), session_id, nonce)
+
+    monkeypatch.setattr(coherent_volume_module, "claim_caller_principal", claim_refused)
+    try:
+        ep_a = resolve_endpoint(root_a)
+        remote = resolve_remote_endpoint("127.0.0.1", ep_a.port, ep_a.bearer)
+        with pytest.raises(CoordinatorUnreachable, match="caller principal not obtained"):
+            CoherentVolume(root_b, config=fast_cfg, on_error="strict", remote_endpoint=remote)
+        assert vol_a.is_attached, "control: the coordinator itself is up"
+        assert not (root_b / ".coherence" / "server.pid").exists()
+    finally:
+        stop_coordinator(root_a)
 
 
 def test_remote_endpoint_requires_flag(

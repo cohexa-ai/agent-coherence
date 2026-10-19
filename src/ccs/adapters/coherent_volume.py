@@ -97,6 +97,7 @@ from ccs.core.exceptions import (
     CoherenceError,
     CommitPreempted,
     CommitUnconfirmed,
+    CoordinatorUnreachable,
     GiverFenced,
     HandoffPathsInvalid,
     InternalConcurrencyError,
@@ -573,7 +574,11 @@ class CoherentVolume:
 
     - ``"strict"`` (default): any coherence failure — a coordinator that is
       unavailable, or one already running that we cannot enable strict on —
-      raises :class:`~ccs.core.exceptions.CoherenceError`. Fail-closed.
+      raises :class:`~ccs.core.exceptions.CoherenceError`. Fail-closed. A
+      request that gets no usable answer from the coordinator raises its
+      subclass :class:`~ccs.core.exceptions.CoordinatorUnreachable`, except
+      one that may have landed (a handoff verb), which raises
+      :class:`~ccs.core.exceptions.CommitUnconfirmed`.
     - ``"degrade"``: the same conditions warn once
       (:class:`~ccs.core.exceptions.CoherenceDegradedWarning`) and the appliance
       operates best-effort (coherence may be off). Mirrors the other adapters.
@@ -1004,9 +1009,9 @@ class CoherentVolume:
         except CoordinatorUnavailable as exc:
             # Transport failure = unreachable -> fail closed (strict raises, so the
             # lines below are unreachable today). They are kept defensively: if a
-            # future non-strict remote mode ever lets _fail_closed_or_degrade return
-            # instead of raise, we must stay DETACHED, never attached to a dead endpoint.
-            self._fail_closed_or_degrade(f"remote coordinator unreachable: {exc}")
+            # future non-strict remote mode ever lets the failure return instead of
+            # raise, we must stay DETACHED, never attached to a dead endpoint.
+            self._unreachable_or_degrade(f"remote coordinator unreachable: {exc}", cause=exc)
             self._endpoint = None
             return
         except urllib.error.HTTPError as exc:
@@ -1048,9 +1053,13 @@ class CoherentVolume:
         if not pre_existing:
             self._write_policy_yaml()
 
+        # No coordinator to spawn or attach, and an endpoint that cannot be
+        # resolved, are the same fact for the caller as a coordinator that is
+        # gone: nothing will answer. A raw spawn error is not one of them and
+        # still propagates as itself.
         port = connect_or_spawn(self._root, config=cfg, bind_host=self._bind_host)
         if port == -1:
-            self._fail_closed_or_degrade(
+            self._unreachable_or_degrade(
                 "coordinator unavailable (could not spawn or attach for this workspace)"
             )
             self._endpoint = None
@@ -1059,7 +1068,7 @@ class CoherentVolume:
         try:
             self._endpoint = resolve_endpoint(self._root)
         except CoordinatorUnavailable as exc:
-            self._fail_closed_or_degrade(str(exc))
+            self._unreachable_or_degrade(str(exc), cause=exc)
             self._endpoint = None
             return
 
@@ -1082,7 +1091,16 @@ class CoherentVolume:
         # every later attacher, whose untracked paths then answered every hook
         # as if enforced, so its stale writes landed with no signal (#190).
         if self._managed:
-            enforcement = self.managed_glob_enforcement()
+            try:
+                enforcement = self._read_glob_enforcement()
+            except CoordinatorUnavailable as exc:
+                # The view's GET got no usable answer: detach as below, then
+                # type it. Degrade warns exactly as it does for "cannot tell".
+                self._endpoint = None
+                self._unreachable_or_degrade(
+                    self._enforcement_failure(self._unreadable_view(exc)), cause=exc
+                )
+                return
             if not enforcement.confirmed:
                 # Detach BEFORE failing, in both modes. Do NOT keep a live
                 # endpoint to a coordinator that does not enforce our paths —
@@ -1146,10 +1164,17 @@ class CoherentVolume:
                 f"coordinator caller principal not obtained (refused: {claim.detail})",
             )
         elif claim.outcome == "unconfirmed":
-            self._fail_closed_or_degrade(
+            message = (
                 f"coordinator caller principal not obtained (unconfirmed: {claim.detail}); "
                 "the same mint nonce is claimed again before the next request"
             )
+            # Only a claim that got no answer at all is "unreachable"; an
+            # answer that bound nothing (a redirect, an error status) keeps
+            # the plain error, as it does for the hook client sharing the path.
+            if claim.transport_failed:
+                self._unreachable_or_degrade(message)
+            else:
+                self._fail_closed_or_degrade(message)
 
     def _adopt_claim(self, claim: PrincipalClaim) -> None:
         """Record ``claim``'s outcome, and the principal it settles: the bound
@@ -1268,6 +1293,23 @@ class CoherentVolume:
         is concluded about the globs: the attach fails closed on it, and never
         takes a count for confirmation.
         """
+        try:
+            return self._read_glob_enforcement()
+        except CoordinatorUnavailable as exc:
+            return self._unreadable_view(exc)
+
+    @staticmethod
+    def _unreadable_view(exc: Exception) -> ManagedGlobEnforcement:
+        """The "cannot tell" answer for a view whose GET raised ``exc``. Only
+        the exception's type is named, never its text."""
+        return ManagedGlobEnforcement((), (), f"{type(exc).__name__} reading the operator view")
+
+    def _read_glob_enforcement(self) -> ManagedGlobEnforcement:
+        """:meth:`managed_glob_enforcement`'s check, except that a GET that got
+        no usable answer raises the client's ``CoordinatorUnavailable`` rather
+        than answering "cannot tell": the attach types it as
+        :class:`~ccs.core.exceptions.CoordinatorUnreachable`, which a string
+        could not carry."""
         globs = self._managed
         if self._endpoint is None:
             return ManagedGlobEnforcement((), (), "the volume is not attached")
@@ -1277,6 +1319,8 @@ class CoherentVolume:
                 "/status?detail=full",
                 extra_headers={"Coherence-Local-Operator": "true"},
             )
+        except CoordinatorUnavailable:
+            raise
         except urllib.error.HTTPError as exc:
             # The Node coordinator answers 501 to the operator view and
             # publishes no strict patterns at any tier; name it when the pid
@@ -1287,10 +1331,8 @@ class CoherentVolume:
                 else "the operator view was refused"
             )
             return ManagedGlobEnforcement((), (), f"{who} (HTTP {exc.code})")
-        except Exception as exc:  # any failure to read the view is "cannot tell"
-            return ManagedGlobEnforcement(
-                (), (), f"{type(exc).__name__} reading the operator view"
-            )
+        except Exception as exc:  # any other failure to read the view is "cannot tell"
+            return self._unreadable_view(exc)
         summary = status.get("policy_summary") if isinstance(status, dict) else None
         sets: dict[str, set[str]] = {}
         for key in (
@@ -3008,7 +3050,9 @@ class CoherentVolume:
     ) -> dict | None:
         """POST to the coordinator. Transport errors and non-2xx HTTP responses
         route through ``on_error`` (strict raises, degrade warns + returns
-        ``None``). Otherwise returns the parsed 200 body.
+        ``None``); in strict mode a request that got no usable answer raises
+        :class:`~ccs.core.exceptions.CoordinatorUnreachable`. Otherwise returns
+        the parsed 200 body.
 
         With ``outcome_unknown_on_failure`` (the handoff verbs), a request
         whose outcome is unknown -- no answer, or an HTTP 5xx -- returns
@@ -3027,7 +3071,9 @@ class CoherentVolume:
         reason) is recovered as R20 describes: the SAME nonce claims again, and
         a principal that differs from the one presented is adopted and the
         request retried exactly ONCE — safe, because a refused request mutated
-        nothing. A 404 on that claim retries once without the header. A refusal
+        nothing. A 404 on that claim retries once without the header. In strict
+        mode a claim that gets no answer at all raises
+        :class:`~ccs.core.exceptions.CoordinatorUnreachable`. A refusal
         the claim cannot cure raises the typed
         :class:`~ccs.core.exceptions.CallerPrincipalRefused` in BOTH ``on_error``
         modes: it is the coordinator's definite answer, not an infrastructure
@@ -3042,6 +3088,13 @@ class CoherentVolume:
         reason = sent.principal_refusal
         recovery = self._recover_principal()
         detail = recovery.detail
+        if self._on_error == "strict" and recovery.claim is not None and recovery.claim.transport_failed:
+            # The recovery claim got no answer at all: the coordinator could
+            # not be reached to settle the principal, and that is what a strict
+            # caller must be told, not a principal refusal the next call may
+            # cure. The claim stays unconfirmed, so the next request still
+            # claims again with the same nonce. Degrade keeps the refusal below.
+            raise CoordinatorUnreachable(principal_refusal_message(reason, detail))
         if recovery.action == "retry":
             sent = self._send(
                 endpoint_path, payload, outcome_unknown_on_failure=outcome_unknown_on_failure
@@ -3049,8 +3102,9 @@ class CoherentVolume:
             if sent.principal_refusal is None:
                 return sent.body
             reason, detail = sent.principal_refusal, PRINCIPAL_REFUSED_AGAIN
-        # ``settled`` is False only when the recovery claim's answer was lost:
-        # the volume adopted ``unconfirmed``, and its next request claims again
+        # ``settled`` is False only when the recovery claim did not confirm
+        # (its answer lost in degrade mode, or answered without binding): the
+        # volume adopted ``unconfirmed``, and its next request claims again
         # with the same nonce by itself (_settle_unconfirmed_claim) — so this
         # refusal is not the session's settled state, and a consumer must not
         # report it as one. A retry refused again follows a confirmed claim.
@@ -3082,13 +3136,20 @@ class CoherentVolume:
     ) -> _Sent:
         """One POST presenting the current principal. A caller-principal
         refusal is returned for :meth:`_post` to recover; every other failure
-        routes through ``on_error`` here.
+        routes through ``on_error`` here, and in strict mode a request that got
+        no usable answer (the client's ``CoordinatorUnavailable``, or a 2xx
+        whose JSON is not an object) raises
+        :class:`~ccs.core.exceptions.CoordinatorUnreachable`.
 
         Every raise for a rejected request happens OUTSIDE the ``except``
         block, so the ``HTTPError`` never rides the raised error's chain: its
         text is the status line's reason phrase, which is the coordinator's,
         and a traceback or ``logger.exception`` would print it. What this
         client reports of a rejected request is its status code."""
+        # The handoff verbs are not typed here: they return no answer in both
+        # modes and their caller raises CommitUnconfirmed, because a verb that
+        # reached the coordinator may have landed. Degrade mode keeps warning.
+        typed = self._on_error == "strict" and not outcome_unknown_on_failure
         try:
             body = _coordinator_post(
                 self._endpoint,
@@ -3099,11 +3160,19 @@ class CoherentVolume:
         except urllib.error.HTTPError as exc:
             status, reason = exc.code, principal_refusal_reason(exc)
         except CoordinatorUnavailable as exc:
-            return self._failed_request(
-                f"coordinator request to {endpoint_path} failed: {exc}",
-                outcome_unknown=outcome_unknown_on_failure,
-            )
+            message = f"coordinator request to {endpoint_path} failed: {exc}"
+            if typed:
+                raise CoordinatorUnreachable(message) from exc
+            return self._failed_request(message, outcome_unknown=outcome_unknown_on_failure)
         else:
+            # A non-object JSON body answers nothing this client can read, like
+            # a malformed answer (a coordinator never sends one; a stranger on a
+            # reused port could). Nothing of the body reaches the message.
+            if typed and not isinstance(body, dict):
+                raise CoordinatorUnreachable(
+                    f"coordinator request to {endpoint_path} failed: the coordinator "
+                    "answered with JSON that is not an object"
+                )
             return _Sent(body, None)
         # R2: a remote 401 is a wrong/missing secret — fail LOUD and CLOSED
         # with a distinct type, never the generic degrade path (which a
@@ -3611,6 +3680,16 @@ class CoherentVolume:
         """Strict → raise (fail-closed); degrade → warn once + count."""
         if self._on_error == "strict":
             raise CoherenceError(message)
+        self._record_degraded(message)
+
+    def _unreachable_or_degrade(self, message: str, *, cause: BaseException | None = None) -> None:
+        """No usable answer from the coordinator. Strict raises the typed
+        :class:`~ccs.core.exceptions.CoordinatorUnreachable`, chained to
+        ``cause``, so a caller can tell "coordinator gone" from every other
+        refusal without parsing prose; degrade warns once and counts, as for
+        any infrastructure failure."""
+        if self._on_error == "strict":
+            raise CoordinatorUnreachable(message) from cause
         self._record_degraded(message)
 
     def _record_degraded(self, message: str) -> None:

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import builtins
 import contextlib
+import errno
 import gc
 import http.server
 import io
@@ -20,6 +21,7 @@ import logging
 import os
 import select
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -61,6 +63,7 @@ from ccs.core.exceptions import (
     CoherenceDegradedWarning,
     CoherenceError,
     CommitPreempted,
+    CoordinatorUnreachable,
     StaleView,
     ViewWedged,
 )
@@ -372,6 +375,26 @@ def _raise_once(real: Callable[..., object], error: BaseException) -> Callable[.
     return flaky
 
 
+def _refusing_port() -> int:
+    """A loopback port that refuses connections and that no other test can take.
+
+    Port 4, not a freed ephemeral port: another test worker's port-0 bind can
+    take a freed port before the connect, and the client would then talk to a
+    stranger. Ports below 1024 are never handed out for port 0, and port 4 is
+    unassigned, so no standard service listens on it; the assert says so if
+    something does."""
+    with socket.socket() as probe:
+        probe.settimeout(2)
+        assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
+    return 4
+
+
+def _refused(endpoint: CoordinatorEndpoint) -> CoordinatorEndpoint:
+    """``endpoint`` moved to a port that refuses connections, so the real client
+    fails exactly as it does against a coordinator that is gone."""
+    return replace(endpoint, port=_refusing_port())
+
+
 def _fail_first_resolve(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make the next ``resolve_endpoint`` raise once, as when ``server.pid`` or
     ``hook.secret`` is briefly missing during a coordinator restart."""
@@ -517,7 +540,7 @@ def test_reattach_to_non_strict_coordinator_after_fork_keeps_failing_closed(
     try:
         vol._after_fork()
         monkeypatch.setattr(
-            vol, "managed_glob_enforcement",
+            vol, "_read_glob_enforcement",
             lambda: ManagedGlobEnforcement((), ("data/**",), None),
         )
 
@@ -545,8 +568,8 @@ def test_interrupted_reattach_after_fork_leaves_the_child_detached(
     vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
     try:
         vol._after_fork()
-        flaky_check = _raise_once(vol.managed_glob_enforcement, _Interrupted())
-        monkeypatch.setattr(vol, "managed_glob_enforcement", flaky_check)
+        flaky_check = _raise_once(vol._read_glob_enforcement, _Interrupted())
+        monkeypatch.setattr(vol, "_read_glob_enforcement", flaky_check)
 
         with pytest.raises(_Interrupted):
             vol.read("data/shared.txt")
@@ -619,8 +642,8 @@ def _fail_spawn(vol: CoherentVolume, monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _interrupt_strict_check(vol: CoherentVolume, monkeypatch: pytest.MonkeyPatch) -> None:
     """An interrupt after the child connected, during the strict-mode check."""
-    flaky_check = _raise_once(vol.managed_glob_enforcement, _Interrupted())
-    monkeypatch.setattr(vol, "managed_glob_enforcement", flaky_check)
+    flaky_check = _raise_once(vol._read_glob_enforcement, _Interrupted())
+    monkeypatch.setattr(vol, "_read_glob_enforcement", flaky_check)
 
 
 def _fail_resolve(vol: CoherentVolume, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -670,8 +693,8 @@ def test_interrupted_reattach_after_fork_is_detached_and_degraded_in_degrade_mod
     vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
     try:
         vol._after_fork()
-        flaky_check = _raise_once(vol.managed_glob_enforcement, _Interrupted())
-        monkeypatch.setattr(vol, "managed_glob_enforcement", flaky_check)
+        flaky_check = _raise_once(vol._read_glob_enforcement, _Interrupted())
+        monkeypatch.setattr(vol, "_read_glob_enforcement", flaky_check)
 
         with pytest.warns(CoherenceDegradedWarning):
             with pytest.raises(_Interrupted):
@@ -794,6 +817,46 @@ def test_foreign_coordinator_degrade_warns(tmp_path: Path, fast_cfg: LifecycleCo
     finally:
         stop_coordinator(tmp_path)
 
+
+# --- attach with no coordinator to answer (AE5) -------------------------------
+#
+# What these do not prove: one machine and loopback only; no network partition;
+# the hook client still fails open; a fresh attach to a dead recorded port still
+# respawns (attach-leg respawn is unchanged); the Node coordinator is untouched.
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+def test_no_coordinator_to_spawn_or_attach_is_unreachable_in_strict_and_degrades_as_before(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, on_error: str
+) -> None:
+    """AE5: spawn-or-attach finds no coordinator (``connect_or_spawn`` answers
+    -1, as when the spawn budget runs out). For the caller that is the same
+    fact as a coordinator that is gone: nothing will answer. Strict raises
+    ``CoordinatorUnreachable``, keeping its message; degrade warns once and
+    runs detached, as before."""
+    monkeypatch.setattr(coherent_volume_module, "connect_or_spawn", lambda *_a, **_k: -1)
+    if on_error == "strict":
+        with pytest.raises(CoordinatorUnreachable, match="could not spawn or attach"):
+            CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        return
+    with pytest.warns(CoherenceDegradedWarning, match="could not spawn or attach"):
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    assert not vol.is_attached and vol.degradation_count == 1
+
+
+def test_an_endpoint_that_cannot_be_resolved_at_attach_is_unreachable(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AE5: spawn-or-attach found a coordinator, which then exited and took
+    its pid file with it before the endpoint was read. The real
+    ``resolve_endpoint`` raises ``CoordinatorUnavailable``; the strict attach
+    raises ``CoordinatorUnreachable`` with its message, chained to it."""
+    monkeypatch.setattr(coherent_volume_module, "connect_or_spawn", lambda *_a, **_k: _refusing_port())
+
+    with pytest.raises(CoordinatorUnreachable, match="no coordinator running for this workspace") as raised:
+        CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+
+    assert isinstance(raised.value.__cause__, CoordinatorUnavailable), repr(raised.value.__cause__)
 
 def _fail_strict_construction(root: Path, cfg: LifecycleConfig) -> list[CoherentVolume]:
     """Construct a strict volume over a coordinator it did not spawn, so ``_attach``
@@ -1171,7 +1234,7 @@ _UNCONFIRMABLE_VIEWS = {
     "absent": "publishes no glob sets",
     "refused": "the operator view was refused (HTTP 501)",
     "refused-node": "the Node coordinator does not serve the operator view (HTTP 501)",
-    "transport": "URLError reading the operator view",
+    "transport": "CoordinatorUnavailable reading the operator view",
 }
 
 
@@ -1182,14 +1245,16 @@ def test_a_coordinator_that_does_not_publish_its_glob_sets_cannot_confirm_enforc
     """When the operator view cannot be read — an older Python coordinator
     whose summary carries only counts, a coordinator that refuses the view,
     the Node coordinator (which answers 501, and is named from the pid file's
-    backend line), or a transport failure during that one GET — the volume
-    cannot tell whether its globs are enforced. It fails closed, detached, and
-    says which: "cannot tell" is never reported as "not enforced", nor as
-    enforced.
+    backend line), or a transport failure during that one GET (a refused
+    connect, through the real client) — the volume cannot tell whether its
+    globs are enforced. It fails closed, detached, and says which: "cannot
+    tell" is never reported as "not enforced", nor as enforced. Only the GET
+    that got no answer at all raises ``CoordinatorUnreachable`` (AE5); the
+    answered ones keep the plain error.
 
     Prevents a count, nothing at all, or a raised transport error being read
-    as confirmation; the generic exception arm is what keeps a coordinator
-    dying mid-attach from escaping the constructor as a raw error."""
+    as confirmation, and a coordinator dying mid-attach escaping the
+    constructor as a raw error."""
     import urllib.error
 
     _seed(tmp_path, content=b"v1")
@@ -1206,7 +1271,7 @@ def test_a_coordinator_that_does_not_publish_its_glob_sets_cannot_confirm_enforc
         if sets in ("refused", "refused-node"):
             raise urllib.error.HTTPError(path, 501, "Not Implemented", {}, None)  # type: ignore[arg-type]
         if sets == "transport":
-            raise urllib.error.URLError("connection refused")
+            return real_get(_refused(endpoint), path, **kwargs)
         doc = real_get(endpoint, path, **kwargs)
         summary = dict(doc["policy_summary"])
         for key in ("tracked_patterns", "strict_mode_patterns", "ignored_patterns"):
@@ -1217,6 +1282,8 @@ def test_a_coordinator_that_does_not_publish_its_glob_sets_cannot_confirm_enforc
     try:
         with pytest.raises(CoherenceError) as raised:
             CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        expected = CoordinatorUnreachable if sets == "transport" else CoherenceError
+        assert type(raised.value) is expected, repr(raised.value)
         message = str(raised.value)
         assert "cannot be confirmed" in message, message
         assert _UNCONFIRMABLE_VIEWS[sets] in message, message
@@ -4100,12 +4167,14 @@ def test_re_mint_spends_no_request_on_an_incarnation_without_a_write_grant(
 def test_failed_release_is_kept_and_retried_at_the_next_re_mint(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, on_error: str
 ) -> None:
-    """A release that does not reach the coordinator must not be forgotten: the
-    grant it was for still stands, and dropping the record would bring the
-    self-refusal back with nothing left to retry it. It fails like any other
-    coordinator request (strict raises, degrade warns and the CAS is refused as
-    ``other_holder`` — a typed signal, not a silent drop), and the next re-mint
-    releases it and commits.
+    """A release that does not reach the coordinator (its connect refused,
+    through the real client) must not be forgotten: the grant it was for still
+    stands, and dropping the record would bring the self-refusal back with
+    nothing left to retry it. It fails like any other coordinator request with
+    no answer (strict raises ``CoordinatorUnreachable`` naming the
+    ``session-stop``; degrade warns and the CAS is refused as ``other_holder``
+    — a typed signal, not a silent drop), and the next re-mint releases it and
+    commits.
 
     The failing call runs on a worker with a bounded join, so a release made while
     holding the volume's identity lock — which deadlocks as soon as degrade mode
@@ -4121,10 +4190,12 @@ def test_failed_release_is_kept_and_retried_at_the_next_re_mint(
         real_post = coherent_volume_module._coordinator_post
         failures = {"left": 1}
 
-        def release_fails_once(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        def release_fails_once(
+            endpoint: CoordinatorEndpoint, path: str, payload: dict, **kwargs: object
+        ) -> object:
             if path == "/hooks/session-stop" and failures["left"]:
                 failures["left"] -= 1
-                raise CoordinatorUnavailable("simulated: the release did not arrive")
+                return real_post(_refused(endpoint), path, payload, **kwargs)
             return real_post(endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", release_fails_once)
@@ -4150,8 +4221,7 @@ def test_failed_release_is_kept_and_retried_at_the_next_re_mint(
         raised = outcome["raised"]
         assert failures["left"] == 0, "the simulated failure never fired"
         if on_error == "strict":
-            assert isinstance(raised, CoherenceError), raised
-            assert not isinstance(raised, CasVersionConflict), raised
+            assert isinstance(raised, CoordinatorUnreachable), raised
             assert "session-stop" in str(raised)
         else:
             assert isinstance(raised, CasVersionConflict), raised
@@ -4521,6 +4591,40 @@ def test_an_unconfirmed_claim_is_re_presented_with_the_same_nonce_until_it_settl
         assert vol._principal is None
         assert (tmp_path / "data/shared.txt").read_bytes() == b"v2"
     finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("claim", ["refused", "answered"])
+def test_a_claim_with_no_answer_at_attach_is_unreachable_and_an_answered_one_keeps_its_error(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, claim: str
+) -> None:
+    """AE5: the claim at attach goes to a port that refuses, so the real
+    client reports it got no answer: a strict attach raises
+    ``CoordinatorUnreachable``. Control: a claim the coordinator ANSWERED
+    without binding (HTTP 503 here) is an answer, and keeps the plain
+    ``CoherenceError``; the claim path is shared with the hook client, so
+    only a claim that got no answer at all is typed."""
+    _seed(tmp_path, content=b"v1")
+    real_claim = coherent_volume_module.claim_caller_principal
+    _AnsweringCoordinator.status, _AnsweringCoordinator.seen = 503, []
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _AnsweringCoordinator)
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+    def claim_elsewhere(endpoint: CoordinatorEndpoint, session_id: str, nonce: str) -> object:
+        answering = replace(endpoint, port=httpd.server_address[1])
+        return real_claim(_refused(endpoint) if claim == "refused" else answering, session_id, nonce)
+
+    monkeypatch.setattr(coherent_volume_module, "claim_caller_principal", claim_elsewhere)
+    try:
+        with pytest.raises(CoherenceError, match="caller principal not obtained") as raised:
+            CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+
+        expected = CoordinatorUnreachable if claim == "refused" else CoherenceError
+        assert type(raised.value) is expected, repr(raised.value)
+        assert _AnsweringCoordinator.seen == ([] if claim == "refused" else ["/principal/claim"])
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
         stop_coordinator(tmp_path)
 
 
@@ -5412,6 +5516,53 @@ def test_a_refusal_whose_recovery_claim_is_unconfirmed_is_not_settled_and_the_ne
         stop_coordinator(tmp_path)
 
 
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+def test_a_principal_refusal_whose_re_claim_gets_no_answer_is_unreachable_in_strict(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, on_error: str,
+) -> None:
+    """AE11: a read is refused for its principal (the presented one is no
+    longer the bound one), and the claim recovery sends goes to a port that
+    refuses. Strict raises ``CoordinatorUnreachable``: the coordinator could
+    not be reached to settle the principal. Not an unsettled
+    ``CallerPrincipalRefused``, which tells a caller the next call may cure a
+    principal problem. Degrade keeps that unsettled refusal. Either way the
+    claim stays unconfirmed, so the next request claims again with the same
+    nonce and lands; no principal or nonce reaches the error."""
+    from ccs.core.exceptions import CallerPrincipalRefused
+
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    caplog.set_level(logging.DEBUG)
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_error=on_error, config=fast_cfg  # type: ignore[arg-type]
+    )
+    try:
+        bound, nonce = vol._principal, vol._mint_nonce
+        real_claim = coherent_volume_module.claim_caller_principal
+        with monkeypatch.context() as unreachable:
+            unreachable.setattr(
+                coherent_volume_module, "claim_caller_principal",
+                lambda endpoint, sid, n: real_claim(_refused(endpoint), sid, n),
+            )
+            vol._principal = "X" * 43  # no longer the bound one, as after a store reset
+            with pytest.raises(CoherenceError) as raised:
+                vol.read(rel)
+
+        if on_error == "strict":
+            assert type(raised.value) is CoordinatorUnreachable, repr(raised.value)
+            assert "caller_principal_foreign" in str(raised.value)
+        else:
+            assert isinstance(raised.value, CallerPrincipalRefused), repr(raised.value)
+            assert raised.value.settled is False
+        assert vol.principal_claim_outcome == "unconfirmed"
+        assert vol.read(rel) == b"v1"
+        assert vol.principal_claim_outcome == "bound" and vol._principal == bound
+        _assert_no_secret_in(str(raised.value) + caplog.text, bound, nonce, "X" * 43)
+    finally:
+        stop_coordinator(tmp_path)
+
+
 # --- a reason that is not a string is not a principal refusal -----------------
 
 
@@ -5810,12 +5961,21 @@ def test_write_cas_seeds_the_baseline_with_the_bytes_it_hands_make_content(
 
 #: A pre-read answer a strict volume cannot take as registered, so the read
 #: raises without handing its bytes on: the coordinator's watchdog timed out,
-#: the request never reached it (``None``: the transport raises), or the
+#: the request never reached it (``None``: the connect is refused), or the
 #: coordinator answered with its failure envelope.
 _UNCONFIRMED_PRE_READ_ANSWERS: dict[str, dict[str, object] | None] = {
     "watchdog": {"ok": True, "degraded": True},
     "transport": None,
     "envelope": {"ok": False, "reason": _INTERNAL_OPERATIONAL_ERROR},
+}
+#: What each of them raises: only the request that got no answer at all is
+#: "coordinator unreachable". The other two came from a coordinator that was
+#: reached, so they keep the plain error (an answer that decides nothing is
+#: still an answer).
+_UNCONFIRMED_PRE_READ_RAISES: dict[str, type[CoherenceError]] = {
+    "watchdog": CoherenceError,
+    "transport": CoordinatorUnreachable,
+    "envelope": CoherenceError,
 }
 
 
@@ -5823,15 +5983,16 @@ def _answer_the_second_pre_read(
     monkeypatch: pytest.MonkeyPatch, answer: dict[str, object] | None, answers: list[object]
 ) -> None:
     """The next pre-read goes to the coordinator; the one after it gets
-    ``answer`` instead (``None``: the transport raises); every other request
-    goes to the coordinator. Records what each pre-read got back."""
+    ``answer`` instead (``None``: it goes to a port that refuses, through the
+    real client); every other request goes to the coordinator. Records what
+    each pre-read got back."""
     real_post = coherent_volume_module._coordinator_post
 
-    def post(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+    def post(endpoint: CoordinatorEndpoint, path: str, payload: dict, **kwargs: object) -> object:
         if path == "/hooks/pre-read" and len(answers) == 1:
             answers.append(answer)
             if answer is None:
-                raise CoordinatorUnavailable("connection refused")
+                return real_post(_refused(endpoint), path, payload, **kwargs)
             return answer
         got = real_post(endpoint, path, payload, **kwargs)
         if path == "/hooks/pre-read":
@@ -5883,7 +6044,9 @@ def test_a_cas_whose_retry_read_fails_after_a_denied_read_still_guards_the_next_
         with pytest.raises(CoherenceError) as failed:
             vol.write_cas(rel, derive)
 
-        assert type(failed.value) is CoherenceError, "not the fail-closed read: " + repr(failed.value)
+        assert type(failed.value) is _UNCONFIRMED_PRE_READ_RAISES[retry_answer], (
+            "not the fail-closed read: " + repr(failed.value)
+        )
         first = answers[0]
         assert isinstance(first, dict), first
         assert first["hookSpecificOutput"]["permissionDecision"] == "deny", (
@@ -6790,5 +6953,156 @@ def test_an_empty_pre_edit_answer_fails_closed_before_the_write(
             vol.write(rel, b"v2")
 
         assert target.read_bytes() == b"v1"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# --- a strict volume whose coordinator gives no usable answer (AE3, AE6, AE9) ---
+#
+# What these do not prove: one machine and loopback only; no network partition;
+# the hook client still fails open; a fresh attach to a dead recorded port still
+# respawns (attach-leg respawn is unchanged); the Node coordinator is untouched.
+
+
+def test_a_read_and_a_cas_after_the_coordinator_stops_answering_are_unreachable(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AE3: a strict volume with no grant recorded on the path, whose
+    coordinator refuses connections right after attach. A read raises
+    ``CoordinatorUnreachable`` naming the request, and so does ``write_cas``,
+    from its comparand read, before any CAS is sent; the file keeps its
+    bytes. Before, both raised a plain ``CoherenceError`` a caller could not
+    tell from a path escape or a corrupt CAS."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        assert not vol._grant_incarnations, "control: no grant, so no release precedes the read"
+        sent: list[tuple[str, str | None]] = []
+        _record_principals(monkeypatch, sent)
+        vol._endpoint = _refused(vol._endpoint)
+
+        with pytest.raises(CoordinatorUnreachable, match="/hooks/pre-read") as read_raised:
+            vol.read(rel)
+        with pytest.raises(CoordinatorUnreachable, match="/hooks/pre-read"):
+            vol.write_cas(rel, lambda current: current + b"+cas")
+
+        assert isinstance(read_raised.value.__cause__, CoordinatorUnavailable)
+        assert [route for route, _p in sent] == ["/hooks/pre-read", "/hooks/pre-read"]
+        assert target.read_bytes() == b"v1"
+        assert vol.is_attached, "the volume keeps the endpoint it attached to"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+class _RawAnswer:
+    """A 2xx answer whose body is ``raw``, read the way ``_execute`` reads one."""
+
+    def __init__(self, raw: bytes) -> None:
+        self._raw = raw
+
+    def __enter__(self) -> _RawAnswer:
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self._raw
+
+
+def _answer_with_body(monkeypatch: pytest.MonkeyPatch, route: str, raw: bytes) -> None:
+    """Every request to ``route`` is answered 2xx with body ``raw``, where the
+    real client's transport reads it (the opener seam); every other request
+    goes to the coordinator."""
+    from ccs.cli import _coherence_client
+
+    real_build = _coherence_client._build_opener
+    # Plain-http openers are cached process-wide; an empty cache makes the
+    # next request build its opener through the patched seam.
+    monkeypatch.setattr(_coherence_client, "_shared_openers", {})
+
+    class _Opener:
+        def __init__(self, real: object) -> None:
+            self._real = real
+
+        def open(self, req: object, timeout: float | None = None) -> object:
+            if req.selector == route:  # type: ignore[attr-defined]
+                return _RawAnswer(raw)
+            return self._real.open(req, timeout=timeout)  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(_coherence_client, "_build_opener", lambda ctx: _Opener(real_build(ctx)))
+
+
+@pytest.mark.parametrize(
+    ("raw", "says"),
+    [(b"", "empty response"), (b"<html>busy</html>", "non-JSON response"), (b"[]", "not an object")],
+    ids=["empty", "non-json", "non-object"],
+)
+def test_a_pre_read_answer_with_nothing_usable_in_it_is_unreachable(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, raw: bytes, says: str,
+) -> None:
+    """AE6: a strict read whose pre-read is answered 2xx with an empty body,
+    a body that is not JSON, or JSON that is not an object got no usable
+    answer, so it raises ``CoordinatorUnreachable`` and hands back no bytes.
+    Before, the non-object answer read as an admitted read: the bytes came
+    back with no view registered, and the next write went unguarded."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        _answer_with_body(monkeypatch, "/hooks/pre-read", raw)
+
+        with pytest.raises(CoordinatorUnreachable, match=says):
+            vol.read(rel)
+
+        assert rel not in vol._read_incarnations, "an unusable answer registered a view"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_the_status_helpers_answer_unknown_against_a_coordinator_that_refuses(
+    tmp_path: Path, fast_cfg: LifecycleConfig,
+) -> None:
+    """The best-effort status surfaces keep answering "unknown" instead of
+    raising when the coordinator refuses connections: ``coordinator_status()``
+    is None, ``strict_mode_active()`` is False, and
+    ``managed_glob_enforcement()`` keeps its three-way answer, "cannot
+    tell", never "not enforced"."""
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        assert vol.coordinator_status() is not None, "control: it answers while reachable"
+        vol._endpoint = _refused(vol._endpoint)
+
+        assert vol.coordinator_status() is None
+        assert vol.strict_mode_active() is False
+        assert vol.managed_glob_enforcement() == ManagedGlobEnforcement(
+            (), (), "CoordinatorUnavailable reading the operator view"
+        )
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_degrade_volume_whose_coordinator_refuses_warns_once_and_counts_each_failure(
+    tmp_path: Path, fast_cfg: LifecycleConfig,
+) -> None:
+    """AE9: under ``on_error="degrade"`` a coordinator that refuses
+    connections changes nothing: the first failed request warns, every one
+    counts, nothing new is raised, and the reads return the disk's bytes."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol._endpoint = _refused(vol._endpoint)
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            assert vol.read(rel) == b"v1"
+            assert vol.read_with_version(rel) == (b"v1", 0)
+            assert vol.read(rel) == b"v1"
+
+        assert vol.degradation_count == 3
+        degraded = [w for w in warned if issubclass(w.category, CoherenceDegradedWarning)]
+        assert len(degraded) == 1, [str(w.message) for w in degraded]
     finally:
         stop_coordinator(tmp_path)

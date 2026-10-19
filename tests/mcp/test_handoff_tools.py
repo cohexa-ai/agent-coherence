@@ -17,6 +17,9 @@ its own session with a bound caller principal.
 
 from __future__ import annotations
 
+import errno
+import socket
+from dataclasses import replace
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -882,14 +885,32 @@ def test_a_status_lookup_tells_no_record_from_cannot_tell() -> None:
     )
 
 
+#: Stands for a request whose connect is refused, so it is never sent.
+_NEVER_SENT = object()
+
+
+def _refusing_port() -> int:
+    """A loopback port that refuses connections and that no other test can take
+    (port 4: ports below 1024 are never handed out for port 0, so no other
+    worker's bind can take it before the connect)."""
+    with socket.socket() as probe:
+        probe.settimeout(2)
+        assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
+    return 4
+
+
 def _answer_lost_after_forwarding(route: str, answer: object) -> object:
     """``_coordinator_post`` that forwards ``route`` and then loses its answer
-    (``answer`` None) or hands back ``answer`` in its place."""
+    (``answer`` None) or hands back ``answer`` in its place; for
+    ``_NEVER_SENT`` it sends ``route`` to a port that refuses instead, through
+    the real client."""
     real_post = coherent_volume_module._coordinator_post
 
     def post(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
         if path != route:
             return real_post(endpoint, path, payload, **kwargs)
+        if answer is _NEVER_SENT:
+            return real_post(replace(endpoint, port=_refusing_port()), path, payload, **kwargs)
         real_post(endpoint, path, payload, **kwargs)
         if answer is None:
             raise CoordinatorUnavailable("simulated: the answer was lost")
@@ -898,7 +919,7 @@ def _answer_lost_after_forwarding(route: str, answer: object) -> object:
     return post
 
 
-@pytest.mark.parametrize("answer", [None, []], ids=["lost", "not_an_object"])
+@pytest.mark.parametrize("answer", [None, [], _NEVER_SENT], ids=["lost", "not_an_object", "never_sent"])
 @pytest.mark.parametrize("verb", ["transfer", "accept", "decline", "withdraw"])
 def test_a_handoff_tool_whose_answer_is_lost_is_the_check_handoff_deny(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, verb: str, answer: object
@@ -909,7 +930,9 @@ def test_a_handoff_tool_whose_answer_is_lost_is_the_check_handoff_deny(
     the agent to the path's handoff -- not to read and transfer again, which
     after the successor's write is a second handoff. The next step is the
     verb's own: "do not withdraw" belongs to a transfer only, and would drop a
-    withdraw that never landed."""
+    withdraw that never landed. A request whose connect was refused gets the
+    same deny, never ``coordinator_unavailable``: a handoff verb keeps one
+    answer for every transport failure."""
     _seed(tmp_path, PLAN, b"plan v1")
     config = _config(tmp_path)
     volume = _vol(tmp_path, fast_cfg)
