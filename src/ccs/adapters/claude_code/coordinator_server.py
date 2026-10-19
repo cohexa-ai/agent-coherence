@@ -87,6 +87,7 @@ from ccs.adapters.claude_code.auth import (
 )
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.bash_write_detector import detect_tracked_writes
+from ccs.adapters.claude_code.disk_content import hash_regular_file
 from ccs.adapters.claude_code.policy import (
     POLICY_LOAD_ERRORS,
     UNTRACK_STRICT_PATH_REASON,
@@ -2394,6 +2395,10 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     agent_id = coordinator.register_session(session_id, read_subagent_id(body))
     caller = caller_principal_identity(session_id)
     now = monotonic_seconds()
+    # #278: set by work() on an admitted read whose bytes changed outside the
+    # coordinator -- the version they no longer match -- and read by the
+    # wrapper, which attaches the notice once the notice drain has run.
+    out_of_band_change: dict[str, int] = {}
 
     def work() -> dict:
         coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
@@ -2562,8 +2567,21 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                         summary=shared_summary,
                         source="pre_read_shared_hash_deny",
                         effects=effects,
+                        out_of_band=True,
                     )
                 fresh["hash_differs"] = True
+                # #278: unless the caller's own commit explains it, the
+                # mismatch is a change made outside the coordinator, and the
+                # flag above is a key the model never sees. The notice is
+                # attached after the notice drain, which only fires on a body
+                # with no envelope yet.
+                if not (
+                    decision.commit_lag_suppressed
+                    or _is_recent_self_commit_lag(
+                        coordinator, artifact_id, agent_id, now_unix=_now
+                    )
+                ):
+                    out_of_band_change["version"] = decision.version
             # The read is allowed. A SHARED grant that a denied Bash / Grep
             # command re-armed certifies no read, so this one is the read to
             # record. A verify_only fence read discards its bytes and must not.
@@ -2747,6 +2765,15 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # corpus's), and on an admit the handoff prose in the context-only
         # envelope, after the notices.
         result = _attach_hook_handoff(coordinator, result, path=path, caller=caller)
+        # #278: an admitted read whose bytes changed outside the coordinator
+        # says so, after the notices and the handoff prose, as context only.
+        if "version" in out_of_band_change and not verify_only:
+            result = _attach_pretooluse_context(
+                result,
+                _payloads.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(
+                    path=path, version=out_of_band_change["version"]
+                ),
+            )
         # SB-10 U4 (KTD6): the deferred re-grounding seam sits AFTER the
         # deny decision inside work() — a strict deny returns untouched and
         # keeps the flag pending — and AFTER the notice drain above, so
@@ -3235,9 +3262,13 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # the acquire (which records the current version as observed), so the
     # successor's admit can warn when it never read the version it was handed.
     observed_before_acquire: int | None = None
+    # #278: the recorded version whose content the file on disk no longer
+    # holds, when no commit explains it -- set by an admitted acquire, read by
+    # the wrapper that attaches the notice.
+    out_of_band_version: int | None = None
 
     def work() -> dict:
-        nonlocal observed_before_acquire
+        nonlocal observed_before_acquire, out_of_band_version
         coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
         # Seed the artifact row if this is the first Edit on a fresh path.
         artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
@@ -3353,6 +3384,16 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         peers_in_me = _peers_in_me_excluding(coordinator, artifact_id, agent_id)
         # Detect collision BEFORE acquiring: is any other session in M∪E?
         holder_id, holder_ts = _exclusive_holder(coordinator, artifact_id, exclude_agent=agent_id)
+        # #278: also before the acquire, which revokes every peer's claim: a
+        # peer's write still landing explains a mismatch on disk, by the rule
+        # the foreign-write detector applies. Its bytes can reach the disk
+        # before its commit does, and the collision warning already names it.
+        peer_write_in_flight = _a_write_is_in_flight(
+            coordinator.registry, artifact_id,
+            now_unix=_payloads.now_unix(),
+            window_sec=_SHARED_FOREIGN_DENY_LAG_WINDOW_SEC,
+            exclude_agent=agent_id,
+        )
 
         # Acquire EXCLUSIVE — this invalidates peers (KTD-1 single-writer).
         # ``caller`` is the session-level identity the giver fence keys on
@@ -3373,6 +3414,19 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             )
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
+
+        # #278: pre-edit carries no content hash, and post-edit records
+        # whatever it is sent, so a write built from an earlier read replaced a
+        # change made outside the coordinator with nothing to notice it. The
+        # coordinator runs on the workspace's host, so it reads the file
+        # itself, after the acquire (a refused editor is not told) and before
+        # the caller's write lands. It warns and never denies: in strict mode
+        # a read is already refused until a commit lands, so a write is the
+        # one way out.
+        if not peer_write_in_flight:
+            out_of_band_version = _recorded_content_missing_from_disk(
+                coordinator, artifact_id, agent_id, path=path, now_unix=_payloads.now_unix()
+            )
 
         # A1: record preemption notices for the agents whose M∪E grants we
         # just silently revoked via the write() side effect. The victims
@@ -3436,6 +3490,18 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             coordinator, produced, path=path, caller=caller,
             acquired=True, observed=observed_before_acquire,
         )
+        # #278: after the notices and the handoff prose, as context only, plus
+        # a key for a client that reads keys rather than prose.
+        if out_of_band_version is not None and produced.get("ok") is True:
+            result = {
+                **_attach_pretooluse_context(
+                    result,
+                    _payloads.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(
+                        path=path, version=out_of_band_version
+                    ),
+                ),
+                "disk_differs": True,
+            }
         return _deliver_pending_reground(
             coordinator, session_id, body, result, abort=abort
         )
@@ -6958,6 +7024,13 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     ``reclaimed``; the times are the sweep's tick basis, whole unix seconds.
     None of it appears below the operator tier.
 
+    #278 — what the foreign-write detector found, at the operator tier: a
+    ``tracked_artifacts`` entry the detector has counted anything for carries
+    ``foreign_writes``, ``{"foreign": n, "lag_suppressed": n, "mediated": n}``
+    with zero buckets omitted -- the store's per-file totals, which the offline
+    report reads too. An entry with no counts, and every tier below, keep
+    today's bytes.
+
     #238 — a bounded wait for the registry: the minimal and full tiers wait
     for the registry lock on the request thread, through the registry's own
     ``abort_guard(deadline=...)``, until the request's watchdog deadline
@@ -7052,6 +7125,12 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
                 include_reclamations=operator_tier,
                 include_grant_detail=operator_tier,
             )
+            # #278: the foreign-write detector's per-file counts, at the
+            # operator tier only (they say which files changed behind the
+            # coordinator's back), in the same hold as the rows they annotate.
+            foreign_writes_by_artifact = (
+                coordinator.registry.foreign_write_totals() if operator_tier else {}
+            )
     except RegistryLockTimeout:
         # #238: counted BEFORE the counters are read, so the answer reports
         # its own timeout, and logged as a degraded hook is. The body is built
@@ -7101,6 +7180,11 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
             # without a version move (a reclaim, a release, a handoff from
             # M/E), the one change a version comparison cannot see.
             entry["owner_generation"] = meta["owner_generation"]
+            # #278: only on an entry the detector has counted something for,
+            # so every other entry keeps its bytes.
+            foreign_writes = foreign_writes_by_artifact.get(artifact_id)
+            if foreign_writes:
+                entry["foreign_writes"] = dict(foreign_writes)
         # #185: the path's transfer record, only while one exists, so an
         # entry with no record keeps today's bytes at every tier.
         transfer = transfer_by_artifact.get(artifact_id)
@@ -8633,6 +8717,7 @@ def _emit_pre_read_strict_deny(
     summary: _payloads.StaleSummary,
     source: str,
     effects: _AnswerEffects,
+    out_of_band: bool = False,
 ) -> dict:
     """Single source of truth for emitting a pre-read strict-mode deny, used by
     both deny arms: the INVALID/None-grant path and the Survivor #6
@@ -8642,7 +8727,10 @@ def _emit_pre_read_strict_deny(
     audit row (counting mode drift on failure), and returns the byte-stable
     deny payload. Keeping both arms here means their telemetry and KTD-T
     byte-stable deny text cannot drift apart. The bookkeeping is queued on
-    ``effects`` and recorded only when this deny is the answer sent (#236)."""
+    ``effects`` and recorded only when this deny is the answer sent (#236).
+    ``out_of_band`` is the SHARED-holder arm's alone (#278): only a reader
+    that still holds a valid grant is told its file changed outside the
+    coordinator."""
     def record_deny() -> None:
         coordinator.increment_stale_warning_emitted()
         coordinator.mark_stale_warned(agent_id, artifact_id)
@@ -8655,7 +8743,7 @@ def _emit_pre_read_strict_deny(
     effects.defer(record_deny)
     return {
         "hookSpecificOutput": _payloads.emit_strict_deny(
-            source=source, summary=summary,
+            source=source, summary=summary, out_of_band=out_of_band,
         ),
         "status": "stale",
         "summary": summary,
@@ -8697,6 +8785,71 @@ def _is_recent_self_commit_lag(
     if updated_at is None:
         return False
     return (now_unix - updated_at) <= _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC
+
+
+# An acquired, uncommitted write claim is the registry's own evidence that a
+# mediated write is in flight, which the commit timestamp cannot supply. Only
+# EXCLUSIVE: a pre-edit acquire sets it, and the commit turns it MODIFIED, which
+# says the write already landed (#278). A MODIFIED row stands until release or
+# reclaim, up to half an hour, and excusing on it hid every out-of-band change
+# made after a commit for that long.
+_WRITE_IN_FLIGHT_STATE = MESIState.EXCLUSIVE
+
+
+def _a_write_is_in_flight(
+    registry,
+    artifact_id: UUID,
+    *,
+    now_unix: float,
+    window_sec: float,
+    exclude_agent: UUID | None = None,
+) -> bool:
+    """Whether a session other than ``exclude_agent`` holds a write it acquired
+    and has not committed, and was active within the window (#278).
+
+    The one rule for "a write still landing explains this mismatch", shared by
+    the sweep's foreign-write detection pass and pre-edit's out-of-band check.
+    EXCLUSIVE alone, never MODIFIED: see ``_WRITE_IN_FLIGHT_STATE``. And the
+    holder's last heartbeat must be recent, because a claim whose holder went
+    quiet -- a handoff successor that ran pre-edit and stopped, a client that
+    died before its commit -- explains nothing on disk, and its row stands until
+    the sweep reclaims it. A holder with no heartbeat on record is given the
+    benefit of the doubt, as every holder was before: only a recorded silence
+    longer than the window ends it."""
+    for agent_id, state in registry.get_state_map(artifact_id).items():
+        if state != _WRITE_IN_FLIGHT_STATE or agent_id == exclude_agent:
+            continue
+        last_heartbeat = registry.last_heartbeat_tick(agent_id)
+        if last_heartbeat is None or (now_unix - last_heartbeat) <= window_sec:
+            return True
+    return False
+
+
+def _recorded_content_missing_from_disk(
+    coordinator: CoordinatorHTTPServer,
+    artifact_id: UUID,
+    caller_agent_id: UUID,
+    *,
+    path: str,
+    now_unix: float,
+) -> int | None:
+    """The recorded version whose content the file on disk no longer holds,
+    when nothing the coordinator recorded explains it (#278); ``None`` otherwise.
+
+    ``None`` when the record carries no content claim (a first edit's seed, the
+    sentinels), when the file is not an observable regular file within the
+    foreign-write detector's size cap, when the bytes match, and when the
+    mismatch is the caller's own recent commit still reaching the disk. The read
+    is the detector's: raw bytes, no symlink leaf, no blocking on a named pipe."""
+    artifact = coordinator.registry.get_artifact(artifact_id)
+    if artifact is None or not coordinator_holds_content_claim(artifact.content_hash):
+        return None
+    disk_hash = hash_regular_file(Path(coordinator.coordinator_root) / path)
+    if disk_hash is None or disk_hash == artifact.content_hash:
+        return None
+    if _is_recent_self_commit_lag(coordinator, artifact_id, caller_agent_id, now_unix=now_unix):
+        return None
+    return artifact.version
 
 
 # ----------------------------------------------------------------------

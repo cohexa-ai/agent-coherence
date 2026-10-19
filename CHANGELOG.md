@@ -104,7 +104,48 @@ Alpha — APIs may change before `v1.0`.
   package README carries the old marker. Install commands are unchanged: the
   PyPI package is still `agent-coherence`.
 
+- **The protocol corpus runs its #261 strict-path rows on the Claude Code
+  plugin's Node coordinator too.** One row refuses an untrack of a strict path;
+  the other keeps a strict path strict under a broader ignore pattern (`**`).
+  Both ran on the Python coordinator only, as did three older strict rows that
+  now run on both. Plugin releases after 0.6.0 carry the fix for
+  cohexa-ai/agent-coherence-plugin#177, which lifts the 0.15.0 known
+  limitation that the Node coordinator let an untrack or an ignore pattern
+  take a path out of strict mode; the guide's section on the policy routes now
+  says the Node coordinator refuses too. The package is unchanged.
+
 ### Fixed
+
+- **A file changed outside the coordinator no longer goes unnoticed while a
+  session holds it (#278).** A change that reaches the disk without a commit
+  -- a script, an editor, a shell write the hooks do not recognise, including
+  a handoff giver's -- was hidden in three places.
+  - **Detection.** The foreign-write detector treated any write grant as a
+    write still landing, and a commit leaves its writer holding the file for
+    up to half an hour. So a change made after any commit was counted as
+    excused, not foreign, for that long. Now only a write claim not yet
+    committed, by a session active in the last few seconds, is excused.
+  - **Reads.** A session reading the file with a valid grant was told
+    nothing: warn mode answered `"hash_differs": true`, a key the model
+    never sees. It now adds a sentence, as added context only, saying the
+    file changed outside the coordinator. In strict mode the read is still
+    denied, and the deny now names that change instead of the last session
+    that committed, and tells the session to tell its user rather than
+    restore or overwrite the file. A reader whose grant another session's
+    `pre-edit` revoked keeps its old deny. The deny was byte-mirrored by the
+    Claude Code plugin's
+    Node coordinator; the new wording reaches it with
+    cohexa-ai/agent-coherence-plugin#205.
+  - **Writes.** `pre-edit` admitted a session about to write the file from
+    an earlier read, so the change was replaced and the record looked clean.
+    `pre-edit` now reads the file itself. When the file no longer holds the
+    recorded content, it answers `"disk_differs": true` and the same
+    sentence, unless another session's write is still landing. It still
+    admits, in strict mode too.
+
+  `/status?detail=full` now lists each file's detector counts as
+  `foreign_writes`. `agent-coherence-status` prints them, along with the two
+  hash-mismatch counters that used to reach only `--json`.
 
 - **A `CoherentVolume.write()` after a read that raced a peer's commit is
   refused again (#335).** A pre-read by a session with no grant on a tracked

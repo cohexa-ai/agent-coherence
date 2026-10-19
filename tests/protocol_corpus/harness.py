@@ -713,9 +713,7 @@ def apply_setup(workspace: Path, setup: dict[str, Any]) -> None:
     - ``tracked``: writes ``.coherence/tracked.yaml`` with one path per line.
     - ``ignored``: writes ``.coherence/ignored.yaml`` with one path per line.
     - ``strict_mode``: writes ``.coherence/strict_mode.yaml`` with one path
-      per line (Unit 7b — strict-mode-fixture support; the Node coordinator
-      doesn't ship strict_mode.yaml loading in v0.2 so strict fixtures are
-      python-only).
+      per line (both coordinators load it).
     - ``preflight_requests``: list of request dicts fired BEFORE the main
       test request; responses ignored. Used to drive multi-step setup like
       "session A reads → session B preempts → A re-reads (the test request)".

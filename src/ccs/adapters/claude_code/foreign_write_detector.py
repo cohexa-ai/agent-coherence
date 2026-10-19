@@ -89,7 +89,6 @@ from __future__ import annotations
 
 import logging
 import os
-import stat
 import subprocess
 import sys
 import threading
@@ -98,9 +97,11 @@ from pathlib import Path
 from typing import Iterable, Protocol
 from uuid import UUID
 
-from ccs.adapters.claude_code.coordinator_server import _F_SENTINEL_CONTENT_HASH
-from ccs.core.states import MESIState
-from ccs.core.substrate import sha256_hex
+from ccs.adapters.claude_code.coordinator_server import (
+    _F_SENTINEL_CONTENT_HASH,
+    _a_write_is_in_flight,
+)
+from ccs.adapters.claude_code.disk_content import hash_regular_file
 
 logger = logging.getLogger(__name__)
 
@@ -208,10 +209,6 @@ _WALK_BUDGET_SEC = 2.0
 # already "present", so a second one would buy nothing.
 _walk_lock = threading.Lock()
 _walk_in_flight: threading.Thread | None = None
-
-# An outstanding write grant is the registry's own evidence that a mediated
-# write is in flight, which the timestamp alone cannot supply — see _classify.
-_WRITE_GRANT_STATES = (MESIState.MODIFIED, MESIState.EXCLUSIVE)
 
 
 class DetectionTarget(Protocol):
@@ -642,48 +639,11 @@ def _argv_encodable(name: str) -> bool:
 
 
 def _disk_hash(path: Path) -> str | None:
-    """Hash the file's raw bytes, or return None when it is not observable.
-
-    Raw bytes and the one canonical helper: no decode, no newline translation,
-    no git filter. A normalization here would be the first in the system and
-    would diverge this comparison from every writer that produced a stored hash.
-
-    One descriptor answers every question, which closes three gaps a
-    stat-then-open sequence leaves open. ``O_NOFOLLOW`` refuses a symlink leaf,
-    so a coordinated name cannot be pointed at a file outside the workspace.
-    ``O_NONBLOCK`` means a path replaced by a named pipe fails instead of
-    blocking this thread forever. And checking the size on the open descriptor,
-    then reading one byte past the cap, means a file that grows between the
-    check and the read is still refused rather than read unbounded.
-
-    None covers every way an artifact can stop being an observable regular file
-    — deleted, renamed away, replaced by a directory or a link, permission
-    revoked, or oversized. All of those are coverage gaps, not detections.
-    """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    try:
-        fd = os.open(path, flags)
-    except OSError:
-        return None
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            return None
-        if info.st_size > _MAX_HASH_BYTES:
-            logger.debug("detection: %s exceeds the per-tick hash cap; skipped", path)
-            return None
-        with os.fdopen(fd, "rb", closefd=True) as handle:
-            fd = -1  # ownership moved to the file object
-            data = handle.read(_MAX_HASH_BYTES + 1)
-        if len(data) > _MAX_HASH_BYTES:
-            logger.debug("detection: %s grew past the per-tick hash cap; skipped", path)
-            return None
-        return sha256_hex(data)
-    except OSError:
-        return None
-    finally:
-        if fd >= 0:
-            os.close(fd)
+    """Hash the file's raw bytes, or return None when it is not observable --
+    :func:`~ccs.adapters.claude_code.disk_content.hash_regular_file`, the read
+    pre-edit's out-of-band check shares (#278), under this pass's own cap. None
+    is a coverage gap, not a detection."""
+    return hash_regular_file(path, max_bytes=_MAX_HASH_BYTES)
 
 
 def _stat_signature(path: Path) -> tuple[int, int] | None:
@@ -714,7 +674,7 @@ def _classify_mismatch(
     *,
     updated_at: float | None,
     has_mediated_writer: bool,
-    has_write_grant: bool,
+    has_write_in_flight: bool,
     now_unix: float,
     window_sec: float,
 ) -> str:
@@ -729,9 +689,12 @@ def _classify_mismatch(
     lands, so a commit caught mid-flight looks like a divergence. The timestamp
     catches that only when a PREVIOUS commit happens to be recent — during the
     gap it still holds the previous commit's time, so a mediated write to an
-    artifact untouched for an hour would read as foreign. An outstanding write
-    grant is the registry's own evidence that a write is in flight right now,
-    and it covers exactly the case the timestamp misses.
+    artifact untouched for an hour would read as foreign. An acquired write
+    claim not yet committed, held by a session active within the window, is the
+    registry's own evidence that a write is in flight right now, and it covers
+    exactly the case the timestamp misses (``has_write_in_flight``; see
+    :func:`~ccs.adapters.claude_code.coordinator_server._a_write_is_in_flight`,
+    the rule pre-edit's out-of-band check shares).
 
     The timestamp leg additionally requires a witnessed writer: ``updated_at``
     is also stamped by first-observation registration, with no writer behind it,
@@ -741,7 +704,7 @@ def _classify_mismatch(
     What either leg admits is not hidden — a suppression is its own counted
     outcome, so an operator can size the exposure rather than trust it.
     """
-    if has_write_grant:
+    if has_write_in_flight:
         return "lag_suppressed"
     if (
         has_mediated_writer
@@ -1202,11 +1165,12 @@ def _observe(
     if disk_hash == canonical:
         outcome = "mediated"
     else:
-        states = registry.get_state_map(artifact_id).values()
         outcome = _classify_mismatch(
             updated_at=registry.get_artifact_updated_at(artifact_id),
             has_mediated_writer=registry.last_writer_for(artifact_id) is not None,
-            has_write_grant=any(state in _WRITE_GRANT_STATES for state in states),
+            has_write_in_flight=_a_write_is_in_flight(
+                registry, artifact_id, now_unix=now_unix, window_sec=window_sec
+            ),
             now_unix=now_unix,
             window_sec=window_sec,
         )
