@@ -173,23 +173,20 @@ class _CommitNotAnswered(Exception):
     ``detail`` names the request and what failed, from the client's own
     text; ``__cause__`` is the client's error, when there was one."""
 
-    def __init__(self, detail: str, *, never_sent: bool, cause: BaseException | None = None) -> None:
+    def __init__(self, detail: str, *, never_sent: bool) -> None:
         super().__init__(detail)
         self.detail = detail
         self.never_sent = never_sent
-        self.__cause__ = cause
 
 
 class _Sent(NamedTuple):
     """What one POST from :meth:`CoherentVolume._send` yielded: the 2xx body,
     or the typed reason of a caller-principal refusal left to the caller's
-    recovery (R20), or, for a strict commit leg, ``unanswered``: the request
-    got no usable answer. All three ``None`` after any other failure, which
-    already went through ``on_error`` (degrade mode only — strict raised)."""
+    recovery (R20). Both ``None`` after any other failure, which already went
+    through ``on_error`` (degrade mode only — strict raised)."""
 
     body: dict | None
     principal_refusal: str | None
-    unanswered: _CommitNotAnswered | None = None
 
 
 def _is_commit_leg(endpoint_path: str, payload: dict) -> bool:
@@ -3260,7 +3257,7 @@ class CoherentVolume:
             outcome_unknown_on_failure=outcome_unknown_on_failure, commit_leg=commit_leg,
         )
         if sent.principal_refusal is None:
-            return self._answer_of(sent)
+            return sent.body
         reason = sent.principal_refusal
         recovery = self._recover_principal()
         detail = recovery.detail
@@ -3282,7 +3279,7 @@ class CoherentVolume:
                 outcome_unknown_on_failure=outcome_unknown_on_failure, commit_leg=commit_leg,
             )
             if sent.principal_refusal is None:
-                return self._answer_of(sent)
+                return sent.body
             reason, detail = sent.principal_refusal, PRINCIPAL_REFUSED_AGAIN
         # ``settled`` is False only when the recovery claim did not confirm
         # (its answer lost in degrade mode, or answered without binding): the
@@ -3313,14 +3310,6 @@ class CoherentVolume:
         self._adopt_claim(claim)
         return decide_principal_recovery(claim, presented)
 
-    @staticmethod
-    def _answer_of(sent: _Sent) -> dict | None:
-        """The body :meth:`_post` returns for ``sent``; a commit leg that got
-        no usable answer raises, for its caller to type."""
-        if sent.unanswered is not None:
-            raise sent.unanswered
-        return sent.body
-
     def _send(
         self, endpoint_path: str, payload: dict, *,
         outcome_unknown_on_failure: bool = False, commit_leg: bool = False,
@@ -3331,8 +3320,9 @@ class CoherentVolume:
         no usable answer (the client's ``CoordinatorUnavailable``, or a 2xx
         whose JSON is not an object) raises
         :class:`~ccs.core.exceptions.CoordinatorUnreachable` — except a
-        ``commit_leg`` one, which is returned as ``unanswered`` with what the
-        client knows of its delivery, for the commit's caller to type.
+        ``commit_leg`` one, which raises the private :class:`_CommitNotAnswered`
+        with what the client knows of its delivery, for the commit's caller to
+        type.
 
         Every raise for a rejected request happens OUTSIDE the ``except``
         block, so the ``HTTPError`` never rides the raised error's chain: its
@@ -3357,7 +3347,7 @@ class CoherentVolume:
             if typed and commit_leg:
                 # R7: only the client's mark counts as "never sent"; every
                 # other failure may have reached the coordinator.
-                return _Sent(None, None, _CommitNotAnswered(message, never_sent=exc.never_sent, cause=exc))
+                raise _CommitNotAnswered(message, never_sent=exc.never_sent) from exc
             if typed:
                 raise CoordinatorUnreachable(message) from exc
             return self._failed_request(message, outcome_unknown=outcome_unknown_on_failure)
@@ -3372,7 +3362,7 @@ class CoherentVolume:
                     "answered with JSON that is not an object"
                 )
                 if commit_leg:
-                    return _Sent(None, None, _CommitNotAnswered(message, never_sent=False))
+                    raise _CommitNotAnswered(message, never_sent=False)
                 raise CoordinatorUnreachable(message)
             return _Sent(body, None)
         # R2: a remote 401 is a wrong/missing secret — fail LOUD and CLOSED
