@@ -17,7 +17,8 @@ Alpha — APIs may change before `v1.0`.
   coordinator cannot be started or attached, when the connection is refused or
   times out, and when a request that commits nothing gets no usable answer,
   including the caller-principal claim and the strict-glob check at attach. A
-  coordinator that answers with a refusal raises what it raised before. The
+  coordinator that answers with a refusal raises what it raised before, unless
+  the claim sent to recover from a caller-principal refusal gets no answer. The
   MCP server maps it to `coordinator_unavailable` with `recover:
   stop_and_report`, not retryable, because an attached volume never reaches a
   coordinator started after the old one went away; a server whose volume never

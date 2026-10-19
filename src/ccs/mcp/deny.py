@@ -356,14 +356,17 @@ _CAS_TERMINALS: dict[str, _Terminal] = {
 # coordinator bug, for a state that is typed and the session's own.
 PRINCIPAL_REFUSED_RECOVER = "restart_session"
 
-# The refusal that is NOT settled: the request was refused, but the recovery
-# claim's answer was lost, so the volume adopted ``unconfirmed`` and its very
-# next request claims again with the same nonce by itself — the next tool call
-# may simply succeed, and ``swg_status`` reads ``principal_claim: unconfirmed``
+# The refusal that is NOT settled: the request was refused, and the recovery
+# claim was answered without binding (a redirect, an HTTP status, an
+# unconfirmed body), so the volume adopted ``unconfirmed`` and its very next
+# request claims again with the same nonce by itself — the next tool call may
+# simply succeed, and ``swg_status`` reads ``principal_claim: unconfirmed``
 # meanwhile. The verb is the existing one for "the state clears on its own,
 # call again" (``other_holder`` uses it), ``retryable`` true. Answering this arm
 # ``restart_session`` over-claimed durability: it sent the agent to a new
-# session for a state the next call cures.
+# session for a state the next call cures. A recovery claim that gets no answer
+# at all raises ``CoordinatorUnreachable`` on the strict volume and takes that
+# row's stop instead.
 PRINCIPAL_UNSETTLED_RECOVER = "wait_and_retry"
 
 # Fallback for any unrecognized exception (an unexpected ``CoherenceError`` such

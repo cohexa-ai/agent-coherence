@@ -3582,12 +3582,15 @@ caller_principal_absent`, `caller_principal_foreign` or
 `retryable: false`, and so does every `swg_write`, `swg_read` and `swg_gate`
 after it: no tool call in that server session can regain coordination, and a
 new server session claims its own principal. `swg_status` says so ahead of time
-as `principal_claim: refused`. When instead the *answer* to that claim is lost
-(a transport blip), the refusal is not yet settled: the tool call answers the
-same `reason` with `recover: wait_and_retry` and `retryable: true`, the next
-tool call claims again with the same nonce by itself before it runs — and
-usually just succeeds — and `swg_status` reads `principal_claim: unconfirmed`
-until it does. The other values are `bound`, `unsupported` (the coordinator
+as `principal_claim: refused`. When instead that claim is answered without
+binding (a redirect, an HTTP error status, or an answer that leaves the claim
+unconfirmed), the refusal is not yet settled: the tool call answers the same
+`reason` with `recover: wait_and_retry` and `retryable: true`, the next tool
+call claims again with the same nonce by itself before it runs — and may just
+succeed — and `swg_status` reads `principal_claim: unconfirmed` until it does.
+When that claim gets no answer at all, the tool call answers as it does for a
+coordinator that stops answering (next paragraph), with
+`recover: stop_and_report`. The other values are `bound`, `unsupported` (the coordinator
 issues no principals) and `not_attempted`. `swg_status` also forwards the
 coordinator's `caller_principal_absent_total` and
 `caller_principal_refused_total`, `null` rather than `0` when the coordinator
@@ -3600,9 +3603,12 @@ usable answer from its coordinator, the tool call answers `reason:
 coordinator_unavailable` with `recover: stop_and_report` and
 `retryable: false`, and a `next_step` that tells the agent to stop, not to
 write the managed files by any other route, and to report that the server must
-be restarted. Every later tool call in that server session answers the same
-way: the volume keeps the endpoint it attached to and never reaches a
-coordinator started after the old one went away. Restarting the server
+be restarted. While that coordinator stays down, every later tool call answers
+the same way, and the server never reaches a coordinator started after the old
+one went away: the volume keeps the endpoint it attached to. A coordinator that
+is only too slow to answer within the client's timeout gets the same answer,
+although a later call might have gone through; stopping is the safe side of
+that guess. Restarting the server
 attaches it again; if it will not start, stop the workspace's coordinator
 process first. The same `reason` with `recover: retry_later` comes only from a
 server whose volume never attached, so branch on `recover`, not on `reason`. A
