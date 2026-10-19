@@ -7,9 +7,6 @@ coordinator and silently split peers onto different coordinators).
 
 from __future__ import annotations
 
-import errno
-import socket
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,6 +16,7 @@ from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.cli._coherence_client import CoordinatorEndpoint, resolve_endpoint, resolve_remote_endpoint
 from ccs.core.exceptions import CoordinatorUnreachable
+from tests.loopback_helpers import refused_endpoint, refusing_port
 
 
 @pytest.fixture
@@ -32,21 +30,6 @@ def fast_cfg() -> LifecycleConfig:
         connect_retry_attempts=10,
         connect_retry_interval_sec=0.05,
     )
-
-
-def _refusing_port() -> int:
-    """A loopback port that refuses connections and that no other test can take.
-
-    A port freed after ``bind(("127.0.0.1", 0))`` can be handed to another
-    test worker's port-0 bind before the connect, and the connect then reaches
-    a stranger. Ports below 1024 are never handed out for port 0, and port 4
-    is unassigned, so no standard service listens on it; the assert says so
-    if something does. A socket bound without listening is no substitute: on
-    macOS a connect to it hangs until its timeout instead of being refused."""
-    with socket.socket() as probe:
-        probe.settimeout(2)
-        assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
-    return 4
 
 
 def test_remote_mode_connects_without_spawning(
@@ -85,7 +68,7 @@ def test_remote_unreachable_fails_closed_no_spawn(
 
     Does not prove: anything off loopback, or a partition."""
     monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
-    remote = resolve_remote_endpoint("127.0.0.1", _refusing_port(), "deadbeef")
+    remote = resolve_remote_endpoint("127.0.0.1", refusing_port(), "deadbeef")
     with pytest.raises(CoordinatorUnreachable, match="remote coordinator unreachable"):
         CoherentVolume(tmp_path, config=fast_cfg, on_error="strict", remote_endpoint=remote)
     assert not (tmp_path / ".coherence" / "server.pid").exists()
@@ -109,7 +92,7 @@ def test_remote_claim_with_no_answer_is_unreachable(
     real_claim = coherent_volume_module.claim_caller_principal
 
     def claim_refused(endpoint: CoordinatorEndpoint, session_id: str, nonce: str) -> object:
-        return real_claim(replace(endpoint, port=_refusing_port()), session_id, nonce)
+        return real_claim(refused_endpoint(endpoint), session_id, nonce)
 
     monkeypatch.setattr(coherent_volume_module, "claim_caller_principal", claim_refused)
     try:

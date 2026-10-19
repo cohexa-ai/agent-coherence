@@ -54,6 +54,7 @@ from ccs.core.exceptions import (
     ViewWedged,
 )
 from ccs.core.substrate import CapabilityDescriptor, Tier
+from tests.loopback_helpers import refused_endpoint, refusing_port
 from tests.test_coherence_client_tls import (
     _make_handler_class,
     _mint_bundle,
@@ -1052,24 +1053,6 @@ _TLS_FAILED_AFTER = (
 )
 
 
-def _refusing_port() -> int:
-    """A loopback port that refuses connections and that no other test can take.
-
-    A port freed after ``bind(("127.0.0.1", 0))`` can be handed to another
-    test worker's port-0 bind before the connect, and the connect then reaches
-    a stranger. Ports below 1024 are never handed out for port 0, and port 4
-    is unassigned, so no standard service listens on it; the assert says so
-    if something does. A socket bound without listening is no substitute: on
-    macOS a connect to it hangs until its timeout instead of being refused."""
-    import errno
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.settimeout(2)
-        assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
-    return 4
-
-
 @pytest.mark.parametrize(
     "failure",
     ["redirect-presented", "redirect-none", "unreachable", "http-503", "degraded", "principal-refused"],
@@ -1110,7 +1093,7 @@ def test_a_failed_completeness_check_of_a_converged_write_is_the_bump_legs_unkno
         material = [sa._mint_nonce, sa._principal]
         _Redirector.location = f"http://127.0.0.1:1/{''.join(material)}"
         answering = CoordinatorEndpoint(
-            port=_refusing_port() if failure == "unreachable" else httpd.server_address[1],
+            port=refusing_port() if failure == "unreachable" else httpd.server_address[1],
             bearer=sa._endpoint.bearer,
         )
         fake_a.script_unknown(landed=True)  # A's substrate write landed (b"v2")
@@ -1949,7 +1932,7 @@ def _claims_reach_a_refusing_port(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     the REAL claim, so the claim itself reports that it got no answer.
     Returns the session id each claim named."""
     real = substrate_module.claim_caller_principal
-    dead = _refusing_port()
+    dead = refusing_port()
     named: list[str] = []
 
     def unreachable(endpoint, session_id, nonce):  # noqa: ANN001, ANN202
@@ -2105,7 +2088,7 @@ def test_a_read_or_commit_whose_pre_read_is_refused_is_unreachable_and_writes_no
     try:
         a, fake = _agent(store, sa)
         _bytes, tok = a.read(REF)
-        monkeypatch.setattr(sa, "_endpoint", dataclasses.replace(sa._endpoint, port=_refusing_port()))
+        monkeypatch.setattr(sa, "_endpoint", refused_endpoint(sa._endpoint))
 
         with pytest.raises(CoherenceError) as raised:
             if op == "read":

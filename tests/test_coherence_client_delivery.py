@@ -44,20 +44,9 @@ from ccs.cli._coherence_client import (
     CoordinatorUnavailable,
     PrincipalClaim,
 )
+from tests.loopback_helpers import refusing_port
 
 _CLAIM_ROUTE = "/principal/claim"  # frozen duplicate of the wire route
-
-
-def _refusing_port() -> int:
-    """A loopback port that refuses connections and that no other test can take.
-
-    Port 4, not a freed ephemeral port: another test worker's port-0 bind can
-    take a freed port before the connect, and the client would then talk to a
-    stranger. Ports below 1024 are never handed out for port 0."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.settimeout(2)
-        assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
-    return 4
 
 
 # --- the opener seam: a real _execute meeting a scripted transport ------------
@@ -165,7 +154,7 @@ def test_a_malformed_answer_is_not_marked_never_sent(
 def test_a_real_refused_port_is_marked_never_sent() -> None:
     """The real opener against a loopback port that refuses: the mark is set
     from what urllib actually raises, not from a scripted stand-in."""
-    exc = _raised_by_post(_endpoint(_refusing_port()))
+    exc = _raised_by_post(_endpoint(refusing_port()))
 
     assert type(exc) is CoordinatorUnavailable
     assert exc.never_sent is True
@@ -231,7 +220,7 @@ def claim_server() -> Iterator[int]:
 
 
 def test_a_claim_whose_connect_is_refused_is_unconfirmed_and_transport_failed() -> None:
-    claim = cc.claim_caller_principal(_endpoint(_refusing_port()), "session-a", "N" * 43)
+    claim = cc.claim_caller_principal(_endpoint(refusing_port()), "session-a", "N" * 43)
 
     assert claim.outcome == "unconfirmed"
     assert claim.principal is None
