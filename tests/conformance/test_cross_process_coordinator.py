@@ -4,12 +4,17 @@
 """U3 — cross-process coordinator-layer assertions (guarantee-ladder plan).
 
 The coordinator is the serialization point under test, so the only honest
-cross-process shape is: one coordinator process (here: the parent, serving on
-a daemon thread with test-scale sweep timings — the shipped CLI entrypoint
-hard-codes a 600 s heartbeat window, so a test-owned config is the sanctioned
-route per the plan's stop condition (c)), and contender CLIENTS as separate
-spawn-context OS processes driving the shipped client path
+cross-process shape is: one coordinator process (for most cases here: the
+parent, serving on a daemon thread with test-scale sweep timings — the shipped
+CLI entrypoint hard-codes a 600 s heartbeat window, so a test-owned config is
+the sanctioned route per the plan's stop condition (c)), and contender CLIENTS
+as separate spawn-context OS processes driving the shipped client path
 (`resolve_endpoint` + `post` from `ccs.cli._coherence_client`).
+
+The SIGKILL case is the exception: it needs no sweep timings and must kill the
+coordinator without killing pytest, so it launches the coordinator as its own
+process through the shipped `agent-coherence-coordinator` entry point and
+SIGKILLs the detached worker that entry point leaves running.
 
 Precedence note (pins shipped semantics, sharpening the plan's literal
 scenario text): when a peer HAS committed, the version leg fires first and a
@@ -20,22 +25,39 @@ which is the fence's whole job. Both variants are asserted.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import uuid
+from collections.abc import Iterator
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
 import pytest
 
+import ccs
+from ccs.adapters import coherent_volume
+from ccs.adapters.claude_code import lifecycle
 from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     ensure_coordinator,
     stop_coordinator,
+)
+from ccs.adapters.coherent_volume import CoherentVolume
+from ccs.adapters.substrate import (
+    CoordinatedSubstrate,
+    SubstrateCoordinatorSession,
+    _write_strict_policy,
 )
 from ccs.cli._coherence_client import (
     CoordinatorEndpoint,
@@ -52,6 +74,7 @@ from ccs.testing.process_harness import (
     run_in_subprocess,
     run_park_after_ack,
 )
+from ccs.testing.substrate_conformance import ConformanceSubstrate, InMemoryStore
 
 # Spawns real processes that race each other: run with -n 0 (tests/conftest.py).
 pytestmark = pytest.mark.serial
@@ -482,6 +505,264 @@ def test_coordinator_killed_mid_run_yields_typed_unavailable(
     stop_coordinator(coordinator_workspace)
     verdict = run_in_subprocess(ContenderSpec(_child_commit_expect_unavailable, args=(ws, sid)))
     assert verdict == "typed-unavailable"
+
+
+# ---------------------------------------------------------------------------
+# A coordinator process SIGKILLed under a child holding both strict surfaces.
+# The coordinator is its own process here, launched through the shipped entry
+# point; the parent signals only the worker that launch left running.
+# ---------------------------------------------------------------------------
+
+# One glob for both surfaces: the policy is written before the launch (it loads
+# once), and a strict volume refuses a coordinator that does not enforce it.
+_KILL_MANAGED = ("data/**",)
+_KILL_FILE = "data/notes.md"
+_KILL_REF = "data/row.bin"
+_ENTRY_POINT = "agent-coherence-coordinator"
+_LAUNCH_TIMEOUT_SEC = 30.0
+_PORT_REFUSED_DEADLINE_SEC = 15.0
+_PORT_REFUSED_POLL_SEC = 0.05
+_KILL_CHILD_TIMEOUT_SEC = 60.0
+_UNREACHABLE = "ccs.core.exceptions.CoordinatorUnreachable"
+_SPAWN_CALLS = ("volume_connect_or_spawn", "lifecycle_connect_or_spawn", "ensure_coordinator")
+
+
+class _CallCounter:
+    """Counts the calls made through the functions it wraps (child only)."""
+
+    def __init__(self) -> None:
+        self.counts: dict[str, int] = {}
+
+    def wrap(self, owner: Any, name: str, key: str) -> None:
+        original = getattr(owner, name)
+        self.counts[key] = 0
+
+        def counted(*args: Any, **kwargs: Any) -> Any:
+            self.counts[key] += 1
+            return original(*args, **kwargs)
+
+        setattr(owner, name, counted)
+
+    def reset(self) -> None:
+        self.counts = dict.fromkeys(self.counts, 0)
+
+    def snapshot(self) -> dict[str, int]:
+        return dict(self.counts)
+
+
+def _arm_call_counters() -> _CallCounter:
+    """Wrap, before anything is constructed, the call every coordinator request
+    opens its connection through (http.client uses socket.create_connection;
+    the attach probe's raw connect is not counted) and every spawn route."""
+    counter = _CallCounter()
+    counter.wrap(socket, "create_connection", "connections")
+    counter.wrap(coherent_volume, "connect_or_spawn", "volume_connect_or_spawn")
+    counter.wrap(lifecycle, "connect_or_spawn", "lifecycle_connect_or_spawn")
+    counter.wrap(lifecycle, "ensure_coordinator", "ensure_coordinator")
+    return counter
+
+
+def _attach_strict_surfaces(root: Path) -> tuple[CoherentVolume, CoordinatedSubstrate, InMemoryStore]:
+    volume = CoherentVolume(root, managed=_KILL_MANAGED, on_error="strict")
+    store = InMemoryStore()
+    store.set(_KILL_REF, b"row seed")
+    session = SubstrateCoordinatorSession(root, managed=_KILL_MANAGED)
+    return volume, CoordinatedSubstrate(ConformanceSubstrate(store), session), store
+
+
+def _observe_op(
+    op: Callable[[], Any], counter: _CallCounter, state: Callable[[], tuple[str, str]]
+) -> dict[str, Any]:
+    """Run one operation on fresh counters. The raise is reported by its
+    qualified class name (an exception object need not pickle), beside the
+    calls the operation made and the file hash and store token around it."""
+    counter.reset()
+    before = state()
+    raised = message = None
+    try:
+        op()
+    except Exception as exc:  # noqa: BLE001 - every outcome is reported, by name
+        raised = f"{type(exc).__module__}.{type(exc).__qualname__}"
+        message = str(exc)
+    calls = counter.snapshot()
+    return {"raised": raised, "message": message, "calls": calls, "before": before, "after": state()}
+
+
+def _child_strict_surfaces_across_kill(ctx: ParkContext, workspace_str: str) -> dict[str, Any]:
+    """Attach a strict volume and a substrate session, read once through each
+    and ack. Once resumed (the parent has killed the coordinator), read and
+    commit once through each surface and report each outcome."""
+    counter = _arm_call_counters()
+    root = Path(workspace_str)
+    volume, substrate, store = _attach_strict_surfaces(root)
+    volume.read(_KILL_FILE)
+    _seen, token = substrate.read(_KILL_REF)
+    ctx.ack({"attach_calls": counter.snapshot()})
+
+    def state() -> tuple[str, str]:
+        return sha256_hex((root / _KILL_FILE).read_bytes()), store.get(_KILL_REF)[1]
+
+    ops: dict[str, Callable[[], Any]] = {
+        "volume read": lambda: volume.read(_KILL_FILE),
+        "volume write": lambda: volume.write(_KILL_FILE, b"written after the kill\n"),
+        "substrate read": lambda: substrate.read(_KILL_REF),
+        "substrate commit": lambda: substrate.commit(
+            _KILL_REF, expected_token=token, new_bytes=b"row written after the kill"
+        ),
+    }
+    return {name: _observe_op(op, counter, state) for name, op in ops.items()}
+
+
+@dataclass(frozen=True)
+class _LaunchedCoordinator:
+    root: Path
+    pid: int
+    port: int
+    pid_file_bytes: bytes
+
+
+def _entry_point() -> str:
+    """The shipped console script beside this interpreter, else on PATH. A
+    missing script fails the test: skipping would report a kill never run."""
+    beside = Path(sys.executable).parent / _ENTRY_POINT
+    if beside.is_file():
+        return str(beside)
+    found = shutil.which(_ENTRY_POINT)
+    if found is None:
+        pytest.fail(f"{_ENTRY_POINT} is neither beside {sys.executable} nor on PATH")
+    return found
+
+
+def _tree_env() -> dict[str, str]:
+    """The launch env, with this tree's ``src`` first on PYTHONPATH so the
+    detached worker runs this tree's code, not another checkout's."""
+    tree_src = str(Path(ccs.__file__).resolve().parent.parent)
+    existing = os.environ.get("PYTHONPATH", "")
+    return {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [tree_src, existing]))}
+
+
+def _pid_file(root: Path) -> Path:
+    return root / ".coherence" / "server.pid"
+
+
+def _launch_coordinator(root: Path) -> _LaunchedCoordinator:
+    launch = subprocess.run(
+        [_entry_point(), "--root", str(root), "--quiet"],
+        env=_tree_env(), capture_output=True, text=True, timeout=_LAUNCH_TIMEOUT_SEC, check=False,
+    )
+    assert launch.returncode == 0, f"{_ENTRY_POINT} failed ({launch.returncode}): {launch.stderr}"
+    pid_file_bytes = _pid_file(root).read_bytes()
+    pid_line, port_line = pid_file_bytes.decode().splitlines()[:2]
+    return _LaunchedCoordinator(root, int(pid_line), int(port_line), pid_file_bytes)
+
+
+def _command_line(pid: int) -> str:
+    return subprocess.run(
+        ["ps", "-ww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, check=False
+    ).stdout.strip()
+
+
+def _is_own_worker(pid: int, root: Path) -> bool:
+    """Whether ``pid`` is, right now, the detached worker launched for ``root``:
+    never pytest itself (in-process fixtures write ``os.getpid()`` to
+    server.pid) and never a process that reused the pid."""
+    tokens = _command_line(pid).split()
+    return pid != os.getpid() and "--_daemonized" in tokens and str(root) in tokens
+
+
+def _await_port_refused(port: int) -> float:
+    """Seconds until a connect to ``port`` is refused, polled against a
+    wall-clock deadline."""
+    started = time.monotonic()
+    while time.monotonic() - started < _PORT_REFUSED_DEADLINE_SEC:
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.25).close()
+        except ConnectionRefusedError:
+            return time.monotonic() - started
+        except OSError:
+            pass  # not a refusal (a timeout, say): keep polling
+        time.sleep(_PORT_REFUSED_POLL_SEC)
+    raise AssertionError(f"port {port} still accepted connections {_PORT_REFUSED_DEADLINE_SEC}s after SIGKILL")
+
+
+def _kill_worker(launched: _LaunchedCoordinator, _acked: dict[str, Any]) -> dict[str, Any]:
+    """The parent's window: snapshot server.pid, SIGKILL the worker it names
+    once its command line proves it is ours, and wait until its port refuses."""
+    pid_file_bytes = _pid_file(launched.root).read_bytes()
+    assert pid_file_bytes == launched.pid_file_bytes, (pid_file_bytes, launched.pid_file_bytes)
+    command = _command_line(launched.pid)
+    assert _is_own_worker(launched.pid, launched.root), f"pid {launched.pid} is not our worker: {command!r}"
+    os.kill(launched.pid, signal.SIGKILL)
+    return {"pid_file_bytes": pid_file_bytes, "refused_after_sec": _await_port_refused(launched.port)}
+
+
+def _signal_own_worker(root: Path, launched_pid: int | None) -> None:
+    """Teardown: SIGKILL the launched worker only if it is still alive and its
+    command line still names it, by the pid recorded at launch or, when the
+    launch did not get that far, the pid server.pid names now."""
+    try:
+        recorded = int(_pid_file(root).read_text().splitlines()[0])
+    except (OSError, ValueError, IndexError):
+        recorded = None
+    for pid in {launched_pid, recorded} - {None}:
+        if _is_own_worker(pid, root):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+
+
+@pytest.fixture
+def launched_coordinator(tmp_path: Path) -> Iterator[_LaunchedCoordinator]:
+    """A strict workspace whose coordinator runs as its own process, launched
+    through the shipped entry point."""
+    root = tmp_path.resolve()
+    (root / ".git").mkdir()
+    (root / _KILL_FILE).parent.mkdir(parents=True)
+    (root / _KILL_FILE).write_text("seed\n")
+    _write_strict_policy(root / ".coherence", _KILL_MANAGED)
+    launched: _LaunchedCoordinator | None = None
+    try:
+        launched = _launch_coordinator(root)
+        yield launched
+    finally:
+        _signal_own_worker(root, launched.pid if launched is not None else None)
+
+
+def test_sigkilled_coordinator_refuses_both_strict_surfaces_typed(
+    launched_coordinator: _LaunchedCoordinator,
+) -> None:
+    """A coordinator launched through the shipped entry point is SIGKILLed while
+    a child holds a strict volume and a substrate session, each read once. Once
+    the port refuses, the child's volume read, volume write, substrate read and
+    substrate commit each raise ``CoordinatorUnreachable`` after exactly one
+    connection attempt and no spawn or ensure call; the file, the substrate
+    token and server.pid are as they were before the kill.
+
+    What this does not prove: one machine and loopback only; no network
+    partition; the hook client still fails open; attach-leg respawn is
+    unchanged, so a fresh attach to a dead recorded port still respawns; Node
+    is untouched.
+    """
+    launched = launched_coordinator
+    result = run_park_after_ack(
+        ContenderSpec(_child_strict_surfaces_across_kill, args=(str(launched.root),)),
+        partial(_kill_worker, launched),
+        stop=False,
+        timeout_sec=_KILL_CHILD_TIMEOUT_SEC,
+    )
+
+    # The counters were live: attach connected and went through both spawn routes.
+    attach = result.acked["attach_calls"]
+    assert attach["connections"] >= 1, attach
+    assert attach["volume_connect_or_spawn"] == attach["lifecycle_connect_or_spawn"] == 1, attach
+    assert result.window["refused_after_sec"] < _PORT_REFUSED_DEADLINE_SEC, result.window
+
+    assert list(result.value) == ["volume read", "volume write", "substrate read", "substrate commit"]
+    for name, op in result.value.items():
+        assert op["raised"] == _UNREACHABLE, (name, op)
+        assert op["calls"]["connections"] == 1, (name, op)
+        assert all(op["calls"][key] == 0 for key in _SPAWN_CALLS), (name, op)
+        assert op["after"] == op["before"], (name, op)
+    assert _pid_file(launched.root).read_bytes() == result.window["pid_file_bytes"]
 
 
 # ---------------------------------------------------------------------------
