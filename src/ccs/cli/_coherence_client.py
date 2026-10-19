@@ -28,7 +28,7 @@ import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -232,7 +232,21 @@ class CoordinatorUnavailable(Exception):
     """Coordinator is not running or its auth surface is missing.
 
     Carries a human-readable message the console script prints verbatim.
+
+    ``never_sent`` is ``True`` only when the connection never carried the
+    request, so the coordinator cannot have acted on it. Every other failure
+    leaves it ``False`` — a timeout or reset after the request went out, a
+    malformed answer, a raise with no request at all — and a caller deciding
+    whether a commit may have landed must treat that as delivered: only
+    positive evidence counts as "not delivered". Keyword-only and defaulted,
+    so every existing construction, message and repr is unchanged.
     """
+
+    never_sent: bool = False
+
+    def __init__(self, *args: object, never_sent: bool = False) -> None:
+        super().__init__(*args)
+        self.never_sent = never_sent
 
 
 class CoordinatorMalformedAnswer(CoordinatorUnavailable):
@@ -598,12 +612,17 @@ def post(
     body: dict[str, Any],
     *,
     extra_headers: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     """Authenticated POST with JSON body.
 
     M-04 / finding #28: ``extra_headers`` mirrors the pattern on ``get()``
     so callers can add e.g. ``Coherence-Local-Operator: true`` without
     reimplementing the urllib transport layer.
+
+    ``timeout`` bounds this one request, for a best-effort call that must not
+    cost a full timeout on top of the failure it follows; ``None`` means
+    :data:`CLI_HTTP_TIMEOUT_SEC` as it is when the request is made.
     """
     payload = json.dumps(body).encode("utf-8")
     headers: dict[str, str] = {
@@ -621,6 +640,9 @@ def post(
     )
     # Carry the CA bundle to _execute (only consulted for https requests).
     req._ccs_ca_file = endpoint.ca_file  # type: ignore[attr-defined]
+    # The timeout rides the request like the CA bundle, so _execute keeps its
+    # one-argument call shape (test seams replace it with one-argument fakes).
+    req._ccs_timeout = timeout  # type: ignore[attr-defined]
     return _execute(req)
 
 
@@ -677,11 +699,19 @@ class PrincipalClaim:
 
     ``detail`` is diagnostic prose built from constants, known reason tokens,
     an HTTP status code or this client's own transport message — never from
-    the coordinator's answer — so it carries no principal or nonce."""
+    the coordinator's answer — so it carries no principal or nonce.
+
+    ``transport_failed`` is ``True`` only on an ``unconfirmed`` claim that got
+    no answer at all (the client raised :class:`CoordinatorUnavailable`), so a
+    strict surface can type "coordinator unreachable" instead of reading
+    prose; a redirect, an error status or a 2xx that binds nothing is an
+    answer and leaves it ``False``. Keyword-only so positional construction is
+    unchanged; out of repr so a message that embeds one is unchanged."""
 
     outcome: Literal["bound", "unsupported", "refused", "unconfirmed"]
     principal: str | None = None
     detail: str = ""
+    transport_failed: bool = field(default=False, kw_only=True, repr=False)
 
 
 def claim_caller_principal(
@@ -721,7 +751,7 @@ def claim_caller_principal(
         reason = reportable_reason(error_body.get("reason") if isinstance(error_body, dict) else None)
         return PrincipalClaim("unconfirmed", detail=f"claim answered HTTP {exc.code}, reason={reason}")
     except CoordinatorUnavailable as exc:
-        return PrincipalClaim("unconfirmed", detail=str(exc))
+        return PrincipalClaim("unconfirmed", detail=str(exc), transport_failed=True)
     principal = body.get("principal") if isinstance(body, dict) else None
     if isinstance(body, dict) and body.get("ok") is True and isinstance(principal, str) and principal:
         return PrincipalClaim("bound", principal=principal)
@@ -1158,9 +1188,11 @@ def _execute(req: urllib.request.Request) -> dict[str, Any]:
             opener = _get_shared_opener(system_tls=True)
     else:
         opener = _get_shared_opener(system_tls=False)
+    # CLI_HTTP_TIMEOUT_SEC is read per request, not bound once, so a patched value is obeyed.
+    timeout = getattr(req, "_ccs_timeout", None)
     malformed: str | None = None
     try:
-        with opener.open(req, timeout=CLI_HTTP_TIMEOUT_SEC) as resp:
+        with opener.open(req, timeout=CLI_HTTP_TIMEOUT_SEC if timeout is None else timeout) as resp:
             raw = resp.read()
     except urllib.error.HTTPError:
         # Caller handles status-code-specific paths.
@@ -1178,8 +1210,12 @@ def _execute(req: urllib.request.Request) -> dict[str, Any]:
             raise TlsVerificationFailed(
                 _host_of(req), str(exc.reason)
             ) from exc
+        # urllib wraps an OSError in URLError only around the connect and the
+        # send; reading the answer raises unwrapped (the arms below). So here,
+        # and only here, the coordinator never received a whole request.
         raise CoordinatorUnavailable(
-            f"could not reach coordinator at {req.full_url}: {exc.reason}"
+            f"could not reach coordinator at {req.full_url}: {exc.reason}",
+            never_sent=True,
         ) from exc
     except (OSError, TimeoutError) as exc:
         raise CoordinatorUnavailable(
