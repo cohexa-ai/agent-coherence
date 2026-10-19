@@ -17,5 +17,5 @@
     "status": 200,
     "body": {"status": "fresh"}
   },
-  "backends": ["python"]
+  "backends": ["python", "node"]
 }

@@ -38,5 +38,5 @@
     }
   },
   "backends": ["python"],
-  "_comment": "strict_mode.yaml loading is Python-only in v0.2 (see harness.apply_setup), so a strict fixture could not run against Node even if the route existed there."
+  "_comment": "Python only: the Node coordinator does not serve the effect-fence route (fixture 13)."
 }
