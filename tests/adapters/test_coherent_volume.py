@@ -7159,14 +7159,19 @@ def _route_one_commit(
     monkeypatch: pytest.MonkeyPatch, commit: Callable[[str, dict], bool],
     elsewhere: Callable[[CoordinatorEndpoint], CoordinatorEndpoint],
     calls: list[tuple[str, dict, dict]],
+    release_answer: dict | None = None,
 ) -> None:
     """Send every request ``commit(route, payload)`` picks to ``elsewhere(endpoint)``
     through the REAL client, every other request to the coordinator, and record
-    each as ``(route, payload, keyword arguments)``."""
+    each as ``(route, payload, keyword arguments)``. A ``release_answer`` is
+    returned for every ``success:false`` release instead, which then never
+    reaches the coordinator, so the grant it names still stands there."""
     real_post = coherent_volume_module._coordinator_post
 
     def post(endpoint: CoordinatorEndpoint, path: str, payload: dict, **kwargs: object) -> object:
         calls.append((path, dict(payload), dict(kwargs)))
+        if release_answer is not None and path == "/hooks/post-edit" and payload.get("success") is False:
+            return dict(release_answer)
         target = elsewhere(endpoint) if commit(path, payload) else endpoint
         return real_post(target, path, payload, **kwargs)
 
@@ -7278,6 +7283,85 @@ def test_a_write_keeps_its_grant_on_record_until_a_release_is_answered(
         stop_coordinator(tmp_path)
 
 
+def test_a_released_grant_leaves_the_record_of_the_incarnation_s_other_paths_alone(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The incarnation already holds a grant on ``other`` from an earlier
+    write() that landed, then a write() on ``rel`` gets no answer to its commit
+    and its release is answered. The release names ``rel`` only, so only
+    ``rel`` leaves the volume's record: the incarnation's entry stays, holding
+    ``other``, and the next re-mint still sends the ``session-stop`` that
+    releases it. Not proved: more than one machine, or a network between the
+    volume and the coordinator; the answer to the release is the real
+    coordinator's, over loopback."""
+    rel, other = "data/shared.txt", "data/other.txt"
+    _seed(tmp_path, rel, content=b"v1")
+    _seed(tmp_path, other, content=b"o1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read(rel)
+        vol.read(other)
+        holder = vol._incarnation
+        holder_row = str(session_to_agent_id(vol.session_id, holder))
+        vol.write(other, b"o2")
+        assert vol._grant_incarnations.get(holder) == {other}, "control: the earlier write() recorded its grant"
+        calls: list[tuple[str, dict, dict]] = []
+        _route_one_commit(monkeypatch, _is_write_commit, refused_endpoint, calls)
+
+        with pytest.raises(CoordinatorUnreachable):
+            vol.write(rel, b"v2")
+
+        assert len(_releases(calls)) == 1, "control: one release was sent"
+        assert vol._grant_incarnations == {holder: {other}}, "the release took more than its own path"
+        assert rel not in _held(vol, holder_row), "control: the coordinator released the path"
+        calls.clear()
+        vol.reacquire(rel)
+
+        stops = [body["agent_id"] for path, body, _k in calls if path == "/hooks/session-stop"]
+        assert stops == [holder], "the record of the other path was lost, so no re-mint released it"
+        assert _held(vol, holder_row) == {}
+        assert holder not in vol._grant_incarnations
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("answer", [{"ok": True, "degraded": True}, {"ok": False}])
+def test_a_release_that_is_not_a_clean_ok_leaves_the_grant_on_record(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, answer: dict,
+) -> None:
+    """write()'s commit never left and its release IS answered, but not with a
+    clean ``ok: true``: degraded, or ``ok: false``. Neither confirms the
+    coordinator released the grant, so it stays on the volume's record, still
+    stands at the coordinator, and the next re-mint sends the ``session-stop``
+    naming the incarnation, which releases it. Not proved: more than one
+    machine; the release answers are canned in-process, not the coordinator's."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read(rel)
+        holder = vol._incarnation
+        holder_row = str(session_to_agent_id(vol.session_id, holder))
+        calls: list[tuple[str, dict, dict]] = []
+        _route_one_commit(monkeypatch, _is_write_commit, refused_endpoint, calls, release_answer=answer)
+
+        with pytest.raises(CoordinatorUnreachable):
+            vol.write(rel, b"v2")
+
+        assert len(_releases(calls)) == 1, "control: one release was sent"
+        assert vol._grant_incarnations.get(holder) == {rel}, "an unconfirmed release dropped the record"
+        assert _held(vol, holder_row) == {rel: "EXCLUSIVE"}, "control: the grant still stands"
+        calls.clear()
+        vol.reacquire(rel)
+
+        stops = [body["agent_id"] for path, body, _k in calls if path == "/hooks/session-stop"]
+        assert stops == [holder]
+        assert _held(vol, holder_row) == {}
+        assert holder not in vol._grant_incarnations
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_a_write_whose_commit_is_refused_for_its_principal_and_whose_re_claim_gets_no_answer_is_unreachable(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -7351,8 +7435,9 @@ def test_a_cas_with_no_answer_is_unreachable_when_never_sent_and_unconfirmed_whe
     saying the outcome is unknown and to re-read. Either way the CAS is sent
     once and no byte touches disk. Covers write_cas, write_cas_at, and a
     single-member atomic_publish, which takes write_cas_at's path. Before,
-    both raised ``CoordinatorUnreachable``, telling a caller "nothing
-    happened" of a commit that may have landed."""
+    both raised a bare ``CoherenceError``. Raising ``CoordinatorUnreachable``
+    for the delivered case would tell a caller "nothing happened" of a commit
+    that may have landed."""
     from ccs.core.exceptions import CommitUnconfirmed
 
     rel = "data/shared.txt"
