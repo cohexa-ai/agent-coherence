@@ -3666,8 +3666,9 @@ def test_write_cas_at_commits_over_a_grant_its_own_write_left_standing(
     coordinator, so the CAS met its own grant as ``other_holder`` with expected ==
     current — and every retry re-minted into the same refusal (#196). Two ways to
     strand the grant: the acquire landed but its answer was lost, or the commit
-    never reached the coordinator. The grant has to be recorded at the acquire,
-    not at the commit, or both are missed."""
+    never reached the coordinator (its connect refused) and neither did the
+    release write() sends after it. The grant has to be recorded at the
+    acquire, not at the commit, or both are missed."""
     rel = "data/shared.txt"
     target = _seed(tmp_path, content=b"v1")
     vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
@@ -3675,12 +3676,15 @@ def test_write_cas_at_commits_over_a_grant_its_own_write_left_standing(
         _data, version = vol.read_with_version(rel)
         real_post = coherent_volume_module._coordinator_post
 
-        def strand_the_grant(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        def strand_the_grant(
+            endpoint: CoordinatorEndpoint, path: str, payload: dict, **kwargs: object
+        ) -> object:
             if lost == "pre-edit answer" and path == "/hooks/pre-edit":
                 real_post(endpoint, path, payload, **kwargs)  # the acquire lands ...
                 raise CoordinatorUnavailable("simulated: the acquire's answer was lost")
-            if lost == "post-edit" and path == "/hooks/post-edit" and payload.get("success"):
-                raise CoordinatorUnavailable("simulated: the commit never arrived")
+            if lost == "post-edit" and path == "/hooks/post-edit":
+                # The commit, and the success:false release after it.
+                return real_post(_refused(endpoint), path, payload, **kwargs)
             return real_post(endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", strand_the_grant)
@@ -6582,7 +6586,9 @@ def test_a_commit_that_fails_after_the_bytes_landed_takes_one_path_whatever_its_
     refused, never followed, and reported by its status alone. Before, a
     redirect escaped as ``RedirectRefused`` in both modes: the trust refusal
     of a request that changed nothing, after the write had changed the file.
-    The grant stays recorded, as for any failed commit."""
+    The grant stays recorded, as for any failed commit, and nothing releases
+    it: an answered commit is not one with no answer, so write() sends no
+    ``success:false`` release."""
     import traceback
 
     rel = "data/shared.txt"
@@ -6597,9 +6603,12 @@ def test_a_commit_that_fails_after_the_bytes_landed_takes_one_path_whatever_its_
         vol.read(rel)
         real_post = coherent_volume_module._coordinator_post
         answering = CoordinatorEndpoint(port=httpd.server_address[1], bearer=vol._endpoint.bearer)
+        releases: list[dict] = []
 
         def fail_the_commit(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
             commit = path == "/hooks/post-edit" and payload.get("success") is True
+            if path == "/hooks/post-edit" and payload.get("success") is False:
+                releases.append(dict(payload))
             return real_post(answering if commit else endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", fail_the_commit)
@@ -6622,6 +6631,7 @@ def test_a_commit_that_fails_after_the_bytes_landed_takes_one_path_whatever_its_
         assert _AnsweringCoordinator.seen == ["/hooks/post-edit"], "control: the commit was answered"
         assert target.read_bytes() == b"v2", "control: the bytes had landed"
         assert vol._incarnation in vol._grant_incarnations, "the grant stays recorded"
+        assert releases == [], "an answered commit was treated as one with no answer"
         # The one path, down to the commit record the 5xx arm (the control)
         # leaves: strict raised before it; degrade wrote best-effort past it.
         committed = _sha(b"v2") if on_error == "degrade" else None
@@ -7106,3 +7116,419 @@ def test_a_degrade_volume_whose_coordinator_refuses_warns_once_and_counts_each_f
         assert len(degraded) == 1, [str(w.message) for w in degraded]
     finally:
         stop_coordinator(tmp_path)
+
+
+# --- a commit leg with no answer: delivered or never sent (AE2, AE4, AE6, AE9) ---
+#
+# What these do not prove: one machine and loopback only; no network partition;
+# the hook client still fails open; a fresh attach to a dead recorded port still
+# respawns (attach-leg respawn is unchanged); the Node coordinator is untouched.
+
+
+class _SilentListener:
+    """A loopback listener that reads each whole request, then closes the
+    connection without answering: the request was delivered and got no
+    answer, as from a coordinator that died after receiving it. The real
+    client reports that as a ``CoordinatorUnavailable`` NOT marked never-sent.
+    Records the route of every request it received in full."""
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(8)
+        self.port = self._sock.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _addr = self._sock.accept()
+            except OSError:
+                return
+            with conn:
+                self._receive(conn)
+
+    def _receive(self, conn: socket.socket) -> None:
+        raw = b""
+        while b"\r\n\r\n" not in raw:
+            chunk = conn.recv(65536)
+            if not chunk:
+                return
+            raw += chunk
+        head, _sep, body = raw.partition(b"\r\n\r\n")
+        lines = head.decode("latin-1").split("\r\n")
+        length = next(
+            (int(v) for k, _s, v in (h.partition(":") for h in lines[1:]) if k.strip().lower() == "content-length"),
+            0,
+        )
+        while len(body) < length:
+            chunk = conn.recv(65536)
+            if not chunk:
+                return
+            body += chunk
+        # Only a request received in full counts as delivered.
+        self.seen.append(lines[0].split(" ")[1])
+
+    def close(self) -> None:
+        self._sock.close()
+
+
+def _route_one_commit(
+    monkeypatch: pytest.MonkeyPatch, commit: Callable[[str, dict], bool],
+    elsewhere: Callable[[CoordinatorEndpoint], CoordinatorEndpoint],
+    calls: list[tuple[str, dict, dict]],
+) -> None:
+    """Send every request ``commit(route, payload)`` picks to ``elsewhere(endpoint)``
+    through the REAL client, every other request to the coordinator, and record
+    each as ``(route, payload, keyword arguments)``."""
+    real_post = coherent_volume_module._coordinator_post
+
+    def post(endpoint: CoordinatorEndpoint, path: str, payload: dict, **kwargs: object) -> object:
+        calls.append((path, dict(payload), dict(kwargs)))
+        target = elsewhere(endpoint) if commit(path, payload) else endpoint
+        return real_post(target, path, payload, **kwargs)
+
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_post", post)
+
+
+def _is_write_commit(path: str, payload: dict) -> bool:
+    """write()'s commit, not the release it sends on the same route."""
+    return path == "/hooks/post-edit" and payload.get("success") is True
+
+
+def _releases(calls: list[tuple[str, dict, dict]]) -> list[tuple[dict, dict]]:
+    return [(body, kwargs) for path, body, kwargs in calls if path == "/hooks/post-edit" and body.get("success") is False]
+
+
+@pytest.mark.parametrize("commit", ["refused", "unanswered"])
+def test_a_write_whose_commit_gets_no_answer_releases_its_grant_and_never_returns(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, commit: str,
+) -> None:
+    """AE4: write() took its grant and put its bytes on disk, then its commit
+    (post-edit) got no answer. Its connect refused (the request never left):
+    ``CoordinatorUnreachable``, saying the coordinator did not record the
+    write. Delivered to a listener that never answers: ``CommitUnconfirmed``,
+    saying it may have. Either way write() does not return, the bytes are on
+    disk, and ONE best-effort ``success:false`` release names the incarnation
+    holding the grant, bounded by its own short timeout rather than the
+    client's default. The release is answered here, so the grant is gone at
+    the coordinator and from the volume's record.
+
+    Before, a strict write() raised ``CoordinatorUnreachable`` for both, with
+    nothing about the bytes it left, and released nothing: the grant stood
+    until a later re-mint, blocking every peer's write of the path."""
+    from ccs.cli._coherence_client import CLI_HTTP_TIMEOUT_SEC
+    from ccs.core.exceptions import CommitUnconfirmed
+
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    silent = _SilentListener()
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read(rel)
+        holder = vol._incarnation
+        calls: list[tuple[str, dict, dict]] = []
+        moved = _refused if commit == "refused" else (lambda e: replace(e, port=silent.port))
+        _route_one_commit(monkeypatch, _is_write_commit, moved, calls)
+
+        with pytest.raises(CoherenceError) as raised:
+            vol.write(rel, b"v2")
+
+        message = str(raised.value)
+        if commit == "refused":
+            assert type(raised.value) is CoordinatorUnreachable, repr(raised.value)
+            assert "did not record the write" in message, message
+            assert raised.value.__cause__.never_sent is True  # type: ignore[union-attr]
+            assert silent.seen == []
+        else:
+            assert type(raised.value) is CommitUnconfirmed, repr(raised.value)
+            assert "may have recorded the write" in message, message
+            assert silent.seen == ["/hooks/post-edit"], "control: the commit was delivered"
+        assert f"bytes are on disk at {rel}" in message, message
+        assert target.read_bytes() == b"v2"
+        assert rel not in vol._last_committed_hash, "write() went on as though its commit landed"
+        (release, kwargs), = _releases(calls)
+        assert release == {"session_id": vol.session_id, "agent_id": holder, "path": rel, "success": False}
+        assert kwargs["timeout"] == coherent_volume_module._GRANT_RELEASE_TIMEOUT_SEC < CLI_HTTP_TIMEOUT_SEC
+        assert _held(vol, str(session_to_agent_id(vol.session_id, holder))) == {}, "the grant stands"
+        assert holder not in vol._grant_incarnations, "an answered release left the grant recorded"
+    finally:
+        silent.close()
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("release", ["answered", "unanswered"])
+def test_a_write_keeps_its_grant_on_record_until_a_release_is_answered(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, release: str,
+) -> None:
+    """write()'s commit never left (connect refused), and so, here, did or did
+    not its release. An answered release drops the grant from the volume's
+    record: the coordinator released it, and the next re-mint spends no
+    request on it. An unanswered one keeps it on record, the grant still
+    stands at the coordinator, and the next re-mint sends the
+    ``session-stop`` naming that incarnation, which releases it. The
+    raised type is the same either way."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read(rel)
+        holder = vol._incarnation
+        holder_row = str(session_to_agent_id(vol.session_id, holder))
+        calls: list[tuple[str, dict, dict]] = []
+        moved = _is_write_commit if release == "answered" else (lambda path, _b: path == "/hooks/post-edit")
+        _route_one_commit(monkeypatch, moved, _refused, calls)
+
+        with pytest.raises(CoordinatorUnreachable):
+            vol.write(rel, b"v2")
+
+        assert len(_releases(calls)) == 1, "control: one release was sent"
+        if release == "answered":
+            assert holder not in vol._grant_incarnations
+            assert _held(vol, holder_row) == {}
+        else:
+            assert vol._grant_incarnations.get(holder) == {rel}
+            assert _held(vol, holder_row) == {rel: "EXCLUSIVE"}, "control: the grant still stands"
+        calls.clear()
+        vol.reacquire(rel)
+
+        stops = [body["agent_id"] for path, body, _k in calls if path == "/hooks/session-stop"]
+        assert stops == ([] if release == "answered" else [holder])
+        assert _held(vol, holder_row) == {}
+        assert holder not in vol._grant_incarnations
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_write_whose_commit_is_refused_for_its_principal_and_whose_re_claim_gets_no_answer_is_unreachable(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """write()'s commit is refused for its principal after the bytes landed,
+    and the claim recovery sends goes to a port that refuses. A refused
+    commit was not recorded, and the coordinator could not be reached to
+    settle the principal, so the write takes the never-sent arm of a commit
+    with no answer: one release attempt, then ``CoordinatorUnreachable``
+    saying the bytes are on disk and the coordinator did not record the
+    write. Before, ``CoordinatorUnreachable`` escaped straight from the
+    request, saying nothing of the bytes, and nothing was released. No
+    principal or nonce reaches the error."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    caplog.set_level(logging.DEBUG)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read(rel)
+        holder, bound, nonce = vol._incarnation, vol._principal, vol._mint_nonce
+        real_post = coherent_volume_module._coordinator_post
+        real_claim = coherent_volume_module.claim_caller_principal
+        calls: list[tuple[str, dict, dict]] = []
+
+        def lose_principal_after_the_grant(
+            endpoint: CoordinatorEndpoint, path: str, payload: dict, **kwargs: object
+        ) -> object:
+            calls.append((path, dict(payload), dict(kwargs)))
+            answer = real_post(endpoint, path, payload, **kwargs)
+            if path == "/hooks/pre-edit":
+                vol._principal = "X" * 43  # no longer the bound one, as after a store reset
+            return answer
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", lose_principal_after_the_grant)
+        monkeypatch.setattr(
+            coherent_volume_module, "claim_caller_principal",
+            lambda endpoint, sid, n: real_claim(_refused(endpoint), sid, n),
+        )
+        with pytest.raises(CoherenceError) as raised:
+            vol.write(rel, b"v2")
+
+        message = str(raised.value)
+        assert type(raised.value) is CoordinatorUnreachable, repr(raised.value)
+        assert f"bytes are on disk at {rel}" in message, message
+        assert "did not record the write" in message, message
+        assert "caller_principal_foreign" in message, message
+        assert target.read_bytes() == b"v2"
+        (release, _kwargs), = _releases(calls)
+        assert release["agent_id"] == holder
+        _assert_no_secret_in(message + caplog.text, bound, nonce, "X" * 43)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+#: The commit legs that never write to disk before a confirmed win, each run
+#: once with an expected version read just before.
+_CAS_COMMIT_SURFACES = {
+    "write_cas": lambda vol, rel, version: vol.write_cas(rel, lambda cur: cur + b"+mine"),
+    "write_cas_at": lambda vol, rel, version: vol.write_cas_at(rel, version, b"mine"),
+    "atomic_publish": lambda vol, rel, version: vol.atomic_publish([(rel, version, b"mine")]),
+}
+
+
+@pytest.mark.parametrize("commit", ["refused", "unanswered"])
+@pytest.mark.parametrize("surface", list(_CAS_COMMIT_SURFACES))
+def test_a_cas_with_no_answer_is_unreachable_when_never_sent_and_unconfirmed_when_delivered(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    surface: str, commit: str,
+) -> None:
+    """AE2: the coordinator answers attach and the comparand read, then the
+    compare-and-swap gets no answer. Its connect refused, the request never
+    left and cannot have landed: ``CoordinatorUnreachable``. Delivered to a
+    listener that never answers, it may have landed: ``CommitUnconfirmed``,
+    saying the outcome is unknown and to re-read. Either way the CAS is sent
+    once and no byte touches disk. Covers write_cas, write_cas_at, and a
+    single-member atomic_publish, which takes write_cas_at's path. Before,
+    both raised ``CoordinatorUnreachable``, telling a caller "nothing
+    happened" of a commit that may have landed."""
+    from ccs.core.exceptions import CommitUnconfirmed
+
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    silent = _SilentListener()
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        _data, version = vol.read_with_version(rel)
+        calls: list[tuple[str, dict, dict]] = []
+        moved = _refused if commit == "refused" else (lambda e: replace(e, port=silent.port))
+        _route_one_commit(monkeypatch, lambda path, _b: path == "/hooks/post-edit-cas", moved, calls)
+
+        with pytest.raises(CoherenceError) as raised:
+            _CAS_COMMIT_SURFACES[surface](vol, rel, version)
+
+        message = str(raised.value)
+        if commit == "refused":
+            assert type(raised.value) is CoordinatorUnreachable, repr(raised.value)
+            assert "did not land" in message, message
+        else:
+            assert type(raised.value) is CommitUnconfirmed, repr(raised.value)
+            assert "whether it landed is unknown" in message and "Re-read" in message, message
+            assert silent.seen == ["/hooks/post-edit-cas"], "control: the CAS was delivered"
+        assert isinstance(raised.value.__cause__, CoordinatorUnavailable), repr(raised.value.__cause__)
+        assert [path for path, _b, _k in calls].count("/hooks/post-edit-cas") == 1, "sent once"
+        assert target.read_bytes() == b"v1", "an unconfirmed CAS touched disk"
+    finally:
+        silent.close()
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "raw", [b"", b"<html>busy</html>", b"[]"], ids=["empty", "non-json", "non-object"]
+)
+@pytest.mark.parametrize("surface", ["write", "write_cas"])
+def test_a_commit_answered_with_nothing_usable_is_unconfirmed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    surface: str, raw: bytes,
+) -> None:
+    """AE6: a commit answered 2xx with an empty body, a body that is not
+    JSON, or JSON that is not an object got no usable answer, and it was
+    delivered: ``CommitUnconfirmed``. write()'s bytes are on disk; a
+    write_cas wrote none. Before, a strict write() took the non-object
+    answer as an admitted commit and returned."""
+    from ccs.core.exceptions import CommitUnconfirmed
+
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        vol.read(rel)
+        if surface == "write":
+            _answer_with_body(monkeypatch, "/hooks/post-edit", raw)
+            with pytest.raises(CommitUnconfirmed, match="may have recorded the write"):
+                vol.write(rel, b"v2")
+            assert target.read_bytes() == b"v2"
+        else:
+            _answer_with_body(monkeypatch, "/hooks/post-edit-cas", raw)
+            with pytest.raises(CommitUnconfirmed, match="whether it landed is unknown"):
+                vol.write_cas(rel, lambda cur: cur + b"+mine")
+            assert target.read_bytes() == b"v1"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("surface", ["write", "write_cas"])
+def test_a_degrade_volume_whose_commit_is_delivered_and_unanswered_behaves_as_before(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, surface: str,
+) -> None:
+    """AE9: under ``on_error="degrade"`` a commit delivered to a listener that
+    never answers changes nothing: write() warns once and returns, writing
+    best-effort and sending no release; write_cas warns once and raises
+    ``CommitUnconfirmed``, with the same unknown-outcome text as strict,
+    and writes nothing."""
+    from ccs.core.exceptions import CommitUnconfirmed
+
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    silent = _SilentListener()
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        vol.read(rel)
+        calls: list[tuple[str, dict, dict]] = []
+        commit = _is_write_commit if surface == "write" else (lambda path, _b: path == "/hooks/post-edit-cas")
+        _route_one_commit(monkeypatch, commit, lambda e: replace(e, port=silent.port), calls)
+
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            if surface == "write":
+                vol.write(rel, b"v2")
+            else:
+                with pytest.raises(CommitUnconfirmed, match="whether it landed is unknown"):
+                    vol.write_cas(rel, lambda cur: cur + b"+mine")
+
+        assert silent.seen == ["/hooks/post-edit" if surface == "write" else "/hooks/post-edit-cas"]
+        degraded = [w for w in warned if issubclass(w.category, CoherenceDegradedWarning)]
+        assert len(degraded) == 1 and vol.degradation_count == 1, [str(w.message) for w in degraded]
+        assert _releases(calls) == [], "degrade mode sent a release"
+        assert target.read_bytes() == (b"v2" if surface == "write" else b"v1")
+    finally:
+        silent.close()
+        stop_coordinator(tmp_path)
+
+
+def test_a_release_after_a_commit_that_landed_leaves_the_commit_as_it_is(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """write()'s commit reaches a live coordinator and lands, and its answer
+    is lost on the way back (the real client's read timeout). write() raises
+    ``CommitUnconfirmed`` and sends its release; the coordinator answers it.
+    The release only gives up the grant: the artifact's version, hash and
+    last writer are exactly what the landed commit left. The coordinator
+    runs in this process so its registry can be read."""
+    from ccs.core.exceptions import CommitUnconfirmed
+
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    server = _serve_in_process(tmp_path, "release-after-landed-commit")
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+        vol.read(rel)
+        holder_row = str(session_to_agent_id(vol.session_id, vol._incarnation))
+        artifact_id = server.registry.lookup_artifact_id_by_name(rel)
+        real_post = coherent_volume_module._coordinator_post
+        landed: list[tuple[int, str | None, str | None]] = []
+
+        def record_of() -> tuple[int, str | None, str | None]:
+            artifact = server.registry.get_artifact(artifact_id)
+            writer = server.registry.last_writer_for(artifact_id)
+            return artifact.version, artifact.content_hash, writer.hex if writer else None
+
+        def lose_the_commits_answer(
+            endpoint: CoordinatorEndpoint, path: str, payload: dict, **kwargs: object
+        ) -> object:
+            answer = real_post(endpoint, path, payload, **kwargs)
+            if _is_write_commit(path, payload):
+                landed.append(record_of())
+                try:
+                    raise TimeoutError("timed out")
+                except TimeoutError as exc:
+                    raise CoordinatorUnavailable(f"network error talking to coordinator: {exc}") from exc
+            return answer
+
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", lose_the_commits_answer)
+        with pytest.raises(CommitUnconfirmed):
+            vol.write(rel, b"v2")
+
+        (after_commit,) = landed
+        assert after_commit == (2, _sha(b"v2"), holder_row.replace("-", "")), "control: the commit landed"
+        assert record_of() == after_commit, "the release changed what the commit recorded"
+        assert _held(vol, holder_row) == {}, "control: the release was answered and gave up the grant"
+    finally:
+        server.shutdown()

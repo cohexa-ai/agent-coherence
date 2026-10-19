@@ -159,14 +159,58 @@ class _ReadResult(NamedTuple):
         return self.stale_denied and self.content_differs
 
 
+class _CommitNotAnswered(Exception):
+    """A strict commit leg's request (see :func:`_is_commit_leg`) that got no
+    usable answer. :meth:`CoherentVolume._post` raises it in place of
+    ``CoordinatorUnreachable``, and the commit leg's caller turns it into
+    its own typed error, because a commit that reached the coordinator may
+    have landed. Private: it never leaves the volume.
+
+    ``never_sent`` is True only when the coordinator cannot have recorded
+    the commit: the client marked the request never sent, or the coordinator
+    refused it for its principal and the re-claim got no answer. Anything
+    else, a malformed or non-object answer included, counts as delivered.
+    ``detail`` names the request and what failed, from the client's own
+    text; ``__cause__`` is the client's error, when there was one."""
+
+    def __init__(self, detail: str, *, never_sent: bool, cause: BaseException | None = None) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.never_sent = never_sent
+        self.__cause__ = cause
+
+
 class _Sent(NamedTuple):
     """What one POST from :meth:`CoherentVolume._send` yielded: the 2xx body,
     or the typed reason of a caller-principal refusal left to the caller's
-    recovery (R20). Both ``None`` after any other failure, which already went
-    through ``on_error`` (degrade mode only — strict raised)."""
+    recovery (R20), or, for a strict commit leg, ``unanswered``: the request
+    got no usable answer. All three ``None`` after any other failure, which
+    already went through ``on_error`` (degrade mode only — strict raised)."""
 
     body: dict | None
     principal_refusal: str | None
+    unanswered: _CommitNotAnswered | None = None
+
+
+def _is_commit_leg(endpoint_path: str, payload: dict) -> bool:
+    """Whether a request is a commit leg: write()'s ``success: true``
+    post-edit (not the release it sends on the same route), the
+    compare-and-swap of ``write_cas`` and ``write_cas_at``, or
+    ``atomic_publish``'s batch commit. Whether one of these reached the
+    coordinator decides what a strict volume raises when it gets no answer.
+    Classified here, by route, rather than by a keyword each caller passes,
+    so every call keeps ``_post``'s two-argument shape, which stand-ins for
+    ``_post`` rely on."""
+    if endpoint_path in ("/hooks/post-edit-cas", "/session/commit_all"):
+        return True
+    return endpoint_path == "/hooks/post-edit" and payload.get("success") is True
+
+
+# R9: the bound on write()'s best-effort release of its grant after its commit
+# got no answer. Against a silent coordinator that commit already cost a full
+# client timeout; the release must not cost a second one, on the caller and on
+# the MCP server's event loop.
+_GRANT_RELEASE_TIMEOUT_SEC = 1.0
 
 
 # Plan Unit 6 (R6): client-side bound on the OCC re-mint→re-commit loop in
@@ -267,6 +311,70 @@ _PUBLISH_UNCLASSIFIABLE_MESSAGE = (
     "coordinator is unknown, and no file was written. Re-read every member, "
     "and retry only if the publish is absent."
 )
+# The batch commit got no usable answer, and may have reached the coordinator
+# (strict), or degrade mode already warned about the failure: the outcome is
+# unknown either way.
+_PUBLISH_UNANSWERED_MESSAGE = (
+    "atomic_publish commit could not be confirmed: the coordinator gave no "
+    "usable answer, so whether the batch landed at the coordinator is unknown, "
+    "and no file was written. Re-read every member, and retry only if the "
+    "publish is absent."
+)
+
+
+def _publish_not_recorded_message(detail: str) -> str:
+    """What a strict multi-member atomic_publish raises
+    (:class:`~ccs.core.exceptions.CoordinatorUnreachable`) when the
+    coordinator cannot have recorded its batch commit. ``detail`` is the
+    client's own text, never the coordinator's."""
+    return (
+        f"atomic_publish commit did not land: the coordinator did not record it "
+        f"({detail}), and no file was written. Re-read every member before "
+        "publishing again."
+    )
+
+
+def _unanswered_cas_message(rel: str) -> str:
+    """What an OCC commit raises (:class:`~ccs.core.exceptions.CommitUnconfirmed`)
+    when it got no usable answer and may have reached the coordinator, or,
+    in degrade mode, when the failure already warned: whether it landed is
+    unknown, and CAS-first means the bytes never touched disk."""
+    return (
+        f"OCC commit of {rel} could not be confirmed: the coordinator gave no "
+        "usable answer, so whether it landed is unknown, and the write did not "
+        "touch disk. Re-read, and retry only if it is absent."
+    )
+
+
+def _cas_not_recorded_message(rel: str, detail: str) -> str:
+    """What a strict OCC commit raises
+    (:class:`~ccs.core.exceptions.CoordinatorUnreachable`) when the
+    coordinator cannot have recorded it. ``detail`` is the client's own
+    text, never the coordinator's."""
+    return (
+        f"OCC commit of {rel} did not land: the coordinator did not record it "
+        f"({detail}), and the write did not touch disk. Re-read before retrying."
+    )
+
+
+def _unanswered_write_message(rel: str, no_answer: _CommitNotAnswered) -> str:
+    """What a strict write() raises when its commit (post-edit) got no usable
+    answer after its bytes reached disk (R8): that they are there, and
+    whether the coordinator certainly did not record the write or may have.
+    The release it sends first is best-effort and not reported, so the text
+    holds whether or not that release was answered (R9). ``detail`` is the
+    client's own text, never the coordinator's."""
+    if no_answer.never_sent:
+        recorded = f"the coordinator did not record the write ({no_answer.detail})"
+    else:
+        recorded = (
+            f"its commit got no usable answer ({no_answer.detail}), so the "
+            "coordinator may have recorded the write"
+        )
+    return (
+        f"The write's bytes are on disk at {rel}, but {recorded}. One best-effort "
+        "release of its grant was attempted. Re-read the path before writing it again."
+    )
 
 
 # What write()'s grant request (pre-edit) had already done when its commit is
@@ -577,8 +685,11 @@ class CoherentVolume:
       raises :class:`~ccs.core.exceptions.CoherenceError`. Fail-closed. A
       request that gets no usable answer from the coordinator raises its
       subclass :class:`~ccs.core.exceptions.CoordinatorUnreachable`, except
-      one that may have landed (a handoff verb), which raises
-      :class:`~ccs.core.exceptions.CommitUnconfirmed`.
+      one that may have landed — a handoff verb, or a commit request that
+      may have reached the coordinator — which raises
+      :class:`~ccs.core.exceptions.CommitUnconfirmed`. A :meth:`write` whose
+      commit gets no answer first sends one best-effort release of its grant,
+      and its error says the bytes are on disk.
     - ``"degrade"``: the same conditions warn once
       (:class:`~ccs.core.exceptions.CoherenceDegradedWarning`) and the appliance
       operates best-effort (coherence may be off). Mirrors the other adapters.
@@ -1534,6 +1645,12 @@ class CoherentVolume:
         :meth:`reacquire`'s fresh bytes. ``on_error`` governs only
         coherence-infrastructure failures (unavailable coordinator, watchdog
         timeout): strict raises, degrade warns once and writes best-effort.
+        A strict commit (post-edit) that gets no answer after the bytes
+        reached disk sends one best-effort release of the grant, then raises
+        :class:`~ccs.core.exceptions.CoordinatorUnreachable` when the commit
+        never left (the coordinator did not record the write) or
+        :class:`~ccs.core.exceptions.CommitUnconfirmed` (it may have); either
+        way, re-read before writing again.
 
         **Not thread-safe (A5).** Overlapping use of this instance from another
         thread raises ``CoherenceError`` (the single-op guard) — one instance per
@@ -1661,6 +1778,15 @@ class CoherentVolume:
                     "content_hash": new_hash,
                 },
             )
+        except _CommitNotAnswered as no_answer:
+            # Strict only, and only when the commit got no answer at all: the
+            # bytes are on disk and the grant is held, and returning would
+            # report a write the coordinator may never have recorded. Release
+            # the grant first, so it does not block every peer until a re-mint,
+            # then say which: never sent, or delivered and maybe recorded.
+            self._release_unconfirmed_grant(rel)
+            unconfirmed = CoordinatorUnreachable if no_answer.never_sent else CommitUnconfirmed
+            raise unconfirmed(_unanswered_write_message(rel, no_answer)) from no_answer.__cause__
         except RedirectRefused as redirect:
             # A redirected commit is a failed commit like any other status
             # outside 2xx — refused, never followed — so, the bytes being on
@@ -1696,6 +1822,40 @@ class CoherentVolume:
             # fail closed so the caller knows the commit did not register.
             self._check_grant(post_resp, rel, phase="post-edit")
         self._last_committed_hash[rel] = new_hash
+
+    def _release_unconfirmed_grant(self, rel: str) -> None:
+        """write()'s one best-effort release of its grant on ``rel`` after its
+        commit got no answer (R9): ``success: false`` naming the incarnation
+        that holds the grant, as the release after a hash or disk error does.
+        It goes out raw, not through :meth:`_post`, whose claim settlement and
+        failure routing would raise over the typed error write() raises next,
+        and with its own short timeout, so a silent coordinator costs one full
+        timeout and one short one, not two full ones. The coordinator's
+        release invalidates the holder's own row and never touches the
+        version, hash or last writer, so it cannot revert a commit that
+        landed. The path leaves the grant record only on a confirmed release,
+        ``ok: true`` without ``degraded`` (as in
+        :meth:`_release_abandoned_grants`); otherwise the next re-mint
+        releases it."""
+        incarnation = self._incarnation
+        answer: object = None
+        with contextlib.suppress(Exception):
+            answer = _coordinator_post(
+                self._endpoint,
+                "/hooks/post-edit",
+                {"session_id": self._session_id, "agent_id": incarnation, "path": rel, "success": False},
+                extra_headers=caller_principal_headers(self._principal),
+                timeout=_GRANT_RELEASE_TIMEOUT_SEC,
+            )
+        if not (isinstance(answer, dict) and answer.get("ok") is True and not answer.get("degraded")):
+            return
+        # Only this path: the incarnation may still hold grants that earlier
+        # write() calls took on other paths, which this release did not touch.
+        written = self._grant_incarnations.get(incarnation)
+        if written is not None:
+            written.discard(rel)
+            if not written:
+                del self._grant_incarnations[incarnation]
 
     def reacquire(self, path: str | os.PathLike[str]) -> bytes:
         """Recover from a sticky strict deny and return the current bytes.
@@ -1941,7 +2101,12 @@ class CoherentVolume:
         lost-update). ``on_error`` still governs whether an infra failure raises
         vs. warns *inside* ``_post`` and the genuinely-unattached
         (``_endpoint is None``) degrade branch above — but never lets an
-        unconfirmed OCC commit silently land.
+        unconfirmed OCC commit silently land. Under ``"strict"`` a commit that
+        gets no usable answer raises
+        :class:`~ccs.core.exceptions.CoordinatorUnreachable` when the request
+        never left (it did not land), else
+        :class:`~ccs.core.exceptions.CommitUnconfirmed` (it may have; re-read
+        before retrying); neither writes to disk.
 
         **Not thread-safe (A5).** Overlapping use of this instance from another
         thread raises ``CoherenceError`` (the single-op guard). The internal
@@ -2053,16 +2218,7 @@ class CoherentVolume:
             # lost-update this guards). Contrast the pessimistic write(), which
             # writes between pre-edit (EXCLUSIVE held) and post-edit.
             cas_attempts += 1
-            resp = self._post(
-                "/hooks/post-edit-cas",
-                {
-                    "session_id": self._session_id,
-                    "path": rel,
-                    "success": True,
-                    "content_hash": new_hash,
-                    "expected_version": expected_version,
-                },
-            )
+            resp = self._post_cas(rel, new_hash, expected_version)
             if resp is None:
                 # Degrade mode swallowed a mid-operation transport/infra failure
                 # in _post and returned None — the CAS was NOT confirmed. An OCC
@@ -2070,14 +2226,9 @@ class CoherentVolume:
                 # touch disk: writing them would re-open the very lost-update this
                 # guards. Fail closed in BOTH on_error modes — identical to how
                 # the {ok:false, degraded:true, commit_unconfirmed} degrade BODY
-                # is handled below ("raise"). on_error governs only whether the
-                # infra failure already warned (degrade) or raised (strict) inside
-                # _post; either way an unconfirmed CAS must read as failure.
-                raise CommitUnconfirmed(
-                    f"OCC commit of {rel} could not be confirmed (coordinator "
-                    "transport failed mid-commit); the write did not land. "
-                    "reacquire() and retry from the fresh bytes."
-                )
+                # is handled below ("raise"). Strict reaches no None here: a
+                # commit with no answer raised in _post_cas, by delivery.
+                raise CommitUnconfirmed(_unanswered_cas_message(rel))
 
             outcome = self._classify_cas_response(resp)
             if outcome == "win":
@@ -2140,6 +2291,30 @@ class CoherentVolume:
             if isinstance(hook_output, dict) and hook_output.get("permissionDecisionReason"):
                 raise StaleView(self._deny_reason(resp))
             raise CoherenceError(self._deny_reason(resp))
+
+    def _post_cas(self, rel: str, new_hash: str, expected_version: int) -> dict | None:
+        """Send one OCC commit of ``rel``. A strict commit that got no usable
+        answer raises by what the client knows of its delivery: never sent
+        is :class:`~ccs.core.exceptions.CoordinatorUnreachable` (it did not
+        land), anything else :class:`~ccs.core.exceptions.CommitUnconfirmed`
+        (it may have). The caller writes nothing to disk on either."""
+        try:
+            return self._post(
+                "/hooks/post-edit-cas",
+                {
+                    "session_id": self._session_id,
+                    "path": rel,
+                    "success": True,
+                    "content_hash": new_hash,
+                    "expected_version": expected_version,
+                },
+            )
+        except _CommitNotAnswered as no_answer:
+            if no_answer.never_sent:
+                raise CoordinatorUnreachable(
+                    _cas_not_recorded_message(rel, no_answer.detail)
+                ) from no_answer.__cause__
+            raise CommitUnconfirmed(_unanswered_cas_message(rel)) from no_answer.__cause__
 
     def write_cas_at(
         self,
@@ -2213,21 +2388,10 @@ class CoherentVolume:
             # Stale expected_version → typed conflict; NO write, NO server retry.
             raise CasVersionConflict(rel, expected_version, current_version)
         new_hash = self._sha256_bytes(new_content)
-        resp = self._post(
-            "/hooks/post-edit-cas",
-            {
-                "session_id": self._session_id,
-                "path": rel,
-                "success": True,
-                "content_hash": new_hash,
-                "expected_version": expected_version,
-            },
-        )
+        resp = self._post_cas(rel, new_hash, expected_version)
         if resp is None:
-            raise CommitUnconfirmed(
-                f"OCC commit of {rel} could not be confirmed (coordinator transport "
-                "failed mid-commit); the write did not land. re-read and retry."
-            )
+            # Degrade mode only (it already warned); never a write to disk.
+            raise CommitUnconfirmed(_unanswered_cas_message(rel))
         outcome = self._classify_cas_response(resp)
         if outcome == "win":
             self._atomic_write(abs_path, new_content)  # confirmed → persist
@@ -2291,6 +2455,10 @@ class CoherentVolume:
             :class:`~ccs.core.exceptions.CommitUnconfirmed` in both ``on_error``
             modes; whether the batch committed is unknown, NO file written —
             re-read, and retry only if the publish is absent.
+          - the commit gets no usable answer → under ``"strict"``,
+            :class:`~ccs.core.exceptions.CoordinatorUnreachable` when the
+            request never left (nothing committed), else ``CommitUnconfirmed``;
+            under ``"degrade"``, ``CommitUnconfirmed``. NO file written.
 
         **Atomicity boundary (read this).** The all-or-nothing guarantee is at the
         COORDINATOR commit: either every member's version advances as one unit or
@@ -2456,19 +2624,26 @@ class CoherentVolume:
                     rel, expected_version, pinned if isinstance(pinned, int) else -1
                 )
 
-        commit = self._post(
-            "/session/commit_all",
-            {
-                "session_id": self._session_id,
-                "session_token": begin.get("session_token"),
-                "writes": wire,
-            },
-        )
-        if commit is None:
-            raise CommitUnconfirmed(
-                "atomic_publish commit could not be confirmed (coordinator transport "
-                "failed mid-commit); nothing landed. re-read and retry."
+        try:
+            commit = self._post(
+                "/session/commit_all",
+                {
+                    "session_id": self._session_id,
+                    "session_token": begin.get("session_token"),
+                    "writes": wire,
+                },
             )
+        except _CommitNotAnswered as no_answer:
+            # Strict, no answer: a batch that was never sent did not land; one
+            # that may have reached the coordinator may have.
+            if no_answer.never_sent:
+                raise CoordinatorUnreachable(
+                    _publish_not_recorded_message(no_answer.detail)
+                ) from no_answer.__cause__
+            raise CommitUnconfirmed(_PUBLISH_UNANSWERED_MESSAGE) from no_answer.__cause__
+        if commit is None:
+            # Degrade mode only: the failure already warned.
+            raise CommitUnconfirmed(_PUBLISH_UNANSWERED_MESSAGE)
         # An unconfirmed commit — the watchdog's degrade envelope, or a non-win
         # carrying its reason — raises in BOTH on_error modes, as on the
         # single-commit paths: degrade mode must not soften it into the HELD
@@ -3060,6 +3235,13 @@ class CoherentVolume:
         rather than a generic error that reads as "nothing happened"; degrade
         mode still warns and counts it. A 4xx still follows ``on_error``.
 
+        A commit leg (:func:`_is_commit_leg`) that gets no usable answer in
+        strict mode raises the private :class:`_CommitNotAnswered` instead,
+        saying whether the coordinator cannot have recorded it, and its
+        caller raises ``CoordinatorUnreachable`` or ``CommitUnconfirmed``
+        accordingly. Only a transport failure or an unusable 2xx takes that
+        route; an HTTP status or a redirect keeps the path above.
+
         Every request names the current incarnation in the subagent field
         (``agent_id``), which the coordinator folds into the grant-row key; a
         body that already names one — the release of an abandoned incarnation —
@@ -3081,10 +3263,14 @@ class CoherentVolume:
         caller would read as an unanswered request (a degraded read, a
         ``CommitUnconfirmed``, bytes written to disk unrecorded)."""
         payload = {"agent_id": self._incarnation, **payload}
+        commit_leg = _is_commit_leg(endpoint_path, payload)
         self._settle_unconfirmed_claim()
-        sent = self._send(endpoint_path, payload, outcome_unknown_on_failure=outcome_unknown_on_failure)
+        sent = self._send(
+            endpoint_path, payload,
+            outcome_unknown_on_failure=outcome_unknown_on_failure, commit_leg=commit_leg,
+        )
         if sent.principal_refusal is None:
-            return sent.body
+            return self._answer_of(sent)
         reason = sent.principal_refusal
         recovery = self._recover_principal()
         detail = recovery.detail
@@ -3094,13 +3280,19 @@ class CoherentVolume:
             # caller must be told, not a principal refusal the next call may
             # cure. The claim stays unconfirmed, so the next request still
             # claims again with the same nonce. Degrade keeps the refusal below.
-            raise CoordinatorUnreachable(principal_refusal_message(reason, detail))
+            # A refused commit was not recorded, so a commit leg's caller
+            # reports it as one the coordinator cannot have recorded.
+            message = principal_refusal_message(reason, detail)
+            if commit_leg:
+                raise _CommitNotAnswered(message, never_sent=True)
+            raise CoordinatorUnreachable(message)
         if recovery.action == "retry":
             sent = self._send(
-                endpoint_path, payload, outcome_unknown_on_failure=outcome_unknown_on_failure
+                endpoint_path, payload,
+                outcome_unknown_on_failure=outcome_unknown_on_failure, commit_leg=commit_leg,
             )
             if sent.principal_refusal is None:
-                return sent.body
+                return self._answer_of(sent)
             reason, detail = sent.principal_refusal, PRINCIPAL_REFUSED_AGAIN
         # ``settled`` is False only when the recovery claim did not confirm
         # (its answer lost in degrade mode, or answered without binding): the
@@ -3131,15 +3323,26 @@ class CoherentVolume:
         self._adopt_claim(claim)
         return decide_principal_recovery(claim, presented)
 
+    @staticmethod
+    def _answer_of(sent: _Sent) -> dict | None:
+        """The body :meth:`_post` returns for ``sent``; a commit leg that got
+        no usable answer raises, for its caller to type."""
+        if sent.unanswered is not None:
+            raise sent.unanswered
+        return sent.body
+
     def _send(
-        self, endpoint_path: str, payload: dict, *, outcome_unknown_on_failure: bool = False
+        self, endpoint_path: str, payload: dict, *,
+        outcome_unknown_on_failure: bool = False, commit_leg: bool = False,
     ) -> _Sent:
         """One POST presenting the current principal. A caller-principal
         refusal is returned for :meth:`_post` to recover; every other failure
         routes through ``on_error`` here, and in strict mode a request that got
         no usable answer (the client's ``CoordinatorUnavailable``, or a 2xx
         whose JSON is not an object) raises
-        :class:`~ccs.core.exceptions.CoordinatorUnreachable`.
+        :class:`~ccs.core.exceptions.CoordinatorUnreachable` — except a
+        ``commit_leg`` one, which is returned as ``unanswered`` with what the
+        client knows of its delivery, for the commit's caller to type.
 
         Every raise for a rejected request happens OUTSIDE the ``except``
         block, so the ``HTTPError`` never rides the raised error's chain: its
@@ -3161,18 +3364,26 @@ class CoherentVolume:
             status, reason = exc.code, principal_refusal_reason(exc)
         except CoordinatorUnavailable as exc:
             message = f"coordinator request to {endpoint_path} failed: {exc}"
+            if typed and commit_leg:
+                # R7: only the client's mark counts as "never sent"; every
+                # other failure may have reached the coordinator.
+                return _Sent(None, None, _CommitNotAnswered(message, never_sent=exc.never_sent, cause=exc))
             if typed:
                 raise CoordinatorUnreachable(message) from exc
             return self._failed_request(message, outcome_unknown=outcome_unknown_on_failure)
         else:
             # A non-object JSON body answers nothing this client can read, like
             # a malformed answer (a coordinator never sends one; a stranger on a
-            # reused port could). Nothing of the body reaches the message.
+            # reused port could), and like one it was delivered. Nothing of the
+            # body reaches the message.
             if typed and not isinstance(body, dict):
-                raise CoordinatorUnreachable(
+                message = (
                     f"coordinator request to {endpoint_path} failed: the coordinator "
                     "answered with JSON that is not an object"
                 )
+                if commit_leg:
+                    return _Sent(None, None, _CommitNotAnswered(message, never_sent=False))
+                raise CoordinatorUnreachable(message)
             return _Sent(body, None)
         # R2: a remote 401 is a wrong/missing secret — fail LOUD and CLOSED
         # with a distinct type, never the generic degrade path (which a

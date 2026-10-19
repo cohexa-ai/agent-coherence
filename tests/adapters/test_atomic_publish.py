@@ -8,7 +8,10 @@ write-set lands or none does, and a torn intermediate is never on disk.
 """
 from __future__ import annotations
 
+import errno
+import socket
 import warnings
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,11 +22,14 @@ from ccs.adapters.claude_code.lifecycle import (
     stop_coordinator,
 )
 from ccs.adapters.coherent_volume import CoherentVolume
+from ccs.cli._coherence_client import CoordinatorEndpoint, CoordinatorUnavailable
 from ccs.core.exceptions import (
     COMMIT_UNCONFIRMED_REASON,
     CasVersionConflict,
+    CoherenceDegradedWarning,
     CoherenceError,
     CommitUnconfirmed,
+    CoordinatorUnreachable,
     PublishMaterializationError,
     StaleView,
     ViewWedged,
@@ -528,6 +534,119 @@ def test_an_unconfirmed_commit_all_answer_is_commit_unconfirmed_in_both_modes(
 
         assert str(raised.value) == _PUBLISH_UNCONFIRMED
         assert sent == ["/session/commit_all"], "sent once, never retried"
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-v1"
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+# ----------------------------------------------------------------------
+# A batch commit with no answer: never sent, or delivered (AE2, AE9)
+# ----------------------------------------------------------------------
+#
+# What these do not prove: one machine and loopback only; no network partition;
+# the hook client still fails open; a fresh attach to a dead recorded port still
+# respawns (attach-leg respawn is unchanged); the Node coordinator is untouched.
+
+
+def _refusing_port() -> int:
+    """A loopback port that refuses connections and that no other test can take
+    (port 4: ports below 1024 are never handed out for port 0, so no other
+    worker's bind can take it before the connect)."""
+    with socket.socket() as probe:
+        probe.settimeout(2)
+        assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
+    return 4
+
+
+def _fail_route(monkeypatch: pytest.MonkeyPatch, route: str, how: str, sent: list[str]) -> None:
+    """Fail every request to ``route`` the way the real client fails it:
+    ``refused`` sends it to a port that refuses (never sent); ``lost``
+    delivers it to the coordinator, then loses the answer to a read timeout.
+    Every other request goes to the coordinator. Records each route sent."""
+    real_post = coherent_volume_module._coordinator_post
+
+    def post(endpoint: CoordinatorEndpoint, path: str, payload: dict, **kwargs: object) -> object:
+        sent.append(path)
+        if path != route:
+            return real_post(endpoint, path, payload, **kwargs)
+        if how == "refused":
+            return real_post(replace(endpoint, port=_refusing_port()), path, payload, **kwargs)
+        real_post(endpoint, path, payload, **kwargs)
+        try:
+            raise TimeoutError("timed out")
+        except TimeoutError as exc:
+            raise CoordinatorUnavailable(f"network error talking to coordinator: {exc}") from exc
+
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_post", post)
+
+
+_WRITES = [("data/a.txt", 1, b"a-v2"), ("data/b.txt", 1, b"b-v2")]
+
+
+@pytest.mark.parametrize(
+    ("route", "how", "raises"),
+    [
+        ("/session/commit_all", "refused", CoordinatorUnreachable),
+        ("/session/commit_all", "lost", CommitUnconfirmed),
+        ("/session/begin", "refused", CoordinatorUnreachable),
+    ],
+    ids=["commit-never-sent", "commit-delivered", "begin-never-sent"],
+)
+def test_a_publish_whose_request_gets_no_answer_raises_by_delivery_and_writes_nothing(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    route: str, how: str, raises: type[CoherenceError],
+) -> None:
+    """AE2 for a multi-member publish. Its batch commit never sent (connect
+    refused) cannot have landed: ``CoordinatorUnreachable``. Delivered, its
+    answer lost, it may have: ``CommitUnconfirmed``, saying the outcome is
+    unknown and to re-read. A session that never opened committed nothing:
+    ``CoordinatorUnreachable``, and no commit is sent. No member is written
+    in any case. Before, the commit raised ``CoordinatorUnreachable`` either
+    way."""
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        sent: list[str] = []
+        _fail_route(monkeypatch, route, how, sent)
+
+        with pytest.raises(CoherenceError) as raised:
+            vol.atomic_publish(_WRITES)
+
+        assert type(raised.value) is raises, repr(raised.value)
+        assert isinstance(raised.value.__cause__, CoordinatorUnavailable), repr(raised.value.__cause__)
+        if how == "lost":
+            assert "is unknown" in str(raised.value) and "Re-read" in str(raised.value)
+        assert sent.count("/session/commit_all") == (0 if route == "/session/begin" else 1)
+        assert (tmp_path / "data/a.txt").read_bytes() == b"a-v1"
+        assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_degrade_publish_whose_commit_answer_is_lost_is_unconfirmed_as_before(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AE9: under ``on_error="degrade"`` a batch commit whose answer is lost
+    warns once and raises ``CommitUnconfirmed``, as before, with the same
+    unknown-outcome text a strict delivered commit gets; no member is
+    written."""
+    _seed(tmp_path, "data/a.txt", b"a-v1")
+    _seed(tmp_path, "data/b.txt", b"b-v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    try:
+        sent: list[str] = []
+        _fail_route(monkeypatch, "/session/commit_all", "lost", sent)
+
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            with pytest.raises(CommitUnconfirmed) as raised:
+                vol.atomic_publish(_WRITES)
+
+        assert "is unknown" in str(raised.value) and "Re-read" in str(raised.value)
+        degraded = [w for w in warned if issubclass(w.category, CoherenceDegradedWarning)]
+        assert vol.degradation_count == 1 and len(degraded) == 1, [str(w.message) for w in degraded]
         assert (tmp_path / "data/a.txt").read_bytes() == b"a-v1"
         assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"
     finally:
