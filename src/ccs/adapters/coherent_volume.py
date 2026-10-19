@@ -2065,6 +2065,7 @@ class CoherentVolume:
                         attempts=cas_attempts,
                         last_current_version=last_current_version,
                         last_conflict_reason=resp.get("reason"),
+                        **self._refusal_generations(resp),
                     )
                 # Re-mint (NOT reacquire) before the next attempt so the next
                 # comparand read is a hash-checked None-state read that sees the
@@ -2205,6 +2206,7 @@ class CoherentVolume:
                 expected_version,
                 self._cas_current_version(resp, current_version),
                 reason=resp.get("reason"),
+                **self._refusal_generations(resp),
             )
         # outcome == "raise": corruption or the commit_unconfirmed degrade body,
         # or an answer with no string reason, whose outcome is unknown, or the
@@ -3537,6 +3539,16 @@ class CoherentVolume:
             return cv
         return fallback
 
+    @staticmethod
+    def _refusal_generations(resp: dict) -> dict[str, object]:
+        """A commit refusal body's pair, as the refusal exceptions take it.
+        Passed through as sent: each exception keeps it only when both are
+        generations, by the one rule the coordinator emits it under."""
+        return {
+            "captured_generation": resp.get("captured_generation"),
+            "owner_generation": resp.get("owner_generation"),
+        }
+
     def _check_grant(self, resp: dict, rel: str, *, phase: str) -> None:
         """Map a coordinator pre-/post-edit response to the fail-closed contract.
 
@@ -3555,7 +3567,7 @@ class CoherentVolume:
             # already hit disk un-versioned, so it is a distinct terminal that
             # needs reconcile, not a bare retry.
             if phase == "post-edit":
-                raise CommitPreempted(self._deny_reason(resp))
+                raise CommitPreempted(self._deny_reason(resp), **self._refusal_generations(resp))
             # The giver of a live handoff (#185). Matched on the typed top-level
             # reason, never on the deny prose beside it (which _deny_reason
             # prefers): read as a StaleView it would send the caller to

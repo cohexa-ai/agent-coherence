@@ -18,6 +18,7 @@ from uuid import uuid4
 import pytest
 
 from ccs.coordinator.registry import ArtifactRegistry
+from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import STALE_READ_GENERATION_REASON, StaleReadGeneration
 from ccs.core.states import MESIState
@@ -61,6 +62,34 @@ def _poke_owner_generation(reg, artifact_id) -> None:
         )
     else:
         reg._records[artifact_id].owner_generation += 1
+
+
+def _poke_read_generation(reg, artifact_id, agent_id, value: int) -> None:
+    """Overwrite an agent's recorded claim behind set_agent_state's back, for
+    a claim-ahead-of-owner state no binding-agnostic path creates."""
+    if isinstance(reg, SqliteArtifactRegistry):
+        reg._conn.execute(
+            "UPDATE agent_states SET read_generation = ? WHERE artifact_id = ? AND agent_id = ?",
+            (value, artifact_id.hex, agent_id.hex),
+        )
+    else:
+        reg._records[artifact_id].read_generation_by_agent[agent_id] = value
+
+
+def _sweep_reclaim(reg, artifact_id, holder, *, tick: int) -> None:
+    """Grant ``holder`` EXCLUSIVE, which records its claim at the current
+    generation, then let the shipped stable-grant sweep reclaim it. The holder
+    never heartbeats, so the sweep fires reclaim_heartbeat: owner_generation
+    moves, the version does not."""
+    reg.set_agent_state(artifact_id, holder, MESIState.EXCLUSIVE, trigger="write", tick=tick)
+    reclaimed = CoordinatorService(reg).enforce_stable_grant_timeouts(
+        current_tick=tick + 1, heartbeat_timeout_ticks=1, max_hold_ticks=1_000
+    )
+    assert reclaimed == 1
+
+
+def _refused_pair(detail: ConflictDetail) -> tuple[int | None, int | None]:
+    return detail.captured_generation, detail.owner_generation
 
 
 def test_parity_owner_generation_bumps_on_reclaim_only(registry) -> None:
@@ -134,6 +163,136 @@ def test_parity_absent_read_generation_admits_version_cas_arbitrates(registry) -
     assert isinstance(res2, ConflictDetail)
     assert res2.reason == "version_mismatch"
     assert reg.get_artifact(art.id).version == 2  # no phantom bump
+    # No recorded claim, so the refusal names no generations at all: the
+    # owner generation alone would name no lost token.
+    assert _refused_pair(res2) == (None, None)
+
+
+def test_parity_sweep_reclaim_refusal_names_the_lost_token(registry) -> None:
+    """After a real sweep reclaim with the version unmoved, the zombie's
+    commit_cas is refused stale_read_generation carrying the claim it recorded
+    and the generation that superseded it, the same generation the pair-atomic
+    accessor reports. Two earlier reclaims put the values at 2 and 3, so a
+    swapped, hard-coded or zero-defaulted field fails."""
+    reg = registry
+    art = _register(reg)
+    zombie = uuid4()
+    _sweep_reclaim(reg, art.id, uuid4(), tick=1)
+    _sweep_reclaim(reg, art.id, uuid4(), tick=10)
+    _sweep_reclaim(reg, art.id, zombie, tick=20)  # records claim 2, then owner 3
+
+    res = reg.commit_cas(art.id, zombie, expected_version=1, content_hash="zombie")
+
+    assert isinstance(res, ConflictDetail)
+    assert res.reason == STALE_READ_GENERATION_REASON
+    assert _refused_pair(res) == (2, 3)
+    assert _pair(reg, art.id) == (1, res.owner_generation)
+
+
+def test_parity_version_mismatch_still_names_the_lost_token(registry) -> None:
+    """Precedence: a reclaimed committer whose peer has since committed loses
+    on version first, and the refusal still shows its claim was superseded."""
+    reg = registry
+    art = _register(reg)
+    zombie, peer = uuid4(), uuid4()
+    _sweep_reclaim(reg, art.id, uuid4(), tick=1)
+    _sweep_reclaim(reg, art.id, zombie, tick=10)  # records claim 1, then owner 2
+    won = reg.commit_cas(art.id, peer, expected_version=1, content_hash="peer")
+    assert not isinstance(won, ConflictDetail)
+
+    res = reg.commit_cas(art.id, zombie, expected_version=1, content_hash="zombie")
+
+    assert isinstance(res, ConflictDetail)
+    assert (res.reason, res.current_version) == ("version_mismatch", 2)
+    assert _refused_pair(res) == (1, 2)
+
+
+def test_parity_other_holder_refusal_carries_an_equal_pair(registry) -> None:
+    """A committer whose claim is current, refused because a pessimistic peer
+    holds the grant, reports its claim equal to the owner generation."""
+    reg = registry
+    art = _register(reg)
+    committer, holder = uuid4(), uuid4()
+    _sweep_reclaim(reg, art.id, uuid4(), tick=1)
+    _sweep_reclaim(reg, art.id, uuid4(), tick=10)
+    reg.set_agent_state(art.id, committer, MESIState.SHARED, trigger="fetch", tick=20)
+    reg.set_agent_state(art.id, holder, MESIState.EXCLUSIVE, trigger="write", tick=21)
+
+    res = reg.commit_cas(art.id, committer, expected_version=1, content_hash="late")
+
+    assert isinstance(res, ConflictDetail)
+    assert res.reason == "other_holder"
+    assert _refused_pair(res) == (2, 2)
+
+
+def test_parity_refusal_reports_a_claim_ahead_of_the_owner_as_is(registry) -> None:
+    """A recorded claim greater than the owner generation, a state no
+    binding-agnostic path creates today, is reported unchanged: the refusal
+    never assumes the claim cannot lead."""
+    reg = registry
+    art = _register(reg)
+    committer, peer = uuid4(), uuid4()
+    _sweep_reclaim(reg, art.id, uuid4(), tick=1)  # owner 1
+    reg.set_agent_state(art.id, committer, MESIState.SHARED, trigger="fetch", tick=10)
+    _poke_read_generation(reg, art.id, committer, 2)
+    won = reg.commit_cas(art.id, peer, expected_version=1, content_hash="peer")
+    assert not isinstance(won, ConflictDetail)
+
+    res = reg.commit_cas(art.id, committer, expected_version=1, content_hash="late")
+
+    assert isinstance(res, ConflictDetail)
+    assert res.reason == "version_mismatch"
+    assert _refused_pair(res) == (2, 1)
+
+
+def test_parity_pessimistic_fence_raise_carries_the_pair(registry) -> None:
+    """The fenced persist's raise exposes the pair its check read after a real
+    sweep reclaim, and its message is byte-identical to the one it has always
+    carried."""
+    reg = registry
+    art = _register(reg)
+    zombie = uuid4()
+    _sweep_reclaim(reg, art.id, uuid4(), tick=1)
+    _sweep_reclaim(reg, art.id, zombie, tick=10)  # records claim 1, then owner 2
+    late = Artifact(id=art.id, name="plan.md", version=2, content_hash="late")
+
+    with pytest.raises(StaleReadGeneration) as raised:
+        reg.set_artifact_and_content(art.id, late, "x", last_writer=zombie, fence_agent_id=zombie)
+
+    assert (raised.value.captured_generation, raised.value.owner_generation) == (1, 2)
+    assert str(raised.value) == (
+        f"stale_read_generation agent={zombie} artifact={art.id} read_gen=1 owner_gen=2"
+    )
+    assert reg.get_artifact(art.id).version == 1
+
+
+def test_conflict_detail_pair_is_compared_but_not_in_repr() -> None:
+    """The pair takes part in equality, so a dropped or over-filled pair fails
+    an exact assertion, and stays out of repr, which a CLI message embeds."""
+    plain = ConflictDetail("stale_read_generation", 1)
+    with_pair = ConflictDetail("stale_read_generation", 1, captured_generation=2, owner_generation=3)
+
+    assert repr(with_pair) == repr(plain) == (
+        "ConflictDetail(reason='stale_read_generation', current_version=1)"
+    )
+    assert with_pair != plain
+    assert _refused_pair(plain) == (None, None)
+    with pytest.raises(TypeError):
+        ConflictDetail("stale_read_generation", 1, 2, 3)  # the pair is keyword-only
+
+
+@pytest.mark.parametrize(
+    ("captured", "owner"),
+    [(None, None), (1, None), (None, 2), (True, 2), (1, False), (-1, 2), (1, -2), ("1", 2), (1.0, 2)],
+)
+def test_stale_read_generation_treats_a_malformed_pair_as_absent(captured, owner) -> None:
+    """Generations start at 0 and only grow, so a lone value, a bool, a
+    negative or a non-int is no generation: the whole pair reads as absent,
+    the message is untouched, and the constructor does not raise."""
+    exc = StaleReadGeneration("refused", captured_generation=captured, owner_generation=owner)
+
+    assert (exc.captured_generation, exc.owner_generation) == (None, None)
+    assert str(exc) == "refused"
 
 
 def test_parity_pessimistic_fence_rejects_superseded_committer(registry) -> None:

@@ -132,7 +132,16 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "over state_by_agent) + read-generation fence all live INSIDE "
         "registry.commit_cas and return a CasResult in one serialized step "
         "(sqlite: BEGIN IMMEDIATE). service.commit_cas wraps it in abort_guard "
-        "and maps the three outcomes; the arbitration itself is atomic here.",
+        "and maps the three outcomes; the arbitration itself is atomic here. "
+        "Every ConflictDetail it returns, whatever the reason, carries the "
+        "committer's recorded read_generation as captured_generation and the "
+        "artifact's owner_generation, both read in the same step that decided "
+        "the refusal, and neither value when the committer has no recorded "
+        "claim. That pair widens what the conformance kit certifies for an "
+        "outside backend: the kit fails a binding that drops it, and a race in "
+        "the kit fails one that reads the pair in a second step after deciding, "
+        "by checking every refusal against the states a concurrent reclaim, "
+        "peer commit and re-capture pass through.",
     ),
     MemberContract(
         "commit_all",
@@ -144,7 +153,12 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "one _lock hold with snapshot-restore). All-or-nothing -- a partial "
         "batch is never observable (NoPartialPublish). Returns a MultiCasResult; "
         "the aggregated invalidation broadcasts only after the commit. A genuinely "
-        "new atomic op, never a loop of commit_cas.",
+        "new atomic op, never a loop of commit_cas. Each refused member's "
+        "ConflictDetail carries that member's own captured_generation and "
+        "owner_generation from the CHECK snapshot, as on commit_cas, and neither "
+        "value for a member the committer holds no recorded claim on; the "
+        "conformance kit certifies the pair per member, sequentially and under "
+        "the same concurrent race as commit_cas.",
     ),
     MemberContract(
         "set_artifact_and_content",
@@ -154,7 +168,13 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "fence_agent_id so the read-generation fence check fires ATOMICALLY with "
         "the version move (service._commit_impl). A StaleReadGeneration raise "
         "here is the fence rejecting a reclaimed committer in the write's race "
-        "window — part of the boundary, not a plain write.",
+        "window — part of the boundary, not a plain write. The raise carries "
+        "the two values the fence compared, the committer's read_generation as "
+        "captured_generation and the artifact's owner_generation, with its "
+        "message unchanged; the conformance kit certifies the pair on the raise, "
+        "and a race in the kit, which alternates a concurrent reclaim with the "
+        "committer's own re-capture, fails a raise whose pair was read after "
+        "the fence decided.",
     ),
     MemberContract(
         "set_agent_state",

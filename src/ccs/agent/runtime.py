@@ -99,9 +99,10 @@ class AgentRuntime:
                 acquire and commit (``ccs.core.exceptions``). Retry-eligible,
                 but THIS path has no built-in retry loop (unlike ``write_cas``):
                 the caller re-acquires / re-reads and calls ``write()`` again.
-            CoherenceError: the grant was already reclaimed before commit (the
-                error names the reclaim trigger and tick), or another protocol
-                precondition failed.
+            CommitNotAllowed: the grant was already reclaimed or preempted
+                before commit (the error names the reclaim trigger and tick),
+                carrying the generation pair read in that decision.
+            CoherenceError: another protocol precondition failed.
         """
         if content_hash is not None:
             computed = compute_content_hash(content)
@@ -187,8 +188,9 @@ class AgentRuntime:
 
         Raises:
             CasRetriesExhausted: every allowed attempt was refused — a typed
-                terminal, NEVER a silent drop, whose ``last_conflict_reason``
-                names the last refusal. The cache is left at the latest
+                terminal, NEVER a silent drop, whose ``last_conflict_reason``,
+                ``captured_generation`` and ``owner_generation`` are the last
+                refusal's. The cache is left at the latest
                 refreshed version (no unconfirmed write cached).
             CoherenceError: the coordinator reported corruption
                 (``expected_version > current``) or a precondition failure
@@ -204,6 +206,10 @@ class AgentRuntime:
 
         last_current_version = -1
         last_conflict_reason: str | None = None
+        # The LAST refusal's pair, never a running maximum: the terminal names
+        # the lost token of the refusal that exhausted the budget.
+        last_captured_generation: int | None = None
+        last_owner_generation: int | None = None
         max_attempts = self.strategy.max_cas_retries() + 1
         for attempt in range(max_attempts):
             entry = self.cache.get(artifact_id)
@@ -230,6 +236,8 @@ class AgentRuntime:
             if isinstance(result, ConflictDetail):
                 last_current_version = result.current_version
                 last_conflict_reason = result.reason
+                last_captured_generation = result.captured_generation
+                last_owner_generation = result.owner_generation
                 # Re-read: re-fetch refreshes the cache entry to the winner's new
                 # version (SHARED, fresh local_version) so the next attempt's
                 # expected_version + make_content() see current state.
@@ -272,6 +280,8 @@ class AgentRuntime:
             attempts=max_attempts,
             last_current_version=last_current_version,
             last_conflict_reason=last_conflict_reason,
+            captured_generation=last_captured_generation,
+            owner_generation=last_owner_generation,
         )
 
     def _resolve_content_hash(self, content: str, provided_hash: str | None) -> str:

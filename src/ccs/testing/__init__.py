@@ -19,6 +19,9 @@ Current members:
   outcomes, and the declared-exemption seam (R-8) for bindings that are
   in-process-only by construction. In-process serialization satisfies no clause
   of the conformance contract; this harness is what makes a kit race probative.
+  Its ``run_park_after_ack`` stops a contender right after it acks, gives the
+  parent a window while the child cannot run, and resumes it on demand,
+  returning what the contender produces after the resume.
 - :mod:`ccs.testing.claim_ladder` — the machine-checked claim ladder
   (guarantee-ladder plan U7): frozen rungs pairing each claimed guarantee with
   its README claim-pins and the pytest node-ids that would fail without it.

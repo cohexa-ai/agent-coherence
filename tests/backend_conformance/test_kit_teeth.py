@@ -32,11 +32,28 @@ teeth: it delegates everything, but a requester's ``"fetch"`` set re-lists every
 OTHER non-INVALID holder under the capture trigger — the effect the service's
 fetch loop used to have when it rewrote peers that were already SHARED, moved
 inside the backend. The kit's peer-fetch scenario MUST FAIL it.
+
+The refusal-pair stubs give each of the kit's three refusal-pair scenarios its
+teeth. Each delegates everything to a real in-memory registry and drops the
+generation pair at ONE entry point (``commit_cas``, ``commit_all``, or the
+fenced persist's raise), keeping the reason and version, as a binding would
+that kept its pre-pair refusal constructor. A fourth fills the pair only on
+``stale_read_generation``, and the other reasons' checks MUST catch it.
+
+The follow-up-read stub (:class:`_FollowUpReadRegistry`) gives the two
+refusal-pair races their teeth. It decides every refusal on the right snapshot,
+then re-reads the owner leg alone, or both legs, after a 0.5 ms window at one
+entry point. The sequential scenarios cannot see that; the race for its entry
+point MUST FAIL it as a snapshot violation. A starving stub
+(:class:`_StarvedMutatorRegistry`) keeps a race's mutator from running beside
+its actor, and the race MUST FAIL it as starved, not as a snapshot violation.
 """
 
 from __future__ import annotations
 
+import threading
 import time
+from functools import partial
 from pathlib import Path
 from uuid import UUID
 
@@ -44,8 +61,9 @@ import pytest
 
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.registry_protocol import CLAIM_CAPTURE_TRIGGERS, CasResult
+from ccs.core.exceptions import STALE_READ_GENERATION_REASON, StaleReadGeneration
 from ccs.core.states import MESIState
-from ccs.core.types import CasCorruption, ConflictDetail
+from ccs.core.types import CasCorruption, ConflictDetail, MultiCommitConflict
 from tests.backend_conformance import kit
 from tests.backend_conformance.kit import RegistryFactory
 
@@ -335,6 +353,328 @@ def test_torn_pair_stub_fails_pair_atomicity_scenario() -> None:
         "the teeth failure must name the obligation a backend author skipped; "
         f"got: {message}"
     )
+
+
+def _without_pair(detail: ConflictDetail) -> ConflictDetail:
+    return ConflictDetail(detail.reason, detail.current_version)
+
+
+def _strip_batch(result: object, *, keep: frozenset[str] = frozenset()) -> object:
+    """``result`` with the pair dropped from every refused member whose reason
+    is not in ``keep``."""
+    if not isinstance(result, MultiCommitConflict):
+        return result
+    return MultiCommitConflict(
+        per_artifact={
+            art: detail if detail.reason in keep else _without_pair(detail)
+            for art, detail in result.per_artifact.items()
+        }
+    )
+
+
+class _PairlessCasRegistry:
+    """A degraded backend whose ``commit_cas`` refusals carry the reason and
+    version but no generation pair. Everything else is the real in-memory
+    registry."""
+
+    def __init__(self) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def commit_cas(self, *args: object, **kwargs: object) -> CasResult:
+        result = self._inner.commit_cas(*args, **kwargs)  # type: ignore[arg-type]
+        return _without_pair(result) if isinstance(result, ConflictDetail) else result
+
+
+class _PairlessBatchRegistry:
+    """A degraded backend whose ``commit_all`` names every refused member with
+    its reason and version but no generation pair."""
+
+    def __init__(self) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def commit_all(self, *args: object, **kwargs: object) -> object:
+        return _strip_batch(self._inner.commit_all(*args, **kwargs))  # type: ignore[arg-type]
+
+
+class _PairlessFenceRaiseRegistry:
+    """A degraded backend whose fenced persist still raises
+    :class:`StaleReadGeneration`, with the same message, but without the pair."""
+
+    def __init__(self) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def set_artifact_and_content(self, *args: object, **kwargs: object) -> None:
+        try:
+            self._inner.set_artifact_and_content(*args, **kwargs)  # type: ignore[arg-type]
+        except StaleReadGeneration as exc:
+            raise StaleReadGeneration(*exc.args) from None
+
+
+class _FenceOnlyPairRegistry:
+    """A degraded backend that reports the pair on ``stale_read_generation``
+    only, at both commit entry points: the reading under which the pair is a
+    fence detail rather than part of every refusal."""
+
+    _KEEP = frozenset({STALE_READ_GENERATION_REASON})
+
+    def __init__(self) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def commit_cas(self, *args: object, **kwargs: object) -> CasResult:
+        result = self._inner.commit_cas(*args, **kwargs)  # type: ignore[arg-type]
+        if isinstance(result, ConflictDetail) and result.reason not in self._KEEP:
+            return _without_pair(result)
+        return result
+
+    def commit_all(self, *args: object, **kwargs: object) -> object:
+        return _strip_batch(self._inner.commit_all(*args, **kwargs), keep=self._KEEP)  # type: ignore[arg-type]
+
+
+class _OneStoreFactory:
+    """A :class:`RegistryFactory` minting one process-scoped instance of
+    ``stub`` (the shape of :class:`_DegradedFactory`, for any stub class)."""
+
+    def __init__(self, stub: type) -> None:
+        self._stub = stub
+        self._reg: object | None = None
+
+    def __call__(self) -> object:
+        if self._reg is None:
+            self._reg = self._stub()
+        return self._reg
+
+    def close_all(self) -> None:
+        return None
+
+    @property
+    def db_path(self) -> Path | None:
+        return None
+
+
+def test_pairless_cas_stub_fails_commit_cas_pair_scenario() -> None:
+    """THE TEETH for the ``commit_cas`` refusal-pair scenario. A binding that
+    refuses the right commit with the right reason but drops the pair MUST FAIL
+    the kit; the failure names the entry point, the reason and both fields."""
+    with pytest.raises(AssertionError) as excinfo:
+        kit.assert_commit_cas_refusals_carry_the_generation_pair(_OneStoreFactory(_PairlessCasRegistry))
+    message = str(excinfo.value)
+    assert "commit_cas's stale_read_generation refusal DROPPED the generation pair" in message
+    assert "captured_generation=2, owner_generation=3" in message
+    assert "captured_generation=None, owner_generation=None" in message
+
+
+def test_pairless_batch_stub_fails_commit_all_pair_scenario() -> None:
+    """THE TEETH for the ``commit_all`` refusal-pair scenario: a batch that names
+    its refused members without their pairs MUST FAIL the kit."""
+    with pytest.raises(AssertionError) as excinfo:
+        kit.assert_commit_all_refusals_carry_each_members_generation_pair(
+            _OneStoreFactory(_PairlessBatchRegistry)
+        )
+    message = str(excinfo.value)
+    assert (
+        "commit_all's stale_read_generation refusal for the fenced member DROPPED the "
+        "generation pair" in message
+    )
+    assert "captured_generation=2, owner_generation=3" in message
+
+
+def test_pairless_fence_raise_stub_fails_fenced_persist_pair_scenario() -> None:
+    """THE TEETH for the fenced-persist refusal-pair scenario: a raise that keeps
+    its type and message but drops the pair MUST FAIL the kit."""
+    with pytest.raises(AssertionError) as excinfo:
+        kit.assert_fenced_persist_raise_carries_the_generation_pair(
+            _OneStoreFactory(_PairlessFenceRaiseRegistry)
+        )
+    message = str(excinfo.value)
+    assert (
+        "set_artifact_and_content's StaleReadGeneration raise DROPPED the generation pair"
+        in message
+    )
+    assert "captured_generation=2, owner_generation=3" in message
+
+
+def test_fence_only_pair_stub_fails_the_other_reasons() -> None:
+    """A binding that fills the pair only on the fence reason MUST FAIL both the
+    ``other_holder`` check (``commit_cas``) and the claim-holding
+    ``version_mismatch`` check (``commit_all``). Each scenario checks its fence
+    refusal first, so these failures also show the stub's fence leg passed:
+    the kit fails it for the reasons it drops, not for the one it keeps."""
+    factory: RegistryFactory = _OneStoreFactory(_FenceOnlyPairRegistry)
+    with pytest.raises(AssertionError) as excinfo:
+        kit.assert_commit_cas_refusals_carry_the_generation_pair(factory)
+    assert "commit_cas's other_holder refusal DROPPED the generation pair" in str(excinfo.value)
+
+    with pytest.raises(AssertionError) as excinfo:
+        kit.assert_commit_all_refusals_carry_each_members_generation_pair(
+            _OneStoreFactory(_FenceOnlyPairRegistry)
+        )
+    assert (
+        "commit_all's version_mismatch refusal for the overtaken member DROPPED the "
+        "generation pair" in str(excinfo.value)
+    )
+
+
+# The gap a binding leaves when it decides a refusal, then reads the pair in a
+# second step. A real (GIL-releasing) sleep, so the race's mutator runs inside
+# it, as in _TornPairRegistry.
+_FOLLOW_UP_WINDOW_SECONDS = 0.0005
+
+_OWNER_LEG, _BOTH_LEGS = "owner", "both"
+_CAS, _BATCH, _FENCE = "commit_cas", "commit_all", "fence"
+
+
+class _FollowUpReadRegistry:
+    """A degraded backend that decides every refusal on the right snapshot but
+    fills the pair from a second read after it, at ONE entry point:
+    ``commit_cas``, ``commit_all`` per member, or the fenced persist's raise.
+    With ``legs="owner"`` only ``owner_generation`` is re-read, and the decided
+    ``captured_generation`` is kept; with ``legs="both"`` both are re-read.
+    Reason, version and message stay the decision's. Everything else is the
+    real in-memory registry, so the sequential refusal-pair scenarios pass it:
+    only a race can see the re-read."""
+
+    def __init__(self, entry: str, legs: str) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+        self._entry, self._legs = entry, legs
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def _reread(self, artifact_id: UUID, agent_id: UUID, decided: int | None) -> tuple[int | None, int | None]:
+        owner = self._inner.get_owner_generation(artifact_id)
+        captured = self._inner.get_read_generation(artifact_id, agent_id) if self._legs == _BOTH_LEGS else decided
+        # The no-claim rule still holds on the re-read: no claim, no pair.
+        return (None, None) if captured is None else (captured, owner)
+
+    def _refill(self, detail: ConflictDetail, artifact_id: UUID, agent_id: UUID) -> ConflictDetail:
+        captured, owner = self._reread(artifact_id, agent_id, detail.captured_generation)
+        return ConflictDetail(
+            detail.reason, detail.current_version, captured_generation=captured, owner_generation=owner
+        )
+
+    def commit_cas(self, artifact_id: UUID, agent_id: UUID, **kwargs: object) -> CasResult:
+        result = self._inner.commit_cas(artifact_id, agent_id, **kwargs)  # type: ignore[arg-type]
+        if self._entry != _CAS or not isinstance(result, ConflictDetail):
+            return result
+        time.sleep(_FOLLOW_UP_WINDOW_SECONDS)
+        return self._refill(result, artifact_id, agent_id)
+
+    def commit_all(self, agent_id: UUID, writes: object, **kwargs: object) -> object:
+        result = self._inner.commit_all(agent_id, writes, **kwargs)  # type: ignore[arg-type]
+        if self._entry != _BATCH or not isinstance(result, MultiCommitConflict):
+            return result
+        time.sleep(_FOLLOW_UP_WINDOW_SECONDS)
+        return MultiCommitConflict(
+            per_artifact={
+                art: self._refill(detail, art, agent_id) for art, detail in result.per_artifact.items()
+            }
+        )
+
+    def set_artifact_and_content(self, artifact_id: UUID, *args: object, **kwargs: object) -> None:
+        try:
+            self._inner.set_artifact_and_content(artifact_id, *args, **kwargs)  # type: ignore[arg-type]
+        except StaleReadGeneration as exc:
+            if self._entry != _FENCE:
+                raise
+            time.sleep(_FOLLOW_UP_WINDOW_SECONDS)
+            fenced = kwargs["fence_agent_id"]
+            captured, owner = self._reread(artifact_id, fenced, exc.captured_generation)  # type: ignore[arg-type]
+            raise StaleReadGeneration(
+                *exc.args, captured_generation=captured, owner_generation=owner
+            ) from None
+
+
+_RACES = {
+    _CAS: kit.assert_commit_refusal_pairs_come_from_the_decision_snapshot,
+    _BATCH: kit.assert_commit_refusal_pairs_come_from_the_decision_snapshot,
+    _FENCE: kit.assert_fenced_persist_raise_pair_comes_from_the_decision_snapshot,
+}
+_ENTRY_IN_MESSAGE = {
+    _CAS: "commit_cas's",
+    _BATCH: "commit_all's",
+    _FENCE: "set_artifact_and_content's StaleReadGeneration raise",
+}
+
+
+@pytest.mark.parametrize("legs", [_OWNER_LEG, _BOTH_LEGS])
+@pytest.mark.parametrize("entry", [_CAS, _BATCH, _FENCE])
+def test_follow_up_read_stub_fails_its_race(entry: str, legs: str) -> None:
+    """THE TEETH for the snapshot rule. A binding that refuses correctly but reads the pair
+    after the decision MUST FAIL the race for its entry point (the commit race for the
+    two commit routes, the fence race for the fenced persist), as a snapshot violation naming
+    that entry point, never as a starved run."""
+    factory: RegistryFactory = _OneStoreFactory(partial(_FollowUpReadRegistry, entry, legs))  # type: ignore[arg-type]
+    with pytest.raises(AssertionError) as excinfo:
+        _RACES[entry](factory)
+    message = str(excinfo.value)
+    assert kit.SNAPSHOT_VIOLATION in message, message
+    assert _ENTRY_IN_MESSAGE[entry] in message, message
+    assert kit.STARVED_RACE not in message
+
+
+def test_follow_up_read_stub_passes_the_sequential_pair_scenarios() -> None:
+    """The re-read is invisible without concurrency: each follow-up-read stub
+    passes its entry point's sequential refusal-pair scenario, so the races
+    above are what catch it."""
+    sequential = {
+        _CAS: kit.assert_commit_cas_refusals_carry_the_generation_pair,
+        _BATCH: kit.assert_commit_all_refusals_carry_each_members_generation_pair,
+        _FENCE: kit.assert_fenced_persist_raise_carries_the_generation_pair,
+    }
+    for entry, scenario in sequential.items():
+        for legs in (_OWNER_LEG, _BOTH_LEGS):
+            scenario(_OneStoreFactory(partial(_FollowUpReadRegistry, entry, legs)))  # type: ignore[arg-type]
+
+
+# The thread each race's actor runs in, by the name of its mutator's thread.
+_ACTOR_OF_MUTATOR = {
+    kit.COMMIT_RACE_MUTATOR_THREAD: kit.COMMIT_RACE_COMMITTER_THREAD,
+    kit.FENCE_RACE_MUTATOR_THREAD: kit.FENCE_RACE_ZOMBIE_THREAD,
+}
+
+
+class _StarvedMutatorRegistry:
+    """A correct backend on a runner that never schedules a race's mutator
+    while the actor runs: the mutator's first move waits for the actor's
+    thread to finish, so every refusal lands on the race's starting state."""
+
+    def __init__(self) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def set_agent_state(self, *args: object, **kwargs: object) -> None:
+        actor = _ACTOR_OF_MUTATOR.get(threading.current_thread().name)
+        for thread in threading.enumerate():
+            if thread.name == actor:
+                thread.join()
+        self._inner.set_agent_state(*args, **kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("race", [_CAS, _FENCE], ids=["commit_race", "fence_race"])
+def test_starved_race_fails_as_starved_not_as_a_snapshot_violation(race: str) -> None:
+    """A run whose mutator never ran beside the actor proves nothing, so it
+    must FAIL rather than pass, and with its own message: a correct backend
+    reported as a snapshot violation would send its author after a bug it does not
+    have."""
+    with pytest.raises(AssertionError) as excinfo:
+        _RACES[race](_OneStoreFactory(_StarvedMutatorRegistry))
+    message = str(excinfo.value)
+    assert kit.STARVED_RACE in message, message
+    assert kit.SNAPSHOT_VIOLATION not in message
 
 
 def test_degraded_stub_fails_single_writer_scenario() -> None:

@@ -31,6 +31,12 @@ cannot be raced cross-process (``in_process_only = True``) is *refused with a
 recorded reason*, never silently skipped. KTD-4 (the in-memory registry and
 in-memory bindings) is the first consumer.
 
+Beside the race sit single-contender lifecycles keyed on an ack.
+:func:`run_kill_after_ack` SIGKILLs the contender the moment it acks.
+:func:`run_park_after_ack` SIGSTOPs it after its ack, runs the parent's own
+window while the child cannot run (a stalled-but-live holder), then resumes it
+on a lock-free flag and returns what it produces afterwards.
+
 Test-infrastructure layer: nothing in ``ccs.coordinator`` or the adapters may
 import this module; production modules gain no test-only branches.
 """
@@ -54,11 +60,14 @@ __all__ = [
     "ContenderSpec",
     "DeclaredExemption",
     "HarnessFailure",
+    "ParkContext",
+    "ParkResult",
     "ProcessRaceHarness",
     "RaceResult",
     "park_forever",
     "run_in_subprocess",
     "run_kill_after_ack",
+    "run_park_after_ack",
 ]
 
 
@@ -465,3 +474,180 @@ def run_kill_after_ack(spec: ContenderSpec, *, timeout_sec: float = 60.0) -> Any
         if proc.is_alive():
             proc.kill()
             proc.join(timeout=5.0)
+
+
+# How often a parked child's ack re-reads the resume flag, and how often the
+# parent re-checks that its SIGSTOP has landed. Polling cadence only: the
+# ordering events are the flag and the kernel's stop report, not the sleeps.
+_RESUME_POLL_SECONDS = 0.01
+_STOP_POLL_SECONDS = 0.005
+
+
+@dataclass(frozen=True)
+class ParkResult:
+    """What :func:`run_park_after_ack` hands back: the acked value, whatever
+    the parent's window returned, and the contender's post-resume value."""
+
+    acked: Any
+    window: Any
+    value: Any
+
+
+class ParkContext:
+    """What :func:`run_park_after_ack` hands its child: a NON-parking ack and
+    the resume flag.
+
+    Deliberately not a :class:`ContenderContext`: that ack parks forever for
+    the kill, while this one returns once the parent resumes the child.
+    """
+
+    def __init__(self, ack_channel: Any, resume_flag: Any) -> None:
+        self._ack_channel = ack_channel
+        self._resume_flag = resume_flag
+
+    @property
+    def resumed(self) -> bool:
+        """Whether the parent has resumed this child; safe from any thread.
+
+        A contender's other threads (a heartbeat loop, say) poll this to stop
+        on resume: the parent sets it while the child is still stopped, so the
+        first read after SIGCONT already sees it.
+        """
+        return bool(self._resume_flag.value)
+
+    def ack(self, value: Any) -> None:
+        """Send ``value`` to the parent, then wait until resumed and return.
+
+        Between this call and its return the parent stops the child (unless
+        the stop switch is off), runs its own window, sets the flag and
+        resumes it. Call it exactly once.
+        """
+        self._ack_channel.put(("ack", value))
+        while not self.resumed:
+            time.sleep(_RESUME_POLL_SECONDS)
+
+
+def _park_child_main(
+    fn: Callable[..., Any],
+    args: tuple[Any, ...],
+    queue: Any,
+    resume_flag: Any,
+) -> None:  # pragma: no cover - runs in the spawned child
+    ctx = ParkContext(queue, resume_flag)
+    try:
+        value = fn(ctx, *args)
+        queue.put(("returned", value))
+    except BaseException as exc:  # noqa: BLE001 - the channel carries everything
+        queue.put(("error", repr(exc), traceback.format_exc()))
+
+
+def _await_park_message(queue: Any, timeout_sec: float, awaiting: str) -> tuple[Any, ...]:
+    """The child's next message; a timeout is a HarnessFailure, a raise a ContenderError."""
+    message = _next_message(queue, time.monotonic() + timeout_sec)
+    if message is None:
+        raise HarnessFailure(
+            f"park-after-ack timed out after {timeout_sec}s awaiting {awaiting} (child killed)"
+        )
+    if message[0] == "error":
+        raise ContenderError(0, message[1], message[2])
+    return message
+
+
+def _await_ack(queue: Any, timeout_sec: float) -> Any:
+    message = _await_park_message(queue, timeout_sec, "the ack")
+    if message[0] == "returned":
+        raise HarnessFailure(
+            "contender returned without acking; the case needs an ack to park "
+            "after — call ctx.ack(value), which returns once the parent resumes"
+        )
+    return message[1]
+
+
+def _await_post_resume_value(queue: Any, timeout_sec: float) -> Any:
+    message = _await_park_message(queue, timeout_sec, "the post-resume value")
+    if message[0] != "returned":
+        raise HarnessFailure(
+            f"contender sent {message[0]!r} after its resume; ctx.ack() is called exactly once"
+        )
+    return message[1]
+
+
+def _confirm_stopped(pid: int, timeout_sec: float) -> None:
+    """Poll until the kernel reports ``pid`` stopped, without reaping anything.
+
+    ``WNOWAIT`` leaves the child's status in place, so multiprocessing's own
+    ``Popen`` bookkeeping still collects the exit status later; a reaping
+    ``waitpid`` here could consume it.
+    """
+    deadline = time.monotonic() + timeout_sec
+    flags = os.WSTOPPED | os.WNOHANG | os.WNOWAIT
+    while time.monotonic() < deadline:
+        report = os.waitid(os.P_PID, pid, flags)
+        if report is not None and report.si_code == os.CLD_STOPPED:
+            return
+        time.sleep(_STOP_POLL_SECONDS)
+    raise HarnessFailure(
+        f"park-after-ack could not confirm the child's stop within {timeout_sec}s (child killed)"
+    )
+
+
+def run_park_after_ack(
+    spec: ContenderSpec,
+    while_parked: Callable[[Any], Any],
+    *,
+    stop: bool = True,
+    timeout_sec: float = 60.0,
+) -> ParkResult:
+    """Run ONE contender until it acks, STOP it, run the parent's window, then
+    resume it and return what it produces afterwards.
+
+    Protocol: the contender calls ``ctx.ack(value)`` (a :class:`ParkContext`)
+    exactly once; the ack returns only after the resume. When the ack arrives
+    the parent SIGSTOPs the child and confirms the stop by non-destructive
+    polling, then calls ``while_parked(value)`` — the parent's window, in which
+    it may observe or act out of band while the child cannot run. It then sets
+    the resume flag (the child still stopped) and SIGCONTs the child. The
+    contender's return value comes back as ``ParkResult.value``.
+
+    - The resume flag is a lock-free shared ``RawValue``: an ``Event``,
+      ``Condition`` or locked ``Value`` can be held by the stopped child, and
+      the parent then blocks against it.
+    - ``stop=False`` (the negative controls) skips SIGSTOP, SIGCONT and the
+      stop confirmation and keeps everything else: the ack, the window, the
+      flag, the kill.
+    - Every exit, ``BaseException`` included, SIGKILLs and reaps the child;
+      SIGKILL works on a stopped process.
+    - A raise re-raises as :class:`ContenderError`; returning without an ack,
+      or a wait the harness owns (ack, stop, post-resume value — each bounded
+      by ``timeout_sec``) running out, is a :class:`HarnessFailure`. The
+      window is the caller's to bound.
+    - The acked and returned values cross a process boundary: plain picklable
+      data, never exception objects (``CasVersionConflict`` does not pickle).
+    """
+    if not hasattr(signal, "SIGSTOP"):
+        raise HarnessFailure(
+            f"park primitive unavailable on this platform (no SIGSTOP); declare "
+            f"an exemption instead of running the case (os.name={os.name!r})"
+        )
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    resume_flag = ctx.RawValue("b", 0)
+    proc = ctx.Process(
+        target=_park_child_main, args=(spec.fn, spec.args, queue, resume_flag), daemon=True
+    )
+    proc.start()
+    try:
+        acked = _await_ack(queue, timeout_sec)
+        if stop:
+            os.kill(proc.pid, signal.SIGSTOP)  # type: ignore[arg-type]
+            _confirm_stopped(proc.pid, timeout_sec)  # type: ignore[arg-type]
+        window = while_parked(acked)
+        resume_flag.value = 1
+        if stop:
+            os.kill(proc.pid, signal.SIGCONT)  # type: ignore[arg-type]
+        value = _await_post_resume_value(queue, timeout_sec)
+        return ParkResult(acked=acked, window=window, value=value)
+    finally:
+        if proc.is_alive():
+            proc.kill()
+        proc.join(timeout=5.0)

@@ -50,6 +50,7 @@ from ccs.core.exceptions import (
     CheckpointRegistrationRefused,
     CheckpointUnknown,
     CoherenceError,
+    CommitNotAllowed,
     GiverFenced,
     OccCallerTransientError,
     SessionInvalidated,
@@ -2248,8 +2249,10 @@ class CoordinatorService:
                 still live -- checked first, so a giver whose grant was
                 handed off is never answered commit_not_allowed, nor shown a
                 reclaim it did not suffer.
-            CoherenceError: the committer does not hold M/E (e.g. its grant was
-                already reclaimed — the error names the reclaim trigger/tick).
+            CommitNotAllowed: the committer does not hold M/E (e.g. its grant
+                was already reclaimed — the error names the reclaim
+                trigger/tick), carrying the generation pair read in this
+                decision.
             StaleReadGeneration: the read-generation fence fired — a sweep
                 reclaimed this committer in the race window between the state
                 check above and the version persist (``ccs.core.exceptions``).
@@ -2261,15 +2264,26 @@ class CoordinatorService:
         self._refuse_handed_off_giver(artifact_id, caller if caller is not None else agent_id)
         agent_state = self.registry.get_agent_state(artifact_id, agent_id)
         if agent_state not in {MESIState.EXCLUSIVE, MESIState.MODIFIED}:
+            # Read under commit()'s abort_guard hold, the one this refusal is
+            # decided in, so no reclaim or release can land between the state
+            # check and the pair the refusal reports.
+            pair = {
+                "captured_generation": self.registry.get_read_generation(
+                    artifact_id, agent_id
+                ),
+                "owner_generation": self.registry.get_owner_generation(artifact_id),
+            }
             reclamation = self.registry.get_last_reclamation(agent_id, artifact_id)
             if reclamation is not None:
                 trigger, reclaimed_at_tick = reclamation
-                raise CoherenceError(
+                raise CommitNotAllowed(
                     f"commit_not_allowed agent={agent_id} artifact={artifact_id} "
-                    f"state={agent_state} reclaimed_by={trigger} at_tick={reclaimed_at_tick}"
+                    f"state={agent_state} reclaimed_by={trigger} at_tick={reclaimed_at_tick}",
+                    **pair,
                 )
-            raise CoherenceError(
-                f"commit_not_allowed agent={agent_id} artifact={artifact_id} state={agent_state}"
+            raise CommitNotAllowed(
+                f"commit_not_allowed agent={agent_id} artifact={artifact_id} state={agent_state}",
+                **pair,
             )
 
         self.registry.set_agent_transient(

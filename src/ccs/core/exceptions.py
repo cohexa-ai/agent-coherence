@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from typing import Protocol, TypeGuard
 from uuid import UUID
 
 # Wire-stable reason string for the retry-eligible OCC precondition where a peer
@@ -559,7 +560,69 @@ class CoherenceError(Exception):
     """Base error for coherence domain failures."""
 
 
-class StaleReadGeneration(CoherenceError):
+def _is_generation(value: object) -> TypeGuard[int]:
+    # bool is an int subclass, and True is no generation.
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _generation_pair(captured: object, owner: object) -> tuple[int, int] | None:
+    """A commit refusal's ``(captured_generation, owner_generation)``, or
+    ``None`` when the pair is absent or malformed.
+
+    Generations start at 0 and only grow, so a negative, a bool, a non-int or
+    a lone value is no generation, and half a pair names no lost token: the
+    pair is kept or dropped whole. The one rule for every place that parses or
+    emits the pair, so they cannot disagree. Never raises, because exception
+    constructors call it with whatever a response body held."""
+    if _is_generation(captured) and _is_generation(owner):
+        return captured, owner
+    return None
+
+
+class _PairCarrier(Protocol):
+    @property
+    def captured_generation(self) -> int | None: ...
+
+    @property
+    def owner_generation(self) -> int | None: ...
+
+
+def _generation_pair_fields(refusal: _PairCarrier) -> dict[str, int]:
+    """A refusal's pair as two body or result keys, both or neither, so a
+    response never carries a null or half a pair."""
+    pair = _generation_pair(refusal.captured_generation, refusal.owner_generation)
+    if pair is None:
+        return {}
+    captured, owner = pair
+    return {"captured_generation": captured, "owner_generation": owner}
+
+
+class _CarriesGenerationPair:
+    """The keyword-only ``captured_generation`` / ``owner_generation`` a commit
+    refusal carries, kept or dropped whole by :func:`_generation_pair` and
+    never part of the message. Not an exception base, so it changes no
+    ``except`` clause; the class defaults keep both attributes on a subclass
+    that bypasses ``__init__``."""
+
+    captured_generation: int | None = None
+    owner_generation: int | None = None
+
+    def __init__(
+        self,
+        *args: object,
+        captured_generation: object = None,
+        owner_generation: object = None,
+    ) -> None:
+        super().__init__(*args)
+        self._adopt_generation_pair(captured_generation, owner_generation)
+
+    def _adopt_generation_pair(self, captured: object, owner: object) -> None:
+        pair = _generation_pair(captured, owner)
+        if pair is not None:
+            self.captured_generation, self.owner_generation = pair
+
+
+class StaleReadGeneration(_CarriesGenerationPair, CoherenceError):
     """The read-generation fence rejected a commit: the committer's
     read_generation is older than the artifact's current owner_generation --
     its captured ownership/read-claim was superseded by a sweep reclamation.
@@ -568,7 +631,32 @@ class StaleReadGeneration(CoherenceError):
     ``commit_cas`` path returns a :class:`ConflictDetail` with the same reason
     instead. Retry-eligible: ``reacquire()`` + fresh read + re-commit. Carries
     ``STALE_READ_GENERATION_REASON`` so the client classifier matches it
-    exactly (never on the human message)."""
+    exactly (never on the human message).
+
+    :attr:`captured_generation` and :attr:`owner_generation` are the two values
+    the fence compared, as on :class:`ConflictDetail`. They are keyword-only
+    and never enter the message, which stays whatever the raise site wrote;
+    both are ``None`` (the class default) when no valid pair was passed."""
+
+
+class CommitNotAllowed(_CarriesGenerationPair, CoherenceError):
+    """The coordinator refused a pessimistic commit because the committer does
+    not hold the artifact's write grant (M or E): a sweep reclaimed it, a peer
+    preempted it, or it never held one. Nothing landed.
+
+    Raised by ``CoordinatorService.commit``. The message is the refusal's
+    prose, ``commit_not_allowed ...`` (naming the reclaim trigger and tick
+    when a sweep reclaimed the grant).
+
+    :attr:`captured_generation` is the read_generation the coordinator
+    recorded at the committer's last claim; :attr:`owner_generation` is the
+    artifact's ownership generation. Both are read in the same decision as
+    the refusal. ``captured < owner`` means some write claim on the artifact
+    ended without a version move after the committer's claim was recorded (a
+    release, a reclaim or a handoff); it does not say why this committer
+    lost, and the two are not ordered otherwise. Both are ``None`` (the class
+    default) when the committer has no recorded claim. Keyword-only, never in
+    the message; recovery follows the refusal, never the pair."""
 
 
 class OccCallerTransientError(CoherenceError):
@@ -725,7 +813,7 @@ class InvariantViolationError(CoherenceError):
     """Raised when a runtime invariant check fails."""
 
 
-class CasRetriesExhausted(CoherenceError):
+class CasRetriesExhausted(_CarriesGenerationPair, CoherenceError):
     """Raised when an optimistic-concurrency commit-CAS retry loop is exhausted.
 
     The typed terminal failure for the OCC write path (plan Unit 5, R6 /
@@ -756,11 +844,18 @@ class CasRetriesExhausted(CoherenceError):
     Carries :data:`CAS_EXHAUSTED_REASON` (MCP-C Unit 1) so the deny mapper
     classifies it by type; the wire reason ``cas_exhausted`` is deliberately
     distinct from the ``cas_retries_exhausted`` prose token in the message.
+
+    :attr:`captured_generation` and :attr:`owner_generation` are the LAST
+    refusal's pair, as on :class:`ConflictDetail`: the committer's recorded
+    claim and the artifact's ownership generation, read in that refusal's
+    decision. Both are ``None`` when that refusal carried none (no recorded
+    claim, or a coordinator that does not report them). Keyword-only and never
+    in the message; recovery follows the reason, never the pair.
     """
 
     reason = CAS_EXHAUSTED_REASON
-    #: Class default, so a subclass that bypasses ``__init__``
-    #: (``ConditionalPutRetriesExhausted``) still has the attribute.
+    #: Class defaults, so a subclass that bypasses ``__init__``
+    #: (``ConditionalPutRetriesExhausted``) still has the attributes.
     last_conflict_reason: str | None = None
 
     def __init__(
@@ -770,11 +865,14 @@ class CasRetriesExhausted(CoherenceError):
         last_current_version: int,
         *,
         last_conflict_reason: str | None = None,
+        captured_generation: object = None,
+        owner_generation: object = None,
     ) -> None:
         # isinstance, not truthiness alone: the reason arrives from a JSON body,
         # and an exception constructor must never raise (see CasVersionConflict).
         if isinstance(last_conflict_reason, str) and last_conflict_reason:
             self.last_conflict_reason = last_conflict_reason
+        self._adopt_generation_pair(captured_generation, owner_generation)
         if self.last_conflict_reason is None:
             # No reason known (a raise site that does not pass one): the text
             # this message has always had.
@@ -830,14 +928,21 @@ class StaleView(CoherenceError):
     current_generation: int | None = None
 
 
-class CommitPreempted(CoherenceError):
+class CommitPreempted(_CarriesGenerationPair, CoherenceError):
     """Post-edit deny (MCP-C Unit 1): the EXCLUSIVE grant was preempted /
     sweep-reclaimed AFTER the atomic disk write but BEFORE the commit landed, so
     the bytes may already be on disk *un-versioned* (disk ahead of the
     coordinator version). NOT only a concurrent edge — a lone sequential writer's
     grant can age out mid-write (crash-recovery sweep, default-on). Recover by
     re-reading fresh bytes and reconciling the pending buffer (agent-driven; v1
-    has no server reconcile primitive). Carries :data:`COMMIT_PREEMPTED_REASON`."""
+    has no server reconcile primitive). Carries :data:`COMMIT_PREEMPTED_REASON`.
+
+    :attr:`captured_generation` and :attr:`owner_generation` are the commit
+    refusal's pair, as on :class:`CommitNotAllowed`: ``captured < owner`` means
+    some write claim on the artifact ended without a version move after this
+    writer's claim was recorded (a sweep reclaim, for one). Both are ``None``
+    when the refusal carried none. Keyword-only and never in the message; the
+    recovery above holds whatever they say."""
 
     reason = COMMIT_PREEMPTED_REASON
 
@@ -1059,7 +1164,7 @@ _CAS_EXHAUSTED_ADVICE: dict[str, str] = {
 }
 
 
-class CasVersionConflict(CoherenceError):
+class CasVersionConflict(_CarriesGenerationPair, CoherenceError):
     """Option-A CAS rejected (MCP-C Unit 5). Typed-conflict, NOT auto-merge: NO
     write landed, and both versions are carried so the client can recover
     without another read.
@@ -1079,6 +1184,11 @@ class CasVersionConflict(CoherenceError):
     not re-read — it is best-effort (the version observed at pre-read time); a
     caller keys recovery on ``reacquire()`` (which re-reads fresh), not on the
     numeric.
+
+    :attr:`captured_generation` and :attr:`owner_generation` are the
+    coordinator refusal's pair, as on :class:`ConflictDetail`. Both are
+    ``None`` when the refusal carried none, and on a conflict the client
+    decided itself (no refusal body). Keyword-only and never in the message.
     """
 
     #: Class default, kept so ``except`` clauses and consumers that read the
@@ -1093,6 +1203,8 @@ class CasVersionConflict(CoherenceError):
         current_version: int,
         *,
         reason: str | None = None,
+        captured_generation: object = None,
+        owner_generation: object = None,
     ) -> None:
         """``reason`` is the coordinator's refusal reason when the raise site
         has one. The coordinator distinguishes four — ``version_mismatch``,
@@ -1119,6 +1231,7 @@ class CasVersionConflict(CoherenceError):
         self.artifact_id = artifact_id
         self.expected_version = expected_version
         self.current_version = current_version
+        self._adopt_generation_pair(captured_generation, owner_generation)
 
 
 class ScenarioValidationError(CoherenceError):
