@@ -11,6 +11,7 @@ another's recovery.
 
 from __future__ import annotations
 
+import pickle
 from dataclasses import FrozenInstanceError
 from uuid import uuid4
 
@@ -49,6 +50,7 @@ from ccs.core.exceptions import (
     VERSION_MISMATCH_REASON,
     VIEW_WEDGED_REASON,
     CoherenceError,
+    CoordinatorUnreachable,
     GiverFenced,
 )
 from ccs.core.states import MESIState
@@ -170,6 +172,24 @@ def test_giver_fenced_carries_its_reason_successor_and_version() -> None:
     assert isinstance(err, CoherenceError)
     assert str(successor) in str(err)
     assert "version_at_transfer=7" in str(err)
+
+
+def test_coordinator_unreachable_carries_its_reason_and_crosses_a_process_boundary() -> None:
+    """The refusal for no usable answer from the coordinator is a typed
+    terminal in the coherence family, so a strict caller catches it with the
+    rest and a consumer classifies it by type or ``.reason``, never by the
+    message. Its class-level reason is the existing wire value the MCP
+    unattached refusal already answers, not a new one. It carries the message
+    only, so a child process can raise it and the parent unpickle it whole."""
+    err = CoordinatorUnreachable("coordinator gone")
+    assert CoordinatorUnreachable.reason == "coordinator_unavailable"
+    assert err.reason == COORDINATOR_UNAVAILABLE_REASON
+    assert isinstance(err, CoherenceError)
+
+    restored = pickle.loads(pickle.dumps(err))
+    assert type(restored) is CoordinatorUnreachable
+    assert restored.args == ("coordinator gone",)
+    assert restored.reason == "coordinator_unavailable"
 
 
 def test_transfer_statuses_are_the_six_closed_values() -> None:

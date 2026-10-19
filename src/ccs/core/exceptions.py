@@ -551,8 +551,10 @@ INTERNAL_CONCURRENCY_REASON = "internal_concurrency_error"
 # longer matches the coordinator's current version. Typed-conflict, NOT
 # auto-merge — the agent re-reads at current_version, re-merges, and retries.
 VERSION_MISMATCH_REASON = "version_mismatch"
-# Type B — synthesized by the mapper (no adapter raise-site) when the volume is
-# unattached / coordinator transport failed; the write is NOT version-committed.
+# No usable answer from the coordinator; the write is NOT version-committed.
+# Two producers share it: the MCP mapper synthesizes it for a volume that is
+# not attached (Type B), and it is the class reason of
+# :class:`CoordinatorUnreachable`, which the strict surfaces raise.
 COORDINATOR_UNAVAILABLE_REASON = "coordinator_unavailable"
 
 
@@ -1062,12 +1064,38 @@ class RedirectRefused(CoherenceError):
 
 
 class CommitUnconfirmed(CoherenceError):
-    """OCC commit unconfirmed (MCP-C Unit 1): the coordinator transport failed
-    mid-commit, a false-negative ack — NOT a confirmed loss. The write may or may
-    not have landed; reconcile by re-reading, then retry only if absent. Carries
-    :data:`COMMIT_UNCONFIRMED_REASON`."""
+    """A commit's outcome is unknown (MCP-C Unit 1): a false-negative ack, NOT a
+    confirmed loss. Raised when a commit request got no usable answer after it
+    may have reached the coordinator: an OCC commit (``write_cas``,
+    ``write_cas_at``, ``atomic_publish``), a pessimistic ``write()``'s post-edit,
+    or any other commit request delivered and left unanswered. It does not by
+    itself mean the request was delivered: the handoff verbs and the
+    substrate's legs after its write landed raise it even when the request was
+    never sent, because the outcome they must reconcile is the same. The write
+    may or may not have landed; reconcile by re-reading, then retry only if
+    absent. Carries :data:`COMMIT_UNCONFIRMED_REASON`."""
 
     reason = COMMIT_UNCONFIRMED_REASON
+
+
+class CoordinatorUnreachable(CoherenceError):
+    """No usable answer came from the coordinator. Either the request never
+    reached it (no coordinator to spawn or attach, a refused connect), on any
+    leg; or it reached it and got no usable answer (a silent listener, a reset,
+    an empty, unparseable or non-object reply) on a leg that commits nothing. A
+    commit request that reached it and went unanswered raises
+    :class:`CommitUnconfirmed` instead, because it may have landed.
+
+    No write was version-committed. A pessimistic ``write()`` that raises it
+    has already put its bytes on disk, and its message says so. Recovery is
+    not a retry: the coordinator is gone or wedged, and an attached volume or
+    substrate session keeps the endpoint it attached to, so it cannot recover
+    in place. Build a new one (for the MCP server, restart it) once a
+    coordinator is running again; see ``docs/guide.md``. Carries
+    :data:`COORDINATOR_UNAVAILABLE_REASON`. Message only, so it pickles whole
+    across a process boundary."""
+
+    reason = COORDINATOR_UNAVAILABLE_REASON
 
 
 class PublishMaterializationError(CoherenceError):
