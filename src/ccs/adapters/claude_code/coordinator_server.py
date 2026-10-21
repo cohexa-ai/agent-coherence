@@ -194,15 +194,35 @@ class _RequestProtocol(Protocol):
     _watchdog_deadline: float | None
 
     def _read_json(self) -> dict | None:
-        """Read + parse the request body as JSON. Returns None on error."""
+        """Read + parse the request body as JSON. Returns None when the request
+        is already settled: answered with a 4xx, or a stalled body dropped with
+        no answer. The caller returns without writing."""
         ...
 
     def _json(self, status: int, body: dict) -> None:
-        """Write a JSON response with the given HTTP status code."""
+        """Write a JSON response with the given HTTP status code. A client that
+        stops reading it is dropped, and the call returns as usual."""
         ...
 
 
 HANDLER_TIMEOUT_SEC = 4.0
+
+HANDLER_READ_TIMEOUT_SEC = 2.0
+"""How long a handler waits on each socket read, and on each
+:data:`_ANSWER_WRITE_CHUNK_BYTES` of its answer, before it drops the connection
+(#237). A connection takes one of the :data:`HANDLER_CONCURRENCY_LIMIT` handler
+slots as soon as it is accepted, before it sends a byte, so without this a few
+silent connections hold every slot. A client sends a whole request at once, so
+2 s is ample, and it keeps the window those connections hold the slots under
+:data:`HANDLER_TIMEOUT_SEC`. It bounds each read, not the whole request, and
+not the slots a peer can take: one that sends a byte before every read times out
+(#393), or reconnects as each connection is dropped (#394), still keeps them."""
+
+_ANSWER_WRITE_CHUNK_BYTES = 64 * 1024
+"""How much of an answer one socket write sends. A socket timeout bounds a whole
+``sendall``, so an answer written in one call was cut once it took longer than
+:data:`HANDLER_READ_TIMEOUT_SEC` to drain, even to a client reading steadily
+(#237). In chunks, only a client that stops reading for that long is dropped."""
 
 _STATUS_CLIENT_TIMEOUT_SEC = 6.0
 """How long this package's ``/status`` clients wait for the answer: the
@@ -2146,6 +2166,9 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
         # Use HTTP/1.1 with Connection: close per response (keep-alive is
         # not worth the complexity at hook-call rate).
         protocol_version = "HTTP/1.0"
+        # StreamRequestHandler.setup() puts this on the socket; the stdlib
+        # default, None, never times a read out.
+        timeout = HANDLER_READ_TIMEOUT_SEC
 
         # ----------------------------------------------------------
         # stdlib hook overrides
@@ -2281,7 +2304,14 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
                     },
                 )
                 return None
-            raw = self.rfile.read(n)
+            try:
+                raw = self.rfile.read(n)
+            except TimeoutError:
+                # Uncaught, _dispatch's catch-all would answer 500 and log an
+                # ERROR for a client that only went quiet. Drop it instead, as
+                # the stdlib does for a silent request line.
+                self.close_connection = True
+                return None
             try:
                 obj = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -2298,8 +2328,16 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(data)
+            answer = memoryview(data)
+            try:
+                self.end_headers()
+                for start in range(0, len(answer), _ANSWER_WRITE_CHUNK_BYTES):
+                    self.wfile.write(answer[start:start + _ANSWER_WRITE_CHUNK_BYTES])
+            except TimeoutError:
+                # The client stopped reading (#237). Uncaught, _dispatch's
+                # catch-all would log an ERROR and write a 500 into the
+                # half-sent answer, waiting out a second timeout to do it.
+                self.close_connection = True
 
     return _Handler
 

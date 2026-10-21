@@ -2059,6 +2059,232 @@ def test_handler_concurrency_limit_constant_matches_spec(client: _Client) -> Non
 
 
 # ----------------------------------------------------------------------
+# #237 — a silent connection gives back its handler slot
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def short_read_timeout_coordinator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A coordinator whose handlers drop a silent socket after 1 s, so a test
+    can wait out the read timeout quickly. The handler class reads the
+    constant when the server builds it."""
+    from ccs.adapters.claude_code import coordinator_server
+
+    monkeypatch.setattr(coordinator_server, "HANDLER_READ_TIMEOUT_SEC", 1.0, raising=False)
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
+    server.serve_in_thread()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+
+
+def _handler_slots_all_free(server: CoordinatorHTTPServer, budget_sec: float = 10.0) -> bool:
+    """Whether every handler slot comes back within ``budget_sec``."""
+    from ccs.adapters.claude_code.coordinator_server import HANDLER_CONCURRENCY_LIMIT
+
+    deadline = time.monotonic() + budget_sec
+    while time.monotonic() < deadline:
+        if server._server._concurrency_sem._value == HANDLER_CONCURRENCY_LIMIT:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _read_until_closed(sock, timeout_sec: float = 10.0) -> bytes:
+    """Everything the coordinator sends before it closes ``sock``."""
+    sock.settimeout(timeout_sec)
+    reply = b""
+    try:
+        while chunk := sock.recv(65536):
+            reply += chunk
+    except TimeoutError:
+        pytest.fail(f"the coordinator held the connection open for {timeout_sec:.0f} s")
+    return reply
+
+
+def test_idle_connections_give_back_their_handler_slots_after_the_read_timeout(
+    short_read_timeout_coordinator,
+) -> None:
+    """#237: a connection takes a handler slot as soon as it is accepted, before
+    it sends a byte. With no read timeout, HANDLER_CONCURRENCY_LIMIT connections
+    that sent nothing held every slot until their owner closed them, and every
+    request, hooks included, got 503. The read timeout drops them, so the
+    coordinator serves again while their owner still holds them."""
+    import socket
+
+    from ccs.adapters.claude_code.coordinator_server import HANDLER_CONCURRENCY_LIMIT
+
+    server = short_read_timeout_coordinator
+    client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
+
+    def status() -> object:
+        try:
+            return client.get("/status")[0]
+        except OSError as exc:  # the overflow 503 can race the request's own write
+            return type(exc).__name__
+
+    idle = [socket.create_connection(("127.0.0.1", server.port)) for _ in range(HANDLER_CONCURRENCY_LIMIT)]
+    try:
+        # Inside the timeout window the idle sockets hold every slot: proof the
+        # test filled them, and the window the read timeout leaves open.
+        window_end = time.monotonic() + 0.8
+        refused = None
+        while refused is None and time.monotonic() < window_end:
+            if (answer := status()) != 200:
+                refused = answer
+        assert refused is not None, "the idle sockets never filled the handler slots"
+
+        deadline = time.monotonic() + 10.0
+        while (answer := status()) != 200 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert answer == 200, f"the coordinator still refused requests past the read timeout: {answer}"
+        for sock in idle:
+            sock.settimeout(5.0)
+            assert sock.recv(1) == b"", "the coordinator left a silent connection open"
+        assert _handler_slots_all_free(server), "a dropped connection kept its handler slot"
+    finally:
+        for sock in idle:
+            sock.close()
+
+
+def test_a_stalled_request_body_closes_its_connection_without_a_500(
+    short_read_timeout_coordinator, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#237: a request whose body never arrives held its slot until the client
+    closed it. Its read now times out inside the route, where the
+    dispatcher's catch-all would answer 500 "internal: TimeoutError" and log
+    an ERROR; the connection is closed with no answer instead, as the stdlib
+    does for a silent request line."""
+    import socket
+
+    server = short_read_timeout_coordinator
+    secret = load_secret(server.coordinator_root)
+    request = (
+        "POST /hooks/pre-read HTTP/1.0\r\n"
+        "Host: 127.0.0.1\r\n"
+        f"Authorization: Bearer {secret}\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: 64\r\n"
+        "\r\n"
+        '{"session_id"'
+    )
+    with caplog.at_level(logging.ERROR, logger="ccs"):
+        with socket.create_connection(("127.0.0.1", server.port)) as sock:
+            sock.sendall(request.encode())
+            reply = _read_until_closed(sock)
+    assert reply == b"", f"expected the connection closed with no answer, got {reply[:120]!r}"
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert _handler_slots_all_free(server), "the stalled request kept its handler slot"
+
+
+@pytest.mark.parametrize(
+    "partial_request",
+    [b"GET /status HTTP/1.0", b"GET /status HTTP/1.0\r\nHost: 127.0.0.1\r\n"],
+    ids=["request-line", "headers"],
+)
+def test_a_stalled_request_line_or_headers_gives_back_its_slot(
+    short_read_timeout_coordinator, caplog: pytest.LogCaptureFixture, partial_request: bytes
+) -> None:
+    """#237: a request that stops partway through its first line or its headers
+    is dropped by the read timeout with no answer and no ERROR, and its slot
+    comes back."""
+    import socket
+
+    server = short_read_timeout_coordinator
+    with caplog.at_level(logging.ERROR, logger="ccs"):
+        with socket.create_connection(("127.0.0.1", server.port)) as sock:
+            sock.sendall(partial_request)
+            reply = _read_until_closed(sock)
+    assert reply == b"", f"expected the connection closed with no answer, got {reply[:120]!r}"
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert _handler_slots_all_free(server), "the stalled request kept its handler slot"
+
+
+def _large_answer_request(
+    server: CoordinatorHTTPServer, monkeypatch: pytest.MonkeyPatch, size: int
+) -> bytes:
+    """Register a route answering a JSON body of about ``size`` bytes, and
+    return an authenticated request for it."""
+    from ccs.adapters.claude_code import coordinator_server
+
+    answer = {"blob": "x" * size}
+    monkeypatch.setitem(
+        coordinator_server._ROUTES, ("GET", "/test/large-answer"), lambda req, _: req._json(200, answer)
+    )
+    secret = load_secret(server.coordinator_root)
+    return (
+        "GET /test/large-answer HTTP/1.0\r\n"
+        "Host: 127.0.0.1\r\n"
+        f"Authorization: Bearer {secret}\r\n"
+        "\r\n"
+    ).encode()
+
+
+def test_a_client_that_keeps_reading_gets_a_large_answer_whole(
+    short_read_timeout_coordinator, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#237: the handler timeout must not cut off a client that is still
+    reading. A socket timeout bounds a whole sendall, so an answer written in
+    one call was cut once it took longer than the timeout to drain, even to a
+    client reading steadily; the client then saw a short body and took the
+    coordinator for unavailable."""
+    import socket
+
+    server = short_read_timeout_coordinator
+    request = _large_answer_request(server, monkeypatch, 3 << 20)
+    with caplog.at_level(logging.ERROR, logger="ccs"):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16384)
+            sock.connect(("127.0.0.1", server.port))
+            sock.sendall(request)
+            sock.settimeout(10.0)
+            reply = b""
+            # About 1.6 MB/s: the whole answer takes longer than the 1 s timeout.
+            while chunk := sock.recv(32768):
+                reply += chunk
+                time.sleep(0.02)
+    head, _, body = reply.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.0 200"), head[:80]
+    length = int(next(line.split(b":", 1)[1] for line in head.split(b"\r\n") if line.lower().startswith(b"content-length:")))
+    assert len(body) == length, f"the answer was cut after {len(body)} of {length} bytes"
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_a_client_that_stops_reading_its_answer_is_dropped_without_an_error(
+    short_read_timeout_coordinator, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#237: a client that stops reading an answer larger than the socket
+    buffers is dropped once a write makes no progress for the timeout. The
+    write's timeout used to reach the dispatcher's catch-all, which logged an
+    ERROR and wrote a 500 onto the stuck socket, holding the slot for a second
+    timeout."""
+    import socket
+
+    server = short_read_timeout_coordinator
+    request = _large_answer_request(server, monkeypatch, 16 << 20)
+    with caplog.at_level(logging.ERROR, logger="ccs"):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            sock.connect(("127.0.0.1", server.port))
+            sock.sendall(request)
+            time.sleep(0.2)  # let the handler start writing before the slot check
+            assert _handler_slots_all_free(server), "a client that stopped reading kept its handler slot"
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_handler_sockets_get_a_read_timeout_shorter_than_the_handler_deadline(coordinator) -> None:
+    """#237: the stdlib sets no socket timeout unless the handler class names
+    one, and a handler with none waits on a silent connection for as long as
+    the peer keeps it open, holding its slot."""
+    from ccs.adapters.claude_code.coordinator_server import HANDLER_TIMEOUT_SEC, _make_handler_class
+
+    timeout = _make_handler_class(coordinator).timeout
+    assert timeout is not None, "handler sockets have no read timeout"
+    assert 0 < timeout < HANDLER_TIMEOUT_SEC
+
+
+# ----------------------------------------------------------------------
 # KTD-I (Unit 5 L2) — in-flight handler semaphore drain on shutdown
 # ----------------------------------------------------------------------
 
