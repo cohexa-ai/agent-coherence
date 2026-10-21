@@ -342,6 +342,49 @@ STORE_OPEN_SIGNALS: frozenset[str] = frozenset(
 CROSS_RUNTIME_SCHEMA_REASON = "cross_runtime_schema"
 
 # ---------------------------------------------------------------------------
+# schema-version refusal reasons (#345)
+# ---------------------------------------------------------------------------
+#
+# ``SchemaVersionError.reason`` (defined in ``ccs.coordinator.sqlite_registry``
+# for the same layering reason as the cross-runtime class above) says WHICH
+# refusal a store open raised, so a host can tell "upgrade this build" from
+# "this store is broken" without substring-matching the message (the
+# typed-signal-not-substring house rule). The error's ``found_version`` is
+# the store's raw ``user_version`` under the three version reasons (negative
+# under ``schema_unrecognized``) and ``None`` under the other two, so a host
+# branches on ``reason``, not on a version comparison. Wire-stable and
+# ADDITIVE: renaming a value is a wire break; add, do not mutate.
+SCHEMA_OLDER_REASON = "schema_older"
+"""The store is at an older Python registry schema that a read-only open
+will not migrate. Remedy: re-open it once with a writer (a coordinator start
+migrates it)."""
+
+SCHEMA_NEWER_REASON = "schema_newer"
+"""The store is stamped past this build's schema: a newer Python coordinator,
+or a sibling-runtime ledger this build does not recognize, wrote it. Remedy:
+use a build that understands that schema; no build migrates down."""
+
+SCHEMA_UNRECOGNIZED_REASON = "schema_unrecognized"
+"""The store's ``user_version`` is negative: no coordinator build stamps it.
+Remedy: restore the store from a backup."""
+
+REGISTRY_META_INCOMPLETE_REASON = "registry_meta_incomplete"
+"""``registry_meta`` lacks, or holds an unreadable value for, a key every store
+carries (``instance_id``, ``sequence_number`` or ``coordinator_epoch``).
+Raised after a migration step as well as on a current store, so the error
+carries no found version. Remedy: restore the store from a backup."""
+
+SCHEMA_VERSION_REASONS: frozenset[str] = frozenset(
+    {
+        SCHEMA_OLDER_REASON,
+        SCHEMA_NEWER_REASON,
+        SCHEMA_UNRECOGNIZED_REASON,
+        REGISTRY_META_INCOMPLETE_REASON,
+        CROSS_RUNTIME_SCHEMA_REASON,
+    }
+)
+
+# ---------------------------------------------------------------------------
 # caller-principal refusal reasons (coordinator caller principal, U4)
 # ---------------------------------------------------------------------------
 #

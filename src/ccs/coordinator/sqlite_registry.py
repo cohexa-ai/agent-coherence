@@ -104,6 +104,10 @@ from uuid import UUID, uuid4
 
 from ccs.core.exceptions import (
     CROSS_RUNTIME_SCHEMA_REASON,
+    REGISTRY_META_INCOMPLETE_REASON,
+    SCHEMA_NEWER_REASON,
+    SCHEMA_OLDER_REASON,
+    SCHEMA_UNRECOGNIZED_REASON,
     STALE_READ_GENERATION_REASON,
     STORE_SIGNAL_BUSY,
     STORE_SIGNAL_UNREADABLE,
@@ -614,7 +618,41 @@ class SchemaVersionError(RuntimeError):
     state, so a delete is destructive (it drops retained history AND the fence
     epoch). The forward path is upgrading the embedder binary to one that
     understands the schema, never ``rm state.db``.
+
+    Typed fields (#345), so a host branches on attributes, never on the
+    message (the typed-signal-not-substring house rule):
+
+    - ``reason`` — one of :data:`ccs.core.exceptions.SCHEMA_VERSION_REASONS`
+      on every raise in this module; ``None`` only for an embedder's own
+      message-only construction.
+    - ``found_version`` — the store's raw ``user_version`` under
+      ``schema_older``, ``schema_newer`` and ``schema_unrecognized``. It is
+      negative under ``schema_unrecognized``, and under ``schema_newer`` it may
+      be a sibling runtime's ledger number this build does not recognize, so
+      read it with ``reason``, never alone. ``None`` under
+      ``registry_meta_incomplete`` (the check runs after every migration step,
+      so the version is not what is wrong), under ``cross_runtime_schema`` (a
+      Node ledger number means a different schema, #294), and for an
+      embedder's own message-only construction.
+    - ``expected_version`` — the schema this build serves.
+
+    All three are keyword-only with defaults, so ``SchemaVersionError("m")``
+    keeps working. Pickling keeps them: ``BaseException.__reduce__`` carries
+    the instance ``__dict__`` and re-applies it after ``cls(message)``.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str | None = None,
+        found_version: int | None = None,
+        expected_version: int = SCHEMA_USER_VERSION,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.found_version = found_version
+        self.expected_version = expected_version
 
 
 class CrossRuntimeSchemaError(SchemaVersionError):
@@ -635,12 +673,29 @@ class CrossRuntimeSchemaError(SchemaVersionError):
     ``exc.reason == CONSTANT``, never a substring of the message (the
     typed-signal-not-substring house rule). Same anti-delete wording rule as
     the parent: the message must never advise removing the db — it holds the
-    sibling runtime's live coordination state.
+    sibling runtime's live coordination state. ``found_version`` stays
+    ``None``: a Node ledger number names a different schema than the same
+    Python number (#294), so it is never comparable to ``expected_version``.
     """
 
     def __init__(self, message: str) -> None:
-        super().__init__(message)
-        self.reason = CROSS_RUNTIME_SCHEMA_REASON
+        super().__init__(message, reason=CROSS_RUNTIME_SCHEMA_REASON)
+
+
+def _unrecognized_schema_error(header: str, current: int) -> SchemaVersionError:
+    """The refusal of a negative ``user_version``, which no coordinator build
+    stamps (#345). Its remedy is a backup restore on the writer and the
+    read-only open alike: no build understands the store, so "upgrade" would
+    send the user after a build that does not exist, and "re-open read-write
+    to migrate" would loop, because the writer open refuses it too."""
+    return SchemaVersionError(
+        f"{header} No coordinator build stamps a negative user_version, so "
+        f"the store was damaged or changed outside a coordinator. Restore it "
+        f"from a backup rather than removing it — it may hold durable retained "
+        f"content and read-generation fence state that a delete would destroy.",
+        reason=SCHEMA_UNRECOGNIZED_REASON,
+        found_version=current,
+    )
 
 
 class ReadOnlyRegistryError(RuntimeError):
@@ -711,6 +766,101 @@ def classify_sqlite_operational_signal(exc: sqlite3.OperationalError) -> str:
     if "readonly" in text or "recovery" in text or "wal" in text:
         return STORE_SIGNAL_WAL_RECOVERY
     return STORE_SIGNAL_UNREADABLE
+
+
+# ---------------------------------------------------------------------------
+# Trial opens of a store COPY (the #345 store check)
+# ---------------------------------------------------------------------------
+#
+# The store check (``ccs.adapters.claude_code.store_check``) predicts a
+# coordinator start by running the start's own writer open on a private copy
+# of the store. Every SQLite call it needs lives HERE, beside the registry
+# that opens the coordinator store for writing: adapters, cli and mcp modules
+# never import ``sqlite3`` (tests/coordinator/test_caller_principal.py::
+# test_no_interface_module_owns_a_table sweeps those three), so SQLite
+# failures cross into the adapter typed, as :class:`StoreSqliteError`.
+
+#: Primary SQLite result codes that describe the side OPENING a store — its
+#: disk, memory, file handles and locks — never the store's content.
+_OPENER_SIDE_SQLITE_CODES = frozenset(
+    {
+        sqlite3.SQLITE_FULL,
+        sqlite3.SQLITE_IOERR,
+        sqlite3.SQLITE_CANTOPEN,
+        sqlite3.SQLITE_PERM,
+        sqlite3.SQLITE_NOMEM,
+        sqlite3.SQLITE_READONLY,
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+    }
+)
+
+
+class StoreSqliteError(RuntimeError):
+    """A ``sqlite3.Error`` from a trial open of a store copy, typed (#345).
+
+    ``reason`` is ``sqlite_<code name>`` lower-cased (``sqlite_notadb``,
+    ``sqlite_corrupt``; ``sqlite_error`` when SQLite attached no code).
+    ``opener_side`` is True when the PRIMARY result code is one of
+    :data:`_OPENER_SIDE_SQLITE_CODES`: the failure is the opener's
+    environment (a full or failing disk, memory, a lock), which says nothing
+    about the store. Matched by attribute, never by message (the
+    typed-signal-not-substring house rule).
+    """
+
+    def __init__(self, message: str, *, reason: str, opener_side: bool) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.opener_side = opener_side
+
+    @classmethod
+    def from_sqlite(cls, exc: sqlite3.Error) -> "StoreSqliteError":
+        # sqlite_errorcode/-name (Python >= 3.11) carry the EXTENDED code;
+        # the low byte is the primary one. Absent on an error SQLite did not
+        # raise itself, which then reads as the store's.
+        code = getattr(exc, "sqlite_errorcode", None)
+        name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
+        return cls(
+            " ".join(str(exc).split()),
+            reason=name.lower(),
+            opener_side=code is not None and (code & 0xFF) in _OPENER_SIDE_SQLITE_CODES,
+        )
+
+
+def read_copy_user_version(copy_path: str | Path) -> int:
+    """``PRAGMA user_version`` of a store COPY as a writer open would read it:
+    committed WAL frames applied, a hot journal rolled back (#345).
+
+    A read-write connection, so it may write — replay the journal, build a
+    ``-shm`` — which is why it is for a disposable copy only, never a live
+    store. A plain path, never a ``file:`` URI, so a ``#`` or ``?`` in the
+    path is never parsed as URI syntax. Raises :class:`StoreSqliteError`.
+    """
+    try:
+        conn = sqlite3.connect(str(copy_path))
+        try:
+            return conn.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise StoreSqliteError.from_sqlite(exc) from exc
+
+
+def trial_writer_open(copy_path: str | Path) -> None:
+    """Run the writer open a coordinator start reaches
+    (``CoordinatorHTTPServer`` → :class:`SqliteArtifactRegistry`) on a store
+    COPY, then close it (#345).
+
+    It MIGRATES, creates the schema, or replays a hot WAL/journal exactly as
+    the start would — on ``copy_path``, which must be a disposable copy.
+    Raises what that open raises (:class:`SchemaVersionError` and its
+    cross-runtime subclass, ``OSError``), with any ``sqlite3.Error`` typed as
+    :class:`StoreSqliteError`.
+    """
+    try:
+        SqliteArtifactRegistry(copy_path).close()
+    except sqlite3.Error as exc:
+        raise StoreSqliteError.from_sqlite(exc) from exc
 
 
 # The one place the outcome vocabulary is bound to the columns that store it.
@@ -819,6 +969,15 @@ class SqliteArtifactRegistry:
         # store but never ran the detector leaves no observation row at all —
         # which is exactly the not-instrumented signal ``detection_runs`` reads.
         self._detection_run_id: str = uuid4().hex
+        # The registry schema version THIS open migrated the store from, or
+        # None when it migrated nothing (a fresh create, a current store, a
+        # read-only open, or a concurrent loser whose every step found the
+        # racing winner's stamp) (#345). Set by the first migration step that
+        # actually runs its body — each step marks itself only AFTER its
+        # concurrent-loser early return — so the spawn can log an exact
+        # "migrated from N" line; the dispatch's pre-lock read cannot, since a
+        # loser dispatches on a version it then never migrates.
+        self.migrated_from_version: int | None = None
 
         if read_only:
             self._open_read_only(instance_id)
@@ -1081,7 +1240,7 @@ class SqliteArtifactRegistry:
                 # Existing v10 database — rehydrate; NO writes on this path (the
                 # prerequisite for read-only open mode).
                 self._rehydrate_meta(instance_id)
-            else:
+            elif current > SCHEMA_USER_VERSION:
                 raise SchemaVersionError(
                     f"unexpected schema version {current}; this build expects "
                     f"{SCHEMA_USER_VERSION}. The database at {self._db_path} was "
@@ -1091,7 +1250,16 @@ class SqliteArtifactRegistry:
                     f"to a build that understands schema v{current} rather than "
                     f"removing the store — as of v2 it holds durable retained "
                     f"content and read-generation fence state that a delete would "
-                    f"destroy."
+                    f"destroy.",
+                    reason=SCHEMA_NEWER_REASON,
+                    found_version=current,
+                )
+            else:
+                # Only a negative value is left, and no build stamps one (#345).
+                raise _unrecognized_schema_error(
+                    f"unexpected schema version {current}; this build expects "
+                    f"{SCHEMA_USER_VERSION}. The database is at {self._db_path}.",
+                    current,
                 )
 
     # ------------------------------------------------------------------
@@ -1510,6 +1678,11 @@ class SqliteArtifactRegistry:
         same code be reused read-only. Earlier versions ran the
         ``pending_notices`` IF-NOT-EXISTS and the fence-column ALTERs here on
         EVERY open; those moved into ``_migrate_v1_to_v2`` and run once.
+
+        Every refusal carries ``found_version=None`` (#345): this runs after EVERY
+        migration step as well as on a current store, so ``user_version`` here
+        can be anything from 2 to the current schema — and the version is not
+        what is wrong.
         """
         rows = dict(
             self._conn.execute(
@@ -1521,11 +1694,21 @@ class SqliteArtifactRegistry:
                 f"registry_meta is missing required keys at {self._db_path}; "
                 f"the database may be corrupted (a v2 store always carries these). "
                 f"Restore from a backup rather than deleting — the store may hold "
-                f"durable retained content."
+                f"durable retained content.",
+                reason=REGISTRY_META_INCOMPLETE_REASON,
             )
         # Caller's explicit instance_id wins (rare; typically used in tests).
         self._instance_id = instance_id_override or rows["instance_id"]
-        self._seq = int(rows["sequence_number"])
+        try:
+            self._seq = int(rows["sequence_number"])
+        except (TypeError, ValueError) as exc:
+            raise SchemaVersionError(
+                f"registry_meta holds a sequence_number that is not an integer "
+                f"({rows['sequence_number']!r}) at {self._db_path}; the database may "
+                f"be corrupted. Restore from a backup rather than deleting — the "
+                f"store may hold durable retained content.",
+                reason=REGISTRY_META_INCOMPLETE_REASON,
+            ) from exc
         epoch_row = self._conn.execute(
             "SELECT value FROM registry_meta WHERE key = 'coordinator_epoch'"
         ).fetchone()
@@ -1534,9 +1717,23 @@ class SqliteArtifactRegistry:
                 f"coordinator_epoch missing from registry_meta at {self._db_path}; "
                 f"the database may be corrupted (a v2 store always seeds the epoch). "
                 f"Restore from a backup rather than deleting — the store may hold "
-                f"durable retained content and fence state."
+                f"durable retained content and fence state.",
+                reason=REGISTRY_META_INCOMPLETE_REASON,
             )
         self._coordinator_epoch = epoch_row[0]
+
+    def _mark_migrated_from(self, version: int) -> None:
+        """Record ``version`` as the schema this open migrated from, unless an
+        earlier step of the same chain already did (#345). Each migration step
+        calls it as its first statement AFTER its concurrent-loser early
+        return, so a loser that migrates nothing records nothing.
+
+        ``getattr``, not the attribute: the migration-step crash tests assemble
+        a handle without ``__init__``. A plain attribute set in ``__init__``,
+        not a class default, keeps it off the class's public surface, which
+        the registry-lock coverage test enumerates."""
+        if getattr(self, "migrated_from_version", None) is None:
+            self.migrated_from_version = version
 
     def _migrate_v1_to_v2(self, instance_id: str | None) -> None:
         """Migrate any wild v1 db to v2 in ONE atomic transaction. Caller holds lock.
@@ -1581,6 +1778,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(1)
             art_cols = {
                 row[1] for row in c.execute("PRAGMA table_info(artifacts)").fetchall()
             }
@@ -1680,6 +1878,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(2)
             # IF NOT EXISTS guards the half-migrated-db case (table created by a
             # prior crashed migration whose user_version stamp never committed).
             c.execute(
@@ -1735,6 +1934,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(3)
             c.execute(
                 _SESSION_META_DDL.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1)
             )
@@ -1813,6 +2013,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(4)
             c.execute(
                 _WORKSPACE_CHECKPOINTS_DDL.replace(
                     "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
@@ -1891,6 +2092,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(5)
             if not self._has_column("agent_states", "last_observed_version"):
                 c.execute(
                     "ALTER TABLE agent_states ADD COLUMN last_observed_version INTEGER"
@@ -1950,6 +2152,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(6)
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_agent_states_agent "
                 "ON agent_states(agent_id)"
@@ -2003,6 +2206,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(7)
             c.execute(
                 _CALLER_PRINCIPALS_DDL.replace(
                     "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
@@ -2058,6 +2262,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(8)
             c.execute(
                 _TRANSFER_RECORDS_DDL.replace(
                     "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
@@ -2111,6 +2316,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(9)
             if not self._has_column("workspace_checkpoints", "receiver"):
                 c.execute("ALTER TABLE workspace_checkpoints ADD COLUMN receiver TEXT")
             if not self._has_column("workspace_checkpoints", "registered_by"):
@@ -2207,14 +2413,26 @@ class SqliteArtifactRegistry:
                     f"a newer Python coordinator or a sibling-runtime coordinator "
                     f"whose ledger this build does not recognize may have written "
                     f"it. Read-only mode performs NO migration — use a build that "
-                    f"understands schema v{current}, then retry."
+                    f"understands schema v{current}, then retry.",
+                    reason=SCHEMA_NEWER_REASON,
+                    found_version=current,
+                )
+            if current < 0:
+                raise _unrecognized_schema_error(
+                    f"read-only open: database at {self._db_path} is schema "
+                    f"v{current}, this build serves v{SCHEMA_USER_VERSION}.",
+                    current,
                 )
             if current != SCHEMA_USER_VERSION:
+                # Below the current schema, 0 included: read-only never creates
+                # the schema a writer open would.
                 raise SchemaVersionError(
                     f"read-only open: database at {self._db_path} is schema "
                     f"v{current}, this build serves v{SCHEMA_USER_VERSION}. Read-only "
                     f"mode performs NO migration — re-open the store once with the "
-                    f"embedder (read-write) to migrate it, then retry."
+                    f"embedder (read-write) to migrate it, then retry.",
+                    reason=SCHEMA_OLDER_REASON,
+                    found_version=current,
                 )
             try:
                 self._rehydrate_meta(instance_id)

@@ -38,7 +38,7 @@ from ccs.coordinator.sqlite_registry import (
     SqliteArtifactRegistry,
     StoreNeedsRecoveryError,
 )
-from ccs.core.exceptions import CROSS_RUNTIME_SCHEMA_REASON
+from ccs.core.exceptions import CROSS_RUNTIME_SCHEMA_REASON, SCHEMA_VERSION_REASONS
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail, FetchRequest
 
@@ -2700,3 +2700,393 @@ def test_status_snapshot_scoped_query_is_index_backed(db_path: Path) -> None:
         )
     assert "idx_agent_states_agent" in plan, plan
     assert "SCAN agent_states" not in plan, plan
+
+
+# ----------------------------------------------------------------------
+# Typed SchemaVersionError (#345)
+# ----------------------------------------------------------------------
+
+#: FROZEN duplicates of the wire-stable schema refusal reasons (#345). A host
+#: branches on ``exc.reason == CONSTANT`` to tell "upgrade this build" from
+#: "this store is broken"; renaming a value is a wire break, so each one is
+#: pinned to a hand-written literal here, never to the constant.
+_FROZEN_SCHEMA_OLDER = "schema_older"
+_FROZEN_SCHEMA_NEWER = "schema_newer"
+_FROZEN_SCHEMA_UNRECOGNIZED = "schema_unrecognized"
+_FROZEN_REGISTRY_META_INCOMPLETE = "registry_meta_incomplete"
+_FROZEN_CROSS_RUNTIME = "cross_runtime_schema"
+
+
+def _set_user_version(db_path: Path, value: int) -> Path:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(f"PRAGMA user_version = {int(value)}")
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def _delete_meta_key(db_path: Path, key: str) -> Path:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("DELETE FROM registry_meta WHERE key = ?", (key,))
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def _current_store(db_path: Path) -> Path:
+    SqliteArtifactRegistry(db_path).close()
+    return db_path
+
+
+def _execute_statements(db_path: Path, *statements: str) -> Path:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        for statement in statements:
+            conn.execute(statement)
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def _v11_store(db_path: Path) -> Path:
+    return _set_user_version(_current_store(db_path), 11)
+
+
+def _negative_store(db_path: Path) -> Path:
+    return _set_user_version(_current_store(db_path), -1)
+
+
+def _v9_store(db_path: Path) -> Path:
+    from tests.coordinator.test_checkpoint_registration_schema import _revert_to_v9_shape
+
+    _revert_to_v9_shape(_current_store(db_path))
+    return db_path
+
+
+def _v8_store(db_path: Path) -> Path:
+    from tests.coordinator.test_checkpoint_registration_schema import _revert_to_v8_shape
+
+    _revert_to_v8_shape(_current_store(db_path))
+    return db_path
+
+
+def _v7_store(db_path: Path) -> Path:
+    from tests.coordinator.test_checkpoint_registration_schema import _revert_to_v7_shape
+
+    _revert_to_v7_shape(_current_store(db_path))
+    return db_path
+
+
+def _v6_store(db_path: Path) -> Path:
+    from tests.coordinator.test_last_observed_version import _revert_to_v6_shape
+
+    _revert_to_v6_shape(_v7_store(db_path))
+    return db_path
+
+
+def _v5_store(db_path: Path) -> Path:
+    from tests.coordinator.test_last_observed_version import _revert_to_v5_shape
+
+    _revert_to_v5_shape(_v7_store(db_path))
+    return db_path
+
+
+def _v4_store(db_path: Path) -> Path:
+    from tests.coordinator.test_last_observed_version import _revert_to_v4_shape
+
+    _revert_to_v4_shape(_v7_store(db_path))
+    return db_path
+
+
+def _v3_store(db_path: Path) -> Path:
+    # Rewound from v4 by hand: the workspace-checkpoint suite's v3 helper
+    # drops last_observed_version itself, which the v4 rewind already dropped.
+    _execute_statements(
+        _v4_store(db_path),
+        "DROP TABLE IF EXISTS session_meta",
+        "DROP INDEX IF EXISTS idx_session_pins_artifact",
+    )
+    return _set_user_version(db_path, 3)
+
+
+def _v2_store(db_path: Path) -> Path:
+    _execute_statements(_v3_store(db_path), "DROP TABLE IF EXISTS session_pins")
+    return _set_user_version(db_path, 2)
+
+
+def _raw_v1_store(db_path: Path) -> Path:
+    _build_raw_v1_db(db_path, fence=True, notices=True)
+    return db_path
+
+
+#: A store at every schema a writer open migrates FROM, keyed by that schema:
+#: each migration step marks its own origin, so each needs its own case.
+_STORES_BY_ORIGIN = {
+    1: _raw_v1_store,
+    2: _v2_store,
+    3: _v3_store,
+    4: _v4_store,
+    5: _v5_store,
+    6: _v6_store,
+    7: _v7_store,
+    8: _v8_store,
+    9: _v9_store,
+}
+
+
+def _zero_byte_store(db_path: Path) -> Path:
+    db_path.write_bytes(b"")
+    return db_path
+
+
+def _schema_error(db_path: Path, *, read_only: bool = False) -> SchemaVersionError:
+    with pytest.raises(SchemaVersionError) as ei:
+        SqliteArtifactRegistry(db_path, read_only=read_only)
+    return ei.value
+
+
+class TestSchemaVersionErrorTyped:
+    """#345: a store-open refusal says WHICH refusal it is, as fields.
+
+    ``reason`` is one of the wire-stable schema reasons, ``found_version`` the
+    store's raw ``user_version`` under the three version reasons (negative for
+    an unrecognized store; ``None`` under the meta-incomplete and cross-runtime
+    reasons), and ``expected_version`` the schema this build serves. Before
+    these fields a host could only substring-match the message to tell
+    "upgrade the coordinator" from "the store is corrupt"."""
+
+    def test_writer_open_of_a_newer_store_reports_newer_and_both_versions(
+        self, db_path: Path
+    ) -> None:
+        """A writer open of a store stamped past this build names it newer,
+        with the store's version and this build's. Prevents a host telling a
+        user to "migrate" a store only a newer build can open."""
+        _v11_store(db_path)
+
+        exc = _schema_error(db_path)
+
+        assert exc.reason == _FROZEN_SCHEMA_NEWER
+        assert exc.found_version == 11
+        assert exc.expected_version == SCHEMA_USER_VERSION
+        assert "unexpected schema version 11" in str(exc)  # message unchanged
+
+    @pytest.mark.parametrize("read_only", [False, True], ids=["writer", "read-only"])
+    def test_a_negative_user_version_is_unrecognized_and_advises_a_backup_restore(
+        self, db_path: Path, read_only: bool
+    ) -> None:
+        """A negative user_version is no build's schema: both opens report it
+        as unrecognized, never as newer or older, and their message advises a
+        backup restore. Prevents "upgrade the coordinator" or "re-open
+        read-write to migrate" advice for a store no coordinator wrote, which
+        a writer open refuses too."""
+        _negative_store(db_path)
+
+        exc = _schema_error(db_path, read_only=read_only)
+
+        assert exc.reason == _FROZEN_SCHEMA_UNRECOGNIZED
+        assert exc.found_version == -1
+        assert exc.expected_version == SCHEMA_USER_VERSION
+        # The path is masked so a temp directory's name cannot satisfy or
+        # trip a phrase check.
+        message = str(exc).replace(str(db_path), "<db>").lower()
+        assert "backup" in message, str(exc)
+        for wrong_advice in ("newer", "upgrade", "migrate", "read-write"):
+            assert wrong_advice not in message, str(exc)
+
+    @pytest.mark.parametrize(
+        ("build", "reason", "found"),
+        [
+            (_v9_store, _FROZEN_SCHEMA_OLDER, 9),
+            (_v11_store, _FROZEN_SCHEMA_NEWER, 11),
+            (_zero_byte_store, _FROZEN_SCHEMA_OLDER, 0),
+        ],
+        ids=["v9", "v11", "zero-byte"],
+    )
+    def test_read_only_open_reports_older_or_newer_with_the_found_version(
+        self, db_path: Path, build, reason: str, found: int
+    ) -> None:
+        """The read-only open (which never migrates) names the direction of
+        the mismatch and the store's version. Prevents a resolver reading an
+        older store and a newer one as the same failure."""
+        build(db_path)
+
+        exc = _schema_error(db_path, read_only=True)
+
+        assert exc.reason == reason
+        assert exc.found_version == found
+        assert exc.expected_version == SCHEMA_USER_VERSION
+
+    @pytest.mark.parametrize("read_only", [False, True], ids=["writer", "read-only"])
+    @pytest.mark.parametrize("key", ["instance_id", "coordinator_epoch"])
+    def test_a_current_store_missing_a_meta_key_reports_meta_incomplete_without_a_version(
+        self, db_path: Path, key: str, read_only: bool
+    ) -> None:
+        """A store whose ``registry_meta`` lost a required key is refused as
+        incomplete, and claims no schema version: the check runs after every
+        migration step, so the version is not what is wrong. Prevents a
+        corrupt store reading as a version mismatch."""
+        _delete_meta_key(_current_store(db_path), key)
+
+        exc = _schema_error(db_path, read_only=read_only)
+
+        assert exc.reason == _FROZEN_REGISTRY_META_INCOMPLETE
+        assert exc.found_version is None
+        assert exc.expected_version == SCHEMA_USER_VERSION
+
+    @pytest.mark.parametrize("read_only", [False, True], ids=["writer", "read-only"])
+    @pytest.mark.parametrize("value", ["'abc'", "NULL"], ids=["text", "null"])
+    def test_a_sequence_number_that_is_not_an_integer_reports_meta_incomplete(
+        self, db_path: Path, value: str, read_only: bool
+    ) -> None:
+        """A current store whose ``sequence_number`` holds a value that is not
+        an integer is refused as incomplete, with no found version, and the
+        message names the store. Prevents a bare ValueError or TypeError
+        escaping the open, which the store check and the CLI cannot type."""
+        _execute_statements(
+            _current_store(db_path),
+            f"UPDATE registry_meta SET value = {value} WHERE key = 'sequence_number'",
+        )
+
+        exc = _schema_error(db_path, read_only=read_only)
+
+        assert exc.reason == _FROZEN_REGISTRY_META_INCOMPLETE
+        assert exc.found_version is None
+        assert exc.expected_version == SCHEMA_USER_VERSION
+        assert str(db_path) in str(exc)
+
+    def test_a_v7_store_missing_its_epoch_is_meta_incomplete_after_one_migration_step(
+        self, db_path: Path
+    ) -> None:
+        """A v7 store with no ``coordinator_epoch`` is migrated to 8 and then
+        refused as incomplete mid-ladder, with no found version: 10 would be
+        wrong (the store is at 8), and so would 7. Prevents the error
+        reporting a version the store is not at."""
+        _delete_meta_key(_v7_store(db_path), "coordinator_epoch")
+
+        exc = _schema_error(db_path)
+
+        assert exc.reason == _FROZEN_REGISTRY_META_INCOMPLETE
+        assert exc.found_version is None
+        assert _user_version(db_path) == 8
+
+    @pytest.mark.parametrize("read_only", [False, True], ids=["writer", "read-only"])
+    def test_a_node_store_keeps_its_cross_runtime_reason_and_claims_no_version(
+        self, db_path: Path, read_only: bool
+    ) -> None:
+        """The cross-runtime refusal keeps its reason, is still a
+        :class:`SchemaVersionError`, and carries no found version: a Node
+        ledger number means a different schema (#294). Prevents a host
+        comparing a Node version against this build's."""
+        _forge_node_v3_db(db_path)
+
+        with pytest.raises(CrossRuntimeSchemaError) as ei:
+            SqliteArtifactRegistry(db_path, read_only=read_only)
+
+        assert isinstance(ei.value, SchemaVersionError)
+        assert ei.value.reason == _FROZEN_CROSS_RUNTIME
+        assert ei.value.found_version is None
+        assert ei.value.expected_version == SCHEMA_USER_VERSION
+
+    def test_a_legacy_message_only_construction_still_works_with_empty_fields(self) -> None:
+        """``SchemaVersionError("m")`` keeps working: the new fields are
+        optional keywords. Prevents breaking an embedder that raises or
+        subclasses it with a message only."""
+        exc = SchemaVersionError("m")
+
+        assert str(exc) == "m"
+        assert exc.reason is None
+        assert exc.found_version is None
+        assert exc.expected_version == SCHEMA_USER_VERSION
+
+    def test_pickle_round_trip_keeps_every_field_on_both_classes(self, db_path: Path) -> None:
+        """Both classes survive pickling with message, reason, found and
+        expected version intact, built by hand and raised by a real open.
+        Prevents a multiprocessing or executor boundary dropping the typed
+        fields a host branches on."""
+        import pickle
+
+        raised = _schema_error(_v11_store(db_path))
+        cases = [
+            SchemaVersionError(
+                "m", reason=_FROZEN_SCHEMA_OLDER, found_version=3, expected_version=7
+            ),
+            CrossRuntimeSchemaError("foreign"),
+            raised,
+        ]
+
+        for original in cases:
+            # Round-trips only objects this test just built; no untrusted input.
+            copy = pickle.loads(pickle.dumps(original))
+            assert type(copy) is type(original)
+            assert str(copy) == str(original)
+            assert (copy.reason, copy.found_version, copy.expected_version) == (
+                original.reason, original.found_version, original.expected_version,
+            )
+
+    def test_the_schema_reason_set_is_exactly_the_five_wire_reasons(self) -> None:
+        """``SCHEMA_VERSION_REASONS``, the closed set a host enumerates, is
+        exactly the five frozen literals; each raise site's reason is pinned
+        by its own test above. Prevents the set silently gaining, losing or
+        renaming a value a host branches on."""
+        assert SCHEMA_VERSION_REASONS == frozenset({
+            _FROZEN_SCHEMA_OLDER, _FROZEN_SCHEMA_NEWER, _FROZEN_SCHEMA_UNRECOGNIZED,
+            _FROZEN_REGISTRY_META_INCOMPLETE, _FROZEN_CROSS_RUNTIME,
+        })
+
+    @pytest.mark.parametrize("origin", sorted(_STORES_BY_ORIGIN), ids=lambda n: f"v{n}")
+    def test_migrated_from_version_names_the_schema_a_writer_open_migrated_from(
+        self, db_path: Path, origin: int
+    ) -> None:
+        """A writer open that migrates records the version it started from,
+        from every origin: each step marks its own. Prevents a host losing,
+        or misnumbering, the one fact it needs to say "a coordinator
+        expecting schema N refuses this store from now on" (a 0.13.x store
+        is at schema 4)."""
+        _STORES_BY_ORIGIN[origin](db_path)
+
+        with SqliteArtifactRegistry(db_path) as reg:
+            assert reg.migrated_from_version == origin
+        assert _user_version(db_path) == SCHEMA_USER_VERSION
+
+    def test_the_origin_cases_cover_every_migration_step(self) -> None:
+        """Every schema below this build's has an origin case above.
+        Prevents a new migration step shipping with a mark nothing checks."""
+        assert sorted(_STORES_BY_ORIGIN) == list(range(1, SCHEMA_USER_VERSION))
+
+    def test_migrated_from_version_is_none_when_no_migration_ran(self, db_path: Path) -> None:
+        """A fresh create, a reopen of a current store and a read-only open
+        migrate nothing, so they record nothing. Prevents a migration notice
+        on every start."""
+        with SqliteArtifactRegistry(db_path) as fresh:
+            assert fresh.migrated_from_version is None
+        with SqliteArtifactRegistry(db_path) as reopened:
+            assert reopened.migrated_from_version is None
+        with SqliteArtifactRegistry(db_path, read_only=True) as read_only:
+            assert read_only.migrated_from_version is None
+
+    def test_a_concurrent_loser_that_migrates_nothing_records_no_origin(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A writer whose pre-lock read saw v1 while a racing winner already
+        migrated the store runs every step's loser guard and migrates nothing,
+        so it records no origin. Prevents two coordinators racing one start
+        both announcing the migration: in every step, the marker sits after
+        the step's concurrent-loser early return, not before it."""
+        _raw_v1_store(db_path)
+        with SqliteArtifactRegistry(db_path) as winner:
+            assert winner.migrated_from_version == 1
+
+        def stale_v1_dispatch(self, instance_id):
+            # The loser's dispatch decision, made from a stale pre-lock read of
+            # the oldest origin, so the whole chain runs: every step's guard.
+            for step in range(1, SCHEMA_USER_VERSION):
+                getattr(self, f"_migrate_v{step}_to_v{step + 1}")(instance_id)
+
+        monkeypatch.setattr(SqliteArtifactRegistry, "_initialize_schema", stale_v1_dispatch)
+        with SqliteArtifactRegistry(db_path) as loser:
+            assert loser.migrated_from_version is None

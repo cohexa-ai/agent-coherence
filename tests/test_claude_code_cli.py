@@ -2929,3 +2929,293 @@ def test_status_table_on_an_answer_with_one_list_null_exits_2(
         _DEGRADED_STATUS_LINE if degraded else "agent-coherence-status: unexpected /status shape\n"
     )
     assert captured.out == ""
+
+
+# ----------------------------------------------------------------------
+# #345 -- agent-coherence-coordinator --check-store
+# ----------------------------------------------------------------------
+
+#: FROZEN duplicate of the --check-store exit-code contract a host hard-codes:
+#: 0 for a store a start opens unchanged, 10-16 for the rest, clear of 1 (not
+#: a git repo) and 2 (usage) and of 3-9, which spawn mode may still claim.
+_CHECK_STORE_EXIT_CODES = {
+    "current": 0,
+    "fresh": 10,
+    "will_migrate": 11,
+    "newer": 12,
+    "foreign": 13,
+    "unusable": 14,
+    "live": 15,
+    "cannot_tell": 16,
+}
+
+#: FROZEN duplicate of the --check-store --json object's key set. No bare
+#: ``schema_version``: the store's and this build's registry schema versions
+#: are named apart, so neither can be read as the other.
+_CHECK_STORE_JSON_KEYS = {
+    "kind", "outcome", "exit_code", "db_path", "coordinator_backend",
+    "registry_schema_version", "store_registry_schema_version", "reason", "message",
+}
+
+
+def _lay_store(shape: str, workspace: Path) -> None:
+    """One store shape under ``workspace`` (the store-check test's builders,
+    plus an orphan WAL with no store beside it)."""
+    from tests.test_claude_code_store_check import _build
+
+    if shape == "orphan_wal":
+        coherence_dir = workspace / ".coherence"
+        coherence_dir.mkdir(mode=0o700)
+        (coherence_dir / "state.db-wal").write_bytes(b"\x00" * 4096)
+        return
+    _build(shape, workspace)
+
+
+@pytest.mark.parametrize(
+    ("shape", "outcome", "found"),
+    [
+        ("v10", "current", 10),
+        ("absent", "fresh", None),
+        ("v7", "will_migrate", 7),
+        ("v11", "newer", 11),
+        ("node_stamp", "foreign", None),
+        ("text", "unusable", None),
+        ("orphan_wal", "cannot_tell", None),
+    ],
+)
+def test_check_store_json_prints_one_object_and_exits_with_the_outcomes_code(
+    shape: str, outcome: str, found: int | None,
+    git_workspace: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--check-store --json`` prints exactly one JSON object — the outcome,
+    its exit code, the store path, the backend it speaks for, this build's
+    and the store's registry schema versions under distinct keys, the reason
+    and a message — and exits with that outcome's code. Prevents a host that
+    pins the binary (or a TS host that can only run it) parsing prose, or
+    reading the store's schema version as the build's."""
+    _lay_store(shape, git_workspace)
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace), "--check-store", "--json"])
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    [line] = captured.out.splitlines()
+    body = json.loads(line)
+    assert set(body) == _CHECK_STORE_JSON_KEYS
+    assert "schema_version" not in body
+    assert (body["kind"], body["outcome"], body["coordinator_backend"]) == (
+        "store_check", outcome, "python",
+    )
+    assert rc == body["exit_code"] == _CHECK_STORE_EXIT_CODES[outcome]
+    assert body["registry_schema_version"] == 10
+    assert body["store_registry_schema_version"] == found
+    assert body["db_path"] == str(git_workspace.resolve() / ".coherence" / "state.db")
+    assert body["message"]
+
+
+def test_check_store_against_a_running_coordinator_exits_live(
+    git_workspace: Path, fast_cfg: LifecycleConfig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With a coordinator running for the workspace, the check exits with the
+    ``live`` code and names the running coordinator as the reason. Prevents a
+    host asking consent for a migration a start would never run (it joins
+    the running coordinator)."""
+    assert ensure_coordinator(git_workspace, config=fast_cfg) > 0
+    try:
+        rc = coherence_coordinator.main(
+            ["--root", str(git_workspace), "--check-store", "--json"]
+        )
+    finally:
+        stop_coordinator(git_workspace)
+
+    body = json.loads(capsys.readouterr().out)
+    assert rc == body["exit_code"] == _CHECK_STORE_EXIT_CODES["live"]
+    assert (body["outcome"], body["reason"]) == ("live", "coordinator_running")
+
+
+@pytest.mark.parametrize(
+    ("shape", "outcome"), [("v10", "current"), ("v7", "will_migrate"), ("text", "unusable")]
+)
+def test_check_store_without_json_prints_one_line_that_quiet_suppresses(
+    shape: str, outcome: str, git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without ``--json`` the check prints one plain line naming the outcome;
+    ``--quiet`` prints nothing and keeps the exit code. Prevents a shell
+    script needing the JSON to read the answer, or ``--quiet`` changing it."""
+    _lay_store(shape, git_workspace)
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace), "--check-store"])
+    loud = capsys.readouterr()
+    quiet_rc = coherence_coordinator.main(
+        ["--root", str(git_workspace), "--check-store", "--quiet"]
+    )
+    quiet = capsys.readouterr()
+
+    assert rc == quiet_rc == _CHECK_STORE_EXIT_CODES[outcome]
+    [line] = loud.out.splitlines()
+    assert outcome in line
+    assert (quiet.out, quiet.err) == ("", "")
+
+
+def test_check_store_json_still_prints_under_quiet(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--quiet`` silences only the plain line; ``--json`` still prints its
+    one object and keeps the exit code. Prevents a host that adds ``--quiet``
+    getting an empty stdout (a JSON parse failure) and losing the store's
+    schema version and the reason."""
+    _lay_store("v7", git_workspace)
+    args = ["--root", str(git_workspace), "--check-store", "--json"]
+
+    rc = coherence_coordinator.main(args)
+    loud = capsys.readouterr()
+    quiet_rc = coherence_coordinator.main([*args, "--quiet"])
+    quiet = capsys.readouterr()
+
+    assert rc == quiet_rc == _CHECK_STORE_EXIT_CODES["will_migrate"]
+    assert (quiet.out, quiet.err) == (loud.out, "")
+    assert json.loads(quiet.out)["store_registry_schema_version"] == 7
+
+
+#: An object name that sets the terminal title, then turns the text red.
+_TERMINAL_CONTROL_NAME = "\x1b]0;title\x07\x1b[31mred"
+
+
+def _lay_store_naming_an_object(workspace: Path, name: str) -> None:
+    """A store whose schema holds a malformed table named ``name``, so a
+    writer open fails with SQLite's ``malformed database schema (<name>)``."""
+    import sqlite3
+
+    coherence_dir = workspace / ".coherence"
+    coherence_dir.mkdir(mode=0o700)
+    conn = sqlite3.connect(str(coherence_dir / "state.db"))
+    try:
+        conn.execute("CREATE TABLE t (x)")
+        conn.execute("PRAGMA writable_schema = ON")
+        conn.execute(
+            "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) "
+            "VALUES ('table', ?, ?, 0, 'not sql')",
+            (name, name),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_check_store_plain_line_escapes_control_characters_from_the_store(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The plain line prints a store's own text (here an object name SQLite
+    quotes in its error) with each control character escaped, while
+    ``--json`` keeps the message as it is (JSON escapes it). Prevents a
+    crafted store, the kind the check exists to inspect before a start,
+    retitling or recoloring the terminal of whoever checks it."""
+    _lay_store_naming_an_object(git_workspace, _TERMINAL_CONTROL_NAME)
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace), "--check-store"])
+    plain = capsys.readouterr()
+    json_rc = coherence_coordinator.main(
+        ["--root", str(git_workspace), "--check-store", "--json"]
+    )
+    body = json.loads(capsys.readouterr().out)
+
+    assert rc == json_rc == _CHECK_STORE_EXIT_CODES["unusable"]
+    assert "\x1b" not in plain.out
+    assert "\x07" not in plain.out
+    assert r"\x1b]0;title\x07\x1b[31mred" in plain.out
+    assert _TERMINAL_CONTROL_NAME in body["message"]
+
+
+def test_check_store_on_a_sequence_number_that_is_not_an_integer_exits_unusable(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A store whose ``registry_meta`` sequence number is not an integer
+    reads ``unusable`` (``registry_meta_incomplete``) with exit 14 and one
+    JSON object. Prevents the check crashing with exit 1 and an empty stdout,
+    which a host cannot parse, on a store a start refuses."""
+    _lay_store("seq_text", git_workspace)
+
+    rc = coherence_coordinator.main(
+        ["--root", str(git_workspace), "--check-store", "--json"]
+    )
+
+    body = json.loads(capsys.readouterr().out)
+    assert rc == body["exit_code"] == _CHECK_STORE_EXIT_CODES["unusable"]
+    assert (body["outcome"], body["reason"]) == ("unusable", "registry_meta_incomplete")
+
+
+def test_check_store_on_an_absent_store_creates_no_coherence_dir(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Checking a workspace with no store reads ``fresh`` and leaves it with
+    no ``.coherence/`` — the check never runs the spawn's directory setup.
+    Prevents a check leaving the workspace looking initialized."""
+    rc = coherence_coordinator.main(["--root", str(git_workspace), "--check-store", "--json"])
+
+    assert rc == _CHECK_STORE_EXIT_CODES["fresh"]
+    assert json.loads(capsys.readouterr().out)["store_registry_schema_version"] is None
+    assert not (git_workspace / ".coherence").exists()
+
+
+def test_check_store_ignores_the_bind_host_it_never_binds(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The check runs before the bind-host validation: it binds nothing and
+    dials nothing, so a bind host spawn mode would refuse does not turn the
+    answer into a usage error. Prevents a host's routed-bind configuration
+    breaking its pre-start check."""
+    monkeypatch.delenv("CCS_REMOTE_COORDINATOR", raising=False)
+
+    rc = coherence_coordinator.main(
+        ["--root", str(git_workspace), "--check-store", "--bind-host", "0.0.0.0"]
+    )
+
+    assert rc == _CHECK_STORE_EXIT_CODES["fresh"]
+    assert capsys.readouterr().err == ""
+
+
+def test_json_without_check_store_is_a_usage_error(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--json`` only shapes the check's answer, so alone it is a usage
+    error (exit 2) naming ``--check-store``, and nothing is spawned.
+    Prevents a host's ``--json`` spawn call silently starting a coordinator
+    and printing prose."""
+    with pytest.raises(SystemExit) as excinfo:
+        coherence_coordinator.main(["--root", str(git_workspace), "--json"])
+
+    assert excinfo.value.code == 2
+    assert "--json requires --check-store" in capsys.readouterr().err
+    assert not (git_workspace / ".coherence").exists()
+
+
+@pytest.mark.parametrize("mode_flag", ["--prepare-for-migration", "--no-detach", "--_daemonized"])
+def test_check_store_with_a_spawn_or_shutdown_mode_is_a_usage_error(
+    mode_flag: str, git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--check-store`` never starts or stops a coordinator, so combining it
+    with a mode that does is a usage error (exit 2) and nothing runs.
+    Prevents a check that drains grants, or one that spawns."""
+    with pytest.raises(SystemExit) as excinfo:
+        coherence_coordinator.main(["--root", str(git_workspace), "--check-store", mode_flag])
+
+    assert excinfo.value.code == 2
+    assert f"--check-store cannot be combined with {mode_flag}" in capsys.readouterr().err
+    assert not (git_workspace / ".coherence").exists()
+
+
+def test_the_check_store_exit_map_covers_every_outcome_and_avoids_1_and_2() -> None:
+    """The exit map is the frozen contract: one code per outcome, every
+    outcome mapped, no code shared, and none equal to 1 (not a git repo) or
+    2 (usage). Prevents a new outcome exiting with a code a host reads as
+    another, or as a usage error."""
+    from ccs.adapters.claude_code.store_check import StoreCheckOutcome
+
+    codes = {
+        outcome.value: code
+        for outcome, code in coherence_coordinator._CHECK_STORE_EXIT_CODES.items()
+    }
+    assert codes == _CHECK_STORE_EXIT_CODES
+    assert set(codes) == {outcome.value for outcome in StoreCheckOutcome}
+    assert len(set(codes.values())) == len(codes)
+    assert not set(codes.values()) & {1, 2}

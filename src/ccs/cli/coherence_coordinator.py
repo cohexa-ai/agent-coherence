@@ -30,17 +30,45 @@ Pattern:
 The ``--_daemonized`` flag is intentionally underscore-prefixed: this is
 the internal worker mode, not part of the user-facing CLI contract.
 
-Exit codes:
+## Store check (#345)
+
+``--check-store [--json]`` starts nothing. It says what a start would do to
+``<root>/.coherence/state.db`` — open it unchanged, create it, migrate it
+(after which a coordinator built for the old schema refuses it), or refuse it
+— by running the start's writer open on a private copy
+(:func:`ccs.adapters.claude_code.store_check.check_store`), and exits with
+that outcome's code. It never creates ``.coherence/``. ``--json`` prints one
+object (``kind: "store_check"``) carrying the outcome, the exit code, the
+store path, ``coordinator_backend`` (always ``"python"``: the answer is for
+this build's Python coordinator), ``registry_schema_version`` (this build's)
+and ``store_registry_schema_version`` (the store's, or null), the reason and
+a message; without it one plain line is printed, which ``--quiet``
+suppresses.
+
+Exit codes (spawn mode):
 - 0: coordinator is up and reachable (port printed to stdout)
 - 1: not in a git repository (no coordinator root resolved)
 - 2: coordinator failed to spawn (platform unsupported, FS read-only,
-     port never appeared in the file, or detached child crashed)
+     port never appeared in the file, or detached child crashed), or a
+     usage error
+
+Exit codes (``--check-store``; 1 and 2 as above, 3-9 left to spawn mode):
+- 0: current — a start opens the store unchanged
+- 10: fresh — no store (or an empty one); a start creates it
+- 11: will_migrate — a start migrates the store in place
+- 12: newer — the store is past this build's schema; a start refuses it
+- 13: foreign — the Node coordinator's ledger wrote it; a start refuses it
+- 14: unusable — a start fails on the store itself
+- 15: live — a coordinator is running; a start joins it, migrating nothing
+  while it runs (the store is not read, so its schema is unknown)
+- 16: cannot_tell — the check could not observe the answer
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import logging
 import subprocess
 import sys
@@ -61,9 +89,41 @@ from ccs.adapters.claude_code.lifecycle import (
     tcp_probe as _tcp_probe,
 )
 from ccs.adapters.claude_code.resolver import find_coordinator_root
-from ccs.cli._coherence_client import err
+from ccs.adapters.claude_code.store_check import StoreCheckOutcome, check_store
+from ccs.cli._coherence_client import err, escape_nonprintable
 
 logger = logging.getLogger(__name__)
+
+# --check-store exit codes (#345): a CLI contract a host hard-codes, so fixed
+# once released. 0 is "nothing to do"; the rest sit at 10+ so a check code can
+# never collide with a present or future spawn-mode code (1 = not a git repo,
+# 2 = spawn failure or usage; 3-9 stay free for spawn mode).
+_CHECK_STORE_EXIT_CODES: dict[StoreCheckOutcome, int] = {
+    StoreCheckOutcome.CURRENT: 0,
+    StoreCheckOutcome.FRESH: 10,
+    StoreCheckOutcome.WILL_MIGRATE: 11,
+    StoreCheckOutcome.NEWER: 12,
+    StoreCheckOutcome.FOREIGN: 13,
+    StoreCheckOutcome.UNUSABLE: 14,
+    StoreCheckOutcome.LIVE: 15,
+    StoreCheckOutcome.CANNOT_TELL: 16,
+}
+
+# Import-time exhaustiveness pin (the coherence_replay pattern): an outcome
+# added to StoreCheckOutcome without a code, a shared code, or a code that
+# reads as "not a git repo" / "usage" must fail LOUDLY at import, not as a
+# KeyError mid-check or a host acting on the wrong answer.
+if (
+    set(_CHECK_STORE_EXIT_CODES) != set(StoreCheckOutcome)
+    or len(set(_CHECK_STORE_EXIT_CODES.values())) != len(_CHECK_STORE_EXIT_CODES)
+    or set(_CHECK_STORE_EXIT_CODES.values()) & {1, 2}
+):
+    raise RuntimeError(
+        "ccs.cli.coherence_coordinator: _CHECK_STORE_EXIT_CODES must map every "
+        "StoreCheckOutcome to its own exit code, none of them 1 or 2 "
+        f"(codes={sorted((o.value, c) for o, c in _CHECK_STORE_EXIT_CODES.items())}, "
+        f"outcomes={sorted(o.value for o in StoreCheckOutcome)})."
+    )
 
 #: How long the parent polls for the detached child to write the port
 #: file. Generous: cold Python interpreter + SQLite WAL setup + bind
@@ -111,6 +171,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--check-store",
+        action="store_true",
+        help=(
+            "Start nothing: say what starting a coordinator would do to "
+            ".coherence/state.db (open it as is, create it, migrate it, or "
+            "refuse it) and exit with that outcome's code: 0 current, 10 fresh, "
+            "11 will_migrate, 12 newer, 13 foreign, 14 unusable, 15 live, "
+            "16 cannot_tell."
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="With --check-store: print the answer as one JSON object.",
+    )
+    parser.add_argument(
         "--_daemonized",
         action="store_true",
         help=argparse.SUPPRESS,  # hidden — internal detached-worker flag
@@ -124,13 +200,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    _reject_check_store_misuse(parser, args)
 
     root_arg = args.root if args.root is not None else find_coordinator_root()
     if root_arg is None:
         err("agent-coherence-coordinator: not in a git repository")
         return 1
     root = Path(root_arg).resolve()
+
+    # #345: before the bind-host validation, because the check binds and dials
+    # nothing, and before any spawn path, because it must never run
+    # _ensure_coherence_dir (a check leaves the workspace as it found it).
+    if args.check_store:
+        return _run_check_store(root, as_json=args.json, quiet=args.quiet)
 
     # Validate here, not only in the forked child's server construction:
     # the parent dials this host directly for the reuse/spawn probes, and
@@ -182,6 +266,60 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # No live coordinator — fork a detached child to run it.
     return _spawn_detached(root, quiet=args.quiet, bind_host=args.bind_host)
+
+
+def _reject_check_store_misuse(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Usage errors (exit 2) for the #345 flags: ``--json`` only shapes the
+    check's answer, and the check never combines with a mode that starts or
+    stops a coordinator (a "check" that drained grants or spawned would be
+    the very side effect a host runs it to avoid)."""
+    if args.json and not args.check_store:
+        parser.error("--json requires --check-store")
+    if not args.check_store:
+        return
+    for flag, given in (
+        ("--prepare-for-migration", args.prepare_for_migration),
+        ("--no-detach", args.no_detach),
+        ("--_daemonized", args._daemonized),
+    ):
+        if given:
+            parser.error(f"--check-store cannot be combined with {flag}")
+
+
+def _run_check_store(root: Path, *, as_json: bool, quiet: bool) -> int:
+    """#345: answer what a start would do to the store, and exit with the
+    outcome's code. ``--json`` always prints its one object (a host parses
+    it); the plain line obeys ``--quiet``."""
+    result = check_store(root)
+    exit_code = _CHECK_STORE_EXIT_CODES[result.outcome]
+    if as_json:
+        # Two schema-version keys, never a bare ``schema_version``: the
+        # build's and the store's must not be readable as each other.
+        print(
+            json.dumps(
+                {
+                    "kind": "store_check",
+                    "outcome": result.outcome.value,
+                    "exit_code": exit_code,
+                    "db_path": str(result.db_path),
+                    "coordinator_backend": "python",
+                    "registry_schema_version": result.expected_version,
+                    "store_registry_schema_version": result.found_version,
+                    "reason": result.reason,
+                    "message": result.message,
+                }
+            ),
+            flush=True,
+        )
+    elif not quiet:
+        # The message carries the store's own text (an object name inside a
+        # SQLite error), so it is escaped like any foreign string printed to
+        # a terminal; json.dumps above already escapes control characters.
+        message = escape_nonprintable(result.message)
+        print(f"check-store: {result.outcome.value}: {message}", flush=True)
+    return exit_code
 
 
 def _run_prepare_for_migration(

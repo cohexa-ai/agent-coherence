@@ -15,5 +15,6 @@ Modules:
 - :mod:`auth` — shared-secret token generation + verification (KTD-12)
 - :mod:`coordinator_server` — stdlib HTTP server wrapping CoordinatorService
 - :mod:`lifecycle` — fcntl spawn, port file, idle shutdown
+- :mod:`store_check` — what a coordinator start would do to the store (#345)
 - :mod:`hook_payloads` — request/response JSON shapes (typed dicts)
 """
