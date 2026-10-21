@@ -11,6 +11,7 @@ another's recovery.
 
 from __future__ import annotations
 
+import pickle
 from dataclasses import FrozenInstanceError
 from uuid import uuid4
 
@@ -21,6 +22,7 @@ from ccs.core.exceptions import (
     CAS_EXHAUSTED_REASON,
     COMMIT_PREEMPTED_REASON,
     COMMIT_UNCONFIRMED_REASON,
+    COORDINATOR_FAILED_REASON,
     COORDINATOR_UNAVAILABLE_REASON,
     GIVER_FENCED_REASON,
     HANDOFF_ACCEPT_UNCONFIRMED_REASON,
@@ -44,12 +46,16 @@ from ccs.core.exceptions import (
     HOLD_REASONS,
     INTERNAL_CONCURRENCY_REASON,
     OCC_CALLER_TRANSIENT_REASON,
+    SPLIT_PAIR_REASON,
     STALE_READ_GENERATION_REASON,
     STALE_VIEW_REASON,
     VERSION_MISMATCH_REASON,
     VIEW_WEDGED_REASON,
     CoherenceError,
+    CoordinatorFailed,
+    CoordinatorUnreachable,
     GiverFenced,
+    StaleView,
 )
 from ccs.core.states import MESIState
 from ccs.core.types import (
@@ -147,6 +153,8 @@ def test_handoff_reasons_collide_with_no_existing_reason_or_status() -> None:
             CAS_EXHAUSTED_REASON,
             INTERNAL_CONCURRENCY_REASON,
             COORDINATOR_UNAVAILABLE_REASON,
+            COORDINATOR_FAILED_REASON,
+            SPLIT_PAIR_REASON,
         }
     )
     assert HANDOFF_REASONS.isdisjoint(existing)
@@ -170,6 +178,42 @@ def test_giver_fenced_carries_its_reason_successor_and_version() -> None:
     assert isinstance(err, CoherenceError)
     assert str(successor) in str(err)
     assert "version_at_transfer=7" in str(err)
+
+
+def test_coordinator_unreachable_carries_its_reason_and_crosses_a_process_boundary() -> None:
+    """The refusal for no usable answer from the coordinator is a typed
+    terminal in the coherence family, so a strict caller catches it with the
+    rest and a consumer classifies it by type or ``.reason``, never by the
+    message. Its class-level reason is the existing wire value the MCP
+    unattached refusal already answers, not a new one. It carries the message
+    only, so a child process can raise it and the parent unpickle it whole."""
+    err = CoordinatorUnreachable("coordinator gone")
+    assert CoordinatorUnreachable.reason == "coordinator_unavailable"
+    assert err.reason == COORDINATOR_UNAVAILABLE_REASON
+    assert isinstance(err, CoherenceError)
+
+    restored = pickle.loads(pickle.dumps(err))
+    assert type(restored) is CoordinatorUnreachable
+    assert restored.args == ("coordinator gone",)
+    assert restored.reason == "coordinator_unavailable"
+
+
+def test_coordinator_failed_carries_its_reason_and_crosses_a_process_boundary() -> None:
+    """The read error for the coordinator's failure envelope (#259) is a typed
+    terminal in the coherence family, never a stale view (a caller reads a
+    ``StaleView`` from a versioned read as the split pair), with its own wire
+    value. It carries the message only, so a child process can raise it and the
+    parent unpickle it whole."""
+    err = CoordinatorFailed("coordinator answered the read with a failure")
+    assert CoordinatorFailed.reason == "coordinator_failed"
+    assert err.reason == COORDINATOR_FAILED_REASON
+    assert isinstance(err, CoherenceError)
+    assert not isinstance(err, StaleView)
+
+    restored = pickle.loads(pickle.dumps(err))
+    assert type(restored) is CoordinatorFailed
+    assert restored.args == ("coordinator answered the read with a failure",)
+    assert SPLIT_PAIR_REASON == "split_pair"
 
 
 def test_transfer_statuses_are_the_six_closed_values() -> None:

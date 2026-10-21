@@ -616,6 +616,7 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
             print(f"  {_elide_middle(path, path_w):<{path_w}}  {version:>{ver_w}}")
     print()
     _render_handoff_block(tracked)
+    _render_foreign_write_block(tracked)
 
     if show_policy:
         observed_paths = {a.get("path", "") for a in tracked}
@@ -703,6 +704,34 @@ def _render_handoff_block(tracked: list[dict[str, Any]]) -> None:
     print()
 
 
+def _render_foreign_write_block(tracked: list[dict[str, Any]]) -> None:
+    """#278: one line per tracked artifact whose entry carries
+    ``foreign_writes`` (the operator tier) with a change made outside the
+    coordinator -- counted ``foreign`` -- or one the detector excused as a write
+    still landing. A ``mediated`` count alone is no news. Prints nothing when
+    no entry qualifies, so the table is otherwise unchanged."""
+    lines: list[str] = []
+    for artifact in tracked:
+        counts = artifact.get("foreign_writes")
+        if not isinstance(counts, dict):
+            continue
+        facts: list[str] = []
+        if counts.get("foreign"):
+            facts.append(f"{escape_nonprintable(counts['foreign'])} foreign")
+        if counts.get("lag_suppressed"):
+            facts.append(
+                f"{escape_nonprintable(counts['lag_suppressed'])} excused as a write still landing"
+            )
+        if facts:
+            lines.append(f"  {escape_nonprintable(artifact.get('path', ''))}: {', '.join(facts)}")
+    if not lines:
+        return
+    print("Changes made outside the coordinator (counted by the foreign-write detector):")
+    for line in lines:
+        print(line)
+    print()
+
+
 def _handoff_line(path: str, handoff: dict[str, Any], now: float) -> str:
     giver, successor = (_short_agent_id(handoff.get(key)) for key in ("giver", "successor"))
     facts = [escape_nonprintable(handoff.get("status", "?"))]
@@ -746,6 +775,9 @@ def _render_counter_block(payload: dict[str, Any]) -> None:
             "handler_concurrency_overflows_total",
             "cold_start_duration_ms",
             "sweep_reclaims_total",
+            # #278: a reader's bytes differing from the recorded content.
+            "fresh_shared_hash_mismatch_total",
+            "shared_foreign_lag_suppressed_total",
         ) if k in payload
     ]
     if not has_endpoint_counters and not keys_present:

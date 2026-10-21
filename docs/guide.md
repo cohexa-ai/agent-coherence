@@ -1271,7 +1271,7 @@ data = vol.reacquire("plans/plan.md")       # recover: clear the stale view + fr
 |---|---|---|
 | `workspace_root` | — | Directory the volume manages; the coordinator's state lives in `<root>/.coherence/` |
 | `managed` | `()` | Glob patterns for the files under coordination; unmanaged paths bypass the volume |
-| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
+| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A read the coordinator answers with its failure envelope raises `CoordinatorFailed`; see [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
 | `config` | `None` | Coordinator settings as a `LifecycleConfig` (`from ccs.adapters.claude_code.lifecycle import LifecycleConfig`); `None` uses the defaults. Only the volume that starts the coordinator applies it |
@@ -1384,6 +1384,84 @@ which says whether the sweep reclaimed the grant or a peer took it. Its
 reclaim, for example, `0` and `1`. Both are `None` when the refusal carried
 none. The recovery is the same whatever they say.
 
+### When the coordinator does not answer
+
+In strict mode, a volume that gets no usable answer from its coordinator raises
+`CoordinatorUnreachable`, a `CoherenceError` whose `reason` is
+`coordinator_unavailable` (import it from `ccs.core.exceptions`). That covers a
+coordinator that cannot be started or attached, a refused or timed-out
+connection, a reset, a listener that never answers, and an empty or unreadable
+reply, on every request that commits nothing. A coordinator that answers with a
+refusal, such as an HTTP error status or a watchdog `degraded` body, raises the
+error it raised before. Its `internal:` failure envelope is covered in
+[When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure).
+
+A commit is different, because its request may have reached the coordinator
+before the answer was lost. When the CAS of `write_cas` or `write_cas_at`, the
+commit of `atomic_publish`, or the post-edit of a plain `write()` was sent and
+got no usable answer, the volume raises `CommitUnconfirmed`: the commit may or
+may not have landed, so re-read before retrying. When the request never left,
+because the connection was refused, it raises `CoordinatorUnreachable`.
+`CommitUnconfirmed` does not by itself mean the request was delivered: the
+handoff verbs raise it even when nothing was sent, and so does a
+`CoordinatedSubstrate` after its substrate write landed.
+
+A plain `write()` has already put its bytes on disk when its post-edit fails.
+Its error says so, and says whether the coordinator certainly did not record
+the write or may have. Before raising, the volume sends one short, best-effort
+request to release its write grant, so peers are not held off until the sweep
+takes the file back.
+
+To recover, keep in mind that a volume keeps the endpoint it attached to, so
+it never finds a coordinator started after the old one went away:
+
+- If the coordinator stalled and comes back on the same port, the next call
+  goes through.
+- Otherwise build a new `CoherentVolume`. It attaches to the running
+  coordinator, or starts one.
+- If the release was answered, the volume gave up its own grant as well, so
+  `reacquire()` and re-read before writing that file again.
+
+A coordinator goes away when it is killed or crashes, when the session or
+process hosting it exits, or after `idle_shutdown_sec` (900 s by default) with
+no requests. During a graceful stop it answers `503` for a moment before it
+stops listening, and requests in that moment raise the error an HTTP status
+raised before. `on_error="degrade"` is unchanged: it warns once, counts every
+failure and falls back to plain IO.
+
+### When the coordinator answers with a failure
+
+When something raises inside the coordinator while it handles a request, such
+as a registry call that finds the store locked or a fault in its own code, it
+answers HTTP 200 `{"ok": false, "reason": "internal: <Type>"}`. The answer
+names only the exception's type, so a busy store, which clears by itself, looks
+the same as a fault that repeats on every call. On a commit, the coordinator
+may have recorded the commit before the error.
+
+- **A strict read raises `CoordinatorFailed`**, a `CoherenceError` whose
+  `reason` is `coordinator_failed` (import it from `ccs.core.exceptions`). That
+  covers `read()`, `read_with_version()`, `read_with_version_generation()`,
+  `reacquire()`, and the reads that `write_cas`, `write_cas_at` and `gate()`
+  make. The read is not confirmed as registered. Retry it once after a few
+  seconds; if it fails again, report the coordinator as failing. A
+  `CoordinatedSubstrate` raises the same type from `read()`, `reacquire()` and
+  the check `commit()` makes before its substrate write. `on_error="degrade"` is
+  unchanged: it warns once, counts, and returns the bytes at version 0.
+- **A commit raises `CommitUnconfirmed`** in both modes, because whether it
+  landed is unknown. That covers the CAS of `write_cas` and `write_cas_at`, the
+  batch of `atomic_publish`, and the post-edit of a plain `write()`. Re-read,
+  and judge by the content you read back, not the version: `write_cas`,
+  `write_cas_at` and `atomic_publish` write disk only after a confirmed
+  commit, so a commit the coordinator recorded moves the version while the old
+  bytes are still on disk. A plain `write()` has already put its bytes on disk;
+  its error says so, and it first releases its grant, as it does when a commit
+  gets no answer.
+- **A write's grant request** (the pre-edit of `write()`) answered this way
+  still raises `StaleView` and lands nothing.
+
+A reason without the `internal: ` prefix is not this envelope, and keeps the
+error it raised before.
+
 ### Atomic multi-file publish: `atomic_publish` (v0.12.0+)
 
 `write_cas_at` lands one file. When an agent edits a *set* of files that must stay
@@ -1451,6 +1529,13 @@ script. The volume checks a content hash at both boundaries:
 
 A volume never denies its own just-written bytes: the benign window between a
 commit and its disk write is recognized and suppressed.
+
+Whatever `on_stale_read` says, the versioned reads (`read_with_version()`,
+`read_with_version_generation()` and the MCP `swg_read`) refuse a managed file
+whose bytes are not the coordinator's content at the version it reports,
+outside that same window. They raise `StaleView` whose `reason` is
+`split_pair`, so a caller can tell this refusal from every other stale view by
+value; `swg_read` answers it as a `stale_view` deny.
 
 These guards are **content-hash checks at the volume boundary** — best-effort
 point-in-time detection, not filesystem interception. An edit that bypasses the
@@ -3538,18 +3623,53 @@ caller_principal_absent`, `caller_principal_foreign` or
 `retryable: false`, and so does every `swg_write`, `swg_read` and `swg_gate`
 after it: no tool call in that server session can regain coordination, and a
 new server session claims its own principal. `swg_status` says so ahead of time
-as `principal_claim: refused`. When instead the *answer* to that claim is lost
-(a transport blip), the refusal is not yet settled: the tool call answers the
-same `reason` with `recover: wait_and_retry` and `retryable: true`, the next
-tool call claims again with the same nonce by itself before it runs — and
-usually just succeeds — and `swg_status` reads `principal_claim: unconfirmed`
-until it does. The other values are `bound`, `unsupported` (the coordinator
+as `principal_claim: refused`. When instead that claim is answered without
+binding (a redirect, an HTTP error status, or an answer that leaves the claim
+unconfirmed), the refusal is not yet settled: the tool call answers the same
+`reason` with `recover: wait_and_retry` and `retryable: true`, the next tool
+call claims again with the same nonce by itself before it runs — and may just
+succeed — and `swg_status` reads `principal_claim: unconfirmed` until it does.
+When that claim gets no answer at all, the tool call answers as it does for a
+coordinator that stops answering (next paragraph), with
+`recover: stop_and_report`. The other values are `bound`, `unsupported` (the coordinator
 issues no principals) and `not_attempted`. `swg_status` also forwards the
 coordinator's `caller_principal_absent_total` and
 `caller_principal_refused_total`, `null` rather than `0` when the coordinator
 is unreachable or does not report them. It forwards the coordinator's
 `registry_schema_version` under the same rule: `null` when the coordinator is
 unreachable or its answer carries no such field.
+
+**A coordinator that stops answering.** When the server's volume gets no
+usable answer from its coordinator, the tool call answers `reason:
+coordinator_unavailable` with `recover: stop_and_report` and
+`retryable: false`, and a `next_step` that tells the agent to stop, not to
+write the managed files by any other route, and to report that the server must
+be restarted. While that coordinator stays down, every later tool call answers
+the same way, and the server never reaches a coordinator started after the old
+one went away: the volume keeps the endpoint it attached to. A coordinator that
+is only too slow to answer within the client's timeout gets the same answer,
+although a later call might have gone through; stopping is the safe side of
+that guess. Restarting the server
+attaches it again; if it will not start, stop the workspace's coordinator
+process first. The same `reason` with `recover: retry_later` comes only from a
+server whose volume never attached, so branch on `recover`, not on `reason`. A
+commit that was sent and got no answer answers `commit_unconfirmed` with
+`recover: read_then_retry`, where `swg_write` and `swg_write_cas` answered
+`internal_error` before. During a graceful stop the coordinator answers `503`
+for a moment before it stops listening, and calls in that moment still answer
+`internal_error`.
+
+**A coordinator that fails while answering.** When the coordinator answers a
+read with its `internal:` failure envelope ([details](#when-the-coordinator-answers-with-a-failure)),
+the tool call answers `reason: coordinator_failed` with
+`recover: stop_and_report` and `retryable: false`, and a `next_step` that tells
+the agent to make the same call once more after a few seconds and, if it fails
+the same way, to stop and report that the coordinator is failing. That covers
+`swg_read`, `swg_reacquire`, and the reads that `swg_write_cas` and `swg_gate`
+make; they answered `internal_error` before. A write whose commit gets that answer may
+have landed, so `swg_write` and `swg_write_cas` answer `commit_unconfirmed`
+with `recover: read_then_retry`, where `swg_write` answered `commit_preempted`
+and `swg_write_cas` answered `internal_error`.
 
 **Multiple sessions, one workspace.** Multiple `stale-write-guard-fs` instances
 pointed at the same `SWG_ROOT` attach to one coordinator, so a stale write is denied
@@ -3984,8 +4104,45 @@ Each file lands in one of three buckets:
 - **mediated** — the file changed, and the coordinator holds exactly those
   bytes. It was a write that went through it.
 - **lag_suppressed** — the mismatch looked like a write that was still landing
-  when the check ran. Counted separately, never as a foreign write and never as
-  a clean result, so you can see how often the benefit of the doubt was given.
+  when the check ran: a commit landed in the last few seconds, or a session
+  holds a write claim it has not committed yet and was active in that time.
+  Counted separately, never as a foreign write and never as a clean result, so
+  you can see how often the benefit of the doubt was given. A write that has
+  already committed excuses nothing: a session that committed a file and still
+  holds it does not hide a later change someone else makes outside the
+  coordinator.
+
+**What sessions are told.** Detection itself never denies, but the hooks look
+at the same thing when a session touches the file. A session that holds a valid
+grant on a file whose bytes on disk no longer match the version it read, with
+no commit of its own to explain them, is told so:
+
+- its next read is admitted in warn mode with `"hash_differs": true` and a
+  sentence, as added context only, saying the file changed outside the
+  coordinator and not to write it from an earlier read;
+- in strict mode that read is denied, and the deny names the change rather
+  than the last session that committed. It tells the session not to restore or
+  overwrite the file, since the change may be its user's work, and to tell its
+  user: the read stays denied until the change is committed through the
+  coordinator. A session whose grant another session's `pre-edit` revoked is
+  not told this; that writer went through the coordinator, and the deny says
+  the grant was revoked, as before;
+- its `pre-edit` reads the file itself and, when it no longer holds the recorded
+  content, adds `"disk_differs": true` and the same sentence. It skips the check
+  while another session holds a write it has not committed and was active in
+  the last few seconds, the case the detector excuses too: that write can
+  reach the disk before its commit, and the collision warning already names
+  it. It never denies, in strict mode either: a read is already denied there
+  until a commit lands, and a write is the one way to commit the change. A
+  client that writes whole files should re-read before it writes when it sees
+  the key.
+
+**Reading the counts while the coordinator runs.** `/status?detail=full` adds
+`foreign_writes` to each tracked file the detector has counted anything for,
+for example `{"foreign": 1, "lag_suppressed": 1}`, and
+`agent-coherence-status --detail full` lists the files with a foreign or an
+excused change under "Changes made outside the coordinator". The offline report
+below reads the same counts.
 
 **The honesty rules matter more than the numbers, so they are worth stating
 plainly:**
@@ -4255,6 +4412,7 @@ All bundled CLIs are installed as console scripts when you
 | `agent-coherence-status` | — | Print the coordinator's tracked paths, sessions, handoffs, sweep reclaims and counters; see [Status, track and untrack commands](#status-track-and-untrack-commands) and [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status) |
 | `agent-coherence-track` | — | Add paths to the coordinator's tracked set; see [Status, track and untrack commands](#status-track-and-untrack-commands) |
 | `agent-coherence-untrack` | — | Add paths to the coordinator's ignored set (a path enforced in strict mode is refused); see [Status, track and untrack commands](#status-track-and-untrack-commands) |
+| `agent-coherence-migrate-rules` | — | Propose `permissions.deny` entries from prose rules in `CLAUDE.md`. `--apply` writes them into `.claude/settings.local.json` under a lock file, and exits 2 without touching the settings when it cannot take that lock |
 | `agent-coherence-workspace` | — | Checkpoint / list / status / restore a workspace of file and forward-only members; see [Workspace versioning & restore](#workspace-versioning--restore-workspaceversioner) |
 | `agent-coherence-transfer`, `agent-coherence-accept`, `agent-coherence-decline`, `agent-coherence-withdraw` | — | Hand a path from one Claude Code session to another, and accept, decline or withdraw the handoff; see [Handoff commands](#handoff-commands) |
 
@@ -4303,7 +4461,8 @@ way until then; branch on `reason`, not on the text. To untrack the path,
 remove its entry from `.coherence/strict_mode.yaml` and restart the
 coordinator. `agent-coherence-untrack` exits `3` on it, and so does the Claude
 Code plugin's own `agent-coherence-untrack` from plugin 0.6.0. The plugin's
-Node coordinator has no such refusal.
+Node coordinator refuses the same way in plugin releases after 0.6.0; up to
+0.6.0 it has no such refusal.
 
 **Policy files.** `track` and `untrack` add each path to
 `.coherence/tracked.yaml` or `.coherence/ignored.yaml` as a double-quoted YAML
@@ -4430,6 +4589,9 @@ these differences:
   `last_writer_at_unix_ts` (the agent that last committed the path, and when;
   both `null` until a commit) and `owner_generation`, and its `handoff` key
   adds `created_at_unix_ts`;
+- an entry the foreign-write detector has counted anything for adds
+  `foreign_writes`, its counts by outcome with zero ones left out (see
+  [Foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back));
 - each `sessions[]` row adds `reclaimed`, `grants` and
   `last_heartbeat_unix_ts`, and an agent listed only for a reclaim gets a row
   too, for 24 hours after its newest reclaim (see

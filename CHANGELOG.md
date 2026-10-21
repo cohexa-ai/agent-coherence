@@ -8,6 +8,27 @@ Alpha — APIs may change before `v1.0`.
 
 ### Added
 
+- **A strict surface that gets no usable answer from its coordinator raises
+  `CoordinatorUnreachable` (#376).** Until now a strict `CoherentVolume` or a
+  `CoordinatedSubstrate` whose coordinator was gone raised a bare
+  `CoherenceError`, and the `stale-write-guard-fs` server reported it as
+  `internal_error`. `CoordinatorUnreachable` is a `CoherenceError` whose
+  `reason` is `coordinator_unavailable`. Both surfaces raise it when the
+  coordinator cannot be started or attached, when the connection is refused or
+  times out, and when a request that commits nothing gets no usable answer,
+  including the caller-principal claim and the strict-glob check at attach. A
+  coordinator that answers with a refusal raises what it raised before, unless
+  the claim sent to recover from a caller-principal refusal gets no answer; its
+  failure envelope is typed separately (#259, under Changed). The
+  MCP server maps it to `coordinator_unavailable` with `recover:
+  stop_and_report`, not retryable, because an attached volume never reaches a
+  coordinator started after the old one went away; a server whose volume never
+  attached keeps answering `retry_later`. The client's own
+  `CoordinatorUnavailable` is unchanged, and so is the Claude Code hook client.
+  A cross-process test SIGKILLs a coordinator started with
+  `agent-coherence-coordinator` and checks the refusal on both surfaces. The
+  guide's "When the coordinator does not answer" section has the details.
+
 - **`tools/run_local_tests.py` runs the test suite locally the way CI does,
   from the main checkout or any git worktree.** It uses the main checkout's
   virtual environment, keeps bytecode caches on, and runs the parallel tests
@@ -52,7 +73,55 @@ Alpha — APIs may change before `v1.0`.
   refusing it with the pair. The guide's "Reading a commit refusal's
   generation pair" section has the details.
 
+- **A versioned read refused as a split pair says so by value (#264).**
+  `read_with_version()` and `read_with_version_generation()` refuse a file
+  whose bytes are not the coordinator's content at the version it reports,
+  with a `StaleView` that was identical to every other stale view except for
+  its message. Its `reason` is now `split_pair` (`SPLIT_PAIR_REASON` in
+  `ccs.core.exceptions`); every other `StaleView` keeps `stale_view`, and
+  `swg_read` still answers the refusal as a `stale_view` deny.
+
 ### Changed
+
+- **A strict commit whose request was sent but got no answer raises
+  `CommitUnconfirmed` (#376).** The CAS of `write_cas` and `write_cas_at`, the
+  commit of `atomic_publish`, and the post-edit of a plain `write()` raised a
+  bare `CoherenceError` in strict mode when the coordinator's answer was lost;
+  they now raise `CommitUnconfirmed`, because the commit may have landed, and
+  `CoordinatorUnreachable` when the request never left. `swg_write` and
+  `swg_write_cas` answer `commit_unconfirmed` where they answered
+  `internal_error`. A plain `write()` whose post-edit fails this way says its
+  bytes are on disk, makes one short best-effort request to release its write
+  grant, and never returns normally.
+
+- **A commit the coordinator answers with its failure envelope raises
+  `CommitUnconfirmed`, and a strict read raises the new `CoordinatorFailed`
+  (#259).** When something raises inside the coordinator, it answers HTTP 200
+  `{"ok": false, "reason": "internal: <Type>"}`, and on a commit it may already
+  have recorded the commit. The CAS of `write_cas` and `write_cas_at` raised a
+  plain `CoherenceError`, which `swg_write_cas` reported as `internal_error`,
+  `recover: none`; the post-edit of a plain `write()` raised `CommitPreempted`;
+  and `atomic_publish` said the batch was not published. All four raise
+  `CommitUnconfirmed` now, in both modes, so `swg_write` and `swg_write_cas`
+  answer `commit_unconfirmed` with `recover: read_then_retry`. A plain
+  `write()` says its bytes are on disk and first releases its write grant. A
+  strict read, on a `CoherentVolume` or a `CoordinatedSubstrate`, raised a
+  plain `CoherenceError`; it raises `CoordinatorFailed`, a `CoherenceError`
+  whose `reason` is `coordinator_failed`, and `swg_read` answers
+  `coordinator_failed` with `recover: stop_and_report`, `retryable: false`,
+  and a next step that names one retry, then a report. Degrade-mode reads, the
+  pre-edit's `StaleView`, and any reason without the `internal: ` prefix are
+  unchanged. The guide's "When the coordinator answers with a failure" section
+  has the details.
+
+- **`agent-coherence-migrate-rules --apply` refuses when it cannot take its
+  lock (#376).** It used to print "proceeding without it" and rewrite
+  `.claude/settings.local.json` unprotected whenever opening or locking the
+  sidecar lock file failed. An interrupted or would-block attempt is now
+  retried, up to three times; any other error, or running out of attempts,
+  prints the error, the lock path and what to do, and exits 2 without reading
+  or writing the settings. A platform without `fcntl` still proceeds without a
+  lock.
 
 - **The MCP Registry lists the `stale-write-guard-fs` server as
   `io.github.cohexa-ai/stale-write-guard-fs`.** The GitHub organization is now
@@ -64,7 +133,48 @@ Alpha — APIs may change before `v1.0`.
   package README carries the old marker. Install commands are unchanged: the
   PyPI package is still `agent-coherence`.
 
+- **The protocol corpus runs its #261 strict-path rows on the Claude Code
+  plugin's Node coordinator too.** One row refuses an untrack of a strict path;
+  the other keeps a strict path strict under a broader ignore pattern (`**`).
+  Both ran on the Python coordinator only, as did three older strict rows that
+  now run on both. Plugin releases after 0.6.0 carry the fix for
+  cohexa-ai/agent-coherence-plugin#177, which lifts the 0.15.0 known
+  limitation that the Node coordinator let an untrack or an ignore pattern
+  take a path out of strict mode; the guide's section on the policy routes now
+  says the Node coordinator refuses too. The package is unchanged.
+
 ### Fixed
+
+- **A file changed outside the coordinator no longer goes unnoticed while a
+  session holds it (#278).** A change that reaches the disk without a commit
+  -- a script, an editor, a shell write the hooks do not recognise, including
+  a handoff giver's -- was hidden in three places.
+  - **Detection.** The foreign-write detector treated any write grant as a
+    write still landing, and a commit leaves its writer holding the file for
+    up to half an hour. So a change made after any commit was counted as
+    excused, not foreign, for that long. Now only a write claim not yet
+    committed, by a session active in the last few seconds, is excused.
+  - **Reads.** A session reading the file with a valid grant was told
+    nothing: warn mode answered `"hash_differs": true`, a key the model
+    never sees. It now adds a sentence, as added context only, saying the
+    file changed outside the coordinator. In strict mode the read is still
+    denied, and the deny now names that change instead of the last session
+    that committed, and tells the session to tell its user rather than
+    restore or overwrite the file. A reader whose grant another session's
+    `pre-edit` revoked keeps its old deny. The deny was byte-mirrored by the
+    Claude Code plugin's
+    Node coordinator; the new wording reaches it with
+    cohexa-ai/agent-coherence-plugin#205.
+  - **Writes.** `pre-edit` admitted a session about to write the file from
+    an earlier read, so the change was replaced and the record looked clean.
+    `pre-edit` now reads the file itself. When the file no longer holds the
+    recorded content, it answers `"disk_differs": true` and the same
+    sentence, unless another session's write is still landing. It still
+    admits, in strict mode too.
+
+  `/status?detail=full` now lists each file's detector counts as
+  `foreign_writes`. `agent-coherence-status` prints them, along with the two
+  hash-mismatch counters that used to reach only `--json`.
 
 - **A `CoherentVolume.write()` after a read that raced a peer's commit is
   refused again (#335).** A pre-read by a session with no grant on a tracked
@@ -193,6 +303,21 @@ Alpha — APIs may change before `v1.0`.
   and admit the call. An append slower than the hook client's own request
   timeout (6 seconds for the Python client) still reaches the client too
   late, and the client admits the call as before.
+
+- **A connection that goes silent no longer holds a coordinator handler slot
+  until its owner closes it (#237).** A connection takes one of the
+  coordinator's eight handler slots as soon as it is accepted, before it sends
+  a byte. A handler had no timeout, so eight connections that opened and sent
+  nothing held every slot until their owner closed them. Every request, hooks
+  and `/status` included, got `503`, and a hook client lets the call through
+  on a `503` (#223), so stale-read warnings and strict-mode denies were lost.
+  A handler now drops a connection whose request stops arriving for 2
+  seconds, with no answer, where it used to hold its slot until the client
+  closed it. It also drops a client that stops reading its answer for 2
+  seconds; a client that keeps reading gets the whole answer, however long it
+  takes. For those 2 seconds the slots are still full, and a peer that sends a
+  byte before every timeout (#393), or reconnects as each connection is
+  dropped (#394), still keeps them.
 
 ## [0.15.0] - 2026-10-14
 

@@ -29,6 +29,8 @@ from ccs.core.exceptions import (
     CoherenceError,
     CommitPreempted,
     CommitUnconfirmed,
+    CoordinatorFailed,
+    CoordinatorUnreachable,
     GiverFenced,
     InternalConcurrencyError,
     StaleView,
@@ -57,6 +59,11 @@ _PRINCIPAL_UNSETTLED_RECOVER = "wait_and_retry"
 _GIVER_REASON = "handed_off"
 _GIVER_RECOVER = "stop_and_report"
 _SUCCESSOR = "6b0f3c1e-4a5d-5b7e-9c2f-1d3e5a7b9c0d"
+#: FROZEN duplicates of the coordinator-unreachable terminal: the reason the
+#: synthesized unattached refusal already answers, and the same stop verb the
+#: giver terminal uses, never that refusal's ``retry_later``.
+_UNREACHABLE_REASON = "coordinator_unavailable"
+_UNREACHABLE_RECOVER = "stop_and_report"
 
 
 def _principal_refusal(reason: str) -> CallerPrincipalRefused:
@@ -114,6 +121,7 @@ _TERMINALS = [
     ),
     (CasRetriesExhausted("data/x", 8, 3), "cas_exhausted", "stop", False),
     (GiverFenced("data/x", _SUCCESSOR, 3), _GIVER_REASON, _GIVER_RECOVER, False),
+    (CoordinatorUnreachable("coordinator gone"), _UNREACHABLE_REASON, _UNREACHABLE_RECOVER, False),
     (
         InternalConcurrencyError("concurrent use detected"),
         "internal_concurrency_error",
@@ -190,8 +198,11 @@ def test_unrecognized_coherence_error_fails_closed_generic():
 
 
 def test_type_b_coordinator_unavailable_is_synthesized_and_fails_closed():
-    """Type B: no adapter raise-site — when the volume is unattached/transport
-    failed, deny.py synthesizes a fail-closed coordinator_unavailable."""
+    """Type B: when the volume is unattached, the server answers before any
+    adapter call and deny.py synthesizes a fail-closed coordinator_unavailable
+    that keeps ``retry_later``. The same reason raised by an attached strict
+    volume, as ``CoordinatorUnreachable``, maps through its own row instead
+    (see the test below)."""
     result = coordinator_unavailable_result("coordinator unreachable at attach")
 
     assert result.isError is True
@@ -200,6 +211,92 @@ def test_type_b_coordinator_unavailable_is_synthesized_and_fails_closed():
     assert sc["recover"] == "retry_later"
     assert sc["retryable"] is False
     assert sc["detail"] == "coordinator unreachable at attach"
+
+
+def test_a_coordinator_unreachable_refusal_is_a_typed_stop_that_says_restart_and_never_retry():
+    """AE7. An attached strict volume whose coordinator gives no usable answer
+    raises ``CoordinatorUnreachable``. Without its own row it fell to
+    ``internal_error`` / ``none``, the shape of a bug inside the server. It
+    maps to ``coordinator_unavailable``, ``retryable: false``, and the stop
+    verb, not the unattached refusal's ``retry_later``: the attached volume
+    keeps its dead endpoint, so no retry inside this server session can reach
+    a coordinator again. The detail stays verbatim (first text item); the
+    fixed next step (second text item) says to restart the server, forbids
+    writing the managed files another way, and never names a retry, since a
+    refusal that names the act that lifts it invites the agent to take it.
+    A bare ``CoherenceError`` with the same text still answers
+    ``internal_error``: the row is keyed on the type, not the message."""
+    exc = CoordinatorUnreachable("coordinator gone")
+
+    result = deny_result(exc)
+
+    sc = result.structuredContent
+    assert result.isError is True
+    assert (sc["reason"], sc["recover"], sc["retryable"]) == (
+        _UNREACHABLE_REASON, _UNREACHABLE_RECOVER, False,
+    )
+    assert sc["detail"] == str(exc)
+    assert result.content[0].text == str(exc)
+    words = sc["next_step"]
+    assert [item.text for item in result.content[1:]] == [words]
+    for phrase in ("stop", "report", "restart", "other route", "will not start"):
+        assert phrase in words.lower(), phrase
+    assert "retry" not in words.lower()
+    assert "try again" not in words.lower()
+
+    assert deny_result(CoherenceError("coordinator gone")).structuredContent["reason"] == "internal_error"
+
+
+def test_a_coordinator_failed_read_is_a_stop_that_names_one_retry():
+    """#259. A strict read the coordinator answered with its failure envelope
+    raises ``CoordinatorFailed``. Without its own row it fell to
+    ``internal_error`` / ``none``. It maps to ``coordinator_failed`` with the
+    stop verb and ``retryable: false``, and its fixed next step names exactly
+    one retry before the report: the envelope names only an exception's type,
+    so a busy store and a fault that repeats on every call look the same, and
+    an unbounded ``wait_and_retry`` would loop forever on the fault. The
+    detail stays verbatim."""
+    exc = CoordinatorFailed(
+        "coordinator answered the read of data/x with a failure "
+        "(internal: OperationalError); the read is not confirmed as registered"
+    )
+
+    result = deny_result(exc)
+
+    sc = result.structuredContent
+    assert result.isError is True
+    assert (sc["reason"], sc["recover"], sc["retryable"]) == (
+        "coordinator_failed", "stop_and_report", False,
+    )
+    assert sc["detail"] == str(exc)
+    words = sc["next_step"]
+    assert [item.text for item in result.content[1:]] == [words]
+    for phrase in ("once more", "stop", "report", "do not keep retrying"):
+        assert phrase in words.lower(), phrase
+
+
+def test_a_split_pair_refusal_keeps_the_stale_view_answer():
+    """#264. The split-pair read refusal carries ``split_pair`` on its
+    instance so a Python caller tells it from other stale views, but the MCP
+    answer is the documented ``swg_read`` one: ``stale_view`` / ``reacquire``
+    / retryable, read from the class, never the instance."""
+    refusal = StaleView("split prose")
+    refusal.reason = "split_pair"
+
+    sc = deny_result(refusal).structuredContent
+
+    assert (sc["reason"], sc["recover"], sc["retryable"]) == ("stale_view", "reacquire", True)
+
+
+def test_a_coordinator_unreachable_subclass_does_not_inherit_the_mapping():
+    """Type A is matched by EXACT type, so a future subclass cannot silently
+    inherit a recover verb that may be wrong for it."""
+
+    class _Narrower(CoordinatorUnreachable):
+        pass
+
+    sc = deny_result(_Narrower("coordinator gone")).structuredContent
+    assert sc["reason"] == "internal_error"
 
 
 def test_cas_exhausted_reason_constant_lives_on_the_type():

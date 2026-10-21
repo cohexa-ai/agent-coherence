@@ -307,12 +307,55 @@ def test_pre_read_fresh_shared_hash_mismatch_sets_hash_differs(client: _Client) 
     have left the session INVALID, so the mismatch implies an
     out-of-band write — surfaced additively, never denied (the plugin
     path stays fail-open)."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
     client.post("/hooks/pre-read",
                 {"session_id": _sid("s1"), "path": "CLAUDE.md",
                  "content_hash": _hash("on-disk-v1")})
     status, body = client.post("/hooks/pre-read",
                                 {"session_id": _sid("s1"), "path": "CLAUDE.md",
                                  "content_hash": _hash("out-of-band-edit")})
+    assert status == 200
+    # #278: the flag is a top-level key the model never sees, so the change is
+    # also named in a context-only envelope -- never a permission decision.
+    assert body == {
+        "status": "fresh", "version": 1, "hash_differs": True,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": hp.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(
+                path="CLAUDE.md", version=1),
+        },
+    }
+
+
+def test_out_of_band_change_notice_wording_is_pinned() -> None:
+    """#278: the bytes a model reads when its file changed outside the
+    coordinator. Pinned literally, so a reword is a reviewed change."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    assert hp.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(path="plan.md", version=3) == (
+        "⚠ plan.md on disk differs from v3, the last content committed through "
+        "the coordinator, and no session committed the change: it was made "
+        "outside the coordinator. Read plan.md before relying on it, and do not "
+        "write it from an earlier read; that write would replace the change."
+    )
+
+
+def test_pre_read_of_its_own_commit_still_landing_carries_no_out_of_band_notice(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#278: a mismatch the caller's own recent commit explains -- the registry
+    took the new hash before the bytes reached disk -- is not a change made
+    outside the coordinator, and the reader is not told it is. The flag stays,
+    as before. Fails if the notice ignores the self-commit lag exclusion."""
+    client.post("/hooks/pre-read",
+                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                 "content_hash": _hash("on-disk-v1")})
+    agent_id = session_to_agent_id(_sid("s1"))
+    _patch_last_writer(monkeypatch, coordinator, writer=agent_id, ts=time.time())
+    status, body = client.post("/hooks/pre-read",
+                                {"session_id": _sid("s1"), "path": "CLAUDE.md",
+                                 "content_hash": _hash("not-yet-flushed")})
     assert status == 200
     assert body == {"status": "fresh", "version": 1, "hash_differs": True}
 
@@ -2013,6 +2056,232 @@ def test_handler_concurrency_limit_constant_matches_spec(client: _Client) -> Non
     assert _WATCHDOG_POOL_SIZE == 4
     assert HANDLER_CONCURRENCY_LIMIT == 8
     assert WATCHDOG_QUEUE_LIMIT == 8
+
+
+# ----------------------------------------------------------------------
+# #237 — a silent connection gives back its handler slot
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def short_read_timeout_coordinator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A coordinator whose handlers drop a silent socket after 1 s, so a test
+    can wait out the read timeout quickly. The handler class reads the
+    constant when the server builds it."""
+    from ccs.adapters.claude_code import coordinator_server
+
+    monkeypatch.setattr(coordinator_server, "HANDLER_READ_TIMEOUT_SEC", 1.0, raising=False)
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
+    server.serve_in_thread()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+
+
+def _handler_slots_all_free(server: CoordinatorHTTPServer, budget_sec: float = 10.0) -> bool:
+    """Whether every handler slot comes back within ``budget_sec``."""
+    from ccs.adapters.claude_code.coordinator_server import HANDLER_CONCURRENCY_LIMIT
+
+    deadline = time.monotonic() + budget_sec
+    while time.monotonic() < deadline:
+        if server._server._concurrency_sem._value == HANDLER_CONCURRENCY_LIMIT:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _read_until_closed(sock, timeout_sec: float = 10.0) -> bytes:
+    """Everything the coordinator sends before it closes ``sock``."""
+    sock.settimeout(timeout_sec)
+    reply = b""
+    try:
+        while chunk := sock.recv(65536):
+            reply += chunk
+    except TimeoutError:
+        pytest.fail(f"the coordinator held the connection open for {timeout_sec:.0f} s")
+    return reply
+
+
+def test_idle_connections_give_back_their_handler_slots_after_the_read_timeout(
+    short_read_timeout_coordinator,
+) -> None:
+    """#237: a connection takes a handler slot as soon as it is accepted, before
+    it sends a byte. With no read timeout, HANDLER_CONCURRENCY_LIMIT connections
+    that sent nothing held every slot until their owner closed them, and every
+    request, hooks included, got 503. The read timeout drops them, so the
+    coordinator serves again while their owner still holds them."""
+    import socket
+
+    from ccs.adapters.claude_code.coordinator_server import HANDLER_CONCURRENCY_LIMIT
+
+    server = short_read_timeout_coordinator
+    client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
+
+    def status() -> object:
+        try:
+            return client.get("/status")[0]
+        except OSError as exc:  # the overflow 503 can race the request's own write
+            return type(exc).__name__
+
+    idle = [socket.create_connection(("127.0.0.1", server.port)) for _ in range(HANDLER_CONCURRENCY_LIMIT)]
+    try:
+        # Inside the timeout window the idle sockets hold every slot: proof the
+        # test filled them, and the window the read timeout leaves open.
+        window_end = time.monotonic() + 0.8
+        refused = None
+        while refused is None and time.monotonic() < window_end:
+            if (answer := status()) != 200:
+                refused = answer
+        assert refused is not None, "the idle sockets never filled the handler slots"
+
+        deadline = time.monotonic() + 10.0
+        while (answer := status()) != 200 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert answer == 200, f"the coordinator still refused requests past the read timeout: {answer}"
+        for sock in idle:
+            sock.settimeout(5.0)
+            assert sock.recv(1) == b"", "the coordinator left a silent connection open"
+        assert _handler_slots_all_free(server), "a dropped connection kept its handler slot"
+    finally:
+        for sock in idle:
+            sock.close()
+
+
+def test_a_stalled_request_body_closes_its_connection_without_a_500(
+    short_read_timeout_coordinator, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#237: a request whose body never arrives held its slot until the client
+    closed it. Its read now times out inside the route, where the
+    dispatcher's catch-all would answer 500 "internal: TimeoutError" and log
+    an ERROR; the connection is closed with no answer instead, as the stdlib
+    does for a silent request line."""
+    import socket
+
+    server = short_read_timeout_coordinator
+    secret = load_secret(server.coordinator_root)
+    request = (
+        "POST /hooks/pre-read HTTP/1.0\r\n"
+        "Host: 127.0.0.1\r\n"
+        f"Authorization: Bearer {secret}\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: 64\r\n"
+        "\r\n"
+        '{"session_id"'
+    )
+    with caplog.at_level(logging.ERROR, logger="ccs"):
+        with socket.create_connection(("127.0.0.1", server.port)) as sock:
+            sock.sendall(request.encode())
+            reply = _read_until_closed(sock)
+    assert reply == b"", f"expected the connection closed with no answer, got {reply[:120]!r}"
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert _handler_slots_all_free(server), "the stalled request kept its handler slot"
+
+
+@pytest.mark.parametrize(
+    "partial_request",
+    [b"GET /status HTTP/1.0", b"GET /status HTTP/1.0\r\nHost: 127.0.0.1\r\n"],
+    ids=["request-line", "headers"],
+)
+def test_a_stalled_request_line_or_headers_gives_back_its_slot(
+    short_read_timeout_coordinator, caplog: pytest.LogCaptureFixture, partial_request: bytes
+) -> None:
+    """#237: a request that stops partway through its first line or its headers
+    is dropped by the read timeout with no answer and no ERROR, and its slot
+    comes back."""
+    import socket
+
+    server = short_read_timeout_coordinator
+    with caplog.at_level(logging.ERROR, logger="ccs"):
+        with socket.create_connection(("127.0.0.1", server.port)) as sock:
+            sock.sendall(partial_request)
+            reply = _read_until_closed(sock)
+    assert reply == b"", f"expected the connection closed with no answer, got {reply[:120]!r}"
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert _handler_slots_all_free(server), "the stalled request kept its handler slot"
+
+
+def _large_answer_request(
+    server: CoordinatorHTTPServer, monkeypatch: pytest.MonkeyPatch, size: int
+) -> bytes:
+    """Register a route answering a JSON body of about ``size`` bytes, and
+    return an authenticated request for it."""
+    from ccs.adapters.claude_code import coordinator_server
+
+    answer = {"blob": "x" * size}
+    monkeypatch.setitem(
+        coordinator_server._ROUTES, ("GET", "/test/large-answer"), lambda req, _: req._json(200, answer)
+    )
+    secret = load_secret(server.coordinator_root)
+    return (
+        "GET /test/large-answer HTTP/1.0\r\n"
+        "Host: 127.0.0.1\r\n"
+        f"Authorization: Bearer {secret}\r\n"
+        "\r\n"
+    ).encode()
+
+
+def test_a_client_that_keeps_reading_gets_a_large_answer_whole(
+    short_read_timeout_coordinator, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#237: the handler timeout must not cut off a client that is still
+    reading. A socket timeout bounds a whole sendall, so an answer written in
+    one call was cut once it took longer than the timeout to drain, even to a
+    client reading steadily; the client then saw a short body and took the
+    coordinator for unavailable."""
+    import socket
+
+    server = short_read_timeout_coordinator
+    request = _large_answer_request(server, monkeypatch, 3 << 20)
+    with caplog.at_level(logging.ERROR, logger="ccs"):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16384)
+            sock.connect(("127.0.0.1", server.port))
+            sock.sendall(request)
+            sock.settimeout(10.0)
+            reply = b""
+            # About 1.6 MB/s: the whole answer takes longer than the 1 s timeout.
+            while chunk := sock.recv(32768):
+                reply += chunk
+                time.sleep(0.02)
+    head, _, body = reply.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.0 200"), head[:80]
+    length = int(next(line.split(b":", 1)[1] for line in head.split(b"\r\n") if line.lower().startswith(b"content-length:")))
+    assert len(body) == length, f"the answer was cut after {len(body)} of {length} bytes"
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_a_client_that_stops_reading_its_answer_is_dropped_without_an_error(
+    short_read_timeout_coordinator, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#237: a client that stops reading an answer larger than the socket
+    buffers is dropped once a write makes no progress for the timeout. The
+    write's timeout used to reach the dispatcher's catch-all, which logged an
+    ERROR and wrote a 500 onto the stuck socket, holding the slot for a second
+    timeout."""
+    import socket
+
+    server = short_read_timeout_coordinator
+    request = _large_answer_request(server, monkeypatch, 16 << 20)
+    with caplog.at_level(logging.ERROR, logger="ccs"):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            sock.connect(("127.0.0.1", server.port))
+            sock.sendall(request)
+            time.sleep(0.2)  # let the handler start writing before the slot check
+            assert _handler_slots_all_free(server), "a client that stopped reading kept its handler slot"
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_handler_sockets_get_a_read_timeout_shorter_than_the_handler_deadline(coordinator) -> None:
+    """#237: the stdlib sets no socket timeout unless the handler class names
+    one, and a handler with none waits on a silent connection for as long as
+    the peer keeps it open, holding its slot."""
+    from ccs.adapters.claude_code.coordinator_server import HANDLER_TIMEOUT_SEC, _make_handler_class
+
+    timeout = _make_handler_class(coordinator).timeout
+    assert timeout is not None, "handler sockets have no read timeout"
+    assert 0 < timeout < HANDLER_TIMEOUT_SEC
 
 
 # ----------------------------------------------------------------------
@@ -8635,7 +8904,12 @@ def test_fresh_arm_reads_only_the_fresh_hash_predicate(
     _u3b_doctor(monkeypatch, fresh_hash_differs=True, stale_hash_differs=False)
     body = _u3b_read(client, sid, path, _hash("canonical"))
 
-    assert body == {"status": "fresh", "version": 2, "hash_differs": True}
+    # #278: a mismatch the fresh arm reports also carries the out-of-band
+    # notice as context; the payload keys are what this test is about.
+    assert {key: body[key] for key in body if key != "hookSpecificOutput"} == {
+        "status": "fresh", "version": 2, "hash_differs": True,
+    }
+    assert "permissionDecision" not in body["hookSpecificOutput"]
     assert server.counters_snapshot()["fresh_shared_hash_mismatch_total"] == before + 1
 
 
@@ -8945,6 +9219,50 @@ def test_summary_reports_a_write_only_when_the_version_moved() -> None:
     assert hp.summary_reports_a_write(_summary(current_version=1,
                                                prior_version_seen_by_session=1,
                                                hash_differs=True))
+
+
+def test_summary_reports_an_out_of_band_change_only_when_bytes_moved_without_a_version() -> None:
+    """#278: the version this session saw is still current, yet its bytes
+    differ -- so no commit explains them. Asserted on both sides."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    assert hp.summary_reports_an_out_of_band_change(
+        _summary(current_version=1, prior_version_seen_by_session=1, hash_differs=True))
+    assert not hp.summary_reports_an_out_of_band_change(
+        _summary(current_version=2, prior_version_seen_by_session=1, hash_differs=True))
+    assert not hp.summary_reports_an_out_of_band_change(
+        _summary(current_version=1, prior_version_seen_by_session=1, hash_differs=False))
+    assert not hp.summary_reports_an_out_of_band_change(
+        _summary(prior_version_seen_by_session=None, hash_differs=True))
+
+
+def test_deny_for_bytes_changed_outside_the_coordinator_names_no_writer() -> None:
+    """#278: the strict deny no longer attributes an out-of-band change to the
+    last committer at the time of its commit -- a write that did not make the
+    change, at a time it was not made. It names what happened, tells the
+    session to leave the file alone and tell its user -- a re-read is denied
+    again, and putting the old bytes back would discard the change -- from
+    per-artifact fields only, so it stays byte-stable. Only a caller denying a
+    reader that holds a valid grant asks for it; the same summary without that
+    flag keeps the write template."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    summary = _summary(current_version=1, prior_version_seen_by_session=1, hash_differs=True)
+    reason = hp.emit_strict_deny(
+        source="test", summary=summary, out_of_band=True,
+    )["permissionDecisionReason"]
+    assert reason == (
+        "Stale read denied: docs/plan.md on disk no longer matches v1, the "
+        "version you last read, and no session committed the change, so it was "
+        "made outside the coordinator. Do not restore or overwrite docs/plan.md: "
+        "the change may be your user's work. Tell your user that docs/plan.md "
+        "changed outside the coordinator; the read stays denied until the change "
+        "is committed through the coordinator. This denial is structural (v0.2 "
+        "strict mode); retrying the same operation will produce the same denial."
+    )
+    assert "was updated by" not in reason
+    unflagged = hp.emit_strict_deny(source="test", summary=summary)["permissionDecisionReason"]
+    assert "outside the coordinator" not in unflagged
 
 
 def test_deny_after_a_real_commit_still_names_the_writer_and_the_version() -> None:
@@ -15863,3 +16181,367 @@ def test_a_notice_pop_for_an_abandoned_request_does_not_wait_for_the_registry(
     pop.join(_ABANDONED_BODY_SETTLE_SEC)
     assert returned_while_held, "the abandoned pop waited on the registry lock"
     assert popped == [[]]
+
+
+# ----------------------------------------------------------------------
+# #278 -- a reader whose file changed outside the coordinator is told so
+#
+# A change that reaches the disk without a commit -- a script, an editor, a
+# shell write the giver check does not recognise -- leaves the recorded
+# version and hash where they were. A reader holding a valid grant then reads
+# bytes the coordinator never recorded. Its answer used to carry only a
+# top-level hash_differs flag the model never sees (warn mode), or a deny that
+# named the last committer at the time of its commit (strict mode).
+# ----------------------------------------------------------------------
+
+
+def test_a_successor_reading_a_file_changed_outside_the_coordinator_is_told_after_its_provenance(
+    coordinator, client: _Client,
+) -> None:
+    """#278: the giver of a live handoff changes plan.md out of band. The
+    successor's next read carries its handoff provenance and then the
+    out-of-band notice, in one context-only envelope -- no permission
+    decision. Fails if the notice is missing, comes first, or widens the
+    answer to an allow."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    before, after = _hash("v1"), _hash("v1 and a line the giver appended")
+    seeded = client.post("/hooks/pre-read",
+                         {"session_id": str(uuid.uuid4()), "path": "plan.md", "content_hash": before})
+    assert seeded[0] == 200, seeded
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+
+    def read(content_hash: str) -> tuple[int, dict]:
+        return client.post(
+            "/hooks/pre-read",
+            {"session_id": successor.sid, "path": "plan.md", "content_hash": content_hash},
+            principal=successor.principal,
+        )
+
+    read(before)
+    status, clean = read(before)
+    assert status == 200 and clean["status"] == "fresh" and "hash_differs" not in clean, clean
+    provenance = clean["hookSpecificOutput"]["additionalContext"]
+
+    status, body = read(after)
+    assert status == 200 and body["status"] == "fresh" and body["hash_differs"] is True, body
+    assert body["hookSpecificOutput"] == {
+        "hookEventName": "PreToolUse",
+        "additionalContext": provenance + "\n\n"
+        + hp.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(path="plan.md", version=1),
+    }
+
+
+def test_a_strict_reader_whose_file_changed_outside_the_coordinator_is_denied_naming_no_writer(
+    strict_plan_coordinator, strict_plan_client: _Client,
+) -> None:
+    """#278: in strict mode the same read is denied, and the deny says the
+    file changed outside the coordinator rather than naming the last
+    committer -- here no session has committed at all, so the old text named
+    'agent <unknown>' at the file's registration time. The retry is
+    byte-identical. Fails if the out-of-band arm falls back to the write
+    template."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    client = strict_plan_client
+    reader = str(uuid.uuid4())
+    before, after = _hash("v1"), _hash("changed outside the coordinator")
+    first = client.post("/hooks/pre-read", {"session_id": reader, "path": "plan.md", "content_hash": before})
+    assert first[0] == 200 and first[1]["status"] == "fresh", first
+
+    status, body = client.post(
+        "/hooks/pre-read", {"session_id": reader, "path": "plan.md", "content_hash": after})
+    assert status == 200
+    assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
+    assert body["hookSpecificOutput"]["permissionDecisionReason"] == (
+        hp.OUT_OF_BAND_DENY_REASON_TEMPLATE.format(path="plan.md", current_version=1))
+    retry = client.post(
+        "/hooks/pre-read", {"session_id": reader, "path": "plan.md", "content_hash": after})
+    assert retry[1]["hookSpecificOutput"] == body["hookSpecificOutput"]
+
+
+def test_a_verify_only_fence_read_of_a_changed_file_carries_no_out_of_band_notice(
+    coordinator, client: _Client,
+) -> None:
+    """#278: a verify_only read is the effect fence comparing comparands; it
+    discards its bytes and is not a read the model acts on, so the notice
+    meant for a reader stays off it. Fails if the notice reaches a fence read."""
+    reader = str(uuid.uuid4())
+    seeded = client.post(
+        "/hooks/pre-read", {"session_id": reader, "path": "plan.md", "content_hash": _hash("v1")})
+    assert seeded[0] == 200 and seeded[1]["status"] == "fresh", seeded
+
+    status, body = client.post("/hooks/pre-read", {
+        "session_id": reader, "path": "plan.md",
+        "content_hash": _hash("changed outside the coordinator"), "verify_only": True})
+
+    assert status == 200 and body["status"] == "fresh", body
+    assert "outside the coordinator" not in json.dumps(body), body
+
+
+def test_a_strict_reader_a_peer_invalidated_without_a_commit_keeps_the_grant_change_deny(
+    strict_plan_coordinator, strict_plan_client: _Client,
+) -> None:
+    """#278: the out-of-band wording belongs to a reader that still holds a
+    valid grant. A reader whose grant a peer's pre-edit revoked -- no commit,
+    so the version is unchanged -- and who then hashes the peer's bytes is
+    denied with the text its summary picked before #278: that writer went
+    through the coordinator. Fails if the out-of-band template answers this
+    arm."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    client = strict_plan_client
+    reader, writer = str(uuid.uuid4()), str(uuid.uuid4())
+    first = client.post("/hooks/pre-read", {"session_id": reader, "path": "plan.md", "content_hash": _hash("v1")})
+    assert first[0] == 200 and first[1]["status"] == "fresh", first
+    edit = client.post("/hooks/pre-edit", {"session_id": writer, "path": "plan.md"})
+    assert edit[0] == 200 and edit[1]["ok"] is True, edit
+
+    status, body = client.post(
+        "/hooks/pre-read",
+        {"session_id": reader, "path": "plan.md", "content_hash": _hash("the writer's bytes")})
+
+    assert status == 200 and body["status"] == "stale", body
+    summary = body["summary"]
+    assert (summary["current_version"], summary["prior_version_seen_by_session"]) == (1, 1), summary
+    reason = body["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "outside the coordinator" not in reason, reason
+    assert reason == hp.emit_strict_deny(source="pre_read_strict_deny", summary=summary)[
+        "permissionDecisionReason"]
+
+
+# ----------------------------------------------------------------------
+# #278 -- a writer about to overwrite a change made outside the coordinator
+#
+# Pre-edit carries no content hash, and post-edit records whatever hash it is
+# sent, so a session that writes a whole file from an earlier read replaced a
+# change made out of band with nothing on the wire to notice: the version
+# moved, the record looked clean, and the change was gone. Pre-edit now hashes
+# the file on disk itself -- the coordinator runs on the workspace's host -- and
+# compares it with the recorded content before the write lands.
+# ----------------------------------------------------------------------
+
+
+def _bytes_hash(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def test_status_full_tier_reports_each_files_foreign_write_counts(
+    coordinator, client: _Client,
+) -> None:
+    """#278: the foreign-write detector's per-file counts reach /status at the
+    operator tier as a ``foreign_writes`` key -- only on an entry with counts,
+    so every other entry keeps its bytes -- and nowhere below it. They used to
+    be readable only through the offline report. Fails if the key is missing
+    at the full tier, or leaks to the default tier."""
+    _seed_with_disk(coordinator, client, "plan.md", b"v1\n")
+    _seed_with_disk(coordinator, client, "spec.md", b"spec\n")
+    plan = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    coordinator.registry.record_foreign_write(plan, "lag_suppressed", _bytes_hash(b"v2\n"))
+    coordinator.registry.record_foreign_write(plan, "foreign", _bytes_hash(b"v2\n"))
+
+    _status, full = client.get(
+        "/status?detail=full", headers_override={"Coherence-Local-Operator": "true"})
+    entries = {entry["path"]: entry for entry in full["tracked_artifacts"]}
+    assert entries["plan.md"]["foreign_writes"] == {"foreign": 1, "lag_suppressed": 1}
+    assert "foreign_writes" not in entries["spec.md"]
+
+    _status, minimal = client.get("/status")
+    assert all("foreign_writes" not in entry for entry in minimal["tracked_artifacts"])
+
+
+def _seed_with_disk(coordinator, client: _Client, path: str, data: bytes) -> str:
+    """Write ``data`` to ``path`` and record it through a hashed first read, so
+    the coordinator's content claim is exactly those bytes. Answers the
+    reader's session id."""
+    (coordinator.coordinator_root / path).parent.mkdir(parents=True, exist_ok=True)
+    (coordinator.coordinator_root / path).write_bytes(data)
+    reader = str(uuid.uuid4())
+    status, body = client.post(
+        "/hooks/pre-read", {"session_id": reader, "path": path, "content_hash": _bytes_hash(data)})
+    assert status == 200 and body["status"] == "fresh", body
+    return reader
+
+
+def test_pre_edit_on_a_file_changed_outside_the_coordinator_flags_it_and_warns(
+    coordinator, client: _Client,
+) -> None:
+    """#278: the file on disk no longer holds the recorded content and no
+    commit explains it. Pre-edit still admits -- a write is the one way out of
+    an out-of-band change -- but answers disk_differs for a client that reads
+    keys, and the out-of-band notice as context only for the model. Fails if
+    the acquire answers a bare ok."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    writer = _seed_with_disk(coordinator, client, "plan.md", b"# plan\n- a\n")
+    (coordinator.coordinator_root / "plan.md").write_bytes(b"# plan\n- a\n- appended out of band\n")
+
+    status, body = client.post("/hooks/pre-edit", {"session_id": writer, "path": "plan.md"})
+
+    assert status == 200
+    assert body == {
+        "ok": True,
+        "disk_differs": True,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": hp.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(path="plan.md", version=1),
+        },
+    }
+
+
+@pytest.mark.parametrize("case", ["unchanged", "no-claim", "missing", "own-commit-landing"])
+def test_pre_edit_answers_a_bare_ok_when_the_disk_explains_nothing_new(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    """#278: the controls. Disk matching the record, a record with no content
+    claim, a file that is not there to hash, and the caller's own commit
+    still reaching the disk all answer exactly {"ok": true}, as before. Fails
+    if the check fires on any of them."""
+    data = b"# plan\n- a\n"
+    if case == "no-claim":
+        (coordinator.coordinator_root / "plan.md").write_bytes(data)
+        writer = str(uuid.uuid4())
+        assert client.post("/hooks/pre-read", {"session_id": writer, "path": "plan.md"})[0] == 200
+        (coordinator.coordinator_root / "plan.md").write_bytes(data + b"- later\n")
+    else:
+        writer = _seed_with_disk(coordinator, client, "plan.md", data)
+    if case == "missing":
+        (coordinator.coordinator_root / "plan.md").unlink()
+    if case == "own-commit-landing":
+        (coordinator.coordinator_root / "plan.md").write_bytes(data + b"- mine, not yet flushed\n")
+        _patch_last_writer(monkeypatch, coordinator,
+                           writer=session_to_agent_id(writer), ts=time.time())
+
+    assert client.post("/hooks/pre-edit", {"session_id": writer, "path": "plan.md"}) == (
+        200, {"ok": True})
+
+
+def test_pre_edit_in_strict_mode_warns_about_an_out_of_band_change_and_admits(
+    strict_plan_coordinator, strict_plan_client: _Client,
+) -> None:
+    """#278: strict mode admits too. A strict read is already denied until a
+    commit lands, so denying the write as well would leave the file with no
+    way out through the hooks. Fails if the out-of-band check denies."""
+    writer = _seed_with_disk(strict_plan_coordinator, strict_plan_client, "plan.md", b"v1\n")
+    (strict_plan_coordinator.coordinator_root / "plan.md").write_bytes(b"v1\nchanged by a script\n")
+
+    status, body = strict_plan_client.post(
+        "/hooks/pre-edit", {"session_id": writer, "path": "plan.md"})
+
+    assert status == 200 and body["ok"] is True and body["disk_differs"] is True, body
+    assert "permissionDecision" not in body["hookSpecificOutput"]
+
+
+def test_a_successor_about_to_overwrite_its_givers_out_of_band_change_is_warned(
+    coordinator, client: _Client,
+) -> None:
+    """#278, the reported scenario: the successor read plan.md, the giver then
+    appended to it out of band, and the successor is about to write the whole
+    file from its earlier read. Its pre-edit answers disk_differs, and the
+    notice follows the handoff prose. Fails if the successor's acquire tells it
+    nothing about the change it is about to replace."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    original = b"# plan\n- a\n"
+    _seed_with_disk(coordinator, client, "plan.md", original)
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    for _ in range(2):
+        status, _body = client.post(
+            "/hooks/pre-read",
+            {"session_id": successor.sid, "path": "plan.md", "content_hash": _bytes_hash(original)},
+            principal=successor.principal)
+        assert status == 200
+    (coordinator.coordinator_root / "plan.md").write_bytes(original + b"- x giver appended\n")
+
+    status, body = _verb(client, "/hooks/pre-edit", successor, "plan.md")
+
+    assert status == 200 and body["ok"] is True and body["disk_differs"] is True, body
+    context = body["hookSpecificOutput"]["additionalContext"]
+    assert context.startswith("Handoff: agent "), context
+    assert context.endswith(hp.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(path="plan.md", version=1))
+    assert "permissionDecision" not in body["hookSpecificOutput"]
+
+
+def test_a_strict_stale_editor_of_a_changed_file_gets_its_deny_unchanged(
+    strict_plan_coordinator, strict_plan_client: _Client,
+) -> None:
+    """#278: the disk check runs after an admitted acquire only, so a refused
+    editor's answer keeps its bytes -- no disk_differs, no notice -- even when
+    the file also changed out of band. Fails if the check moves ahead of the
+    strict stale-edit deny."""
+    client = strict_plan_client
+    root = strict_plan_coordinator.coordinator_root
+    reader = _seed_with_disk(strict_plan_coordinator, client, "plan.md", b"v1\n")
+    writer = str(uuid.uuid4())
+    assert client.post("/hooks/pre-edit", {"session_id": writer, "path": "plan.md"})[1]["ok"] is True
+    (root / "plan.md").write_bytes(b"v2\n")
+    client.post("/hooks/post-edit", {
+        "session_id": writer, "path": "plan.md", "content_hash": _bytes_hash(b"v2\n"), "success": True})
+    (root / "plan.md").write_bytes(b"v2\nchanged by a script\n")
+
+    status, body = client.post("/hooks/pre-edit", {"session_id": reader, "path": "plan.md"})
+
+    assert status == 200 and body["ok"] is False and body["status"] == "stale", body
+    assert "disk_differs" not in body and "outside the coordinator" not in json.dumps(body), body
+
+
+def test_the_giver_of_a_live_handoff_editing_a_changed_file_gets_its_deny_unchanged(
+    coordinator, client: _Client,
+) -> None:
+    """#278: the giver's pre-edit deny answers before any acquire, so it never
+    reaches the disk check. Fails if a refused giver is told disk_differs."""
+    _seed_with_disk(coordinator, client, "plan.md", b"# plan\n")
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    (coordinator.coordinator_root / "plan.md").write_bytes(b"# plan\n- the giver's shell append\n")
+
+    status, body = _verb(client, "/hooks/pre-edit", giver, "plan.md")
+
+    assert status == 200 and body["ok"] is False, body
+    assert "disk_differs" not in body and "outside the coordinator" not in json.dumps(body), body
+
+
+@pytest.mark.parametrize("peer", ["writing", "committed", "gone-quiet"])
+def test_pre_edit_behind_a_peer_flags_only_what_no_write_in_flight_explains(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, peer: str,
+) -> None:
+    """#278: a peer that acquired the file and is still active has a write in
+    flight, and its bytes can reach the disk before its commit does. That is
+    the coordinator's own concurrent write, which the collision warning
+    already names, not a change made outside it -- the rule the foreign-write
+    detector applies. A peer that committed (its write landed) or went quiet
+    explains nothing, so the check still runs behind it. Fails if pre-edit
+    calls a peer's in-flight write out-of-band, or stops checking behind a
+    committed or quiet peer."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    original = b"# plan\n- a\n"
+    _seed_with_disk(coordinator, client, "plan.md", original)
+    holder, editor = str(uuid.uuid4()), str(uuid.uuid4())
+    acquired = client.post("/hooks/pre-edit", {"session_id": holder, "path": "plan.md"})
+    assert acquired == (200, {"ok": True}), acquired
+    peer_bytes = original + b"- the peer's edit\n"
+    (coordinator.coordinator_root / "plan.md").write_bytes(peer_bytes)
+    version = 1
+    if peer == "committed":
+        committed = client.post("/hooks/post-edit", {
+            "session_id": holder, "path": "plan.md",
+            "content_hash": _bytes_hash(peer_bytes), "success": True})
+        assert committed[0] == 200, committed
+        version = 2
+        (coordinator.coordinator_root / "plan.md").write_bytes(peer_bytes + b"- out of band\n")
+    if peer == "gone-quiet":
+        later = time.time() + 60
+        monkeypatch.setattr(hp, "now_unix", lambda: later)
+
+    status, body = client.post("/hooks/pre-edit", {"session_id": editor, "path": "plan.md"})
+
+    assert status == 200 and body["ok"] is True and body["collision"] is True, body
+    notice = hp.OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(path="plan.md", version=version)
+    context = body["hookSpecificOutput"]["additionalContext"]
+    if peer == "writing":
+        assert "disk_differs" not in body and notice not in context, body
+    else:
+        assert body["disk_differs"] is True and context.endswith(notice), body
