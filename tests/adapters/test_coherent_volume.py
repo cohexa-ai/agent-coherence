@@ -62,6 +62,7 @@ from ccs.core.exceptions import (
     CoherenceDegradedWarning,
     CoherenceError,
     CommitPreempted,
+    CoordinatorFailed,
     CoordinatorUnreachable,
     StaleView,
     ViewWedged,
@@ -5955,12 +5956,12 @@ _UNCONFIRMED_PRE_READ_ANSWERS: dict[str, dict[str, object] | None] = {
 }
 #: What each of them raises: only the request that got no answer at all is
 #: "coordinator unreachable". The other two came from a coordinator that was
-#: reached, so they keep the plain error (an answer that decides nothing is
-#: still an answer).
+#: reached (an answer that decides nothing is still an answer): the watchdog
+#: body keeps the plain error, and the failure envelope is typed (#259).
 _UNCONFIRMED_PRE_READ_RAISES: dict[str, type[CoherenceError]] = {
     "watchdog": CoherenceError,
     "transport": CoordinatorUnreachable,
-    "envelope": CoherenceError,
+    "envelope": CoordinatorFailed,
 }
 
 

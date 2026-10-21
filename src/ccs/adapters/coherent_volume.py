@@ -89,6 +89,7 @@ from ccs.core.exceptions import (
     HANDOFF_NOT_LIVE_REASON,
     HANDOFF_NOT_SUCCESSOR_REASON,
     OCC_CALLER_TRANSIENT_REASON,
+    SPLIT_PAIR_REASON,
     STALE_READ_GENERATION_REASON,
     CallerPrincipalRefused,
     CasRetriesExhausted,
@@ -97,6 +98,7 @@ from ccs.core.exceptions import (
     CoherenceError,
     CommitPreempted,
     CommitUnconfirmed,
+    CoordinatorFailed,
     CoordinatorUnreachable,
     GiverFenced,
     HandoffPathsInvalid,
@@ -106,6 +108,7 @@ from ccs.core.exceptions import (
     RemoteAuthFailed,
     StaleView,
     ViewWedged,
+    _is_handler_failure_reason,
 )
 from ccs.core.fence import confirmed_generation
 
@@ -319,6 +322,22 @@ _PUBLISH_UNANSWERED_MESSAGE = (
 )
 
 
+def _publish_failed_message(reason: str) -> str:
+    """What a multi-member atomic_publish raises
+    (:class:`~ccs.core.exceptions.CommitUnconfirmed`) when the coordinator
+    answered its batch commit with its failure envelope (#259): the work
+    raised, possibly after the batch was recorded. A recorded batch moves the
+    versions while the old bytes stay on disk, so the text says to judge by
+    content. ``reason`` is the envelope's, an exception's type."""
+    return (
+        f"atomic_publish commit was answered with a coordinator failure ({reason}); "
+        "whether the batch landed at the coordinator is unknown, and no file was "
+        "written. Re-read every member, and retry only if the publish is absent: "
+        "judge by the content read back, not the versions, which can move to this "
+        "batch while the old bytes are still on disk."
+    )
+
+
 def _publish_not_recorded_message(detail: str) -> str:
     """What a strict multi-member atomic_publish raises
     (:class:`~ccs.core.exceptions.CoordinatorUnreachable`) when the
@@ -340,6 +359,33 @@ def _unanswered_cas_message(rel: str) -> str:
         f"OCC commit of {rel} could not be confirmed: the coordinator gave no "
         "usable answer, so whether it landed is unknown, and the write did not "
         "touch disk. Re-read, and retry only if it is absent."
+    )
+
+
+def _is_failure_envelope(resp: object) -> bool:
+    """Whether ``resp`` is the coordinator's failure envelope, HTTP 200
+    ``{"ok": false, "reason": "internal: <Type>"}``: what it answers when a
+    route's work, or the caller-principal gate's store read, raised (#259)."""
+    return (
+        isinstance(resp, dict)
+        and resp.get("ok") is False
+        and _is_handler_failure_reason(resp.get("reason"))
+    )
+
+
+def _failed_cas_message(rel: str, reason: str) -> str:
+    """What an OCC commit raises (:class:`~ccs.core.exceptions.CommitUnconfirmed`)
+    when the coordinator answered it with its failure envelope: the work
+    raised, possibly after the commit was recorded, so whether it landed is
+    unknown, and CAS-first means the bytes never touched disk. A landed commit
+    moves the version while the old bytes stay on disk, so the text says to
+    judge by content. ``reason`` is the envelope's, an exception's type."""
+    return (
+        f"OCC commit of {rel} was answered with a coordinator failure ({reason}), "
+        "so whether it landed is unknown, and the write did not touch disk. "
+        "Re-read, and retry only if it is absent: judge by the content read back, "
+        "not the version, which can move to this commit while the old bytes are "
+        "still on disk."
     )
 
 
@@ -371,6 +417,21 @@ def _unanswered_write_message(rel: str, no_answer: _CommitNotAnswered) -> str:
     return (
         f"The write's bytes are on disk at {rel}, but {recorded}. One best-effort "
         "release of its grant was attempted. Re-read the path before writing it again."
+    )
+
+
+def _failed_write_message(rel: str, reason: str) -> str:
+    """What write() raises (:class:`~ccs.core.exceptions.CommitUnconfirmed`)
+    when the coordinator answered its commit (post-edit) with its failure
+    envelope: the bytes are on disk, and the work may have recorded the
+    version before it raised. Worded like the unanswered commit's text,
+    whose release it shares. ``reason`` is the envelope's, an exception's
+    type."""
+    return (
+        f"The write's bytes are on disk at {rel}, but the coordinator answered its "
+        f"commit with a failure ({reason}), so it may have recorded the write. One "
+        "best-effort release of its grant was attempted. Re-read the path before "
+        "writing it again."
     )
 
 
@@ -686,7 +747,10 @@ class CoherentVolume:
       may have reached the coordinator — which raises
       :class:`~ccs.core.exceptions.CommitUnconfirmed`. A :meth:`write` whose
       commit gets no answer first sends one best-effort release of its grant,
-      and its error says the bytes are on disk.
+      and its error says the bytes are on disk. A read the coordinator answers
+      with its failure envelope raises
+      :class:`~ccs.core.exceptions.CoordinatorFailed`; a commit it answers that
+      way raises ``CommitUnconfirmed`` in both modes, because it may have landed.
     - ``"degrade"``: the same conditions warn once
       (:class:`~ccs.core.exceptions.CoherenceDegradedWarning`) and the appliance
       operates best-effort (coherence may be off). Mirrors the other adapters.
@@ -1532,9 +1596,11 @@ class CoherentVolume:
 
         Raises ``FileNotFoundError`` for a missing file (no phantom artifact is
         seeded). Under ``on_error="strict"`` a coordinator-infrastructure
-        failure (unavailable coordinator, watchdog timeout, a coordinator-side
-        error answering the pre-read) raises ``CoherenceError`` — a read whose
-        coherence cannot be registered fails closed.
+        failure raises — a read whose coherence cannot be registered fails
+        closed: an unavailable coordinator raises ``CoordinatorUnreachable``, a
+        coordinator-side error answering the pre-read (its failure envelope)
+        raises ``CoordinatorFailed``, and a watchdog timeout raises
+        ``CoherenceError``.
 
         **Not thread-safe (A5).** Overlapping use of this instance from another
         thread raises ``CoherenceError`` (the single-op guard) — one instance per
@@ -1587,7 +1653,7 @@ class CoherentVolume:
                     f"coordinator watchdog timeout during read of {rel}"
                 )
             elif isinstance(resp, dict) and resp.get("ok") is False:
-                self._fail_closed_or_degrade(self._pre_read_failure(resp, rel))
+                self._failed_read_or_degrade(resp, rel)
             elif _enforce_stale and self._on_stale_read == "raise" and denied:
                 # PH-A read-surface instance (opt-in): surface a strict
                 # foreign-edit / stale-view deny as StaleView so the caller can
@@ -1647,7 +1713,10 @@ class CoherentVolume:
         :class:`~ccs.core.exceptions.CoordinatorUnreachable` when the commit
         never left (the coordinator did not record the write) or
         :class:`~ccs.core.exceptions.CommitUnconfirmed` (it may have); either
-        way, re-read before writing again.
+        way, re-read before writing again. A commit the coordinator answers
+        with its failure envelope may have been recorded too, so it raises
+        ``CommitUnconfirmed`` in both modes, after the same release, never the
+        ``CommitPreempted`` of a post-edit preempt.
 
         **Not thread-safe (A5).** Overlapping use of this instance from another
         thread raises ``CoherenceError`` (the single-op guard) — one instance per
@@ -1802,6 +1871,15 @@ class CoherentVolume:
                 f"coordinator request to /hooks/post-edit failed: HTTP {redirect_status}, "
                 "a redirect, which this client never follows"
             )
+        if _is_failure_envelope(post_resp):
+            # The coordinator's failure envelope (#259): the commit's work raised,
+            # and it records the version before it updates the writer, so the
+            # write may have landed; never the preempt below, which says it did
+            # not. In both modes, as a deny is. The grant is released first, as
+            # for a commit that got no answer, so it does not block every peer
+            # until a re-mint.
+            self._release_unconfirmed_grant(rel)
+            raise CommitUnconfirmed(_failed_write_message(rel, post_resp["reason"]))
         if post_resp is not None:
             # ok:false here means the grant was preempted / sweep-reclaimed mid-
             # write (a concurrent-writer case v1 does not claim to serialize);
@@ -2259,22 +2337,13 @@ class CoherentVolume:
             # commit_unconfirmed degrade body — ALWAYS raises in both modes.
             # Nothing was written to disk (the CAS did not win). Type the terminal
             # so the MCP deny mapper classifies by exception type, not a substring
-            # of the (verbatim) coordinator prose:
-            #  - commit_unconfirmed degrade body → CommitUnconfirmed (re-read, retry
-            #    only if absent — the false-negative-ack window);
+            # of the (verbatim) coordinator prose: the unknown outcomes and the
+            # giver's fence first (_raise_unsettled_cas, shared with write_cas_at),
+            # then
             #  - a permission-style deny → StaleView (recoverable by reacquire);
             #  - anything else (corruption: commit_cas_corruption / expected>current)
-            #    → plain CoherenceError → the mapper fails it closed as internal_error;
-            #  - no string reason at all → the outcome is unknown → CommitUnconfirmed.
-            #  - the giver of a live handoff (#185) → GiverFenced, a terminal no
-            #    retry clears (it is not in _CAS_RETRY_REASONS, so the loop never
-            #    re-mints into it).
-            if resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
-                raise CommitUnconfirmed(self._deny_reason(resp))
-            if not isinstance(resp.get("reason"), str):
-                raise CommitUnconfirmed(_unclassifiable_cas_message(rel))
-            if resp.get("reason") == GIVER_FENCED_REASON:
-                raise self._giver_fenced(resp, rel)
+            #    → plain CoherenceError → the mapper fails it closed as internal_error.
+            self._raise_unsettled_cas(resp, rel)
             hook_output = resp.get("hookSpecificOutput")
             if isinstance(hook_output, dict) and hook_output.get("permissionDecisionReason"):
                 raise StaleView(self._deny_reason(resp))
@@ -2403,16 +2472,35 @@ class CoherentVolume:
                 reason=resp.get("reason"),
                 **self._refusal_generations(resp),
             )
-        # outcome == "raise": corruption or the commit_unconfirmed degrade body,
-        # or an answer with no string reason, whose outcome is unknown, or the
-        # giver of a live handoff (#185), a terminal no retry clears.
-        if resp.get("reason") == COMMIT_UNCONFIRMED_REASON:
-            raise CommitUnconfirmed(self._deny_reason(resp))
-        if not isinstance(resp.get("reason"), str):
-            raise CommitUnconfirmed(_unclassifiable_cas_message(rel))
-        if resp.get("reason") == GIVER_FENCED_REASON:
-            raise self._giver_fenced(resp, rel)
+        # outcome == "raise": an unknown outcome or the giver's fence
+        # (_raise_unsettled_cas, shared with write_cas), else corruption.
+        self._raise_unsettled_cas(resp, rel)
         raise CoherenceError(self._deny_reason(resp))
+
+    def _raise_unsettled_cas(self, resp: dict, rel: str) -> None:
+        """Raise for a non-winning OCC answer whose outcome is unknown, or that
+        fences the giver of a live handoff; return for any other refusal, which
+        the caller types. One copy for ``write_cas`` and ``write_cas_at``, so an
+        answer added here is classified the same on both:
+
+        - the ``commit_unconfirmed`` degrade body → ``CommitUnconfirmed`` (re-read,
+          retry only if absent — the false-negative-ack window);
+        - no string reason at all → the outcome is unknown → ``CommitUnconfirmed``;
+        - the coordinator's failure envelope (#259) → ``CommitUnconfirmed``: the
+          work raised, possibly after recording the commit. Never retried (not in
+          ``_CAS_RETRY_REASONS``), since a re-drive could land the write twice;
+        - the giver of a live handoff (#185) → ``GiverFenced``, a terminal no
+          retry clears (not in ``_CAS_RETRY_REASONS``, so no loop re-mints into it).
+        """
+        reason = resp.get("reason")
+        if reason == COMMIT_UNCONFIRMED_REASON:
+            raise CommitUnconfirmed(self._deny_reason(resp))
+        if not isinstance(reason, str):
+            raise CommitUnconfirmed(_unclassifiable_cas_message(rel))
+        if _is_failure_envelope(resp):
+            raise CommitUnconfirmed(_failed_cas_message(rel, reason))
+        if reason == GIVER_FENCED_REASON:
+            raise self._giver_fenced(resp, rel)
 
     def atomic_publish(
         self,
@@ -2439,8 +2527,8 @@ class CoherentVolume:
           - a peer commits a member in the capture→commit window →
             :class:`~ccs.core.exceptions.StaleView` (HELD; recover via
             :meth:`reacquire` + re-decide + retry); NOTHING committed, NO file written.
-          - the commit is answered as unconfirmed, or with no outcome this
-            client can classify →
+          - the commit is answered as unconfirmed, with the coordinator's
+            failure envelope, or with no outcome this client can classify →
             :class:`~ccs.core.exceptions.CommitUnconfirmed` in both ``on_error``
             modes; whether the batch committed is unknown, NO file written —
             re-read, and retry only if the publish is absent.
@@ -2650,6 +2738,12 @@ class CoherentVolume:
         # committed"), and never a TypeError from the substring test below.
         if not isinstance(reason, str):
             raise CommitUnconfirmed(_PUBLISH_UNCLASSIFIABLE_MESSAGE)
+        # The coordinator's failure envelope (#259): the batch's work raised,
+        # and it can raise after the batch was recorded, so this is the unknown
+        # too. Matched before the corruption test and the HELD conflict below,
+        # which would say nothing was published of a batch that may have landed.
+        if _is_failure_envelope(commit):
+            raise CommitUnconfirmed(_publish_failed_message(reason))
         # The giver of a live handoff (#185): a member of this batch is a path
         # this session handed off. The same typed terminal as the single-path
         # writes, never the HELD conflict below, whose recovery (reacquire and
@@ -3437,9 +3531,15 @@ class CoherentVolume:
         commit-lag window, whatever the cause: its own disk write not yet
         landed or failed, or an out-of-band edit made after it landed. Those
         split pairs are returned, not refused.
+
+        The refusal's instance ``reason`` is ``split_pair`` (#264), so a caller
+        tells it from every other stale view by value, not by its text; the
+        MCP answer stays ``stale_view``.
         """
         if result.split_pair:
-            raise StaleView(_SPLIT_READ_DENY_REASON)
+            refusal = StaleView(_SPLIT_READ_DENY_REASON)
+            refusal.reason = SPLIT_PAIR_REASON
+            raise refusal
 
     #: Whether the most recent read, by any read method, was refused by the
     #: coordinator (strict-mode deny); the public face is
@@ -3603,7 +3703,7 @@ class CoherentVolume:
                 elif resp.get("ok") is False:
                     # Degrade mode falls through with the fail-closed
                     # comparands: no version key → 0, no generation → None.
-                    self._fail_closed_or_degrade(self._pre_read_failure(resp, _rel))
+                    self._failed_read_or_degrade(resp, _rel)
                 version = self._pre_read_version(resp)
                 owner_generation = self._pre_read_owner_generation(resp)
                 # A strict-deny (INVALID, NOT re-granted — KTD-T) is the only
@@ -3662,10 +3762,10 @@ class CoherentVolume:
         separate statements and one can fail after another has recorded a
         SHARED grant. Either way the client cannot know the read's standing,
         so the answer is an unanswered request with a name: it goes through
-        ``_fail_closed_or_degrade`` exactly as a transport failure does
-        (strict raises, degrade warns and counts), never through the deny
-        arm (a deny is enforcement working and the read stays registered)
-        and never through as a registered read. Before this arm existed a
+        ``_failed_read_or_degrade`` (strict raises ``CoordinatorFailed``,
+        degrade warns and counts), never through the deny arm (a deny is
+        enforcement working and the read stays registered) and never through
+        as a registered read. Before this arm existed a
         strict volume returned the bytes with no view recorded, so a peer's
         later commit invalidated nothing and this instance's next write
         landed over it. The pre-read handler itself never answers an ``ok``
@@ -3872,6 +3972,17 @@ class CoherentVolume:
         if self._on_error == "strict":
             raise CoherenceError(message)
         self._record_degraded(message)
+
+    def _failed_read_or_degrade(self, resp: dict, rel: str) -> None:
+        """A pre-read the coordinator answered with ``ok: false``, which it does
+        only with its failure envelope. Strict raises the typed
+        :class:`~ccs.core.exceptions.CoordinatorFailed` for the envelope (#259),
+        and the untyped fail-closed error for any other such answer; degrade
+        warns once and counts, as for any infrastructure failure."""
+        message = self._pre_read_failure(resp, rel)
+        if self._on_error == "strict" and _is_failure_envelope(resp):
+            raise CoordinatorFailed(message)
+        self._fail_closed_or_degrade(message)
 
     def _unreachable_or_degrade(self, message: str, *, cause: BaseException | None = None) -> None:
         """No usable answer from the coordinator. Strict raises the typed

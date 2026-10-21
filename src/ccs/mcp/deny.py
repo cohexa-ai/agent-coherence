@@ -16,7 +16,10 @@ Two input types (plan §"Deny reason-flow"):
   via the ``.reason`` constant carried on the exception class — or, for the two
   types that carry the coordinator's reason per INSTANCE (``CasVersionConflict``,
   ``CallerPrincipalRefused``), by that reason's exact membership in its
-  vocabulary. The exception
+  vocabulary. The split-pair read refusal also carries a reason per instance
+  (``split_pair``, #264), but it is the client's own name for one kind of
+  ``StaleView``, not a coordinator reason, so it is answered by the class
+  constant like every other ``StaleView``. The exception
   *message* stays the verbatim coordinator ``permissionDecisionReason`` (it is
   surfaced as ``detail``; the model's retry loop depends on that byte-stability,
   auto-memory ``project_cc_strict_mode_retry_hazard``). An unrecognized
@@ -66,6 +69,7 @@ from ccs.core.exceptions import (
     CasVersionConflict,
     CommitPreempted,
     CommitUnconfirmed,
+    CoordinatorFailed,
     CoordinatorUnreachable,
     GiverFenced,
     InternalConcurrencyError,
@@ -118,6 +122,20 @@ COORDINATOR_UNREACHABLE_NEXT_STEP = (
     "the workspace's coordinator process first if the server will not start."
 )
 
+# The coordinator answered a read with its failure envelope (#259): something
+# raised inside it, and the envelope names only the exception's type, so a busy
+# store that clears by itself looks the same as a fault that repeats on every
+# call. The verb is the house stop, with one retry named in the words: an
+# unbounded ``wait_and_retry`` would loop forever on the fault. ``retryable``
+# stays false so a client that retries on that flag alone does not loop either.
+COORDINATOR_FAILED_RECOVER = GIVER_FENCED_RECOVER
+COORDINATOR_FAILED_NEXT_STEP = (
+    "The coordinator failed while answering this call, so nothing was confirmed. "
+    "Make the same call once more after a few seconds: a busy coordinator store "
+    "clears by itself. If it fails the same way again, stop and report to your "
+    "user or host that the coordinator is failing; do not keep retrying."
+)
+
 
 # Type A — matched by EXACT exception type (so a future subclass cannot silently
 # inherit a mapping). ``reason`` mirrors the constant carried on the exception
@@ -138,6 +156,12 @@ _TERMINALS: dict[type, _Terminal] = {
         COORDINATOR_UNREACHABLE_RECOVER,
         False,
         COORDINATOR_UNREACHABLE_NEXT_STEP,
+    ),
+    CoordinatorFailed: _Terminal(
+        CoordinatorFailed.reason,
+        COORDINATOR_FAILED_RECOVER,
+        False,
+        COORDINATOR_FAILED_NEXT_STEP,
     ),
 }
 

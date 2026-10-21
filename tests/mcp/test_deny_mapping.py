@@ -29,6 +29,7 @@ from ccs.core.exceptions import (
     CoherenceError,
     CommitPreempted,
     CommitUnconfirmed,
+    CoordinatorFailed,
     CoordinatorUnreachable,
     GiverFenced,
     InternalConcurrencyError,
@@ -244,6 +245,47 @@ def test_a_coordinator_unreachable_refusal_is_a_typed_stop_that_says_restart_and
     assert "try again" not in words.lower()
 
     assert deny_result(CoherenceError("coordinator gone")).structuredContent["reason"] == "internal_error"
+
+
+def test_a_coordinator_failed_read_is_a_stop_that_names_one_retry():
+    """#259. A strict read the coordinator answered with its failure envelope
+    raises ``CoordinatorFailed``. Without its own row it fell to
+    ``internal_error`` / ``none``. It maps to ``coordinator_failed`` with the
+    stop verb and ``retryable: false``, and its fixed next step names exactly
+    one retry before the report: the envelope names only an exception's type,
+    so a busy store and a fault that repeats on every call look the same, and
+    an unbounded ``wait_and_retry`` would loop forever on the fault. The
+    detail stays verbatim."""
+    exc = CoordinatorFailed(
+        "coordinator answered the read of data/x with a failure "
+        "(internal: OperationalError); the read is not confirmed as registered"
+    )
+
+    result = deny_result(exc)
+
+    sc = result.structuredContent
+    assert result.isError is True
+    assert (sc["reason"], sc["recover"], sc["retryable"]) == (
+        "coordinator_failed", "stop_and_report", False,
+    )
+    assert sc["detail"] == str(exc)
+    words = sc["next_step"]
+    assert [item.text for item in result.content[1:]] == [words]
+    for phrase in ("once more", "stop", "report", "do not keep retrying"):
+        assert phrase in words.lower(), phrase
+
+
+def test_a_split_pair_refusal_keeps_the_stale_view_answer():
+    """#264. The split-pair read refusal carries ``split_pair`` on its
+    instance so a Python caller tells it from other stale views, but the MCP
+    answer is the documented ``swg_read`` one: ``stale_view`` / ``reacquire``
+    / retryable, read from the class, never the instance."""
+    refusal = StaleView("split prose")
+    refusal.reason = "split_pair"
+
+    sc = deny_result(refusal).structuredContent
+
+    assert (sc["reason"], sc["recover"], sc["retryable"]) == ("stale_view", "reacquire", True)
 
 
 def test_a_coordinator_unreachable_subclass_does_not_inherit_the_mapping():

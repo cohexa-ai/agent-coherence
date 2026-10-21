@@ -2780,8 +2780,8 @@ class WorkspaceVersioner:
                 outcome=RESTORE_OUTCOME_HELD_UNCONFIRMED,
                 attempts=budget.attempts,
                 detail=(
-                    "the version-CAS commit could not be confirmed (transport "
-                    "failed mid-commit) — HELD, never best-effort"
+                    "the version-CAS commit could not be confirmed (no definite "
+                    "answer to the commit) — HELD, never best-effort"
                 ),
                 observation=OBSERVATION_NOT_RECORDED,
             )

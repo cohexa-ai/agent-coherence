@@ -49,6 +49,7 @@ from ccs.core.exceptions import (
     CasVersionConflict,
     CoherenceError,
     CommitUnconfirmed,
+    CoordinatorFailed,
     CoordinatorUnreachable,
     StaleView,
     ViewWedged,
@@ -1788,12 +1789,13 @@ def test_a_read_answered_with_the_failure_envelope_fails_closed(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A read whose pre-read the coordinator answers with its failure envelope
-    raises the read leg's infrastructure failure, naming the envelope's
-    reason, and records no observed hash. It is not a deny (``StaleView``):
-    nothing was decided about this reader's view.
+    raises ``CoordinatorFailed``, as the volume's strict reads do, naming the
+    envelope's reason, and records no observed hash. It is not a deny
+    (``StaleView``): nothing was decided about this reader's view.
 
     Prevents the answer passing as a clean pre-read: version 0, no deny, so
-    the read returned bytes whose registration nobody confirmed."""
+    the read returned bytes whose registration nobody confirmed. Also
+    prevents the two bindings typing one answer differently (#259)."""
     store = _FakeStore()
     store.seed(REF, b"v1")
     server = _serve_in_process(tmp_path, "substrate-read-envelope")
@@ -1805,7 +1807,7 @@ def test_a_read_answered_with_the_failure_envelope_fails_closed(
         with pytest.raises(CoherenceError) as raised:
             a.read(REF)
 
-        assert type(raised.value) is CoherenceError, type(raised.value)
+        assert type(raised.value) is CoordinatorFailed, type(raised.value)
         assert _INTERNAL_OPERATIONAL_ERROR in str(raised.value)
         assert REF in str(raised.value)
         assert REF not in a._observed_hash, "an observed hash was recorded for an unconfirmed read"
@@ -1836,10 +1838,79 @@ def test_a_commit_whose_pre_read_is_answered_with_the_failure_envelope_writes_no
         with pytest.raises(CoherenceError) as raised:
             a.commit(REF, expected_token=token, new_bytes=b"v2")
 
-        assert not isinstance(raised.value, CasVersionConflict), raised.value
+        # Nothing has landed yet, so it is the read leg's typed failure (#259),
+        # never CommitUnconfirmed, which would send the caller to reconcile a
+        # write that never happened.
+        assert type(raised.value) is CoordinatorFailed, type(raised.value)
         assert _INTERNAL_OPERATIONAL_ERROR in str(raised.value)
         assert fake.cas_calls == [], "the substrate was written on an unconfirmed pre-read"
         assert store.get(REF)[0] == b"v1"
+    finally:
+        server.shutdown()
+
+
+def test_a_reacquire_answered_with_the_failure_envelope_raises_coordinator_failed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reacquire whose re-read the coordinator answers with its failure
+    envelope raises ``CoordinatorFailed``, as a read does (#259): it is a read
+    leg, and nothing was written."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    server = _serve_in_process(tmp_path, "substrate-reacquire-envelope")
+    try:
+        sa = _session(tmp_path, fast_cfg)
+        a, _fake = _agent(store, sa)
+        a.read(REF)
+        _fail_the_next(server, monkeypatch)
+
+        with pytest.raises(CoherenceError) as raised:
+            a.reacquire(REF)
+
+        assert type(raised.value) is CoordinatorFailed, type(raised.value)
+        assert _INTERNAL_OPERATIONAL_ERROR in str(raised.value)
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"ok": False, "reason": "internal error: registry busy"},
+        {"ok": False, "reason": "x internal: y"},
+        {"ok": False},
+    ],
+    ids=["prose", "prefix-mid-string", "no-reason"],
+)
+def test_a_read_answered_ok_false_outside_the_envelope_stays_untyped(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    answer: dict[str, object],
+) -> None:
+    """Only a reason that starts with the envelope's exact prefix is typed. A
+    pre-read answered ``ok: false`` with any other reason (what a coordinator
+    that answers prose sends for a definite reject), or with none, keeps the
+    read leg's untyped fail-closed error: ``CoordinatorFailed`` names a retry,
+    which must never be offered for a definite reject."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    server = _serve_in_process(tmp_path, "substrate-read-prose")
+    try:
+        sa = _session(tmp_path, fast_cfg)
+        a, _fake = _agent(store, sa)
+        real_post = substrate_module._coordinator_post
+
+        def post(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            if path == "/hooks/pre-read":
+                return answer
+            return real_post(endpoint, path, payload, **kwargs)
+
+        monkeypatch.setattr(substrate_module, "_coordinator_post", post)
+        with pytest.raises(CoherenceError) as raised:
+            a.read(REF)
+
+        assert type(raised.value) is CoherenceError, type(raised.value)
     finally:
         server.shutdown()
 
