@@ -18,7 +18,8 @@ Alpha — APIs may change before `v1.0`.
   times out, and when a request that commits nothing gets no usable answer,
   including the caller-principal claim and the strict-glob check at attach. A
   coordinator that answers with a refusal raises what it raised before, unless
-  the claim sent to recover from a caller-principal refusal gets no answer. The
+  the claim sent to recover from a caller-principal refusal gets no answer; its
+  failure envelope is typed separately (#259, under Changed). The
   MCP server maps it to `coordinator_unavailable` with `recover:
   stop_and_report`, not retryable, because an attached volume never reaches a
   coordinator started after the old one went away; a server whose volume never
@@ -72,6 +73,14 @@ Alpha — APIs may change before `v1.0`.
   refusing it with the pair. The guide's "Reading a commit refusal's
   generation pair" section has the details.
 
+- **A versioned read refused as a split pair says so by value (#264).**
+  `read_with_version()` and `read_with_version_generation()` refuse a file
+  whose bytes are not the coordinator's content at the version it reports,
+  with a `StaleView` that was identical to every other stale view except for
+  its message. Its `reason` is now `split_pair` (`SPLIT_PAIR_REASON` in
+  `ccs.core.exceptions`); every other `StaleView` keeps `stale_view`, and
+  `swg_read` still answers the refusal as a `stale_view` deny.
+
 ### Changed
 
 - **A strict commit whose request was sent but got no answer raises
@@ -84,6 +93,26 @@ Alpha — APIs may change before `v1.0`.
   `internal_error`. A plain `write()` whose post-edit fails this way says its
   bytes are on disk, makes one short best-effort request to release its write
   grant, and never returns normally.
+
+- **A commit the coordinator answers with its failure envelope raises
+  `CommitUnconfirmed`, and a strict read raises the new `CoordinatorFailed`
+  (#259).** When something raises inside the coordinator, it answers HTTP 200
+  `{"ok": false, "reason": "internal: <Type>"}`, and on a commit it may already
+  have recorded the commit. The CAS of `write_cas` and `write_cas_at` raised a
+  plain `CoherenceError`, which `swg_write_cas` reported as `internal_error`,
+  `recover: none`; the post-edit of a plain `write()` raised `CommitPreempted`;
+  and `atomic_publish` said the batch was not published. All four raise
+  `CommitUnconfirmed` now, in both modes, so `swg_write` and `swg_write_cas`
+  answer `commit_unconfirmed` with `recover: read_then_retry`. A plain
+  `write()` says its bytes are on disk and first releases its write grant. A
+  strict read, on a `CoherentVolume` or a `CoordinatedSubstrate`, raised a
+  plain `CoherenceError`; it raises `CoordinatorFailed`, a `CoherenceError`
+  whose `reason` is `coordinator_failed`, and `swg_read` answers
+  `coordinator_failed` with `recover: stop_and_report`, `retryable: false`,
+  and a next step that names one retry, then a report. Degrade-mode reads, the
+  pre-edit's `StaleView`, and any reason without the `internal: ` prefix are
+  unchanged. The guide's "When the coordinator answers with a failure" section
+  has the details.
 
 - **`agent-coherence-migrate-rules --apply` refuses when it cannot take its
   lock (#376).** It used to print "proceeding without it" and rewrite

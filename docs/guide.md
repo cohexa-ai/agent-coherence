@@ -1271,7 +1271,7 @@ data = vol.reacquire("plans/plan.md")       # recover: clear the stale view + fr
 |---|---|---|
 | `workspace_root` | — | Directory the volume manages; the coordinator's state lives in `<root>/.coherence/` |
 | `managed` | `()` | Glob patterns for the files under coordination; unmanaged paths bypass the volume |
-| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
+| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A read the coordinator answers with its failure envelope raises `CoordinatorFailed`; see [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
 | `config` | `None` | Coordinator settings as a `LifecycleConfig` (`from ccs.adapters.claude_code.lifecycle import LifecycleConfig`); `None` uses the defaults. Only the volume that starts the coordinator applies it |
@@ -1392,8 +1392,9 @@ In strict mode, a volume that gets no usable answer from its coordinator raises
 coordinator that cannot be started or attached, a refused or timed-out
 connection, a reset, a listener that never answers, and an empty or unreadable
 reply, on every request that commits nothing. A coordinator that answers with a
-refusal, such as an HTTP error status, a watchdog `degraded` body or its
-`internal:` failure envelope, raises the error it raised before.
+refusal, such as an HTTP error status or a watchdog `degraded` body, raises the
+error it raised before. Its `internal:` failure envelope is covered in
+[When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure).
 
 A commit is different, because its request may have reached the coordinator
 before the answer was lost. When the CAS of `write_cas` or `write_cas_at`, the
@@ -1427,6 +1428,39 @@ no requests. During a graceful stop it answers `503` for a moment before it
 stops listening, and requests in that moment raise the error an HTTP status
 raised before. `on_error="degrade"` is unchanged: it warns once, counts every
 failure and falls back to plain IO.
+
+### When the coordinator answers with a failure
+
+When something raises inside the coordinator while it handles a request, such
+as a registry call that finds the store locked or a fault in its own code, it
+answers HTTP 200 `{"ok": false, "reason": "internal: <Type>"}`. The answer
+names only the exception's type, so a busy store, which clears by itself, looks
+the same as a fault that repeats on every call. On a commit, the coordinator
+may have recorded the commit before the error.
+
+- **A strict read raises `CoordinatorFailed`**, a `CoherenceError` whose
+  `reason` is `coordinator_failed` (import it from `ccs.core.exceptions`). That
+  covers `read()`, `read_with_version()`, `read_with_version_generation()`,
+  `reacquire()`, and the reads that `write_cas`, `write_cas_at` and `gate()`
+  make. The read is not confirmed as registered. Retry it once after a few
+  seconds; if it fails again, report the coordinator as failing. A
+  `CoordinatedSubstrate` raises the same type from `read()`, `reacquire()` and
+  the check `commit()` makes before its substrate write. `on_error="degrade"` is
+  unchanged: it warns once, counts, and returns the bytes at version 0.
+- **A commit raises `CommitUnconfirmed`** in both modes, because whether it
+  landed is unknown. That covers the CAS of `write_cas` and `write_cas_at`, the
+  batch of `atomic_publish`, and the post-edit of a plain `write()`. Re-read,
+  and judge by the content you read back, not the version: `write_cas`,
+  `write_cas_at` and `atomic_publish` write disk only after a confirmed
+  commit, so a commit the coordinator recorded moves the version while the old
+  bytes are still on disk. A plain `write()` has already put its bytes on disk;
+  its error says so, and it first releases its grant, as it does when a commit
+  gets no answer.
+- **A write's grant request** (the pre-edit of `write()`) answered this way
+  still raises `StaleView` and lands nothing.
+
+A reason without the `internal: ` prefix is not this envelope, and keeps the
+error it raised before.
 
 ### Atomic multi-file publish: `atomic_publish` (v0.12.0+)
 
@@ -1495,6 +1529,13 @@ script. The volume checks a content hash at both boundaries:
 
 A volume never denies its own just-written bytes: the benign window between a
 commit and its disk write is recognized and suppressed.
+
+Whatever `on_stale_read` says, the versioned reads (`read_with_version()`,
+`read_with_version_generation()` and the MCP `swg_read`) refuse a managed file
+whose bytes are not the coordinator's content at the version it reports,
+outside that same window. They raise `StaleView` whose `reason` is
+`split_pair`, so a caller can tell this refusal from every other stale view by
+value; `swg_read` answers it as a `stale_view` deny.
 
 These guards are **content-hash checks at the volume boundary** — best-effort
 point-in-time detection, not filesystem interception. An edit that bypasses the
@@ -3617,6 +3658,18 @@ commit that was sent and got no answer answers `commit_unconfirmed` with
 `internal_error` before. During a graceful stop the coordinator answers `503`
 for a moment before it stops listening, and calls in that moment still answer
 `internal_error`.
+
+**A coordinator that fails while answering.** When the coordinator answers a
+read with its `internal:` failure envelope ([details](#when-the-coordinator-answers-with-a-failure)),
+the tool call answers `reason: coordinator_failed` with
+`recover: stop_and_report` and `retryable: false`, and a `next_step` that tells
+the agent to make the same call once more after a few seconds and, if it fails
+the same way, to stop and report that the coordinator is failing. That covers
+`swg_read`, `swg_reacquire`, and the reads that `swg_write_cas` and `swg_gate`
+make; they answered `internal_error` before. A write whose commit gets that answer may
+have landed, so `swg_write` and `swg_write_cas` answer `commit_unconfirmed`
+with `recover: read_then_retry`, where `swg_write` answered `commit_preempted`
+and `swg_write_cas` answered `internal_error`.
 
 **Multiple sessions, one workspace.** Multiple `stale-write-guard-fs` instances
 pointed at the same `SWG_ROOT` attach to one coordinator, so a stale write is denied
