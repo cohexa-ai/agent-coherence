@@ -222,13 +222,21 @@ def test_pre_read_strict_shared_foreign_edit_denies(strict_client: _Client) -> N
     out = body["hookSpecificOutput"]
     assert out["permissionDecision"] == "deny"
     assert out["hookEventName"] == "PreToolUse"
-    assert "CLAUDE.md" in out["permissionDecisionReason"]
-    assert "Re-read" in out["permissionDecisionReason"]
+    # #278: named as a change made outside the coordinator. A re-read is
+    # denied again, so the text does not offer one; it says to tell the user.
+    from ccs.adapters.claude_code.hook_payloads import OUT_OF_BAND_DENY_REASON_TEMPLATE
+
+    assert out["permissionDecisionReason"] == OUT_OF_BAND_DENY_REASON_TEMPLATE.format(
+        path="CLAUDE.md", current_version=1)
 
 
 def test_pre_read_warn_shared_foreign_edit_still_allows(strict_client: _Client) -> None:
-    """Warn-mode unchanged: on a tracked-but-NOT-strict path the SHARED-holder
-    mismatch stays a fail-open allow + hash_differs (R1 warn preserved)."""
+    """Warn mode still admits: on a tracked-but-NOT-strict path the
+    SHARED-holder mismatch stays fail-open with hash_differs (R1 warn
+    preserved), and since #278 names the out-of-band change as context only --
+    never a permission decision."""
+    from ccs.adapters.claude_code.hook_payloads import OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE
+
     strict_client.post(
         "/hooks/pre-read",
         {"session_id": _sid("s1"), "path": "docs/plans/x.md", "content_hash": _hash("v1")},
@@ -238,7 +246,14 @@ def test_pre_read_warn_shared_foreign_edit_still_allows(strict_client: _Client) 
         {"session_id": _sid("s1"), "path": "docs/plans/x.md", "content_hash": _hash("foreign-v2")},
     )
     assert status == 200
-    assert body == {"status": "fresh", "version": 1, "hash_differs": True}
+    assert body == {
+        "status": "fresh", "version": 1, "hash_differs": True,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(
+                path="docs/plans/x.md", version=1),
+        },
+    }
 
 
 def test_pre_read_strict_shared_sentinel_never_denies(
@@ -2113,3 +2128,12 @@ def test_a_warn_path_re_armed_by_a_denied_command_still_edits(
         "/hooks/pre-edit", {"session_id": _sid("A"), "path": "docs/plans/x.md"},
     )
     assert _admitted(edit), edit
+
+
+def test_out_of_band_deny_reason_template_is_static() -> None:
+    """#278: the out-of-band arm of the strict deny is byte-stable like the
+    other two -- per-artifact placeholders only, no timestamp of any kind."""
+    from ccs.adapters.claude_code.hook_payloads import OUT_OF_BAND_DENY_REASON_TEMPLATE
+
+    actual = set(m.group(1) for m in re.finditer(r"\{([a-z_]+)\}", OUT_OF_BAND_DENY_REASON_TEMPLATE))
+    assert actual == {"path", "current_version"}

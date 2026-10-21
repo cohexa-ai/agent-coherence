@@ -1407,6 +1407,45 @@ def test_status_text_lists_a_handoff_after_the_artifacts_table(
     assert capsys.readouterr().out == expected
 
 
+def test_status_text_lists_changes_made_outside_the_coordinator_after_the_artifacts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#278: an entry carrying ``foreign_writes`` (the operator tier) gets one
+    line in a block after the artifacts table: the changes the detector found
+    on disk with no commit behind them, and the ones it excused as a write
+    still landing. A mediated count alone is no news and prints nothing.
+    Prevents a detected out-of-band change being visible only in --json."""
+    monkeypatch.setenv("COLUMNS", "80")
+    payload = _status_payload(foreign_writes={"foreign": 2, "lag_suppressed": 1, "mediated": 3})
+    payload["tracked_artifacts"][1]["foreign_writes"] = {"mediated": 4}
+
+    coherence_status._render_table(payload)
+
+    block = (
+        "Changes made outside the coordinator (counted by the foreign-write detector):\n"
+        "  plan.md: 2 foreign, 1 excused as a write still landing\n"
+        "\n"
+    )
+    expected = _STATUS_TEXT_WITHOUT_HANDOFF.replace("\nSessions:\n", "\n" + block + "Sessions:\n")
+    assert capsys.readouterr().out == expected
+
+
+def test_status_counters_print_the_hash_mismatch_counts(
+    capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#278: the two counters that move when a reader's bytes differ from the
+    recorded content print in the counter block, which shows them in the
+    table and in --detail metrics alike; they used to reach only --json."""
+    coherence_status._render_counter_block({
+        "fresh_shared_hash_mismatch_total": 3,
+        "shared_foreign_lag_suppressed_total": 1,
+    })
+
+    lines = capsys.readouterr().out.splitlines()
+    assert f"  {'fresh_shared_hash_mismatch_total':<40}  3" in lines
+    assert f"  {'shared_foreign_lag_suppressed_total':<40}  1" in lines
+
+
 def test_status_text_is_byte_identical_to_today_when_no_entry_carries_a_handoff(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

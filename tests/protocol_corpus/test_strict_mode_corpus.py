@@ -3,10 +3,10 @@
 
 """Cross-implementation strict-mode wire-shape corpus tests (plan Unit 7b).
 
-Parametrized over (fixture, backend) like the warn-mode corpus, but the
-fixtures only declare ``"backends": ["python"]`` — the Node coordinator does
-NOT ship strict-mode in v0.2 (strict mode lives on the Python coordinator
-only per § System-Wide Impact). Node parity is deferred to v0.3.
+Parametrized over (fixture, backend) like the warn-mode corpus. Each fixture
+runs on the backends its ``"backends"`` list names: most strict rows run on
+both the Python coordinator and the Claude Code plugin's Node coordinator,
+and a row scoped to one backend says why in its description.
 
 Marked ``protocol_corpus`` — opt-in via ``pytest -m protocol_corpus``."""
 
@@ -57,8 +57,8 @@ def test_strict_mode_fixture_response_matches_expected(
     fixture, backend = row
     if backend == BACKEND_NODE and _NODE_DIST_PATH is None:
         pytest.xfail(
-            "Node coordinator dist not resolvable; Node strict-mode is NOT "
-            "shipped in v0.2 anyway. v0.3 deferred."
+            "Node coordinator dist not resolvable. Build the plugin checkout "
+            "(npm ci && npm run build) or set AGENT_COHERENCE_PLUGIN_DIST_PATH."
         )
 
     actual_status, actual_body = run_scenario(

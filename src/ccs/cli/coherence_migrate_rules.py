@@ -24,21 +24,34 @@ not running the helper. The exit-codes are tuned for shell-scriptability:
 - 0: completed successfully (proposals printed, or --apply succeeded,
   or no rules detected)
 - 1: workspace root could not be resolved
-- 2: --apply confirmation declined, or settings.json could not be written
+- 2: --apply confirmation declined, its lock could not be taken, or
+  settings.json could not be written
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import ModuleType
 from typing import Sequence
 
 from ccs.adapters.claude_code.resolver import find_coordinator_root
+
+# A blocking LOCK_EX never yields EAGAIN, and Python already retries an
+# interrupted flock (PEP 475), so these retries are defensive. Any other
+# errno means the lock cannot be taken, and writing without it would let a
+# concurrent --apply or hand edit be clobbered, so --apply refuses instead.
+_LOCK_RETRY_ERRNOS = frozenset({errno.EINTR, errno.EAGAIN})
+_LOCK_ATTEMPTS = 3
+_LOCK_RETRY_PAUSE_SECONDS = 0.05
 
 
 @dataclass(frozen=True)
@@ -360,14 +373,52 @@ def main(argv: Sequence[str] | None = None) -> int:
     return _apply_entries(root, proposed, prompt_for_confirmation=not args.yes)
 
 
+def _lock_sidecar(fcntl_module: ModuleType, lock_path: Path) -> int:
+    """Open ``lock_path`` and take a blocking exclusive lock on it.
+
+    Returns the locked descriptor. An EINTR or EAGAIN is retried, up to
+    ``_LOCK_ATTEMPTS`` attempts in all; a failed lock is retried on the
+    descriptor already open, and a failed open opened nothing to close.
+    Any other ``OSError``, or the last retryable one, is raised with the
+    descriptor closed."""
+    lock_fd: int | None = None
+    attempt = 1
+    while True:
+        try:
+            if lock_fd is None:
+                lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl_module.flock(lock_fd, fcntl_module.LOCK_EX)
+            return lock_fd
+        except OSError as exc:
+            if exc.errno not in _LOCK_RETRY_ERRNOS or attempt >= _LOCK_ATTEMPTS:
+                if lock_fd is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(lock_fd)
+                raise
+        attempt += 1
+        time.sleep(_LOCK_RETRY_PAUSE_SECONDS)
+
+
+def _print_lock_refusal(lock_path: Path, settings_path: Path, exc: OSError) -> None:
+    errno_name = errno.errorcode.get(exc.errno, f"errno {exc.errno}")
+    print(
+        f"agent-coherence-migrate-rules: could not lock {lock_path} "
+        f"({errno_name}: {exc.strerror or exc}); not writing {settings_path}. "
+        "Remove the lock file if it is stale (no other --apply running), "
+        "or copy the fragment printed above into that file by hand.",
+        file=sys.stderr,
+    )
+
+
 def _apply_entries(
     workspace: Path, proposed: list[str], *, prompt_for_confirmation: bool
 ) -> int:
     """Merge ``proposed`` into ``.claude/settings.local.json``'s
     ``permissions.deny`` list and write back atomically.
 
-    Returns 0 on success, 2 if the operator declined the prompt or if
-    the file could not be written."""
+    Returns 0 on success, 2 if the operator declined the prompt, if the
+    sidecar lock could not be taken (the file is then neither read nor
+    written), or if the file could not be written."""
     settings_path = workspace / ".claude" / "settings.local.json"
     if prompt_for_confirmation:
         # CLR-05 / finding #7: block in non-interactive context so pipelines
@@ -405,32 +456,23 @@ def _apply_entries(
     # --apply runs serialize.
     #
     # POSIX-only (matches the rest of the codebase per lifecycle.py
-    # _FCNTL_AVAILABLE guard). On Windows the call is a no-op — the race
-    # is wider but the broader Windows story is deferred to v0.1.1+ per
-    # CLAUDE.md.
+    # _FCNTL_AVAILABLE guard). Where fcntl is missing (Windows) there is no
+    # lock to take, so --apply proceeds silently — the race is wider but the
+    # broader Windows story is deferred to v0.1.1+ per CLAUDE.md. Where
+    # fcntl exists, a lock that cannot be taken refuses (fail closed).
     try:
         import fcntl  # type: ignore[import-not-found]
-    except ImportError:  # pragma: no cover — exercised only on Windows
+    except ImportError:
         fcntl = None  # type: ignore[assignment]
 
     lock_path = settings_path.with_suffix(settings_path.suffix + ".lock")
     lock_fd: int | None = None
     if fcntl is not None:
         try:
-            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            lock_fd = _lock_sidecar(fcntl, lock_path)
         except OSError as exc:
-            print(
-                f"agent-coherence-migrate-rules: could not acquire lock on "
-                f"{lock_path}: {exc}; proceeding without it (race window present).",
-                file=sys.stderr,
-            )
-            if lock_fd is not None:
-                try:
-                    os.close(lock_fd)
-                except OSError:
-                    pass
-                lock_fd = None
+            _print_lock_refusal(lock_path, settings_path, exc)
+            return 2
 
     try:
         if settings_path.is_file():

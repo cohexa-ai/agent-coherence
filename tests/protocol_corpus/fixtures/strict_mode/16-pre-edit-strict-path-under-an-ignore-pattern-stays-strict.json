@@ -1,6 +1,6 @@
 {
   "name": "pre-edit-strict-path-under-an-ignore-pattern-stays-strict",
-  "description": "#261: strict wins over ignore. With .coherence/ignored.yaml listing the strict path itself (a leftover ignore entry, present at spawn; the harness writes unquoted YAML, so a '*'-led glob would parse as an alias), a tracked strict path is still tracked and strict: the stale pre-edit denies exactly as in fixture 05 instead of taking the untracked fast path, where a read reports version 0 and a CAS commit is accepted at any expected_version (a silent lost update). Python only: the Node coordinator's policy evaluator lives in the plugin repository (not in this tree) and still lets ignore win, so this fixture is the parity target for that follow-up rather than a Node row that would fail.",
+  "description": "#261: strict wins over ignore. With .coherence/ignored.yaml holding '**', an ignore pattern broader than the strict path and present at spawn, a tracked strict path is still tracked and strict: the stale pre-edit denies exactly as in fixture 05 instead of taking the untracked fast path, where a read reports version 0 and a CAS commit is accepted at any expected_version (a silent lost update). Both backends: the plugin's Node coordinator lets strict win over ignore too (cohexa-ai/agent-coherence-plugin#177).",
   "setup": {
     "tracked": [
       "plan.md"
@@ -9,7 +9,7 @@
       "plan.md"
     ],
     "ignored": [
-      "plan.md"
+      "**"
     ],
     "files": {
       "plan.md": "# Plan\nv1\n"
@@ -78,6 +78,7 @@
     }
   },
   "backends": [
-    "python"
+    "python",
+    "node"
   ]
 }

@@ -31,6 +31,10 @@ from ccs.core.exceptions import CasVersionConflict, CoherenceError, StaleView, V
 
 _PATH = "data/counter.txt"
 _WAIT_SEC = 10.0
+#: FROZEN duplicates of the refusal's typed reasons (#264): the split pair's
+#: instance reason, and the class reason every other stale view keeps.
+_SPLIT_PAIR = "split_pair"
+_STALE_VIEW = "stale_view"
 
 
 @pytest.fixture
@@ -164,6 +168,10 @@ def test_read_with_version_refuses_a_split_pair_in_the_commit_window(
     assert "reacquire()" in guidance
     assert guidance.index("few seconds") < guidance.index("write()")
     assert "overwritten" in guidance
+    # Typed, so a caller tells the split from every other stale view by value
+    # (#264); the class keeps the reason the MCP mapper answers.
+    assert exc.value.reason == _SPLIT_PAIR
+    assert StaleView.reason == _STALE_VIEW
 
 
 @_READER_STATES
@@ -200,11 +208,13 @@ def test_refused_read_does_not_absolve_an_out_of_band_edit(volumes, read: str) -
     target, _peer, reader = volumes
     buffered, _version = reader.read_with_version(_PATH)
     target.write_bytes(b"HUMAN")
-    with pytest.raises(StaleView):
+    with pytest.raises(StaleView) as refused:
         getattr(reader, read)(_PATH)
-    with pytest.raises(StaleView):
+    with pytest.raises(StaleView) as denied:
         reader.write(_PATH, _increment(buffered))
     assert target.read_bytes() == b"HUMAN"
+    # The split is told from the write's own deny by value, not prose (#264).
+    assert (refused.value.reason, denied.value.reason) == (_SPLIT_PAIR, _STALE_VIEW)
 
 
 @pytest.mark.parametrize("read", ["read_with_version", "read_with_version_generation"])
@@ -421,8 +431,9 @@ def test_read_with_version_generation_refuses_a_split_pair_in_the_commit_window(
     peer = LaggingPeer(peer_vol, monkeypatch)
     peer.commit(b"1")
     try:
-        with pytest.raises(StaleView):
+        with pytest.raises(StaleView) as exc:
             reader.read_with_version_generation(_PATH)
+        assert exc.value.reason == _SPLIT_PAIR
         # The flags still describe the read that was refused.
         assert reader._last_read_denied is True
     finally:

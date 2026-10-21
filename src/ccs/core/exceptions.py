@@ -533,8 +533,16 @@ protocol corpus's coverage check, matches against."""
 # byte-stable coordinator ``permissionDecisionReason`` prose (the model's retry
 # loop depends on that stability, auto-memory
 # ``project_cc_strict_mode_retry_hazard``; the typed-signal-not-substring house
-# rule). Renaming a value is a wire break; add, do not mutate.
+# rule). Renaming a value is a wire break; add, do not mutate. One exception
+# carries a second value per instance: the split-pair read refusal (#264) is a
+# :class:`StaleView` whose instance ``.reason`` is :data:`SPLIT_PAIR_REASON`,
+# while the mapper keeps answering the class's :data:`STALE_VIEW_REASON`.
 STALE_VIEW_REASON = "stale_view"
+#: The instance reason of the :class:`StaleView` a version-checked read raises
+#: when the bytes on disk are not the content the coordinator records at its
+#: current version (#264): a peer's commit whose bytes have not landed yet, or
+#: an out-of-band edit. It names the split, not its cause.
+SPLIT_PAIR_REASON = "split_pair"
 COMMIT_PREEMPTED_REASON = "commit_preempted"
 VIEW_WEDGED_REASON = "view_wedged"
 COMMIT_UNCONFIRMED_REASON = "commit_unconfirmed"
@@ -551,13 +559,25 @@ INTERNAL_CONCURRENCY_REASON = "internal_concurrency_error"
 # longer matches the coordinator's current version. Typed-conflict, NOT
 # auto-merge — the agent re-reads at current_version, re-merges, and retries.
 VERSION_MISMATCH_REASON = "version_mismatch"
-# Type B — synthesized by the mapper (no adapter raise-site) when the volume is
-# unattached / coordinator transport failed; the write is NOT version-committed.
+# No usable answer from the coordinator; the write is NOT version-committed.
+# Two producers share it: the MCP mapper synthesizes it for a volume that is
+# not attached (Type B), and it is the class reason of
+# :class:`CoordinatorUnreachable`, which the strict surfaces raise.
 COORDINATOR_UNAVAILABLE_REASON = "coordinator_unavailable"
+#: The class reason of :class:`CoordinatorFailed`: the coordinator answered a
+#: read with its failure envelope (#259).
+COORDINATOR_FAILED_REASON = "coordinator_failed"
 
 
 class CoherenceError(Exception):
     """Base error for coherence domain failures."""
+
+
+def _is_handler_failure_reason(reason: object) -> bool:
+    """Whether ``reason`` is the coordinator's failure envelope's: a string
+    with :data:`HANDLER_FAILURE_REASON_PREFIX`, matched exactly, so a reason
+    worded any other way stays an ordinary refusal (#259)."""
+    return isinstance(reason, str) and reason.startswith(HANDLER_FAILURE_REASON_PREFIX)
 
 
 def _is_generation(value: object) -> TypeGuard[int]:
@@ -906,7 +926,12 @@ class StaleView(CoherenceError):
     move", the generation pair answers "was the grant it was read under
     reclaimed" (a sweep reclamation advances the generation WITHOUT a version
     move). On every other raise path (the coordinator deny sites) all four stay
-    ``None``, so a generic ``except StaleView`` handler reads them uniformly."""
+    ``None``, so a generic ``except StaleView`` handler reads them uniformly.
+
+    ``reason`` is :data:`STALE_VIEW_REASON` except on the split-pair read
+    refusal (#264), whose instance carries :data:`SPLIT_PAIR_REASON` so a
+    caller can tell it from every other stale view by value. The MCP answer
+    stays ``stale_view`` for both: the mapper reads the class constant."""
 
     reason = STALE_VIEW_REASON
     #: Version drift set by gate()'s HOLD; ``None`` on coordinator-raised instances.
@@ -1062,12 +1087,57 @@ class RedirectRefused(CoherenceError):
 
 
 class CommitUnconfirmed(CoherenceError):
-    """OCC commit unconfirmed (MCP-C Unit 1): the coordinator transport failed
-    mid-commit, a false-negative ack — NOT a confirmed loss. The write may or may
-    not have landed; reconcile by re-reading, then retry only if absent. Carries
-    :data:`COMMIT_UNCONFIRMED_REASON`."""
+    """A commit's outcome is unknown (MCP-C Unit 1): a false-negative ack, NOT a
+    confirmed loss. Raised when a commit request got no usable answer after it
+    may have reached the coordinator, or an answer that decides nothing (the
+    coordinator's failure envelope, #259): an OCC commit (``write_cas``,
+    ``write_cas_at``, ``atomic_publish``), a pessimistic ``write()``'s post-edit,
+    or any other commit request delivered and left unanswered. It does not by
+    itself mean the request was delivered: the handoff verbs and the
+    substrate's legs after its write landed raise it even when the request was
+    never sent, because the outcome they must reconcile is the same. The write
+    may or may not have landed; reconcile by re-reading, then retry only if
+    absent. Carries :data:`COMMIT_UNCONFIRMED_REASON`."""
 
     reason = COMMIT_UNCONFIRMED_REASON
+
+
+class CoordinatorUnreachable(CoherenceError):
+    """No usable answer came from the coordinator. Either the request never
+    reached it (no coordinator to spawn or attach, a refused connect), on any
+    leg; or it reached it and got no usable answer (a silent listener, a reset,
+    an empty, unparseable or non-object reply) on a leg that commits nothing. A
+    commit request that reached it and went unanswered raises
+    :class:`CommitUnconfirmed` instead, because it may have landed.
+
+    No write was version-committed. A pessimistic ``write()`` that raises it
+    has already put its bytes on disk, and its message says so. Recovery is
+    not a retry: the coordinator is gone or wedged, and an attached volume or
+    substrate session keeps the endpoint it attached to, so it cannot recover
+    in place. Build a new one (for the MCP server, restart it) once a
+    coordinator is running again; see ``docs/guide.md``. Carries
+    :data:`COORDINATOR_UNAVAILABLE_REASON`. Message only, so it pickles whole
+    across a process boundary."""
+
+    reason = COORDINATOR_UNAVAILABLE_REASON
+
+
+class CoordinatorFailed(CoherenceError):
+    """The coordinator answered a read with its failure envelope, HTTP 200
+    ``{"ok": false, "reason": "internal: <Type>"}`` (#259): the route's work,
+    or the caller-principal gate's store read, raised inside it. The read is
+    not confirmed as registered, so a strict volume or substrate session
+    raises rather than hand out bytes no peer's commit would invalidate.
+
+    The envelope names only the exception's type, so nothing here tells a
+    busy store, which clears by itself, from a fault that repeats on every
+    call. One retry after a short wait is the recovery; a second failure is
+    for the operator. A commit answered with the envelope raises
+    :class:`CommitUnconfirmed` instead, because it may have landed. Carries
+    :data:`COORDINATOR_FAILED_REASON`. Message only, so it pickles whole
+    across a process boundary."""
+
+    reason = COORDINATOR_FAILED_REASON
 
 
 class PublishMaterializationError(CoherenceError):
