@@ -81,6 +81,33 @@ Alpha — APIs may change before `v1.0`.
   `ccs.core.exceptions`); every other `StaleView` keeps `stale_view`, and
   `swg_read` still answers the refusal as a `stale_view` deny.
 
+- **A host can check, before it starts a coordinator, whether the start will
+  migrate `.coherence/state.db` (#345).** A start migrates an older store
+  forward, after which a coordinator that expects the old schema refuses it,
+  and nothing said so beforehand: reading the store left `-wal` and `-shm`
+  files beside it, and older, newer and damaged stores raised the same
+  untyped error. `agent-coherence-coordinator --check-store [--json]` and
+  `check_store(root)` in `ccs.adapters.claude_code.store_check` now answer
+  `current`, `fresh`, `will_migrate`, `newer`, `foreign`, `unusable`, `live`
+  or `cannot_tell`, with exit codes 0 and 10–16. The check runs the start's
+  own open on a private copy, so it matches what a start would do even when a
+  killed writer left changes in the WAL, and it creates or changes nothing in
+  the workspace. `SchemaVersionError` now carries `reason`, `found_version`
+  and `expected_version`; a store whose `user_version` is negative, which no
+  build writes, is refused as unrecognized with advice to restore it from a
+  backup instead of to upgrade; and a start that migrates a store logs one
+  `INFO` line naming both schemas. The guide's "Checking a store before a
+  coordinator starts" section has the details.
+
+- **`ensure_coordinator_handle` tells a host whether its call started the
+  coordinator or joined one already running (#348).** It returns a
+  `CoordinatorHandle` whose `outcome` is `bound`, `joined_same_process` or
+  `joined_other_process`, with `spawned_by_this_call` and the `binder_pid`.
+  The only way to tell before was to read a private registry around the
+  call, and when two threads raced, both read as having started it.
+  `ensure_coordinator` still returns a bare port. The guide's "Starting a
+  coordinator from your own process" section has the details.
+
 ### Changed
 
 - **The protocol corpus pins the rejected count on both backends (plugin #192).** A pair of `/status`
@@ -151,6 +178,16 @@ Alpha — APIs may change before `v1.0`.
   says the Node coordinator refuses too. The package is unchanged.
 
 ### Fixed
+
+- **A coordinator start no longer hands callers that race it the port of a
+  coordinator that did not stop cleanly.** A coordinator that exits without
+  shutting down (killed with `SIGTERM` or `SIGKILL`, a crash, a reboot)
+  leaves its pid and port in `.coherence/server.pid`. While the next start
+  was still building its coordinator, every call that lost the race to start
+  read that old port, and `ensure_coordinator` returned it: a coordinator
+  that no longer ran. The start now empties the file first, so calls that
+  race it from then on wait for the new port. A file the plugin's Node
+  coordinator wrote is left as it is.
 
 - **A file changed outside the coordinator no longer goes unnoticed while a
   session holds it (#278).** A change that reaches the disk without a commit

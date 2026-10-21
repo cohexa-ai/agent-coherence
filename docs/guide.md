@@ -169,6 +169,112 @@ A 0.15.0 coordinator reports the schema of the store it serves as
 `registry_schema_version` in every `/status` view (see
 [Status, track and untrack commands](#status-track-and-untrack-commands)).
 
+### Checking a store before a coordinator starts
+
+`agent-coherence-coordinator --check-store` says what starting a coordinator
+of the installed build would do to `.coherence/state.db`, without starting one
+and without creating or changing anything in the workspace. It copies the
+store (and any `-wal` or `-journal` file beside it; for a symlinked
+`state.db`, the target and the files beside the target, where SQLite keeps
+them) to a private temporary directory, runs the same open a coordinator start
+runs on the copy, and removes the copy when it finishes. A check that is
+killed leaves the copy behind (see
+[security.md](security.md#store-check-copy)). Run it after upgrading the
+package and before any client starts a coordinator, and ask before a
+migration: it is one-way.
+
+| Outcome | Exit | What a start would do |
+|---|---|---|
+| `current` | 0 | open the store as it is |
+| `fresh` | 10 | create the schema (no store, an empty file, or a store with no schema yet) |
+| `will_migrate` | 11 | migrate the store forward; a coordinator that expects the old schema refuses it from then on |
+| `newer` | 12 | refuse it: a newer build wrote it |
+| `foreign` | 13 | refuse it: the Claude Code plugin's Node coordinator wrote it |
+| `unusable` | 14 | fail on the store itself; `reason` says how |
+| `live` | 15 | join the Python coordinator already serving the workspace, and migrate nothing while it runs; the check does not read the store (see below) |
+| `cannot_tell` | 16 | unknown: the check could not observe the answer; `reason` says why |
+
+`live` says only that a coordinator is running now, so it carries no store
+schema. After an upgrade, that coordinator can be one of the old build: it
+keeps the store at its own schema until it exits, and the next start of this
+build then migrates the store without asking. To learn what that start will
+do, stop the coordinator with `agent-coherence-coordinator
+--prepare-for-migration` (see [Back up `.coherence/` first](#back-up-coherence-first))
+and check again.
+
+`reason` is `null` for `current`, `fresh` and `will_migrate`. Otherwise it is:
+
+- `newer`: `schema_newer`.
+- `foreign`: `cross_runtime_schema`.
+- `unusable`: `schema_unrecognized` (the store's `user_version` is negative,
+  which no build writes; restore it from a backup), `registry_meta_incomplete`
+  (the store's `registry_meta` table lacks a value every store has, or holds
+  one that cannot be read; restore it from a backup), or SQLite's own error
+  code name in lower case, such as `sqlite_notadb` for a file that is not a
+  SQLite database, or `sqlite_corrupt`. The name can be SQLite's extended
+  code, such as `sqlite_corrupt_index`, so match these by prefix
+  (`reason.startswith("sqlite_corrupt")`), not by equality.
+- `live`: `coordinator_running`.
+- `cannot_tell`, one of:
+  - `store_changed`: something that takes no workspace lock (the plugin's Node
+    coordinator, a script) wrote the store during every copy. Check again
+    later.
+  - `orphan_sidecar`: a `-wal` or `-journal` file holds data, but `state.db`
+    is missing or empty. A start deletes that file unread and creates an
+    empty store, so move it aside first if it matters.
+  - `store_unreadable`: this process cannot read the store as a regular file.
+    Run the check as the user the coordinator runs as.
+  - `check_environment_failed`: the check's own side failed, such as its
+    temporary directory or a full temporary disk. This says nothing about the
+    store.
+  - `lock_probe_failed`: the workspace lock could not be probed, so a running
+    coordinator cannot be ruled out.
+  - `platform_unsupported`: this platform has no `fcntl`, so no coordinator
+    starts here.
+
+The check's own reasons are constants in `ccs.adapters.claude_code.store_check`
+(`COORDINATOR_RUNNING_REASON` and the rest, collected in
+`STORE_CHECK_REASONS`); the store's are in `ccs.core.exceptions` (below).
+
+Exit 1 means the directory is not a git repository, and exit 2 a usage error.
+`--json` prints one object with `kind` (always `"store_check"`), `outcome`,
+`exit_code`, `db_path`, `coordinator_backend` (always `"python"`: the answer
+is for a start of this build's Python coordinator), `registry_schema_version`
+(this build's schema), `store_registry_schema_version` (the store's, or
+`null`), `reason` and `message`. `--quiet` silences only the plain line;
+`--json` always prints its object. The plain line prints any non-printable
+character in the store's own text (an object name SQLite quotes in its error,
+say) escaped, as `\x1b` for an escape character (see
+[Status, track and untrack commands](#status-track-and-untrack-commands));
+`--json` keeps the message as it is, JSON-escaped. The answer holds only as of
+the check: nothing stops another process starting a coordinator after it.
+
+From Python, `check_store(root)` in `ccs.adapters.claude_code.store_check`
+returns the same answer as a `StoreCheck`, with `outcome`, `db_path`,
+`found_version`, `expected_version`, `reason`, `message` and a `will_migrate`
+property.
+
+A coordinator start that refuses a store (`ensure_coordinator_handle` or
+`ensure_coordinator`) raises `SchemaVersionError`, with `reason` set to
+`schema_newer`, `schema_unrecognized`, `registry_meta_incomplete` or, for a
+Node store, `cross_runtime_schema`. A start never refuses a store for being
+older: it migrates it (`will_migrate` above). A read-only open,
+`SqliteArtifactRegistry(path, read_only=True)`, never migrates or creates a
+schema: it raises the same error with `schema_older` for any store below this
+build's schema, one with no schema yet included, and can raise each of the
+other reasons too. Import the class with
+`from ccs.coordinator.sqlite_registry import SchemaVersionError`, and the
+reason constants (`SCHEMA_OLDER_REASON` and the rest) and the set of all of
+them, `SCHEMA_VERSION_REASONS`, from `ccs.core.exceptions`. Its
+`found_version` is the store's registry schema (negative when `reason` is
+`schema_unrecognized`; `None` for a Node store or a damaged `registry_meta`)
+and its `expected_version` this build's. The message text is unchanged, except
+that a store whose `user_version` is negative now names its own remedy
+(restore it from a backup) instead of telling you to upgrade or to re-open it
+read-write, so branch on `reason`, not on the text. A start that migrates a
+store and opens it logs one `INFO` line naming both schemas (see
+[Reclamation diagnostics](#reclamation-diagnostics)).
+
 ### What changes for a 0.14.1 user
 
 **Coordinator answers**
@@ -703,6 +809,15 @@ agent id, never the session id. A coordinator started in the background (the
 detached `agent-coherence-coordinator` process) sends its stderr to
 `/dev/null`, so there the line is lost; read the reclaim from `/status`
 instead (see [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status)).
+
+A start that migrates `.coherence/state.db` forward and opens it logs one
+`INFO` line on the same logger: `coordinator migrated <path> from registry
+schema 7 to 10; a coordinator that expects schema 7 refuses this store from
+now on`. A start
+that creates or opens a store at the current schema logs none, and neither
+does [`--check-store`](#checking-a-store-before-a-coordinator-starts). The
+detached coordinator loses this line too, so check the store before the start
+when the answer matters.
 
 ### Reading a sweep reclaim from `/status`
 
@@ -1461,6 +1576,33 @@ may have recorded the commit before the error.
 
 A reason without the `internal: ` prefix is not this envelope, and keeps the
 error it raised before.
+
+### Starting a coordinator from your own process
+
+A host that runs the coordinator itself, rather than through a volume, starts
+it with `ensure_coordinator_handle(root, config=...)` from
+`ccs.adapters.claude_code.lifecycle`. It returns a `CoordinatorHandle` with the
+`port`, the `binder_pid` (the pid of the process that started the coordinator,
+or `None` when `.coherence/server.pid` holds no readable pid) and an `outcome`
+that says what this call did:
+
+| `outcome` | The call |
+|---|---|
+| `bound` | started the coordinator; `spawned_by_this_call` is true |
+| `joined_same_process` | joined one this process started earlier, from another thread or an earlier call |
+| `joined_other_process` | joined one another process started, including a parent process before a fork |
+
+The call that returns decides the outcome, so when several threads race to
+start one coordinator, exactly one of them is told `bound`. The handle records
+the call, not whether the coordinator still runs: idle shutdown can stop a
+coordinator the call started, and the next call reports `bound` again. Only a
+caller told `bound` should stop the coordinator with `stop_coordinator`. It
+returns `None` where `ensure_coordinator` returns `-1`; `ensure_coordinator`
+still returns a bare port. A start that fails raises instead:
+`SchemaVersionError` on a store it refuses (its `reason` says why),
+`sqlite3.Error` on a file SQLite cannot open, and `OSError` when the lock or
+the bind fails. To ask before a start migrates the store, call
+[`check_store`](#checking-a-store-before-a-coordinator-starts) first.
 
 ### Atomic multi-file publish: `atomic_publish` (v0.12.0+)
 
@@ -4409,6 +4551,7 @@ All bundled CLIs are installed as console scripts when you
 | `ccs-compare` | — | Compare two or more strategies on the same scenario |
 | `ccs-check-architecture` | — | Verify the four-layer architecture boundary (also runs in CI) |
 | `agent-coherence-replay` | `[langgraph]` | Replay a captured coordinator session and report invariant breaches |
+| `agent-coherence-coordinator` | — | Start the workspace's coordinator in the background. `--prepare-for-migration` releases its write grants and stops it; `--check-store [--json]` says what a start would do to the store, without starting one; see [Checking a store before a coordinator starts](#checking-a-store-before-a-coordinator-starts) |
 | `agent-coherence-status` | — | Print the coordinator's tracked paths, sessions, handoffs, sweep reclaims and counters; see [Status, track and untrack commands](#status-track-and-untrack-commands) and [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status) |
 | `agent-coherence-track` | — | Add paths to the coordinator's tracked set; see [Status, track and untrack commands](#status-track-and-untrack-commands) |
 | `agent-coherence-untrack` | — | Add paths to the coordinator's ignored set (a path enforced in strict mode is refused); see [Status, track and untrack commands](#status-track-and-untrack-commands) |

@@ -363,6 +363,27 @@ principal refuse that session. The files a handoff command leaves for a
 mistyped session id, or for a `CoherentVolume` or MCP session it could not act
 for, belong to no hook session, so you can remove them at any time.
 
+### Store-check copy
+
+[Checking a store](guide.md#checking-a-store-before-a-coordinator-starts)
+with `agent-coherence-coordinator --check-store` or `check_store(root)` writes
+a copy of the workspace store outside `.coherence/`, in the system temporary
+directory.
+
+| File | Path | Mode | Created when |
+|---|---|---|---|
+| Store copy | `<temp>/ccs-store-check-<random>/state.db`, with a copy of `state.db-wal` or `state.db-journal` when the store's is not empty, and the files SQLite makes beside the copy while the check opens it. `<temp>` is the system temporary directory: `$TMPDIR` when it is set, usually `/tmp` otherwise | directory `0700`, files `0600` | Each check that finds a store to copy. Removed when the check returns |
+
+The copy holds everything `state.db` holds: the caller principal and mint
+nonce of each session that claimed one, and, with
+[retention](#durable-version-retention-opt-in) on, version bodies. Treat it
+like `state.db`. A check that ends without returning, because it was killed
+(`kill`, which sends `SIGTERM`, or `SIGKILL`, for example from a host's
+timeout), leaves the directory behind; one stopped with Ctrl-C does not. When
+you purge a store's content, also remove any `ccs-store-check-*` directory left
+in the temporary directory. To keep the copy on the same volume or encrypted
+disk as the workspace, run the check with `TMPDIR` pointing there.
+
 ### Durable version retention (opt-in)
 
 `SqliteArtifactRegistry` can durably retain a bounded history of committed
@@ -394,7 +415,8 @@ What this means for sensitive content:
   reset (delete-and-recreate of `state.db`) *deletes* the rows, but SQLite may
   keep freed-page residue in the file and its WAL until a checkpoint / `VACUUM`.
   To purge rotated content fully, remove `state.db` together with its `-wal` and
-  `-shm` sidecars. Disabling retention does **not** purge existing rows — they
+  `-shm` sidecars, and any [store-check copy](#store-check-copy) a killed check
+  left behind. Disabling retention does **not** purge existing rows — they
   stay readable; purge is a re-open under a tighter policy or an epoch reset.
 - **What a retained version is.** The store records the content the coordinator
   *committed* at that version — not necessarily the bytes a client later
