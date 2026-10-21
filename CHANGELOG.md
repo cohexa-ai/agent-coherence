@@ -275,6 +275,21 @@ Alpha — APIs may change before `v1.0`.
   timeout (6 seconds for the Python client) still reaches the client too
   late, and the client admits the call as before.
 
+- **A connection that goes silent no longer holds a coordinator handler slot
+  until its owner closes it (#237).** A connection takes one of the
+  coordinator's eight handler slots as soon as it is accepted, before it sends
+  a byte. A handler had no timeout, so eight connections that opened and sent
+  nothing held every slot until their owner closed them. Every request, hooks
+  and `/status` included, got `503`, and a hook client lets the call through
+  on a `503` (#223), so stale-read warnings and strict-mode denies were lost.
+  A handler now drops a connection whose request stops arriving for 2
+  seconds, with no answer, where it used to hold its slot until the client
+  closed it. It also drops a client that stops reading its answer for 2
+  seconds; a client that keeps reading gets the whole answer, however long it
+  takes. For those 2 seconds the slots are still full, and a peer that sends a
+  byte before every timeout (#393), or reconnects as each connection is
+  dropped (#394), still keeps them.
+
 ## [0.15.0] - 2026-10-14
 
 **Sessions can hand a held path to a named successor, a caller principal keeps protocol-following clients from acting as each other's sessions, and the effect fence answers over HTTP; `/status` reports sweep reclaims, grant ages, each artifact's last writer and the store's schema version; and a run of fixes closes ways a stale read, a refused read or a policy edit let a write overwrite newer work.**
