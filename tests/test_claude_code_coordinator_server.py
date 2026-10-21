@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import statistics
 import sys
 import threading
 import time
@@ -2091,6 +2092,18 @@ def _handler_slots_all_free(server: CoordinatorHTTPServer, budget_sec: float = 1
     return False
 
 
+def _handler_slots_held(server: CoordinatorHTTPServer, count: int, budget_sec: float = 10.0) -> bool:
+    """Whether ``count`` handler slots are held at once within ``budget_sec``."""
+    from ccs.adapters.claude_code.coordinator_server import HANDLER_CONCURRENCY_LIMIT
+
+    deadline = time.monotonic() + budget_sec
+    while time.monotonic() < deadline:
+        if HANDLER_CONCURRENCY_LIMIT - server._server._concurrency_sem._value >= count:
+            return True
+        time.sleep(0.002)
+    return False
+
+
 def _read_until_closed(sock, timeout_sec: float = 10.0) -> bytes:
     """Everything the coordinator sends before it closes ``sock``."""
     sock.settimeout(timeout_sec)
@@ -2124,16 +2137,16 @@ def test_idle_connections_give_back_their_handler_slots_after_the_read_timeout(
         except OSError as exc:  # the overflow 503 can race the request's own write
             return type(exc).__name__
 
-    idle = [socket.create_connection(("127.0.0.1", server.port)) for _ in range(HANDLER_CONCURRENCY_LIMIT)]
+    idle: list[socket.socket] = []
     try:
-        # Inside the timeout window the idle sockets hold every slot: proof the
-        # test filled them, and the window the read timeout leaves open.
-        window_end = time.monotonic() + 0.8
-        refused = None
-        while refused is None and time.monotonic() < window_end:
-            if (answer := status()) != 200:
-                refused = answer
-        assert refused is not None, "the idle sockets never filled the handler slots"
+        # The idle sockets hold every slot at once: proof the test filled them.
+        # Each is opened once the last holds its slot, so the proof does not
+        # depend on the listen backlog: a burst that overflows it has a SYN
+        # dropped, Linux retries it after 1 s, the read timeout here, and the
+        # first sockets time out before the last one connects.
+        for opened in range(1, HANDLER_CONCURRENCY_LIMIT + 1):
+            idle.append(socket.create_connection(("127.0.0.1", server.port)))
+            assert _handler_slots_held(server, opened), "the idle sockets never filled the handler slots"
 
         deadline = time.monotonic() + 10.0
         while (answer := status()) != 200 and time.monotonic() < deadline:
@@ -2346,8 +2359,18 @@ def test_a_stop_right_after_a_request_takes_well_under_the_old_half_second(tmp_p
     can slip in before the loop goes back to sleep and return at once even at
     0.5 s (1-3 trials in 100 on CI). Measured on ubuntu-24.04, 100 trials per
     Python, idle and with three busy neighbours: the 50 ms poll stopped in at
-    most 0.043 s, the 0.5 s poll in no less than 0.480 s."""
-    for trial in range(3):
+    most 0.043 s, the 0.5 s poll in no less than 0.480 s.
+
+    The median of five stops is judged, not each stop. On a loaded host the
+    thread that called shutdown() can wait 0.2-0.3 s to run again after the
+    loop wakes it, a stall the poll does not cause; one 50 ms stop took
+    0.281 s on CI. Such stalls hit single stops, not most of five. On an
+    8-thread Intel Mac (Python 3.13) with 48 busy neighbours beside xdist, the
+    50 ms poll's median was at most 0.203 s in 301 runs (single stops up to
+    0.38 s), the 0.5 s poll's at least 0.477 s in 140. Linux was not measured
+    under that load."""
+    stops: list[float] = []
+    for trial in range(5):
         srv = CoordinatorHTTPServer(tmp_path / f"t{trial}", port=0, instance_id=f"stop-{trial}")
         srv.serve_in_thread()
         try:
@@ -2358,8 +2381,8 @@ def test_a_stop_right_after_a_request_takes_well_under_the_old_half_second(tmp_p
         finally:
             started = time.monotonic()
             srv.shutdown()
-            stopped_in = time.monotonic() - started
-        assert stopped_in < 0.25, f"trial {trial}: shutdown took {stopped_in:.3f} s"
+            stops.append(time.monotonic() - started)
+    assert statistics.median(stops) < 0.25, f"shutdown took {', '.join(f'{s:.3f}' for s in stops)} s"
 
 
 def test_i2_acquire_denied_after_shutdown_started(tmp_path: Path) -> None:
@@ -9838,6 +9861,10 @@ def test_a_timed_out_gate_answers_exactly_its_routes_timed_out_work_body(
     posture = _EXPECTED_ROUTE_POSTURE[route]
     never_claimed = str(uuid.uuid4())
     presented = None if posture == "require" else _NEVER_MINTED_PRINCIPAL
+    # The control's claim goes through the watchdog too: made under the short
+    # deadline, a slow store bind answers claim_unconfirmed instead.
+    claimed = str(uuid.uuid4())
+    principal = _explicit_claim(client, claimed)
     monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
     timeouts_before = coordinator._watchdog_timeouts_total
     with _HeldRegistryLock(coordinator) as held:
@@ -9848,8 +9875,6 @@ def test_a_timed_out_gate_answers_exactly_its_routes_timed_out_work_body(
     assert answered, f"{path}: no answer while the registry lock was held"
     assert coordinator._watchdog_timeouts_total == timeouts_before + 1
 
-    claimed = str(uuid.uuid4())
-    principal = _explicit_claim(client, claimed)
     # pre-grep answers "fresh" before its work body when the store knows no
     # tracked artifact under the search root.
     coordinator.registry.resolve_or_register("plan.md", content_hash=_hash("seed"))
@@ -10297,11 +10322,12 @@ def test_a_cached_identity_is_admitted_on_the_request_thread_not_in_the_watchdog
     import ccs.adapters.claude_code.coordinator_server as mod
 
     free_worker_grace_sec = 0.2
-    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
     workers = mod._WATCHDOG_POOL_SIZE
     blockers = [(s, _explicit_claim(client, s)) for s in (str(uuid.uuid4()) for _ in range(workers))]
     sid = str(uuid.uuid4())
     principal = _explicit_claim(client, sid)
+    # Shortened only after the claims, which run through the watchdog too.
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
 
     with _HeldRegistryLock(coordinator) as held:
         stuck = [
