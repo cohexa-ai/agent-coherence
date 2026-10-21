@@ -1,0 +1,71 @@
+{
+  "name": "status-default-tier-counts-a-policy-file-that-loads-as-no-entries",
+  "description": "#284 / plugin #192: tracked.yaml holds the unquoted `- *.md` that plugin v0.3.0 to v0.5.0 and library releases up to 0.14.1 wrote, a YAML alias, so the file loads as no entries. GET /status counts the file as one rejected pattern and no user-added ones, so the workspace no longer reads as one with no user patterns. Python half of a pair: fixture 33 is the Node half, split like 08/09 because the two /status envelopes differ.",
+  "setup": {
+    "files": {
+      ".coherence/tracked.yaml": "- data/**\n- *.md\n"
+    }
+  },
+  "request": {
+    "method": "GET",
+    "path": "/status"
+  },
+  "ignore_keys": [
+    "tracked_artifacts",
+    "sessions",
+    "default_pattern_count",
+    "endpoint_counters",
+    "coordinator_version"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "auth_401_total": 0,
+      "caller_principal_absent_total": 0,
+      "caller_principal_refused_total": 0,
+      "cold_start_duration_ms": 0,
+      "coordinator_backend": "python",
+      "coordinator_pid": "<PID>",
+      "coordinator_root": ".",
+      "coordinator_uptime_s": "<UPTIME>",
+      "coordinator_uptime_seconds": "<UPTIME>",
+      "coordinator_version": "<IGNORED>",
+      "detail": "minimal",
+      "effect_fence_holds_total": 0,
+      "endpoint_counters": "<IGNORED>",
+      "fresh_shared_hash_mismatch_total": 0,
+      "handler_concurrency_overflows_total": 0,
+      "handoff_giver_denials_total": 0,
+      "in_flight_drain_timed_out": false,
+      "intra_task_acquire_release_total": 0,
+      "policy_summary": {
+        "coordinator_root": ".",
+        "default_pattern_count": "<IGNORED>",
+        "ignored_pattern_count": 0,
+        "rejected_pattern_count": 1,
+        "strict_mode_pattern_count": 0,
+        "user_added_pattern_count": 0
+      },
+      "registry_schema_version": 10,
+      "sessions": "<IGNORED>",
+      "shared_foreign_lag_suppressed_total": 0,
+      "stale_warning_emitted_total": 0,
+      "stale_warning_reread_total": 0,
+      "strict_mode_denials_total": 0,
+      "strict_mode_routed_around_via_bash_total": 0,
+      "sweep_reclaims_by_trigger": {
+        "reclaim_heartbeat": 0,
+        "reclaim_max_hold": 0
+      },
+      "sweep_reclaims_total": 0,
+      "audit_log_mode_drift_total": 0,
+      "tracked_artifacts": "<IGNORED>",
+      "watchdog_late_aborts_total": 0,
+      "watchdog_late_completion_total": 0,
+      "watchdog_queue_overflows_total": 0,
+      "watchdog_timeouts_total": 0
+    }
+  },
+  "_comment": "Copies fixture 08's envelope, so a counter that joins the Python /status body joins both rows. Only policy_summary differs from 08: rejected_pattern_count is 1 and user_added_pattern_count stays 0, because the broken file contributes one rejected entry and none of the patterns it was meant to hold.",
+  "backends": ["python"]
+}

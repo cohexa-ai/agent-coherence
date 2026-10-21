@@ -83,6 +83,13 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **The protocol corpus pins the rejected count on both backends (plugin #192).** A pair of `/status`
+  rows, warn_mode/32 (Python) and warn_mode/33 (Node), loads a `tracked.yaml` holding the unquoted
+  `- *.md` and expects `rejected_pattern_count: 1`, and the Node row warn_mode/09 now expects
+  `strict_mode_pattern_count` too. The Claude Code plugin's Node coordinator counts a policy file
+  that loads as no entries from its release after 0.6.0, so the 0.14.x note that it did not is
+  superseded; the user guide says so.
+
 - **A strict commit whose request was sent but got no answer raises
   `CommitUnconfirmed` (#376).** The CAS of `write_cas` and `write_cas_at`, the
   commit of `atomic_publish`, and the post-edit of a plain `write()` raised a

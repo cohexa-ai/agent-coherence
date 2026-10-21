@@ -24,6 +24,7 @@
         "default_pattern_count": "<IGNORED>",
         "ignored_pattern_count": 0,
         "rejected_pattern_count": 0,
+        "strict_mode_pattern_count": 0,
         "user_added_pattern_count": 0
       },
       "schema_version": 5,
@@ -33,6 +34,6 @@
       "version": "<IGNORED>"
     }
   },
-  "_comment": "Cross-backend /status shape parity is a stretch goal tracked as AC-08 follow-up. v0.2 broad-beta launch ships with the divergence documented here in the corpus, the AC-09 README note, and the configuration.md operator guide. v0.3 should converge the shapes when the multi-target converter layer lands. schema_version tracks the Node SQLite registry schema: bumped 3→4 by SB-10 U5 (plugin migration v4, agent_states.last_observed_version), then 4→5 by the SB-10 perf follow-up (plugin migration v5, the agent_states(agent_id) index paired with Python v7).",
+  "_comment": "Cross-backend /status shape parity is a stretch goal tracked as AC-08 follow-up. v0.2 broad-beta launch ships with the divergence documented here in the corpus, the AC-09 README note, and the configuration.md operator guide. v0.3 should converge the shapes when the multi-target converter layer lands. schema_version tracks the Node SQLite registry schema: bumped 3→4 by SB-10 U5 (plugin migration v4, agent_states.last_observed_version), then 4→5 by the SB-10 perf follow-up (plugin migration v5, the agent_states(agent_id) index paired with Python v7). strict_mode_pattern_count joined the Node policy_summary with plugin #192, which matched the Python key set (fixture 08); like the other counts it is pinned at zero on an empty workspace.",
   "backends": ["node"]
 }

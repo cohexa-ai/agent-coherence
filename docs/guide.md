@@ -4483,7 +4483,8 @@ left the whole file unreadable, and the coordinator then dropped every entry
 in it without a word: tracked paths stopped being coordinated, ignored paths
 came back, and a strict path whose tracked entry was in the file lost strict
 mode at the next coordinator start. The Python coordinator now counts a policy
-file it cannot load as a rejected pattern: `/status` reports it in
+file it cannot load as a rejected pattern, and so does the Claude Code plugin's
+Node coordinator from the plugin release after 0.6.0: `/status` reports it in
 `policy_summary.rejected_pattern_count`, and `agent-coherence-status` ends its
 Policy line with `, N rejected`. If you see that, rewrite the files in
 `.coherence/` as above and restart the coordinator.
