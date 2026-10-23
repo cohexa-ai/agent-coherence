@@ -1772,6 +1772,88 @@ def test_handle_after_the_coordinator_stopped_reports_bound_again(
         stop_coordinator(workspace)
 
 
+@pytest.mark.parametrize("stopped_by", ["idle_shutdown", "stop_coordinator"])
+def test_a_stopped_coordinators_bind_marker_is_dropped(
+    workspace: Path, fast_cfg: LifecycleConfig, stopped_by: str,
+) -> None:
+    """#348: once the coordinator this process bound has shut down, its bind
+    marker is gone.
+
+    Prevents a host that starts and stops coordinators for many workspaces
+    from keeping one marker per start for its whole life. Shutdown drops the
+    port from the pid file before it finishes, so no later read of the pid
+    file can name that port and need the marker."""
+    idle = stopped_by == "idle_shutdown"
+    handle = ensure_coordinator_handle(workspace, config=replace(fast_cfg, idle_shutdown_sec=0.5) if idle else fast_cfg)
+    try:
+        assert handle is not None and handle.outcome == _BOUND
+        marker = (str(workspace.resolve()), handle.port)
+        assert marker in lifecycle._BOUND_IN_THIS_PROCESS
+        if idle:
+            assert lifecycle.wait_for_shutdown(workspace, poll_interval_sec=0.05, timeout_sec=10.0) is True
+        else:
+            assert stop_coordinator(workspace) is True
+        assert marker not in lifecycle._BOUND_IN_THIS_PROCESS
+    finally:
+        stop_coordinator(workspace)
+
+
+def test_a_start_that_fails_after_marking_its_bind_drops_the_marker(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#348: a start that raises after it marked its bind leaves no marker.
+
+    Prevents each failed start from adding a marker that nothing removes."""
+    built: list[CoordinatorHTTPServer] = []
+
+    def recording_server(*args, **kwargs) -> CoordinatorHTTPServer:
+        built.append(CoordinatorHTTPServer(*args, **kwargs))
+        return built[-1]
+
+    def failing_write(fd: int, pid: int, port: int) -> None:
+        raise RuntimeError("pid file write failed")
+
+    monkeypatch.setattr(lifecycle, "CoordinatorHTTPServer", recording_server)
+    monkeypatch.setattr(lifecycle, "_write_pidfile", failing_write)
+    try:
+        with pytest.raises(RuntimeError, match="pid file write failed"):
+            ensure_coordinator_handle(workspace, config=fast_cfg)
+        assert built, "the start failed before it built a coordinator, so it never marked a bind"
+        assert (str(workspace.resolve()), built[0].port) not in lifecycle._BOUND_IN_THIS_PROCESS
+    finally:
+        for coordinator in built:
+            coordinator.shutdown()
+
+
+def test_a_start_that_fails_after_registering_keeps_the_marker(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#348: a start that raises after its coordinator is registered keeps
+    the marker, since that coordinator keeps serving under a pid file that
+    names its port; its own shutdown drops the marker.
+
+    Prevents the failure path from dropping the marker of a coordinator that
+    still serves, which would report a join of it from this process as
+    another process's."""
+    def failing_threads(entry: object, cfg: LifecycleConfig) -> None:
+        raise RuntimeError("background threads failed")
+
+    monkeypatch.setattr(lifecycle, "_start_background_threads", failing_threads)
+    with pytest.raises(RuntimeError, match="background threads failed"):
+        ensure_coordinator_handle(workspace, config=fast_cfg)
+    key = str(workspace.resolve())
+    entry = lifecycle._SPAWNED_REGISTRY[key]
+    try:
+        assert entry.bound_marker == (key, entry.coordinator.port)
+        assert entry.bound_marker in lifecycle._BOUND_IN_THIS_PROCESS
+    finally:
+        # Not stop_coordinator: the failed start already closed the entry's
+        # lock fd, and a stop would write to that fd number.
+        entry.coordinator.shutdown()
+        lifecycle._SPAWNED_REGISTRY.pop(key, None)
+        lifecycle._BOUND_IN_THIS_PROCESS.discard(entry.bound_marker)
+
+
 def _hold_the_flock_with_no_port(root: Path) -> int:
     """Hold server.pid's flock through a separate open in this process, with
     no port line: every call then loses the flock and never reads a port."""

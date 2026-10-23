@@ -418,6 +418,7 @@ def ensure_coordinator_handle(
         # ``cold_start_duration_ms`` attribute for the future /status
         # endpoint (Unit 8).
         cold_start_start = time.monotonic()
+        bound_marker: tuple[str, int] | None = None
         try:
             # #348: a binder that exited without stop_coordinator (SIGTERM,
             # crash, reboot) leaves its '<pid>\n<port>\n' behind. Empty the
@@ -481,7 +482,8 @@ def ensure_coordinator_handle(
             # the port, and the registry insert below lands only after that,
             # so a marker written after the pid file could miss such a
             # joiner (see _classify_join).
-            _BOUND_IN_THIS_PROCESS.add((resolved_key, port))
+            bound_marker = (resolved_key, port)
+            _BOUND_IN_THIS_PROCESS.add(bound_marker)
             _write_pidfile(fd, os.getpid(), port)
             coordinator.serve_in_thread()
             entry = _SpawnedEntry(
@@ -490,8 +492,12 @@ def ensure_coordinator_handle(
                 coherence_dir=coherence_dir,
                 shutdown_lock=threading.Lock(),
                 shutdown_done=threading.Event(),
+                bound_marker=bound_marker,
             )
             _SPAWNED_REGISTRY[resolved_key] = entry
+            # The entry owns the marker from here: a registered coordinator
+            # keeps serving if a later step raises, and its shutdown drops it.
+            bound_marker = None
             _start_background_threads(entry, cfg)
             # G2 fix: self-probe with generous spawn-side budget before
             # returning so the caller is guaranteed a coordinator that
@@ -513,6 +519,8 @@ def ensure_coordinator_handle(
             )
             return CoordinatorHandle(port, SpawnOutcome.BOUND, os.getpid())
         except Exception:
+            if bound_marker is not None:
+                _BOUND_IN_THIS_PROCESS.discard(bound_marker)
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
@@ -689,7 +697,8 @@ class _SpawnedEntry:
     #348: ``binder_pid`` is the pid of the process that bound the
     coordinator. A child forked after the bind inherits the entry but not
     that pid, so the G3 short-circuit tells the parent's coordinator from
-    one the child bound itself.
+    one the child bound itself. ``bound_marker`` is the coordinator's pair
+    in :data:`_BOUND_IN_THIS_PROCESS`, dropped when its shutdown completes.
     """
 
     coordinator: CoordinatorHTTPServer
@@ -699,6 +708,7 @@ class _SpawnedEntry:
     shutdown_done: threading.Event
     shutdown_abort_count: int = 0
     binder_pid: int = field(default_factory=os.getpid)
+    bound_marker: tuple[str, int] | None = None
 
 
 #: Maps coordinator_root → _SpawnedEntry. Only the spawn-side ever populates
@@ -706,11 +716,14 @@ class _SpawnedEntry:
 #: to manage.
 _SPAWNED_REGISTRY: dict[str, _SpawnedEntry] = {}
 
-#: #348: every (resolved root, port) this process has bound. The winner adds
-#: its pair immediately BEFORE it writes the port to the pid file, and pairs
-#: are never removed. :func:`_classify_join` reads it to tell a same-process
-#: join from an other-process one. :data:`_SPAWNED_REGISTRY` cannot serve:
-#: its insert lands after the port is already visible to joiners.
+#: #348: the (resolved root, port) of every coordinator this process has bound
+#: and not yet shut down. The winner adds its pair immediately BEFORE it
+#: writes the port to the pid file. A pair is dropped when its coordinator's
+#: shutdown completes, which first drops the port from the pid file, or when
+#: the start fails before the coordinator is registered, so a long-lived host
+#: keeps no pair per past start. :func:`_classify_join` reads it to tell a
+#: same-process join from an other-process one. :data:`_SPAWNED_REGISTRY`
+#: cannot serve: its insert lands after the port is already visible to joiners.
 _BOUND_IN_THIS_PROCESS: set[tuple[str, int]] = set()
 
 
@@ -1377,6 +1390,7 @@ def _shutdown_sequence(entry: _SpawnedEntry) -> bool:
                 except OSError:
                     pass
                 _close_quiet(lock_fd)
+                _forget_bind(entry)
                 entry.shutdown_done.set()
                 return True
             logger.critical(
@@ -1405,8 +1419,17 @@ def _shutdown_sequence(entry: _SpawnedEntry) -> bool:
         except OSError:
             pass
 
+        _forget_bind(entry)
         entry.shutdown_done.set()
         return True
+
+
+def _forget_bind(entry: _SpawnedEntry) -> None:
+    """Drop a shut-down coordinator's bind marker (#348). Step 1 of the
+    shutdown already dropped its port from the pid file, so no later join
+    reads that port and needs the marker."""
+    if entry.bound_marker is not None:
+        _BOUND_IN_THIS_PROCESS.discard(entry.bound_marker)
 
 
 # ----------------------------------------------------------------------
