@@ -345,6 +345,42 @@ Alpha — APIs may change before `v1.0`.
   `MissingDatabaseError`, which `resolve` reports as `db_missing` (exit 11),
   like any store that is not there.
 
+- **A read-only store open now says what a store it cannot read needs, and
+  stops calling stores an unclean write-ahead log (#419, #420).** The docs
+  said a crashed coordinator's write-ahead log makes the open fail and must be
+  checkpointed by a read-write open first. It does not: the open reads the
+  log in place, so `resolve` returns the committed versions whose only copy is
+  in the log, never the unfinished transaction, and `state.db` and
+  `state.db-wal` are not changed. SQLite does create an empty `state.db-wal`
+  and a `state.db-shm` when they are missing and rewrites `state.db-shm`, so
+  the docs now say so, and say to resolve a copy of `state.db` and
+  `state.db-wal` (never `-shm`) to leave an original untouched. Refusals are
+  now classified by SQLite's error code instead of its message, which reads
+  the same for every read-only case: a hot rollback journal, and a stopped
+  store in a directory this user cannot write, are no longer reported as an
+  unclean write-ahead log that a read-write open would fix (in a read-only
+  directory, it fails too). Each message from the open now names SQLite's
+  code and a step that works for it, such as a writable directory or
+  resolving a copy. For Python callers, `StoreNeedsRecoveryError.reason` is
+  `wal_recovery` only for `SQLITE_READONLY_RECOVERY`; every other
+  `SQLITE_READONLY_*` code is `unreadable`, and so is the constructor's
+  default (it was `wal_recovery`). An error met while the open loads its
+  retention settings is now typed too: a lock is `db_busy`, any other is
+  `needs_recovery`, where `resolve` reported `db_corrupt` for both. An empty
+  `state.db` with a `state.db-wal` beside it is refused before SQLite opens
+  it, since SQLite would discard that log, which may hold every committed
+  version. `resolve` still reports a store it cannot read as
+  `needs_recovery`, exit 12.
+
+- **A read-only store open under a directory this user cannot search is now a
+  store error, not an internal one (#437).** The existence check raised a raw
+  `PermissionError`, and `resolve` exited 4 with `internal_error`. The open is
+  now `StoreNeedsRecoveryError(reason="unreadable")`, and `resolve` reports
+  `needs_recovery`, exit 12, as for a store file this user cannot read; so is
+  any other failure to stat the path (an I/O error, for example). A path too
+  long for the file system is `MissingDatabaseError`, which `resolve` reports
+  as `db_missing` (exit 11), like a path under a file or a symlink loop.
+
 - **A Read, Bash or Grep hook that times out no longer approves the call
   (#337).** When `pre-read`, `pre-bash` or `pre-grep` could not answer within
   the coordinator's 4-second handler budget, its "could not verify" advisory

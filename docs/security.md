@@ -424,10 +424,13 @@ What this means for sensitive content:
 
 The read side (`CoordinatorService.read_at_version`, `agent-coherence-replay
 resolve`) opens the store **read-only** and returns retained bytes only on
-explicit request; the replay CLI is metadata-only by default and emits bodies
-only via `--include-content` / `--output-file`, so terminals, CI logs, and shell
-history don't capture content inadvertently. No HTTP route serves version
-content.
+explicit request. It never changes `state.db` or `-wal`, but SQLite creates a
+missing `-wal` or `-shm` beside the store with the store file's mode and
+rewrites `-shm`; to keep an original byte-identical, resolve a copy of
+`state.db` and `-wal` (never `-shm`). The replay CLI is metadata-only by
+default and emits bodies only via `--include-content` / `--output-file`, so
+terminals, CI logs, and shell history don't capture content inadvertently. No
+HTTP route serves version content.
 
 ### Workspace checkpoints ride this retention window (file members)
 

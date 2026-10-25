@@ -1315,7 +1315,15 @@ agent-coherence-replay resolve --db ./.coherence/state.db \
     --artifact plans/plan.md --version 2 --json
 ```
 
-The store is opened **read-only** (never created, never migrated). Output is
+The store is opened **read-only**: never created, never migrated, and
+`state.db` and its write-ahead log are never changed. A store a crashed
+coordinator left behind resolves as it is: its committed changes are read from
+the write-ahead log, and the unfinished transaction is not. SQLite does create
+an empty `state.db-wal` and a `state.db-shm` beside the store when they are
+missing, and rewrites `state.db-shm`. To leave an original untouched, copy
+`state.db` and `state.db-wal` (never `state.db-shm`) while no coordinator runs,
+and resolve the copy. When the open fails, the message names SQLite's error
+code and the step that works for it. Output is
 content-safe by default — `version`, `coordinator_epoch`, `captured_at`, content
 hash and length — and emits the retained bytes only with `--include-content`
 (base64 for binary) or `--output-file` (raw, written `0600`), so secrets don't
@@ -4298,7 +4306,7 @@ plainly:**
 
 - A database written **before** this release has no `conflict_counters` table.
   That reads as **zero recorded conflicts** — a real, reportable result.
-- Every **other** read failure — a locked database, a hot-WAL recovery failure,
+- Every **other** read failure — a locked database, a store SQLite cannot open read-only,
   disk I/O — is raised, never mapped to zero. A broken read can never
   masquerade as a quiet month.
 - A missing file raises `FileNotFoundError`: a report against a store that does
@@ -4488,8 +4496,9 @@ plainly:**
 - **Attribution is by file only.** A change on disk carries no author, so the
   report names what changed and never who changed it.
 
-Reading the report never writes to the store, so you can point it at a database
-copied off a machine after the fact.
+Reading the report never changes the store's data, so you can point it at a
+database copied off a machine after the fact. SQLite may create an empty
+`state.db-wal` and a `state.db-shm` beside it.
 
 ## Replay (v0.8.2+)
 

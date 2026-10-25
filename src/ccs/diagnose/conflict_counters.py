@@ -14,7 +14,7 @@ path today, and a report built from these totals must say so rather than
 invent one. A database that predates the instrumentation simply has no
 ``conflict_counters`` table; that reads as zero conflicts recorded — zero is a
 reportable result, not an error. Any other read failure (a locked database,
-a hot-WAL recovery failure, disk I/O) is never mapped to zero — it propagates
+a store SQLite cannot open read-only, disk I/O) is never mapped to zero — it propagates
 so the report cannot mistake a broken read for a quiet 30 days.
 """
 
@@ -37,7 +37,7 @@ def read_conflict_totals(db_path: str | Path) -> dict[tuple[str, str, str], int]
     ``FileNotFoundError`` (a report against a nonexistent store is a caller
     error, not zero); a missing ``conflict_counters`` table (pre-instrumentation
     db) returns ``{}``. Every other ``sqlite3.OperationalError`` — a locked
-    database, a hot-WAL recovery failure, disk I/O — is re-raised rather than
+    database, a store SQLite cannot open read-only, disk I/O — is re-raised rather than
     swallowed, so it can never masquerade as zero conflicts.
     """
     conn = open_readonly_state_db(Path(db_path))

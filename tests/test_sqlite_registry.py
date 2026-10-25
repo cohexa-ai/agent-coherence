@@ -40,14 +40,27 @@ from ccs.coordinator.sqlite_registry import (
     SqliteArtifactRegistry,
     StoreNeedsRecoveryError,
     _read_only_uri,
+    classify_sqlite_operational_signal,
 )
 from ccs.core.exceptions import (
     CROSS_RUNTIME_SCHEMA_REASON,
     SCHEMA_VERSION_REASONS,
+    STORE_SIGNAL_BUSY,
     STORE_SIGNAL_UNREADABLE,
+    STORE_SIGNAL_WAL_RECOVERY,
 )
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail, FetchRequest
+from tests.store_images import (
+    COMMITTED_V1,
+    COMMITTED_V2,
+    UNCOMMITTED_TABLE,
+    crashed_wal_image,
+    hot_journal_image,
+    kill_writer_mid_flight,
+    sidecar_path,
+    sqlite_error,
+)
 
 
 @pytest.fixture
@@ -1814,7 +1827,8 @@ def _assert_refuses_writes(reg: SqliteArtifactRegistry) -> None:
 
 
 class TestReadOnlyMode:
-    """R2: read-only open never creates / migrates / mutates; typed failures."""
+    """R2: read-only open never creates the store, migrates it, or changes
+    state.db or its WAL; typed failures."""
 
     def test_missing_path_raises_and_creates_no_file(self, tmp_path: Path) -> None:
         missing = tmp_path / "absent.db"
@@ -1861,9 +1875,10 @@ class TestReadOnlyMode:
     def test_read_only_needs_recovery_fault_injected(
         self, db_path: Path, monkeypatch
     ) -> None:
-        # A real post-crash hot-WAL state cannot be deterministically created in
-        # pytest, so inject SQLITE_READONLY_RECOVERY on the ro connection's first
-        # user_version read (the point a hot-WAL ro open fails).
+        # SQLite raises SQLITE_READONLY_RECOVERY only while another process
+        # holds the store's WAL index in a state a read-only reader cannot
+        # rebuild; a crashed writer's WAL is read in place instead. Inject the
+        # code on the first user_version read.
         with SqliteArtifactRegistry(db_path) as reg:
             _retain_artifact(reg, content="x")
 
@@ -1875,9 +1890,8 @@ class TestReadOnlyMode:
 
             def execute(self, sql, *a, **k):
                 if "user_version" in sql:
-                    raise sqlite3.OperationalError(
-                        "attempt to write a readonly database "
-                        "(SQLITE_READONLY_RECOVERY)"
+                    raise sqlite_error(
+                        "attempt to write a readonly database", "SQLITE_READONLY_RECOVERY"
                     )
                 return self._real.execute(sql, *a, **k)
 
@@ -1893,26 +1907,30 @@ class TestReadOnlyMode:
             return conn
 
         monkeypatch.setattr(sr.sqlite3, "connect", fake_connect)
-        with pytest.raises(StoreNeedsRecoveryError):
+        with pytest.raises(StoreNeedsRecoveryError) as excinfo:
             SqliteArtifactRegistry(db_path, read_only=True)
+        assert excinfo.value.reason == STORE_SIGNAL_WAL_RECOVERY
+        assert "SQLITE_READONLY_RECOVERY" in str(excinfo.value)
+        assert "Retry once that process exits" in str(excinfo.value)
 
     @pytest.mark.parametrize(
-        ("build_store", "fault_message", "expected_error"),
+        ("build_store", "fault", "expected_error"),
         [
             pytest.param("v1", None, SchemaVersionError, id="schema-version-mismatch"),
             pytest.param(
                 "v2",
-                "attempt to write a readonly database (SQLITE_READONLY_RECOVERY)",
+                ("attempt to write a readonly database", "SQLITE_READONLY_RECOVERY"),
                 StoreNeedsRecoveryError,
                 id="needs-recovery",
             ),
             pytest.param(
-                "v2", "database is locked", StoreNeedsRecoveryError, id="busy"
+                "v2", ("database is locked", "SQLITE_BUSY"), StoreNeedsRecoveryError,
+                id="busy",
             ),
         ],
     )
     def test_read_only_open_failure_closes_connection(
-        self, db_path: Path, monkeypatch, build_store, fault_message, expected_error
+        self, db_path: Path, monkeypatch, build_store, fault, expected_error
     ) -> None:
         # A typed failure AFTER sqlite3.connect succeeded must close the
         # connection before raising — the caller never receives a registry
@@ -1937,8 +1955,8 @@ class TestReadOnlyMode:
                 return self._real.close()
 
             def execute(self, sql, *a, **k):
-                if fault_message is not None and "user_version" in sql:
-                    raise sqlite3.OperationalError(fault_message)
+                if fault is not None and "user_version" in sql:
+                    raise sqlite_error(*fault)
                 return self._real.execute(sql, *a, **k)
 
             def __getattr__(self, n):
@@ -1994,6 +2012,8 @@ class TestReadOnlyMode:
         with pytest.raises(StoreNeedsRecoveryError) as excinfo:
             SqliteArtifactRegistry(db_path, read_only=True)
         assert excinfo.value.reason == STORE_SIGNAL_BUSY
+        assert "Retry shortly" in str(excinfo.value)
+        assert "no SQLite code" in str(excinfo.value)
 
     @pytest.mark.parametrize("dirname", _URI_HOSTILE_DIRS)
     def test_a_uri_reserved_character_in_the_path_opens_the_named_store(
@@ -2141,6 +2161,7 @@ class TestReadOnlyMode:
         with pytest.raises(StoreNeedsRecoveryError) as excinfo:
             SqliteArtifactRegistry(db_path, read_only=True)
         assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert "is a directory" in str(excinfo.value)
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
     def test_an_unreadable_store_file_raises_a_typed_unreadable_error(
@@ -2154,6 +2175,293 @@ class TestReadOnlyMode:
         finally:
             db_path.chmod(_DB_FILE_MODE)
         assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert "cannot read state.db" in str(excinfo.value)
+        assert "state.db-wal" in str(excinfo.value)
+        assert "mode 0600" in str(excinfo.value)
+
+    @pytest.mark.parametrize("shm", ["as-left", "missing"])
+    def test_a_crashed_writers_wal_is_read_in_place(
+        self, tmp_path: Path, shm: str
+    ) -> None:
+        """The docs said a crashed writer's WAL makes a read-only open fail
+        (#419). SQLite reads it in place: the committed versions, whose only
+        copy is in the WAL, are visible, and the unfinished transaction is not."""
+        db, art_id = crashed_wal_image(tmp_path)
+        if shm == "missing":
+            sidecar_path(db, "-shm").unlink()
+        db_bytes, wal_bytes = db.read_bytes(), sidecar_path(db, "-wal").read_bytes()
+
+        with SqliteArtifactRegistry(db, read_only=True) as ro:
+            assert ro.get_content_at_version(art_id, 1) == COMMITTED_V1
+            assert ro.get_content_at_version(art_id, 2) == COMMITTED_V2
+            tables = {row[0] for row in ro._conn.execute("SELECT name FROM sqlite_master")}
+        assert UNCOMMITTED_TABLE not in tables
+
+        assert db.read_bytes() == db_bytes
+        assert sidecar_path(db, "-wal").read_bytes() == wal_bytes
+        # The next writer open, a coordinator restart, finds the same history.
+        with SqliteArtifactRegistry(db) as writer:
+            assert writer.get_content_at_version(art_id, 2) == COMMITTED_V2
+            tables = {row[0] for row in writer._conn.execute("SELECT name FROM sqlite_master")}
+        assert UNCOMMITTED_TABLE not in tables
+
+    @pytest.mark.serial
+    def test_a_crashed_writers_wal_reads_the_same_as_a_sigkilled_writers(
+        self, tmp_path: Path
+    ) -> None:
+        """tests/store_images.py builds a crashed writer's files in-process; this
+        checks that image against a writer that really is SIGKILLed."""
+        db = tmp_path / "state.db"
+        SqliteArtifactRegistry(db).close()
+        kill_writer_mid_flight(_CRASHING_WRITER, str(db))
+
+        with SqliteArtifactRegistry(db, read_only=True) as ro:
+            art_id = ro.lookup_artifact_id_by_name("plan.md")
+            assert ro.get_content_at_version(art_id, 1) == COMMITTED_V1
+            assert ro.get_content_at_version(art_id, 2) == COMMITTED_V2
+            tables = {row[0] for row in ro._conn.execute("SELECT name FROM sqlite_master")}
+        assert UNCOMMITTED_TABLE not in tables
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_a_missing_shm_in_a_directory_this_user_cannot_write_names_the_copy(
+        self, tmp_path: Path
+    ) -> None:
+        """SQLite must create state.db-shm beside a WAL and cannot. The message
+        said to re-open the store read-write, which fails the same way."""
+        db, _ = crashed_wal_image(tmp_path)
+        sidecar_path(db, "-shm").unlink()
+        db.parent.chmod(0o555)
+        try:
+            with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+                SqliteArtifactRegistry(db, read_only=True)
+        finally:
+            db.parent.chmod(0o700)
+
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert excinfo.value.__cause__.sqlite_errorcode == sqlite3.SQLITE_CANTOPEN
+        assert "must create state.db-shm" in str(excinfo.value)
+        assert "resolve the copy" in str(excinfo.value)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_a_closed_store_in_a_read_only_directory_is_not_an_unclean_wal(
+        self, db_path: Path
+    ) -> None:
+        """A cleanly closed store has no WAL, but SQLite must create one and
+        cannot (SQLITE_READONLY_DIRECTORY). The text rule called it an unclean
+        write-ahead log that a read-write open would checkpoint."""
+        _writer_store(db_path)
+        db_path.parent.chmod(0o555)
+        try:
+            with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+                SqliteArtifactRegistry(db_path, read_only=True)
+        finally:
+            db_path.parent.chmod(0o700)
+
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert (
+            excinfo.value.__cause__.sqlite_errorcode == sqlite3.SQLITE_READONLY_DIRECTORY
+        )
+        assert "the directory is read-only" in str(excinfo.value)
+        assert "write-ahead log" not in str(excinfo.value)
+
+    def test_a_hot_rollback_journal_is_not_an_unclean_wal(self, tmp_path: Path) -> None:
+        """#420: the store has no WAL; SQLite reports SQLITE_READONLY_ROLLBACK,
+        and the text rule labelled it a WAL in need of recovery."""
+        db, _ = hot_journal_image(tmp_path)
+
+        with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+            SqliteArtifactRegistry(db, read_only=True)
+
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert excinfo.value.__cause__.sqlite_errorcode == sqlite3.SQLITE_READONLY_ROLLBACK
+        assert "state.db-journal" in str(excinfo.value)
+        assert "write-ahead log" not in str(excinfo.value)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
+    def test_a_store_under_a_directory_this_user_cannot_search_is_unreadable(
+        self, tmp_path: Path
+    ) -> None:
+        """#437: the existence check raised a raw PermissionError."""
+        db = tmp_path / "locked" / "state.db"
+        _writer_store(db)
+        db.parent.chmod(0)
+        try:
+            with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+                SqliteArtifactRegistry(db, read_only=True)
+        finally:
+            db.parent.chmod(0o700)
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert "cannot be searched" in str(excinfo.value)
+        assert "mode 0600" in str(excinfo.value)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
+    def test_a_directory_that_becomes_unsearchable_before_the_connect_is_unreadable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The check after a failed connect raised the raw PermissionError too."""
+        db = tmp_path / "locked" / "state.db"
+        _writer_store(db)
+        from ccs.coordinator import sqlite_registry as sr
+
+        real_connect = sqlite3.connect
+
+        def connect_after_lock(*a, **k):
+            if a and "mode=ro" in str(a[0]):
+                db.parent.chmod(0)
+            return real_connect(*a, **k)
+
+        monkeypatch.setattr(sr.sqlite3, "connect", connect_after_lock)
+        try:
+            with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+                SqliteArtifactRegistry(db, read_only=True)
+        finally:
+            db.parent.chmod(0o700)
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+
+    def test_a_path_too_long_for_the_file_system_is_a_missing_store(
+        self, tmp_path: Path
+    ) -> None:
+        """The existence check raised a raw OSError (ENAMETOOLONG)."""
+        with pytest.raises(MissingDatabaseError):
+            SqliteArtifactRegistry(tmp_path / ("x" * 300) / "state.db", read_only=True)
+
+    def test_a_path_under_a_file_or_a_symlink_loop_is_a_missing_store(
+        self, tmp_path: Path
+    ) -> None:
+        """Path.exists() answers False for these (ENOTDIR, ELOOP), so they stay
+        db_missing rather than becoming a store this user cannot read."""
+        (tmp_path / "a-file").write_text("x")
+        (tmp_path / "loop-a").symlink_to(tmp_path / "loop-b")
+        (tmp_path / "loop-b").symlink_to(tmp_path / "loop-a")
+
+        for path in (tmp_path / "a-file" / "state.db", tmp_path / "loop-a" / "state.db"):
+            with pytest.raises(MissingDatabaseError):
+                SqliteArtifactRegistry(path, read_only=True)
+
+    def test_a_store_name_too_long_for_its_wal_is_unreadable_not_a_raw_error(
+        self, tmp_path: Path
+    ) -> None:
+        """At 252 bytes the -wal name passes the file system's limit, so SQLite
+        cannot open the store, and choosing the message stat'ed that name."""
+        db = tmp_path / "state.db"
+        _writer_store(db)
+        long_name = db.rename(tmp_path / ("s" * 252))
+
+        with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+            SqliteArtifactRegistry(long_name, read_only=True)
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert "may be damaged" in str(excinfo.value)
+
+    def test_an_empty_store_beside_a_wal_is_refused_before_sqlite_discards_the_wal(
+        self, tmp_path: Path
+    ) -> None:
+        """SQLite discards the WAL of an empty database file on its first read,
+        even read-only, and here that log is the only copy of the history."""
+        db, _ = crashed_wal_image(tmp_path)
+        db.write_bytes(b"")
+        wal_bytes = sidecar_path(db, "-wal").read_bytes()
+
+        with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+            SqliteArtifactRegistry(db, read_only=True)
+
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert "is empty" in str(excinfo.value)
+        assert sidecar_path(db, "-wal").read_bytes() == wal_bytes
+
+    def test_a_busy_store_while_the_retention_policy_loads_is_busy(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The open's last read sat outside its classifying try, so a lock there
+        escaped raw, and the resolver reported it as a corrupt store."""
+        _writer_store(db_path)
+
+        def locked(self):
+            raise sqlite_error("database is locked", "SQLITE_BUSY")
+
+        monkeypatch.setattr(SqliteArtifactRegistry, "_load_retention_meta", locked)
+        with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+            SqliteArtifactRegistry(db_path, read_only=True)
+        assert excinfo.value.reason == STORE_SIGNAL_BUSY
+        assert "SQLITE_BUSY" in str(excinfo.value)
+        assert "Retry shortly" in str(excinfo.value)
+
+    def test_an_unclassified_refusal_names_its_code_and_the_generic_step(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _writer_store(db_path)
+
+        def failing(self):
+            raise sqlite_error("disk I/O error", "SQLITE_IOERR_READ")
+
+        monkeypatch.setattr(SqliteArtifactRegistry, "_load_retention_meta", failing)
+        with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+            SqliteArtifactRegistry(db_path, read_only=True)
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert "SQLITE_IOERR_READ" in str(excinfo.value)
+        assert "may be damaged" in str(excinfo.value)
+
+    def test_a_read_only_open_creates_the_wal_sidecars_at_the_store_files_mode(
+        self, db_path: Path
+    ) -> None:
+        """The docs say so: SQLite creates a missing -wal and -shm beside a WAL
+        store even on a read-only open, with the store file's mode."""
+        _writer_store(db_path)
+        assert not sidecar_path(db_path, "-wal").exists()
+
+        SqliteArtifactRegistry(db_path, read_only=True).close()
+
+        for suffix in ("-wal", "-shm"):
+            mode = stat.S_IMODE(sidecar_path(db_path, suffix).stat().st_mode)
+            assert mode == stat.S_IMODE(db_path.stat().st_mode)
+
+
+#: The writer tests/store_images.py copies mid-transaction, run in a child
+#: process the test SIGKILLs once it says READY.
+_CRASHING_WRITER = """
+import sys, time
+from tests.store_images import open_crashing_writer
+
+writer, _ = open_crashing_writer(sys.argv[1])
+print("READY", flush=True)
+time.sleep(600)
+"""
+
+
+@pytest.mark.parametrize(
+    ("name", "message", "signal_name"),
+    [
+        ("SQLITE_BUSY", "database is locked", "busy"),
+        ("SQLITE_LOCKED", "database table is locked", "busy"),
+        ("SQLITE_BUSY_RECOVERY", "database is locked", "busy"),
+        ("SQLITE_BUSY_SNAPSHOT", "database is locked", "busy"),
+        ("SQLITE_LOCKED_SHAREDCACHE", "database table is locked: t", "busy"),
+        ("SQLITE_READONLY_RECOVERY", "attempt to write a readonly database", "wal_recovery"),
+        ("SQLITE_READONLY_ROLLBACK", "attempt to write a readonly database", "unreadable"),
+        ("SQLITE_READONLY_DIRECTORY", "attempt to write a readonly database", "unreadable"),
+        ("SQLITE_READONLY_CANTLOCK", "attempt to write a readonly database", "unreadable"),
+        ("SQLITE_CANTOPEN", "unable to open database file", "unreadable"),
+        ("SQLITE_IOERR_READ", "disk I/O error", "unreadable"),
+        # The code decides, whatever the message says.
+        ("SQLITE_IOERR_READ", "database is locked", "unreadable"),
+        ("SQLITE_BUSY", "x", "busy"),
+        (None, "database is locked", "busy"),
+        (None, "database table is locked: t", "busy"),
+        (None, "attempt to write a readonly database", "unreadable"),
+        # Python raises this one itself, quoting the stored bytes.
+        (None, "Could not decode to UTF-8 column 'value' with text 'busy�'", "unreadable"),
+        (None, "Could not decode to UTF-8 column 'value' with text 'wal�'", "unreadable"),
+        (None, "Could not decode to UTF-8 column 'value' with text 'database is locked'", "unreadable"),
+        (None, "Could not decode to UTF-8 column 'value' with text 'database table is locked'", "unreadable"),
+    ],
+)
+def test_a_read_only_refusal_is_classified_by_its_sqlite_code(
+    name: str | None, message: str, signal_name: str
+) -> None:
+    """#420: the classifier read SQLite's message, which is the same for every
+    SQLITE_READONLY_* code, and called each of them a WAL in need of recovery.
+    An error SQLite did not raise has no code; only the start of SQLite's own
+    lock messages counts then, since Python's own errors can quote store data."""
+    assert classify_sqlite_operational_signal(sqlite_error(message, name)) == signal_name
 
 
 class TestRetentionRemoveAndEpoch:

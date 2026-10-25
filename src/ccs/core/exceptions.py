@@ -291,24 +291,28 @@ SESSION_BEGIN_CAP_REASONS: frozenset[str] = frozenset(
 # Machine-readable signals carried by ``StoreNeedsRecoveryError.reason``
 # (``ccs.coordinator.sqlite_registry``). INTERNAL routing values, not the wire
 # contract: the CLI's JSON ``reason`` slugs (``needs_recovery`` / ``db_busy`` /
-# ``db_corrupt``) stay owned by the resolver error classes. sqlite renders its
-# operational errors as prose, so SOME substring matching is unavoidable — it
-# happens in exactly ONE place (``classify_sqlite_operational_signal``), and
-# every consumer branches on ``exc.reason == CONSTANT`` from here, never on a
-# substring of the human message (the typed-signal-not-substring house rule,
+# ``db_corrupt``) stay owned by the resolver error classes. They are chosen by
+# SQLite's error code in exactly ONE place
+# (``classify_sqlite_operational_signal``), and every consumer branches on
+# ``exc.reason == CONSTANT`` from here, never on a substring of the human
+# message (the typed-signal-not-substring house rule,
 # ``docs/solutions/best-practices/typed-signal-not-substring-...``).
 STORE_SIGNAL_WAL_RECOVERY = "wal_recovery"
-"""A hot WAL a read-only connection cannot replay (SQLITE_READONLY_RECOVERY).
-Remedy: re-open once with the embedder (read-write) to checkpoint the WAL."""
+"""Another process holds the store's WAL index in a state a read-only reader
+cannot rebuild (SQLITE_READONLY_RECOVERY). A crashed writer's WAL does not
+produce this: a read-only open reads it in place. Remedy: retry once that
+process exits, or resolve a copy of ``state.db`` and ``-wal``."""
 
 STORE_SIGNAL_BUSY = "busy"
-"""The store is locked by a concurrent writer (SQLITE_BUSY); retry shortly."""
+"""The store is locked by a concurrent writer (SQLITE_BUSY / SQLITE_LOCKED);
+retry shortly."""
 
 STORE_SIGNAL_UNREADABLE = "unreadable"
-"""The catch-all: the read-only connection could not read the store for a
-reason that is neither a recognized recovery state nor a lock. The operator
-remedy matches ``wal_recovery`` (re-open with the embedder), so consumers may
-fold this into their needs-recovery surface."""
+"""The store cannot be read as it is: this user cannot reach or read it,
+SQLite must create a sidecar in a directory it cannot write, a writer left a
+hot rollback journal, or another SQLite error. The message names the code
+and the step that works; consumers fold this into their needs-recovery
+surface."""
 
 STORE_OPEN_SIGNALS: frozenset[str] = frozenset(
     {STORE_SIGNAL_WAL_RECOVERY, STORE_SIGNAL_BUSY, STORE_SIGNAL_UNREADABLE}

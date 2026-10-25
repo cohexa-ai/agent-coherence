@@ -29,12 +29,13 @@ Typed outcomes (no raw stack traces ever reach a script):
   …or RAISES a :class:`ResolverError` for an open/lookup failure that has no
   servable value:
 
-  - :class:`ResolverMissingDatabaseError` — path does not exist (and the
-    registry is NEVER constructed — see the pre-existence check below)
+  - :class:`ResolverMissingDatabaseError` — path does not exist (no store is
+    ever materialized there)
   - :class:`ResolverSchemaVersionError` — wrong ``user_version`` (a v1 db; the
     resolver performs NO migration)
-  - :class:`ResolverNeedsRecoveryError` — post-crash hot WAL a read-only
-    connection cannot replay
+  - :class:`ResolverNeedsRecoveryError` — the store cannot be read as it is
+    (no access, a read-only directory, a hot rollback journal); the message
+    names the step that works
   - :class:`ResolverCorruptDatabaseError` — the file is not a SQLite database
   - :class:`ResolverBusyError` — the store is locked (SQLITE_BUSY)
   - :class:`ResolverUnknownArtifactPathError` — a workspace-path selector that
@@ -103,13 +104,12 @@ class ResolverError(ReplayTraceError):
 
 
 class ResolverMissingDatabaseError(ResolverError):
-    """The ``--db`` path does not exist; the resolver constructed NO registry.
+    """The ``--db`` path does not exist; no store was materialized there.
 
-    Belt-and-suspenders against materializing a fresh empty
-    ``.coherence/state.db``: :func:`resolve_version` checks ``path.exists()``
-    BEFORE touching ``SqliteArtifactRegistry`` at all, so this is raised without
-    any side effect (read-only mode would also refuse to create, but the
-    pre-check guarantees zero filesystem touch and a clean message)."""
+    The read-only open checks the path before it connects and never creates
+    the file, so this is raised without any side effect. The resolver lets
+    that one check decide rather than running its own first: a second check
+    would classify the same path in two places (#437)."""
 
     reason = "db_missing"
 
@@ -125,13 +125,14 @@ class ResolverSchemaVersionError(ResolverError):
 
 
 class ResolverNeedsRecoveryError(ResolverError):
-    """The store has an unclean hot WAL a read-only connection cannot replay.
+    """The store cannot be read as it is.
 
-    After an embedder crash, SQLite forbids a ``mode=ro`` connection from
-    running WAL recovery (SQLITE_READONLY_RECOVERY). The forensic population
-    over-represents crashed writers, so this is the resolver's most on-brand
-    failure: the remedy is to re-open once with the embedder (read-write) so it
-    checkpoints the WAL, then retry the resolve."""
+    This user cannot reach or read it; SQLite must create a sidecar file in a
+    directory it cannot write; a writer left a hot rollback journal; or another
+    process holds a WAL index a read-only reader cannot rebuild. The message
+    names SQLite's error code and the step that works. A crashed writer's WAL
+    is not in this class: the read-only open reads its committed transactions
+    in place (#419)."""
 
     reason = "needs_recovery"
 
@@ -151,8 +152,8 @@ class ResolverBusyError(ResolverError):
     """The store is locked by a concurrent writer (SQLITE_BUSY).
 
     A read-only resolve that times out waiting for a writer's lock surfaces
-    here. Distinct from needs-recovery (a hot WAL) and corruption (bad bytes):
-    the store is fine, just busy — retry shortly."""
+    here. Distinct from needs-recovery (cannot be read as it is) and corruption
+    (bad bytes): the store is fine, just busy — retry shortly."""
 
     reason = "db_busy"
 
@@ -220,23 +221,21 @@ def resolve_version(request: ResolverRequest) -> ResolverResult:
 
     Steps (each failure is a typed error or typed rejection — never a raw trace):
 
-    1. **Pre-existence check.** If ``request.db_path`` does not exist, raise
-       :class:`ResolverMissingDatabaseError` and NEVER construct the registry
-       (no fresh ``.coherence/state.db`` is ever materialized).
-    2. **Read-only open.** Construct ``SqliteArtifactRegistry(path,
-       read_only=True)`` — the Unit 3 mode that never creates/migrates/ALTERs and
-       rejects mutators. Map its typed open failures
-       (``MissingDatabaseError`` / ``SchemaVersionError`` /
-       ``StoreNeedsRecoveryError``) plus raw ``sqlite3.DatabaseError`` (non-sqlite
-       file) and SQLITE_BUSY to the resolver error taxonomy.
-    3. **Instance cross-check** (optional). If ``expected_instance_id`` is given
+    1. **Read-only open.** Construct ``SqliteArtifactRegistry(path,
+       read_only=True)`` — the Unit 3 mode that never creates the store,
+       migrates or ALTERs it, and rejects mutators. A missing path raises
+       :class:`ResolverMissingDatabaseError` with nothing created. Map the
+       other typed open failures (``SchemaVersionError`` /
+       ``StoreNeedsRecoveryError``) plus raw ``sqlite3.DatabaseError``
+       (non-sqlite file) to the resolver error taxonomy.
+    2. **Instance cross-check** (optional). If ``expected_instance_id`` is given
        and != the store's persisted ``instance_id``, raise
        :class:`ResolverInstanceMismatchError`.
-    4. **Selector → id.** A raw-UUID selector is used directly (an unknown id
+    3. **Selector → id.** A raw-UUID selector is used directly (an unknown id
        flows to ``read_at_version`` → ``unknown_artifact`` rejection). A path
        selector is looked up via ``artifacts.name`` (UNIQUE); a miss raises
        :class:`ResolverUnknownArtifactPathError`.
-    5. **read_at_version.** Construct ``CoordinatorService`` over the read-only
+    4. **read_at_version.** Construct ``CoordinatorService`` over the read-only
        registry and return its ``VersionedContent | VersionedReadRejection``
        (``version < 1`` raises ``ValueError`` from the service — caller misuse,
        surfaced by the CLI as a usage error, not a resolver reason).
@@ -244,15 +243,6 @@ def resolve_version(request: ResolverRequest) -> ResolverResult:
     The coordinator/sqlite imports are LAZY (inside this function) per the
     no-eager-optional-import discipline.
     """
-    # (1) Pre-existence check — BEFORE any registry construction so a wrong path
-    # never materializes a fresh empty store (zero filesystem side effect).
-    if not request.db_path.exists():
-        raise ResolverMissingDatabaseError(
-            f"read-at-version resolve: no coordinator store at "
-            f"{request.db_path}. The resolver opens the store read-only and "
-            f"never creates it — point --db at an existing .coherence/state.db."
-        )
-
     # Lazy imports (optional-extra discipline): keep ``import
     # ccs.cli.coherence_replay`` from pulling the coordinator + sqlite surface
     # at module-load time.
@@ -266,13 +256,16 @@ def resolve_version(request: ResolverRequest) -> ResolverResult:
         StoreNeedsRecoveryError,
     )
 
-    # (2) Read-only open with typed-failure mapping.
+    # (1) Read-only open with typed-failure mapping. Its own existence check
+    # decides a missing or unreachable path; nothing is created either way.
     try:
         registry = SqliteArtifactRegistry(request.db_path, read_only=True)
     except MissingDatabaseError as exc:
-        # Defense in depth: the pre-check above already covers a missing path,
-        # but a TOCTOU delete between the check and the open lands here too.
-        raise ResolverMissingDatabaseError(str(exc)) from exc
+        raise ResolverMissingDatabaseError(
+            f"read-at-version resolve: no coordinator store at "
+            f"{request.db_path}. The resolver opens the store read-only and "
+            f"never creates it — point --db at an existing .coherence/state.db."
+        ) from exc
     except SchemaVersionError as exc:
         raise ResolverSchemaVersionError(str(exc)) from exc
     except StoreNeedsRecoveryError as exc:
@@ -292,7 +285,7 @@ def resolve_version(request: ResolverRequest) -> ResolverResult:
         ) from exc
 
     try:
-        # (3) Optional instance-id identity guard.
+        # (2) Optional instance-id identity guard.
         if request.expected_instance_id is not None:
             actual = registry.instance_id
             if actual != request.expected_instance_id:
@@ -304,10 +297,10 @@ def resolve_version(request: ResolverRequest) -> ResolverResult:
                     f"manifest describes; check --db."
                 )
 
-        # (4) Selector → artifact id.
+        # (3) Selector → artifact id.
         artifact_id = _resolve_artifact_id(registry, request.selector)
 
-        # (5) read_at_version via the service over the read-only registry. A
+        # (4) read_at_version via the service over the read-only registry. A
         # SQLITE_BUSY/locked store can surface OperationalError at QUERY time
         # (after a clean open) — distinct from the open-time mapping above — so
         # we map it to the resolver taxonomy here too rather than leaking a raw
@@ -367,9 +360,10 @@ def _resolver_error_for_store_signal(signal: str, exc: Exception) -> ResolverErr
     registry seam and is matched with ``==`` against the constants in
     ``ccs.core.exceptions`` (the typed-signal house rule). ``busy`` keeps its
     own class (retry shortly); ``wal_recovery`` and the ``unreadable``
-    catch-all share :class:`ResolverNeedsRecoveryError` because they share the
-    operator remedy (re-open once with the embedder) — preserving the
-    wire-visible JSON reasons / exit codes exactly.
+    catch-all share :class:`ResolverNeedsRecoveryError`: the store cannot be
+    read as it is, and the registry's message names the step that works for
+    the code it got — preserving the wire-visible JSON reasons / exit codes
+    exactly.
     """
     if signal == STORE_SIGNAL_BUSY:
         return ResolverBusyError(

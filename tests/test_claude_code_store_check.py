@@ -24,7 +24,6 @@ import fcntl
 import hashlib
 import os
 import shutil
-import signal
 import sqlite3
 import subprocess
 import sys
@@ -52,6 +51,7 @@ from tests.coordinator.test_checkpoint_registration_schema import (
     _revert_to_v7_shape,
     _revert_to_v9_shape,
 )
+from tests.store_images import kill_writer_mid_flight
 from tests.test_sqlite_registry import (
     _build_raw_v1_db,
     _forge_node_v3_db,
@@ -427,23 +427,9 @@ time.sleep(600)
 
 
 def _kill_writer_mid_flight(mode: str, db: Path) -> None:
-    """Run the child writer in ``mode`` against ``db``, SIGKILL it once it
-    reports READY, and reap it. Signals only the child this call started."""
-    child = subprocess.Popen(
-        [sys.executable, "-c", _CHILD_WRITER, mode, str(db)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
-    )
-    try:
-        ready = child.stdout.readline()
-        assert ready.strip() == b"READY", (ready, child.stderr.read() if child.poll() else b"")
-    finally:
-        if child.poll() is None:
-            os.kill(child.pid, signal.SIGKILL)
-        child.wait(timeout=30)
-        child.stdout.close()
-        child.stderr.close()
+    """Run the child writer in ``mode`` against ``db`` and SIGKILL it once it
+    reports READY."""
+    kill_writer_mid_flight(_CHILD_WRITER, mode, str(db))
 
 
 def _header_user_version(db: Path) -> int | None:

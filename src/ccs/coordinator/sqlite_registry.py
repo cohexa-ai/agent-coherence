@@ -79,6 +79,7 @@ IMMEDIATE transactions).
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import sqlite3
@@ -712,11 +713,22 @@ def _read_only_uri(db_path: Path) -> str:
     return f"file:{encoded}?mode=ro"
 
 
+#: ``os.stat`` errors for a path where no store can stand: the ones
+#: ``Path.exists()`` reads as False, plus a name too long for the file system.
+_PATH_NOT_THERE_ERRNOS = frozenset(
+    {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EBADF, errno.ENAMETOOLONG}
+)
+
+
 class ReadOnlyRegistryError(RuntimeError):
     """Base for read-only-open failures (the resolver / SB-17 inherit this).
 
-    A read-only :class:`SqliteArtifactRegistry` (``mode=ro`` URI) never creates,
-    migrates, or mutates the store. The subclasses below give the CLI a typed,
+    A read-only :class:`SqliteArtifactRegistry` (``mode=ro`` URI) never creates
+    the store, never migrates it, and never changes ``state.db`` or its WAL.
+    SQLite itself creates an empty ``-wal`` and a ``-shm`` beside a WAL store
+    when they are missing, and rewrites ``-shm`` (#419): resolve a copy of
+    ``state.db`` and ``-wal`` to leave an original untouched. The subclasses
+    below give the CLI a typed,
     prose-free way to distinguish *why* a read-only open or call failed; they
     are exceptions (not the ``ConflictDetail`` typed-return discipline) because
     an open that cannot proceed has no value to return.
@@ -737,14 +749,15 @@ class ReadOnlyMutationError(ReadOnlyRegistryError):
 
 
 class StoreNeedsRecoveryError(ReadOnlyRegistryError):
-    """The read-only connection could not read the store (recovery/busy/other).
+    """The read-only connection could not read the store as it is.
 
-    After an embedder crash SQLite leaves a hot WAL whose recovery requires a
-    *write* lock; a ``mode=ro`` connection raises ``SQLITE_READONLY_RECOVERY``.
-    This is distinct from missing / corrupt — the remedy is to re-open
-    the store once with the embedder (read-write) so it checkpoints the WAL,
-    then retry the read-only resolve. The forensic population over-represents
-    crashed writers, so this is the resolver's most on-brand failure mode.
+    A writer holds its lock (``busy``); another process holds a WAL index a
+    read-only reader cannot rebuild (``wal_recovery``); or the store cannot be
+    read as it is (``unreadable``): no access, a read-only directory SQLite
+    cannot create a sidecar in, a hot rollback journal. A crashed writer's WAL
+    is not among them: a ``mode=ro`` connection reads it in place, committed
+    transactions visible and the unfinished one not (#419). The message names
+    SQLite's error code and a step that works for it.
 
     ``reason`` is the machine-readable classification signal (one of
     ``ccs.core.exceptions.STORE_OPEN_SIGNALS``: ``wal_recovery`` / ``busy`` /
@@ -754,30 +767,96 @@ class StoreNeedsRecoveryError(ReadOnlyRegistryError):
     message — per the typed-signal house rule.
     """
 
-    def __init__(self, message: str, *, reason: str = STORE_SIGNAL_WAL_RECOVERY) -> None:
+    def __init__(self, message: str, *, reason: str = STORE_SIGNAL_UNREADABLE) -> None:
         super().__init__(message)
         self.reason = reason
+
+
+_BUSY_SQLITE_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+
+#: How SQLite's own lock messages start. Only for an error that carries no
+#: code: Python raises some OperationalErrors itself, and a decode error's text
+#: quotes the stored bytes, so a substring anywhere would let data pick the label.
+_BUSY_TEXT_PREFIXES = ("database is locked", "database table is locked")
+
+# The operator step each read-only refusal names. A read-write open is named
+# only where it works: in a read-only directory it fails the same way.
+_COPY_STEP = (
+    "or copy state.db and state.db-wal (never state.db-shm) to a writable "
+    "directory and resolve the copy"
+)
+#: For a user who cannot read the store: a copy of retained content stays 0600.
+_CROSS_USER_COPY_STEP = (
+    "or have that user copy state.db and state.db-wal (never state.db-shm) into a "
+    "directory only this user can reach, keeping the copy at mode 0600, and resolve the copy"
+)
+_BUSY_STEP = "A writer holds the store's lock and the open timed out waiting for it. Retry shortly."
+_WAL_INDEX_STEP = (
+    "Another process has the store open, and SQLite cannot rebuild its write-ahead "
+    "log index for a read-only reader. Retry once that process exits; a copy of "
+    "state.db and state.db-wal (never state.db-shm) taken after it exits resolves too."
+)
+_STEP_BY_SQLITE_CODE = {
+    sqlite3.SQLITE_READONLY_ROLLBACK: (
+        "A writer stopped mid-transaction and left state.db-journal, which a "
+        "read-only open cannot roll back. One read-write SQLite open rolls it back, "
+        "in a writable directory; to leave this store as it is, copy state.db and "
+        "state.db-journal, open the copy read-write once (for example "
+        "sqlite3.connect(path).execute('PRAGMA user_version')), and resolve the copy."
+    ),
+    sqlite3.SQLITE_READONLY_DIRECTORY: (
+        "SQLite must create state.db-wal and state.db-shm beside the store and "
+        "cannot: the directory is read-only, and a read-write open fails the same "
+        "way. Make the directory writable for the resolve, or copy state.db to a "
+        "writable directory and resolve the copy."
+    ),
+}
+_UNREADABLE_FILE_STEP = (
+    "This user cannot read state.db. Run the resolve as a user that can read it "
+    f"(the user the coordinator runs as), {_CROSS_USER_COPY_STEP}."
+)
+_MISSING_SHM_STEP = (
+    "SQLite must create state.db-shm beside the store's write-ahead log and "
+    "cannot: this user cannot write the directory, and a read-write open fails "
+    f"the same way. Make the directory writable for the resolve, {_COPY_STEP}."
+)
+_GENERIC_STEP = (
+    f"Check that this user can read the store and write its directory, {_COPY_STEP}. "
+    "If it can, retry once (a process out of file descriptors gets the same code); "
+    "if it fails again, the store may be damaged: inspect a copy, not the original."
+)
+
+
+def _unreachable_store_step(exc: OSError) -> str:
+    """The step for an ``os.stat`` failure on the store path that is not a
+    missing file: an access error names a user, anything else a retry."""
+    if exc.errno in (errno.EACCES, errno.EPERM):
+        return (
+            "A directory above it cannot be searched by this user. Run the resolve "
+            f"as a user that can reach the store, {_CROSS_USER_COPY_STEP}."
+        )
+    return "Retry; if it fails again, check the file system the store is on."
 
 
 def classify_sqlite_operational_signal(exc: sqlite3.OperationalError) -> str:
     """Classify an ``OperationalError`` from a read-only connection into one of
     the ``STORE_OPEN_SIGNALS`` (``busy`` / ``wal_recovery`` / ``unreadable``).
 
-    The ONE place sqlite's rendered error text is substring-matched: Python's
-    ``sqlite3`` exposes no stable error code on every path/version, so the
-    classification is unavoidably text-based and therefore FRAGILE against
-    sqlite message rewording — which is exactly why it must not be duplicated
-    (the typed-signal-not-substring house rule,
-    ``docs/solutions/best-practices/typed-signal-not-substring-...``). Every
-    downstream consumer matches the returned constant with ``==``, never the
-    message. Order matters: a locked store is checked FIRST because a busy
-    signal has a different remedy (retry) than a recovery one (re-open with
-    the embedder).
+    By SQLite's extended error code (``sqlite_errorcode``, on every error
+    SQLite raises since Python 3.11), never its message: SQLite renders every
+    ``SQLITE_READONLY_*`` code as the same "attempt to write a readonly
+    database" (#420). This is the ONE classification point (the
+    typed-signal-not-substring house rule,
+    ``docs/solutions/best-practices/typed-signal-not-substring-...``); every
+    consumer matches the returned constant with ``==``, never the message.
     """
-    text = str(exc).lower()
-    if "busy" in text or "locked" in text:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is None:
+        text = str(exc).lower()
+        return STORE_SIGNAL_BUSY if text.startswith(_BUSY_TEXT_PREFIXES) else STORE_SIGNAL_UNREADABLE
+    if (code & 0xFF) in _BUSY_SQLITE_CODES:
         return STORE_SIGNAL_BUSY
-    if "readonly" in text or "recovery" in text or "wal" in text:
+    if code == sqlite3.SQLITE_READONLY_RECOVERY:
         return STORE_SIGNAL_WAL_RECOVERY
     return STORE_SIGNAL_UNREADABLE
 
@@ -2370,7 +2449,8 @@ class SqliteArtifactRegistry:
         self._chmod_if_exists(self._shm_path())
 
     def _open_read_only(self, instance_id: str | None) -> None:
-        """Open the store read-only: never creates, migrates, ALTERs, or mutates.
+        """Open the store read-only: never creates the store, migrates, ALTERs,
+        or changes ``state.db`` or its WAL.
 
         Used by the replay resolver (Unit 6) and SB-17 later. The
         ``file:...?mode=ro`` URI requires ``uri=True`` to be passed EXPLICITLY —
@@ -2382,14 +2462,13 @@ class SqliteArtifactRegistry:
         store), and so is one deleted between that check and the connect; any
         other failure of the connect is typed like a failed read on it. A v1
         (un-migrated) db is a typed :class:`SchemaVersionError` with NO
-        migration attempted. A post-crash hot WAL that needs replay raises
-        :class:`StoreNeedsRecoveryError` (a read-only connection cannot run WAL
-        recovery — SQLITE_READONLY_RECOVERY).
+        migration attempted. A crashed writer's WAL is read in place: its
+        committed transactions are visible, the unfinished one is not. SQLite
+        creates ``-wal`` and ``-shm`` when they are missing and rewrites
+        ``-shm`` (#419); where it cannot, the open raises
+        :class:`StoreNeedsRecoveryError` naming the step that works.
         """
-        # Ahead of the connect, not only after it: exists() is False for a path
-        # with a NUL, and an encoded NUL (%00) would cut the path short in SQLite.
-        if not self._db_path.exists():
-            raise self._missing_read_only_store_error()
+        self._check_read_only_store_path()
         # mode=ro + uri=True (explicit) — see docstring on the silent-rw hazard.
         try:
             self._conn = sqlite3.connect(
@@ -2399,8 +2478,7 @@ class SqliteArtifactRegistry:
                 isolation_level=None,
             )
         except sqlite3.OperationalError as exc:
-            if not self._db_path.exists():
-                raise self._missing_read_only_store_error() from exc
+            self._check_read_only_store_path(cause=exc)
             raise self._classify_readonly_operational_error(exc) from exc
         # Everything past the connect is validation that can raise a TYPED
         # error; without the close-on-raise the construction failure would leak
@@ -2416,8 +2494,9 @@ class SqliteArtifactRegistry:
             try:
                 current = self._conn.execute("PRAGMA user_version").fetchone()[0]
                 # Cross-runtime fail-closed guard (same classification as the
-                # writer path): the probes are plain reads, so a busy/hot-WAL
-                # store surfaces the SAME typed signal as the version read.
+                # writer path): the probes are plain reads, so a locked or
+                # unreadable store surfaces the SAME typed signal as the version
+                # read.
                 self._reject_foreign_ledger_db(current)
             except sqlite3.OperationalError as exc:
                 raise self._classify_readonly_operational_error(exc) from exc
@@ -2455,13 +2534,54 @@ class SqliteArtifactRegistry:
                 )
             try:
                 self._rehydrate_meta(instance_id)
+                # Policy is immutable per handle (see retention_meta) — cache once.
+                self._retention_meta_cache = self._load_retention_meta()
             except sqlite3.OperationalError as exc:
                 raise self._classify_readonly_operational_error(exc) from exc
-            # Policy is immutable per handle (see retention_meta) — cache once.
-            self._retention_meta_cache = self._load_retention_meta()
         except BaseException:
             self._conn.close()
             raise
+
+    def _check_read_only_store_path(self, *, cause: BaseException | None = None) -> None:
+        """Raise unless a file the open could read stands at the store path,
+        and refuse an empty store file with a write-ahead log beside it.
+
+        ``os.stat``, not ``Path.exists()``, which raises ``PermissionError`` for
+        a path under a directory this user cannot search, and ``OSError`` for a
+        name too long for the file system (#437). A NUL stops here too
+        (``ValueError``): encoded as ``%00`` it would cut the path short in
+        SQLite and open the store before it. ``cause`` is the failed connect
+        this check explains, when there is one.
+        """
+        try:
+            found = os.stat(self._db_path)
+        except ValueError as exc:
+            raise self._missing_read_only_store_error() from (cause or exc)
+        except OSError as exc:
+            if exc.errno in _PATH_NOT_THERE_ERRNOS:
+                raise self._missing_read_only_store_error() from (cause or exc)
+            raise StoreNeedsRecoveryError(
+                f"read-only open: this user cannot reach the store at "
+                f"{self._db_path} ({exc.strerror}). {_unreachable_store_step(exc)}",
+                reason=STORE_SIGNAL_UNREADABLE,
+            ) from exc
+        if stat.S_ISDIR(found.st_mode):
+            raise StoreNeedsRecoveryError(
+                f"read-only open: {self._db_path} is a directory, not a store "
+                f"file; point the open at the state.db file inside it.",
+                reason=STORE_SIGNAL_UNREADABLE,
+            ) from cause
+        # SQLite discards the WAL of an empty database file on its first read,
+        # even read-only, and that log may hold every committed version.
+        if found.st_size == 0 and os.path.lexists(self._wal_path()):
+            raise StoreNeedsRecoveryError(
+                f"read-only open: {self._db_path} is empty, and the write-ahead "
+                f"log beside it holds the store's committed data, which a SQLite "
+                f"open of the empty file would discard; nothing was opened. Copy "
+                f"state.db and state.db-wal, keeping mode 0600, before anything "
+                f"opens them, and restore the store from a backup.",
+                reason=STORE_SIGNAL_UNREADABLE,
+            ) from cause
 
     def _missing_read_only_store_error(self) -> MissingDatabaseError:
         return MissingDatabaseError(
@@ -2479,32 +2599,41 @@ class SqliteArtifactRegistry:
         :func:`classify_sqlite_operational_signal` seam; the signal rides on
         ``StoreNeedsRecoveryError.reason`` so consumers (the replay resolver)
         branch on the attribute, never re-parse the message. All three signals
-        stay ONE exception type — a locked store and a hot WAL are both
-        "cannot read right now" from the registry's perspective; the reason
-        carries the operator remedy.
+        stay ONE exception type — "cannot read the store as it is" from the
+        registry's perspective; the message names SQLite's code and the step
+        that works for it.
         """
         signal = classify_sqlite_operational_signal(exc)
-        if signal == STORE_SIGNAL_BUSY:
-            return StoreNeedsRecoveryError(
-                f"the store at {self._db_path} is locked by a concurrent writer "
-                f"(SQLITE_BUSY) and the read-only open timed out waiting for the "
-                f"lock. Retry shortly. Underlying: {exc}",
-                reason=signal,
-            )
-        if signal == STORE_SIGNAL_WAL_RECOVERY:
-            return StoreNeedsRecoveryError(
-                f"the store at {self._db_path} has an unclean write-ahead log that "
-                f"a read-only connection cannot replay (SQLITE_READONLY_RECOVERY). "
-                f"Re-open it once with the embedder (read-write) so it checkpoints "
-                f"the WAL, then retry the read-only resolve. Underlying: {exc}",
-                reason=signal,
-            )
+        code = getattr(exc, "sqlite_errorcode", None)
+        code_name = getattr(exc, "sqlite_errorname", None) or "no SQLite code"
         return StoreNeedsRecoveryError(
-            f"the read-only store at {self._db_path} could not be read "
-            f"({exc}); it may need recovery (re-open once with the embedder) or "
-            f"be corrupt.",
+            f"read-only open of the store at {self._db_path} failed "
+            f"({code_name}: {exc}). {self._read_only_step(signal, code)}",
             reason=signal,
         )
+
+    def _read_only_step(self, signal: str, code: int | None) -> str:
+        """The step that works for this refusal (the ``_*_STEP`` texts)."""
+        if signal == STORE_SIGNAL_BUSY:
+            return _BUSY_STEP
+        if signal == STORE_SIGNAL_WAL_RECOVERY:
+            return _WAL_INDEX_STEP
+        if code in _STEP_BY_SQLITE_CODE:
+            return _STEP_BY_SQLITE_CODE[code]
+        if code is not None and (code & 0xFF) == sqlite3.SQLITE_CANTOPEN:
+            return self._cantopen_step()
+        return _GENERIC_STEP
+
+    def _cantopen_step(self) -> str:
+        """SQLITE_CANTOPEN names no file: tell a store file this user cannot
+        read apart from a ``-shm`` SQLite must create and cannot. ``os.path``
+        checks, which answer False rather than raise: choosing a message must
+        not replace the refusal (a ``-wal`` name past the file system's limit)."""
+        if not os.access(self._db_path, os.R_OK):
+            return _UNREADABLE_FILE_STEP
+        if os.path.exists(self._wal_path()) and not os.path.exists(self._shm_path()):
+            return _MISSING_SHM_STEP
+        return _GENERIC_STEP
 
     def _persist_retention_policy(self) -> None:
         """Persist the constructor retention policy to registry_meta (writer open).
