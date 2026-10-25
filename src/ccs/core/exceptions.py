@@ -611,6 +611,11 @@ COORDINATOR_UNAVAILABLE_REASON = "coordinator_unavailable"
 #: read, or a volume's release of an earlier attempt's write grant (#401), with
 #: its failure envelope (#259).
 COORDINATOR_FAILED_REASON = "coordinator_failed"
+#: The coordinator's refusal of a ``pre-edit`` that opted in with
+#: ``if_unheld: true`` and that it could not decide in time. A live, busy
+#: coordinator answers it, so it is not :data:`COORDINATOR_UNAVAILABLE_REASON`.
+#: A request that did not opt in still gets the degraded admit.
+UNAVAILABLE_REASON = "unavailable"
 
 
 class CoherenceError(Exception):

@@ -49,6 +49,7 @@ from ccs.core.exceptions import (
     SPLIT_PAIR_REASON,
     STALE_READ_GENERATION_REASON,
     STALE_VIEW_REASON,
+    UNAVAILABLE_REASON,
     VERSION_MISMATCH_REASON,
     VIEW_WEDGED_REASON,
     CoherenceError,
@@ -155,6 +156,7 @@ def test_handoff_reasons_collide_with_no_existing_reason_or_status() -> None:
             COORDINATOR_UNAVAILABLE_REASON,
             COORDINATOR_FAILED_REASON,
             SPLIT_PAIR_REASON,
+            UNAVAILABLE_REASON,
         }
     )
     assert HANDOFF_REASONS.isdisjoint(existing)
@@ -214,6 +216,15 @@ def test_coordinator_failed_carries_its_reason_and_crosses_a_process_boundary() 
     assert type(restored) is CoordinatorFailed
     assert restored.args == ("coordinator answered the read with a failure",)
     assert SPLIT_PAIR_REASON == "split_pair"
+
+
+def test_unavailable_reason_is_its_own_wire_value() -> None:
+    """An opted-in pre-edit the coordinator could not decide in time is refused
+    with this reason, and a client keys its refusal on the value. It stays apart
+    from ``coordinator_unavailable``, which means the coordinator gave no usable
+    answer at all: this answer comes from a coordinator that is alive and busy."""
+    assert UNAVAILABLE_REASON == "unavailable"
+    assert UNAVAILABLE_REASON != COORDINATOR_UNAVAILABLE_REASON
 
 
 def test_transfer_statuses_are_the_six_closed_values() -> None:

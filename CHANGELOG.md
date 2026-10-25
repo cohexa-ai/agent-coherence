@@ -109,6 +109,23 @@ Alpha — APIs may change before `v1.0`.
   `ensure_coordinator` still returns a bare port. The guide's "Starting a
   coordinator from your own process" section has the details.
 
+- **A `pre-edit` that opts in with `"if_unheld": true` is refused as
+  `unavailable` when the coordinator cannot decide it in time.** Such a
+  request asks not to displace a live holder, and the load that times a
+  request out is when a holder matters most. When the caller-principal check
+  or the pre-edit work runs past the 4-second handler budget, the coordinator
+  now answers HTTP 200 `{"ok": false, "reason": "unavailable", "degraded":
+  true}`, with the degraded admit's could-not-verify advisory as added context
+  and no `permissionDecision`, instead of admitting. Work it abandons takes no
+  grant unless it had already won the registry lock before the answer went
+  out. Only a JSON `true` opts in. Every other request, strict-mode paths
+  included, keeps its timed-out answer `{"ok": true, "degraded": true}` byte
+  for byte, and an opted-in request decided in time is still granted like any
+  other, displacing a holder. `UNAVAILABLE_REASON` in `ccs.core.exceptions`
+  names the reason. No released client sends the flag yet. The guide's
+  "Acquire-or-fail on `pre-edit`" section has the details, including which
+  answers an opted-in client may admit on.
+
 ### Changed
 
 - **The protocol corpus pins the out-of-band change signals on both backends (plugin #205).** The
