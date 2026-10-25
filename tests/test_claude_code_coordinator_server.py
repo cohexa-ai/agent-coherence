@@ -42,6 +42,7 @@ from ccs.adapters.claude_code.coordinator_server import (
 )
 from ccs.core.exceptions import (
     HOLD_REASONS,
+    UNAVAILABLE_REASON,
     CoherenceError,
     InvariantViolationError,
     StaleReadGeneration,
@@ -4639,34 +4640,31 @@ def test_pre_edit_late_body_after_timeout_grants_nothing_and_leaves_the_holder(
 
 
 def test_pre_edit_degraded_disposition_refuses_once_acquire_or_fail_can_refuse() -> None:
-    """While any acquire-or-fail refusal reason exists, a timed-out pre-edit
-    must answer ``ok: false``, never the admit.
+    """A timed-out pre-edit that opted in to acquire-or-fail must answer
+    ``ok: false``, never the admit.
 
-    Prevents the refusal asked for in #196 landing with a hole at the watchdog
+    Prevents the refusal asked for in #196 growing a hole at the watchdog
     seam. The contention that makes displacing a holder worth refusing is the
-    same contention that times a handler out; if the degraded answer were
-    still ``ok: true``, an opted-in caller would be told to proceed over the
+    same contention that times a handler out; if the opted-in timeout answer
+    were ``ok: true``, an opted-in caller would be told to proceed over the
     holder it asked not to displace. ``ok: false`` is the shape
     ``CoherentVolume._check_grant`` refuses in both ``on_error`` modes;
     ``ok: true`` it lets through under ``degrade``.
 
-    Today the reason set is empty, so nothing is asserted about the
-    disposition -- deliberately: adding the first reason turns this red until
-    the disposition changes in the same change. If the refusal lands with a
-    separate disposition for opted-in requests, point this test at that one,
-    in that change. The timeout test above ties the named disposition to what
-    the route sends, so this is not a check on a constant nobody reads."""
+    The opted-in requests have their own timeout answer, so this holds that
+    one, with no condition on the refusal set: the timeout refusal is already
+    a member of it. The opted-in timeout tests tie the named disposition to
+    what the route sends, so this is not a check on a constant nobody reads."""
     import ccs.adapters.claude_code.coordinator_server as mod
 
     refusal_reasons = mod._ACQUIRE_OR_FAIL_REFUSAL_REASONS
-    disposition = mod._PRE_EDIT_DEGRADED_RESPONSE
+    disposition = mod._PRE_EDIT_UNAVAILABLE_RESPONSE
     assert isinstance(refusal_reasons, frozenset)
     assert all(isinstance(reason, str) and reason for reason in refusal_reasons)
-    if refusal_reasons:
-        assert disposition.get("ok") is False, (
-            f"pre-edit can refuse with {sorted(refusal_reasons)} but a timed-out "
-            f"pre-edit still answers {disposition!r}, which admits the edit"
-        )
+    assert disposition.get("ok") is False, (
+        f"pre-edit can refuse with {sorted(refusal_reasons)} but an opted-in "
+        f"timed-out pre-edit answers {disposition!r}, which admits the edit"
+    )
 
 
 # ----------------------------------------------------------------------
@@ -9889,6 +9887,202 @@ def test_a_timed_out_gate_answers_exactly_its_routes_timed_out_work_body(
     assert gate_timed_out == work_timed_out, (
         f"{path}: a timed-out gate answered {gate_timed_out!r}, "
         f"a timed-out work body {work_timed_out!r}")
+
+
+# --- an opted-in pre-edit that times out is refused, at either point ----------
+#
+# A pre-edit sent with ``if_unheld: true`` opts in to acquire-or-fail. When the
+# coordinator cannot decide it in time -- its caller-principal gate cannot read
+# the store, or its work body cannot take the registry lock -- it answers the
+# ``unavailable`` refusal instead of the degraded admit, so a writer that asked
+# not to displace a holder is never told to go ahead because the coordinator was
+# busy. Every other pre-edit keeps the degraded admit. Both points are driven
+# for real: the registry lock held, the watchdog deadline shortened.
+
+#: Stands for a pre-edit body that leaves ``if_unheld`` out.
+_ABSENT = object()
+
+
+def _pre_edit_request(who: _Session, if_unheld: object) -> tuple[dict, str]:
+    """A pre-edit of ``plan.md`` from ``who`` carrying ``if_unheld`` (left out
+    for :data:`_ABSENT`), with the principal it presents."""
+    body: dict = {"session_id": who.sid, "path": "plan.md"}
+    if if_unheld is not _ABSENT:
+        body["if_unheld"] = if_unheld
+    return body, who.principal
+
+
+def _answer_while_the_registry_is_held(
+    coordinator, client: _Client, request: tuple[dict, str]
+) -> dict:
+    """Send the pre-edit ``request`` while the registry lock is held and return
+    its answer, failing unless it came in time and counted one watchdog
+    timeout."""
+    body, principal = request
+    timeouts_before = coordinator._watchdog_timeouts_total
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(client, "/hooks/pre-edit", body, principal)
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+    status, reply = answer.result()
+    assert answered, "no answer while the registry lock was held"
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1, (
+        "the request did not time out, so this measured an undegraded pre-edit")
+    assert status == 200
+    return reply
+
+
+def _timed_out_in_its_work(coordinator, client: _Client, request: tuple[dict, str]) -> dict:
+    """The answer to ``request`` when its work body cannot take the registry
+    lock in time, returned once the abandoned body has settled -- which also
+    shows the request got past its gate."""
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+    reply = _answer_while_the_registry_is_held(coordinator, client, request)
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+    return reply
+
+
+def _timed_out_at_its_gate(coordinator, client: _Client, request: tuple[dict, str]) -> dict:
+    """The answer to ``request`` -- from a claimed session presenting its
+    principal -- when its gate cannot read the store in time. The principal
+    cache is emptied first, as a restart leaves it, so the gate has to read."""
+    with coordinator.service._caller_principal_lock:
+        coordinator.service._caller_principals.clear()
+    return _answer_while_the_registry_is_held(coordinator, client, request)
+
+
+def test_an_opted_in_pre_edit_whose_work_times_out_is_refused_and_takes_no_grant(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An opted-in pre-edit whose work body cannot take the registry lock in
+    time answers the ``unavailable`` refusal, takes no grant, and leaves the
+    live holder exclusive.
+
+    Prevents the opt-in being admitted exactly when it matters: the contention
+    that makes a holder worth respecting is the contention that times a
+    handler out, so a degraded admit would tell the caller to edit over the
+    holder it asked not to displace. The late-abort count shows the abandoned
+    body stopped at the registry lock instead of acquiring after the answer."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    holder, caller = _claimed(client), _claimed(client)
+    status, _ = client.post(
+        "/hooks/pre-edit", {"session_id": holder.sid, "path": "plan.md"},
+        principal=holder.principal)
+    assert status == 200
+    assert _agent_state_on(coordinator, "plan.md", holder.sid) == MESIState.EXCLUSIVE
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    aborts_before = coordinator._watchdog_late_aborts_total
+
+    body = _timed_out_in_its_work(coordinator, client, _pre_edit_request(caller, True))
+
+    assert body.get("ok") is False and body.get("reason") == UNAVAILABLE_REASON, body
+    assert body == mod._PRE_EDIT_UNAVAILABLE_RESPONSE
+    assert coordinator._watchdog_late_aborts_total == aborts_before + 1
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) is None, (
+        "the refused caller holds a grant it was told it did not get")
+    assert _agent_state_on(coordinator, "plan.md", holder.sid) == MESIState.EXCLUSIVE
+
+
+def test_an_opted_in_pre_edit_whose_gate_times_out_is_refused(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the caller-principal gate cannot read the store in time, an
+    opted-in pre-edit answers the ``unavailable`` refusal and an ordinary one
+    the gate's degraded admit for pre-edit.
+
+    Prevents the gate's timeout answering by route alone: the gate runs before
+    the work body, so an opted-in request stopped there would be admitted even
+    though the same request stopped in its work is refused. The binding reads
+    show both requests were stopped at the gate, not in their work."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    opted_in, ordinary = _claimed(client), _claimed(client)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    reads = _count_binding_reads(coordinator, monkeypatch)
+
+    refused = _timed_out_at_its_gate(coordinator, client, _pre_edit_request(opted_in, True))
+    reads_for_refused = len(reads)
+    admitted = _timed_out_at_its_gate(coordinator, client, _pre_edit_request(ordinary, _ABSENT))
+
+    assert reads_for_refused >= 1 and len(reads) > reads_for_refused, (
+        f"a request never reached the gate's store read: {reads!r}")
+    assert refused.get("ok") is False and refused.get("reason") == UNAVAILABLE_REASON, refused
+    assert refused == mod._PRE_EDIT_UNAVAILABLE_RESPONSE
+    assert admitted == mod._CALLER_GATE_DEGRADED_RESPONSE[("POST", "/hooks/pre-edit")]
+
+
+@pytest.mark.parametrize(
+    "if_unheld", [False, "true", 1, None, _ABSENT],
+    ids=["false", "string-true", "one", "null", "absent"],
+)
+def test_a_pre_edit_that_does_not_send_json_true_keeps_the_degraded_admit_at_both_points(
+    if_unheld: object, coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a JSON ``true`` opts in. A pre-edit carrying any other
+    ``if_unheld``, or none, answers today's degraded admit whether its work or
+    its gate timed out.
+
+    Prevents the opt-in changing what a caller that never asked for it gets: a
+    truthy check would refuse ``"true"`` or ``1``, and a client that sent
+    ``"false"`` meaning no would be refused under load."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    at_work, at_gate = _claimed(client), _claimed(client)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+
+    worked = _timed_out_in_its_work(coordinator, client, _pre_edit_request(at_work, if_unheld))
+    reads = _count_binding_reads(coordinator, monkeypatch)
+    gated = _timed_out_at_its_gate(coordinator, client, _pre_edit_request(at_gate, if_unheld))
+
+    assert reads, "the request never reached the gate's store read"
+    assert worked == mod._PRE_EDIT_DEGRADED_RESPONSE
+    assert gated == mod._PRE_EDIT_DEGRADED_RESPONSE
+
+
+def test_an_opted_in_pre_edit_decided_in_time_acquires_as_an_ordinary_one_does(
+    coordinator, client: _Client
+) -> None:
+    """An opted-in pre-edit the coordinator decides in time takes the grant and
+    displaces the holder, as an ordinary pre-edit does.
+
+    Prevents the opt-in reaching further than its timeout answer before the
+    in-time refusal exists: until then, sending ``if_unheld: true`` changes
+    nothing about a pre-edit that is answered in time."""
+    holder, caller = _claimed(client), _claimed(client)
+    status, _ = client.post(
+        "/hooks/pre-edit", {"session_id": holder.sid, "path": "plan.md"},
+        principal=holder.principal)
+    assert status == 200
+
+    body, principal = _pre_edit_request(caller, True)
+    status, answer = client.post("/hooks/pre-edit", body, principal=principal)
+
+    assert status == 200 and answer.get("ok") is True and "degraded" not in answer, answer
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.EXCLUSIVE
+    assert _agent_state_on(coordinator, "plan.md", holder.sid) == MESIState.INVALID
+
+
+def test_an_ordinary_pre_edit_on_a_strict_path_that_times_out_keeps_the_degraded_admit(
+    strict_plan_coordinator, strict_plan_client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A strict-listed path does not opt a pre-edit in: one that sends no
+    ``if_unheld`` and times out answers the degraded admit byte for byte.
+
+    Prevents the refusal keying on strict mode instead of the request's own
+    opt-in, which would change what every strict-mode hook user gets under
+    load."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    coordinator, client = strict_plan_coordinator, strict_plan_client
+    who = _claimed(client)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+
+    body = _timed_out_in_its_work(coordinator, client, _pre_edit_request(who, _ABSENT))
+
+    assert body == mod._PRE_EDIT_DEGRADED_RESPONSE
 
 
 # --- the gate's store read RAISES: the route's own internal-error answer ------

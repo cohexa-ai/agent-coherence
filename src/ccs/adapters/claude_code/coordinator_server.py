@@ -129,6 +129,7 @@ from ccs.core.exceptions import (
     RESTORE_STATUSES,
     SESSION_INVALIDATED_REASON,
     STALE_READ_GENERATION_REASON,
+    UNAVAILABLE_REASON,
     CallerPrincipalRefused,
     CheckpointRegistrationRefused,
     CheckpointUnknown,
@@ -192,6 +193,11 @@ class _RequestProtocol(Protocol):
     #: pre-bash's giver lookup (which puts it back when it times out), and the
     #: work body then waits only for what is left (:func:`_watchdog_deadline`).
     _watchdog_deadline: float | None
+    #: What this request answers if it cannot be decided in time, when its
+    #: handler chose that from the body before the caller-principal gate -- an
+    #: opted-in pre-edit's refusal -- or ``None`` for the route's degraded
+    #: envelope. The dispatcher resets it (:func:`_gate_degraded_answer`).
+    _degraded_response: dict | None
 
     def _read_json(self) -> dict | None:
         """Read + parse the request body as JSON. Returns None when the request
@@ -713,8 +719,8 @@ def _admit_caller(
 
     It never waits longer than the handler watchdog: see
     :func:`_attributed_within_deadline`. A gate that cannot decide in time
-    writes the route's degraded envelope (past a full watchdog queue, the 503)
-    and returns ``None`` too — neither admitted nor refused, so it is counted
+    writes what the request's timed-out work body would answer (past a full
+    watchdog queue, the 503) and returns ``None`` too — neither admitted nor refused, so it is counted
     by neither principal counter."""
     posture = _CALLER_PRINCIPAL_POSTURE[req._route_key].posture
     unverified = session_to_agent_id(presented.session_id, presented.subagent_id)
@@ -757,8 +763,9 @@ def _attributed_within_deadline(
 
     Returns the agent id, or ``None`` after writing the answer itself, one of
     three: the watchdog pool's queue-overflow 503; when the lookup is not done
-    by the deadline, exactly the route's degraded envelope
-    (:data:`_CALLER_GATE_DEGRADED_RESPONSE`), counted as a watchdog timeout
+    by the deadline, exactly what the request's timed-out work body would
+    answer (:func:`_gate_degraded_answer`: the route's degraded envelope, or
+    the answer its handler chose from the body), counted as a watchdog timeout
     like a timed-out work body; and when the lookup RAISED anything but a
     refusal — the registry read failing once ``busy_timeout`` elapsed, say —
     exactly the route's internal-error envelope, logged as a failed work body
@@ -789,7 +796,7 @@ def _attributed_within_deadline(
             "caller-principal lookup on %s %s timed out after %ss; degrading",
             method, path, HANDLER_TIMEOUT_SEC,
         )
-        req._json(200, _CALLER_GATE_DEGRADED_RESPONSE[req._route_key])
+        req._json(200, _gate_degraded_answer(req))
         return None
     except Exception as exc:
         # Ordered after the refusal and the timeout: both are Exceptions too
@@ -2261,6 +2268,9 @@ def _make_handler_class(coordinator: CoordinatorHTTPServer) -> type:
                     # giver lookup only when the command writes a tracked path
                     # (a lookup that times out puts the deadline back).
                     self._watchdog_deadline = None
+                    # No handler-chosen timeout answer yet: pre-edit picks one
+                    # from its body before its caller-principal gate runs.
+                    self._degraded_response = None
                     handler(self, coordinator)
                 except Exception as exc:
                     logger.exception("unhandled error in handler for %s %s", method, route_path)
@@ -3285,6 +3295,10 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
         req._json(400, {"error": msg})
         return
+    # The answer if this request cannot be decided in time, chosen once from
+    # the body so the caller-principal gate and the work body give the same one.
+    degraded_answer = _pre_edit_degraded_answer(body)
+    req._degraded_response = degraded_answer
     if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
         return
     # SB-10 U4 (KTD6): advisory peek hoisted above the untracked exit —
@@ -3544,11 +3558,13 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             coordinator, session_id, body, result, abort=abort
         )
 
-    # On watchdog timeout this route ADMITS, with the could-not-verify
-    # advisory (_PRE_EDIT_DEGRADED_RESPONSE). The answer is chosen without the
-    # work body's decision, so it admits the strict-mode stale editor, or the
-    # giver of a live handoff, the body would have denied. See the constant
-    # for the rule a future acquire-or-fail refusal must keep.
+    # On watchdog timeout this route answers degraded_answer: an ordinary
+    # request is ADMITTED with the could-not-verify advisory
+    # (_PRE_EDIT_DEGRADED_RESPONSE), and one that opted in with if_unheld is
+    # refused as unavailable (_PRE_EDIT_UNAVAILABLE_RESPONSE). The answer is
+    # chosen without the work body's decision, so the admit lets through the
+    # strict-mode stale editor, or the giver of a live handoff, the body would
+    # have denied. See the constants for the rule both answers keep.
     # A6: abort threaded into service.write so a late acquire aborts at the
     # registry lock instead of granting a phantom EXCLUSIVE (and silently
     # invalidating peers) the agent never saw.
@@ -3556,7 +3572,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     abort = effects.abort
     _run_or_degrade(
         req, coordinator, work_with_reground,
-        degraded_response=_PRE_EDIT_DEGRADED_RESPONSE, effects=effects,
+        degraded_response=degraded_answer, effects=effects,
     )
 
 
@@ -7763,7 +7779,8 @@ DEGRADED_FRESHNESS_ADVISORY = (
 )
 """What a hook answered on a watchdog timeout tells the model: the coherence
 check did not run. One string, so every route that degrades to an admit says it
-in the same words."""
+in the same words, and so does a pre-edit refused as unavailable for the same
+timeout."""
 
 _DEFAULT_DEGRADED_RESPONSE: dict = {
     "status": "fresh",
@@ -7804,17 +7821,19 @@ _PRE_EDIT_DEGRADED_RESPONSE: dict = {
         additional_context=DEGRADED_FRESHNESS_ADVISORY,
     ),
 }
-"""What ``/hooks/pre-edit`` answers when the watchdog times out: an ADMIT.
+"""What ``/hooks/pre-edit`` answers when it cannot be decided in time and the
+request did not opt in to acquire-or-fail: an ADMIT.
 
-The rule this constant carries: a timed-out acquire must not answer in a shape
-that admits an edit the route would refuse when it is not degraded. The
-acquire-or-fail refusal asked for in Cohexa-ai/agent-coherence#196 (an opt-in
-answering ``{"ok": false, "reason": "other_holder"}`` instead of displacing a
-live holder) is not built; :data:`_ACQUIRE_OR_FAIL_REFUSAL_REASONS` is where it
-will register its reasons, and a guard test fails while that set is non-empty
-and this envelope is still ``ok: true``. A timed-out request never looked for a
-holder: admitting it lets the caller edit over a holder the refusal would have
-reported, and answering ``other_holder`` would report a holder nobody observed.
+The rule both timed-out pre-edit answers carry: a timed-out acquire must not
+answer in a shape that admits an edit the route would refuse when it is not
+degraded. A request that opts in with ``if_unheld: true`` asked to be refused
+rather than displace a live holder, so it gets
+:data:`_PRE_EDIT_UNAVAILABLE_RESPONSE` instead: a timed-out request never
+looked for a holder, and admitting it would let the caller edit over the holder
+its opt-in was meant to protect. The in-time refusal asked for in
+Cohexa-ai/agent-coherence#196 (``{"ok": false, "reason": "other_holder"}``
+instead of displacing a live holder) is not built yet; a timeout cannot answer
+``other_holder``, which would report a holder nobody observed.
 
 The rule bends for one refusal that exists today. Undegraded, a strict-mode
 editor whose grant a peer invalidated gets the strict deny; on a timeout it is
@@ -7831,14 +7850,51 @@ Its own name, rather than a share of :data:`_OK_DEGRADED_RESPONSE`, so that
 changing what a timed-out acquire answers cannot silently change what a
 timed-out post-edit or session-stop answers."""
 
-_ACQUIRE_OR_FAIL_REFUSAL_REASONS: frozenset[str] = frozenset()
+_PRE_EDIT_UNAVAILABLE_RESPONSE: dict = {
+    "ok": False,
+    "reason": UNAVAILABLE_REASON,
+    "degraded": True,
+    "hookSpecificOutput": _payloads.emit_pretooluse_context(
+        additional_context=DEGRADED_FRESHNESS_ADVISORY,
+    ),
+}
+"""What ``/hooks/pre-edit`` answers when a request that opted in with
+``if_unheld: true`` cannot be decided in time, at its caller-principal gate or
+in its work body: a refusal, never the admit.
+
+The request asked not to displace a live holder, and the contention that makes
+a holder worth respecting is the contention that times a handler out. Its
+abandoned work body still carries the abort, so one that has not won the
+registry lock takes no grant once this is sent; one that already won it keeps
+its grant. The advisory is the degraded admit's, context-only -- no
+``permissionDecision`` -- so a hook client that relays the body unread passes
+the same advisory either way. The shape is pinned by
+``tests/fixtures/wire/pre_edit_unavailable.json``."""
+
+_ACQUIRE_OR_FAIL_REFUSAL_REASONS: frozenset[str] = frozenset({UNAVAILABLE_REASON})
 """Reasons an opted-in acquire-or-fail ``/hooks/pre-edit`` may refuse with.
 
-Empty: that refusal is not built (see :data:`_PRE_EDIT_DEGRADED_RESPONSE`). The
-change that builds it adds its reasons here -- ``other_holder`` first -- and
-that same change must give a timed-out opted-in request a non-admitting
-answer, or the guard test on this pair goes red. The strict-mode deny is not
-listed: it is not opt-in and its reason travels in ``hookSpecificOutput``."""
+Its first member is the timeout refusal's
+(:data:`_PRE_EDIT_UNAVAILABLE_RESPONSE`); the change that builds the in-time
+refusal adds ``other_holder``. The strict-mode deny is not listed: it is not
+opt-in and its reason travels in ``hookSpecificOutput``."""
+
+
+def _opted_in_acquire_or_fail(body: dict) -> bool:
+    """Whether a pre-edit ``body`` opted in to acquire-or-fail. Only a JSON
+    ``true`` opts in: any other ``if_unheld`` -- ``"true"``, ``1``, ``null``, or
+    none -- is an ordinary request and keeps its ordinary answers, so a client
+    that sent ``"false"`` meaning no is never refused for it."""
+    return body.get("if_unheld") is True
+
+
+def _pre_edit_degraded_answer(body: dict) -> dict:
+    """What a pre-edit with ``body`` answers if it cannot be decided in time,
+    at either point it can time out: the ``unavailable`` refusal when it opted
+    in, the degraded admit otherwise."""
+    if _opted_in_acquire_or_fail(body):
+        return _PRE_EDIT_UNAVAILABLE_RESPONSE
+    return _PRE_EDIT_DEGRADED_RESPONSE
 
 _SESSION_START_DEGRADED_RESPONSE: dict = {}
 """SB-10 U2 (KTD7): degrade envelope for ``/hooks/session-start`` — the
@@ -7899,7 +7955,17 @@ refused) and never an admission (nothing was checked). Keyed like
 :data:`_CALLER_PRINCIPAL_POSTURE`, over every route whose gate can read the
 registry, i.e. all but the mint; no default, so a missing route fails loudly. A
 test compares each entry with the route's own timed-out work body, so the two
-cannot drift."""
+cannot drift. A request whose handler chose its own timeout answer from the
+body before the gate -- an opted-in pre-edit -- gets that answer instead
+(:func:`_gate_degraded_answer`), which is still what its work body would give."""
+
+
+def _gate_degraded_answer(req: _RequestProtocol) -> dict:
+    """What a caller-principal gate that cannot decide in time answers: the
+    timeout answer this request's handler chose from the body, when it chose
+    one, and otherwise the route's degraded envelope."""
+    chosen = getattr(req, "_degraded_response", None)
+    return chosen if chosen is not None else _CALLER_GATE_DEGRADED_RESPONSE[req._route_key]
 
 
 def _watchdog_deadline(req: _RequestProtocol) -> float | None:
@@ -8004,8 +8070,9 @@ def _run_or_degrade(
 
     AC-05: callers from ``{ok: bool}``-shape endpoints (post-edit,
     session-stop) pass ``degraded_response=_OK_DEGRADED_RESPONSE`` -- and
-    pre-edit its own :data:`_PRE_EDIT_DEGRADED_RESPONSE` -- so clients
-    reading ``result.get("ok")`` see ``True`` rather than ``None``. Callers
+    pre-edit its own :data:`_PRE_EDIT_DEGRADED_RESPONSE`, or for a request that
+    opted in to acquire-or-fail :data:`_PRE_EDIT_UNAVAILABLE_RESPONSE` -- so
+    clients reading ``result.get("ok")`` never see ``None``. Callers
     from ``{status: ...}``-shape endpoints (pre-read, pre-bash, pre-grep)
     accept the default fresh-shape envelope.
 
