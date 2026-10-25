@@ -5,8 +5,8 @@ coordinator cannot decide in time is refused, never admitted.
 ``tests/fixtures/wire/pre_edit_unavailable.json`` pins that answer's structure:
 every key, and every value a client branches on. The advisory's wording is left
 out (``<IGNORED>``), so another implementation need not copy this one's text,
-but the advisory must be there. Hook clients and other coordinators compare
-their answer against this one file.
+but the advisory must be there. It is the shape any other implementation of
+this answer has to match.
 """
 
 from __future__ import annotations

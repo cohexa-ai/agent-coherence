@@ -196,7 +196,7 @@ class _RequestProtocol(Protocol):
     #: What this request answers if it cannot be decided in time, when its
     #: handler chose that from the body before the caller-principal gate -- an
     #: opted-in pre-edit's refusal -- or ``None`` for the route's degraded
-    #: envelope. The dispatcher resets it (:func:`_gate_degraded_answer`).
+    #: envelope. The dispatcher resets it; :func:`_gate_degraded_answer` reads it.
     _degraded_response: dict | None
 
     def _read_json(self) -> dict | None:
@@ -720,8 +720,8 @@ def _admit_caller(
     It never waits longer than the handler watchdog: see
     :func:`_attributed_within_deadline`. A gate that cannot decide in time
     writes what the request's timed-out work body would answer (past a full
-    watchdog queue, the 503) and returns ``None`` too — neither admitted nor refused, so it is counted
-    by neither principal counter."""
+    watchdog queue, the 503) and returns ``None`` too — neither admitted nor
+    refused, so it is counted by neither principal counter."""
     posture = _CALLER_PRINCIPAL_POSTURE[req._route_key].posture
     unverified = session_to_agent_id(presented.session_id, presented.subagent_id)
     if posture is PrincipalPosture.MINT:
@@ -7879,23 +7879,6 @@ Its first member is the timeout refusal's
 refusal adds ``other_holder``. The strict-mode deny is not listed: it is not
 opt-in and its reason travels in ``hookSpecificOutput``."""
 
-
-def _opted_in_acquire_or_fail(body: dict) -> bool:
-    """Whether a pre-edit ``body`` opted in to acquire-or-fail. Only a JSON
-    ``true`` opts in: any other ``if_unheld`` -- ``"true"``, ``1``, ``null``, or
-    none -- is an ordinary request and keeps its ordinary answers, so a client
-    that sent ``"false"`` meaning no is never refused for it."""
-    return body.get("if_unheld") is True
-
-
-def _pre_edit_degraded_answer(body: dict) -> dict:
-    """What a pre-edit with ``body`` answers if it cannot be decided in time,
-    at either point it can time out: the ``unavailable`` refusal when it opted
-    in, the degraded admit otherwise."""
-    if _opted_in_acquire_or_fail(body):
-        return _PRE_EDIT_UNAVAILABLE_RESPONSE
-    return _PRE_EDIT_DEGRADED_RESPONSE
-
 _SESSION_START_DEGRADED_RESPONSE: dict = {}
 """SB-10 U2 (KTD7): degrade envelope for ``/hooks/session-start`` — the
 empty payload. Re-grounding is advisory (KD3): a watchdog timeout must look
@@ -7966,6 +7949,23 @@ def _gate_degraded_answer(req: _RequestProtocol) -> dict:
     one, and otherwise the route's degraded envelope."""
     chosen = getattr(req, "_degraded_response", None)
     return chosen if chosen is not None else _CALLER_GATE_DEGRADED_RESPONSE[req._route_key]
+
+
+def _opted_in_acquire_or_fail(body: dict) -> bool:
+    """Whether a pre-edit ``body`` opted in to acquire-or-fail. Only a JSON
+    ``true`` opts in: any other ``if_unheld`` -- ``"true"``, ``1``, ``null``, or
+    none -- is an ordinary request and keeps its ordinary answers, so a client
+    that sent ``"false"`` meaning no is never refused for it."""
+    return body.get("if_unheld") is True
+
+
+def _pre_edit_degraded_answer(body: dict) -> dict:
+    """What a pre-edit with ``body`` answers if it cannot be decided in time,
+    at either point it can time out: the ``unavailable`` refusal when it opted
+    in, the degraded admit otherwise."""
+    if _opted_in_acquire_or_fail(body):
+        return _PRE_EDIT_UNAVAILABLE_RESPONSE
+    return _PRE_EDIT_DEGRADED_RESPONSE
 
 
 def _watchdog_deadline(req: _RequestProtocol) -> float | None:
