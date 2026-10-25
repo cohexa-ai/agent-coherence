@@ -2573,7 +2573,7 @@ class SqliteArtifactRegistry:
             ) from cause
         # SQLite discards the WAL of an empty database file on its first read,
         # even read-only, and that log may hold every committed version.
-        if found.st_size == 0 and os.path.lexists(self._wal_path()):
+        if found.st_size == 0 and os.path.lexists(self._sidecar_sqlite_opens("-wal")):
             raise StoreNeedsRecoveryError(
                 f"read-only open: {self._db_path} is empty, and the write-ahead "
                 f"log beside it holds the store's committed data, which a SQLite "
@@ -2631,9 +2631,15 @@ class SqliteArtifactRegistry:
         not replace the refusal (a ``-wal`` name past the file system's limit)."""
         if not os.access(self._db_path, os.R_OK):
             return _UNREADABLE_FILE_STEP
-        if os.path.exists(self._wal_path()) and not os.path.exists(self._shm_path()):
+        wal, shm = self._sidecar_sqlite_opens("-wal"), self._sidecar_sqlite_opens("-shm")
+        if os.path.exists(wal) and not os.path.exists(shm):
             return _MISSING_SHM_STEP
         return _GENERIC_STEP
+
+    def _sidecar_sqlite_opens(self, suffix: str) -> str:
+        """The sidecar SQLite uses for this store: beside the symlink's target,
+        not beside the link, since SQLite resolves the path it opens."""
+        return os.path.realpath(self._db_path) + suffix
 
     def _persist_retention_policy(self) -> None:
         """Persist the constructor retention policy to registry_meta (writer open).

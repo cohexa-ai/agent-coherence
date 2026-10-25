@@ -2352,17 +2352,24 @@ class TestReadOnlyMode:
         assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
         assert "may be damaged" in str(excinfo.value)
 
+    @pytest.mark.parametrize("opened_as", ["the file", "a symlink to it"])
     def test_an_empty_store_beside_a_wal_is_refused_before_sqlite_discards_the_wal(
-        self, tmp_path: Path
+        self, tmp_path: Path, opened_as: str
     ) -> None:
         """SQLite discards the WAL of an empty database file on its first read,
-        even read-only, and here that log is the only copy of the history."""
+        even read-only, and here that log is the only copy of the history.
+        Through a symlink, SQLite uses the WAL beside the target, not the link."""
         db, _ = crashed_wal_image(tmp_path)
         db.write_bytes(b"")
         wal_bytes = sidecar_path(db, "-wal").read_bytes()
+        opened = db
+        if opened_as == "a symlink to it":
+            opened = tmp_path / "link" / "state.db"
+            opened.parent.mkdir()
+            opened.symlink_to(db)
 
         with pytest.raises(StoreNeedsRecoveryError) as excinfo:
-            SqliteArtifactRegistry(db, read_only=True)
+            SqliteArtifactRegistry(opened, read_only=True)
 
         assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
         assert "is empty" in str(excinfo.value)
