@@ -125,6 +125,7 @@ from ccs.core.exceptions import (
     HOLD_REASONS,
     HOLD_VERSION_UNCONFIRMED,
     OCC_CALLER_TRANSIENT_REASON,
+    OTHER_HOLDER_REASON,
     RESTORE_MEMBER_OUTCOMES,
     RESTORE_STATUSES,
     SESSION_INVALIDATED_REASON,
@@ -137,6 +138,7 @@ from ccs.core.exceptions import (
     CommitNotAllowed,
     GiverFenced,
     OccCallerTransientError,
+    OtherHolder,
     RegistryLockTimeout,
     SessionInvalidated,
     StaleReadGeneration,
@@ -552,7 +554,8 @@ _CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
         "peers. That was chosen over admitting an acquire the caller could "
         "neither commit nor release. The class does not stop preemption "
         "itself: a fresh, principal-bearing identity preempts identically "
-        "until the acquire-or-fail contract lands")),
+        "unless its request opts in with if_unheld: true, which is refused "
+        "with other_holder while another agent holds the path")),
     ("POST", "/hooks/post-edit"): RoutePrincipalPosture(_REQUIRE, (
         "commits a version and records artifacts.last_writer_id under the "
         "named identity (or, on success:false, releases its grant): a caller "
@@ -1286,6 +1289,11 @@ class CoordinatorHTTPServer:
         # counter, not the strict-mode one: the deny is not a stale-view deny
         # and fires in warn mode too.
         self._handoff_giver_denials_total: int = 0
+        # pre_edit_other_holder_denials_total: opted-in pre-edits refused
+        # because another agent held the path. Its own counter: the refusal is
+        # neither a stale-view deny nor a principal refusal, and it writes no
+        # conflict row, so nothing else in /status would show it.
+        self._pre_edit_other_holder_denials_total: int = 0
         # Per-(session, path) "recent strict-deny" memory for route-around
         # detection. Bounded by the registry's own (session, artifact)
         # cardinality at worst — same upper bound as _stale_warned_pairs.
@@ -1746,6 +1754,15 @@ class CoordinatorHTTPServer:
         :meth:`increment_strict_mode_denial`."""
         self._handoff_giver_denials_total += 1
 
+    def increment_pre_edit_other_holder_denial(self) -> None:
+        """Bumped once per ``other_holder`` refusal of an opted-in
+        ``/hooks/pre-edit`` when that refusal is the answer chosen: a refusal
+        abandoned by the watchdog is answered ``unavailable`` and not counted.
+        Counts this process's HTTP route only; a library caller refused by the
+        service directly is not seen here. Same GIL-atomicity contract as
+        :meth:`increment_strict_mode_denial`."""
+        self._pre_edit_other_holder_denials_total += 1
+
     def record_strict_deny(self, session_id: str, path: str) -> None:
         """v0.2 Unit 4 route-around tracker — store the (session, path)
         pair with monotonic timestamp so a subsequent pre-bash deny on
@@ -1859,6 +1876,7 @@ class CoordinatorHTTPServer:
             "fresh_shared_hash_mismatch_total": self._fresh_shared_hash_mismatch_total,
             "shared_foreign_lag_suppressed_total": self._shared_foreign_lag_suppressed_total,
             "handoff_giver_denials_total": self._handoff_giver_denials_total,
+            "pre_edit_other_holder_denials_total": self._pre_edit_other_holder_denials_total,
             "effect_fence_holds_total": self._effect_fence_holds_total,
             "sweep_reclaims_total": sweep_reclaims_total,
             "sweep_reclaims_by_trigger": sweep_reclaims_by_trigger,
@@ -3295,9 +3313,10 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
         req._json(400, {"error": msg})
         return
-    # The answer if this request cannot be decided in time, chosen once from
-    # the body so the caller-principal gate and the work body give the same one.
-    degraded_answer = _pre_edit_degraded_answer(body)
+    # Read once, so the timeout answer, at the gate or in the work body, and
+    # the write's holder check all follow the same opt-in.
+    opted_in = _opted_in_acquire_or_fail(body)
+    degraded_answer = _pre_edit_degraded_answer(opted_in)
     req._degraded_response = degraded_answer
     if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
         return
@@ -3454,7 +3473,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         try:
             coordinator.service.write(
                 agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=now,
-                abort=abort, caller=caller,
+                abort=abort, caller=caller, if_unheld=opted_in,
             )
         except GiverFenced as exc:
             # Ahead of the generic arm, which would answer the refusal as prose.
@@ -3464,6 +3483,20 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 coordinator, exc, session_id=session_id, path=path, caller=caller,
                 source=_PRE_EDIT_GIVER_DENY_SOURCE, effects=effects,
             )
+        except OtherHolder as exc:
+            # Ahead of the generic arm too. The holder named is the one the
+            # write's own decision read, never the lookup above, which a
+            # release and a new acquire may have outdated. Nothing was granted,
+            # so no notice, pop or collision work follows; the wrapper leaves
+            # this body as it is, so the key is attached here, and the count is
+            # queued last, after the body's final registry read.
+            refusal = _attach_handoff_key(coordinator, {
+                "ok": False,
+                "reason": OTHER_HOLDER_REASON,
+                "holder_agent_id": exc.holder_agent_id.hex,
+            }, path=path, caller=caller)
+            effects.defer(coordinator.increment_pre_edit_other_holder_denial)
+            return refusal
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
 
@@ -3533,9 +3566,10 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # additionalContext, so the re-grounding block always lands last.
         # The abort token rides along so a timed-out request never
         # consumes the compact-pending flag. #185: while a record exists the
-        # handoff key rides every arm but a deny (the giver's deny carries its
-        # own), and an admit gets the handoff prose before the re-grounding
-        # block. work() runs first, on its own line: it is what sets
+        # handoff key rides every arm but a deny and an other_holder refusal
+        # (the giver's deny and the refusal carry their own), and an admit
+        # gets the handoff prose before the re-grounding block. work() runs
+        # first, on its own line: it is what sets
         # ``observed_before_acquire``, which the attach then reads.
         produced = work()
         result = _attach_hook_handoff(
@@ -5957,13 +5991,15 @@ def _attach_hook_handoff(
     so a failed read answers ``result`` with neither the key nor the prose.
 
     A deny is returned untouched: a strict deny keeps the corpus's bytes, and
-    the giver's deny carries its own key. Every other arm gets the
+    the giver's deny carries its own key. So is an opted-in pre-edit's
+    ``other_holder`` refusal, which attaches its own key before it queues its
+    count, so no read follows that count. Every other arm gets the
     ``handoff`` key while the path has a record, and an admit also gets the
     role's prose through the context-only envelope -- never the allow
     emitter, which would widen a permission decision. ``acquired`` marks the
     pre-edit's acquire, where ``observed`` (this agent's last observed
     version before it) decides the successor's read-first warning."""
-    if _is_deny(result):
+    if _is_deny(result) or result.get("reason") == OTHER_HOLDER_REASON:
         return result
     result = _attach_handoff_key(coordinator, result, path=path, caller=caller)
     projection = result.get("handoff")
@@ -7830,9 +7866,9 @@ degraded. A request that opts in with ``if_unheld: true`` asked to be refused
 rather than displace a live holder, so it gets
 :data:`_PRE_EDIT_UNAVAILABLE_RESPONSE` instead: a timed-out request never
 looked for a holder, and admitting it would let the caller edit over the holder
-its opt-in was meant to protect. The in-time refusal asked for in
-Cohexa-ai/agent-coherence#196 (``{"ok": false, "reason": "other_holder"}``
-instead of displacing a live holder) is not built yet; a timeout cannot answer
+its opt-in was meant to protect. Decided in time, the same request meets the
+refusal asked for in Cohexa-ai/agent-coherence#196 (``{"ok": false, "reason":
+"other_holder"}`` instead of displacing a live holder); a timeout cannot answer
 ``other_holder``, which would report a holder nobody observed.
 
 The rule bends for one refusal that exists today. Undegraded, a strict-mode
@@ -7865,19 +7901,23 @@ in its work body: a refusal, never the admit.
 The request asked not to displace a live holder, and the contention that makes
 a holder worth respecting is the contention that times a handler out. Its
 abandoned work body still carries the abort, so one that has not won the
-registry lock takes no grant once this is sent; one that already won it keeps
-its grant, and the holder it displaced has been notified. The advisory is the degraded admit's, context-only -- no
+registry lock takes no grant once this is sent. One that already won it
+decides as an in-time request does: on a path another agent holds EXCLUSIVE or
+MODIFIED it is refused and lands nothing, so a grant the caller was not told
+about can land only on a path no other agent held. The advisory is the
+degraded admit's, context-only -- no
 ``permissionDecision`` -- so a hook client that relays the body unread passes
 the same advisory either way. The shape is pinned by
 ``tests/fixtures/wire/pre_edit_unavailable.json``."""
 
-_ACQUIRE_OR_FAIL_REFUSAL_REASONS: frozenset[str] = frozenset({UNAVAILABLE_REASON})
-"""Reasons an opted-in acquire-or-fail ``/hooks/pre-edit`` may refuse with.
-
-Its first member is the timeout refusal's
-(:data:`_PRE_EDIT_UNAVAILABLE_RESPONSE`); the change that builds the in-time
-refusal adds ``other_holder``. The strict-mode deny is not listed: it is not
-opt-in and its reason travels in ``hookSpecificOutput``."""
+_ACQUIRE_OR_FAIL_REFUSAL_REASONS: frozenset[str] = frozenset(
+    {UNAVAILABLE_REASON, OTHER_HOLDER_REASON}
+)
+"""Reasons an opted-in acquire-or-fail ``/hooks/pre-edit`` may refuse with:
+the timeout refusal's (:data:`_PRE_EDIT_UNAVAILABLE_RESPONSE`), and the
+in-time refusal's, answered while another agent holds the path EXCLUSIVE or
+MODIFIED. The strict-mode deny is not listed: it is not opt-in and its reason
+travels in ``hookSpecificOutput``."""
 
 _SESSION_START_DEGRADED_RESPONSE: dict = {}
 """SB-10 U2 (KTD7): degrade envelope for ``/hooks/session-start`` — the
@@ -7959,11 +7999,11 @@ def _opted_in_acquire_or_fail(body: dict) -> bool:
     return body.get("if_unheld") is True
 
 
-def _pre_edit_degraded_answer(body: dict) -> dict:
-    """What a pre-edit with ``body`` answers if it cannot be decided in time,
-    at either point it can time out: the ``unavailable`` refusal when it opted
-    in, the degraded admit otherwise."""
-    if _opted_in_acquire_or_fail(body):
+def _pre_edit_degraded_answer(opted_in: bool) -> dict:
+    """What a pre-edit answers if it cannot be decided in time, at either
+    point it can time out: the ``unavailable`` refusal when it ``opted_in``
+    (:func:`_opted_in_acquire_or_fail`), the degraded admit otherwise."""
+    if opted_in:
         return _PRE_EDIT_UNAVAILABLE_RESPONSE
     return _PRE_EDIT_DEGRADED_RESPONSE
 
