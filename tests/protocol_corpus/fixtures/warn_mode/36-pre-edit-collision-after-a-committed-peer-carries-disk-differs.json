@@ -46,9 +46,6 @@
       "path": "CLAUDE.md"
     }
   },
-  "ignore_keys": [
-    "additionalContext"
-  ],
   "expected": {
     "status": 200,
     "body": {
@@ -58,7 +55,7 @@
       "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
-        "additionalContext": "<ignored>"
+        "additionalContext": "⚠ Concurrent edit detected at <TS> (UTC): another agent (814dac78) has been editing CLAUDE.md since <TS>. Your edit will land in your own worktree, but only one session's commit will be accepted by the coordinator. Consider waiting for the other session to finish or coordinating which one should proceed.\n\n⚠ CLAUDE.md on disk differs from v2, the last content committed through the coordinator, and no session committed the change: it was made outside the coordinator. Read CLAUDE.md before relying on it, and do not write it from an earlier read; that write would replace the change."
       }
     }
   },
