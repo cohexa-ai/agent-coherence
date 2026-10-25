@@ -555,6 +555,7 @@ class SimulationEngine:
                 new_version=version,
                 issued_at_tick=now_tick,
                 issuer_agent_id=writer_agent_id,
+                victim_agent_id=peer_id,
             )
             self._network.send(
                 payload=signal,

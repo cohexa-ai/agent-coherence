@@ -540,12 +540,25 @@ class EffectFired:
 
 @dataclass(frozen=True)
 class InvalidationSignal:
-    """Lightweight invalidation signal sent to agents."""
+    """Lightweight invalidation signal sent to agents.
+
+    ``victim_agent_id`` is populated by coordinator operations that invalidate
+    a specific peer. It lets callers that need side effects for the displaced
+    holder use the same lock-consistent result that decided the invalidation;
+    older producers may omit it because the field is additive.
+
+    ``victim_state`` records the victim's state immediately before the
+    invalidation when the producer has that snapshot. Consumers that surface
+    write-grant preemption notices use it to distinguish M/E victims from
+    shared readers, which have no write grant to report.
+    """
 
     artifact_id: UUID
     new_version: int
     issued_at_tick: int
     issuer_agent_id: UUID
+    victim_agent_id: UUID | None = None
+    victim_state: MESIState | None = None
 
 
 @dataclass(frozen=True)

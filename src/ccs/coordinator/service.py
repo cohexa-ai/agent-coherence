@@ -2185,6 +2185,8 @@ class CoordinatorService:
                     new_version=artifact.version,
                     issued_at_tick=issued_at_tick,
                     issuer_agent_id=agent_id,
+                    victim_agent_id=peer_id,
+                    victim_state=state,
                 )
             )
 
@@ -2343,6 +2345,7 @@ class CoordinatorService:
                     new_version=next_version,
                     issued_at_tick=issued_at_tick,
                     issuer_agent_id=agent_id,
+                    victim_agent_id=peer_id,
                 )
             )
         commit_hash = content_hash if content_hash is not None else compute_content_hash(content)
@@ -2514,8 +2517,9 @@ class CoordinatorService:
                 new_version=updated.version,
                 issued_at_tick=issued_at_tick,
                 issuer_agent_id=agent_id,
+                victim_agent_id=invalidated_id,
             )
-            for _ in invalidated_ids
+            for invalidated_id in invalidated_ids
         ]
         self._validate_single_writer(artifact_id)
         self._label_live_transfer(admitted, identity)
@@ -2605,6 +2609,7 @@ class CoordinatorService:
                         new_version=new_version,
                         issued_at_tick=issued_at_tick,
                         issuer_agent_id=agent_id,
+                        victim_agent_id=_peer,
                     )
                 )
             self._validate_single_writer(art_id)
@@ -3516,6 +3521,7 @@ class CoordinatorService:
             new_version=new_version,
             issued_at_tick=issued_at_tick,
             issuer_agent_id=issuer_agent_id,
+            victim_agent_id=agent_id,
         )
 
     def _revoke_is_superseded(
@@ -3599,6 +3605,7 @@ class CoordinatorService:
                     new_version=artifact.version,
                     issued_at_tick=issued_at_tick,
                     issuer_agent_id=agent_id,
+                    victim_agent_id=holder_id,
                 )
                 for holder_id, state in self.registry.get_state_map(artifact_id).items()
                 if state != MESIState.INVALID

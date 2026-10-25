@@ -59,6 +59,8 @@ def test_write_invalidates_peers_and_grants_exclusive() -> None:
 
     assert len(signals) == 1
     assert signals[0].issuer_agent_id == agent_a
+    assert signals[0].victim_agent_id == agent_b
+    assert signals[0].victim_state == MESIState.SHARED
     assert svc.registry.get_agent_state(artifact.id, agent_a) == MESIState.EXCLUSIVE
     assert svc.registry.get_agent_state(artifact.id, agent_b) == MESIState.INVALID
 
