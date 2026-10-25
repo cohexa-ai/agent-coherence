@@ -3417,7 +3417,7 @@ class CoordinatorService:
         and its parent refuse each other. Only opted-in writers are refused:
         an ordinary write still displaces an opted-in holder."""
         for peer_id, state in self.registry.get_state_map(artifact_id).items():
-            if peer_id != agent_id and state in (MESIState.EXCLUSIVE, MESIState.MODIFIED):
+            if peer_id != agent_id and state in _M_OR_E_STATES:
                 raise OtherHolder(artifact_id, peer_id)
 
     def _live_transfer_record(self, artifact_id: UUID) -> TransferRecord | None:

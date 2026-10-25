@@ -3331,8 +3331,9 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # The holder check admits the caller's own identity, so an opted-in
         # request must prove the one it names, claimed session or not. Decided
         # from the request alone, ahead of the gate: no binding read to wait
-        # on, and ahead of the untracked exit too. Today's reason, so a claimed
-        # session gets today's bytes and its typed re-claim recovery.
+        # on, and ahead of the untracked exit too. The existing reason, so a
+        # claimed session gets the bytes it always got and keeps its typed
+        # re-claim recovery.
         _refuse_caller(req, coordinator, CALLER_PRINCIPAL_ABSENT_REASON)
         return
     if _admit_caller(req, coordinator, presented) is None:
