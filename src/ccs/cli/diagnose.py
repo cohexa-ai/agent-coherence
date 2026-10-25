@@ -41,7 +41,8 @@ import math
 import signal
 import sys
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -399,10 +400,27 @@ def console_main(argv: Sequence[str] | None = None) -> int:
     # entrypoint portable.
     if hasattr(signal, "SIGPIPE"):
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-    return main(argv)
+    return main(argv, _graph_context=_graph_sigpipe_guard)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+@contextmanager
+def _graph_sigpipe_guard() -> Iterator[None]:
+    """Let user graph code handle broken pipes without changing CLI output."""
+    if not hasattr(signal, "SIGPIPE"):
+        yield
+        return
+    previous = signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGPIPE, previous)
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    _graph_context: Callable[[], AbstractContextManager[None]] = nullcontext,
+) -> int:
     """Run diagnostics without changing SIGPIPE. Returns the exit code."""
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -432,7 +450,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return EXIT_USAGE_ERROR
 
-    return _run_pipeline(args)
+    return _run_pipeline(args, graph_context=_graph_context)
 
 
 # -------------------------------------------------------------------- #
@@ -555,7 +573,11 @@ def _run_reset_token(args: argparse.Namespace) -> int:
 # -------------------------------------------------------------------- #
 
 
-def _run_pipeline(args: argparse.Namespace) -> int:
+def _run_pipeline(
+    args: argparse.Namespace,
+    *,
+    graph_context: Callable[[], AbstractContextManager[None]] = nullcontext,
+) -> int:
     """Orchestrate the diagnose CLI pipeline.
 
     The work is broken into four named phases (each ≤ 30 lines):
@@ -567,7 +589,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     """
     consent = _resolve_consent(args)
 
-    invoke = _load_graph_and_invoke(args)
+    with graph_context():
+        invoke = _load_graph_and_invoke(args)
     if isinstance(invoke, int):
         return invoke
     callback, initial_state, result = invoke
