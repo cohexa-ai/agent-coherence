@@ -53,6 +53,7 @@ from ccs.core.exceptions import (
     CommitNotAllowed,
     GiverFenced,
     OccCallerTransientError,
+    OtherHolder,
     SessionInvalidated,
     StaleReadGeneration,
 )
@@ -2128,6 +2129,7 @@ class CoordinatorService:
         issued_at_tick: int = 0,
         abort: threading.Event | None = None,
         caller: UUID | None = None,
+        if_unheld: bool = False,
     ) -> list[InvalidationSignal]:
         """Request write ownership by invalidating peers and granting EXCLUSIVE.
 
@@ -2140,10 +2142,21 @@ class CoordinatorService:
         compares ``agent_id`` itself, so a library agent is unchanged. The giver
         of a live handoff of the path is refused with :class:`GiverFenced`
         before anyone is invalidated; any other acquire on a live record labels
-        it completed (the successor) or overtaken (anyone else)."""
+        it completed (the successor) or overtaken (anyone else).
+
+        ``if_unheld`` asks to take the artifact only if no other agent holds it:
+        another composite holding it EXCLUSIVE or MODIFIED refuses the write
+        with :class:`OtherHolder`, and nothing changes. The check runs inside
+        the same hold as the grant, so two such writers never both win, among
+        the writers of this one service: a second read-write registry on the
+        same store is outside that hold."""
         with self.registry.abort_guard(abort):
             return self._write_impl(
-                agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=issued_at_tick, caller=caller
+                agent_id=agent_id,
+                artifact_id=artifact_id,
+                issued_at_tick=issued_at_tick,
+                caller=caller,
+                if_unheld=if_unheld,
             )
 
     def _write_impl(
@@ -2153,6 +2166,7 @@ class CoordinatorService:
         artifact_id: UUID,
         issued_at_tick: int = 0,
         caller: UUID | None = None,
+        if_unheld: bool = False,
     ) -> list[InvalidationSignal]:
         artifact = self._require_artifact(artifact_id)
         identity = caller if caller is not None else agent_id
@@ -2160,6 +2174,10 @@ class CoordinatorService:
         # the successor's read and then meet it as another holder.
         self._refuse_handed_off_giver(artifact_id, identity)
         admitted = self._live_transfer_record(artifact_id)
+        if if_unheld:
+            # Before the first state write, so a refusal changes nothing,
+            # transfer labels included.
+            self._refuse_other_holder(artifact_id, agent_id)
         self.registry.set_agent_transient(
             artifact_id,
             agent_id,
@@ -3389,6 +3407,18 @@ class CoordinatorService:
         record = self.live_handoff_given_by(artifact_id, identity)
         if record is not None:
             raise GiverFenced(artifact_id, record.successor, record.version_at_transfer)
+
+    def _refuse_other_holder(self, artifact_id: UUID, agent_id: UUID) -> None:
+        """Raise :class:`OtherHolder` when an agent other than ``agent_id``
+        holds ``artifact_id`` EXCLUSIVE or MODIFIED, naming that agent from the
+        same read. Caller holds the abort guard.
+
+        "Other" is any composite agent id but the writer's own, so a subagent
+        and its parent refuse each other. Only opted-in writers are refused:
+        an ordinary write still displaces an opted-in holder."""
+        for peer_id, state in self.registry.get_state_map(artifact_id).items():
+            if peer_id != agent_id and state in (MESIState.EXCLUSIVE, MESIState.MODIFIED):
+                raise OtherHolder(artifact_id, peer_id)
 
     def _live_transfer_record(self, artifact_id: UUID) -> TransferRecord | None:
         """The path's record if it is live now. Read inside the write path's
