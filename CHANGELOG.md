@@ -607,6 +607,20 @@ Alpha — APIs may change before `v1.0`.
   refusal is unchanged, on both coordinators. The guide's "Concurrent writers:
   `write_cas`" section has the details.
 
+- **`CoordinatorService.effect_gate` in its commit form now holds when any
+  input moved, not only the file it writes (#456).** Given
+  `effect_gate(read_set=[plan, brief], commit=(plan, ...))`, a peer that
+  committed `brief` after the gate pinned it did not stop the commit: the
+  gate checked only `plan`, wrote the plan derived from the old brief, and
+  reported both inputs unchanged in `EffectFired.revalidated_cut`. The
+  callable form already held. The commit form now re-checks every input and
+  returns `EffectHeld` naming the ones that moved, as the callable form does.
+  It also runs that check and the commit as one step, so no writer that goes
+  through the same coordinator can change an input in between. A writer on a
+  second handle to the same store (another process, or a second registry
+  opened on the same SQLite file) is outside that step and can still change
+  an input other than the one written.
+
 ## [0.15.0] - 2026-10-14
 
 **Sessions can hand a held path to a named successor, a caller principal keeps protocol-following clients from acting as each other's sessions, and the effect fence answers over HTTP; `/status` reports sweep reclaims, grant ages, each artifact's last writer and the store's schema version; and a run of fixes closes ways a stale read, a refused read or a policy edit let a write overwrite newer work.**

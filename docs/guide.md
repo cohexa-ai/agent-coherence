@@ -2459,7 +2459,11 @@ single coordinator, and cooperative — an effect that never asks is never held.
 **A narrower gate this vocabulary does not govern.** The coordinator also
 offers a session-based gate in Python — `CoordinatorService.effect_gate`, which
 pins a read-set and re-validates every member's *version* at the effect
-boundary. It checks versions only: it does not apply the grant-standing leg, so
+boundary, holding the effect if any moved, whether the effect is a callable or
+a commit of one of the members. In the commit form the check and the commit
+are one step for every writer that goes through the same coordinator; a writer
+on a second handle to the same store can still change a member other than the
+one written. It checks versions only: it does not apply the grant-standing leg, so
 a peer's write-acquire that preempts the session's grant without moving any
 version lets that gate fire where this fence holds. It is in-process Python
 only — no HTTP route and no tool reaches it — and it answers in its own

@@ -493,7 +493,8 @@ class CoordinatorService:
         # via ``_drop_session_state``). Lock ORDER is always service-lock →
         # registry-lock (the registry never calls back into the service), so the
         # ``with self._session_lock:`` blocks that wrap ``registry`` calls
-        # (capture / release / get_session_meta) cannot deadlock.
+        # (capture / release / get_session_meta / the atomic effect gate's check
+        # and commit) cannot deadlock.
         self._session_lock = threading.RLock()
         self._session_owners: dict[str, UUID] = {}
         # Snapshot session CREATION tick (SB-17 / TX-1, Unit 7 / R14):
@@ -1623,16 +1624,21 @@ class CoordinatorService:
         or neither, is caller misuse → ``ValueError``):
 
         - **ATOMIC** (``commit=(artifact_id, content)``) — the effect IS an
-          artifact write, routed through :meth:`session_commit` so the shipped
-          ``commit_cas`` arbitrates AT the pinned base in the SAME step. There is
-          NO re-validate→fire window: "unchanged" and "commit" are one atomic
-          arbitration. The pre-fire re-validate still runs as a fast HELD short
-          circuit (it spares the CAS when a peer already moved the target), but
-          the AUTHORITATIVE guard is ``commit_cas`` — even if a peer commits in
-          the instant between the re-validate and the CAS, the CAS at the pinned
-          ``expected_version`` loses cleanly and returns :class:`ConflictDetail`
-          (surfaced as :class:`EffectHeld` with ``conflict`` set). This is the
-          STRONG guarantee.
+          artifact write. The gate re-validates the WHOLE read-set and routes the
+          write through :meth:`session_commit` (the shipped ``commit_cas`` at the
+          pinned base) under ONE hold of the service and registry locks. Every
+          in-process registry write takes that registry lock, so no writer using
+          this registry instance can move any read-set member between the
+          re-validate and the commit: "unchanged" and "commit" are one step, and
+          a moved non-target member holds the commit just as a moved target does.
+          The target is also CAS-guarded inside the registry's own transaction,
+          so a writer on another store handle that moves it loses cleanly
+          (:class:`ConflictDetail`, surfaced as :class:`EffectHeld` with
+          ``conflict`` set). This is the STRONG guarantee, with one residual: a
+          writer on another handle to the same store (a second process, or a
+          second registry instance on the same SQLite file) can still move a
+          NON-target member between the re-validate and the CAS. A store has one
+          writer by contract.
         - **ESCAPING** (``effect=callable``) — the effect is a non-commit side
           effect (deploy / charge / click). The gate re-validates, then fires the
           callable. **The guarantee is "the read-set was unchanged AS OF the
@@ -1781,7 +1787,8 @@ class CoordinatorService:
         # callable runs. The gate gates PRE-FIRE and never rolls back (EO-7), so
         # the guarantee is "unchanged as of re-validate", NOT "as of fire". This
         # is intrinsic to a non-commit side effect (deploy/charge/click cannot be
-        # version-CAS'd); ATOMIC mode closes it by riding ``commit_cas``.
+        # version-CAS'd); ATOMIC mode closes it by re-validating and committing
+        # under one lock hold (see ``_effect_gate_atomic``).
         result = effect(decision)
         return EffectFired(
             revalidated_cut=dict(session.cut),
@@ -1797,61 +1804,76 @@ class CoordinatorService:
         commit: tuple[UUID, bytes | str],
         issued_at_tick: int,
     ) -> EffectFired | EffectHeld:
-        """ATOMIC mode — route the write through ``session_commit`` so the shipped
-        ``commit_cas`` arbitrates at the pinned base in the SAME step. NO
-        re-validate→fire window: the CAS at ``expected_version=pin`` is the
-        authoritative guard. A pre-CAS re-validate runs as a fast HELD short
-        circuit (sparing the CAS when the target already moved), but even without
-        it the CAS would lose cleanly on a raced peer commit."""
-        artifact_id, content = commit
-        # Fast pre-CAS re-validate: if the COMMIT TARGET already moved, hold
-        # before attempting the CAS. (The CAS itself is still authoritative for
-        # the no-window guarantee; this only short-circuits the common case and
-        # surfaces a uniform drift map with the escaping mode.)
-        moved = self._revalidate_cut(session.cut)
-        if artifact_id in moved:
-            return EffectHeld(
-                moved=moved,
-                coordinator_epoch=session.coordinator_epoch,
-            )
+        """ATOMIC mode — re-validate the WHOLE cut, then route the write through
+        ``session_commit`` so the shipped ``commit_cas`` arbitrates the target at
+        the pinned base, both under ONE hold of ``_session_lock`` and the registry
+        lock (``abort_guard``). Every in-process registry write takes that
+        registry lock, so no writer using this registry instance can move ANY
+        read-set member between the re-validate and the commit (#456). The
+        target is also CAS-guarded inside the registry's own transaction, against
+        every writer.
 
-        # Atomic arbitration at the pinned base. ``session_commit`` reuses the
-        # shipped ``commit_cas`` verbatim (admit-on-absent → version-CAS), maps
-        # the CasCorruption sentinel to a raised CoherenceError, and returns the
-        # ConflictDetail unchanged on a lost race. A SessionCommitRejection here
-        # means the cut died mid-gate (token/pin gone) → fail closed.
-        outcome = self.session_commit(
-            session.session_token,
-            artifact_id,
-            content,
-            caller=owner,
-            issued_at_tick=issued_at_tick,
-        )
-        if isinstance(outcome, SessionCommitRejection):
-            # Fail-closed: the session is gone (reaped / restart-wiped / released)
-            # — never a silent non-fire. Raise the typed dead-session error.
-            raise SessionInvalidated(
-                f"effect_gate atomic commit failed closed: {outcome.reason} "
-                f"(artifact={outcome.artifact_id})"
+        Residual: a writer on another handle to the same store (a second
+        process, or a second registry instance on the same SQLite file) is
+        outside the hold and can move a NON-target member between the re-validate
+        and the CAS. A store has one writer by contract; checking the read-set inside
+        the registry's commit transaction would close it. ``decide`` has already
+        run, so no caller code runs under the hold."""
+        artifact_id, content = commit
+        # Service lock first, then the registry lock: the documented order (see
+        # ``_session_lock`` and ``begin_session``). ``session_commit`` re-takes
+        # both (re-entrant); taking the registry lock first would invert the
+        # order against a concurrent ``begin_session``.
+        with self._session_lock, self.registry.abort_guard():
+            # The whole cut, not just the target: the commit is derived from the
+            # pinned cut, so ANY moved (or vanished) member holds it, as escaping
+            # mode does.
+            moved = self._revalidate_cut(session.cut)
+            if moved:
+                return EffectHeld(
+                    moved=moved,
+                    coordinator_epoch=session.coordinator_epoch,
+                )
+
+            # Atomic arbitration at the pinned base. ``session_commit`` reuses the
+            # shipped ``commit_cas`` verbatim (admit-on-absent → version-CAS), maps
+            # the CasCorruption sentinel to a raised CoherenceError, and returns the
+            # ConflictDetail unchanged on a lost race. A SessionCommitRejection here
+            # means the cut died mid-gate (token/pin gone) → fail closed.
+            outcome = self.session_commit(
+                session.session_token,
+                artifact_id,
+                content,
+                caller=owner,
+                issued_at_tick=issued_at_tick,
             )
-        if isinstance(outcome, ConflictDetail):
-            # Lost the OCC race AT the pinned base — HELD, nothing mutated. Carry
-            # the shipped ConflictDetail through verbatim (the same taxonomy a
-            # bare session_commit surfaces). Re-read the post-conflict drift so
-            # ``moved`` reflects what actually changed under the commit target.
-            post = self._revalidate_cut(session.cut)
-            return EffectHeld(
-                moved=post,
+            if isinstance(outcome, SessionCommitRejection):
+                # Fail-closed: the session is gone (reaped / restart-wiped / released)
+                # — never a silent non-fire. Raise the typed dead-session error.
+                raise SessionInvalidated(
+                    f"effect_gate atomic commit failed closed: {outcome.reason} "
+                    f"(artifact={outcome.artifact_id})"
+                )
+            if isinstance(outcome, ConflictDetail):
+                # Lost the OCC race AT the pinned base — HELD, nothing mutated. Carry
+                # the shipped ConflictDetail through verbatim (the same taxonomy a
+                # bare session_commit surfaces). Re-read the whole cut so ``moved``
+                # shows what changed; it is empty for ``other_holder`` (a peer holds
+                # the target, so nothing moved).
+                post = self._revalidate_cut(session.cut)
+                return EffectHeld(
+                    moved=post,
+                    coordinator_epoch=session.coordinator_epoch,
+                    conflict=outcome,
+                )
+            # WIN — (updated_artifact, signals); the whole cut was unchanged at the
+            # re-validate and the target committed at its pin, with no writer on
+            # this registry instance in between.
+            return EffectFired(
+                revalidated_cut=dict(session.cut),
                 coordinator_epoch=session.coordinator_epoch,
-                conflict=outcome,
+                commit=outcome,
             )
-        # WIN — (updated_artifact, signals); the commit landed atomically at the
-        # pinned base with NO window.
-        return EffectFired(
-            revalidated_cut=dict(session.cut),
-            coordinator_epoch=session.coordinator_epoch,
-            commit=outcome,
-        )
 
     # ------------------------------------------------------------------
     # Session pin lifetime — heartbeat lease + liveness sweep (Unit 5 / R4)
