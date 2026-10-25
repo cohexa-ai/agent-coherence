@@ -608,7 +608,8 @@ VERSION_MISMATCH_REASON = "version_mismatch"
 # :class:`CoordinatorUnreachable`, which the strict surfaces raise.
 COORDINATOR_UNAVAILABLE_REASON = "coordinator_unavailable"
 #: The class reason of :class:`CoordinatorFailed`: the coordinator answered a
-#: read with its failure envelope (#259).
+#: read, or a volume's release of an earlier attempt's write grant (#401), with
+#: its failure envelope (#259).
 COORDINATOR_FAILED_REASON = "coordinator_failed"
 #: The coordinator's refusal of a ``pre-edit`` that opted in with
 #: ``if_unheld: true`` and that it could not decide in time. A live, busy
@@ -1138,12 +1139,14 @@ class CommitUnconfirmed(CoherenceError):
     """A commit's outcome is unknown (MCP-C Unit 1): a false-negative ack, NOT a
     confirmed loss. Raised when a commit request got no usable answer after it
     may have reached the coordinator, or an answer that decides nothing (the
-    coordinator's failure envelope, #259): an OCC commit (``write_cas``,
-    ``write_cas_at``, ``atomic_publish``), a pessimistic ``write()``'s post-edit,
-    or any other commit request delivered and left unanswered. It does not by
-    itself mean the request was delivered: the handoff verbs and the
-    substrate's legs after its write landed raise it even when the request was
-    never sent, because the outcome they must reconcile is the same. The write
+    coordinator's failure envelope, #259, or, on a strict volume, an HTTP 5xx,
+    which says nothing of whether the commit ran, #398): an OCC commit
+    (``write_cas``, ``write_cas_at``, ``atomic_publish``), a pessimistic
+    ``write()``'s post-edit, or any other commit request delivered and left
+    unanswered. It does not by itself mean the request was delivered: the
+    handoff verbs and the substrate's legs after its write landed raise it even
+    when the request was never sent, because the outcome they must reconcile is
+    the same. The write
     may or may not have landed; reconcile by re-reading, then retry only if
     absent. Carries :data:`COMMIT_UNCONFIRMED_REASON`."""
 
@@ -1176,6 +1179,15 @@ class CoordinatorFailed(CoherenceError):
     or the caller-principal gate's store read, raised inside it. The read is
     not confirmed as registered, so a strict volume or substrate session
     raises rather than hand out bytes no peer's commit would invalidate.
+
+    A strict volume raises it too when the envelope answers the release its
+    re-mint sends for an earlier attempt's write grant (#401), before
+    ``write_cas``, ``write_cas_at``, ``atomic_publish`` or ``reacquire()``
+    goes on. The grant may still stand (the envelope can follow a release that
+    ran, and the client cannot tell), and a standing grant would refuse the
+    volume's own commit as another agent's, so the operation stops there, with
+    nothing committed; the grant stays recorded, and the next re-mint sends the
+    release again.
 
     The envelope names only the exception's type, so nothing here tells a
     busy store, which clears by itself, from a fault that repeats on every

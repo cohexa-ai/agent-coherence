@@ -1,0 +1,71 @@
+{
+  "name": "pre-read-exclusive-holder-out-of-band-change-denies",
+  "description": "Session A seeds CLAUDE.md and pre-edits, so it holds EXCLUSIVE. A's read then offers bytes that are neither the recorded content nor committed by anyone: the out-of-band deny applies to any valid grant, not only SHARED. Both backends (cohexa-ai/agent-coherence-plugin#205).",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "strict_mode": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\nv1 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "CLAUDE.md",
+          "content_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "CLAUDE.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "CLAUDE.md",
+      "content_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  },
+  "ignore_keys": [
+    "last_writer_at_unix_ts",
+    "warning_generated_at_unix_ts"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "Stale read denied: CLAUDE.md on disk no longer matches v1, the version you last read, and no session committed the change, so it was made outside the coordinator. Do not restore or overwrite CLAUDE.md: the change may be your user's work. Tell your user that CLAUDE.md changed outside the coordinator; the read stays denied until the change is committed through the coordinator. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+      },
+      "status": "stale",
+      "summary": {
+        "path": "CLAUDE.md",
+        "current_version": 1,
+        "prior_version_seen_by_session": 1,
+        "last_writer_session_id": "<unknown>",
+        "last_writer_at_unix_ts": "<IGNORED>",
+        "warning_generated_at_unix_ts": "<IGNORED>",
+        "hash_differs": true
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

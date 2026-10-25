@@ -1,0 +1,46 @@
+{
+  "name": "pre-edit-recorded-content-missing-from-disk-carries-the-notice",
+  "description": "Session A's first read of CLAUDE.md seeds v1 with A's hash, which is not the bytes on disk. A then pre-edits: after the admitted acquire the coordinator hashes the file itself, finds the recorded content gone with no commit to explain it, and adds disk_differs with the out-of-band notice as context only. Both backends (cohexa-ai/agent-coherence-plugin#205).",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\nv1 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "CLAUDE.md",
+          "content_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "CLAUDE.md"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "additionalContext": "⚠ CLAUDE.md on disk differs from v1, the last content committed through the coordinator, and no session committed the change: it was made outside the coordinator. Read CLAUDE.md before relying on it, and do not write it from an earlier read; that write would replace the change."
+      },
+      "disk_differs": true
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

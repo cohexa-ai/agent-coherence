@@ -457,6 +457,16 @@ def test_a_transferred_path_leaves_the_write_record_and_the_rest_stays(
         stop_coordinator(tmp_path)
 
 
+#: What a stop that left the plan's grant held answers (#185): the release is
+#: not confirmed, so the volume keeps the grant recorded, and a strict volume
+#: goes on past it.
+_PLAN_HELD_RELEASE = {
+    "ok": False,
+    "released_artifacts": [],
+    "grants": [{"path": _PLAN, "held": True, "reason": "internal: RuntimeError"}],
+}
+
+
 def test_a_stranded_write_grant_is_presented_ahead_of_the_current_incarnation(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -478,7 +488,7 @@ def test_a_stranded_write_grant_is_presented_ahead_of_the_current_incarnation(
         def refuse_one_release(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
             if path == "/hooks/session-stop" and unconfirmed[0]:
                 unconfirmed[0] -= 1
-                return {"ok": False, "reason": "internal: RuntimeError"}  # not released
+                return _PLAN_HELD_RELEASE
             return real_post(endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", refuse_one_release)
@@ -1039,7 +1049,7 @@ def test_the_latest_of_two_stranded_write_grants_is_the_one_presented(
 
         def refuse_releases(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
             if path == "/hooks/session-stop":
-                return {"ok": False, "reason": "internal: RuntimeError"}  # not released
+                return _PLAN_HELD_RELEASE
             return real_post(endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", refuse_releases)

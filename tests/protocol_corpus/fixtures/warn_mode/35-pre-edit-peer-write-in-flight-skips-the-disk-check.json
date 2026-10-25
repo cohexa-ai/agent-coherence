@@ -1,0 +1,58 @@
+{
+  "name": "pre-edit-peer-write-in-flight-skips-the-disk-check",
+  "description": "Session B seeds CLAUDE.md with a hash that is not the bytes on disk and pre-edits, so it holds an uncommitted write claim. A's pre-edit preempts it with a collision warning, and adds no disk_differs: the bytes may be B's write still landing. Both backends (cohexa-ai/agent-coherence-plugin#205).",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\nv1 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "CLAUDE.md",
+          "content_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "CLAUDE.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "CLAUDE.md"
+    }
+  },
+  "ignore_keys": [
+    "additionalContext"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "collision": true,
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "additionalContext": "<ignored>"
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

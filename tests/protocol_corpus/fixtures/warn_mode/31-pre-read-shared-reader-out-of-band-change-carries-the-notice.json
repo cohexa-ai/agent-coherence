@@ -1,6 +1,6 @@
 {
   "name": "pre-read-shared-reader-out-of-band-change-carries-the-notice",
-  "description": "The warn-mode counterpart of the out-of-band deny (#278). Session A's first read of CLAUDE.md seeds v1 with A's hash and grants A SHARED; A's next read offers different bytes with the version unchanged and no commit of A's own to explain them. The read is still admitted with hash_differs, and the change is named in a context-only hookSpecificOutput -- no permissionDecision -- because hash_differs is a top-level key the model never sees. Python-only until the Node coordinator mirrors it (cohexa-ai/agent-coherence-plugin#205): today Node emits no hash_differs in warn mode at all.",
+  "description": "The warn-mode counterpart of the out-of-band deny (#278). Session A's first read of CLAUDE.md seeds v1 with A's hash and grants A SHARED; A's next read offers different bytes with the version unchanged and no commit of A's own to explain them. The read is still admitted with hash_differs, and the change is named in a context-only hookSpecificOutput -- no permissionDecision -- because hash_differs is a top-level key the model never sees. Both backends (cohexa-ai/agent-coherence-plugin#205).",
   "setup": {
     "tracked": [
       "CLAUDE.md"
@@ -29,6 +29,9 @@
       "content_hash": "3333333333333333333333333333333333333333333333333333333333333333"
     }
   },
+  "optional_keys": [
+    "version"
+  ],
   "expected": {
     "status": 200,
     "body": {
@@ -42,6 +45,7 @@
     }
   },
   "backends": [
-    "python"
+    "python",
+    "node"
   ]
 }

@@ -17,27 +17,39 @@ Each commit case runs twice: ``before``, where the fault fires before the
 registry records anything, and ``after``, where the commit is recorded first.
 The client cannot tell the two apart, which is why both get the same type.
 The coordinator runs in this process so its registry can be made to fail.
+
+The release a re-mint sends for an earlier attempt's write grant (one
+``session-stop`` naming the attempt a ``write()`` left holding the file) gets
+the same envelope when the stop's store read raises (#401). A stop commits
+nothing, so this is not an unknown outcome: strict raises
+:class:`CoordinatorFailed` at that release, before the operation commits, and
+degrade warns once and counts. Either way the grant stays recorded, so the
+next re-mint sends the release again.
 """
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import warnings
 from pathlib import Path
 
 import pytest
 
+from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig
 from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.core.exceptions import (
+    CasRetriesExhausted,
+    CasVersionConflict,
     CoherenceDegradedWarning,
     CoherenceError,
     CommitUnconfirmed,
     CoordinatorFailed,
+    InvariantViolationError,
     StaleView,
 )
 from ccs.core.states import MESIState
+from tests.coordinator_helpers import recorded_version, serve_in_process, write_holders
 
 #: FROZEN duplicate of the envelope's reason for the fault these tests raise
 #: (never imported from the code under test).
@@ -47,6 +59,7 @@ _COORDINATOR_FAILED = "coordinator_failed"
 
 _REL = "data/shared.txt"
 _OTHER = "data/other.txt"
+_THIRD = "data/third.txt"
 
 _WHEN = pytest.mark.parametrize("when", ["before", "after"])
 _MODE = pytest.mark.parametrize("mode", ["strict", "degrade"])
@@ -72,22 +85,6 @@ def _seed(tmp_path: Path, rel: str = _REL, content: bytes = b"v1") -> Path:
     return target
 
 
-def _serve_in_process(tmp_path: Path, instance_id: str):
-    """A strict coordinator for ``data/**`` running in THIS process, reachable
-    through the usual pid file, so a test can reach into its registry. Policy
-    is loaded once at construction, so the YAML is written first."""
-    from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
-
-    coherence = tmp_path / ".coherence"
-    coherence.mkdir(mode=0o700)
-    for name in ("tracked.yaml", "strict_mode.yaml"):
-        (coherence / name).write_text("- data/**\n")
-    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id=instance_id)
-    server.serve_in_thread()
-    (coherence / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
-    return server
-
-
 def _fail_registry(server, monkeypatch: pytest.MonkeyPatch, method: str, when: str) -> None:
     """Make the registry's ``method`` raise the error a locked store raises,
     ``before`` it records anything or ``after`` it has recorded its commit."""
@@ -101,17 +98,11 @@ def _fail_registry(server, monkeypatch: pytest.MonkeyPatch, method: str, when: s
     monkeypatch.setattr(server.registry, method, failing)
 
 
-def _recorded_version(server, rel: str) -> int:
-    artifact_id = server.registry.lookup_artifact_id_by_name(rel)
-    assert artifact_id is not None, f"control: {rel} is registered"
-    return server.registry.get_artifact(artifact_id).version
-
-
 def _assert_landed_iff_after(server, rel: str, before_version: int, when: str) -> None:
     """Control: the ``after`` case really recorded the commit, and the
     ``before`` case really did not, so each test covers the case it names."""
     expected = before_version + 1 if when == "after" else before_version
-    assert _recorded_version(server, rel) == expected, f"control: commit recorded ({when})"
+    assert recorded_version(server, rel) == expected, f"control: commit recorded ({when})"
 
 
 @_WHEN
@@ -135,7 +126,7 @@ def test_an_occ_commit_answered_with_the_failure_envelope_is_unconfirmed(
     caller abandons a commit the coordinator may have recorded, and a later
     blind retry re-drives it."""
     target = _seed(tmp_path)
-    server = _serve_in_process(tmp_path, f"envelope-{operation}-{mode}-{when}")
+    server = serve_in_process(tmp_path, f"envelope-{operation}-{mode}-{when}")
     try:
         vol = CoherentVolume(tmp_path, managed=("data/**",), on_error=mode, config=fast_cfg)
         data, version = vol.read_with_version(_REL)
@@ -174,7 +165,7 @@ def test_a_publish_answered_with_the_failure_envelope_is_unconfirmed_never_held(
     caller who believes nothing landed rebuilds and republishes over it."""
     target = _seed(tmp_path)
     other = _seed(tmp_path, _OTHER, b"o1")
-    server = _serve_in_process(tmp_path, f"envelope-publish-{mode}-{when}")
+    server = serve_in_process(tmp_path, f"envelope-publish-{mode}-{when}")
     try:
         vol = CoherentVolume(tmp_path, managed=("data/**",), on_error=mode, config=fast_cfg)
         _data, version = vol.read_with_version(_REL)
@@ -212,7 +203,7 @@ def test_a_write_whose_commit_is_answered_with_the_failure_envelope_is_unconfirm
     the grant outliving the call: the writer stayed EXCLUSIVE at the
     coordinator, blocking every peer until this volume re-minted."""
     target = _seed(tmp_path)
-    server = _serve_in_process(tmp_path, f"envelope-write-{mode}-{when}")
+    server = serve_in_process(tmp_path, f"envelope-write-{mode}-{when}")
     try:
         vol = CoherentVolume(tmp_path, managed=("data/**",), on_error=mode, config=fast_cfg)
         _data, version = vol.read_with_version(_REL)
@@ -255,7 +246,7 @@ def test_a_strict_read_answered_with_the_failure_envelope_raises_coordinator_fai
     the MCP mapper answers as ``internal_error``: the shape of a bug, for a
     condition one retry may clear."""
     _seed(tmp_path)
-    server = _serve_in_process(tmp_path, f"envelope-{read}")
+    server = serve_in_process(tmp_path, f"envelope-{read}")
     try:
         vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
 
@@ -284,7 +275,7 @@ def test_a_degrade_read_answered_with_the_failure_envelope_still_returns_the_byt
     counts, and returns the bytes at version 0. Only the strict raise is
     typed."""
     _seed(tmp_path)
-    server = _serve_in_process(tmp_path, "envelope-degrade-read")
+    server = serve_in_process(tmp_path, "envelope-degrade-read")
     try:
         vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
 
@@ -315,7 +306,7 @@ def test_a_commit_answered_with_a_reason_outside_the_envelope_stays_untyped(
     from ccs.adapters import coherent_volume as coherent_volume_module
 
     _seed(tmp_path)
-    server = _serve_in_process(tmp_path, "envelope-prose")
+    server = serve_in_process(tmp_path, "envelope-prose")
     try:
         vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
         _data, version = vol.read_with_version(_REL)
@@ -345,7 +336,7 @@ def test_a_strict_read_answered_with_a_reason_outside_the_envelope_stays_untyped
     from ccs.adapters import coherent_volume as coherent_volume_module
 
     _seed(tmp_path)
-    server = _serve_in_process(tmp_path, "envelope-prose-read")
+    server = serve_in_process(tmp_path, "envelope-prose-read")
     try:
         vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
         real_post = coherent_volume_module._coordinator_post
@@ -360,5 +351,453 @@ def test_a_strict_read_answered_with_a_reason_outside_the_envelope_stays_untyped
             vol.read_with_version(_REL)
 
         assert type(raised.value) is CoherenceError, type(raised.value)
+    finally:
+        server.shutdown()
+
+
+#: The release a re-mint sends for an earlier attempt's write grants.
+_STOP = "/hooks/session-stop"
+#: Every route that carries a commit: write()'s, the OCC commit's, the batch's.
+_COMMITS = frozenset({"/hooks/post-edit", "/hooks/post-edit-cas", "/session/commit_all"})
+
+#: Each operation re-mints before it can commit, so after a write() it first
+#: releases the grant that write() left (a batch of one member goes by the OCC
+#: commit's path, a batch of two by its own).
+_RE_MINTS = pytest.mark.parametrize(
+    "operation", ["write_cas", "write_cas_at", "publish_one", "publish_two", "reacquire"]
+)
+
+#: How each operation still ends under degrade once its release failed. A
+#: KNOWN GAP, pinned so that closing it is a visible change: the grant the
+#: abandoned attempt still holds refuses the volume's own commit as another
+#: agent's (``other_holder``, or the batch's ``StaleView``), and ``write_cas``
+#: spends its budget re-sending the failing release.
+_DEGRADE_ENDS_TODAY = {
+    "write_cas": ("CasRetriesExhausted", "other_holder"),
+    "write_cas_at": ("CasVersionConflict", "other_holder"),
+    "publish_one": ("CasVersionConflict", "other_holder"),
+    "publish_two": ("StaleView", None),
+    "reacquire": ("returned", b"v2"),
+}
+
+
+def _wire(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict, object]]:
+    """Record the route and payload of every request the volume sends from
+    here on, with the answer it got."""
+    from ccs.adapters import coherent_volume as coherent_volume_module
+
+    real_post = coherent_volume_module._coordinator_post
+    sent: list[tuple[str, dict, object]] = []
+
+    def recording(endpoint, path, payload, **kwargs):
+        answer = real_post(endpoint, path, payload, **kwargs)
+        sent.append((path, payload, answer))
+        return answer
+
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_post", recording)
+    return sent
+
+
+def _stops(sent: list[tuple[str, dict, object]]) -> list[object]:
+    return [answer for route, _payload, answer in sent if route == _STOP]
+
+
+def _stopped_attempts(sent: list[tuple[str, dict, object]]) -> list[object]:
+    """The attempt each release named, in the order they went out."""
+    return [payload.get("agent_id") for route, payload, _answer in sent if route == _STOP]
+
+
+def _commits(sent: list[tuple[str, dict, object]]) -> list[str]:
+    return [route for route, _payload, _answer in sent if route in _COMMITS]
+
+
+def _degraded_warning(warned: list[warnings.WarningMessage]) -> str:
+    """The text of the one degradation warning ``warned`` holds."""
+    degraded = [str(w.message) for w in warned if issubclass(w.category, CoherenceDegradedWarning)]
+    assert len(degraded) == 1, degraded
+    return degraded[0]
+
+
+#: FROZEN duplicate of degrade's warning for a release the envelope answered.
+_DEGRADED_RELEASE_WARNING = (
+    "CoherentVolume degraded: coordinator answered the release of this "
+    f"volume's earlier write grant with a failure ({_ENVELOPE}); the grant may "
+    "still stand, and the release is sent again at the next fresh attempt."
+)
+
+
+def _assert_claims_no_outcome(text: str) -> None:
+    """Degrade's text for a release the envelope answered: what failed, that
+    the grant may stand, that the release goes out again, and nothing about
+    the operation's own outcome, which goes on and may commit."""
+    assert text == _DEGRADED_RELEASE_WARNING, text
+    assert "nothing was committed" not in text, f"the operation may commit: {text}"
+    assert "Retry once" not in text, f"a retry may apply the change twice: {text}"
+    assert _ENVELOPE in text, text
+    assert "release" in text, "the text must name what failed"
+    assert "the grant may still stand" in text, text
+    assert "sent again" in text, "the text must say the release goes out again"
+
+
+def _volume_after_a_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig, mode: str
+) -> tuple[CoherentVolume, str, tuple[int, int]]:
+    """A volume whose ``write()`` of ``_REL`` left its attempt holding the
+    grant. Returns the volume, that attempt, and the versions of ``_REL`` and
+    ``_OTHER`` an operation commits against."""
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error=mode, config=fast_cfg)
+    vol.write(_REL, b"v2")
+    writer = vol._incarnation
+    _data, version = vol.read_with_version(_REL)
+    _other, other_version = vol.read_with_version(_OTHER)
+    return vol, writer, (version, other_version)
+
+
+def _re_mint(vol: CoherentVolume, operation: str, versions: tuple[int, int]) -> object:
+    """Run ``operation``, which re-mints before it commits (see
+    ``_RE_MINTS``), and return what it returned."""
+    version, other_version = versions
+    if operation == "write_cas":
+        return vol.write_cas(_REL, lambda current: current + b"+cas")
+    if operation == "write_cas_at":
+        return vol.write_cas_at(_REL, version, b"v3")
+    if operation == "publish_one":
+        return vol.atomic_publish([(_REL, version, b"v3")])
+    if operation == "publish_two":
+        return vol.atomic_publish([(_REL, version, b"v3"), (_OTHER, other_version, b"o2")])
+    assert operation == "reacquire", operation
+    return vol.reacquire(_REL)
+
+
+def _ended_in(outcome: object) -> tuple[str, object]:
+    """What an operation ended in: the error's type and the refusal it names
+    (an exhausted ``write_cas`` names its last one), or that it returned."""
+    if isinstance(outcome, CasRetriesExhausted):
+        return type(outcome).__name__, outcome.last_conflict_reason
+    if isinstance(outcome, CasVersionConflict):
+        return type(outcome).__name__, outcome.reason
+    if isinstance(outcome, BaseException):
+        return type(outcome).__name__, None
+    return "returned", outcome
+
+
+@_RE_MINTS
+def test_a_strict_release_answered_with_the_failure_envelope_raises_coordinator_failed_before_any_commit(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """After ``write()`` the volume's attempt still holds the file's grant,
+    and each of these operations re-mints first, releasing that attempt with
+    one ``session-stop``. When the envelope answers the release, strict raises
+    :class:`CoordinatorFailed` at that first failed release, naming the
+    envelope and saying nothing was committed. No commit is sent, and the
+    abandoned attempt stays in the release record, so the next re-mint sends
+    the release again.
+
+    Prevents the operation carrying on under its new attempt with no error:
+    its own grant, held by the old attempt, refuses the commit as another
+    agent's (``other_holder``, or the batch's ``StaleView``), ``write_cas``
+    re-sends the failing release on every attempt until its budget runs out,
+    and ``reacquire()`` returns as if nothing failed. The caller backs off for
+    a peer that does not exist and never learns the coordinator failed."""
+    target = _seed(tmp_path)
+    _seed(tmp_path, _OTHER, b"o1")
+    server = serve_in_process(tmp_path, f"envelope-release-{operation}-strict")
+    try:
+        vol, writer, versions = _volume_after_a_write(tmp_path, fast_cfg, "strict")
+        writer_row = str(session_to_agent_id(vol.session_id, writer))
+        assert write_holders(server, _REL) == {writer_row}, "control: write() left its grant"
+        with monkeypatch.context() as faulted:
+            _fail_registry(server, faulted, "artifacts_held_by_agent", "before")
+            sent = _wire(faulted)
+            with pytest.raises(CoherenceError) as raised:
+                _re_mint(vol, operation, versions)
+
+        assert type(raised.value) is CoordinatorFailed, repr(raised.value)
+        assert raised.value.reason == _COORDINATOR_FAILED
+        assert _ENVELOPE in str(raised.value)
+        assert "release" in str(raised.value), "the text must name what failed"
+        assert "nothing was committed" in str(raised.value)
+        stops = _stops(sent)
+        assert len(stops) == 1, f"the operation went on past its failed release: {len(stops)} stops"
+        assert stops[0].get("reason") == _ENVELOPE, f"control: the envelope answered {stops[0]!r}"
+        assert not _commits(sent), "a commit went out after the release failed"
+        assert _REL in vol._grant_incarnations.get(writer, set()), "the held grant left the record"
+        assert write_holders(server, _REL) == {writer_row}, "control: the grant still stands"
+        assert target.read_bytes() == b"v2"
+        assert vol.degradation_count == 0
+    finally:
+        server.shutdown()
+
+
+@_RE_MINTS
+def test_a_degrade_release_answered_with_the_failure_envelope_warns_once_and_counts(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """Degrade mode warns once and counts every release the envelope
+    answered, as for any other coordinator failure, and keeps the abandoned
+    attempt in the release record. The warning names the envelope, says the
+    grant may still stand and the release goes out again, and claims nothing
+    about the operation, which goes on.
+
+    Prevents the failure showing only as a log line: the volume reported
+    nothing degraded (``degradation_count`` 0, no warning) while its own
+    grant stood. Prevents too the strict text's "nothing was committed.
+    Retry once", which is false here: the operation goes on after the
+    warning.
+
+    The operation's outcome after that is pinned as it is today
+    (``_DEGRADE_ENDS_TODAY``), a known gap this does not close: the volume
+    still cannot tell its own unreleased grant from a peer's."""
+    target = _seed(tmp_path)
+    _seed(tmp_path, _OTHER, b"o1")
+    server = serve_in_process(tmp_path, f"envelope-release-{operation}-degrade")
+    try:
+        vol, writer, versions = _volume_after_a_write(tmp_path, fast_cfg, "degrade")
+        with monkeypatch.context() as faulted:
+            _fail_registry(server, faulted, "artifacts_held_by_agent", "before")
+            sent = _wire(faulted)
+            with warnings.catch_warnings(record=True) as warned:
+                warnings.simplefilter("always")
+                try:
+                    outcome: object = _re_mint(vol, operation, versions)
+                except CoherenceError as exc:
+                    outcome = exc
+
+        stops = _stops(sent)
+        assert stops, "control: no release was sent"
+        assert all(answer.get("reason") == _ENVELOPE for answer in stops), (
+            f"control: the envelope answered {stops!r}"
+        )
+        assert vol.degradation_count == len(stops), (
+            f"{len(stops)} failed releases, {vol.degradation_count} counted"
+        )
+        _assert_claims_no_outcome(_degraded_warning(warned))
+        assert _REL in vol._grant_incarnations.get(writer, set()), "the held grant left the record"
+        assert _ended_in(outcome) == _DEGRADE_ENDS_TODAY[operation], repr(outcome)
+        assert target.read_bytes() == b"v2"
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("operation", ["write_cas_at", "publish_one", "publish_two"])
+def test_a_degrade_release_answered_with_the_failure_envelope_claims_no_outcome_for_a_commit_that_lands(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """The grant ``write()`` left stands on one file, and the operation
+    commits other files (alone, as a batch of one, or as a batch of two).
+    Under degrade the release the envelope answers warns once, and the
+    operation goes on and commits: the bytes land and the coordinator's
+    version moves. The warning says what failed and nothing of the commit.
+
+    Prevents a warning that says nothing was committed and to retry once,
+    over a commit that landed: a caller that follows it applies its change a
+    second time, or is refused as a conflict with its own commit."""
+    _seed(tmp_path)
+    other = _seed(tmp_path, _OTHER, b"o1")
+    third = _seed(tmp_path, _THIRD, b"t1")
+    server = serve_in_process(tmp_path, f"envelope-release-elsewhere-{operation}")
+    try:
+        vol, writer, (_version, other_version) = _volume_after_a_write(
+            tmp_path, fast_cfg, "degrade"
+        )
+        _third, third_version = vol.read_with_version(_THIRD)
+        with monkeypatch.context() as faulted:
+            _fail_registry(server, faulted, "artifacts_held_by_agent", "before")
+            sent = _wire(faulted)
+            with warnings.catch_warnings(record=True) as warned:
+                warnings.simplefilter("always")
+                if operation == "write_cas_at":
+                    vol.write_cas_at(_OTHER, other_version, b"o2")
+                elif operation == "publish_one":
+                    vol.atomic_publish([(_OTHER, other_version, b"o2")])
+                else:
+                    vol.atomic_publish(
+                        [(_OTHER, other_version, b"o2"), (_THIRD, third_version, b"t2")]
+                    )
+
+        assert [answer.get("reason") for answer in _stops(sent)] == [_ENVELOPE], (
+            "control: one release, answered with the envelope"
+        )
+        assert other.read_bytes() == b"o2", "control: the commit landed"
+        assert recorded_version(server, _OTHER) == other_version + 1
+        if operation == "publish_two":
+            assert third.read_bytes() == b"t2", "control: the batch landed"
+            assert recorded_version(server, _THIRD) == third_version + 1
+        assert vol.degradation_count == 1
+        _assert_claims_no_outcome(_degraded_warning(warned))
+        assert vol._grant_incarnations.get(writer) == {_REL}, "the held grant left the record"
+    finally:
+        server.shutdown()
+
+
+def test_a_degrade_re_mint_stops_at_the_first_release_the_failure_envelope_answers(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two earlier attempts each still hold a grant ``write()`` left, on
+    different files. While the envelope answers every release, each re-mint
+    sends one ``session-stop``, for the first attempt in the order the
+    record is released in, counts one degradation, and leaves both records
+    as they were: the other attempt gets no release and waits, recorded, for
+    a later re-mint.
+
+    Prevents a re-mint that goes on past a failed release: every abandoned
+    attempt meets the same failing coordinator, so it would spend a failed
+    request, and count a degradation, for each one instead of one."""
+    _seed(tmp_path)
+    _seed(tmp_path, _OTHER, b"o1")
+    _seed(tmp_path, _THIRD, b"t1")
+    server = serve_in_process(tmp_path, "envelope-release-stops-at-the-first")
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+        vol.write(_REL, b"v2")
+        first = vol._incarnation
+        # Strand the first attempt: its release fails, so the re-mint leaves
+        # it recorded, and the next attempt writes another file.
+        with monkeypatch.context() as faulted:
+            _fail_registry(server, faulted, "artifacts_held_by_agent", "before")
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                vol.reacquire(_OTHER)
+        vol.write(_OTHER, b"o2")
+        record = {first: {_REL}, vol._incarnation: {_OTHER}}
+        assert vol._grant_incarnations == record, "control: two attempts hold a grant"
+        assert vol.degradation_count == 1, "control: the first attempt's release failed"
+        released_first = sorted(record)[0]
+
+        with monkeypatch.context() as faulted:
+            _fail_registry(server, faulted, "artifacts_held_by_agent", "before")
+            sent = _wire(faulted)
+            for re_mints in (1, 2):
+                # A file neither attempt holds, so the read changes no grant.
+                vol.reacquire(_THIRD)
+                assert _stopped_attempts(sent) == [released_first] * re_mints, (
+                    f"re-mint {re_mints} went on past its failed release"
+                )
+                assert [answer.get("reason") for answer in _stops(sent)] == (
+                    [_ENVELOPE] * re_mints
+                ), "control: the envelope answered every release"
+                assert vol.degradation_count == 1 + re_mints
+                assert vol._grant_incarnations == record, "a failed release changed the record"
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("operation", ["write_cas", "write_cas_at", "publish_one", "publish_two"])
+def test_a_strict_operation_retried_after_a_failed_release_sends_it_again_and_commits(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """The envelope answers the release once, and then the coordinator is
+    healthy. The first call raises :class:`CoordinatorFailed`; the same call
+    retried sends the release again, the coordinator confirms it, the
+    attempt leaves the release record, its grant is gone, and the commit
+    wins.
+
+    Prevents a release that, once failed, is never sent again: the grant
+    would stand for the life of the volume, and every later commit of the
+    file would be refused as another agent's."""
+    target = _seed(tmp_path)
+    other = _seed(tmp_path, _OTHER, b"o1")
+    server = serve_in_process(tmp_path, f"envelope-release-recovers-{operation}")
+    try:
+        vol, writer, versions = _volume_after_a_write(tmp_path, fast_cfg, "strict")
+        writer_row = str(session_to_agent_id(vol.session_id, writer))
+        sent = _wire(monkeypatch)
+        with monkeypatch.context() as faulted:
+            _fail_registry(server, faulted, "artifacts_held_by_agent", "before")
+            with pytest.raises(CoordinatorFailed):
+                _re_mint(vol, operation, versions)
+        assert _REL in vol._grant_incarnations.get(writer, set()), "control: the release failed"
+        assert not _commits(sent), "control: the first call committed nothing"
+
+        _re_mint(vol, operation, versions)
+
+        stops = _stops(sent)
+        assert _stopped_attempts(sent) == [writer, writer], "the retry did not send the release"
+        assert stops[0].get("reason") == _ENVELOPE, f"control: the envelope answered {stops[0]!r}"
+        assert stops[1].get("ok") is True and not stops[1].get("degraded"), (
+            f"control: the retried release was not confirmed: {stops[1]!r}"
+        )
+        assert writer not in vol._grant_incarnations, "a confirmed release stayed in the record"
+        assert writer_row not in write_holders(server, _REL), "the grant still stands"
+        expected = b"v2+cas" if operation == "write_cas" else b"v3"
+        assert target.read_bytes() == expected, "the retried commit did not land"
+        assert recorded_version(server, _REL) == versions[0] + 1
+        if operation == "publish_two":
+            assert other.read_bytes() == b"o2", "the retried batch did not land"
+        assert vol.degradation_count == 0
+    finally:
+        server.shutdown()
+
+
+@_MODE
+@pytest.mark.parametrize("operation", ["write_cas_at", "reacquire"])
+def test_a_release_answered_with_its_grant_still_held_keeps_its_outcome(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    mode: str,
+) -> None:
+    """Control. A stop that ran but left the grant held answers per grant
+    (#185): ``ok: false`` with a ``grants`` list, and no top-level reason.
+    That is the coordinator's account of the grant, not a failure of the
+    coordinator, so in both modes the release keeps today's handling: nothing
+    raises there, nothing is counted or warned, the record keeps the grant,
+    and the operation goes on (the CAS is refused ``other_holder``, the
+    reacquire returns the bytes).
+
+    Prevents the envelope's handling widening to every ``ok: false``
+    release."""
+    target = _seed(tmp_path)
+    _seed(tmp_path, _OTHER, b"o1")
+    server = serve_in_process(tmp_path, f"held-release-{operation}-{mode}")
+    try:
+        vol, writer, versions = _volume_after_a_write(tmp_path, fast_cfg, mode)
+
+        def refusing(*_args, **_kwargs):
+            raise InvariantViolationError("release refused")
+
+        with monkeypatch.context() as faulted:
+            # The stop's per-grant release; its failure is answered per grant.
+            faulted.setattr(server.service, "invalidate", refusing)
+            sent = _wire(faulted)
+            with warnings.catch_warnings(record=True) as warned:
+                warnings.simplefilter("always")
+                try:
+                    outcome: object = _re_mint(vol, operation, versions)
+                except CoherenceError as exc:
+                    outcome = exc
+
+        stops = _stops(sent)
+        assert len(stops) == 1, stops
+        assert stops[0].get("ok") is False and "reason" not in stops[0], (
+            f"control: not a per-grant answer: {stops[0]!r}"
+        )
+        assert [grant.get("held") for grant in stops[0]["grants"]] == [True], (
+            "control: the grant is held"
+        )
+        expected = (
+            ("CasVersionConflict", "other_holder") if operation == "write_cas_at"
+            else ("returned", b"v2")
+        )
+        assert _ended_in(outcome) == expected, repr(outcome)
+        assert vol.degradation_count == 0
+        assert not [w for w in warned if issubclass(w.category, CoherenceDegradedWarning)]
+        assert _REL in vol._grant_incarnations.get(writer, set()), "the held grant left the record"
+        assert target.read_bytes() == b"v2"
     finally:
         server.shutdown()

@@ -8,7 +8,9 @@ write-set lands or none does, and a torn intermediate is never on disk.
 """
 from __future__ import annotations
 
+import traceback
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -31,6 +33,7 @@ from ccs.core.exceptions import (
     StaleView,
     ViewWedged,
 )
+from tests.coordinator_helpers import ANSWERED_TEXT, answer_with_status, recorded_version, serve_in_process
 from tests.loopback_helpers import refused_endpoint
 
 
@@ -638,6 +641,214 @@ def test_a_degrade_publish_whose_commit_answer_is_lost_is_unconfirmed_as_before(
         assert (tmp_path / "data/b.txt").read_bytes() == b"b-v1"
     finally:
         stop_coordinator(tmp_path)
+
+
+# ----------------------------------------------------------------------
+# A publish commit answered with an HTTP 5xx after it reached the coordinator
+# ----------------------------------------------------------------------
+#
+# A 5xx says nothing of whether the work behind it ran: the coordinator's
+# dispatcher answers 500 when a handler raises after its work, and a gateway in
+# front of a remote coordinator answers 502, 503 or 504 after it forwarded the
+# request. Each commit here reaches a coordinator running in this process,
+# which records it, and only then is the status answered. What these do not
+# prove: one machine and loopback only; the status is raised at the client's
+# HTTP boundary, not sent by a real gateway.
+
+#: The route each publish size commits on: one member takes write_cas_at's
+#: compare-and-swap, more take the batch commit.
+_COMMIT_ROUTE = {1: "/hooks/post-edit-cas", 2: "/session/commit_all"}
+_MEMBERS = ("data/a.txt", "data/b.txt")
+
+
+def _commit_of(size: int) -> Callable[[str, dict], bool]:
+    """Picks the commit a publish of ``size`` members sends."""
+    route = _COMMIT_ROUTE[size]
+    return lambda path, _payload: path == route
+
+
+def _read_members(vol: CoherentVolume, size: int) -> dict[str, int]:
+    """The version each of the first ``size`` members is read at, the
+    comparand its publish passes."""
+    return {rel: vol.read_with_version(rel)[1] for rel in _MEMBERS[:size]}
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+@pytest.mark.parametrize("size", [1, 2])
+def test_a_strict_publish_answered_with_a_5xx_after_it_landed_is_unconfirmed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    size: int, status: int,
+) -> None:
+    """A strict publish of one member or of two reaches the coordinator, which
+    records every member, and the answer to its commit is an HTTP 5xx.
+    Whether the publish landed is unknown, so it raises ``CommitUnconfirmed``,
+    as a degrade publish and the substrate session already do for the same
+    answer. The text names the status and says the outcome is unknown and to
+    re-read; it says nothing the answer carried, and does not call a status
+    "no usable answer". The commit is sent once and no member is written.
+    Before, strict raised a plain ``CoherenceError`` (MCP ``internal_error``,
+    recover ``none``) for a publish the coordinator had recorded. A 503 is no
+    special case: a gateway sends one after forwarding too."""
+    targets = [_seed(tmp_path, rel, b"old") for rel in _MEMBERS[:size]]
+    server = serve_in_process(tmp_path, f"publish-5xx-{size}-{status}")
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+        versions = _read_members(vol, size)
+        calls: list[tuple[str, dict, dict]] = []
+        answer_with_status(monkeypatch, _commit_of(size), status, calls=calls)
+
+        with pytest.raises(CoherenceError) as raised:
+            vol.atomic_publish([(rel, version, b"new") for rel, version in versions.items()])
+
+        recorded = {rel: recorded_version(server, rel) for rel in versions}
+        assert recorded == {rel: v + 1 for rel, v in versions.items()}, "control: every member was recorded"
+        assert [t.read_bytes() for t in targets] == [b"old"] * size, "a file was written"
+        assert [path for path, _p, _k in calls].count(_COMMIT_ROUTE[size]) == 1, "sent once, never retried"
+        message = str(raised.value)
+        assert type(raised.value) is CommitUnconfirmed, repr(raised.value)
+        assert f"HTTP {status}" in message, message
+        assert "is unknown" in message and "Re-read" in message, message
+        assert "no usable answer" not in message, message
+        rendered = "".join(traceback.format_exception(raised.value))
+        assert ANSWERED_TEXT not in rendered, "the answer's text reached the error"
+    finally:
+        server.shutdown()
+
+
+#: FROZEN duplicate of what a strict multi-member publish raises for a 5xx.
+_PUBLISH_UNCONFIRMED_5XX = (
+    "atomic_publish commit could not be confirmed: the coordinator answered "
+    "with HTTP {status}, so whether the batch landed at the coordinator is "
+    "unknown, and no file was written. Re-read every member, and retry only "
+    "if the publish is absent."
+)
+
+
+@pytest.mark.parametrize("status", [500, 502])
+def test_a_strict_publish_its_coordinator_answers_with_a_5xx_after_recording_it_is_unconfirmed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, status: int,
+) -> None:
+    """End to end, nothing faked at the client: a two-member publish's batch
+    commit reaches the coordinator, whose real handler records both members,
+    and the coordinator's socket then answers HTTP ``status`` in place of the
+    win. A 500 is its dispatcher's answer to a handler that raised after its
+    work; a 502 is what a gateway in front of it sends after forwarding, with
+    its own text in the reason phrase and body. Strict raises
+    ``CommitUnconfirmed`` naming the status alone, with no ``HTTPError`` on its
+    chain; the batch commit ran once and no member was written."""
+    import json
+    import urllib.error
+
+    import ccs.adapters.claude_code.coordinator_server as coordinator_server_module
+
+    targets = [_seed(tmp_path, rel, b"old") for rel in _MEMBERS]
+    server = serve_in_process(tmp_path, f"publish-wire-5xx-{status}")
+    route = ("POST", "/session/commit_all")
+    real_commit_all = coordinator_server_module._ROUTES[route]
+    held_back: list[tuple[int, dict]] = []
+
+    def answer_the_status_after_the_work(req: object, coordinator: object) -> None:
+        # The handler answers through req._json. An instance attribute holds
+        # that answer back, so the work runs and records the batch, and the
+        # status goes out in its place.
+        req._json = lambda answered, body: held_back.append((answered, body))  # type: ignore[attr-defined]
+        try:
+            real_commit_all(req, coordinator)
+        finally:
+            del req._json  # type: ignore[attr-defined]
+        if status == 500:
+            raise RuntimeError(ANSWERED_TEXT)
+        body = json.dumps({"error": ANSWERED_TEXT}).encode()
+        req.send_response(status, ANSWERED_TEXT)  # type: ignore[attr-defined]
+        req.send_header("Content-Type", "application/json")  # type: ignore[attr-defined]
+        req.send_header("Content-Length", str(len(body)))  # type: ignore[attr-defined]
+        req.end_headers()  # type: ignore[attr-defined]
+        req.wfile.write(body)  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(coordinator_server_module._ROUTES, route, answer_the_status_after_the_work)
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        versions = _read_members(vol, len(_MEMBERS))
+
+        with pytest.raises(CoherenceError) as raised:
+            vol.atomic_publish([(rel, version, b"new") for rel, version in versions.items()])
+
+        assert [(answered, body.get("ok")) for answered, body in held_back] == [(200, True)], (
+            "control: the batch commit ran once and won"
+        )
+        recorded = {rel: recorded_version(server, rel) for rel in versions}
+        assert recorded == {rel: v + 1 for rel, v in versions.items()}, "control: every member was recorded"
+        assert type(raised.value) is CommitUnconfirmed, repr(raised.value)
+        assert str(raised.value) == _PUBLISH_UNCONFIRMED_5XX.format(status=status)
+        assert [t.read_bytes() for t in targets] == [b"old"] * len(_MEMBERS), "a member was written"
+        chain, link = [], raised.value
+        while link is not None:
+            chain.append(link)
+            link = link.__cause__ or link.__context__
+        assert not [cause for cause in chain if isinstance(cause, urllib.error.HTTPError)], chain
+        rendered = "".join(traceback.format_exception(raised.value))
+        assert ANSWERED_TEXT not in rendered, "the answer's text reached the error"
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("size", [1, 2])
+def test_a_strict_publish_refused_with_a_4xx_keeps_its_plain_error(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, size: int,
+) -> None:
+    """Control: a 4xx is a definite refusal, never an unknown outcome. A strict
+    publish whose commit is refused with one, before the coordinator ran it,
+    raises the plain ``CoherenceError`` naming the request and its status, as
+    it always has; no member is recorded or written."""
+    targets = [_seed(tmp_path, rel, b"old") for rel in _MEMBERS[:size]]
+    server = serve_in_process(tmp_path, f"publish-4xx-{size}")
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+        versions = _read_members(vol, size)
+        answer_with_status(monkeypatch, _commit_of(size), 400, forwarded=False)
+
+        with pytest.raises(CoherenceError) as raised:
+            vol.atomic_publish([(rel, version, b"new") for rel, version in versions.items()])
+
+        assert type(raised.value) is CoherenceError, repr(raised.value)
+        assert str(raised.value) == f"coordinator request to {_COMMIT_ROUTE[size]} failed: HTTP 400"
+        assert {rel: recorded_version(server, rel) for rel in versions} == versions, "a member was recorded"
+        assert [t.read_bytes() for t in targets] == [b"old"] * size, "a file was written"
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+@pytest.mark.parametrize("size", [1, 2])
+def test_a_degrade_publish_answered_with_a_5xx_after_it_landed_behaves_as_before(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    size: int, status: int,
+) -> None:
+    """Control: under ``on_error="degrade"`` a publish whose commit is
+    answered with a 5xx after it landed changes nothing. It warns once,
+    naming the request and its status and nothing the answer carried, counts,
+    and raises ``CommitUnconfirmed``; no member is written."""
+    targets = [_seed(tmp_path, rel, b"old") for rel in _MEMBERS[:size]]
+    server = serve_in_process(tmp_path, f"publish-degrade-5xx-{size}-{status}")
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+        versions = _read_members(vol, size)
+        answer_with_status(monkeypatch, _commit_of(size), status)
+
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            with pytest.raises(CommitUnconfirmed):
+                vol.atomic_publish([(rel, version, b"new") for rel, version in versions.items()])
+
+        recorded = {rel: recorded_version(server, rel) for rel in versions}
+        assert recorded == {rel: v + 1 for rel, v in versions.items()}, "control: every member was recorded"
+        degraded = [str(w.message) for w in warned if issubclass(w.category, CoherenceDegradedWarning)]
+        route = _COMMIT_ROUTE[size]
+        assert degraded == [f"CoherentVolume degraded: coordinator request to {route} failed: HTTP {status}"]
+        assert vol.degradation_count == 1
+        assert [t.read_bytes() for t in targets] == [b"old"] * size, "a file was written"
+    finally:
+        server.shutdown()
 
 
 # ----------------------------------------------------------------------
