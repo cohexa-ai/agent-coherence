@@ -240,6 +240,50 @@ Alpha — APIs may change before `v1.0`.
   take a path out of strict mode; the guide's section on the policy routes now
   says the Node coordinator refuses too. The package is unchanged.
 
+- **A strict request that commits nothing, answered with an HTTP 5xx, raises
+  `CoordinatorFailed` (#433).** The coordinator reports a failure of its own
+  either as its failure envelope, which a strict read and the release of an
+  earlier write grant already raise `CoordinatorFailed` for (#259, #401), or as
+  an HTTP 5xx: `500` when a handler raises, and `502` to `504` from a proxy in
+  front of a remote coordinator. A strict `CoherentVolume` read, `reacquire()`,
+  the grant request of `write()`, that release, and the snapshot session
+  `atomic_publish` opens for two or more files raised a plain `CoherenceError`
+  for a 5xx, which the `stale-write-guard-fs` server answered as
+  `internal_error` with `recover: none`. They now raise `CoordinatorFailed`,
+  answered as `coordinator_failed` with `recover: stop_and_report` and a next
+  step that names one retry, with the text they always had: the request and
+  its status. A `CoordinatedSubstrate` raises it for a 5xx on its read leg
+  too. Commits keep `CommitUnconfirmed` (#398); a 4xx, a redirect, degrade
+  mode and the handoff verbs are unchanged. The guide's "When the coordinator
+  answers with a failure" section has the details.
+
+- **One split pair gets one answer on every surface: `read()` and the effect
+  fence name it `split_pair` (#405).** When the bytes on disk are not the
+  content the coordinator records at its version, a strict coordinator refuses
+  the read with `hash_differs`. `read_with_version()` and
+  `read_with_version_generation()` raise `StaleView` with `reason`
+  `split_pair` for that (#264), but `read()` with `on_stale_read="raise"`
+  raised one with the class reason `stale_view` and the coordinator's own
+  text, and the effect fence (`gate()`, `check_fence()`, `swg_gate` and the
+  coordinator's `POST /hooks/effect-fence`) held it as `read_denied`, "view is
+  INVALID", and told the caller to reacquire. A reacquire never clears it, so
+  an agent that followed the advice looped. `read()` now raises the refusal
+  the versioned reads raise, and the fence holds with a new reason,
+  `split_pair`, checked after `version_moved` and before `read_denied`, and
+  the `StaleView` it raises carries `reason` `split_pair` as well. Its text
+  names the steps that clear it: re-gate after a few seconds first, since a
+  peer's `write()` puts its bytes on disk before its commit moves the
+  version; only a hold that outlasts that is a change outside the
+  coordinator, and then `write()` the bytes the reacquire returns, or a merge
+  of them, to record them, then read and re-decide.
+  `split_pair` is added to the published hold reasons, which may be added to
+  but never renamed: code that matches reasons one by one must accept it, and
+  should already treat a reason it does not recognise as a hold. `read_denied`
+  keeps every refusal whose bytes match the recorded content, such as a
+  reclaimed grant. `swg_gate` answers both as a `stale_view` deny, with the
+  cause in `hold_cause`. The Node coordinator does not serve the fence route,
+  so nothing changes there. The guide's "Hold reasons" table has the details.
+
 ### Fixed
 
 - **A coordinator start no longer hands callers that race it the port of a
@@ -506,6 +550,32 @@ Alpha — APIs may change before `v1.0`.
   takes. For those 2 seconds the slots are still full, and a peer that sends a
   byte before every timeout (#393), or reconnects as each connection is
   dropped (#394), still keeps them.
+
+- **A volume whose commit is refused by its own unreleased write grant says
+  so, instead of telling the caller to wait for another agent (#434).** After
+  a `write()`, a volume holds the file's write grant until its next fresh
+  attempt releases it. When that release fails in degrade mode (no answer, an
+  HTTP 5xx or the coordinator's failure envelope), or the coordinator answers
+  it grant by grant with the grant still held (either mode), the call went on
+  and its commit was refused as `other_holder` by the volume's own grant.
+  `write_cas` spent all nine commit attempts on it, re-sending the failing
+  release each time, and raised `CasRetriesExhausted`; `write_cas_at` and a
+  one-file `atomic_publish` raised `CasVersionConflict(other_holder)`, which
+  `swg_write_cas` answered with `recover: wait_and_retry`, though no peer
+  held the file; a multi-file `atomic_publish` was held as a peer's conflict.
+  `write_cas_at` and `atomic_publish` now raise `CoordinatorFailed` after
+  that commit, and `write_cas` after one retry, whose re-mint sends the
+  release again and so still clears a one-off release failure in the same
+  call. The error names the volume's own earlier write grant: the file "is
+  held" by it when the
+  coordinator reported the grant still held, and "may be held" when the
+  release got no confirmed answer, since that release may have run.
+  `swg_write_cas` answers `coordinator_failed` with `recover:
+  stop_and_report`, and one retry sends the release again. A refusal by a
+  grant the volume does not record keeps `other_holder`. The volume tells the
+  two apart from its own record and the release's answer; the coordinator's
+  refusal is unchanged, on both coordinators. The guide's "Concurrent writers:
+  `write_cas`" section has the details.
 
 ## [0.15.0] - 2026-10-14
 

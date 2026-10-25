@@ -2999,10 +2999,11 @@ def _effect_fence_no_record(
         expected_version=expected_version,
         current_version=None,
         expected_generation=expected_generation,
-        # No row means no generation and no claim; the read was not refused
-        # (there was nothing to refuse) and no grant stood.
+        # No row means no generation and no claim; the read was neither refused
+        # nor split (there was nothing to refuse) and no grant stood.
         current_generation=None,
         read_refused=False,
+        split_pair=False,
         grant_did_not_stand=True,
         content_claim_present=False,
     )
@@ -3018,7 +3019,7 @@ def _effect_fence_comparands(
     caller_content_hash: str,
     now_unix: float,
 ) -> FenceComparands:
-    """Assemble the seven fence inputs from the registry and the request.
+    """Assemble the eight fence inputs from the registry and the request.
 
     Every registry call here is a READ through a non-mutating accessor:
     ``lookup_artifact_id_by_name`` (never ``resolve_or_register``, which mints
@@ -3069,6 +3070,7 @@ def _effect_fence_comparands(
         decision.fresh_hash_differs if decision.holds_valid_grant
         else decision.stale_hash_differs
     )
+    refused = decision.outcome == "denied"
 
     return FenceComparands(
         expected_version=expected_version,
@@ -3085,7 +3087,11 @@ def _effect_fence_comparands(
         # docstring warns about, one holding the registry's real generation,
         # which would otherwise fall past that leg and either mislabel its hold
         # or proceed on a view the coordinator had just refused to serve.
-        read_refused=decision.outcome == "denied",
+        read_refused=refused,
+        # A refusal of bytes that are not the content recorded at that version:
+        # the deny the pre-read would have answered carries ``hash_differs``,
+        # the split pair a version-checked read refuses (#405).
+        split_pair=refused and hash_differs,
         # A peer's pessimistic write-acquire ends a holder's grant while moving
         # NEITHER comparand, so this is the only leg that can see it.
         grant_did_not_stand=not decision.holds_valid_grant,

@@ -30,6 +30,7 @@ from ccs.core.exceptions import (
     HOLD_INPUT_VANISHED,
     HOLD_READ_DENIED,
     HOLD_REASONS,
+    HOLD_SPLIT_PAIR,
     HOLD_VERSION_MOVED,
     HOLD_VERSION_UNCONFIRMED,
 )
@@ -50,13 +51,14 @@ EXPECTED_HOLD_REASONS = {
     "input_vanished",
     "version_unconfirmed",
     "version_moved",
+    "split_pair",
     "read_denied",
     "content_claim_absent",
     "generation_unconfirmed",
     "grant_reclaimed",
     "grant_preempted",
 }
-EXPECTED_HOLD_REASON_COUNT = 8
+EXPECTED_HOLD_REASON_COUNT = 9
 
 # A clean, all-legs-confirmed input. Every test below states its case as a
 # DELTA from this, so what each one is actually varying is visible at a glance
@@ -67,6 +69,7 @@ _CLEAN = FenceComparands(
     expected_generation=7,
     current_generation=7,
     read_refused=False,
+    split_pair=False,
     grant_did_not_stand=False,
     content_claim_present=True,
 )
@@ -92,6 +95,12 @@ def _with(**overrides) -> FenceComparands:
         ({"current_version": 0}, HOLD_VERSION_UNCONFIRMED),
         # The value the decision was derived from changed.
         ({"current_version": 6}, HOLD_VERSION_MOVED),
+        # The coordinator refused the re-validate read because the bytes are
+        # not its content at that version (#405).
+        (
+            {"read_refused": True, "split_pair": True, "current_generation": None},
+            HOLD_SPLIT_PAIR,
+        ),
         # The coordinator refused the re-validate read (strict-mode deny).
         ({"read_refused": True, "current_generation": None}, HOLD_READ_DENIED),
         # The residual bucket: a generation the coordinator never confirmed.
@@ -172,6 +181,30 @@ def test_refused_read_holds_even_when_both_comparands_match() -> None:
     assert refused.current_generation == refused.expected_generation
     assert refused.current_version == refused.expected_version
     assert classify_hold(refused) == HOLD_READ_DENIED
+
+
+def test_a_refused_split_pair_outranks_a_plain_refusal() -> None:
+    """A re-validate read refused because the bytes are not the content the
+    coordinator records at that version answers ``split_pair``, on the
+    route's input shape too (a real generation on both sides), not
+    ``read_denied`` (#405).
+
+    Prevents the split folding back into ``read_denied``, whose text calls
+    the view INVALID and whose recovery, a reacquire, never clears it: the
+    bytes on disk stay unrecorded until a write records them, so an agent
+    following it loops through reacquire, gate and hold."""
+    split = _with(read_refused=True, split_pair=True)
+    assert isinstance(split.current_generation, int)
+    assert classify_hold(split) == HOLD_SPLIT_PAIR
+    assert classify_hold(_with(read_refused=True)) == HOLD_READ_DENIED
+
+
+def test_a_moved_version_outranks_a_split_pair() -> None:
+    """A split read whose version also moved answers ``version_moved``: a
+    peer's commit still reaching disk moves the version first, and that is
+    the cause the caller recovers from (re-read and re-decide)."""
+    moved = _with(current_version=6, read_refused=True, split_pair=True)
+    assert classify_hold(moved) == HOLD_VERSION_MOVED
 
 
 # --- the no-claim reason, and its control ----------------------------------
@@ -290,6 +323,7 @@ def test_proceed_requires_the_affirmative_predicate() -> None:
         {"expected_version": 0},
         {"current_version": 6},
         {"read_refused": True},
+        {"split_pair": True},
         {"content_claim_present": False},
         {"current_generation": None},
         {"current_generation": 8},
@@ -341,6 +375,7 @@ def _exhaustive_inputs():
         expected_generation,
         current_generation,
         read_refused,
+        split_pair,
         grant_did_not_stand,
         content_claim_present,
     ) in itertools.product(
@@ -351,6 +386,7 @@ def _exhaustive_inputs():
         (False, True),
         (False, True),
         (False, True),
+        (False, True),
     ):
         yield FenceComparands(
             expected_version=expected_version,
@@ -358,6 +394,7 @@ def _exhaustive_inputs():
             expected_generation=expected_generation,
             current_generation=current_generation,
             read_refused=read_refused,
+            split_pair=split_pair,
             grant_did_not_stand=grant_did_not_stand,
             content_claim_present=content_claim_present,
         )
@@ -399,7 +436,7 @@ def test_published_vocabulary_matches_its_frozen_duplicate() -> None:
 
 @pytest.mark.parametrize(
     "omitted",
-    ["read_refused", "grant_did_not_stand", "content_claim_present"],
+    ["read_refused", "split_pair", "grant_did_not_stand", "content_claim_present"],
 )
 def test_comparands_cannot_be_built_without_grant_state(omitted) -> None:
     """Omitting a grant-state field fails LOUDLY at construction, naming the
@@ -416,6 +453,7 @@ def test_comparands_cannot_be_built_without_grant_state(omitted) -> None:
         "expected_generation": 7,
         "current_generation": 7,
         "read_refused": False,
+        "split_pair": False,
         "grant_did_not_stand": False,
         "content_claim_present": True,
     }
@@ -430,26 +468,28 @@ def test_comparands_are_keyword_only_and_frozen() -> None:
     after construction.
 
     Keyword-only is what makes a transposition UNEXPRESSIBLE rather than merely
-    unlikely: two ints, two optional ints and three bools in a row type-check
+    unlikely: two ints, two optional ints and four bools in a row type-check
     in either order, and swapping the expected and current sides of a comparand
     is a silent admit. Frozen keeps the object the classifier examined the same
     one the message was formatted from.
     """
     with pytest.raises(TypeError):
-        FenceComparands(5, 5, 7, 7, False, False, True)  # type: ignore[misc]
+        FenceComparands(5, 5, 7, 7, False, False, False, True)  # type: ignore[misc]
     with pytest.raises(Exception):
         _CLEAN.expected_version = 9  # type: ignore[misc]
 
 
 def test_a_refused_read_outranks_an_absent_content_claim() -> None:
-    """Pins leg 4 over leg 5 -- the one precedence pair the docstring's "each
+    """Pins leg 5 over leg 6 -- the one precedence pair the docstring's "each
     leg's precedence is pinned by a test" claim did not actually cover.
 
     Both predicates are reachable AT ONCE on the coordinator route: an
-    artifact seeded with no content claim (the launch-gate all-``f`` form, or
-    a first observation that carried no caller hash) whose holder is then
-    invalidated by a peer under strict mode arrives with ``read_refused`` and
-    ``content_claim_present=False`` both set. Without this test the two legs
+    artifact seeded with no content claim by a first observation that
+    carried no caller hash, whose holder is then invalidated by a peer under
+    strict mode, arrives with ``read_refused`` and
+    ``content_claim_present=False`` both set. (The launch-gate all-``f`` form
+    also reports the caller's bytes as differing, so it holds ``split_pair``,
+    pinned on the route.) Without this test the two legs
     could be swapped and nothing would go red -- and their order is published
     contract, so a swap changes the reason a real, reachable state answers
     with. The refusal wins because it is the immediate blocker: the

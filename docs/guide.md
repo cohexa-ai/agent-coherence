@@ -1397,7 +1397,7 @@ data = vol.reacquire("plans/plan.md")       # recover: clear the stale view + fr
 |---|---|---|
 | `workspace_root` | — | Directory the volume manages; the coordinator's state lives in `<root>/.coherence/` |
 | `managed` | `()` | Glob patterns for the files under coordination; unmanaged paths bypass the volume |
-| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A read the coordinator answers with its failure envelope raises `CoordinatorFailed`, and so does the release of a write grant an earlier `write()` left held; see [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
+| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A read the coordinator answers with its failure envelope raises `CoordinatorFailed`, and so does the release of a write grant an earlier `write()` left held, every request that commits nothing answered with an HTTP 5xx, and a commit refused by the volume's own unreleased write grant; see [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
 | `config` | `None` | Coordinator settings as a `LifecycleConfig` (`from ccs.adapters.claude_code.lifecycle import LifecycleConfig`); `None` uses the defaults. Only the volume that starts the coordinator applies it |
@@ -1459,14 +1459,23 @@ answer, or the coordinator's
 [failure envelope](#when-the-coordinator-answers-with-a-failure)) follows
 `on_error`. Under `"strict"` the call raises before it commits anything:
 `CoordinatorUnreachable` when the release got no usable answer, and
-`CoordinatorFailed` for the failure envelope. Under `"degrade"` it warns once,
-counts the failure and goes on. For the failure envelope the
-warning says the grant may still stand and that the release is sent again at
-the next fresh attempt; it does not say that nothing was committed, because the
-call can still commit. A commit of the file that grant holds is refused by the
-volume's own grant until a later attempt releases it: `write_cas` and
-`write_cas_at` as `other_holder`, and an `atomic_publish` that includes the
-file is held. A commit of any other file can land.
+`CoordinatorFailed` for the failure envelope or an HTTP 5xx. Under
+`"degrade"` it warns once, counts the failure and goes on. For the failure
+envelope the warning says the grant may still stand and that the release is
+sent again at the next fresh attempt; it does not say that nothing was
+committed, because the call can still commit. A commit of any other file can
+land. A commit of the file that grant holds is refused by the volume's own
+grant, and the volume says so: `write_cas_at` and `atomic_publish` raise
+`CoordinatorFailed` after that commit, and `write_cas` after one retry, whose
+re-mint sends the release again and so still clears a one-off release
+failure. The error names the volume's own earlier write grant, not
+`other_holder`, which would send you to wait for a peer that does not exist. The same holds in strict mode when the
+coordinator answers the release grant by grant with the grant still held: the
+call goes on to its commit and raises the same error. Its text says the file
+"is held" by that grant when the coordinator reported it held, and "may be
+held" when the release got no confirmed answer, since that release may have
+run. Retry the call once after a few seconds, which sends the release again;
+if it fails again, report the coordinator as failing.
 
 When the retry budget runs out, `write_cas` raises `CasRetriesExhausted`. Its
 `last_conflict_reason` says why the last attempt was refused:
@@ -1475,9 +1484,8 @@ When the retry budget runs out, `write_cas` raises `CasRetriesExhausted`. Its
   retry can win.
 - `other_holder`: another agent wrote the file with a plain `write()` and still
   holds it. The version has not moved, so re-reading returns the same bytes.
-  The holder can also be this volume's own earlier `write()`, when the release
-  described above was not confirmed and the call went on, as it does under
-  `"degrade"`.
+  The holder is never this volume's own earlier `write()`: a commit refused by
+  that grant raises `CoordinatorFailed` instead (above).
 - `caller_in_transient_state`: another agent's plain `write()` landed between
   your read and your commit. That agent may still hold the file, as with
   `other_holder`.
@@ -1537,9 +1545,11 @@ In strict mode, a volume that gets no usable answer from its coordinator raises
 coordinator that cannot be started or attached, a refused or timed-out
 connection, a reset, a listener that never answers, and an empty or unreadable
 reply, on every request that commits nothing. A coordinator that answers with a
-refusal, such as an HTTP error status or a watchdog `degraded` body, raises the
-error it raised before, except an HTTP `5xx` on a commit (next paragraph). Its
-`internal:` failure envelope is covered in
+refusal, such as an HTTP `4xx` or a watchdog `degraded` body, raises the error
+it raised before. An HTTP `5xx` raises `CoordinatorFailed` on a request that
+commits nothing and `CommitUnconfirmed` on a commit (next paragraph). Its
+`internal:` failure envelope, and the `5xx` on a request that commits nothing,
+are covered in
 [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure).
 
 A commit is different, because its request may have reached the coordinator
@@ -1579,8 +1589,9 @@ A coordinator goes away when it is killed or crashes, when the session or
 process hosting it exits, or after `idle_shutdown_sec` (900 s by default) with
 no requests. During a graceful stop it answers `503` for a moment before it
 stops listening. A commit in that moment raises `CommitUnconfirmed`, as on any
-`5xx`, so re-read before retrying; any other request raises the error an HTTP
-status raised before.
+`5xx`, so re-read before retrying; any other request raises
+`CoordinatorFailed`, as on any `5xx` that answers a request that commits
+nothing.
 
 `agent-coherence-coordinator --prepare-for-migration` stops the coordinator
 after a drain. Until the requests already under way finish, a few seconds at
@@ -1591,7 +1602,7 @@ shows the file as it was. A retry meets the same `503` until the drain ends;
 then the coordinator stops and the call raises `CoordinatorUnreachable`. So do
 not retry in a tight loop: wait for the migration to finish, then build a new
 `CoherentVolume`. During the drain a plain `write()` is refused at its grant
-request, with the error an HTTP status raised before, and writes nothing.
+request, with `CoordinatorFailed`, and writes nothing.
 Reads, and the post-edit of a `write()` already under way, are still answered.
 
 `on_error="degrade"` is unchanged: it warns once, counts every failure and
@@ -1637,11 +1648,24 @@ may have recorded the commit before the error.
   failing. `on_error="degrade"` warns once, counts, and goes on. Its
   warning says the grant may still stand and that the release is sent again at
   the next fresh attempt, not that nothing was committed. A commit of the file
-  the grant holds is refused until a later attempt releases it (`other_holder`,
-  or a held `atomic_publish`); a commit of another file can land.
+  the grant holds is refused by it, and raises `CoordinatorFailed` naming the
+  volume's own grant (see
+  [Concurrent writers](#concurrent-writers-write_cas)); a commit of another
+  file can land.
 
 A reason without the `internal: ` prefix is not this envelope, and keeps the
 error it raised before.
+
+The same coordinator failure can arrive as an HTTP 5xx: the coordinator
+answers 500 when a handler raises, and a gateway in front of a remote
+coordinator answers 502, 503 or 504. A strict volume treats it as it treats
+the envelope: every request that commits nothing (a read, `reacquire()`, the
+grant request of `write()`, the release above, and the snapshot session
+`atomic_publish` opens for two or more files) raises `CoordinatorFailed`,
+whose text names the request and its status. A commit answered with a 5xx
+raises `CommitUnconfirmed`, as a commit answered with the envelope does. A
+`CoordinatedSubstrate` raises `CoordinatorFailed` for a 5xx on its read leg
+too. `on_error="degrade"` is unchanged.
 
 ### Starting a coordinator from your own process
 
@@ -1743,7 +1767,10 @@ Whatever `on_stale_read` says, the versioned reads (`read_with_version()`,
 whose bytes are not the coordinator's content at the version it reports,
 outside that same window. They raise `StaleView` whose `reason` is
 `split_pair`, so a caller can tell this refusal from every other stale view by
-value; `swg_read` answers it as a `stale_view` deny.
+value; `swg_read` answers it as a `stale_view` deny. With
+`on_stale_read="raise"`, `read()` raises the same refusal for the same answer,
+and the effect fence holds it as `split_pair` (see
+[Hold reasons](#hold-reasons--the-published-vocabulary)).
 
 These guards are **content-hash checks at the volume boundary** — best-effort
 point-in-time detection, not filesystem interception. An edit that bypasses the
@@ -2341,7 +2368,8 @@ repurposed.** Match on the whole value (`reason == "version_moved"`), never on
 a substring of a human-readable message, and treat a `hold` whose `reason` you
 do not recognise as a hold — a later coordinator may split a case out of the
 residual bucket, exactly as `read_denied` and `content_claim_absent` were split
-out of it.
+out of it, or split a case out of another reason, as `split_pair` was split out
+of `read_denied`.
 
 Each reason names who established it — the **coordinator**, from state only it
 can see, or the **caller**, from state only *it* can see — and each has its own
@@ -2352,6 +2380,7 @@ reasons exist.
 | `reason` | Established by | What it means | How you clear it |
 |---|---|---|---|
 | `version_moved` | the coordinator | a peer committed a newer version than the one the decision was derived from | re-read the input, re-decide, re-gate |
+| `split_pair` | the coordinator | it refused the re-validate read because the bytes are not the content it records at that version, which has not moved: a peer's `write()` whose bytes landed before its commit, a change made outside the coordinator, or a commit's disk write failed (strict mode). The `StaleView`'s `reason` is `split_pair` too | re-gate after a few seconds first: a peer's write still landing clears by itself, or moves the version. A hold that outlasts that is a change outside the coordinator, and a reacquire alone does not clear it, because it does not record the bytes on disk: reacquire, `write()` the bytes it returns (or your merge of them) to record them, then read, re-decide and re-gate |
 | `read_denied` | the coordinator | it refused the re-validate read outright — this view is invalid (strict mode; on a strict-mode workspace this is how a reclaim usually surfaces) | reacquire, take a fresh read, re-decide, re-gate |
 | `grant_reclaimed` | the coordinator | both generations are confirmed and they differ: a sweep reclaimed the grant the decision was read under, while the version never moved | reacquire, re-decide, re-gate |
 | `grant_preempted` | the coordinator | neither comparand moved, yet the re-validate read was served without a standing grant — a peer's write-claim acquire took the grant with no commit behind it yet | reacquire. A bare re-ask holds again: the fence does not re-grant on the read it checks with |
@@ -2385,8 +2414,9 @@ needed.
 
 **Which reason you get when several apply.** The legs are evaluated in a fixed
 order and the first match is the answer: `input_vanished`,
-`version_unconfirmed`, `version_moved`, `read_denied`, `content_claim_absent`,
-`generation_unconfirmed`, `grant_reclaimed`, `grant_preempted`. The order is
+`version_unconfirmed`, `version_moved`, `split_pair`, `read_denied`,
+`content_claim_absent`, `generation_unconfirmed`, `grant_reclaimed`,
+`grant_preempted`. The order is
 part of the contract — a state that matches two legs has one right answer, and
 an implementation that reorders them answers a different question.
 
@@ -3899,7 +3929,7 @@ an HTTP `5xx`, answers `commit_unconfirmed` with `recover: read_then_retry`,
 where `swg_write` and `swg_write_cas` answered `internal_error` before. During
 a graceful stop the coordinator answers `503` for a moment before it stops
 listening: a call whose commit meets it answers `commit_unconfirmed`, and every
-other call in that moment still answers `internal_error`. While the coordinator
+other call in that moment answers `coordinator_failed`. While the coordinator
 drains for `agent-coherence-coordinator --prepare-for-migration`, it refuses
 the commit of `swg_write_cas` with `503` before any work runs, so the call
 answers `commit_unconfirmed` although nothing landed: `swg_read` returns the
@@ -3907,7 +3937,7 @@ old content, and the same write meets the same answer until the drain ends.
 Then the coordinator stops and calls answer `coordinator_unavailable`. A retry
 made at once only meets the refusal again, so an agent should not retry in a
 tight loop. During the drain `swg_write` is refused at its grant request: it
-answers `internal_error` and writes nothing.
+answers `coordinator_failed` and writes nothing.
 
 **A coordinator that fails while answering.** When the coordinator answers a
 read with its `internal:` failure envelope ([details](#when-the-coordinator-answers-with-a-failure)),
@@ -3921,7 +3951,10 @@ write grant an earlier `swg_write` left held, which `swg_write_cas` and
 `swg_reacquire` send before they go further: nothing was committed. There,
 `swg_write_cas` answered `other_holder` with `recover: wait_and_retry`, as if
 another agent held the file, and `swg_reacquire` returned the content as if the
-release had gone through. A write whose commit gets that answer may
+release had gone through. The same answer comes when any of these calls is
+answered with an HTTP `5xx`, and when the release is answered with the grant
+still held, so that grant refuses the commit of `swg_write_cas`. A write whose
+commit gets that answer may
 have landed, so `swg_write` and `swg_write_cas` answer `commit_unconfirmed`
 with `recover: read_then_retry`, where `swg_write` answered `commit_preempted`
 and `swg_write_cas` answered `internal_error`.
