@@ -110,6 +110,15 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **The protocol corpus pins the out-of-band change signals on both backends (plugin #205).** The
+  Claude Code plugin's Node coordinator now answers an out-of-band change the way this coordinator
+  does (#278), so strict_mode/20 and warn_mode/31 run on both backends, and eight new rows pin the
+  rest: pre-edit's `disk_differs` in warn and strict mode (warn_mode/34, strict_mode/21), a peer's
+  write still in flight skipping the check (warn_mode/35), a committed peer's change reported after
+  the collision (warn_mode/36), an EXCLUSIVE holder's out-of-band read denied or noticed
+  (strict_mode/22, warn_mode/37), and a MODIFIED holder's own commit lag flagged without a notice
+  (warn_mode/38, strict_mode/23).
+
 - **The protocol corpus pins the rejected count on both backends (plugin #192).** A pair of `/status`
   rows, warn_mode/32 (Python) and warn_mode/33 (Node), loads a `tracked.yaml` holding the unquoted
   `- *.md` and expects `rejected_pattern_count: 1`, and the Node row warn_mode/09 now expects

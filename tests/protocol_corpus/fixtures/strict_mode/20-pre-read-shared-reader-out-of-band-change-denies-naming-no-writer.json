@@ -1,6 +1,6 @@
 {
   "name": "pre-read-shared-reader-out-of-band-change-denies-naming-no-writer",
-  "description": "The out-of-band arm of the strict deny (#278). Session A's first read of CLAUDE.md seeds v1 with A's hash and grants A SHARED. A then reads again offering different bytes: the version A saw is still the current one and nothing committed, so the change was made outside the coordinator. The deny says so and tells the session to leave the file alone and tell its user -- a re-read is denied again, and putting the old bytes back would discard a change that may be the user's -- instead of the write template, which named the last committer at its commit time ('agent <unknown>' here, since nothing ever committed). Per-artifact placeholders only, so the reason is byte-stable. Python-only until the Node coordinator mirrors it (cohexa-ai/agent-coherence-plugin#205).",
+  "description": "The out-of-band arm of the strict deny (#278). Session A's first read of CLAUDE.md seeds v1 with A's hash and grants A SHARED. A then reads again offering different bytes: the version A saw is still the current one and nothing committed, so the change was made outside the coordinator. The deny says so and tells the session to leave the file alone and tell its user -- a re-read is denied again, and putting the old bytes back would discard a change that may be the user's -- instead of the write template, which named the last committer at its commit time ('agent <unknown>' here, since nothing ever committed). Per-artifact placeholders only, so the reason is byte-stable. Both backends (cohexa-ai/agent-coherence-plugin#205).",
   "setup": {
     "tracked": [
       "CLAUDE.md"
@@ -57,6 +57,7 @@
     }
   },
   "backends": [
-    "python"
+    "python",
+    "node"
   ]
 }

@@ -1,0 +1,59 @@
+{
+  "name": "pre-read-exclusive-holder-out-of-band-change-carries-the-notice",
+  "description": "The warn-mode counterpart: an EXCLUSIVE holder whose bytes changed out of band is admitted with hash_differs and the context-only notice. Both backends (cohexa-ai/agent-coherence-plugin#205).",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\nv1 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "CLAUDE.md",
+          "content_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "CLAUDE.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "CLAUDE.md",
+      "content_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  },
+  "optional_keys": [
+    "version"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "status": "fresh",
+      "version": 1,
+      "hash_differs": true,
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "additionalContext": "⚠ CLAUDE.md on disk differs from v1, the last content committed through the coordinator, and no session committed the change: it was made outside the coordinator. Read CLAUDE.md before relying on it, and do not write it from an earlier read; that write would replace the change."
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

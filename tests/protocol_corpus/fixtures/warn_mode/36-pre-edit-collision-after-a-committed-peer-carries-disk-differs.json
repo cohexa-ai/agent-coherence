@@ -1,0 +1,69 @@
+{
+  "name": "pre-edit-collision-after-a-committed-peer-carries-disk-differs",
+  "description": "Session B seeds CLAUDE.md, pre-edits and commits a hash that is not the bytes on disk. A's pre-edit preempts B's MODIFIED grant with a collision warning, and because no write is in flight and the commit was not A's, it also reports disk_differs (the notice follows the collision text in additionalContext). Both backends (cohexa-ai/agent-coherence-plugin#205).",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\nv1 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "CLAUDE.md",
+          "content_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "CLAUDE.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "CLAUDE.md",
+          "success": true,
+          "content_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "CLAUDE.md"
+    }
+  },
+  "ignore_keys": [
+    "additionalContext"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "collision": true,
+      "disk_differs": true,
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "additionalContext": "<ignored>"
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}
