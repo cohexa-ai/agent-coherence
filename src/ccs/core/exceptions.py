@@ -407,9 +407,10 @@ SCHEMA_VERSION_REASONS: frozenset[str] = frozenset(
 # hold invites a retry, and no retry supplies a principal the caller never had.
 CALLER_PRINCIPAL_ABSENT_REASON = "caller_principal_absent"
 """The request names an identity but presents no caller principal. On the wire
-a route sends it only for an identity that is BOUND: a request presenting none
-for an identity nobody has claimed is a client predating the principal, and is
-admitted (KTD15)."""
+a route sends it for an identity that is BOUND, and ``POST /hooks/pre-edit``
+also for a request that opts in with ``if_unheld: true``, whatever identity it
+names. Any other request presenting none for an identity nobody has claimed is
+a client predating the principal, and is admitted."""
 
 CALLER_PRINCIPAL_FOREIGN_REASON = "caller_principal_foreign"
 """The request presents a caller principal that is not the one bound to the

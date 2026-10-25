@@ -503,6 +503,8 @@ class PrincipalPosture(Enum):
     #: hold — KTD9). An absent principal for an identity nobody ever claimed is
     #: an older client's: admitted and counted, as before the principal
     #: existed (R16, KTD15).
+    #: One request is refused without a principal whatever identity it names:
+    #: a pre-edit that opts in with ``if_unheld: true``.
     REQUIRE = "require"
     #: Admit an absent principal, bound identity or not, and count it (a local
     #: diagnostic, not a flip trigger — KTD4); refuse a foreign one, so a
@@ -555,7 +557,10 @@ _CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
         "neither commit nor release. The class does not stop preemption "
         "itself: a fresh, principal-bearing identity preempts identically "
         "unless its request opts in with if_unheld: true, which is refused "
-        "with other_holder while another agent holds the path")),
+        "with other_holder while another agent holds the path. An opted-in "
+        "request must present its principal whether or not its session was "
+        "ever claimed, on an untracked path too: the holder check admits the "
+        "caller's own identity, so that identity has to be proven")),
     ("POST", "/hooks/post-edit"): RoutePrincipalPosture(_REQUIRE, (
         "commits a version and records artifacts.last_writer_id under the "
         "named identity (or, on success:false, releases its grant): a caller "
@@ -663,14 +668,17 @@ _CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
 ``session_id`` and no other. The require-class harm is what an absent
 principal admits for an identity a client has CLAIMED; a request naming an
 identity nobody claimed (a client predating the principal) is admitted and
-counted on every class, as it was before. An accept-class entry states what an
-absent principal is nonetheless ALLOWED to do there — the accepted behaviour,
-not only the harm it rules out. The lookup in :func:`_admit_caller` has no
+counted on every class, as it was before, except a pre-edit that opts in with
+``if_unheld: true``, which is refused without a principal whatever identity it
+names. An accept-class entry states what an absent principal is nonetheless
+ALLOWED to do there — the accepted behaviour, not only the harm it rules out.
+The lookup in :func:`_admit_caller` has no
 default: a route missing here fails loudly (500) rather than falling to a
 residual class, and a test pins the key set to the routes that read one."""
 
-# Sent only for a session that IS bound; a session nobody claimed is admitted
-# without a principal (KTD15).
+# Sent for a session that IS bound, and for an opted-in pre-edit whatever
+# session it names; any other request from a session nobody claimed is
+# admitted without a principal.
 _CALLER_PRINCIPAL_ABSENT_ERROR = (
     f"missing {CALLER_PRINCIPAL_HEADER} header: this route requires the caller "
     f"principal that POST /principal/claim bound to the session_id it names "
@@ -3318,7 +3326,16 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     opted_in = _opted_in_acquire_or_fail(body)
     degraded_answer = _pre_edit_degraded_answer(opted_in)
     req._degraded_response = degraded_answer
-    if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
+    presented = _presented_caller(req, session_id, read_subagent_id(body))
+    if opted_in and presented.principal is None:
+        # The holder check admits the caller's own identity, so an opted-in
+        # request must prove the one it names, claimed session or not. Decided
+        # from the request alone, ahead of the gate: no binding read to wait
+        # on, and ahead of the untracked exit too. Today's reason, so a claimed
+        # session gets today's bytes and its typed re-claim recovery.
+        _refuse_caller(req, coordinator, CALLER_PRINCIPAL_ABSENT_REASON)
+        return
+    if _admit_caller(req, coordinator, presented) is None:
         return
     # SB-10 U4 (KTD6): advisory peek hoisted above the untracked exit —
     # see the pre-read twin for the no-flag byte/behavior guarantee.

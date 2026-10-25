@@ -244,10 +244,11 @@ def test_a_header_naming_a_capture_not_issued_here_is_omitted_not_sent() -> None
 
 
 def test_a_python_refusal_row_binds_the_identity_it_refuses() -> None:
-    """An absent principal is refused only for a CLAIMED session (a session
-    nobody claimed is an older client's and is admitted), so every Python row
-    asserting ``caller_principal_absent`` must claim the session it names in a
-    preflight first. A row that stopped claiming would assert a refusal the
+    """Without the acquire-or-fail opt-in (``if_unheld: true`` on a pre-edit,
+    which no row sends), an absent principal is refused only for a CLAIMED
+    session (a session nobody claimed is an older client's and is admitted),
+    so every Python row asserting ``caller_principal_absent`` must claim the
+    session it names in a preflight first. A row that stopped claiming would assert a refusal the
     coordinator no longer gives — or, worse, pin a rule that refuses older
     clients."""
     absent_rows = [
