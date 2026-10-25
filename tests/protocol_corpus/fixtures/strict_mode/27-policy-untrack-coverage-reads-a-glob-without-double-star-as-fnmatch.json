@@ -1,0 +1,64 @@
+{
+  "name": "policy-untrack-coverage-reads-a-glob-without-double-star-as-fnmatch",
+  "description": "cohexa-ai/agent-coherence-plugin#209: /policy/untrack decides strict coverage (#261) under the same matching rules as the policy, so an entry or strict pattern without '**' is read as fnmatch reads it. With tracked.yaml 'data/**' and strict_mode.yaml 'data/*.json' (where '*' crosses '/'), '*.json' covers data/x.json because its '*' crosses '/', 'data?a.json' covers data/a.json because '?' matches '/', and 'data/[!a-z].json' covers data/5.json because a negated class matches '5' (read literally, it is refused too, as the one path data/[!a-z].json), and 'data[!a-z]x.json' covers data/x.json because a negated class matches '/' as well; each is refused naming data/*.json. 'data/[0-9]' matches only data/0 to data/9, none ending .json, so it is not refused and is absent from 'refused'. One refused entry refuses the whole request (HTTP 409, nothing written). The body is pinned whole, error text included. Under the '**' grammar entries 1, 2 and 4 cover nothing and are not refused: the '*' and '?' of the first two cannot cross '/', and the fourth reads as the one path data[!a-z]x.json, outside data/. Both backends.",
+  "setup": {
+    "tracked": [
+      "data/**"
+    ],
+    "strict_mode": [
+      "data/*.json"
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/policy/untrack",
+    "body": {
+      "paths": [
+        "*.json",
+        "data?a.json",
+        "data/[!a-z].json",
+        "data[!a-z]x.json",
+        "data/[0-9]"
+      ]
+    }
+  },
+  "expected": {
+    "status": 409,
+    "body": {
+      "ok": false,
+      "error": "refusing to untrack paths the coordinator enforces in strict mode: *.json (strict: data/*.json); data?a.json (strict: data/*.json); data/[!a-z].json (strict: data/*.json); data[!a-z]x.json (strict: data/*.json). A strict path stays enforced while the coordinator runs; to untrack it, remove its entry from .coherence/strict_mode.yaml and restart the coordinator (untrack_strict_path)",
+      "reason": "untrack_strict_path",
+      "refused": [
+        {
+          "path": "*.json",
+          "strict_patterns": [
+            "data/*.json"
+          ]
+        },
+        {
+          "path": "data?a.json",
+          "strict_patterns": [
+            "data/*.json"
+          ]
+        },
+        {
+          "path": "data/[!a-z].json",
+          "strict_patterns": [
+            "data/*.json"
+          ]
+        },
+        {
+          "path": "data[!a-z]x.json",
+          "strict_patterns": [
+            "data/*.json"
+          ]
+        }
+      ],
+      "rejected": []
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "name": "ignored-star-that-crosses-a-slash-untracks-a-nested-default-path",
+  "description": "cohexa-ai/agent-coherence-plugin#209: an ignored.yaml pattern without '**' is matched as fnmatch matches it, where '*' crosses '/'. docs/plans/x.md is tracked by the default 'docs/plans/**/*.md', and ignored.yaml's only entry 'docs/*.md' covers it through that '*', so it is untracked: B's pre-edit takes no grant and A's pre-edit is admitted with a bare {ok: true}. Read with the '**' grammar, where '*' stays inside one segment, the ignore entry misses the path, which stays tracked, and A's pre-edit reports a collision with B's EXCLUSIVE grant, as in fixture 22. Both backends.",
+  "setup": {
+    "ignored": [
+      "docs/*.md"
+    ],
+    "files": {
+      "docs/plans/x.md": "# Plan\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "docs/plans/x.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "docs/plans/x.md"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

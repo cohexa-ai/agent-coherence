@@ -128,6 +128,17 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **The protocol corpus pins how a policy pattern without `**` matches, on both backends (plugin
+  #209).** This coordinator matches a `tracked.yaml`, `ignored.yaml` or `strict_mode.yaml` pattern
+  without `**` as `fnmatch` does, where `*` and `?` cross `/` and `[...]` is a character class; the
+  Claude Code plugin's Node coordinator, which read every pattern with the `**` grammar, now does
+  the same. Five new rows pin it: a path tracked through a `*` (strict_mode/24) or a `?`
+  (strict_mode/25) that crosses `/`, and a path strict through a character class (strict_mode/26),
+  each denied as a stale pre-edit; `/policy/untrack` refusing `*.json`, `data?a.json`,
+  `data/[!a-z].json` and `data[!a-z]x.json` (a negated class matches `/`) against a strict
+  `data/*.json`, with `data/[0-9]` absent from `refused` (strict_mode/27); and an `ignored.yaml`
+  `docs/*.md` untracking the default-tracked `docs/plans/x.md` (warn_mode/39).
+
 - **The protocol corpus pins the out-of-band change signals on both backends (plugin #205).** The
   Claude Code plugin's Node coordinator now answers an out-of-band change the way this coordinator
   does (#278), so strict_mode/20 and warn_mode/31 run on both backends, and eight new rows pin the
