@@ -158,6 +158,23 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **New tests pin what each strict surface does when the coordinator takes a request and never
+  answers it.** `tests/test_silent_coordinator.py` points a strict `CoherentVolume` and a
+  `CoordinatedSubstrate` at a loopback listener that holds the connection open without writing a
+  byte, with the client's timeout shrunk to 0.5 s. A request that commits nothing (`read()`,
+  `write()`'s pre-edit, the substrate's `read()` and the pre-read its `commit()` sends first)
+  raises `CoordinatorUnreachable`. A commit that reached the coordinator raises
+  `CommitUnconfirmed`, because it may have landed: `write()`'s post-edit (its bytes are on disk,
+  and its release is sent and bounded by its own 1 s timeout), `write_cas()`'s compare-and-swap
+  (nothing touches disk), and the substrate's coordinator bump (the substrate write landed first
+  and is not re-driven). Each case raises within its timeouts plus 0.5 s and sends each request
+  once. Before, every such test of these two surfaces failed fast, on a refused or dropped
+  connection or on an error raised through a patched client, so none checked the time bound or
+  counted what was sent. The listeners ship as
+  `ccs.testing.silent_listener`: one holds every request silent; the other relays the first N
+  requests to a real coordinator and then holds the rest. Both count what they received, so a
+  test needs no patch of the client. No library behaviour changes.
+
 - **The protocol corpus pins how a policy pattern without `**` matches, on both backends (plugin
   #209).** This coordinator matches a `tracked.yaml`, `ignored.yaml` or `strict_mode.yaml` pattern
   without `**` as `fnmatch` does, where `*` and `?` cross `/` and `[...]` is a character class; the
