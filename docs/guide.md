@@ -35,7 +35,7 @@ full command-line toolset, and the API reference.
 15. [Effect fence over HTTP](#effect-fence-over-http)
 16. [Caller principal](#caller-principal)
 17. [Targeted grant handoff](#targeted-grant-handoff)
-18. [Acquire-or-fail on `pre-edit` (specified, not yet built)](#acquire-or-fail-on-pre-edit-specified-not-yet-built)
+18. [Acquire-or-fail on `pre-edit` (specified, partly built)](#acquire-or-fail-on-pre-edit-specified-partly-built)
 19. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
 20. [Inline benchmark mode](#inline-benchmark-mode)
 21. [Telemetry](#telemetry)
@@ -1209,7 +1209,10 @@ when the coordinator is under load, and says so: it answers
 The answer carries no `permissionDecision`, so Claude Code asks about the Edit
 or Write exactly as it otherwise would. A strict-mode edit the check would have
 denied is admitted this way too, because the check did not run. If the edit
-goes ahead over a peer's newer commit, its `post-edit` is refused.
+goes ahead over a peer's newer commit, its `post-edit` is refused. That is the
+answer to an ordinary request: a `pre-edit` that opted in with
+`"if_unheld": true` is refused as `unavailable` instead; see
+[Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit-specified-partly-built).
 
 **A check that finishes late records nothing.** A hook answered on a timeout
 keeps working in the background. When that work reaches a deny afterwards, it
@@ -3632,16 +3635,20 @@ route, but it reads the refusal differently on each:
   fence, so an older MCP giver can loop on reacquire and write until its
   client is upgraded.
 
-## Acquire-or-fail on `pre-edit` (specified, not yet built)
+## Acquire-or-fail on `pre-edit` (specified, partly built)
 
-**Nothing in this section is implemented.** It fixes the shape of an opt-in
-refusal so the change that builds it does not have to re-decide it.
+**Only the answer to an opted-in request that times out is built**, as
+**Under load** below describes. The rest of this section is still a
+specification: it fixes the shape of an opt-in refusal so the change that
+builds it does not have to re-decide it.
 
 Today `POST /hooks/pre-edit` grants EXCLUSIVE to whoever asks, except the giver
 of a live [handoff](#targeted-grant-handoff) of the path. A session already
 holding the grant is set to INVALID — nothing is committed — and finds out on its
 next request. There is no request that declines instead, so a real mutex cannot be
-built on this route: the second session to ask always wins.
+built on this route: the second session to ask always wins. That holds for a
+request that sends `"if_unheld": true` too, whenever the coordinator decides it
+in time.
 
 **Request.** `pre-edit` with `"if_unheld": true` in the body, carrying the
 [caller principal](#caller-principal). An opted-in request without a principal is refused as a
@@ -3669,11 +3676,38 @@ with backoff rather than wait for a signal.
 
 **Under load.** A timed-out opted-in request must not answer in a shape that
 admits the edit: the contention that makes a holder worth respecting is the
-contention that times a handler out. It answers `ok: false` with
-`"degraded": true`, and the caller treats that as a refusal. Today a timed-out
-`pre-edit` admits, answering `{"ok": true, "degraded": true}` with the
-could-not-verify advisory; a test in the coordinator suite fails as soon as a
-refusal reason is registered while that is still the answer.
+contention that times a handler out. This part is built. When the coordinator
+cannot decide a `pre-edit` carrying `"if_unheld": true` within the 4-second
+handler budget, at the caller-principal check or in the pre-edit work itself,
+it refuses it with HTTP 200:
+
+```json
+{"ok": false, "reason": "unavailable", "degraded": true, "hookSpecificOutput": {…}}
+```
+
+`hookSpecificOutput` carries the same could-not-verify advisory as the degraded
+admit, as added context only, with no `permissionDecision`. Python code can
+import the reason as `UNAVAILABLE_REASON` from `ccs.core.exceptions`. The work
+the coordinator abandons takes no grant, unless it had already won the
+registry lock when the answer went out. Only a JSON `true` opts in: any other
+`if_unheld` (`"true"`, `1`, `null`, `false`) or none is an ordinary request,
+and an ordinary request that times out still admits with
+`{"ok": true, "degraded": true}`, strict-mode paths included, exactly as
+before (see [When the registry is busy](#when-the-registry-is-busy)). Nothing
+sends `if_unheld` yet. The Claude Code hooks and the library will not send it
+until the in-time refusal (**Refusal** above), a hook deny on strict-mode paths
+and a refuse mode in the library have shipped.
+
+An opted-in client admits the edit only on an HTTP 2xx answer whose body has
+`ok: true` and no `degraded` key, and treats everything else as a refusal:
+
+- `unavailable`;
+- an `internal:` failure
+  ([details](#when-the-coordinator-answers-with-a-failure)), which a busy store
+  can also cause, at the caller-principal check or in the pre-edit work;
+- any non-2xx status, or no answer at all;
+- `{"ok": true, "degraded": true}`, which an older coordinator answers on a
+  timeout because it never reads `if_unheld`.
 
 **What it does not close.**
 
