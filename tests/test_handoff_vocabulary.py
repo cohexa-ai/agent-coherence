@@ -46,6 +46,7 @@ from ccs.core.exceptions import (
     HOLD_REASONS,
     INTERNAL_CONCURRENCY_REASON,
     OCC_CALLER_TRANSIENT_REASON,
+    OTHER_HOLDER_REASON,
     SPLIT_PAIR_REASON,
     STALE_READ_GENERATION_REASON,
     STALE_VIEW_REASON,
@@ -56,6 +57,7 @@ from ccs.core.exceptions import (
     CoordinatorFailed,
     CoordinatorUnreachable,
     GiverFenced,
+    OtherHolder,
     StaleView,
 )
 from ccs.core.states import MESIState
@@ -144,7 +146,7 @@ def test_handoff_reasons_collide_with_no_existing_reason_or_status() -> None:
         | CALLER_PRINCIPAL_REASONS
         | {
             VERSION_MISMATCH_REASON,
-            "other_holder",
+            OTHER_HOLDER_REASON,
             STALE_READ_GENERATION_REASON,
             OCC_CALLER_TRANSIENT_REASON,
             STALE_VIEW_REASON,
@@ -225,6 +227,56 @@ def test_unavailable_reason_is_its_own_wire_value() -> None:
     answer at all: this answer comes from a coordinator that is alive and busy."""
     assert UNAVAILABLE_REASON == "unavailable"
     assert UNAVAILABLE_REASON != COORDINATOR_UNAVAILABLE_REASON
+
+
+def test_other_holder_reason_is_its_own_wire_value() -> None:
+    """An opted-in pre-edit refused because another agent holds the file
+    answers this reason, the value ``post-edit-cas`` already returns when a
+    commit meets a holder. It is not the handoff route's
+    ``handoff_other_holder``, which refuses a transfer, and not an effect-gate
+    hold cause, which an effect check answers and a client matches by
+    membership in ``HOLD_REASONS``."""
+    assert OTHER_HOLDER_REASON == "other_holder"
+    assert OTHER_HOLDER_REASON != HANDOFF_OTHER_HOLDER_REASON
+    assert OTHER_HOLDER_REASON not in HOLD_REASONS
+
+
+def test_other_holder_carries_its_reason_artifact_and_holder() -> None:
+    """The refusal is one typed error whose class-level reason equals the wire
+    constant, so a consumer classifies it by type or ``.reason`` and never by
+    the message, and it carries the holder the caller backs off from."""
+    holder = uuid4()
+    with pytest.raises(OtherHolder) as caught:
+        raise OtherHolder("notes/plan.md", holder)
+    err = caught.value
+    assert OtherHolder.reason == "other_holder"
+    assert err.reason == OTHER_HOLDER_REASON
+    assert err.artifact_id == "notes/plan.md"
+    assert err.holder_agent_id == holder
+    assert isinstance(err, CoherenceError)
+    assert str(holder) in str(err)
+
+
+@pytest.mark.parametrize(
+    ("artifact_id", "holder"),
+    [
+        (uuid4(), uuid4()),
+        ("notes/plan.md", "0123456789abcdef0123456789abcdef"),
+        (None, None),
+    ],
+    ids=["uuid-holder", "wire-string-holder", "no-holder"],
+)
+def test_other_holder_crosses_a_process_boundary(artifact_id: object, holder: object) -> None:
+    """The service raises it in process, and a client raises the same class
+    from the wire answer, so a worker process that raises it must hand the
+    parent the typed refusal, not a ``TypeError`` from unpickling."""
+    err = OtherHolder(artifact_id, holder)
+    restored = pickle.loads(pickle.dumps(err))
+    assert type(restored) is OtherHolder
+    assert restored.reason == OTHER_HOLDER_REASON
+    assert restored.artifact_id == artifact_id
+    assert restored.holder_agent_id == holder
+    assert str(restored) == str(err)
 
 
 def test_transfer_statuses_are_the_six_closed_values() -> None:

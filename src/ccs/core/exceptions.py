@@ -620,6 +620,13 @@ COORDINATOR_FAILED_REASON = "coordinator_failed"
 #: coordinator answers it, so it is not :data:`COORDINATOR_UNAVAILABLE_REASON`.
 #: A request that did not opt in still gets the degraded admit.
 UNAVAILABLE_REASON = "unavailable"
+#: The class reason of :class:`OtherHolder`: another agent holds the artifact
+#: EXCLUSIVE or MODIFIED. A ``pre-edit`` that opted in with ``if_unheld: true``
+#: is refused with it, and ``post-edit-cas`` returns the same value when a
+#: commit meets a holder. The two routes ask different things of a client (back
+#: off, against re-read and retry), so a client reads it by route. Not
+#: :data:`HANDOFF_OTHER_HOLDER_REASON`, which refuses a transfer.
+OTHER_HOLDER_REASON = "other_holder"
 
 
 class CoherenceError(Exception):
@@ -843,6 +850,40 @@ class GiverFenced(CoherenceError):
         self.artifact_id = artifact_id
         self.successor = successor
         self.version_at_transfer = version_at_transfer
+
+
+class OtherHolder(CoherenceError):
+    """Another agent holds the artifact EXCLUSIVE or MODIFIED, so a write that
+    asked to take it only if nobody holds it is refused, and nothing changed
+    hands: the holder keeps its grant and the caller gains none.
+
+    The caller backs off and asks again. The holder lets go when it releases
+    the artifact, hands it on, or is reclaimed by the coordinator's sweep.
+
+    Carries :data:`OTHER_HOLDER_REASON` on the class, so a consumer classifies
+    it by type or ``.reason``, never by the message, plus ``holder_agent_id``,
+    the agent the decision found holding. ``artifact_id`` names what was
+    refused: the artifact id in process, a path on a client. The holder is a
+    ``UUID`` in process and the wire string on a client, and the constructor
+    never parses either, because an exception constructor must not raise. It
+    rebuilds from its two fields, so it pickles whole across a process
+    boundary.
+    """
+
+    reason = OTHER_HOLDER_REASON
+
+    def __init__(self, artifact_id: object, holder_agent_id: UUID | str | None) -> None:
+        super().__init__(
+            f"{OTHER_HOLDER_REASON} artifact={artifact_id} holder={holder_agent_id} "
+            "(nothing changed hands: another agent holds this for writing. Back off "
+            "and ask again; it is free once the holder releases it, hands it on, or "
+            "is reclaimed)"
+        )
+        self.artifact_id = artifact_id
+        self.holder_agent_id = holder_agent_id
+
+    def __reduce__(self) -> tuple[type[OtherHolder], tuple[object, UUID | str | None]]:
+        return (type(self), (self.artifact_id, self.holder_agent_id))
 
 
 class CoherenceDegradedWarning(UserWarning):
