@@ -844,6 +844,9 @@ class GiverFenced(CoherenceError):
         self.successor = successor
         self.version_at_transfer = version_at_transfer
 
+    def __reduce__(self) -> tuple[type[GiverFenced], tuple[object, UUID | str, int]]:
+        return type(self), (self.artifact_id, self.successor, self.version_at_transfer)
+
 
 class CoherenceDegradedWarning(UserWarning):
     """Emitted once per adapter instance when a coherence error degrades to fallback.

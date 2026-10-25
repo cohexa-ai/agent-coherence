@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pickle
 from dataclasses import FrozenInstanceError
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -180,6 +180,21 @@ def test_giver_fenced_carries_its_reason_successor_and_version() -> None:
     assert isinstance(err, CoherenceError)
     assert str(successor) in str(err)
     assert "version_at_transfer=7" in str(err)
+
+
+@pytest.mark.parametrize("successor", [uuid4(), "successor-session"], ids=["uuid", "string"])
+def test_giver_fenced_crosses_a_process_boundary(successor: UUID | str) -> None:
+    """Pickling retains the terminal type and the fields callers inspect."""
+    err = GiverFenced("notes/plan.md", successor, 7)
+
+    restored = pickle.loads(pickle.dumps(err))
+
+    assert type(restored) is GiverFenced
+    assert restored.args == err.args
+    assert restored.reason == err.reason == GIVER_FENCED_REASON
+    assert restored.artifact_id == err.artifact_id
+    assert restored.successor == successor
+    assert restored.version_at_transfer == err.version_at_transfer == 7
 
 
 def test_coordinator_unreachable_carries_its_reason_and_crosses_a_process_boundary() -> None:
