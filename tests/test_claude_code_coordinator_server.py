@@ -10564,6 +10564,48 @@ def test_an_opted_in_refusal_decided_after_its_request_timed_out_is_not_counted(
     assert _agent_state_on(coordinator, "plan.md", caller.sid) is None
 
 
+def test_a_refusal_whose_handoff_key_read_outlives_its_deadline_is_a_late_abort(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """On a file with a transfer record, a refusal whose ``handoff`` key read
+    is held past the watchdog deadline: the caller is answered
+    ``unavailable``, the refusal is not counted, and the watchdog counts a
+    late abort, not a late completion logged at CRITICAL.
+
+    Prevents the refusal queuing its count before its last registry read. The
+    count is queued last so that a deadline passing during that read finds
+    nothing queued and the abandoned body aborts when it tries to queue it."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _take(client, successor)
+    caplog.set_level(logging.CRITICAL, logger=mod.__name__)
+    denials_before = _other_holder_denials(coordinator)
+    delayed = _DelayedCall(monkeypatch, mod, "_read_handoff", lambda *_args: True)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+
+    answer = _opted_in(client, bystander)
+    assert delayed.entered.is_set(), "the refusal's handoff key read never started"
+    delayed.release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1, (
+        "the request did not time out, so this measured the undegraded route")
+    assert answer == (200, mod._PRE_EDIT_UNAVAILABLE_RESPONSE)
+    assert _other_holder_denials(coordinator) == denials_before
+    assert coordinator._watchdog_late_aborts_total == aborts_before + 1
+    assert coordinator._watchdog_late_completion_total == completions_before
+    assert _late_completion_criticals(caplog) == 0
+    assert _agent_state_on(coordinator, "plan.md", successor.sid) == MESIState.EXCLUSIVE
+    assert _agent_state_on(coordinator, "plan.md", bystander.sid) is None
+
+
 # --- an opted-in pre-edit with no principal: refused ahead of the gate --------
 #
 # An opted-in pre-edit that presents no principal gets the principal-absent
