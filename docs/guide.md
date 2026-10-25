@@ -35,7 +35,7 @@ full command-line toolset, and the API reference.
 15. [Effect fence over HTTP](#effect-fence-over-http)
 16. [Caller principal](#caller-principal)
 17. [Targeted grant handoff](#targeted-grant-handoff)
-18. [Acquire-or-fail on `pre-edit` (specified, partly built)](#acquire-or-fail-on-pre-edit-specified-partly-built)
+18. [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)
 19. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
 20. [Inline benchmark mode](#inline-benchmark-mode)
 21. [Telemetry](#telemetry)
@@ -1212,7 +1212,7 @@ denied is admitted this way too, because the check did not run. If the edit
 goes ahead over a peer's newer commit, its `post-edit` is refused. That is the
 answer to an ordinary request: a `pre-edit` that opted in with
 `"if_unheld": true` is refused as `unavailable` instead; see
-[Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit-specified-partly-built).
+[Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit).
 
 **A check that finishes late records nothing.** A hook answered on a timeout
 keeps working in the background. When that work reaches a deny afterwards, it
@@ -1235,9 +1235,12 @@ the coordinator's open-session cap until the liveness sweep reaps it.
 
 Late work that finishes normally counts in `watchdog_late_completion_total`.
 The coordinator logs it at `CRITICAL` only when that work had already won the
-registry write lock for a change, so a grant, commit or release it made may be
-in the registry without the caller knowing. Other late work is logged at
-`WARNING`.
+registry write lock, so a grant, commit or release it made may be in the
+registry without the caller knowing. A refusal decided under that lock
+triggers it too, though it lands nothing: an opted-in `pre-edit` refused with
+`other_holder` just before its deadline is one (see
+[Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)). Other late
+work is logged at `WARNING`.
 
 ### Reference
 
@@ -1516,6 +1519,11 @@ the coordinator. A Claude Code session releases what it holds when its turn ends
 So after `other_holder`, retry once the holder has released, not in a tight loop,
 or use a plain `write()`, which takes the file over (the previous holder's next
 write is then refused until it re-reads).
+
+Over HTTP this `other_holder` is the answer of `post-edit-cas`: a commit that
+lost to a holder, which the client retries. A `pre-edit` that opts in with
+`"if_unheld": true` answers the same reason before anything is written, for a
+different question; see [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit).
 
 When a plain `write()` loses its commit to a peer on the volume (or MCP) path,
 the raised `CommitPreempted` is **terminal for that attempt, not a transient to
@@ -2470,7 +2478,8 @@ left unused. (A strict volume's forked child attaches on its first request
 instead: that request raises, and its next one claims again with the same
 nonce.) A client written before principals existed keeps working
 unchanged: its sessions never claim one, and a request naming a session that
-never claimed one is admitted exactly as before (and counted, see below).
+never claimed one is admitted exactly as before (and counted, see below),
+unless it is a `pre-edit` that opts in with `"if_unheld": true`.
 
 The Claude Code plugin's Node coordinator issues no principals. It answers
 `/principal/claim` with `404`, and clients proceed without one; the hook
@@ -2516,6 +2525,11 @@ principal, `caller_principal_foreign` when the principal presented is not the
 one bound to the named session. Branch on `reason`, not on the text. It is never
 a hold, and a refused request changes nothing, so it is safe to send again once
 the client has the right principal.
+
+One request needs a principal whichever session it names: a `pre-edit` that
+opts in with `"if_unheld": true` is refused with `caller_principal_absent` even
+for a session nobody claimed, and on an untracked path too (see
+[Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)).
 
 The policy routes, `POST /policy/track` and `POST /policy/untrack`, name no
 session and check no principal. One of their answers is a deliberate refusal
@@ -3698,51 +3712,150 @@ route, but it reads the refusal differently on each:
   fence, so an older MCP giver can loop on reacquire and write until its
   client is upgraded.
 
-## Acquire-or-fail on `pre-edit` (specified, partly built)
+## Acquire-or-fail on `pre-edit`
 
-**Only the answer to an opted-in request that times out is built**, as
-**Under load** below describes. The rest of this section is still a
-specification: it fixes the shape of an opt-in refusal so the change that
-builds it does not have to re-decide it.
+An ordinary `POST /hooks/pre-edit` grants EXCLUSIVE to whoever asks, except the
+giver of a live [handoff](#targeted-grant-handoff) of the path. An agent
+already holding the grant is set to INVALID — nothing is committed — and finds
+out on its next request. A `pre-edit` that opts in with `"if_unheld": true`
+asks for the path only if no other agent holds it. While another agent holds
+the path EXCLUSIVE or MODIFIED, the coordinator refuses the request with
+`other_holder`, names the holder, and changes nothing else. The holder check
+and the grant are one decision, so two opted-in requests racing for a path
+nobody holds get one grant and one refusal that names the winner.
 
-Today `POST /hooks/pre-edit` grants EXCLUSIVE to whoever asks, except the giver
-of a live [handoff](#targeted-grant-handoff) of the path. A session already
-holding the grant is set to INVALID — nothing is committed — and finds out on its
-next request. There is no request that declines instead, so a real mutex cannot be
-built on this route: the second session to ask always wins. That holds for a
-request that sends `"if_unheld": true` too, whenever the coordinator decides it
-in time.
+This is the Python coordinator's behavior; the Claude Code plugin's Node
+coordinator ignores `if_unheld`. Nothing sends the flag yet: the Claude Code
+hooks do not opt in, and no released client sends it. A coordinator that
+ignores the flag (the Node coordinator, or an older release) admits an
+opted-in request it decides in time as it admits any other, and a client
+cannot yet tell that admit from a real one.
 
 **Request.** `pre-edit` with `"if_unheld": true` in the body, carrying the
-[caller principal](#caller-principal). An opted-in request without a principal is refused as a
-malformed request (HTTP 400 naming the principal), because a refusal that a
+[caller principal](#caller-principal). Only a JSON `true` opts in: any other
+`if_unheld` (`"true"`, `1`, `null`, `false`) or none is an ordinary request,
+answered exactly as before. An opted-in request without a principal is refused
+with HTTP `400` and `"reason": "caller_principal_absent"`, even from a session
+that never claimed one and on an untracked path, because a refusal that a
 caller could step around by naming the holder's session is not a refusal.
 
 **Refusal.** HTTP 200 with
-`{"ok": false, "reason": "other_holder", "holder_agent_id": "<agent id>"}` — the
-same reason string `post-edit-cas` already returns when a commit meets a
-session holding the write grant. The holder is named by agent id, never by
-session id. Nothing changes hands: the holder keeps its grant and the caller
-gains none.
 
-**What the refused caller does.** Back off and retry the acquire. The refusal
-carries no retry hint because none exists. Committing does not end a grant: a
-holder that commits keeps the file MODIFIED, and the optimistic lane is no way
-around it — `post-edit-cas` answers `other_holder` against a MODIFIED holder
-too. A grant ends when its holder releases it — `session-stop`, which a Claude
-Code session sends at the end of its turn, or a failed `post-edit` — or hands it
-on with a [transfer](#targeted-grant-handoff), or when the
-coordinator reclaims it from a silent holder (no heartbeat for
-`grant_heartbeat_timeout_sec`, or held longer than `grant_max_hold_sec`; see
-[which requests record a heartbeat](#reading-when-the-sweep-will-reclaim-a-grant)). Poll
-with backoff rather than wait for a signal.
+```json
+{"ok": false, "reason": "other_holder", "holder_agent_id": "5d0f3c9a8b7e4d21a6c3b2e1f0d9c8b7"}
+```
 
-**Under load.** A timed-out opted-in request must not answer in a shape that
-admits the edit: the contention that makes a holder worth respecting is the
-contention that times a handler out. This part is built. When the coordinator
-cannot decide a `pre-edit` carrying `"if_unheld": true` within the 4-second
-handler budget, at the caller-principal check or in the pre-edit work itself,
-it refuses it with HTTP 200:
+The holder is named by agent id, never by session id, as 32 lowercase hex
+characters without hyphens. `/status` and the `handoff` key write agent ids
+with hyphens, so compare parsed UUIDs, not strings. On a path with a transfer
+record the body also carries the [`handoff` key](#the-handoff-key), last. It
+carries no `hookSpecificOutput` and no `permissionDecision`. Python code can
+import the reason as `OTHER_HOLDER_REASON` from `ccs.core.exceptions`. In
+process, `CoordinatorService.write(..., if_unheld=True)` makes the same check
+and raises `OtherHolder`, from the same module, carrying `artifact_id` and
+`holder_agent_id`.
+
+`post-edit-cas` answers the same reason string when a commit meets a holder,
+and there it means something else: the commit lost, nothing was committed, and
+the client retries it (see [Concurrent writers](#concurrent-writers-write_cas)).
+Read `other_holder` by the route that sent it.
+
+**Who counts as another agent.** The check compares agent identities: the
+session, plus the subagent id when the request sends one. A malformed subagent
+id counts as none (see **What it does not close**).
+
+- A holder repeating its own opted-in `pre-edit` is admitted.
+- Two subagents of one session refuse each other.
+- A subagent is refused on a path its parent session holds, and the parent on
+  a path its subagent holds.
+- A SHARED reader is not a holder. An opted-in request over readers only is
+  granted, and the readers go INVALID, as for any `pre-edit`.
+
+**What a refusal changes.** Nothing changes hands: the holder keeps its grant
+and the caller gains none. A refusal moves exactly four things:
+
+- the caller's heartbeat;
+- the caller's `agent_name` in the operator view of `/status`, recorded on its
+  first request;
+- `pre_edit_total`, the route's request counter in `endpoint_counters`;
+- `pre_edit_other_holder_denials_total`, the refusal counter.
+
+Everything else stays as it was: grants and states, transient ones included,
+observed versions, the state log, the holder's and the caller's pending
+notices, the transfer record and its status, and every other `/status`
+counter.
+
+**Which answer comes first.** For state that was settled before the request
+arrived:
+
+- the giver of a live handoff of the path gets its `handed_off` deny (see
+  [The giver's fence](#the-givers-fence)), not `other_holder`;
+- on a strict-mode path, an editor whose read a peer's commit made stale gets
+  the strict deny, not `other_holder`;
+- a bystander refused on a path with a live handoff leaves the record's
+  `status` as it was: the refusal neither completes nor overtakes the handoff.
+
+**Answers an opted-in client can get.** Admit the edit only on an HTTP 2xx
+answer whose body has `ok: true` and no `degraded` key.
+
+| When the request is decided | Answer | `/status` counter | What the client does |
+|---|---|---|---|
+| it presents no principal header, or an empty or whitespace-only one | HTTP `400`, `"reason": "caller_principal_absent"` | `caller_principal_refused_total` | claim a principal, then send again; claiming binds the session (see the client rules below) |
+| it presents a principal that is not the one bound to the session | HTTP `400`, `"reason": "caller_principal_foreign"` | `caller_principal_refused_total` | claim again with the same nonce, then send again |
+| the caller-principal check or the pre-edit work runs past the 4-second handler budget | `unavailable` (see **Under load**) | `watchdog_timeouts_total` | release, then back off |
+| the path is not tracked | `{"ok": true}`, unchecked; it may carry re-grounding context | none, or `watchdog_timeouts_total` when delivering that context times out, which still answers `{"ok": true}` | proceed; the path is outside this contract (see **What it does not close**) |
+| the caller is the giver of a live handoff of the path | the `handed_off` deny | `handoff_giver_denials_total` | stop: no retry clears it |
+| the path is in strict mode and the caller's read is stale | the strict deny: `"status": "stale"`, a deny in `hookSpecificOutput`, and no top-level `reason` | `strict_mode_denials_total` and `stale_warning_emitted_total` | re-read under a new `agent_id` with the same `session_id`, then send again: a deny never re-grants the identity it denied |
+| another agent holds the path EXCLUSIVE or MODIFIED | `other_holder` | `pre_edit_other_holder_denials_total` | back off; once admitted, re-read the file before writing |
+| no other agent holds the path EXCLUSIVE or MODIFIED | the admit an ordinary `pre-edit` gets | as for an ordinary `pre-edit` | proceed |
+| anything else: a `503` (the coordinator's queue or handler slots are full, or it is stopping or draining for a migration), an `internal:` failure ([details](#when-the-coordinator-answers-with-a-failure)), which a busy store can also cause, an `ok: false` whose `reason` is prose, any other non-2xx status, no answer at all, or `{"ok": true, "degraded": true}`, which an older coordinator answers on a timeout because it never reads `if_unheld` | as for an ordinary `pre-edit` | as for an ordinary `pre-edit` | treat it as a refusal and back off |
+
+**When the path comes free.** The refusal carries no retry hint because none
+exists. Committing does not end a grant: a holder that commits keeps the path
+MODIFIED, and the optimistic lane is no way around it — `post-edit-cas` answers
+`other_holder` against a MODIFIED holder too. A grant ends when its holder
+releases it — `session-stop`, which a Claude Code session sends at the end of
+its turn, or a failed `post-edit` — or hands it on with a
+[transfer](#targeted-grant-handoff), or when the coordinator reclaims it from a
+silent holder (see **What it does not close**). Poll with backoff rather than
+wait for a signal.
+
+**Client rules.**
+
+- **Back off.** After any refusal or missing answer, wait at least 4 seconds,
+  the handler budget, then double the wait, with jitter, up to a cap, and stop
+  after a bounded total. Keep at most one opted-in request per path in flight.
+  Work the coordinator abandoned on a timeout keeps its place in the
+  coordinator's work queue until it finishes, and about 13 such pieces of work,
+  across all clients, are enough for every route, ordinary hooks included, to
+  answer `503` ([#223](https://github.com/Cohexa-ai/agent-coherence/issues/223)).
+  Backoff makes that less likely; it does not prevent it.
+- **Re-read after `other_holder`.** Once a later request is admitted, re-read
+  the file before you build the write. Nothing marks a refused caller stale
+  while it waits, so the copy it read before the refusal may be out of date.
+- **Release after `unavailable`.** Work the coordinator abandoned may still
+  have taken the grant (see **Under load**). Send a failed `post-edit`
+  (`"success": false`) for the path, with the same `session_id` and
+  `agent_id`. The release counts only when the answer says `"released": true`.
+  That answer does not prove a grant existed, and it leaves the caller INVALID
+  on the path. On a strict-mode path a deny never re-grants that identity, so
+  its next `pre-edit`, and every later read under it, gets the strict deny.
+  Re-read under a new `agent_id` with the same `session_id`, as the
+  [capture rule](#capturing-the-comparands) and `CoherentVolume.reacquire()`
+  do.
+- **Send `session-stop` only when the work is done.** It releases every path
+  the identity holds EXCLUSIVE or MODIFIED, not only the one in question.
+- **Claiming a principal binds the session.** A client that claims one to clear
+  the `400` binds its session: from then on, every request naming that session
+  on a route that requires a principal must present it, whichever client or
+  subagent sends it (see [What is checked, and where](#what-is-checked-and-where)).
+- **Release before you exit.** A client that restarts under a new session or
+  `agent_id` is a new agent, so a grant its previous run left held refuses it
+  until that grant is released or reclaimed.
+
+**Under load.** When the coordinator cannot decide an opted-in `pre-edit`
+within the 4-second handler budget, at the caller-principal check or in the
+pre-edit work itself, it refuses it with HTTP 200:
 
 ```json
 {"ok": false, "reason": "unavailable", "degraded": true, "hookSpecificOutput": {…}}
@@ -3750,41 +3863,83 @@ it refuses it with HTTP 200:
 
 `hookSpecificOutput` carries the same could-not-verify advisory as the degraded
 admit, as added context only, with no `permissionDecision`. Python code can
-import the reason as `UNAVAILABLE_REASON` from `ccs.core.exceptions`. The work
-the coordinator abandons takes no grant, unless it had already won the
-registry lock when the answer went out: then the grant stands, the holder it
-displaced has been told so, and the refused caller holds the grant until it
-releases it or the coordinator reclaims it. Only a JSON `true` opts in: any other
-`if_unheld` (`"true"`, `1`, `null`, `false`) or none is an ordinary request,
-and an ordinary request that times out still admits with
-`{"ok": true, "degraded": true}`, strict-mode paths included, exactly as
-before (see [When the registry is busy](#when-the-registry-is-busy)). Nothing
-sends `if_unheld` yet. The Claude Code hooks and the library will not send it
-until the in-time refusal (**Refusal** above), a hook deny on strict-mode paths
-and a refuse mode in the library have shipped.
+import the reason as `UNAVAILABLE_REASON` from `ccs.core.exceptions`. A
+timed-out request never looked for a holder, so it cannot answer
+`other_holder`, and it does not admit either: the contention that makes a
+holder worth respecting is the contention that times a handler out.
 
-An opted-in client admits the edit only on an HTTP 2xx answer whose body has
-`ok: true` and no `degraded` key, and treats everything else as a refusal:
-
-- `unavailable`;
-- an `internal:` failure
-  ([details](#when-the-coordinator-answers-with-a-failure)), which a busy store
-  can also cause, at the caller-principal check or in the pre-edit work;
-- any non-2xx status, or no answer at all;
-- `{"ok": true, "degraded": true}`, which an older coordinator answers on a
-  timeout because it never reads `if_unheld`.
+The work the coordinator abandons takes no grant unless it had already won the
+registry lock when the answer went out. Work that had won it decides as an
+in-time request does: on a path another agent holds EXCLUSIVE or MODIFIED it is
+refused and lands nothing, so a grant the caller was not told about can land
+only on a path no other agent held that way. The caller then holds that grant
+until it releases it or the coordinator reclaims it. An ordinary request that
+times out still admits with `{"ok": true, "degraded": true}`, strict-mode paths
+included, exactly as before (see
+[When the registry is busy](#when-the-registry-is-busy)).
 
 **What it does not close.**
 
+- **Opted-in callers only.** The refusal protects a holder only from callers
+  that also opt in: an ordinary pre-edit still displaces an opted-in holder,
+  and every Claude Code hook edit is an ordinary one.
+- **Tracked paths only.** An opted-in request that presents its principal on
+  an untracked path is admitted with `{"ok": true}` and no check, and so is one
+  on a held path that was untracked afterwards; the holder keeps its grant. An
+  untrack of a strict-mode path is refused (`untrack_strict_path`), and such a
+  path stays tracked even when `ignored.yaml` lists it, so opt in on
+  strict-mode paths.
+- **A silent holder refuses until the sweep reclaims it.** The acquire reclaims
+  nothing itself. A holder that stops sending requests keeps refusing until a
+  sweep pass takes its grant back: once it has recorded no heartbeat for
+  `grant_heartbeat_timeout_sec` (600 s by default), or has held the path for
+  `grant_max_hold_sec` (1800 s by default), whichever comes first (see
+  [Reading when the sweep will reclaim a grant](#reading-when-the-sweep-will-reclaim-a-grant)).
+  With the sweep off (`sweep_interval_sec` set to `0`), it refuses until it
+  releases the path.
+- **One coordinator process.** The check and the grant are one decision inside
+  the coordinator process that holds the workspace's store. A second writer
+  opened on the same `state.db` is outside that decision
+  ([#453](https://github.com/Cohexa-ai/agent-coherence/issues/453)).
+- **A malformed subagent id is read as the parent.** An `agent_id` that is not
+  a string of 1 to 64 characters from `[A-Za-z0-9_-]` is read as no subagent
+  id, as on every hook route, so the request acts as the parent session. From
+  a session that holds the path, such a request is admitted as the holder's
+  own repeat.
+- **An admit can carry a stale collision warning.** The handler looks for a
+  holder before the decision, to word its answer. When that holder lets go
+  before the decision, the admitted answer can still carry a collision warning
+  naming it, and that agent can be sent a preemption notice although it
+  released the path itself
+  ([#450](https://github.com/Cohexa-ai/agent-coherence/issues/450)). The grant
+  itself is decided correctly.
+- **The `handoff` key is read after the decision.** On a refusal it is a
+  best-effort read taken once the refusal is decided, so it can describe a
+  later record than the one in force at the decision. Act on `reason` and
+  `holder_agent_id`.
+- **The refusal counter counts refusals sent.**
+  `pre_edit_other_holder_denials_total` counts the refusals this coordinator
+  process sent on the HTTP route. A refusal reached after its request timed
+  out, whose caller got `unavailable`, is not counted, and neither is a refusal
+  of an in-process `CoordinatorService.write`. The counter resets when the
+  coordinator restarts, and no refusal is written to the durable
+  [conflict-outcome counters](#conflict-outcome-counters--how-often-did-it-actually-fire).
+- **A refusal can be logged as a late completion.** When the deadline passes
+  just after a refusal is ready to send, the caller gets `unavailable`, and
+  the coordinator counts the work in `watchdog_late_completion_total` and logs
+  it at `CRITICAL`, as work that may have left a grant behind, although the
+  refusal landed nothing. When the deadline passes earlier, the work counts in
+  `watchdog_late_aborts_total` instead.
 - A refused agent can still write the file with a shell command. The Bash hook
   refuses a shell write only from the giver of a live
   [handoff](#targeted-grant-handoff), so a write that goes around the Edit and
   Write tools is not refused here;
   [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)
   reports it afterwards.
-- A new kind of deny on the edit path is shown to the model, and that changes
-  how it retries. The change that builds the refusal needs its own measurement
-  of that before it ships.
+- The Claude Code hooks do not opt in, so a Claude Code edit is never refused
+  this way. A new kind of deny on the edit path is shown to the model and
+  changes how it retries, so the change that adds one to the hooks needs its
+  own measurement of that before it ships.
 - On the hook surface, any process that can read `.coherence/` can read another
   session's principal. The refusal separates writers that follow the protocol;
   it does not stop one that deliberately uses another's principal.
@@ -4300,6 +4455,11 @@ for (artifact, agent, reason), count in sorted(totals.items()):
 The reader opens the database **read-only and raw** — it imports no coordinator
 and needs no daemon — so you can point it at a `state.db` copied off a machine
 after the fact.
+
+A `pre-edit` that opted in with `"if_unheld": true` and was refused with
+`other_holder` is not in this tally: it writes no row. `/status` counts those
+refusals in `pre_edit_other_holder_denials_total`, which resets when the
+coordinator restarts (see [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)).
 
 **The honesty rules matter more than the numbers, so they are worth stating
 plainly:**

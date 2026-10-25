@@ -118,13 +118,43 @@ Alpha — APIs may change before `v1.0`.
   true}`, with the degraded admit's could-not-verify advisory as added context
   and no `permissionDecision`, instead of admitting. Work it abandons takes no
   grant unless it had already won the registry lock before the answer went
-  out. Only a JSON `true` opts in. Every other request, strict-mode paths
+  out, and such work is refused like an in-time request while another agent
+  holds the path, so it can land a grant only on a path no other agent held.
+  Only a JSON `true` opts in. Every other request, strict-mode paths
   included, keeps its timed-out answer `{"ok": true, "degraded": true}` byte
-  for byte, and an opted-in request decided in time is still granted like any
-  other, displacing a holder. `UNAVAILABLE_REASON` in `ccs.core.exceptions`
-  names the reason. No released client sends the flag yet. The guide's
-  "Acquire-or-fail on `pre-edit`" section has the details, including which
-  answers an opted-in client may admit on.
+  for byte. An opted-in request decided in time is refused as `other_holder`
+  while another agent holds the path (next entry), and granted otherwise.
+  `UNAVAILABLE_REASON` in `ccs.core.exceptions` names the reason. No released
+  client sends the flag yet. The guide's "Acquire-or-fail on `pre-edit`"
+  section has the details, including which answers an opted-in client may
+  admit on.
+
+- **A `pre-edit` that opts in with `"if_unheld": true` is refused as
+  `other_holder` while another agent holds the path (part of #246).** Until
+  now the coordinator granted such a request like any other when it decided it
+  in time, and the agent holding the path lost its grant. Now, while another
+  agent identity holds the path EXCLUSIVE or MODIFIED, the request gets HTTP
+  200 `{"ok": false, "reason": "other_holder", "holder_agent_id": "<agent
+  id>"}`, the holder as 32 lowercase hex characters, with the `handoff` key
+  last on a path with a transfer record. Nothing changes hands: the holder
+  keeps its grant and the caller gains none. The check runs inside the same
+  registry hold as the grant, so two opted-in requests racing for a free path
+  get one grant and one refusal naming the winner; a cross-process test pins
+  it. Subagents of one session count as separate agents, a SHARED reader is
+  not a holder, and the giver's `handed_off` deny and the strict-mode deny
+  still come first. An opted-in request without a caller principal now gets
+  the `caller_principal_absent` 400 even from a session that never claimed
+  one, on an untracked path too. `/status` counts refusals in
+  `pre_edit_other_holder_denials_total`, and no conflict row is written.
+  `OTHER_HOLDER_REASON` and `OtherHolder` are new in `ccs.core.exceptions`,
+  `CoordinatorService.write` takes a keyword-only `if_unheld`, and
+  `tests/fixtures/wire/pre_edit_other_holder.json` pins the refusal's wire
+  shape. Every pre-edit that does not send JSON `true` is unchanged, so an
+  ordinary pre-edit, every Claude Code hook edit included, still displaces an
+  opted-in holder. The contract covers tracked paths only, nothing sends the
+  flag yet, and the Claude Code plugin's Node coordinator ignores it. The
+  guide's "Acquire-or-fail on `pre-edit`" section has the details, including
+  every answer an opted-in client can get and what to do on each.
 
 ### Changed
 
