@@ -71,12 +71,14 @@ def live_client(live_coordinator) -> _Client:
     return _Client("127.0.0.1", live_coordinator.port, secret)
 
 
-def _structure(answer: dict) -> dict:
-    """``answer`` with the advisory's wording masked, as the contract compares it."""
-    return normalize_response(answer, ignore_keys=_ADVISORY)
+def _structure(answer: dict) -> str:
+    """``answer`` with the advisory's wording masked, as the contract compares
+    it: as JSON text, because Python's ``1 == True`` would let a wrong wire type
+    pass a dict comparison."""
+    return json.dumps(normalize_response(answer, ignore_keys=_ADVISORY), sort_keys=True)
 
 
-def _contract() -> dict:
+def _contract() -> str:
     return _structure(json.loads(_CONTRACT.read_text(encoding="utf-8")))
 
 
@@ -169,6 +171,8 @@ _BREAKING_CHANGES: list[tuple[str, Callable[[dict], None]]] = [
     ("dropped-degraded", lambda answer: answer.pop("degraded")),
     ("renamed-reason", _rename_reason),
     ("ok-true", _set_value(("ok",), True)),
+    ("ok-zero", _set_value(("ok",), 0)),
+    ("degraded-one", _set_value(("degraded",), 1)),
     ("other-reason", _set_value(("reason",), "other_holder")),
     ("not-degraded", _set_value(("degraded",), False)),
     ("other-event", _set_value(("hookSpecificOutput", "hookEventName"), "PostToolUse")),
