@@ -7756,6 +7756,69 @@ def test_strict_refused_read_holds_with_the_refusal_reason(served_decider) -> No
     assert body == {"verdict": "hold", "reason": "read_denied"}
 
 
+@pytest.mark.parametrize("state", [None, MESIState.SHARED], ids=["no-prior-grant", "still-shared"])
+def test_strict_refused_split_pair_holds_with_the_split_pair_reason(
+    served_decider, state: Optional[MESIState]
+) -> None:
+    """A strict-mode deny of bytes that are not the content the coordinator
+    records at that version, with BOTH comparands matching: a caller with no
+    grant holding other bytes, or a still-SHARED holder whose file changed
+    outside the coordinator. It holds as ``split_pair`` (#405), as a
+    version-checked read refuses the same pair, not as ``read_denied``, whose
+    recovery (reacquire) never records the bytes on disk."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=state, version=4, label=f"split-{'shared' if state else 'none'}",
+    )
+    version, generation = _u4_captured(server, artifact_id)
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_STRICT_PATH, version=version, generation=generation,
+        content_hash=_hash("edited-outside-the-coordinator"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "split_pair"}
+
+
+@pytest.mark.parametrize(
+    ("recorded_hash", "state", "reason"),
+    [
+        ("f" * 64, None, "split_pair"),
+        ("f" * 64, MESIState.INVALID, "split_pair"),
+        ("", MESIState.INVALID, "read_denied"),
+        ("", None, "content_claim_absent"),
+    ],
+    ids=["all-f-no-grant", "all-f-invalid", "empty-invalid", "empty-no-grant"],
+)
+def test_a_strict_refusal_of_a_no_claim_artifact_holds_by_its_recorded_form(
+    served_decider, recorded_hash: str, state: Optional[MESIState], reason: str
+) -> None:
+    """The two spellings of "no content claim" answer differently, by what
+    the pre-read deny itself reports. The all-``f`` launch-gate placeholder is
+    a hash that matches no real bytes, so the deny says the caller's bytes
+    differ (``hash_differs``) and the fence holds ``split_pair``, as a
+    version-checked read refuses the same pair (#405). An empty recorded hash
+    has nothing to differ from: an INVALID reader's refusal stays
+    ``read_denied``, and a reader with no grant is not refused at all, so the
+    missing claim answers ``content_claim_absent``."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_STRICT_PATH, recorded_hash=recorded_hash, state=state, version=4,
+        label=f"no-claim-{len(recorded_hash)}-{'invalid' if state else 'none'}",
+    )
+    version, generation = _u4_captured(server, artifact_id)
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_STRICT_PATH, version=version, generation=generation,
+        content_hash=_hash("whatever-the-caller-holds"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": reason}
+
+
 # --- the artifact the coordinator does not track ---------------------------
 
 

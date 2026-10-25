@@ -49,7 +49,12 @@ from ccs.core.exceptions import (
     StaleView,
 )
 from ccs.core.states import MESIState
-from tests.coordinator_helpers import recorded_version, serve_in_process, write_holders
+from tests.coordinator_helpers import (
+    answer_with_status,
+    recorded_version,
+    serve_in_process,
+    write_holders,
+)
 
 #: FROZEN duplicate of the envelope's reason for the fault these tests raise
 #: (never imported from the code under test).
@@ -367,18 +372,43 @@ _RE_MINTS = pytest.mark.parametrize(
     "operation", ["write_cas", "write_cas_at", "publish_one", "publish_two", "reacquire"]
 )
 
-#: How each operation still ends under degrade once its release failed. A
-#: KNOWN GAP, pinned so that closing it is a visible change: the grant the
-#: abandoned attempt still holds refuses the volume's own commit as another
-#: agent's (``other_holder``, or the batch's ``StaleView``), and ``write_cas``
-#: spends its budget re-sending the failing release.
-_DEGRADE_ENDS_TODAY = {
-    "write_cas": ("CasRetriesExhausted", "other_holder"),
-    "write_cas_at": ("CasVersionConflict", "other_holder"),
-    "publish_one": ("CasVersionConflict", "other_holder"),
-    "publish_two": ("StaleView", None),
+#: How each operation ends under degrade once its release failed. The grant
+#: the abandoned attempt still holds refuses the volume's own commit as another
+#: agent's, and the volume names that grant with ``CoordinatorFailed`` (#434),
+#: after that commit (``write_cas`` after one retry, see
+#: :func:`_own_grant_commits`). A reacquire commits nothing and returns the
+#: bytes.
+_DEGRADE_ENDS = {
+    "write_cas": ("CoordinatorFailed", None),
+    "write_cas_at": ("CoordinatorFailed", None),
+    "publish_one": ("CoordinatorFailed", None),
+    "publish_two": ("CoordinatorFailed", None),
     "reacquire": ("returned", b"v2"),
 }
+
+#: FROZEN duplicates of what a commit raises when the volume's own earlier
+#: write grant refused it (#434), by what that grant's release answered.
+_OWN_GRANT_HELD = (
+    "{rel} is held by this volume's own earlier write grant: the coordinator "
+    "answered that grant's release with the grant still held, and refused this "
+    "commit as another agent's. Nothing was committed. Retry once after a short "
+    "wait, which sends the release again; if it fails again, report it to the "
+    "operator."
+)
+def _own_grant_commits(operation: str) -> int:
+    """How many commits ``operation`` sends before its own unreleased grant's
+    refusal stops it: ``write_cas`` retries once, because its re-mint sends
+    the release again (#434); the single-shot operations stop at the first."""
+    return 2 if operation == "write_cas" else 1
+
+
+_OWN_GRANT_UNRELEASED = (
+    "{rel} may be held by this volume's own earlier write grant, whose release "
+    "was not confirmed: the coordinator refused this commit because another "
+    "write grant holds the file. Nothing was committed. Retry once after a "
+    "short wait, which sends the release again; if it fails again, report it "
+    "to the operator."
+)
 
 
 def _wire(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict, object]]:
@@ -551,9 +581,9 @@ def test_a_degrade_release_answered_with_the_failure_envelope_warns_once_and_cou
     Retry once", which is false here: the operation goes on after the
     warning.
 
-    The operation's outcome after that is pinned as it is today
-    (``_DEGRADE_ENDS_TODAY``), a known gap this does not close: the volume
-    still cannot tell its own unreleased grant from a peer's."""
+    The operation's outcome after that is pinned in ``_DEGRADE_ENDS``: a
+    commit is refused by the volume's own unreleased grant, which the volume
+    names (#434)."""
     target = _seed(tmp_path)
     _seed(tmp_path, _OTHER, b"o1")
     server = serve_in_process(tmp_path, f"envelope-release-{operation}-degrade")
@@ -579,7 +609,12 @@ def test_a_degrade_release_answered_with_the_failure_envelope_warns_once_and_cou
         )
         _assert_claims_no_outcome(_degraded_warning(warned))
         assert _REL in vol._grant_incarnations.get(writer, set()), "the held grant left the record"
-        assert _ended_in(outcome) == _DEGRADE_ENDS_TODAY[operation], repr(outcome)
+        assert _ended_in(outcome) == _DEGRADE_ENDS[operation], repr(outcome)
+        if operation != "reacquire":
+            assert str(outcome) == _OWN_GRANT_UNRELEASED.format(rel=_REL)
+            assert len(_commits(sent)) == _own_grant_commits(operation), (
+                "the call went on committing into its own grant"
+            )
         assert target.read_bytes() == b"v2"
     finally:
         server.shutdown()
@@ -693,6 +728,235 @@ def test_a_degrade_re_mint_stops_at_the_first_release_the_failure_envelope_answe
         server.shutdown()
 
 
+_COMMITTING = pytest.mark.parametrize(
+    "operation", ["write_cas", "write_cas_at", "publish_one", "publish_two"]
+)
+
+
+@_COMMITTING
+def test_a_degrade_commit_refused_by_a_grant_whose_release_got_a_5xx_names_that_grant(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    """The release is answered with an HTTP 503 before the coordinator ran
+    it, so the grant stands; degrade warns and counts, and the call goes on.
+    Its commit is refused ``other_holder`` by that grant, and the volume
+    raises ``CoordinatorFailed`` saying its own earlier write grant may hold
+    the file, after that commit (``write_cas`` after one retry) (#434). "May":
+    a release whose answer
+    was a status may or may not have run, so the holder could be a peer."""
+    target = _seed(tmp_path)
+    _seed(tmp_path, _OTHER, b"o1")
+    server = serve_in_process(tmp_path, f"5xx-release-{operation}-degrade")
+    try:
+        vol, writer, versions = _volume_after_a_write(tmp_path, fast_cfg, "degrade")
+        with monkeypatch.context() as faulted:
+            answer_with_status(faulted, lambda path, _p: path == _STOP, 503, forwarded=False)
+            sent = _wire(faulted)
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                with pytest.raises(CoordinatorFailed) as raised:
+                    _re_mint(vol, operation, versions)
+
+        assert str(raised.value) == _OWN_GRANT_UNRELEASED.format(rel=_REL)
+        assert len(_commits(sent)) == _own_grant_commits(operation), (
+            "the call went on committing into its own grant"
+        )
+        assert vol.degradation_count == _own_grant_commits(operation), "one per failed release"
+        assert write_holders(server, _REL) == {str(session_to_agent_id(vol.session_id, writer))}, (
+            "control: the only write holder is the volume's own earlier attempt"
+        )
+        assert target.read_bytes() == b"v2"
+    finally:
+        server.shutdown()
+
+
+@_MODE
+@pytest.mark.parametrize("operation", ["write_cas_at", "publish_two"])
+def test_a_commit_refused_by_a_peers_grant_stays_other_holder(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    operation: str,
+    mode: str,
+) -> None:
+    """Control: a peer's write() holds the grant, and this volume holds no
+    earlier grant of its own on the file. The refusal is the peer's and
+    keeps its answer, ``CasVersionConflict(other_holder)`` or the batch's
+    ``StaleView`` naming ``other_holder``, never the own-grant
+    ``CoordinatorFailed``."""
+    _seed(tmp_path)
+    _seed(tmp_path, _OTHER, b"o1")
+    server = serve_in_process(tmp_path, f"peer-holds-{operation}-{mode}")
+    try:
+        peer = CoherentVolume(tmp_path, managed=("data/**",), on_error=mode, config=fast_cfg)
+        peer.write(_REL, b"peer")
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error=mode, config=fast_cfg)
+        versions = (vol.read_with_version(_REL)[1], vol.read_with_version(_OTHER)[1])
+        assert not vol._grant_incarnations, "control: this volume holds no grant of its own"
+
+        with pytest.raises(CoherenceError) as raised:
+            _re_mint(vol, operation, versions)
+
+        if operation == "write_cas_at":
+            assert _ended_in(raised.value) == ("CasVersionConflict", "other_holder")
+        else:
+            assert type(raised.value) is StaleView, repr(raised.value)
+            assert raised.value.member_reason == "other_holder"
+    finally:
+        server.shutdown()
+
+
+def test_a_commit_refused_for_another_reason_keeps_it_while_an_own_grant_is_recorded(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control: only an ``other_holder`` refusal can come from the volume's own
+    grant. The release fails (degrade), so the record keeps the grant, and the
+    commit is refused ``version_mismatch``, answered in place of the
+    coordinator's own answer. The caller is told the version moved,
+    ``CasVersionConflict(version_mismatch)``, never the own-grant
+    ``CoordinatorFailed``."""
+    from ccs.adapters import coherent_volume as coherent_volume_module
+
+    _seed(tmp_path)
+    _seed(tmp_path, _OTHER, b"o1")
+    server = serve_in_process(tmp_path, "own-grant-other-reason")
+    try:
+        vol, writer, versions = _volume_after_a_write(tmp_path, fast_cfg, "degrade")
+        real_post = coherent_volume_module._coordinator_post
+
+        def refuse_the_commit(endpoint, path, payload, **kwargs):
+            if path == "/hooks/post-edit-cas":
+                return {"ok": False, "reason": "version_mismatch", "current_version": versions[0] + 1}
+            return real_post(endpoint, path, payload, **kwargs)
+
+        with monkeypatch.context() as faulted:
+            _fail_registry(server, faulted, "artifacts_held_by_agent", "before")
+            faulted.setattr(coherent_volume_module, "_coordinator_post", refuse_the_commit)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with pytest.raises(CoherenceError) as raised:
+                    vol.write_cas_at(_REL, versions[0], b"v3")
+
+        assert _REL in vol._grant_incarnations.get(writer, set()), "control: the grant is still recorded"
+        assert _ended_in(raised.value) == ("CasVersionConflict", "version_mismatch")
+    finally:
+        server.shutdown()
+
+
+def test_a_later_release_that_goes_unanswered_says_the_grant_may_be_held(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first call's release is answered with the grant still held, so its
+    commit names the grant: the file "is held" by it. The next call's release
+    gets the failure envelope instead (degrade), and its commit says the
+    grant "may be held": what an earlier release reported is not what this
+    one did."""
+    _seed(tmp_path)
+    _seed(tmp_path, _OTHER, b"o1")
+    server = serve_in_process(tmp_path, "own-grant-held-then-unanswered")
+    try:
+        vol, _writer, versions = _volume_after_a_write(tmp_path, fast_cfg, "degrade")
+
+        def refusing(*_args, **_kwargs):
+            raise InvariantViolationError("release refused")
+
+        with monkeypatch.context() as faulted:
+            faulted.setattr(server.service, "invalidate", refusing)
+            with pytest.raises(CoordinatorFailed) as first:
+                vol.write_cas_at(_REL, versions[0], b"v3")
+        assert str(first.value) == _OWN_GRANT_HELD.format(rel=_REL), "control: the first release said held"
+
+        with monkeypatch.context() as faulted:
+            _fail_registry(server, faulted, "artifacts_held_by_agent", "before")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with pytest.raises(CoordinatorFailed) as second:
+                    vol.write_cas_at(_REL, versions[0], b"v3")
+
+        assert str(second.value) == _OWN_GRANT_UNRELEASED.format(rel=_REL)
+    finally:
+        server.shutdown()
+
+
+def test_a_degrade_write_cas_whose_release_fails_once_recovers_in_the_same_call(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first release is answered with an HTTP 503 before the coordinator
+    ran it, and the next is answered as usual. write_cas's first commit is
+    refused by the volume's own grant; it re-mints, which sends the release
+    again, the release is confirmed, and the second commit wins in the same
+    call. One degradation is counted, the record is clear, and the new bytes
+    are on disk.
+
+    Prevents the own-grant stop (#434) costing a degrade volume the recovery
+    its retry loop gave a one-off release failure."""
+    target = _seed(tmp_path)
+    _seed(tmp_path, _OTHER, b"o1")
+    server = serve_in_process(tmp_path, "release-fails-once-write-cas")
+    try:
+        vol, writer, versions = _volume_after_a_write(tmp_path, fast_cfg, "degrade")
+        failed = [False]
+
+        def the_first_release(path: str, _payload: dict) -> bool:
+            if path != _STOP or failed[0]:
+                return False
+            failed[0] = True
+            return True
+
+        with monkeypatch.context() as faulted:
+            answer_with_status(faulted, the_first_release, 503, forwarded=False)
+            sent = _wire(faulted)
+            with warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                result = vol.write_cas(_REL, lambda current: current + b"+cas")
+
+        assert failed[0], "control: the first release was answered 503"
+        assert result.version == versions[0] + 1
+        assert target.read_bytes() == b"v2+cas"
+        assert len(_commits(sent)) == 2, "the call did not retry once after its own grant refused it"
+        assert vol.degradation_count == 1
+        assert writer not in vol._grant_incarnations, "the confirmed release stayed in the record"
+    finally:
+        server.shutdown()
+
+
+def test_a_commit_refused_by_a_peer_after_this_volumes_release_was_confirmed_stays_other_holder(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+) -> None:
+    """Control: this volume wrote the file and its release was confirmed (a
+    reacquire of another file re-minted), so its record is clear; a peer's
+    write() then holds the file. The refusal is the peer's and keeps its
+    answer, ``CasVersionConflict(other_holder)``. Tells "the record still
+    holds a grant" apart from "this volume once wrote the path"."""
+    _seed(tmp_path)
+    _seed(tmp_path, _OTHER, b"o1")
+    server = serve_in_process(tmp_path, "released-then-peer-holds")
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        vol.write(_REL, b"v2")
+        vol.reacquire(_OTHER)
+        assert not vol._grant_incarnations, "control: the release was confirmed"
+        peer = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        peer.write(_REL, b"peer")
+        version = vol.read_with_version(_REL)[1]
+
+        with pytest.raises(CasVersionConflict) as raised:
+            vol.write_cas_at(_REL, version, b"v3")
+
+        assert raised.value.reason == "other_holder"
+    finally:
+        server.shutdown()
+
+
 @pytest.mark.parametrize("operation", ["write_cas", "write_cas_at", "publish_one", "publish_two"])
 def test_a_strict_operation_retried_after_a_failed_release_sends_it_again_and_commits(
     tmp_path: Path,
@@ -744,24 +1008,30 @@ def test_a_strict_operation_retried_after_a_failed_release_sends_it_again_and_co
 
 
 @_MODE
-@pytest.mark.parametrize("operation", ["write_cas_at", "reacquire"])
-def test_a_release_answered_with_its_grant_still_held_keeps_its_outcome(
+@_RE_MINTS
+def test_a_commit_refused_by_a_grant_its_release_left_held_names_that_grant(
     tmp_path: Path,
     fast_cfg: LifecycleConfig,
     monkeypatch: pytest.MonkeyPatch,
     operation: str,
     mode: str,
 ) -> None:
-    """Control. A stop that ran but left the grant held answers per grant
-    (#185): ``ok: false`` with a ``grants`` list, and no top-level reason.
-    That is the coordinator's account of the grant, not a failure of the
-    coordinator, so in both modes the release keeps today's handling: nothing
-    raises there, nothing is counted or warned, the record keeps the grant,
-    and the operation goes on (the CAS is refused ``other_holder``, the
-    reacquire returns the bytes).
+    """A stop that ran but left the grant held answers per grant (#185):
+    ``ok: false`` with a ``grants`` list, and no top-level reason. That is the
+    coordinator's account of the grant, not a failure of the coordinator, so
+    in both modes the release itself raises nothing, counts and warns
+    nothing, the record keeps the grant, and the operation goes on: a
+    reacquire returns the bytes. A commit goes out and is refused
+    ``other_holder`` by that grant, and the volume raises
+    ``CoordinatorFailed`` saying its own earlier write grant holds the file
+    (#434), after that commit (``write_cas`` after one retry, whose re-mint
+    sends the release again).
 
-    Prevents the envelope's handling widening to every ``ok: false``
-    release."""
+    Prevents the volume telling its caller to wait for a peer that does not
+    exist: the CAS raised ``CasVersionConflict(other_holder)``, which MCP
+    answers ``wait_and_retry``, ``write_cas`` spent its retry budget against
+    its own grant, and the batch held as a peer's conflict. Prevents too the
+    envelope's handling widening to every ``ok: false`` release."""
     target = _seed(tmp_path)
     _seed(tmp_path, _OTHER, b"o1")
     server = serve_in_process(tmp_path, f"held-release-{operation}-{mode}")
@@ -783,18 +1053,24 @@ def test_a_release_answered_with_its_grant_still_held_keeps_its_outcome(
                     outcome = exc
 
         stops = _stops(sent)
-        assert len(stops) == 1, stops
+        assert len(stops) == _own_grant_commits(operation), stops
         assert stops[0].get("ok") is False and "reason" not in stops[0], (
             f"control: not a per-grant answer: {stops[0]!r}"
         )
         assert [grant.get("held") for grant in stops[0]["grants"]] == [True], (
             "control: the grant is held"
         )
-        expected = (
-            ("CasVersionConflict", "other_holder") if operation == "write_cas_at"
-            else ("returned", b"v2")
-        )
-        assert _ended_in(outcome) == expected, repr(outcome)
+        if operation == "reacquire":
+            assert _ended_in(outcome) == ("returned", b"v2"), repr(outcome)
+        else:
+            assert type(outcome) is CoordinatorFailed, repr(outcome)
+            assert str(outcome) == _OWN_GRANT_HELD.format(rel=_REL)
+            assert len(_commits(sent)) == _own_grant_commits(operation), (
+                "the call went on committing into its own grant"
+            )
+            assert write_holders(server, _REL) == {str(session_to_agent_id(vol.session_id, writer))}, (
+                "control: the only write holder is the volume's own earlier attempt"
+            )
         assert vol.degradation_count == 0
         assert not [w for w in warned if issubclass(w.category, CoherenceDegradedWarning)]
         assert _REL in vol._grant_incarnations.get(writer, set()), "the held grant left the record"

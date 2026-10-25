@@ -3939,8 +3939,9 @@ def test_a_degraded_release_answer_is_not_a_confirmed_release(
     """A watchdog-degraded session-stop answers ``ok: true`` whether or not the
     release ran. Treated as confirmed, it would drop the record while the grant
     still stands, and every later commit would be refused by the volume's own
-    grant with nothing left to retry the release. It must stay recorded, and the
-    next attempt must release it."""
+    grant with nothing left to retry the release. It must stay recorded, so the
+    commit that grant refuses names it (#434), and the next attempt must release
+    it."""
     rel = "data/shared.txt"
     target = _seed(tmp_path, content=b"v1")
     vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
@@ -3960,8 +3961,9 @@ def test_a_degraded_release_answer_is_not_a_confirmed_release(
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", degrade_one_release)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            with pytest.raises(CasVersionConflict):
+            with pytest.raises(CoordinatorFailed) as raised:
                 vol.write_cas_at(rel, version, b"v3")
+        assert str(raised.value).startswith(f"{rel} may be held by this volume's own earlier write grant")
         assert _held(vol, writer_row) == {rel: "MODIFIED"}, "precondition: the release never ran"
 
         vol.write_cas_at(rel, version, b"v3")
@@ -4166,9 +4168,9 @@ def test_failed_release_is_kept_and_retried_at_the_next_re_mint(
     stands, and dropping the record would bring the self-refusal back with
     nothing left to retry it. It fails like any other coordinator request with
     no answer (strict raises ``CoordinatorUnreachable`` naming the
-    ``session-stop``; degrade warns and the CAS is refused as ``other_holder``
-    — a typed signal, not a silent drop), and the next re-mint releases it and
-    commits.
+    ``session-stop``; degrade warns, and the CAS that grant refuses raises
+    ``CoordinatorFailed`` naming it (#434) — a typed signal, not a silent
+    drop), and the next re-mint releases it and commits.
 
     The failing call runs on a worker with a bounded join, so a release made while
     holding the volume's identity lock — which deadlocks as soon as degrade mode
@@ -4218,8 +4220,8 @@ def test_failed_release_is_kept_and_retried_at_the_next_re_mint(
             assert isinstance(raised, CoordinatorUnreachable), raised
             assert "session-stop" in str(raised)
         else:
-            assert isinstance(raised, CasVersionConflict), raised
-            assert raised.reason == "other_holder"
+            assert type(raised) is CoordinatorFailed, raised
+            assert str(raised).startswith(f"{rel} may be held by this volume's own earlier write grant")
             assert any(issubclass(w.category, CoherenceDegradedWarning) for w in caught)
         assert target.read_bytes() == b"v2-pessimistic"
         assert _held(vol, writer_row) == {rel: "MODIFIED"}
@@ -7963,5 +7965,129 @@ def test_a_degrade_commit_answered_with_a_5xx_after_it_landed_behaves_as_before(
             assert vol._incarnation in vol._grant_incarnations, "the grant stays recorded"
         else:
             assert target.read_bytes() == b"v1", "an unconfirmed CAS touched disk"
+    finally:
+        server.shutdown()
+
+
+# --- a request that commits nothing, answered with an HTTP 5xx ---------------
+#
+# The coordinator reports a failure of its own either as an HTTP 5xx (its
+# dispatcher's answer to a handler that raised, or a gateway's after it
+# forwarded) or as the failure envelope, HTTP 200 ``{"ok": false, "reason":
+# "internal: <Type>"}``. A strict volume names both the same way (#433): a
+# request that commits nothing raises ``CoordinatorFailed``, which the envelope
+# on a read or a release already raises (#259, #401); a commit leg keeps
+# ``CommitUnconfirmed`` (#398). Each request reaches a coordinator running in
+# this process, which does its work, and only then is the status answered.
+
+_OTHER_REL = "data/other.txt"
+
+
+def _publish_two(vol: CoherentVolume, rel: str, versions: tuple[int, int]) -> object:
+    """Two members, so the publish opens a snapshot session first."""
+    return vol.atomic_publish([(rel, versions[0], b"v3"), (_OTHER_REL, versions[1], b"o2")])
+
+
+#: Each request that commits nothing: its route, and the call that sends it,
+#: given the versions of ``rel`` and ``_OTHER_REL``. The release is the one a
+#: re-mint sends for the grant the test's earlier write() left.
+_NOT_COMMITS: dict[str, tuple[str, Callable[[CoherentVolume, str, tuple[int, int]], object]]] = {
+    "read": ("/hooks/pre-read", lambda vol, rel, _v: vol.read(rel)),
+    "read_with_version": ("/hooks/pre-read", lambda vol, rel, _v: vol.read_with_version(rel)),
+    "read_with_version_generation": (
+        "/hooks/pre-read", lambda vol, rel, _v: vol.read_with_version_generation(rel)
+    ),
+    "reacquire": ("/hooks/pre-read", lambda vol, rel, _v: vol.reacquire(rel)),
+    "write_claim": ("/hooks/pre-edit", lambda vol, rel, _v: vol.write(rel, b"v2")),
+    "release": ("/hooks/session-stop", lambda vol, rel, v: vol.write_cas_at(rel, v[0], b"v3")),
+    "publish_session": ("/session/begin", _publish_two),
+}
+
+_COMMIT_ROUTES = ("/hooks/post-edit-cas", "/session/commit_all")
+
+
+def _volume_for(
+    tmp_path: Path, fast_cfg: LifecycleConfig, operation: str, on_error: str
+) -> tuple[CoherentVolume, tuple[int, int]]:
+    """A volume that has read both files (and, for the release, first written
+    ``data/shared.txt``, so a grant waits for the re-mint to release it),
+    with the files' versions."""
+    vol = CoherentVolume(
+        tmp_path, managed=("data/**",), on_error=on_error, config=fast_cfg  # type: ignore[arg-type]
+    )
+    if operation == "release":
+        vol.write("data/shared.txt", b"v2")
+    versions = (vol.read_with_version("data/shared.txt")[1], vol.read_with_version(_OTHER_REL)[1])
+    return vol, versions
+
+
+@_SERVER_ERRORS
+@pytest.mark.parametrize("operation", list(_NOT_COMMITS))
+def test_a_strict_request_that_commits_nothing_answered_with_a_5xx_raises_coordinator_failed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    operation: str, status: int,
+) -> None:
+    """A strict read, a reacquire, write()'s claim, the release a re-mint
+    sends and a publish's snapshot session each reach the coordinator, and the
+    answer is an HTTP 5xx. Each raises ``CoordinatorFailed``, as the same
+    coordinator failure does when it arrives as the failure envelope, with
+    the text it always had: the request and its status, and nothing the
+    answer carried. Nothing is committed. Before, each raised a plain
+    ``CoherenceError``, which MCP answers ``internal_error`` with no recovery,
+    while the envelope on the same request answered ``coordinator_failed``."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path, content=b"v1")
+    _seed(tmp_path, _OTHER_REL, b"o1")
+    server = serve_in_process(tmp_path, f"not-commit-5xx-{operation}-{status}")
+    try:
+        vol, versions = _volume_for(tmp_path, fast_cfg, operation, "strict")
+        on_disk = target.read_bytes()
+        route, send = _NOT_COMMITS[operation]
+        calls: list[tuple[str, dict, dict]] = []
+        answer_with_status(monkeypatch, lambda path, _p: path == route, status, calls=calls)
+
+        with pytest.raises(CoherenceError) as raised:
+            send(vol, rel, versions)
+
+        assert type(raised.value) is CoordinatorFailed, repr(raised.value)
+        assert str(raised.value) == f"coordinator request to {route} failed: HTTP {status}"
+        assert raised.value.reason == "coordinator_failed"
+        assert ANSWERED_TEXT not in _rendered(raised.value), "the answer's text reached the error"
+        sent = [path for path, _payload, _kwargs in calls]
+        assert sent.count(route) == 1, sent
+        assert not [path for path in sent if path in _COMMIT_ROUTES], "a commit was sent"
+        assert target.read_bytes() == on_disk, "the call changed the file"
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("operation", list(_NOT_COMMITS))
+def test_a_degrade_request_that_commits_nothing_answered_with_a_5xx_still_degrades(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, operation: str,
+) -> None:
+    """Control: under ``on_error="degrade"`` the same answer warns, naming the
+    request and its status, and counts, as before; it never raises
+    ``CoordinatorFailed``."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    _seed(tmp_path, _OTHER_REL, b"o1")
+    server = serve_in_process(tmp_path, f"not-commit-5xx-degrade-{operation}")
+    try:
+        vol, versions = _volume_for(tmp_path, fast_cfg, operation, "degrade")
+        route, send = _NOT_COMMITS[operation]
+        answer_with_status(monkeypatch, lambda path, _p: path == route, 500)
+
+        outcome: object = None
+        with warnings.catch_warnings(record=True) as warned:
+            warnings.simplefilter("always")
+            try:
+                send(vol, rel, versions)
+            except CoherenceError as exc:
+                outcome = exc
+
+        assert not isinstance(outcome, CoordinatorFailed), repr(outcome)
+        degraded = [str(w.message) for w in warned if issubclass(w.category, CoherenceDegradedWarning)]
+        assert f"CoherentVolume degraded: coordinator request to {route} failed: HTTP 500" in degraded
+        assert vol.degradation_count >= 1
     finally:
         server.shutdown()

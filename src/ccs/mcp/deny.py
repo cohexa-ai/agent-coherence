@@ -123,9 +123,11 @@ COORDINATOR_UNREACHABLE_NEXT_STEP = (
 )
 
 # The coordinator answered a read, or the volume's release of an earlier write
-# grant before a CAS or a reacquire (#401), with its failure envelope (#259):
-# something raised inside it, and the envelope names only the exception's type,
-# so a busy store that clears by itself looks the same as a fault that repeats
+# grant before a CAS or a reacquire (#401), with its failure envelope (#259) or
+# an HTTP 5xx (#433); or a commit was refused by the volume's own earlier
+# grant, which that release did not clear (#434). None of these says whether
+# its cause clears by itself (the envelope names only an exception's type, a
+# status names nothing), so a busy store looks the same as a fault that repeats
 # on every call. The verb is the house stop, with one retry named in the words:
 # an unbounded ``wait_and_retry`` would loop forever on the fault. ``retryable``
 # stays false so a client that retries on that flag alone does not loop either.

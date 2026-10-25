@@ -30,7 +30,9 @@ STALE_READ_GENERATION_REASON = "stale_read_generation"
 #
 # Honest limits of the discriminator: VERSION_MOVED, GRANT_RECLAIMED,
 # GRANT_PREEMPTED, INPUT_VANISHED, READ_DENIED and CONTENT_CLAIM_ABSENT are
-# recoverable — reacquire, re-decide, re-gate. GENERATION_UNCONFIRMED is the
+# recoverable — reacquire, re-decide, re-gate. SPLIT_PAIR is recoverable too,
+# but not by a reacquire: the bytes on disk stay unrecorded until a write
+# records them. GENERATION_UNCONFIRMED is the
 # residual bucket and is NOT a clean
 # permanent/transient signal: a degraded read, an unconfirmable foreign edit,
 # and a coordinator that predates generation reporting all land there. Treat it
@@ -49,6 +51,15 @@ HOLD_GRANT_RECLAIMED = "grant_reclaimed"
 HOLD_GRANT_PREEMPTED = "grant_preempted"
 HOLD_INPUT_VANISHED = "input_vanished"
 HOLD_VERSION_UNCONFIRMED = "version_unconfirmed"
+# The coordinator refused the re-validate read because the bytes are not the
+# content it records at the version, which has not moved: a peer's write()
+# whose bytes landed before its commit, a change made outside the coordinator,
+# or a commit's disk write failed (#405). The same answer a version-checked
+# read refuses as the split pair (#264), hence the same value as
+# SPLIT_PAIR_REASON. Split out of READ_DENIED because its recovery differs: a
+# reacquire returns the bytes on disk but does not record them, so the hold
+# repeats until the peer's commit lands or a write() records them.
+HOLD_SPLIT_PAIR = "split_pair"
 HOLD_READ_DENIED = "read_denied"
 # The coordinator records NO content claim for this artifact at all — the
 # recorded hash is absent, empty, or the all-``f`` launch-gate sentinel — so it
@@ -76,6 +87,7 @@ HOLD_REASONS: frozenset[str] = frozenset(
         HOLD_GRANT_PREEMPTED,
         HOLD_INPUT_VANISHED,
         HOLD_VERSION_UNCONFIRMED,
+        HOLD_SPLIT_PAIR,
         HOLD_READ_DENIED,
         HOLD_CONTENT_CLAIM_ABSENT,
         HOLD_GENERATION_UNCONFIRMED,
@@ -586,10 +598,12 @@ protocol corpus's coverage check, matches against."""
 # :class:`StaleView` whose instance ``.reason`` is :data:`SPLIT_PAIR_REASON`,
 # while the mapper keeps answering the class's :data:`STALE_VIEW_REASON`.
 STALE_VIEW_REASON = "stale_view"
-#: The instance reason of the :class:`StaleView` a version-checked read raises
-#: when the bytes on disk are not the content the coordinator records at its
-#: current version (#264): a peer's commit whose bytes have not landed yet, or
-#: an out-of-band edit. It names the split, not its cause.
+#: The instance reason of the :class:`StaleView` a read raises when the bytes
+#: on disk are not the content the coordinator records at its current version
+#: (#264; ``read()`` too since #405): a peer's commit whose bytes have not
+#: landed yet, or an out-of-band edit. It names the split, not its cause. The
+#: effect fence's hold for the same answer carries it as well, beside
+#: ``hold_cause`` :data:`HOLD_SPLIT_PAIR`.
 SPLIT_PAIR_REASON = "split_pair"
 COMMIT_PREEMPTED_REASON = "commit_preempted"
 VIEW_WEDGED_REASON = "view_wedged"
@@ -1023,10 +1037,12 @@ class StaleView(CoherenceError):
     move). On every other raise path (the coordinator deny sites) all four stay
     ``None``, so a generic ``except StaleView`` handler reads them uniformly.
 
-    ``reason`` is :data:`STALE_VIEW_REASON` except on the split-pair read
-    refusal (#264), whose instance carries :data:`SPLIT_PAIR_REASON` so a
-    caller can tell it from every other stale view by value. The MCP answer
-    stays ``stale_view`` for both: the mapper reads the class constant."""
+    ``reason`` is :data:`STALE_VIEW_REASON` except on a split pair, whose
+    instance carries :data:`SPLIT_PAIR_REASON` so a caller can tell it from
+    every other stale view by value: the refusal an observing read raises for
+    one (#264, #405), and the effect fence's ``split_pair`` hold. The MCP answer
+    stays ``stale_view`` for all of them: the mapper reads the class
+    constant."""
 
     reason = STALE_VIEW_REASON
     #: Version drift set by gate()'s HOLD; ``None`` on coordinator-raised instances.
@@ -1234,6 +1250,15 @@ class CoordinatorFailed(CoherenceError):
     volume's own commit as another agent's, so the operation stops there, with
     nothing committed; the grant stays recorded, and the next re-mint sends the
     release again.
+
+    The same coordinator failure answered as an HTTP 5xx raises it too, for
+    every strict volume request that commits nothing (a read, write()'s
+    claim, that release, a publish's snapshot session) and for the
+    substrate's read leg (#433). And a commit refused ``other_holder`` while
+    the volume's own earlier write grant on the file is still unreleased
+    raises it, in either ``on_error`` mode, naming that grant (#434): a retry
+    sends the release again, where waiting for the holder waits on a peer
+    that does not exist.
 
     The envelope names only the exception's type, so nothing here tells a
     busy store, which clears by itself, from a fault that repeats on every

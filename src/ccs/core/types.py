@@ -575,8 +575,8 @@ class FenceComparands:
     decides whether an irreversible effect may still fire. Both surfaces that
     ask that question build one of these: the in-process wrapper
     (``adapters.effect_gate``) and the coordinator route that answers the same
-    question over HTTP. One object, not six positionals: two ints, two optional
-    ints and two bools in a row is a transposition hazard, and this is the one
+    question over HTTP. One object, not eight positionals: two ints, two optional
+    ints and four bools in a row is a transposition hazard, and this is the one
     path in the product where a silently swapped pair IS the lost update the
     fence exists to prevent. ``kw_only`` makes the swap unexpressible rather
     than merely unlikely, and NO field carries a default — a caller that
@@ -601,6 +601,11 @@ class FenceComparands:
     - ``read_refused`` — the coordinator REFUSED the re-validate read
       (strict-mode deny). A distinct, recoverable answer, and on the strict
       path it is how a sweep reclaim actually reaches a client.
+    - ``split_pair`` — the coordinator refused the re-validate read BECAUSE
+      the bytes are not the content it records at that version (the deny
+      carried ``hash_differs``): the split pair a version-checked read
+      refuses. Its recovery differs from a plain refusal's, since a reacquire
+      does not record the bytes on disk; only a write does.
     - ``grant_did_not_stand`` — the re-validate read was served WITHOUT a
       standing grant. A peer's pessimistic write-acquire preempts a holder
       while moving NEITHER comparand (no commit yet, and ``trigger="write"``
@@ -617,6 +622,7 @@ class FenceComparands:
     expected_generation: int | None
     current_generation: int | None
     read_refused: bool
+    split_pair: bool
     grant_did_not_stand: bool
     content_claim_present: bool
 
