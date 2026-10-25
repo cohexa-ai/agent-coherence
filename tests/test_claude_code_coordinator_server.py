@@ -4665,6 +4665,10 @@ def test_pre_edit_degraded_disposition_refuses_once_acquire_or_fail_can_refuse()
         f"pre-edit can refuse with {sorted(refusal_reasons)} but an opted-in "
         f"timed-out pre-edit answers {disposition!r}, which admits the edit"
     )
+    assert disposition.get("reason") in refusal_reasons, (
+        f"the opted-in timeout refusal answers {disposition.get('reason')!r}, "
+        f"which is not among the registered refusals {sorted(refusal_reasons)}"
+    )
 
 
 # ----------------------------------------------------------------------
@@ -10065,24 +10069,31 @@ def test_an_opted_in_pre_edit_decided_in_time_acquires_as_an_ordinary_one_does(
     assert _agent_state_on(coordinator, "plan.md", holder.sid) == MESIState.INVALID
 
 
-def test_an_ordinary_pre_edit_on_a_strict_path_that_times_out_keeps_the_degraded_admit(
-    strict_plan_coordinator, strict_plan_client: _Client, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("if_unheld", "expected"),
+    [(True, "_PRE_EDIT_UNAVAILABLE_RESPONSE"), (_ABSENT, "_PRE_EDIT_DEGRADED_RESPONSE")],
+    ids=["opted-in", "ordinary"],
+)
+def test_a_pre_edit_on_a_strict_path_that_times_out_answers_by_its_own_opt_in(
+    if_unheld: object, expected: str,
+    strict_plan_coordinator, strict_plan_client: _Client, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A strict-listed path does not opt a pre-edit in: one that sends no
-    ``if_unheld`` and times out answers the degraded admit byte for byte.
+    """A strict-listed path neither opts a pre-edit in nor out: one that times
+    out answers by its own ``if_unheld`` -- the refusal when it sent JSON
+    ``true``, the degraded admit byte for byte when it sent nothing.
 
-    Prevents the refusal keying on strict mode instead of the request's own
-    opt-in, which would change what every strict-mode hook user gets under
-    load."""
+    Prevents the timeout answer keying on strict mode instead of the request's
+    own opt-in, either way: refusing every strict-mode hook user under load, or
+    telling an opted-in writer on a strict path to edit over a live holder."""
     import ccs.adapters.claude_code.coordinator_server as mod
 
     coordinator, client = strict_plan_coordinator, strict_plan_client
     who = _claimed(client)
     monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
 
-    body = _timed_out_in_its_work(coordinator, client, _pre_edit_request(who, _ABSENT))
+    body = _timed_out_in_its_work(coordinator, client, _pre_edit_request(who, if_unheld))
 
-    assert body == mod._PRE_EDIT_DEGRADED_RESPONSE
+    assert body == getattr(mod, expected)
 
 
 # --- the gate's store read RAISES: the route's own internal-error answer ------
