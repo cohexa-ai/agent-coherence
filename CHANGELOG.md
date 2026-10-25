@@ -316,6 +316,13 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **Calling `ccs.cli.diagnose.main()` preserves the process's SIGPIPE handler
+  (#304).** Embedded calls no longer make later writes to closed pipes or
+  sockets terminate the host process, and can run from a worker thread.
+  The `ccs-diagnose` command and `python -m ccs.cli.diagnose` still exit
+  quietly on SIGPIPE. For an existing editable install, rerun
+  `pip install -e .` to regenerate the `ccs-diagnose` launcher.
+
 - **A coordinator start no longer hands callers that race it the port of a
   coordinator that did not stop cleanly.** A coordinator that exits without
   shutting down (killed with `SIGTERM` or `SIGKILL`, a crash, a reboot)

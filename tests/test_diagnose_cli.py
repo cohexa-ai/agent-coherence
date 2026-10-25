@@ -27,6 +27,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -770,32 +771,128 @@ def test_invalid_json_in_show_payload_returns_exit_1(tmp_path: Path) -> None:
     assert code == 1
 
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+@pytest.mark.skipif(not hasattr(signal, "SIGPIPE"), reason="no SIGPIPE on this platform")
+@pytest.mark.parametrize("handler_name", ["ignored", "default", "custom"])
+@pytest.mark.parametrize("path", ["help", "usage", "parse_error", "io_error", "pipeline"])
+def test_main_preserves_sigpipe(handler_name: str, path: str, tmp_path: Path) -> None:
+    """Assert before fixture teardown, which restores SIGPIPE between tests."""
+    def custom_handler(signum, frame):
+        pass
+
+    handler = {"ignored": signal.SIG_IGN, "default": signal.SIG_DFL, "custom": custom_handler}[handler_name]
+    argv, expected = {
+        "help": (["--help"], 0),
+        "usage": ([], 2),
+        "parse_error": (["--unknown-option"], 2),
+        "io_error": (["--show-payload", str(tmp_path / "missing.json")], 5),
+        "pipeline": (_basic_argv(tmp_path), 0),
+    }[path]
+    saved = signal.signal(signal.SIGPIPE, handler)
+    try:
+        code, _, _ = _invoke(argv)
+        assert code == expected
+        assert signal.getsignal(signal.SIGPIPE) == handler
+    finally:
+        signal.signal(signal.SIGPIPE, saved)
+
+
+def test_main_can_run_in_a_worker_thread() -> None:
+    """Embedded help must not attempt a main-thread-only signal operation."""
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        code, stdout, stderr = executor.submit(_invoke, ["--help"]).result(timeout=15)
+    assert code == 0
+    assert "ccs-diagnose" in stdout
+    assert stderr == ""
 
 
 @pytest.mark.skipif(not hasattr(signal, "SIGPIPE"), reason="no SIGPIPE on this platform")
-def test_running_the_cli_in_process_leaves_sigpipe_ignored_for_later_tests(tmp_path: Path) -> None:
-    """``main()`` resets SIGPIPE to the default action for the whole process,
-    and tests/conftest.py puts it back after each test. Without that, a later
-    test in the same process that writes to a closed socket is killed with no
-    traceback: an xdist worker died this way. One real CLI test runs in a
-    nested session, and SIGPIPE's disposition is read after it."""
-    report = tmp_path / "sigpipe.txt"
-    plugin_dir = tmp_path / "plugin"
-    plugin_dir.mkdir()
-    (plugin_dir / "report_sigpipe.py").write_text(textwrap.dedent(f"""\
-        import signal
+def test_main_leaves_later_broken_pipe_catchable() -> None:
+    """A real write after an embedded call must not kill its host process."""
+    proc = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent("""\
+            import contextlib
+            import io
+            import os
+            from ccs.cli.diagnose import main
 
-        def pytest_sessionfinish(session):
-            handler = signal.getsignal(signal.SIGPIPE)
-            with open({str(report)!r}, "w") as out:
-                out.write(getattr(handler, "name", repr(handler)))
-    """))
-    cmd = [
-        sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-n", "0", "-p", "report_sigpipe",
-        "tests/test_diagnose_cli.py::test_pipeline_emits_html_and_json",
-    ]
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(plugin_dir), os.environ.get("PYTHONPATH", "")])}
-    proc = subprocess.run(cmd, cwd=_REPO_ROOT, env=env, capture_output=True, text=True, timeout=120, check=False)
-    assert "1 passed" in proc.stdout, "control: the nested CLI test ran\n" + proc.stdout + proc.stderr
-    assert report.read_text() == "SIG_IGN"
+            with contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    main(["--help"])
+                except SystemExit as exc:
+                    assert exc.code == 0
+            read_fd, write_fd = os.pipe()
+            os.close(read_fd)
+            try:
+                os.write(write_fd, b"later write")
+            except BrokenPipeError:
+                print("host survived")
+            finally:
+                os.close(write_fd)
+            """)],
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "host survived\n"
+
+
+@pytest.mark.parametrize("has_sigpipe", [False, True])
+@pytest.mark.parametrize("outcome", [0, 5, "exception"])
+def test_console_main_delegates_without_changing_errors(
+    has_sigpipe: bool, outcome: int | str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from ccs.cli import diagnose
+
+    calls = []
+    fake_signal = SimpleNamespace(SIG_DFL=0, signal=lambda *args: calls.append(args))
+    if has_sigpipe:
+        fake_signal.SIGPIPE = 13
+    monkeypatch.setattr(diagnose, "signal", fake_signal)
+    argv = ["--help"]
+    error = RuntimeError("original failure")
+
+    def embedded_main(received):
+        assert received is argv
+        assert calls == ([(13, 0)] if has_sigpipe else [])
+        if outcome == "exception":
+            raise error
+        return outcome
+
+    monkeypatch.setattr(diagnose, "main", embedded_main)
+    if outcome == "exception":
+        with pytest.raises(RuntimeError) as exc:
+            diagnose.console_main(argv)
+        assert exc.value is error
+    else:
+        assert diagnose.console_main(argv) == outcome
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGPIPE"), reason="no SIGPIPE on this platform")
+@pytest.mark.parametrize("unbuffered", [False, True])
+@pytest.mark.parametrize("path", ["help", "small_output", "usage_error"])
+def test_python_m_closed_stdout_is_quiet(
+    unbuffered: bool, path: str,
+) -> None:
+    # Close the reader before launch so this cannot race against a fast writer.
+    # reset-token's small output also covers the buffered shutdown flush.
+    argv, expected = {
+        "help": (["--help"], -signal.SIGPIPE),
+        "small_output": (["--reset-token"], -signal.SIGPIPE),
+        "usage_error": ([], 2),
+    }[path]
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    try:
+        proc = subprocess.run(
+            [sys.executable, *(["-u"] if unbuffered else []), "-m", "ccs.cli.diagnose", *argv],
+            env={**os.environ, "PYTHONUNBUFFERED": "1" if unbuffered else ""},
+            stdout=write_fd, stderr=subprocess.PIPE, text=True, timeout=15, check=False,
+        )
+    finally:
+        os.close(write_fd)
+    assert proc.returncode == expected, proc.stderr
+    if path == "usage_error":
+        assert "--graph is required" in proc.stderr
+    else:
+        assert proc.stderr == ""
