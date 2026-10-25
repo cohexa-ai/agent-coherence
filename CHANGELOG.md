@@ -333,6 +333,13 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **Calling `ccs.cli.diagnose.main()` preserves the process's SIGPIPE handler
+  (#304).** Embedded calls no longer make later writes to closed pipes or
+  sockets terminate the host process, and can run from a worker thread.
+  The `ccs-diagnose` command and `python -m ccs.cli.diagnose` still exit
+  quietly on SIGPIPE. For an existing editable install, rerun
+  `pip install -e .` to regenerate the `ccs-diagnose` launcher.
+
 - **A coordinator start no longer hands callers that race it the port of a
   coordinator that did not stop cleanly.** A coordinator that exits without
   shutting down (killed with `SIGTERM` or `SIGKILL`, a crash, a reboot)
@@ -623,6 +630,20 @@ Alpha — APIs may change before `v1.0`.
   two apart from its own record and the release's answer; the coordinator's
   refusal is unchanged, on both coordinators. The guide's "Concurrent writers:
   `write_cas`" section has the details.
+
+- **`CoordinatorService.effect_gate` in its commit form now holds when any
+  input moved, not only the file it writes (#456).** Given
+  `effect_gate(read_set=[plan, brief], commit=(plan, ...))`, a peer that
+  committed `brief` after the gate pinned it did not stop the commit: the
+  gate checked only `plan`, wrote the plan derived from the old brief, and
+  reported both inputs unchanged in `EffectFired.revalidated_cut`. The
+  callable form already held. The commit form now re-checks every input and
+  returns `EffectHeld` naming the ones that moved, as the callable form does.
+  It also runs that check and the commit as one step, so no writer that goes
+  through the same coordinator can change an input in between. A writer on a
+  second handle to the same store (another process, or a second registry
+  opened on the same SQLite file) is outside that step and can still change
+  an input other than the one written.
 
 ## [0.15.0] - 2026-10-14
 

@@ -41,7 +41,7 @@ ccs-simulate = "ccs.cli.simulate:main"
 ccs-compare = "ccs.cli.compare:main"
 ccs-check-architecture = "ccs.hardening.architecture:main"
 ccs-benchmark = "ccs.cli.benchmark:main"
-ccs-diagnose = "ccs.cli.diagnose:main"
+ccs-diagnose = "ccs.cli.diagnose:console_main"
 # Claude Code coordinator console scripts. The plugin's bin/ensure-coordinator
 # shim wraps the first; the latter three back the /agent-coherence
 # {status,track,untrack} slash commands.

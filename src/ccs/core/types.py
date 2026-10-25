@@ -468,9 +468,11 @@ class EffectHeld:
     The non-fire return of :meth:`CoordinatorService.effect_gate`: between
     ``begin_session`` (the pin) and the effect boundary, at least one read-set
     member's CURRENT version no longer equals its pinned version, so firing would
-    act on stale input. The gate HOLDS — it never fires an escaping effect and
-    never lets the atomic commit land — and returns this typed value. NEVER an
-    exception (the ``ConflictDetail`` discipline), and NEVER a partial fire.
+    act on stale input — or, in ATOMIC mode, the registry refused the commit
+    (``conflict`` set; see that field). The gate HOLDS — it never fires an
+    escaping effect and never lets the atomic commit land — and returns this
+    typed value. NEVER an exception (the ``ConflictDetail`` discipline), and
+    NEVER a partial fire.
 
     Recovery is to open a NEW session, re-read the fresh cut, re-decide, and
     re-gate — exactly like a ``version_mismatch`` HELD; the dead decision is not
@@ -490,6 +492,9 @@ class EffectHeld:
       same taxonomy a bare ``session_commit`` would surface. It is ``None`` for
       an escaping-effect HELD (no commit was attempted) and for an atomic HELD
       caught at the pre-commit re-validate (``moved`` populated, no CAS attempted).
+      With ``conflict.reason == "other_holder"`` (a peer holds the target, so no
+      version changed) ``moved`` can be empty: nothing moved, but the commit
+      could not land.
     - ``coordinator_epoch`` mirrors the other session results so the caller can
       pin which store-incarnation evaluated the gate.
     """
@@ -507,9 +512,12 @@ class EffectFired:
     The fire return of :meth:`CoordinatorService.effect_gate`. Its guarantee is
     mode-dependent and stated honestly (EO-5 / EO-7):
 
-    - **ATOMIC mode** (the effect IS ``session.commit``): the commit rode the
-      shipped ``commit_cas`` at the pinned base in the SAME arbitration step, so
-      "unchanged" and "fire" are one atomic event — there is NO window. ``commit``
+    - **ATOMIC mode** (the effect IS ``session.commit``): the whole read-set was
+      re-validated and the commit rode the shipped ``commit_cas`` at the pinned
+      base under one hold of the coordinator's locks, so for every writer using
+      the same registry instance "unchanged" and "fire" are one atomic event —
+      there is NO window. (A writer on another handle to the same store is
+      outside that hold; see :meth:`CoordinatorService.effect_gate`.) ``commit``
       carries the ``(updated_artifact, signals)`` WIN tuple.
     - **ESCAPING mode** (the effect is a non-commit side effect — deploy / charge
       / click — a caller-supplied callable): the gate re-validated the whole
