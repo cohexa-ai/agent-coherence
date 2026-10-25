@@ -9,6 +9,7 @@ per-session counter bounds a cooperating agent's retry loop.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from ccs.mcp.server import (
 )
 from ccs.mcp.session import SessionConfig
 from tests.adapters.test_coherent_volume_split_read import LaggingPeer
+from tests.coordinator_helpers import answer_with_status, recorded_version, serve_in_process
 
 
 @pytest.fixture
@@ -472,3 +474,148 @@ def test_swg_read_then_write_cas_through_a_peer_commit_window_loses_no_update(
         assert target.read_bytes() == b"2"
     finally:
         stop_coordinator(tmp_path)
+
+
+# --- a commit answered with an HTTP 5xx after it reached the coordinator ------
+#
+# A 5xx says nothing of whether the work behind it ran: the coordinator's
+# dispatcher answers 500 when a handler raises after its work, and a gateway in
+# front of a remote coordinator answers 502, 503 or 504 after it forwarded the
+# request. Each commit here reaches a coordinator running in this process,
+# which records it, and only then is the status answered. Driven through the
+# sync ``_do_*`` helpers. What these do not prove: one machine and loopback
+# only; the status is raised at the client's HTTP boundary, not sent by a real
+# gateway.
+#
+# The journey test at the end answers the status before the commit reaches the
+# coordinator, as a coordinator shedding load does, so nothing is recorded:
+# the client cannot tell that 5xx from the others, and the agent recovers by
+# the same steps.
+
+#: FROZEN duplicates of the unconfirmed-commit terminal, of the terminal a
+#: failure the deny mapper recognises nothing in gets, and of the stale-read
+#: terminal (never imported from the code under test).
+_COMMIT_UNCONFIRMED = ("commit_unconfirmed", "read_then_retry", False)
+_UNRECOGNIZED = ("internal_error", "none", False)
+_STALE_VIEW = ("stale_view", "reacquire", True)
+
+#: The route each write tool commits on.
+_TOOL_COMMITS = {"swg_write_cas": "/hooks/post-edit-cas", "swg_write": "/hooks/post-edit"}
+
+
+def _commit_on(route: str) -> Callable[[str, dict], bool]:
+    """Picks the commit on ``route``, never swg_write's ``success:false``
+    release on the same route."""
+    return lambda path, payload: path == route and payload.get("success") is True
+
+
+def _write_with(tool: str, vol: CoherentVolume, config: SessionConfig, version: int) -> tuple[str, str, bool]:
+    """Run ``tool`` writing ``v2`` and return its deny's (reason, recover, retryable)."""
+    if tool == "swg_write_cas":
+        result = _do_write_cas(vol, config, {}, _PATH, version, "v2")
+    else:
+        result = _do_write(vol, config, _PATH, "v2")
+    assert result.isError is True, result.structuredContent
+    sc = result.structuredContent
+    return sc["reason"], sc["recover"], sc["retryable"]
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+@pytest.mark.parametrize("tool", list(_TOOL_COMMITS))
+def test_a_write_tool_whose_commit_is_answered_with_a_5xx_after_it_landed_answers_commit_unconfirmed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, tool: str, status: int,
+) -> None:
+    """swg_write_cas and swg_write reach the coordinator, which records the
+    commit, and the answer is an HTTP 5xx. The write may already be recorded,
+    so the tool answers the unconfirmed-commit deny: ``commit_unconfirmed``,
+    ``read_then_retry``, not retryable as is. Before, it answered
+    ``internal_error`` with recover ``none``: the shape of a bug in the
+    server, telling the agent to stop, with no hint that its write may have
+    landed."""
+    _seed(tmp_path, b"v1")
+    config = _config(tmp_path)
+    server = serve_in_process(tmp_path, f"swg-5xx-{tool}-{status}")
+    try:
+        vol = _vol(tmp_path, fast_cfg)
+        version = _do_read(vol, config, _PATH).structuredContent["version"]
+        answer_with_status(monkeypatch, _commit_on(_TOOL_COMMITS[tool]), status)
+
+        deny = _write_with(tool, vol, config, version)
+
+        assert recorded_version(server, _PATH) == version + 1, "control: the coordinator recorded the commit"
+        assert deny == _COMMIT_UNCONFIRMED
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("tool", list(_TOOL_COMMITS))
+def test_a_write_tool_whose_commit_is_refused_with_a_4xx_answers_as_before(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, tool: str,
+) -> None:
+    """Control: a 4xx is a definite refusal, never an unknown outcome. A
+    commit refused with one, before the coordinator ran it, answers the deny
+    it always has, and nothing is recorded."""
+    _seed(tmp_path, b"v1")
+    config = _config(tmp_path)
+    server = serve_in_process(tmp_path, f"swg-4xx-{tool}")
+    try:
+        vol = _vol(tmp_path, fast_cfg)
+        version = _do_read(vol, config, _PATH).structuredContent["version"]
+        answer_with_status(monkeypatch, _commit_on(_TOOL_COMMITS[tool]), 400, forwarded=False)
+
+        deny = _write_with(tool, vol, config, version)
+
+        assert recorded_version(server, _PATH) == version, "control: the refused commit was not recorded"
+        assert deny == _UNRECOGNIZED
+    finally:
+        server.shutdown()
+
+
+def test_a_write_whose_commit_is_answered_with_a_5xx_before_it_ran_recovers_by_read_then_retry(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """swg_write's bytes reach disk and its commit is answered with a 503
+    before the coordinator ran it, so nothing is recorded. The agent follows
+    each answer: ``commit_unconfirmed`` / ``read_then_retry``; ``swg_read``
+    refuses the unrecorded bytes as ``stale_view`` / ``reacquire`` with no
+    version; ``swg_reacquire`` answers the bytes on disk; the rewrite from
+    them lands, and the coordinator records it one version on.
+
+    Prevents a read that answers the unrecorded bytes with the old version,
+    so the agent takes a write the coordinator never recorded for one it
+    did, and a recovery step that refuses, which leaves the bytes on disk
+    and never recorded."""
+    target = _seed(tmp_path, b"v1")
+    config = _config(tmp_path)
+    server = serve_in_process(tmp_path, "swg-5xx-before-it-ran")
+    try:
+        vol = _vol(tmp_path, fast_cfg)
+        version = _do_read(vol, config, _PATH).structuredContent["version"]
+        with monkeypatch.context() as answered:
+            answer_with_status(answered, _commit_on("/hooks/post-edit"), 503, forwarded=False)
+            deny = _write_with("swg_write", vol, config, version)
+
+        assert deny == _COMMIT_UNCONFIRMED
+        assert target.read_bytes() == b"v2", "control: the write's bytes reached disk"
+        assert recorded_version(server, _PATH) == version, "control: the coordinator recorded nothing"
+
+        read = _do_read(vol, config, _PATH)
+        assert read.isError is True, read.structuredContent
+        sc = read.structuredContent
+        assert (sc["reason"], sc["recover"], sc["retryable"]) == _STALE_VIEW, sc
+        assert "version" not in sc and "content" not in sc
+
+        reacquired = _do_reacquire(vol, config, _PATH)
+        assert reacquired.isError is False, reacquired.structuredContent
+        assert reacquired.structuredContent["content"] == "v2"
+
+        rewrite = _do_write(vol, config, _PATH, reacquired.structuredContent["content"])
+        assert rewrite.isError is False, rewrite.structuredContent
+        assert recorded_version(server, _PATH) == version + 1, "the rewrite was not recorded"
+        settled = _do_read(vol, config, _PATH)
+        assert settled.isError is False, settled.structuredContent
+        assert (settled.structuredContent["content"], settled.structuredContent["version"]) == (
+            "v2", version + 1
+        )
+    finally:
+        server.shutdown()
