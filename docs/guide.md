@@ -3689,7 +3689,9 @@ it refuses it with HTTP 200:
 admit, as added context only, with no `permissionDecision`. Python code can
 import the reason as `UNAVAILABLE_REASON` from `ccs.core.exceptions`. The work
 the coordinator abandons takes no grant, unless it had already won the
-registry lock when the answer went out. Only a JSON `true` opts in: any other
+registry lock when the answer went out: then the grant stands, the holder it
+displaced has been told so, and the refused caller holds the grant until it
+releases it or the coordinator reclaims it. Only a JSON `true` opts in: any other
 `if_unheld` (`"true"`, `1`, `null`, `false`) or none is an ordinary request,
 and an ordinary request that times out still admits with
 `{"ok": true, "degraded": true}`, strict-mode paths included, exactly as

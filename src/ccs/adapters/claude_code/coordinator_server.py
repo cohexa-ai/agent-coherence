@@ -7866,7 +7866,7 @@ The request asked not to displace a live holder, and the contention that makes
 a holder worth respecting is the contention that times a handler out. Its
 abandoned work body still carries the abort, so one that has not won the
 registry lock takes no grant once this is sent; one that already won it keeps
-its grant. The advisory is the degraded admit's, context-only -- no
+its grant, and the holder it displaced has been notified. The advisory is the degraded admit's, context-only -- no
 ``permissionDecision`` -- so a hook client that relays the body unread passes
 the same advisory either way. The shape is pinned by
 ``tests/fixtures/wire/pre_edit_unavailable.json``."""
