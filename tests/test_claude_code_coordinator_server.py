@@ -10518,6 +10518,47 @@ def test_the_refusal_names_the_holder_its_own_decision_read(
     assert _agent_state_on(coordinator, "plan.md", caller.sid) is None
 
 
+def test_an_opted_in_admit_after_the_holder_released_carries_no_collision_or_notice(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The handler looks the holder up before it calls the write. When that
+    holder releases in between, an opted-in request is admitted with no
+    collision warning, and the agent that released gets no preemption notice.
+
+    Prevents an opted-in admit reporting a displacement that did not happen:
+    the write admits an opted-in request only when no other agent holds the
+    path for writing, so it displaced nobody. A collision warning would tell
+    the caller someone else is editing, and a notice would tell the released
+    agent it was preempted."""
+    holder, caller = _claimed(client), _claimed(client)
+    _take(client, holder)
+    holder_agent = session_to_agent_id(holder.sid)
+    caller_agent = session_to_agent_id(caller.sid)
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    service = coordinator.service
+    real_write = service.write
+    released: list[bool] = []
+
+    def write_after_the_holder_releases(**kwargs: Any) -> Any:
+        if kwargs["agent_id"] == caller_agent and not released:
+            released.append(True)
+            version = coordinator.registry.get_artifact(artifact_id).version
+            service.invalidate(
+                agent_id=holder_agent, artifact_id=artifact_id, new_version=version,
+                issuer_agent_id=holder_agent, issued_at_tick=kwargs["issued_at_tick"],
+            )
+        return real_write(**kwargs)
+
+    monkeypatch.setattr(service, "write", write_after_the_holder_releases)
+    status, answer = _opted_in(client, caller)
+
+    assert released, "the caller's write never reached the seam"
+    assert status == 200 and answer.get("ok") is True, answer
+    assert "collision" not in answer, answer
+    assert coordinator.registry.peek_preemption_notice(holder_agent, artifact_id) is None
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.EXCLUSIVE
+
+
 def test_a_malformed_subagent_id_is_read_as_the_holders_own_repeat(
     coordinator, client: _Client
 ) -> None:

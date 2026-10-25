@@ -3524,6 +3524,13 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
 
+        if opted_in:
+            # The write admits an opted-in request only when no other agent
+            # holds the path for writing, so it displaced nobody. The holders
+            # looked up above may have let go since; naming them would report a
+            # collision and a preemption that did not happen (#450).
+            peers_in_me, holder_id = [], None
+
         # #278: pre-edit carries no content hash, and post-edit records
         # whatever it is sent, so a write built from an earlier read replaced a
         # change made outside the coordinator with nothing to notice it. The

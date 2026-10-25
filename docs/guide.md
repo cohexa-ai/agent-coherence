@@ -3837,7 +3837,7 @@ answer whose body has `ok: true` and no `degraded` key.
 | the caller is the giver of a live handoff of the path | the `handed_off` deny | `handoff_giver_denials_total` | stop: no retry clears it |
 | the path is in strict mode and the caller's read is stale | the strict deny: `"status": "stale"`, a deny in `hookSpecificOutput`, and no top-level `reason` | `strict_mode_denials_total` and `stale_warning_emitted_total` | re-read under a new `agent_id` with the same `session_id`, then send again: a deny never re-grants the identity it denied |
 | another agent holds the path EXCLUSIVE or MODIFIED | `other_holder` | `pre_edit_other_holder_denials_total` | back off; once admitted, re-read the file before writing |
-| no other agent holds the path EXCLUSIVE or MODIFIED | the admit an ordinary `pre-edit` gets | as for an ordinary `pre-edit` | proceed |
+| no other agent holds the path EXCLUSIVE or MODIFIED | the admit an ordinary `pre-edit` gets, but never with a collision warning: the decision displaced nobody, even when a holder let go just before it | as for an ordinary `pre-edit` | proceed |
 | anything else: a `503` (the coordinator's queue or handler slots are full, or it is stopping or draining for a migration), an `internal:` failure ([details](#when-the-coordinator-answers-with-a-failure)), which a busy store can also cause, an `ok: false` whose `reason` is prose, any other non-2xx status, no answer at all, or `{"ok": true, "degraded": true}`, which an older coordinator answers on a timeout because it never reads `if_unheld` | as for an ordinary `pre-edit` | as for an ordinary `pre-edit` | treat it as a refusal and back off |
 
 **When the path comes free.** The refusal carries no retry hint because none
@@ -3936,13 +3936,6 @@ included, exactly as before (see
   id, as on every hook route, so the request acts as the parent session. From
   a session that holds the path, such a request is admitted as the holder's
   own repeat.
-- **An admit can carry a stale collision warning.** The handler looks for a
-  holder before the decision, to word its answer. When that holder lets go
-  before the decision, the admitted answer can still carry a collision warning
-  naming it, and that agent can be sent a preemption notice although it
-  released the path itself
-  ([#450](https://github.com/Cohexa-ai/agent-coherence/issues/450)). The grant
-  itself is decided correctly.
 - **The `handoff` key is read after the decision.** On a refusal it is a
   best-effort read taken once the refusal is decided, so it can describe a
   later record than the one in force at the decision. Act on `reason` and
