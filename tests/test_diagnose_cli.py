@@ -852,7 +852,8 @@ def test_console_main_delegates_without_changing_errors(
     argv = ["--help"]
     error = RuntimeError("original failure")
 
-    def embedded_main(received):
+    def embedded_main(received, *, _graph_context):
+        assert _graph_context is diagnose._graph_sigpipe_guard
         assert received is argv
         assert calls == ([(13, 0)] if has_sigpipe else [])
         if outcome == "exception":
