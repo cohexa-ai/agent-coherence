@@ -14,6 +14,8 @@ agent takes for registered is one a peer's later commit invalidates nothing
 for, and the agent's next write lands over it. The deny is typed
 (``coordinator_failed``, #259) and names one retry. A write tool whose commit
 gets the same answer may have landed, so it answers ``commit_unconfirmed``.
+A CAS or a reacquire whose release of the volume's earlier write grant gets
+it (#401) committed nothing, so it answers ``coordinator_failed`` too.
 
 **Death.** Once the coordinator the server's strict volume attached to is
 gone, no request reaches it, and the volume keeps that dead endpoint: it never
@@ -37,7 +39,6 @@ closed, as the volume's own tests do.
 
 from __future__ import annotations
 
-import os
 import sqlite3
 from pathlib import Path
 
@@ -48,6 +49,7 @@ from ccs.adapters.claude_code.lifecycle import LifecycleConfig
 from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.mcp.server import _do_gate, _do_reacquire, _do_read, _do_write, _do_write_cas
 from ccs.mcp.session import SessionConfig
+from tests.coordinator_helpers import serve_in_process
 
 #: FROZEN duplicate of the deny reason an answered failure envelope gets on a
 #: read (#259): its own typed terminal, not the ``internal_error`` of a
@@ -82,22 +84,6 @@ def _seed(tmp_path: Path, rel: str = "data/shared.txt", content: bytes = b"v1") 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(content)
     return target
-
-
-def _serve_in_process(tmp_path: Path, instance_id: str):
-    """A strict coordinator for ``data/**`` running in THIS process, reachable
-    through the usual pid file, so a test can reach into its registry. Policy
-    is loaded once at construction, so the YAML is written first."""
-    from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
-
-    coherence = tmp_path / ".coherence"
-    coherence.mkdir(mode=0o700)
-    for name in ("tracked.yaml", "strict_mode.yaml"):
-        (coherence / name).write_text("- data/**\n")
-    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id=instance_id)
-    server.serve_in_thread()
-    (coherence / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
-    return server
 
 
 def _fail_the_pre_read(server, monkeypatch: pytest.MonkeyPatch, fault: str) -> None:
@@ -137,7 +123,7 @@ def test_a_read_the_coordinator_answers_with_a_failure_is_a_deny_never_content(
     rel = "data/shared.txt"
     _seed(tmp_path)
     config = SessionConfig(root=tmp_path.resolve(), managed=("data/**",))
-    server = _serve_in_process(tmp_path, f"swg-read-{fault}")
+    server = serve_in_process(tmp_path, f"swg-read-{fault}")
     try:
         vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
         assert vol.is_attached and vol.principal_claim_outcome == "bound", "control: bound"
@@ -177,7 +163,7 @@ def test_the_other_read_tools_answer_the_failure_envelope_with_coordinator_faile
     rel = "data/shared.txt"
     _seed(tmp_path)
     config = SessionConfig(root=tmp_path.resolve(), managed=("data/**",))
-    server = _serve_in_process(tmp_path, f"{tool}-envelope")
+    server = serve_in_process(tmp_path, f"{tool}-envelope")
     try:
         vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
         live = _do_read(vol, config, rel)
@@ -219,7 +205,7 @@ def test_a_write_whose_commit_the_coordinator_answers_with_a_failure_is_unconfir
     rel = "data/shared.txt"
     _seed(tmp_path)
     config = SessionConfig(root=tmp_path.resolve(), managed=("data/**",))
-    server = _serve_in_process(tmp_path, f"{tool}-envelope")
+    server = serve_in_process(tmp_path, f"{tool}-envelope")
     try:
         vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
         live = _do_read(vol, config, rel)
@@ -252,6 +238,100 @@ def test_a_write_whose_commit_the_coordinator_answers_with_a_failure_is_unconfir
         server.shutdown()
 
 
+def test_a_cas_whose_release_of_an_earlier_write_grant_fails_answers_coordinator_failed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After ``swg_write``, the volume's attempt still holds the file's grant,
+    so the next ``swg_write_cas`` first releases it. When the coordinator
+    answers that release with its failure envelope (the stop's store read
+    raised), the tool answers the typed ``coordinator_failed`` deny (#401):
+    the stop verb, ``retryable: false``, and a next step that bounds the
+    retry. No conflict is counted and no commit lands.
+
+    Prevents ``other_holder`` with ``wait_and_retry`` and ``retryable: true``:
+    the grant refusing the commit is the volume's own, so the agent backs off
+    for a peer that does not exist, and on a fault that repeats it never stops
+    retrying."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path)
+    config = SessionConfig(root=tmp_path.resolve(), managed=("data/**",))
+    server = serve_in_process(tmp_path, "swg-write-cas-release-envelope")
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        wrote = _do_write(vol, config, rel, "v2")
+        assert wrote.isError is False, "control: the write landed"
+        live = _do_read(vol, config, rel)
+        assert live.isError is False, "control: the live coordinator answers"
+        version = live.structuredContent["version"]
+        conflicts: dict[str, int] = {}
+
+        def raising(*_args, **_kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        with monkeypatch.context() as faulted:
+            # Only the session-stop handler reads this, so only the release fails.
+            faulted.setattr(server.registry, "artifacts_held_by_agent", raising)
+            result = _do_write_cas(vol, config, conflicts, rel, version, "v3")
+
+        assert result.isError is True, result.structuredContent
+        sc = result.structuredContent
+        assert (sc["reason"], sc["recover"], sc["retryable"]) == (
+            _COORDINATOR_FAILED, _STOP_AND_REPORT, False
+        ), sc
+        assert "once more" in sc["next_step"]
+        assert conflicts == {}, "the failed release counted as a CAS conflict"
+        artifact_id = server.registry.lookup_artifact_id_by_name(rel)
+        assert server.registry.get_artifact(artifact_id).version == version, "a commit landed"
+        assert target.read_bytes() == b"v2"
+    finally:
+        server.shutdown()
+
+
+def test_a_reacquire_whose_release_of_an_earlier_write_grant_fails_answers_coordinator_failed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``swg_reacquire`` re-mints the volume's identity, so after ``swg_write``
+    it first releases the grant that write's attempt still holds. When the
+    coordinator answers that release with its failure envelope, the tool
+    answers as ``swg_write_cas`` does above (#401): ``coordinator_failed``,
+    the stop verb, ``retryable: false``, and a next step that names one retry
+    and then a report. It answers no content, and the file is unchanged.
+
+    Prevents the guide's promise for ``swg_reacquire`` resting on the CAS
+    test alone: it reaches the release by its own path. Also prevents
+    content answered as a recovery while the earlier grant may still stand,
+    unreleased."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path)
+    config = SessionConfig(root=tmp_path.resolve(), managed=("data/**",))
+    server = serve_in_process(tmp_path, "swg-reacquire-release-envelope")
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        assert _do_read(vol, config, rel).isError is False, "control: the live coordinator answers"
+        wrote = _do_write(vol, config, rel, "v2")
+        assert wrote.isError is False, "control: the write landed"
+
+        def raising(*_args, **_kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        with monkeypatch.context() as faulted:
+            # Only the session-stop handler reads this, so only the release fails.
+            faulted.setattr(server.registry, "artifacts_held_by_agent", raising)
+            result = _do_reacquire(vol, config, rel)
+
+        assert result.isError is True, result.structuredContent
+        sc = result.structuredContent
+        assert (sc["reason"], sc["recover"], sc["retryable"]) == (
+            _COORDINATOR_FAILED, _STOP_AND_REPORT, False
+        ), sc
+        assert "once more" in sc["next_step"], "the next step must bound the retry"
+        assert "report" in sc["next_step"], "the next step must end in a report"
+        assert "content" not in sc
+        assert target.read_bytes() == b"v2"
+    finally:
+        server.shutdown()
+
+
 def _assert_stop_and_report(result: CallToolResult) -> None:
     """A non-ignorable ``coordinator_unavailable`` deny with the stop verb, not
     retryable, carrying its fixed next step, and no content or version."""
@@ -274,7 +354,7 @@ def _attach_then_shut_down(
     the live read answered."""
     _seed(tmp_path)
     config = SessionConfig(root=tmp_path.resolve(), managed=("data/**",))
-    server = _serve_in_process(tmp_path, instance_id)
+    server = serve_in_process(tmp_path, instance_id)
     try:
         vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
         assert vol.is_attached and vol.principal_claim_outcome == "bound", "control: bound"

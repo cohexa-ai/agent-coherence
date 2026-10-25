@@ -19,7 +19,8 @@ Alpha — APIs may change before `v1.0`.
   including the caller-principal claim and the strict-glob check at attach. A
   coordinator that answers with a refusal raises what it raised before, unless
   the claim sent to recover from a caller-principal refusal gets no answer; its
-  failure envelope is typed separately (#259, under Changed). The
+  failure envelope is typed separately (#259, under Changed), and so is an
+  HTTP 5xx answering a strict commit (#398, under Changed). The
   MCP server maps it to `coordinator_unavailable` with `recover:
   stop_and_report`, not retryable, because an attached volume never reaches a
   coordinator started after the old one went away; a server whose volume never
@@ -157,6 +158,31 @@ Alpha — APIs may change before `v1.0`.
   unchanged. The guide's "When the coordinator answers with a failure" section
   has the details.
 
+- **A strict commit the coordinator answers with an HTTP 5xx raises
+  `CommitUnconfirmed` (#398).** A 5xx does not say whether the commit ran: the
+  coordinator answers `500` when it fails partway through a request, which can
+  be after the commit was recorded, and a proxy in front of a remote
+  coordinator can answer `502` to `504` after passing the request on. The CAS
+  of `write_cas` and `write_cas_at`, the commit of `atomic_publish` and the
+  post-edit of a plain `write()` raised a plain `CoherenceError` for one in
+  strict mode, which reads as a request that changed nothing. They now raise
+  `CommitUnconfirmed`, as when a commit gets no answer, with a message that
+  names the status: re-read before retrying. A plain `write()` says its bytes
+  are on disk and first makes one short best-effort request to release its
+  write grant, which it used to keep until its next fresh attempt released it
+  or the coordinator took the file back. Every 5xx counts, including the `503`
+  a coordinator answers while it stops or is overloaded, and the one it answers
+  while it drains for `agent-coherence-coordinator --prepare-for-migration`.
+  The drain refuses the commit of `write_cas`, `write_cas_at` and
+  `atomic_publish` before any work runs, so nothing lands and a re-read shows
+  the file as it was, but a retry meets the same `503` until the drain ends and
+  the coordinator stops: do not retry in a tight loop. `swg_write` and
+  `swg_write_cas` answer `commit_unconfirmed` with `recover: read_then_retry`
+  where they answered `internal_error`. A 4xx or a redirect, degrade mode,
+  reads, and the handoff verbs, which already treated a 5xx as an unknown
+  outcome, are unchanged. The guide's "When the coordinator does not answer"
+  section has the details.
+
 - **`agent-coherence-migrate-rules --apply` refuses when it cannot take its
   lock (#376).** It used to print "proceeding without it" and rewrite
   `.claude/settings.local.json` unprotected whenever opening or locking the
@@ -245,6 +271,34 @@ Alpha — APIs may change before `v1.0`.
   its next `write()` is refused at pre-edit. The read itself still answers
   with the bytes and version it was classified at. `write_cas`, `write_cas_at`
   and Claude Code hook clients were not affected.
+
+- **A volume whose release of an earlier write grant fails now raises in
+  strict mode and warns in degrade mode, as the 0.15.0 notes said (#401).** A
+  successful `write()` leaves the volume holding the file's write grant, and
+  `write_cas`, `write_cas_at`, `atomic_publish` and `reacquire()` release it
+  before they go further. When something raised inside the
+  coordinator while it handled that release, it answered with its failure
+  envelope, HTTP 200 `{"ok": false, "reason": "internal: <Type>"}`, and the
+  volume only logged it and went on, in both modes. The grant still stood, so
+  the volume's own grant refused the commit that followed as if another agent
+  held the file: `write_cas` spent its retries and raised `CasRetriesExhausted`
+  with `other_holder`, `write_cas_at` raised `CasVersionConflict`, a multi-file
+  `atomic_publish` was held as a conflict, and `reacquire()` returned as if the
+  release had gone through. `swg_write_cas` answered `other_holder` with
+  `recover: wait_and_retry`, so on a fault that repeats the agent never
+  stopped. A strict volume now raises `CoordinatorFailed` before anything is
+  committed, and `swg_write_cas` and `swg_reacquire` answer
+  `coordinator_failed` with `recover: stop_and_report`, `retryable: false`, and
+  a next step that names one retry, then a report. A degrade volume warns once,
+  counts the failure and goes on: its warning says the grant may still stand
+  and that the release is sent again at the next fresh attempt, not that
+  nothing was committed. A commit of the file that grant holds is still refused
+  until a later attempt releases the grant (`other_holder`, or a held
+  `atomic_publish`), and a commit of another file can land. Either way the
+  volume keeps the grant on
+  its record and sends the release again at its next fresh attempt. A release
+  the coordinator answers grant by grant, with some still held, is unchanged.
+  The guide's "Concurrent writers: `write_cas`" section has the details.
 
 - **A Read, Bash or Grep hook that times out no longer approves the call
   (#337).** When `pre-read`, `pre-bash` or `pre-grep` could not answer within

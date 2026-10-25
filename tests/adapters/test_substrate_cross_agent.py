@@ -55,6 +55,7 @@ from ccs.core.exceptions import (
     ViewWedged,
 )
 from ccs.core.substrate import CapabilityDescriptor, Tier
+from tests.coordinator_helpers import serve_in_process
 from tests.loopback_helpers import refused_endpoint, refusing_port
 from tests.test_coherence_client_tls import (
     _make_handler_class,
@@ -1735,24 +1736,6 @@ def test_no_coordinator_supplied_text_rides_the_chain_of_what_the_session_raises
 _INTERNAL_OPERATIONAL_ERROR = "internal: OperationalError"
 
 
-def _serve_in_process(tmp_path: Path, instance_id: str):
-    """A strict coordinator for ``workspace/**`` running in THIS process,
-    reachable through the usual pid file, so a test can reach into its
-    registry. Policy is loaded once at construction, so the YAML is written
-    first; a substrate session then attaches to it as to any spawned one."""
-
-    from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
-
-    coherence = tmp_path / ".coherence"
-    coherence.mkdir(mode=0o700)
-    for name in ("tracked.yaml", "strict_mode.yaml"):
-        (coherence / name).write_text("- workspace/**\n")
-    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id=instance_id)
-    server.serve_in_thread()
-    (coherence / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
-    return server
-
-
 def _fail_the_next(
     server, monkeypatch: pytest.MonkeyPatch, route: str = "/hooks/pre-read"
 ) -> None:
@@ -1798,7 +1781,7 @@ def test_a_read_answered_with_the_failure_envelope_fails_closed(
     prevents the two bindings typing one answer differently (#259)."""
     store = _FakeStore()
     store.seed(REF, b"v1")
-    server = _serve_in_process(tmp_path, "substrate-read-envelope")
+    server = serve_in_process(tmp_path, "substrate-read-envelope", tracked="workspace/**")
     try:
         sa = _session(tmp_path, fast_cfg)
         a, _fake = _agent(store, sa)
@@ -1828,7 +1811,7 @@ def test_a_commit_whose_pre_read_is_answered_with_the_failure_envelope_writes_no
     landed. A caller that re-merges and retries applies the write twice."""
     store = _FakeStore()
     store.seed(REF, b"v1")
-    server = _serve_in_process(tmp_path, "substrate-commit-envelope")
+    server = serve_in_process(tmp_path, "substrate-commit-envelope", tracked="workspace/**")
     try:
         sa = _session(tmp_path, fast_cfg)
         a, fake = _agent(store, sa)
@@ -1857,7 +1840,7 @@ def test_a_reacquire_answered_with_the_failure_envelope_raises_coordinator_faile
     leg, and nothing was written."""
     store = _FakeStore()
     store.seed(REF, b"v1")
-    server = _serve_in_process(tmp_path, "substrate-reacquire-envelope")
+    server = serve_in_process(tmp_path, "substrate-reacquire-envelope", tracked="workspace/**")
     try:
         sa = _session(tmp_path, fast_cfg)
         a, _fake = _agent(store, sa)
@@ -1895,7 +1878,7 @@ def test_a_read_answered_ok_false_outside_the_envelope_stays_untyped(
     which must never be offered for a definite reject."""
     store = _FakeStore()
     store.seed(REF, b"v1")
-    server = _serve_in_process(tmp_path, "substrate-read-prose")
+    server = serve_in_process(tmp_path, "substrate-read-prose", tracked="workspace/**")
     try:
         sa = _session(tmp_path, fast_cfg)
         a, _fake = _agent(store, sa)
@@ -1928,7 +1911,7 @@ def test_a_converged_commit_that_cannot_check_the_coordinators_hash_is_unconfirm
     itself converged and complete."""
     store = _FakeStore()
     store.seed(REF, b"v1")
-    server = _serve_in_process(tmp_path, "substrate-converge-envelope")
+    server = serve_in_process(tmp_path, "substrate-converge-envelope", tracked="workspace/**")
     try:
         sa, sb = _session(tmp_path, fast_cfg), _session(tmp_path, fast_cfg)
         a, fake_a = _agent(store, sa)
@@ -1966,7 +1949,7 @@ def test_a_bump_answered_with_the_failure_envelope_after_the_write_landed_is_unc
     while the substrate holds bytes the coordinator may never have recorded."""
     store = _FakeStore()
     store.seed(REF, b"v1")
-    server = _serve_in_process(tmp_path, "substrate-bump-envelope")
+    server = serve_in_process(tmp_path, "substrate-bump-envelope", tracked="workspace/**")
     try:
         sa = _session(tmp_path, fast_cfg)
         a, fake = _agent(store, sa)
