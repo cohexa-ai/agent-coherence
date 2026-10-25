@@ -33,6 +33,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import sqlite3
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -630,6 +631,97 @@ class TestErrorPaths:
         )
         assert rc == 5  # current_version rejection
         assert not out.exists()
+
+
+# ===========================================================================
+# --db NAMES A FILE — never URI syntax (#418)
+# ===========================================================================
+
+
+class TestDbPathIsFilenameBytes:
+    """tmp_path never emits '#', '?' or '%', so these names are the only way a
+    test here can see the resolver answer from a file other than the one named."""
+
+    @pytest.mark.parametrize("dirname", ["proj#2", "proj?x", "p%41q"])
+    def test_a_reserved_character_in_the_db_path_resolves_the_named_store(
+        self, tmp_path: Path, dirname: str
+    ) -> None:
+        # Unencoded, '#' and '?' reported a current store as schema v0 and left
+        # a stray file at the cut-short name; '%41' reported it as db_corrupt.
+        db = tmp_path / dirname / ".coherence" / "state.db"
+        _write_store(db, ("c1", "c2", "c3"))
+        before = sorted(p.name for p in tmp_path.iterdir())
+
+        rc, obj = _resolve_json(
+            ["--db", str(db), "--artifact", "plan.md", "--version", "2",
+             "--include-content", "--json"]
+        )
+
+        assert rc == 0
+        assert obj["content"] == "c2"
+        assert sorted(p.name for p in tmp_path.iterdir()) == before
+
+    def test_a_copy_beside_the_live_store_answers_for_the_copy(
+        self, tmp_path: Path
+    ) -> None:
+        # A forensic resolve against a saved copy returned the live store's
+        # bytes: 'state.db#before-upgrade' was cut to the 'state.db' beside it.
+        live = tmp_path / ".coherence" / "state.db"
+        _write_store(live, ("live-v1", "live-v2", "live-v3"))
+        other = tmp_path / "other" / "state.db"
+        _write_store(other, ("copy-v1", "copy-v2", "copy-v3"))
+        copy = live.with_name("state.db#before-upgrade")
+        shutil.copyfile(other, copy)
+
+        rc, obj = _resolve_json(
+            ["--db", str(copy), "--artifact", "plan.md", "--version", "2",
+             "--include-content", "--json"]
+        )
+
+        assert rc == 0
+        assert obj["content"] == "copy-v2"
+
+    def test_a_directory_at_db_is_needs_recovery_not_db_corrupt(
+        self, tmp_path: Path
+    ) -> None:
+        # A failed connect now takes the registry's read-only classification,
+        # like every later read: a store the open cannot read is needs_recovery.
+        db = tmp_path / "state.db"
+        db.mkdir()
+
+        rc, obj = _resolve_json(
+            ["--db", str(db), "--artifact", "plan.md", "--version", "1", "--json"]
+        )
+
+        assert rc == 12
+        assert obj["reason"] == "needs_recovery"
+
+    def test_a_store_deleted_after_the_existence_check_is_db_missing(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # The resolver and the registry each check that the store exists, then
+        # connect; a store deleted in between failed the connect with a raw
+        # error the resolver reported as db_corrupt (exit 12).
+        db = tmp_path / "state.db"
+        _write_store(db, ("c1", "c2", "c3"))
+
+        from ccs.coordinator import sqlite_registry as sr
+
+        real_connect = sqlite3.connect
+
+        def connect_after_delete(*a, **k):
+            if a and "mode=ro" in str(a[0]):
+                for path in tmp_path.glob("state.db*"):
+                    path.unlink()
+            return real_connect(*a, **k)
+
+        monkeypatch.setattr(sr.sqlite3, "connect", connect_after_delete)
+        rc, obj = _resolve_json(
+            ["--db", str(db), "--artifact", "plan.md", "--version", "2", "--json"]
+        )
+
+        assert rc == 11
+        assert obj["reason"] == "db_missing"
 
 
 # ===========================================================================

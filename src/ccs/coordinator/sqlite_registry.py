@@ -100,6 +100,7 @@ from typing import (
     Optional,
     Sequence,
 )
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 from ccs.core.exceptions import (
@@ -696,6 +697,19 @@ def _unrecognized_schema_error(header: str, current: int) -> SchemaVersionError:
         reason=SCHEMA_UNRECOGNIZED_REASON,
         found_version=current,
     )
+
+
+def _read_only_uri(db_path: Path) -> str:
+    """The ``mode=ro`` SQLite URI that opens exactly ``db_path`` (#418)."""
+    # Quoted so SQLite reads the path as filename bytes, never URI syntax:
+    # unquoted, a '#' or '?' cut it short and took mode=ro with it, so SQLite
+    # opened (or created) the shorter path read-write, and a '%xx' decoded to
+    # another name. safe="" so a leading '//' is not an authority; absolute() so
+    # a bare ':memory:' is not the in-memory store; surrogateescape so an
+    # undecodable filename byte still reaches the open. The same encoding as
+    # ccs.diagnose._state_db (#183), which this layer may not import.
+    encoded = quote(str(db_path.absolute()), safe="", errors="surrogateescape")
+    return f"file:{encoded}?mode=ro"
 
 
 class ReadOnlyRegistryError(RuntimeError):
@@ -2361,28 +2375,33 @@ class SqliteArtifactRegistry:
         Used by the replay resolver (Unit 6) and SB-17 later. The
         ``file:...?mode=ro`` URI requires ``uri=True`` to be passed EXPLICITLY —
         without it sqlite3 treats the whole string as a literal filename and can
-        silently fall back to read-write (and create the file). A missing path is
-        a typed :class:`MissingDatabaseError` (a read-write open would create it;
-        read-only must not materialize a fresh empty store). A v1 (un-migrated)
-        db is a typed :class:`SchemaVersionError` with NO migration attempted. A
-        post-crash hot WAL that needs replay raises
+        silently fall back to read-write (and create the file). The path rides in
+        that URI percent-encoded, so SQLite opens exactly the named file (#418).
+        A missing path is a typed :class:`MissingDatabaseError` (a read-write
+        open would create it; read-only must not materialize a fresh empty
+        store), and so is one deleted between that check and the connect; any
+        other failure of the connect is typed like a failed read on it. A v1
+        (un-migrated) db is a typed :class:`SchemaVersionError` with NO
+        migration attempted. A post-crash hot WAL that needs replay raises
         :class:`StoreNeedsRecoveryError` (a read-only connection cannot run WAL
         recovery — SQLITE_READONLY_RECOVERY).
         """
+        # Ahead of the connect, not only after it: exists() is False for a path
+        # with a NUL, and an encoded NUL (%00) would cut the path short in SQLite.
         if not self._db_path.exists():
-            raise MissingDatabaseError(
-                f"read-only open: no database at {self._db_path}. A read-only "
-                f"registry never creates the file (that would materialize a fresh "
-                f"empty store); point it at an existing coordinator state.db."
-            )
+            raise self._missing_read_only_store_error()
         # mode=ro + uri=True (explicit) — see docstring on the silent-rw hazard.
-        uri = f"file:{self._db_path}?mode=ro"
-        self._conn = sqlite3.connect(
-            uri,
-            uri=True,
-            check_same_thread=False,
-            isolation_level=None,
-        )
+        try:
+            self._conn = sqlite3.connect(
+                _read_only_uri(self._db_path),
+                uri=True,
+                check_same_thread=False,
+                isolation_level=None,
+            )
+        except sqlite3.OperationalError as exc:
+            if not self._db_path.exists():
+                raise self._missing_read_only_store_error() from exc
+            raise self._classify_readonly_operational_error(exc) from exc
         # Everything past the connect is validation that can raise a TYPED
         # error; without the close-on-raise the construction failure would leak
         # the open handle (the caller never gets a registry to .close()). The
@@ -2443,6 +2462,13 @@ class SqliteArtifactRegistry:
         except BaseException:
             self._conn.close()
             raise
+
+    def _missing_read_only_store_error(self) -> MissingDatabaseError:
+        return MissingDatabaseError(
+            f"read-only open: no database at {self._db_path}. A read-only "
+            f"registry never creates the file (that would materialize a fresh "
+            f"empty store); point it at an existing coordinator state.db."
+        )
 
     def _classify_readonly_operational_error(
         self, exc: sqlite3.OperationalError

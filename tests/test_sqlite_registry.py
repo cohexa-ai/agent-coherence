@@ -13,8 +13,10 @@ deliberately does not preserve (KTD-13 contract divergence).
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import stat
+import sys
 import threading
 import time
 import warnings
@@ -37,8 +39,13 @@ from ccs.coordinator.sqlite_registry import (
     SchemaVersionError,
     SqliteArtifactRegistry,
     StoreNeedsRecoveryError,
+    _read_only_uri,
 )
-from ccs.core.exceptions import CROSS_RUNTIME_SCHEMA_REASON, SCHEMA_VERSION_REASONS
+from ccs.core.exceptions import (
+    CROSS_RUNTIME_SCHEMA_REASON,
+    SCHEMA_VERSION_REASONS,
+    STORE_SIGNAL_UNREADABLE,
+)
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail, FetchRequest
 
@@ -1786,6 +1793,26 @@ class TestRetentionCrashAtomicity:
             assert reg.get_content_at_version(art.id, 2) is None
 
 
+# Characters the URI layer reads as syntax: '#' starts a fragment, '?' the
+# query, '%' an escape; a space and non-ASCII names are the ordinary cases that
+# must keep working once every path is encoded. tmp_path never emits them, so
+# without these names no test here could see a read-only open land on a file
+# other than the one it was given (#418).
+_URI_HOSTILE_DIRS = ["ws#hash", "ws?q", "p%41q", "proj dir", "café", "日本語"]
+
+
+def _writer_store(db: Path) -> str:
+    """Create a current store at ``db`` with a writer open; return its instance_id."""
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with SqliteArtifactRegistry(db) as reg:
+        return reg.instance_id
+
+
+def _assert_refuses_writes(reg: SqliteArtifactRegistry) -> None:
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        reg._conn.execute("CREATE TABLE proof_of_write (x)")
+
+
 class TestReadOnlyMode:
     """R2: read-only open never creates / migrates / mutates; typed failures."""
 
@@ -1967,6 +1994,166 @@ class TestReadOnlyMode:
         with pytest.raises(StoreNeedsRecoveryError) as excinfo:
             SqliteArtifactRegistry(db_path, read_only=True)
         assert excinfo.value.reason == STORE_SIGNAL_BUSY
+
+    @pytest.mark.parametrize("dirname", _URI_HOSTILE_DIRS)
+    def test_a_uri_reserved_character_in_the_path_opens_the_named_store(
+        self, tmp_path: Path, dirname: str
+    ) -> None:
+        """Unencoded, '#' and '?' cut the path short and took ``mode=ro`` with
+        them, so SQLite created an empty file at the shorter name and the open
+        reported a current store as schema v0; '%41' decoded to a path that was
+        not there. Asserted on tmp_path, where the stray file appeared."""
+        db = tmp_path / dirname / "state.db"
+        instance_id = _writer_store(db)
+        before = sorted(p.name for p in tmp_path.iterdir())
+
+        with SqliteArtifactRegistry(db, read_only=True) as ro:
+            assert ro.instance_id == instance_id
+            _assert_refuses_writes(ro)
+
+        assert sorted(p.name for p in tmp_path.iterdir()) == before
+
+    def test_a_copy_beside_a_live_store_opens_the_copy(self, tmp_path: Path) -> None:
+        """'state.db#before-upgrade' was cut to 'state.db', so the open answered
+        from the live store beside the copy, over a writable connection."""
+        live = tmp_path / "sib" / "state.db"
+        _writer_store(live)
+        other = tmp_path / "other" / "state.db"
+        copy_instance_id = _writer_store(other)
+        copy = live.with_name("state.db#before-upgrade")
+        shutil.copyfile(other, copy)
+        live_bytes = live.read_bytes()
+
+        with SqliteArtifactRegistry(copy, read_only=True) as ro:
+            assert ro.instance_id == copy_instance_id
+            _assert_refuses_writes(ro)
+
+        assert live.read_bytes() == live_bytes
+
+    def test_a_reserved_character_cut_to_an_existing_directory_opens_the_named_store(
+        self, tmp_path: Path
+    ) -> None:
+        """'dirB#x' was cut to 'dirB', a directory, so the open failed with a
+        raw sqlite3.OperationalError instead of reading the store it was given."""
+        (tmp_path / "dirB").mkdir()
+        db = tmp_path / "dirB#x" / "state.db"
+        instance_id = _writer_store(db)
+
+        with SqliteArtifactRegistry(db, read_only=True) as ro:
+            assert ro.instance_id == instance_id
+
+    def test_a_relative_path_with_a_reserved_character_opens_the_named_store(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guide documents the relative '.coherence/state.db' form, so the
+        encoding must hold for a relative path, not only an absolute one."""
+        instance_id = _writer_store(tmp_path / "rel#1" / "state.db")
+        monkeypatch.chdir(tmp_path)
+
+        with SqliteArtifactRegistry(Path("rel#1/state.db"), read_only=True) as ro:
+            assert ro.instance_id == instance_id
+
+        assert not (tmp_path / "rel").exists()
+
+    def test_a_leading_double_slash_is_not_read_as_a_uri_authority(
+        self, db_path: Path
+    ) -> None:
+        """'//tmp/...' names the same file to the OS, but unescaped the URI
+        parser read its first component as a host and refused the open."""
+        instance_id = _writer_store(db_path)
+
+        with SqliteArtifactRegistry(Path(f"/{db_path}"), read_only=True) as ro:
+            assert ro.instance_id == instance_id
+
+    def test_a_relative_memory_name_opens_that_file_not_an_in_memory_store(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bare ':memory:' that reached the URI intact opened SQLite's
+        in-memory store, which then read as an un-migrated schema v0."""
+        instance_id = _writer_store(tmp_path / ":memory:")
+        monkeypatch.chdir(tmp_path)
+
+        with SqliteArtifactRegistry(Path(":memory:"), read_only=True) as ro:
+            assert ro.instance_id == instance_id
+
+    @pytest.mark.skipif(
+        sys.platform == "darwin", reason="APFS refuses a filename that is not UTF-8"
+    )
+    def test_an_undecodable_filename_byte_still_opens_the_named_store(
+        self, tmp_path: Path
+    ) -> None:
+        """POSIX filenames are bytes, and Python surfaces an undecodable one as a
+        surrogate. Encoded strictly, it raised UnicodeEncodeError past every
+        typed error before the open was tried."""
+        db = tmp_path / "\udcff" / "state.db"
+        instance_id = _writer_store(db)
+
+        with SqliteArtifactRegistry(db, read_only=True) as ro:
+            assert ro.instance_id == instance_id
+
+    def test_an_undecodable_filename_byte_can_be_encoded_on_every_platform(
+        self,
+    ) -> None:
+        """The open above runs only on Linux, and the existence check stops a
+        missing undecodable path before it is encoded; this keeps the encoding
+        itself checked on a host that cannot create such a file."""
+        _read_only_uri(Path("/store/\udcff/state.db"))
+
+    def test_a_nul_byte_in_the_path_is_a_missing_store_not_a_truncated_one(
+        self, db_path: Path
+    ) -> None:
+        """Encoded, a NUL becomes %00 and SQLite cuts the path there, opening
+        the real store under a name nobody gave. The existence check refuses it
+        first; this pins that it stays ahead of the connect."""
+        _writer_store(db_path)
+
+        with pytest.raises(MissingDatabaseError):
+            SqliteArtifactRegistry(Path(f"{db_path}\x00.evil"), read_only=True)
+
+    def test_a_store_deleted_before_the_connect_is_missing_not_a_raw_error(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The existence check and the connect are two calls; a store deleted
+        between them failed the connect with a raw sqlite3.OperationalError."""
+        _writer_store(db_path)
+        from ccs.coordinator import sqlite_registry as sr
+
+        real_connect = sqlite3.connect
+
+        def connect_after_delete(*a, **k):
+            if a and "mode=ro" in str(a[0]):
+                for path in db_path.parent.glob("state.db*"):
+                    path.unlink()
+            return real_connect(*a, **k)
+
+        monkeypatch.setattr(sr.sqlite3, "connect", connect_after_delete)
+        with pytest.raises(MissingDatabaseError):
+            SqliteArtifactRegistry(db_path, read_only=True)
+
+    def test_a_directory_at_the_store_path_raises_a_typed_unreadable_error(
+        self, db_path: Path
+    ) -> None:
+        """No reserved character needed: the connect sat outside every
+        classifying try, so a directory leaked a raw sqlite3.OperationalError
+        past the typed ReadOnlyRegistryError contract."""
+        db_path.mkdir()
+
+        with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+            SqliteArtifactRegistry(db_path, read_only=True)
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+    def test_an_unreadable_store_file_raises_a_typed_unreadable_error(
+        self, db_path: Path
+    ) -> None:
+        _writer_store(db_path)
+        db_path.chmod(0)
+        try:
+            with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+                SqliteArtifactRegistry(db_path, read_only=True)
+        finally:
+            db_path.chmod(_DB_FILE_MODE)
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
 
 
 class TestRetentionRemoveAndEpoch:

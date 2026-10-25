@@ -300,6 +300,23 @@ Alpha — APIs may change before `v1.0`.
   the coordinator answers grant by grant, with some still held, is unchanged.
   The guide's "Concurrent writers: `write_cas`" section has the details.
 
+- **A read-only store open, and so `agent-coherence-replay resolve`, now opens
+  the file it was given when the path holds a `#`, `?` or `%` (#418).** The
+  path went into the SQLite URI unescaped. A `#` or `?` cut it short and
+  dropped `mode=ro`, so SQLite opened the shorter path read-write: where
+  nothing was there it created an empty file and the open reported a current
+  store as schema v0 (`schema_version_mismatch`), and a copy named
+  `state.db#before-upgrade` was answered from the live `state.db` beside it,
+  its bytes included. A `%41` decoded to another name, and a missing one
+  reported a healthy store as `db_corrupt`. The path is now percent-encoded,
+  the way the diagnose reports already encode it (#183). A failure of the open
+  itself is now typed like a failed read. A path that is a directory or an
+  unreadable file is `StoreNeedsRecoveryError` (`reason="unreadable"`):
+  `resolve` reports it as `needs_recovery` where it reported `db_corrupt`,
+  still exit 12. A store deleted just before the open is
+  `MissingDatabaseError`, which `resolve` reports as `db_missing` (exit 11),
+  like any store that is not there.
+
 - **A Read, Bash or Grep hook that times out no longer approves the call
   (#337).** When `pre-read`, `pre-bash` or `pre-grep` could not answer within
   the coordinator's 4-second handler budget, its "could not verify" advisory
