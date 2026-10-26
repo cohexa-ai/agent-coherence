@@ -38,11 +38,12 @@ import importlib.util
 import inspect
 import json
 import math
+import os
 import signal
 import sys
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -403,15 +404,47 @@ def console_main(argv: Sequence[str] | None = None) -> int:
     return main(argv, _graph_context=_graph_sigpipe_guard)
 
 
+class _ConsoleStdout:
+    """Keep a closed console pipe quiet, including writes from graph workers."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    def write(self, data: str) -> int:
+        try:
+            return self._stream.write(data)
+        except BrokenPipeError:
+            # signal.signal() cannot run in a worker thread. Exit immediately
+            # with the conventional shell status instead: graph exception
+            # handlers must not turn a closed stdout into a failure report.
+            os._exit(128 + signal.SIGPIPE)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except BrokenPipeError:
+            os._exit(128 + signal.SIGPIPE)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
 @contextmanager
 def _graph_sigpipe_guard() -> Iterator[None]:
-    """Let user graph code handle broken pipes without changing CLI output."""
+    """Protect graph sockets while preserving quiet console stdout exits.
+
+    This process-wide window ends when graph load/build/invoke returns.
+    Embedded main() never enters it. Raw file descriptors, stdout.buffer,
+    captured stream aliases and graph work running after the window are not
+    covered by the stdout proxy.
+    """
     if not hasattr(signal, "SIGPIPE"):
         yield
         return
     previous = signal.signal(signal.SIGPIPE, signal.SIG_IGN)
     try:
-        yield
+        with redirect_stdout(_ConsoleStdout(sys.stdout)):
+            yield
     finally:
         signal.signal(signal.SIGPIPE, previous)
 
