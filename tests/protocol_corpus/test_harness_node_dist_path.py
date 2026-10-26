@@ -32,6 +32,7 @@ derived name would follow a rename instead of catching it."""
 #: The corpus modules that resolve the dist at import. A frozen SUBSET check:
 #: the glob below may find more, never fewer.
 _CORPUS_MODULES = frozenset({
+    "test_acquire_or_fail_corpus.py",
     "test_caller_principal_corpus.py",
     "test_effect_fence_corpus.py",
     "test_session_start_corpus.py",

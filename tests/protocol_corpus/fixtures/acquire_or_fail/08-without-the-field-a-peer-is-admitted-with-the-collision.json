@@ -1,0 +1,66 @@
+{
+  "name": "acquire-or-fail-without-the-field-a-peer-is-admitted-with-the-collision",
+  "description": "The control for row 01, with the same setup: session B's pre-edit carries no if_unheld, so it displaces A as before and gets the collision allow envelope. additionalContext names the holder and timestamps that vary per run, so it is ignored; the collision keys are the contract.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "backends": [
+          "python"
+        ],
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "path": "CLAUDE.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+      "path": "CLAUDE.md"
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_b}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "collision": true,
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "additionalContext": "<ignored>"
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ],
+  "ignore_keys": [
+    "additionalContext"
+  ]
+}
