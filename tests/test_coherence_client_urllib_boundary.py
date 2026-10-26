@@ -69,18 +69,28 @@ def one_shot() -> Iterator[Callable[[Callable[[socket.socket], None]], tuple[int
     returns the port and a dict where the listener records what it read."""
     listeners: list[socket.socket] = []
     threads: list[threading.Thread] = []
+    stop = threading.Event()
 
     def start(act: Callable[[socket.socket], None]) -> tuple[int, dict]:
         seen: dict = {}
         lsock = socket.socket()
         lsock.bind(("127.0.0.1", 0))
         lsock.listen(1)
+        # close() from another thread does not wake a blocked accept() on Linux,
+        # so a test that fails before connecting would strand this thread: poll
+        # with a short timeout and stop on a flag, as proxy_recorder does.
+        lsock.settimeout(0.05)
         listeners.append(lsock)
 
         def serve() -> None:
-            conn, _ = lsock.accept()
-            seen["request"] = _read_request(conn)
-            act(conn)
+            while not stop.is_set():
+                try:
+                    conn, _ = lsock.accept()
+                except OSError:  # includes socket.timeout
+                    continue
+                seen["request"] = _read_request(conn)
+                act(conn)
+                return
 
         t = threading.Thread(target=serve, daemon=True)
         t.start()
@@ -88,6 +98,7 @@ def one_shot() -> Iterator[Callable[[Callable[[socket.socket], None]], tuple[int
         return lsock.getsockname()[1], seen
 
     yield start
+    stop.set()
     for t in threads:
         t.join(timeout=5)
     for lsock in listeners:
