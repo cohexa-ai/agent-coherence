@@ -852,7 +852,8 @@ def test_console_main_delegates_without_changing_errors(
     argv = ["--help"]
     error = RuntimeError("original failure")
 
-    def embedded_main(received):
+    def embedded_main(received, *, _graph_context):
+        assert _graph_context is diagnose._graph_sigpipe_guard
         assert received is argv
         assert calls == ([(13, 0)] if has_sigpipe else [])
         if outcome == "exception":
@@ -896,3 +897,25 @@ def test_python_m_closed_stdout_is_quiet(
         assert "--graph is required" in proc.stderr
     else:
         assert proc.stderr == ""
+
+
+@pytest.mark.parametrize('worker', [False, True])
+def test_embedded_full_pipeline_never_changes_signals_or_stdout(tmp_path, monkeypatch, worker):
+    """Embedded calls must work in a thread, not merely parse --help there."""
+    from ccs.cli import diagnose
+
+    calls = []
+    monkeypatch.setattr(diagnose.signal, 'signal', lambda *args: calls.append(args))
+    original_stdout = sys.stdout
+    html, report = tmp_path / 'embedded.html', tmp_path / 'embedded.json'
+    argv = ['--graph', GRAPH_FACTORY, '--no-network', '--no-telemetry',
+            '--output-html', str(html), '--output-json', str(report)]
+    if worker:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            code = executor.submit(diagnose.main, argv).result(timeout=30)
+    else:
+        code = diagnose.main(argv)
+    assert code == 0
+    assert html.exists() and report.exists()
+    assert calls == []
+    assert sys.stdout is original_stdout
