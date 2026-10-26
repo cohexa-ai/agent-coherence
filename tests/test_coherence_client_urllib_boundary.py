@@ -86,7 +86,7 @@ def one_shot() -> Iterator[Callable[[Callable[[socket.socket], None]], tuple[int
             while not stop.is_set():
                 try:
                     conn, _ = lsock.accept()
-                except OSError:  # includes socket.timeout
+                except TimeoutError:  # the poll interval; any other error surfaces
                     continue
                 seen["request"] = _read_request(conn)
                 act(conn)
