@@ -1,0 +1,67 @@
+{
+  "name": "acquire-or-fail-untracked-path-admits-an-opted-in-caller-unchecked",
+  "description": "Session A takes EXCLUSIVE on CLAUDE.md, then the path is untracked. Session B's opted-in pre-edit gets the untracked answer {ok: true}: the untracked admit comes before the holder check, so the grant A still has on record does not refuse it.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "backends": [
+          "python"
+        ],
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "path": "CLAUDE.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/policy/untrack",
+        "body": {
+          "paths": [
+            "CLAUDE.md"
+          ]
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+      "path": "CLAUDE.md",
+      "if_unheld": true
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_b}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}
