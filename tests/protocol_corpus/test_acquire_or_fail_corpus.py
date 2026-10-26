@@ -10,8 +10,9 @@ the answer is ``{"ok": false, "reason": "other_holder", "holder_agent_id":
 backends: the refusals (held EXCLUSIVE, held MODIFIED, sibling subagents, a
 parent and its subagent either way) and the answers the opt-in must leave alone
 (the holder's own repeat, an unheld path, the field absent or not JSON
-``true``, an untracked path, SHARED readers only, and an ordinary pre-edit
-displacing an opted-in holder).
+``true``, an untracked path, SHARED readers only, an ordinary pre-edit
+displacing an opted-in holder, and a stale strict-mode editor getting the
+strict deny before any holder check).
 
 The holder is pinned literally in each refusal row: the identity scrub matches
 only the dashed spelling, so the 32-hex agent id is compared as written. The
@@ -63,7 +64,7 @@ from tests.protocol_corpus.harness import (
 pytestmark = pytest.mark.protocol_corpus
 
 _FIXTURE_DIR = "acquire_or_fail"
-_EXPECTED_FIXTURE_COUNT = 12
+_EXPECTED_FIXTURE_COUNT = 13
 _HEADER = "Coherence-Caller-Principal"  # frozen duplicate of the wire name
 _CLAIM_PATH = "/principal/claim"
 _HELD_ROW = "acquire-or-fail-held-exclusive-refuses-an-opted-in-peer"

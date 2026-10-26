@@ -3855,7 +3855,7 @@ keeps none of them.
 | Python coordinator: it presents no principal header, or an empty or whitespace-only one | HTTP `400`, `"reason": "caller_principal_absent"` | `caller_principal_refused_total` | claim a principal, then send again; claiming binds the session (see the client rules below) |
 | Python coordinator: it presents a principal that is not the one bound to the session | HTTP `400`, `"reason": "caller_principal_foreign"` | `caller_principal_refused_total` | claim again with the same nonce, then send again |
 | Python coordinator: the caller-principal check or the pre-edit work runs past the 4-second handler budget | `unavailable` (see **Under load**) | `watchdog_timeouts_total` | release, then back off |
-| Node coordinator: the store is busy before the grant | `{"ok": false, "reason": "internal: SqliteError"}`, and nothing is granted | none | treat it as a refusal and back off |
+| Node coordinator: the store is busy before the grant, or (rarely) fails after it | `{"ok": false, "reason": "internal: SqliteError"}`; nothing is granted unless the failure came after the grant | none | release, then back off |
 | the path is not tracked | `{"ok": true}`, unchecked; it may carry re-grounding context | none, or `watchdog_timeouts_total` when delivering that context times out, which still answers `{"ok": true}` | proceed; the path is outside this contract (see **What it does not close**) |
 | Python coordinator: the caller is the giver of a live handoff of the path | the `handed_off` deny | `handoff_giver_denials_total` | stop: no retry clears it |
 | the path is in strict mode and the caller's read is stale | the strict deny: `"status": "stale"`, a deny in `hookSpecificOutput`, and no top-level `reason` | `strict_mode_denials_total` and `stale_warning_emitted_total` | re-read under a new `agent_id` with the same `session_id`, then send again: a deny never re-grants the identity it denied |
@@ -3890,10 +3890,12 @@ backoff rather than wait for a signal.
 - **Re-read after `other_holder`.** Once a later request is admitted, re-read
   the file before you build the write. Nothing marks a refused caller stale
   while it waits, so the copy it read before the refusal may be out of date.
-- **Release after `unavailable`, or after no answer from the Node
-  coordinator.** Work the Python coordinator abandoned, or a request the Node
-  coordinator was still holding when the client stopped waiting, may still
-  have taken the grant (see **Under load** and **On the Node coordinator**).
+- **Release after `unavailable`, or after an `internal:` answer or no answer
+  from the Node coordinator.** Work the Python coordinator abandoned, a
+  request the Node coordinator was still holding when the client stopped
+  waiting, or a Node request whose store failed after its grant (answered
+  `internal:`), may still have taken the grant (see **Under load** and
+  **On the Node coordinator**).
   Send a failed `post-edit` (`"success": false`) for the path, with the same
   `session_id` and `agent_id`. The release counts only when the answer says
   `"released": true`.
@@ -3956,7 +3958,9 @@ coordinator in these ways:
   (`internal: OperationalError`), and nothing is granted. When the grant is
   made and only delivering the caller's queued notices finds the store busy,
   the request is admitted without them, and they stay queued for its next
-  answer.
+  answer. Any other store failure after the grant, which is rare, still
+  answers `internal:` with the grant made, so a client releases after any
+  `internal:` answer (see the client rules above).
 - **A request nobody waits for can still take a path.** While the store is
   busy, a request can sit in the coordinator past the point where its client
   stops waiting. It is still decided when the store frees, like any other
@@ -3973,7 +3977,8 @@ coordinator in these ways:
   holder too, and the 1800 s is fixed. The holder goes INVALID, with
   `reclaim_max_hold` recorded as its reclaim trigger, and is queued a notice
   that reads "reclaimed at <time>: held 30 minutes or more while another
-  agent asked for it", which reaches it on its next admitted request or
+  agent asked for it; read the file again before editing it", which reaches
+  it on its next admitted request or
   session start. The caller gets the plain admit, and the coordinator writes
   one line naming the path's artifact id, the holder, how long it held, and
   the caller to `coordinator.log`. A grant with no recorded grant time is
