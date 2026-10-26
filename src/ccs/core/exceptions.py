@@ -806,6 +806,11 @@ class CallerPrincipalRefused(CoherenceError):
         self.reason = reason
         self.settled = settled
 
+    def __reduce__(
+        self,
+    ) -> tuple[type[CallerPrincipalRefused], tuple[str, str], dict[str, object]]:
+        return type(self), (self.reason, str(self)), {**self.__dict__, "args": self.args}
+
 
 class GiverFenced(CoherenceError):
     """The committer handed this path off, and the handoff is still live: its
@@ -844,8 +849,18 @@ class GiverFenced(CoherenceError):
         self.successor = successor
         self.version_at_transfer = version_at_transfer
 
-    def __reduce__(self) -> tuple[type[GiverFenced], tuple[object, UUID | str, int]]:
-        return type(self), (self.artifact_id, self.successor, self.version_at_transfer)
+    def __reduce__(
+        self,
+    ) -> tuple[
+        type[GiverFenced],
+        tuple[object, UUID | str, int],
+        dict[str, object],
+    ]:
+        return (
+            type(self),
+            (self.artifact_id, self.successor, self.version_at_transfer),
+            {**self.__dict__, "args": self.args},
+        )
 
 
 class CoherenceDegradedWarning(UserWarning):
@@ -967,6 +982,19 @@ class CasRetriesExhausted(_CarriesGenerationPair, CoherenceError):
         self.artifact_id = artifact_id
         self.attempts = attempts
         self.last_current_version = last_current_version
+
+    def __reduce__(
+        self,
+    ) -> tuple[
+        type[CasRetriesExhausted],
+        tuple[object, int, int],
+        dict[str, object],
+    ]:
+        return (
+            type(self),
+            (self.artifact_id, self.attempts, self.last_current_version),
+            {**self.__dict__, "args": self.args},
+        )
 
 
 class StaleView(CoherenceError):
@@ -1239,6 +1267,19 @@ class PublishMaterializationError(CoherenceError):
         self.landed = landed
         self.not_landed = not_landed
 
+    def __reduce__(
+        self,
+    ) -> tuple[
+        type[PublishMaterializationError],
+        tuple[tuple[str, ...], tuple[str, ...]],
+        dict[str, object],
+    ]:
+        return (
+            type(self),
+            (self.landed, self.not_landed),
+            {**self.__dict__, "args": self.args},
+        )
+
 
 class InternalConcurrencyError(CoherenceError):
     """The single-op guard fired (MCP-C Unit 1): one CoherentVolume instance was
@@ -1369,6 +1410,19 @@ class CasVersionConflict(_CarriesGenerationPair, CoherenceError):
         self.expected_version = expected_version
         self.current_version = current_version
         self._adopt_generation_pair(captured_generation, owner_generation)
+
+    def __reduce__(
+        self,
+    ) -> tuple[
+        type[CasVersionConflict],
+        tuple[object, int, int],
+        dict[str, object],
+    ]:
+        return (
+            type(self),
+            (self.artifact_id, self.expected_version, self.current_version),
+            {**self.__dict__, "args": self.args},
+        )
 
 
 class ScenarioValidationError(CoherenceError):
