@@ -3983,10 +3983,11 @@ coordinator in these ways:
   one line naming the path's artifact id, the holder, how long it held, and
   the caller to `coordinator.log`. A grant with no recorded grant time is
   never reclaimed this way. Only an opted-in request reclaims.
-- **The reclaim bounds a refused caller's wait.** A subagent refused on a path
-  its parent session holds gets the path on its first opted-in request sent
-  1800 s or more after the parent's first grant in that hold, unless the
-  parent releases it sooner. The same bound holds for any refused caller.
+- **The reclaim bounds one holder's hold, not a refused caller's wait.** An
+  opted-in request can take the path once the current holder's continuous
+  hold reaches 1800 s, unless that holder releases it sooner. Another caller
+  can take the path first, which starts a new hold and a new 1800 s, so a
+  caller refused each time can wait more than 30 minutes in total.
 - **A reclaimed holder's commit.** Its later `post-edit` with
   `"success": true` gets the ordinary
   `{"ok": false, "reason": "commit_not_allowed: …"}` refusal, without the
