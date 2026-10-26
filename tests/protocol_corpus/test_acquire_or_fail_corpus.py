@@ -17,7 +17,9 @@ strict deny before any holder check).
 The holder is pinned literally in each refusal row: the identity scrub matches
 only the dashed spelling, so the 32-hex agent id is compared as written. The
 held-EXCLUSIVE row's raw answer is also held to the wire contract the Python
-coordinator ships (#466): its keys in order, and no envelope at any depth.
+coordinator ships (#466): its keys in order, and no envelope at any depth. Each
+refusal row is also sent twice to one coordinator, so a refusal that changed
+who holds the path fails on its second answer.
 
 Principals. Python refuses an opted-in pre-edit without the caller principal,
 whatever session it names, and refuses any request without it once that
@@ -38,15 +40,17 @@ green while checking nothing."""
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import pytest
 
 from tests.protocol_corpus.harness import (
     ALL_BACKENDS,
     BACKEND_NODE,
+    CoordinatorBackend,
     Fixture,
     FixtureContractError,
     _omit_headers_not_issued,
@@ -123,6 +127,7 @@ def _by_name(name: str) -> Fixture:
 
 
 _ROWS = [(f, b) for f in _fixtures() for b in f.backends]
+_REFUSAL_ROWS = [(f, b) for f, b in _ROWS if f.expected["body"].get("reason") == "other_holder"]
 
 
 @pytest.mark.parametrize("row", _ROWS, ids=[f"{f.name}[{b}]" for f, b in _ROWS])
@@ -147,16 +152,19 @@ def test_acquire_or_fail_fixture_response_matches_expected(
     assert body == expected, f"{fixture.name}[{backend}]\nexpected={expected!r}\nactual=  {body!r}"
 
 
-def _run_raw(fixture: Fixture, backend: str, workspace: Path) -> tuple[int, dict[str, Any]]:
-    """``run_scenario`` without the normaliser, which sorts keys."""
+@contextmanager
+def _prepared(
+    fixture: Fixture, backend: str, workspace: Path
+) -> Iterator[tuple[CoordinatorBackend, dict[str, Any]]]:
+    """``run_scenario`` up to its request: the coordinator still running and
+    the request ready to send, with no normaliser to sort the answer's keys."""
     apply_setup(workspace, fixture.setup)
     with coordinator_running(backend, workspace, _NODE_DIST_PATH) as live:
         captures = apply_preflight_requests(live, fixture.setup["preflight_requests"])
-        request = _substitute(
+        yield live, _substitute(
             _omit_headers_not_issued(fixture.request, captures), captures,
             where=f"{fixture.name} request",
         )
-        return execute_request(live, request)
 
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
@@ -169,11 +177,31 @@ def test_the_held_refusal_honours_the_wire_contract(backend: str, tmp_path: Path
     if backend == BACKEND_NODE and _NODE_DIST_PATH is None:
         pytest.fail(_NODE_DIST_UNRESOLVED)
     fixture = _by_name(_HELD_ROW)
-    status, raw = _run_raw(fixture, backend, tmp_path)
+    with _prepared(fixture, backend, tmp_path) as (live, request):
+        status, raw = execute_request(live, request)
     assert status == 200, raw
     assert list(raw) == ["ok", "reason", "holder_agent_id"], raw
     assert _contract_breaches(raw) == [], raw
     assert raw["holder_agent_id"] == fixture.expected["body"]["holder_agent_id"], raw
+
+
+@pytest.mark.parametrize(
+    "row", _REFUSAL_ROWS, ids=[f"{f.name}[{b}]" for f, b in _REFUSAL_ROWS]
+)
+def test_a_refusal_leaves_the_path_with_its_holder(
+    row: tuple[Fixture, str], tmp_path: Path
+) -> None:
+    """The refused request, sent again to the same coordinator, is refused
+    again naming the same holder. Had the first refusal granted the caller the
+    path, the repeat would be the holder's own repeat and admitted; had it
+    revoked the holder's grant, the repeat would find the path unheld."""
+    fixture, backend = row
+    if backend == BACKEND_NODE and _NODE_DIST_PATH is None:
+        pytest.fail(f"{fixture.name}: {_NODE_DIST_UNRESOLVED}")
+    with _prepared(fixture, backend, tmp_path) as (live, request):
+        answers = [execute_request(live, request) for _ in range(2)]
+    refusal = (200, fixture.expected["body"])
+    assert answers == [refusal, refusal], f"{fixture.name}[{backend}]: {answers!r}"
 
 
 def test_fixture_directory_is_actually_loaded() -> None:
@@ -184,6 +212,12 @@ def test_fixture_directory_is_actually_loaded() -> None:
 
 def test_every_row_runs_on_both_backends() -> None:
     assert all(f.backends == ALL_BACKENDS for f in _fixtures())
+
+
+def test_every_refusal_row_is_sent_twice() -> None:
+    """A refusal row whose reason were mistyped would drop out of the repeat
+    check and leave it green over fewer rows."""
+    assert len(_REFUSAL_ROWS) == 5 * len(ALL_BACKENDS)
 
 
 def test_the_node_rows_cannot_be_satisfied_by_a_skip() -> None:
