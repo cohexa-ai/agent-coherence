@@ -118,15 +118,62 @@ Alpha — APIs may change before `v1.0`.
   true}`, with the degraded admit's could-not-verify advisory as added context
   and no `permissionDecision`, instead of admitting. Work it abandons takes no
   grant unless it had already won the registry lock before the answer went
-  out. Only a JSON `true` opts in. Every other request, strict-mode paths
+  out, and such work is refused like an in-time request while another agent
+  holds the path, so it can land a grant only on a path no other agent held.
+  Only a JSON `true` opts in. Every other request, strict-mode paths
   included, keeps its timed-out answer `{"ok": true, "degraded": true}` byte
-  for byte, and an opted-in request decided in time is still granted like any
-  other, displacing a holder. `UNAVAILABLE_REASON` in `ccs.core.exceptions`
-  names the reason. No released client sends the flag yet. The guide's
-  "Acquire-or-fail on `pre-edit`" section has the details, including which
-  answers an opted-in client may admit on.
+  for byte. An opted-in request decided in time is refused as `other_holder`
+  while another agent holds the path (next entry), and granted otherwise.
+  `UNAVAILABLE_REASON` in `ccs.core.exceptions` names the reason. No released
+  client sends the flag yet. The guide's "Acquire-or-fail on `pre-edit`"
+  section has the details, including which answers an opted-in client may
+  admit on.
+
+- **A `pre-edit` that opts in with `"if_unheld": true` is refused as
+  `other_holder` while another agent holds the path (part of #246).** Until
+  now the coordinator granted such a request like any other when it decided it
+  in time, and the agent holding the path lost its grant. Now, while another
+  agent identity holds the path EXCLUSIVE or MODIFIED, the request gets HTTP
+  200 `{"ok": false, "reason": "other_holder", "holder_agent_id": "<agent
+  id>"}`, the holder as 32 lowercase hex characters, with the `handoff` key
+  last on a path with a transfer record. Nothing changes hands: the holder
+  keeps its grant and the caller gains none. The check runs inside the same
+  registry hold as the grant, so two opted-in requests racing for a free path
+  get one grant and one refusal naming the winner; a cross-process test pins
+  it. Subagents of one session count as separate agents, a SHARED reader is
+  not a holder, and the giver's `handed_off` deny and the strict-mode deny
+  still come first. An opted-in request without a caller principal now gets
+  the `caller_principal_absent` 400 even from a session that never claimed
+  one, on an untracked path too. `/status` counts refusals in
+  `pre_edit_other_holder_denials_total`, and no conflict row is written.
+  `OTHER_HOLDER_REASON` and `OtherHolder` are new in `ccs.core.exceptions`,
+  `CoordinatorService.write` takes a keyword-only `if_unheld`, and
+  `tests/fixtures/wire/pre_edit_other_holder.json` pins the refusal's wire
+  shape. Every pre-edit that does not send JSON `true` is unchanged, so an
+  ordinary pre-edit, every Claude Code hook edit included, still displaces an
+  opted-in holder. The contract covers tracked paths only, nothing sends the
+  flag yet, and the Claude Code plugin's Node coordinator ignores it. The
+  guide's "Acquire-or-fail on `pre-edit`" section has the details, including
+  every answer an opted-in client can get and what to do on each.
 
 ### Changed
+
+- **New tests pin what each strict surface does when the coordinator takes a request and never
+  answers it.** `tests/test_silent_coordinator.py` points a strict `CoherentVolume` and a
+  `CoordinatedSubstrate` at a loopback listener that holds the connection open without writing a
+  byte, with the client's timeout shrunk to 0.5 s. A request that commits nothing (`read()`,
+  `write()`'s pre-edit, the substrate's `read()` and the pre-read its `commit()` sends first)
+  raises `CoordinatorUnreachable`. A commit that reached the coordinator raises
+  `CommitUnconfirmed`, because it may have landed: `write()`'s post-edit (its bytes are on disk,
+  and its release is sent and bounded by its own 1 s timeout), `write_cas()`'s compare-and-swap
+  (nothing touches disk), and the substrate's coordinator bump (the substrate write landed first
+  and is not re-driven). Each case raises within its timeouts plus 0.5 s and sends each request
+  once. Before, every such test of these two surfaces failed fast, on a refused or dropped
+  connection or on an error raised through a patched client, so none checked the time bound or
+  counted what was sent. The listeners ship as
+  `ccs.testing.silent_listener`: one holds every request silent; the other relays the first N
+  requests to a real coordinator and then holds the rest. Both count what they received, so a
+  test needs no patch of the client. No library behaviour changes.
 
 - **The protocol corpus pins how a policy pattern without `**` matches, on both backends (plugin
   #209).** This coordinator matches a `tracked.yaml`, `ignored.yaml` or `strict_mode.yaml` pattern
@@ -240,7 +287,58 @@ Alpha — APIs may change before `v1.0`.
   take a path out of strict mode; the guide's section on the policy routes now
   says the Node coordinator refuses too. The package is unchanged.
 
+- **A strict request that commits nothing, answered with an HTTP 5xx, raises
+  `CoordinatorFailed` (#433).** The coordinator reports a failure of its own
+  either as its failure envelope, which a strict read and the release of an
+  earlier write grant already raise `CoordinatorFailed` for (#259, #401), or as
+  an HTTP 5xx: `500` when a handler raises, and `502` to `504` from a proxy in
+  front of a remote coordinator. A strict `CoherentVolume` read, `reacquire()`,
+  the grant request of `write()`, that release, and the snapshot session
+  `atomic_publish` opens for two or more files raised a plain `CoherenceError`
+  for a 5xx, which the `stale-write-guard-fs` server answered as
+  `internal_error` with `recover: none`. They now raise `CoordinatorFailed`,
+  answered as `coordinator_failed` with `recover: stop_and_report` and a next
+  step that names one retry, with the text they always had: the request and
+  its status. A `CoordinatedSubstrate` raises it for a 5xx on its read leg
+  too. Commits keep `CommitUnconfirmed` (#398); a 4xx, a redirect, degrade
+  mode and the handoff verbs are unchanged. The guide's "When the coordinator
+  answers with a failure" section has the details.
+
+- **One split pair gets one answer on every surface: `read()` and the effect
+  fence name it `split_pair` (#405).** When the bytes on disk are not the
+  content the coordinator records at its version, a strict coordinator refuses
+  the read with `hash_differs`. `read_with_version()` and
+  `read_with_version_generation()` raise `StaleView` with `reason`
+  `split_pair` for that (#264), but `read()` with `on_stale_read="raise"`
+  raised one with the class reason `stale_view` and the coordinator's own
+  text, and the effect fence (`gate()`, `check_fence()`, `swg_gate` and the
+  coordinator's `POST /hooks/effect-fence`) held it as `read_denied`, "view is
+  INVALID", and told the caller to reacquire. A reacquire never clears it, so
+  an agent that followed the advice looped. `read()` now raises the refusal
+  the versioned reads raise, and the fence holds with a new reason,
+  `split_pair`, checked after `version_moved` and before `read_denied`, and
+  the `StaleView` it raises carries `reason` `split_pair` as well. Its text
+  names the steps that clear it: re-gate after a few seconds first, since a
+  peer's `write()` puts its bytes on disk before its commit moves the
+  version; only a hold that outlasts that is a change outside the
+  coordinator, and then `write()` the bytes the reacquire returns, or a merge
+  of them, to record them, then read and re-decide.
+  `split_pair` is added to the published hold reasons, which may be added to
+  but never renamed: code that matches reasons one by one must accept it, and
+  should already treat a reason it does not recognise as a hold. `read_denied`
+  keeps every refusal whose bytes match the recorded content, such as a
+  reclaimed grant. `swg_gate` answers both as a `stale_view` deny, with the
+  cause in `hold_cause`. The Node coordinator does not serve the fence route,
+  so nothing changes there. The guide's "Hold reasons" table has the details.
+
 ### Fixed
+
+- **Calling `ccs.cli.diagnose.main()` preserves the process's SIGPIPE handler
+  (#304).** Embedded calls no longer make later writes to closed pipes or
+  sockets terminate the host process, and can run from a worker thread.
+  The `ccs-diagnose` command and `python -m ccs.cli.diagnose` still exit
+  quietly on SIGPIPE. For an existing editable install, rerun
+  `pip install -e .` to regenerate the `ccs-diagnose` launcher.
 
 - **A coordinator start no longer hands callers that race it the port of a
   coordinator that did not stop cleanly.** A coordinator that exits without
@@ -506,6 +604,46 @@ Alpha — APIs may change before `v1.0`.
   takes. For those 2 seconds the slots are still full, and a peer that sends a
   byte before every timeout (#393), or reconnects as each connection is
   dropped (#394), still keeps them.
+
+- **A volume whose commit is refused by its own unreleased write grant says
+  so, instead of telling the caller to wait for another agent (#434).** After
+  a `write()`, a volume holds the file's write grant until its next fresh
+  attempt releases it. When that release fails in degrade mode (no answer, an
+  HTTP 5xx or the coordinator's failure envelope), or the coordinator answers
+  it grant by grant with the grant still held (either mode), the call went on
+  and its commit was refused as `other_holder` by the volume's own grant.
+  `write_cas` spent all nine commit attempts on it, re-sending the failing
+  release each time, and raised `CasRetriesExhausted`; `write_cas_at` and a
+  one-file `atomic_publish` raised `CasVersionConflict(other_holder)`, which
+  `swg_write_cas` answered with `recover: wait_and_retry`, though no peer
+  held the file; a multi-file `atomic_publish` was held as a peer's conflict.
+  `write_cas_at` and `atomic_publish` now raise `CoordinatorFailed` after
+  that commit, and `write_cas` after one retry, whose re-mint sends the
+  release again and so still clears a one-off release failure in the same
+  call. The error names the volume's own earlier write grant: the file "is
+  held" by it when the
+  coordinator reported the grant still held, and "may be held" when the
+  release got no confirmed answer, since that release may have run.
+  `swg_write_cas` answers `coordinator_failed` with `recover:
+  stop_and_report`, and one retry sends the release again. A refusal by a
+  grant the volume does not record keeps `other_holder`. The volume tells the
+  two apart from its own record and the release's answer; the coordinator's
+  refusal is unchanged, on both coordinators. The guide's "Concurrent writers:
+  `write_cas`" section has the details.
+
+- **`CoordinatorService.effect_gate` in its commit form now holds when any
+  input moved, not only the file it writes (#456).** Given
+  `effect_gate(read_set=[plan, brief], commit=(plan, ...))`, a peer that
+  committed `brief` after the gate pinned it did not stop the commit: the
+  gate checked only `plan`, wrote the plan derived from the old brief, and
+  reported both inputs unchanged in `EffectFired.revalidated_cut`. The
+  callable form already held. The commit form now re-checks every input and
+  returns `EffectHeld` naming the ones that moved, as the callable form does.
+  It also runs that check and the commit as one step, so no writer that goes
+  through the same coordinator can change an input in between. A writer on a
+  second handle to the same store (another process, or a second registry
+  opened on the same SQLite file) is outside that step and can still change
+  an input other than the one written.
 
 ## [0.15.0] - 2026-10-14
 

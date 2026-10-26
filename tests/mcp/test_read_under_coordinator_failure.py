@@ -47,9 +47,10 @@ from mcp.types import CallToolResult
 
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig
 from ccs.adapters.coherent_volume import CoherentVolume
+from ccs.core.exceptions import InvariantViolationError
 from ccs.mcp.server import _do_gate, _do_reacquire, _do_read, _do_write, _do_write_cas
 from ccs.mcp.session import SessionConfig
-from tests.coordinator_helpers import serve_in_process
+from tests.coordinator_helpers import answer_with_status, serve_in_process
 
 #: FROZEN duplicate of the deny reason an answered failure envelope gets on a
 #: read (#259): its own typed terminal, not the ``internal_error`` of a
@@ -283,6 +284,78 @@ def test_a_cas_whose_release_of_an_earlier_write_grant_fails_answers_coordinator
         artifact_id = server.registry.lookup_artifact_id_by_name(rel)
         assert server.registry.get_artifact(artifact_id).version == version, "a commit landed"
         assert target.read_bytes() == b"v2"
+    finally:
+        server.shutdown()
+
+
+def test_a_cas_refused_by_the_grant_its_release_left_held_answers_coordinator_failed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After ``swg_write``, the next ``swg_write_cas`` first releases that
+    write's grant, and the coordinator answers the release grant by grant
+    with the grant still held (#185). That answer is no coordinator failure,
+    so the call goes on to its commit, and the volume's own grant refuses it.
+    The tool answers ``coordinator_failed`` (#434): the stop verb,
+    ``retryable: false``, and a next step that bounds the retry. No conflict
+    is counted and the commit did not land.
+
+    Prevents ``other_holder`` with ``wait_and_retry``: the agent would wait
+    for a peer that does not exist."""
+    rel = "data/shared.txt"
+    target = _seed(tmp_path)
+    config = SessionConfig(root=tmp_path.resolve(), managed=("data/**",))
+    server = serve_in_process(tmp_path, "swg-write-cas-release-held")
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        assert _do_write(vol, config, rel, "v2").isError is False, "control: the write landed"
+        version = _do_read(vol, config, rel).structuredContent["version"]
+        conflicts: dict[str, int] = {}
+
+        def refusing(*_args, **_kwargs):
+            raise InvariantViolationError("release refused")
+
+        with monkeypatch.context() as faulted:
+            # The stop's per-grant release; its failure is answered per grant.
+            faulted.setattr(server.service, "invalidate", refusing)
+            result = _do_write_cas(vol, config, conflicts, rel, version, "v3")
+
+        assert result.isError is True, result.structuredContent
+        sc = result.structuredContent
+        assert (sc["reason"], sc["recover"], sc["retryable"]) == (
+            _COORDINATOR_FAILED, _STOP_AND_REPORT, False
+        ), sc
+        assert "once more" in sc["next_step"]
+        assert conflicts == {}, "the refusal counted as a CAS conflict"
+        assert target.read_bytes() == b"v2"
+    finally:
+        server.shutdown()
+
+
+def test_a_read_answered_with_an_http_5xx_answers_coordinator_failed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``swg_read`` whose pre-read is answered with an HTTP 503 answers the
+    same typed deny as the failure envelope (#433): ``coordinator_failed``,
+    the stop verb, ``retryable: false``, and no content.
+
+    Prevents ``internal_error`` with ``recover: none`` for a coordinator
+    failure that arrives as a status."""
+    rel = "data/shared.txt"
+    _seed(tmp_path)
+    config = SessionConfig(root=tmp_path.resolve(), managed=("data/**",))
+    server = serve_in_process(tmp_path, "swg-read-5xx")
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        answer_with_status(monkeypatch, lambda path, _payload: path == "/hooks/pre-read", 503)
+
+        result = _do_read(vol, config, rel)
+
+        assert result.isError is True, result.structuredContent
+        sc = result.structuredContent
+        assert (sc["reason"], sc["recover"], sc["retryable"]) == (
+            _COORDINATOR_FAILED, _STOP_AND_REPORT, False
+        ), sc
+        assert "content" not in sc
     finally:
         server.shutdown()
 

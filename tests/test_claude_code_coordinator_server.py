@@ -4728,15 +4728,20 @@ def test_pre_edit_degraded_disposition_refuses_once_acquire_or_fail_can_refuse()
     ``ok: true`` it lets through under ``degrade``.
 
     The opted-in requests have their own timeout answer, so this holds that
-    one, with no condition on the refusal set: the timeout refusal is already
-    a member of it. The opted-in timeout tests tie the named disposition to
-    what the route sends, so this is not a check on a constant nobody reads."""
+    one, with no condition on the refusal set: it holds both the timeout
+    refusal and the in-time ``other_holder`` refusal an opted-in request gets
+    while another agent holds the path. The opted-in timeout tests tie the
+    named disposition to what the route sends, so this is not a check on a
+    constant nobody reads."""
     import ccs.adapters.claude_code.coordinator_server as mod
 
     refusal_reasons = mod._ACQUIRE_OR_FAIL_REFUSAL_REASONS
     disposition = mod._PRE_EDIT_UNAVAILABLE_RESPONSE
     assert isinstance(refusal_reasons, frozenset)
     assert all(isinstance(reason, str) and reason for reason in refusal_reasons)
+    assert "other_holder" in refusal_reasons, (
+        f"pre-edit refuses an opted-in request with other_holder in time, but the "
+        f"registered refusals are {sorted(refusal_reasons)}")
     assert disposition.get("ok") is False, (
         f"pre-edit can refuse with {sorted(refusal_reasons)} but an opted-in "
         f"timed-out pre-edit answers {disposition!r}, which admits the edit"
@@ -7827,6 +7832,69 @@ def test_strict_refused_read_holds_with_the_refusal_reason(served_decider) -> No
     assert body == {"verdict": "hold", "reason": "read_denied"}
 
 
+@pytest.mark.parametrize("state", [None, MESIState.SHARED], ids=["no-prior-grant", "still-shared"])
+def test_strict_refused_split_pair_holds_with_the_split_pair_reason(
+    served_decider, state: Optional[MESIState]
+) -> None:
+    """A strict-mode deny of bytes that are not the content the coordinator
+    records at that version, with BOTH comparands matching: a caller with no
+    grant holding other bytes, or a still-SHARED holder whose file changed
+    outside the coordinator. It holds as ``split_pair`` (#405), as a
+    version-checked read refuses the same pair, not as ``read_denied``, whose
+    recovery (reacquire) never records the bytes on disk."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_STRICT_PATH, recorded_hash=_hash("canonical"),
+        state=state, version=4, label=f"split-{'shared' if state else 'none'}",
+    )
+    version, generation = _u4_captured(server, artifact_id)
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_STRICT_PATH, version=version, generation=generation,
+        content_hash=_hash("edited-outside-the-coordinator"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": "split_pair"}
+
+
+@pytest.mark.parametrize(
+    ("recorded_hash", "state", "reason"),
+    [
+        ("f" * 64, None, "split_pair"),
+        ("f" * 64, MESIState.INVALID, "split_pair"),
+        ("", MESIState.INVALID, "read_denied"),
+        ("", None, "content_claim_absent"),
+    ],
+    ids=["all-f-no-grant", "all-f-invalid", "empty-invalid", "empty-no-grant"],
+)
+def test_a_strict_refusal_of_a_no_claim_artifact_holds_by_its_recorded_form(
+    served_decider, recorded_hash: str, state: Optional[MESIState], reason: str
+) -> None:
+    """The two spellings of "no content claim" answer differently, by what
+    the pre-read deny itself reports. The all-``f`` launch-gate placeholder is
+    a hash that matches no real bytes, so the deny says the caller's bytes
+    differ (``hash_differs``) and the fence holds ``split_pair``, as a
+    version-checked read refuses the same pair (#405). An empty recorded hash
+    has nothing to differ from: an INVALID reader's refusal stays
+    ``read_denied``, and a reader with no grant is not refused at all, so the
+    missing claim answers ``content_claim_absent``."""
+    server, client = served_decider
+    sid, _agent_id, artifact_id = _u3a_seed(
+        server, _U3A_STRICT_PATH, recorded_hash=recorded_hash, state=state, version=4,
+        label=f"no-claim-{len(recorded_hash)}-{'invalid' if state else 'none'}",
+    )
+    version, generation = _u4_captured(server, artifact_id)
+
+    status, body = client.post(_U4_ROUTE, _u4_body(
+        sid, _U3A_STRICT_PATH, version=version, generation=generation,
+        content_hash=_hash("whatever-the-caller-holds"),
+    ))
+
+    assert status == 200
+    assert body == {"verdict": "hold", "reason": reason}
+
+
 # --- the artifact the coordinator does not track ---------------------------
 
 
@@ -10122,27 +10190,71 @@ def test_a_pre_edit_that_does_not_send_json_true_keeps_the_degraded_admit_at_bot
     assert gated == mod._PRE_EDIT_DEGRADED_RESPONSE
 
 
-def test_an_opted_in_pre_edit_decided_in_time_acquires_as_an_ordinary_one_does(
+def _other_holder_denials(coordinator) -> int:
+    """The opted-in other-holder refusal counter, read as 0 while it is absent
+    so a test reports its answer assertion before the counter's."""
+    return coordinator.counters_snapshot().get("pre_edit_other_holder_denials_total", 0)
+
+
+def _other_holder_refusal(holder: uuid.UUID) -> tuple[int, dict]:
+    """The exact answer to an opted-in pre-edit refused because ``holder``
+    holds the path: no deny envelope, the holder as 32 lowercase hex."""
+    return 200, {"ok": False, "reason": "other_holder", "holder_agent_id": holder.hex}
+
+
+def test_an_opted_in_pre_edit_decided_in_time_is_refused_while_another_agent_holds_the_path(
     coordinator, client: _Client
 ) -> None:
-    """An opted-in pre-edit the coordinator decides in time takes the grant and
-    displaces the holder, as an ordinary pre-edit does.
+    """An opted-in pre-edit the coordinator decides in time, against a live
+    EXCLUSIVE holder, is refused naming that holder and takes nothing: the
+    holder keeps its grant and gets no preemption notice, the caller gains no
+    row, and the refusal is counted once.
 
-    Prevents the opt-in reaching further than its timeout answer before the
-    in-time refusal exists: until then, sending ``if_unheld: true`` changes
-    nothing about a pre-edit that is answered in time."""
+    Prevents an opted-in writer displacing the agent it asked not to: an
+    acquire that ignored the opt-in would invalidate the holder, whose next
+    commit then fails over an edit it was never told it lost."""
     holder, caller = _claimed(client), _claimed(client)
     status, _ = client.post(
         "/hooks/pre-edit", {"session_id": holder.sid, "path": "plan.md"},
         principal=holder.principal)
     assert status == 200
+    holder_agent = session_to_agent_id(holder.sid)
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    denials_before = _other_holder_denials(coordinator)
 
     body, principal = _pre_edit_request(caller, True)
+    answer = client.post("/hooks/pre-edit", body, principal=principal)
+
+    assert answer == _other_holder_refusal(holder_agent), answer
+    assert _agent_state_on(coordinator, "plan.md", holder.sid) == MESIState.EXCLUSIVE
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) is None
+    assert coordinator.registry.peek_preemption_notice(holder_agent, artifact_id) is None
+    assert _other_holder_denials(coordinator) == denials_before + 1
+
+
+def test_an_ordinary_pre_edit_decided_in_time_still_displaces_the_holder(
+    coordinator, client: _Client
+) -> None:
+    """The twin of the refusal above, without the opt-in: the same pre-edit
+    takes the grant and invalidates the holder, and nothing counts a refusal.
+
+    Prevents the holder check reaching requests that never asked for it: every
+    Claude Code hook edit is an ordinary pre-edit, and its answers must not
+    move."""
+    holder, caller = _claimed(client), _claimed(client)
+    status, _ = client.post(
+        "/hooks/pre-edit", {"session_id": holder.sid, "path": "plan.md"},
+        principal=holder.principal)
+    assert status == 200
+    denials_before = _other_holder_denials(coordinator)
+
+    body, principal = _pre_edit_request(caller, _ABSENT)
     status, answer = client.post("/hooks/pre-edit", body, principal=principal)
 
     assert status == 200 and answer.get("ok") is True and "degraded" not in answer, answer
     assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.EXCLUSIVE
     assert _agent_state_on(coordinator, "plan.md", holder.sid) == MESIState.INVALID
+    assert _other_holder_denials(coordinator) == denials_before
 
 
 @pytest.mark.parametrize(
@@ -10170,6 +10282,832 @@ def test_a_pre_edit_on_a_strict_path_that_times_out_answers_by_its_own_opt_in(
     body = _timed_out_in_its_work(coordinator, client, _pre_edit_request(who, if_unheld))
 
     assert body == getattr(mod, expected)
+
+
+# --- an opted-in pre-edit decided in time: refused while another agent holds --
+#
+# Decided in time, an opted-in pre-edit meets a holder check inside the write's
+# own decision: another agent identity -- any session-and-subagent pair but the
+# caller's own -- holding the path EXCLUSIVE or MODIFIED refuses it with
+# ``other_holder``, naming that agent. SHARED readers are not holders, and the
+# giver's and the strict-mode denies still answer first.
+
+
+def _opted_in(client: _Client, who: _Session, **fields: Any) -> tuple[int, dict]:
+    """``who``'s opted-in pre-edit of ``plan.md``; ``fields`` adds a subagent
+    id or names another path."""
+    body = {"session_id": who.sid, "path": "plan.md", "if_unheld": True, **fields}
+    return client.post("/hooks/pre-edit", body, principal=who.principal)
+
+
+def _take(client: _Client, who: _Session, **fields: Any) -> None:
+    """``who``'s ordinary pre-edit of ``plan.md`` (``fields`` as for
+    :func:`_opted_in`), which must be admitted."""
+    body = {"session_id": who.sid, "path": "plan.md", **fields}
+    status, answer = client.post("/hooks/pre-edit", body, principal=who.principal)
+    assert status == 200 and answer.get("ok") is True, answer
+
+
+def _commit(client: _Client, who: _Session) -> None:
+    """``who`` commits its edit of ``plan.md``, which leaves it MODIFIED."""
+    status, answer = client.post("/hooks/post-edit", {
+        "session_id": who.sid, "path": "plan.md", "content_hash": _hash("v2"), "success": True,
+    }, principal=who.principal)
+    assert status == 200 and answer.get("ok") is True, answer
+
+
+def test_an_opted_in_pre_edit_is_refused_by_a_holder_that_has_committed(
+    coordinator, client: _Client
+) -> None:
+    """A holder that committed is MODIFIED, and still a holder: an opted-in
+    pre-edit is refused naming it, and it stays MODIFIED.
+
+    Prevents the check counting only EXCLUSIVE, which would let an opted-in
+    writer displace the agent that just landed a version."""
+    holder, caller = _claimed(client), _claimed(client)
+    _take(client, holder)
+    _commit(client, holder)
+    assert _agent_state_on(coordinator, "plan.md", holder.sid) == MESIState.MODIFIED
+
+    assert _opted_in(client, caller) == _other_holder_refusal(session_to_agent_id(holder.sid))
+    assert _agent_state_on(coordinator, "plan.md", holder.sid) == MESIState.MODIFIED
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) is None
+
+
+def test_a_holders_own_opted_in_pre_edit_is_admitted(coordinator, client: _Client) -> None:
+    """A holder repeating its pre-edit with the opt-in is admitted: it is not
+    another agent. Prevents an opted-in writer being refused by its own
+    grant on its second edit of the same file."""
+    holder = _claimed(client)
+    _take(client, holder)
+    denials_before = _other_holder_denials(coordinator)
+
+    assert _opted_in(client, holder) == (200, {"ok": True})
+    assert _agent_state_on(coordinator, "plan.md", holder.sid) == MESIState.EXCLUSIVE
+    assert _other_holder_denials(coordinator) == denials_before
+
+
+def test_sibling_subagents_refuse_each_others_opted_in_pre_edits(
+    coordinator, client: _Client
+) -> None:
+    """Two subagents of one session are two agents: each holding a file, each
+    one's opted-in pre-edit of the other's file is refused naming the other.
+
+    Prevents "another agent" meaning another session, which would let a
+    sibling displace a sibling mid-edit."""
+    session = _claimed(client)
+    _take(client, session, agent_id="sub1")
+    _take(client, session, agent_id="sub2", path="spec.md")
+
+    assert _opted_in(client, session, agent_id="sub2") == _other_holder_refusal(
+        session.composite("sub1"))
+    assert _opted_in(client, session, agent_id="sub1", path="spec.md") == _other_holder_refusal(
+        session.composite("sub2"))
+    assert _state(coordinator, "plan.md", session.composite("sub1")) == MESIState.EXCLUSIVE
+    assert _state(coordinator, "spec.md", session.composite("sub2")) == MESIState.EXCLUSIVE
+
+
+def test_a_subagent_is_refused_on_its_parents_committed_file_until_the_parent_stops(
+    coordinator, client: _Client
+) -> None:
+    """A subagent's opted-in pre-edit of a file its parent holds MODIFIED is
+    refused naming the parent; once the parent's Stop releases the file, the
+    same request is admitted.
+
+    Prevents the parent's grant counting as the subagent's own, and pins that
+    the refusal ends when the holder lets go."""
+    parent = _claimed(client)
+    _take(client, parent)
+    _commit(client, parent)
+
+    assert _opted_in(client, parent, agent_id="sub1") == _other_holder_refusal(
+        session_to_agent_id(parent.sid))
+    status, stopped = client.post(
+        "/hooks/session-stop", {"session_id": parent.sid}, principal=parent.principal)
+    assert status == 200 and stopped.get("ok") is True, stopped
+    status, answer = _opted_in(client, parent, agent_id="sub1")
+    assert status == 200 and answer.get("ok") is True, answer
+    assert _state(coordinator, "plan.md", parent.composite("sub1")) == MESIState.EXCLUSIVE
+
+
+def test_an_opted_in_pre_edit_over_readers_only_is_granted(coordinator, client: _Client) -> None:
+    """SHARED readers do not hold a file for writing: an opted-in pre-edit
+    over two of them is granted and invalidates them, as an ordinary one does.
+
+    Prevents the check refusing a writer because others have read the file,
+    which would make every opted-in edit of a read file fail."""
+    readers, caller = (_claimed(client), _claimed(client)), _claimed(client)
+    for reader in readers:
+        _read(client, reader, "plan.md")
+        assert _agent_state_on(coordinator, "plan.md", reader.sid) == MESIState.SHARED
+    denials_before = _other_holder_denials(coordinator)
+
+    status, answer = _opted_in(client, caller)
+
+    assert status == 200 and answer.get("ok") is True, answer
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.EXCLUSIVE
+    for reader in readers:
+        assert _agent_state_on(coordinator, "plan.md", reader.sid) == MESIState.INVALID
+    assert _other_holder_denials(coordinator) == denials_before
+
+
+def test_an_opted_in_giver_still_gets_its_handed_off_deny(coordinator, client: _Client) -> None:
+    """The giver of a handoff whose successor now holds the file EXCLUSIVE --
+    the record completed and still live -- gets its ``handed_off`` deny when
+    it opts in, not ``other_holder``, and no refusal is counted.
+
+    Prevents the opt-in costing the giver the answer that tells it the file is
+    no longer its own: ``other_holder`` invites a retry, ``handed_off`` is
+    final for the giver."""
+    giver, successor = _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _take(client, successor)
+    record, live = _record(coordinator, "plan.md")
+    assert (record.status, live) == ("completed", True)
+    denials_before = _other_holder_denials(coordinator)
+
+    status, answer = _opted_in(client, giver)
+
+    assert (status, answer.get("reason")) == (200, "handed_off"), answer
+    assert _other_holder_denials(coordinator) == denials_before
+
+
+def test_on_a_strict_path_an_opted_in_stale_editor_is_denied_and_a_new_editor_refused(
+    strict_plan_coordinator, strict_plan_client: _Client
+) -> None:
+    """On a strict path, an opted-in editor whose read a peer's commit made
+    stale still gets the strict deny, and no refusal is counted; an opted-in
+    editor that never touched the file gets ``other_holder`` naming the peer,
+    which holds it MODIFIED.
+
+    Prevents the opt-in pre-empting the strict deny, which tells the stale
+    editor to re-read before any write, and pins that the holder check still
+    guards the editors strict mode lets through."""
+    coordinator, client = strict_plan_coordinator, strict_plan_client
+    stale, writer, newcomer = _claimed(client), _claimed(client), _claimed(client)
+    status, _ = client.post(
+        "/hooks/pre-read",
+        {"session_id": stale.sid, "path": "plan.md", "content_hash": _hash("v1")},
+        principal=stale.principal)
+    assert status == 200
+    _take(client, writer)
+    _commit(client, writer)
+    assert _agent_state_on(coordinator, "plan.md", stale.sid) == MESIState.INVALID
+    assert _agent_state_on(coordinator, "plan.md", writer.sid) == MESIState.MODIFIED
+    denials_before = _other_holder_denials(coordinator)
+
+    status, denied = _opted_in(client, stale)
+    assert status == 200 and denied.get("status") == "stale", denied
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", denied
+    assert "reason" not in denied, denied
+    assert _other_holder_denials(coordinator) == denials_before
+
+    assert _opted_in(client, newcomer) == _other_holder_refusal(session_to_agent_id(writer.sid))
+    assert _other_holder_denials(coordinator) == denials_before + 1
+
+
+def test_an_opted_in_bystander_on_a_completed_handoff_is_refused_and_the_record_keeps_its_label(
+    coordinator, client: _Client
+) -> None:
+    """A bystander's opted-in pre-edit of a file whose handoff completed, the
+    successor holding it EXCLUSIVE, is refused naming the successor. The
+    record stays ``completed``, and the refusal carries the ``handoff`` key
+    last, after the three refusal keys.
+
+    Prevents the refused acquire labelling the record ``overtaken``: a
+    bystander that took nothing overtook nothing, and the successor would read
+    its own handoff as lost."""
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _take(client, successor)
+
+    status, answer = _opted_in(client, bystander)
+
+    assert status == 200
+    assert list(answer) == ["ok", "reason", "holder_agent_id", "handoff"], answer
+    assert answer == {
+        "ok": False, "reason": "other_holder",
+        "holder_agent_id": session_to_agent_id(successor.sid).hex,
+        "handoff": _projection(giver, successor, "bystander", status="completed"),
+    }
+    record, live = _record(coordinator, "plan.md")
+    assert (record.status, live) == ("completed", True)
+
+
+def test_an_other_holder_refusal_reads_the_handoff_record_once(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a file with a transfer record, an ``other_holder`` refusal reads the
+    record for its ``handoff`` key exactly once: the refusal attaches the key
+    itself, and the route's wrapper leaves the body alone.
+
+    Prevents a second read after the refusal queued its count: a deadline
+    passing during that read would turn a refusal nobody was sent into a late
+    completion, logged at CRITICAL, instead of a late abort."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _take(client, successor)
+    reads: list[str] = []
+    real_read = mod._read_handoff
+
+    def counted(server: Any, path: str) -> Any:
+        reads.append(path)
+        return real_read(server, path)
+
+    monkeypatch.setattr(mod, "_read_handoff", counted)
+    status, answer = _opted_in(client, bystander)
+
+    assert status == 200 and answer.get("reason") == "other_holder" and "handoff" in answer, answer
+    assert reads == ["plan.md"]
+
+
+@pytest.mark.parametrize(
+    "if_unheld", ["true", 1, None, False, _ABSENT],
+    ids=["string-true", "one", "null", "false", "absent"],
+)
+def test_a_pre_edit_that_does_not_send_json_true_displaces_even_an_opted_in_holder(
+    if_unheld: object, coordinator, client: _Client
+) -> None:
+    """Only a JSON ``true`` opts in. A pre-edit carrying any other
+    ``if_unheld``, or none, takes the grant and invalidates the holder --
+    one that took the file with the opt-in included -- and nothing counts a
+    refusal.
+
+    Prevents the opt-in reaching requests that never sent it, and pins the
+    documented limit: the refusal holds only among opted-in writers."""
+    holder, caller = _claimed(client), _claimed(client)
+    status, granted = _opted_in(client, holder)
+    assert status == 200 and granted.get("ok") is True, granted
+    denials_before = _other_holder_denials(coordinator)
+
+    body, principal = _pre_edit_request(caller, if_unheld)
+    status, answer = client.post("/hooks/pre-edit", body, principal=principal)
+
+    assert status == 200 and answer.get("ok") is True, answer
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.EXCLUSIVE
+    assert _agent_state_on(coordinator, "plan.md", holder.sid) == MESIState.INVALID
+    assert _other_holder_denials(coordinator) == denials_before
+
+
+def test_the_refusal_names_the_holder_its_own_decision_read(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The handler looks the holder up before it calls the write. When that
+    holder releases and another agent acquires in between, the refusal names
+    the new holder, the one the write's decision found.
+
+    Prevents a refusal naming an agent that no longer holds the file: the
+    caller would wait on, or contact, the wrong agent. The change is made at
+    the write's entry, after the handler's lookup, for this caller only."""
+    first, second, caller = _claimed(client), _claimed(client), _claimed(client)
+    _take(client, first)
+    first_agent, second_agent = session_to_agent_id(first.sid), session_to_agent_id(second.sid)
+    caller_agent = session_to_agent_id(caller.sid)
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    service = coordinator.service
+    real_write = service.write
+    changed: list[bool] = []
+
+    def write_after_the_holder_changes(**kwargs: Any) -> Any:
+        if kwargs["agent_id"] == caller_agent and not changed:
+            changed.append(True)
+            version = coordinator.registry.get_artifact(artifact_id).version
+            service.invalidate(
+                agent_id=first_agent, artifact_id=artifact_id, new_version=version,
+                issuer_agent_id=first_agent, issued_at_tick=kwargs["issued_at_tick"],
+            )
+            real_write(
+                agent_id=second_agent, artifact_id=artifact_id,
+                issued_at_tick=kwargs["issued_at_tick"],
+            )
+        return real_write(**kwargs)
+
+    monkeypatch.setattr(service, "write", write_after_the_holder_changes)
+    answer = _opted_in(client, caller)
+
+    assert changed, "the caller's write never reached the seam"
+    assert answer == _other_holder_refusal(second_agent), answer
+    assert _agent_state_on(coordinator, "plan.md", first.sid) == MESIState.INVALID
+    assert _agent_state_on(coordinator, "plan.md", second.sid) == MESIState.EXCLUSIVE
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) is None
+
+
+def test_an_opted_in_admit_after_the_holder_released_carries_no_collision_or_notice(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The handler looks the holder up before it calls the write. When that
+    holder releases in between, an opted-in request is admitted with no
+    collision warning, and the agent that released gets no preemption notice.
+
+    Prevents an opted-in admit reporting a displacement that did not happen:
+    the write admits an opted-in request only when no other agent holds the
+    path for writing, so it displaced nobody. A collision warning would tell
+    the caller someone else is editing, and a notice would tell the released
+    agent it was preempted."""
+    holder, caller = _claimed(client), _claimed(client)
+    _take(client, holder)
+    holder_agent = session_to_agent_id(holder.sid)
+    caller_agent = session_to_agent_id(caller.sid)
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    service = coordinator.service
+    real_write = service.write
+    released: list[bool] = []
+
+    def write_after_the_holder_releases(**kwargs: Any) -> Any:
+        if kwargs["agent_id"] == caller_agent and not released:
+            released.append(True)
+            version = coordinator.registry.get_artifact(artifact_id).version
+            service.invalidate(
+                agent_id=holder_agent, artifact_id=artifact_id, new_version=version,
+                issuer_agent_id=holder_agent, issued_at_tick=kwargs["issued_at_tick"],
+            )
+        return real_write(**kwargs)
+
+    monkeypatch.setattr(service, "write", write_after_the_holder_releases)
+    status, answer = _opted_in(client, caller)
+
+    assert released, "the caller's write never reached the seam"
+    assert status == 200 and answer.get("ok") is True, answer
+    assert "collision" not in answer, answer
+    assert coordinator.registry.peek_preemption_notice(holder_agent, artifact_id) is None
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.EXCLUSIVE
+
+
+def test_a_malformed_subagent_id_is_read_as_the_holders_own_repeat(
+    coordinator, client: _Client
+) -> None:
+    """A documented limit, pinned: a subagent id outside the accepted shape is
+    read as the parent, so a holder session sending one is admitted as its
+    own repeat. The same request with a well-formed subagent id is another
+    agent, refused naming the parent."""
+    session = _claimed(client)
+    _take(client, session)
+
+    status, admitted = _opted_in(client, session, agent_id="bad id!")
+    assert status == 200 and admitted.get("ok") is True, admitted
+    assert _opted_in(client, session, agent_id="sub1") == _other_holder_refusal(
+        session_to_agent_id(session.sid))
+    assert _agent_state_on(coordinator, "plan.md", session.sid) == MESIState.EXCLUSIVE
+
+
+def test_a_holder_whose_heartbeat_stopped_refuses_until_the_sweep_reclaims_it(
+    coordinator, client: _Client
+) -> None:
+    """A documented limit, pinned: the acquire path reclaims nothing, so a
+    holder whose last heartbeat is long past still refuses an opted-in
+    pre-edit on a coordinator whose sweep has not run. Once a sweep pass
+    reclaims that holder, the same request is admitted.
+
+    The holder is seeded through the registry with an ancient heartbeat; this
+    server runs no sweep of its own, so the pass below is the only one."""
+    caller = _claimed(client)
+    holder_agent = session_to_agent_id(str(uuid.uuid4()))
+    artifact_id = coordinator.registry.resolve_or_register("plan.md", content_hash=_hash("v1"))
+    coordinator.service.write(agent_id=holder_agent, artifact_id=artifact_id, issued_at_tick=1)
+    coordinator.registry.record_heartbeat(holder_agent, 41)
+
+    assert _opted_in(client, caller) == _other_holder_refusal(holder_agent)
+    assert _sweep(coordinator, int(time.time())) == 1
+    status, answer = _opted_in(client, caller)
+    assert status == 200 and answer.get("ok") is True, answer
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.EXCLUSIVE
+
+
+def test_after_a_refusal_the_holder_commits_and_reads_fresh(
+    coordinator, client: _Client
+) -> None:
+    """A refused opted-in pre-edit costs the holder nothing: its next commit
+    lands one version up, and its next read is fresh, with no preemption
+    notice.
+
+    Prevents a refusal that left a trace the holder trips over, such as a
+    revoked grant or a notice telling it it was preempted when it was not."""
+    holder, caller = _claimed(client), _claimed(client)
+    _take(client, holder)
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    version_before = coordinator.registry.get_artifact(artifact_id).version
+    assert _opted_in(client, caller) == _other_holder_refusal(session_to_agent_id(holder.sid))
+
+    _commit(client, holder)
+    assert coordinator.registry.get_artifact(artifact_id).version == version_before + 1
+    status, read = client.post(
+        "/hooks/pre-read",
+        {"session_id": holder.sid, "path": "plan.md", "content_hash": _hash("v2")},
+        principal=holder.principal)
+    assert status == 200 and read.get("status") == "fresh", read
+    assert "preempt" not in json.dumps(read).lower(), read
+
+
+def test_an_opted_in_refusal_decided_after_its_request_timed_out_is_not_counted(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A refusal whose holder check is held past the watchdog deadline: the
+    caller is answered ``unavailable``, and the refusal the abandoned body
+    reaches afterwards is not counted. The watchdog counts a late abort, not a
+    late completion, and logs no CRITICAL about orphaned grants.
+
+    Prevents the refusal counter, or the operator's late-completion alarm,
+    reporting a decision the caller was never sent."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    holder, caller = _claimed(client), _claimed(client)
+    _take(client, holder)
+    caller_agent = session_to_agent_id(caller.sid)
+    caplog.set_level(logging.CRITICAL, logger=mod.__name__)
+    denials_before = _other_holder_denials(coordinator)
+    delayed = _DelayedCall(
+        monkeypatch, coordinator.service, "_refuse_other_holder",
+        lambda artifact_id, agent_id: agent_id == caller_agent,
+    )
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+
+    answer = _opted_in(client, caller)
+    assert delayed.entered.is_set(), "the caller's holder check never started"
+    delayed.release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1, (
+        "the request did not time out, so this measured the undegraded route")
+    assert answer == (200, mod._PRE_EDIT_UNAVAILABLE_RESPONSE)
+    assert _other_holder_denials(coordinator) == denials_before
+    assert coordinator._watchdog_late_aborts_total == aborts_before + 1
+    assert coordinator._watchdog_late_completion_total == completions_before
+    assert _late_completion_criticals(caplog) == 0
+    assert _agent_state_on(coordinator, "plan.md", holder.sid) == MESIState.EXCLUSIVE
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) is None
+
+
+def test_a_refusal_whose_handoff_key_read_outlives_its_deadline_is_a_late_abort(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """On a file with a transfer record, a refusal whose ``handoff`` key read
+    is held past the watchdog deadline: the caller is answered
+    ``unavailable``, the refusal is not counted, and the watchdog counts a
+    late abort, not a late completion logged at CRITICAL.
+
+    Prevents the refusal queuing its count before its last registry read. The
+    count is queued last so that a deadline passing during that read finds
+    nothing queued and the abandoned body aborts when it tries to queue it."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    giver, successor, bystander = _claimed(client), _claimed(client), _claimed(client)
+    _hand_off(client, giver, successor, "plan.md")
+    _take(client, successor)
+    caplog.set_level(logging.CRITICAL, logger=mod.__name__)
+    denials_before = _other_holder_denials(coordinator)
+    delayed = _DelayedCall(monkeypatch, mod, "_read_handoff", lambda *_args: True)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    aborts_before = coordinator._watchdog_late_aborts_total
+    completions_before = coordinator._watchdog_late_completion_total
+
+    answer = _opted_in(client, bystander)
+    assert delayed.entered.is_set(), "the refusal's handoff key read never started"
+    delayed.release()
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1, (
+        "the request did not time out, so this measured the undegraded route")
+    assert answer == (200, mod._PRE_EDIT_UNAVAILABLE_RESPONSE)
+    assert _other_holder_denials(coordinator) == denials_before
+    assert coordinator._watchdog_late_aborts_total == aborts_before + 1
+    assert coordinator._watchdog_late_completion_total == completions_before
+    assert _late_completion_criticals(caplog) == 0
+    assert _agent_state_on(coordinator, "plan.md", successor.sid) == MESIState.EXCLUSIVE
+    assert _agent_state_on(coordinator, "plan.md", bystander.sid) is None
+
+
+# --- an opted-in pre-edit with no principal: refused ahead of the gate --------
+#
+# An opted-in pre-edit that presents no principal gets the principal-absent
+# 400 whether or not its session was ever claimed, on a tracked path or an
+# untracked one. It is decided from the request alone, ahead of the
+# caller-principal gate, so it reads no binding and never waits on the
+# registry. A claimed session gets the bytes it got before, and a pre-edit
+# without the opt-in from a session nobody claimed is still admitted. The rows
+# after those pin what stays as it was on an untracked path, and the release
+# rule a refused client follows on a strict one.
+
+
+def _raw_pre_edit(client: _Client, body: dict, principal: str | None) -> tuple[int, bytes]:
+    """``body`` posted to ``/hooks/pre-edit`` presenting ``principal``: the
+    answer's status and exact bytes, so two answers compare byte for byte."""
+    headers = dict(client.headers)
+    if principal is not None:
+        headers[_PRINCIPAL_HEADER] = principal
+    request = urlrequest.Request(
+        client.base + "/hooks/pre-edit", data=json.dumps(body).encode("utf-8"),
+        method="POST", headers=headers)
+    try:
+        with urlrequest.urlopen(request, timeout=10) as resp:
+            return resp.status, resp.read()
+    except urlerror.HTTPError as e:
+        return e.code, e.read()
+
+
+def test_an_opted_in_pre_edit_with_no_principal_is_refused_from_a_session_nobody_claimed(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session nobody claimed sends an opted-in pre-edit with no principal:
+    it gets the principal-absent 400, counted as a refusal and not as an
+    admission without a principal, decided without reading any binding. The
+    holder keeps its grant.
+
+    Prevents an opted-in request acting as an identity it never proved: the
+    holder check admits the caller's own identity, so a request that could
+    name any session nobody claimed could pass as that session's repeat."""
+    holder = _claimed(client)
+    _take(client, holder)
+    never_claimed = str(uuid.uuid4())
+    reads = _count_binding_reads(coordinator, monkeypatch)
+    absent_before, refused_before = _principal_counts(coordinator)
+
+    answer = client.post(
+        "/hooks/pre-edit", {"session_id": never_claimed, "path": "plan.md", "if_unheld": True})
+
+    assert answer == (400, _PRINCIPAL_ABSENT_REFUSAL), answer
+    assert _principal_counts(coordinator) == (absent_before, refused_before + 1)
+    assert reads == [], f"the refusal read a binding: {reads}"
+    assert _agent_state_on(coordinator, "plan.md", holder.sid) == MESIState.EXCLUSIVE
+    assert _agent_state_on(coordinator, "plan.md", never_claimed) is None
+
+
+def test_an_opted_in_pre_edit_with_no_principal_is_refused_on_an_untracked_path(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same refusal on a path the policy does not track: the 400 comes
+    ahead of the untracked exit, which would admit the request unchecked.
+
+    Prevents the rule holding on some paths only: the same request from the
+    same client would be refused on a tracked path and admitted on an
+    untracked one."""
+    never_claimed = str(uuid.uuid4())
+    assert not coordinator.policy.is_tracked("notes.txt")
+    reads = _count_binding_reads(coordinator, monkeypatch)
+    refused_before = _refused_count(coordinator)
+
+    answer = client.post(
+        "/hooks/pre-edit", {"session_id": never_claimed, "path": "notes.txt", "if_unheld": True})
+
+    assert answer == (400, _PRINCIPAL_ABSENT_REFUSAL), answer
+    assert _refused_count(coordinator) == refused_before + 1
+    assert reads == [], f"the refusal read a binding: {reads}"
+
+
+@pytest.mark.parametrize(
+    ("principal", "subagent"),
+    [(None, None), ("", None), (None, "sub1")],
+    ids=["no-header", "empty-header", "subagent-no-header"],
+)
+def test_a_claimed_sessions_opted_in_pre_edit_with_no_principal_gets_todays_refusal_bytes(
+    principal: str | None, subagent: str | None, coordinator, client: _Client
+) -> None:
+    """A claimed session's opted-in pre-edit without its principal -- no
+    header, an empty one, or from one of its subagents -- answers the
+    principal-absent 400 byte for byte as the same request without the
+    opt-in does, and each counts one refusal.
+
+    Prevents the opt-in giving a claimed session a refusal of its own: a
+    client classifies the 400 by its ``reason`` and recovers by claiming
+    again with its stored nonce, so a new reason or text would break that
+    recovery for exactly the writers that opt in."""
+    who = _claimed(client)
+    body = {"session_id": who.sid, "path": "plan.md"}
+    if subagent is not None:
+        body["agent_id"] = subagent
+    refused_before = _refused_count(coordinator)
+
+    opted_in = _raw_pre_edit(client, {**body, "if_unheld": True}, principal)
+    ordinary = _raw_pre_edit(client, body, principal)
+
+    assert opted_in == ordinary, (opted_in, ordinary)
+    assert (opted_in[0], json.loads(opted_in[1])) == (400, _PRINCIPAL_ABSENT_REFUSAL)
+    assert _refused_count(coordinator) == refused_before + 2
+
+
+def test_a_claimed_sessions_opted_in_pre_edit_with_no_principal_is_refused_at_once_on_a_cold_cache(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the principal cache empty, as a restart leaves it, and the
+    registry lock held, a claimed session's opted-in pre-edit without its
+    principal still gets the 400 within the gate bound, with no binding read
+    and no watchdog timeout.
+
+    Prevents the refusal waiting on the store: decided at the gate, it would
+    first have to read whether the session is bound, and under contention it
+    would answer ``unavailable`` instead, which tells the client to release
+    and back off rather than to present its principal."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    who = _claimed(client)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    with coordinator.service._caller_principal_lock:
+        coordinator.service._caller_principals.clear()
+    reads = _count_binding_reads(coordinator, monkeypatch)
+    timeouts_before = coordinator._watchdog_timeouts_total
+    refused_before = _refused_count(coordinator)
+
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _Background(
+            client, "/hooks/pre-edit",
+            {"session_id": who.sid, "path": "plan.md", "if_unheld": True})
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+    response = answer.result()
+
+    assert answered, "no answer while the registry lock was held"
+    assert response == (400, _PRINCIPAL_ABSENT_REFUSAL), response
+    assert reads == [], f"the refusal read a binding: {reads}"
+    assert coordinator._watchdog_timeouts_total == timeouts_before
+    assert _refused_count(coordinator) == refused_before + 1
+
+
+def test_an_opted_in_pre_edits_blank_principal_is_absent_and_a_wrong_one_foreign(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A principal header of spaces arrives empty, because the HTTP server
+    strips a header value's leading whitespace, so an opted-in pre-edit
+    carrying one gets the principal-absent 400 without a binding read. A
+    non-empty principal nobody minted goes on to the gate, which reads the
+    binding and refuses it as foreign.
+
+    Pins how a blank header is classified, and that only an absent principal
+    is refused ahead of the gate: a wrong one still gets the foreign refusal,
+    which tells the client to claim again."""
+    never_claimed = str(uuid.uuid4())
+    body = {"session_id": never_claimed, "path": "plan.md", "if_unheld": True}
+    reads = _count_binding_reads(coordinator, monkeypatch)
+
+    blank = client.post("/hooks/pre-edit", body, principal="   ")
+    reads_for_blank = list(reads)
+    wrong = client.post("/hooks/pre-edit", body, principal=_NEVER_MINTED_PRINCIPAL)
+
+    assert blank == (400, _PRINCIPAL_ABSENT_REFUSAL), blank
+    assert reads_for_blank == [], f"the blank header's refusal read a binding: {reads_for_blank}"
+    assert wrong == (400, _PRINCIPAL_FOREIGN_REFUSAL), wrong
+    assert reads, "the wrong principal never reached the gate's binding read"
+
+
+@pytest.mark.parametrize("if_unheld", [_ABSENT, "true"], ids=["absent", "string-true"])
+def test_a_pre_edit_without_the_opt_in_from_a_session_nobody_claimed_is_still_admitted(
+    if_unheld: object, coordinator, client: _Client
+) -> None:
+    """A session nobody claimed, presenting no principal, whose pre-edit
+    leaves ``if_unheld`` out or sends the string ``"true"``, is admitted as
+    before: it takes the grant, displaces the holder, and counts as an
+    admission without a principal, not as a refusal.
+
+    Prevents the principal rule reaching clients that predate the principal:
+    the shipped hook client sends none and reads a 400 as an allow, so
+    refusing it would only leave its edits uncoordinated."""
+    holder = _claimed(client)
+    _take(client, holder)
+    never_claimed = str(uuid.uuid4())
+    body = {"session_id": never_claimed, "path": "plan.md"}
+    if if_unheld is not _ABSENT:
+        body["if_unheld"] = if_unheld
+    absent_before, refused_before = _principal_counts(coordinator)
+
+    status, answer = client.post("/hooks/pre-edit", body)
+
+    assert status == 200 and answer.get("ok") is True, answer
+    assert _principal_counts(coordinator) == (absent_before + 1, refused_before)
+    assert _agent_state_on(coordinator, "plan.md", never_claimed) == MESIState.EXCLUSIVE
+    assert _agent_state_on(coordinator, "plan.md", holder.sid) == MESIState.INVALID
+
+
+def test_an_opted_in_pre_edit_on_a_held_path_that_was_untracked_is_admitted_unchecked(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A documented limit, pinned: once a held, non-strict path is untracked,
+    an opted-in pre-edit presenting its principal is admitted with a bare
+    ``{"ok": true}``. The write, and the holder check inside it, never run,
+    and the holder keeps its grant: the contract covers tracked paths only."""
+    holder, caller = _claimed(client), _claimed(client)
+    _take(client, holder)
+    status, untracked = client.post("/policy/untrack", {"paths": ["plan.md"]})
+    assert status == 200 and untracked["removed"] == ["plan.md"], untracked
+    writes: list[uuid.UUID] = []
+    real_write = coordinator.service.write
+
+    def recording(**kwargs: Any) -> Any:
+        writes.append(kwargs["agent_id"])
+        return real_write(**kwargs)
+
+    monkeypatch.setattr(coordinator.service, "write", recording)
+
+    assert _opted_in(client, caller) == (200, {"ok": True})
+    assert writes == [], "the untracked path reached the write"
+    assert _agent_state_on(coordinator, "plan.md", holder.sid) == MESIState.EXCLUSIVE
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) is None
+
+
+def test_a_held_strict_path_listed_as_ignored_stays_tracked_and_refuses(tmp_path: Path) -> None:
+    """A strict path stays tracked even when ``ignored.yaml`` lists it, so an
+    opted-in pre-edit of it while another agent holds it is refused with
+    ``other_holder``, naming the holder. The advice to opt in on strict paths
+    rests on this."""
+    (tmp_path / ".coherence").mkdir()
+    (tmp_path / ".coherence" / "strict_mode.yaml").write_text("- plan.md\n")
+    (tmp_path / ".coherence" / "ignored.yaml").write_text("- plan.md\n")
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="test-instance")
+    server.serve_in_thread()
+    try:
+        client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
+        assert server.policy.is_tracked("plan.md"), "the ignore entry won over strict mode"
+        holder, caller = _claimed(client), _claimed(client)
+        _take(client, holder)
+
+        assert _opted_in(client, caller) == _other_holder_refusal(session_to_agent_id(holder.sid))
+        assert _agent_state_on(server, "plan.md", holder.sid) == MESIState.EXCLUSIVE
+    finally:
+        server.shutdown()
+
+
+def test_an_untracked_opted_in_pre_edit_whose_re_grounding_times_out_answers_the_bare_admit(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An opted-in pre-edit of an untracked path, with a re-grounding delivery
+    armed for its session and that delivery timing out, answers the bare
+    ``{"ok": true}`` and counts one watchdog timeout.
+
+    Pins that the opt-in's ``unavailable`` answer belongs to the holder
+    decision: on an untracked path no holder is checked, so a timed-out
+    delivery degrades to the admit the path gives without one."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    caller = _claimed(client)
+    coordinator.mark_compact_pending(caller.sid)
+
+    def slow_build(coord: Any, sid_arg: str, *, abort: Any = None) -> Any:
+        time.sleep(1.0)
+        return ("never reaches the client", True)
+
+    monkeypatch.setattr(mod, "_build_session_start_context", slow_build)
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timeouts_before = coordinator._watchdog_timeouts_total
+
+    answer = _opted_in(client, caller, path="notes.txt")
+
+    assert answer == (200, {"ok": True}), answer
+    assert coordinator._watchdog_timeouts_total == timeouts_before + 1
+
+
+def test_on_a_strict_path_a_release_after_unavailable_leaves_that_identity_denied(
+    strict_plan_coordinator, strict_plan_client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The release a client makes after ``unavailable``, on a strict path that
+    has a version: the failed post-edit answers ``released: true`` and leaves
+    the caller INVALID, so the same identity's next opted-in pre-edit gets
+    the strict deny, and so does its read, and it stays INVALID. The same
+    pre-edit under a new ``agent_id``, with the same session and principal,
+    is admitted while nobody holds the file.
+
+    Pins why a client re-reads under a new ``agent_id`` after releasing: a
+    deny never re-grants the identity it denies, so every retry under the
+    released one is denied."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    coordinator, client = strict_plan_coordinator, strict_plan_client
+    writer, caller = _claimed(client), _claimed(client)
+    _take(client, writer)
+    _commit(client, writer)
+    status, stopped = client.post(
+        "/hooks/session-stop", {"session_id": writer.sid}, principal=writer.principal)
+    assert status == 200 and stopped.get("ok") is True, stopped
+    request = {"session_id": caller.sid, "path": "plan.md", "if_unheld": True}
+    full_deadline = mod.HANDLER_TIMEOUT_SEC
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    timed_out = _timed_out_in_its_work(coordinator, client, (request, caller.principal))
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", full_deadline)
+    assert timed_out == mod._PRE_EDIT_UNAVAILABLE_RESPONSE
+
+    released = client.post(
+        "/hooks/post-edit", {"session_id": caller.sid, "path": "plan.md", "success": False},
+        principal=caller.principal)
+    assert released == (200, {"ok": True, "released": True}), released
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.INVALID
+
+    status, denied = client.post("/hooks/pre-edit", request, principal=caller.principal)
+    assert status == 200 and denied.get("status") == "stale", denied
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", denied
+    read = _read(client, caller, "plan.md")
+    assert read["hookSpecificOutput"]["permissionDecision"] == "deny", read
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.INVALID
+
+    status, admitted = client.post(
+        "/hooks/pre-edit", {**request, "agent_id": "reread-1"}, principal=caller.principal)
+    assert status == 200 and admitted.get("ok") is True, admitted
+    assert _state(coordinator, "plan.md", caller.composite("reread-1")) == MESIState.EXCLUSIVE
 
 
 # --- the gate's store read RAISES: the route's own internal-error answer ------
@@ -11105,12 +12043,17 @@ def _seed_a_claimed_peer(coordinator, client: _Client) -> dict:
     stale-warned pair, a strict-deny memory, and a checkpoint it owns. Seeded
     through the registry, never a hook route, so the peer's names are NOT in
     the display-name map: a handler that registers its caller before the gate
-    shows up as a new entry."""
+    shows up as a new entry.
+
+    A second claimed session, the caller, gets the pending state an admitted
+    request of its own would consume: a preemption notice on another tracked
+    path and an armed re-grounding flag."""
     from ccs.coordinator.registry_protocol import CheckpointMember
 
     peer, caller = str(uuid.uuid4()), str(uuid.uuid4())
     seed = {
         "peer": peer,
+        "caller": caller,
         "peer_principal": _explicit_claim(client, peer),
         "caller_principal": _explicit_claim(client, caller),
         "peer_agent": session_to_agent_id(peer),
@@ -11135,7 +12078,16 @@ def _seed_a_claimed_peer(coordinator, client: _Client) -> dict:
         )],
         window_min=1.0, window_max=1.0, issued_at_tick=1,
     )
-    return {**seed, "artifact_id": artifact_id, "checkpoint_id": record.checkpoint_id}
+    other_id = reg.resolve_or_register("spec.md", content_hash=_hash("v1"))
+    reg.record_preemption_notice(
+        victim_agent_id=seed["caller_agent"], artifact_id=other_id,
+        preempter_agent_id=seed["peer_agent"], preempted_at_unix_ts=1234.0,
+    )
+    coordinator.mark_compact_pending(caller)
+    return {
+        **seed, "artifact_id": artifact_id, "other_artifact_id": other_id,
+        "checkpoint_id": record.checkpoint_id,
+    }
 
 
 def _refused_request_body(route: tuple[str, str], seed: dict, *, subagent: bool) -> dict:
@@ -11193,7 +12145,10 @@ def _refusal_observable(coordinator, seed: dict) -> dict:
     failing comparison prints none."""
     reg = coordinator.registry
     artifacts, states = reg.status_snapshot()
-    agents = (seed["peer_agent"], session_to_agent_id(seed["peer"], _REFUSED_SUBAGENT))
+    agents = (
+        seed["peer_agent"], session_to_agent_id(seed["peer"], _REFUSED_SUBAGENT),
+        seed["caller_agent"],
+    )
     coherence = coordinator.coordinator_root / ".coherence"
     return {
         "counters": coordinator.counters_snapshot(),
@@ -11208,8 +12163,23 @@ def _refusal_observable(coordinator, seed: dict) -> dict:
             str(agent): reg.peek_preemption_notice(agent, seed["artifact_id"])
             for agent in agents
         },
+        "notices_elsewhere": {
+            str(agent): reg.peek_preemption_notice(agent, seed["other_artifact_id"])
+            for agent in agents
+        },
+        "transients": {
+            str(a): {str(agent): state for agent, state in reg.get_transient_map(a).items()}
+            for a in artifacts
+        },
+        "observed_versions": {
+            str(a): {str(agent): reg.last_observed_version_for(a, agent) for agent in agents}
+            for a in artifacts
+        },
+        "transfer_record": reg.get_transfer_record(seed["artifact_id"]),
+        "conflicts": reg.conflict_outcome_totals(),
         "agent_names": sorted((str(a), n) for a, n in coordinator.agent_names_snapshot()),
         "compact_pending": coordinator.has_compact_pending(seed["peer"]),
+        "caller_compact_pending": coordinator.has_compact_pending(seed["caller"]),
         "stale_warned": set(coordinator._stale_warned_pairs),
         "strict_denies": set(coordinator._recent_strict_denies),
         "bindings": [
@@ -11227,15 +12197,18 @@ def _refusal_observable(coordinator, seed: dict) -> dict:
     }
 
 
-def _split_counters(observable: dict, path: str) -> tuple[dict, int | None, int | None]:
+def _split_counters(
+    observable: dict, path: str, refusal: str = "caller_principal_refused_total"
+) -> tuple[dict, int | None, int | None]:
     """``observable`` minus the two counters a refusal may move — the route's
-    attempt counter and the refusal counter — returned beside them."""
+    attempt counter and the refusal's own counter, ``refusal`` — returned
+    beside them."""
     rest = dict(observable)
     counters = dict(rest["counters"])
     endpoint = dict(counters["endpoint_counters"])
     attempts = endpoint.pop(_ATTEMPT_COUNTER[path]) if path in _ATTEMPT_COUNTER else None
     counters["endpoint_counters"] = endpoint
-    refused = counters.pop("caller_principal_refused_total", None)
+    refused = counters.pop(refusal, None)
     rest["counters"] = counters
     return rest, attempts, refused
 
@@ -11292,6 +12265,68 @@ def test_a_refused_require_class_request_leaves_state_untouched(
     assert not _principal_refused((status, body)), body
     rest_admitted, _, _ = _split_counters(_refusal_observable(coordinator, seed), path)
     assert rest_admitted != rest_after, "the admitted request moved nothing the snapshot sees"
+
+
+def test_an_opted_in_other_holder_refusal_leaves_state_untouched(tmp_path: Path) -> None:
+    """An opted-in pre-edit refused because another agent holds the path moves
+    only what any request of the caller's moves -- its heartbeat and, on its
+    first request, its display name -- plus the route's attempt counter and
+    the refusal counter, each by one. The holder's grant, heartbeat and notice,
+    the caller's queued notice on another path and its armed re-grounding
+    flag, transients, observed versions, the transfer record, conflict counts,
+    every other counter and the state log all stay as they were.
+
+    Prevents a refusal that half-acquired: a caller told it got nothing must
+    find nothing changed, or its retry starts from a state it was never told
+    about. Control: the same request without the opt-in is admitted and moves
+    the grants, the notices and the state log, so the comparison sees what an
+    acquire changes."""
+    state_log: list[dict] = []
+    server = CoordinatorHTTPServer(
+        tmp_path, port=0, instance_id="other-holder-refusal", state_log=state_log.append)
+    server.serve_in_thread()
+    try:
+        client = _Client("127.0.0.1", server.port, load_secret(server.coordinator_root))
+        seed = _seed_a_claimed_peer(server, client)
+        caller_key = str(seed["caller_agent"])
+        request = {"session_id": seed["caller"], "path": "plan.md"}
+        before = _refusal_observable(server, seed)
+        logged = len(state_log)
+        assert before["grants"][str(seed["artifact_id"])][str(seed["peer_agent"])] == "EXCLUSIVE"
+        assert before["notices_elsewhere"][caller_key] is not None
+        assert before["caller_compact_pending"] is True
+
+        answer = client.post(
+            "/hooks/pre-edit", {**request, "if_unheld": True}, principal=seed["caller_principal"])
+        assert answer == _other_holder_refusal(seed["peer_agent"]), answer
+        after = _refusal_observable(server, seed)
+
+        refusal = "pre_edit_other_holder_denials_total"
+        rest_before, attempts_before, refused_before = _split_counters(
+            before, "/hooks/pre-edit", refusal)
+        rest_after, attempts_after, refused_after = _split_counters(
+            after, "/hooks/pre-edit", refusal)
+        # Any request of the caller's moves these two, so they are compared
+        # apart: the heartbeat must move, and the display name is not state.
+        heartbeat_before = rest_before["heartbeats"].pop(caller_key)
+        heartbeat_after = rest_after["heartbeats"].pop(caller_key)
+        for rest in (rest_before, rest_after):
+            rest["agent_names"] = [entry for entry in rest["agent_names"] if entry[0] != caller_key]
+        assert heartbeat_after is not None and heartbeat_after != heartbeat_before
+        assert rest_after == rest_before
+        assert (attempts_after, refused_after) == (attempts_before + 1, refused_before + 1)
+        assert state_log[logged:] == []
+
+        status, admitted = client.post(
+            "/hooks/pre-edit", request, principal=seed["caller_principal"])
+        assert status == 200 and admitted.get("ok") is True, admitted
+        control = _refusal_observable(server, seed)
+        assert state_log[logged:], "the admitted control logged no state change"
+        assert control["grants"] != after["grants"]
+        assert control["notices"] != after["notices"]
+        assert control["notices_elsewhere"] != after["notices_elsewhere"]
+    finally:
+        server.shutdown()
 
 
 # --- the accept-class notice drain, stated rather than implied --------------
@@ -15407,6 +16442,7 @@ def _deny_records(coordinator: CoordinatorHTTPServer) -> dict:
         "strict_mode_denials_total": counters["strict_mode_denials_total"],
         "stale_warning_emitted_total": counters["stale_warning_emitted_total"],
         "handoff_giver_denials_total": counters["handoff_giver_denials_total"],
+        "pre_edit_other_holder_denials_total": counters["pre_edit_other_holder_denials_total"],
         "audit_log_mode_drift_total": counters["audit_log_mode_drift_total"],
         "audit_lines": len(audit.read_text().splitlines()) if audit.exists() else 0,
         "route_around_marker": marker,

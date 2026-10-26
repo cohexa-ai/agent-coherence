@@ -267,7 +267,12 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "atomic mutation loop of write/commit (to invalidate peers) and by the "
         "same-lock sweep to enumerate M/E holders and re-check single-writer. Its "
         "consistency with the concurrent grant transitions is what the boundary "
-        "serializes; a backend must serve it inside the same atomic step.",
+        "serializes; a backend must serve it inside the same atomic step. "
+        "An opted-in write's holder check (write(..., if_unheld=True)) also "
+        "reads it before the first state write: a service-layer precondition "
+        "whose atomicity with the grant comes from reading it inside the write "
+        "path's abort_guard hold, so a cross-host backend must re-home that read "
+        "into the same critical section as the grant it decides.",
     ),
     # ---- INDEPENDENT (base) -----------------------------------------------
     MemberContract(

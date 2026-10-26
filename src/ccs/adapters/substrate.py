@@ -526,6 +526,18 @@ def _failure_envelope_type(unknown: type[CoherenceError], reason: object) -> typ
     return CoordinatorFailed
 
 
+def _status_type(unknown: type[CoherenceError], status: int) -> type[CoherenceError]:
+    """What an answered HTTP ``status`` raises, on a leg whose answered
+    failures raise ``unknown``. A 5xx reports the same coordinator failure as
+    the failure envelope, so a read leg raises
+    :class:`~ccs.core.exceptions.CoordinatorFailed`, as on the volume (#433);
+    a leg sent after the substrate write landed keeps ``CommitUnconfirmed``,
+    and any other status keeps ``unknown``."""
+    if issubclass(unknown, CommitUnconfirmed) or status < 500:
+        return unknown
+    return CoordinatorFailed
+
+
 class SubstrateCoordinatorSession:
     """A single agent's client to the SHIPPED coordinator, for a substrate binding.
 
@@ -542,9 +554,9 @@ class SubstrateCoordinatorSession:
     start or after, raises the typed
     :class:`~ccs.core.exceptions.CoordinatorUnreachable`, except after the
     substrate write landed, where it stays ``CommitUnconfirmed``. The
-    coordinator's failure envelope on a read leg raises the typed
-    :class:`~ccs.core.exceptions.CoordinatorFailed` (#259); any other answer
-    that decides nothing keeps the plain error. A request refused for its caller
+    coordinator's failure envelope (#259) or an HTTP 5xx (#433) on a read leg
+    raises the typed :class:`~ccs.core.exceptions.CoordinatorFailed`; any other
+    answer that decides nothing keeps the plain error. A request refused for its caller
     principal is first recovered with the session's own mint nonce (R20); what
     that cannot cure raises the typed
     :class:`~ccs.core.exceptions.CallerPrincipalRefused` on either leg. Two
@@ -661,8 +673,8 @@ class SubstrateCoordinatorSession:
         ``CommitUnconfirmed`` for a pre-read a commit sends after its
         substrate write landed — except that a read that gets no usable
         answer raises ``CoordinatorUnreachable``, and a read answered with the
-        coordinator's failure envelope raises ``CoordinatorFailed`` (#259), as
-        the volume's strict reads do.
+        coordinator's failure envelope (#259) or an HTTP 5xx (#433) raises
+        ``CoordinatorFailed``, as the volume's strict reads do.
         """
         payload: dict[str, object] = {"session_id": self._session_id, "path": artifact_ref}
         if content_hash is not None:
@@ -779,9 +791,9 @@ class SubstrateCoordinatorSession:
         :func:`_no_answer_type`: ``CoordinatorUnreachable`` on a read leg,
         still ``unknown`` after the substrate write landed. A status or a
         redirect is an answer from whatever was reached, so it keeps
-        ``unknown``, as does the degraded body that this method's callers
-        refuse; the failure envelope they refuse is typed by
-        :func:`_failure_envelope_type`.
+        ``unknown`` (except a 5xx on a read leg: see :func:`_status_type`), as
+        does the degraded body that this method's callers refuse; the failure
+        envelope they refuse is typed by :func:`_failure_envelope_type`.
 
         A rejected request raises OUTSIDE the ``except`` block, so the
         ``HTTPError`` is not on the raised error's chain: its text is the
@@ -825,7 +837,9 @@ class SubstrateCoordinatorSession:
             )
         if reason is not None:
             return _Sent(None, reason)
-        raise unknown(f"coordinator {endpoint_path} failed (fail-closed): HTTP {status}")
+        raise _status_type(unknown, status)(
+            f"coordinator {endpoint_path} failed (fail-closed): HTTP {status}"
+        )
 
 
 @dataclass(frozen=True)

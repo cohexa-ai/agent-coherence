@@ -150,6 +150,30 @@ def test_gate_denies_when_the_grant_was_reclaimed_version_unchanged(
         stop_coordinator(tmp_path)
 
 
+def test_gate_names_a_file_changed_outside_the_coordinator_a_split_pair(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """After swg_read, the file is edited outside the coordinator. swg_gate
+    holds with ``hold_cause=split_pair`` (#405): the bytes on disk are not the
+    content the coordinator records at the version the agent holds. Not
+    ``read_denied``, which says the view is INVALID and sends the agent to a
+    reacquire that never clears this. The deny answer stays ``stale_view``."""
+    target = _seed(tmp_path)
+    vol = _vol(tmp_path, fast_cfg)
+    try:
+        cfg = _config(tmp_path)
+        version, generation = _comparand(_do_read(vol, cfg, REL))
+        target.write_bytes(b"edited-outside-the-coordinator")
+
+        res = _do_gate(vol, cfg, REL, version, generation)
+
+        assert res.isError is True
+        assert res.structuredContent["reason"] == "stale_view"
+        assert res.structuredContent["hold_cause"] == "split_pair"
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_gate_refuses_a_missing_authority_comparand_as_an_agent_error(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:

@@ -36,6 +36,12 @@ Current members:
   ``LocalWorkspaceBinding`` reference arm, the torn-cut-blind teeth stub).
   The in-repo runner under ``tests/conformance/`` imports FROM here through a
   thin shim; the corpus never imports from the test tree.
+- :mod:`ccs.testing.silent_listener` — loopback listeners that take a
+  coordinator request and never answer it: one that holds every connection
+  silent, and one that relays the first N requests to a real coordinator and
+  then holds the rest. Both count the connections and record the requests at
+  the far end, so a test sees what an operation sent without patching the
+  client. Stdlib only.
 
 The corpus imports and runs WITHOUT pytest (its raise-expectations ride an
 internal shim); only scenario SKIP reporting requires it — install via the

@@ -26,7 +26,7 @@ import pytest
 
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
-from ccs.adapters.effect_gate import gate
+from ccs.adapters.effect_gate import check_fence, gate
 from ccs.core.exceptions import CasVersionConflict, CoherenceError, StaleView, ViewWedged
 
 _PATH = "data/counter.txt"
@@ -477,3 +477,187 @@ def test_gate_does_not_decide_from_bytes_read_in_the_commit_window(
     finally:
         peer.finish()
     assert decided == []
+
+
+# --- one split pair, named the same on every surface (#405) ----------------
+#
+# The coordinator answers a split pair with one answer, a strict deny carrying
+# ``hash_differs``, whichever surface asked. read() raising on a stale view
+# raises the refusal the versioned reads raise, and the effect fence holds as
+# ``split_pair``, never as ``read_denied``, which calls the view INVALID and
+# names a reacquire that never clears it.
+
+#: The start of the split-pair refusal's text, which an observing read raises.
+_SPLIT_TEXT = "stale read refused: the bytes on disk are not the content the coordinator records"
+
+
+def _raising_vol(tmp_path: Path, cfg: LifecycleConfig) -> CoherentVolume:
+    return CoherentVolume(
+        tmp_path, managed=("data/**",), on_error="strict", on_stale_read="raise", config=cfg
+    )
+
+
+@_READER_STATES
+def test_read_raising_on_a_stale_view_refuses_a_split_pair_in_the_commit_window(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    read_before_peer: bool,
+) -> None:
+    _seed(tmp_path)
+    peer_vol = _vol(tmp_path, fast_cfg)
+    reader = _raising_vol(tmp_path, fast_cfg)
+    try:
+        if read_before_peer:
+            reader.read(_PATH)
+        peer = LaggingPeer(peer_vol, monkeypatch)
+        peer.commit(b"1")
+        try:
+            with pytest.raises(StaleView) as exc:
+                reader.read(_PATH)
+            assert exc.value.reason == _SPLIT_PAIR
+            assert str(exc.value).startswith(_SPLIT_TEXT), str(exc.value)
+        finally:
+            peer.finish()
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_read_raising_on_a_stale_view_keeps_a_refusal_whose_bytes_match(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """Control: a peer committed and its bytes have landed, so this reader is
+    INVALID while the file holds exactly the content the coordinator
+    records. The deny carries no ``hash_differs``: it is not a split pair,
+    and ``read()`` raises the coordinator's own refusal, reason
+    ``stale_view``, as before."""
+    _seed(tmp_path)
+    reader = _raising_vol(tmp_path, fast_cfg)
+    peer = _vol(tmp_path, fast_cfg)
+    try:
+        reader.read(_PATH)
+        peer.write(_PATH, b"1")
+
+        with pytest.raises(StaleView) as refused:
+            reader.read(_PATH)
+
+        assert refused.value.reason == _STALE_VIEW
+        assert not str(refused.value).startswith(_SPLIT_TEXT), str(refused.value)
+        assert reader._last_read_denied is True, "control: the read was refused"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_every_surface_names_a_file_changed_outside_the_coordinator_a_split_pair(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A strict reader reads v1, and the file is then changed outside the
+    coordinator. ``read()`` (raising on a stale view) and both versioned
+    reads raise the same refusal, reason ``split_pair``; the effect fence
+    holds with ``hold_cause`` and ``reason`` ``split_pair``, and its text
+    names the step that clears it, recording the bytes with ``write()``.
+
+    Prevents one coordinator answer reading three ways: ``read()`` raised the
+    class reason ``stale_view`` with the coordinator's text, and the fence
+    held as ``read_denied``, "view is INVALID", whose reacquire never clears
+    it, so an agent following it looped."""
+    target = _seed(tmp_path)
+    reader = _raising_vol(tmp_path, fast_cfg)
+    try:
+        _data, version, generation = reader.read_with_version_generation(_PATH)
+        target.write_bytes(b"edited-outside-the-coordinator")
+
+        for read in (reader.read, reader.read_with_version, reader.read_with_version_generation):
+            with pytest.raises(StaleView) as refused:
+                read(_PATH)
+            assert refused.value.reason == _SPLIT_PAIR, read.__name__
+            assert str(refused.value).startswith(_SPLIT_TEXT), (read.__name__, str(refused.value))
+        with pytest.raises(StaleView) as held:
+            check_fence(reader, _PATH, expected_version=version, expected_generation=generation)
+        assert held.value.hold_cause == _SPLIT_PAIR
+        assert held.value.reason == _SPLIT_PAIR
+        assert "view is INVALID" not in str(held.value), str(held.value)
+        assert "write()" in str(held.value), str(held.value)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_split_pair_hold_clears_once_the_bytes_on_disk_are_written(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """The recovery the hold names. A reacquire alone leaves the file's bytes
+    unrecorded, so the fence holds as ``split_pair`` again; writing the bytes
+    the reacquire returned records them, and the comparands of a fresh read
+    then proceed."""
+    target = _seed(tmp_path)
+    reader = _raising_vol(tmp_path, fast_cfg)
+    try:
+        _data, version, generation = reader.read_with_version_generation(_PATH)
+        target.write_bytes(b"edited-outside-the-coordinator")
+        current = reader.reacquire(_PATH)
+        assert current == b"edited-outside-the-coordinator"
+
+        with pytest.raises(StaleView) as held:
+            check_fence(reader, _PATH, expected_version=version, expected_generation=generation)
+        assert held.value.hold_cause == _SPLIT_PAIR, "a reacquire alone cleared the split"
+
+        reader.write(_PATH, current)
+        _data, version, generation = reader.read_with_version_generation(_PATH)
+        check_fence(reader, _PATH, expected_version=version, expected_generation=generation)
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_split_pair_hold_inside_a_peers_write_names_the_wait_first(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A peer's write() puts its bytes on disk before its commit moves the
+    version, so a re-gate in that window is refused at an unchanged version:
+    a ``split_pair`` hold. Its text gives the step that clears this case,
+    re-gating after a few seconds, before the write() that records a change
+    made outside the coordinator; once the peer's commit lands, the same gate
+    holds as ``version_moved``.
+
+    Prevents the hold sending a gated agent straight to write() a file a peer
+    is still writing: that write preempts the peer's commit."""
+    _seed(tmp_path)
+    reader = _vol(tmp_path, fast_cfg)
+    peer = _vol(tmp_path, fast_cfg)
+    try:
+        _data, version, generation = reader.read_with_version_generation(_PATH)
+        at_commit, go = threading.Event(), threading.Event()
+        real_post = peer._post
+
+        def commit_waits(endpoint: str, payload: dict, **kwargs: object) -> object:
+            if endpoint == "/hooks/post-edit" and payload.get("success") is True:
+                at_commit.set()
+                go.wait(_WAIT_SEC)
+            return real_post(endpoint, payload, **kwargs)
+
+        monkeypatch.setattr(peer, "_post", commit_waits)
+        errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                peer.write(_PATH, b"peer-bytes")
+            except BaseException as exc:  # surfaced below
+                errors.append(exc)
+
+        thread = threading.Thread(target=run, name="writing-peer")
+        thread.start()
+        try:
+            assert at_commit.wait(_WAIT_SEC), "control: the peer's bytes are on disk, its commit unsent"
+            with pytest.raises(StaleView) as held:
+                check_fence(reader, _PATH, expected_version=version, expected_generation=generation)
+            assert held.value.hold_cause == _SPLIT_PAIR
+            text = str(held.value)
+            assert "a peer's write still landing" in text, text
+            assert text.index("after a few seconds") < text.index("write() the bytes"), text
+        finally:
+            go.set()
+            thread.join(_WAIT_SEC)
+        assert not thread.is_alive() and not errors, errors
+
+        with pytest.raises(StaleView) as moved:
+            check_fence(reader, _PATH, expected_version=version, expected_generation=generation)
+        assert moved.value.hold_cause == "version_moved"
+    finally:
+        stop_coordinator(tmp_path)

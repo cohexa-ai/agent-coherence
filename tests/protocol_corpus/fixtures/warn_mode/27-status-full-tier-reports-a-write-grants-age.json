@@ -51,6 +51,7 @@
       "in_flight_drain_timed_out": false,
       "intra_task_acquire_release_total": 0,
       "policy_summary": "<IGNORED>",
+      "pre_edit_other_holder_denials_total": 0,
       "registry_schema_version": 10,
       "sessions": [
         {
