@@ -502,9 +502,10 @@ class SimulationEngine:
             self._context_injections += 1
             self._tokens_fetch += self._artifact_token_size(artifact_id)
 
+        states_before_write = self._registry.get_state_map(artifact_id)
         peers_to_sync = [
             peer_id
-            for peer_id, state in self._registry.get_state_map(artifact_id).items()
+            for peer_id, state in states_before_write.items()
             if peer_id != agent_id and state != MESIState.INVALID
         ]
         previous = self._registry.get_artifact(artifact_id)
@@ -536,6 +537,7 @@ class SimulationEngine:
                 artifact_id=artifact_id,
                 version=updated.version,
                 now_tick=now_tick,
+                peer_states=states_before_write,
             )
 
         self._monitor.validate_single_writer(self._registry.get_state_map(artifact_id))
@@ -548,6 +550,7 @@ class SimulationEngine:
         artifact_id: UUID,
         version: int,
         now_tick: int,
+        peer_states: dict[UUID, MESIState],
     ) -> None:
         for peer_id in peers:
             signal = InvalidationSignal(
@@ -556,6 +559,7 @@ class SimulationEngine:
                 issued_at_tick=now_tick,
                 issuer_agent_id=writer_agent_id,
                 victim_agent_id=peer_id,
+                victim_state=peer_states[peer_id],
             )
             self._network.send(
                 payload=signal,

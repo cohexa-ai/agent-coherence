@@ -2386,6 +2386,7 @@ class CoordinatorService:
                     issued_at_tick=issued_at_tick,
                     issuer_agent_id=agent_id,
                     victim_agent_id=peer_id,
+                    victim_state=state,
                 )
             )
         commit_hash = content_hash if content_hash is not None else compute_content_hash(content)
@@ -2525,6 +2526,9 @@ class CoordinatorService:
         self._refuse_handed_off_giver(artifact_id, identity)
         admitted = self._live_transfer_record(artifact_id)
 
+        # The abort-guard held by commit_cas keeps this pre-mutation state
+        # snapshot consistent with the registry's invalidated_ids result.
+        victim_states = self.registry.get_state_map(artifact_id)
         result = self.registry.commit_cas(
             artifact_id,
             agent_id,
@@ -2558,6 +2562,7 @@ class CoordinatorService:
                 issued_at_tick=issued_at_tick,
                 issuer_agent_id=agent_id,
                 victim_agent_id=invalidated_id,
+                victim_state=victim_states[invalidated_id],
             )
             for invalidated_id in invalidated_ids
         ]
@@ -2626,6 +2631,12 @@ class CoordinatorService:
             self._refuse_handed_off_giver(artifact_id, identity)
             admitted[artifact_id] = self._live_transfer_record(artifact_id)
 
+        # commit_all holds the same abort guard across this snapshot and the
+        # atomic batch mutation below.
+        victim_states = {
+            artifact_id: self.registry.get_state_map(artifact_id)
+            for artifact_id in writes
+        }
         result = self.registry.commit_all(agent_id, writes, tick=issued_at_tick)
 
         if isinstance(result, CasCorruption):
@@ -2650,6 +2661,7 @@ class CoordinatorService:
                         issued_at_tick=issued_at_tick,
                         issuer_agent_id=agent_id,
                         victim_agent_id=_peer,
+                        victim_state=victim_states[art_id][_peer],
                     )
                 )
             self._validate_single_writer(art_id)
@@ -3564,6 +3576,7 @@ class CoordinatorService:
             issuer_agent_id=issuer_agent_id,
         ):
             return None
+        victim_state = self.registry.get_agent_state(artifact_id, agent_id)
         self.registry.set_agent_state(
             artifact_id, agent_id, MESIState.INVALID, trigger="invalidate", tick=issued_at_tick
         )
@@ -3574,6 +3587,7 @@ class CoordinatorService:
             issued_at_tick=issued_at_tick,
             issuer_agent_id=issuer_agent_id,
             victim_agent_id=agent_id,
+            victim_state=victim_state,
         )
 
     def _revoke_is_superseded(
@@ -3658,6 +3672,7 @@ class CoordinatorService:
                     issued_at_tick=issued_at_tick,
                     issuer_agent_id=agent_id,
                     victim_agent_id=holder_id,
+                    victim_state=state,
                 )
                 for holder_id, state in self.registry.get_state_map(artifact_id).items()
                 if state != MESIState.INVALID

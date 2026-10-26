@@ -550,15 +550,15 @@ class EffectFired:
 class InvalidationSignal:
     """Lightweight invalidation signal sent to agents.
 
-    ``victim_agent_id`` is populated by coordinator operations that invalidate
-    a specific peer. It lets callers that need side effects for the displaced
-    holder use the same lock-consistent result that decided the invalidation;
-    older producers may omit it because the field is additive.
+    ``victim_agent_id`` identifies the peer invalidated by an in-tree
+    coordinator or simulation operation. It lets callers that need side
+    effects for the displaced holder use the result produced by that operation.
 
-    ``victim_state`` records the victim's state immediately before the
-    invalidation when the producer has that snapshot. Consumers that surface
-    write-grant preemption notices use it to distinguish M/E victims from
-    shared readers, which have no write grant to report.
+    ``victim_state`` records the victim's state immediately before
+    invalidation. Consumers that surface write-grant preemption notices use it
+    to distinguish M/E victims from shared readers, which have no write grant
+    to report. It remains optional for compatibility with older signal
+    producers and manually constructed signals.
     """
 
     artifact_id: UUID
