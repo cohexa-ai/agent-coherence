@@ -1,0 +1,67 @@
+{
+  "name": "acquire-or-fail-ordinary-pre-edit-displaces-an-opted-in-holder",
+  "description": "Opting in protects only the request that opts in. Session B takes EXCLUSIVE with an opted-in pre-edit; session A's ordinary pre-edit then displaces B and gets the collision allow envelope, as it would against any holder. additionalContext varies per run and is ignored.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "backends": [
+          "python"
+        ],
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+          "path": "CLAUDE.md",
+          "if_unheld": true
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_b}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+      "path": "CLAUDE.md"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "collision": true,
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "additionalContext": "<ignored>"
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ],
+  "ignore_keys": [
+    "additionalContext"
+  ]
+}
