@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pickle
 from dataclasses import FrozenInstanceError
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -53,10 +53,14 @@ from ccs.core.exceptions import (
     UNAVAILABLE_REASON,
     VERSION_MISMATCH_REASON,
     VIEW_WEDGED_REASON,
+    CallerPrincipalRefused,
+    CasRetriesExhausted,
+    CasVersionConflict,
     CoherenceError,
     CoordinatorFailed,
     CoordinatorUnreachable,
     GiverFenced,
+    PublishMaterializationError,
     OtherHolder,
     StaleView,
 )
@@ -182,6 +186,71 @@ def test_giver_fenced_carries_its_reason_successor_and_version() -> None:
     assert isinstance(err, CoherenceError)
     assert str(successor) in str(err)
     assert "version_at_transfer=7" in str(err)
+
+
+@pytest.mark.parametrize("successor", [uuid4(), "successor-session"], ids=["uuid", "string"])
+def test_giver_fenced_crosses_a_process_boundary(successor: UUID | str) -> None:
+    """Pickling retains the terminal type and the fields callers inspect."""
+    err = GiverFenced("notes/plan.md", successor, 7)
+    err.add_note("context")
+
+    restored = pickle.loads(pickle.dumps(err))
+
+    assert type(restored) is GiverFenced
+    assert restored.args == err.args
+    assert restored.reason == err.reason == GIVER_FENCED_REASON
+    assert restored.artifact_id == err.artifact_id
+    assert restored.successor == successor
+    assert restored.version_at_transfer == err.version_at_transfer == 7
+    assert restored.__dict__ == err.__dict__
+    assert restored.__notes__ == ["context"]
+
+
+@pytest.mark.parametrize(
+    "err",
+    [
+        CallerPrincipalRefused(
+            sorted(CALLER_PRINCIPAL_REASONS)[0], "caller refused", settled=False
+        ),
+        CasRetriesExhausted(
+            "notes/plan.md",
+            3,
+            7,
+            last_conflict_reason=VERSION_MISMATCH_REASON,
+            captured_generation=4,
+            owner_generation=5,
+        ),
+        CasVersionConflict(
+            "notes/plan.md",
+            6,
+            7,
+            reason=VERSION_MISMATCH_REASON,
+            captured_generation=4,
+            owner_generation=5,
+        ),
+        PublishMaterializationError(
+            ("notes/plan.md",), ("notes/other.md",), cause=OSError("disk write failed")
+        ),
+    ],
+    ids=[
+        "caller-principal-refused",
+        "cas-retries-exhausted",
+        "cas-version-conflict",
+        "publish-materialization-error",
+    ],
+)
+def test_client_exceptions_with_constructor_fields_cross_a_process_boundary(
+    err: CoherenceError,
+) -> None:
+    """The message and per-instance recovery details survive process transfer."""
+    err.add_note("context")
+
+    restored = pickle.loads(pickle.dumps(err))
+
+    assert type(restored) is type(err)
+    assert restored.args == err.args
+    assert restored.__dict__ == err.__dict__
+    assert restored.__notes__ == ["context"]
 
 
 def test_coordinator_unreachable_carries_its_reason_and_crosses_a_process_boundary() -> None:
