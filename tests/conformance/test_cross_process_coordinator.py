@@ -47,7 +47,7 @@ import pytest
 import ccs
 from ccs.adapters import coherent_volume
 from ccs.adapters.claude_code import lifecycle
-from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
+from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer, session_to_agent_id
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     ensure_coordinator,
@@ -62,12 +62,23 @@ from ccs.adapters.substrate import (
 from ccs.cli._coherence_client import (
     CoordinatorEndpoint,
     CoordinatorUnavailable,
+    caller_principal_headers,
+    claim_caller_principal,
     get,
     post,
     resolve_endpoint,
 )
+from ccs.coordinator.service import CoordinatorService
+from ccs.core.exceptions import (
+    HANDLER_FAILURE_REASON_PREFIX,
+    OTHER_HOLDER_REASON,
+    UNAVAILABLE_REASON,
+)
+from ccs.core.states import MESIState
 from ccs.core.substrate import sha256_hex
 from ccs.testing.process_harness import (
+    ContenderContext,
+    ContenderOutcome,
     ContenderSpec,
     ParkContext,
     ProcessRaceHarness,
@@ -1035,3 +1046,223 @@ def test_degraded_status_read_is_cannot_tell_and_read_again() -> None:
     assert verdict == {"granted_at": 100, "last_heartbeat": 101, "version": 1, "owner_generation": 0}
     with pytest.raises(AssertionError, match="could not witness the held grant within"):
         _poll_status(lambda: degraded, witness, timeout_sec=0.3, what="the held grant")
+
+
+# ---------------------------------------------------------------------------
+# Opted-in pre-edits racing for a file nobody holds. Each contender process
+# claims a caller principal and sends a pre-edit with ``if_unheld: true``. The
+# coordinator serves in this process, so a wrapper on CoordinatorService.write
+# holds both requests at a barrier after the handler's own holder lookup and
+# before either enters the write's hold: from there only a check inside that
+# hold can refuse the second, because the lookup already saw nobody.
+# ---------------------------------------------------------------------------
+
+_RACE_ROUNDS = 3
+_SEAM_PARTIES = 2
+# Well inside the 4 s handler budget, so a racer is not still held when its
+# deadline passes; one that is answers ``unavailable`` and the round cannot count.
+_SEAM_WAIT_SEC = 2.0
+_GUARDED_WRITE = CoordinatorService.write
+
+
+@dataclass(frozen=True)
+class _Racer:
+    """One opted-in contender: its workspace, its session and the path."""
+
+    workspace: str
+    session_id: str
+    path: str
+
+
+def _child_opted_in_pre_edit(ctx: ContenderContext, racer: _Racer) -> dict[str, Any]:
+    """Claim the session's caller principal before the rendezvous, then send
+    one opted-in pre-edit presenting it."""
+    endpoint = resolve_endpoint(Path(racer.workspace))
+    claim = claim_caller_principal(endpoint, racer.session_id, uuid.uuid4().hex)
+    assert claim.outcome == "bound", claim
+    ctx.barrier_wait()
+    return post(
+        endpoint,
+        "/hooks/pre-edit",
+        {"session_id": racer.session_id, "path": racer.path, "if_unheld": True},
+        extra_headers=caller_principal_headers(claim.principal),
+    )
+
+
+class _WriteEntrySeam:
+    """A barrier at ``CoordinatorService.write`` entry, outside the write's
+    hold. It records each write that passed and whether the barrier broke; a
+    write whose wait broke is never called, so a round the barrier did not
+    force cannot count."""
+
+    def __init__(self) -> None:
+        self._barrier = threading.Barrier(_SEAM_PARTIES, timeout=_SEAM_WAIT_SEC)
+        self._passed: list[uuid.UUID] = []
+        self._broke = False
+
+    def wait(self, agent_id: uuid.UUID) -> None:
+        try:
+            self._barrier.wait()
+        except threading.BrokenBarrierError:
+            self._broke = True
+            raise
+        self._passed.append(agent_id)
+
+    @property
+    def filled(self) -> bool:
+        return not self._broke and len(self._passed) == _SEAM_PARTIES
+
+
+def _hold_writes_at(seam: _WriteEntrySeam, monkeypatch: pytest.MonkeyPatch, *, moved_check: bool) -> None:
+    """Route every ``CoordinatorService.write`` through ``seam``.
+
+    ``moved_check`` builds the mutant: the same holder check, run before the
+    barrier and so outside the write's hold, then the guarded write without the
+    flag. It never calls the write unguarded, whose grant could answer with a
+    different refusal and prove nothing about where the check sits."""
+
+    def write(service: CoordinatorService, **kwargs: Any) -> Any:
+        if moved_check and kwargs.get("if_unheld"):
+            service._refuse_other_holder(kwargs["artifact_id"], kwargs["agent_id"])
+            kwargs = {**kwargs, "if_unheld": False}
+        seam.wait(kwargs["agent_id"])
+        return _GUARDED_WRITE(service, **kwargs)
+
+    monkeypatch.setattr(CoordinatorService, "write", write)
+
+
+@dataclass(frozen=True)
+class _Round:
+    """One raced round: who raced for which artifact, whether the barrier
+    forced the interleaving, and what each racer got back."""
+
+    racers: tuple[_Racer, ...]
+    artifact_id: uuid.UUID
+    forced: bool
+    outcomes: tuple[ContenderOutcome, ...]
+
+
+def _served_coordinator(workspace: Path) -> CoordinatorHTTPServer:
+    """The coordinator ``ensure_coordinator`` serves in this process."""
+    return lifecycle._SPAWNED_REGISTRY[str(workspace.resolve())].coordinator
+
+
+def _race_round(workspace: Path, number: int, install: Callable[[_WriteEntrySeam], None]) -> _Round:
+    """Race two opted-in pre-edits from separate processes for a fresh path,
+    registered up front so neither request registers it and nobody holds it."""
+    path = f"race-{number}/plan.md"
+    (workspace / path).parent.mkdir()
+    (workspace / path).write_text("seed\n")
+    artifact_id = _served_coordinator(workspace).registry.resolve_or_register(path, content_hash="")
+    seam = _WriteEntrySeam()
+    install(seam)
+    racers = (_Racer(str(workspace), _sid(), path), _Racer(str(workspace), _sid(), path))
+    result = ProcessRaceHarness(timeout_sec=60.0).race(
+        [ContenderSpec(_child_opted_in_pre_edit, args=(racer,)) for racer in racers]
+    )
+    return _Round(racers, artifact_id, seam.filled, result.outcomes)
+
+
+def _forcing_verdict(round_: _Round) -> str | None:
+    """Why ``round_`` cannot pass, judged by its forcing before its answers;
+    ``None`` when its answers can be judged.
+
+    A barrier that never filled, or a racer whose deadline passed while it was
+    held, leaves the round inconclusive: the race was not the one under test,
+    so the round fails and never passes. A handler failure behind a filled
+    barrier is the code's own failure."""
+    if not round_.forced:
+        return f"INCONCLUSIVE: the barrier at write entry never filled: {round_.outcomes}"
+    reasons = [o.value.get("reason") for o in round_.outcomes if o.error is None]
+    if UNAVAILABLE_REASON in reasons:
+        return f"INCONCLUSIVE: a racer's deadline passed while it was held: {round_.outcomes}"
+    if any(isinstance(reason, str) and reason.startswith(HANDLER_FAILURE_REASON_PREFIX) for reason in reasons):
+        return f"FAILED: a racer answered a handler failure behind a filled barrier: {round_.outcomes}"
+    return None
+
+
+def _forced_answers(round_: _Round) -> list[dict[str, Any]]:
+    """The racers' answers, in racer order, from a round shown to be forced."""
+    verdict = _forcing_verdict(round_)
+    if verdict is not None:
+        pytest.fail(verdict)
+    for outcome in round_.outcomes:
+        if outcome.error is not None:
+            raise outcome.error
+    return [outcome.value for outcome in round_.outcomes]
+
+
+def _assert_one_grant(coordinator: CoordinatorHTTPServer, round_: _Round, answers: list[dict[str, Any]]) -> None:
+    """Exactly one racer was admitted and the other refused naming it, and the
+    path has one row: the winner's, EXCLUSIVE. The loser has none."""
+    admitted = [index for index, answer in enumerate(answers) if answer.get("ok") is True]
+    assert len(admitted) == 1, f"expected exactly one grant: {answers}"
+    winner = session_to_agent_id(round_.racers[admitted[0]].session_id)
+    refusal = answers[1 - admitted[0]]
+    assert refusal == {"ok": False, "reason": OTHER_HOLDER_REASON, "holder_agent_id": winner.hex}, answers
+    assert coordinator.registry.get_state_map(round_.artifact_id) == {winner: MESIState.EXCLUSIVE}
+
+
+def test_opted_in_pre_edits_racing_from_two_processes_grant_exactly_one(
+    coordinator_workspace_no_sweep: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two client processes send opted-in pre-edits for a file nobody holds,
+    held together after the handler's holder lookup and before either enters
+    the write's hold. In every round one is granted, the other is refused with
+    ``other_holder`` naming the winner, and only the winner has a row.
+
+    Prevents two opted-in writers both taking one file: each would edit
+    believing it alone holds it, and the first loses its grant unknowingly.
+
+    What this does not prove: one machine and one coordinator only; a second
+    read-write registry on the same store is outside the write's hold."""
+    workspace = coordinator_workspace_no_sweep
+    install = partial(_hold_writes_at, monkeypatch=monkeypatch, moved_check=False)
+
+    for number in range(1, _RACE_ROUNDS + 1):
+        round_ = _race_round(workspace, number, install)
+
+        _assert_one_grant(_served_coordinator(workspace), round_, _forced_answers(round_))
+
+
+def test_a_holder_check_moved_before_the_write_hold_grants_both_racers(
+    coordinator_workspace_no_sweep: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mutant the race above exists to catch: the same holder check, run
+    before the barrier instead of inside the write's hold. Both racers check
+    while nobody holds the file, so in every round both are granted and the
+    exactly-one assertion fails.
+
+    Prevents the race above passing for a reason other than where the check
+    sits: if it could not tell this placement apart, its single grant would
+    prove nothing."""
+    workspace = coordinator_workspace_no_sweep
+    install = partial(_hold_writes_at, monkeypatch=monkeypatch, moved_check=True)
+
+    for number in range(1, _RACE_ROUNDS + 1):
+        round_ = _race_round(workspace, number, install)
+        answers = _forced_answers(round_)
+
+        assert [answer.get("ok") for answer in answers] == [True, True], answers
+        with pytest.raises(AssertionError, match="expected exactly one grant"):
+            _assert_one_grant(_served_coordinator(workspace), round_, answers)
+
+
+def test_a_race_round_is_judged_by_its_forcing_before_its_answers() -> None:
+    """A round whose barrier never filled is inconclusive even with answers
+    that would pass, and so is one where a held racer's deadline passed; a
+    handler failure behind a filled barrier is a failure of the code; a filled
+    round with real answers goes on to be judged."""
+    granted = {"ok": True}
+    refused = {"ok": False, "reason": OTHER_HOLDER_REASON, "holder_agent_id": uuid.uuid4().hex}
+
+    def round_of(forced: bool, refusal: dict[str, Any]) -> _Round:
+        outcomes = (ContenderOutcome(index=0, value=granted), ContenderOutcome(index=1, value=refusal))
+        return _Round(racers=(), artifact_id=uuid.uuid4(), forced=forced, outcomes=outcomes)
+
+    assert (_forcing_verdict(round_of(False, refused)) or "").startswith("INCONCLUSIVE:")
+    unavailable = {"ok": False, "reason": UNAVAILABLE_REASON, "degraded": True}
+    assert (_forcing_verdict(round_of(True, unavailable)) or "").startswith("INCONCLUSIVE:")
+    internal = {"ok": False, "reason": f"{HANDLER_FAILURE_REASON_PREFIX}BrokenBarrierError"}
+    assert (_forcing_verdict(round_of(True, internal)) or "").startswith("FAILED:")
+    assert _forcing_verdict(round_of(True, refused)) is None

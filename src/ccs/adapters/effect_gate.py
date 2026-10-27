@@ -55,8 +55,10 @@ from ccs.core.exceptions import (
     HOLD_GRANT_RECLAIMED,
     HOLD_INPUT_VANISHED,
     HOLD_READ_DENIED,
+    HOLD_SPLIT_PAIR,
     HOLD_VERSION_MOVED,
     HOLD_VERSION_UNCONFIRMED,
+    SPLIT_PAIR_REASON,
     InvariantViolationError,
     StaleView,
 )
@@ -174,6 +176,18 @@ _HOLD_DETAILS: dict[str, Callable[[FenceComparands], str]] = {
         lambda c: "could not be confirmed (coordinator degraded or unresolved)"
     ),
     HOLD_VERSION_MOVED: lambda c: f"moved to v{c.current_version}",
+    # The coordinator refused the re-read because the bytes on disk are not its
+    # content at a version that has not moved (#405): a peer's write() whose
+    # bytes landed before its commit, a change made outside the coordinator,
+    # or a commit whose disk write failed. Not "INVALID": the view may still be
+    # SHARED, and a reacquire does not clear it.
+    HOLD_SPLIT_PAIR: (
+        lambda c: (
+            "is not on disk as the coordinator records it (a peer's write still "
+            "landing, a change made outside the coordinator, or a commit whose "
+            "disk write failed)"
+        )
+    ),
     # The coordinator REFUSED the re-read (strict mode). A distinct, recoverable
     # answer -- and on the strict path it is how a sweep reclaim actually
     # reaches the client, so folding it into the residual bucket would hide the
@@ -227,6 +241,28 @@ _HOLD_DETAILS: dict[str, Callable[[FenceComparands], str]] = {
 }
 
 
+#: The recovery a HOLD names, for a reason a reacquire does not clear. Every
+#: other reason names :data:`_REACQUIRE_AND_RE_DECIDE`. Byte-stable, like the
+#: details above.
+_HOLD_RECOVERIES: dict[str, str] = {
+    # The wait comes first, as on the read refusal for the same answer: a
+    # write() made while a peer's commit is still to land preempts it.
+    HOLD_SPLIT_PAIR: (
+        "a peer's write still landing clears by itself, so re-gate after a few "
+        "seconds; only a hold that outlasts that is a change outside the "
+        "coordinator: then reacquire() and write() the bytes it returns, or your "
+        "merge of them, to record them, then read and re-decide"
+    ),
+}
+_REACQUIRE_AND_RE_DECIDE = "reacquire and re-decide"
+
+#: The instance ``reason`` a HOLD carries where it is not the class's
+#: ``stale_view``: a split pair reads ``split_pair`` here as on every read that
+#: refuses one (#264, #405), so a caller branching on ``reason`` sees one value
+#: for one coordinator answer.
+_HOLD_INSTANCE_REASONS: dict[str, str] = {HOLD_SPLIT_PAIR: SPLIT_PAIR_REASON}
+
+
 def _held(
     path: str | os.PathLike[str],
     comparands: FenceComparands,
@@ -255,10 +291,12 @@ def _held(
         target = os.fspath(path)
     except TypeError:
         target = str(path)
+    recovery = _HOLD_RECOVERIES.get(reason, _REACQUIRE_AND_RE_DECIDE)
     exc = StaleView(
         f"effect held: {target} {detail_of(comparands)} since it was read at "
-        f"v{comparands.expected_version}; effect not fired (reacquire and re-decide)"
+        f"v{comparands.expected_version}; effect not fired ({recovery})"
     )
+    exc.reason = _HOLD_INSTANCE_REASONS.get(reason, exc.reason)
     exc.expected_version = comparands.expected_version
     exc.current_version = comparands.current_version
     exc.expected_generation = comparands.expected_generation
@@ -369,6 +407,12 @@ def check_fence(
         # flags exist, and a defaulting accessor is what silently admitted a
         # volume that answers neither question.
         denied = bool(volume._last_read_denied)
+        # Whether that refusal said the bytes are not the content at that
+        # version (#405). Read with a default, unlike the two flags here: an
+        # absent flag can only change WHICH hold (read_denied for split_pair),
+        # never turn a hold into a proceed, so a volume that predates it holds
+        # exactly as it did.
+        split = bool(getattr(volume, "_last_read_split", False))
         # The third leg of the fence: the pair answers "did the value or the
         # epoch move", but a peer's pessimistic write-acquire ends the caller's
         # grant while moving NEITHER (no commit yet, and trigger="write" is
@@ -387,6 +431,7 @@ def check_fence(
         current_version = None
         current_generation = None
         denied = False
+        split = False
         lapsed = False
 
     # ONE classification, shared with the coordinator route: HOLD unless the
@@ -406,6 +451,7 @@ def check_fence(
         expected_generation=expected_generation,
         current_generation=current_generation,
         read_refused=denied,
+        split_pair=split,
         grant_did_not_stand=lapsed,
         # HONEST LIMIT, in-process: the pre-read wire carries ``hash_differs``
         # (a comparison) and never the coordinator's RECORDED hash, so this

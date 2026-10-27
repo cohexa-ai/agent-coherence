@@ -244,11 +244,10 @@ def _neutralize_v090_first_use_warning():
 def _restore_sigpipe_disposition():
     """Put SIGPIPE's disposition back after every test.
 
-    ``ccs.cli.diagnose.main()`` resets SIGPIPE to the default action for the
-    whole process, so ``ccs-diagnose | head`` exits quietly. Left that way, the
-    next test in the same process that writes to a closed socket kills the
-    process with no traceback; under xdist that took down a worker mid-run
-    (tests/test_diagnose_cli.py pins this)."""
+    Tests that change process-wide signal state must not affect later tests.
+    Leaving SIGPIPE at its default action can kill the next test's process
+    when it writes to a closed pipe or socket, without a Python traceback.
+    """
     if not hasattr(signal, "SIGPIPE"):
         yield
         return

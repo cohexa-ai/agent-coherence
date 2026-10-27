@@ -1856,6 +1856,99 @@ def test_a_reacquire_answered_with_the_failure_envelope_raises_coordinator_faile
         server.shutdown()
 
 
+#: What the status answers below carry as their reason phrase and body; the
+#: session reports a status by its code alone.
+_ANSWERED_TEXT = "text-the-coordinator-answered-with"
+
+
+def _answer_after_the_work(monkeypatch: pytest.MonkeyPatch, route: str, status: int) -> None:
+    """Answer every request on ``route`` with HTTP ``status`` once the
+    coordinator has run it, as its dispatcher does for a handler that raised
+    after its work, or a gateway after it forwarded; send every other request
+    on as usual."""
+    import io
+    import json
+    import urllib.error
+
+    real_post = substrate_module._coordinator_post
+
+    def post(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        answer = real_post(endpoint, path, payload, **kwargs)
+        if path != route:
+            return answer
+        raw = io.BytesIO(json.dumps({"error": _ANSWERED_TEXT}).encode())
+        raise urllib.error.HTTPError(path, status, _ANSWERED_TEXT, {}, raw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(substrate_module, "_coordinator_post", post)
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+@pytest.mark.parametrize("call", ["read", "reacquire", "commit"])
+def test_a_read_leg_answered_with_a_5xx_raises_coordinator_failed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    call: str, status: int,
+) -> None:
+    """A pre-read answered with an HTTP 5xx raises ``CoordinatorFailed``, as
+    the same coordinator failure does when it arrives as the failure envelope,
+    and as the volume's strict reads do (#433): the read, the reacquire, and
+    the commit's pre-read, which is sent before the substrate is touched, so
+    nothing is written. The text names the request and its status, and
+    nothing the answer carried. Before, it raised the plain fail-closed
+    ``CoherenceError``."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    server = serve_in_process(tmp_path, f"substrate-read-5xx-{call}-{status}", tracked="workspace/**")
+    try:
+        sa = _session(tmp_path, fast_cfg)
+        a, fake = _agent(store, sa)
+        _bytes, token = a.read(REF)
+        _answer_after_the_work(monkeypatch, "/hooks/pre-read", status)
+
+        with pytest.raises(CoherenceError) as raised:
+            if call == "read":
+                a.read(REF)
+            elif call == "reacquire":
+                a.reacquire(REF)
+            else:
+                a.commit(REF, expected_token=token, new_bytes=b"v2")
+
+        assert type(raised.value) is CoordinatorFailed, type(raised.value)
+        assert str(raised.value) == f"coordinator /hooks/pre-read failed (fail-closed): HTTP {status}"
+        assert _ANSWERED_TEXT not in "".join(traceback.format_exception(raised.value))
+        assert fake.cas_calls == [], "the substrate was written on an unconfirmed pre-read"
+        assert store.get(REF)[0] == b"v1"
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(("route", "status"), [("/hooks/pre-read", 400), ("/hooks/post-edit-cas", 500)])
+def test_a_status_that_is_not_a_read_legs_5xx_keeps_its_error(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    route: str, status: int,
+) -> None:
+    """Control: a 4xx on the read leg is a definite refusal and keeps the
+    plain error; a 5xx on the bump, sent after the substrate write landed,
+    keeps ``CommitUnconfirmed``, because the bytes are on the substrate
+    whatever the coordinator did."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    server = serve_in_process(tmp_path, f"substrate-status-{status}", tracked="workspace/**")
+    try:
+        sa = _session(tmp_path, fast_cfg)
+        a, _fake = _agent(store, sa)
+        _bytes, token = a.read(REF)
+        _answer_after_the_work(monkeypatch, route, status)
+
+        with pytest.raises(CoherenceError) as raised:
+            a.commit(REF, expected_token=token, new_bytes=b"v2")
+
+        expected = CommitUnconfirmed if route == "/hooks/post-edit-cas" else CoherenceError
+        assert type(raised.value) is expected, type(raised.value)
+        assert f"HTTP {status}" in str(raised.value)
+    finally:
+        server.shutdown()
+
+
 @pytest.mark.parametrize(
     "answer",
     [

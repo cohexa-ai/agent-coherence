@@ -83,7 +83,7 @@ from ccs.diagnose.telemetry import (
     resolve_consent,
 )
 
-__all__ = ["main", "build_parser"]
+__all__ = ["main", "console_main", "build_parser"]
 
 
 _DEFAULT_HTML_PATH = "diagnose_report.html"
@@ -391,15 +391,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """``ccs-diagnose`` entry point. Returns the process exit code."""
+def console_main(argv: Sequence[str] | None = None) -> int:
+    """Console-only entry point; embedded callers should use :func:`main`."""
     # Restore the default SIGPIPE behaviour so piping into ``head`` etc. exits
     # cleanly with status 141 instead of raising ``BrokenPipeError`` from the
     # interpreter. Windows lacks SIGPIPE; the ``hasattr`` guard keeps the
     # entrypoint portable.
     if hasattr(signal, "SIGPIPE"):
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    return main(argv)
 
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run diagnostics without changing SIGPIPE. Returns the exit code."""
     parser = build_parser()
     args = parser.parse_args(argv)
     args.ignore_keys = _parse_csv(args.ignore)
@@ -1226,7 +1230,7 @@ def _write_report_json(
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        raise SystemExit(console_main())
     except BrokenPipeError:
         # Mirror the conventional shell exit status for a SIGPIPE-killed
         # process. Without this, piping into ``head`` etc. surfaces a

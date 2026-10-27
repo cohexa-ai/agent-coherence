@@ -440,6 +440,34 @@ def _degraded_release_message(reason: str) -> str:
     )
 
 
+def _own_grant_message(rel: str, *, held: bool) -> str:
+    """What a commit of ``rel`` raises
+    (:class:`~ccs.core.exceptions.CoordinatorFailed`) when the coordinator
+    refused it ``other_holder`` and the grant may be this volume's own: one an
+    earlier attempt's write() took and no release has confirmed (#434). Told
+    as such, never as another agent's grant to wait out. ``held``: the
+    release's answer reported that grant still held, so the holder is that
+    grant; otherwise the release went unconfirmed and may or may not have run,
+    so the holder may be a peer. Byte-stable but for the path. A retry sends
+    the release again; a second failure is the coordinator's to report."""
+    if held:
+        claim = (
+            f"{rel} is held by this volume's own earlier write grant: the coordinator "
+            "answered that grant's release with the grant still held, and refused this "
+            "commit as another agent's."
+        )
+    else:
+        claim = (
+            f"{rel} may be held by this volume's own earlier write grant, whose release "
+            "was not confirmed: the coordinator refused this commit because another "
+            "write grant holds the file."
+        )
+    return (
+        f"{claim} Nothing was committed. Retry once after a short wait, which "
+        "sends the release again; if it fails again, report it to the operator."
+    )
+
+
 def _cas_not_recorded_message(rel: str, detail: str) -> str:
     """What a strict OCC commit raises
     (:class:`~ccs.core.exceptions.CoordinatorUnreachable`) when the
@@ -565,6 +593,15 @@ _SPLIT_READ_DENY_REASON = (
     "again. A write made while a peer's commit is still reaching disk is "
     "overwritten when that commit lands."
 )
+
+
+def _split_pair_refusal() -> StaleView:
+    """The refusal an observing read raises for a split pair: the text above,
+    and the instance reason ``split_pair`` (#264, #405)."""
+    refusal = StaleView(_SPLIT_READ_DENY_REASON)
+    refusal.reason = SPLIT_PAIR_REASON
+    return refusal
+
 
 # Live volumes a forked child must reset (CoherentVolume._after_fork). One
 # process-wide handler walks this set because os.register_at_fork cannot
@@ -811,7 +848,8 @@ class CoherentVolume:
       :class:`~ccs.core.exceptions.CoordinatorFailed`, and so does the release
       a re-mint sends for an earlier attempt's write grant, before anything is
       committed; a commit it answers that way raises ``CommitUnconfirmed`` in
-      both modes, because it may have landed.
+      both modes, because it may have landed. Every request that commits
+      nothing raises ``CoordinatorFailed`` for an HTTP 5xx too (#433).
     - ``"degrade"``: the same conditions warn once
       (:class:`~ccs.core.exceptions.CoherenceDegradedWarning`) and the appliance
       operates best-effort (coherence may be off). Mirrors the other adapters.
@@ -824,7 +862,10 @@ class CoherentVolume:
       audits the foreign edit).
     - ``"raise"``: that same deny surfaces as
       :class:`~ccs.core.exceptions.StaleView` so the caller can abort or
-      :meth:`reacquire` instead of silently acting on the foreign bytes.
+      :meth:`reacquire` instead of silently acting on the foreign bytes. A
+      deny of bytes that are not the content the coordinator records (a split
+      pair) raises the refusal :meth:`read_with_version` raises, reason
+      ``split_pair`` (#405).
       Independent of ``on_error`` (which governs only infra failures);
       :meth:`reacquire`'s recovery read always bypasses it.
 
@@ -951,6 +992,12 @@ class CoherentVolume:
         # optimistic commit is refused on. The paths decide whether write_cas
         # must rotate first: a held grant refuses a commit of that file only.
         self._grant_incarnations: dict[str, set[str]] = {}
+        # The paths the latest release pass's answer reported still held, grant
+        # by grant (#185). A commit of one refused other_holder is refused by
+        # this volume's own grant, which it then names as such (#434); any other
+        # path still in the record was not released either, but whether its
+        # grant still stands is unknown.
+        self._release_held_paths: set[str] = set()
         # Per path, the incarnation whose read registered this volume's standing
         # SHARED view of it (#185). A re-mint moves every later request to
         # a new incarnation but leaves that view with the one that took it, so a
@@ -1039,6 +1086,7 @@ class CoherentVolume:
         # re-attaches.
         self._new_principal_claim()
         self._grant_incarnations.clear()
+        self._release_held_paths.clear()
         self._read_incarnations.clear()
         self._read_handoffs.clear()
         self._endpoint = None
@@ -1691,6 +1739,7 @@ class CoherentVolume:
         # a strict deny. An unanswered or failed read leaves neither set.
         self._read_handoffs.pop(rel, None)
         self._last_read_denied = False
+        self._last_read_split = False
         if self._endpoint is not None:
             reader = self._incarnation  # the incarnation this request names
             resp = self._post(
@@ -1705,6 +1754,8 @@ class CoherentVolume:
             hook_output = resp.get("hookSpecificOutput") if isinstance(resp, dict) else None
             denied = isinstance(hook_output, dict) and hook_output.get("permissionDecision") == "deny"
             self._last_read_denied = denied
+            split = denied and self._pre_read_hash_differs(resp)
+            self._last_read_split = split
             # A stale / strict-deny response is expected and changes nothing here
             # (read returns current bytes; INVALID stays sticky). Two answers
             # are infra failures that take the unanswered-request seam: a
@@ -1721,7 +1772,11 @@ class CoherentVolume:
                 # abort or reacquire(), instead of silently returning current
                 # bytes. Default ("allow") keeps the back-compat swallow.
                 # reacquire()'s recovery read passes _enforce_stale=False so
-                # recovery is never blocked.
+                # recovery is never blocked. A split pair raises the refusal
+                # the versioned reads raise for the same answer (#405), never
+                # the coordinator's text, whose "re-read" is refused again.
+                if split:
+                    raise _split_pair_refusal()
                 raise StaleView(self._deny_reason(resp))
             if self._read_registered(resp):
                 self._read_incarnations[rel] = reader
@@ -2113,6 +2168,7 @@ class CoherentVolume:
         The pass stops at the first release not confirmed — the rest would meet
         the same coordinator — so one re-mint spends at most one failed request.
         """
+        self._release_held_paths.clear()
         if self._endpoint is None:
             return  # nothing to send it to; the record waits for an attached re-mint
         for incarnation in incarnations:
@@ -2156,10 +2212,16 @@ class CoherentVolume:
         if written is None or not isinstance(grants, list):
             return
         for entry in grants:
-            if isinstance(entry, dict) and entry.get("held") is False:
-                path = entry.get("path")
-                if isinstance(path, str):
-                    written.discard(path)
+            if not isinstance(entry, dict):
+                continue
+            path = entry.get("path")
+            if not isinstance(path, str):
+                continue
+            held = entry.get("held")
+            if held is False:
+                written.discard(path)
+            elif held is True and path in written:
+                self._release_held_paths.add(path)
         if not written:
             del self._grant_incarnations[incarnation]
 
@@ -2197,9 +2259,14 @@ class CoherentVolume:
         release of a grant ``write()`` left held fails stops the call under
         ``"strict"`` before anything commits —
         :class:`~ccs.core.exceptions.CoordinatorFailed` when the coordinator
-        answered it with its failure envelope (#401) — and under ``"degrade"``
-        warns, counts, and goes on, so a grant still held on ``path`` refuses
-        the commit as ``other_holder``.
+        answered it with its failure envelope (#401) or an HTTP 5xx (#433) —
+        and under ``"degrade"`` warns, counts, and goes on. A commit then
+        refused ``other_holder`` while that grant is still recorded, in either
+        mode (a release answered with the grant still held goes on in strict
+        too), is retried once, after a re-mint that sends the release again,
+        which clears a one-off release failure; refused by that grant again,
+        the call raises ``CoordinatorFailed`` naming this volume's own grant
+        rather than spend the budget on it (#434).
 
         **Contention bound.** The commit budget is :data:`MAX_CAS_REACQUIRES`
         (=8 → 9 CAS attempts); each lost race (a peer winning the version)
@@ -2298,7 +2365,7 @@ class CoherentVolume:
             self._record_own_write(rel, self._sha256_bytes(data))
             return CasCommitResult(path=rel, version=None)
 
-        if any(rel in paths for paths in self._grant_incarnations.values()):
+        if self._records_write_grant(rel):
             # This volume's write() may still hold THIS file: under the current
             # incarnation, or under an abandoned one whose release was not
             # confirmed. The loop's comparand read must run as a None-state
@@ -2317,6 +2384,7 @@ class CoherentVolume:
         max_attempts = MAX_CAS_REACQUIRES + 1  # commit (CAS POST) budget
         cas_attempts = 0
         denied_streak = 0  # CONSECUTIVE stale-denied comparand reads
+        own_grant_retried = False  # the one retry a refusal by our own grant gets
         while True:
             # Fresh read each attempt. _read_with_version returns the bytes, the
             # coordinator's authoritative version (the OCC comparand), and whether
@@ -2399,6 +2467,16 @@ class CoherentVolume:
                     path=rel, version=expected_version + 1, handoff=self._win_outcome(resp)
                 )
             if outcome == "conflict":
+                # Refused by this volume's own unreleased grant (#434): the
+                # re-mint below sends its release again, which clears a one-off
+                # failure, so retry once; refused by it again, or out of
+                # budget, stop and name it rather than re-mint into the same
+                # failing release.
+                own_grant = self._own_grant_refusal(rel, resp.get("reason"))
+                if own_grant is not None:
+                    if own_grant_retried or cas_attempts >= max_attempts:
+                        raise own_grant
+                    own_grant_retried = True
                 last_current_version = self._cas_current_version(resp, last_current_version)
                 if cas_attempts >= max_attempts:
                     # Every allowed commit attempt was refused — typed terminal,
@@ -2492,7 +2570,10 @@ class CoherentVolume:
         touches disk ONLY on a confirmed win, and the win returns a
         :class:`CasCommitResult` (the new version, and what the win did to a live
         handoff of the path). A path this volume's session handed off raises
-        :class:`~ccs.core.exceptions.GiverFenced`.
+        :class:`~ccs.core.exceptions.GiverFenced`. A commit refused
+        ``other_holder`` while this volume's own earlier write grant on the path
+        is still unreleased raises :class:`~ccs.core.exceptions.CoordinatorFailed`
+        naming that grant, not ``CasVersionConflict`` (#434).
         """
         if not isinstance(new_content, (bytes, bytearray)):
             raise TypeError(f"new_content must be bytes, got {type(new_content).__name__}")
@@ -2554,7 +2635,9 @@ class CoherentVolume:
             # pessimistic peer holds the grant, OR the claim this read was taken
             # under was reclaimed, OR a peer invalidated us mid-window. All four
             # are conflicts; they are NOT the same conflict, so the coordinator's
-            # own reason travels with the terminal rather than being relabelled.
+            # own reason travels with the terminal rather than being relabelled,
+            # except when the holder is this volume's own unreleased grant (#434).
+            self._raise_if_refused_by_own_grant(rel, resp.get("reason"))
             raise CasVersionConflict(
                 rel,
                 expected_version,
@@ -2591,6 +2674,43 @@ class CoherentVolume:
             raise CommitUnconfirmed(_failed_cas_message(rel, reason))
         if reason == GIVER_FENCED_REASON:
             raise self._giver_fenced(resp, rel)
+
+    def _own_grant_refusal(self, rel: str, reason: object) -> CoordinatorFailed | None:
+        """The :class:`~ccs.core.exceptions.CoordinatorFailed` for a commit of
+        ``rel`` refused ``other_holder`` while this volume still records an
+        earlier attempt's write grant on ``rel`` that no release confirmed
+        (#434). That grant refused it, or may have, and a caller told
+        ``other_holder`` waits for a peer that does not exist; a retry instead
+        sends the release again. ``None`` for any other refusal, and when no
+        such grant is recorded, so a peer's refusal keeps its own answer. Only
+        a path this volume recorded can match, so nothing the coordinator
+        answered reaches the text."""
+        if reason != "other_holder" or not self._records_write_grant(rel):
+            return None
+        return CoordinatorFailed(_own_grant_message(rel, held=rel in self._release_held_paths))
+
+    def _raise_if_refused_by_own_grant(self, rel: str, reason: object) -> None:
+        """Raise :meth:`_own_grant_refusal`'s error, when there is one."""
+        refusal = self._own_grant_refusal(rel, reason)
+        if refusal is not None:
+            raise refusal
+
+    def _raise_if_a_member_refused_by_own_grant(self, commit: dict) -> None:
+        """:meth:`_raise_if_refused_by_own_grant` for each member of a batch
+        commit's refusal (``per_artifact``), so a member this volume's own
+        unreleased grant refused is named rather than held as a peer's
+        conflict (#434)."""
+        per_artifact = commit.get("per_artifact")
+        if not isinstance(per_artifact, dict):
+            return
+        for member, detail in per_artifact.items():
+            if isinstance(detail, dict):
+                self._raise_if_refused_by_own_grant(member, detail.get("reason"))
+
+    def _records_write_grant(self, rel: str) -> bool:
+        """Whether this volume's record holds a write grant on ``rel`` that no
+        confirmed release has cleared, under any incarnation."""
+        return any(rel in written for written in self._grant_incarnations.values())
 
     def atomic_publish(
         self,
@@ -2631,9 +2751,13 @@ class CoherentVolume:
             :meth:`write` left held (see :meth:`_remint`) fails → under
             ``"strict"`` the publish raises before its commit,
             :class:`~ccs.core.exceptions.CoordinatorFailed` for the
-            coordinator's failure envelope (#401); NOTHING committed, NO file
-            written. Under ``"degrade"`` it warns and goes on, and a member
-            that grant still holds is refused as another holder's.
+            coordinator's failure envelope (#401) or an HTTP 5xx (#433);
+            NOTHING committed, NO file written. Under ``"degrade"`` it warns
+            and goes on.
+          - a member that grant still holds is refused as another holder's,
+            in either mode (a release answered with the grant still held goes
+            on in strict too) → ``CoordinatorFailed`` naming this volume's own
+            grant (#434); NOTHING committed, NO file written.
 
         **Atomicity boundary (read this).** The all-or-nothing guarantee is at the
         COORDINATOR commit: either every member's version advances as one unit or
@@ -2863,6 +2987,7 @@ class CoherentVolume:
             raise CoherenceError(
                 f"atomic_publish rejected (non-retryable): {reason}"
             )
+        self._raise_if_a_member_refused_by_own_grant(commit)
         # A batch conflict or a session-lifecycle rejection: recover via a fresh
         # read/session, which a StaleView (reacquire + re-decide) drives. Nothing
         # was committed and NO file is written.
@@ -3407,8 +3532,9 @@ class CoherentVolume:
         """POST to the coordinator. Transport errors and non-2xx HTTP responses
         route through ``on_error`` (strict raises, degrade warns + returns
         ``None``); in strict mode a request that got no usable answer raises
-        :class:`~ccs.core.exceptions.CoordinatorUnreachable`. Otherwise returns
-        the parsed 200 body.
+        :class:`~ccs.core.exceptions.CoordinatorUnreachable`, and one answered
+        with an HTTP 5xx raises :class:`~ccs.core.exceptions.CoordinatorFailed`.
+        Otherwise returns the parsed 200 body.
 
         With ``outcome_unknown_on_failure`` (the handoff verbs), a request
         whose outcome is unknown -- no answer, or an HTTP 5xx -- returns
@@ -3520,7 +3646,9 @@ class CoherentVolume:
         with what the client knows of its delivery, for the commit's caller to
         type. A strict ``commit_leg`` answered with an HTTP 5xx raises it too,
         as delivered, with the status: a 5xx says nothing of whether the
-        commit ran. Any other status follows ``on_error``.
+        commit ran. Any other strict request answered with a 5xx raises
+        :class:`~ccs.core.exceptions.CoordinatorFailed`, as the coordinator's
+        failure envelope does (#433). Any other status follows ``on_error``.
 
         Every raise for a rejected request happens OUTSIDE the ``except``
         block, so the ``HTTPError`` never rides the raised error's chain: its
@@ -3585,6 +3713,12 @@ class CoherentVolume:
             # after would mean trusting that every 503 from this endpoint
             # precedes its work, which ties the client to the server's code.
             raise _CommitNotAnswered(message, never_sent=False, status=status)
+        if typed and status >= 500:
+            # Any other request answered with a 5xx commits nothing, but the
+            # coordinator failed on it: the same answer its failure envelope
+            # gives, which the reads and the release already type (#259,
+            # #401, #433).
+            raise CoordinatorFailed(message)
         return self._failed_request(
             message, outcome_unknown=outcome_unknown_on_failure and status >= 500
         )
@@ -3651,9 +3785,7 @@ class CoherentVolume:
         MCP answer stays ``stale_view``.
         """
         if result.split_pair:
-            refusal = StaleView(_SPLIT_READ_DENY_REASON)
-            refusal.reason = SPLIT_PAIR_REASON
-            raise refusal
+            raise _split_pair_refusal()
 
     #: Whether the most recent read, by any read method, was refused by the
     #: coordinator (strict-mode deny); the public face is
@@ -3661,6 +3793,12 @@ class CoherentVolume:
     #: :meth:`read_with_version_generation` to name the HOLD cause precisely;
     #: per-instance and overwritten by every read.
     _last_read_denied: bool = False
+
+    #: Whether that refusal was a split pair: the coordinator said the bytes are
+    #: not its content at that version (``hash_differs``). The effect fence
+    #: names its HOLD ``split_pair`` from it rather than ``read_denied`` (#405).
+    #: Per-instance and overwritten by every read, like its sibling.
+    _last_read_split: bool = False
 
     #: Whether the most recent :meth:`read_with_version_generation` came back
     #: with the STALE status shape — this instance had no standing grant on the
@@ -3697,13 +3835,14 @@ class CoherentVolume:
         An observing read raises :class:`~ccs.core.exceptions.StaleView` instead
         of returning a split pair (see :meth:`_refuse_split_pair`). A
         verification read still returns: its bytes are discarded, and the fence
-        classifies it from ``_last_read_denied``, which is set either way.
+        classifies it from ``_last_read_denied`` and ``_last_read_split``,
+        which are set either way.
         """
         with self._single_op_guard():
             result = self._read_with_version(path, observe=observe)
             # A strict-mode deny is reported as a REFUSED read, not merely as a
-            # missing generation: they need different answers (a deny clears
-            # with reacquire; a coordinator that cannot report generations at
+            # missing generation: they need different answers (a plain deny
+            # clears with reacquire; a coordinator that cannot report generations at
             # all does not), and on the strict path a sweep reclaim reaches the
             # client precisely AS a deny.
             self._last_read_denied = result.stale_denied
@@ -3782,6 +3921,7 @@ class CoherentVolume:
         # a strict deny. An unanswered or failed read leaves neither set.
         self._read_handoffs.pop(_rel, None)
         self._last_read_denied = False
+        self._last_read_split = False
         if self._endpoint is not None:
             reader = self._incarnation  # the incarnation this request names
             resp = self._post(
@@ -3844,6 +3984,7 @@ class CoherentVolume:
         result = _ReadResult(
             data, version, stale_denied, owner_generation, stale_status, content_differs
         )
+        self._last_read_split = result.split_pair
         # SB-23: the OCC read path also advances the foreign-edit baseline — but
         # ONLY when the caller actually OBSERVES these bytes: here, where they
         # are returned to it (a raise above — a request refused for its caller

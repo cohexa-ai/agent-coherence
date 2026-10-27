@@ -17,10 +17,13 @@ directly — a dead session at any step RAISES ``SessionInvalidated``, never fir
 
 The two modes under test:
 
-- **ATOMIC** (``commit=(artifact_id, content)``) — routed through ``session_commit``
-  so ``commit_cas`` arbitrates at the pinned base in the SAME step: NO
-  re-validate->fire window. A raced peer commit loses the CAS cleanly (HELD with the
-  shipped ``ConflictDetail`` carried through verbatim).
+- **ATOMIC** (``commit=(artifact_id, content)``) — the whole cut is re-validated and
+  the write routed through ``session_commit`` (``commit_cas`` at the pinned base)
+  under one hold of the service and registry locks: any moved member HOLDS, and no
+  writer on the same registry instance can land between the check and the commit. A
+  raced target write loses the CAS cleanly (HELD with the shipped ``ConflictDetail``
+  carried through verbatim). A writer on a second handle to the same store is
+  outside the hold; that residual is OBSERVED here, not asserted away.
 - **ESCAPING** (``effect=callable``) — re-validate, then fire the callable. The
   guarantee is "unchanged AS OF the re-validate point", NOT "as of the fire point":
   the residual re-validate->fire window is unclosable (EO-7) and is OBSERVED here,
@@ -29,12 +32,17 @@ The two modes under test:
 Timing is exercised with FIXED-STALE BUFFERS (a peer commit driven explicitly at a
 chosen point), never counters or wall-clock sleeps — the institutional steer for
 the multi-read window (a protocol proof bounds the registry, not the integration).
+The thread tests start their peer at a chosen point too; their ``_WINDOW_WAIT``
+join only gives a peer the chance to land, and they pass deterministically when
+the gate's lock hold works (the peer cannot land under it).
 Reason matching is ALWAYS ``reason == CONSTANT`` against the imported wire-stable
 constant, never a substring of a human message.
 """
 
 from __future__ import annotations
 
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -61,6 +69,10 @@ from ccs.core.types import (
 )
 
 _HB_TIMEOUT = 120
+# How long a peer writer started inside the atomic gate's check-to-commit span
+# gets to land before the gate's CAS runs. Without the gate's lock hold it lands
+# in milliseconds; with the hold it is still blocked when this runs out.
+_WINDOW_WAIT = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +335,115 @@ class TestHeldOnDrift:
         finally:
             sql.close()
 
+    @pytest.mark.parametrize("arm", ["in_memory", "sqlite"])
+    def test_atomic_commit_held_when_a_non_target_member_moved(
+        self, tmp_path: Path, arm: str
+    ) -> None:
+        """#456: the commit is derived from EVERY read-set member, so a peer
+        moving one the gate does not write must hold it, exactly as escaping
+        mode holds. Before the fix the gate checked only the commit target,
+        committed the plan from a superseded brief, and reported the brief
+        unchanged in ``revalidated_cut``."""
+        mem, sql = _lazy_registries(tmp_path)
+        reg = mem if arm == "in_memory" else sql
+        try:
+            svc = CoordinatorService(reg)
+            owner = uuid4()
+            a, b = uuid4(), uuid4()
+            _register(reg, a, "plan.md", "PLAN-V1")
+            _register(reg, b, "brief.md", "BRIEF-V1")
+
+            def decide(view: SessionView) -> object:
+                view.read(a)
+                view.read(b)
+                # A peer moves the brief, which the gate reads but does not write.
+                _peer_commit_cas(reg, b, uuid4(), expected=1, body="BRIEF-V2")
+                return view
+
+            outcome = svc.effect_gate(
+                read_set=[a, b],
+                owner=owner,
+                decide=decide,
+                commit=(a, "PLAN-FROM-BRIEF-V1"),
+            )
+
+            assert isinstance(outcome, EffectHeld)
+            assert outcome.moved == {b: (1, 2)}
+            # Caught at the check, so no CAS was attempted.
+            assert outcome.conflict is None
+            # The plan derived from the superseded brief never landed.
+            assert reg.get_artifact(a).version == 1
+        finally:
+            sql.close()
+
+    @pytest.mark.parametrize("arm", ["in_memory", "sqlite"])
+    def test_atomic_commit_held_when_a_non_target_member_vanished(
+        self, tmp_path: Path, arm: str
+    ) -> None:
+        """A read-set member removed under the pin can no longer be proven
+        unchanged, so the atomic gate holds (``current`` is ``None``) even when
+        it is not the commit target."""
+        mem, sql = _lazy_registries(tmp_path)
+        reg = mem if arm == "in_memory" else sql
+        try:
+            svc = CoordinatorService(reg)
+            owner = uuid4()
+            a, b = uuid4(), uuid4()
+            _register(reg, a, "plan.md", "PLAN-V1")
+            _register(reg, b, "brief.md", "BRIEF-V1")
+
+            def decide(view: SessionView) -> object:
+                view.read(b)
+                reg.remove_artifact(b)
+                return view
+
+            outcome = svc.effect_gate(
+                read_set=[a, b],
+                owner=owner,
+                decide=decide,
+                commit=(a, "PLAN-FROM-A-REMOVED-BRIEF"),
+            )
+
+            assert isinstance(outcome, EffectHeld)
+            assert outcome.moved == {b: (1, None)}
+            assert outcome.conflict is None
+            assert reg.get_artifact(a).version == 1
+        finally:
+            sql.close()
+
+    @pytest.mark.parametrize("arm", ["in_memory", "sqlite"])
+    def test_atomic_commit_held_with_nothing_moved_when_a_peer_holds_the_target(
+        self, tmp_path: Path, arm: str
+    ) -> None:
+        """A pessimistic peer holding the target's write grant moves no version,
+        so the re-validate passes and the CAS refuses the commit as
+        ``other_holder``. The gate holds with that conflict and an EMPTY
+        ``moved``: nothing moved, but the commit could not land."""
+        mem, sql = _lazy_registries(tmp_path)
+        reg = mem if arm == "in_memory" else sql
+        try:
+            svc = CoordinatorService(reg)
+            owner = uuid4()
+            a = uuid4()
+            _register(reg, a, "plan.md", "PLAN-V1")
+
+            def decide(view: SessionView) -> object:
+                view.read(a)
+                reg.set_agent_state(a, uuid4(), MESIState.EXCLUSIVE, tick=1)
+                return view
+
+            outcome = svc.effect_gate(
+                read_set=[a], owner=owner, decide=decide, commit=(a, "PLAN-V2"),
+            )
+
+            assert isinstance(outcome, EffectHeld)
+            assert outcome.conflict is not None
+            assert outcome.conflict.reason == "other_holder"
+            assert outcome.moved == {}
+            assert reg.get_artifact(a).version == 1
+        finally:
+            sql.close()
+
 
 # ===========================================================================
 # C — Fail-closed: the session is reaped mid-gate -> SessionInvalidated, no fire.
@@ -437,7 +558,7 @@ class TestRevalidateFireWindow:
         effect: the effect FIRES on a vector that was valid at re-validate but
         moved before the fire completed. The window is OBSERVED (the gate fired
         AND the member moved), NOT asserted away. This is the honest EO-5 / EO-7
-        bound — atomic-iff holds ONLY for ``session.commit``."""
+        bound — only ATOMIC mode (``session.commit``) closes the window."""
         mem, sql = _lazy_registries(tmp_path)
         reg = mem if arm == "in_memory" else sql
         try:
@@ -483,10 +604,12 @@ class TestRevalidateFireWindow:
     def test_atomic_mode_closes_the_window(
         self, tmp_path: Path, arm: str
     ) -> None:
-        """The ATOMIC counterpart: the SAME race that an escaping effect cannot
-        catch is caught by ``commit_cas`` arbitration — when the commit target is
-        moved by a peer, the atomic commit HOLDS (no fire), proving the window is
-        closed for ``session.commit`` (the strong guarantee)."""
+        """The ATOMIC counterpart for the commit TARGET: when a peer moves it after
+        the pin, the atomic commit HOLDS (no fire) and only the peer's write lands.
+        The peer commits inside ``decide``, so the pre-commit check catches it;
+        the CAS-loss branch is ``test_atomic_commit_conflict_surfaced_when_cas_loses``
+        and a peer writing between the check and the CAS is
+        ``test_atomic_peer_writer_cannot_land_between_check_and_commit``."""
         mem, sql = _lazy_registries(tmp_path)
         reg = mem if arm == "in_memory" else sql
         try:
@@ -509,6 +632,265 @@ class TestRevalidateFireWindow:
             # The pinned-base CAS would surface version_mismatch had the pre-CAS
             # short-circuit not caught it first; either way nothing of mine landed.
         finally:
+            sql.close()
+
+    @pytest.mark.parametrize("arm", ["in_memory", "sqlite"])
+    def test_atomic_peer_writer_cannot_land_between_check_and_commit(
+        self, tmp_path: Path, arm: str
+    ) -> None:
+        """#456: a peer writing a NON-target member after the atomic gate's
+        whole-cut check passed, but before its CAS, waits until the gate's commit
+        has landed. The check and the commit run under one hold of the service
+        and registry locks, so the plan commits from a brief that is still
+        current and the peer's write lands after it. Without the hold the peer
+        lands in between and the plan commits from a superseded brief.
+
+        The peer is started the moment the whole-cut check returns (wrapping
+        ``_revalidate_cut``) and given ``_WINDOW_WAIT`` seconds to land before
+        the gate goes on to its CAS."""
+        mem, sql = _lazy_registries(tmp_path)
+        reg = mem if arm == "in_memory" else sql
+        try:
+            svc = CoordinatorService(reg)
+            owner = uuid4()
+            a, b = uuid4(), uuid4()
+            _register(reg, a, "plan.md", "PLAN-V1")
+            _register(reg, b, "brief.md", "BRIEF-V1")
+
+            peer = threading.Thread(
+                target=_peer_commit_cas, args=(reg, b, uuid4(), 1, "BRIEF-V2")
+            )
+            peer_done_before_cas: list[bool] = []
+            real_revalidate = svc._revalidate_cut
+
+            def revalidate_then_start_peer(cut):
+                moved = real_revalidate(cut)
+                if not peer_done_before_cas:
+                    peer.start()
+                    peer.join(timeout=_WINDOW_WAIT)
+                    peer_done_before_cas.append(not peer.is_alive())
+                return moved
+
+            svc._revalidate_cut = revalidate_then_start_peer
+
+            def decide(view: SessionView) -> object:
+                view.read(a)
+                view.read(b)
+                return view
+
+            outcome = svc.effect_gate(
+                read_set=[a, b],
+                owner=owner,
+                decide=decide,
+                commit=(a, "PLAN-FROM-BRIEF-V1"),
+            )
+            peer.join(timeout=10)
+
+            # The peer was still waiting a full _WINDOW_WAIT after the re-validate
+            # returned (that it stays held through the CAS is
+            # test_atomic_check_and_cas_share_one_registry_lock_hold) ...
+            assert peer_done_before_cas == [False]
+            assert isinstance(outcome, EffectFired)
+            assert outcome.revalidated_cut == {a: 1, b: 1}
+            assert reg.get_artifact(a).version == 2
+            # ... and landed afterwards.
+            assert not peer.is_alive()
+            assert reg.get_artifact(b).version == 2
+        finally:
+            sql.close()
+
+    @pytest.mark.parametrize("arm", ["in_memory", "sqlite"])
+    def test_atomic_check_and_cas_share_one_registry_lock_hold(
+        self, tmp_path: Path, arm: str
+    ) -> None:
+        """The re-validate and the registry CAS run inside ONE hold of the
+        registry lock, with no release between them. The peer-writer test above
+        starts its peer when the re-validate returns, so it cannot see a hold
+        that ends before the CAS, or a second, separate hold around the CAS;
+        either reopens #456's window for a writer on the same registry. This
+        pins the structure without timing: each point records how deep in
+        ``abort_guard`` it runs and how many outermost holds had ended."""
+        mem, sql = _lazy_registries(tmp_path)
+        reg = mem if arm == "in_memory" else sql
+        try:
+            svc = CoordinatorService(reg)
+            owner = uuid4()
+            a, b = uuid4(), uuid4()
+            _register(reg, a, "plan.md", "PLAN-V1")
+            _register(reg, b, "brief.md", "BRIEF-V1")
+
+            depth = [0]
+            holds_ended = [0]
+            seen: dict[str, tuple[int, int]] = {}
+            real_abort_guard = reg.abort_guard
+            real_commit_cas = reg.commit_cas
+            real_revalidate = svc._revalidate_cut
+
+            @contextmanager
+            def counting_abort_guard(*args, **kwargs):
+                with real_abort_guard(*args, **kwargs):
+                    depth[0] += 1
+                    try:
+                        yield
+                    finally:
+                        depth[0] -= 1
+                        if depth[0] == 0:
+                            holds_ended[0] += 1
+
+            def recording_revalidate(cut):
+                seen.setdefault("re-validate", (depth[0], holds_ended[0]))
+                return real_revalidate(cut)
+
+            def recording_commit_cas(*args, **kwargs):
+                seen.setdefault("cas", (depth[0], holds_ended[0]))
+                return real_commit_cas(*args, **kwargs)
+
+            reg.abort_guard = counting_abort_guard
+            reg.commit_cas = recording_commit_cas
+            svc._revalidate_cut = recording_revalidate
+
+            def decide(view: SessionView) -> object:
+                view.read(a)
+                view.read(b)
+                return view
+
+            outcome = svc.effect_gate(
+                read_set=[a, b], owner=owner, decide=decide, commit=(a, "PLAN-V2"),
+            )
+
+            assert isinstance(outcome, EffectFired)
+            check_depth, ended_at_check = seen["re-validate"]
+            cas_depth, ended_at_cas = seen["cas"]
+            assert check_depth > 0
+            assert cas_depth > 0
+            # No outermost hold ended between the re-validate and the CAS.
+            assert ended_at_cas == ended_at_check
+        finally:
+            sql.close()
+
+    @pytest.mark.parametrize("arm", ["in_memory", "sqlite"])
+    def test_atomic_gate_takes_its_locks_in_begin_session_order(
+        self, tmp_path: Path, arm: str
+    ) -> None:
+        """The atomic gate holds the service lock and the registry lock across
+        its re-validate and commit, and must take them in the order
+        ``begin_session`` does: service lock first. A ``begin_session`` started
+        once the gate holds the registry lock then waits for the service lock
+        the gate already holds. Taken the other way round, the begin takes the
+        service lock and waits for the registry lock, the gate waits for the
+        service lock, and neither finishes.
+
+        The begin is started the moment the gate enters the registry lock after
+        ``decide`` (wrapping that registry's ``abort_guard``) and given
+        ``_WINDOW_WAIT`` seconds to take what it can before the gate goes on."""
+        mem, sql = _lazy_registries(tmp_path)
+        reg = mem if arm == "in_memory" else sql
+        deadlocked = False
+        try:
+            svc = CoordinatorService(reg)
+            owner = uuid4()
+            a = uuid4()
+            _register(reg, a, "plan.md", "PLAN-V1")
+
+            begun: list[object] = []
+            begin = threading.Thread(
+                target=lambda: begun.append(
+                    svc.begin_session(read_set=[a], owner=uuid4())
+                ),
+                daemon=True,
+            )
+            # Armed by ``decide``, so the gate's own ``begin_session`` (which
+            # also enters the registry lock) does not start the begin early.
+            armed: list[bool] = []
+            real_abort_guard = reg.abort_guard
+
+            @contextmanager
+            def abort_guard_then_begin(*args, **kwargs):
+                with real_abort_guard(*args, **kwargs):
+                    if armed and begin.ident is None:
+                        begin.start()
+                        begin.join(timeout=_WINDOW_WAIT)
+                    yield
+
+            reg.abort_guard = abort_guard_then_begin
+
+            def decide(view: SessionView) -> object:
+                view.read(a)
+                armed.append(True)
+                return view
+
+            outcomes: list[object] = []
+            gate = threading.Thread(
+                target=lambda: outcomes.append(
+                    svc.effect_gate(
+                        read_set=[a],
+                        owner=owner,
+                        decide=decide,
+                        commit=(a, "PLAN-V2"),
+                    )
+                ),
+                daemon=True,
+            )
+            gate.start()
+            gate.join(timeout=10)
+            begin.join(timeout=10)
+            deadlocked = gate.is_alive() or begin.is_alive()
+
+            assert not deadlocked, "the atomic gate deadlocked against begin_session"
+            assert isinstance(outcomes[0], EffectFired)
+            assert len(begun) == 1
+        finally:
+            # A deadlocked thread still holds the registry lock, which close()
+            # takes: leave the handle open so the test fails instead of hanging.
+            if not deadlocked:
+                sql.close()
+
+    def test_atomic_second_store_handle_window_is_observed(
+        self, tmp_path: Path
+    ) -> None:
+        """The residual the lock hold does not close: a writer on a SECOND
+        registry handle to the same SQLite file is outside it, so it can move a
+        non-target member between the gate's check and its CAS, and the gate
+        still fires. A store has one writer by contract; checking the read-set
+        inside the registry's own commit transaction would close this (#375).
+        OBSERVED here, not asserted away."""
+        _, sql = _lazy_registries(tmp_path)
+        other = SqliteArtifactRegistry(
+            tmp_path / "gate_lazy.db",
+            retain_versions=True,
+            retention_policy=RetentionPolicy(max_versions=8),
+        )
+        try:
+            svc = CoordinatorService(sql)
+            owner = uuid4()
+            a, b = uuid4(), uuid4()
+            _register(sql, a, "plan.md", "PLAN-V1")
+            _register(sql, b, "brief.md", "BRIEF-V1")
+            real_session_commit = svc.session_commit
+
+            def session_commit_after_other_writer(*args, **kwargs):
+                _peer_commit_cas(other, b, uuid4(), expected=1, body="BRIEF-V2")
+                return real_session_commit(*args, **kwargs)
+
+            svc.session_commit = session_commit_after_other_writer
+
+            def decide(view: SessionView) -> object:
+                view.read(b)
+                return view
+
+            outcome = svc.effect_gate(
+                read_set=[a, b],
+                owner=owner,
+                decide=decide,
+                commit=(a, "PLAN-FROM-BRIEF-V1"),
+            )
+
+            # The gate fired although the brief moved inside the window.
+            assert isinstance(outcome, EffectFired)
+            assert sql.get_artifact(a).version == 2
+            assert sql.get_artifact(b).version == 2
+        finally:
+            other.close()
             sql.close()
 
 

@@ -32,11 +32,13 @@ import json
 import os
 import subprocess
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from tests.protocol_corpus.harness import (
+    ALL_BACKENDS,
     BACKEND_NODE,
     BACKEND_PYTHON,
     NOT_ISSUED,
@@ -55,8 +57,14 @@ from tests.protocol_corpus.harness import (
 pytestmark = pytest.mark.protocol_corpus
 
 _FIXTURE_DIR = "caller_principal"
-_EXPECTED_FIXTURE_COUNT = 18
+_EXPECTED_FIXTURE_COUNT = 20
 _HEADER = "Coherence-Caller-Principal"  # frozen duplicate of the wire name
+#: An opted-in pre-edit without a principal from a session nobody claimed: the
+#: Python row that refuses it, then the Node row that admits it.
+_OPTED_IN_PAIR = (
+    "caller-principal-python-opted-in-pre-edit-refuses-an-absent-principal",
+    "caller-principal-node-opted-in-pre-edit-admits-an-absent-principal",
+)
 
 _NODE_DIST_PATH = resolve_node_dist_path()
 _NODE_DIST_UNRESOLVED = (
@@ -158,7 +166,7 @@ def test_every_principal_refusal_row_carries_its_typed_reason() -> None:
     Every 400 row here pins both, and the two agree, so a Python refusal that
     dropped the key — the one field the clients branch on — goes red."""
     refusals = [f for f in _fixtures() if f.expected["status"] == 400]
-    assert len(refusals) == 5
+    assert len(refusals) == 6
     for row in refusals:
         body = row.expected["body"]
         assert set(body) == {"error", "reason"}, row.name
@@ -243,25 +251,77 @@ def test_a_header_naming_a_capture_not_issued_here_is_omitted_not_sent() -> None
         _substitute({"body": {"p": "${principal_a}"}}, captures, where="probe")
 
 
-def test_a_python_refusal_row_binds_the_identity_it_refuses() -> None:
-    """An absent principal is refused only for a CLAIMED session (a session
-    nobody claimed is an older client's and is admitted), so every Python row
-    asserting ``caller_principal_absent`` must claim the session it names in a
-    preflight first. A row that stopped claiming would assert a refusal the
-    coordinator no longer gives — or, worse, pin a rule that refuses older
-    clients."""
+def _opts_in(row: Fixture) -> bool:
+    return row.request["body"].get("if_unheld") is True
+
+
+def _claimed_sessions(row: Fixture) -> set[str]:
+    return {
+        req["body"]["session_id"]
+        for req in row.setup.get("preflight_requests") or []
+        if req["path"] == "/principal/claim" and "backends" not in req
+    }
+
+
+def _check_absent_rows_bind_their_identity(fixtures: list[Fixture]) -> None:
     absent_rows = [
-        f for f in _fixtures()
+        f for f in fixtures
         if f.expected["body"].get("reason") == "caller_principal_absent"
     ]
-    assert len(absent_rows) == 3
-    for row in absent_rows:
-        claimed = {
-            req["body"]["session_id"]
-            for req in row.setup.get("preflight_requests") or []
-            if req["path"] == "/principal/claim" and "backends" not in req
-        }
-        assert row.request["body"]["session_id"] in claimed, row.name
+    ordinary = [row for row in absent_rows if not _opts_in(row)]
+    assert len(ordinary) == 3
+    for row in ordinary:
+        assert row.request["body"]["session_id"] in _claimed_sessions(row), row.name
+    opted_in = [row for row in absent_rows if _opts_in(row)]
+    assert [row.name for row in opted_in] == [_OPTED_IN_PAIR[0]]
+    assert not _claimed_sessions(opted_in[0]), "the opted-in row is the never-claimed control"
+
+
+def test_a_python_refusal_row_binds_the_identity_it_refuses() -> None:
+    """A request that does not opt in to acquire-or-fail (``if_unheld: true``
+    on a pre-edit) is refused for an absent principal only when its session is
+    CLAIMED (a session nobody claimed is an older client's and is admitted),
+    so every such Python row asserting ``caller_principal_absent`` must claim
+    the session it names in a preflight first. A row that stopped claiming
+    would assert a refusal the coordinator no longer gives, or worse, pin a
+    rule that refuses older clients. An opted-in pre-edit is refused without a
+    principal whatever session it names, and the one row asserting that names
+    a session nobody claimed."""
+    _check_absent_rows_bind_their_identity(_fixtures())
+
+
+def _check_opted_in_pair(fixtures: list[Fixture]) -> None:
+    by_name = {f.name: f for f in fixtures}
+    refuse, admit = (by_name[name] for name in _OPTED_IN_PAIR)
+    assert refuse.backends == (BACKEND_PYTHON,) and admit.backends == (BACKEND_NODE,)
+    assert refuse.request == admit.request and refuse.setup == admit.setup
+    assert _opts_in(refuse) and _HEADER not in (refuse.request.get("headers") or {})
+    assert not refuse.setup.get("preflight_requests"), "the session must be one nobody claimed"
+    assert refuse.expected["status"] == 400
+    assert refuse.expected["body"]["reason"] == "caller_principal_absent"
+    assert admit.expected == {"status": 200, "body": {"ok": True}}
+
+
+def test_an_opted_in_pre_edit_without_a_principal_is_refused_on_python_and_admitted_on_node() -> None:
+    """The pairs test above requires a claim in the setup, which this pair
+    deliberately lacks, so it is pinned here: the same unclaimed, opted-in
+    request is a 400 on Python and an admit on Node, which keeps no caller
+    principal."""
+    _check_opted_in_pair(_fixtures())
+
+
+def test_the_absent_row_pins_fail_on_a_fourth_ordinary_row_or_a_widened_pair() -> None:
+    fixtures = _fixtures()
+    ordinary = next(
+        f for f in fixtures
+        if f.expected["body"].get("reason") == "caller_principal_absent" and not _opts_in(f)
+    )
+    with pytest.raises(AssertionError):
+        _check_absent_rows_bind_their_identity([*fixtures, replace(ordinary, name="a-fourth-row")])
+    for name in _OPTED_IN_PAIR:
+        widened = [replace(f, backends=ALL_BACKENDS) if f.name == name else f for f in fixtures]
+        with pytest.raises(AssertionError):
+            _check_opted_in_pair(widened)
 
 
 # ----------------------------------------------------------------------

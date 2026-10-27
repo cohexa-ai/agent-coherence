@@ -1,0 +1,31 @@
+{
+  "name": "caller-principal-python-opted-in-pre-edit-refuses-an-absent-principal",
+  "description": "A pre-edit that opts in with if_unheld: true must present its principal whatever session it names, because the holder check admits the caller's own identity, so that identity has to be proven. Session A was never claimed and sends no principal, and Python refuses it with the typed absent reason; without the opt-in the same request is admitted (warn_mode/04). Twin of the Node row with the identical setup and request (20).",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+      "path": "CLAUDE.md",
+      "if_unheld": true
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": "missing Coherence-Caller-Principal header: this route requires the caller principal that POST /principal/claim bound to the session_id it names (caller_principal_absent)",
+      "reason": "caller_principal_absent"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}

@@ -77,6 +77,20 @@ PINS: tuple[Pin, ...] = (
         doc="README.md",
         doc_phrase="must declare the **same** `managed` globs",
     ),
+    Pin(
+        name="acquire-or-fail: an ordinary pre-edit still displaces an opted-in holder",
+        source="src/ccs/coordinator/service.py",
+        source_marker="an ordinary write still displaces an opted-in holder",
+        doc="docs/guide.md",
+        doc_phrase="an ordinary pre-edit still displaces an opted-in holder",
+    ),
+    Pin(
+        name="acquire-or-fail: the same limit on the project's front page",
+        source="src/ccs/coordinator/service.py",
+        source_marker="an ordinary write still displaces an opted-in holder",
+        doc="README.md",
+        doc_phrase="an ordinary pre-edit still displaces an opted-in holder",
+    ),
 )
 
 
