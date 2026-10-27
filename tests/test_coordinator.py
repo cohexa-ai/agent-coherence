@@ -14,7 +14,7 @@ from ccs.coordinator.service import CoordinatorService
 from ccs.core.exceptions import CoherenceError
 from ccs.core.hashing import compute_content_hash
 from ccs.core.states import MESIState, TransientState
-from ccs.core.types import ConflictDetail, FetchRequest
+from ccs.core.types import CommitAllEntry, ConflictDetail, FetchRequest
 
 
 def _service() -> CoordinatorService:
@@ -59,6 +59,8 @@ def test_write_invalidates_peers_and_grants_exclusive() -> None:
 
     assert len(signals) == 1
     assert signals[0].issuer_agent_id == agent_a
+    assert signals[0].victim_agent_id == agent_b
+    assert signals[0].victim_state == MESIState.SHARED
     assert svc.registry.get_agent_state(artifact.id, agent_a) == MESIState.EXCLUSIVE
     assert svc.registry.get_agent_state(artifact.id, agent_b) == MESIState.INVALID
 
@@ -158,6 +160,82 @@ def test_write_and_commit_propagate_issued_tick_in_signals() -> None:
     )
     assert updated.version == 2
     assert all(signal.issued_at_tick == 13 for signal in commit_signals)
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_state"),
+    [
+        ("commit", MESIState.SHARED),
+        ("commit_cas", MESIState.SHARED),
+        ("commit_all", MESIState.SHARED),
+        ("invalidate", MESIState.EXCLUSIVE),
+        ("delete", MESIState.EXCLUSIVE),
+    ],
+)
+def test_invalidation_operations_capture_victim_state(
+    operation: str, expected_state: MESIState
+) -> None:
+    svc = _service()
+    artifact = svc.register_artifact(name="plan.md", content="v1")
+    writer = uuid4()
+    victim = uuid4()
+
+    if operation == "commit":
+        # Seed the state a commit must invalidate after a concurrent holder
+        # transition; the post-commit state is a valid single writer.
+        svc.registry.set_agent_state(artifact.id, writer, MESIState.MODIFIED, tick=1)
+        svc.registry.set_agent_state(artifact.id, victim, MESIState.SHARED, tick=1)
+        _, signals = svc.commit(
+            agent_id=writer, artifact_id=artifact.id, content="v2", issued_at_tick=2
+        )
+    elif operation == "commit_cas":
+        svc.registry.set_agent_state(artifact.id, writer, MESIState.SHARED, tick=1)
+        svc.registry.set_agent_state(artifact.id, victim, MESIState.SHARED, tick=1)
+        _, signals = svc.commit_cas(
+            agent_id=writer,
+            artifact_id=artifact.id,
+            expected_version=artifact.version,
+            content_hash=compute_content_hash("v2"),
+            issued_at_tick=2,
+        )
+    elif operation == "commit_all":
+        svc.registry.set_agent_state(artifact.id, writer, MESIState.SHARED, tick=1)
+        svc.registry.set_agent_state(artifact.id, victim, MESIState.SHARED, tick=1)
+        result = svc.commit_all(
+            agent_id=writer,
+            writes={
+                artifact.id: CommitAllEntry(
+                    expected_version=artifact.version,
+                    content_hash=compute_content_hash("v2"),
+                    content="v2",
+                )
+            },
+            issued_at_tick=2,
+        )
+        assert isinstance(result, tuple)
+        _, signals = result
+    elif operation == "invalidate":
+        svc.fetch(
+            FetchRequest(artifact_id=artifact.id, requesting_agent_id=victim, requested_at_tick=1)
+        )
+        signal = svc.invalidate(
+            agent_id=victim,
+            artifact_id=artifact.id,
+            new_version=artifact.version + 1,
+            issuer_agent_id=writer,
+            issued_at_tick=2,
+        )
+        assert signal is not None
+        signals = [signal]
+    else:
+        svc.fetch(
+            FetchRequest(artifact_id=artifact.id, requesting_agent_id=victim, requested_at_tick=1)
+        )
+        signals = svc.delete(agent_id=writer, artifact_id=artifact.id, issued_at_tick=2)
+
+    assert len(signals) == 1
+    assert signals[0].victim_agent_id == victim
+    assert signals[0].victim_state == expected_state
 
 
 def test_delete_returns_signals_for_non_invalid_holders_and_removes_artifact() -> None:

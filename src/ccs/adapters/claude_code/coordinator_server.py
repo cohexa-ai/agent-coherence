@@ -159,6 +159,7 @@ from ccs.core.types import (
     ConflictDetail,
     DataPlaneDeferredRead,
     FenceComparands,
+    InvalidationSignal,
     MultiCommitConflict,
     SessionCommitRejection,
     SessionReadRejection,
@@ -3474,10 +3475,8 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                     "summary": summary,
                 }
 
-        # A1: snapshot peers in M∪E BEFORE write so we can record preemption
-        # notices for victims after the side-effecting invalidation.
-        peers_in_me = _peers_in_me_excluding(coordinator, artifact_id, agent_id)
-        # Detect collision BEFORE acquiring: is any other session in M∪E?
+        # Retain the acquisition time only when this same holder is later
+        # confirmed in the write's lock-consistent invalidation signals.
         holder_id, holder_ts = _exclusive_holder(coordinator, artifact_id, exclude_agent=agent_id)
         # #278: also before the acquire, which revokes every peer's claim: a
         # peer's write still landing explains a mismatch on disk, by the rule
@@ -3495,7 +3494,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # (#185): the giver of a live handoff is refused whichever subagent or
         # incarnation it sends.
         try:
-            coordinator.service.write(
+            invalidation_signals = coordinator.service.write(
                 agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=now,
                 abort=abort, caller=caller, if_unheld=opted_in,
             )
@@ -3524,13 +3523,6 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
 
-        if opted_in:
-            # The write admits an opted-in request only when no other agent
-            # holds the path for writing, so it displaced nobody. The holders
-            # looked up above may have let go since; naming them would report a
-            # collision and a preemption that did not happen (#450).
-            peers_in_me, holder_id = [], None
-
         # #278: pre-edit carries no content hash, and post-edit records
         # whatever it is sent, so a write built from an earlier read replaced a
         # change made outside the coordinator with nothing to notice it. The
@@ -3544,16 +3536,31 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 coordinator, artifact_id, agent_id, path=path, now_unix=_payloads.now_unix()
             )
 
-        # A1: record preemption notices for the agents whose M∪E grants we
-        # just silently revoked via the write() side effect. The victims
-        # will see these on their next pre-read / pre-edit hook.
-        for victim_id in peers_in_me:
+        # Collision answers and notices share the acquire's lock-consistent
+        # list of holders whose M/E grants were actually displaced.
+        displaced: list[tuple[UUID, InvalidationSignal]] = []
+        for signal in invalidation_signals:
+            victim_id = signal.victim_agent_id
+            if victim_id is None or signal.victim_state not in (
+                MESIState.EXCLUSIVE,
+                MESIState.MODIFIED,
+            ):
+                continue
+            displaced.append((victim_id, signal))
+        for victim_id, signal in displaced:
             coordinator.registry.record_preemption_notice(
                 victim_agent_id=victim_id,
-                artifact_id=artifact_id,
-                preempter_agent_id=agent_id,
+                artifact_id=signal.artifact_id,
+                preempter_agent_id=signal.issuer_agent_id,
                 preempted_at_unix_ts=_payloads.now_unix(),
             )
+
+        # A stale or absent lookup cannot decide whether the write displaced a
+        # holder; only keep it as a timestamp hint for the matching signal.
+        if not displaced:
+            holder_id, holder_ts = None, None
+        elif holder_id != displaced[0][0]:
+            holder_id, holder_ts = displaced[0][0], None
 
         # Pop any notices for THIS session (the caller of pre-edit) and
         # merge into the response (A1: surface on the victim's next hook
@@ -8245,8 +8252,7 @@ def _exclusive_holder(
     *,
     exclude_agent: UUID,
 ) -> tuple[UUID | None, int | None]:
-    """Return (agent_id, granted_at_tick) of any current M∪E holder OTHER
-    than the given agent. Used for KTD-9 collision detection in pre-edit."""
+    """Return a current M/E holder and its acquisition-time hint for pre-edit."""
     state_map = coordinator.registry.get_state_map(artifact_id)
     for other_id, state in state_map.items():
         if other_id == exclude_agent:
@@ -8255,23 +8261,6 @@ def _exclusive_holder(
             granted_at = coordinator.registry.granted_at_tick(other_id, artifact_id)
             return other_id, granted_at
     return None, None
-
-
-def _peers_in_me_excluding(
-    coordinator: CoordinatorHTTPServer,
-    artifact_id: UUID,
-    agent_id: UUID,
-) -> list[UUID]:
-    """A1: return the list of agents currently in MODIFIED or EXCLUSIVE on
-    the given artifact, EXCLUDING the given agent. Used to snapshot victims
-    BEFORE service.write side-effects invalidate them, so the plugin can
-    record preemption notices for each."""
-    state_map = coordinator.registry.get_state_map(artifact_id)
-    return [
-        peer_id
-        for peer_id, state in state_map.items()
-        if peer_id != agent_id and state in (MESIState.EXCLUSIVE, MESIState.MODIFIED)
-    ]
 
 
 def _iso_utc(unix_ts: float) -> str:

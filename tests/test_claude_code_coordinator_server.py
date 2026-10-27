@@ -1364,6 +1364,158 @@ def test_a1_fresh_with_notice_preserves_version_field(client: _Client) -> None:
     )
 
 
+def test_a1_forced_pre_edit_interleaving_notifies_exactly_the_displaced_holder(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A1/#450: the acquire result, rather than a pre-acquire snapshot, names
+    the holder that was actually displaced under the registry lock."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    seed = _sid("forced-seed")
+    path = "plan.md"
+    status, _ = client.post(
+        "/hooks/pre-read", {"session_id": seed, "path": path, "content_hash": _hash(path)}
+    )
+    assert status == 200
+    status, _ = client.post("/hooks/session-stop", {"session_id": seed})
+    assert status == 200
+
+    original_holder = mod._exclusive_holder
+    reads_complete = threading.Barrier(2)
+
+    def force_read_interleaving(coordinator_arg, artifact_id, *, exclude_agent):
+        holder = original_holder(
+            coordinator_arg, artifact_id, exclude_agent=exclude_agent
+        )
+        reads_complete.wait(timeout=5)
+        return holder
+
+    # Keep the barrier at the pre-acquire read point: both requests finish their
+    # collision read before either can enter service.write.
+    monkeypatch.setattr(mod, "_exclusive_holder", force_read_interleaving)
+
+    sessions = (_sid("forced-A"), _sid("forced-B"))
+    results: dict[str, tuple[int, dict]] = {}
+    results_lock = threading.Lock()
+
+    def pre_edit(session_id: str) -> None:
+        result = client.post("/hooks/pre-edit", {"session_id": session_id, "path": path})
+        with results_lock:
+            results[session_id] = result
+
+    threads = [threading.Thread(target=pre_edit, args=(session_id,)) for session_id in sessions]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive(), f"pre-edit thread did not finish: {results}"
+
+    assert set(results) == set(sessions), results
+    assert all(status == 200 for status, _ in results.values()), results
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    assert artifact_id is not None
+    agent_ids = {session_to_agent_id(session_id) for session_id in sessions}
+    states = {
+        agent_id: coordinator.registry.get_agent_state(artifact_id, agent_id)
+        for agent_id in agent_ids
+    }
+    losers = [agent_id for agent_id, state in states.items() if state == MESIState.INVALID]
+    winners = [agent_id for agent_id, state in states.items() if state == MESIState.EXCLUSIVE]
+    assert len(losers) == len(winners) == 1, states
+    winner_session = next(
+        session_id for session_id in sessions if session_to_agent_id(session_id) == winners[0]
+    )
+    winner_body = results[winner_session][1]
+    loser_session = next(
+        session_id for session_id in sessions if session_to_agent_id(session_id) == losers[0]
+    )
+    loser_pre_edit_body = results[loser_session][1]
+    assert winner_body.get("collision") is True, winner_body
+    winner_context = winner_body["hookSpecificOutput"]["additionalContext"]
+    assert losers[0].hex[:8] in winner_context, winner_context
+    assert loser_pre_edit_body.get("collision") is not True, loser_pre_edit_body
+    status, loser_body = client.post(
+        "/hooks/pre-read", {"session_id": loser_session, "path": path}
+    )
+    assert status == 200, loser_body
+    notice_bodies = [
+        body for body in (loser_pre_edit_body, loser_body)
+        if "Coordinator notice" in body.get("hookSpecificOutput", {}).get("additionalContext", "")
+    ]
+    assert len(notice_bodies) == 1, (loser_pre_edit_body, loser_body)
+    notice_context = notice_bodies[0]["hookSpecificOutput"]["additionalContext"]
+    assert path in notice_context and "preempt" in notice_context.lower(), notice_context
+    assert coordinator.registry.pop_pending_notices(losers[0]) == []
+
+
+def test_a1_pre_edit_drops_a_holder_released_after_the_collision_lookup(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    holder = _sid("released-holder")
+    editor = _sid("released-editor")
+    path = "plan.md"
+    status, _ = client.post("/hooks/pre-edit", {"session_id": holder, "path": path})
+    assert status == 200
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    assert artifact_id is not None
+
+    original_holder = mod._exclusive_holder
+
+    def release_after_lookup(coordinator_arg, looked_up_artifact_id, *, exclude_agent):
+        result = original_holder(
+            coordinator_arg, looked_up_artifact_id, exclude_agent=exclude_agent
+        )
+        assert result[0] == session_to_agent_id(holder)
+        coordinator_arg.service.invalidate(
+            agent_id=result[0],
+            artifact_id=looked_up_artifact_id,
+            new_version=1,
+            issuer_agent_id=result[0],
+            issued_at_tick=2,
+        )
+        return result
+
+    monkeypatch.setattr(mod, "_exclusive_holder", release_after_lookup)
+    status, body = client.post("/hooks/pre-edit", {"session_id": editor, "path": path})
+
+    assert status == 200, body
+    assert body.get("ok") is True, body
+    assert body.get("collision") is not True, body
+    assert "hookSpecificOutput" not in body, body
+    assert coordinator.registry.pop_pending_notices(session_to_agent_id(holder)) == []
+
+
+def test_a1_preemption_notice_surfaces_for_modified_holder(client: _Client, coordinator) -> None:
+    editor = _sid("modified-holder")
+    preempter = _sid("modified-preempter")
+    path = "plan.md"
+
+    status, _ = client.post("/hooks/pre-edit", {"session_id": editor, "path": path})
+    assert status == 200
+    status, body = client.post(
+        "/hooks/post-edit",
+        {"session_id": editor, "path": path, "content_hash": _hash("edited"), "success": True},
+    )
+    assert status == 200, body
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    assert artifact_id is not None
+    editor_id = session_to_agent_id(editor)
+    assert coordinator.registry.get_agent_state(artifact_id, editor_id) == MESIState.MODIFIED
+
+    status, body = client.post("/hooks/pre-edit", {"session_id": preempter, "path": path})
+    assert status == 200, body
+    assert body.get("collision") is True, body
+    assert editor_id.hex[:8] in body["hookSpecificOutput"]["additionalContext"]
+
+    status, body = client.post("/hooks/pre-read", {"session_id": editor, "path": path})
+    assert status == 200, body
+    context = body.get("hookSpecificOutput", {}).get("additionalContext", "")
+    assert "Coordinator notice" in context and "preempt" in context.lower(), context
+    assert session_to_agent_id(preempter).hex[:8] in context, context
+
+
 def test_a1_preemption_surfaces_on_victim_next_pre_edit(client: _Client) -> None:
     """A1: surface preemption even when X's next hook is pre-edit, not pre-read."""
     x = _sid("X"); y = _sid("Y")
