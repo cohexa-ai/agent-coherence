@@ -440,6 +440,33 @@ def _degraded_release_message(reason: str) -> str:
     )
 
 
+#: What a refuse volume raises at attach, or in a forked child at its first read
+#: or write, when the operator view does not say the coordinator refuses an
+#: opted-in pre-edit. Nothing the coordinator answered reaches the text.
+_IF_UNHELD_NOT_ADVERTISED_MESSAGE = (
+    "on_held='refuse' needs a coordinator that refuses an opted-in pre-edit. The one "
+    "running for this workspace does not advertise pre_edit_if_unheld, so it could "
+    "take a file from its holder instead. Nothing was sent. Run agent-coherence-status "
+    "to see its version, then upgrade it or use on_held='displace'."
+)
+
+
+def _check_refuse_mode(
+    on_error: str, managed: Sequence[str], remote_endpoint: CoordinatorEndpoint | None
+) -> None:
+    """Raise :class:`ValueError` for a volume that could not honour
+    ``on_held="refuse"``. Degrade mode would write best-effort when detached.
+    No managed globs means nothing ever opts in, so every write would displace
+    in silence. A remote coordinator's capability cannot be trusted for the
+    volume's life, because a fixed-port replacement goes unseen."""
+    if on_error != "strict":
+        raise ValueError("on_held='refuse' is strict-only (on_error must be 'strict')")
+    if not managed:
+        raise ValueError("on_held='refuse' opts in on managed paths, so it needs managed globs")
+    if remote_endpoint is not None:
+        raise ValueError("on_held='refuse' is not supported with remote_endpoint")
+
+
 def _own_grant_message(rel: str, *, held: bool) -> str:
     """What a commit of ``rel`` raises
     (:class:`~ccs.core.exceptions.CoordinatorFailed`) when the coordinator
@@ -884,6 +911,17 @@ class CoherentVolume:
       coordinated peer change can hit the disk without an INVALID deny, so a
       mismatch is not necessarily foreign.
 
+    ``on_held`` (what :meth:`write` does to a file another agent holds):
+
+    - ``"displace"`` (default): take it. The holder's next write is refused.
+    - ``"refuse"``: on a managed path, opt in with ``if_unheld`` and raise
+      :class:`~ccs.core.exceptions.OtherHolder` while another agent holds the
+      file, leaving it with its holder. Strict-only, needs ``managed`` globs,
+      not available with ``remote_endpoint``. At attach the coordinator must
+      advertise ``pre_edit_if_unheld``; otherwise the attach raises
+      :class:`~ccs.core.exceptions.CoherenceError` before it sends anything. A
+      write outside ``managed`` sends no flag and still displaces.
+
     **Fleet requirement (hard, v1).** Every instance coordinating a given
     workspace MUST declare the **same** ``managed`` globs: an attaching instance
     adds no globs to a running coordinator's policy (only the track and untrack
@@ -913,6 +951,7 @@ class CoherentVolume:
         config: LifecycleConfig | None = None,
         bind_host: str = "127.0.0.1",
         remote_endpoint: CoordinatorEndpoint | None = None,
+        on_held: Literal["displace", "refuse"] = "displace",
     ) -> None:
         if on_error not in ("strict", "degrade"):
             raise ValueError(f"on_error must be 'strict' or 'degrade', got {on_error!r}")
@@ -924,6 +963,10 @@ class CoherentVolume:
             raise ValueError(
                 f"on_stale_write must be 'allow' or 'raise', got {on_stale_write!r}"
             )
+        if on_held not in ("displace", "refuse"):
+            raise ValueError(f"on_held must be 'displace' or 'refuse', got {on_held!r}")
+        if on_held == "refuse":
+            _check_refuse_mode(on_error, managed, remote_endpoint)
         if remote_endpoint is not None:
             # Cross-host demo path (R0b). Defense-in-depth: remote mode is gated by
             # the default-OFF flag, is strict-only (an unreachable coordinator must
@@ -949,6 +992,10 @@ class CoherentVolume:
         # same grammar as tracked.yaml). They must be tracked AND strict for the
         # INVALID-deny to fire (is_strict_mode ⊂ is_tracked).
         self._managed: tuple[str, ...] = tuple(managed)
+        self._on_held = on_held
+        # What the latest operator view said about the opted-in refusal. Only
+        # refuse mode reads it, right after the view that set it.
+        self._advertises_if_unheld = False
         self._on_error = on_error
         self._on_stale_read = on_stale_read
         self._on_stale_write = on_stale_write
@@ -1392,6 +1439,12 @@ class CoherentVolume:
                 self._endpoint = None
                 self._fail_closed_or_degrade(self._enforcement_failure(enforcement))
                 return
+            if self._on_held == "refuse" and not self._advertises_if_unheld:
+                # Before the claim, so a coordinator that would displace a holder
+                # receives nothing. Refuse mode is strict-only, so this raises.
+                self._endpoint = None
+                self._fail_closed_or_degrade(_IF_UNHELD_NOT_ADVERTISED_MESSAGE)
+                return
         self._claim_principal()
 
     def _enforcement_failure(self, enforcement: ManagedGlobEnforcement) -> str:
@@ -1614,6 +1667,9 @@ class CoherentVolume:
             return ManagedGlobEnforcement((), (), f"{who} (HTTP {exc.code})")
         except Exception as exc:  # any other failure to read the view is "cannot tell"
             return self._unreadable_view(exc)
+        self._advertises_if_unheld = (
+            isinstance(status, dict) and status.get("pre_edit_if_unheld") is True
+        )
         summary = status.get("policy_summary") if isinstance(status, dict) else None
         sets: dict[str, set[str]] = {}
         for key in (
