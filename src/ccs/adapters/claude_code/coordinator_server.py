@@ -60,6 +60,7 @@ import os
 import re
 import secrets
 import socketserver
+import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -69,7 +70,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal, Protocol, TypeVar, runtime_checkable
+from typing import Any, Callable, Iterable, Iterator, Literal, Protocol, TypeVar, runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import yaml
@@ -9396,14 +9397,25 @@ def _read_policy_bytes(yaml_path: Path, name: str) -> bytes:
     whatever the locale), or none for a missing file. Raises ValueError (the
     routes answer 400) for any other read failure: reading it as empty would
     replace a file holding every pattern with one holding only the new ones.
-    The text matches the Node coordinator's."""
+    The text for a failed read matches the Node coordinator's.
+
+    Reads a regular file only, because a repository can commit this file as a
+    link: opening a FIFO with no writer blocks forever, and a device such as
+    ``/dev/zero`` never reaches EOF."""
     try:
-        return yaml_path.read_bytes()
+        with open(yaml_path, "rb", opener=_open_nonblocking) as handle:
+            if stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return handle.read()
     except FileNotFoundError:
         return b""
     except OSError as exc:
         code = errno.errorcode.get(exc.errno, str(exc)) if exc.errno else str(exc)
         raise ValueError(f"{name} could not be read ({code}); nothing was written.") from None
+    raise ValueError(f"{name} could not be read (not a regular file); nothing was written.")
+
+
+def _open_nonblocking(path: str, flags: int) -> int:
+    return os.open(path, flags | os.O_NONBLOCK)
 
 
 def _entries_or_none(text: str, name: str) -> list[str] | None:
@@ -9428,6 +9440,25 @@ def _replace_policy_file(yaml_path: Path, content: str) -> None:
         os.replace(tmp, yaml_path)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def merge_policy_globs(yaml_paths: Iterable[Path], globs: tuple[str, ...]) -> None:
+    """Merge ``globs`` into each policy file. A file that already holds them is
+    left as it is.
+
+    Raises ValueError, before writing any file, naming one that cannot be read, is
+    not valid YAML or is not a list, with the routes' own refusal (#305). Reading it
+    as empty would replace every entry in it with only these globs, at the restart
+    that would otherwise report it in ``rejected_pattern_count``."""
+    rewrites: list[tuple[Path, list[str]]] = []
+    for yaml_path in yaml_paths:
+        name = policy_file_name(yaml_path)
+        existing = _read_policy_entries(_read_policy_bytes(yaml_path, name), name)
+        merged = sorted(set(existing) | set(globs))
+        if merged != sorted(existing):
+            rewrites.append((yaml_path, merged))
+    for yaml_path, merged in rewrites:
+        _replace_policy_file(yaml_path, yaml.safe_dump(merged, default_flow_style=False))
 
 
 def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str], list[dict]]:

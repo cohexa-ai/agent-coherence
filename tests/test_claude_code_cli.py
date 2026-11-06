@@ -358,6 +358,34 @@ def test_spawn_detached_wait_is_wall_clock_bounded(
     )
 
 
+@pytest.mark.parametrize("target_exists", [True, False], ids=["existing_target", "dangling"])
+def test_coordinator_names_a_symlinked_pid_file_without_spawning(
+    git_workspace: Path, tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], target_exists: bool,
+) -> None:
+    """#464: the detached worker refuses the link too, but its stderr is /dev/null,
+    so the user would wait out the window and read only "did not become reachable".
+    Prevents that: the parent names the link, exits 2 and spawns nothing."""
+    target = tmp_path_factory.mktemp("outside") / "target"
+    if target_exists:
+        target.write_bytes(b"keep\n")
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir(mode=0o700)
+    (coherence / "server.pid").symlink_to(target)
+
+    def spawn(*args: object, **kwargs: object) -> None:
+        pytest.fail("spawned a detached worker")
+
+    monkeypatch.setattr(coherence_coordinator.subprocess, "Popen", spawn)
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace)])
+
+    assert rc == 2
+    assert ".coherence/server.pid: it is a symlink" in capsys.readouterr().err
+    assert (coherence / "server.pid").is_symlink()
+    assert (target.read_bytes() == b"keep\n") if target_exists else not target.exists()
+
+
 def test_wildcard_bind_host_rejected_before_any_dial(
     git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

@@ -36,6 +36,7 @@ import pytest
 import ccs.adapters.claude_code.coordinator_server as coordinator_server_module
 import ccs.adapters.coherent_volume as coherent_volume_module
 from ccs.adapters.claude_code.coordinator_server import (
+    merge_policy_globs,
     read_subagent_id,
     session_to_agent_id,
 )
@@ -947,12 +948,12 @@ def _track_only(tmp_path: Path, glob: str = "data/**") -> None:
     view) while deliberately leaving ``strict_mode.yaml`` absent (so the re-grant
     is warn-mode — never denied). ``managed=()`` volumes then attach to this
     coordinator without the strict-mode requirement that ``managed`` globs carry.
-    Reuses the coordinator's own ``_merge_yaml_list`` writer so the fixture tracks
+    Reuses the coordinator's own ``merge_policy_globs`` writer so the fixture tracks
     the real tracked.yaml format instead of duplicating it.
     """
     coherence_dir = tmp_path / ".coherence"
     coherence_dir.mkdir(parents=True, exist_ok=True)
-    CoherentVolume._merge_yaml_list(coherence_dir / "tracked.yaml", (glob,))
+    merge_policy_globs((coherence_dir / "tracked.yaml",), (glob,))
 
 
 def _agent_id(vol: CoherentVolume) -> str:
@@ -1087,7 +1088,7 @@ def test_a_managed_glob_the_coordinator_carries_in_only_one_set_is_not_enforced(
     coherence_dir = tmp_path / ".coherence"
     coherence_dir.mkdir(parents=True, exist_ok=True)
     only = "tracked.yaml" if policy == "tracked-not-strict" else "strict_mode.yaml"
-    CoherentVolume._merge_yaml_list(coherence_dir / only, ("data/**",))
+    merge_policy_globs((coherence_dir / only,), ("data/**",))
     assert ensure_coordinator(tmp_path, config=fast_cfg) > 0  # loads that policy
     try:
         with pytest.raises(CoherenceError) as raised:
@@ -1114,7 +1115,7 @@ def test_a_managed_glob_the_coordinator_ignores_is_not_enforced(
     _seed(tmp_path)
     coherence_dir = tmp_path / ".coherence"
     coherence_dir.mkdir(parents=True, exist_ok=True)
-    CoherentVolume._merge_yaml_list(coherence_dir / "ignored.yaml", ("data/**",))
+    merge_policy_globs((coherence_dir / "ignored.yaml",), ("data/**",))
     try:
         with pytest.raises(CoherenceError) as raised:
             CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
@@ -1123,6 +1124,140 @@ def test_a_managed_glob_the_coordinator_ignores_is_not_enforced(
         assert "ignored" in message, message
     finally:
         stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("name", ["tracked.yaml", "strict_mode.yaml"])
+def test_a_strict_volume_refuses_a_policy_file_it_cannot_load_and_keeps_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig, name: str
+) -> None:
+    """#305: a strict volume about to spawn the coordinator raises naming a policy
+    file that loads as no entries, leaves it and the other file as they were, and
+    starts no coordinator.
+
+    Prevents the spawn replacing the file with only this volume's globs, which
+    deleted the user's other entries with no signal."""
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True)
+    broken = coherence_dir / name
+    broken.write_text("- docs/**\n- *.md\n")
+
+    with pytest.raises(CoherenceError, match="is not valid YAML") as raised:
+        CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+
+    assert f".coherence/{name}" in str(raised.value)
+    assert broken.read_text() == "- docs/**\n- *.md\n"
+    assert [path.name for path in coherence_dir.glob("*.yaml")] == [name]
+    assert not (coherence_dir / "server.pid").exists()
+
+
+def test_a_degrade_volume_warns_about_a_policy_file_it_cannot_load_and_keeps_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#305: a degrade volume keeps the file too, warns naming it, and stays
+    detached like its other failed attaches. Prevents degrade mode, which promises
+    only to run without enforcement, destroying a policy file to get there."""
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True)
+    broken = coherence_dir / "tracked.yaml"
+    broken.write_text("- docs/**\n- *.md\n")
+
+    with pytest.warns(CoherenceDegradedWarning, match=r"\.coherence/tracked\.yaml is not valid YAML"):
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+
+    assert not vol.is_attached
+    assert broken.read_text() == "- docs/**\n- *.md\n"
+    assert not (coherence_dir / "server.pid").exists()
+
+
+def test_a_volume_joining_a_running_coordinator_is_not_refused_over_a_policy_file(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """Only the spawner merges: a coordinator loads its policy once, so a file broken
+    after that changes nothing for a volume joining it. Prevents the #305 refusal
+    reaching a sibling, or the sibling rewriting the file."""
+    _seed(tmp_path)
+    CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        broken = tmp_path / ".coherence" / "tracked.yaml"
+        broken.write_text("- docs/**\n- *.md\n")
+
+        sibling = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+
+        assert sibling.is_attached
+        assert broken.read_text() == "- docs/**\n- *.md\n"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
+def test_a_forked_child_refuses_a_policy_file_until_it_is_fixed(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A strict child's lazy re-attach spawns a coordinator when the parent's is
+    gone, so it reaches the #305 refusal. Prevents the refusal sticking: it re-arms
+    the re-attach, so the operation after the user fixes the file attaches."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    stop_coordinator(tmp_path)
+    broken = tmp_path / ".coherence" / "tracked.yaml"
+    broken.write_text("- docs/**\n- *.md\n")
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        os.close(read_fd)
+        try:
+            with pytest.raises(CoherenceError, match=r"\.coherence/tracked\.yaml is not valid YAML"):
+                vol.read(rel)
+            kept = broken.read_text() == "- docs/**\n- *.md\n"
+            broken.write_text('- "docs/**"\n')
+            report = {"kept": kept, "read": vol.read(rel).decode(), "attached": vol.is_attached}
+            stop_coordinator(tmp_path)
+            os.write(write_fd, json.dumps(report).encode())
+        except BaseException as exc:  # report, never hang the parent
+            os.write(write_fd, json.dumps({"error": repr(exc)}).encode())
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+    os.close(write_fd)
+    ready, _w, _x = select.select([read_fd], [], [], 60)
+    if not ready:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        pytest.fail("timed out waiting for the forked child's report")
+    report = json.loads(os.read(read_fd, 4096).decode("utf-8"))
+    os.close(read_fd)
+    os.waitpid(pid, 0)
+
+    assert report == {"kept": True, "read": "v1", "attached": True}
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+def test_a_volume_refuses_a_symlinked_pid_file_and_leaves_its_target_alone(
+    tmp_path: Path, fast_cfg: LifecycleConfig, tmp_path_factory: pytest.TempPathFactory, on_error: str
+) -> None:
+    """#464 through a volume, which reads the pid file before it starts anything.
+    Prevents that path writing through the link: a strict volume raises, a degrade
+    volume warns and stays detached, and the file the link names keeps its bytes."""
+    _seed(tmp_path)
+    target = tmp_path_factory.mktemp("outside") / "target"
+    target.write_bytes(b"keep\n")
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True)
+    (coherence_dir / "server.pid").symlink_to(target)
+
+    if on_error == "strict":
+        with pytest.raises(CoordinatorUnreachable):
+            CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+    else:
+        with pytest.warns(CoherenceDegradedWarning):
+            vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+        assert not vol.is_attached
+
+    assert (coherence_dir / "server.pid").is_symlink()
+    assert target.read_bytes() == b"keep\n"
 
 
 def _untrack_refusal(vol: CoherentVolume, paths: list[str]) -> tuple[int, dict]:
@@ -1183,7 +1318,7 @@ def test_a_broader_ignore_pattern_at_spawn_does_not_unguard_a_managed_path(
     target = _seed(tmp_path, content=b"v1")
     coherence_dir = tmp_path / ".coherence"
     coherence_dir.mkdir(parents=True, exist_ok=True)
-    CoherentVolume._merge_yaml_list(coherence_dir / "ignored.yaml", ("**",))
+    merge_policy_globs((coherence_dir / "ignored.yaml",), ("**",))
     vol, peer = _pair(tmp_path, fast_cfg)
     try:
         assert vol.is_attached and not vol.is_degraded

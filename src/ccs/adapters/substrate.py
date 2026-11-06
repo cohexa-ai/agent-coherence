@@ -32,8 +32,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeAlias, runtime_checkable
 
-import yaml
-
+from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
 from ccs.cli._coherence_client import (
     PRINCIPAL_REFUSED_AGAIN,
     CoordinatorEndpoint,
@@ -387,28 +386,11 @@ def _deny_is_peer_invalidation(version: int, prior_seen: int | None) -> bool:
     return prior_seen is not None and prior_seen < version
 
 
-def _merge_yaml_list(path: Path, globs: tuple[str, ...]) -> None:
-    """Idempotently merge ``globs`` into a coordinator policy YAML list file."""
-    existing: list[str] = []
-    if path.is_file():
-        try:
-            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except (yaml.YAMLError, OSError):
-            loaded = None
-        if isinstance(loaded, list):
-            existing = [x for x in loaded if isinstance(x, str)]
-    merged = sorted(set(existing) | set(globs))
-    if merged == sorted(existing):
-        return
-    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-    tmp.write_text(yaml.safe_dump(merged, default_flow_style=False), encoding="utf-8")
-    os.replace(tmp, path)
-
-
 def _write_strict_policy(coherence_dir: Path, managed: tuple[str, ...]) -> None:
     """Enable strict mode on the managed artifact globs BEFORE the coordinator
     spawns (policy is load-once-at-startup): a path must be tracked AND strict
-    for a peer commit to invalidate this reader's cached view."""
+    for a peer commit to invalidate this reader's cached view. Raises ValueError
+    naming a policy file it cannot merge into (#305)."""
     if not managed:
         return
     # Runs BEFORE the lifecycle creates the directory, so on a fresh workspace
@@ -417,8 +399,7 @@ def _write_strict_policy(coherence_dir: Path, managed: tuple[str, ...]) -> None:
     # about a directory this call made a moment earlier. An existing directory
     # is left as-is (mkdir never chmods); re-tightening is the lifecycle's job.
     coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for name in ("tracked.yaml", "strict_mode.yaml"):
-        _merge_yaml_list(coherence_dir / name, managed)
+    merge_policy_globs((coherence_dir / "tracked.yaml", coherence_dir / "strict_mode.yaml"), managed)
 
 
 @dataclass(frozen=True)
@@ -572,7 +553,6 @@ class SubstrateCoordinatorSession:
         config: LifecycleConfig | None = None,
         bind_host: str = "127.0.0.1",
     ) -> None:
-        # Deferred so importing a binding never pulls in the coordinator server.
         from ccs.adapters.claude_code.lifecycle import (  # noqa: PLC0415
             LifecycleConfig,
             connect_or_spawn,
@@ -590,7 +570,12 @@ class SubstrateCoordinatorSession:
         )
         # Only the SPAWNER writes policy (load-once); a sibling must not clobber it.
         if not pre_existing:
-            _write_strict_policy(coherence_dir, self._managed)
+            try:
+                _write_strict_policy(coherence_dir, self._managed)
+            except ValueError as exc:
+                # Fail closed: a session has no check after it attaches, so going
+                # on without the merge would run it unenforced with no signal.
+                raise CoherenceError(str(exc)) from exc
         # No coordinator to spawn or attach, or none to name, is the same fact
         # to this caller as one that will not answer: nothing will.
         if connect_or_spawn(self._root, config=cfg, bind_host=bind_host) == -1:

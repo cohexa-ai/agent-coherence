@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
+from ccs.core.exceptions import CoherenceError
 from ccs.mcp.server import build_server, lifespan
 from ccs.mcp.session import SessionConfig, build_volume
 
@@ -77,6 +78,28 @@ def test_lifespan_attaches_strict_and_stops(tmp_path: Path, monkeypatch) -> None
     # The lifespan's finally already stopped the coordinator; a second stop in
     # THIS process reports False (nothing left for us to stop).
     assert stop_coordinator(tmp_path) is False
+
+
+def test_lifespan_refuses_a_policy_file_it_cannot_load_and_keeps_it(tmp_path: Path, monkeypatch) -> None:
+    """#305 at server startup, the attach that spawns the coordinator: the error names
+    the file, as every other attach refusal does. Prevents startup replacing the file
+    with only the managed globs."""
+    monkeypatch.setenv("SWG_ROOT", str(tmp_path))
+    monkeypatch.setenv("SWG_MANAGED", "data/**")
+    _seed(tmp_path)
+    broken = tmp_path / ".coherence" / "tracked.yaml"
+    broken.parent.mkdir(mode=0o700)
+    broken.write_text("- docs/**\n- *.md\n")
+    server = build_server()
+
+    async def go() -> None:
+        async with lifespan(server):
+            pytest.fail("attached over a policy file it cannot load")
+
+    with pytest.raises(CoherenceError, match=r"\.coherence/tracked\.yaml is not valid YAML"):
+        asyncio.run(go())
+
+    assert broken.read_text() == "- docs/**\n- *.md\n"
 
 
 # --- strict-only construction (no degrade-mode volume) -----------------------
