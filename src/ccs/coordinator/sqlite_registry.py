@@ -1026,6 +1026,7 @@ class SqliteArtifactRegistry:
         retain_versions: bool = False,
         retention_policy: RetentionPolicy | None = None,
         read_only: bool = False,
+        on_migrated: Callable[[int], None] | None = None,
     ) -> None:
         if state_log is not None and instance_id is None:
             raise ValueError(
@@ -1103,6 +1104,19 @@ class SqliteArtifactRegistry:
             check_same_thread=False,
             isolation_level=None,  # autocommit; we manage transactions explicitly
         )
+        # Every step past the connect can raise, and the caller then never gets
+        # a registry to .close(): a kept exception's traceback would hold the
+        # store open (#426). The BaseException breadth mirrors _open_read_only.
+        try:
+            self._finish_writer_open(instance_id, on_migrated)
+        except BaseException:
+            self._conn.close()
+            raise
+
+    def _finish_writer_open(
+        self, instance_id: str | None, on_migrated: Callable[[int], None] | None
+    ) -> None:
+        """The steps of a writer open past the connect."""
         # WAL for concurrent readers + bounded busy_timeout for write contention.
         # synchronous=NORMAL is durable enough for non-financial use.
         #
@@ -1131,6 +1145,13 @@ class SqliteArtifactRegistry:
         self._chmod_if_exists(self._shm_path())
 
         self._initialize_schema(instance_id)
+        # Reported here, not at the end: the chain has committed, and the store
+        # stays moved even if a later step of this open raises (#417).
+        if on_migrated is not None and self.migrated_from_version is not None:
+            try:
+                on_migrated(self.migrated_from_version)
+            except Exception:  # noqa: BLE001 — observer isolation by design
+                logger.exception("on_migrated callback raised; store open unaffected")
         # Conflict-counter table (guarantee-ladder U5 / KTD-9): an idempotent
         # writer-open ensure, deliberately OUTSIDE the versioned migration
         # chain — the counters are observability exhaust, not coordination

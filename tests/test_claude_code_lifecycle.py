@@ -9,11 +9,14 @@ the 10-process race integration test that gives Unit 5 its main signal.
 
 from __future__ import annotations
 
+import errno
 import multiprocessing as mp
 import os
 import select
+import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -1753,13 +1756,9 @@ def test_handle_after_the_coordinator_stopped_reports_bound_again(
     first_coordinator = lifecycle._SPAWNED_REGISTRY[key].coordinator
     if idle:
         assert lifecycle.wait_for_shutdown(workspace, poll_interval_sec=0.05, timeout_sec=10.0) is True
-        # The idle thread drops the registry entry just after shutdown_done:
-        # wait for that, so the drop cannot land on the next call's entry.
-        deadline = time.monotonic() + 5.0
-        while key in lifecycle._SPAWNED_REGISTRY and time.monotonic() < deadline:
-            time.sleep(0.01)
     else:
         assert stop_coordinator(workspace) is True
+    assert key not in lifecycle._SPAWNED_REGISTRY
     second = ensure_coordinator_handle(workspace, config=fast_cfg)
     try:
         assert second is not None
@@ -1825,33 +1824,460 @@ def test_a_start_that_fails_after_marking_its_bind_drops_the_marker(
             coordinator.shutdown()
 
 
-def test_a_start_that_fails_after_registering_keeps_the_marker(
+def _connection_refused(port: int) -> bool:
+    """Whether nothing listens on ``port``. A bound socket accepts into its
+    backlog before anything serves it, so only a closed socket refuses."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(2.0)
+        return probe.connect_ex(("127.0.0.1", port)) == errno.ECONNREFUSED
+
+
+def _join_the_thread_that_ran_the_sequence(sequence_callers: list[threading.Thread]) -> None:
+    """Wait until the idle thread that a forced schedule caught has run all
+    that follows the shutdown sequence."""
+    deadline = time.monotonic() + 30.0
+    while not sequence_callers and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert sequence_callers, "no idle shutdown ran within the deadline"
+    sequence_callers[0].join(timeout=30.0)
+    assert not sequence_callers[0].is_alive()
+
+
+@pytest.mark.parametrize("stopped_by", ["idle_shutdown", "stop_coordinator"])
+def test_a_shutdown_keeps_the_entry_of_a_coordinator_started_right_after_it(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, stopped_by: str,
+) -> None:
+    """#424: a coordinator started once the previous one's flock is free keeps
+    its registry entry, whatever the previous shutdown's caller does next.
+
+    Prevents a removal by key that runs after the flock release from dropping
+    the new coordinator's entry: it stays reachable, the next call reports a
+    join of it, and the caller told BOUND gets False from stop_coordinator
+    with the coordinator still running. The schedule is forced: the natural
+    one lost no entry in 600 rounds."""
+    idle = stopped_by == "idle_shutdown"
+    real_sequence = lifecycle._shutdown_sequence
+    second: list[CoordinatorHandle | None] = []
+    sequence_callers: list[threading.Thread] = []
+
+    def start_another_after_the_sequence(entry: object) -> bool:
+        ran = real_sequence(entry)
+        if not second:
+            second.append(ensure_coordinator_handle(workspace, config=fast_cfg))
+            sequence_callers.append(threading.current_thread())
+        return ran
+
+    # Before the first start: its idle shutdown is on a timer from the moment it binds.
+    monkeypatch.setattr(lifecycle, "_shutdown_sequence", start_another_after_the_sequence)
+    first = ensure_coordinator_handle(
+        workspace, config=replace(fast_cfg, idle_shutdown_sec=0.3) if idle else fast_cfg,
+    )
+    assert first is not None and first.outcome == _BOUND
+    if idle:
+        _join_the_thread_that_ran_the_sequence(sequence_callers)
+    else:
+        assert stop_coordinator(workspace) is True
+    try:
+        assert second[0] is not None and second[0].outcome == _BOUND
+        entry = lifecycle._SPAWNED_REGISTRY.get(str(workspace.resolve()))
+        assert entry is not None, "the new coordinator lost its registry entry"
+        assert entry.coordinator.port == second[0].port
+        assert stop_coordinator(workspace) is True
+        assert _connection_refused(second[0].port)
+    finally:
+        stop_coordinator(workspace)
+
+
+def test_an_orphaned_coordinators_idle_shutdown_keeps_the_entry_that_replaced_it(
     workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#348: a start that raises after its coordinator is registered keeps
-    the marker, since that coordinator keeps serving under a pid file that
-    names its port; its own shutdown drops the marker.
+    """#424: removing ``.coherence/`` lets a second coordinator bind while the
+    first still holds the flock of the unlinked pid file. The first one's idle
+    shutdown leaves the second one's entry alone.
 
-    Prevents the failure path from dropping the marker of a coordinator that
-    still serves, which would report a join of it from this process as
-    another process's."""
-    def failing_threads(entry: object, cfg: LifecycleConfig) -> None:
-        raise RuntimeError("background threads failed")
-
-    monkeypatch.setattr(lifecycle, "_start_background_threads", failing_threads)
-    with pytest.raises(RuntimeError, match="background threads failed"):
-        ensure_coordinator_handle(workspace, config=fast_cfg)
+    Prevents a removal by key from relying on the flock alone: the flock of an
+    unlinked file excludes nobody."""
     key = str(workspace.resolve())
-    entry = lifecycle._SPAWNED_REGISTRY[key]
+    replacement_registered = threading.Event()
+    sequence_callers: list[threading.Thread] = []
+    real_sequence = lifecycle._shutdown_sequence
+
+    def sequence_once_the_replacement_registered(entry: object) -> bool:
+        assert replacement_registered.wait(timeout=30.0)
+        ran = real_sequence(entry)
+        sequence_callers.append(threading.current_thread())
+        return ran
+
+    monkeypatch.setattr(lifecycle, "_shutdown_sequence", sequence_once_the_replacement_registered)
+    first = ensure_coordinator_handle(workspace, config=replace(fast_cfg, idle_shutdown_sec=0.1))
+    assert first is not None and first.outcome == _BOUND
+    first_entry = lifecycle._SPAWNED_REGISTRY[key]
+    shutil.rmtree(workspace / ".coherence")
+    with monkeypatch.context() as probe_patch:
+        probe_patch.setattr(lifecycle, "tcp_probe", lambda *args, **kwargs: False)
+        second = ensure_coordinator_handle(workspace, config=fast_cfg)
+    replacement_registered.set()
     try:
-        assert entry.bound_marker == (key, entry.coordinator.port)
-        assert entry.bound_marker in lifecycle._BOUND_IN_THIS_PROCESS
+        assert second is not None and second.outcome == _BOUND and second.port != first.port
+        second_entry = lifecycle._SPAWNED_REGISTRY[key]
+        assert second_entry is not first_entry
+        _join_the_thread_that_ran_the_sequence(sequence_callers)
+        assert first_entry.shutdown_done.is_set()
+        assert lifecycle._SPAWNED_REGISTRY.get(key) is second_entry
     finally:
-        # Not stop_coordinator: the failed start already closed the entry's
-        # lock fd, and a stop would write to that fd number.
-        entry.coordinator.shutdown()
-        lifecycle._SPAWNED_REGISTRY.pop(key, None)
-        lifecycle._BOUND_IN_THIS_PROCESS.discard(entry.bound_marker)
+        replacement_registered.set()
+        stop_coordinator(workspace)
+
+
+@pytest.mark.parametrize("path", ["normal", "escalated"])
+def test_a_shutdown_drops_its_entry_before_it_releases_the_flock(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, path: str,
+) -> None:
+    """#424: the entry is gone by the time the flock is free, on the normal
+    path and on the escalated one (REL-06). An aborted attempt keeps it for
+    the retry.
+
+    Prevents the removal moving after the release, where a new coordinator's
+    insert can land first. No forced schedule of a caller sees that: both ends
+    of the window would sit inside the shutdown sequence."""
+    key = str(workspace.resolve())
+    assert ensure_coordinator(workspace, config=fast_cfg) > 0
+    entry = lifecycle._SPAWNED_REGISTRY[key]
+    registered_at_release: list[bool] = []
+    real_flock = lifecycle.fcntl.flock
+
+    def recording_flock(fd: int, operation: int) -> None:
+        if fd == entry.lock_fd and operation == lifecycle.fcntl.LOCK_UN:
+            registered_at_release.append(key in lifecycle._SPAWNED_REGISTRY)
+        real_flock(fd, operation)
+
+    monkeypatch.setattr(lifecycle.fcntl, "flock", recording_flock)
+    if path == "escalated":
+        real_shutdown = entry.coordinator.shutdown
+
+        def raising_shutdown() -> None:
+            real_shutdown()
+            raise RuntimeError("simulated shutdown failure")
+
+        monkeypatch.setattr(entry.coordinator, "shutdown", raising_shutdown)
+        for _ in range(lifecycle._MAX_SHUTDOWN_RETRIES_BEFORE_ESCALATION - 1):
+            assert stop_coordinator(workspace) is True
+            assert not entry.shutdown_done.is_set()
+            assert key in lifecycle._SPAWNED_REGISTRY
+    assert stop_coordinator(workspace) is True
+    assert entry.shutdown_done.is_set()
+    assert registered_at_release == [False]
+    assert key not in lifecycle._SPAWNED_REGISTRY
+
+
+#: Every step of a start after the coordinator is built: two before its registry
+#: insert, two after (#429).
+_START_STEPS = [
+    pytest.param(lifecycle, "_write_pidfile", id="pid_file"),
+    pytest.param(CoordinatorHTTPServer, "serve_in_thread", id="serve_thread"),
+    pytest.param(lifecycle, "_start_background_threads", id="background_threads"),
+    pytest.param(lifecycle, "_self_probe", id="self_probe"),
+]
+
+
+def _raise_once(monkeypatch: pytest.MonkeyPatch, owner: object, step: str) -> None:
+    """Make ``owner.step`` raise on its first call and work from then on."""
+    real_step = getattr(owner, step)
+    raised: list[bool] = []
+
+    def failing_step(*args: object, **kwargs: object) -> object:
+        if not raised:
+            raised.append(True)
+            raise RuntimeError(f"{step} failed")
+        return real_step(*args, **kwargs)
+
+    monkeypatch.setattr(owner, step, failing_step)
+
+
+def _record_built_coordinators(monkeypatch: pytest.MonkeyPatch) -> list[CoordinatorHTTPServer]:
+    built: list[CoordinatorHTTPServer] = []
+    real_server = lifecycle.CoordinatorHTTPServer
+
+    def recording_server(*args: object, **kwargs: object) -> CoordinatorHTTPServer:
+        built.append(real_server(*args, **kwargs))
+        return built[-1]
+
+    monkeypatch.setattr(lifecycle, "CoordinatorHTTPServer", recording_server)
+    return built
+
+
+def _record_lock_fds(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    lock_fds: list[int] = []
+    real_open = lifecycle._open_pidfile
+
+    def recording_open(pid_file: Path) -> int | None:
+        fd = real_open(pid_file)
+        assert fd is not None
+        lock_fds.append(fd)
+        return fd
+
+    monkeypatch.setattr(lifecycle, "_open_pidfile", recording_open)
+    return lock_fds
+
+
+def _record_fd_closes(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    closes: list[int] = []
+    real_close = os.close
+
+    def recording_close(fd: int) -> None:
+        closes.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(os, "close", recording_close)
+    return closes
+
+
+def _assert_no_new_coordinator_thread_survives(before: set[threading.Thread]) -> None:
+    deadline = time.monotonic() + 10.0
+    while True:
+        survivors = [
+            thread.name for thread in threading.enumerate()
+            if thread not in before and thread.name.startswith("coord-")
+        ]
+        if not survivors or time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
+    assert not survivors
+
+
+@pytest.mark.parametrize(("owner", "step"), _START_STEPS)
+def test_a_start_that_fails_after_the_bind_leaves_nothing_running(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, owner: object, step: str,
+) -> None:
+    """#429: a start that raises after the bind stops what it started: the
+    port refuses connections, the pid file names no port, and no registry
+    entry, bind marker or coordinator thread remains. The next call binds.
+
+    Prevents a caller told the start failed from leaving a coordinator that
+    still serves the port and answers joiners, with no owner to stop it. The
+    connect runs while this test still holds the coordinator object, so
+    nothing but the failure path can have closed the socket."""
+    key = str(workspace.resolve())
+    built = _record_built_coordinators(monkeypatch)
+    threads_before = set(threading.enumerate())
+    _raise_once(monkeypatch, owner, step)
+    lock_fds = _record_lock_fds(monkeypatch)
+    closes = _record_fd_closes(monkeypatch)
+    try:
+        with pytest.raises(RuntimeError, match=f"{step} failed"):
+            ensure_coordinator_handle(workspace, config=replace(fast_cfg, idle_shutdown_sec=900))
+        # First, before anything below can reuse the number. Closed, and only
+        # once: a repeat close after another thread reused it closes their file.
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(lock_fds[0])
+        assert closes.count(lock_fds[0]) == 1
+        port = built[0].port
+        assert _connection_refused(port)
+        assert _read_port_from_file(workspace / ".coherence" / "server.pid") is None
+        assert key not in lifecycle._SPAWNED_REGISTRY
+        assert (key, port) not in lifecycle._BOUND_IN_THIS_PROCESS
+        _assert_no_new_coordinator_thread_survives(threads_before)
+        second = ensure_coordinator_handle(workspace, config=fast_cfg)
+        assert second is not None and second.outcome == _BOUND
+    finally:
+        stop_coordinator(workspace)
+        for coordinator in built:
+            coordinator.shutdown()
+
+
+@pytest.mark.parametrize(("step", "stopped_by"), [
+    ("_start_background_threads", "stop_coordinator"),
+    ("_self_probe", "stop_coordinator"),
+    ("_self_probe", "idle_shutdown"),
+])
+def test_a_failed_start_leaves_no_shutdown_to_write_into_a_reused_fd(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory, step: str, stopped_by: str,
+) -> None:
+    """#429: a file opened after a start failed keeps its contents and its
+    descriptor through a later ``stop_coordinator`` and the idle shutdown.
+
+    Prevents an entry that outlives its closed lock fd: its shutdown would
+    write the pid line into, and close, whatever file reuses that number."""
+    _raise_once(monkeypatch, lifecycle, step)
+    lock_fds = _record_lock_fds(monkeypatch)
+    idle = stopped_by == "idle_shutdown"
+    threads_before = set(threading.enumerate())
+    with pytest.raises(RuntimeError, match=f"{step} failed"):
+        ensure_coordinator_handle(
+            workspace, config=replace(fast_cfg, idle_shutdown_sec=0.1) if idle else fast_cfg,
+        )
+    unrelated = tmp_path_factory.mktemp("unrelated") / "unrelated.txt"
+    opened = os.open(unrelated, os.O_CREAT | os.O_RDWR, 0o600)
+    # dup2, so the file holds the exact number even if a lower one is free.
+    fd = os.dup2(opened, lock_fds[0])
+    if opened != fd:
+        os.close(opened)
+    try:
+        os.write(fd, b"contents\n")
+        if idle:
+            _assert_no_new_coordinator_thread_survives(threads_before)
+        else:
+            assert stop_coordinator(workspace) is False
+        assert unrelated.read_bytes() == b"contents\n"
+        os.fstat(fd)
+    finally:
+        os.close(fd)
+
+
+def test_a_failed_start_racing_the_idle_shutdown_stops_the_coordinator_once(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#429: when the idle thread is inside the shutdown as the start fails,
+    the coordinator stops once, on that thread, and the lock fd closes once.
+    The caller still gets the start's own failure.
+
+    Prevents the failure branch running a second teardown beside the idle
+    shutdown, or closing a descriptor number that thread already closed."""
+    real_server = lifecycle.CoordinatorHTTPServer
+    idle_is_shutting_down = threading.Event()
+    start_has_failed = threading.Event()
+    shutdown_threads: list[str] = []
+
+    def held_server(*args: object, **kwargs: object) -> CoordinatorHTTPServer:
+        coordinator = real_server(*args, **kwargs)
+        real_shutdown = coordinator.shutdown
+
+        def held_shutdown() -> None:
+            shutdown_threads.append(threading.current_thread().name)
+            idle_is_shutting_down.set()
+            assert start_has_failed.wait(timeout=30.0)
+            real_shutdown()
+
+        coordinator.shutdown = held_shutdown  # type: ignore[method-assign]
+        return coordinator
+
+    def probe_failing_during_the_idle_shutdown(*args: object, **kwargs: object) -> bool:
+        assert idle_is_shutting_down.wait(timeout=30.0)
+        start_has_failed.set()
+        raise RuntimeError("_self_probe failed")
+
+    monkeypatch.setattr(lifecycle, "CoordinatorHTTPServer", held_server)
+    monkeypatch.setattr(lifecycle, "_self_probe", probe_failing_during_the_idle_shutdown)
+    lock_fds = _record_lock_fds(monkeypatch)
+    closes = _record_fd_closes(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="_self_probe failed"):
+        ensure_coordinator_handle(workspace, config=replace(fast_cfg, idle_shutdown_sec=0.1))
+
+    assert shutdown_threads == ["coord-idle"]
+    assert closes.count(lock_fds[0]) == 1
+    assert str(workspace.resolve()) not in lifecycle._SPAWNED_REGISTRY
+
+
+def test_an_unregistered_failed_start_empties_the_pid_file_before_it_stops_the_coordinator(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#429: the port leaves the pid file before the coordinator starts to stop.
+
+    Prevents a call that lost the flock reading the port during the teardown
+    and joining a coordinator that is about to refuse it."""
+    real_server = lifecycle.CoordinatorHTTPServer
+    pid_file = workspace / ".coherence" / "server.pid"
+    pid_file_at_shutdown: list[str] = []
+
+    def recording_server(*args: object, **kwargs: object) -> CoordinatorHTTPServer:
+        coordinator = real_server(*args, **kwargs)
+        real_shutdown = coordinator.shutdown
+
+        def recording_shutdown() -> None:
+            pid_file_at_shutdown.append(pid_file.read_text())
+            real_shutdown()
+
+        coordinator.shutdown = recording_shutdown  # type: ignore[method-assign]
+        return coordinator
+
+    monkeypatch.setattr(lifecycle, "CoordinatorHTTPServer", recording_server)
+    _raise_once(monkeypatch, CoordinatorHTTPServer, "serve_in_thread")
+
+    with pytest.raises(RuntimeError, match="serve_in_thread failed"):
+        ensure_coordinator_handle(workspace, config=fast_cfg)
+
+    assert pid_file_at_shutdown == [""]
+
+
+def test_a_start_whose_serve_thread_cannot_start_raises_and_leaves_nothing_running(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#429: a real ``Thread.start`` failure, as a host out of threads sees it,
+    raises and frees the port.
+
+    Prevents the cleanup hanging: ``socketserver``'s ``shutdown()`` waits on an
+    event only ``serve_forever`` sets, so a coordinator that records a serve
+    thread before it starts would wait forever. The start runs on its own
+    thread so that hang fails this test and not the whole run."""
+    built = _record_built_coordinators(monkeypatch)
+    real_start = threading.Thread.start
+
+    def start_all_but_the_serve_thread(thread: threading.Thread) -> None:
+        if thread.name == "coord-http":
+            raise RuntimeError("can't start new thread")
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", start_all_but_the_serve_thread)
+    raised: list[BaseException] = []
+
+    def run_the_start() -> None:
+        try:
+            ensure_coordinator_handle(workspace, config=fast_cfg)
+        except RuntimeError as exc:
+            raised.append(exc)
+
+    starter = threading.Thread(target=run_the_start, daemon=True)
+    starter.start()
+    starter.join(timeout=30.0)
+    assert not starter.is_alive(), "the failed start hangs in its cleanup"
+    assert "can't start new thread" in str(raised[0])
+    assert _connection_refused(built[0].port)
+    assert _read_port_from_file(workspace / ".coherence" / "server.pid") is None
+
+
+@pytest.mark.parametrize("shutdown_raises", ["once", "always"])
+@pytest.mark.parametrize(("owner", "step"), _START_STEPS)
+def test_a_failed_start_whose_shutdown_raises_too_still_frees_the_workspace(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    owner: object, step: str, shutdown_raises: str,
+) -> None:
+    """#429: the caller still gets the start's own failure when the cleanup's
+    shutdown raises as well, and the next call binds.
+
+    Prevents an aborted cleanup keeping the flock with no idle thread left to
+    retry, which would wedge the workspace until the process exits."""
+    real_server = lifecycle.CoordinatorHTTPServer
+    built: list[CoordinatorHTTPServer] = []
+
+    def raising_server(*args: object, **kwargs: object) -> CoordinatorHTTPServer:
+        coordinator = real_server(*args, **kwargs)
+        real_shutdown = coordinator.shutdown
+        calls: list[bool] = []
+
+        def raising_shutdown() -> None:
+            real_shutdown()
+            if not calls or shutdown_raises == "always":
+                calls.append(True)
+                raise RuntimeError("shutdown failed too")
+
+        coordinator.shutdown = raising_shutdown  # type: ignore[method-assign]
+        built.append(coordinator)
+        return coordinator
+
+    monkeypatch.setattr(lifecycle, "CoordinatorHTTPServer", raising_server)
+    _raise_once(monkeypatch, owner, step)
+    with pytest.raises(RuntimeError, match=f"{step} failed"):
+        ensure_coordinator_handle(workspace, config=fast_cfg)
+    monkeypatch.setattr(lifecycle, "CoordinatorHTTPServer", real_server)
+    try:
+        assert str(workspace.resolve()) not in lifecycle._SPAWNED_REGISTRY
+        assert _connection_refused(built[0].port)
+        second = ensure_coordinator_handle(workspace, config=fast_cfg)
+        assert second is not None and second.outcome == _BOUND
+    finally:
+        stop_coordinator(workspace)
 
 
 def _hold_the_flock_with_no_port(root: Path) -> int:
@@ -2108,3 +2534,61 @@ def test_checking_a_store_that_would_migrate_logs_no_migration(
 
     assert result.outcome.value == "will_migrate"
     assert _migration_records(caplog) == []
+
+
+def _fail_the_start_after_the_migration(step: str, workspace: Path, monkeypatch: pytest.MonkeyPatch) -> type[Exception]:
+    """Make a start on a version-7 store raise at ``step``, every one of them
+    after the migration chain committed. Returns the type the start raises."""
+    from ccs.adapters.claude_code import coordinator_server
+    from ccs.adapters.claude_code.auth import EnsureSecretError
+    from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+
+    def raising(exc: Exception):
+        def raise_it(*args: object, **kwargs: object) -> None:
+            raise exc
+        return raise_it
+
+    if step == "rest_of_the_store_open":
+        monkeypatch.setattr(
+            SqliteArtifactRegistry, "_ensure_conflict_counters_table",
+            raising(sqlite3.OperationalError("disk I/O error")),
+        )
+        return sqlite3.OperationalError
+    if step == "secret":
+        (workspace / ".coherence" / "hook.secret").mkdir()
+        return EnsureSecretError
+    if step == "bind":
+        monkeypatch.setattr(
+            coordinator_server, "_ThreadingHTTPServer",
+            raising(OSError(errno.EADDRINUSE, "Address already in use")),
+        )
+        return OSError
+    monkeypatch.setattr(lifecycle, "_write_pidfile", raising(RuntimeError("pid file write failed")))
+    return RuntimeError
+
+
+@pytest.mark.parametrize("step", ["rest_of_the_store_open", "secret", "bind", "pid_file"])
+def test_a_start_that_fails_after_migrating_the_store_logs_the_migration_once(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, step: str,
+) -> None:
+    """#417: the migration line does not depend on the rest of the start. A
+    start that raises after the store moved forward still logs it, once, on
+    the lifecycle logger, and still raises.
+
+    Prevents a store that moved one way with nothing saying so: the failed
+    start's error names the later step, and the next start finds the store
+    current and logs no migration."""
+    from ccs.coordinator.sqlite_registry import SCHEMA_USER_VERSION
+
+    db = _v7_store(workspace)
+    expected = _fail_the_start_after_the_migration(step, workspace, monkeypatch)
+    caplog.set_level("INFO")
+
+    with pytest.raises(expected):
+        ensure_coordinator_handle(workspace, config=fast_cfg)
+
+    records = _migration_records(caplog)
+    assert [name for name, _ in records] == [_LIFECYCLE_LOGGER], records
+    assert f"from registry schema 7 to {SCHEMA_USER_VERSION}" in records[0][1]
+    assert str(db) in records[0][1]

@@ -1035,6 +1035,7 @@ class CoordinatorHTTPServer:
         agent_names: dict[UUID, str] | None = None,
         state_log: Callable[[dict[str, Any]], None] | None = None,
         instance_id: str | None = None,
+        on_migrated: Callable[[int], None] | None = None,
     ) -> None:
         self.coordinator_root = Path(coordinator_root).resolve()
         self.bind_host = bind_host
@@ -1336,7 +1337,20 @@ class CoordinatorHTTPServer:
             state_log=state_log,
             agent_names=self._agent_names,
             instance_id=instance_id,
+            on_migrated=on_migrated,
         )
+        # A later step that raises leaves the caller no server to shutdown(), and
+        # a kept exception's traceback would hold the store open (#426). The
+        # watchdog pool has no thread until the first request, so only the store
+        # needs closing.
+        try:
+            self._finish_construction(port)
+        except BaseException:
+            self.registry.close()
+            raise
+
+    def _finish_construction(self, port: int) -> None:
+        """The steps of the constructor past the store open."""
         self.service = CoordinatorService(self.registry)
         self.policy = TrackedArtifactPolicy.load(self.coordinator_root)
 
@@ -1357,7 +1371,7 @@ class CoordinatorHTTPServer:
         # limit get a synchronous 503 without spawning a handler thread.
         handler_cls = _make_handler_class(self)
         self._server = _ThreadingHTTPServer(
-            (bind_host, port),
+            (self.bind_host, port),
             handler_cls,
             concurrency_limit=HANDLER_CONCURRENCY_LIMIT,
         )
@@ -1368,13 +1382,16 @@ class CoordinatorHTTPServer:
         """Start the serving loop in a daemon thread."""
         if self._serve_thread is not None:
             return
-        self._serve_thread = threading.Thread(
+        serve_thread = threading.Thread(
             target=self._server.serve_forever,
             kwargs={"poll_interval": SERVE_POLL_INTERVAL_SEC},
             name="coord-http",
             daemon=True,
         )
-        self._serve_thread.start()
+        serve_thread.start()
+        # Recorded only once it runs: shutdown() waits for the recorded thread's
+        # serve_forever to exit, and one that never started never would (#429).
+        self._serve_thread = serve_thread
 
     def shutdown(self) -> None:
         """Stop the server, drain in-flight handlers, close storage.

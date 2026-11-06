@@ -272,8 +272,8 @@ and its `expected_version` this build's. The message text is unchanged, except
 that a store whose `user_version` is negative now names its own remedy
 (restore it from a backup) instead of telling you to upgrade or to re-open it
 read-write, so branch on `reason`, not on the text. A start that migrates a
-store and opens it logs one `INFO` line naming both schemas (see
-[Reclamation diagnostics](#reclamation-diagnostics)).
+store logs one `INFO` line naming both schemas, even if a later step of that
+start fails (see [Reclamation diagnostics](#reclamation-diagnostics)).
 
 ### What changes for a 0.14.1 user
 
@@ -810,8 +810,8 @@ detached `agent-coherence-coordinator` process) sends its stderr to
 `/dev/null`, so there the line is lost; read the reclaim from `/status`
 instead (see [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status)).
 
-A start that migrates `.coherence/state.db` forward and opens it logs one
-`INFO` line on the same logger: `coordinator migrated <path> from registry
+A start that migrates `.coherence/state.db` forward logs one `INFO` line on
+the same logger, even if a later step of that start fails: `coordinator migrated <path> from registry
 schema 7 to 10; a coordinator that expects schema 7 refuses this store from
 now on`. A start
 that creates or opens a store at the current schema logs none, and neither
@@ -1696,10 +1696,14 @@ the call, not whether the coordinator still runs: idle shutdown can stop a
 coordinator the call started, and the next call reports `bound` again. Only a
 caller told `bound` should stop the coordinator with `stop_coordinator`. It
 returns `None` where `ensure_coordinator` returns `-1`; `ensure_coordinator`
-still returns a bare port. A start that fails raises instead:
-`SchemaVersionError` on a store it refuses (its `reason` says why),
-`sqlite3.Error` on a file SQLite cannot open, and `OSError` when the lock or
-the bind fails. To ask before a start migrates the store, call
+still returns a bare port. A start that fails stops whatever it started and
+raises instead: `SchemaVersionError` on a store it refuses (its `reason` says
+why), `sqlite3.Error` on a file SQLite cannot open, `OSError` when the lock or
+the bind fails, `ValueError` on a `bind_host` it refuses, and `RuntimeError`
+when it cannot read the hook secret or start a thread. A start interrupted by
+`KeyboardInterrupt` or `SystemExit` runs no cleanup, so a host that survives the
+interrupt can keep the workspace's lock until it exits. To ask before a start
+migrates the store, call
 [`check_store`](#checking-a-store-before-a-coordinator-starts) first.
 
 ### Atomic multi-file publish: `atomic_publish` (v0.12.0+)
