@@ -124,10 +124,9 @@ Alpha — APIs may change before `v1.0`.
   included, keeps its timed-out answer `{"ok": true, "degraded": true}` byte
   for byte. An opted-in request decided in time is refused as `other_holder`
   while another agent holds the path (next entry), and granted otherwise.
-  `UNAVAILABLE_REASON` in `ccs.core.exceptions` names the reason. No released
-  client sends the flag yet. The guide's "Acquire-or-fail on `pre-edit`"
-  section has the details, including which answers an opted-in client may
-  admit on.
+  `UNAVAILABLE_REASON` in `ccs.core.exceptions` names the reason. The guide's
+  "Acquire-or-fail on `pre-edit`" section has the details, including which
+  answers an opted-in client may admit on.
 
 - **A `pre-edit` that opts in with `"if_unheld": true` is refused as
   `other_holder` while another agent holds the path (part of #246).** Until
@@ -151,13 +150,37 @@ Alpha — APIs may change before `v1.0`.
   `tests/fixtures/wire/pre_edit_other_holder.json` pins the refusal's wire
   shape. Every pre-edit that does not send JSON `true` is unchanged, so an
   ordinary pre-edit, every Claude Code hook edit included, still displaces an
-  opted-in holder. The contract covers tracked paths only, and nothing sends
-  the flag yet. The Claude Code plugin's Node coordinator ignores the flag
-  through plugin 0.6.0; later plugin releases refuse with the same body,
+  opted-in holder. The contract covers tracked paths only. The Claude Code
+  plugin's Node coordinator ignores the flag through plugin 0.6.0; later plugin releases refuse with the same body,
   need no caller principal, and let an opted-in request take back a grant
   another agent has held 30 minutes or more. The guide's "Acquire-or-fail on
   `pre-edit`" section has the details, including every answer an opted-in
   client can get from each coordinator and what to do on each.
+
+- **`CoherentVolume(on_held="refuse")` raises `OtherHolder` instead of taking a
+  file another agent holds (part of #246).** On a managed path, `write()` opts in
+  with `if_unheld`. While another agent holds the file it raises `OtherHolder`,
+  naming the holder, with nothing written and the holder untouched. The default,
+  `on_held="displace"`, changes nothing. Refuse mode needs `on_error="strict"` and
+  `managed` globs, and is not available with `remote_endpoint`. A successful
+  `write()` keeps its grant across later commits, and `reacquire()` is the
+  release; it releases every path the attempt holds. The other answers to the
+  grant request are typed too, and none writes bytes: `unavailable` raises
+  `CoordinatorFailed`, a refusal by this volume's own unreleased grant raises
+  `CoordinatorFailed` pointing at `reacquire()`, and a body without `ok: true`
+  raises `CoordinatorUnreachable`. The `stale-write-guard-fs` deny table maps
+  `OtherHolder` to `other_holder` / `wait_and_retry` with the holder, though its
+  tools do not opt in yet. `OtherHolder`'s message now says to read the file again
+  before writing, because a write built without reading lands over what the holder
+  committed. It covers managed paths only, and the Claude Code hooks do not opt in.
+
+- **`/status` advertises the refusal as `pre_edit_if_unheld: true`, at every tier
+  and in the degraded answer.** A coordinator that ignores `if_unheld` displaces
+  the holder, and versions cannot separate the two, so a client reads this first.
+  A refuse-mode volume reads it at attach and raises `CoherenceError` before it
+  sends anything when the key is not JSON `true`. It cannot see a different
+  coordinator started later on the same port and secret; the guide says what that
+  leaves open.
 
 ### Changed
 

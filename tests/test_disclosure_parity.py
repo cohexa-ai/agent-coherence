@@ -91,6 +91,48 @@ PINS: tuple[Pin, ...] = (
         doc="README.md",
         doc_phrase="an ordinary pre-edit still displaces an opted-in holder",
     ),
+    Pin(
+        name="refuse mode: a write outside managed still displaces",
+        source="src/ccs/adapters/coherent_volume.py",
+        source_marker="write outside ``managed`` sends no flag and still displaces",
+        doc="docs/guide.md",
+        doc_phrase="A write outside `managed` sends no flag and displaces",
+    ),
+    Pin(
+        name="refuse mode: a link under managed to a file outside it still displaces",
+        source="src/ccs/adapters/coherent_volume.py",
+        source_marker="reads the resolved path, so a link under ``managed``",
+        doc="docs/guide.md",
+        doc_phrase="The check reads the resolved path, so a link under `managed`",
+    ),
+    Pin(
+        name="refuse mode: the release gives up every path",
+        source="src/ccs/adapters/coherent_volume.py",
+        source_marker="path this attempt holds, not only ``path``",
+        doc="docs/guide.md",
+        doc_phrase="`reacquire()` releases every path this attempt holds",
+    ),
+    Pin(
+        name="refuse mode: other paths must be read again after the release",
+        source="src/ccs/adapters/coherent_volume.py",
+        source_marker="other tracked paths should be re-read before writing",
+        doc="docs/guide.md",
+        doc_phrase="So re-read every other path before you write it",
+    ),
+    Pin(
+        name="refuse mode: the capability check cannot see a same-port replacement",
+        source="src/ccs/adapters/coherent_volume.py",
+        source_marker="a fixed-port replacement goes unseen",
+        doc="docs/guide.md",
+        doc_phrase="same port and secret goes unseen",
+    ),
+    Pin(
+        name="refuse mode: a blind retry overwrites the holder's commit",
+        source="src/ccs/core/exceptions.py",
+        source_marker="overwrites what the holder committed",
+        doc="docs/guide.md",
+        doc_phrase="write, so a write built without reading lands over whatever the holder",
+    ),
 )
 
 
