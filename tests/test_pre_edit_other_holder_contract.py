@@ -25,6 +25,7 @@ from typing import Callable
 
 import pytest
 
+import ccs.adapters.claude_code.coordinator_server as server_module
 from ccs.adapters.claude_code.auth import load_secret
 from ccs.adapters.claude_code.coordinator_server import (
     CoordinatorHTTPServer,
@@ -33,9 +34,14 @@ from ccs.adapters.claude_code.coordinator_server import (
 from ccs.core.exceptions import HANDOFF_OTHER_HOLDER_REASON, OTHER_HOLDER_REASON
 from tests.protocol_corpus.harness import IGNORED_SENTINEL, normalize_response
 from tests.test_claude_code_coordinator_server import (
+    _DEGRADE_DEADLINE_SEC,
+    _GATE_ANSWER_BOUND_SEC,
+    _OPERATOR_HEADER,
+    _Background,
     _claimed,
     _Client,
     _hand_off,
+    _HeldRegistryLock,
     _opted_in,
     _take,
 )
@@ -223,3 +229,54 @@ def test_the_contract_catches_a_deny_envelope_inside_the_handoff_key() -> None:
     check for a deny envelope at any depth is what sees inside it."""
     changed = {**_REFUSAL, _HANDOFF: {"hookSpecificOutput": {"permissionDecision": "deny"}}}
     assert _contract_breaches(changed, with_handoff=True) == ["no envelope or degraded marker"]
+
+
+@pytest.mark.parametrize(
+    "query, headers",
+    [
+        ("/status", None),
+        ("/status?detail=metrics", None),
+        ("/status?detail=full", _OPERATOR_HEADER),
+    ],
+    ids=["minimal", "metrics", "full"],
+)
+def test_every_status_tier_advertises_the_refusal(
+    query: str, headers: dict | None, live_client: _Client
+) -> None:
+    """A client reads ``pre_edit_if_unheld`` to tell this coordinator from one
+    that ignores ``if_unheld`` and answers an opted-in request by displacing
+    the holder. It is JSON ``true``, not a truthy value, at every tier.
+
+    Prevents a client that reads one tier finding nothing there and refusing a
+    coordinator that would have honoured the flag."""
+    status, body = live_client.get(query, headers_override=headers)
+    assert status == 200
+    assert body["pre_edit_if_unheld"] is True
+
+
+@pytest.mark.parametrize(
+    "query, headers",
+    [("/status", None), ("/status?detail=full", _OPERATOR_HEADER)],
+    ids=["minimal", "full"],
+)
+def test_a_degraded_status_still_advertises_the_refusal(
+    query: str,
+    headers: dict | None,
+    live_coordinator: CoordinatorHTTPServer,
+    live_client: _Client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registry read that timed out still answers the key: the fact is about
+    this build, so a busy registry cannot change it.
+
+    Prevents a volume attaching during contention being told its coordinator
+    does not honour the flag."""
+    monkeypatch.setattr(server_module, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    with _HeldRegistryLock(live_coordinator) as held:
+        answer = _Background(live_client, query, headers=headers)
+        answered = answer.answered_within(_GATE_ANSWER_BOUND_SEC)
+        held.release()
+    status, body = answer.result()
+    assert answered, "/status did not answer while the registry lock was held"
+    assert (status, body["degraded"]) == (200, True)
+    assert body["pre_edit_if_unheld"] is True
