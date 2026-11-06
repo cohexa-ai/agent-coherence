@@ -51,7 +51,7 @@ from typing import Literal, NamedTuple
 
 import yaml
 
-from ccs.adapters.claude_code.coordinator_server import session_to_agent_id
+from ccs.adapters.claude_code.coordinator_server import parse_agent_id, session_to_agent_id
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     connect_or_spawn,
@@ -1500,10 +1500,9 @@ class CoherentVolume:
                 return
             if self._on_held == "refuse" and not self._advertises_if_unheld:
                 # Before the claim, so a coordinator that would displace a holder
-                # receives nothing. Refuse mode is strict-only, so this raises.
+                # receives nothing.
                 self._endpoint = None
-                self._fail_closed_or_degrade(_IF_UNHELD_NOT_ADVERTISED_MESSAGE)
-                return
+                raise CoherenceError(_IF_UNHELD_NOT_ADVERTISED_MESSAGE)
         self._claim_principal()
 
     def _enforcement_failure(self, enforcement: ManagedGlobEnforcement) -> str:
@@ -1988,11 +1987,7 @@ class CoherentVolume:
             self._record_own_write(rel, self._sha256_bytes(data))
             return
 
-        # A path outside the managed globs takes no flag: an untrack could send it
-        # through the untracked exit, around the check.
-        opts_in = self._on_held == "refuse" and matches_any(rel, self._managed)
-        if opts_in and self._principal is None:
-            raise CoherenceError(_no_principal_message(rel, self.principal_claim_outcome))
+        opts_in = self._opts_in(rel)
 
         # Record the grant BEFORE the acquire is sent: an acquire whose answer is
         # lost, a degraded answer, and every failure after the grant (the disk
@@ -2037,7 +2032,7 @@ class CoherentVolume:
         if resp is not None:
             self._check_grant(resp, rel, phase="pre-edit")
         if opts_in:
-            self._require_a_real_admit(resp, rel)
+            self._require_admit(resp, rel)
         # Past the deny check, a dict answer that is not watchdog-degraded is
         # an admitted acquire; a degraded or lost one (degrade mode only) may
         # or may not have taken the grant.
@@ -2146,6 +2141,18 @@ class CoherentVolume:
             # fail closed so the caller knows the commit did not register.
             self._check_grant(post_resp, rel, phase="post-edit")
         self._last_committed_hash[rel] = new_hash
+
+    def _opts_in(self, rel: str) -> bool:
+        """Whether this write asks for ``rel`` only if nobody holds it: refuse mode,
+        on a managed path. Any other path takes no flag, because an untrack could
+        send it through the untracked exit, around the check. A session with no
+        caller principal raises, with nothing sent, because the coordinator would
+        refuse the request."""
+        if self._on_held != "refuse" or not matches_any(rel, self._managed):
+            return False
+        if self._principal is None:
+            raise CoherenceError(_no_principal_message(rel, self.principal_claim_outcome))
+        return True
 
     def _send_grant_release(self, rel: str, **post_kwargs: object) -> object:
         """One raw ``success: false`` post-edit releasing ``rel``'s grant, naming
@@ -4366,19 +4373,16 @@ class CoherentVolume:
         wire writes 32 hex and :attr:`agent_id` is dashed. An id that does not
         parse names nothing here. The current incarnation cannot match, because
         the coordinator admits an identity to its own grant."""
-        if holder is None:
-            return False
-        try:
-            named = uuid.UUID(holder)
-        except ValueError:
+        named = parse_agent_id(holder)
+        if named is None:
             return False
         return any(
             session_to_agent_id(self._session_id, incarnation) == named
             for incarnation in self._grant_incarnations
         )
 
-    def _require_a_real_admit(self, resp: object, rel: str) -> None:
-        """Stop an opted-in :meth:`write` on an answer that is not a real admit.
+    def _require_admit(self, resp: object, rel: str) -> None:
+        """Stop an opted-in :meth:`write` on an answer that is not an admit.
         Only JSON ``ok: true`` admits. The refusals and a degraded answer raised in
         :meth:`_check_grant`, so anything else here answered nothing. ``collision``
         shows the coordinator ignored the flag, so the volume releases what it

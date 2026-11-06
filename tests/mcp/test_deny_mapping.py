@@ -674,7 +674,10 @@ def test_the_other_holder_terminal_names_the_holder_and_bounds_the_wait():
     assert "holder_agent_id" in words
     assert "swg_read" in words, "the agent must rebuild from a read before writing again"
     assert "swg_reacquire does not clear" in words
-    assert "30 minutes" in words
+    assert "at least 4 seconds" in words
+    assert "bounded total" in words, "wait_and_retry alone would loop"
+    assert "next holder starts a new clock" in words
+    assert "keeps your own holds" in words, "two waiting agents otherwise wait out the ceiling"
     assert "report" in words.lower()
 
 
