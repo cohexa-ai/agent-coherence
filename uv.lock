@@ -8,12 +8,6 @@ resolution-markers = [
     "(python_full_version < '3.13' and sys_platform != 'emscripten') or (python_full_version < '3.12' and sys_platform == 'emscripten')",
 ]
 
-[manifest]
-overrides = [
-    { name = "mcp", specifier = ">=1.30,<2" },
-    { name = "uv", specifier = ">=0.13.4" },
-]
-
 [[package]]
 name = "agent-coherence"
 source = { editable = "." }
