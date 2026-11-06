@@ -336,6 +336,53 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **A coordinator start that fails after the bind stops what it started
+  (#429).** A start that raised after the coordinator bound (a failed pid-file
+  write, a serve or background thread that could not start, a socket error in
+  the self-probe) left that coordinator serving its port with no owner. If it
+  had also been registered, its later shutdown wrote the pid line into
+  whatever file had reused the closed lock descriptor. The start now shuts the
+  coordinator down, takes the port out of `.coherence/server.pid` and releases
+  the lock before it raises, so the next call starts a new one. The caller
+  gets the start's own exception even when the cleanup fails too.
+
+- **A coordinator start interrupted by `KeyboardInterrupt` or `SystemExit` no
+  longer keeps the workspace's lock (#488).** A host that survived the interrupt,
+  such as a notebook, a REPL or a harness embedding a volume, held the lock until
+  it exited: every later start in any process returned `None`, and
+  `stop_coordinator` could not free it. An interrupted start now gets the same
+  cleanup as a failed one, which can wait out the shutdown drain, and the
+  interrupt then propagates. A first start stopped while it writes
+  `.coherence/hook.secret`, by an interrupt or a full disk, now removes the file:
+  left empty, it made every later start refuse it until someone removed it by
+  hand.
+
+- **A shutdown no longer drops the registry entry of a coordinator started just
+  after it (#424).** `stop_coordinator` and the idle shutdown removed the entry
+  by workspace root after releasing the lock, so a start landing in that gap
+  lost its entry. Its coordinator kept running, the next call reported a join
+  of it, and the caller told `bound` got `False` from `stop_coordinator`. The
+  entry now leaves before the lock is released, and only if it is still that
+  shutdown's own.
+
+- **A coordinator start that fails after migrating the store still logs the
+  migration (#417).** The line was logged once the coordinator was built, so a
+  start that raised later in the store open, on the hook secret or at the bind
+  moved the store forward with nothing saying so, and the next start found it
+  current and logged nothing. The store open now reports the migration as soon
+  as the chain commits, through a new optional `on_migrated` callback on
+  `SqliteArtifactRegistry` and `CoordinatorHTTPServer`. `check_store`'s dry run
+  and read-only opens stay silent. A chain that fails after an earlier step
+  committed still logs nothing, and the next start names the schema it found
+  (#491).
+
+- **A refused or failed open of the SQLite registry closes its connection
+  (#426).** A writer open that raised after connecting, such as on a store from
+  a newer build or a file that is not a database, left the connection open
+  until garbage collection, and a kept exception held it open indefinitely.
+  `CoordinatorHTTPServer` did the same when a step after its store open raised,
+  such as a port already in use. Both now close it before raising.
+
 - **Calling `ccs.cli.diagnose.main()` preserves the process's SIGPIPE handler
   (#304).** Embedded calls no longer make later writes to closed pipes or
   sockets terminate the host process, and can run from a worker thread.

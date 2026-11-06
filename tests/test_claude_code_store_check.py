@@ -51,6 +51,7 @@ from tests.coordinator.test_checkpoint_registration_schema import (
     _revert_to_v7_shape,
     _revert_to_v9_shape,
 )
+from tests.coordinator_helpers import no_sqlite_connection_left_open
 from tests.store_images import kill_writer_mid_flight
 from tests.test_sqlite_registry import (
     _build_raw_v1_db,
@@ -1046,6 +1047,20 @@ def test_an_unexpected_dry_run_error_propagates(
         check_store(root)
 
     assert list(check_tmp.iterdir()) == []
+
+
+def test_a_refused_trial_open_closes_its_connection(tmp_path: Path) -> None:
+    """A dry run the store refuses closes the connection it opened on the copy
+    (#426). Prevents the check holding the copy open until a collection, past
+    the point it removes it."""
+    db = _current(tmp_path)
+    _sql(db, "PRAGMA user_version=99")
+
+    with no_sqlite_connection_left_open():
+        with pytest.raises(SchemaVersionError) as refused:
+            sqlite_registry.trial_writer_open(db)
+
+    assert refused.value.found_version == 99
 
 
 def test_the_result_is_frozen() -> None:

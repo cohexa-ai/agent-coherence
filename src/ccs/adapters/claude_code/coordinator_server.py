@@ -1035,6 +1035,7 @@ class CoordinatorHTTPServer:
         agent_names: dict[UUID, str] | None = None,
         state_log: Callable[[dict[str, Any]], None] | None = None,
         instance_id: str | None = None,
+        on_migrated: Callable[[int], None] | None = None,
     ) -> None:
         self.coordinator_root = Path(coordinator_root).resolve()
         self.bind_host = bind_host
@@ -1336,7 +1337,20 @@ class CoordinatorHTTPServer:
             state_log=state_log,
             agent_names=self._agent_names,
             instance_id=instance_id,
+            on_migrated=on_migrated,
         )
+        # A later step that raises leaves the caller no server to shutdown(), and
+        # a kept exception's traceback would hold the store open (#426). The
+        # watchdog pool has no thread until the first request, so only the store
+        # needs closing.
+        try:
+            self._finish_construction(port)
+        except BaseException:
+            self.registry.close()
+            raise
+
+    def _finish_construction(self, port: int) -> None:
+        """The steps of the constructor past the store open."""
         self.service = CoordinatorService(self.registry)
         self.policy = TrackedArtifactPolicy.load(self.coordinator_root)
 
@@ -1357,24 +1371,39 @@ class CoordinatorHTTPServer:
         # limit get a synchronous 503 without spawning a handler thread.
         handler_cls = _make_handler_class(self)
         self._server = _ThreadingHTTPServer(
-            (bind_host, port),
+            (self.bind_host, port),
             handler_cls,
             concurrency_limit=HANDLER_CONCURRENCY_LIMIT,
         )
         self.port = self._server.server_port
         self._serve_thread: threading.Thread | None = None
+        self._serve_loop_committed = False
 
     def serve_in_thread(self) -> None:
         """Start the serving loop in a daemon thread."""
         if self._serve_thread is not None:
             return
         self._serve_thread = threading.Thread(
-            target=self._server.serve_forever,
-            kwargs={"poll_interval": SERVE_POLL_INTERVAL_SEC},
+            target=self._serve,
             name="coord-http",
             daemon=True,
         )
         self._serve_thread.start()
+
+    def _serve(self) -> None:
+        """The serve thread's body. It commits to the serving loop under the
+        lock :meth:`shutdown` sets its flag under, so exactly one of them wins
+        and shutdown knows whether a loop will run.
+
+        ``Thread.start`` cannot tell it: an interrupt can make it raise with
+        the thread running or never created (#488). ``BaseServer.shutdown()``
+        waits forever for a loop that never ran (#429), and a loop nothing
+        stops spins on the closed socket."""
+        with self._in_flight_lock:
+            if self._shutting_down:
+                return
+            self._serve_loop_committed = True
+        self._server.serve_forever(poll_interval=SERVE_POLL_INTERVAL_SEC)
 
     def shutdown(self) -> None:
         """Stop the server, drain in-flight handlers, close storage.
@@ -1409,13 +1438,15 @@ class CoordinatorHTTPServer:
             if self._shutting_down:
                 return
             self._shutting_down = True
+            serve_loop_committed = self._serve_loop_committed
         try:
             # http.server.HTTPServer.shutdown() blocks on an Event set by
-            # serve_forever's exit. If serve_in_thread was never called,
-            # serve_forever never ran, and the event was never set —
-            # shutdown() would wait forever. Guard against that so unit
+            # serve_forever's exit. With no loop committed (see _serve),
+            # serve_forever never ran and never will, and the event was never
+            # set — shutdown() would wait forever. Guard against that so unit
             # tests that construct a server purely for state manipulation
-            # can still tear it down cleanly.
+            # can still tear it down cleanly, and so can a start whose serve
+            # thread could not start or was interrupted.
             #
             # COR-01: order is shutdown → drain → server_close → registry.close.
             # _server.shutdown() stops the serve_forever accept loop but does
@@ -1426,16 +1457,23 @@ class CoordinatorHTTPServer:
             # listening socket is independent of accepted-connection sockets
             # but keeping it open through the drain matches the canonical
             # shutdown ordering and removes a refactor footgun.
-            if self._serve_thread is not None:
+            if serve_loop_committed:
                 self._server.shutdown()
         finally:
-            self._drain_in_flight(IN_FLIGHT_DRAIN_TIMEOUT_SEC)
+            # Nested, because this method runs once: a second interrupt during
+            # the drain or the watchdog wait (#488) must not leave the port
+            # accepting or the store open with nothing left to close them.
             try:
-                self._server.server_close()
-            except Exception:  # noqa: BLE001 - best-effort cleanup
-                logger.exception("server_close raised during shutdown")
-            self._watchdog.shutdown(wait=True, cancel_futures=False)
-            self.registry.close()
+                self._drain_in_flight(IN_FLIGHT_DRAIN_TIMEOUT_SEC)
+            finally:
+                try:
+                    self._server.server_close()
+                except Exception:  # noqa: BLE001 - best-effort cleanup
+                    logger.exception("server_close raised during shutdown")
+                try:
+                    self._watchdog.shutdown(wait=True, cancel_futures=False)
+                finally:
+                    self.registry.close()
 
     def acquire_handler_slot(self) -> bool:
         """KTD-I L2: atomic shutting_down check + counter increment.

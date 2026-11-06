@@ -38,6 +38,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from uuid import UUID
 
@@ -282,7 +283,8 @@ def ensure_coordinator_handle(
     repo, an unopenable pid file, pid-file churn beyond the revalidation
     budget, or a join whose retry budget ran out.
 
-    Raises, after releasing the flock, when a start fails:
+    Raises when a start fails, after stopping what it started and releasing
+    the flock, so no coordinator is left running:
 
     - :class:`~ccs.coordinator.sqlite_registry.SchemaVersionError` when the
       store open refuses the store. Its ``reason`` says why; its
@@ -295,6 +297,11 @@ def ensure_coordinator_handle(
     - :class:`OSError` when ``flock`` fails for a reason other than
       contention, or when the bind or a pid-file write fails.
     - :class:`ValueError` for a ``bind_host`` the coordinator refuses.
+    - :class:`RuntimeError` when the hook secret cannot be read or a thread
+      cannot start.
+
+    A ``KeyboardInterrupt`` or ``SystemExit`` during a start gets the same
+    cleanup, which can wait out the shutdown drain, and then propagates.
     """
     if not _FCNTL_AVAILABLE:
         return None
@@ -410,6 +417,11 @@ def ensure_coordinator_handle(
             time.sleep(cfg.port_file_retry_interval_sec)
             attempt += 1
             continue
+        except BaseException:
+            # #488: a signal is delivered as a call returns, so an interrupt
+            # here can mean the flock was just taken.
+            _release_pidfile(fd)
+            raise
 
         # Winner — we hold the lock. Bind, write port, serve.
         # KTD-H/I/L3 (Unit 5 L3): time the winner path so operators have a
@@ -417,9 +429,13 @@ def ensure_coordinator_handle(
         # behavior change. Surfaced via the coordinator's
         # ``cold_start_duration_ms`` attribute for the future /status
         # endpoint (Unit 8).
-        cold_start_start = time.monotonic()
+        coordinator: CoordinatorHTTPServer | None = None
+        entry: _SpawnedEntry | None = None
         bound_marker: tuple[str, int] | None = None
         try:
+            # #488: the first call after the flock, inside the try: an interrupt
+            # delivered as it returns must reach the cleanup below.
+            cold_start_start = time.monotonic()
             # #348: a binder that exited without stop_coordinator (SIGTERM,
             # crash, reboot) leaves its '<pid>\n<port>\n' behind. Empty the
             # file before the slow build so a call that loses the flock polls,
@@ -430,22 +446,13 @@ def ensure_coordinator_handle(
             # can still read the old lines; that window is not closed here.
             if not _names_another_runtime(fd):
                 os.ftruncate(fd, 0)
-            coordinator = CoordinatorHTTPServer(coordinator_root, port=0, bind_host=bind_host)
+            coordinator = CoordinatorHTTPServer(
+                coordinator_root,
+                port=0,
+                bind_host=bind_host,
+                on_migrated=partial(_log_store_migration, coordinator_root),
+            )
             port = coordinator.port
-            # The store migration is one-way (#345): once moved forward, a
-            # coordinator that expects the old schema refuses the store, so the
-            # spawn says so. Only this spawn logs it; check_store's dry run on a
-            # copy stays silent.
-            migrated_from = coordinator.registry.migrated_from_version
-            if migrated_from is not None:
-                logger.info(
-                    "coordinator migrated %s from registry schema %d to %d; a "
-                    "coordinator that expects schema %d refuses this store from now on",
-                    coordinator_root / ".coherence" / "state.db",
-                    migrated_from,
-                    SCHEMA_USER_VERSION,
-                    migrated_from,
-                )
             # KTD-H Unit 5 L1: close the construct->write TOCTOU window. The
             # top-of-loop inode check ran BEFORE this construction, which opens
             # state.db (+WAL) and binds the TCP socket (>300ms cold). An external
@@ -495,9 +502,6 @@ def ensure_coordinator_handle(
                 bound_marker=bound_marker,
             )
             _SPAWNED_REGISTRY[resolved_key] = entry
-            # The entry owns the marker from here: a registered coordinator
-            # keeps serving if a later step raises, and its shutdown drops it.
-            bound_marker = None
             _start_background_threads(entry, cfg)
             # G2 fix: self-probe with generous spawn-side budget before
             # returning so the caller is guaranteed a coordinator that
@@ -518,13 +522,13 @@ def ensure_coordinator_handle(
                 os.getpid(), port, coordinator_root, cold_start_ms,
             )
             return CoordinatorHandle(port, SpawnOutcome.BOUND, os.getpid())
-        except Exception:
-            if bound_marker is not None:
-                _BOUND_IN_THIS_PROCESS.discard(bound_marker)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                _close_quiet(fd)
+        except BaseException:
+            # BaseException: a host that survives an interrupt would otherwise
+            # keep the flock, and no API could free it (#488).
+            if entry is not None:
+                _stop_registered_start(entry)
+            else:
+                _abandon_unregistered_start(fd, coordinator, bound_marker)
             raise
 
     # Retry budget exhausted without acquiring the lock or seeing a
@@ -619,13 +623,7 @@ def stop_coordinator(coordinator_root: Path) -> bool:
     entry = _SPAWNED_REGISTRY.get(key)
     if entry is None:
         return False
-    ran = _shutdown_sequence(entry)
-    # Only pop the registry if the shutdown actually completed successfully.
-    # If shutdown_sequence aborted (e.g. coordinator.shutdown raised) we leave
-    # the entry in place so a subsequent stop_coordinator call can retry.
-    if entry.shutdown_done.is_set():
-        _SPAWNED_REGISTRY.pop(key, None)
-    return ran
+    return _shutdown_sequence(entry)
 
 
 def wait_for_shutdown(
@@ -1294,7 +1292,6 @@ def _idle_shutdown_loop(entry: _SpawnedEntry, cfg: LifecycleConfig) -> None:
             )
             _shutdown_sequence(entry)
             if entry.shutdown_done.is_set():
-                _SPAWNED_REGISTRY.pop(str(coordinator.coordinator_root), None)
                 return
             # G4 abort: shutdown_done NOT set — loop continues so the next
             # sweep tick will retry. Stable-grant reclamation
@@ -1324,8 +1321,11 @@ def _shutdown_sequence(entry: _SpawnedEntry) -> bool:
          lock stays held, the pid file stays port-empty, and the next
          spawn-side caller will retry. Stable-grant reclamation
          (max_hold_ticks) provides the long-term safety net.
-      4. Release the flock.
-      5. Close the fd.
+      4. Drop the registry entry, before the flock is free for the next
+         coordinator to start and insert its own (#424). An aborted sequence
+         keeps it, so a retry can find it.
+      5. Release the flock.
+      6. Close the fd.
 
     Returns True if this caller's invocation actually ran the sequence
     (whether it completed cleanly OR aborted on G4). Returns False only
@@ -1385,6 +1385,7 @@ def _shutdown_sequence(entry: _SpawnedEntry) -> bool:
                     _MAX_SHUTDOWN_RETRIES_BEFORE_ESCALATION,
                     exc,
                 )
+                _drop_registration(entry)
                 try:
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 except OSError:
@@ -1407,7 +1408,9 @@ def _shutdown_sequence(entry: _SpawnedEntry) -> bool:
             # entry.shutdown_done to distinguish complete vs aborted.
             return True
 
-        # Step 4 + 5: release the flock + close fd. Wrap each in try/except
+        _drop_registration(entry)
+
+        # Step 5 + 6: release the flock + close fd. Wrap each in try/except
         # so a failure at this stage (rare — lock already validly held)
         # doesn't crash but still marks the sequence done.
         try:
@@ -1424,12 +1427,103 @@ def _shutdown_sequence(entry: _SpawnedEntry) -> bool:
         return True
 
 
+def _drop_registration(entry: _SpawnedEntry) -> None:
+    """Remove a coordinator that has shut down from the registry (#424). A
+    caller removing it after the flock release could drop the entry of the
+    coordinator started next.
+
+    The flock alone does not make the key this entry's: with ``.coherence/``
+    removed, the flock of the unlinked pid file excludes nobody, and a
+    replacement may already hold the key."""
+    key = str(entry.coordinator.coordinator_root)
+    if _SPAWNED_REGISTRY.get(key) is entry:
+        _SPAWNED_REGISTRY.pop(key, None)
+
+
 def _forget_bind(entry: _SpawnedEntry) -> None:
     """Drop a shut-down coordinator's bind marker (#348). Step 1 of the
     shutdown already dropped its port from the pid file, so no later join
     reads that port and needs the marker."""
     if entry.bound_marker is not None:
         _BOUND_IN_THIS_PROCESS.discard(entry.bound_marker)
+
+
+def _stop_registered_start(entry: _SpawnedEntry) -> None:
+    """Stop a coordinator whose start raised after its registry insert (#429).
+
+    The entry owns the lock fd from the insert on, so only its shutdown may
+    close it: an entry left registered with a closed fd would write the pid
+    line into whatever file reuses that number.
+
+    Repeats an aborted sequence, which keeps the flock: the start has no
+    caller left to retry it, and the idle thread stops at the first attempt.
+    Escalation bounds the loop: the sequence completes at
+    :data:`_MAX_SHUTDOWN_RETRIES_BEFORE_ESCALATION` aborts."""
+    try:
+        while not entry.shutdown_done.is_set():
+            _shutdown_sequence(entry)
+    finally:
+        # A second interrupt escaped the sequence (#488), likely during the
+        # drain, the slow step. The coordinator's shutdown runs once, so this
+        # pass only releases what is left, and no caller has to finish it.
+        if not entry.shutdown_done.is_set():
+            _shutdown_sequence(entry)
+
+
+def _abandon_unregistered_start(
+    fd: int,
+    coordinator: CoordinatorHTTPServer | None,
+    bound_marker: tuple[str, int] | None,
+) -> None:
+    """Undo a start that raised before any registry insert (#429), without
+    raising, so the caller re-raises the start's own failure. A second
+    interrupt does escape, but only after the flock is released: no entry
+    exists for anything to finish this later (#488).
+
+    A marked bind may have written its port, so the pid file goes back to
+    empty first, as the winner path leaves it: a reader must not join a
+    coordinator that is about to stop."""
+    try:
+        if bound_marker is not None:
+            try:
+                os.ftruncate(fd, 0)
+            except OSError as exc:
+                logger.warning("could not clear the pid file after a failed start: %s", exc)
+            _BOUND_IN_THIS_PROCESS.discard(bound_marker)
+        if coordinator is not None:
+            try:
+                coordinator.shutdown()
+            except Exception:  # noqa: BLE001 - the start's own failure is what the caller needs
+                logger.exception("coordinator.shutdown raised while a failed start cleaned up")
+    finally:
+        _release_pidfile(fd)
+
+
+def _release_pidfile(fd: int) -> None:
+    """Release the flock and close its fd, never raising on the way. The
+    explicit unlock matters: a forked child's copy of the fd would keep the
+    lock through a close alone."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    _close_quiet(fd)
+
+
+def _log_store_migration(coordinator_root: Path, migrated_from: int) -> None:
+    """Say that this start moved the store forward (#345). The migration is
+    one-way: a coordinator that expects the old schema refuses the store from
+    then on. The store open calls this as soon as the store moved, so a start
+    that fails later still says so (#417), and only a spawn passes it, so
+    check_store's dry run on a copy stays silent."""
+    logger.info(
+        "coordinator migrated %s from registry schema %d to %d; a "
+        "coordinator that expects schema %d refuses this store from now on",
+        coordinator_root / ".coherence" / "state.db",
+        migrated_from,
+        SCHEMA_USER_VERSION,
+        migrated_from,
+    )
 
 
 # ----------------------------------------------------------------------
