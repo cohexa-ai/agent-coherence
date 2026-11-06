@@ -1700,10 +1700,9 @@ still returns a bare port. A start that fails stops whatever it started and
 raises instead: `SchemaVersionError` on a store it refuses (its `reason` says
 why), `sqlite3.Error` on a file SQLite cannot open, `OSError` when the lock or
 the bind fails, `ValueError` on a `bind_host` it refuses, and `RuntimeError`
-when it cannot read the hook secret or start a thread. A start interrupted by
-`KeyboardInterrupt` or `SystemExit` runs no cleanup, so a host that survives the
-interrupt can keep the workspace's lock until it exits. To ask before a start
-migrates the store, call
+when it cannot read the hook secret or start a thread. A `KeyboardInterrupt` or
+`SystemExit` during a start gets the same cleanup and then propagates. To ask
+before a start migrates the store, call
 [`check_store`](#checking-a-store-before-a-coordinator-starts) first.
 
 ### Atomic multi-file publish: `atomic_publish` (v0.12.0+)

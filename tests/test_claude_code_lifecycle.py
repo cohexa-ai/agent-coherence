@@ -31,7 +31,7 @@ from typing import Optional
 import pytest
 
 import ccs
-from ccs.adapters.claude_code import lifecycle
+from ccs.adapters.claude_code import coordinator_server, lifecycle
 from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
 from ccs.adapters.claude_code.lifecycle import (
     CoordinatorHandle,
@@ -45,6 +45,7 @@ from ccs.adapters.claude_code.lifecycle import (
 from ccs.adapters.claude_code.lifecycle import (
     read_port_from_file as _read_port_from_file,
 )
+from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 
 #: FROZEN duplicates of the ``SpawnOutcome`` values (#348), written out as
 #: literals on purpose: the enum is a ``str`` Enum and a host compares the
@@ -1980,7 +1981,9 @@ _START_STEPS = [
 ]
 
 
-def _raise_once(monkeypatch: pytest.MonkeyPatch, owner: object, step: str) -> None:
+def _raise_once(
+    monkeypatch: pytest.MonkeyPatch, owner: object, step: str, exc: BaseException | None = None,
+) -> None:
     """Make ``owner.step`` raise on its first call and work from then on."""
     real_step = getattr(owner, step)
     raised: list[bool] = []
@@ -1988,7 +1991,7 @@ def _raise_once(monkeypatch: pytest.MonkeyPatch, owner: object, step: str) -> No
     def failing_step(*args: object, **kwargs: object) -> object:
         if not raised:
             raised.append(True)
-            raise RuntimeError(f"{step} failed")
+            raise exc or RuntimeError(f"{step} failed")
         return real_step(*args, **kwargs)
 
     monkeypatch.setattr(owner, step, failing_step)
@@ -2208,9 +2211,9 @@ def test_a_start_whose_serve_thread_cannot_start_raises_and_leaves_nothing_runni
     raises and frees the port.
 
     Prevents the cleanup hanging: ``socketserver``'s ``shutdown()`` waits on an
-    event only ``serve_forever`` sets, so a coordinator that records a serve
-    thread before it starts would wait forever. The start runs on its own
-    thread so that hang fails this test and not the whole run."""
+    event only ``serve_forever`` sets, so a coordinator that waits for a serve
+    loop whose thread never started would wait forever. The start runs on its
+    own thread so that hang fails this test and not the whole run."""
     built = _record_built_coordinators(monkeypatch)
     real_start = threading.Thread.start
 
@@ -2275,6 +2278,422 @@ def test_a_failed_start_whose_shutdown_raises_too_still_frees_the_workspace(
         assert str(workspace.resolve()) not in lifecycle._SPAWNED_REGISTRY
         assert _connection_refused(built[0].port)
         second = ensure_coordinator_handle(workspace, config=fast_cfg)
+        assert second is not None and second.outcome == _BOUND
+    finally:
+        stop_coordinator(workspace)
+
+
+#: Where an interrupt can land in a start: each step of ``_START_STEPS`` and the
+#: two before them, the store open and the bind (#488).
+_INTERRUPT_STEPS = [
+    pytest.param(SqliteArtifactRegistry, "_initialize_schema", id="store_open"),
+    pytest.param(coordinator_server, "_ThreadingHTTPServer", id="bind"),
+    *_START_STEPS,
+]
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize(("owner", "step"), _INTERRUPT_STEPS)
+def test_an_interrupted_start_leaves_nothing_running(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+    owner: object, step: str, interrupt: type[BaseException],
+) -> None:
+    """#488: an interrupt anywhere in a start runs the same cleanup as a
+    failure, then propagates: the port refuses, the pid file names no port, no
+    entry, marker or thread remains, the lock fd is closed once, and the next
+    call binds.
+
+    Prevents a host that survives a Ctrl-C (a notebook, a REPL, a harness
+    embedding a volume) holding the workspace's flock with no API that frees
+    it, so that every later start in any process returns ``None``."""
+    key = str(workspace.resolve())
+    built = _record_built_coordinators(monkeypatch)
+    threads_before = set(threading.enumerate())
+    lock_fds = _record_lock_fds(monkeypatch)
+    closes = _record_fd_closes(monkeypatch)
+    _raise_once(monkeypatch, owner, step, interrupt())
+    try:
+        with pytest.raises(interrupt):
+            ensure_coordinator_handle(workspace, config=replace(fast_cfg, idle_shutdown_sec=900))
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(lock_fds[0])
+        assert closes.count(lock_fds[0]) == 1
+        for coordinator in built:
+            assert _connection_refused(coordinator.port)
+            assert (key, coordinator.port) not in lifecycle._BOUND_IN_THIS_PROCESS
+        assert _read_port_from_file(workspace / ".coherence" / "server.pid") is None
+        assert key not in lifecycle._SPAWNED_REGISTRY
+        _assert_no_new_coordinator_thread_survives(threads_before)
+        second = ensure_coordinator_handle(workspace, config=fast_cfg)
+        assert second is not None and second.outcome == _BOUND
+    finally:
+        stop_coordinator(workspace)
+        for coordinator in built:
+            coordinator.shutdown()
+
+
+@pytest.mark.parametrize("thread_runs", [True, False], ids=["thread_running", "thread_never_ran"])
+def test_a_start_interrupted_inside_thread_start_stops_cleanly(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, thread_runs: bool,
+) -> None:
+    """#488: an interrupt inside ``Thread.start`` leaves the OS thread running
+    or never created, and the start cannot tell which. Either way the cleanup
+    returns, the port refuses and no serve loop survives.
+
+    Prevents both ways of getting it wrong: waiting for a loop that never ran
+    hangs forever, and skipping one that runs leaves it spinning on a closed
+    socket. The start runs on its own thread so a hang fails this test and not
+    the whole run."""
+    built = _record_built_coordinators(monkeypatch)
+    real_start = threading.Thread.start
+    serve_threads: list[threading.Thread] = []
+
+    def interrupted_start(thread: threading.Thread) -> None:
+        if thread.name != "coord-http":
+            real_start(thread)
+            return
+        serve_threads.append(thread)
+        if thread_runs:
+            real_start(thread)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(threading.Thread, "start", interrupted_start)
+    raised: list[BaseException] = []
+
+    def run_the_start() -> None:
+        try:
+            ensure_coordinator_handle(workspace, config=fast_cfg)
+        except KeyboardInterrupt as exc:
+            raised.append(exc)
+
+    starter = threading.Thread(target=run_the_start, daemon=True)
+    starter.start()
+    starter.join(timeout=30.0)
+    assert not starter.is_alive(), "the interrupted start hangs in its cleanup"
+    assert raised, "the start swallowed the interrupt"
+    assert _connection_refused(built[0].port)
+    if thread_runs:
+        serve_threads[0].join(timeout=10.0)
+        assert not serve_threads[0].is_alive(), "a serve loop outlived the shutdown"
+    monkeypatch.undo()
+    second = ensure_coordinator_handle(workspace, config=fast_cfg)
+    try:
+        assert second is not None and second.outcome == _BOUND
+    finally:
+        stop_coordinator(workspace)
+
+
+def test_a_serve_thread_that_starts_after_the_shutdown_never_serves(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#488: a shutdown that finds no committed serve loop does not wait for
+    one, and a thread that gets going afterwards does not start one.
+
+    Prevents the interrupted start's serve thread, already created when the
+    cleanup ran, entering ``serve_forever`` on a closed socket."""
+    coordinator = CoordinatorHTTPServer(workspace)
+    entered: list[bool] = []
+    monkeypatch.setattr(
+        coordinator._server, "serve_forever", lambda **kwargs: entered.append(True),
+    )
+    real_start = threading.Thread.start
+    deferred: list[threading.Thread] = []
+
+    def defer_the_serve_thread(thread: threading.Thread) -> None:
+        if thread.name == "coord-http":
+            deferred.append(thread)
+        else:
+            real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", defer_the_serve_thread)
+    coordinator.serve_in_thread()
+    stopper = threading.Thread(target=coordinator.shutdown, daemon=True)
+    stopper.start()
+    stopper.join(timeout=30.0)
+    assert not stopper.is_alive(), "shutdown waits for a serve loop that never ran"
+
+    real_start(deferred[0])
+    deferred[0].join(timeout=10.0)
+    assert not deferred[0].is_alive()
+    assert entered == []
+
+
+def test_a_serve_thread_committed_before_the_shutdown_is_stopped(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#488: a thread that committed to the serve loop, but has not reached it
+    when the shutdown begins, is still waited for and stopped.
+
+    Prevents a shutdown that decides from a thread's progress: it would close
+    the socket under a loop about to start, which then spins on it."""
+    coordinator = CoordinatorHTTPServer(workspace)
+    real_serve = coordinator._server.serve_forever
+    committed = threading.Event()
+    shutdown_began = threading.Event()
+
+    def serve_once_the_shutdown_began(**kwargs: object) -> None:
+        committed.set()
+        assert shutdown_began.wait(timeout=30.0)
+        real_serve(**kwargs)
+
+    monkeypatch.setattr(coordinator._server, "serve_forever", serve_once_the_shutdown_began)
+    real_start = threading.Thread.start
+    serve_threads: list[threading.Thread] = []
+
+    def recording_start(thread: threading.Thread) -> None:
+        if thread.name == "coord-http":
+            serve_threads.append(thread)
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", recording_start)
+    coordinator.serve_in_thread()
+    assert committed.wait(timeout=30.0)
+    stopper = threading.Thread(target=coordinator.shutdown, daemon=True)
+    stopper.start()
+    deadline = time.monotonic() + 30.0
+    while not coordinator.shutting_down and time.monotonic() < deadline:
+        time.sleep(0.01)
+    shutdown_began.set()
+
+    stopper.join(timeout=30.0)
+    assert not stopper.is_alive()
+    serve_threads[0].join(timeout=10.0)
+    assert not serve_threads[0].is_alive(), "a serve loop outlived the shutdown"
+
+
+def test_a_start_interrupted_as_it_takes_the_flock_releases_it(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#488: Python delivers a signal as a call returns, so an interrupt can
+    land just after ``flock`` succeeded and before the start's cleanup covers
+    it. The lock still goes.
+
+    Prevents the same wedge from the one line that takes the lock."""
+    real_flock = lifecycle.fcntl.flock
+    lock_fds = _record_lock_fds(monkeypatch)
+    closes = _record_fd_closes(monkeypatch)
+    interrupted: list[bool] = []
+
+    def flock_then_interrupt(fd: int, operation: int) -> None:
+        real_flock(fd, operation)
+        if operation & lifecycle.fcntl.LOCK_EX and not interrupted:
+            interrupted.append(True)
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(lifecycle.fcntl, "flock", flock_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        ensure_coordinator_handle(workspace, config=fast_cfg)
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(lock_fds[0])
+    assert closes.count(lock_fds[0]) == 1
+    second = ensure_coordinator_handle(workspace, config=fast_cfg)
+    try:
+        assert second is not None and second.outcome == _BOUND
+    finally:
+        stop_coordinator(workspace)
+
+
+class _SecretFileWhoseWriteRaises:
+    """What ``os.fdopen`` returns for ``hook.secret`` in the test below: it
+    closes its fd as the real one does, and its write raises."""
+
+    def __init__(self, fd: int, exc: BaseException) -> None:
+        self._fd = fd
+        self._exc = exc
+
+    def __enter__(self) -> "_SecretFileWhoseWriteRaises":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        os.close(self._fd)
+
+    def write(self, text: str) -> int:
+        raise self._exc
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [KeyboardInterrupt(), OSError(errno.ENOSPC, "No space left on device")],
+    ids=["interrupted", "disk_full"],
+)
+def test_a_start_that_cannot_finish_writing_the_secret_leaves_no_empty_file(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, exc: BaseException,
+) -> None:
+    """#488: a first start stopped between creating ``hook.secret`` and writing
+    it removes the file, and the next start binds.
+
+    Prevents a durable wedge the process exiting would not clear: every later
+    start refuses an empty secret file until someone removes it by hand. Found
+    by scanning a real SIGINT across cold starts."""
+    secret = workspace / ".coherence" / "hook.secret"
+    real_fdopen = os.fdopen
+
+    def fdopen_failing_for_the_secret(fd: int, *args: object, **kwargs: object) -> object:
+        if secret.exists() and os.fstat(fd).st_ino == secret.stat().st_ino:
+            return _SecretFileWhoseWriteRaises(fd, exc)
+        return real_fdopen(fd, *args, **kwargs)
+
+    with monkeypatch.context() as write_patch:
+        write_patch.setattr(os, "fdopen", fdopen_failing_for_the_secret)
+        with pytest.raises(type(exc)):
+            ensure_coordinator_handle(workspace, config=fast_cfg)
+
+    assert not secret.exists()
+    second = ensure_coordinator_handle(workspace, config=fast_cfg)
+    try:
+        assert second is not None and second.outcome == _BOUND
+    finally:
+        stop_coordinator(workspace)
+
+
+def test_a_failed_start_frees_the_flock_even_with_a_copy_of_its_fd_open(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#429: the flock goes by an explicit unlock, not only by the close.
+
+    Prevents a child forked during the start keeping the lock through its
+    inherited copy of the fd, which a close in the parent would not release."""
+    real_open = lifecycle._open_pidfile
+    copies: list[int] = []
+
+    def open_with_a_copy(pid_file: Path) -> int | None:
+        fd = real_open(pid_file)
+        assert fd is not None
+        copies.append(os.dup(fd))
+        return fd
+
+    monkeypatch.setattr(lifecycle, "_open_pidfile", open_with_a_copy)
+    _raise_once(monkeypatch, lifecycle, "_write_pidfile")
+    with pytest.raises(RuntimeError, match="_write_pidfile failed"):
+        ensure_coordinator_handle(workspace, config=fast_cfg)
+
+    other = os.open(workspace / ".coherence" / "server.pid", os.O_RDWR)
+    try:
+        lifecycle.fcntl.flock(other, lifecycle.fcntl.LOCK_EX | lifecycle.fcntl.LOCK_NB)
+    finally:
+        os.close(other)
+        for copy in copies:
+            os.close(copy)
+
+
+@pytest.mark.parametrize("step", ["_write_pidfile", "_self_probe"], ids=["unregistered", "registered"])
+def test_a_second_interrupt_during_the_cleanup_still_frees_the_workspace(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, step: str,
+) -> None:
+    """#488: a second Ctrl-C during the cleanup's shutdown, which can wait out
+    the in-flight drain, does not wedge the workspace. The flock goes, no entry
+    remains, and the next call binds with no ``stop_coordinator``.
+
+    Prevents an impatient second interrupt bringing the wedge back, for a host
+    that was never told ``bound`` and so must not call ``stop_coordinator``."""
+    real_server = lifecycle.CoordinatorHTTPServer
+    key = str(workspace.resolve())
+
+    def interrupted_server(*args: object, **kwargs: object) -> CoordinatorHTTPServer:
+        coordinator = real_server(*args, **kwargs)
+        real_shutdown = coordinator.shutdown
+        calls: list[bool] = []
+
+        def interrupted_shutdown() -> None:
+            real_shutdown()
+            if not calls:
+                calls.append(True)
+                raise KeyboardInterrupt
+
+        coordinator.shutdown = interrupted_shutdown  # type: ignore[method-assign]
+        return coordinator
+
+    monkeypatch.setattr(lifecycle, "CoordinatorHTTPServer", interrupted_server)
+    _raise_once(monkeypatch, lifecycle, step, KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        ensure_coordinator_handle(workspace, config=fast_cfg)
+    monkeypatch.setattr(lifecycle, "CoordinatorHTTPServer", real_server)
+    assert key not in lifecycle._SPAWNED_REGISTRY
+
+    second = ensure_coordinator_handle(workspace, config=fast_cfg)
+    try:
+        assert second is not None and second.outcome == _BOUND
+    finally:
+        stop_coordinator(workspace)
+
+
+@pytest.mark.parametrize("slow_step", ["drain", "watchdog"])
+@pytest.mark.parametrize("step", ["_write_pidfile", "_self_probe"], ids=["unregistered", "registered"])
+def test_a_second_interrupt_in_a_slow_shutdown_step_still_closes_the_port_and_the_store(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, step: str, slow_step: str,
+) -> None:
+    """#488: the drain and the watchdog wait are where a shutdown spends its
+    time, so they are where a second Ctrl-C lands. The port still refuses and
+    the store still closes, and the next call binds.
+
+    Prevents a one-shot ``shutdown()`` skipping its remaining closes: the port
+    would keep accepting with nothing behind it, and the next call, whose probe
+    connects, would join a coordinator that never answers."""
+    built = _record_built_coordinators(monkeypatch)
+    real_server = lifecycle.CoordinatorHTTPServer
+
+    def server_interrupted_in_its_slow_step(*args: object, **kwargs: object) -> CoordinatorHTTPServer:
+        coordinator = real_server(*args, **kwargs)
+        interrupted: list[bool] = []
+        slow_owner = coordinator if slow_step == "drain" else coordinator._watchdog
+        slow_name = "_drain_in_flight" if slow_step == "drain" else "shutdown"
+        real_slow_step = getattr(slow_owner, slow_name)
+
+        def interrupted_slow_step(*slow_args: object, **slow_kwargs: object) -> object:
+            if not interrupted:
+                interrupted.append(True)
+                real_slow_step(*slow_args, **slow_kwargs)
+                raise KeyboardInterrupt
+            return real_slow_step(*slow_args, **slow_kwargs)
+
+        setattr(slow_owner, slow_name, interrupted_slow_step)
+        return coordinator
+
+    monkeypatch.setattr(lifecycle, "CoordinatorHTTPServer", server_interrupted_in_its_slow_step)
+    _raise_once(monkeypatch, lifecycle, step, KeyboardInterrupt())
+
+    with pytest.raises(KeyboardInterrupt):
+        ensure_coordinator_handle(workspace, config=fast_cfg)
+
+    assert _connection_refused(built[0].port)
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        _ = built[0].registry._conn.total_changes
+    monkeypatch.setattr(lifecycle, "CoordinatorHTTPServer", real_server)
+    second = ensure_coordinator_handle(workspace, config=fast_cfg)
+    try:
+        assert second is not None and second.outcome == _BOUND
+    finally:
+        stop_coordinator(workspace)
+
+
+def test_a_start_interrupted_just_after_it_took_the_flock_releases_it(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#488: the first call after the flock is covered too.
+
+    Prevents the wedge returning through the gap between the flock attempt's
+    own guard and the start's cleanup. Python delivers a signal as a call
+    returns, so any call in that gap is a place an interrupt lands."""
+    real_monotonic = lifecycle.time.monotonic
+    test_thread = threading.current_thread()
+    interrupted: list[bool] = []
+
+    def interrupted_clock() -> float:
+        if threading.current_thread() is test_thread and not interrupted:
+            interrupted.append(True)
+            raise KeyboardInterrupt
+        return real_monotonic()
+
+    lock_fds = _record_lock_fds(monkeypatch)
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(lifecycle.time, "monotonic", interrupted_clock)
+        with pytest.raises(KeyboardInterrupt):
+            ensure_coordinator_handle(workspace, config=fast_cfg)
+
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(lock_fds[0])
+    second = ensure_coordinator_handle(workspace, config=fast_cfg)
+    try:
         assert second is not None and second.outcome == _BOUND
     finally:
         stop_coordinator(workspace)
@@ -2539,9 +2958,7 @@ def test_checking_a_store_that_would_migrate_logs_no_migration(
 def _fail_the_start_after_the_migration(step: str, workspace: Path, monkeypatch: pytest.MonkeyPatch) -> type[Exception]:
     """Make a start on a version-7 store raise at ``step``, every one of them
     after the migration chain committed. Returns the type the start raises."""
-    from ccs.adapters.claude_code import coordinator_server
     from ccs.adapters.claude_code.auth import EnsureSecretError
-    from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 
     def raising(exc: Exception):
         def raise_it(*args: object, **kwargs: object) -> None:

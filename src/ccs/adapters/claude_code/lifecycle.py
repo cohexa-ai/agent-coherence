@@ -300,9 +300,8 @@ def ensure_coordinator_handle(
     - :class:`RuntimeError` when the hook secret cannot be read or a thread
       cannot start.
 
-    A start interrupted by ``KeyboardInterrupt`` or ``SystemExit`` is not a
-    failed start: it runs no cleanup, so a host that survives the interrupt
-    can keep the flock until it exits.
+    A ``KeyboardInterrupt`` or ``SystemExit`` during a start gets the same
+    cleanup, which can wait out the shutdown drain, and then propagates.
     """
     if not _FCNTL_AVAILABLE:
         return None
@@ -418,6 +417,11 @@ def ensure_coordinator_handle(
             time.sleep(cfg.port_file_retry_interval_sec)
             attempt += 1
             continue
+        except BaseException:
+            # #488: a signal is delivered as a call returns, so an interrupt
+            # here can mean the flock was just taken.
+            _release_pidfile(fd)
+            raise
 
         # Winner — we hold the lock. Bind, write port, serve.
         # KTD-H/I/L3 (Unit 5 L3): time the winner path so operators have a
@@ -425,11 +429,13 @@ def ensure_coordinator_handle(
         # behavior change. Surfaced via the coordinator's
         # ``cold_start_duration_ms`` attribute for the future /status
         # endpoint (Unit 8).
-        cold_start_start = time.monotonic()
         coordinator: CoordinatorHTTPServer | None = None
         entry: _SpawnedEntry | None = None
         bound_marker: tuple[str, int] | None = None
         try:
+            # #488: the first call after the flock, inside the try: an interrupt
+            # delivered as it returns must reach the cleanup below.
+            cold_start_start = time.monotonic()
             # #348: a binder that exited without stop_coordinator (SIGTERM,
             # crash, reboot) leaves its '<pid>\n<port>\n' behind. Empty the
             # file before the slow build so a call that loses the flock polls,
@@ -516,7 +522,9 @@ def ensure_coordinator_handle(
                 os.getpid(), port, coordinator_root, cold_start_ms,
             )
             return CoordinatorHandle(port, SpawnOutcome.BOUND, os.getpid())
-        except Exception:
+        except BaseException:
+            # BaseException: a host that survives an interrupt would otherwise
+            # keep the flock, and no API could free it (#488).
             if entry is not None:
                 _stop_registered_start(entry)
             else:
@@ -1451,8 +1459,15 @@ def _stop_registered_start(entry: _SpawnedEntry) -> None:
     caller left to retry it, and the idle thread stops at the first attempt.
     Escalation bounds the loop: the sequence completes at
     :data:`_MAX_SHUTDOWN_RETRIES_BEFORE_ESCALATION` aborts."""
-    while not entry.shutdown_done.is_set():
-        _shutdown_sequence(entry)
+    try:
+        while not entry.shutdown_done.is_set():
+            _shutdown_sequence(entry)
+    finally:
+        # A second interrupt escaped the sequence (#488), likely during the
+        # drain, the slow step. The coordinator's shutdown runs once, so this
+        # pass only releases what is left, and no caller has to finish it.
+        if not entry.shutdown_done.is_set():
+            _shutdown_sequence(entry)
 
 
 def _abandon_unregistered_start(
@@ -1461,22 +1476,33 @@ def _abandon_unregistered_start(
     bound_marker: tuple[str, int] | None,
 ) -> None:
     """Undo a start that raised before any registry insert (#429), without
-    raising, so the caller re-raises the start's own failure.
+    raising, so the caller re-raises the start's own failure. A second
+    interrupt does escape, but only after the flock is released: no entry
+    exists for anything to finish this later (#488).
 
     A marked bind may have written its port, so the pid file goes back to
     empty first, as the winner path leaves it: a reader must not join a
     coordinator that is about to stop."""
-    if bound_marker is not None:
-        try:
-            os.ftruncate(fd, 0)
-        except OSError as exc:
-            logger.warning("could not clear the pid file after a failed start: %s", exc)
-        _BOUND_IN_THIS_PROCESS.discard(bound_marker)
-    if coordinator is not None:
-        try:
-            coordinator.shutdown()
-        except Exception:  # noqa: BLE001 - the start's own failure is what the caller needs
-            logger.exception("coordinator.shutdown raised while a failed start cleaned up")
+    try:
+        if bound_marker is not None:
+            try:
+                os.ftruncate(fd, 0)
+            except OSError as exc:
+                logger.warning("could not clear the pid file after a failed start: %s", exc)
+            _BOUND_IN_THIS_PROCESS.discard(bound_marker)
+        if coordinator is not None:
+            try:
+                coordinator.shutdown()
+            except Exception:  # noqa: BLE001 - the start's own failure is what the caller needs
+                logger.exception("coordinator.shutdown raised while a failed start cleaned up")
+    finally:
+        _release_pidfile(fd)
+
+
+def _release_pidfile(fd: int) -> None:
+    """Release the flock and close its fd, never raising on the way. The
+    explicit unlock matters: a forked child's copy of the fd would keep the
+    lock through a close alone."""
     try:
         fcntl.flock(fd, fcntl.LOCK_UN)
     except OSError:

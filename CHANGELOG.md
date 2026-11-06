@@ -344,9 +344,18 @@ Alpha — APIs may change before `v1.0`.
   whatever file had reused the closed lock descriptor. The start now shuts the
   coordinator down, takes the port out of `.coherence/server.pid` and releases
   the lock before it raises, so the next call starts a new one. The caller
-  gets the start's own exception even when the cleanup fails too. A start
-  interrupted by `KeyboardInterrupt` or `SystemExit` still runs no cleanup
-  (#488).
+  gets the start's own exception even when the cleanup fails too.
+
+- **A coordinator start interrupted by `KeyboardInterrupt` or `SystemExit` no
+  longer keeps the workspace's lock (#488).** A host that survived the interrupt,
+  such as a notebook, a REPL or a harness embedding a volume, held the lock until
+  it exited: every later start in any process returned `None`, and
+  `stop_coordinator` could not free it. An interrupted start now gets the same
+  cleanup as a failed one, which can wait out the shutdown drain, and the
+  interrupt then propagates. A first start stopped while it writes
+  `.coherence/hook.secret`, by an interrupt or a full disk, now removes the file:
+  left empty, it made every later start refuse it until someone removed it by
+  hand.
 
 - **A shutdown no longer drops the registry entry of a coordinator started just
   after it (#424).** `stop_coordinator` and the idle shutdown removed the entry
