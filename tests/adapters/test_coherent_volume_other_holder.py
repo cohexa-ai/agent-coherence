@@ -763,6 +763,41 @@ def test_a_refused_connection_on_the_grant_request_raises_unreachable(
     assert (tmp_path / _PATH).read_bytes() == b"seed"
 
 
+def test_a_grant_taken_by_abandoned_work_stands_until_reacquire(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """Work the coordinator abandoned had already won the lock, so the grant landed
+    though the answer said ``unavailable``. The volume keeps the record, a peer is
+    refused naming this volume's incarnation, and ``reacquire()`` releases it.
+
+    Prevents a withdrawn record stranding a grant the caller was never told about."""
+    (tmp_path / _PATH).write_bytes(b"seed")
+    volume, peer = _refuser(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
+    stranded_id = volume.agent_id
+
+    def land_then_answer_unavailable(forward: Callable[..., object], payload: dict) -> object:
+        wire.answers.pop(_PRE_EDIT)
+        forward()
+        return _UNAVAILABLE
+
+    wire.answers[_PRE_EDIT] = land_then_answer_unavailable
+    with pytest.raises(CoordinatorFailed):
+        volume.write(_PATH, b"from-the-volume")
+    assert (tmp_path / _PATH).read_bytes() == b"seed"
+    assert write_holders(server, _PATH) == {stranded_id}
+
+    with pytest.raises(OtherHolder) as raised:
+        peer.write(_PATH, b"from-the-peer")
+    assert UUID(raised.value.holder_agent_id) == UUID(stranded_id)
+
+    wire.sent.clear()
+    volume.reacquire(_PATH)
+    assert _SESSION_STOP in wire.routes()
+    assert write_holders(server, _PATH) == set()
+    peer.write(_PATH, b"from-the-peer")
+    assert (tmp_path / _PATH).read_bytes() == b"from-the-peer"
+
+
 def test_a_grant_whose_answer_was_lost_stands_until_reacquire(
     tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
 ) -> None:
@@ -950,14 +985,14 @@ def test_a_holder_id_that_does_not_parse_is_never_this_volumes_own(
     assert raised.value.holder_agent_id == (holder if isinstance(holder, str) else None)
 
 
-def test_a_holder_in_the_wire_spelling_matches_a_recorded_incarnation(
+def test_a_peers_refusal_is_not_this_volumes_own(
     tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
 ) -> None:
-    """Control on the spelling: the wire writes 32 hex and ``agent_id`` is dashed.
-    The real refusal above matched, so here a different well-formed id does not:
-    only this volume's own incarnations count.
+    """A well-formed id that is none of this volume's incarnations is a peer, even
+    while the volume records an abandoned grant.
 
-    Prevents a peer's refusal being reported as this volume's own."""
+    Prevents a real peer's refusal being reported as this volume's own, which
+    would send the caller to ``reacquire()`` instead of waiting."""
     volume = _refuser(tmp_path, fast_cfg)
     _with_an_abandoned_grant(volume, wire)
     wire.answers[_PRE_EDIT] = {
