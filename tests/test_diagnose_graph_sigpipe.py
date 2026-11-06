@@ -170,7 +170,7 @@ def test_graph_closed_stdout_exits_without_failure_report(tmp_path, phase, mode,
     action = {
         'unbuffered': "print('synthetic')",
         'flush': "print('synthetic', flush=True)",
-        'bufferfull': "print('x' * 16384)",
+        'bufferfull': "print('x' * (1024 * 1024))",
     }[mode]
     graph = tmp_path / 'graph.py'
     graph.write_text(textwrap.dedent(f'''\
@@ -295,3 +295,92 @@ def build():
     assert 'DiagnoseWarning: graph invoke failed:' in result.stderr
     assert 'BrokenPipeError' in result.stderr or 'ConnectionResetError' in result.stderr
     assert json.loads(report.read_text(encoding='utf-8'))['verdict']['bucket'] == 'insufficient'
+
+
+@pytest.mark.skipif(not hasattr(signal, 'SIGPIPE'), reason='no SIGPIPE on this platform')
+@pytest.mark.parametrize('phase', ['import', 'build', 'invoke'])
+@pytest.mark.parametrize('stdout_shape', ['rewrap', 'detach_rewrap', 'closed_fd'])
+def test_console_graph_stdout_shapes_preserve_success(tmp_path, phase, stdout_shape):
+    """Preserve graph-owned stdout replacements and Python's absent-stdout no-op."""
+    action = {
+        'rewrap': "sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')",
+        'detach_rewrap': "sys.stdout = io.TextIOWrapper(sys.stdout.detach(), encoding='utf-8')",
+        'closed_fd': "print('synthetic absent stdout')",
+    }[stdout_shape]
+    graph = tmp_path / 'stdout_graph.py'
+    graph.write_text(textwrap.dedent(f'''\
+        import io
+        import sys
+        PHASE = {phase!r}
+        def emit():
+            {action}
+            print('synthetic graph output', flush=True)
+        if PHASE == 'import': emit()
+        class Graph:
+            def invoke(self, state, config=None):
+                if PHASE == 'invoke': emit()
+                return {{'plan': 'done'}}
+        def build():
+            if PHASE == 'build': emit()
+            return Graph()
+    '''), encoding='utf-8')
+    html, report = tmp_path / 'r.html', tmp_path / 'r.json'
+    argv = [sys.executable, '-m', 'ccs.cli.diagnose', '--graph', f'{graph}:build',
+            '--no-network', '--no-telemetry', '--output-html', str(html),
+            '--output-json', str(report)]
+    if stdout_shape == 'closed_fd':
+        # Close fd 1 before Python starts so CPython initializes stdout to None.
+        argv = ['/bin/sh', '-c', 'exec "$@" >&-', 'sh', *argv]
+    env = {key: os.environ[key] for key in ('PATH', 'PYTHONPATH') if key in os.environ}
+    env.update(HOME=str(tmp_path), XDG_CONFIG_HOME=str(tmp_path / 'config'), CI='1')
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=30, env=env)
+    assert result.returncode == 0, (result.returncode, result.stderr)
+    assert '<html' in html.read_text(encoding='utf-8').lower()
+    assert 'report' in json.loads(report.read_text(encoding='utf-8'))
+    if stdout_shape != 'closed_fd':
+        assert 'Your write pattern' in result.stdout
+        assert 'synthetic graph output' in result.stdout
+    else:
+        assert result.stdout == ''
+    for noise in ('Traceback', 'BrokenPipe', 'Broken pipe', 'DiagnoseWarning', 'AttributeError', 'ValueError'):
+        assert noise not in result.stderr
+
+
+@pytest.mark.skipif(not hasattr(signal, 'SIGPIPE'), reason='no SIGPIPE on this platform')
+@pytest.mark.parametrize('absent', [False, True])
+@pytest.mark.parametrize('replace', [False, True])
+@pytest.mark.parametrize('fail', [False, True])
+def test_graph_guard_preserves_absent_or_replaced_stdout(absent, replace, fail):
+    code = f'''
+import io
+import signal
+import sys
+from ccs.cli.diagnose import _graph_sigpipe_guard
+original = sys.stdout
+previous = signal.getsignal(signal.SIGPIPE)
+replacement = io.StringIO()
+initial = None if {absent!r} else io.StringIO()
+error = RuntimeError('synthetic')
+try:
+    sys.stdout = initial
+    try:
+        with _graph_sigpipe_guard():
+            if {absent!r}:
+                assert sys.stdout is None
+            else:
+                assert sys.stdout is not initial
+                assert sys.stdout._stream is initial
+            print('synthetic stream output')
+            if {replace!r}:
+                sys.stdout = replacement
+            if {fail!r}:
+                raise error
+    except RuntimeError as caught:
+        assert caught is error
+    assert sys.stdout is (replacement if {replace!r} else initial)
+    assert signal.getsignal(signal.SIGPIPE) is previous
+finally:
+    sys.stdout = original
+'''
+    result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr

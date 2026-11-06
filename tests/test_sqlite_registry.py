@@ -51,6 +51,7 @@ from ccs.core.exceptions import (
 )
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail, FetchRequest
+from tests.coordinator_helpers import no_sqlite_connection_left_open
 from tests.store_images import (
     COMMITTED_V1,
     COMMITTED_V2,
@@ -3590,5 +3591,127 @@ class TestSchemaVersionErrorTyped:
                 getattr(self, f"_migrate_v{step}_to_v{step + 1}")(instance_id)
 
         monkeypatch.setattr(SqliteArtifactRegistry, "_initialize_schema", stale_v1_dispatch)
-        with SqliteArtifactRegistry(db_path) as loser:
+        heard: list[int] = []
+        with SqliteArtifactRegistry(db_path, on_migrated=heard.append) as loser:
             assert loser.migrated_from_version is None
+        assert heard == []
+
+    def test_on_migrated_reports_the_origin_once_the_store_is_current(self, db_path: Path) -> None:
+        """A writer open tells ``on_migrated`` the schema it migrated from, once,
+        when the whole chain has committed (#417). Prevents a host that reports
+        the migration from depending on the rest of its start, or saying the
+        store reached the current schema before it did."""
+        _STORES_BY_ORIGIN[7](db_path)
+        heard: list[tuple[int, int]] = []
+
+        def hear(origin: int) -> None:
+            heard.append((origin, _user_version(db_path)))
+
+        SqliteArtifactRegistry(db_path, on_migrated=hear).close()
+
+        assert heard == [(7, SCHEMA_USER_VERSION)]
+
+    def test_on_migrated_stays_silent_when_no_migration_ran(self, db_path: Path) -> None:
+        """A fresh create, a current store and a read-only open migrate nothing
+        and report nothing, so a report means a store really moved (#417)."""
+        heard: list[int] = []
+        SqliteArtifactRegistry(db_path, on_migrated=heard.append).close()
+        SqliteArtifactRegistry(db_path, on_migrated=heard.append).close()
+        SqliteArtifactRegistry(db_path, read_only=True, on_migrated=heard.append).close()
+        assert heard == []
+
+    def test_on_migrated_stays_silent_when_the_chain_fails_part_way(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A chain that fails after an earlier step committed reports nothing,
+        since the report means the store reached the current schema, and the
+        next open reports from where the store stopped. Prevents the known
+        limit moving unnoticed: this is the state a host's log cannot show."""
+        _STORES_BY_ORIGIN[7](db_path)
+        heard: list[int] = []
+
+        def failing_last_step(self: SqliteArtifactRegistry, instance_id: str | None) -> None:
+            raise sqlite3.OperationalError("database or disk is full")
+
+        with monkeypatch.context() as last_step_patch:
+            last_step_patch.setattr(SqliteArtifactRegistry, "_migrate_v9_to_v10", failing_last_step)
+            with pytest.raises(sqlite3.OperationalError, match="disk is full"):
+                SqliteArtifactRegistry(db_path, on_migrated=heard.append)
+
+        assert heard == []
+        assert _user_version(db_path) == 9
+        SqliteArtifactRegistry(db_path, on_migrated=heard.append).close()
+        assert heard == [9]
+
+    def test_a_raising_on_migrated_does_not_fail_the_open(self, db_path: Path) -> None:
+        """An observer's raise leaves the open as it was, as it does for
+        ``conflict_callbacks``: the store has already moved, and a report
+        must not refuse it."""
+        _STORES_BY_ORIGIN[7](db_path)
+
+        def raising_observer(origin: int) -> None:
+            raise ValueError("observer failed")
+
+        with SqliteArtifactRegistry(db_path, on_migrated=raising_observer) as reg:
+            assert reg.migrated_from_version == 7
+
+
+def _store_at_user_version(db_path: Path, version: int) -> None:
+    SqliteArtifactRegistry(db_path).close()
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(f"PRAGMA user_version={version}")
+    finally:
+        conn.close()
+
+
+class TestRefusedOpenClosesItsConnection:
+    """#426: an open that raises closes the connection it made. The caller never
+    gets a registry to ``.close()``, and a kept exception's traceback holds the
+    connection, so until then nothing closes it and the store stays open."""
+
+    @pytest.mark.parametrize("version", [99, -3], ids=["newer", "negative"])
+    def test_a_writer_open_refusing_the_schema_closes_its_connection(self, db_path: Path, version: int) -> None:
+        _store_at_user_version(db_path, version)
+        with no_sqlite_connection_left_open():
+            with pytest.raises(SchemaVersionError) as refused:
+                SqliteArtifactRegistry(db_path)
+        assert refused.value.found_version == version
+
+    def test_a_writer_open_of_a_file_that_is_no_database_closes_its_connection(self, db_path: Path) -> None:
+        db_path.write_bytes(b"this is not a sqlite database" * 100)
+        with no_sqlite_connection_left_open():
+            with pytest.raises(sqlite3.DatabaseError) as refused:
+                SqliteArtifactRegistry(db_path)
+        assert "not a database" in str(refused.value)
+
+    def test_a_writer_open_failing_at_its_last_step_closes_its_connection(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def failing_last_step(self: SqliteArtifactRegistry) -> None:
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(SqliteArtifactRegistry, "_load_retention_meta", failing_last_step)
+        with no_sqlite_connection_left_open():
+            with pytest.raises(sqlite3.OperationalError) as failed:
+                SqliteArtifactRegistry(db_path)
+        assert "disk I/O error" in str(failed.value)
+
+    def test_a_writer_open_interrupted_closes_its_connection(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Ctrl-C mid-open must not orphan the connection either."""
+        def interrupted_schema_step(self: SqliteArtifactRegistry, instance_id: str | None) -> None:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(SqliteArtifactRegistry, "_initialize_schema", interrupted_schema_step)
+        with no_sqlite_connection_left_open():
+            with pytest.raises(KeyboardInterrupt) as _interrupted:
+                SqliteArtifactRegistry(db_path)
+
+    def test_a_refused_read_only_open_closes_its_connection(self, db_path: Path) -> None:
+        _store_at_user_version(db_path, 99)
+        with no_sqlite_connection_left_open():
+            with pytest.raises(SchemaVersionError) as refused:
+                SqliteArtifactRegistry(db_path, read_only=True)
+        assert refused.value.found_version == 99

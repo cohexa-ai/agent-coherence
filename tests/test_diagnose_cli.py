@@ -907,6 +907,14 @@ def test_embedded_full_pipeline_never_changes_signals_or_stdout(tmp_path, monkey
     calls = []
     monkeypatch.setattr(diagnose.signal, 'signal', lambda *args: calls.append(args))
     original_stdout = sys.stdout
+    observed_stdout = []
+    load_graph = diagnose._load_graph_and_invoke
+
+    def observe_inside_run(*args, **kwargs):
+        observed_stdout.append(sys.stdout)
+        return load_graph(*args, **kwargs)
+
+    monkeypatch.setattr(diagnose, '_load_graph_and_invoke', observe_inside_run)
     html, report = tmp_path / 'embedded.html', tmp_path / 'embedded.json'
     argv = ['--graph', GRAPH_FACTORY, '--no-network', '--no-telemetry',
             '--output-html', str(html), '--output-json', str(report)]
@@ -918,4 +926,5 @@ def test_embedded_full_pipeline_never_changes_signals_or_stdout(tmp_path, monkey
     assert code == 0
     assert html.exists() and report.exists()
     assert calls == []
+    assert observed_stdout == [original_stdout]
     assert sys.stdout is original_stdout

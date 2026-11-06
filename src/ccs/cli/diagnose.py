@@ -43,7 +43,7 @@ import signal
 import sys
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stdout
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -442,10 +442,18 @@ def _graph_sigpipe_guard() -> Iterator[None]:
         yield
         return
     previous = signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    original = sys.stdout
+    proxy = None if original is None else _ConsoleStdout(original)
+    if proxy is not None:
+        sys.stdout = proxy
     try:
-        with redirect_stdout(_ConsoleStdout(sys.stdout)):
-            yield
+        yield
     finally:
+        # Restore only our proxy. A graph may replace stdout or detach and
+        # rewrap its buffer; restoring the old stream would close or invalidate
+        # the buffer the CLI needs. Absent stdout must keep print() a no-op.
+        if proxy is not None and sys.stdout is proxy:
+            sys.stdout = original
         signal.signal(signal.SIGPIPE, previous)
 
 
