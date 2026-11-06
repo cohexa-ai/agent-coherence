@@ -73,6 +73,7 @@ from ccs.core.exceptions import (
     CoordinatorUnreachable,
     GiverFenced,
     InternalConcurrencyError,
+    OtherHolder,
     StaleView,
     ViewWedged,
     _generation_pair_fields,
@@ -125,7 +126,8 @@ COORDINATOR_UNREACHABLE_NEXT_STEP = (
 # The coordinator answered a read, or the volume's release of an earlier write
 # grant before a CAS or a reacquire (#401), with its failure envelope (#259) or
 # an HTTP 5xx (#433); or a commit was refused by the volume's own earlier
-# grant, which that release did not clear (#434). None of these says whether
+# grant, which that release did not clear (#434); or it could not decide a
+# refuse-mode write's grant request in time. None of these says whether
 # its cause clears by itself (the envelope names only an exception's type, a
 # status names nothing), so a busy store looks the same as a fault that repeats
 # on every call. The verb is the house stop, with one retry named in the words:
@@ -139,6 +141,26 @@ COORDINATOR_FAILED_NEXT_STEP = (
     "user or host that the coordinator is failing; do not keep retrying."
 )
 
+
+# A refuse-mode write another agent holds, from a volume that opted in. The verb
+# is the one a commit's ``other_holder`` takes, but only the words make it safe
+# here: ``swg_write`` resends the same bytes, and once the path comes free those
+# land over whatever the holder committed. A CAS retry re-derives instead.
+OTHER_HOLDER_NEXT_STEP = (
+    "Nothing was written and nothing changed hands: another agent holds this path for "
+    "writing, and holder_agent_id names it. Wait at least 4 seconds, double the wait "
+    "with jitter, and stop after a bounded total. One holder can keep a path for up to "
+    "30 minutes, and the next holder starts a new clock, so the wait can run longer. "
+    "swg_reacquire does not clear this refusal, and there is no other route to the "
+    "path. A refused call keeps your own holds on other paths alive, and two agents "
+    "waiting on each other wait out the 30 minutes, so if you hold any, let go of them "
+    "before you wait: swg_reacquire on any path you hold drops every hold you have, so "
+    "read each path again before you write it. "
+    "Before you write again, call swg_read and rebuild your content from "
+    "it, because a write built on an old copy or on no read overwrites what the holder "
+    "committed. If your bound runs out, report to your user or host that another agent "
+    "holds the path."
+)
 
 # Type A — matched by EXACT exception type (so a future subclass cannot silently
 # inherit a mapping). ``reason`` mirrors the constant carried on the exception
@@ -154,6 +176,7 @@ _TERMINALS: dict[type, _Terminal] = {
     GiverFenced: _Terminal(
         GiverFenced.reason, GIVER_FENCED_RECOVER, False, GIVER_FENCED_NEXT_STEP
     ),
+    OtherHolder: _Terminal(OtherHolder.reason, "wait_and_retry", True, OTHER_HOLDER_NEXT_STEP),
     CoordinatorUnreachable: _Terminal(
         CoordinatorUnreachable.reason,
         COORDINATOR_UNREACHABLE_RECOVER,
@@ -360,7 +383,8 @@ _CAS_TERMINALS: dict[str, _Terminal] = {
     VERSION_MISMATCH_REASON: _Terminal(
         VERSION_MISMATCH_REASON, "read_then_merge", False
     ),
-    # The holder will release; a bounded backoff is the recovery, not a merge.
+    # The holder will release; a bounded backoff is the recovery, not a merge. A
+    # refuse-mode pre-edit's refusal has its own row, by exception type.
     "other_holder": _Terminal("other_holder", "wait_and_retry", True),
     STALE_READ_GENERATION_REASON: _Terminal(
         STALE_READ_GENERATION_REASON, "reacquire_and_reread", False
@@ -460,6 +484,8 @@ def deny_result(exc: BaseException) -> CallToolResult:
     extra: dict | None = None
     if isinstance(exc, GiverFenced) and terminal is not _UNRECOGNIZED:
         extra = _giver_fields(exc)
+    elif isinstance(exc, OtherHolder) and terminal is not _UNRECOGNIZED:
+        extra = _other_holder_fields(exc)
     elif type(exc) in (CasRetriesExhausted, CommitPreempted):
         # The two commit terminals add the refusal's lost token beside their
         # unchanged recover verb. Diagnostic only: it changes no recovery.
@@ -552,6 +578,13 @@ def _giver_fields(exc: GiverFenced) -> dict:
     if isinstance(version, bool) or not isinstance(version, int):
         version = None
     return {"successor": successor, "version_at_transfer": version}
+
+
+def _other_holder_fields(exc: OtherHolder) -> dict:
+    """The holder as the wire string a client raises with, ``None`` otherwise: an
+    in-process refusal carries a ``UUID``, which ``json.dumps`` refuses."""
+    holder = exc.holder_agent_id
+    return {"holder_agent_id": holder if isinstance(holder, str) else None}
 
 
 def coordinator_unavailable_result(detail: str) -> CallToolResult:
