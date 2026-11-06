@@ -117,6 +117,7 @@ ccs-diagnose --graph my_graph.py:build_graph --yes
 | `3` | Dependency missing (import error from graph or extras) |
 | `4` | Schema mismatch (`--show-payload` version not supported) |
 | `5` | I/O error (write/read failed; oversized input file) |
+| `141` | POSIX console stdout pipe closed (quiet exit; see below) |
 
 ## Trust posture
 
@@ -171,3 +172,38 @@ Once promoted, `v1`-tagged submissions populate the public benchmark; `v0-previe
 ## Sharing calibration data
 
 DM `vlad@agent-coherence.dev` (or open an issue on the repo) with your `calibration.jsonl` contents. Nothing is collected that isn't documented above; you can read every field before sharing.
+
+## Broken pipes in console and embedded runs
+
+On POSIX, the console entry point retains the usual quiet SIGPIPE behavior
+for its own output. While loading, building and invoking the user graph, it
+instead ignores SIGPIPE so graph code can catch `BrokenPipeError` from its
+own sockets. This is a **process-wide**, not thread-local, window; it closes
+when graph invocation returns, restoring the previous signal handler.
+
+Within that window, `sys.stdout.write()` and `sys.stdout.flush()` (including
+`print()`) are wrapped: a
+broken stdout pipe ends the process immediately with shell status **141**,
+without turning the error into an `insufficient` report. This also works
+when graph workers print. Python's `subprocess` sees **+141** for this
+explicit exit, versus **-13** for a SIGPIPE signal death outside the window.
+The immediate exit intentionally does not run `finally`/`atexit` cleanup;
+normal returns and ordinary graph errors restore the signal handler and remove
+the stdout proxy if it is still installed. A graph's replacement stdout remains
+in place, as without the guard; a missing stdout (`cmd >&-`) stays `None`,
+so `print()` remains a no-op. Other stream errors and graph-owned socket errors
+are not swallowed.
+
+This narrow protection does not wrap stderr, raw file-descriptor writes,
+`sys.stdout.buffer`, delegated methods such as `writelines()`, or previously
+captured stdout aliases. With `2>&1 | head`, a graph's direct write to stderr
+after the reader closes can therefore raise `BrokenPipeError`, be recorded as
+a graph failure, and produce an `insufficient` report. A small buffered print may only flush after this
+window, retaining the usual signal behavior at that later write; the
+no-report guarantee applies to broken stdout writes detected inside the
+window. Graph-owned
+threads/exporters and `atexit` handlers running after invocation returns are
+outside the window and remain subject to the console's default SIGPIPE
+handler, even if that code would otherwise catch `BrokenPipeError`.
+Embedded callers of `main()` do not enter this guard or replace host streams
+or signal handlers, including when called from a worker thread.
