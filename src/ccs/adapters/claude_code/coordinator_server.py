@@ -7229,9 +7229,10 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
       counts a different ledger.
 
       ``pre_edit_if_unheld`` is JSON ``true``: this build refuses a pre-edit
-      that sends ``if_unheld: true`` while another agent holds the path. Its
-      absence means the coordinator ignores the flag, so only this key tells
-      the two apart: the version does not.
+      that sends ``if_unheld: true`` while another agent holds the path. An
+      older build of this coordinator has no such key and ignores the flag,
+      and the version does not tell the two apart. The Node coordinator
+      honours the flag and does not advertise it.
 
       Fields may be ADDED in minor versions (additive change is
       non-breaking for dashboards using selective key access).

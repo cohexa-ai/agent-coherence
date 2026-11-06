@@ -18,6 +18,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import select
+import signal
+import time
 import urllib.error
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
@@ -306,6 +309,45 @@ def test_a_displace_volume_attaches_to_a_coordinator_without_the_key(
     assert CoherentVolume(tmp_path, managed=_MANAGED, config=fast_cfg).is_attached
 
 
+def _report_from_fork_child(child: Callable[[], dict]) -> dict:
+    """Fork, run ``child`` in the child and return its report. A fork in this
+    threaded process can deadlock the child, so one that hangs is killed and
+    fails the test rather than stalling the suite."""
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child: report through the pipe, never return into pytest
+        os.close(read_fd)
+        try:
+            os.write(write_fd, json.dumps(child()).encode("utf-8"))
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+    os.close(write_fd)
+    try:
+        ready, _, _ = select.select([read_fd], [], [], 30)
+        if not ready:
+            pytest.fail("timed out waiting for the forked child's report")
+        return json.loads(os.read(read_fd, 65536).decode("utf-8"))
+    finally:
+        os.close(read_fd)
+        os.kill(pid, signal.SIGKILL)  # no-op on a child that already exited
+        os.waitpid(pid, 0)
+
+
+def _write_and_report(volume: CoherentVolume, data: bytes) -> dict:
+    """What a ``write()`` did, as JSON a forked child can send its parent."""
+    try:
+        volume.write(_PATH, data)
+    except BaseException as exc:  # noqa: BLE001 - reported to the parent
+        return {
+            "raised": type(exc).__name__,
+            "message": str(exc),
+            "holder": getattr(exc, "holder_agent_id", None),
+        }
+    return {"raised": None}
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
 def test_a_forked_child_checks_the_coordinator_again(
     tmp_path: Path,
     fast_cfg: LifecycleConfig,
@@ -321,28 +363,32 @@ def test_a_forked_child_checks_the_coordinator_again(
     _operator_view_changed_to(monkeypatch, _without_the_key)
     sent.clear()
 
-    read_fd, write_fd = os.pipe()
-    pid = os.fork()
-    if pid == 0:  # child: report through the pipe, never return into pytest
-        os.close(read_fd)
-        report: dict = {"raised": None}
-        try:
-            volume.write(_PATH, b"from-the-child")
-        except BaseException as exc:  # noqa: BLE001 - reported to the parent
-            report = {"raised": type(exc).__name__, "message": str(exc)}
-        report["routes"] = _routes(sent)
-        os.write(write_fd, json.dumps(report).encode("utf-8"))
-        os.close(write_fd)
-        os._exit(0)
-    os.close(write_fd)
-    with os.fdopen(read_fd, "rb") as pipe:
-        report = json.loads(pipe.read().decode("utf-8"))
-    os.waitpid(pid, 0)
+    report = _report_from_fork_child(
+        lambda: {**_write_and_report(volume, b"from-the-child"), "routes": _routes(sent)}
+    )
 
     assert report["raised"] == "CoherenceError", report
     assert "pre_edit_if_unheld" in report["message"], report
     assert "/hooks/pre-edit" not in report["routes"], report
     assert not (tmp_path / _PATH).exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
+def test_a_forked_child_is_refused_while_its_parent_holds_the_file(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer
+) -> None:
+    """A forked child attaches as its own agent, so its parent's grant refuses it,
+    naming an id the child recorded nothing under.
+
+    Pins the limit the docs state, so a change to it is seen."""
+    parent = _refuser(tmp_path, fast_cfg)
+    parent.write(_PATH, b"from-the-parent")
+
+    report = _report_from_fork_child(lambda: _write_and_report(parent, b"from-the-child"))
+
+    assert report["raised"] == "OtherHolder", report
+    assert UUID(report["holder"]) == UUID(parent.agent_id)
+    assert (tmp_path / _PATH).read_bytes() == b"from-the-parent"
 
 
 def test_a_refused_operator_view_keeps_its_own_message(
@@ -926,6 +972,52 @@ def test_a_write_outside_managed_sends_no_flag_and_displaces(
     assert write_holders(server, "plan.md") == {writer.agent_id}
 
 
+def test_a_link_under_managed_to_a_file_outside_it_sends_no_flag(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """The managed check reads the resolved path, so a link whose name matches
+    ``managed`` is a write outside it and displaces the file's holder.
+
+    Pins the limit the docs state, so a change to it is seen."""
+    (tmp_path / "plan.md").write_bytes(b"seed")
+    (tmp_path / "data" / "plan-link.md").symlink_to(tmp_path / "plan.md")
+    holder, writer = _displacer(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
+    holder.write("plan.md", b"from-the-holder")
+    wire.sent.clear()
+
+    writer.write("data/plan-link.md", b"through-the-link")
+
+    assert "if_unheld" not in wire.bodies(_PRE_EDIT)[0]
+    assert (tmp_path / "plan.md").read_bytes() == b"through-the-link"
+    assert write_holders(server, "plan.md") == {writer.agent_id}
+
+
+@pytest.mark.parametrize(
+    ("spelling", "alias"),
+    [("data/shared.txt", "data/SHARED.txt"), ("data/café.txt", "data/café.txt")],
+    ids=["case", "unicode-form"],
+)
+def test_another_spelling_of_a_held_path_gets_no_refusal(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    server: CoordinatorHTTPServer,
+    spelling: str,
+    alias: str,
+) -> None:
+    """The coordinator tracks a path by its spelling, so each spelling has its own
+    holder. Where the filesystem folds the two, as a default Mac volume does, the
+    second write lands on the first holder's file.
+
+    Pins the limit the docs state, so a change to it is seen."""
+    holder, writer = _refuser(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
+    holder.write(spelling, b"from-the-holder")
+
+    writer.write(alias, b"from-the-writer")
+
+    assert write_holders(server, spelling) == {holder.agent_id}
+    assert write_holders(server, alias) == {writer.agent_id}
+
+
 # --- this volume's own abandoned grant ------------------------------------
 
 
@@ -1033,6 +1125,7 @@ def test_an_admit_over_a_holder_releases_and_raises(
 
     assert type(raised.value) is CoherenceError
     assert "nothing changed hands" not in str(raised.value)
+    assert "grant was released" in str(raised.value)
     assert wire.routes() == [_PRE_EDIT, _POST_EDIT]
     assert wire.bodies(_POST_EDIT)[0]["success"] is False
     assert (tmp_path / _PATH).read_bytes() == b"from-the-holder"
@@ -1047,20 +1140,77 @@ def test_an_unanswered_release_after_a_displacing_admit_keeps_the_record(
     tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
 ) -> None:
     """The grant is real until a release is confirmed, so ``reacquire()`` must
-    still send one.
+    still send one, and the message must say so: a new volume is a new agent,
+    which that grant would refuse.
 
     Prevents a release that did not land stranding the grant until the sweep."""
     holder, writer = _displacer(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
     holder.write(_PATH, b"from-the-holder")
     wire.answers[_PRE_EDIT] = _strip_the_flag
     wire.answers[_POST_EDIT] = _status(503)
-    with pytest.raises(CoherenceError, match="pre_edit_if_unheld"):
+    with pytest.raises(CoherenceError, match="pre_edit_if_unheld") as raised:
         writer.write(_PATH, b"from-the-writer")
+    assert "grant was released" not in str(raised.value)
+    assert "not confirmed" in str(raised.value)
+    assert "reacquire()" in str(raised.value)
     wire.answers.clear()
     wire.sent.clear()
     writer.reacquire(_PATH)
     assert _SESSION_STOP in wire.routes()
     assert write_holders(server, _PATH) == set()
+
+
+def test_a_degraded_admit_raises_and_keeps_the_record(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """A coordinator that ignores the flag answers ``degraded: true`` beside
+    ``ok: true`` when its watchdog fires, and the work it abandoned may still take
+    the grant, so a later release must still go out.
+
+    Prevents a refuse-mode write landing on an answer that decided nothing."""
+    (tmp_path / _PATH).write_bytes(b"seed")
+    writer = _refuser(tmp_path, fast_cfg)
+    wire.answers[_PRE_EDIT] = {"ok": True, "degraded": True}
+    wire.sent.clear()
+
+    with pytest.raises(CoherenceError) as raised:
+        writer.write(_PATH, b"from-the-writer")
+
+    assert type(raised.value) is CoherenceError
+    assert wire.routes() == [_PRE_EDIT]
+    assert (tmp_path / _PATH).read_bytes() == b"seed"
+    wire.answers.clear()
+    wire.sent.clear()
+    writer.reacquire(_PATH)
+    assert _SESSION_STOP in wire.routes()
+
+
+# --- how long a holder refuses ---------------------------------------------
+
+
+def test_a_quiet_holder_refuses_until_the_sweep_reclaims_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer
+) -> None:
+    """A holder whose heartbeat stopped keeps refusing until a sweep pass reclaims
+    it. The peer is then admitted, and the reclaimed holder's next write is a
+    stale view, not a write over the peer's bytes.
+
+    This server runs no sweep of its own, so the pass below is the only one. A
+    heartbeat never moves back, so the pass runs an hour ahead of it instead."""
+    from tests.test_claude_code_coordinator_server import _sweep
+
+    holder, peer = _refuser(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
+    holder.write(_PATH, b"from-the-holder")
+
+    with pytest.raises(OtherHolder):
+        peer.write(_PATH, b"too-early")
+    assert _sweep(server, int(time.time()) + 3600) == 1
+    peer.write(_PATH, b"from-the-peer")
+    with pytest.raises(StaleView):
+        holder.write(_PATH, b"from-the-reclaimed-holder")
+
+    assert (tmp_path / _PATH).read_bytes() == b"from-the-peer"
+    assert write_holders(server, _PATH) == {peer.agent_id}
 
 
 # --- letting go -----------------------------------------------------------

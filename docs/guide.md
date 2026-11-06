@@ -1554,7 +1554,8 @@ By default a `write()` takes a file from whoever holds it, and the holder finds
 out at its next write. With `on_held="refuse"`, a `write()` on a managed path
 asks first: while another agent holds the file it raises `OtherHolder` (from
 `ccs.core.exceptions`), which names the holder in `holder_agent_id`. Nothing is
-written and the holder keeps the file.
+written and the holder keeps the file. That id is 32 hex digits and a volume's
+`agent_id` is dashed, so compare them as UUIDs.
 
 ```python
 from ccs.core.exceptions import OtherHolder
@@ -1593,7 +1594,8 @@ not reach it.
 | no answer, or a body without `ok: true` | `CoordinatorUnreachable` | a grant may have landed: retry, or see below if the coordinator is gone |
 | your copy is stale, or any other `ok: false`, such as an `internal:` failure | `StaleView` | call `reacquire()` and rebuild from the bytes it returns |
 | you handed the file off | `GiverFenced` | stop: no retry clears it |
-| `collision: true`, which only a coordinator that ignores the flag sends | `CoherenceError` | build a new volume: the coordinator changed after this one attached, and the holder may have lost the file |
+| `collision: true`, which only a coordinator that ignores the flag sends | `CoherenceError` | build a new volume: the coordinator changed after this one attached, and the holder may have lost the file. If the message says the release was not confirmed, call `reacquire()` first, or that grant refuses the new volume |
+| `degraded: true` beside `ok: true`, which only a coordinator that ignores the flag sends | `CoherenceError` | call `reacquire()`, because the abandoned request may still take the grant, then build a new volume |
 | none: the session holds no [caller principal](#caller-principal), so nothing is sent | `CoherenceError` | build a new volume |
 
 **Polling.**
@@ -1632,8 +1634,8 @@ a refuse-mode volume protects its work between writes, and peers wait.
   coordinator did not confirm, and a raise can follow one it did.
 
 `write_cas` of a file this volume holds, any `write_cas` retry, `write_cas_at`
-and `atomic_publish` drop every hold too. Closing the volume or exiting the
-process releases nothing.
+and `atomic_publish` drop every hold too. A volume has no `close()`, and exiting
+the process releases nothing.
 
 **How long a holder refuses.** A holder that goes quiet refuses for about 600 s
 (`grant_heartbeat_timeout_sec`) plus the next sweep pass. A commit, or any other
@@ -1651,6 +1653,8 @@ a holder refuses until it releases. A reclaimed holder's next write raises
   default-tracked file such as `plan.md` loses it, and so does a holder of a file
   a peer's narrower `managed` does not cover. The flag stays off those paths
   because an untrack could send them around the check.
+  The check reads the resolved path, so a link under `managed` to a file outside
+  it is a write outside `managed`, whatever its name matches.
 - `install()`, `coherent_workspace()` and the `stale-write-guard-fs` tools take
   no `on_held`, so they displace.
 - A forked child is another agent: it is refused while its parent holds the file,
@@ -4176,9 +4180,10 @@ coordinator in these ways:
   The coordinator command has no port option, so locally this takes a port the
   system reuses. A remote coordinator on a fixed port makes it the normal case,
   which is why refuse mode is not available with `remote_endpoint`.
-- **Case aliases.** The coordinator tracks a path by its spelling. On a
+- **Spelling aliases.** The coordinator tracks a path by its spelling. On a
   case-insensitive filesystem, `data/X.TXT` and `DATA/x.txt` reach the file a
-  holder has as `data/x.txt`, get no refusal, and overwrite it.
+  holder has as `data/x.txt`, get no refusal, and overwrite it. On APFS the two
+  Unicode forms of a name, NFC and NFD, do the same.
 - **A reclaimed holder's pending write can still land.** On both coordinators
   a reclaim does not stop a write the holder had already been admitted for:
   that write can reach the file after the reclaim. Its `post-edit` is refused,

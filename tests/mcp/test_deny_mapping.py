@@ -678,6 +678,7 @@ def test_the_other_holder_terminal_names_the_holder_and_bounds_the_wait():
     assert "bounded total" in words, "wait_and_retry alone would loop"
     assert "next holder starts a new clock" in words
     assert "keeps your own holds" in words, "two waiting agents otherwise wait out the ceiling"
+    assert "swg_reacquire on any path you hold drops every hold" in words, "the way to let go"
     assert "report" in words.lower()
 
 

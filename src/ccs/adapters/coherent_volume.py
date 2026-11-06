@@ -497,16 +497,25 @@ def _no_usable_admit_message(rel: str) -> str:
     )
 
 
-def _displacing_admit_message(rel: str) -> str:
+def _displacing_admit_message(rel: str, released: bool) -> str:
     """What an opted-in :meth:`CoherentVolume.write` raises when the answer carries
     ``collision``, which a coordinator that honours the flag never sends. Not
-    :class:`~ccs.core.exceptions.OtherHolder`: something may have changed hands."""
+    :class:`~ccs.core.exceptions.OtherHolder`: something may have changed hands.
+    ``released`` is whether the coordinator confirmed the release of the grant. A
+    new volume is a new agent, so a grant left standing would refuse it."""
+    next_move = (
+        "this volume's grant was released. Build a new volume, which checks the "
+        "coordinator again."
+        if released
+        else "the release of this volume's grant was not confirmed, so it may still "
+        "stand. Call reacquire(), which sends the release again, then build a new "
+        "volume, which checks the coordinator again."
+    )
     return (
         f"the coordinator admitted an opted-in write of {rel} with a collision warning, "
         "so it does not honour if_unheld (it may be a build without pre_edit_if_unheld "
         "started after this volume attached), and the holder may have lost the file. No "
-        "bytes were written and this volume's grant was released. Build a new volume, "
-        "which checks the coordinator again."
+        f"bytes were written and {next_move}"
     )
 
 
@@ -979,7 +988,9 @@ class CoherentVolume:
       not available with ``remote_endpoint``. At attach the coordinator must
       advertise ``pre_edit_if_unheld``; otherwise the attach raises
       :class:`~ccs.core.exceptions.CoherenceError` before it sends anything. A
-      write outside ``managed`` sends no flag and still displaces.
+      write outside ``managed`` sends no flag and still displaces. The check
+      reads the resolved path, so a link under ``managed`` to a file outside
+      it is such a write.
 
     **Fleet requirement (hard, v1).** Every instance coordinating a given
     workspace MUST declare the **same** ``managed`` globs: an attaching instance
@@ -2174,7 +2185,7 @@ class CoherentVolume:
             )
         return None
 
-    def _release_unconfirmed_grant(self, rel: str) -> None:
+    def _release_unconfirmed_grant(self, rel: str) -> bool:
         """write()'s one best-effort release of its grant on ``rel`` after its
         commit got no answer, an HTTP 5xx or the coordinator's failure envelope
         (R9): ``success: false`` naming the incarnation
@@ -2188,11 +2199,11 @@ class CoherentVolume:
         landed. The path leaves the grant record only on a confirmed release,
         ``ok: true`` without ``degraded`` (as in
         :meth:`_release_abandoned_grants`); otherwise the next re-mint
-        releases it."""
+        releases it. Returns whether the release was confirmed."""
         incarnation = self._incarnation
         answer = self._send_grant_release(rel, timeout=_GRANT_RELEASE_TIMEOUT_SEC)
         if not (isinstance(answer, dict) and answer.get("ok") is True and not answer.get("degraded")):
-            return
+            return False
         # Only this path: the incarnation may still hold grants that earlier
         # write() calls took on other paths, which this release did not touch.
         written = self._grant_incarnations.get(incarnation)
@@ -2200,6 +2211,7 @@ class CoherentVolume:
             written.discard(rel)
             if not written:
                 del self._grant_incarnations[incarnation]
+        return True
 
     def reacquire(self, path: str | os.PathLike[str]) -> bytes:
         """Recover from a sticky strict deny and return the current bytes.
@@ -4390,8 +4402,8 @@ class CoherentVolume:
         if not (isinstance(resp, dict) and resp.get("ok") is True):
             raise CoordinatorUnreachable(_no_usable_admit_message(rel))
         if resp.get("collision"):
-            self._release_unconfirmed_grant(rel)
-            raise CoherenceError(_displacing_admit_message(rel))
+            released = self._release_unconfirmed_grant(rel)
+            raise CoherenceError(_displacing_admit_message(rel, released))
 
     @staticmethod
     def _deny_reason(resp: dict) -> str:
