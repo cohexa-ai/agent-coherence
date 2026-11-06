@@ -36,13 +36,13 @@ from tests.protocol_corpus.harness import IGNORED_SENTINEL, normalize_response
 from tests.test_claude_code_coordinator_server import (
     _DEGRADE_DEADLINE_SEC,
     _GATE_ANSWER_BOUND_SEC,
+    _OPERATOR_HEADER,
     _Background,
     _claimed,
     _Client,
     _hand_off,
     _HeldRegistryLock,
     _opted_in,
-    _OPERATOR_HEADER,
     _take,
 )
 

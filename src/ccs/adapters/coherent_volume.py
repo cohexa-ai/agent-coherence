@@ -89,8 +89,10 @@ from ccs.core.exceptions import (
     HANDOFF_NOT_LIVE_REASON,
     HANDOFF_NOT_SUCCESSOR_REASON,
     OCC_CALLER_TRANSIENT_REASON,
+    OTHER_HOLDER_REASON,
     SPLIT_PAIR_REASON,
     STALE_READ_GENERATION_REASON,
+    UNAVAILABLE_REASON,
     CallerPrincipalRefused,
     CasRetriesExhausted,
     CasVersionConflict,
@@ -103,6 +105,7 @@ from ccs.core.exceptions import (
     GiverFenced,
     HandoffPathsInvalid,
     InternalConcurrencyError,
+    OtherHolder,
     PublishMaterializationError,
     RedirectRefused,
     RemoteAuthFailed,
@@ -449,6 +452,62 @@ _IF_UNHELD_NOT_ADVERTISED_MESSAGE = (
     "take a file from its holder instead. Nothing was sent. Run agent-coherence-status "
     "to see its version, then upgrade it or use on_held='displace'."
 )
+
+
+def _no_principal_message(rel: str, outcome: str) -> str:
+    """What an opted-in :meth:`CoherentVolume.write` raises when its session holds
+    no caller principal: the coordinator refuses such a request, so none is sent."""
+    return (
+        f"on_held='refuse' needs a caller principal, and this session holds none "
+        f"(claim outcome: {outcome}). Nothing was sent for {rel}."
+    )
+
+
+def _undecided_grant_message(rel: str) -> str:
+    """What :class:`~ccs.core.exceptions.CoordinatorFailed` says for an opted-in
+    pre-edit the coordinator could not decide in time. Work it abandoned can still
+    take the grant, so giving up without a release can strand one."""
+    return (
+        f"the coordinator could not decide the grant request for {rel} in time. Nothing "
+        "was written, but the request may still take the grant. Back off, then retry "
+        "the write; if you give up instead, call reacquire(), which releases it."
+    )
+
+
+def _own_abandoned_grant_message(rel: str) -> str:
+    """What :class:`~ccs.core.exceptions.CoordinatorFailed` says for a refusal
+    naming an incarnation this volume recorded: no peer exists to wait for, and
+    :meth:`CoherentVolume.write` does not re-mint, so a plain retry cannot clear
+    it. Only a path this volume recorded reaches the text."""
+    return (
+        f"{rel} is held by this volume's own earlier write grant, whose release was not "
+        "confirmed, and the coordinator refused this write because of it. Nothing was "
+        "written. Call reacquire(), which sends the release again, and write from the "
+        "bytes it returns."
+    )
+
+
+def _no_usable_admit_message(rel: str) -> str:
+    """What :class:`~ccs.core.exceptions.CoordinatorUnreachable` says for an answer
+    to an opted-in pre-edit that neither admits nor refuses. Nothing of the body
+    reaches the text."""
+    return (
+        f"the coordinator answered the grant request for {rel} with neither an admit "
+        "nor a refusal. Nothing was written."
+    )
+
+
+def _displacing_admit_message(rel: str) -> str:
+    """What an opted-in :meth:`CoherentVolume.write` raises when the answer carries
+    ``collision``, which a coordinator that honours the flag never sends. Not
+    :class:`~ccs.core.exceptions.OtherHolder`: something may have changed hands."""
+    return (
+        f"the coordinator admitted an opted-in write of {rel} with a collision warning, "
+        "so it does not honour if_unheld (it may be a build without pre_edit_if_unheld "
+        "started after this volume attached), and the holder may have lost the file. No "
+        "bytes were written and this volume's grant was released. Build a new volume, "
+        "which checks the coordinator again."
+    )
 
 
 def _check_refuse_mode(
@@ -1862,6 +1921,18 @@ class CoherentVolume:
         raises :class:`~ccs.core.exceptions.GiverFenced` instead, while the
         handoff is live: no reacquire clears it, so stop and report.
 
+        Under ``on_held="refuse"``, on a managed path, a write another agent holds
+        raises :class:`~ccs.core.exceptions.OtherHolder`, with nothing written and
+        the holder untouched. Back off, then read the file again before you write:
+        once the file comes free, a write built without reading lands over whatever
+        the holder committed, with no signal. A grant request the coordinator could
+        not decide in time raises :class:`~ccs.core.exceptions.CoordinatorFailed`,
+        and one with no usable answer raises
+        :class:`~ccs.core.exceptions.CoordinatorUnreachable`. Neither writes
+        anything, but either may leave a grant, so retry, or call :meth:`reacquire`
+        if you give up. A successful write keeps its grant, across later commits,
+        until :meth:`reacquire` or another verb that starts a new attempt.
+
         Also prevents the **foreign-edit clobber** (content-CAS, write surface):
         on a managed (strict) path, if the file on disk changed out-of-band since
         this instance last read/wrote it, the write is denied with
@@ -1876,8 +1947,9 @@ class CoherentVolume:
         :meth:`write_cas`'s ``MAX_CAS_REACQUIRES``).
 
         Does NOT prevent concurrent racing writers (this is
-        single-writer-by-invalidation, not a mutex) nor a caller that ignores
-        :meth:`reacquire`'s fresh bytes. ``on_error`` governs only
+        single-writer-by-invalidation, not a mutex, except that refuse-mode writers
+        on a managed path refuse one another: an ordinary write still displaces them)
+        nor a caller that ignores :meth:`reacquire`'s fresh bytes. ``on_error`` governs only
         coherence-infrastructure failures (unavailable coordinator, watchdog
         timeout): strict raises, degrade warns once and writes best-effort.
         A strict commit (post-edit) that gets no answer, or an HTTP 5xx, after
@@ -1916,13 +1988,20 @@ class CoherentVolume:
             self._record_own_write(rel, self._sha256_bytes(data))
             return
 
+        # A path outside the managed globs takes no flag: an untrack could send it
+        # through the untracked exit, around the check.
+        opts_in = self._on_held == "refuse" and matches_any(rel, self._managed)
+        if opts_in and self._principal is None:
+            raise CoherenceError(_no_principal_message(rel, self.principal_claim_outcome))
+
         # Record the grant BEFORE the acquire is sent: an acquire whose answer is
         # lost, a degraded answer, and every failure after the grant (the disk
         # write, the post-edit POST) can each leave this incarnation holding
         # EXCLUSIVE with write() raising. The re-mint that abandons the incarnation
         # releases it (see _remint). Only a stale deny, the giver's handoff
-        # refusal (#185) or a principal refusal proves no grant was taken: an
-        # ok:false with an "internal:" reason can follow an acquire that landed.
+        # refusal (#185), another holder's refusal or a principal refusal proves
+        # no grant was taken: an ok:false with an "internal:" or "unavailable"
+        # reason can follow an acquire that landed.
         # Each withdraws only what this call recorded — the same incarnation may
         # still hold a grant from an earlier write() on another path. A file the
         # coordinator does not track stays recorded too: its answer is the same
@@ -1942,17 +2021,23 @@ class CoherentVolume:
         # pre-edit: acquire EXCLUSIVE, or be denied because we are INVALID. A
         # principal refusal proves no grant was taken too — the coordinator
         # refuses before any mutation — so it withdraws the record like a deny.
+        pre_edit: dict[str, object] = {"session_id": self._session_id, "path": rel}
+        if opts_in:
+            pre_edit["if_unheld"] = True
         try:
-            resp = self._post("/hooks/pre-edit", {"session_id": self._session_id, "path": rel})
+            resp = self._post("/hooks/pre-edit", pre_edit)
         except CallerPrincipalRefused:
             withdraw_record()
             raise
         if isinstance(resp, dict) and resp.get("ok") is False and (
-            resp.get("status") == "stale" or resp.get("reason") == GIVER_FENCED_REASON
+            resp.get("status") == "stale"
+            or resp.get("reason") in (GIVER_FENCED_REASON, OTHER_HOLDER_REASON)
         ):
             withdraw_record()
         if resp is not None:
             self._check_grant(resp, rel, phase="pre-edit")
+        if opts_in:
+            self._require_a_real_admit(resp, rel)
         # Past the deny check, a dict answer that is not watchdog-degraded is
         # an admitted acquire; a degraded or lost one (degrade mode only) may
         # or may not have taken the grant.
@@ -2128,6 +2213,12 @@ class CoherentVolume:
 
         Re-minting the identity resets this instance's view of *every* path, not
         just ``path`` — other tracked paths should be re-read before writing.
+
+        It is also how a holder lets go under ``on_held="refuse"``: it releases every
+        path this attempt holds, not only ``path``, and a peer can then be admitted
+        to each. Best-effort in both directions: a return can follow a release the
+        coordinator did not confirm, which the next re-mint sends again, and a raise
+        can follow one it did, as on a file that was deleted.
 
         Always returns the current bytes without raising, even under
         ``on_stale_read="raise"`` — recovery must never be blocked by the deny
@@ -4226,7 +4317,10 @@ class CoherentVolume:
         A deny (``ok: false`` — strict-deny or collision/preempt) ALWAYS raises
         ``CoherenceError`` with the reason verbatim, in both ``on_error`` modes:
         the deny is the enforcement signal. A watchdog-timeout degrade
-        (``degraded: true``) is an infra failure and routes through ``on_error``.
+        (``degraded: true``) with ``ok`` not false is an infra failure and routes
+        through ``on_error``. ``unavailable`` is both: an opted-in request's deny,
+        so it raises here. Only an opted-in request is answered it or a pre-edit
+        ``other_holder``, and refuse mode is strict-only.
         """
         if not isinstance(resp, dict):
             return
@@ -4245,11 +4339,55 @@ class CoherentVolume:
             # reacquire, and no reacquire clears a fence keyed on the session.
             if resp.get("reason") == GIVER_FENCED_REASON:
                 raise self._giver_fenced(resp, rel)
+            # Matched by route too: on post-edit-cas this reason is a lost race and
+            # takes the CAS retry, but that classification never sees this answer.
+            if resp.get("reason") == OTHER_HOLDER_REASON:
+                raise self._other_holder_refusal(resp, rel)
+            if resp.get("reason") == UNAVAILABLE_REASON:
+                raise CoordinatorFailed(_undecided_grant_message(rel))
             raise StaleView(self._deny_reason(resp))
         if resp.get("degraded"):
             self._fail_closed_or_degrade(
                 f"coordinator watchdog timeout on {phase} for {rel}"
             )
+
+    def _other_holder_refusal(self, resp: dict, rel: str) -> CoherenceError:
+        """The error for a pre-edit refused ``other_holder``: the typed refusal,
+        unless the holder is an incarnation this volume recorded, whose release
+        did not land. No peer exists then, and the record that release left is
+        what lets :meth:`reacquire` send it again."""
+        holder = _wire_str(resp, "holder_agent_id")
+        if self._names_a_recorded_incarnation(holder):
+            return CoordinatorFailed(_own_abandoned_grant_message(rel))
+        return OtherHolder(rel, holder)
+
+    def _names_a_recorded_incarnation(self, holder: str | None) -> bool:
+        """Whether a wire holder id is this volume's own, compared as a UUID: the
+        wire writes 32 hex and :attr:`agent_id` is dashed. An id that does not
+        parse names nothing here. The current incarnation cannot match, because
+        the coordinator admits an identity to its own grant."""
+        if holder is None:
+            return False
+        try:
+            named = uuid.UUID(holder)
+        except ValueError:
+            return False
+        return any(
+            session_to_agent_id(self._session_id, incarnation) == named
+            for incarnation in self._grant_incarnations
+        )
+
+    def _require_a_real_admit(self, resp: object, rel: str) -> None:
+        """Stop an opted-in :meth:`write` on an answer that is not a real admit.
+        Only JSON ``ok: true`` admits. The refusals and a degraded answer raised in
+        :meth:`_check_grant`, so anything else here answered nothing. ``collision``
+        shows the coordinator ignored the flag, so the volume releases what it
+        took, keeping the record unless that release is confirmed."""
+        if not (isinstance(resp, dict) and resp.get("ok") is True):
+            raise CoordinatorUnreachable(_no_usable_admit_message(rel))
+        if resp.get("collision"):
+            self._release_unconfirmed_grant(rel)
+            raise CoherenceError(_displacing_admit_message(rel))
 
     @staticmethod
     def _deny_reason(resp: dict) -> str:
