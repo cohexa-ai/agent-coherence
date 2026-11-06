@@ -1224,11 +1224,14 @@ class CoordinatorUnreachable(CoherenceError):
     :class:`CommitUnconfirmed` instead, because it may have landed.
 
     No write was version-committed. A pessimistic ``write()`` that raises it
-    has already put its bytes on disk, and its message says so. Recovery is
-    not a retry: the coordinator is gone or wedged, and an attached volume or
-    substrate session keeps the endpoint it attached to, so it cannot recover
-    in place. Build a new one (for the MCP server, restart it) once a
-    coordinator is running again; see ``docs/guide.md``. Carries
+    has already put its bytes on disk, and its message says so. An attached
+    volume or substrate session keeps the endpoint it attached to, so recovery
+    depends on what happened to that coordinator. If it only stalled (for
+    example, a stopped process that resumes) and comes back on the same port,
+    the next call on the same volume or session goes through (#389). If it
+    went away, the volume or session never finds a coordinator started after
+    it: build a new one (for the MCP server, restart it) once a coordinator is
+    running again; see ``docs/guide.md``. Carries
     :data:`COORDINATOR_UNAVAILABLE_REASON`. Message only, so it pickles whole
     across a process boundary."""
 

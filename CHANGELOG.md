@@ -151,10 +151,13 @@ Alpha — APIs may change before `v1.0`.
   `tests/fixtures/wire/pre_edit_other_holder.json` pins the refusal's wire
   shape. Every pre-edit that does not send JSON `true` is unchanged, so an
   ordinary pre-edit, every Claude Code hook edit included, still displaces an
-  opted-in holder. The contract covers tracked paths only, nothing sends the
-  flag yet, and the Claude Code plugin's Node coordinator ignores it. The
-  guide's "Acquire-or-fail on `pre-edit`" section has the details, including
-  every answer an opted-in client can get and what to do on each.
+  opted-in holder. The contract covers tracked paths only, and nothing sends
+  the flag yet. The Claude Code plugin's Node coordinator ignores the flag
+  through plugin 0.6.0; later plugin releases refuse with the same body,
+  need no caller principal, and let an opted-in request take back a grant
+  another agent has held 30 minutes or more. The guide's "Acquire-or-fail on
+  `pre-edit`" section has the details, including every answer an opted-in
+  client can get from each coordinator and what to do on each.
 
 ### Changed
 

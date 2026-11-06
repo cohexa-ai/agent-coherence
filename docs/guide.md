@@ -2518,7 +2518,8 @@ unless it is a `pre-edit` that opts in with `"if_unheld": true`.
 The Claude Code plugin's Node coordinator issues no principals. It answers
 `/principal/claim` with `404`, and clients proceed without one; the hook
 clients skip the request altogether when `.coherence/server.pid` names the Node
-backend.
+backend. An opted-in `pre-edit` needs no principal there either (see
+[Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)).
 
 The hook client keeps a session's nonce and principal in two files under
 `.coherence/`; they are listed, with what to do about them, among the
@@ -3758,20 +3759,25 @@ the path EXCLUSIVE or MODIFIED, the coordinator refuses the request with
 and the grant are one decision, so two opted-in requests racing for a path
 nobody holds get one grant and one refusal that names the winner.
 
-This is the Python coordinator's behavior; the Claude Code plugin's Node
-coordinator ignores `if_unheld`. Nothing sends the flag yet: the Claude Code
-hooks do not opt in, and no released client sends it. A coordinator that
-ignores the flag (the Node coordinator, or an older release) admits an
+The Python coordinator refuses this way, and so does the Claude Code plugin's
+Node coordinator in plugin releases after 0.6.0, with the same body. Where the
+two differ is listed under **On the Node coordinator** below. Nothing sends
+the flag yet: the Claude Code hooks do not opt in, and no released client
+sends it. A coordinator that ignores the flag (the Node coordinator in plugin
+0.6.0 or earlier, or this package's coordinator through 0.15.0) admits an
 opted-in request it decides in time as it admits any other, and a client
 cannot yet tell that admit from a real one.
 
 **Request.** `pre-edit` with `"if_unheld": true` in the body, carrying the
-[caller principal](#caller-principal). Only a JSON `true` opts in: any other
-`if_unheld` (`"true"`, `1`, `null`, `false`) or none is an ordinary request,
-answered exactly as before. An opted-in request without a principal is refused
-with HTTP `400` and `"reason": "caller_principal_absent"`, even from a session
-that never claimed one and on an untracked path, because a refusal that a
-caller could step around by naming the holder's session is not a refusal.
+[caller principal](#caller-principal) when the coordinator is the Python one.
+Only a JSON `true` opts in: any other `if_unheld` (`"true"`, `1`, `null`,
+`false`) or none is an ordinary request, answered exactly as before. The
+Python coordinator refuses an opted-in request without a principal with HTTP
+`400` and `"reason": "caller_principal_absent"`, even from a session that never
+claimed one and on an untracked path, because a refusal that a caller could
+step around by naming the holder's session is not a refusal. The Node
+coordinator issues no principals, so it asks for none; see
+**On the Node coordinator** for what that leaves open.
 
 **Refusal.** HTTP 200 with
 
@@ -3782,7 +3788,8 @@ caller could step around by naming the holder's session is not a refusal.
 The holder is named by agent id, never by session id, as 32 lowercase hex
 characters without hyphens. `/status` and the `handoff` key write agent ids
 with hyphens, so compare parsed UUIDs, not strings. On a path with a transfer
-record the body also carries the [`handoff` key](#the-handoff-key), last. It
+record the Python coordinator's body also carries the
+[`handoff` key](#the-handoff-key), last. It
 carries no `hookSpecificOutput` and no `permissionDecision`. Python code can
 import the reason as `OTHER_HOLDER_REASON` from `ccs.core.exceptions`. In
 process, `CoordinatorService.write(..., if_unheld=True)` makes the same check
@@ -3806,7 +3813,8 @@ id counts as none (see **What it does not close**).
   granted, and the readers go INVALID, as for any `pre-edit`.
 
 **What a refusal changes.** Nothing changes hands: the holder keeps its grant
-and the caller gains none. A refusal moves exactly four things:
+and the caller gains none. On the Python coordinator a refusal moves exactly
+four things:
 
 - the caller's heartbeat;
 - the caller's `agent_name` in the operator view of `/status`, recorded on its
@@ -3819,6 +3827,13 @@ observed versions, the state log, the holder's and the caller's pending
 notices, the transfer record and its status, and every other `/status`
 counter.
 
+On the Node coordinator a refusal moves only the caller's session entry in
+the coordinator's memory and, on a path the coordinator had never seen, the
+path's row in its store. The holder keeps its state, its grant time, its
+observed version and its notices. The caller keeps any SHARED grant and its
+observed version, and its queued notices and any re-grounding context it is
+owed wait for its next admitted request.
+
 **Which answer comes first.** For state that was settled before the request
 arrived:
 
@@ -3830,36 +3845,44 @@ arrived:
   `status` as it was: the refusal neither completes nor overtakes the handoff.
 
 **Answers an opted-in client can get.** Admit the edit only on an HTTP 2xx
-answer whose body has `ok: true` and no `degraded` key.
+answer whose body has `ok: true` and no `degraded` key. A row that names a
+coordinator applies to that coordinator only; every other row applies to both.
+The `/status` counters are the Python coordinator's: the Node coordinator
+keeps none of them.
 
 | When the request is decided | Answer | `/status` counter | What the client does |
 |---|---|---|---|
-| it presents no principal header, or an empty or whitespace-only one | HTTP `400`, `"reason": "caller_principal_absent"` | `caller_principal_refused_total` | claim a principal, then send again; claiming binds the session (see the client rules below) |
-| it presents a principal that is not the one bound to the session | HTTP `400`, `"reason": "caller_principal_foreign"` | `caller_principal_refused_total` | claim again with the same nonce, then send again |
-| the caller-principal check or the pre-edit work runs past the 4-second handler budget | `unavailable` (see **Under load**) | `watchdog_timeouts_total` | release, then back off |
+| Python coordinator: it presents no principal header, or an empty or whitespace-only one | HTTP `400`, `"reason": "caller_principal_absent"` | `caller_principal_refused_total` | claim a principal, then send again; claiming binds the session (see the client rules below) |
+| Python coordinator: it presents a principal that is not the one bound to the session | HTTP `400`, `"reason": "caller_principal_foreign"` | `caller_principal_refused_total` | claim again with the same nonce, then send again |
+| Python coordinator: the caller-principal check or the pre-edit work runs past the 4-second handler budget | `unavailable` (see **Under load**) | `watchdog_timeouts_total` | release, then back off |
+| Node coordinator: the store is busy before the grant, or (rarely) fails after it | `{"ok": false, "reason": "internal: SqliteError"}`; nothing is granted unless the failure came after the grant | none | release, then back off |
 | the path is not tracked | `{"ok": true}`, unchecked; it may carry re-grounding context | none, or `watchdog_timeouts_total` when delivering that context times out, which still answers `{"ok": true}` | proceed; the path is outside this contract (see **What it does not close**) |
-| the caller is the giver of a live handoff of the path | the `handed_off` deny | `handoff_giver_denials_total` | stop: no retry clears it |
+| Python coordinator: the caller is the giver of a live handoff of the path | the `handed_off` deny | `handoff_giver_denials_total` | stop: no retry clears it |
 | the path is in strict mode and the caller's read is stale | the strict deny: `"status": "stale"`, a deny in `hookSpecificOutput`, and no top-level `reason` | `strict_mode_denials_total` and `stale_warning_emitted_total` | re-read under a new `agent_id` with the same `session_id`, then send again: a deny never re-grants the identity it denied |
-| another agent holds the path EXCLUSIVE or MODIFIED | `other_holder` | `pre_edit_other_holder_denials_total` | back off; once admitted, re-read the file before writing |
+| another agent holds the path EXCLUSIVE or MODIFIED; on the Node coordinator, one whose grant is less than 1800 s old or has no recorded grant time | `other_holder` | `pre_edit_other_holder_denials_total` | back off; once admitted, re-read the file before writing |
+| Node coordinator: another agent has held the path EXCLUSIVE or MODIFIED for 1800 s or more | the plain admit, with no collision warning: the coordinator reclaims that grant in the same decision (see **On the Node coordinator**) | none | proceed |
 | no other agent holds the path EXCLUSIVE or MODIFIED | the admit an ordinary `pre-edit` gets, but never with a collision warning: the decision displaced nobody, even when a holder let go just before it | as for an ordinary `pre-edit` | proceed |
-| anything else: a `503` (the coordinator's queue or handler slots are full, or it is stopping or draining for a migration), an `internal:` failure ([details](#when-the-coordinator-answers-with-a-failure)), which a busy store can also cause, an `ok: false` whose `reason` is prose, any other non-2xx status, no answer at all, or `{"ok": true, "degraded": true}`, which an older coordinator answers on a timeout because it never reads `if_unheld` | as for an ordinary `pre-edit` | as for an ordinary `pre-edit` | treat it as a refusal and back off |
+| Node coordinator: the grant is made, and only delivering the caller's queued notices finds the store busy | the admit, without the notices, which stay queued for the caller's next answer | none | proceed |
+| anything else: a `503` (the coordinator's queue or handler slots are full, or it is stopping or draining for a migration), an `internal:` failure ([details](#when-the-coordinator-answers-with-a-failure)), which a busy store can also cause on the Python coordinator (`internal: OperationalError`), an `ok: false` whose `reason` is prose, any other non-2xx status, no answer at all, or `{"ok": true, "degraded": true}`, which an older coordinator answers on a timeout because it never reads `if_unheld` | as for an ordinary `pre-edit` | as for an ordinary `pre-edit` | treat it as a refusal and back off; after no answer at all from the Node coordinator, release first (see the client rules) |
 
 **When the path comes free.** The refusal carries no retry hint because none
 exists. Committing does not end a grant: a holder that commits keeps the path
 MODIFIED, and the optimistic lane is no way around it — `post-edit-cas` answers
 `other_holder` against a MODIFIED holder too. A grant ends when its holder
-releases it — `session-stop`, which a Claude Code session sends at the end of
-its turn, or a failed `post-edit` — or hands it on with a
-[transfer](#targeted-grant-handoff), or when the coordinator reclaims it from a
-silent holder (see **What it does not close**). Poll with backoff rather than
-wait for a signal.
+releases it — `session-stop`, which a Claude Code session sends when a turn
+completes normally, or a failed `post-edit` — or hands it on with a
+[transfer](#targeted-grant-handoff) (Python coordinator only), or when the
+coordinator reclaims it: the Python coordinator's sweep from a silent holder
+(see **What it does not close**), the Node coordinator's opted-in acquire from
+a holder of 30 minutes or more (see **On the Node coordinator**). Poll with
+backoff rather than wait for a signal.
 
 **Client rules.**
 
 - **Back off.** After any refusal or missing answer, wait at least 4 seconds,
   the handler budget, then double the wait, with jitter, up to a cap, and stop
   after a bounded total. Keep at most one opted-in request per path in flight.
-  Work the coordinator abandoned on a timeout keeps its place in the
+  Work the Python coordinator abandoned on a timeout keeps its place in the
   coordinator's work queue until it finishes, and about 13 such pieces of work,
   across all clients, are enough for every route, ordinary hooks included, to
   answer `503` ([#223](https://github.com/Cohexa-ai/agent-coherence/issues/223)).
@@ -3867,10 +3890,15 @@ wait for a signal.
 - **Re-read after `other_holder`.** Once a later request is admitted, re-read
   the file before you build the write. Nothing marks a refused caller stale
   while it waits, so the copy it read before the refusal may be out of date.
-- **Release after `unavailable`.** Work the coordinator abandoned may still
-  have taken the grant (see **Under load**). Send a failed `post-edit`
-  (`"success": false`) for the path, with the same `session_id` and
-  `agent_id`. The release counts only when the answer says `"released": true`.
+- **Release after `unavailable`, or after an `internal:` answer or no answer
+  from the Node coordinator.** Work the Python coordinator abandoned, a
+  request the Node coordinator was still holding when the client stopped
+  waiting, or a Node request whose store failed after its grant (answered
+  `internal:`), may still have taken the grant (see **Under load** and
+  **On the Node coordinator**).
+  Send a failed `post-edit` (`"success": false`) for the path, with the same
+  `session_id` and `agent_id`. The release counts only when the answer says
+  `"released": true`.
   That answer does not prove a grant existed, and it leaves the caller INVALID
   on the path. On a strict-mode path a deny never re-grants that identity, so
   its next `pre-edit`, and every later read under it, gets the strict deny.
@@ -3879,17 +3907,18 @@ wait for a signal.
   do.
 - **Send `session-stop` only when the work is done.** It releases every path
   the identity holds EXCLUSIVE or MODIFIED, not only the one in question.
-- **Claiming a principal binds the session.** A client that claims one to clear
-  the `400` binds its session: from then on, every request naming that session
-  on a route that requires a principal must present it, whichever client or
-  subagent sends it (see [What is checked, and where](#what-is-checked-and-where)).
+- **Claiming a principal binds the session.** On the Python coordinator, a
+  client that claims one to clear the `400` binds its session: from then on,
+  every request naming that session on a route that requires a principal must
+  present it, whichever client or subagent sends it (see
+  [What is checked, and where](#what-is-checked-and-where)).
 - **Release before you exit.** A client that restarts under a new session or
   `agent_id` is a new agent, so a grant its previous run left held refuses it
   until that grant is released or reclaimed.
 
-**Under load.** When the coordinator cannot decide an opted-in `pre-edit`
-within the 4-second handler budget, at the caller-principal check or in the
-pre-edit work itself, it refuses it with HTTP 200:
+**Under load.** When the Python coordinator cannot decide an opted-in
+`pre-edit` within the 4-second handler budget, at the caller-principal check or
+in the pre-edit work itself, it refuses it with HTTP 200:
 
 ```json
 {"ok": false, "reason": "unavailable", "degraded": true, "hookSpecificOutput": {…}}
@@ -3912,64 +3941,140 @@ times out still admits with `{"ok": true, "degraded": true}`, strict-mode paths
 included, exactly as before (see
 [When the registry is busy](#when-the-registry-is-busy)).
 
+**On the Node coordinator.** The Claude Code plugin's Node coordinator, in
+plugin releases after 0.6.0, refuses an opted-in `pre-edit` with the same body,
+in the same key order, and grants nothing. It differs from the Python
+coordinator in these ways:
+
+- **No principal.** It issues no principals, so an opted-in request needs
+  none and never gets the `400`. A caller that sends the holder's own
+  `session_id`, and the holder's subagent id if it has one, is the holder as
+  far as the coordinator can tell, so it is admitted as the holder's own
+  repeat. The refusal separates only callers that send their own ids.
+- **A busy store.** It has no handler budget, so it never answers
+  `unavailable`. When its store is busy before the grant, an opted-in request
+  gets `{"ok": false, "reason": "internal: SqliteError"}`, the same `internal:`
+  shape the Python coordinator gives a busy store
+  (`internal: OperationalError`), and nothing is granted. When the grant is
+  made and only delivering the caller's queued notices finds the store busy,
+  the request is admitted without them, and they stay queued for its next
+  answer. Any other store failure after the grant, which is rare, still
+  answers `internal:` with the grant made, so a client releases after any
+  `internal:` answer (see the client rules above).
+- **A request nobody waits for can still take a path.** While the store is
+  busy, a request can sit in the coordinator past the point where its client
+  stops waiting. It is still decided when the store frees, like any other
+  opted-in request, so it can take a grant on a path no other agent holds,
+  and the client is never told. This is why the client rules above say to
+  release after getting no answer from the Node coordinator.
+- **The 30-minute reclaim.** It has no sweep and records no heartbeats, and
+  nothing releases a grant when a session dies or the coordinator restarts.
+  Instead, an opted-in request takes back a grant another agent has held
+  EXCLUSIVE or MODIFIED for 1800 s (30 minutes) or more, in the same decision
+  as the holder check. The time counts from that agent's first grant in its
+  continuous hold: a commit or a repeat `pre-edit` does not restart it. Like
+  the Python sweep's `grant_max_hold_sec` ceiling, the reclaim takes a live
+  holder too, and the 1800 s is fixed. The holder goes INVALID, with
+  `reclaim_max_hold` recorded as its reclaim trigger, and is queued a notice
+  that reads "reclaimed at <time>: held 30 minutes or more while another
+  agent asked for it; read the file again before editing it", which reaches
+  it on its next admitted request or
+  session start. The caller gets the plain admit, and the coordinator writes
+  one line naming the path's artifact id, the holder, how long it held, and
+  the caller to `coordinator.log`. A grant with no recorded grant time is
+  never reclaimed this way. Only an opted-in request reclaims.
+- **The reclaim bounds one holder's hold, not a refused caller's wait.** An
+  opted-in request can take the path once the current holder's continuous
+  hold reaches 1800 s, unless that holder releases it sooner. Another caller
+  can take the path first, which starts a new hold and a new 1800 s, so a
+  caller refused each time can wait more than 30 minutes in total.
+- **A reclaimed holder's commit.** Its later `post-edit` with
+  `"success": true` gets the ordinary
+  `{"ok": false, "reason": "commit_not_allowed: …"}` refusal, without the
+  `"reclaimed": true` key the Python coordinator adds after a sweep reclaim,
+  and does not deliver the reclaim notice.
+- **A turn that ends early keeps its grants.** Claude Code sends
+  `session-stop` only from its Stop hook, so a turn ended by a user interrupt
+  or an API error sends none. That session keeps its grants into later turns
+  until it completes a turn normally or the 30-minute reclaim takes them.
+- **No counter, no `handoff` key.** `/status` counts no refusals, and a
+  refusal never carries the `handoff` key: the Node coordinator has no
+  handoffs.
+- **One coordinator per workspace.** The holder check and the grant are one
+  SQLite transaction, so a grant another process is writing to the same store
+  cannot land between them, and plugin releases after 0.6.0 run one
+  coordinator per workspace.
+
 **What it does not close.**
 
 - **Opted-in callers only.** The refusal protects a holder only from callers
   that also opt in: an ordinary pre-edit still displaces an opted-in holder,
   and every Claude Code hook edit is an ordinary one.
-- **Tracked paths only.** An opted-in request that presents its principal on
-  an untracked path is admitted with `{"ok": true}` and no check, and so is one
-  on a held path that was untracked afterwards; the holder keeps its grant. An
-  untrack of a strict-mode path is refused (`untrack_strict_path`), and such a
-  path stays tracked even when `ignored.yaml` lists it, so opt in on
-  strict-mode paths.
-- **A silent holder refuses until the sweep reclaims it.** The acquire reclaims
-  nothing itself. A holder that stops sending requests keeps refusing until a
-  sweep pass takes its grant back: once it has recorded no heartbeat for
-  `grant_heartbeat_timeout_sec` (600 s by default), or has held the path for
-  `grant_max_hold_sec` (1800 s by default), whichever comes first (see
+- **Tracked paths only.** An opted-in request on an untracked path, presenting
+  its principal on the Python coordinator, is admitted with `{"ok": true}` and
+  no check, and so is one on a held path that was untracked afterwards; the
+  holder keeps its grant. An untrack of a strict-mode path is refused
+  (`untrack_strict_path`), and such a path stays tracked even when
+  `ignored.yaml` lists it, so opt in on strict-mode paths.
+- **A silent holder refuses until the sweep reclaims it.** On the Python
+  coordinator the acquire reclaims nothing itself. A holder that stops sending
+  requests keeps refusing until a sweep pass takes its grant back: once it has
+  recorded no heartbeat for `grant_heartbeat_timeout_sec` (600 s by default),
+  or has held the path for `grant_max_hold_sec` (1800 s by default), whichever
+  comes first (see
   [Reading when the sweep will reclaim a grant](#reading-when-the-sweep-will-reclaim-a-grant)).
   With the sweep off (`sweep_interval_sec` set to `0`), it refuses until it
-  releases the path.
-- **One coordinator process.** The check and the grant are one decision inside
-  the coordinator process that holds the workspace's store. A second writer
-  opened on the same `state.db` is outside that decision
-  ([#453](https://github.com/Cohexa-ai/agent-coherence/issues/453)).
+  releases the path. The Node coordinator has no sweep: its opted-in acquire
+  reclaims a grant held 30 minutes or more (see **On the Node coordinator**).
+- **A reclaimed holder's pending write can still land.** On both coordinators
+  a reclaim does not stop a write the holder had already been admitted for:
+  that write can reach the file after the reclaim. Its `post-edit` is refused,
+  so no version records those bytes.
+- **One coordinator process.** On the Python coordinator the check and the
+  grant are one decision inside the coordinator process that holds the
+  workspace's store. A second writer opened on the same `state.db` is outside
+  that decision ([#453](https://github.com/Cohexa-ai/agent-coherence/issues/453)).
+  On the Node coordinator they are one SQLite transaction, and the plugin runs
+  one coordinator per workspace (see **On the Node coordinator**).
 - **A malformed subagent id is read as the parent.** An `agent_id` that is not
   a string of 1 to 64 characters from `[A-Za-z0-9_-]` is read as no subagent
   id, as on every hook route, so the request acts as the parent session. From
   a session that holds the path, such a request is admitted as the holder's
   own repeat.
-- **The `handoff` key is read after the decision.** On a refusal it is a
-  best-effort read taken once the refusal is decided, so it can describe a
-  later record than the one in force at the decision. Act on `reason` and
-  `holder_agent_id`.
-- **The refusal counter counts refusals sent.**
+- **The `handoff` key is read after the decision.** On a Python coordinator's
+  refusal it is a best-effort read taken once the refusal is decided, so it
+  can describe a later record than the one in force at the decision. Act on
+  `reason` and `holder_agent_id`.
+- **The refusal counter counts refusals sent.** On the Python coordinator,
   `pre_edit_other_holder_denials_total` counts the refusals this coordinator
   process sent on the HTTP route. A refusal reached after its request timed
   out, whose caller got `unavailable`, is not counted, and neither is a refusal
   of an in-process `CoordinatorService.write`. The counter resets when the
   coordinator restarts, and no refusal is written to the durable
   [conflict-outcome counters](#conflict-outcome-counters--how-often-did-it-actually-fire).
-- **A refusal can be logged as a late completion.** When the deadline passes
-  just after a refusal is ready to send, the caller gets `unavailable`, and
-  the coordinator counts the work in `watchdog_late_completion_total` and logs
-  it at `CRITICAL`, as work that may have left a grant behind, although the
-  refusal landed nothing. When the deadline passes earlier, the work counts in
-  `watchdog_late_aborts_total` instead.
-- A refused agent can still write the file with a shell command. The Bash hook
-  refuses a shell write only from the giver of a live
-  [handoff](#targeted-grant-handoff), so a write that goes around the Edit and
-  Write tools is not refused here;
+- **A refusal can be logged as a late completion.** On the Python coordinator,
+  when the deadline passes just after a refusal is ready to send, the caller
+  gets `unavailable`, and the coordinator counts the work in
+  `watchdog_late_completion_total` and logs it at `CRITICAL`, as work that may
+  have left a grant behind, although the refusal landed nothing. When the
+  deadline passes earlier, the work counts in `watchdog_late_aborts_total`
+  instead.
+- A refused agent can still write the file with a shell command. On the
+  Python coordinator the Bash hook refuses a shell write only from the giver of
+  a live [handoff](#targeted-grant-handoff), so a write that goes around the
+  Edit and Write tools is not refused here;
   [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)
-  reports it afterwards.
+  reports it afterwards. The Node coordinator has neither handoffs nor
+  foreign-write detection, so neither applies there.
 - The Claude Code hooks do not opt in, so a Claude Code edit is never refused
   this way. A new kind of deny on the edit path is shown to the model and
   changes how it retries, so the change that adds one to the hooks needs its
   own measurement of that before it ships.
-- On the hook surface, any process that can read `.coherence/` can read another
-  session's principal. The refusal separates writers that follow the protocol;
-  it does not stop one that deliberately uses another's principal.
+- On the Python coordinator's hook surface, any process that can read
+  `.coherence/` can read another session's principal. The refusal separates
+  writers that follow the protocol; it does not stop one that deliberately
+  uses another's principal. The Node coordinator checks no principal at all
+  (see **On the Node coordinator**).
 
 ## `stale-write-guard-fs` MCP server
 
@@ -4487,9 +4592,10 @@ and needs no daemon — so you can point it at a `state.db` copied off a machine
 after the fact.
 
 A `pre-edit` that opted in with `"if_unheld": true` and was refused with
-`other_holder` is not in this tally: it writes no row. `/status` counts those
-refusals in `pre_edit_other_holder_denials_total`, which resets when the
-coordinator restarts (see [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)).
+`other_holder` is not in this tally: it writes no row. The Python
+coordinator's `/status` counts those refusals in
+`pre_edit_other_holder_denials_total`, which resets when the coordinator
+restarts (see [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)).
 
 **The honesty rules matter more than the numbers, so they are worth stating
 plainly:**

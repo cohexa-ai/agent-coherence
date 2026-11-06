@@ -1,0 +1,60 @@
+{
+  "name": "acquire-or-fail-held-exclusive-refuses-an-opted-in-peer",
+  "description": "Session A takes EXCLUSIVE on CLAUDE.md with an ordinary pre-edit. Session B then pre-edits the same path with if_unheld: true and is refused with other_holder, naming A's agent id (32 lowercase hex, pinned literally). Nothing is granted. B presents its principal on Python, where an opted-in request needs one; the claim is scoped to Python and the header is omitted on Node, which needs none.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "backends": [
+          "python"
+        ],
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "path": "CLAUDE.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+      "path": "CLAUDE.md",
+      "if_unheld": true
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_b}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": false,
+      "reason": "other_holder",
+      "holder_agent_id": "80cbc93dbdc35128a0f2b69566f01436"
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

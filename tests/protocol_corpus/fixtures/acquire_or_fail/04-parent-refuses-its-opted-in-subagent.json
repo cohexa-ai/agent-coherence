@@ -1,0 +1,64 @@
+{
+  "name": "acquire-or-fail-parent-refuses-its-opted-in-subagent",
+  "description": "Session A's main thread takes EXCLUSIVE; its subagent X opts in and is refused, naming the parent's agent id. A parent and its subagent are two agents.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "backends": [
+          "python"
+        ],
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "path": "CLAUDE.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+      "agent_id": "a0826622451ec196f",
+      "path": "CLAUDE.md",
+      "if_unheld": true
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_a}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": false,
+      "reason": "other_holder",
+      "holder_agent_id": "80cbc93dbdc35128a0f2b69566f01436"
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}
