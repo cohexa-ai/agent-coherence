@@ -7211,7 +7211,7 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
       Fields PRESENT in the metrics tier are stable within a major
       version. ``coordinator_uptime_seconds``, ``coordinator_backend``,
       ``coordinator_version``, ``registry_schema_version`` (#294),
-      ``watchdog_timeouts_total``,
+      ``pre_edit_if_unheld``, ``watchdog_timeouts_total``,
       ``watchdog_queue_overflows_total``,
       ``handler_concurrency_overflows_total``,
       ``in_flight_drain_timed_out``, ``cold_start_duration_ms``,
@@ -7227,6 +7227,11 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
       only this coordinator sends it: the Node coordinator's body carries
       neither it nor ``coordinator_backend``, and its ``schema_version``
       counts a different ledger.
+
+      ``pre_edit_if_unheld`` is JSON ``true``: this build refuses a pre-edit
+      that sends ``if_unheld: true`` while another agent holds the path. Its
+      absence means the coordinator ignores the flag, so only this key tells
+      the two apart: the version does not.
 
       Fields may be ADDED in minor versions (additive change is
       non-breaking for dashboards using selective key access).
@@ -7498,6 +7503,12 @@ def _status_counters(coordinator: CoordinatorHTTPServer) -> dict[str, Any]:
         # Never the bare ``schema_version``: the Node coordinator sends that
         # from its own migration ledger, whose numbers mean different schemas.
         "registry_schema_version": SCHEMA_USER_VERSION,
+        # A pre-edit that sends ``if_unheld: true`` is refused while another
+        # agent holds the path. A coordinator without this key ignores the flag
+        # and displaces the holder, so a client that relies on the refusal reads
+        # this first. A fact about this build: it makes no registry read, so the
+        # metrics tier and the degraded answer carry it too.
+        "pre_edit_if_unheld": True,
         **coordinator.counters_snapshot(),
     }
 
