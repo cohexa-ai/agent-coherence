@@ -17922,6 +17922,39 @@ def test_the_giver_of_a_live_handoff_editing_a_changed_file_gets_its_deny_unchan
     assert "disk_differs" not in body and "outside the coordinator" not in json.dumps(body), body
 
 
+def test_pre_edit_warns_when_in_flight_holder_releases_before_acquire(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    original = b"# plan\n"
+    _seed_with_disk(coordinator, client, "plan.md", original)
+    holder, editor = str(uuid.uuid4()), str(uuid.uuid4())
+    assert client.post("/hooks/pre-edit", {"session_id": holder, "path": "plan.md"})[1]["ok"]
+    (coordinator.coordinator_root / "plan.md").write_bytes(original + b"peer bytes\n")
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    holder_id = session_to_agent_id(holder)
+    real_check = mod._a_write_is_in_flight
+    seen: list[bool] = []
+
+    def release_after_check(*args: Any, **kwargs: Any) -> bool:
+        in_flight = real_check(*args, **kwargs)
+        seen.append(in_flight)
+        coordinator.service.invalidate(
+            agent_id=holder_id, artifact_id=artifact_id, new_version=1,
+            issuer_agent_id=holder_id, issued_at_tick=1,
+        )
+        return in_flight
+
+    monkeypatch.setattr(mod, "_a_write_is_in_flight", release_after_check)
+    status, body = client.post("/hooks/pre-edit", {"session_id": editor, "path": "plan.md"})
+
+    assert seen == [True]
+    assert status == 200 and body["ok"] is True and body["disk_differs"] is True
+    assert "collision" not in body
+    assert coordinator.registry.peek_preemption_notice(holder_id, artifact_id) is None
+
+
 @pytest.mark.parametrize("peer", ["writing", "committed", "gone-quiet"])
 def test_pre_edit_behind_a_peer_flags_only_what_no_write_in_flight_explains(
     coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, peer: str,

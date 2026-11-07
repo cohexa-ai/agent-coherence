@@ -2526,8 +2526,8 @@ class CoordinatorService:
         self._refuse_handed_off_giver(artifact_id, identity)
         admitted = self._live_transfer_record(artifact_id)
 
-        # The abort-guard held by commit_cas keeps this pre-mutation state
-        # snapshot consistent with the registry's invalidated_ids result.
+        # The abort guard keeps this snapshot consistent with the result for
+        # registry writes made through this process.
         victim_states = self.registry.get_state_map(artifact_id)
         result = self.registry.commit_cas(
             artifact_id,
@@ -2562,7 +2562,11 @@ class CoordinatorService:
                 issued_at_tick=issued_at_tick,
                 issuer_agent_id=agent_id,
                 victim_agent_id=invalidated_id,
-                victim_state=victim_states[invalidated_id],
+                # A second registry writer may add a peer after the snapshot
+                # and before the commit result is returned.  The commit has
+                # still landed; preserve that success and report the state as
+                # unknown instead of turning it into a KeyError.
+                victim_state=victim_states.get(invalidated_id),
             )
             for invalidated_id in invalidated_ids
         ]
@@ -2631,8 +2635,8 @@ class CoordinatorService:
             self._refuse_handed_off_giver(artifact_id, identity)
             admitted[artifact_id] = self._live_transfer_record(artifact_id)
 
-        # commit_all holds the same abort guard across this snapshot and the
-        # atomic batch mutation below.
+        # The abort guard serializes this snapshot and the batch against other
+        # registry writes made through this process.
         victim_states = {
             artifact_id: self.registry.get_state_map(artifact_id)
             for artifact_id in writes
@@ -2661,7 +2665,7 @@ class CoordinatorService:
                         issued_at_tick=issued_at_tick,
                         issuer_agent_id=agent_id,
                         victim_agent_id=_peer,
-                        victim_state=victim_states[art_id][_peer],
+                        victim_state=victim_states[art_id].get(_peer),
                     )
                 )
             self._validate_single_writer(art_id)

@@ -3531,11 +3531,6 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # the caller's write lands. It warns and never denies: in strict mode
         # a read is already refused until a commit lands, so a write is the
         # one way out.
-        if not peer_write_in_flight:
-            out_of_band_version = _recorded_content_missing_from_disk(
-                coordinator, artifact_id, agent_id, path=path, now_unix=_payloads.now_unix()
-            )
-
         # Collision answers and notices share the acquire's lock-consistent
         # list of holders whose M/E grants were actually displaced.
         displaced: list[tuple[UUID, InvalidationSignal]] = []
@@ -3547,6 +3542,12 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             ):
                 continue
             displaced.append((victim_id, signal))
+
+        if not (peer_write_in_flight and displaced):
+            out_of_band_version = _recorded_content_missing_from_disk(
+                coordinator, artifact_id, agent_id, path=path, now_unix=_payloads.now_unix()
+            )
+
         for victim_id, signal in displaced:
             coordinator.registry.record_preemption_notice(
                 victim_agent_id=victim_id,

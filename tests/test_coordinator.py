@@ -969,6 +969,40 @@ def test_commit_cas_happy_path_commits_and_invalidates_peers() -> None:
     assert signals[0].issuer_agent_id == writer
 
 
+def test_commit_cas_keeps_success_when_peer_appears_after_state_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A peer added between the snapshot and CAS must not hide a landed commit."""
+    svc = _service()
+    artifact, writer, existing_peer = _two_shared_holders(svc)
+    late_peer = uuid4()
+    real_commit_cas = svc.registry.commit_cas
+
+    def add_peer_then_commit(*args, **kwargs):
+        svc.registry.set_agent_state(
+            artifact.id,
+            late_peer,
+            MESIState.SHARED,
+            trigger="test_late_peer",
+            tick=3,
+        )
+        return real_commit_cas(*args, **kwargs)
+
+    monkeypatch.setattr(svc.registry, "commit_cas", add_peer_then_commit)
+
+    updated, signals = svc.commit_cas(
+        agent_id=writer,
+        artifact_id=artifact.id,
+        expected_version=artifact.version,
+        content_hash=compute_content_hash("v2"),
+    )
+
+    assert updated.version == 2
+    assert {signal.victim_agent_id for signal in signals} == {existing_peer, late_peer}
+    late_signal = next(signal for signal in signals if signal.victim_agent_id == late_peer)
+    assert late_signal.victim_state is None
+
+
 def test_commit_cas_is_repeatable_for_same_agent_no_d4_rejection() -> None:
     """FIX 3: a winning commit_cas ends the committer SHARED (not MODIFIED), so
     the SAME agent can commit_cas AGAIN on the same artifact without tripping the
