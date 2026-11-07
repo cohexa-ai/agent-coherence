@@ -622,7 +622,7 @@ def run_park_after_ack(
       by ``timeout_sec``) running out, is a :class:`HarnessFailure`. The
       window is the caller's to bound.
     - The acked and returned values cross a process boundary: plain picklable
-      data, never exception objects (``CasVersionConflict`` does not pickle).
+      data, never exception objects.
     """
     if not hasattr(signal, "SIGSTOP"):
         raise HarnessFailure(

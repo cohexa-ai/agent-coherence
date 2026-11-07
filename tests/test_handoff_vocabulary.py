@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from ccs.adapters.coherent_object import ConditionalPutRetriesExhausted
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_REASONS,
     CAS_EXHAUSTED_REASON,
@@ -60,8 +61,8 @@ from ccs.core.exceptions import (
     CoordinatorFailed,
     CoordinatorUnreachable,
     GiverFenced,
-    PublishMaterializationError,
     OtherHolder,
+    PublishMaterializationError,
     StaleView,
 )
 from ccs.core.states import MESIState
@@ -228,6 +229,7 @@ def test_giver_fenced_crosses_a_process_boundary(successor: UUID | str) -> None:
             captured_generation=4,
             owner_generation=5,
         ),
+        ConditionalPutRetriesExhausted("s3://bucket/key", 3),
         PublishMaterializationError(
             ("notes/plan.md",), ("notes/other.md",), cause=OSError("disk write failed")
         ),
@@ -236,6 +238,7 @@ def test_giver_fenced_crosses_a_process_boundary(successor: UUID | str) -> None:
         "caller-principal-refused",
         "cas-retries-exhausted",
         "cas-version-conflict",
+        "conditional-put-retries-exhausted",
         "publish-materialization-error",
     ],
 )
