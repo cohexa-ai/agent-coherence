@@ -1,0 +1,96 @@
+{
+  "name": "pre-read-after-own-stop-and-a-peer-acquire-denies-with-the-grant-change-wording",
+  "description": "The read a session keeps when its turn ends is made stale by a peer's acquire alone (#513). Session A reads notes.md (v1), pre-edits it, commits v2 and its turn ends, so it is a reader of v2. Peer B then pre-edits notes.md and never commits, which makes A's copy INVALID with the version unchanged. A's next Read is denied with the grant-change wording, as in row 09, here at v2. The summary is asserted too: current_version and prior_version_seen_by_session must both be 2, the version A held when it let go and the one the file is still at, and last_writer_session_id must be A's own agent id, since A's commit is the last one (its 32-char hex form is compared as written). Both backends.",
+  "setup": {
+    "tracked": [
+      "notes.md"
+    ],
+    "strict_mode": [
+      "notes.md"
+    ],
+    "files": {
+      "notes.md": "# Notes\nv2 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md",
+          "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md",
+          "success": true,
+          "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/session-stop",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "notes.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "notes.md",
+      "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+    }
+  },
+  "ignore_keys": [
+    "last_writer_at_unix_ts",
+    "warning_generated_at_unix_ts"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "Stale read denied: your grant on notes.md was revoked and no new version was committed — notes.md is still at v2. Re-read notes.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+      },
+      "status": "stale",
+      "summary": {
+        "path": "notes.md",
+        "current_version": 2,
+        "prior_version_seen_by_session": 2,
+        "last_writer_session_id": "7690f70629fe50779d9a76ac403645fe",
+        "last_writer_at_unix_ts": "<IGNORED>",
+        "warning_generated_at_unix_ts": "<IGNORED>",
+        "hash_differs": false
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

@@ -1,0 +1,106 @@
+{
+  "name": "pre-read-after-own-stop-and-a-peer-commit-denies-with-the-write-wording",
+  "description": "The read a session keeps when its turn ends is still made stale by a peer (#513). Session A reads notes.md (v1), pre-edits it, commits v2 and its turn ends, so it is a reader of v2. Peer B then pre-edits notes.md and commits v3, which makes A's copy INVALID. A's next Read is denied with the write wording naming B (agent 814dac78), exactly as a reader that never edited the file is denied in row 01. The summary is asserted too: prior_version_seen_by_session must be 2, the version A held when it let go, current_version must be 3, B's commit, and last_writer_session_id must be B's agent id, which both backends derive the same way (its 32-char hex form is compared as written). A offers the hash of the v2 bytes it holds and B's commit carries other bytes, so hash_differs is true. Both backends.",
+  "setup": {
+    "tracked": [
+      "notes.md"
+    ],
+    "strict_mode": [
+      "notes.md"
+    ],
+    "files": {
+      "notes.md": "# Notes\nv2 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md",
+          "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md",
+          "success": true,
+          "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/session-stop",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "notes.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "notes.md",
+          "success": true,
+          "content_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "notes.md",
+      "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+    }
+  },
+  "ignore_keys": [
+    "last_writer_at_unix_ts",
+    "warning_generated_at_unix_ts"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "Stale read denied: notes.md was updated by agent 814dac78 at <TS>. Re-read notes.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+      },
+      "status": "stale",
+      "summary": {
+        "path": "notes.md",
+        "current_version": 3,
+        "prior_version_seen_by_session": 2,
+        "last_writer_session_id": "814dac789b8f560d9236b12165a0b50d",
+        "last_writer_at_unix_ts": "<IGNORED>",
+        "warning_generated_at_unix_ts": "<IGNORED>",
+        "hash_differs": true
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

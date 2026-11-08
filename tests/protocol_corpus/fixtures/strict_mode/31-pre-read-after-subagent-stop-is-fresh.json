@@ -1,0 +1,78 @@
+{
+  "name": "pre-read-after-subagent-stop-is-fresh",
+  "description": "A subagent keeps a read of a file it edited when it stops (#513). Subagent a0826622451ec196f of session 44444444 reads notes.md (v1), pre-edits it and commits v2, so it holds MODIFIED, then its SubagentStop releases its grants (session-stop carrying its agent_id). The same subagent's next Read is fresh. Before, the stop left the subagent INVALID and this read was denied on every retry. The file on disk holds the bytes the subagent commits, and every hash in this row is theirs. Both backends.",
+  "setup": {
+    "tracked": [
+      "notes.md"
+    ],
+    "strict_mode": [
+      "notes.md"
+    ],
+    "files": {
+      "notes.md": "# Notes\nv2 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444",
+          "agent_id": "a0826622451ec196f",
+          "path": "notes.md",
+          "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444",
+          "agent_id": "a0826622451ec196f",
+          "path": "notes.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444",
+          "agent_id": "a0826622451ec196f",
+          "path": "notes.md",
+          "success": true,
+          "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/session-stop",
+        "body": {
+          "session_id": "44444444-4444-4444-8444-444444444444",
+          "agent_id": "a0826622451ec196f"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "44444444-4444-4444-8444-444444444444",
+      "agent_id": "a0826622451ec196f",
+      "path": "notes.md",
+      "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+    }
+  },
+  "optional_keys": [
+    "version"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "status": "fresh"
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}
