@@ -207,31 +207,34 @@ class _Sent(NamedTuple):
 
 
 class _ReleaseFailure(NamedTuple):
-    """Why one of :meth:`CoherentVolume.release`'s requests did not confirm its
-    release: the error a strict volume raises for it, the failure that error
-    chains to, whether the answer reported the grant still held, and whether
-    ``_post`` already warned for it (degrade mode, a request with no answer)."""
+    """Why a release request of :meth:`CoherentVolume.release` or
+    :meth:`CoherentVolume.close` did not confirm: the error a strict volume
+    raises for it, the failure that error chains to, whether the answer
+    reported the grant still held, whether ``_post`` already warned for it
+    (degrade mode, a request with no answer), and whether the request was
+    never sent because no coordinator was listening."""
 
     error: type[CoherenceError]
     cause: BaseException | None = None
     held: bool = False
-    reported: bool = False
+    already_warned: bool = False
+    never_sent: bool = False
 
 
-def _release_answer_failure(resp: object) -> _ReleaseFailure | None:
-    """What stops a walk of release requests in ``resp``, or ``None`` when the
-    answer can be read: ``ok: true``, or an account of each grant. ``None`` as
-    ``resp`` is a degrade-mode request ``_post`` already warned about. A
+def _read_release_answer(resp: object) -> dict | _ReleaseFailure:
+    """``resp`` when a release's answer can be read (``ok: true``, or an
+    account of each grant), else why it confirms nothing. ``None`` as ``resp``
+    is a degrade-mode request ``_post`` already warned about. A
     watchdog-degraded answer reads ``ok: true`` whether or not the release ran,
     so it confirms nothing."""
     if resp is None:
-        return _ReleaseFailure(CoordinatorUnreachable, reported=True)
-    if isinstance(resp, dict) and resp.get("degraded"):
+        return _ReleaseFailure(CoordinatorUnreachable, already_warned=True)
+    if not isinstance(resp, dict) or resp.get("degraded"):
         return _ReleaseFailure(CoherenceError)
     if _is_failure_envelope(resp):
         return _ReleaseFailure(CoordinatorFailed)
-    if isinstance(resp, dict) and (resp.get("ok") is True or isinstance(resp.get("grants"), list)):
-        return None
+    if resp.get("ok") is True or isinstance(resp.get("grants"), list):
+        return resp
     return _ReleaseFailure(CoherenceError)
 
 
@@ -639,10 +642,10 @@ _CLOSE_INSIDE_AN_OPERATION_MESSAGE = (
 def _close_not_confirmed_message(rels: Sequence[str], *, held: bool) -> str:
     """What :meth:`CoherentVolume.close` raises (strict) or warns (degrade)
     when the coordinator did not confirm the release of every write grant the
-    volume recorded. ``rels``: the paths still recorded. ``held``: an answer
-    reported a grant still held. The volume is closed either way. Byte-stable
-    but for the paths."""
-    listed = ", ".join(sorted(rels))
+    volume recorded. ``rels``: the paths still recorded, sorted. ``held``: an
+    answer reported a grant still held. The volume is closed either way.
+    Byte-stable but for the paths."""
+    listed = ", ".join(rels)
     if held:
         state = (
             "the coordinator answered the release of this volume's write grants with a "
@@ -670,8 +673,8 @@ def _cas_not_recorded_message(rel: str, detail: str) -> str:
 #: What a write() whose commit certainly was not recorded says to do (#526).
 #: Re-reading cannot help: the bytes on disk are not the content the
 #: coordinator records, so a read that refuses stale bytes refuses them until
-#: a write records them. Not "every read": a read inside the volume's own 5 s
-#: commit window, or one under on_stale_read="allow", returns them.
+#: a write records them. Not "every read": a read within a few seconds of the
+#: volume's own last commit, or one under on_stale_read="allow", returns them.
 _UNRECORDED_WRITE_RECOVERY = (
     "Until a write() of this path is recorded, a read that refuses stale bytes "
     "refuses it, and reading again does not clear that: write() the path again, "
@@ -708,19 +711,17 @@ def _unanswered_write_message(rel: str, no_answer: _CommitNotAnswered, *, releas
     alone."""
     if no_answer.never_sent:
         recorded = f"the coordinator did not record the write ({no_answer.detail})"
-        recovery = _UNRECORDED_WRITE_RECOVERY
     elif no_answer.status is not None:
         recorded = (
             f"its commit was answered with HTTP {no_answer.status}, so the "
             "coordinator may have recorded the write"
         )
-        recovery = _MAYBE_RECORDED_WRITE_RECOVERY
     else:
         recorded = (
             f"its commit got no usable answer ({no_answer.detail}), so the "
             "coordinator may have recorded the write"
         )
-        recovery = _MAYBE_RECORDED_WRITE_RECOVERY
+    recovery = _UNRECORDED_WRITE_RECOVERY if no_answer.never_sent else _MAYBE_RECORDED_WRITE_RECOVERY
     return (
         f"The write's bytes are on disk at {rel}, but {recorded}. "
         f"{_grant_release_sentence(released)} {recovery}"
@@ -1391,8 +1392,10 @@ class CoherentVolume:
         ``write_cas``, ``write_cas_at`` and ``atomic_publish`` retries until one
         attaches.
 
-        Every operation that sends a request passes through here first, so a
-        closed volume raises here, before anything is sent.
+        The operations that send a request pass through here first, so a
+        closed volume raises here, before anything is sent. :meth:`release`
+        and :meth:`reacquire` check for themselves, and :meth:`close` is the
+        one operation a closed volume accepts.
         """
         self._require_open()
         if self._endpoint is None and self._needs_reattach:
@@ -2606,7 +2609,7 @@ class CoherentVolume:
             _abs_path, rel = self._to_relative(path)
             failure = self._release_path(rel)
             if failure is not None:
-                self._release_not_confirmed(rel, failure)
+                self._release_failure_or_degrade(_release_not_confirmed_message(rel, held=failure.held), failure)
 
     def _release_path(self, rel: str) -> _ReleaseFailure | None:
         """Send one ``success: false`` post-edit for each attempt that records
@@ -2620,15 +2623,14 @@ class CoherentVolume:
             return None  # detached: no write of this volume recorded a grant
         held: _ReleaseFailure | None = None
         released_first = False
-        for incarnation in self._attempts_recording(rel):
-            resp, failure = self._send_release(
+        for incarnation in self._writer_incarnations(rel):
+            answer = self._send_release(
                 "/hooks/post-edit",
                 {"session_id": self._session_id, "agent_id": incarnation, "path": rel, "success": False},
             )
-            failure = failure or _release_answer_failure(resp)
-            if failure is not None:
-                return failure
-            if self._settle_path_release(incarnation, rel, resp) and not released_first:
+            if isinstance(answer, _ReleaseFailure):
+                return answer
+            if self._settle_path_release(incarnation, rel, answer) and not released_first:
                 self._read_incarnations[rel] = incarnation
                 released_first = True
             if rel in self._grant_incarnations.get(incarnation, ()):
@@ -2637,9 +2639,10 @@ class CoherentVolume:
             self._release_held_paths.discard(rel)
         return held
 
-    def _attempts_recording(self, rel: str) -> list[str]:
-        """The attempts whose write() recorded a grant on ``rel``: the current
-        one first, then the latest, as :meth:`_claim_incarnation` orders them."""
+    def _writer_incarnations(self, rel: str) -> list[str]:
+        """The incarnations whose write() recorded a grant on ``rel``: the
+        current one first, then the latest. The first holds the grant, since
+        each later acquire took it from the earlier ones."""
         writers = [inc for inc, written in self._grant_incarnations.items() if rel in written]
         ordered = list(reversed(writers))
         if self._incarnation in ordered:
@@ -2647,27 +2650,32 @@ class CoherentVolume:
             ordered.insert(0, self._incarnation)
         return ordered
 
-    def _send_release(self, route: str, body: dict) -> tuple[object, _ReleaseFailure | None]:
-        """One release request through :meth:`_post`. The typed errors a
-        strict request raises when it gets no usable answer or an HTTP 5xx come
-        back as a failure instead, so the caller reports the release with its
-        own text and type. Any other error, a principal refusal among them,
+    def _send_release(self, route: str, body: dict) -> dict | _ReleaseFailure:
+        """One release request through :meth:`_post`: its answer when it can
+        be read, else why it confirms nothing. The typed errors a strict
+        request raises when it gets no usable answer or an HTTP 5xx come back
+        as a failure instead, so the caller reports the release with its own
+        text and type; one whose connection never carried the request is
+        marked never sent. Any other error, a principal refusal among them,
         propagates."""
         try:
-            return self._post(route, body), None
+            resp = self._post(route, body)
         except CoordinatorUnreachable as exc:
-            return None, _ReleaseFailure(CoordinatorUnreachable, exc)
+            cause = exc.__cause__
+            never_sent = isinstance(cause, CoordinatorUnavailable) and cause.never_sent
+            return _ReleaseFailure(CoordinatorUnreachable, exc, never_sent=never_sent)
         except CoordinatorFailed as exc:
-            return None, _ReleaseFailure(CoordinatorFailed, exc)
+            return _ReleaseFailure(CoordinatorFailed, exc)
+        return _read_release_answer(resp)
 
-    def _settle_path_release(self, incarnation: str, rel: str, resp: object) -> bool:
+    def _settle_path_release(self, incarnation: str, rel: str, answer: dict) -> bool:
         """Act on a readable answer to the release of ``rel`` under
         ``incarnation``; whether the coordinator released it to a read. ``ok:
         true`` drops the path from that attempt's record; an account of each
         grant drops what it reports released or handed off and keeps a grant
         it reports still held."""
-        if not (isinstance(resp, dict) and resp.get("ok") is True):
-            self._drop_released_paths(incarnation, resp.get("grants") if isinstance(resp, dict) else None)
+        if answer.get("ok") is not True:
+            self._drop_released_paths(incarnation, answer.get("grants"))
             return False
         written = self._grant_incarnations.get(incarnation)
         if written is not None:
@@ -2676,15 +2684,14 @@ class CoherentVolume:
                 del self._grant_incarnations[incarnation]
         return True
 
-    def _release_not_confirmed(self, rel: str, failure: _ReleaseFailure) -> None:
-        """Report a release of ``rel`` the coordinator did not confirm, through
-        ``on_error``: strict raises the failure's type with the release's own
-        text, chained to what failed; degrade warns, unless ``_post`` already
-        warned for the same request."""
-        message = _release_not_confirmed_message(rel, held=failure.held)
+    def _release_failure_or_degrade(self, message: str, failure: _ReleaseFailure) -> None:
+        """A release or close the coordinator did not confirm, through
+        ``on_error``: strict raises the failure's type with ``message``,
+        chained to what failed; degrade warns, unless ``_post`` already warned
+        for the same request."""
         if self._on_error == "strict":
             raise failure.error(message) from failure.cause
-        if not failure.reported:
+        if not failure.already_warned:
             self._record_degraded(message)
 
     @property
@@ -2703,9 +2710,12 @@ class CoherentVolume:
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         if exc_type is None:
             self.close()
-            return
-        # The body's error is the one the caller needs: a close that fails on
-        # top of it is logged, so it cannot replace it.
+        else:
+            self._close_while_unwinding()
+
+    def _close_while_unwinding(self) -> None:
+        """Close while another error unwinds. That error is the one the caller
+        needs, so a close that fails on top of it is logged, not raised."""
         try:
             self.close()
         except (CoherenceError, CoherenceDegradedWarning) as close_failure:
@@ -2758,16 +2768,15 @@ class CoherentVolume:
             return None  # detached: no write of this volume recorded a grant
         held: _ReleaseFailure | None = None
         for incarnation in sorted(self._grant_incarnations):
-            resp, failure = self._send_release(
+            answer = self._send_release(
                 "/hooks/session-stop", {"session_id": self._session_id, "agent_id": incarnation}
             )
-            failure = failure or _release_answer_failure(resp)
-            if failure is not None:
-                return failure
-            if isinstance(resp, dict) and resp.get("ok") is True:
+            if isinstance(answer, _ReleaseFailure):
+                return answer
+            if answer.get("ok") is True:
                 self._grant_incarnations.pop(incarnation, None)
                 continue
-            self._drop_released_paths(incarnation, resp.get("grants") if isinstance(resp, dict) else None)
+            self._drop_released_paths(incarnation, answer.get("grants"))
             if incarnation in self._grant_incarnations:
                 held = _ReleaseFailure(CoherenceError, held=True)
         return held
@@ -2778,19 +2787,14 @@ class CoherentVolume:
         reached a listening coordinator is logged instead: nothing the caller
         does can release those grants, and the next coordinator's sweep will."""
         rels = sorted({rel for written in self._grant_incarnations.values() for rel in written})
-        cause = failure.cause.__cause__ if failure.cause is not None else None
-        if isinstance(cause, CoordinatorUnavailable) and cause.never_sent:
+        if failure.never_sent:
             logger.warning(
                 "CoherentVolume close reached no coordinator; its write grants on %s "
                 "are left to the next coordinator's sweep",
                 ", ".join(rels),
             )
             return
-        message = _close_not_confirmed_message(rels, held=failure.held)
-        if self._on_error == "strict":
-            raise failure.error(message) from failure.cause
-        if not failure.reported:
-            self._record_degraded(message)
+        self._release_failure_or_degrade(_close_not_confirmed_message(rels, held=failure.held), failure)
 
     def write_cas(
         self,
@@ -3854,11 +3858,9 @@ class CoherentVolume:
         registered the standing view, else, for a path neither written nor
         read, the current one. A presented incarnation that holds nothing is
         refused as not held, which changes nothing."""
-        writers = [inc for inc, written in self._grant_incarnations.items() if rel in written]
-        if self._incarnation in writers:
-            return self._incarnation
+        writers = self._writer_incarnations(rel)
         if writers:
-            return writers[-1]
+            return writers[0]
         return self._read_incarnations.get(rel, self._incarnation)
 
     def _forget_claim(self, rel: str) -> None:
@@ -5041,9 +5043,9 @@ def _managed_rel(volume: CoherentVolume, file: object) -> str | None:
     return rel if matches_any(rel, volume._managed) else None
 
 
-def _make_open_wrapper(
-    volume: CoherentVolume, original_open: Callable, writers: weakref.WeakSet[_CommitOnCloseMixin]
-) -> Callable:
+def _make_open_wrapper(state: _ShimState) -> Callable:
+    volume, original_open, writers = state.volume, state.original_open, state.writers
+
     def coherent_open(file, mode="r", *args, **kwargs):
         rel = _managed_rel(volume, file)
         if rel is None:
@@ -5095,16 +5097,17 @@ def install(
     )
     original_open = builtins.open  # is io.open (same object) at install time
     state = _ShimState(volume, original_open)
-    wrapper = _make_open_wrapper(volume, original_open, state.writers)
+    wrapper = _make_open_wrapper(state)
     builtins.open = wrapper  # type: ignore[assignment]
     io.open = wrapper  # type: ignore[assignment]  # pathlib routes here, not builtins.open
     _shim_state = state
     return volume
 
 
-def _restore_open() -> _ShimState | None:
-    """Put the original ``builtins.open`` / ``io.open`` back and clear the shim;
-    the state it cleared, or ``None`` when no shim was installed."""
+def _retire_shim() -> _ShimState | None:
+    """Put the original ``builtins.open`` / ``io.open`` back, clear the shim and
+    name every writer still open; the state it cleared, or ``None`` when no
+    shim was installed. The caller closes the volume."""
     global _shim_state
     state = _shim_state
     if state is None:
@@ -5112,6 +5115,7 @@ def _restore_open() -> _ShimState | None:
     builtins.open = state.original_open  # type: ignore[assignment]
     io.open = state.original_open  # type: ignore[assignment]
     _shim_state = None
+    state.warn_open_writers()
     return state
 
 
@@ -5123,11 +5127,9 @@ def uninstall() -> None:
     leaves no shim behind; call the volume's ``close()`` to send it again. A
     managed file still open for writing is named in a warning: closing it later
     raises and writes nothing."""
-    state = _restore_open()
-    if state is None:
-        return
-    state.warn_open_writers()
-    state.volume.close()
+    state = _retire_shim()
+    if state is not None:
+        state.volume.close()
 
 
 @contextlib.contextmanager
@@ -5160,12 +5162,10 @@ def coherent_workspace(
     )
     try:
         yield volume
-    except BaseException as body_error:
+    except BaseException:
         if not already_installed:
-            state = _restore_open()
-            if state is not None:
-                state.warn_open_writers()
-            volume.__exit__(type(body_error), body_error, body_error.__traceback__)
+            _retire_shim()
+            volume._close_while_unwinding()
         raise
     else:
         if not already_installed:

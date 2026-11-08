@@ -864,3 +864,73 @@ def test_a_file_left_open_for_writing_past_the_block_is_named_and_writes_nothing
     with pytest.raises(CoherenceError, match="closed"):
         handle.close()
     assert (tmp_path / _X).read_bytes() == b"before the block"
+
+
+def test_a_detached_volume_releases_and_closes_without_a_request(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """A forked child drops its parent's grant record with the endpoint, so a
+    detached volume has nothing of its own to release.
+
+    Prevents a detached volume sending a release for grants it does not own."""
+    holder = _holder(tmp_path, fast_cfg)
+    holder.write(_X, b"from the parent")
+    holder._after_fork()
+    wire.sent.clear()
+
+    holder.release(_X)
+    holder.close()
+
+    assert wire.sent == []
+
+
+@pytest.mark.parametrize(
+    ("answer", "text"),
+    [
+        pytest.param(
+            {"ok": True, "degraded": True},
+            "the coordinator did not confirm the release of this volume's write grant on data/x.txt, "
+            "so the grant may still stand. Call release() again to send it again.",
+            id="not-confirmed",
+        ),
+        pytest.param(
+            _held_answer(_X),
+            "the coordinator answered the release of this volume's write grant on data/x.txt with the "
+            "grant still held. Call release() again to send it again.",
+            id="held",
+        ),
+    ],
+)
+def test_an_unconfirmed_release_says_exactly_what_happened(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire,
+    answer: dict, text: str,
+) -> None:
+    """The text is fixed but for the path, so a caller that retries on it sees
+    the same words each time. Prevents the release text drifting unseen."""
+    holder = _holder(tmp_path, fast_cfg)
+    holder.write(_X, b"from the holder")
+    wire.answers[_POST_EDIT] = answer
+
+    with pytest.raises(CoherenceError) as failure:
+        holder.release(_X)
+
+    assert str(failure.value) == text
+
+
+def test_an_unconfirmed_close_says_exactly_what_is_still_recorded(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """Prevents the close text drifting, or listing its paths in another order."""
+    holder = _holder(tmp_path, fast_cfg)
+    holder.write(_Z, b"z from the holder")
+    holder.write(_X, b"x from the holder")
+    wire.answers[_SESSION_STOP] = {"ok": True, "degraded": True}
+
+    with pytest.raises(CoherenceError) as failure:
+        holder.close()
+
+    assert str(failure.value) == (
+        "the coordinator did not confirm the release of every write grant this volume holds, so these "
+        "may still stand: data/x.txt, data/z.txt. The volume is closed; call close() again to send what "
+        "is still recorded."
+    )
