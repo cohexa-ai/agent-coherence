@@ -10,20 +10,26 @@ deletes nothing while the identity holds a write grant, and it keeps a row
 that records a sweep reclaim, which ``/status`` reports for a while after.
 Deleting a row is only safe for an identity that can never act again: the
 read-generation fence admits a commit from an identity with no row (pinned
-here), which is why only an explicit end may trigger it.
+here), which is why only an explicit end may trigger it. The service runs
+the forget under the request's watchdog abort, and forgets the committer of
+each snapshot session it drops, which can never commit again.
 """
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+import threading
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 
+from ccs.coordinator.service import CoordinatorService, SessionCapsConfig
 from ccs.coordinator.sqlite_registry import ReadOnlyMutationError, SqliteArtifactRegistry
+from ccs.core.exceptions import WatchdogAbandoned
 from ccs.core.states import MESIState, TransientState
-from ccs.core.types import Artifact
+from ccs.core.types import Artifact, EffectFired
 
 _RECLAIM_TRIGGER = "reclaim_heartbeat"
 
@@ -256,6 +262,154 @@ def test_a_forgotten_identitys_commit_is_admitted_on_version_alone(registry: obj
     admitted = registry.commit_cas(artifact_id, holder, expected_version=1, content_hash="h-2", tick=4)  # type: ignore[attr-defined]
 
     assert isinstance(admitted, tuple), f"the forgotten identity's commit was refused: {admitted!r}"
+
+
+# ---------------------------------------------------------------------------
+# The service: its forget entry, and the committer of a snapshot session it
+# drops. Once its token is dropped, a commit on it fails closed and no hook
+# route names a raw agent id, so that committer can never act again.
+# ---------------------------------------------------------------------------
+
+_HB_TIMEOUT = 120
+
+
+def _committed_session(service: CoordinatorService, artifact_id: UUID, *, created_at_tick: int = 0) -> tuple[str, UUID]:
+    """Open a snapshot session on ``artifact_id`` and commit it once; return
+    its token and the committer identity the commit ran under, now SHARED."""
+    owner = uuid4()
+    session = service.begin_session(read_set=[artifact_id], owner=owner, created_at_tick=created_at_tick)
+    token = session.session_token  # type: ignore[union-attr]
+    outcome = service.session_commit(token, artifact_id, "v2", caller=owner, issued_at_tick=created_at_tick + 1)
+    assert isinstance(outcome, tuple), f"precondition: the session's commit won, got {outcome!r}"
+    committer = CoordinatorService._session_committer_id(token)
+    assert service.registry.get_agent_state(artifact_id, committer) == MESIState.SHARED, "precondition"
+    return token, committer
+
+
+def test_the_service_forget_deletes_nothing_once_its_watchdog_has_answered(registry: object) -> None:
+    """The service runs the forget in one registry hold under the caller's
+    watchdog abort: once the watchdog has answered the request, the forget
+    raises and deletes nothing; with no abort set, it forgets.
+
+    Prevents a stop the coordinator already answered as degraded deleting
+    rows behind the client's back."""
+    service = CoordinatorService(registry)  # type: ignore[arg-type]
+    artifact_id, ended = _register(registry), uuid4()
+    registry.set_agent_state(artifact_id, ended, MESIState.SHARED, tick=1)  # type: ignore[attr-defined]
+    abort = threading.Event()
+    abort.set()
+
+    with pytest.raises(WatchdogAbandoned):
+        service.forget_agent(ended, abort=abort)
+
+    assert registry.get_agent_state(artifact_id, ended) == MESIState.SHARED  # type: ignore[attr-defined]
+    assert service.forget_agent(ended, abort=threading.Event()) == 1
+    assert registry.get_agent_state(artifact_id, ended) is None  # type: ignore[attr-defined]
+
+
+def test_the_liveness_sweep_forgets_the_committer_of_a_session_it_reaps(registry: object) -> None:
+    """The committer of a session the sweep reaps loses its row; the
+    committer of a session still live and a peer's read keep theirs.
+
+    Prevents every snapshot session leaving its committer's row behind."""
+    service = CoordinatorService(registry)  # type: ignore[arg-type]
+    stale_file, live_file, peer = _register(registry, "a.md"), _register(registry, "b.md"), uuid4()
+    _token, stale = _committed_session(service, stale_file)
+    _token, live = _committed_session(service, live_file, created_at_tick=_HB_TIMEOUT)
+    registry.set_agent_state(stale_file, peer, MESIState.SHARED, tick=_HB_TIMEOUT)  # type: ignore[attr-defined]
+
+    assert service.enforce_session_liveness(current_tick=_HB_TIMEOUT, heartbeat_timeout_ticks=_HB_TIMEOUT) == 1
+
+    assert registry.get_agent_state(stale_file, stale) is None  # type: ignore[attr-defined]
+    assert registry.get_agent_state(live_file, live) == MESIState.SHARED  # type: ignore[attr-defined]
+    assert registry.get_agent_state(stale_file, peer) == MESIState.SHARED  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("release_on_exit", [True, False], ids=["drops-session", "keeps-session"])
+def test_an_effect_gate_forgets_its_committer_when_it_drops_its_session(
+    registry: object, release_on_exit: bool
+) -> None:
+    """An atomic gate commits under its session's committer. A gate that
+    drops its session on exit forgets that committer; one that keeps the
+    session live keeps it."""
+    service = CoordinatorService(registry)  # type: ignore[arg-type]
+    artifact_id = _register(registry)
+    tokens: list[str] = []
+
+    outcome = service.effect_gate(
+        read_set=[artifact_id], owner=uuid4(), decide=lambda view: tokens.append(view._token),
+        commit=(artifact_id, "v2"), release_on_exit=release_on_exit,
+    )
+
+    assert isinstance(outcome, EffectFired), outcome
+    committer = CoordinatorService._session_committer_id(tokens[0])
+    expected = MESIState.SHARED if not release_on_exit else None
+    assert registry.get_agent_state(artifact_id, committer) == expected  # type: ignore[attr-defined]
+
+
+def test_a_dropped_sessions_committer_holding_a_write_grant_is_kept(
+    registry: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A committer's commits end SHARED, so one holding a write grant is a
+    ledger something else wrote. The forget's refusal is logged, the
+    committer keeps its row, and the session is dropped all the same.
+
+    Prevents one refused forget failing the sweep for every session after it."""
+    service = CoordinatorService(registry)  # type: ignore[arg-type]
+    artifact_id = _register(registry)
+    token, committer = _committed_session(service, artifact_id)
+    registry.set_agent_state(artifact_id, committer, MESIState.EXCLUSIVE, tick=2)  # type: ignore[attr-defined]
+
+    with caplog.at_level(logging.WARNING, logger="ccs.coordinator.service"):
+        reaped = service.enforce_session_liveness(current_tick=_HB_TIMEOUT, heartbeat_timeout_ticks=_HB_TIMEOUT)
+
+    assert reaped == 1
+    assert registry.get_agent_state(artifact_id, committer) == MESIState.EXCLUSIVE  # type: ignore[attr-defined]
+    assert registry.get_session_cut(token) is None  # type: ignore[attr-defined]
+    assert "forget_not_allowed" in caplog.text
+
+
+def test_a_store_fault_in_the_committer_forget_fails_the_sweep(
+    registry: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the forget's refusal is logged and passed over. A store fault in
+    the committer's forget raises out of the sweep, as one anywhere else in
+    the sweep does.
+
+    Prevents a failing store being logged as a committer merely kept while
+    the sweep reports the session reaped."""
+    service = CoordinatorService(registry)  # type: ignore[arg-type]
+    _committed_session(service, _register(registry))
+
+    def failing(_agent_id: UUID) -> int:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(registry, "forget_agent", failing)
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        service.enforce_session_liveness(current_tick=_HB_TIMEOUT, heartbeat_timeout_ticks=_HB_TIMEOUT)
+
+
+def test_a_restart_forgets_no_committer_on_its_own(tmp_path: Path) -> None:
+    """Reopening the store forgets nothing: the committer of a session that
+    survived the restart keeps its row until the sweep drops that session,
+    here at its age ceiling."""
+    db_path = tmp_path / "restart.db"
+    with SqliteArtifactRegistry(db_path) as before:
+        artifact_id = _register(before)
+        token, committer = _committed_session(CoordinatorService(before), artifact_id)
+
+    with SqliteArtifactRegistry(db_path) as after:
+        service = CoordinatorService(after)
+        assert after.get_agent_state(artifact_id, committer) == MESIState.SHARED
+        assert after.get_session_cut(token) is not None
+
+        reaped = service.enforce_session_liveness(
+            current_tick=SessionCapsConfig().absolute_age_ticks, heartbeat_timeout_ticks=_HB_TIMEOUT
+        )
+
+        assert reaped == 1
+        assert after.get_agent_state(artifact_id, committer) is None
 
 
 # ---------------------------------------------------------------------------
