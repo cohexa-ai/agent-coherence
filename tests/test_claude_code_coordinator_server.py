@@ -936,6 +936,42 @@ def test_the_policy_writer_refuses_a_file_it_cannot_read(tmp_path: Path) -> None
     assert policy_file.read_text() == "- runbook.md\n"
 
 
+def test_append_policy_yaml_refuses_a_link_to_a_device_and_keeps_it(tmp_path: Path) -> None:
+    """The routes share the merge's reader, so a policy file linked to a device is
+    refused there too. Prevents a route reading ``/dev/zero`` until memory runs
+    out; ``os.devnull`` takes the same path, and a regression here answers wrongly
+    instead."""
+    from ccs.adapters.claude_code.coordinator_server import _append_policy_yaml
+
+    policy_file = tmp_path / ".coherence" / "tracked.yaml"
+    policy_file.parent.mkdir()
+    policy_file.symlink_to(os.devnull)
+
+    with pytest.raises(ValueError) as raised:
+        _append_policy_yaml(policy_file, ["ok.md"])
+
+    assert str(raised.value) == ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."
+    assert policy_file.is_symlink()
+
+
+def test_a_policy_route_answers_400_for_a_policy_file_linked_to_a_device(
+    coordinator, client: _Client,
+) -> None:
+    """On the wire, a policy file linked to a device is the 400 every unreadable
+    file gets, naming it, with the link kept. ``os.devnull`` stands in for
+    ``/dev/zero``, so a regression answers wrongly instead of reading until memory
+    runs out."""
+    policy_file = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
+    policy_file.unlink(missing_ok=True)
+    policy_file.symlink_to(os.devnull)
+
+    s, b = client.post("/policy/track", {"paths": ["ok.md"]})
+
+    assert s == 400, b
+    assert b == {"error": ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."}, b
+    assert policy_file.is_symlink()
+
+
 def test_a_coordinator_over_a_broken_policy_file_counts_it_on_status(tmp_path: Path) -> None:
     """#284 at load time: a coordinator that starts over a tracked.yaml an
     earlier release broke serves, and /status counts the file as rejected,
@@ -3620,6 +3656,215 @@ def test_read_policy_entries_refuses_a_file_that_loads_as_no_entries(text: str, 
         _read_policy_entries(text, ".coherence/tracked.yaml")
     assert str(raised.value).startswith(".coherence/tracked.yaml ")
     assert says in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("body", "says"),
+    [
+        (b"- docs/**\n- *.md\n", "is not valid YAML"),
+        (b"- !!bool x\n", "is not valid YAML"),
+        (b"\xff\xfe\x00not text\n", "holds a single string, not a list"),
+        (b"\xc3\x28 not utf-8\n", "is not valid YAML"),
+        (b"plain: mapping\n", "holds a mapping, not a list"),
+        (b"just a string\n", "holds a single string, not a list"),
+    ],
+    ids=["unquoted_star", "tagged", "utf16_mark", "undecodable", "mapping", "scalar"],
+)
+def test_merge_policy_globs_refuses_a_file_that_loads_as_no_entries_and_keeps_it(
+    tmp_path: Path, body: bytes, says: str,
+) -> None:
+    """#305: a volume or substrate session about to spawn the coordinator refuses
+    a policy file that loads as no entries, names it, and leaves its bytes alone.
+
+    Prevents the merge reading it as empty and replacing it with only the managed
+    globs, deleting every other entry with no log line. A file broken by a release
+    that wrote ``- *.md`` is exactly what the restart after it would have reported
+    as rejected."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked = coherence / "tracked.yaml"
+    tracked.write_bytes(body)
+
+    with pytest.raises(ValueError, match="nothing was written") as raised:
+        merge_policy_globs((tracked,), ("data/**",))
+
+    assert str(raised.value).startswith(".coherence/tracked.yaml ")
+    assert says in str(raised.value)
+    assert tracked.read_bytes() == body
+
+
+def test_merge_policy_globs_refuses_a_file_it_cannot_read(tmp_path: Path) -> None:
+    """#305: a read failure refuses too, as the routes do. Prevents it reading as
+    empty, which replaced a file holding every pattern. A directory stands in
+    for the failure so the test does not depend on the user running it."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    (coherence / "tracked.yaml").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match=r"could not be read \(EISDIR\); nothing was written"):
+        merge_policy_globs((coherence / "tracked.yaml",), ("data/**",))
+
+    assert (coherence / "tracked.yaml").is_dir()
+
+
+def test_merge_policy_globs_refuses_a_link_to_a_device_and_keeps_it(tmp_path: Path) -> None:
+    """A repository can commit a policy file as a link, and a device such as
+    ``/dev/zero`` never reaches EOF. Prevents the merge reading one until memory
+    runs out. ``os.devnull`` takes the same path, and a regression here answers
+    wrongly instead."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked = coherence / "tracked.yaml"
+    tracked.symlink_to(os.devnull)
+
+    with pytest.raises(ValueError) as raised:
+        merge_policy_globs((tracked,), ("data/**",))
+
+    assert str(raised.value) == ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."
+    assert tracked.is_symlink()
+
+
+def test_merge_policy_globs_works_where_the_platform_has_no_o_nonblock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``O_NONBLOCK`` is POSIX-only. Prevents its absence making the merge raise
+    AttributeError out of a volume's or a session's constructor, where degrade mode
+    promises to warn: a regular file still merges and a device is still refused."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked = coherence / "tracked.yaml"
+    tracked.write_text('- "docs/**"\n')
+    device = coherence / "strict_mode.yaml"
+    device.symlink_to(os.devnull)
+    monkeypatch.delattr(os, "O_NONBLOCK")
+
+    merge_policy_globs((tracked,), ("data/**",))
+    with pytest.raises(ValueError, match=r"strict_mode\.yaml could not be read \(not a regular file\)"):
+        merge_policy_globs((device,), ("data/**",))
+
+    assert yaml.safe_load(tracked.read_text()) == ["data/**", "docs/**"]
+
+
+@pytest.mark.parametrize("linked", [False, True], ids=["fifo", "link_to_fifo"])
+def test_merge_policy_globs_refuses_a_fifo_without_blocking(tmp_path: Path, linked: bool) -> None:
+    """Opening a FIFO with no writer blocks forever, which would hang a volume's or
+    a session's constructor with nothing named. The merge runs on a thread so a
+    regression fails here instead of hanging the suite."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked = coherence / "tracked.yaml"
+    fifo = tmp_path / "outside.fifo" if linked else tracked
+    os.mkfifo(fifo)
+    if linked:
+        tracked.symlink_to(fifo)
+    refusals: list[str] = []
+
+    def merge() -> None:
+        try:
+            merge_policy_globs((tracked,), ("data/**",))
+        except ValueError as exc:
+            refusals.append(str(exc))
+
+    worker = threading.Thread(target=merge, daemon=True)
+    worker.start()
+    worker.join(timeout=30)
+    if worker.is_alive():
+        # Opening the other end releases the blocked read so the thread can end.
+        os.close(os.open(fifo, os.O_RDWR | os.O_NONBLOCK))
+        worker.join(timeout=5)
+        pytest.fail("the merge blocked on a FIFO")
+
+    assert refusals == [".coherence/tracked.yaml could not be read (not a regular file); nothing was written."]
+    assert tracked.is_symlink() is linked
+
+
+@pytest.mark.parametrize("target_exists", [True, False], ids=["existing_target", "dangling"])
+def test_merge_policy_globs_leaves_a_linked_files_target_alone(tmp_path: Path, target_exists: bool) -> None:
+    """A merge renames over a policy file kept as a link, as the routes do. Prevents
+    it writing through a link a repository committed: the file the link names keeps
+    its bytes, or stays absent for a dangling link."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    target = tmp_path / "outside.yaml"
+    if target_exists:
+        target.write_text('- "docs/**"\n')
+    (coherence / "tracked.yaml").symlink_to(target)
+
+    merge_policy_globs((coherence / "tracked.yaml",), ("data/**",))
+
+    assert "data/**" in yaml.safe_load((coherence / "tracked.yaml").read_text())
+    assert (target.read_text() == '- "docs/**"\n') if target_exists else not target.exists()
+
+
+@pytest.mark.parametrize("broken_first", [True, False], ids=["broken_first", "broken_last"])
+def test_merge_policy_globs_writes_neither_file_when_it_refuses_one(
+    tmp_path: Path, broken_first: bool,
+) -> None:
+    """#305: the refusal says nothing was written, so it holds for every file in
+    the merge, in either order.
+
+    Prevents a refused attach leaving the managed globs tracked but not strict,
+    for the next coordinator to load."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    good, broken = coherence / "tracked.yaml", coherence / "strict_mode.yaml"
+    good.write_text('- "docs/**"\n')
+    broken.write_text("- *.md\n")
+
+    with pytest.raises(ValueError, match="strict_mode.yaml"):
+        merge_policy_globs((broken, good) if broken_first else (good, broken), ("data/**",))
+
+    assert good.read_text() == '- "docs/**"\n'
+    assert broken.read_text() == "- *.md\n"
+    assert sorted(path.name for path in coherence.iterdir()) == ["strict_mode.yaml", "tracked.yaml"]
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        (None, ["data/**"]),
+        ("", ["data/**"]),
+        ("~\n", ["data/**"]),
+        ('- "docs/**"\n', ["data/**", "docs/**"]),
+        ('- "*.md"\n', ["*.md", "data/**"]),
+    ],
+    ids=["absent", "empty", "null", "an_entry", "a_quoted_star"],
+)
+def test_merge_policy_globs_adds_to_a_file_that_loads(
+    tmp_path: Path, before: Optional[str], after: list[str],
+) -> None:
+    """A missing, empty or valid file takes the globs and keeps what it held, and
+    the result loads back. Prevents the refusal reaching a file with nothing
+    wrong with it: a fresh workspace has no policy file at all."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    tracked = tmp_path / "tracked.yaml"
+    if before is not None:
+        tracked.write_text(before)
+
+    merge_policy_globs((tracked,), ("data/**",))
+
+    assert yaml.safe_load(tracked.read_text()) == after
+    assert [path.name for path in tmp_path.iterdir()] == ["tracked.yaml"]
+
+
+def test_merge_policy_globs_leaves_a_file_that_already_holds_the_globs(tmp_path: Path) -> None:
+    """A merge that adds nothing does not rewrite, so a sibling's start does not
+    churn the file, or drop its comments, for nothing."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    tracked = tmp_path / "tracked.yaml"
+    tracked.write_text('# kept\n- "data/**"\n')
+    before = tracked.stat().st_ino
+
+    merge_policy_globs((tracked,), ("data/**",))
+
+    assert tracked.read_text() == '# kept\n- "data/**"\n'
+    assert tracked.stat().st_ino == before
 
 
 def test_read_policy_entries_blames_extra_documents_only_for_a_second_document() -> None:

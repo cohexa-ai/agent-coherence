@@ -2699,6 +2699,76 @@ def test_a_start_interrupted_just_after_it_took_the_flock_releases_it(
         stop_coordinator(workspace)
 
 
+@pytest.mark.parametrize("target_exists", [True, False], ids=["existing_target", "dangling"])
+def test_a_start_refuses_a_symlinked_pid_file_and_leaves_its_target_alone(
+    workspace: Path, fast_cfg: LifecycleConfig, tmp_path_factory: pytest.TempPathFactory,
+    caplog: pytest.LogCaptureFixture, target_exists: bool,
+) -> None:
+    """#464: a repository can commit ``server.pid`` as a symlink. The first start
+    in a clone refuses it, says why, and the file the link names is untouched, or
+    still absent for a dangling link.
+
+    Prevents a start truncating the link's target and writing its pid and port
+    there, and its shutdown rewriting it, or creating that file outside the
+    workspace."""
+    target = tmp_path_factory.mktemp("outside") / "target"
+    if target_exists:
+        target.write_bytes(b"keep\n")
+    coherence = workspace / ".coherence"
+    coherence.mkdir(mode=0o700)
+    pid_file = coherence / "server.pid"
+    pid_file.symlink_to(target)
+    caplog.set_level("WARNING")
+
+    assert ensure_coordinator_handle(workspace, config=fast_cfg) is None
+    assert ensure_coordinator(workspace, config=fast_cfg) == -1
+
+    assert pid_file.is_symlink()
+    assert (target.read_bytes() == b"keep\n") if target_exists else not target.exists()
+    assert str(workspace.resolve()) not in lifecycle._SPAWNED_REGISTRY
+    assert f"refusing pid file {pid_file}: it is a symlink" in caplog.text
+
+
+def test_a_start_that_cannot_open_its_pid_file_does_not_blame_a_symlink(
+    workspace: Path, fast_cfg: LifecycleConfig, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Prevents a start refused for another reason telling the user to remove a link
+    that is not there. A directory stands in for the failure so the test does not
+    depend on the user running it."""
+    coherence = workspace / ".coherence"
+    coherence.mkdir(mode=0o700)
+    (coherence / "server.pid").mkdir()
+    caplog.set_level("WARNING")
+
+    assert ensure_coordinator_handle(workspace, config=fast_cfg) is None
+
+    assert "cannot open pid file" in caplog.text
+    assert "it is a symlink" not in caplog.text
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root searches a mode-000 directory"
+)
+def test_a_pid_file_in_a_directory_it_cannot_search_is_not_blamed_on_a_link(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``Path.is_symlink`` raises where it cannot look. Prevents the check that names
+    a link raising out of a pid-file open whose callers expect None."""
+    from ccs.adapters.claude_code.lifecycle import _open_pidfile
+
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir(mode=0o700)
+    caplog.set_level("WARNING")
+
+    coherence.chmod(0)
+    try:
+        assert _open_pidfile(coherence / "server.pid") is None
+    finally:
+        coherence.chmod(0o700)
+
+    assert "cannot open pid file" in caplog.text
+
+
 def _hold_the_flock_with_no_port(root: Path) -> int:
     """Hold server.pid's flock through a separate open in this process, with
     no port line: every call then loses the flock and never reads a port."""

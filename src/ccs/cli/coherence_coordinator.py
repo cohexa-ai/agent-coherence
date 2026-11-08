@@ -49,8 +49,8 @@ Exit codes (spawn mode):
 - 0: coordinator is up and reachable (port printed to stdout)
 - 1: not in a git repository (no coordinator root resolved)
 - 2: coordinator failed to spawn (platform unsupported, FS read-only,
-     port never appeared in the file, or detached child crashed), or a
-     usage error
+     a symlinked ``server.pid``, port never appeared in the file, or
+     detached child crashed), or a usage error
 
 Exit codes (``--check-store``; 1 and 2 as above, 3-9 left to spawn mode):
 - 0: current — a start opens the store unchanged
@@ -70,6 +70,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -81,6 +82,7 @@ from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     ensure_coordinator,
     stop_coordinator,
+    symlinked_pid_file_refusal,
 )
 from ccs.adapters.claude_code.lifecycle import (
     read_port_from_file as _read_port_from_file,
@@ -263,6 +265,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.quiet:
             print(f"port={existing_port}", flush=True)
         return 0
+
+    # The child would refuse this too, but its stderr is /dev/null: the user
+    # would wait out the window and never learn why. os.path.islink, because
+    # Path.is_symlink raises on a .coherence it cannot search, which the child
+    # repairs when the user owns it.
+    if os.path.islink(pid_file):
+        err(f"agent-coherence-coordinator: {escape_nonprintable(symlinked_pid_file_refusal(pid_file))}")
+        return 2
 
     # No live coordinator — fork a detached child to run it.
     return _spawn_detached(root, quiet=args.quiet, bind_host=args.bind_host)

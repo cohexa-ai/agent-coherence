@@ -1819,9 +1819,12 @@ the call, not whether the coordinator still runs: idle shutdown can stop a
 coordinator the call started, and the next call reports `bound` again. Only a
 caller told `bound` should stop the coordinator with `stop_coordinator`. It
 returns `None` where `ensure_coordinator` returns `-1`; `ensure_coordinator`
-still returns a bare port. A start that fails stops whatever it started and
-raises instead: `SchemaVersionError` on a store it refuses (its `reason` says
-why), `sqlite3.Error` on a file SQLite cannot open, `OSError` when the lock or
+still returns a bare port. A `.coherence/server.pid` that is a symlink is one
+such case: the start logs a warning naming it and starts nothing, rather than
+write through the link, and `agent-coherence-coordinator` prints that text and
+exits `2`. A start that fails stops whatever it started and raises instead:
+`SchemaVersionError` on a store it refuses (its `reason` says why),
+`sqlite3.Error` on a file SQLite cannot open, `OSError` when the lock or
 the bind fails, `ValueError` on a `bind_host` it refuses, and `RuntimeError`
 when it cannot read the hook secret or start a thread. A `KeyboardInterrupt` or
 `SystemExit` during a start gets the same cleanup and then propagates. To ask
@@ -5181,12 +5184,21 @@ string (`- "*.md"`). A glob that YAML would otherwise read as something else,
 such as `*.md`, `[abc].md`, `{a,b}.md`, `yes` or `2026-10-12`, reads back
 exactly as written. When the file cannot take a new entry, the coordinator
 answers HTTP 400 naming the file, writes nothing, and the command exits `2`
-with that text. That happens when the file cannot be read, when it is not
-valid YAML or not a list, which the coordinator reads as no entries at all, or
-when an added line would break it: a `[ ... ]` list, an indented list, a `...`
-end marker or a lone `~`. Rewrite the file with one entry per line, each
-double-quoted, and retry. The coordinator replaces the file rather than
+with that text. That happens when the file cannot be read (on the Python
+coordinator, a FIFO or device, or a link to one, counts), when it is not valid
+YAML or not a list, which the coordinator reads as no entries at all, or when an
+added line would break it: a `[ ... ]` list, an indented list, a `...` end marker
+or a lone `~`. Rewrite the file with one entry per line, each double-quoted, and
+retry. The coordinator replaces the file rather than
 writing into it, so a policy file kept as a symlink becomes a regular file.
+
+A `CoherentVolume` or substrate session about to start the coordinator merges
+its managed globs into `tracked.yaml` and `strict_mode.yaml`, and treats a file
+that cannot be read, is not valid YAML or is not a list the same way: it names
+the file, writes neither one, and starts no coordinator. A strict volume or a
+session raises `CoherenceError` with that text, after the workspace root. A
+volume in degrade mode warns and stays detached, so build a new one once the
+file is fixed.
 
 Releases up to 0.14.1 wrote entries without quotes. An entry starting with
 `*`, `[`, `{`, `!`, `&`, `%`, `@`, `|`, `>` or a quote, written by one of them,

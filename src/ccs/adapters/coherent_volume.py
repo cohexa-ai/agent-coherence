@@ -49,9 +49,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NamedTuple
 
-import yaml
-
-from ccs.adapters.claude_code.coordinator_server import parse_agent_id, session_to_agent_id
+from ccs.adapters.claude_code.coordinator_server import (
+    merge_policy_globs,
+    parse_agent_id,
+    session_to_agent_id,
+)
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     connect_or_spawn,
@@ -452,6 +454,10 @@ _IF_UNHELD_NOT_ADVERTISED_MESSAGE = (
     "take a file from its holder instead. Nothing was sent. Run agent-coherence-status "
     "to see its version, then upgrade it or use on_held='displace'."
 )
+
+#: What a degrade volume adds to a policy refusal (#305): the retry the refusal
+#: asks for is a new volume, because this one does not attach again.
+_POLICY_REFUSAL_DEGRADED_NOTE = "This volume stays detached: build a new one once the file is fixed."
 
 
 def _no_principal_message(rel: str, outcome: str) -> str:
@@ -928,7 +934,8 @@ class CoherentVolume:
     ``on_error``:
 
     - ``"strict"`` (default): any coherence failure — a coordinator that is
-      unavailable, or one already running that we cannot enable strict on —
+      unavailable, one already running that we cannot enable strict on, or a
+      policy file the volume cannot merge its globs into before spawning one —
       raises :class:`~ccs.core.exceptions.CoherenceError`. Fail-closed. A
       request that gets no usable answer from the coordinator raises its
       subclass :class:`~ccs.core.exceptions.CoordinatorUnreachable`, except
@@ -1449,7 +1456,13 @@ class CoherentVolume:
             pre_port, cfg, bind_host=self._bind_host
         )
         if not pre_existing:
-            self._write_policy_yaml()
+            try:
+                self._write_policy_yaml()
+            except ValueError as exc:
+                # A policy file it cannot merge into (#305). It is the user's to
+                # rewrite, so start nothing: the refusal names the file.
+                self._policy_refusal_or_degrade(exc)
+                return
 
         # No coordinator to spawn or attach, and an endpoint that cannot be
         # resolved, are the same fact for the caller as a coordinator that is
@@ -1624,7 +1637,8 @@ class CoherentVolume:
 
         Writes the managed globs to both ``tracked.yaml`` and ``strict_mode.yaml``
         (a path must be tracked AND strict for the deny to fire). Idempotent —
-        merges with any existing entries. No-op when ``managed`` is empty.
+        merges with any existing entries. No-op when ``managed`` is empty. Raises
+        ValueError naming a policy file it cannot merge into (#305).
         """
         if not self._managed:
             return
@@ -1637,29 +1651,9 @@ class CoherentVolume:
         # earlier. An existing directory is left as-is (mkdir never chmods);
         # re-tightening stays the lifecycle's job.
         coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._merge_yaml_list(coherence_dir / "tracked.yaml", self._managed)
-        self._merge_yaml_list(coherence_dir / "strict_mode.yaml", self._managed)
-
-    @staticmethod
-    def _merge_yaml_list(path: Path, globs: tuple[str, ...]) -> None:
-        existing: list[str] = []
-        if path.is_file():
-            try:
-                loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
-            except (yaml.YAMLError, OSError):
-                loaded = None
-            if isinstance(loaded, list):
-                existing = [x for x in loaded if isinstance(x, str)]
-        merged = sorted(set(existing) | set(globs))
-        if merged == sorted(existing):
-            return  # nothing new — avoid a needless rewrite
-        # Atomic write so a concurrent coordinator spawn never reads a partial file.
-        # UUID-suffix the temp name (like _atomic_write) so a predictable ``.tmp``
-        # path can't be pre-placed as a symlink by a local same-uid process (the
-        # write_text would otherwise follow it).
-        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(yaml.safe_dump(merged, default_flow_style=False), encoding="utf-8")
-        os.replace(tmp, path)
+        merge_policy_globs(
+            (coherence_dir / "tracked.yaml", coherence_dir / "strict_mode.yaml"), self._managed
+        )
 
     # --- strict-mode verification (used by tests + callers) -----------------
 
@@ -4437,6 +4431,15 @@ class CoherentVolume:
         if self._on_error == "strict":
             raise CoherenceError(message)
         self._record_degraded(message)
+
+    def _policy_refusal_or_degrade(self, refusal: ValueError) -> None:
+        """A policy file this volume cannot merge its globs into, through
+        ``on_error``. The text names the workspace, because a caller can hold
+        volumes over several roots."""
+        message = f"{self._root}: {refusal}"
+        if self._on_error == "strict":
+            raise CoherenceError(message)
+        self._record_degraded(f"{message} {_POLICY_REFUSAL_DEGRADED_NOTE}")
 
     def _failed_read_or_degrade(self, resp: dict, rel: str) -> None:
         """A pre-read the coordinator answered with ``ok: false``, which it does

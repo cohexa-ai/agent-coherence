@@ -215,6 +215,68 @@ def _session(tmp_path: Path, fast_cfg: LifecycleConfig) -> SubstrateCoordinatorS
     return SubstrateCoordinatorSession(tmp_path, managed=("**",), config=fast_cfg)
 
 
+@pytest.mark.parametrize("name", ["tracked.yaml", "strict_mode.yaml"])
+def test_a_session_refuses_a_policy_file_it_cannot_load_and_keeps_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig, name: str
+) -> None:
+    """#305: a session about to spawn the coordinator raises naming a policy file
+    that loads as no entries, and its workspace, leaves it and the other file as
+    they were, and starts no coordinator.
+
+    Prevents the spawn deleting the user's entries. Refusing, not skipping the
+    merge, because a session has no check after it attaches: a skipped merge would
+    run it unenforced with no signal."""
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(mode=0o700)
+    broken = coherence_dir / name
+    broken.write_text("- docs/**\n- *.md\n")
+
+    with pytest.raises(CoherenceError, match="is not valid YAML") as raised:
+        SubstrateCoordinatorSession(tmp_path, managed=("data/**",), config=fast_cfg)
+
+    assert str(raised.value).startswith(f"{tmp_path.resolve()}: .coherence/{name} is not valid YAML")
+    assert broken.read_text() == "- docs/**\n- *.md\n"
+    assert [path.name for path in coherence_dir.glob("*.yaml")] == [name]
+    assert not (coherence_dir / "server.pid").exists()
+
+
+def test_a_session_joining_a_running_coordinator_is_not_refused_over_a_policy_file(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """Only the spawner merges: a coordinator loads its policy once, so a file broken
+    after that changes nothing for a session joining it. Prevents the #305 refusal
+    reaching a sibling, or the sibling rewriting the file."""
+    _session(tmp_path, fast_cfg)
+    try:
+        broken = tmp_path / ".coherence" / "tracked.yaml"
+        broken.write_text("- docs/**\n- *.md\n")
+
+        assert _session(tmp_path, fast_cfg).session_id
+
+        assert broken.read_text() == "- docs/**\n- *.md\n"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_session_refuses_a_symlinked_pid_file_and_leaves_its_target_alone(
+    tmp_path: Path, fast_cfg: LifecycleConfig, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """#464 through a session, which reads the pid file before it starts anything.
+    Prevents that path writing through the link: it raises, fail-closed, and the file
+    the link names keeps its bytes."""
+    target = tmp_path_factory.mktemp("outside") / "target"
+    target.write_bytes(b"keep\n")
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(mode=0o700)
+    (coherence_dir / "server.pid").symlink_to(target)
+
+    with pytest.raises(CoordinatorUnreachable):
+        _session(tmp_path, fast_cfg)
+
+    assert (coherence_dir / "server.pid").is_symlink()
+    assert target.read_bytes() == b"keep\n"
+
+
 # --- spawn: the pre-spawn policy write creates .coherence/ at 0700 ----------
 
 
