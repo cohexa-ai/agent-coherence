@@ -4887,7 +4887,9 @@ no commit of its own to explain them, is told so:
 
 A Claude Code session that edited a file keeps a read of it when its turn
 ends, so on its next turn, while nothing has changed the file since, its Read
-is fresh and its Edit is admitted. In warn mode a session can still edit a
+is fresh and its Edit is admitted. The plugin's built-in Node coordinator
+does the same from its releases after 0.6.0; on an older one, a strict-mode
+session's Read of its own file is denied as revoked. In warn mode a session can still edit a
 file another session changed since its last read; if that edit fails or its
 turn ends, the session keeps a read of the current version, so its next Read
 is fresh and no stale warning is shown. Strict mode denies that edit, so this

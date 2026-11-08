@@ -199,7 +199,12 @@ Alpha — APIs may change before `v1.0`.
   and is still denied. In warn mode a session can still edit such a file, and
   if that edit fails or its turn ends, the session keeps a read of the current
   version, so its next Read is fresh and shows no stale warning. A release
-  still moves the ownership epoch. Answer shapes and deny texts are unchanged;
+  still moves the ownership epoch. A registry built on `RegistryBase` must
+  move the epoch whenever a trigger in `EPOCH_BUMP_TRIGGERS` takes an agent
+  out of EXCLUSIVE or MODIFIED, whatever state it lands in: SHARED on a
+  holder's own release as well as INVALID. The conformance kit's
+  voluntary-release check now covers both end states, and the trigger is
+  named `RELEASE_TRIGGER`. Answer shapes and deny texts are unchanged;
   the reason on a refused commit names the caller's state, so a commit
   refused after the caller's own release now says `SHARED` where it said
   `INVALID`. A failed-edit report from a caller that holds no write grant
