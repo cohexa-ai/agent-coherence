@@ -835,6 +835,60 @@ class CallerPrincipalRefused(CoherenceError):
         return type(self), (self.reason, str(self)), {**self.__dict__, "args": self.args}
 
 
+# A start's refusal of this workspace's ``.coherence`` (#498). One class-level
+# reason, so every surface (the exception, ``--check-store``, the workspace
+# envelope) answers one token; ``kind`` says which rule refused it. Wire-stable
+# and ADDITIVE, matched by ``reason == CONSTANT`` / ``kind in KINDS``, never by
+# a substring of the message.
+COHERENCE_DIR_REFUSED_REASON = "coherence_dir_refused"
+COHERENCE_LINK_KIND = "coherence_link"
+"""``.coherence`` is a symlink, or an entry directly inside it is one."""
+
+COHERENCE_NOT_A_DIRECTORY_KIND = "coherence_not_a_directory"
+"""``.coherence`` exists and is not a directory: a regular file, FIFO, socket or
+device."""
+
+COHERENCE_SPECIAL_ENTRY_KIND = "coherence_special_entry"
+"""An entry directly inside ``.coherence`` is a FIFO, socket or device, which no
+coordinator creates and whose open can block a start."""
+
+COHERENCE_DIR_REFUSAL_KINDS: frozenset[str] = frozenset(
+    {
+        COHERENCE_LINK_KIND,
+        COHERENCE_NOT_A_DIRECTORY_KIND,
+        COHERENCE_SPECIAL_ENTRY_KIND,
+    }
+)
+
+
+class CoherenceDirRefused(CoherenceError):
+    """A coordinator start refused this workspace's ``.coherence`` (#498): it is
+    a symlink or not a directory, or it holds a symlink, FIFO, socket or device
+    directly inside it. Nothing was written, joined or probed.
+
+    Not a :class:`CoordinatorUnreachable`: no retry, and no coordinator started
+    later, clears it. A person replaces the link or mounts a directory at
+    ``.coherence``, then builds a new volume or session. Carries
+    :data:`COHERENCE_DIR_REFUSED_REASON` on the class; ``kind`` (one of
+    :data:`COHERENCE_DIR_REFUSAL_KINDS`) says which rule refused it, and
+    ``path`` is the refused path, raw: a CLI escapes it before printing. It
+    rebuilds from its three fields, so it pickles whole across a process
+    boundary.
+    """
+
+    reason = COHERENCE_DIR_REFUSED_REASON
+
+    def __init__(self, kind: str, path: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.path = path
+
+    def __reduce__(
+        self,
+    ) -> tuple[type[CoherenceDirRefused], tuple[str, str, str], dict[str, object]]:
+        return type(self), (self.kind, self.path, str(self)), {**self.__dict__, "args": self.args}
+
+
 class GiverFenced(CoherenceError):
     """The committer handed this path off, and the handoff is still live: its
     write is refused, on the pessimistic route and the compare-and-swap route
