@@ -37,7 +37,6 @@ from ccs.core.exceptions import (
     CoherenceDirRefused,
 )
 
-# The store moves with its sidecars, or the moved copy loses its history.
 _STORE_NAME_PREFIXES = ("state.db", "workspace.db")
 _STORE_NOTE = " (move state.db together with its -wal and -shm)"
 
@@ -67,11 +66,17 @@ def check_coherence_dir(coordinator_root: Path) -> None:
     except OSError:
         return
     if links:
-        raise _refused(COHERENCE_LINK_KIND, links[0], entry_link_refusal(links[0], more=len(links) - 1))
+        raise entry_link_refused(links[0], more=len(links) - 1)
     if specials:
         raise _refused(
             COHERENCE_SPECIAL_ENTRY_KIND, specials[0], special_entry_refusal(specials[0], more=len(specials) - 1)
         )
+
+
+def entry_link_refused(path: Path, more: int = 0) -> CoherenceDirRefused:
+    """The refusal of a symlink directly inside ``.coherence``, as the start
+    check raises it; ``more`` counts the other links there."""
+    return _refused(COHERENCE_LINK_KIND, path, entry_link_refusal(path, more))
 
 
 def _refused(kind: str, path: Path, message: str) -> CoherenceDirRefused:
@@ -137,6 +142,15 @@ def entry_link_refusal(path: Path, more: int = 0) -> str:
         f"directly inside it. Replace the link with a copy of the file it names{store_note}, "
         f"or mount a directory at {path.parent}.{_more_text(more, 'is a link', 'are links')}"
     )
+
+
+def state_file_link_refusal(link_path: Path, coherence_dir: Path) -> str:
+    """The refusal for a :func:`~ccs.adapters.claude_code.regular_file.read_state_file`
+    ``LINK`` answer: ``link_path`` is the answer's path, ``coherence_dir``
+    itself when the state directory is the link."""
+    if link_path == coherence_dir:
+        return dir_link_refusal(coherence_dir)
+    return entry_link_refusal(link_path)
 
 
 def not_a_directory_refusal(coherence_dir: Path) -> str:

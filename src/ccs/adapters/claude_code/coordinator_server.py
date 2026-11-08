@@ -9413,16 +9413,20 @@ def _read_policy_bytes(yaml_path: Path, name: str) -> bytes:
     ``/dev/zero`` never reaches EOF."""
     result = read_regular_file(yaml_path)
     if result.status is ReadStatus.READ:
-        return result.data or b""
+        return result.data
     if result.status is ReadStatus.ABSENT:
         return b""
     if result.status is ReadStatus.LINK:
         raise ValueError(policy_link_refusal(name))
     exc = result.error
-    if exc is None or (result.status is ReadStatus.NOT_REGULAR and exc.errno != errno.EISDIR):
-        raise ValueError(f"{name} could not be read (not a regular file); nothing was written.")
-    code = errno.errorcode.get(exc.errno, str(exc)) if exc.errno else str(exc)
-    raise ValueError(f"{name} could not be read ({code}); nothing was written.")
+    # A directory keeps its errno text, so the wire text matches the Node coordinator's.
+    if exc is not None and (
+        result.status is ReadStatus.UNREADABLE
+        or (result.status is ReadStatus.NOT_REGULAR and exc.errno == errno.EISDIR)
+    ):
+        code = errno.errorcode.get(exc.errno, str(exc)) if exc.errno else str(exc)
+        raise ValueError(f"{name} could not be read ({code}); nothing was written.")
+    raise ValueError(f"{name} could not be read (not a regular file); nothing was written.")
 
 
 def _entries_or_none(text: str, name: str) -> list[str] | None:

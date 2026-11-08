@@ -23,7 +23,6 @@ import json
 import logging
 import os
 import ssl
-import stat
 import sys
 import threading
 import urllib.error
@@ -47,7 +46,7 @@ from ccs.adapters.claude_code.coordinator_server import (
 )
 from ccs.adapters.claude_code.lifecycle import read_port_from_file as _read_port_from_file
 from ccs.adapters.claude_code.regular_file import ReadStatus, read_state_file
-from ccs.adapters.claude_code.state_dir import dir_link_refusal, entry_link_refusal
+from ccs.adapters.claude_code.state_dir import dir_link_refusal, state_file_link_refusal
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_CLAIMED_REASON,
     CALLER_PRINCIPAL_REASONS,
@@ -368,7 +367,7 @@ def resolve_endpoint(coordinator_root: Path) -> CoordinatorEndpoint:
     pid_file = coherence_dir / "server.pid"
     secret_file = coherence_dir / "hook.secret"
 
-    if _is_symlink(coherence_dir):
+    if os.path.islink(coherence_dir):
         raise CoordinatorUnavailable(dir_link_refusal(coherence_dir))
 
     port = _read_port_from_file(pid_file)
@@ -381,13 +380,6 @@ def resolve_endpoint(coordinator_root: Path) -> CoordinatorEndpoint:
     return CoordinatorEndpoint(port=port, bearer=_read_bearer(coherence_dir, secret_file))
 
 
-def _is_symlink(path: Path) -> bool:
-    try:
-        return stat.S_ISLNK(os.lstat(path).st_mode)
-    except OSError:
-        return False
-
-
 def _read_bearer(coherence_dir: Path, secret_file: Path) -> str:
     """``hook.secret``'s token, read as a regular file only, never through a
     link: the bytes of the file a link names would go out as the bearer to
@@ -395,10 +387,7 @@ def _read_bearer(coherence_dir: Path, secret_file: Path) -> str:
     :class:`CoordinatorUnavailable` naming why there is none."""
     result = read_state_file(coherence_dir, secret_file.name)
     if result.status is ReadStatus.LINK:
-        # The state directory itself, when it became a link after the check above.
-        raise CoordinatorUnavailable(
-            dir_link_refusal(coherence_dir) if result.path == coherence_dir else entry_link_refusal(secret_file)
-        )
+        raise CoordinatorUnavailable(state_file_link_refusal(result.path, coherence_dir))
     if result.status is ReadStatus.ABSENT:
         raise CoordinatorUnavailable(
             "coordinator authentication unavailable "

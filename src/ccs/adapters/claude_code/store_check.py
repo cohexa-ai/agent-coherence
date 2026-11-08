@@ -93,9 +93,7 @@ from ccs.coordinator.sqlite_registry import (
     trial_writer_open,
 )
 from ccs.core.exceptions import (
-    COHERENCE_LINK_KIND,
-    COHERENCE_NOT_A_DIRECTORY_KIND,
-    COHERENCE_SPECIAL_ENTRY_KIND,
+    COHERENCE_DIR_REFUSAL_KINDS,
     SCHEMA_NEWER_REASON,
     CoherenceDirRefused,
 )
@@ -160,9 +158,7 @@ STORE_CHECK_REASONS: frozenset[str] = frozenset(
         CHECK_ENVIRONMENT_FAILED_REASON,
         LOCK_PROBE_FAILED_REASON,
         PLATFORM_UNSUPPORTED_REASON,
-        COHERENCE_LINK_KIND,
-        COHERENCE_NOT_A_DIRECTORY_KIND,
-        COHERENCE_SPECIAL_ENTRY_KIND,
+        *COHERENCE_DIR_REFUSAL_KINDS,
     }
 )
 

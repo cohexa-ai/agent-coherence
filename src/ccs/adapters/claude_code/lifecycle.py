@@ -45,9 +45,8 @@ from pathlib import Path
 from uuid import UUID
 
 from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
-from ccs.adapters.claude_code.state_dir import check_coherence_dir, entry_link_refusal
+from ccs.adapters.claude_code.state_dir import check_coherence_dir, entry_link_refused
 from ccs.coordinator.sqlite_registry import SCHEMA_USER_VERSION
-from ccs.core.exceptions import COHERENCE_LINK_KIND, CoherenceDirRefused
 
 logger = logging.getLogger(__name__)
 
@@ -865,9 +864,7 @@ def _open_pidfile(pid_file: Path) -> int | None:
         # os.path.islink: Path.is_symlink raises where it cannot look, and this
         # path must return None.
         if os.path.islink(pid_file):
-            raise CoherenceDirRefused(
-                COHERENCE_LINK_KIND, str(pid_file), entry_link_refusal(pid_file)
-            ) from exc
+            raise entry_link_refused(pid_file) from exc
         logger.warning("cannot open pid file %s: %s", pid_file, exc)
         return None
     return fd

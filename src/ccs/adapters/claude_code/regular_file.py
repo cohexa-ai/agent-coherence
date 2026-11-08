@@ -19,12 +19,7 @@ Two rules keep it safe to call from anywhere in the library:
 - Data is read through :class:`io.FileIO`, never ``io.open``, ``open`` or
   ``Path.read_*``: the volume's all-glob shim patches those and routes a
   managed path back into the volume. ``FileIO`` also closes with the C
-  ``close``, which lifecycle tests that count ``os.close`` calls by descriptor
-  number never see.
-
-``O_NOFOLLOW`` guards the last component only. :func:`read_state_file` also
-looks at ``.coherence`` itself, so a read never goes through a linked state
-directory into the one it names.
+  ``close``.
 """
 
 from __future__ import annotations
@@ -55,9 +50,8 @@ class ReadStatus(str, Enum):
 class RegularFileRead:
     """One read's answer. ``data`` is set for ``READ`` only. ``error`` keeps
     the ``OSError`` behind ``ABSENT``, ``LINK``, ``NOT_REGULAR`` and
-    ``UNREADABLE``, so a caller can rebuild the text it printed before; it is
-    ``None`` for ``READ`` and ``TOO_LARGE``. ``path`` is the path refused:
-    the state directory itself when it is the link."""
+    ``UNREADABLE``; it is ``None`` for ``READ`` and ``TOO_LARGE``. ``path`` is
+    the path refused: the state directory itself when it is the link."""
 
     status: ReadStatus
     path: Path
@@ -74,20 +68,13 @@ class NotRegularFile(OSError):
     Errno EISDIR for a directory, EINVAL for a FIFO, socket or device."""
 
 
-def _is_link(path: Path) -> bool:
-    try:
-        return stat.S_ISLNK(os.lstat(path).st_mode)
-    except OSError:
-        return False
-
-
 def _link_refused(path: Path) -> LinkRefused:
     return LinkRefused(errno.ELOOP, os.strerror(errno.ELOOP), str(path))
 
 
 def _open_checked(path: Path, flags: int, mode: int) -> tuple[int, os.stat_result]:
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    if not nofollow and _is_link(path):
+    if not nofollow and os.path.islink(path):
         # No O_NOFOLLOW here: the lstat is the only guard, with a check-then-open
         # race that no coordinator meets, because none runs on such a platform.
         raise _link_refused(path)
@@ -95,7 +82,7 @@ def _open_checked(path: Path, flags: int, mode: int) -> tuple[int, os.stat_resul
     try:
         fd = os.open(path, flags | extra, mode)
     except OSError as exc:
-        if _is_link(path):
+        if os.path.islink(path):
             raise _link_refused(path) from exc
         raise
     try:
@@ -146,7 +133,7 @@ def read_regular_file(path: Path, *, max_bytes: int | None = None) -> RegularFil
         if max_bytes is not None and info.st_size > max_bytes:
             return RegularFileRead(ReadStatus.TOO_LARGE, path)
         try:
-            data = _read_up_to(handle, None if max_bytes is None else max_bytes + 1)
+            data = _read_up_to(handle, None if max_bytes is None else max_bytes + 1, first=info.st_size + 1)
         except OSError as exc:
             return RegularFileRead(ReadStatus.UNREADABLE, path, error=exc)
     if max_bytes is not None and len(data) > max_bytes:
@@ -154,17 +141,20 @@ def read_regular_file(path: Path, *, max_bytes: int | None = None) -> RegularFil
     return RegularFileRead(ReadStatus.READ, path, data)
 
 
-def _read_up_to(handle: io.FileIO, limit: int | None) -> bytes:
+def _read_up_to(handle: io.FileIO, limit: int | None, first: int) -> bytes:
     # FileIO.read(n) is one read(2), so a short read is not the end of the file.
+    # The first read is sized to the file: one that arrives whole is not copied
+    # by the join, and a small file does not allocate a whole chunk.
     chunks: list[bytes] = []
     total = 0
+    size = first
     while limit is None or total < limit:
-        size = _READ_CHUNK_BYTES if limit is None else min(_READ_CHUNK_BYTES, limit - total)
-        chunk = handle.read(size)
+        chunk = handle.read(size if limit is None else min(size, limit - total))
         if not chunk:
             break
         chunks.append(chunk)
         total += len(chunk)
+        size = _READ_CHUNK_BYTES
     return b"".join(chunks)
 
 
@@ -173,6 +163,6 @@ def read_state_file(coherence_dir: Path, name: str, *, max_bytes: int | None = N
     when ``coherence_dir`` itself is a symlink: ``LINK`` with ``path`` set to
     ``coherence_dir``, and nothing opened. ``O_NOFOLLOW`` on the file alone
     would read the file of the directory the link names."""
-    if _is_link(coherence_dir):
+    if os.path.islink(coherence_dir):
         return RegularFileRead(ReadStatus.LINK, coherence_dir, error=_link_refused(coherence_dir))
     return read_regular_file(coherence_dir / name, max_bytes=max_bytes)

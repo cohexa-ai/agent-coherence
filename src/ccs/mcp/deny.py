@@ -142,10 +142,8 @@ COORDINATOR_FAILED_NEXT_STEP = (
     "user or host that the coordinator is failing; do not keep retrying."
 )
 
-# The workspace's .coherence is a link or not a directory, or holds a link or a
-# FIFO, socket or device (#498). A person must replace it, so the verb is the
-# house stop. The server's own start refuses it before any tool runs; a tool
-# meets it only through a re-attach, which the volume makes in a forked child.
+# A person must replace the workspace's .coherence (#498), so the verb is the
+# house stop. The server's own start refuses it before any tool runs.
 COHERENCE_DIR_REFUSED_RECOVER = GIVER_FENCED_RECOVER
 COHERENCE_DIR_REFUSED_NEXT_STEP = (
     "Stop: nothing was written. This workspace's .coherence is a symlink or not a "

@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 
 from ccs.adapters.claude_code.regular_file import ReadStatus, read_state_file
-from ccs.adapters.claude_code.state_dir import dir_link_refusal, entry_link_refusal
+from ccs.adapters.claude_code.state_dir import state_file_link_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -256,10 +256,7 @@ def ensure_secret(coordinator_root: Path) -> str:
         # one fails the O_EXCL create below on every attempt.
         existing = read_state_file(coherence_dir, SECRET_FILENAME)
         if existing.status is ReadStatus.LINK:
-            raise EnsureSecretError(
-                dir_link_refusal(coherence_dir) if existing.path == coherence_dir
-                else entry_link_refusal(secret_path)
-            )
+            raise EnsureSecretError(state_file_link_refusal(existing.path, coherence_dir))
         if existing.status is ReadStatus.UNREADABLE:
             continue
         if existing.status is ReadStatus.READ and existing.data is not None:
