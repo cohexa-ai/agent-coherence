@@ -3,15 +3,19 @@
 
 """A coordinator running in the test's own process, what its registry
 records, and a status answer put in place of one of its answers, shared by
-the volume, substrate and MCP tests that reach into that registry."""
+the volume, substrate and MCP tests that reach into that registry. Also a
+check that a block of code leaves no SQLite connection open."""
 
 from __future__ import annotations
 
+import gc
 import io
 import json
 import os
+import sqlite3
 import urllib.error
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -24,6 +28,40 @@ from ccs.core.states import MESIState
 #: status answer by its code alone, so none of this may reach what it raises
 #: or warns.
 ANSWERED_TEXT = "text-the-coordinator-answered-with"
+
+
+def _open_sqlite_connections() -> list[sqlite3.Connection]:
+    open_connections = []
+    for candidate in gc.get_objects():
+        if isinstance(candidate, sqlite3.Connection):
+            try:
+                _ = candidate.total_changes  # raises on a closed connection
+            except sqlite3.ProgrammingError:
+                continue
+            open_connections.append(candidate)
+    return open_connections
+
+
+@contextmanager
+def no_sqlite_connection_left_open() -> Iterator[None]:
+    """Fail when the block leaves a new SQLite connection open, with the
+    collector paused so that only an explicit close counts as closed.
+
+    Keep the refusal alive past this check (``pytest.raises(...) as refused``):
+    its traceback holds the refused object, as a caller's kept exception does.
+    Dropped, the connection is freed with it and this check cannot see it."""
+    gc.collect()
+    already_open = _open_sqlite_connections()
+    gc.disable()
+    try:
+        yield
+        left_open = [
+            connection for connection in _open_sqlite_connections()
+            if not any(connection is known for known in already_open)
+        ]
+    finally:
+        gc.enable()
+    assert not left_open, f"left open: {left_open}"
 
 
 def serve_in_process(tmp_path: Path, instance_id: str, tracked: str = "data/**") -> CoordinatorHTTPServer:

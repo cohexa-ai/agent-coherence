@@ -17997,3 +17997,63 @@ def test_pre_edit_behind_a_peer_flags_only_what_no_write_in_flight_explains(
         assert "disk_differs" not in body and notice not in context, body
     else:
         assert body["disk_differs"] is True and context.endswith(notice), body
+
+
+def test_a_server_failing_at_its_first_step_after_the_store_open_closes_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#426: the constructor closes the store it opened when a later step
+    raises, from the first such step on. The caller never gets a server to
+    ``shutdown()``, and a kept exception holds the open connection."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+    from tests.coordinator_helpers import no_sqlite_connection_left_open
+
+    def failing_service(registry: object) -> None:
+        raise RuntimeError("service failed")
+
+    monkeypatch.setattr(mod, "CoordinatorService", failing_service)
+    with no_sqlite_connection_left_open():
+        with pytest.raises(RuntimeError, match="service failed") as _failed:
+            CoordinatorHTTPServer(tmp_path, port=0)
+
+
+def test_a_server_interrupted_after_the_store_open_closes_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#426: a Ctrl-C during construction does not orphan the connection either."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+    from tests.coordinator_helpers import no_sqlite_connection_left_open
+
+    def interrupted_service(registry: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(mod, "CoordinatorService", interrupted_service)
+    with no_sqlite_connection_left_open():
+        with pytest.raises(KeyboardInterrupt) as _interrupted:
+            CoordinatorHTTPServer(tmp_path, port=0)
+
+
+def test_a_server_refused_its_secret_closes_the_store(tmp_path: Path) -> None:
+    """#426: a ``hook.secret`` that cannot be read refuses the start after the
+    store is open."""
+    from ccs.adapters.claude_code.auth import EnsureSecretError
+    from tests.coordinator_helpers import no_sqlite_connection_left_open
+
+    (tmp_path / ".coherence" / "hook.secret").mkdir(parents=True)
+    with no_sqlite_connection_left_open():
+        with pytest.raises(EnsureSecretError) as _refused:
+            CoordinatorHTTPServer(tmp_path, port=0)
+
+
+def test_a_server_refused_its_port_closes_the_store(tmp_path: Path) -> None:
+    """#426: a port already in use refuses the start at its last step."""
+    import socket
+
+    from tests.coordinator_helpers import no_sqlite_connection_left_open
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        with no_sqlite_connection_left_open():
+            with pytest.raises(OSError) as _refused:
+                CoordinatorHTTPServer(tmp_path, port=holder.getsockname()[1])

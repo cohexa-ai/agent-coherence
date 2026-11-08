@@ -15,6 +15,9 @@ before any tool binding.
 
 from __future__ import annotations
 
+import json
+from uuid import UUID
+
 import pytest
 
 import ccs.mcp.deny as deny
@@ -33,6 +36,7 @@ from ccs.core.exceptions import (
     CoordinatorUnreachable,
     GiverFenced,
     InternalConcurrencyError,
+    OtherHolder,
     StaleView,
     ViewWedged,
 )
@@ -59,6 +63,8 @@ _PRINCIPAL_UNSETTLED_RECOVER = "wait_and_retry"
 _GIVER_REASON = "handed_off"
 _GIVER_RECOVER = "stop_and_report"
 _SUCCESSOR = "6b0f3c1e-4a5d-5b7e-9c2f-1d3e5a7b9c0d"
+#: A holder in the refusal's wire spelling: 32 lowercase hex characters.
+_HOLDER = "5d0f3c9a8b7e4d21a6c3b2e1f0d9c8b7"
 #: FROZEN duplicates of the coordinator-unreachable terminal: the reason the
 #: synthesized unattached refusal already answers, and the same stop verb the
 #: giver terminal uses, never that refusal's ``retry_later``.
@@ -121,6 +127,7 @@ _TERMINALS = [
     ),
     (CasRetriesExhausted("data/x", 8, 3), "cas_exhausted", "stop", False),
     (GiverFenced("data/x", _SUCCESSOR, 3), _GIVER_REASON, _GIVER_RECOVER, False),
+    (OtherHolder("data/x", _HOLDER), "other_holder", "wait_and_retry", True),
     (CoordinatorUnreachable("coordinator gone"), _UNREACHABLE_REASON, _UNREACHABLE_RECOVER, False),
     (
         InternalConcurrencyError("concurrent use detected"),
@@ -639,6 +646,76 @@ def test_the_giver_terminal_is_a_typed_stop_that_says_report_and_never_withdraw(
     assert "report" in words.lower()
     assert "stop" in words.lower()
     assert "withdraw" not in words.lower()
+
+
+def test_the_other_holder_terminal_names_the_holder_and_bounds_the_wait():
+    """A refuse-mode write another agent holds. ``swg_write`` resends the same
+    bytes, and once the path comes free they land over whatever the holder
+    committed, so the words tell the agent to read and rebuild first, and the
+    verb that clears a stale view is named as not clearing this. The wait is
+    bounded in words because ``wait_and_retry`` alone would loop on a holder that
+    keeps the path for half an hour.
+
+    Prevents a refusal that falls to ``internal_error``, the shape of a coordinator
+    bug, and one that sends the agent straight back with the same content."""
+    exc = OtherHolder("data/plan.md", _HOLDER)
+
+    result = deny_result(exc)
+
+    sc = result.structuredContent
+    assert result.isError is True
+    assert (sc["reason"], sc["recover"], sc["retryable"]) == ("other_holder", "wait_and_retry", True)
+    assert sc["holder_agent_id"] == _HOLDER
+    assert sc["detail"] == str(exc)
+    assert result.content[0].text == str(exc)
+    words = sc["next_step"]
+    assert [item.text for item in result.content[1:]] == [words]
+    assert "nothing was written" in words.lower()
+    assert "holder_agent_id" in words
+    assert "swg_read" in words, "the agent must rebuild from a read before writing again"
+    assert "swg_reacquire does not clear" in words
+    assert "at least 4 seconds" in words
+    assert "bounded total" in words, "wait_and_retry alone would loop"
+    assert "next holder starts a new clock" in words
+    assert "keeps your own holds" in words, "two waiting agents otherwise wait out the ceiling"
+    assert "swg_reacquire on any path you hold drops every hold" in words, "the way to let go"
+    assert "report" in words.lower()
+
+
+@pytest.mark.parametrize(
+    "holder",
+    [None, UUID(_HOLDER), 7, {"a": 1}],
+    ids=["absent", "in-process-uuid", "number", "object"],
+)
+def test_the_other_holder_terminal_passes_only_a_string_holder(holder):
+    """The holder rides to the model as a value and into ``json.dumps``. An
+    in-process refusal carries a ``UUID``, which does not serialise, and anything
+    but a string is ``None``, as the giver terminal does.
+
+    Prevents a tool result that fails to serialise on the refusal it reports."""
+    sc = deny_result(OtherHolder("data/plan.md", holder)).structuredContent
+    assert sc["holder_agent_id"] is None
+    json.dumps(sc)
+
+
+def test_a_commits_other_holder_keeps_its_own_row():
+    """The same reason on the commit route is a lost race the tool re-derives from,
+    so it carries none of the pre-edit row's words or holder."""
+    sc = deny_result(CasVersionConflict("data/f.txt", 1, 1, reason="other_holder")).structuredContent
+    assert "next_step" not in sc
+    assert "holder_agent_id" not in sc
+
+
+def test_a_subclass_of_the_refusal_fails_closed():
+    """The table matches on the exact type, so a subclass does not inherit a
+    retryable recovery it was never reviewed for."""
+
+    class _Narrower(OtherHolder):
+        pass
+
+    sc = deny_result(_Narrower("data/plan.md", _HOLDER)).structuredContent
+    assert sc["reason"] == "internal_error"
+    assert "holder_agent_id" not in sc
 
 
 
