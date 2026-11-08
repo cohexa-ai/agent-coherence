@@ -98,6 +98,7 @@ from ccs.adapters.claude_code.policy import (
 from ccs.coordinator.registry_protocol import (
     RECLAIM_TRIGGERS,
     CheckpointMember,
+    RegistryBase,
     TransferRecord,
     WatchdogAbort,
 )
@@ -4419,6 +4420,14 @@ def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     req._json(200, {"ok": True, "removed": added, "rejected": yaml_rejected + pre_rejected})
 
 
+def _clear_acknowledged_marker(registry: RegistryBase, artifact_id: UUID, agent_id: UUID) -> None:
+    """Clear the pending-invalidation marker on a row a read is about to grant
+    SHARED. Only a marked row is written, so a grant over an unmarked or new
+    row costs no extra store write. The caller holds the registry lock."""
+    if registry.get_agent_transient(artifact_id, agent_id) is not None:
+        registry.clear_agent_transient(artifact_id, agent_id)
+
+
 def _regrant_unless_overtaken(
     coordinator: CoordinatorHTTPServer,
     artifact_id: UUID,
@@ -4440,11 +4449,18 @@ def _regrant_unless_overtaken(
     can land between them: a moved version leaves the caller INVALID instead,
     exactly as if the commit had come right after the grant, and records no
     observation of a version it never read.
+
+    The SHARED grant also clears the pending-invalidation marker the peer's
+    write left: this read acknowledges it. Kept on a SHARED row, the transient
+    sweep expired it to INVALID a minute later, and the next read was warned
+    stale with no new version (#523).
     """
     registry = coordinator.registry
     with registry.abort_guard():
         artifact = registry.get_artifact(artifact_id)
         overtaken = artifact is not None and artifact.version != classified_version
+        if not overtaken:
+            _clear_acknowledged_marker(registry, artifact_id, agent_id)
         registry.set_agent_state(
             artifact_id, agent_id,
             MESIState.INVALID if overtaken else MESIState.SHARED,
@@ -4525,12 +4541,19 @@ def _apply_bash_grep_regrants(
 
     Keyed on the COMMAND's outcome, not the trigger and not the path's own
     strictness: a warn-only path inside a denied command was not read either.
+
+    Each grant clears the peer write's pending-invalidation marker in the same
+    hold, as pre-read's re-grant does, so the transient sweep cannot expire the
+    granted read to INVALID (#523).
     """
+    registry = coordinator.registry
     for artifact_id, trigger in regrants:
-        coordinator.registry.set_agent_state(
-            artifact_id, agent_id, MESIState.SHARED,
-            trigger=trigger, tick=tick, observed=command_runs,
-        )
+        with registry.abort_guard():
+            _clear_acknowledged_marker(registry, artifact_id, agent_id)
+            registry.set_agent_state(
+                artifact_id, agent_id, MESIState.SHARED,
+                trigger=trigger, tick=tick, observed=command_runs,
+            )
     if command_runs:
         for artifact_id, trigger in held:
             _record_held_read(coordinator, artifact_id, agent_id, trigger=trigger, tick=tick)
