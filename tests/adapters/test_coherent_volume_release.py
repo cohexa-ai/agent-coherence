@@ -473,6 +473,28 @@ def test_release_from_another_thread_raises(
         thread.join(5)
 
 
+def test_a_write_cas_after_a_release_retries_from_a_new_attempt_that_releases_the_rest(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """The release moved the file's read generation, so the next write_cas of
+    it is refused once and retries from a new attempt; starting that attempt
+    releases the volume's other grants, as the guide says.
+
+    Prevents the guide promising a cost the code does not have, or the
+    reverse."""
+    holder, peer = _holder(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
+    holder.write(_X, b"x1")
+    holder.write(_Z, b"z from the holder")
+    first_attempt = holder.incarnation
+    holder.release(_X)
+
+    holder.write_cas(_X, lambda current: current + b" + x2")
+
+    assert (tmp_path / _X).read_bytes() == b"x1 + x2"
+    assert holder.incarnation != first_attempt
+    peer.write(_Z, b"z from the peer")
+
+
 def test_a_release_keeps_the_foreign_edit_guard(
     tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer
 ) -> None:
