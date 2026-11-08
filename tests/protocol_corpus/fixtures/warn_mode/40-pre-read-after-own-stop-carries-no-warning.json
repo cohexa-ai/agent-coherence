@@ -1,0 +1,70 @@
+{
+  "name": "pre-read-after-own-stop-carries-no-warning",
+  "description": "The warn-mode side of a session keeping a read of a file it edited when its turn ends (#513). Session A reads notes.md (v1), pre-edits it, commits v2 and its turn ends (session-stop). A's next Read is the bare fresh answer, with no hookSpecificOutput and so no context text. Before, the stop left A INVALID and this read was answered stale, with a warning that told A its grant on its own edit had been revoked. The file on disk holds the bytes A commits, and every hash in this row is theirs. Both backends.",
+  "setup": {
+    "tracked": [
+      "notes.md"
+    ],
+    "files": {
+      "notes.md": "# Notes\nv2 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md",
+          "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md",
+          "success": true,
+          "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/session-stop",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "notes.md",
+      "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+    }
+  },
+  "optional_keys": [
+    "version"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "status": "fresh"
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

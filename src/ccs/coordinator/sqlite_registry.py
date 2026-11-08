@@ -4355,9 +4355,10 @@ class SqliteArtifactRegistry:
                     raise KeyError(f"artifact {artifact_id} not in registry")
                 version = version_row[0]
 
-                # Read-generation fence: when an M/E -> INVALID transition
-                # revokes the write claim WITHOUT moving the version (a sweep
-                # reclaim, the voluntary "invalidate" release, or a handoff
+                # Read-generation fence: when a transition out of M/E (to
+                # INVALID, or to SHARED when the holder releases its own grant
+                # and keeps a read) revokes the write claim WITHOUT moving the
+                # version (a sweep reclaim, the voluntary "invalidate" release, or a handoff
                 # under HANDOFF_TRIGGER — see EPOCH_BUMP_TRIGGERS), bump the
                 # artifact's ownership epoch atomically with the state
                 # transition in this BEGIN IMMEDIATE, so a commit by the
@@ -5731,7 +5732,7 @@ class SqliteArtifactRegistry:
         """KTD-11 session-stop release iteration: return artifacts where the
         given agent holds any of the listed MESI states. Used by Unit 4's
         ``/hooks/session-stop`` handler to enumerate uncommitted grants for
-        release via :class:`CoordinatorService.invalidate`."""
+        release via :meth:`CoordinatorService.release_to_reader`."""
         state_names = [s.name for s in states]
         if not state_names:
             return []

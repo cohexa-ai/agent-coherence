@@ -99,6 +99,18 @@ InvalidateAction ==
         /\ version' = version
         /\ UNCHANGED clock
 
+(* release to reader: a holder gives back its own write claim and keeps a
+   read, M or E -> S, at the version it held; no peer side-effects. This is
+   the holder's own release at the end of a turn, when a subagent stops, or
+   on a failed edit. A release report from an agent in S or I changes
+   nothing, so it is a stutter and is not modeled. *)
+ReleaseToReaderAction ==
+    \E ag \in Agents, art \in Artifacts :
+        /\ mesiState[art][ag] \in {"M", "E"}
+        /\ mesiState' = [mesiState EXCEPT ![art][ag] = "S"]
+        /\ version' = version
+        /\ UNCHANGED clock
+
 (* tick: advance the global clock by 1. *)
 TickAction ==
     /\ clock < MaxTicks

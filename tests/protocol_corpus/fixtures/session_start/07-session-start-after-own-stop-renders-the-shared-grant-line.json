@@ -1,0 +1,68 @@
+{
+  "name": "session-start-after-own-stop-renders-the-shared-grant-line",
+  "description": "Re-grounding for a file a session edited in an earlier turn (#513). Session A reads notes.md (v1), pre-edits it, commits v2 and its turn ends (session-stop), which leaves it a reader of v2. A's session-start renders the grant line for a held SHARED grant at v2, the same line fixture 01 renders for a file A only read. Before, the stop left A INVALID and the payload carried the bare 'notes.md is at v2.' line instead. No timestamps anywhere in the payload, so the whole additionalContext byte-matches across backends.",
+  "setup": {
+    "tracked": [
+      "notes.md"
+    ],
+    "files": {
+      "notes.md": "# Notes\nv2 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md",
+          "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md",
+          "success": true,
+          "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/session-stop",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/session-start",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": "Post-compaction re-grounding (agent-coherence):\nAt compaction you held SHARED on notes.md (v2) — re-acquire before writing.\nVersions are as of this re-grounding; a more recent read supersedes this notice."
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

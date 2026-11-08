@@ -55,7 +55,9 @@ def test_a6_write_applies_when_abort_clear() -> None:
 
 
 def test_a6_invalidate_aborts_when_abort_preset_does_not_revoke() -> None:
-    """The worst case: a late session-stop release must NOT revoke a grant."""
+    """The worst case: a late operator-drain release must NOT revoke a grant.
+    The Stop path's twin is
+    tests/test_self_release_reader.py::test_a_release_whose_request_already_timed_out_changes_nothing."""
     svc = _service()
     art = svc.register_artifact(name="plan.md", content="v1")
     agent = uuid4()

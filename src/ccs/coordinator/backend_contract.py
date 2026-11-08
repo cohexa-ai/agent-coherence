@@ -114,7 +114,8 @@ class MemberContract:
 # (+13 methods) and ForeignWriteDetection (+9 methods), classified against the CoordinatorService call sites. The
 # ATOMIC_CLASS members are the ones the service touches INSIDE its atomic
 # mutation paths (``write`` / ``commit`` / ``commit_cas`` under ``abort_guard``;
-# ``invalidate``; the same-lock ``enforce_stable_grant_timeouts`` sweep; the
+# ``invalidate``; ``release_to_reader``; the same-lock
+# ``enforce_stable_grant_timeouts`` sweep; the
 # session capture). INDEPENDENT members are individually-durable mutations that
 # do not compose into the R9 RMW. READ_ONLY members never mutate.
 #
@@ -182,10 +183,13 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "base",
         "The MESI grant transition — the grant-arbitration leg of the boundary. "
         "Called inside every atomic mutation path (write/commit peer-invalidation "
-        "+ grant, invalidate, and the same-lock sweep's M/E->INVALID reclaim). "
-        "An M/E->INVALID transition that revokes the write claim WITHOUT moving "
-        "the version bumps owner_generation for the fence — the sweep reclaims, "
-        "the voluntary invalidate release AND the handoff trigger "
+        "+ grant, invalidate, release_to_reader, and the same-lock sweep's "
+        "M/E->INVALID reclaim). "
+        "A transition that leaves M/E, revoking the write claim WITHOUT moving "
+        "the version, bumps owner_generation for the fence whatever state it "
+        "lands in — the sweep reclaims (to INVALID), the voluntary invalidate "
+        "release (to INVALID, or to SHARED when the holder gives back its own "
+        "write grant and keeps a read) AND the handoff trigger "
         "(EPOCH_BUMP_TRIGGERS); the "
         "version-moving peer invalidations do not, because version-CAS already "
         "arbitrates those. Single-writer is checked after each such transition. "
@@ -198,8 +202,8 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "the agent's OWN claim: an I/S->M/E acquire, or a genuine read the agent "
         "requested (CLAIM_CAPTURE_TRIGGERS plus the not-previously-in-M/E "
         "guard); a transition that takes the agent OUT of M/E captures nothing, "
-        "so a peer's fetch that downgrades a holder never refreshes its "
-        "captured generation.",
+        "so neither a peer's fetch that downgrades a holder nor the holder's "
+        "own release to SHARED refreshes its captured generation.",
     ),
     MemberContract(
         "set_agent_transient",
@@ -215,7 +219,8 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         MemberClass.ATOMIC_CLASS,
         "base",
         "Clears the arbitration transient at the end of a grant transition, "
-        "under abort_guard inside write/commit/invalidate. The completing half of "
+        "under abort_guard inside write/commit/invalidate/release_to_reader. "
+        "The completing half of "
         "the transient leg of the boundary.",
     ),
     MemberContract(
@@ -232,7 +237,8 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         MemberClass.ATOMIC_CLASS,
         "base",
         "The context manager that wraps EVERY atomic mutation (write / commit / "
-        "commit_cas / invalidate). It is the boundary's serialization + fail-shut "
+        "commit_cas / invalidate / release_to_reader). It is the boundary's "
+        "serialization + fail-shut "
         "seam: a watchdog-aborted mutation fails closed at the write lock instead "
         "of landing as a phantom write. A backend re-homing the boundary must "
         "provide the equivalent atomic-or-abort envelope. Its keyword-only "
@@ -868,8 +874,9 @@ R9_ATOMIC_BOUNDARY = AtomicBoundary(
         "transition is part of the same step)",
         "read-generation fence (owner_generation vs the committer's captured "
         "read_generation: reject a writer whose M/E grant was revoked without "
-        "the version moving — by the sweep OR by a voluntary invalidate release "
-        "— since version-CAS alone cannot see that; the captured operand is "
+        "the version moving — by the sweep OR by a voluntary invalidate release, "
+        "whether that release leaves the holder INVALID or keeps it a reader "
+        "(SHARED) — since version-CAS alone cannot see that; the captured operand is "
         "written only at the committer's own claim-establishing transitions, "
         "never by a peer's fetch)",
     ),
@@ -909,7 +916,8 @@ R9_ATOMIC_BOUNDARY = AtomicBoundary(
         "(enforce_stable_grant_timeouts), NOT read inside commit_cas's "
         "transaction. It reclaims stale M/E grants (heartbeat / max-hold) and "
         "bumps owner_generation atomically with the M/E->INVALID transition — as "
-        "does the voluntary invalidate release, so a release can never SUPPRESS "
+        "does the voluntary invalidate release, to INVALID or to SHARED, so a "
+        "release can never SUPPRESS "
         "the epoch move by getting there before the sweep — both "
         "serialized under the SAME registry lock as the atomic mutations. Per "
         "tier, a backend states whether liveness folds into the atomic RMW "

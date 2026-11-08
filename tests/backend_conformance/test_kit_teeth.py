@@ -40,6 +40,12 @@ fenced persist's raise), keeping the reason and version, as a binding would
 that kept its pre-pair refusal constructor. A fourth fills the pair only on
 ``stale_read_generation``, and the other reasons' checks MUST catch it.
 
+The INVALID-only bump stub (:class:`_InvalidOnlyBumpRegistry`) gives the
+voluntary-release scenario's release-to-reader leg its teeth. It moves the
+ownership epoch when a holder leaves EXCLUSIVE or MODIFIED only if the holder
+lands INVALID, as a backend would that keyed the bump on the target state. It
+passes the release to INVALID and MUST FAIL the release to SHARED.
+
 The follow-up-read stub (:class:`_FollowUpReadRegistry`) gives the two
 refusal-pair races their teeth. It decides every refusal on the right snapshot,
 then re-reads the owner leg alone, or both legs, after a 0.5 ms window at one
@@ -524,6 +530,44 @@ def test_fence_only_pair_stub_fails_the_other_reasons() -> None:
         "commit_all's version_mismatch refusal for the overtaken member DROPPED the "
         "generation pair" in str(excinfo.value)
     )
+
+
+class _InvalidOnlyBumpRegistry:
+    """A degraded backend that moves ``owner_generation`` on leaving EXCLUSIVE
+    or MODIFIED under a bump trigger only when the holder lands INVALID. A
+    holder that gives back its own write grant and keeps a read lands SHARED,
+    so its claim is revoked with the epoch left behind. Everything else is the
+    real in-memory registry."""
+
+    def __init__(self) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def set_agent_state(self, artifact_id: UUID, agent_id: UUID, state: MESIState, **kwargs: object) -> None:
+        record = self._inner._records[artifact_id]  # noqa: SLF001 - test stub reaches in
+        epoch = record.owner_generation
+        self._inner.set_agent_state(artifact_id, agent_id, state, **kwargs)  # type: ignore[arg-type]
+        # THE INJECTED BUG: the real registry bumped on leaving M/E whatever the
+        # target; this stub takes the bump back unless the holder landed INVALID.
+        if state != MESIState.INVALID:
+            record.owner_generation = epoch
+
+
+def test_invalid_only_bump_stub_fails_the_release_to_reader_leg() -> None:
+    """THE TEETH for the release-to-reader leg. A backend that moves the epoch
+    only when a released holder lands INVALID MUST FAIL the voluntary-release
+    scenario: a holder that gives back its write grant and keeps a read would
+    have its commit on that claim admitted at a version that never moved. The
+    scenario checks the release to INVALID first, so a failure naming a
+    release-to-reader route also shows the stub's INVALID leg passed: the kit
+    fails it for the SHARED landing it skips, not for the one it bumps on."""
+    with pytest.raises(AssertionError) as excinfo:
+        kit.assert_epoch_moves_on_voluntary_release(_OneStoreFactory(_InvalidOnlyBumpRegistry))
+    message = str(excinfo.value)
+    assert "set_agent_state from EXCLUSIVE" in message, message
+    assert "landing SHARED instead of INVALID does not exempt it" in message, message
 
 
 # The gap a binding leaves when it decides a refusal, then reads the pair in a

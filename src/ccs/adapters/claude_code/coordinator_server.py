@@ -105,12 +105,14 @@ from ccs.adapters.claude_code.state_dir import check_coherence_dir, lock_link_re
 from ccs.coordinator.registry_protocol import (
     RECLAIM_TRIGGERS,
     CheckpointMember,
+    RegistryBase,
     TransferRecord,
     WatchdogAbort,
 )
 from ccs.coordinator.service import (
     CallerPrincipalUncached,
     CoordinatorService,
+    ReleaseRequest,
     mint_nonce_problem,
 )
 from ccs.coordinator.sqlite_registry import SCHEMA_USER_VERSION, SqliteArtifactRegistry
@@ -3748,9 +3750,11 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
             return {"ok": True, "note": "untracked-at-commit"}
 
         if not success:
-            # Tool failure path — release the EXCLUSIVE grant without bumping version.
-            artifact = coordinator.registry.get_artifact(artifact_id)
-            if artifact is not None:
+            # Tool failure path — release the caller's own write grant without
+            # bumping the version. It keeps a read of the version it held
+            # (#513); a report from a caller holding no write grant changes
+            # nothing.
+            if coordinator.registry.has_artifact(artifact_id):
                 # #185: the giver of a live handoff reporting a failed edit
                 # holds nothing here -- its grant went to the successor -- so
                 # this is not a clean release. Read BEFORE any release, and
@@ -3759,12 +3763,8 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
                 if handed is not None:
                     return _handed_off_release(path, handed)
                 try:
-                    coordinator.service.invalidate(
-                        agent_id=agent_id,
-                        artifact_id=artifact_id,
-                        new_version=artifact.version,
-                        issuer_agent_id=agent_id,
-                        issued_at_tick=now,
+                    coordinator.service.release_to_reader(
+                        ReleaseRequest(agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=now),
                         abort=abort,
                     )
                 except CoherenceError as exc:
@@ -3862,8 +3862,9 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
 
     # AC-05: post-edit's wire contract is {ok: bool}; ok-shape degraded
     # envelope keeps clients reading result.get("ok") safe on timeout.
-    # A6: abort threaded into invalidate/commit so a late post-edit aborts at
-    # the registry lock instead of landing a phantom version bump/invalidation.
+    # A6: abort threaded into the release and the commit so a late post-edit
+    # aborts at the registry lock instead of landing a phantom version bump or
+    # release.
     abort = WatchdogAbort()
     _run_or_degrade(
         req, coordinator, work_with_handoff, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort
@@ -4112,13 +4113,12 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
             artifact = coordinator.registry.get_artifact(artifact_id)
             if artifact is None:
                 continue
+            # The release decides from the state it reads inside its own hold,
+            # not from this list, which is read before it: a row a peer's
+            # acquire or commit left stale in between stays stale (#513).
             try:
-                coordinator.service.invalidate(
-                    agent_id=agent_id,
-                    artifact_id=artifact_id,
-                    new_version=artifact.version,
-                    issuer_agent_id=agent_id,
-                    issued_at_tick=now,
+                coordinator.service.release_to_reader(
+                    ReleaseRequest(agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=now),
                     abort=abort,
                 )
             except CoherenceError as exc:
@@ -4181,7 +4181,7 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
 
     # AC-05: session-stop's wire contract is {ok: bool}; ok-shape degraded
     # envelope keeps clients reading result.get("ok") safe on timeout.
-    # A6: abort threaded into the per-artifact invalidate so a late release
+    # A6: abort threaded into the per-artifact release so a late release
     # aborts before revoking a grant the registry handed to the next session.
     abort = WatchdogAbort()
     _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
@@ -4431,6 +4431,14 @@ def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     req._json(200, {"ok": True, "removed": added, "rejected": yaml_rejected + pre_rejected})
 
 
+def _clear_acknowledged_marker(registry: RegistryBase, artifact_id: UUID, agent_id: UUID) -> None:
+    """Clear the pending-invalidation marker on a row a read is about to grant
+    SHARED. Only a marked row is written, so a grant over an unmarked or new
+    row costs no extra store write. The caller holds the registry lock."""
+    if registry.get_agent_transient(artifact_id, agent_id) is not None:
+        registry.clear_agent_transient(artifact_id, agent_id)
+
+
 def _regrant_unless_overtaken(
     coordinator: CoordinatorHTTPServer,
     artifact_id: UUID,
@@ -4452,11 +4460,27 @@ def _regrant_unless_overtaken(
     can land between them: a moved version leaves the caller INVALID instead,
     exactly as if the commit had come right after the grant, and records no
     observation of a version it never read.
+
+    A read of the bytes the coordinator recorded also clears the pending-
+    invalidation marker the peer's write left: it acknowledges that write. Kept
+    on a SHARED row, the transient sweep expired it to INVALID a minute later,
+    and the next read was warned stale with no new version (#523). A read of
+    other bytes -- taken before a commit it is now granted at -- keeps it, so an
+    optimistic commit built from those bytes is refused as mid-transition while
+    the marker stands and its writer reads again. A file with no recorded
+    content has had no commit since it was registered, so no read of it can
+    predate one, and any read of it acknowledges.
     """
     registry = coordinator.registry
     with registry.abort_guard():
         artifact = registry.get_artifact(artifact_id)
         overtaken = artifact is not None and artifact.version != classified_version
+        read_the_recorded_bytes = artifact is not None and (
+            not coordinator_holds_content_claim(artifact.content_hash)
+            or content_hash == artifact.content_hash
+        )
+        if read_the_recorded_bytes and not overtaken:
+            _clear_acknowledged_marker(registry, artifact_id, agent_id)
         registry.set_agent_state(
             artifact_id, agent_id,
             MESIState.INVALID if overtaken else MESIState.SHARED,
@@ -4537,12 +4561,19 @@ def _apply_bash_grep_regrants(
 
     Keyed on the COMMAND's outcome, not the trigger and not the path's own
     strictness: a warn-only path inside a denied command was not read either.
+
+    Each grant clears the peer write's pending-invalidation marker in the same
+    hold, as pre-read's re-grant does, so the transient sweep cannot expire the
+    granted read to INVALID (#523).
     """
+    registry = coordinator.registry
     for artifact_id, trigger in regrants:
-        coordinator.registry.set_agent_state(
-            artifact_id, agent_id, MESIState.SHARED,
-            trigger=trigger, tick=tick, observed=command_runs,
-        )
+        with registry.abort_guard():
+            _clear_acknowledged_marker(registry, artifact_id, agent_id)
+            registry.set_agent_state(
+                artifact_id, agent_id, MESIState.SHARED,
+                trigger=trigger, tick=tick, observed=command_runs,
+            )
     if command_runs:
         for artifact_id, trigger in held:
             _record_held_read(coordinator, artifact_id, agent_id, trigger=trigger, tick=tick)

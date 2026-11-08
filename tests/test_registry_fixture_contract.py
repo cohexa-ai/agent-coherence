@@ -48,6 +48,7 @@ EXPECTED_SHARED_CONSUMERS: frozenset[str] = frozenset({
     "coordinator/test_caller_principal.py",
     "coordinator/test_transfer_record.py",
     "test_conflict_instrumentation.py",
+    "test_regrant_clears_transient.py",
 })
 
 SHARED_PARAM_IDS: tuple[str, ...] = ("memory", "sqlite")

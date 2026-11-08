@@ -9,6 +9,7 @@ Next ==
     \/ WriteAction
     \/ CommitAction
     \/ InvalidateAction
+    \/ ReleaseToReaderAction
     \/ TickAction
 
 Spec == Init /\ [][Next]_baseVars

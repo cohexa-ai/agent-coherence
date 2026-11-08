@@ -656,9 +656,11 @@ class ArtifactRegistry:
                 record.granted_at_tick_by_agent.pop(agent_id, None)
                 # Read-generation fence: revoking this M/E grant WITHOUT moving the
                 # version bumps the artifact's ownership epoch, atomically (GIL)
-                # with the INVALID transition, so a commit by the ex-holder (or any
-                # pre-revocation holder) fails the generation check. The sweep
-                # reclaims, the voluntary release ("invalidate") and the handoff
+                # with the transition out of M/E (to INVALID, or to SHARED when
+                # the holder releases its own grant and keeps a read), so a commit
+                # by the ex-holder (or any pre-revocation holder) fails the
+                # generation check. The sweep reclaims, the voluntary release
+                # ("invalidate", whichever state it lands in) and the handoff
                 # (HANDOFF_TRIGGER, a giver ending its write claim) all qualify —
                 # see EPOCH_BUMP_TRIGGERS. The peer invalidations ("write" /
                 # "commit") do not -- a "commit" moves the version and a

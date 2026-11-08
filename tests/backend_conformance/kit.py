@@ -82,7 +82,7 @@ from uuid import UUID, uuid4
 from ccs.coordinator.backend_contract import R18_LIVENESS_SOURCE, LivenessSourceObligation
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.registry_protocol import TransferRequest
-from ccs.coordinator.service import CoordinatorService
+from ccs.coordinator.service import CoordinatorService, ReleaseRequest
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import (
     SESSION_INVALIDATED_REASON,
@@ -110,8 +110,10 @@ _RECLAIM_TRIGGER = "reclaim_heartbeat"
 
 # The voluntary-release trigger. It is NOT a reclaim, but it ends a write claim
 # at an UNCHANGED version exactly as a reclaim does, so R9 requires it to move
-# the ownership epoch too (EPOCH_BUMP_TRIGGERS = RECLAIM_TRIGGERS + this). Named
-# here as the wire-stable constant, matched by identity, never by substring.
+# the ownership epoch too (EPOCH_BUMP_TRIGGERS = RECLAIM_TRIGGERS + this),
+# whether the release leaves the holder INVALID or, when the holder gives back
+# its own write grant, SHARED. Named here as the wire-stable constant, matched
+# by identity, never by substring.
 _RELEASE_TRIGGER = "invalidate"
 
 # The handoff trigger: a transfer moves its giver INVALID under this trigger,
@@ -512,7 +514,12 @@ def assert_epoch_moves_on_voluntary_release(factory: RegistryFactory) -> None:
     epoch never moves, so the fence has nothing to compare.
 
     Contrast with :func:`assert_fence_rejects_superseded_read_generation`: that
-    leg pins the fence's VERDICT, this one pins the operand the verdict needs."""
+    leg pins the fence's VERDICT, this one pins the operand the verdict needs.
+
+    A release has two end states, and both are checked. The move to INVALID is
+    the operator drain's. The move to SHARED is the holder's own release, at a
+    failed edit or at the end of a turn, which gives the write claim back and
+    keeps a read (:func:`_assert_release_to_reader_moves_epoch`)."""
     reg = factory()
     artifact_id = uuid4()
     _register(reg, artifact_id, version=1)
@@ -558,6 +565,113 @@ def assert_epoch_moves_on_voluntary_release(factory: RegistryFactory) -> None:
     assert reg.get_owner_generation(artifact_id) == steady, (  # type: ignore[attr-defined]
         "a version-moving peer invalidation must NOT move the epoch"
     )
+
+    _assert_release_to_reader_moves_epoch(reg)
+
+
+@dataclass(frozen=True)
+class _HeldWriteClaim:
+    """A write claim set up to be released, and the two generations the
+    release is checked against."""
+
+    artifact_id: UUID
+    holder: UUID
+    epoch: int  # owner_generation while the claim was held
+    read_generation: int  # captured by the acquire
+
+
+def _hold_write_claim(reg: object, shape: MESIState, name: str) -> _HeldWriteClaim:
+    """Register ``name`` at version 1 and give a fresh holder an EXCLUSIVE or
+    MODIFIED grant on it: the two shapes a release starts from."""
+    artifact_id, holder = uuid4(), uuid4()
+    _register(reg, artifact_id, version=1, name=name)
+    reg.set_agent_state(artifact_id, holder, MESIState.EXCLUSIVE, tick=1)  # type: ignore[attr-defined]
+    if shape == MESIState.MODIFIED:
+        reg.set_agent_state(artifact_id, holder, MESIState.MODIFIED, tick=2)  # type: ignore[attr-defined]
+    captured = reg.get_read_generation(artifact_id, holder)  # type: ignore[attr-defined]
+    assert captured is not None, "an M/E acquire must capture a read_generation"
+    assert reg.granted_at_tick(holder, artifact_id) is not None, (  # type: ignore[attr-defined]
+        "scenario precondition: an M/E grant must record the tick it was granted at"
+    )
+    epoch = reg.get_owner_generation(artifact_id)  # type: ignore[attr-defined]
+    return _HeldWriteClaim(artifact_id, holder, epoch, captured)
+
+
+def _assert_kept_as_reader(reg: object, claim: _HeldWriteClaim, route: str) -> None:
+    """The holder is a reader at the version it held, and its write grant is
+    gone without a trace of a reclaim."""
+    artifact_id, holder = claim.artifact_id, claim.holder
+    state = reg.get_agent_state(artifact_id, holder)  # type: ignore[attr-defined]
+    assert state == MESIState.SHARED, f"{route}: the released holder is {state}, not SHARED"
+    assert reg.get_artifact(artifact_id).version == 1, (  # type: ignore[attr-defined]
+        f"{route}: a release must not move the version"
+    )
+    assert reg.last_observed_version_for(artifact_id, holder) == 1, (  # type: ignore[attr-defined]
+        f"{route}: the released holder no longer records the version it held"
+    )
+    assert reg.granted_at_tick(holder, artifact_id) is None, (  # type: ignore[attr-defined]
+        f"{route}: the released holder still carries its write grant's tick"
+    )
+    assert reg.get_last_reclamation(holder, artifact_id) is None, (  # type: ignore[attr-defined]
+        f"{route}: a release recorded a reclamation slot; only a sweep reclaim may"
+    )
+
+
+def _assert_old_claim_fenced(reg: object, claim: _HeldWriteClaim, route: str) -> None:
+    """The epoch moved past the claim given back, the release captured nothing,
+    and so the holder's commit on that claim is refused at the unchanged
+    version."""
+    artifact_id, holder = claim.artifact_id, claim.holder
+    assert reg.get_owner_generation(artifact_id) > claim.epoch, (  # type: ignore[attr-defined]
+        f"{route}: a release to SHARED gave up a write claim without moving "
+        "owner_generation; landing SHARED instead of INVALID does not exempt it"
+    )
+    kept = reg.get_read_generation(artifact_id, holder)  # type: ignore[attr-defined]
+    assert kept == claim.read_generation, (
+        f"{route}: the release captured a read_generation ({claim.read_generation} "
+        f"-> {kept}); a transition out of M/E captures nothing"
+    )
+    result = reg.commit_cas(  # type: ignore[attr-defined]
+        artifact_id, holder, expected_version=1, content_hash=_hash(f"kept-{route}"), tick=9
+    )
+    assert isinstance(result, ConflictDetail), (
+        f"{route}: the holder's commit on the claim it gave back was ADMITTED at "
+        f"an unchanged version, got {result!r}"
+    )
+    assert result.reason == STALE_READ_GENERATION_REASON, f"{route}: {result.reason}"
+    assert reg.get_artifact(artifact_id).version == 1  # type: ignore[attr-defined]
+
+
+def _assert_release_to_reader_moves_epoch(reg: object) -> None:
+    """Release-to-reader leg of :func:`assert_epoch_moves_on_voluntary_release`.
+    A holder that gives back its own write grant keeps a read: EXCLUSIVE or
+    MODIFIED to SHARED under the release trigger. Leaving M/E is what revokes
+    the claim, so the epoch MUST move whichever state the holder lands in. A
+    backend that bumps only on landing INVALID passes the leg above and ADMITS
+    the given-back claim's commit here, at a version that never moved.
+
+    Each shape runs twice: as the bare registry write, and through
+    ``CoordinatorService.release_to_reader``, the operation the coordinator
+    calls, which builds that write from this backend's own members."""
+    for shape in (MESIState.EXCLUSIVE, MESIState.MODIFIED):
+        label = shape.name.lower()
+        claim = _hold_write_claim(reg, shape, f"kept-{label}.md")
+        reg.set_agent_state(  # type: ignore[attr-defined]
+            claim.artifact_id, claim.holder, MESIState.SHARED,
+            trigger=_RELEASE_TRIGGER, tick=3, observed=False,
+        )
+        route = f"set_agent_state from {shape.name}"
+        _assert_kept_as_reader(reg, claim, route)
+        _assert_old_claim_fenced(reg, claim, route)
+
+        claim = _hold_write_claim(reg, shape, f"kept-by-service-{label}.md")
+        released = CoordinatorService(reg).release_to_reader(
+            ReleaseRequest(agent_id=claim.holder, artifact_id=claim.artifact_id, issued_at_tick=3)
+        )
+        route = f"release_to_reader from {shape.name}"
+        assert released, f"{route}: reported no write grant to release"
+        _assert_kept_as_reader(reg, claim, route)
+        _assert_old_claim_fenced(reg, claim, route)
 
 
 def assert_epoch_moves_on_handoff(factory: RegistryFactory) -> None:

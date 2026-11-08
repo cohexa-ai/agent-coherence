@@ -316,7 +316,7 @@ def test_a_cas_refused_by_the_grant_its_release_left_held_answers_coordinator_fa
 
         with monkeypatch.context() as faulted:
             # The stop's per-grant release; its failure is answered per grant.
-            faulted.setattr(server.service, "invalidate", refusing)
+            faulted.setattr(server.service, "release_to_reader", refusing)
             result = _do_write_cas(vol, config, conflicts, rel, version, "v3")
 
         assert result.isError is True, result.structuredContent

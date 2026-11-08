@@ -434,7 +434,7 @@ def test_a_transferred_path_leaves_the_write_record_and_the_rest_stays(
     """One incarnation wrote two paths and hands one of them on. The record
     keeps that incarnation for the other path, which it still holds: the next
     re-mint releases it, one stop naming the writing incarnation, and the
-    grant is gone afterwards."""
+    write grant is gone afterwards (the release keeps a read, #513)."""
     _seed(tmp_path, _PLAN, b"plan v1")
     _seed(tmp_path, _OTHER, b"other v1")
     spare = "data/spare.md"
@@ -452,7 +452,8 @@ def test_a_transferred_path_leaves_the_write_record_and_the_rest_stays(
 
         stops = [body for route, body in sent if route == "/hooks/session-stop"]
         assert [body["agent_id"] for body in stops] == [writer]
-        assert _held(giver, str(session_to_agent_id(giver.session_id, writer))) == {}
+        held = _held(giver, str(session_to_agent_id(giver.session_id, writer)))
+        assert not [state for state in held.values() if state in ("EXCLUSIVE", "MODIFIED")], held
     finally:
         stop_coordinator(tmp_path)
 

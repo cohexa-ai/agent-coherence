@@ -968,13 +968,20 @@ def _agent_id(vol: CoherentVolume) -> str:
 def _held(vol: CoherentVolume, agent_id: str) -> dict[str, str]:
     """What the COORDINATOR says ``agent_id`` holds, ``{path: state}``, read from
     ``/status`` — which lists every non-INVALID row, so ``{}`` means the row holds
-    nothing (released, or never taken)."""
+    nothing (never taken, or made stale by a peer). A released write grant stays
+    listed as SHARED (#513)."""
     status = vol.coordinator_status()
     assert status is not None, "the coordinator must be reachable to read its grant rows"
     for session in status["sessions"]:
         if session["agent_id"] == agent_id:
             return dict(session["states"])
     return {}
+
+
+def _write_held(vol: CoherentVolume, agent_id: str) -> dict[str, str]:
+    """The EXCLUSIVE and MODIFIED rows of :func:`_held`: the grants a release
+    gives back, so ``{}`` means the row holds no write grant."""
+    return {path: state for path, state in _held(vol, agent_id).items() if state in ("EXCLUSIVE", "MODIFIED")}
 
 
 def _end_turn(vol: CoherentVolume) -> None:
@@ -991,7 +998,7 @@ def _end_turn(vol: CoherentVolume) -> None:
         {"session_id": vol.session_id, "agent_id": vol._incarnation},
         extra_headers=caller_principal_headers(vol._principal),
     )
-    assert _held(vol, _agent_id(vol)) == {}, "the turn-end stop released nothing"
+    assert _write_held(vol, _agent_id(vol)) == {}, "the turn-end stop released nothing"
 
 
 def test_sibling_volume_attaches_to_strict_coordinator(
@@ -2703,7 +2710,7 @@ def test_fs_write_failure_releases_grant(
         assert any(
             p == "/hooks/post-edit" and pay.get("success") is False for p, pay in posts
         ), "FS-write failure must release the grant via post-edit success=false"
-        assert _held(vol, _agent_id(vol)) == {}, (
+        assert _write_held(vol, _agent_id(vol)) == {}, (
             "the failure release reached the coordinator but left the grant held"
         )
     finally:
@@ -4028,7 +4035,7 @@ def test_write_cas_at_commits_over_a_grant_its_own_write_left_standing(
         vol.write_cas_at(rel, version, b"v2-cas")
 
         assert target.read_bytes() == b"v2-cas"
-        assert _held(vol, stranded) == {}, "the abandoned incarnation still holds a grant"
+        assert _write_held(vol, stranded) == {}, "the abandoned incarnation still holds a grant"
     finally:
         stop_coordinator(tmp_path)
 
@@ -4053,7 +4060,7 @@ def test_write_cas_at_after_a_committed_write_on_the_same_volume_commits(
         vol.write_cas_at(rel, version, b"v3-cas")
 
         assert target.read_bytes() == b"v3-cas"
-        assert _held(vol, writer_row) == {}, "the abandoned incarnation still holds a grant"
+        assert _write_held(vol, writer_row) == {}, "the abandoned incarnation still holds a grant"
     finally:
         stop_coordinator(tmp_path)
 
@@ -4079,7 +4086,7 @@ def test_write_cas_directly_after_a_committed_write_on_the_same_volume_commits(
         vol.write_cas(rel, lambda cur: cur + b"+cas")
 
         assert target.read_bytes() == b"v2-pessimistic+cas"
-        assert _held(vol, writer_row) == {}, "the abandoned incarnation still holds a grant"
+        assert _write_held(vol, writer_row) == {}, "the abandoned incarnation still holds a grant"
     finally:
         stop_coordinator(tmp_path)
 
@@ -4138,7 +4145,7 @@ def test_a_denied_write_on_another_path_keeps_the_grant_record(
         vol.write_cas(p, lambda cur: cur + b"+cas")
 
         assert target.read_bytes() == b"p2+cas"
-        assert _held(vol, writer_row) == {}, "the grant on the first path was never released"
+        assert _write_held(vol, writer_row) == {}, "the grant on the first path was never released"
     finally:
         stop_coordinator(tmp_path)
 
@@ -4225,7 +4232,7 @@ def test_an_error_answer_after_the_acquire_keeps_the_grant_record(
         vol.write_cas(p, lambda cur: cur + b"+cas")
 
         assert target.read_bytes() == b"p1+cas"
-        assert p not in _held(vol, stranded), "the grant the failed write() took was never released"
+        assert p not in _write_held(vol, stranded), "the grant the failed write() took was never released"
     finally:
         stop_coordinator(tmp_path)
 
@@ -4275,7 +4282,7 @@ def test_write_cas_rotates_for_a_file_an_earlier_attempt_still_holds(
 
         assert target.read_bytes() == b"p2+cas"
         assert len(commits) == 1, f"the volume's own grant refused a commit: {commits}"
-        assert p not in _held(vol, first_row)
+        assert p not in _write_held(vol, first_row)
     finally:
         stop_coordinator(tmp_path)
 
@@ -4316,7 +4323,7 @@ def test_a_degraded_release_answer_is_not_a_confirmed_release(
         vol.write_cas_at(rel, version, b"v3")
 
         assert target.read_bytes() == b"v3"
-        assert _held(vol, writer_row) == {}
+        assert _write_held(vol, writer_row) == {}
     finally:
         stop_coordinator(tmp_path)
 
@@ -4576,7 +4583,7 @@ def test_failed_release_is_kept_and_retried_at_the_next_re_mint(
         vol.write_cas_at(rel, version, b"v3-cas")
 
         assert target.read_bytes() == b"v3-cas"
-        assert _held(vol, writer_row) == {}
+        assert _write_held(vol, writer_row) == {}
     finally:
         stop_coordinator(tmp_path)
 
@@ -7649,7 +7656,7 @@ def test_a_write_whose_commit_gets_no_answer_releases_its_grant_and_never_return
         (release, kwargs), = _releases(calls)
         assert release == {"session_id": vol.session_id, "agent_id": holder, "path": rel, "success": False}
         assert kwargs["timeout"] == coherent_volume_module._GRANT_RELEASE_TIMEOUT_SEC < CLI_HTTP_TIMEOUT_SEC
-        assert _held(vol, str(session_to_agent_id(vol.session_id, holder))) == {}, "the grant stands"
+        assert _write_held(vol, str(session_to_agent_id(vol.session_id, holder))) == {}, "the grant stands"
         assert holder not in vol._grant_incarnations, "an answered release left the grant recorded"
     finally:
         silent.close()
@@ -7684,7 +7691,7 @@ def test_a_write_keeps_its_grant_on_record_until_a_release_is_answered(
         assert len(_releases(calls)) == 1, "control: one release was sent"
         if release == "answered":
             assert holder not in vol._grant_incarnations
-            assert _held(vol, holder_row) == {}
+            assert _write_held(vol, holder_row) == {}
         else:
             assert vol._grant_incarnations.get(holder) == {rel}
             assert _held(vol, holder_row) == {rel: "EXCLUSIVE"}, "control: the grant still stands"
@@ -7693,7 +7700,7 @@ def test_a_write_keeps_its_grant_on_record_until_a_release_is_answered(
 
         stops = [body["agent_id"] for path, body, _k in calls if path == "/hooks/session-stop"]
         assert stops == ([] if release == "answered" else [holder])
-        assert _held(vol, holder_row) == {}
+        assert _write_held(vol, holder_row) == {}
         assert holder not in vol._grant_incarnations
     finally:
         stop_coordinator(tmp_path)
@@ -7729,13 +7736,13 @@ def test_a_released_grant_leaves_the_record_of_the_incarnation_s_other_paths_alo
 
         assert len(_releases(calls)) == 1, "control: one release was sent"
         assert vol._grant_incarnations == {holder: {other}}, "the release took more than its own path"
-        assert rel not in _held(vol, holder_row), "control: the coordinator released the path"
+        assert rel not in _write_held(vol, holder_row), "control: the coordinator released the path"
         calls.clear()
         vol.reacquire(rel)
 
         stops = [body["agent_id"] for path, body, _k in calls if path == "/hooks/session-stop"]
         assert stops == [holder], "the record of the other path was lost, so no re-mint released it"
-        assert _held(vol, holder_row) == {}
+        assert _write_held(vol, holder_row) == {}
         assert holder not in vol._grant_incarnations
     finally:
         stop_coordinator(tmp_path)
@@ -7772,7 +7779,7 @@ def test_a_release_that_is_not_a_clean_ok_leaves_the_grant_on_record(
 
         stops = [body["agent_id"] for path, body, _k in calls if path == "/hooks/session-stop"]
         assert stops == [holder]
-        assert _held(vol, holder_row) == {}
+        assert _write_held(vol, holder_row) == {}
         assert holder not in vol._grant_incarnations
     finally:
         stop_coordinator(tmp_path)
@@ -8004,7 +8011,7 @@ def test_a_release_after_a_commit_that_landed_leaves_the_commit_as_it_is(
         (after_commit,) = landed
         assert after_commit == (2, _sha(b"v2"), holder_row.replace("-", "")), "control: the commit landed"
         assert record_of() == after_commit, "the release changed what the commit recorded"
-        assert _held(vol, holder_row) == {}, "control: the release was answered and gave up the grant"
+        assert _write_held(vol, holder_row) == {}, "control: the release was answered and gave up the grant"
     finally:
         server.shutdown()
 
