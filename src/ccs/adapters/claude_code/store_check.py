@@ -66,7 +66,6 @@ from __future__ import annotations
 import errno
 import os
 import shutil
-import stat
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -74,6 +73,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import BinaryIO
+
+from ccs.adapters.claude_code.regular_file import open_regular
 
 # The check's SQLite calls live in the registry module (the sqlite3 module
 # stays out of adapters, cli and mcp; tests/coordinator/test_caller_principal.py
@@ -287,7 +288,7 @@ def _coordinator_holds_lock(pid_file: Path) -> bool:
     """
     with _oserror_means(LOCK_PROBE_FAILED_REASON):
         try:
-            fd = _open_regular(pid_file, os.O_NOFOLLOW)
+            fd = open_regular(pid_file)
         except FileNotFoundError:
             return False
         try:
@@ -328,25 +329,6 @@ def _resolved(db_path: Path) -> Path:
     the registry's pre-create leaves beside the link."""
     with _oserror_means(STORE_UNREADABLE_REASON):
         return Path(os.path.realpath(db_path))
-
-
-def _open_regular(path: Path, extra_flags: int = 0) -> int:
-    """Open ``path`` read-only and return the descriptor, or raise
-    ``OSError(EINVAL)`` when it is not a regular file. Non-blocking, because
-    opening a FIFO that has no writer blocks forever; checked on the
-    descriptor, because a device such as ``/dev/zero`` never reaches EOF and
-    copying it would fill the temp disk. ``O_NONBLOCK`` changes nothing for a
-    regular file, nor for flock."""
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | extra_flags)
-    try:
-        mode = os.fstat(fd).st_mode
-    except OSError:
-        os.close(fd)
-        raise
-    if not stat.S_ISREG(mode):
-        os.close(fd)
-        raise OSError(errno.EINVAL, f"{path} is not a regular file")
-    return fd
 
 
 def _stat_key(path: Path) -> tuple[int, int, int, int, int] | None:
@@ -442,7 +424,7 @@ def _copy_file(source: Path, target: Path) -> None:
     read as an unreadable store, target failures as the check's environment,
     and a vanished source as a change."""
     try:
-        source_file = os.fdopen(_open_regular(source), "rb")
+        source_file = os.fdopen(open_regular(source), "rb")
     except FileNotFoundError as exc:
         raise _SourceChanged from exc
     except OSError as exc:

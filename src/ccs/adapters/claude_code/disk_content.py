@@ -13,10 +13,9 @@ once rather than in either of them.
 from __future__ import annotations
 
 import logging
-import os
-import stat
 from pathlib import Path
 
+from ccs.adapters.claude_code.regular_file import ReadStatus, read_regular_file
 from ccs.core.substrate import sha256_hex
 
 logger = logging.getLogger(__name__)
@@ -45,27 +44,9 @@ def hash_regular_file(path: Path, *, max_bytes: int = DEFAULT_MAX_HASH_BYTES) ->
     — deleted, renamed away, replaced by a directory or a link, permission
     revoked, or larger than ``max_bytes``. All of those are coverage gaps.
     """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    try:
-        fd = os.open(path, flags)
-    except OSError:
+    result = read_regular_file(path, max_bytes=max_bytes)
+    if result.status is ReadStatus.TOO_LARGE:
+        logger.debug("%s exceeds the %d-byte hash cap; not hashed", path, max_bytes)
+    if result.status is not ReadStatus.READ or result.data is None:
         return None
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            return None
-        if info.st_size > max_bytes:
-            logger.debug("%s exceeds the %d-byte hash cap; not hashed", path, max_bytes)
-            return None
-        with os.fdopen(fd, "rb", closefd=True) as handle:
-            fd = -1  # ownership moved to the file object
-            data = handle.read(max_bytes + 1)
-        if len(data) > max_bytes:
-            logger.debug("%s grew past the %d-byte hash cap; not hashed", path, max_bytes)
-            return None
-        return sha256_hex(data)
-    except OSError:
-        return None
-    finally:
-        if fd >= 0:
-            os.close(fd)
+    return sha256_hex(result.data)
