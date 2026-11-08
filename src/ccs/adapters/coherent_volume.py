@@ -513,7 +513,7 @@ def _undecided_grant_message(rel: str) -> str:
     return (
         f"the coordinator could not decide the grant request for {rel} in time. Nothing "
         "was written, but the request may still take the grant. Back off, then retry "
-        "the write; if you give up instead, call reacquire(), which releases it."
+        "the write; if you give up instead, call release() on the path, which releases it."
     )
 
 
@@ -1088,7 +1088,8 @@ class CoherentVolume:
       coordinator answers with an HTTP 5xx, which says nothing of whether it
       ran; a 4xx keeps the plain error. A :meth:`write` whose commit gets no
       answer or a 5xx first sends one best-effort release of its grant, and
-      its error says the bytes are on disk. A read the coordinator answers
+      its error says the bytes are on disk and that writing the path again
+      records them. A read the coordinator answers
       with its failure envelope raises
       :class:`~ccs.core.exceptions.CoordinatorFailed`, and so does the release
       a re-mint sends for an earlier attempt's write grant, before anything is
@@ -1145,6 +1146,14 @@ class CoherentVolume:
       write outside ``managed`` sends no flag and still displaces. The check
       reads the resolved path, so a link under ``managed`` to a file outside
       it is such a write.
+
+    **Letting go (#505).** A successful :meth:`write` keeps the file's write
+    grant after it returns. :meth:`release` gives back one file's grant and
+    keeps the volume's other holds; :meth:`close` gives back every grant and
+    ends the volume, after which every operation but ``close()`` raises; a
+    ``with`` block closes the volume on exit. Nothing closes a volume when its
+    process exits or its last reference is dropped: its grants then wait for
+    the coordinator's sweep.
 
     **Fleet requirement (hard, v1).** Every instance coordinating a given
     workspace MUST declare the **same** ``managed`` globs: an attaching instance
@@ -1442,10 +1451,11 @@ class CoherentVolume:
         file; and in a forked child, which also gets a new :attr:`session_id`.
         Nothing else changes it, so it is stable between those points, and a
         value read after an operation returns names the attempt that operation
-        finished on. Two requests can name an older incarnation: the release
-        of a write grant that incarnation abandoned, and a :meth:`transfer`,
-        whose grants each name the incarnation that holds this volume's claim
-        on that path."""
+        finished on. :meth:`release` and :meth:`close` start no attempt.
+        Several requests can name an older incarnation: the release of a write
+        grant that incarnation abandoned, a :meth:`release` or :meth:`close` of
+        a grant it holds, and a :meth:`transfer`, whose grants each name the
+        incarnation that holds this volume's claim on that path."""
         return self._incarnation
 
     @property
@@ -2104,9 +2114,10 @@ class CoherentVolume:
         not decide in time raises :class:`~ccs.core.exceptions.CoordinatorFailed`,
         and one with no usable answer raises
         :class:`~ccs.core.exceptions.CoordinatorUnreachable`. Neither writes
-        anything, but either may leave a grant, so retry, or call :meth:`reacquire`
-        if you give up. A successful write keeps its grant, across later commits,
-        until :meth:`reacquire` or another verb that starts a new attempt.
+        anything, but either may leave a grant, so retry, or call :meth:`release`
+        on the path if you give up. A successful write keeps its grant, across later
+        commits, until :meth:`release` or :meth:`close` gives it back, or
+        :meth:`reacquire` or another verb that starts a new attempt releases it.
 
         Also prevents the **foreign-edit clobber** (content-CAS, write surface):
         on a managed (strict) path, if the file on disk changed out-of-band since
@@ -2405,11 +2416,12 @@ class CoherentVolume:
         Re-minting the identity resets this instance's view of *every* path, not
         just ``path`` — other tracked paths should be re-read before writing.
 
-        It is also how a holder lets go under ``on_held="refuse"``: it releases every
-        path this attempt holds, not only ``path``, and a peer can then be admitted
-        to each. Best-effort in both directions: a return can follow a release the
-        coordinator did not confirm, which the next re-mint sends again, and a raise
-        can follow one it did, as on a file that was deleted.
+        It also releases: every path this attempt holds, not only ``path``, and a
+        peer can then be admitted to each. To give back one file without a new
+        attempt, call :meth:`release`; to give back every file and end the volume,
+        :meth:`close`. Best-effort in both directions: a return can follow a release
+        the coordinator did not confirm, which the next re-mint sends again, and a
+        raise can follow one it did, as on a file that was deleted.
 
         Always returns the current bytes without raising, even under
         ``on_stale_read="raise"`` — recovery must never be blocked by the deny
@@ -2830,10 +2842,11 @@ class CoherentVolume:
         pessimistic ``write()`` keeps that grant until the coordinator reclaims it
         (after ``grant_heartbeat_timeout_sec`` without a coordinator call, 600 s
         by default, or ``grant_max_hold_sec`` of holding, 1800 s by default) or
-        the holder releases it, which a ``CoherentVolume`` holder does only at
-        its own next re-mint: a ``write_cas`` of that file or any ``write_cas``
-        retry, ``write_cas_at``, ``atomic_publish`` or :meth:`reacquire` (the
-        re-mint releases what its ``write()`` left held; see :meth:`_remint`). A
+        the holder releases it, which a ``CoherentVolume`` holder does when it
+        calls :meth:`release` on the file or :meth:`close`, or at its own next
+        re-mint: a ``write_cas`` of that file or any ``write_cas`` retry,
+        ``write_cas_at``, ``atomic_publish`` or :meth:`reacquire` (the re-mint
+        releases what its ``write()`` left held; see :meth:`_remint`). A
         ``session-stop`` naming only its :attr:`session_id` releases nothing,
         because each attempt holds its grants under its own incarnation. A
         peer's reads and CAS attempts never release it, and a peer's ``write()``

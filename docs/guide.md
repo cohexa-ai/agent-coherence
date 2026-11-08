@@ -1416,6 +1416,12 @@ vol = CoherentVolume(workspace_root, managed=("plans/**", "memory/**"))
 data = vol.read("plans/plan.md")            # bytes — registers a SHARED view
 vol.write("plans/plan.md", revise(data))    # stale view? denied fail-closed
 data = vol.reacquire("plans/plan.md")       # recover: clear the stale view + fresh read
+vol.release("plans/plan.md")                # done with one file: give its grant back
+vol.close()                                 # done with the volume: give every grant back
+
+with CoherentVolume(workspace_root, managed=("plans/**",)) as vol:
+    vol.write("plans/plan.md", revise(vol.read("plans/plan.md")))
+# leaving the block closed the volume
 ```
 
 | Parameter | Default | Meaning |
@@ -1447,8 +1453,21 @@ claim there, which can be an earlier one). Both change
 only when an attempt starts (`reacquire()`, `write_cas_at`, `atomic_publish`, a
 `write_cas` that retries or first releases its own `write()` grant, and a forked
 child) and are stable in between, so read them after the operation whose
-attempt you are reporting. `vol.root` is the workspace root as the volume
-resolved it at construction (absolute, symlinks followed); it never changes.
+attempt you are reporting. `release()` and `close()` start no attempt.
+`vol.root` is the workspace root as the volume resolved it at construction
+(absolute, symlinks followed); it never changes.
+
+`write()` returns a `WriteResult` (from `ccs.adapters.coherent_volume`). Its
+`disk_differs` is `True` when the coordinator reported, as it admitted the
+write's grant request, that the file held bytes it had not recorded, and the
+write replaced them. That is either this volume's own earlier write whose
+commit did not reach the coordinator, which this write now records, or an edit
+made outside the coordinator, which this write overwrote: a path the volume
+never read gives its foreign-edit check nothing to compare against. `False`
+says only that the coordinator did not report it, which it does not on a path
+it does not track, within a few seconds of the volume's own last commit of the
+file, while a peer's write is in flight, or when no coordinator answered. It
+never means an earlier write is now recorded.
 
 ### Concurrent writers: `write_cas`
 
@@ -1530,11 +1549,13 @@ fresh attempt whose read records no claim. In process,
 refusal's pair. Recover by `last_conflict_reason` (or `reason`), never by the
 pair.
 
-A `CoherentVolume` that wrote a file keeps holding it until its own next
-`write_cas` of that file or any `write_cas` retry, `write_cas_at`,
-`atomic_publish` or `reacquire()` releases it. Closing the volume or exiting the process does not release it, and
-neither does a `session-stop` that names only `vol.session_id`, because each
-attempt holds its grants under its own `agent_id`. The coordinator
+A `CoherentVolume` that wrote a file keeps holding it until it calls
+`release()` on the file or `close()`, or its own next `write_cas` of that file
+or any `write_cas` retry, `write_cas_at`, `atomic_publish` or `reacquire()`
+releases it; see [Letting go: `release()` and `close()`](#letting-go-release-and-close).
+Exiting the process without `close()` does not release it, and neither does a
+`session-stop` that names only `vol.session_id`, because each attempt holds its
+grants under its own `agent_id`. The coordinator
 takes the file back once the holder has recorded no heartbeat for
 `grant_heartbeat_timeout_sec` (600 s by default; only its reads, writes and
 commits of tracked files record one), or has held it for
@@ -1570,6 +1591,72 @@ which says whether the sweep reclaimed the grant or a peer took it. Its
 `captured_generation` and `owner_generation` are that refusal's pair: after a
 reclaim, for example, `0` and `1`. Both are `None` when the refusal carried
 none. The recovery is the same whatever they say.
+
+### Letting go: `release()` and `close()`
+
+A successful `write()` keeps the file's write grant after it returns, so a peer
+that waits for a held file waits for this volume. Give grants back when you are
+done with them:
+
+| Call | Gives back | Then |
+|---|---|---|
+| `vol.release(path)` | the write grant on `path`, under every attempt of this volume that took one | the volume keeps a read of the version it held, so it reads and writes the file again with no `reacquire()` until a peer writes it; its other grants stand |
+| `vol.close()` | every write grant the volume holds | every operation but `close()` raises `CoherenceError`; build a new volume to go on. Properties stay readable |
+| leaving `with CoherentVolume(...) as vol:` | as `close()` | when the body raised, a close that fails is logged and the body's error propagates |
+| `vol.reacquire(path)` | every write grant of the current attempt | starts a new attempt and reads `path`; see [Refusing a file another agent holds](#refusing-a-file-another-agent-holds) for what that costs |
+
+A peer with `on_held="refuse"` is admitted to a released file at once, instead
+of after the coordinator's sweep. `release()` and `close()` start no attempt, so
+`vol.agent_id` and `vol.incarnation` do not change.
+
+The volume decides what to release from its own record of the grants its
+`write()` calls took, because the coordinator answers a release the same way
+whether it released a grant or held nothing. So `release()` sends nothing for a
+path this volume never wrote. It sends nothing either for another spelling of a
+path it wrote, such as `data/X.TXT` for `data/x.txt` or another Unicode form of
+the same name, even where the filesystem treats the two as one file, so the
+grant stands (#506). `./data/x.txt` and a symbolic link to the file resolve to
+the same path and are released.
+
+**When the release is not confirmed.** A release the coordinator does not
+confirm keeps the grant on the volume's record. Under `on_error="strict"` it
+raises `CoordinatorUnreachable` when there was no usable answer,
+`CoordinatorFailed` for an HTTP `5xx` or the coordinator's failure envelope, and
+`CoherenceError` for a watchdog-degraded answer or a grant the coordinator
+reports still held; the message names the path and says to call `release()` or
+`close()` again, which sends the release again. Degrade mode warns. A closed
+volume stays closed whatever the answer. `close()` goes on to the volume's other
+attempts after a grant reported still held, and stops at a request with no
+usable answer, so a coordinator that has stopped answering costs one client
+timeout (6 s by default). When no coordinator is listening at all, for example
+after the volume's own coordinator shut down after `idle_shutdown_sec` with no
+requests, `close()` logs the paths it could not release and returns without
+raising: nothing the caller does can release them, and the next coordinator's
+sweep takes them back.
+
+**What else to know.**
+
+- Nothing closes a volume when its process exits, and dropping the last
+  reference to a volume does not close it either: its grants wait for the sweep
+  (600 s by default). There is no exit hook, because a close at interpreter
+  exit fails in the process that hosts the coordinator. A `with` block inside a
+  generator that is never run to its end closes only when the generator is
+  collected, which can be at interpreter exit.
+- `close()` from inside another operation of the same volume, such as a
+  `write_cas` closure, raises and closes nothing. `release()` works there.
+- A forked child of a closed volume is closed.
+- A release records a heartbeat for the attempt that held the grant, which also
+  resets the sweep's clock on that attempt's other grants.
+- After `release(path)`, a `write_cas` of the same path is refused once and
+  retries from a new attempt, which releases the volume's other grants too.
+- Against this package's coordinator through 0.15.0, or the Claude Code
+  plugin's Node coordinator through 0.6.0, a release leaves the volume's copy
+  `INVALID`, so its next `write()` of the file raises `StaleView`: call
+  `reacquire()` before writing it again.
+- On the Node coordinator a session-stop answers `ok: true` even when a release
+  in it failed, so `close()` can count a grant as released that still stands,
+  and a release that fails on its failed-edit route answers with no account of
+  the grant, so `release()` raises `CoherenceError`.
 
 ### Refusing a file another agent holds
 
@@ -1637,13 +1724,17 @@ not reach it.
   can also meet `CoordinatorUnreachable`: the first volume hosts the coordinator
   in its own process, so the holder exiting can end it, and a volume never finds
   the next coordinator. Build a new volume then. It is a new agent, so a grant
-  its predecessor left refuses it until the sweep reclaims that grant.
-- **If you give up, call `reacquire()` once.** After `unavailable` or no answer,
-  a grant you do not know about may stand, and it refuses peers until the sweep.
+  its predecessor left refuses it until the sweep reclaims that grant, unless
+  the predecessor called `close()` before it exited.
+- **If you give up, call `release(path)` once.** After `unavailable` or no
+  answer, a grant you do not know about may stand, and it refuses peers until
+  the sweep. `release(path)` sends its release; `close()` does for every file.
 
 **Letting go.** A successful `write()` keeps its grant across later commits, so
-a refuse-mode volume protects its work between writes, and peers wait.
-`reacquire()` is the release, and it has costs:
+a refuse-mode volume protects its work between writes, and peers wait. Call
+`release(path)` when you are done with a file and `close()` when you are done
+with the volume; see [Letting go: `release()` and `close()`](#letting-go-release-and-close).
+`reacquire()` releases too, and it has costs:
 
 - `reacquire()` releases every path this attempt holds, not only the one you
   name, and a peer can then be admitted to each. A plain retry keeps them.
@@ -1657,14 +1748,14 @@ a refuse-mode volume protects its work between writes, and peers wait.
   coordinator did not confirm, and a raise can follow one it did.
 
 `write_cas` of a file this volume holds, any `write_cas` retry, `write_cas_at`
-and `atomic_publish` drop every hold too. A volume has no `close()`, and exiting
-the process releases nothing.
+and `atomic_publish` drop every hold too. Exiting the process without `close()`
+releases nothing.
 
 **How long a holder refuses.** A holder that goes quiet refuses for about 600 s
 (`grant_heartbeat_timeout_sec`) plus the next sweep pass. A commit, or any other
 request on a tracked file, resets that clock, and a refused request counts: a
 volume polling for one file keeps its own holds on others alive. Let go of those
-before you poll, because two holders polling each other both wait for the
+with `release(path)` before you poll, because two holders polling each other both wait for the
 ceiling, `grant_max_hold_sec` (1800 s), which nothing resets. With the sweep off,
 a holder refuses until it releases. A reclaimed holder's next write raises
 `StaleView` or `CommitPreempted`, depending on where the reclaim falls.
@@ -1681,7 +1772,8 @@ a holder refuses until it releases. A reclaimed holder's next write raises
 - `install()`, `coherent_workspace()` and the `stale-write-guard-fs` tools take
   no `on_held`, so they displace.
 - A forked child is another agent: it is refused while its parent holds the file,
-  naming an id it cannot map. Let go before you fork.
+  naming an id it cannot map. Call `release(path)`, or `close()`, before you
+  fork.
 - During a live [handoff](#targeted-grant-handoff) with nobody holding the file,
   a refuse-mode write is admitted and overtakes the handoff with no signal, and
   the successor is then refused by it. `OtherHolder` carries no handoff record.
@@ -1717,7 +1809,8 @@ A commit is different, because its request may have reached the coordinator
 before the answer was lost. When the CAS of `write_cas` or `write_cas_at`, the
 commit of `atomic_publish`, or the post-edit of a plain `write()` was sent and
 got no usable answer, the volume raises `CommitUnconfirmed`: the commit may or
-may not have landed, so re-read before retrying. When the request never left,
+may not have landed, so re-read before retrying a compare-and-swap (a plain
+`write()` recovers differently; see below). When the request never left,
 because the connection was refused, it raises `CoordinatorUnreachable`.
 A commit the coordinator answers with an HTTP `5xx` raises `CommitUnconfirmed`
 too, and its message names the status. A `5xx` does not say whether the commit
@@ -1734,7 +1827,20 @@ A plain `write()` has already put its bytes on disk when its post-edit gets no
 usable answer or a `5xx`. Its error says so, and says whether the coordinator
 certainly did not record the write or may have. Before raising, the volume
 sends one short, best-effort request to release its write grant, so peers are
-not held off until the sweep takes the file back.
+not held off until the sweep takes the file back; the error says whether that
+release was confirmed, and `release(path)` sends one that was not.
+
+Re-reading does not recover such a write. While the coordinator has not
+recorded it, the bytes on disk are not the content it records, so
+`read_with_version()`, `read_with_version_generation()`, `swg_read`, the effect
+fence and `read()` under `on_stale_read="raise"` refuse the path as a
+`split_pair` every time (under the default `on_stale_read="allow"`, `read()`
+returns the bytes with no signal). Write the path again, with these bytes or a
+change built from them: that write records them, and if the first commit did
+land after all, it commits the same content at the next version. Within a few
+seconds of the volume's own last commit of the file, a versioned read can
+return such bytes with the old version, so a read that returns does not show
+that the commit landed.
 
 To recover, keep in mind that a volume keeps the endpoint it attached to, so
 it never finds a coordinator started after the old one went away:
@@ -1752,7 +1858,8 @@ A coordinator goes away when it is killed or crashes, when the session or
 process hosting it exits, or after `idle_shutdown_sec` (900 s by default) with
 no requests. During a graceful stop it answers `503` for a moment before it
 stops listening. A commit in that moment raises `CommitUnconfirmed`, as on any
-`5xx`, so re-read before retrying; any other request raises
+`5xx`: re-read before retrying a compare-and-swap, and write the path again
+after a plain `write()`; any other request raises
 `CoordinatorFailed`, as on any `5xx` that answers a request that commits
 nothing.
 
@@ -1797,7 +1904,9 @@ may have recorded the commit before the error.
   commit, so a commit the coordinator recorded moves the version while the old
   bytes are still on disk. A plain `write()` has already put its bytes on disk;
   its error says so, and it first releases its grant, as it does when a commit
-  gets no answer.
+  gets no answer. Recover it as you would that write: re-reading does not clear
+  the refusal of a path whose bytes the coordinator did not record, and writing
+  the path again records them.
 - **A write's grant request** (the pre-edit of `write()`) answered this way
   still raises `StaleView` and lands nothing. The `unavailable` refusal is a
   different answer, and raises `CoordinatorFailed` from a refuse-mode `write()`;
@@ -2031,8 +2140,11 @@ script. The volume checks a content hash at both boundaries:
   bytes the rest of your state wasn't computed from. In strict mode the
   coordinator enforces the same check server-side.
 
-A volume never denies its own just-written bytes: the benign window between a
-commit and its disk write is recognized and suppressed.
+A volume does not deny its own just-written bytes once their commit is
+recorded: the benign window between a commit and its disk write is recognized
+and suppressed. Bytes whose commit did not reach the coordinator are refused
+like any bytes it has not recorded, until a `write()` records them (see
+[When the coordinator does not answer](#when-the-coordinator-does-not-answer)).
 
 Whatever `on_stale_read` says, the versioned reads (`read_with_version()`,
 `read_with_version_generation()` and the MCP `swg_read`) refuse a managed file
@@ -2061,8 +2173,19 @@ For code you'd rather not rewrite, `coherent_workspace()` / `install()` patch
 `open()` and `pathlib` so managed-path opens route through the volume unchanged.
 It covers text and binary read/write via `open()`/`pathlib` — not raw `os.open`,
 subprocess redirection, `mmap`, or append/update modes, which delegate to the
-original `open()` unchanged. The explicit `read`/`write`/`reacquire`/`write_cas`
-API is the supported contract; the shim is a convenience.
+original `open()` unchanged. The explicit
+`read`/`write`/`reacquire`/`write_cas`/`release`/`close` API is the supported
+contract; the shim is a convenience.
+
+Leaving the outermost `coherent_workspace()` block closes its volume, and a
+nested block closes nothing; `uninstall()` restores `open()` and then closes the
+volume `install()` returned. So the files the shim wrote are given back as the
+block ends, and the volume raises if used afterwards; see
+[Letting go: `release()` and `close()`](#letting-go-release-and-close). When the
+block's body raised, a close that fails is logged and the body's error
+propagates. A file opened for writing through the shim commits when it is
+closed, so close it inside the block: one still open when the volume closes is
+named in a warning, and closing it afterwards raises and writes nothing.
 
 Run the demo: `python -m examples.coherent_volume.main` (offline, deterministic,
 no keys) — it reproduces the silent lost update, then prevents it.
@@ -2652,7 +2775,7 @@ reasons exist.
 | `reason` | Established by | What it means | How you clear it |
 |---|---|---|---|
 | `version_moved` | the coordinator | a peer committed a newer version than the one the decision was derived from | re-read the input, re-decide, re-gate |
-| `split_pair` | the coordinator | it refused the re-validate read because the bytes are not the content it records at that version, which has not moved: a peer's `write()` whose bytes landed before its commit, a change made outside the coordinator, or a commit's disk write failed (strict mode). The `StaleView`'s `reason` is `split_pair` too | re-gate after a few seconds first: a peer's write still landing clears by itself, or moves the version. A hold that outlasts that is a change outside the coordinator, and a reacquire alone does not clear it, because it does not record the bytes on disk: reacquire, `write()` the bytes it returns (or your merge of them) to record them, then read, re-decide and re-gate |
+| `split_pair` | the coordinator | it refused the re-validate read because the bytes are not the content it records at that version, which has not moved: a peer's `write()` whose bytes landed before its commit, a change made outside the coordinator, a commit's disk write failed, or a `write()` whose commit did not reach the coordinator (strict mode). The `StaleView`'s `reason` is `split_pair` too | re-gate after a few seconds first: a peer's write still landing clears by itself, or moves the version. A hold that outlasts that is a change the coordinator has not recorded, and a reacquire alone does not clear it, because it does not record the bytes on disk: reacquire, `write()` the bytes it returns (or your merge of them) to record them, then read, re-decide and re-gate |
 | `read_denied` | the coordinator | it refused the re-validate read outright — this view is invalid (strict mode; on a strict-mode workspace this is how a reclaim usually surfaces) | reacquire, take a fresh read, re-decide, re-gate |
 | `grant_reclaimed` | the coordinator | both generations are confirmed and they differ: a sweep reclaimed the grant the decision was read under, while the version never moved | reacquire, re-decide, re-gate |
 | `grant_preempted` | the coordinator | neither comparand moved, yet the re-validate read was served without a standing grant — a peer's write-claim acquire took the grant with no commit behind it yet | reacquire. A bare re-ask holds again: the fence does not re-grant on the read it checks with |
@@ -3923,14 +4046,16 @@ recommends, keeps such a model's writes on the MCP session.
 
 A `CoherentVolume`'s session id and principal live only in its process, and an
 MCP session is one volume; a forked child of a volume is a new session too.
-After the process exits nothing can act as that session: the
+After the volume is closed, or its process exits, nothing can act as that
+session: a closed volume raises on every handoff command, and the
 [handoff commands](#handoff-commands) cannot, and a writer started in its place
 is a new session. A new session cannot withdraw, accept or decline a record
 that names its predecessor (`handoff_not_giver`, `handoff_not_successor`), is
 not fenced as the giver, and its write of the path is recorded as overtaking
 the handoff, not completing it, even when it carries on the successor's work.
 
-So settle a handoff while the giver's process is still running:
+So settle a handoff before the giver closes its volume, and while its process
+is still running:
 
 - **If the successor is gone**, have the giver withdraw, or transfer the path
   again to the replacement's session-level id (while the record is live, the
@@ -4424,7 +4549,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 
 | Tool | What it does |
 |---|---|
-| `swg_read` | Tracked read — registers the agent's view of the file. If the bytes on disk are not what the coordinator recorded, the read returns a `stale_view` deny with no version. Retry `swg_reacquire` + `swg_read` for a few seconds first, since a peer's commit may still be reaching disk; if it stays denied, the file was changed outside the coordinator (an out-of-band edit, or a commit whose disk write failed), so `swg_write` the reacquired content to record it. When the path has a [handoff](#from-the-mcp-server) record, the result carries its `handoff` key |
+| `swg_read` | Tracked read — registers the agent's view of the file. If the bytes on disk are not what the coordinator recorded, the read returns a `stale_view` deny with no version. Retry `swg_reacquire` + `swg_read` for a few seconds first, since a peer's commit may still be reaching disk; if it stays denied, the bytes on disk were never recorded (an out-of-band edit, a commit whose disk write failed, or a write whose commit did not reach the coordinator), and reading again does not clear it, so `swg_write` the reacquired content to record it. When the path has a [handoff](#from-the-mcp-server) record, the result carries its `handoff` key |
 | `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite. On a path this session handed off, a `handed_off` deny with `recover: stop_and_report` |
 | `swg_reacquire` | Recovery after a deny — clears the stale view + mandatory fresh read |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention. A win that completed or overtook a live handoff says which, in `handoff`; on a path this session handed off, the same `handed_off` deny as `swg_write` |
@@ -4546,7 +4671,12 @@ and `swg_write_cas` answered `internal_error`.
 
 **Multiple sessions, one workspace.** Multiple `stale-write-guard-fs` instances
 pointed at the same `SWG_ROOT` attach to one coordinator, so a stale write is denied
-across sessions; if the coordinator's session exits, peers fail closed. One
+across sessions; if the coordinator's session exits, peers fail closed. When
+the host ends a server normally, the server closes its volume before it stops a
+coordinator it started, so the files its `swg_write` calls took are given back
+to the other sessions at once, not after the sweep; a close that fails is logged
+to stderr, and a coordinator that does not answer costs one client timeout
+(6 s by default) at shutdown. A server killed by a signal releases nothing. One
 session hands a path to another with `swg_transfer`; see
 [From the MCP server](#from-the-mcp-server).
 
@@ -5019,7 +5149,8 @@ no commit of its own to explain them, is told so:
   it. It never denies, in strict mode either: a read is already denied there
   until a commit lands, and a write is the one way to commit the change. A
   client that writes whole files should re-read before it writes when it sees
-  the key.
+  the key. A `CoherentVolume` passes it on as `WriteResult.disk_differs`, after
+  the write: see [Coherent workspace](#coherent-workspace-coherentvolume).
 
 A Claude Code session that edited a file keeps a read of it when its turn
 ends, so on its next turn, while nothing has changed the file since, its Read

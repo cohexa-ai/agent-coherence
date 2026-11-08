@@ -1035,10 +1035,11 @@ class CasRetriesExhausted(_CarriesGenerationPair, CoherenceError):
     not: another agent holds the grant at an unchanged version. Against the
     cross-process coordinator (``CoherentVolume``) nothing the caller does
     releases it. The holder does: a Claude Code session at its turn end, a
-    ``CoherentVolume`` at its own next ``write_cas`` of that file or any
-    ``write_cas`` retry, ``write_cas_at``, ``atomic_publish`` or
-    ``reacquire()`` (a ``session-stop`` naming only that volume's
-    ``session_id`` releases nothing). Otherwise the coordinator's reclaim
+    ``CoherentVolume`` when it calls ``release()`` on the file or ``close()``,
+    or at its own next ``write_cas`` of that file or any ``write_cas`` retry,
+    ``write_cas_at``, ``atomic_publish`` or ``reacquire()`` (a
+    ``session-stop`` naming only that volume's ``session_id`` releases
+    nothing). Otherwise the coordinator's reclaim
     does. In process (``AgentRuntime``) the loop's own re-fetch
     downgrades the holder, so ``other_holder`` there clears on the next attempt
     unless the holder re-acquires.
