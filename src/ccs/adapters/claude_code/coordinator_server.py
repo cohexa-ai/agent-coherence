@@ -94,7 +94,13 @@ from ccs.adapters.claude_code.policy import (
     TrackedArtifactPolicy,
     policy_file_name,
 )
-from ccs.adapters.claude_code.regular_file import LinkRefused, ReadStatus, open_regular, read_regular_file
+from ccs.adapters.claude_code.regular_file import (
+    LinkRefused,
+    NotRegularFile,
+    ReadStatus,
+    open_regular,
+    read_regular_file,
+)
 from ccs.adapters.claude_code.state_dir import check_coherence_dir, lock_link_refusal, policy_link_refusal
 from ccs.coordinator.registry_protocol import (
     RECLAIM_TRIGGERS,
@@ -9475,8 +9481,9 @@ def merge_policy_globs(yaml_paths: Iterable[Path], globs: tuple[str, ...]) -> No
 def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str], list[dict]]:
     """Append valid patterns to a YAML file. Returns (added, rejected).
     Raises ValueError, which the routes answer as HTTP 400, when the file
-    would exceed MAX_POLICY_YAML_BYTES or an entry could not take effect in
-    it (see :func:`_append_policy_entries`); nothing is written then.
+    would exceed MAX_POLICY_YAML_BYTES, an entry could not take effect in
+    it (see :func:`_append_policy_entries`), or its lock sidecar is a link
+    or not a regular file (#498); nothing is written then.
 
     R14 (Unit 6): the read-modify-write is wrapped in an ``fcntl.flock``
     exclusive lock on a sidecar ``<yaml_path>.lock`` file so two concurrent
@@ -9532,6 +9539,12 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
         lock_fd = open_regular(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     except LinkRefused:
         raise ValueError(lock_link_refusal(policy_file_name(yaml_path))) from None
+    except NotRegularFile:
+        # A FIFO, socket or device put there while the coordinator runs (a start
+        # refuses one): the 400 a policy file that is not regular gets.
+        raise ValueError(
+            f"{policy_file_name(yaml_path)}.lock could not be read (not a regular file); nothing was written."
+        ) from None
     try:
         _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
         return _append_policy_entries(yaml_path, added), rejected

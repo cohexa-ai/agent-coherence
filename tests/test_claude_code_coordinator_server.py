@@ -1086,6 +1086,42 @@ def test_a_policy_route_refuses_a_dangling_lock_sidecar_link_and_creates_nothing
     assert target_snapshot(coherence_dir / "tracked.yaml") == policy_before
 
 
+@pytest.mark.parametrize(("endpoint", "file_name", "answer_key", "loaded_as"), _POLICY_FILES)
+def test_a_policy_route_refuses_a_fifo_lock_sidecar_made_after_the_start(
+    coordinator, client: _Client, endpoint: str, file_name: str, answer_key: str,
+    loaded_as: str,
+) -> None:
+    """#498: a start refuses a FIFO, socket or device in ``.coherence``, but one can
+    be put at the ``<name>.lock`` sidecar while the coordinator runs. The route
+    answers the 400 a policy file that is not regular gets, naming the sidecar,
+    and writes nothing.
+
+    Prevents a server error with nothing named. The request runs on a thread with
+    a deadline and the FIFO is released whatever happens, so a regression fails
+    here instead of hanging the run."""
+    coherence_dir = coordinator.coordinator_root / ".coherence"
+    policy_before = target_snapshot(coherence_dir / file_name)
+    lock = coherence_dir / f"{file_name}.lock"
+    lock.unlink(missing_ok=True)
+    os.mkfifo(lock)
+    answers: list[tuple[int, dict]] = []
+    worker = threading.Thread(
+        target=lambda: answers.append(client.post(endpoint, {"paths": ["ok.md"]})), daemon=True,
+    )
+    try:
+        worker.start()
+        worker.join(timeout=30)
+        assert not worker.is_alive(), "the route blocked on a FIFO lock sidecar"
+    finally:
+        release_fifo(lock)
+
+    assert answers == [(400, {
+        "error": f".coherence/{file_name}.lock could not be read (not a regular file); nothing was written.",
+    })]
+    assert target_snapshot(coherence_dir / file_name) == policy_before
+    assert "ok.md" not in getattr(coordinator.policy, loaded_as)
+
+
 def test_a_policy_route_over_a_fifo_made_after_the_start_answers_at_once(
     coordinator, client: _Client,
 ) -> None:
