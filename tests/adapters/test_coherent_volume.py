@@ -56,7 +56,7 @@ from ccs.adapters.coherent_volume import (
     install,
     uninstall,
 )
-from ccs.cli._coherence_client import CoordinatorEndpoint, CoordinatorUnavailable
+from ccs.cli._coherence_client import CoordinatorEndpoint, CoordinatorUnavailable, escape_nonprintable
 from ccs.core.exceptions import (
     CasRetriesExhausted,
     CasVersionConflict,
@@ -1346,6 +1346,43 @@ def test_a_degrade_volume_warns_naming_the_link_and_stays_detached(
     assert vol.degradation_count == 1
     assert sorted(os.listdir(coherence_dir)) == ["hook.secret"]
     assert target.read_bytes() == TARGET_BYTES
+
+
+@pytest.mark.parametrize("on_error", ["degrade", "strict"])
+def test_a_refused_name_with_control_characters_is_escaped_where_the_volume_prints_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig, caplog: pytest.LogCaptureFixture, on_error: str
+) -> None:
+    """#498: a cloned repository chooses the names in ``.coherence``. A degrade
+    volume prints the refusal itself, as a warning and a log line, so it escapes
+    the name; a strict volume raises the refusal with the raw path, which a
+    caller matches and a CLI escapes. Prevents a name that retitles or clears
+    the terminal, or splits the line, in the one line that says coherence is
+    off."""
+    _seed(tmp_path)
+    name = "x\n\x1b]0;PWNED\x07\x1b[2Jy"
+    plant_link(tmp_path / ".coherence", name, "dangling")
+    link = tmp_path.resolve() / ".coherence" / name
+
+    if on_error == "strict":
+        refusal = _strict_refusal(tmp_path, fast_cfg)
+        assert refusal.path == str(link)
+        assert f"refusing {link}: it is a symlink" in str(refusal)
+        return
+
+    caplog.set_level(logging.WARNING, logger="ccs.adapters.coherent_volume")
+    try:
+        with pytest.warns(CoherenceDegradedWarning) as caught:
+            vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    finally:
+        stop_coordinator(tmp_path)
+
+    messages = [str(w.message) for w in caught if issubclass(w.category, CoherenceDegradedWarning)]
+    logged = [r.getMessage() for r in caplog.records if r.name == "ccs.adapters.coherent_volume"]
+    assert len(messages) == 1 and len(logged) == 1, (messages, logged)
+    for printed in (messages[0], logged[0]):
+        assert printed.isprintable(), printed
+        assert f"refusing {escape_nonprintable(str(link))}: it is a symlink" in printed
+    assert not vol.is_attached
 
 
 def test_a_degrade_volume_warns_for_a_link_made_after_its_check(

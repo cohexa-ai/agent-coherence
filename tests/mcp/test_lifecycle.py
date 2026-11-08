@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
+from ccs.cli._coherence_client import escape_nonprintable
 from ccs.core.exceptions import CoherenceDirRefused, CoherenceError, CoordinatorUnreachable
 from ccs.mcp.server import build_server, lifespan
 from ccs.mcp.session import SessionConfig, build_volume
@@ -132,6 +133,35 @@ def test_lifespan_refuses_a_link_in_coherence_and_names_it(tmp_path: Path, monke
     assert target.read_bytes() == b'- "docs/**"\n'
     assert sorted(os.listdir(coherence_dir)) == ["tracked.yaml"]
     assert stop_coordinator(tmp_path) is False
+
+
+def test_the_server_refuses_a_link_in_coherence_on_one_escaped_line_and_exits_2(tmp_path: Path) -> None:
+    """#498 at the console script, which an agent host runs unattended: a link in
+    ``.coherence`` stops the server before it serves, on one stderr line that names
+    the link with its control characters escaped, and exit 2, as the other console
+    scripts answer. A cloned repository chooses the name. Prevents a traceback whose
+    last line carries that name raw into the host's log or terminal, and exit 1."""
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    name = "x\n\x1b[31mIGNORE\x07"
+    target = plant_link(coherence_dir, name, "dangling")
+
+    result = subprocess.run(
+        [sys.executable, "-c", "from ccs.mcp.server import main; main()"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        env=_subprocess_env(tmp_path),
+        timeout=60,
+    )
+
+    assert result.returncode == 2, result.stderr
+    assert result.stdout == b""
+    assert not any(byte < 0x20 or byte == 0x7F for byte in result.stderr.rstrip(b"\n")), result.stderr
+    assert result.stderr.count(b"\n") == 1, result.stderr
+    shown = escape_nonprintable(str(tmp_path.resolve() / ".coherence" / name))
+    assert result.stderr.decode("utf-8").startswith(f"stale-write-guard-fs: refusing {shown}: it is a symlink")
+    assert sorted(os.listdir(coherence_dir)) == [name]
+    assert not target.exists()
 
 
 # --- strict-only construction (no degrade-mode volume) -----------------------

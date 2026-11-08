@@ -74,6 +74,7 @@ from ccs.cli._coherence_client import (
     claim_caller_principal,
     coordinator_backend,
     decide_principal_recovery,
+    escape_nonprintable,
     principal_refusal_message,
     principal_refusal_reason,
     resolve_endpoint,
@@ -4467,13 +4468,15 @@ class CoherentVolume:
 
     def _state_dir_refusal_or_degrade(self, refusal: CoherenceDirRefused) -> None:
         """A ``.coherence`` a start refuses (#498), through ``on_error``. Strict
-        raises the refusal itself, typed so that no retry loop catches it; degrade
-        warns once and stays detached. Its text names the refused path, so it
-        needs no workspace prefix."""
+        raises the refusal itself, typed so that no retry loop catches it, with
+        its raw path; degrade warns once and stays detached. Its text names the
+        refused path, so it needs no workspace prefix."""
         self._endpoint = None
         if self._on_error == "strict":
             raise refusal
-        self._record_degraded(f"{refusal} {_STATE_DIR_REFUSAL_DEGRADED_NOTE}")
+        # The volume prints this text itself, and a cloned repository chose the
+        # name in it: escaped, it cannot drive the terminal or split the line.
+        self._record_degraded(f"{escape_nonprintable(str(refusal))} {_STATE_DIR_REFUSAL_DEGRADED_NOTE}")
 
     def _failed_read_or_degrade(self, resp: dict, rel: str) -> None:
         """A pre-read the coordinator answered with ``ok: false``, which it does
