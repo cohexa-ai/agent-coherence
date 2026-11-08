@@ -194,10 +194,15 @@ Alpha — APIs may change before `v1.0`.
   `Stale read denied: your grant on plan.md was revoked and no new version
   was committed`, its Edit was denied too, and a warn-mode session was warned
   that its grant on its own edit had been revoked. A `CoherentVolume` whose
-  `write()` failed can now write the file again without `reacquire()`. A copy
-  another agent's acquire or commit made stale is still denied, a release
-  still moves the ownership epoch, and every answer body and deny text is
-  unchanged. A failed-edit report from a caller that holds no write grant
+  `write()` failed can now write the file again without `reacquire()`. In
+  strict mode a copy another agent's acquire or commit made stale stays stale
+  and is still denied. In warn mode a session can still edit such a file, and
+  if that edit fails or its turn ends, the session keeps a read of the current
+  version, so its next Read is fresh and shows no stale warning. A release
+  still moves the ownership epoch. Answer shapes and deny texts are unchanged;
+  the reason on a refused commit names the caller's state, so a commit
+  refused after the caller's own release now says `SHARED` where it said
+  `INVALID`. A failed-edit report from a caller that holds no write grant
   changes nothing; it used to demote a reader to `INVALID`. `/status` lists
   the released session as `SHARED`, session-start re-grounding shows the file
   as a held `SHARED` grant, and a transfer in a later turn hands that read on
@@ -224,8 +229,11 @@ Alpha — APIs may change before `v1.0`.
   the file leaves it a reader (strict_mode/34). A peer's commit or acquire
   after the release still makes A's copy stale: its Read is denied with the
   write wording (strict_mode/32) or the grant-change wording (strict_mode/33).
-  Session-start re-grounding renders a file released in an earlier turn as a
-  held `SHARED` grant line (session_start/07). The Node rows need the Claude
+  In warn mode, a session that edits a file another session committed since
+  its read, and whose edit fails, keeps a read of the current version, and
+  its next Read is fresh (warn_mode/41). Session-start re-grounding renders a
+  file released in an earlier turn as a held `SHARED` grant line
+  (session_start/07). The Node rows need the Claude
   Code plugin's matching change, in its releases after 0.6.0.
 
 - **New tests pin what each strict surface does when the coordinator takes a request and never

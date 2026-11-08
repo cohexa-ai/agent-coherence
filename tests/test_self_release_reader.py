@@ -11,11 +11,11 @@ session was locked out of the file it had just edited. It now leaves the caller
 SHARED at the version it held, so its next Read is fresh and its next Edit is
 admitted, while a copy a peer's acquire or commit made stale is still refused.
 
-The release reads the caller's state and decides inside one registry hold. The
-rows at the two seams below pin that: a peer's acquire and commit run on the
-releasing thread either as the release's first hold is entered or once the
-hold that ended the caller's write claim has exited, and the caller must end
-in a state one of the two serial orders produces.
+The release reads the caller's state, decides and applies inside one registry
+hold. The rows at the two seams below pin that: a peer's acquire and commit run
+on the releasing thread either as the release's first hold is entered or as
+that first hold exits, and the caller must end in a state one of the two serial
+orders produces.
 """
 
 from __future__ import annotations
@@ -64,7 +64,6 @@ _SEED_HASH = _hash("seed")
 _OWN_HASH = _hash("own-edit")
 _PEER_HASH = _hash("peer-edit")
 _PEER = session_to_agent_id(_sid("seam-peer"))
-_WRITE_CLAIM = (MESIState.EXCLUSIVE, MESIState.MODIFIED)
 _OPERATOR = {"Coherence-Local-Operator": "true"}
 _ROUTES = ("stop", "subagent-stop", "failed-edit")
 _POINTS = ("exit", "entry")
@@ -321,34 +320,103 @@ def test_a_peer_write_after_the_release_leaves_the_holder_stale(live: _Live, com
     assert _pre_edit(live, holder, _STRICT).get("ok") is False
 
 
+_EDIT_ROUTES = ("failed-edit", "stop")
+
+
+def _edit_after_a_peer_commit(live: _Live, holder: _Holder, path: str) -> dict:
+    """The holder reads ``path`` at v1, a peer's pre-edit and commit make v2
+    and leave the holder INVALID, and the holder then sends its own pre-edit.
+    Returns the answer to that pre-edit."""
+    client = live.client
+    peer = _sid(f"peer-of-{holder.sid}")
+    client.post("/hooks/pre-read", {**holder.fields, "path": path, "content_hash": _SEED_HASH})
+    assert client.post("/hooks/pre-edit", {"session_id": peer, "path": path})[1].get("ok") is True
+    status, answer = client.post("/hooks/post-edit", {
+        "session_id": peer, "path": path, "success": True, "content_hash": _PEER_HASH,
+    })
+    assert status == 200 and answer.get("ok") is True, answer
+    assert _state(live, path, holder.agent_id) == MESIState.INVALID, "precondition: the peer's commit"
+    return _pre_edit(live, holder, path)
+
+
+def _read_of_the_peer_version(live: _Live, holder: _Holder, path: str) -> dict:
+    status, answer = live.client.post("/hooks/pre-read", {
+        **holder.fields, "path": path, "content_hash": _PEER_HASH,
+    })
+    assert status == 200, answer
+    return answer
+
+
+@pytest.mark.parametrize("route", _EDIT_ROUTES)
+def test_a_released_warn_mode_edit_made_after_a_peer_commit_leaves_a_fresh_read(live: _Live, route: str) -> None:
+    """A known limitation of warn mode. A peer's commit made the holder's copy
+    stale, and warn mode still admits the holder's Edit, with the
+    concurrent-edit note. That Edit takes the write grant, which records the
+    peer's version as the one the holder has, though the holder never read it.
+    If the edit then fails, or the turn ends before its commit, the release
+    leaves the holder a reader of the peer's version, so its next Read is fresh
+    and carries no stale warning. Strict mode denies that Edit before any grant
+    is taken, so this cannot happen there (the next test)."""
+    holder = _Holder(_sid(f"warn-after-peer-{route}"), route)
+    edit = _edit_after_a_peer_commit(live, holder, _WARN)
+    registry = live.server.registry
+    artifact_id = _artifact_id(live, _WARN)
+
+    assert edit.get("ok") is True and edit.get("collision") is True, edit
+    assert registry.get_agent_state(artifact_id, holder.agent_id) == MESIState.EXCLUSIVE
+    assert registry.last_observed_version_for(artifact_id, holder.agent_id) == 2
+    assert _release(live, holder, _WARN) == (200, _released_answer(holder, _WARN))
+
+    assert _state(live, _WARN, holder.agent_id) == MESIState.SHARED
+    assert _read_of_the_peer_version(live, holder, _WARN) == {"status": "fresh", "version": 2}
+
+
+@pytest.mark.parametrize("route", _EDIT_ROUTES)
+def test_a_strict_edit_after_a_peer_commit_is_denied_so_its_release_keeps_the_copy_stale(
+    live: _Live, route: str,
+) -> None:
+    """The strict twin of the row above: the Edit is denied before any grant is
+    taken, so the release finds the holder INVALID and leaves it so, and its
+    next Read is denied with the write wording."""
+    holder = _Holder(_sid(f"strict-after-peer-{route}"), route)
+    edit = _edit_after_a_peer_commit(live, holder, _STRICT)
+    registry = live.server.registry
+    artifact_id = _artifact_id(live, _STRICT)
+
+    assert edit.get("ok") is False, edit
+    assert registry.get_agent_state(artifact_id, holder.agent_id) == MESIState.INVALID
+    assert registry.last_observed_version_for(artifact_id, holder.agent_id) == 1
+    _release(live, holder, _STRICT)
+
+    assert _state(live, _STRICT, holder.agent_id) == MESIState.INVALID
+    assert _UPDATED in _denied_reason(_read_of_the_peer_version(live, holder, _STRICT))
+
+
 class _Seam:
     """Runs a peer's acts once, on the releasing thread, at one point of the
     release's registry holds.
 
-    It wraps ``registry.abort_guard``, the hold every service operation takes.
-    At ``exit`` it runs the acts once the outermost hold has exited with the
-    watched identity no longer holding a write claim: before the release that
-    identity is a writer, so the first such exit is the end of the release's
-    hold, and a release split across two holds lets the acts in between them.
-    At ``entry`` it runs them as the release operation's first hold is entered,
+    It wraps ``registry.abort_guard``, the hold every service operation takes,
+    and ``service.release_to_reader``, so it knows when a release is running.
+    At ``entry`` it runs the acts as the release's first hold is entered,
     before that hold's body, so a release that decided from a state read taken
-    before its hold acts on a read the peer has since made stale. A release
-    that reads and decides inside one hold sees the acts wholly before it or
-    wholly after it at either point."""
+    before its hold acts on a read the peer has since made stale. At ``exit``
+    it runs them as the release's first outermost hold exits, so a release that
+    reads and decides in one hold and applies in a second lets the acts in
+    between the two. A release that reads, decides and applies inside one hold
+    sees the acts wholly before it or wholly after it at either point."""
 
     def __init__(self, live: _Live, point: str) -> None:
-        self._registry = live.server.registry
         self._real_guard = live.server.registry.abort_guard
         self._real_release = live.server.service.release_to_reader
         self._point = point
         self._local = threading.local()
-        self._watched: tuple[uuid.UUID, uuid.UUID] | None = None
         self._acts: Callable[[], None] | None = None
         self.fired = False
 
-    def arm(self, watched: tuple[uuid.UUID, uuid.UUID], acts: Callable[[], None]) -> None:
-        """Watch ``(artifact_id, agent_id)`` and run ``acts`` at the seam."""
-        self._watched, self._acts = watched, acts
+    def arm(self, acts: Callable[[], None]) -> None:
+        """Run ``acts`` at the seam, once."""
+        self._acts = acts
 
     @contextmanager
     def guard(self, abort: threading.Event | None = None, **kwargs: object) -> Iterator[None]:
@@ -356,13 +424,12 @@ class _Seam:
         self._local.depth = depth + 1
         try:
             with self._real_guard(abort, **kwargs):
-                if self._point == "entry" and getattr(self._local, "releasing", False):
-                    self._local.releasing = False
+                if self._point == "entry" and self._releasing():
                     self._fire()
                 yield
         finally:
             self._local.depth = depth
-        if depth == 0 and self._point == "exit" and not self._watched_holds_a_write_claim():
+        if depth == 0 and self._point == "exit" and self._releasing():
             self._fire()
 
     def release(self, *args: object, **kwargs: object) -> object:
@@ -372,14 +439,17 @@ class _Seam:
         finally:
             self._local.releasing = False
 
+    def _releasing(self) -> bool:
+        return getattr(self._local, "releasing", False)
+
     def _fire(self) -> None:
+        """Run the acts the first time only: the peer's own holds, taken while
+        the release is still running, do not fire them again."""
+        self._local.releasing = False
         if self._acts is None or self.fired:
             return
         self.fired = True
         self._acts()
-
-    def _watched_holds_a_write_claim(self) -> bool:
-        return self._watched is None or self._registry.get_agent_state(*self._watched) in _WRITE_CLAIM
 
 
 def _seam_at(live: _Live, point: str, monkeypatch: pytest.MonkeyPatch) -> _Seam:
@@ -427,7 +497,7 @@ def test_a_peer_write_and_commit_at_the_release_leave_the_holder_stale(
     artifact_id = _artifact_id(live, _STRICT)
     version = live.server.registry.get_artifact(artifact_id).version
     seam = _seam_at(live, point, monkeypatch)
-    seam.arm((artifact_id, holder.agent_id), _peer_acts(live, artifact_id, True))
+    seam.arm(_peer_acts(live, artifact_id, True))
 
     assert _release(live, holder, _STRICT) == (200, _released_answer(holder, _STRICT))
 
@@ -449,7 +519,7 @@ def test_a_peer_acquire_at_the_release_leaves_the_holder_stale_beside_the_peer(
     _take(live, holder, _STRICT)
     artifact_id = _artifact_id(live, _STRICT)
     seam = _seam_at(live, point, monkeypatch)
-    seam.arm((artifact_id, holder.agent_id), _peer_acts(live, artifact_id, False))
+    seam.arm(_peer_acts(live, artifact_id, False))
 
     _release(live, holder, _STRICT)
 
@@ -475,7 +545,7 @@ def test_a_release_with_nothing_at_the_seam_is_one_step_to_a_read(
     claim = registry.get_agent_state(artifact_id, holder.agent_id)
     epoch = registry.get_owner_generation(artifact_id)
     seam = _seam_at(live, point, monkeypatch)
-    seam.arm((artifact_id, holder.agent_id), lambda: None)
+    seam.arm(lambda: None)
     mark = len(live.logged)
 
     _release(live, holder, _STRICT)
@@ -490,6 +560,31 @@ def test_a_release_with_nothing_at_the_seam_is_one_step_to_a_read(
 
 
 # --- a release from an identity with no write grant changes nothing ------------
+
+
+@pytest.mark.parametrize(
+    ("route", "transient"),
+    [("failed-edit", TransientState.IED), ("stop", TransientState.MWB)],
+    ids=["exclusive-with-a-pending-write", "modified-with-a-pending-commit"],
+)
+def test_a_release_clears_the_marker_a_write_holder_was_left_with(
+    live: _Live, route: str, transient: TransientState,
+) -> None:
+    """A write or a commit that raised after setting its in-progress marker
+    leaves the holder EXCLUSIVE or MODIFIED with that marker still set. The
+    release clears it as it leaves the holder a reader, so no SHARED row keeps
+    a marker for a write that is over."""
+    holder = _Holder(_sid(f"marker-{route}"), route)
+    _take(live, holder, _STRICT)
+    registry = live.server.registry
+    artifact_id = _artifact_id(live, _STRICT)
+    registry.set_agent_transient(artifact_id, holder.agent_id, transient, entered_tick=monotonic_seconds())
+    assert registry.get_agent_transient(artifact_id, holder.agent_id) == transient, "precondition"
+
+    assert _release(live, holder, _STRICT) == (200, _released_answer(holder, _STRICT))
+
+    assert registry.get_agent_state(artifact_id, holder.agent_id) == MESIState.SHARED
+    assert registry.get_agent_transient(artifact_id, holder.agent_id) is None
 
 
 def test_a_failed_edit_report_from_a_reader_keeps_its_read(live: _Live) -> None:
@@ -582,6 +677,30 @@ def test_a_write_claim_captured_before_the_release_cannot_commit_after_it(live: 
     refused = late_commit()
     assert isinstance(refused, ConflictDetail) and refused.reason == "stale_read_generation", refused
     assert registry.get_artifact(artifact_id).version == version
+
+
+def test_a_commit_sent_after_the_callers_own_failed_edit_is_refused_and_names_shared(live: _Live) -> None:
+    """Two edits of one file in a turn, and the failing one reports first: its
+    release leaves the caller a reader, so the other edit's commit is refused
+    as before, and the refusal's reason, which names the caller's state, now
+    says SHARED where it said INVALID."""
+    sid = _sid("late-commit")
+    client = live.client
+    for _ in range(2):
+        assert client.post("/hooks/pre-edit", {"session_id": sid, "path": _WARN})[1].get("ok") is True
+    assert client.post("/hooks/post-edit", {"session_id": sid, "path": _WARN, "success": False}) == (
+        200, {"ok": True, "released": True},
+    )
+    version = live.server.registry.get_artifact(_artifact_id(live, _WARN)).version
+
+    status, answer = client.post("/hooks/post-edit", {
+        "session_id": sid, "path": _WARN, "success": True, "content_hash": _OWN_HASH,
+    })
+
+    assert status == 200 and answer.get("ok") is False, answer
+    assert answer["reason"].startswith("commit_not_allowed "), answer
+    assert answer["reason"].endswith(" state=MESIState.SHARED"), answer
+    assert live.server.registry.get_artifact(_artifact_id(live, _WARN)).version == version
 
 
 def test_a_grant_the_sweep_reclaimed_before_the_stop_stays_reclaimed(live: _Live) -> None:

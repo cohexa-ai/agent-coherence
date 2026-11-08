@@ -4072,7 +4072,11 @@ one. Poll with backoff rather than wait for a signal.
   later read under it, gets the strict deny. Re-read under a new `agent_id`
   with the same `session_id`, as the
   [capture rule](#capturing-the-comparands) and `CoherentVolume.reacquire()`
-  do.
+  do. In warn mode a caller can still edit a path another agent changed since
+  its last read, and that `pre-edit` takes the grant; if the edit then fails
+  or the turn ends, the release leaves the caller a reader of the current
+  version, so its next read is fresh and shows no stale warning. Strict mode
+  denies that `pre-edit`, so this never happens there.
 - **Send `session-stop` only when the work is done.** It releases every path
   the identity holds EXCLUSIVE or MODIFIED, not only the one in question, and
   leaves the identity a reader of each.
@@ -4883,7 +4887,11 @@ no commit of its own to explain them, is told so:
 
 A Claude Code session that edited a file keeps a read of it when its turn
 ends, so on its next turn, while nothing has changed the file since, its Read
-is fresh and its Edit is admitted. A change made after the session's commit is
+is fresh and its Edit is admitted. In warn mode a session can still edit a
+file another session changed since its last read; if that edit fails or its
+turn ends, the session keeps a read of the current version, so its next Read
+is fresh and no stale warning is shown. Strict mode denies that edit, so this
+never happens there. A change made after the session's commit is
 still a change outside the coordinator, and the rules above apply to it. A
 formatter hook that runs after every edit, for example, rewrites the file
 after the edit's commit: on the next turn the session's Read of that file
