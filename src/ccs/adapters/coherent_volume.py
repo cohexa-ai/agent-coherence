@@ -239,6 +239,21 @@ def _read_release_answer(resp: object) -> dict | _ReleaseFailure:
     return _ReleaseFailure(CoherenceError)
 
 
+def _confirms_end(resp: object) -> bool:
+    """Whether the answer to a session-stop carrying ``ended`` confirms that
+    the attempt it named is over (#525): an answer :func:`_read_release_answer`
+    can read that reports no grant still held. The coordinator keeps every
+    record of an attempt that still holds a grant, so that answer ends nothing.
+    A coordinator that predates the flag answers as to any stop, and its
+    records stay as they always did."""
+    answer = _read_release_answer(resp)
+    if isinstance(answer, _ReleaseFailure):
+        return False
+    if answer.get("ok") is True:
+        return True
+    return not any(isinstance(grant, dict) and grant.get("held") is True for grant in answer["grants"])
+
+
 def _is_commit_leg(endpoint_path: str, payload: dict) -> bool:
     """Whether a request is a commit leg: write()'s ``success: true``
     post-edit (not the release it sends on the same route), the
@@ -1301,6 +1316,14 @@ class CoherentVolume:
         # read_handoff(), which is how the MCP read tool relays a read's
         # provenance without changing what the read calls return.
         self._read_handoffs: dict[str, dict] = {}
+        # Every incarnation a request of this volume named whose end the
+        # coordinator has not confirmed (#525). Each one that reached the
+        # coordinator left records there; a re-mint ends those the volume no
+        # longer references, and close() ends them all. An incarnation never
+        # named never reached it and is never sent anything. Once its end is
+        # confirmed the coordinator has forgotten it, so nothing is sent under
+        # it again: a strict pre-edit would admit what it denied before.
+        self._unended_incarnations: set[str] = set()
         # close() has run: every operation but close() raises from here on, and
         # a close the coordinator did not confirm sends what is still recorded
         # when called again. A forked child inherits it.
@@ -1372,7 +1395,8 @@ class CoherentVolume:
         # (its connection/secret context belongs to the parent), and clear
         # per-path beliefs the child has not established itself. Releases
         # NOTHING, and forgets the grants write() recorded: those belong to the
-        # parent's identity, which is still live in the parent.
+        # parent's identity, which is still live in the parent. It ends none
+        # of the parent's incarnations either: the parent still owns them.
         self._session_id = str(uuid.uuid4())
         self._incarnation = self._new_incarnation()
         # The parent's principal is bound to the parent's session: discard it
@@ -1380,6 +1404,7 @@ class CoherentVolume:
         # re-attaches.
         self._new_principal_claim()
         self._grant_incarnations.clear()
+        self._unended_incarnations.clear()
         self._release_held_paths.clear()
         self._read_incarnations.clear()
         self._read_handoffs.clear()
@@ -1466,8 +1491,17 @@ class CoherentVolume:
         finished on. :meth:`release` and :meth:`close` start no attempt.
         Several requests can name an older incarnation: the release of a write
         grant that incarnation abandoned, a :meth:`release` or :meth:`close` of
-        a grant it holds, and a :meth:`transfer`, whose grants each name the
-        incarnation that holds this volume's claim on that path."""
+        a grant it holds, a :meth:`transfer`, whose grants each name the
+        incarnation that holds this volume's claim on that path, and the end
+        of one the volume no longer uses (#525).
+
+        Each incarnation a request named leaves records at the coordinator.
+        A new attempt ends every older one the volume no longer references:
+        neither the current one nor one holding a read a :meth:`transfer`
+        would present. :meth:`close` ends them all. The coordinator then
+        forgets an ended incarnation, so its rows, heartbeat and ``/status``
+        entry go, and no request names it again. An incarnation that never sent
+        a request costs nothing."""
         return self._incarnation
 
     @property
@@ -2488,14 +2522,28 @@ class CoherentVolume:
         after the rotation (see :meth:`_release_abandoned_grants` for what
         counts as one): under strict the operation that re-minted raises before
         it commits anything, ``CoordinatorFailed`` for the coordinator's failure
-        envelope (#401). An incarnation that did only reads and
-        optimistic commits holds at most SHARED/INVALID, blocks nothing, and is
-        never released — no request is spent on it.
+        envelope (#401).
+
+        The re-mint also ends every older incarnation the volume no longer
+        references (#525): one a request named, that is neither the current
+        one nor one holding a read a :meth:`transfer` would present. Ending it
+        lets the coordinator forget its rows, heartbeat, notices and
+        ``/status`` entry, which otherwise stay for good. One with a recorded
+        grant carries ``ended`` on its release above, in the same request. One
+        that did only reads and optimistic commits holds at most
+        SHARED/INVALID and blocks nothing, so its end follows the release
+        pass, and only when every release in it was confirmed; it is sent like
+        :meth:`_send_grant_release`, raw and with the same short timeout as
+        write()'s best-effort release, so it never raises or counts a
+        degradation, and one not confirmed is logged and sent again at the
+        next re-mint or :meth:`close`. An incarnation that never sent a request
+        never reached the coordinator: no request is spent on it.
         """
         with self._lock:
             self._incarnation = self._new_incarnation()  # fresh row -> no INVALID
             self._last_committed_hash.clear()  # the new identity has committed nothing
             abandoned = sorted(self._grant_incarnations)
+            unreferenced = self._unreferenced_incarnations()
             # SB-23: do NOT clear _last_observed_hash here. The observed-disk
             # baselines are DISK-scoped (what disk looked like when this instance
             # last read/wrote a path), not identity-scoped — a re-mint changes the
@@ -2509,9 +2557,89 @@ class CoherentVolume:
         # request in degrade mode re-enters it (_post -> _fail_closed_or_degrade
         # -> _record_degraded takes self._lock), so holding it here would
         # deadlock on the first failed release.
-        self._release_abandoned_grants(abandoned)
+        if self._release_abandoned_grants(abandoned, unreferenced):
+            # The pass released every grant it holds, so what is left unended
+            # of the unreferenced incarnations holds none.
+            self._end_incarnations(sorted(unreferenced & self._unended_incarnations))
 
-    def _release_abandoned_grants(self, incarnations: list[str]) -> None:
+    def _unreferenced_incarnations(self) -> set[str]:
+        """The incarnations a request named and nothing ended that this volume
+        no longer references: neither the current one nor one that holds a
+        read a :meth:`transfer` would present. Ending one of those would
+        refuse the transfer while the volume still holds the read.
+
+        Leaving out the current one is a guard only: :meth:`_remint` computes
+        this after its rotation, when the current one has sent nothing and so
+        is not yet recorded. That order is what keeps the attempt in use from
+        being ended."""
+        return self._unended_incarnations - {self._incarnation, *self._read_incarnations.values()}
+
+    def _stop_body(self, incarnation: str, *, ended: bool) -> dict:
+        """A ``session-stop`` naming ``incarnation``; with ``ended``, one that
+        also tells the coordinator the volume is done with it (#525)."""
+        body: dict[str, object] = {"session_id": self._session_id, "agent_id": incarnation}
+        if ended:
+            body["ended"] = True
+        return body
+
+    def _end_incarnations(self, incarnations: list[str], *, at_close: bool = False) -> None:
+        """End each of ``incarnations``, which hold no recorded grant: one raw
+        ``session-stop`` with ``ended`` per incarnation (:meth:`_send_end`).
+        One whose end is confirmed (see :func:`_confirms_end`) leaves the
+        record. The walk stops at the first that is not, so a coordinator that
+        stopped answering costs one short timeout, and logs it: an end releases
+        nothing, so it never raises or counts a degradation, and what is still
+        recorded is ended at the next re-mint or :meth:`close`. At close, an end
+        refused because no coordinator listens at the volume's local endpoint
+        gives the rest up instead (:meth:`_give_up_ends`)."""
+        if self._endpoint is None:
+            return
+        for index, incarnation in enumerate(incarnations):
+            answer = self._send_end(incarnation)
+            if _confirms_end(answer):
+                self._unended_incarnations.discard(incarnation)
+                continue
+            if at_close and self._refused_at_local_endpoint(answer):
+                self._give_up_ends(incarnations[index:])
+                return
+            logger.warning(
+                "CoherentVolume could not confirm the end of an attempt it no longer uses; "
+                "the end is sent again at the next re-mint or close(): %r",
+                answer,
+            )
+            return
+
+    def _give_up_ends(self, incarnations: list[str]) -> None:
+        """Drop ``incarnations`` from the unended record at a close that found
+        no coordinator listening at the volume's local endpoint, and log them
+        once. Nothing the caller does can end them, so the volume does not keep
+        its endpoint for them and a later close() sends nothing for them; their
+        records stay with the coordinator."""
+        logger.warning(
+            "CoherentVolume close reached no coordinator, so these attempts it no longer uses "
+            "were not ended and their records stay with the coordinator: %s",
+            ", ".join(incarnations),
+        )
+        self._unended_incarnations.difference_update(incarnations)
+
+    def _send_end(self, incarnation: str) -> object:
+        """One raw ``session-stop`` ending ``incarnation``, presenting the
+        session's caller principal, with the short timeout of
+        :meth:`_release_unconfirmed_grant`: the answer, or the error the post
+        raised. Best-effort, as :meth:`_send_grant_release` is: it never
+        raises, and the caller only reads what it returns."""
+        try:
+            return _coordinator_post(
+                self._endpoint,
+                "/hooks/session-stop",
+                self._stop_body(incarnation, ended=True),
+                extra_headers=caller_principal_headers(self._principal),
+                timeout=_GRANT_RELEASE_TIMEOUT_SEC,
+            )
+        except Exception as failed:
+            return failed
+
+    def _release_abandoned_grants(self, incarnations: list[str], ending: set[str]) -> bool:
         """Release every grant each abandoned incarnation holds: one
         ``session-stop`` naming it in ``agent_id``, which releases all of that
         row's EXCLUSIVE/MODIFIED grants (every path it wrote) and nothing else.
@@ -2533,39 +2661,52 @@ class CoherentVolume:
         as another agent's.
         The pass stops at the first release not confirmed — the rest would meet
         the same coordinator — so one re-mint spends at most one failed request.
+
+        An incarnation in ``ending`` carries ``ended`` on its stop (#525), and
+        leaves the unended record when the answer confirms the end (see
+        :func:`_confirms_end`); the release is read as above either way.
+        Returns whether the pass ran to the end with every release confirmed.
         """
         self._release_held_paths.clear()
         if self._endpoint is None:
-            return  # nothing to send it to; the record waits for an attached re-mint
+            return False  # nothing to send it to; the record waits for an attached re-mint
         for incarnation in incarnations:
-            resp = self._post(
-                "/hooks/session-stop",
-                {"session_id": self._session_id, "agent_id": incarnation},
+            ended = incarnation in ending
+            resp = self._post("/hooks/session-stop", self._stop_body(incarnation, ended=ended))
+            if ended and _confirms_end(resp):
+                self._unended_incarnations.discard(incarnation)
+            if not self._settle_abandoned_release(incarnation, resp):
+                return False
+        return True
+
+    def _settle_abandoned_release(self, incarnation: str, resp: dict | None) -> bool:
+        """Act on the answer to one stop of :meth:`_release_abandoned_grants`,
+        and say whether the pass goes on: only a confirmed release lets it."""
+        if isinstance(resp, dict) and resp.get("degraded"):
+            self._fail_closed_or_degrade(
+                "coordinator watchdog timeout releasing an abandoned write grant"
             )
-            if isinstance(resp, dict) and resp.get("degraded"):
-                self._fail_closed_or_degrade(
-                    "coordinator watchdog timeout releasing an abandoned write grant"
+            return False
+        if _is_failure_envelope(resp):
+            # The stop raised inside the coordinator, so the envelope reports
+            # no grant: the record stays whole for the next re-mint.
+            self._failed_release_or_degrade(resp["reason"])
+            return False
+        if not (isinstance(resp, dict) and resp.get("ok") is True):
+            # None follows a degrade-mode transport failure _post already
+            # warned about. A stop that left a grant held answers each grant
+            # (#185): the ones it released leave the record, the rest stay.
+            if isinstance(resp, dict):
+                self._drop_released_paths(incarnation, resp.get("grants"))
+            if resp is not None:
+                logger.warning(
+                    "release of an abandoned write grant was not confirmed; "
+                    "it will be retried at the next re-mint: %r",
+                    resp,
                 )
-                return
-            if _is_failure_envelope(resp):
-                # The stop raised inside the coordinator, so the envelope reports
-                # no grant: the record stays whole for the next re-mint.
-                self._failed_release_or_degrade(resp["reason"])
-                return
-            if not (isinstance(resp, dict) and resp.get("ok") is True):
-                # None follows a degrade-mode transport failure _post already
-                # warned about. A stop that left a grant held answers each grant
-                # (#185): the ones it released leave the record, the rest stay.
-                if isinstance(resp, dict):
-                    self._drop_released_paths(incarnation, resp.get("grants"))
-                if resp is not None:
-                    logger.warning(
-                        "release of an abandoned write grant was not confirmed; "
-                        "it will be retried at the next re-mint: %r",
-                        resp,
-                    )
-                return
-            self._grant_incarnations.pop(incarnation, None)
+            return False
+        self._grant_incarnations.pop(incarnation, None)
+        return True
 
     def _drop_released_paths(self, incarnation: str, grants: object) -> None:
         """Act on a release answered per grant (#185): drop from
@@ -2679,17 +2820,23 @@ class CoherentVolume:
         return _read_release_answer(resp)
 
     def _nobody_listening(self, exc: CoordinatorUnreachable) -> bool:
-        """Whether ``exc`` shows no coordinator listening at this volume's own
-        local endpoint: the connect was refused, as after the coordinator
-        shut down when idle. A connect that timed out, a name that did not
-        resolve, or a remote endpoint may still have a live coordinator
-        behind it, holding the grants."""
+        """Whether ``exc``, raised for a request through :meth:`_post`, shows
+        no coordinator listening at this volume's own local endpoint (see
+        :meth:`_refused_at_local_endpoint`, which reads the client's error it
+        chains to)."""
+        return self._refused_at_local_endpoint(exc.__cause__)
+
+    def _refused_at_local_endpoint(self, failure: object) -> bool:
+        """Whether ``failure``, the client's error for one request, shows no
+        coordinator listening at this volume's own local endpoint: the connect
+        was refused, as after the coordinator shut down when idle. A connect
+        that timed out, a name that did not resolve, or a remote endpoint may
+        still have a live coordinator behind it, holding the grants."""
         if self._remote_endpoint is not None:
             return False
-        unavailable = exc.__cause__
-        if not (isinstance(unavailable, CoordinatorUnavailable) and unavailable.never_sent):
+        if not (isinstance(failure, CoordinatorUnavailable) and failure.never_sent):
             return False
-        return isinstance(getattr(unavailable.__cause__, "reason", None), ConnectionRefusedError)
+        return isinstance(getattr(failure.__cause__, "reason", None), ConnectionRefusedError)
 
     def _settle_path_release(self, incarnation: str, rel: str, answer: dict) -> bool:
         """Act on a readable answer to the release of ``rel`` under
@@ -2768,6 +2915,20 @@ class CoherentVolume:
         returns, unless a coordinator answered earlier in the same close() that
         a grant was still held.
 
+        Every stop also ends its attempt (#525), and so does one more
+        ``session-stop`` for each other attempt a request of this volume named,
+        sent after the releases with a short timeout, unless a request with no
+        readable answer stopped them: the coordinator then forgets each one,
+        its rows, heartbeat and ``/status`` entry. An end releases nothing, so
+        one the coordinator does not confirm is only logged, never raised or
+        counted; the volume keeps that attempt and its endpoint, and calling
+        ``close()`` again sends it again. When an end is refused because no
+        coordinator listens at the volume's local endpoint, as above, the
+        attempts not yet ended are logged once and given up instead, so a
+        later ``close()`` sends nothing for them. An attempt that never sent a
+        request costs nothing. The endpoint is dropped once nothing is left to
+        release or end.
+
         Nothing calls this at interpreter exit: a volume that exits without
         ``close()``, or is dropped, leaves its grants to the sweep. A ``with``
         block closes the volume on exit, and when its body raised, a close
@@ -2779,27 +2940,34 @@ class CoherentVolume:
                 raise CoherenceError(_CLOSE_INSIDE_AN_OPERATION_MESSAGE)
             self._closed = True
             failure = self._release_every_attempt()
-            if not self._grant_incarnations:
+            if failure is None or failure.held:
+                # No release went unanswered, so the ends have a coordinator to
+                # reach; after one that did, they would only wait it out again.
+                ending = sorted(self._unended_incarnations - self._grant_incarnations.keys())
+                self._end_incarnations(ending, at_close=True)
+            if not self._grant_incarnations and not self._unended_incarnations:
                 self._endpoint = None
             if failure is not None:
                 self._close_not_confirmed(failure)
 
     def _release_every_attempt(self) -> _ReleaseFailure | None:
-        """One ``session-stop`` per attempt the write record lists, and what did
-        not confirm. Each confirmed attempt leaves the record; an account of
-        each grant drops what it reports released or handed off and lets the
-        walk go on; a request with no readable answer stops it."""
+        """One ``session-stop`` per attempt the write record lists, each ending
+        its attempt, and what did not confirm. Each confirmed attempt leaves
+        the record; an account of each grant drops what it reports released or
+        handed off and lets the walk go on; a request with no readable answer
+        stops it. An answer that confirms the end (see :func:`_confirms_end`)
+        drops the attempt from the unended record."""
         if self._endpoint is None:
             return None  # detached: no write of this volume recorded a grant
         held: _ReleaseFailure | None = None
         for incarnation in sorted(self._grant_incarnations):
-            answer = self._send_release(
-                "/hooks/session-stop", {"session_id": self._session_id, "agent_id": incarnation}
-            )
+            answer = self._send_release("/hooks/session-stop", self._stop_body(incarnation, ended=True))
             if isinstance(answer, _ReleaseFailure):
                 # A coordinator answered this close, so a refusal now does not
                 # mean nothing was listening: report it, never log it away.
                 return answer._replace(nobody_listening=False) if held is not None else answer
+            if _confirms_end(answer):
+                self._unended_incarnations.discard(incarnation)
             if answer.get("ok") is True:
                 self._grant_incarnations.pop(incarnation, None)
                 continue
@@ -4155,9 +4323,12 @@ class CoherentVolume:
         Every request names the current incarnation in the subagent field
         (``agent_id``), which the coordinator folds into the grant-row key; a
         body that already names one — the release of an abandoned incarnation —
-        keeps its own. Every request presents the session's caller principal
-        (header), which a require-class route checks the session against; an
-        incarnation is a subagent component, so it shares the session's.
+        keeps its own. The incarnation named is recorded as one the coordinator
+        may now keep records for, which a re-mint or :meth:`close` ends once
+        nothing references it (#525). Every request presents the session's
+        caller principal (header), which a require-class route checks the
+        session against; an incarnation is a subagent component, so it shares
+        the session's.
 
         A request refused for its principal (a typed ``caller_principal_*``
         reason) is recovered as R20 describes: the SAME nonce claims again, and
@@ -4173,6 +4344,7 @@ class CoherentVolume:
         caller would read as an unanswered request (a degraded read, a
         ``CommitUnconfirmed``, bytes written to disk unrecorded)."""
         payload = {"agent_id": self._incarnation, **payload}
+        self._unended_incarnations.add(payload["agent_id"])
         commit_leg = _is_commit_leg(endpoint_path, payload)
         self._settle_unconfirmed_claim()
         sent = self._send(
