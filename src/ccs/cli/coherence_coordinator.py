@@ -49,8 +49,9 @@ Exit codes (spawn mode):
 - 0: coordinator is up and reachable (port printed to stdout)
 - 1: not in a git repository (no coordinator root resolved)
 - 2: coordinator failed to spawn (platform unsupported, FS read-only,
-     a symlinked ``server.pid``, port never appeared in the file, or
-     detached child crashed), or a usage error
+     port never appeared in the file, or detached child crashed),
+     ``.coherence`` is a symlink or not a directory, or holds a symlink
+     (or a FIFO, socket or device), or a usage error
 
 Exit codes (``--check-store``; 1 and 2 as above, 3-9 left to spawn mode):
 - 0: current — a start opens the store unchanged
@@ -70,7 +71,6 @@ import argparse
 import dataclasses
 import json
 import logging
-import os
 import subprocess
 import sys
 import time
@@ -82,7 +82,6 @@ from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     ensure_coordinator,
     stop_coordinator,
-    symlinked_pid_file_refusal,
 )
 from ccs.adapters.claude_code.lifecycle import (
     read_port_from_file as _read_port_from_file,
@@ -91,8 +90,10 @@ from ccs.adapters.claude_code.lifecycle import (
     tcp_probe as _tcp_probe,
 )
 from ccs.adapters.claude_code.resolver import find_coordinator_root
+from ccs.adapters.claude_code.state_dir import check_coherence_dir
 from ccs.adapters.claude_code.store_check import StoreCheckOutcome, check_store
 from ccs.cli._coherence_client import err, escape_nonprintable
+from ccs.core.exceptions import CoherenceDirRefused
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +230,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         err(f"agent-coherence-coordinator: {exc}")
         return 2
 
+    # #498: before every spawn-side mode and the reuse probe, so a link in
+    # .coherence is named here and nothing is read, probed, drained or spawned.
+    # The detached worker's stderr is /dev/null: this parent's line is the one
+    # the user reads.
+    try:
+        check_coherence_dir(root)
+    except CoherenceDirRefused as exc:
+        return _print_refusal(exc)
+
     # Daemonized worker mode: bind + serve, then block forever so the
     # daemon HTTP/sweep/idle threads stay alive.
     if args._daemonized:
@@ -247,7 +257,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Test mode: keep the legacy in-process behavior so test_claude_code_cli
     # can spawn + assert in the same Python process. Not for users.
     if args.no_detach:
-        port = ensure_coordinator(root, bind_host=args.bind_host)
+        try:
+            port = ensure_coordinator(root, bind_host=args.bind_host)
+        except CoherenceDirRefused as exc:
+            return _print_refusal(exc)
         if port == -1:
             err("agent-coherence-coordinator: coordinator could not be spawned")
             return 2
@@ -266,16 +279,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"port={existing_port}", flush=True)
         return 0
 
-    # The child would refuse this too, but its stderr is /dev/null: the user
-    # would wait out the window and never learn why. os.path.islink, because
-    # Path.is_symlink raises on a .coherence it cannot search, which the child
-    # repairs when the user owns it.
-    if os.path.islink(pid_file):
-        err(f"agent-coherence-coordinator: {escape_nonprintable(symlinked_pid_file_refusal(pid_file))}")
-        return 2
-
     # No live coordinator — fork a detached child to run it.
     return _spawn_detached(root, quiet=args.quiet, bind_host=args.bind_host)
+
+
+def _print_refusal(exc: CoherenceDirRefused) -> int:
+    """Print a start's refusal of ``.coherence`` (#498) on one line and
+    return exit 2. The path comes from a directory listing, so it is escaped."""
+    err(f"agent-coherence-coordinator: {escape_nonprintable(str(exc))}")
+    return 2
 
 
 def _reject_check_store_misuse(
@@ -438,7 +450,12 @@ def _run_daemonized(root: Path, *, bind_host: str = "127.0.0.1") -> int:
     and block indefinitely. Exits on SIGTERM (sent by stop_coordinator)
     or natural idle-shutdown (lifecycle's idle loop also detaches via
     ``return`` in its loop, leaving the main thread to block here)."""
-    port = ensure_coordinator(root, bind_host=bind_host)
+    try:
+        port = ensure_coordinator(root, bind_host=bind_host)
+    except CoherenceDirRefused as exc:
+        # A link made after main's check. Spawned detached, this line goes to
+        # /dev/null and the parent reports its timeout; run directly, it shows.
+        return _print_refusal(exc)
     if port == -1:
         return 2
 

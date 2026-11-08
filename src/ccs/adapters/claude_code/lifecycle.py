@@ -873,14 +873,6 @@ def _open_pidfile(pid_file: Path) -> int | None:
     return fd
 
 
-def symlinked_pid_file_refusal(pid_file: Path) -> str:
-    """Why a start refuses ``pid_file``, a symlink (#464)."""
-    return (
-        f"refusing pid file {pid_file}: it is a symlink, and a coordinator start would "
-        "overwrite the file it names. Remove the link to start one here."
-    )
-
-
 def _close_quiet(fd: int) -> None:
     """Best-effort close. Swallows OSError so cleanup paths can chain
     without separate try/except blocks — closing an already-bad fd just
