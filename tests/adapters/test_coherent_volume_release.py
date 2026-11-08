@@ -1163,6 +1163,12 @@ def test_a_detached_volume_releases_and_closes_without_a_request(
             "grant still held. Call release() again to send it again.",
             id="held",
         ),
+        pytest.param(
+            _NO_ACCOUNT,
+            "the coordinator did not confirm the release of this volume's write grant on data/x.txt, "
+            "so the grant may still stand. Call release() again to send it again.",
+            id="no-account-of-the-grant",
+        ),
     ],
 )
 def test_an_unconfirmed_release_says_exactly_what_happened(
