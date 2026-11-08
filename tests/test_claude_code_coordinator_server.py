@@ -40,6 +40,7 @@ from ccs.adapters.claude_code.coordinator_server import (
     decide_tracked_read,
     session_to_agent_id,
 )
+from ccs.coordinator.service import ReleaseRequest
 from ccs.core.exceptions import (
     HOLD_REASONS,
     UNAVAILABLE_REASON,
@@ -1504,13 +1505,9 @@ def test_a1_pre_edit_drops_a_holder_released_after_the_collision_lookup(
             coordinator_arg, looked_up_artifact_id, exclude_agent=exclude_agent
         )
         assert result[0] == session_to_agent_id(holder)
-        coordinator_arg.service.invalidate(
-            agent_id=result[0],
-            artifact_id=looked_up_artifact_id,
-            new_version=1,
-            issuer_agent_id=result[0],
-            issued_at_tick=2,
-        )
+        coordinator_arg.service.release_to_reader(ReleaseRequest(
+            agent_id=result[0], artifact_id=looked_up_artifact_id, issued_at_tick=2,
+        ))
         return result
 
     monkeypatch.setattr(mod, "_exclusive_holder", release_after_lookup)
@@ -5567,12 +5564,13 @@ def test_session_start_pending_notice_rendered_read_only(
     assert "AGENTS.md" in body["hookSpecificOutput"]["additionalContext"]
 
 
-def test_session_start_subagent_grants_grouped_and_released_absent(
+def test_session_start_subagent_grants_grouped_and_a_released_grant_rendered_as_a_read(
     coordinator, client: _Client
 ) -> None:
     """R3 + KTD8: the parent's lines render first, then subagent groups
-    under a `Subagent {name}:` prefix. After the subagent stops (grants
-    released), its grant line disappears from the next payload."""
+    under a `Subagent {name}:` prefix. After the subagent stops, its write
+    grant is released to a read (#513), so its EXCLUSIVE line gives way to a
+    SHARED grant line in the next payload."""
     sid = _sid("ss-sub")
     client.post("/hooks/pre-read",
                 {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("c1")})
@@ -5587,15 +5585,16 @@ def test_session_start_subagent_grants_grouped_and_released_absent(
     sub_at = text.index("At compaction you held EXCLUSIVE on plan.md (v1)")
     assert parent_at < prefix_at < sub_at
 
-    # Stop the subagent — its E grant is released (row goes INVALID).
+    # Stop the subagent — its E grant is released to a read (row goes SHARED).
     client.post("/hooks/session-stop", {"session_id": sid, "agent_id": "worker-1"})
     status, body = client.post("/hooks/session-start", {"session_id": sid})
     assert status == 200
     text = _session_start_text(body)
     assert "At compaction you held EXCLUSIVE on plan.md" not in text
-    # The released row is still a touched row — rendered without a flag.
+    # The released row is a held read, rendered as a grant line.
     assert "Subagent worker-1:" in text
-    assert "plan.md is at v1." in text
+    assert "At compaction you held SHARED on plan.md (v1) — re-acquire before writing." in text
+    assert "plan.md is at v1." not in text
 
 
 def test_session_start_two_identical_calls_byte_identical(
@@ -10894,11 +10893,10 @@ def test_the_refusal_names_the_holder_its_own_decision_read(
     def write_after_the_holder_changes(**kwargs: Any) -> Any:
         if kwargs["agent_id"] == caller_agent and not changed:
             changed.append(True)
-            version = coordinator.registry.get_artifact(artifact_id).version
-            service.invalidate(
-                agent_id=first_agent, artifact_id=artifact_id, new_version=version,
-                issuer_agent_id=first_agent, issued_at_tick=kwargs["issued_at_tick"],
-            )
+            service.release_to_reader(ReleaseRequest(
+                agent_id=first_agent, artifact_id=artifact_id,
+                issued_at_tick=kwargs["issued_at_tick"],
+            ))
             real_write(
                 agent_id=second_agent, artifact_id=artifact_id,
                 issued_at_tick=kwargs["issued_at_tick"],
@@ -10939,11 +10937,10 @@ def test_an_opted_in_admit_after_the_holder_released_carries_no_collision_or_not
     def write_after_the_holder_releases(**kwargs: Any) -> Any:
         if kwargs["agent_id"] == caller_agent and not released:
             released.append(True)
-            version = coordinator.registry.get_artifact(artifact_id).version
-            service.invalidate(
-                agent_id=holder_agent, artifact_id=artifact_id, new_version=version,
-                issuer_agent_id=holder_agent, issued_at_tick=kwargs["issued_at_tick"],
-            )
+            service.release_to_reader(ReleaseRequest(
+                agent_id=holder_agent, artifact_id=artifact_id,
+                issued_at_tick=kwargs["issued_at_tick"],
+            ))
         return real_write(**kwargs)
 
     monkeypatch.setattr(service, "write", write_after_the_holder_releases)
@@ -11383,19 +11380,18 @@ def test_an_untracked_opted_in_pre_edit_whose_re_grounding_times_out_answers_the
     assert coordinator._watchdog_timeouts_total == timeouts_before + 1
 
 
-def test_on_a_strict_path_a_release_after_unavailable_leaves_that_identity_denied(
+def test_on_a_strict_path_a_release_after_unavailable_changes_nothing_for_that_identity(
     strict_plan_coordinator, strict_plan_client: _Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The release a client makes after ``unavailable``, on a strict path that
-    has a version: the failed post-edit answers ``released: true`` and leaves
-    the caller INVALID, so the same identity's next opted-in pre-edit gets
-    the strict deny, and so does its read, and it stays INVALID. The same
-    pre-edit under a new ``agent_id``, with the same session and principal,
-    is admitted while nobody holds the file.
+    has a version: the abandoned work took no grant, so the failed post-edit
+    answers ``released: true`` and changes nothing, making no row for the
+    caller (#513), and the same identity's next opted-in pre-edit is admitted
+    while nobody holds the file.
 
-    Pins why a client re-reads under a new ``agent_id`` after releasing: a
-    deny never re-grants the identity it denies, so every retry under the
-    released one is denied."""
+    Pins that the release costs the client nothing: it used to leave the
+    caller INVALID, and as a deny never re-grants the identity it denies,
+    every later pre-edit and read under it got the strict deny."""
     import ccs.adapters.claude_code.coordinator_server as mod
 
     coordinator, client = strict_plan_coordinator, strict_plan_client
@@ -11416,19 +11412,11 @@ def test_on_a_strict_path_a_release_after_unavailable_leaves_that_identity_denie
         "/hooks/post-edit", {"session_id": caller.sid, "path": "plan.md", "success": False},
         principal=caller.principal)
     assert released == (200, {"ok": True, "released": True}), released
-    assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.INVALID
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) is None
 
-    status, denied = client.post("/hooks/pre-edit", request, principal=caller.principal)
-    assert status == 200 and denied.get("status") == "stale", denied
-    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", denied
-    read = _read(client, caller, "plan.md")
-    assert read["hookSpecificOutput"]["permissionDecision"] == "deny", read
-    assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.INVALID
-
-    status, admitted = client.post(
-        "/hooks/pre-edit", {**request, "agent_id": "reread-1"}, principal=caller.principal)
+    status, admitted = client.post("/hooks/pre-edit", request, principal=caller.principal)
     assert status == 200 and admitted.get("ok") is True, admitted
-    assert _state(coordinator, "plan.md", caller.composite("reread-1")) == MESIState.EXCLUSIVE
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.EXCLUSIVE
 
 
 # --- the gate's store read RAISES: the route's own internal-error answer ------
@@ -12807,12 +12795,13 @@ def test_status_full_tier_does_not_report_a_voluntary_release_as_a_reclaim(
     sid = _sid("release-195")
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
     assert client.post("/hooks/session-stop", {"session_id": sid})[0] == 200
-    # Nothing for the sweep to pull: the release already left INVALID.
+    # Nothing for the sweep to pull: the release left a read, never reclaimed.
     assert _sweep(coordinator, int(time.time()) + 999_999) == 0
 
     row = _row_for(_operator_status(client), sid)
-    assert row["states"] == {}
+    assert row["states"] == {"plan.md": "SHARED"}
     assert row["reclaimed"] == {}
+    assert row["grants"] == {}
     _, metrics = client.get("/status?detail=metrics")
     assert metrics["sweep_reclaims_total"] == 0
 
@@ -12907,7 +12896,7 @@ def test_a_reclaimed_path_stays_listed_through_a_reread_and_clears_on_reacquire(
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
     client.post("/hooks/session-stop", {"session_id": sid})
     row = _row_for(_operator_status(client), sid)
-    assert row["states"] == {}
+    assert row["states"] == {"plan.md": "SHARED"}
     assert row["reclaimed"] == {}, "a re-acquire clears the slot; the later exit was a release"
 
 
@@ -14342,6 +14331,21 @@ def test_a_snapshot_commit_without_a_principal_acts_as_the_bound_session_it_name
 # --- the release answer: per grant only when it is not a clean success -------
 
 
+def _record_watchdog_aborts(coordinator, monkeypatch: pytest.MonkeyPatch) -> list:
+    """Record the abort event each request hands the watchdog, so a test can
+    check that the release runs under that request's own event: only that
+    one is set when the request times out."""
+    aborts: list = []
+    run = coordinator.run_with_watchdog
+
+    def recording(fn, abort=None, **kwargs):
+        aborts.append(abort)
+        return run(fn, abort, **kwargs)
+
+    monkeypatch.setattr(coordinator, "run_with_watchdog", recording)
+    return aborts
+
+
 def test_a_clean_session_stop_answers_todays_exact_bytes(coordinator, client: _Client) -> None:
     """A stop that releases every grant answers
     the body the Node backend mirrors -- no per-grant list. The paths come
@@ -14368,14 +14372,17 @@ def test_a_session_stop_that_keeps_a_grant_answers_per_grant(
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "spec.md"})
     spec_id = coordinator.registry.lookup_artifact_id_by_name("spec.md")
-    release = coordinator.service.invalidate
+    release = coordinator.service.release_to_reader
+    aborts = _record_watchdog_aborts(coordinator, monkeypatch)
 
-    def failing_on_spec(**kwargs: Any):
-        if kwargs["artifact_id"] == spec_id:
+    def failing_on_spec(request: Any, **kwargs: Any):
+        assert kwargs.get("abort") is not None
+        assert kwargs["abort"] is aborts[-1]
+        if request.artifact_id == spec_id:
             raise CoherenceError("release refused by the test")
-        return release(**kwargs)
+        return release(request, **kwargs)
 
-    monkeypatch.setattr(coordinator.service, "invalidate", failing_on_spec)
+    monkeypatch.setattr(coordinator.service, "release_to_reader", failing_on_spec)
     answer = client.post("/hooks/session-stop", {"session_id": sid})
 
     assert answer == (200, {
@@ -14386,7 +14393,7 @@ def test_a_session_stop_that_keeps_a_grant_answers_per_grant(
             {"path": "spec.md", "held": True, "reason": "release refused by the test"},
         ],
     })
-    assert _state(coordinator, "plan.md", agent_id) == MESIState.INVALID
+    assert _state(coordinator, "plan.md", agent_id) == MESIState.SHARED
     assert _state(coordinator, "spec.md", agent_id) == MESIState.EXCLUSIVE
 
 
@@ -14402,11 +14409,14 @@ def test_a_failed_edit_release_that_keeps_its_grant_answers_per_grant(
     sid = _sid("failed-edit-held")
     agent_id = session_to_agent_id(sid)
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    aborts = _record_watchdog_aborts(coordinator, monkeypatch)
 
-    def refusing(**kwargs: Any):
+    def refusing(*_args: Any, **kwargs: Any):
+        assert kwargs.get("abort") is not None
+        assert kwargs["abort"] is aborts[-1]
         raise CoherenceError("release refused by the test")
 
-    monkeypatch.setattr(coordinator.service, "invalidate", refusing)
+    monkeypatch.setattr(coordinator.service, "release_to_reader", refusing)
     answer = client.post("/hooks/post-edit", {
         "session_id": sid, "path": "plan.md", "success": False,
     })
@@ -18185,10 +18195,9 @@ def test_pre_edit_warns_when_in_flight_holder_releases_before_acquire(
     def release_after_check(*args: Any, **kwargs: Any) -> bool:
         in_flight = real_check(*args, **kwargs)
         seen.append(in_flight)
-        coordinator.service.invalidate(
-            agent_id=holder_id, artifact_id=artifact_id, new_version=1,
-            issuer_agent_id=holder_id, issued_at_tick=1,
-        )
+        coordinator.service.release_to_reader(ReleaseRequest(
+            agent_id=holder_id, artifact_id=artifact_id, issued_at_tick=1,
+        ))
         return in_flight
 
     monkeypatch.setattr(mod, "_a_write_is_in_flight", release_after_check)

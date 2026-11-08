@@ -867,7 +867,7 @@ def test_a_later_release_that_goes_unanswered_says_the_grant_may_be_held(
             raise InvariantViolationError("release refused")
 
         with monkeypatch.context() as faulted:
-            faulted.setattr(server.service, "invalidate", refusing)
+            faulted.setattr(server.service, "release_to_reader", refusing)
             with pytest.raises(CoordinatorFailed) as first:
                 vol.write_cas_at(_REL, versions[0], b"v3")
         assert str(first.value) == _OWN_GRANT_HELD.format(rel=_REL), "control: the first release said held"
@@ -1043,7 +1043,7 @@ def test_a_commit_refused_by_a_grant_its_release_left_held_names_that_grant(
 
         with monkeypatch.context() as faulted:
             # The stop's per-grant release; its failure is answered per grant.
-            faulted.setattr(server.service, "invalidate", refusing)
+            faulted.setattr(server.service, "release_to_reader", refusing)
             sent = _wire(faulted)
             with warnings.catch_warnings(record=True) as warned:
                 warnings.simplefilter("always")

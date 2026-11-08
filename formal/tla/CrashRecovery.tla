@@ -87,6 +87,15 @@ CRInvalidateAction ==
     /\ lastReclamation' = UpdatedLastReclamation
     /\ UNCHANGED lastHeartbeat
 
+(* M/E -> S: the grant tick is dropped (GrantUpdate's M/E -> non-M/E case)
+   and no reclamation slot is written, as the registry does when a holder
+   releases its own write claim. *)
+CRReleaseToReaderAction ==
+    /\ ReleaseToReaderAction
+    /\ grantedAtTick'  = UpdatedGrantedAtTick
+    /\ lastReclamation' = UpdatedLastReclamation
+    /\ UNCHANGED lastHeartbeat
+
 CRTickAction ==
     /\ TickAction
     /\ UNCHANGED crVars
@@ -149,6 +158,7 @@ CRNext ==
     \/ CRWriteAction
     \/ CRCommitAction
     \/ CRInvalidateAction
+    \/ CRReleaseToReaderAction
     \/ CRTickAction
     \/ HeartbeatAction
     \/ SweepAction

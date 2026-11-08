@@ -1682,14 +1682,16 @@ _SESSION_VAR = "CLAUDE_CODE_SESSION_ID"
 _EXIT_DONE, _EXIT_USAGE, _EXIT_FAILED, _EXIT_NOT_SERVED = 0, 1, 2, 4
 
 _NOT_HELD_HINT = (
-    "hint: a Claude Code session's write grant ends when its turn ends. If an "
-    "earlier transfer of plan.md may have landed, check the path's handoff in "
-    "agent-coherence-status output first: a handoff from this session to that "
-    "successor made at the version it held, live or ended, means it landed, so "
-    "do not transfer again, and if it shows another session's handoff, ask "
-    "before transferring; otherwise have the giver session read plan.md, then "
-    "transfer it again (on a strict-mode path that read is denied: hand the "
-    "path on in the same turn as its edit)"
+    "hint: this session holds no claim on plan.md: an earlier transfer of it "
+    "may have landed, another session may have taken or changed it since this "
+    "session read it, or this session may never have read it. Check the path's "
+    "handoff in agent-coherence-status output first: a handoff from this "
+    "session to that successor made at the version it held, live or ended, "
+    "means it landed, so do not transfer again, and if it shows another "
+    "session's handoff, ask before transferring; otherwise have the giver "
+    "session read plan.md, then transfer it again (on a strict-mode path that "
+    "read is denied, and grants nothing, when another session took or changed "
+    "plan.md after this session read it)"
 )
 
 _VERB_RUNS = {
@@ -2009,23 +2011,26 @@ def test_a_verb_for_a_session_bound_under_another_nonce_is_refused_and_never_re_
     assert (record["status"], record["live"]) == ("pending", True)
 
 
-def test_a_transfer_after_the_givers_turn_ended_is_not_held_with_a_hint_and_a_pre_read_makes_it_transferable(
+def test_a_transfer_of_a_read_a_peer_made_stale_is_not_held_with_a_hint_and_a_pre_read_makes_it_transferable(
     live_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A hook session's write grant ends at its turn end (its session-stop), so
-    a transfer run afterwards answers not held: the verb prints the wire
+    """A hook session's turn end (its session-stop) leaves it a read of its
+    file (#513), and a peer's pre-edit then makes that read stale, so a
+    transfer run afterwards answers not held: the verb prints the wire
     reason unchanged, adds the client-side hint (have the giver session read
     the path, then transfer) and exits 2. After the giver session's pre-read
     the same transfer goes through, giving up a SHARED claim. Prevents an
     operator meeting a bare refusal with no way forward."""
     workspace, _ = live_coordinator
-    giver = str(uuid.uuid4())
+    giver, peer = str(uuid.uuid4()), str(uuid.uuid4())
     successor_agent = _known_successor(workspace)
     _hook(workspace, "/hooks/pre-edit", {"session_id": giver, "path": "plan.md"})
     _hook(workspace, "/hooks/post-edit", {
         "session_id": giver, "path": "plan.md", "content_hash": "b" * 64, "success": True,
     })
     _hook(workspace, "/hooks/session-stop", {"session_id": giver})
+    _hook(workspace, "/hooks/pre-edit", {"session_id": peer, "path": "plan.md"})
+    _hook(workspace, "/hooks/session-stop", {"session_id": peer})
     argv = ["--root", str(workspace), "--session", giver, "--successor", successor_agent, "plan.md"]
 
     rc = coherence_handoff.transfer_main(argv)

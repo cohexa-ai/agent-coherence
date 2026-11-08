@@ -1,0 +1,57 @@
+{
+  "name": "pre-read-after-a-readers-failed-post-edit-is-fresh",
+  "description": "A failed-edit report from a session that holds no write grant changes nothing (#513). Session A reads notes.md (v1), so it is a reader, and then reports a failed edit of notes.md (post-edit with success:false and no content_hash) without ever having been granted the write, as after a pre-edit that went unanswered. A stays a reader, and its next Read is fresh. Before, the report demoted A's read to INVALID and this read was denied on every retry. Both backends.",
+  "setup": {
+    "tracked": [
+      "notes.md"
+    ],
+    "strict_mode": [
+      "notes.md"
+    ],
+    "files": {
+      "notes.md": "# Notes\nv2 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md",
+          "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md",
+          "success": false
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "notes.md",
+      "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+    }
+  },
+  "optional_keys": [
+    "version"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "status": "fresh"
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}
