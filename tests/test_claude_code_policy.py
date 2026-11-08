@@ -14,6 +14,7 @@ Covers:
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from ccs.adapters.claude_code.policy import (
     DEFAULT_TRACKED_PATTERNS,
     TrackedArtifactPolicy,
 )
+from tests.coherence_link_helpers import plant_link, release_fifo
 
 
 @pytest.fixture
@@ -284,6 +286,38 @@ def test_an_unreadable_policy_file_is_counted_as_rejected(root: Path) -> None:
     assert policy.rejected() == (
         (".coherence/tracked.yaml", "could not be read, so the file loads as no entries"),
     )
+
+
+@pytest.mark.parametrize("shape", ["existing", "dangling", "to_fifo"])
+def test_a_linked_policy_file_loads_as_no_entries_and_is_counted_as_rejected(
+    root: Path, caplog: pytest.LogCaptureFixture, shape: str
+) -> None:
+    """#498: a policy file that is a symlink loads as no entries, whatever it
+    names, and is reported as one rejected entry naming it, with a WARNING. A
+    start refuses the link; this is the load a reload makes after a checkout put
+    one there. The load runs on a thread and the FIFO is released whatever
+    happens, so a regression fails here instead of hanging the suite.
+
+    Prevents a reload reading the entries of the file a link names, and a link to
+    a FIFO or to nothing loading silently as an empty file."""
+    coherence_dir = root / ".coherence"
+    target = plant_link(coherence_dir, "tracked.yaml", shape)
+    if shape == "existing":
+        target.write_text("- runbook.md\n")
+    loaded: list[TrackedArtifactPolicy] = []
+    worker = threading.Thread(target=lambda: loaded.append(TrackedArtifactPolicy.load(root)), daemon=True)
+    try:
+        worker.start()
+        worker.join(timeout=10)
+    finally:
+        if shape == "to_fifo":
+            release_fifo(target)
+        worker.join(timeout=5)
+
+    [policy] = loaded
+    assert policy.user_added_patterns == ()
+    assert policy.rejected() == ((".coherence/tracked.yaml", "a symlink, so the file loads as no entries"),)
+    assert f"{root.resolve() / '.coherence' / 'tracked.yaml'} is a symlink; it loads as no entries" in caplog.text
 
 
 def test_non_string_pattern_in_list_rejected(root: Path) -> None:

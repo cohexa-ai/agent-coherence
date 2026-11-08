@@ -50,7 +50,7 @@ from ccs.core.exceptions import (
     StaleReadGeneration,
 )
 from ccs.core.states import MESIState
-from tests.coherence_link_helpers import plant_link, target_snapshot
+from tests.coherence_link_helpers import TARGET_BYTES, plant_link, release_fifo, target_snapshot
 
 # Test helper: deterministic UUID4-shaped strings for short test labels.
 # Sessions now must be UUIDs (A3 validation); tests use this to keep label
@@ -789,6 +789,18 @@ _POLICY_FILES = [
 ]
 
 
+def _policy_link_refusal(file_name: str) -> str:
+    """The routes' and merges' refusal of a linked ``.coherence/<file_name>``
+    (#498), written out here: the Node coordinator prints the same text."""
+    return (
+        f".coherence/{file_name} is a symlink; nothing was written. Replace it with a copy of "
+        "the file it names, or mount a directory at .coherence."
+    )
+
+
+_TRACKED_YAML_LINK_REFUSAL = _policy_link_refusal("tracked.yaml")
+
+
 @pytest.mark.parametrize(("file_name", "loaded_as"), [
     ("tracked.yaml", "user_added_patterns"), ("ignored.yaml", "ignored_patterns"),
 ])
@@ -941,9 +953,9 @@ def test_the_policy_writer_refuses_a_file_it_cannot_read(tmp_path: Path) -> None
 
 def test_append_policy_yaml_refuses_a_link_to_a_device_and_keeps_it(tmp_path: Path) -> None:
     """The routes share the merge's reader, so a policy file linked to a device is
-    refused there too. Prevents a route reading ``/dev/zero`` until memory runs
-    out; ``os.devnull`` takes the same path, and a regression here answers wrongly
-    instead."""
+    refused there too, as a link, before the device is opened (#498). Prevents a
+    route reading ``/dev/zero`` until memory runs out; ``os.devnull`` takes the same
+    path, and a regression here answers wrongly instead."""
     from ccs.adapters.claude_code.coordinator_server import _append_policy_yaml
 
     policy_file = tmp_path / ".coherence" / "tracked.yaml"
@@ -953,17 +965,17 @@ def test_append_policy_yaml_refuses_a_link_to_a_device_and_keeps_it(tmp_path: Pa
     with pytest.raises(ValueError) as raised:
         _append_policy_yaml(policy_file, ["ok.md"])
 
-    assert str(raised.value) == ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."
+    assert str(raised.value) == _TRACKED_YAML_LINK_REFUSAL
     assert policy_file.is_symlink()
 
 
 def test_a_policy_route_answers_400_for_a_policy_file_linked_to_a_device(
     coordinator, client: _Client,
 ) -> None:
-    """On the wire, a policy file linked to a device is the 400 every unreadable
-    file gets, naming it, with the link kept. ``os.devnull`` stands in for
-    ``/dev/zero``, so a regression answers wrongly instead of reading until memory
-    runs out."""
+    """On the wire, a policy file linked to a device is the 400 every linked
+    policy file gets, naming it and the way out, with the link kept (#498).
+    ``os.devnull`` stands in for ``/dev/zero``, so a regression answers wrongly
+    instead of reading until memory runs out."""
     policy_file = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
     policy_file.unlink(missing_ok=True)
     policy_file.symlink_to(os.devnull)
@@ -971,8 +983,128 @@ def test_a_policy_route_answers_400_for_a_policy_file_linked_to_a_device(
     s, b = client.post("/policy/track", {"paths": ["ok.md"]})
 
     assert s == 400, b
-    assert b == {"error": ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."}, b
+    assert b == {"error": _TRACKED_YAML_LINK_REFUSAL}, b
     assert policy_file.is_symlink()
+
+
+@pytest.mark.parametrize(("endpoint", "file_name", "answer_key", "loaded_as"), _POLICY_FILES)
+def test_a_policy_route_refuses_a_policy_file_linked_after_the_start(
+    coordinator, client: _Client, endpoint: str, file_name: str, answer_key: str,
+    loaded_as: str,
+) -> None:
+    """#498: a start refuses a link in ``.coherence``, but a checkout can put one
+    there while the coordinator runs. The route answers 400 naming the link and
+    the way out, and leaves the link and the file it names alone.
+
+    Prevents the route reading the linked file's entries, renaming a regular file
+    holding them over the link, and loading them into the live policy."""
+    coherence_dir = coordinator.coordinator_root / ".coherence"
+    (coherence_dir / file_name).unlink(missing_ok=True)
+    target = plant_link(coherence_dir, file_name, "existing")
+    target.write_text('- "secret/**"\n')
+    before = target_snapshot(target)
+    link = os.readlink(coherence_dir / file_name)
+
+    s, b = client.post(endpoint, {"paths": ["ok.md"]})
+
+    assert (s, b) == (400, {"error": _policy_link_refusal(file_name)})
+    assert os.readlink(coherence_dir / file_name) == link
+    assert target_snapshot(target) == before
+    assert "secret/**" not in getattr(coordinator.policy, loaded_as)
+
+
+def test_a_policy_reload_does_not_read_a_policy_file_linked_after_the_start(
+    coordinator, client: _Client,
+) -> None:
+    """#498: a track reloads all three policy files. One linked while the
+    coordinator runs loads as no entries and is counted on ``/status`` as
+    rejected, naming it; the route still answers 200 for its own regular file.
+
+    Prevents a reload reading the entries of the file the link names: here an
+    ignore pattern that would stop tracking ``data/**``."""
+    coherence_dir = coordinator.coordinator_root / ".coherence"
+    (coherence_dir / "ignored.yaml").unlink(missing_ok=True)
+    target = plant_link(coherence_dir, "ignored.yaml", "existing")
+    target.write_text('- "data/**"\n')
+
+    s, b = client.post("/policy/track", {"paths": ["ok.md"]})
+    assert (s, b) == (200, {"ok": True, "added": ["ok.md"], "rejected": []}), b
+
+    assert coordinator.policy.ignored_patterns == ()
+    assert coordinator.policy.rejected() == (
+        (".coherence/ignored.yaml", "a symlink, so the file loads as no entries"),
+    )
+    s, status = client.get("/status")
+    assert s == 200 and status["policy_summary"]["rejected_pattern_count"] == 1, status
+
+
+def test_a_policy_file_linked_after_the_start_check_loads_as_no_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#498: the server's own start check refuses a linked policy file. This one
+    is linked after that check (patched out here), so the policy load meets it:
+    it loads as no entries and is counted as rejected, naming it.
+
+    Prevents the load reading the entries of the file the link names."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    target = plant_link(tmp_path / ".coherence", "tracked.yaml", "existing")
+    target.write_text('- "secret/**"\n')
+    monkeypatch.setattr(mod, "check_coherence_dir", lambda root: None)
+
+    server = CoordinatorHTTPServer(tmp_path, port=0)
+    try:
+        assert server.policy.user_added_patterns == ()
+        assert server.policy.rejected() == (
+            (".coherence/tracked.yaml", "a symlink, so the file loads as no entries"),
+        )
+    finally:
+        server.shutdown()
+    assert target.read_text() == '- "secret/**"\n'
+
+
+def test_a_policy_route_refuses_a_dangling_lock_sidecar_link_and_creates_nothing(
+    coordinator, client: _Client,
+) -> None:
+    """#498: the route locks its policy file through a ``<name>.lock`` sidecar it
+    opens with ``O_CREAT``. A link there, made while the coordinator runs, is
+    refused with 400 naming it, and the policy file is left as it was.
+
+    Prevents the lock open following a dangling link and creating the file it
+    names outside ``.coherence``."""
+    coherence_dir = coordinator.coordinator_root / ".coherence"
+    policy_before = target_snapshot(coherence_dir / "tracked.yaml")
+    target = plant_link(coherence_dir, "tracked.yaml.lock", "dangling")
+
+    s, b = client.post("/policy/track", {"paths": ["ok.md"]})
+
+    assert (s, b) == (
+        400, {"error": ".coherence/tracked.yaml.lock is a symlink; nothing was written. Remove the link."},
+    )
+    assert not os.path.lexists(target)
+    assert (coherence_dir / "tracked.yaml.lock").is_symlink()
+    assert target_snapshot(coherence_dir / "tracked.yaml") == policy_before
+
+
+def test_a_policy_route_over_a_fifo_made_after_the_start_answers_at_once(
+    coordinator, client: _Client,
+) -> None:
+    """A FIFO put at a policy file while the coordinator runs is refused at once
+    with the 400 every file that is not regular gets. Prevents the route opening
+    it for reading and blocking its handler with nothing named. The FIFO is
+    released whatever happens, so a regression fails here instead of hanging the
+    coordinator's shutdown."""
+    policy_file = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
+    policy_file.unlink(missing_ok=True)
+    os.mkfifo(policy_file)
+    try:
+        s, b = client.post("/policy/track", {"paths": ["ok.md"]})
+    finally:
+        release_fifo(policy_file)
+
+    assert (s, b) == (
+        400, {"error": ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."},
+    )
 
 
 def test_a_coordinator_built_over_a_link_in_coherence_refuses_before_opening_its_store(
@@ -3742,8 +3874,9 @@ def test_merge_policy_globs_refuses_a_file_it_cannot_read(tmp_path: Path) -> Non
 def test_merge_policy_globs_refuses_a_link_to_a_device_and_keeps_it(tmp_path: Path) -> None:
     """A repository can commit a policy file as a link, and a device such as
     ``/dev/zero`` never reaches EOF. Prevents the merge reading one until memory
-    runs out. ``os.devnull`` takes the same path, and a regression here answers
-    wrongly instead."""
+    runs out: it refuses the link before the device is opened (#498).
+    ``os.devnull`` takes the same path, and a regression here answers wrongly
+    instead."""
     from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
     coherence = tmp_path / ".coherence"
     coherence.mkdir()
@@ -3753,7 +3886,7 @@ def test_merge_policy_globs_refuses_a_link_to_a_device_and_keeps_it(tmp_path: Pa
     with pytest.raises(ValueError) as raised:
         merge_policy_globs((tracked,), ("data/**",))
 
-    assert str(raised.value) == ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."
+    assert str(raised.value) == _TRACKED_YAML_LINK_REFUSAL
     assert tracked.is_symlink()
 
 
@@ -3762,7 +3895,7 @@ def test_merge_policy_globs_works_where_the_platform_has_no_o_nonblock(
 ) -> None:
     """``O_NONBLOCK`` is POSIX-only. Prevents its absence making the merge raise
     AttributeError out of a volume's or a session's constructor, where degrade mode
-    promises to warn: a regular file still merges and a device is still refused."""
+    promises to warn: a regular file still merges and a link is still refused."""
     from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
     coherence = tmp_path / ".coherence"
     coherence.mkdir()
@@ -3773,10 +3906,35 @@ def test_merge_policy_globs_works_where_the_platform_has_no_o_nonblock(
     monkeypatch.delattr(os, "O_NONBLOCK")
 
     merge_policy_globs((tracked,), ("data/**",))
-    with pytest.raises(ValueError, match=r"strict_mode\.yaml could not be read \(not a regular file\)"):
+    with pytest.raises(ValueError) as raised:
         merge_policy_globs((device,), ("data/**",))
 
+    assert str(raised.value) == _policy_link_refusal("strict_mode.yaml")
     assert yaml.safe_load(tracked.read_text()) == ["data/**", "docs/**"]
+
+
+@pytest.mark.parametrize("o_nonblock", [True, False], ids=["o_nonblock", "no_o_nonblock"])
+def test_the_policy_reader_refuses_a_device_given_directly(
+    monkeypatch: pytest.MonkeyPatch, o_nonblock: bool,
+) -> None:
+    """The routes and merges share this reader. A device at the path itself is
+    refused as not a regular file, with ``O_NONBLOCK`` and on a platform without
+    it: the protection the linked-device tests above carried before a link was
+    refused as a link (#498). Only the reader runs, so a regression here cannot
+    write anything at ``/dev``.
+
+    Prevents a route or a merge reading ``/dev/zero`` until memory runs out."""
+    from ccs.adapters.claude_code.coordinator_server import _read_policy_bytes
+
+    if not o_nonblock:
+        monkeypatch.delattr(os, "O_NONBLOCK")
+
+    with pytest.raises(ValueError) as raised:
+        _read_policy_bytes(Path(os.devnull), ".coherence/tracked.yaml")
+
+    assert str(raised.value) == (
+        ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."
+    )
 
 
 @pytest.mark.parametrize("linked", [False, True], ids=["fifo", "link_to_fifo"])
@@ -3809,27 +3967,44 @@ def test_merge_policy_globs_refuses_a_fifo_without_blocking(tmp_path: Path, link
         worker.join(timeout=5)
         pytest.fail("the merge blocked on a FIFO")
 
-    assert refusals == [".coherence/tracked.yaml could not be read (not a regular file); nothing was written."]
+    expected = (
+        _TRACKED_YAML_LINK_REFUSAL if linked
+        else ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."
+    )
+    assert refusals == [expected]
     assert tracked.is_symlink() is linked
 
 
-@pytest.mark.parametrize("target_exists", [True, False], ids=["existing_target", "dangling"])
-def test_merge_policy_globs_leaves_a_linked_files_target_alone(tmp_path: Path, target_exists: bool) -> None:
-    """A merge renames over a policy file kept as a link, as the routes do. Prevents
-    it writing through a link a repository committed: the file the link names keeps
-    its bytes, or stays absent for a dangling link."""
+@pytest.mark.parametrize("shape", ["existing", "dangling"], ids=["existing_target", "dangling"])
+def test_merge_policy_globs_refuses_a_linked_policy_file_and_writes_nothing(
+    tmp_path: Path, shape: str,
+) -> None:
+    """#498: a repository can commit a policy file as a link. The merge refuses
+    it, naming it and the way out, before it writes any file: the regular file
+    merged beside it keeps its bytes too (#305), the link is kept, and the file it
+    names keeps its bytes or stays absent.
+
+    Prevents the merge reading the entries of the file a link names and renaming
+    a regular file holding them over the link."""
     from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
     coherence = tmp_path / ".coherence"
-    coherence.mkdir()
-    target = tmp_path / "outside.yaml"
-    if target_exists:
-        target.write_text('- "docs/**"\n')
-    (coherence / "tracked.yaml").symlink_to(target)
+    strict = coherence / "strict_mode.yaml"
+    target = plant_link(coherence, "tracked.yaml", shape)
+    if shape == "existing":
+        # A list the merge could take, so only the link stops it.
+        target.write_text('- "secret/**"\n')
+    strict.write_text('- "docs/**"\n')
+    before = target_snapshot(target)
+    link = os.readlink(coherence / "tracked.yaml")
 
-    merge_policy_globs((coherence / "tracked.yaml",), ("data/**",))
+    with pytest.raises(ValueError) as raised:
+        merge_policy_globs((strict, coherence / "tracked.yaml"), ("data/**",))
 
-    assert "data/**" in yaml.safe_load((coherence / "tracked.yaml").read_text())
-    assert (target.read_text() == '- "docs/**"\n') if target_exists else not target.exists()
+    assert str(raised.value) == _TRACKED_YAML_LINK_REFUSAL
+    assert os.readlink(coherence / "tracked.yaml") == link
+    assert target_snapshot(target) == before
+    assert strict.read_text() == '- "docs/**"\n'
+    assert sorted(os.listdir(coherence)) == ["strict_mode.yaml", "tracked.yaml"]
 
 
 @pytest.mark.parametrize("broken_first", [True, False], ids=["broken_first", "broken_last"])
@@ -4028,6 +4203,60 @@ def test_r11_ensure_secret_fails_closed_when_empty_file_persists(
     assert "stayed empty" in str(exc.value)
     # The file must remain empty — we did NOT O_TRUNC over it.
     assert secret_path.stat().st_size == 0
+
+
+@pytest.mark.parametrize("shape", ["existing", "dangling"])
+def test_ensure_secret_refuses_a_linked_secret_and_names_it(tmp_path: Path, shape: str) -> None:
+    """#498: a start refuses a linked ``hook.secret`` before it builds a server;
+    ``ensure_secret`` is the backstop for one linked after that check. It raises
+    at once, naming the link and the way out, and leaves the link and the file it
+    names alone.
+
+    Prevents the file a link names becoming the bearer, and a dangling link being
+    reported as a secret that stayed empty across five attempts."""
+    from ccs.adapters.claude_code.auth import EnsureSecretError, ensure_secret
+
+    coherence_dir = tmp_path / ".coherence"
+    secret = coherence_dir / "hook.secret"
+    target = plant_link(coherence_dir, "hook.secret", shape)
+    before = target_snapshot(target)
+
+    with pytest.raises(EnsureSecretError) as refused:
+        ensure_secret(tmp_path)
+
+    assert str(refused.value) == (
+        f"refusing {secret}: it is a symlink, and .coherence must be a real directory with no link "
+        "directly inside it. Replace the link with a copy of the file it names, or mount a directory "
+        f"at {coherence_dir}."
+    )
+    assert secret.is_symlink()
+    assert target_snapshot(target) == before
+
+
+def test_ensure_secret_never_reads_the_secret_of_a_linked_coherence(tmp_path: Path) -> None:
+    """#498: the backstop also looks at ``.coherence`` itself, since ``O_NOFOLLOW``
+    guards only the last component. A ``.coherence`` linked to another
+    directory is refused, naming it, and that directory's secret is never read.
+
+    Prevents a start taking another workspace's secret as its own."""
+    from ccs.adapters.claude_code.auth import EnsureSecretError, ensure_secret
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "hook.secret").write_bytes(TARGET_BYTES)
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.symlink_to(elsewhere)
+
+    with pytest.raises(EnsureSecretError) as refused:
+        ensure_secret(tmp_path)
+
+    assert str(refused.value) == (
+        f"refusing {coherence_dir}: it is a symlink, and .coherence must be a real directory. "
+        "Replace the link with a real directory and copy in the files you want to keep (move "
+        f"state.db together with its -wal and -shm), or mount a directory at {coherence_dir}."
+    )
+    assert sorted(os.listdir(elsewhere)) == ["hook.secret"]
+    assert (elsewhere / "hook.secret").read_bytes() == TARGET_BYTES
 
 
 # ----------------------------------------------------------------------

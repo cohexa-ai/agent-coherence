@@ -60,7 +60,6 @@ import os
 import re
 import secrets
 import socketserver
-import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -95,7 +94,8 @@ from ccs.adapters.claude_code.policy import (
     TrackedArtifactPolicy,
     policy_file_name,
 )
-from ccs.adapters.claude_code.state_dir import check_coherence_dir
+from ccs.adapters.claude_code.regular_file import LinkRefused, ReadStatus, open_regular, read_regular_file
+from ccs.adapters.claude_code.state_dir import check_coherence_dir, lock_link_refusal, policy_link_refusal
 from ccs.coordinator.registry_protocol import (
     RECLAIM_TRIGGERS,
     CheckpointMember,
@@ -9406,25 +9406,23 @@ def _read_policy_bytes(yaml_path: Path, name: str) -> bytes:
     replace a file holding every pattern with one holding only the new ones.
     The text for a failed read matches the Node coordinator's.
 
-    Reads a regular file only, because a repository can commit this file as a
-    link: opening a FIFO with no writer blocks forever, and a device such as
+    Reads a regular file only, and never through a link (#498), because a
+    repository can commit this file as one: the rename after the read would
+    replace the link with a regular file holding the entries of the file it
+    names, opening a FIFO with no writer blocks forever, and a device such as
     ``/dev/zero`` never reaches EOF."""
-    try:
-        with open(yaml_path, "rb", opener=_open_nonblocking) as handle:
-            if stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                return handle.read()
-    except FileNotFoundError:
+    result = read_regular_file(yaml_path)
+    if result.status is ReadStatus.READ:
+        return result.data or b""
+    if result.status is ReadStatus.ABSENT:
         return b""
-    except OSError as exc:
-        code = errno.errorcode.get(exc.errno, str(exc)) if exc.errno else str(exc)
-        raise ValueError(f"{name} could not be read ({code}); nothing was written.") from None
-    raise ValueError(f"{name} could not be read (not a regular file); nothing was written.")
-
-
-def _open_nonblocking(path: str, flags: int) -> int:
-    # O_NONBLOCK is POSIX-only; without it there are no FIFOs to block on, and
-    # the fstat check still refuses a device.
-    return os.open(path, flags | getattr(os, "O_NONBLOCK", 0))
+    if result.status is ReadStatus.LINK:
+        raise ValueError(policy_link_refusal(name))
+    exc = result.error
+    if exc is None or (result.status is ReadStatus.NOT_REGULAR and exc.errno != errno.EISDIR):
+        raise ValueError(f"{name} could not be read (not a regular file); nothing was written.")
+    code = errno.errorcode.get(exc.errno, str(exc)) if exc.errno else str(exc)
+    raise ValueError(f"{name} could not be read ({code}); nothing was written.")
 
 
 def _entries_or_none(text: str, name: str) -> list[str] | None:
@@ -9524,7 +9522,12 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
         # coordinator on Windows, but degrade defensively if reached.
         return _append_policy_entries(yaml_path, added), rejected
     lock_path = yaml_path.with_suffix(yaml_path.suffix + ".lock")
-    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        # No-follow (#498): O_CREAT through a dangling link creates the file it
+        # names, outside .coherence.
+        lock_fd = open_regular(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except LinkRefused:
+        raise ValueError(lock_link_refusal(policy_file_name(yaml_path))) from None
     try:
         _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
         return _append_policy_entries(yaml_path, added), rejected

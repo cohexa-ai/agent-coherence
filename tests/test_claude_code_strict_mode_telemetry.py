@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import stat
 import threading
 import uuid
@@ -39,6 +40,7 @@ from ccs.adapters.claude_code.coordinator_server import (
     STRICT_DENY_ROUTE_AROUND_WINDOW_SEC,
     CoordinatorHTTPServer,
 )
+from tests.coherence_link_helpers import plant_link, target_snapshot
 
 # ----------------------------------------------------------------------
 # Shared test plumbing — mirrors tests/integration/test_strict_mode.py
@@ -409,6 +411,29 @@ def test_audit_log_append_failure_does_not_raise(tmp_path: Path) -> None:
     assert ok is False  # Failure surfaced via return, not raise.
 
 
+@pytest.mark.parametrize("shape", ["existing", "dangling"])
+def test_audit_log_append_refuses_a_link_and_leaves_its_target_alone(tmp_path: Path, shape: str) -> None:
+    """#498: a start refuses an ``audit.log`` link; the append is the backstop
+    for one made while the coordinator runs. It writes nothing and returns False,
+    so the caller bumps the drift counter, and leaves the link and the file it
+    names alone.
+
+    Prevents deny rows being appended to the file a link names, or a dangling
+    link creating that file outside ``.coherence``."""
+    coherence_dir = tmp_path / ".coherence"
+    target = plant_link(coherence_dir, "audit.log", shape)
+    if shape == "existing":
+        # The target's own mode is right, so a False cannot come from mode drift.
+        target.chmod(_REQUIRED_MODE)
+    before = target_snapshot(target)
+
+    ok = append_strict_deny(tmp_path, agent_id="ses-1", path="plan.md", tool="Read")
+
+    assert ok is False
+    assert (coherence_dir / "audit.log").is_symlink()
+    assert target_snapshot(target) == before
+
+
 # ----------------------------------------------------------------------
 # End-to-end: handler deny populates audit.log
 # ----------------------------------------------------------------------
@@ -430,3 +455,33 @@ def test_handler_deny_writes_audit_log_line(coordinator, client: _Client) -> Non
     assert rec["tool"] == "Read"
     assert rec["artifact"] == "CLAUDE.md"
     assert rec["agent"] == _sid("A")
+
+
+def test_a_strict_deny_still_denies_when_audit_log_is_linked_after_the_start(
+    coordinator, client: _Client, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#498: an ``audit.log`` linked while the coordinator runs does not stop a
+    strict deny. The deny is answered and counted, its row is not written
+    through the link, and the operator sees the lost row as
+    ``audit_log_mode_drift_total`` on ``/status`` and as an ERROR naming the
+    failed append.
+
+    Prevents deny rows reaching the file a link names."""
+    coherence_dir = coordinator.coordinator_root / ".coherence"
+    target = plant_link(coherence_dir, "audit.log", "existing")
+    target.chmod(_REQUIRED_MODE)
+    before = target_snapshot(target)
+    counters = coordinator.counters_snapshot()
+    _setup_stale_path(client, "CLAUDE.md")
+
+    with caplog.at_level(logging.ERROR, logger="ccs.adapters.claude_code.audit_log"):
+        s, b = client.post("/hooks/pre-read",
+                           {"session_id": _sid("A"), "path": "CLAUDE.md", "content_hash": _hash("v1")})
+
+    after = coordinator.counters_snapshot()
+    assert s == 200 and b["hookSpecificOutput"]["permissionDecision"] == "deny", b
+    assert after["strict_mode_denials_total"] == counters["strict_mode_denials_total"] + 1
+    assert after["audit_log_mode_drift_total"] == counters["audit_log_mode_drift_total"] + 1
+    assert "audit.log append failed" in caplog.text
+    assert (coherence_dir / "audit.log").is_symlink()
+    assert target_snapshot(target) == before

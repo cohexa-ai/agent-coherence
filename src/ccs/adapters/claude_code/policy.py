@@ -43,6 +43,8 @@ from typing import Callable, Iterable, Iterator, NamedTuple, Sequence
 
 import yaml
 
+from ccs.adapters.claude_code.regular_file import ReadStatus, read_regular_file
+
 logger = logging.getLogger(__name__)
 
 
@@ -872,6 +874,27 @@ def policy_file_name(yaml_path: Path) -> str:
     return f"{yaml_path.parent.name}/{yaml_path.name}"
 
 
+def _read_policy_file(yaml_path: Path, rejected: list[tuple[str, str]]) -> bytes | None:
+    """The policy file's bytes, or None when it loads as no entries: silently
+    when it is absent or not a regular file, and recorded in ``rejected`` when
+    it is a symlink or cannot be read.
+
+    Never read through a link (#498). A start refuses one, so a link met here
+    was put there while the coordinator ran (a checkout, say), and a reload
+    must not load the entries of the file it names."""
+    result = read_regular_file(yaml_path)
+    if result.status is ReadStatus.READ:
+        return result.data
+    name = policy_file_name(yaml_path)
+    if result.status is ReadStatus.LINK:
+        logger.warning("%s is a symlink; it loads as no entries", yaml_path)
+        rejected.append((name, "a symlink, so the file loads as no entries"))
+    elif result.status is ReadStatus.UNREADABLE:
+        logger.warning("could not read %s; falling back to defaults: %s", yaml_path, result.error)
+        rejected.append((name, "could not be read, so the file loads as no entries"))
+    return None
+
+
 def _load_yaml_patterns(
     yaml_path: Path, rejected: list[tuple[str, str]]
 ) -> list[str]:
@@ -879,9 +902,10 @@ def _load_yaml_patterns(
     path-traversal guard. Returns the surviving patterns; mutates the
     ``rejected`` list with (pattern, reason) for each rejection.
 
-    Missing file → empty list (not an error).
+    Missing file, or not a regular file → empty list (not an error).
     Malformed YAML → empty list + WARNING (do not crash hooks).
     Non-list top-level → empty list + WARNING.
+    Symlink → empty list + WARNING, its target unread (#498).
 
     A file that exists but loads as no entries is also recorded in
     ``rejected``, named by its ``.coherence/`` path, so ``/status`` reports a
@@ -889,7 +913,8 @@ def _load_yaml_patterns(
     WARNING to /dev/null, and a strict path whose tracked entry was lost
     with the file otherwise looked configured (#284).
     """
-    if not yaml_path.is_file():
+    data = _read_policy_file(yaml_path, rejected)
+    if data is None:
         return []
 
     name = policy_file_name(yaml_path)
@@ -897,14 +922,10 @@ def _load_yaml_patterns(
         # Bytes, not text: PyYAML decodes them as UTF-8 (UTF-16 by BOM) whatever
         # the locale, as the writer encodes, and undecodable bytes are a YAML
         # error here instead of an exception out of every hook.
-        raw = yaml.safe_load(yaml_path.read_bytes())
+        raw = yaml.safe_load(data)
     except POLICY_LOAD_ERRORS as exc:
         logger.warning("malformed YAML at %s; falling back to defaults: %s", yaml_path, exc)
         rejected.append((name, "not valid YAML, so the file loads as no entries"))
-        return []
-    except OSError as exc:
-        logger.warning("could not read %s; falling back to defaults: %s", yaml_path, exc)
-        rejected.append((name, "could not be read, so the file loads as no entries"))
         return []
 
     if raw is None:

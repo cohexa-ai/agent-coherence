@@ -42,6 +42,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
+from ccs.adapters.claude_code.regular_file import open_regular
+
 logger = logging.getLogger(__name__)
 
 
@@ -96,7 +98,8 @@ def append_strict_deny(
 
     Returns:
         True if the append succeeded; False on OSError (disk full, file
-        unreadable). Errors are LOGGED, not raised — the caller's
+        unreadable, a symlink or anything not a regular file at the path).
+        Errors are LOGGED, not raised — the caller's
         coordinator-state transaction has already committed when this is
         called, and we never want audit-log failures to corrupt that
         transaction by raising.
@@ -134,8 +137,10 @@ def append_strict_deny(
     try:
         # O_APPEND atomic write for small (<PIPE_BUF=4096 bytes) payloads
         # on POSIX. Mode 0o600 only applied on file CREATION; existing
-        # file keeps its mode (verified above).
-        fd = os.open(
+        # file keeps its mode (verified above). A regular file only, never
+        # through a link (#498): deny rows would land in the file a link
+        # names, and a FIFO with no reader would block the deny.
+        fd = open_regular(
             audit_path,
             os.O_APPEND | os.O_CREAT | os.O_WRONLY,
             _REQUIRED_MODE,

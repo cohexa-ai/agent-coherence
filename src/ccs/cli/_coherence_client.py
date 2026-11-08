@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import ssl
+import stat
 import sys
 import threading
 import urllib.error
@@ -45,6 +46,8 @@ from ccs.adapters.claude_code.coordinator_server import (
     validate_session_id,
 )
 from ccs.adapters.claude_code.lifecycle import read_port_from_file as _read_port_from_file
+from ccs.adapters.claude_code.regular_file import ReadStatus, read_state_file
+from ccs.adapters.claude_code.state_dir import dir_link_refusal, entry_link_refusal
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_CLAIMED_REASON,
     CALLER_PRINCIPAL_REASONS,
@@ -355,10 +358,18 @@ def build_tls_context(ca_file: str | None = None) -> ssl.SSLContext:
 
 def resolve_endpoint(coordinator_root: Path) -> CoordinatorEndpoint:
     """Read port + secret from ``<root>/.coherence/`` or raise
-    :class:`CoordinatorUnavailable` with an operator-friendly message."""
+    :class:`CoordinatorUnavailable` with an operator-friendly message.
+
+    A client reads these with no start before it (#498). A ``.coherence``
+    that is a symlink is refused before anything in it is read: it names
+    another directory, whose ``server.pid`` and ``hook.secret`` would join
+    this client to that coordinator with a valid bearer."""
     coherence_dir = coordinator_root / ".coherence"
     pid_file = coherence_dir / "server.pid"
     secret_file = coherence_dir / "hook.secret"
+
+    if _is_symlink(coherence_dir):
+        raise CoordinatorUnavailable(dir_link_refusal(coherence_dir))
 
     port = _read_port_from_file(pid_file)
     if port is None:
@@ -367,25 +378,45 @@ def resolve_endpoint(coordinator_root: Path) -> CoordinatorEndpoint:
             f"(no port in {pid_file}); start one with `agent-coherence-coordinator`"
         )
 
-    if not secret_file.is_file():
+    return CoordinatorEndpoint(port=port, bearer=_read_bearer(coherence_dir, secret_file))
+
+
+def _is_symlink(path: Path) -> bool:
+    try:
+        return stat.S_ISLNK(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _read_bearer(coherence_dir: Path, secret_file: Path) -> str:
+    """``hook.secret``'s token, read as a regular file only, never through a
+    link: the bytes of the file a link names would go out as the bearer to
+    whatever port ``server.pid`` holds (#498). Raises
+    :class:`CoordinatorUnavailable` naming why there is none."""
+    result = read_state_file(coherence_dir, secret_file.name)
+    if result.status is ReadStatus.LINK:
+        # The state directory itself, when it became a link after the check above.
+        raise CoordinatorUnavailable(
+            dir_link_refusal(coherence_dir) if result.path == coherence_dir else entry_link_refusal(secret_file)
+        )
+    if result.status is ReadStatus.ABSENT:
         raise CoordinatorUnavailable(
             "coordinator authentication unavailable "
             f"(missing {secret_file}); restart with `agent-coherence-coordinator`"
         )
-
-    try:
-        bearer = secret_file.read_text(encoding="utf-8").strip()
-    except OSError as exc:
+    if result.status is ReadStatus.NOT_REGULAR:
         raise CoordinatorUnavailable(
-            f"could not read {secret_file}: {exc}"
-        ) from exc
+            f"{secret_file} is not a regular file; restart with `agent-coherence-coordinator`"
+        )
+    if result.status is not ReadStatus.READ or result.data is None:
+        raise CoordinatorUnavailable(f"could not read {secret_file}: {result.error}") from result.error
 
+    bearer = result.data.decode("utf-8").strip()
     if not bearer:
         raise CoordinatorUnavailable(
             f"{secret_file} is empty; restart with `agent-coherence-coordinator`"
         )
-
-    return CoordinatorEndpoint(port=port, bearer=bearer)
+    return bearer
 
 
 #: Truthy env values that enable cross-host remote mode (mirrors the
