@@ -1400,9 +1400,10 @@ data = vol.reacquire("plans/plan.md")       # recover: clear the stale view + fr
 |---|---|---|
 | `workspace_root` | — | Directory the volume manages; the coordinator's state lives in `<root>/.coherence/` |
 | `managed` | `()` | Glob patterns for the files under coordination; unmanaged paths bypass the volume |
-| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A read the coordinator answers with its failure envelope raises `CoordinatorFailed`, and so does the release of a write grant an earlier `write()` left held, every request that commits nothing answered with an HTTP 5xx, and a commit refused by the volume's own unreleased write grant; see [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
+| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A read the coordinator answers with its failure envelope raises `CoordinatorFailed`, and so does the release of a write grant an earlier `write()` left held, every request that commits nothing answered with an HTTP 5xx, a commit refused by the volume's own unreleased write grant, and a refuse-mode grant request the coordinator could not decide in time; see [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
+| `on_held` | `"displace"` | `"refuse"` — on a managed path, raise `OtherHolder` instead of taking a file another agent holds; see [Refusing a file another agent holds](#refusing-a-file-another-agent-holds) |
 | `config` | `None` | Coordinator settings as a `LifecycleConfig` (`from ccs.adapters.claude_code.lifecycle import LifecycleConfig`); `None` uses the defaults. Only the volume that starts the coordinator applies it |
 
 `vol.session_id` is the volume's session with the coordinator, and it stays the
@@ -1526,7 +1527,9 @@ Both are `LifecycleConfig` fields, passed as `config` to the volume that starts
 the coordinator. A Claude Code session releases what it holds when its turn ends.
 So after `other_holder`, retry once the holder has released, not in a tight loop,
 or use a plain `write()`, which takes the file over (the previous holder's next
-write is then refused until it re-reads).
+write is then refused until it re-reads). A volume with `on_held="refuse"` gets
+`OtherHolder` instead of taking the file; see
+[Refusing a file another agent holds](#refusing-a-file-another-agent-holds).
 
 Over HTTP this `other_holder` is the answer of `post-edit-cas`: a commit that
 lost to a holder, which the client retries. A `pre-edit` that opts in with
@@ -1545,6 +1548,123 @@ which says whether the sweep reclaimed the grant or a peer took it. Its
 reclaim, for example, `0` and `1`. Both are `None` when the refusal carried
 none. The recovery is the same whatever they say.
 
+### Refusing a file another agent holds
+
+By default a `write()` takes a file from whoever holds it, and the holder finds
+out at its next write. With `on_held="refuse"`, a `write()` on a managed path
+asks first: while another agent holds the file it raises `OtherHolder` (from
+`ccs.core.exceptions`), which names the holder in `holder_agent_id`. Nothing is
+written and the holder keeps the file. That id is 32 hex digits and a volume's
+`agent_id` is dashed, so compare them as UUIDs.
+
+```python
+from ccs.core.exceptions import OtherHolder
+
+vol = CoherentVolume(workspace_root, managed=("plans/**",), on_held="refuse")
+try:
+    vol.write("plans/plan.md", revised)
+except OtherHolder as refused:
+    logger.info("held by %s", refused.holder_agent_id)
+    # back off, then read the file again before you build the next write
+```
+
+The refusal holds among refuse-mode writers only: an ordinary `write()` by
+another volume still takes the file. On the wire this is
+[acquire-or-fail](#acquire-or-fail-on-pre-edit).
+
+**What it needs.** `on_error="strict"` and `managed` globs, without
+`remote_endpoint`; anything else raises `ValueError` before anything starts. At
+attach the volume reads `pre_edit_if_unheld` from the operator view of `/status`
+and attaches only when it is JSON `true`. Otherwise it raises `CoherenceError`
+before it sends anything, because a coordinator that ignores the flag would take
+the file from its holder. That rules out this package's coordinator through
+0.15.0. A forked child checks again on its first read or write. A volume with
+`managed` globs cannot attach to the Claude Code plugin's Node coordinator in
+either mode, because it does not serve the operator view, so refuse mode does
+not reach it.
+
+**What a refuse-mode `write()` raises.** In every row, no bytes reach the file.
+
+| The answer to its grant request | Raises | What to do |
+|---|---|---|
+| another agent holds the file | `OtherHolder` | back off, then read the file again before you write |
+| the holder is this volume's own earlier attempt, whose release did not land | `CoordinatorFailed` | call `reacquire()` and write from the bytes it returns: no peer exists to wait for, and a plain retry does not send that release again |
+| `unavailable`: the coordinator could not decide in time | `CoordinatorFailed` | back off, then retry; the abandoned request may still take the grant |
+| an HTTP `5xx` | `CoordinatorFailed` | as for `unavailable` |
+| no answer, or a body without `ok: true` | `CoordinatorUnreachable` | a grant may have landed: retry, or see below if the coordinator is gone |
+| your copy is stale, or any other `ok: false`, such as an `internal:` failure | `StaleView` | call `reacquire()` and rebuild from the bytes it returns |
+| you handed the file off | `GiverFenced` | stop: no retry clears it |
+| `collision: true`, which only a coordinator that ignores the flag sends | `CoherenceError` | build a new volume: the coordinator changed after this one attached, and the holder may have lost the file. If the message says the release was not confirmed, call `reacquire()` first, or that grant refuses the new volume |
+| `degraded: true` beside `ok: true`, which only a coordinator that ignores the flag sends | `CoherenceError` | call `reacquire()`, because the abandoned request may still take the grant, then build a new volume |
+| none: the session holds no [caller principal](#caller-principal), so nothing is sent | `CoherenceError` | build a new volume |
+
+**Polling.**
+
+- **Back off.** Wait at least 4 seconds, double the wait with jitter, and stop
+  after a bounded total. One holder can keep a file for up to 30 minutes, and
+  the next holder starts a new clock, so a refused caller's wait can outlast
+  any one holder.
+- **Read before you write again.** One `write()` call is both the admit and the
+  write, so a write built without reading lands over whatever the holder
+  committed once the file comes free, with no signal. If you read the file
+  before the holder committed, `write()` raises `StaleView` instead, and
+  `reacquire()` gives you the holder's bytes.
+- **Catch more than the refusal.** Each commit by the holder makes a copy you
+  read stale again, so a poller meets `StaleView` as well as `OtherHolder`. It
+  can also meet `CoordinatorUnreachable`: the first volume hosts the coordinator
+  in its own process, so the holder exiting can end it, and a volume never finds
+  the next coordinator. Build a new volume then. It is a new agent, so a grant
+  its predecessor left refuses it until the sweep reclaims that grant.
+- **If you give up, call `reacquire()` once.** After `unavailable` or no answer,
+  a grant you do not know about may stand, and it refuses peers until the sweep.
+
+**Letting go.** A successful `write()` keeps its grant across later commits, so
+a refuse-mode volume protects its work between writes, and peers wait.
+`reacquire()` is the release, and it has costs:
+
+- `reacquire()` releases every path this attempt holds, not only the one you
+  name, and a peer can then be admitted to each. A plain retry keeps them.
+- So re-read every other path before you write it. The stale deny on those paths
+  is gone: a write from an old copy lands under `on_stale_write="allow"`, and at
+  the default one made while a `write_cas` peer's bytes are on their way to disk
+  is acknowledged and then overwritten.
+- It forces a read, raises on a deleted file after it has released, and adds one
+  row to the coordinator's store per call.
+- It is best-effort in both directions: a return can follow a release the
+  coordinator did not confirm, and a raise can follow one it did.
+
+`write_cas` of a file this volume holds, any `write_cas` retry, `write_cas_at`
+and `atomic_publish` drop every hold too. A volume has no `close()`, and exiting
+the process releases nothing.
+
+**How long a holder refuses.** A holder that goes quiet refuses for about 600 s
+(`grant_heartbeat_timeout_sec`) plus the next sweep pass. A commit, or any other
+request on a tracked file, resets that clock, and a refused request counts: a
+volume polling for one file keeps its own holds on others alive. Let go of those
+before you poll, because two holders polling each other both wait for the
+ceiling, `grant_max_hold_sec` (1800 s), which nothing resets. With the sweep off,
+a holder refuses until it releases. A reclaimed holder's next write raises
+`StaleView` or `CommitPreempted`, depending on where the reclaim falls.
+
+**What it does not cover.** The limits under
+[acquire-or-fail](#acquire-or-fail-on-pre-edit) apply, and:
+
+- A write outside `managed` sends no flag and displaces. A holder of a
+  default-tracked file such as `plan.md` loses it, and so does a holder of a file
+  a peer's narrower `managed` does not cover. The flag stays off those paths
+  because an untrack could send them around the check.
+  The check reads the resolved path, so a link under `managed` to a file outside
+  it is a write outside `managed`, whatever its name matches.
+- `install()`, `coherent_workspace()` and the `stale-write-guard-fs` tools take
+  no `on_held`, so they displace.
+- A forked child is another agent: it is refused while its parent holds the file,
+  naming an id it cannot map. Let go before you fork.
+- During a live [handoff](#targeted-grant-handoff) with nobody holding the file,
+  a refuse-mode write is admitted and overtakes the handoff with no signal, and
+  the successor is then refused by it. `OtherHolder` carries no handoff record.
+  Call `read()` on the path, then `read_handoff()`. `None` after a never-read path
+  or a strict-denied read says nothing about the record.
+
 ### When the coordinator does not answer
 
 In strict mode, a volume that gets no usable answer from its coordinator raises
@@ -1554,7 +1674,8 @@ coordinator that cannot be started or attached, a refused or timed-out
 connection, a reset, a listener that never answers, and an empty or unreadable
 reply, on every request that commits nothing. A coordinator that answers with a
 refusal, such as an HTTP `4xx` or a watchdog `degraded` body, raises the error
-it raised before. An HTTP `5xx` raises `CoordinatorFailed` on a request that
+it raised before, except that a refuse-mode `write()` raises `CoordinatorFailed`
+for the `unavailable` refusal. An HTTP `5xx` raises `CoordinatorFailed` on a request that
 commits nothing and `CommitUnconfirmed` on a commit (next paragraph). Its
 `internal:` failure envelope, and the `5xx` on a request that commits nothing,
 are covered in
@@ -1644,7 +1765,9 @@ may have recorded the commit before the error.
   its error says so, and it first releases its grant, as it does when a commit
   gets no answer.
 - **A write's grant request** (the pre-edit of `write()`) answered this way
-  still raises `StaleView` and lands nothing.
+  still raises `StaleView` and lands nothing. The `unavailable` refusal is a
+  different answer, and raises `CoordinatorFailed` from a refuse-mode `write()`;
+  see [Refusing a file another agent holds](#refusing-a-file-another-agent-holds).
 - **A strict release of a grant an earlier `write()` left held raises
   `CoordinatorFailed`.** `write_cas`, `write_cas_at`, `atomic_publish` and
   `reacquire()` send that release before they go further (see
@@ -3764,12 +3887,19 @@ nobody holds get one grant and one refusal that names the winner.
 
 The Python coordinator refuses this way, and so does the Claude Code plugin's
 Node coordinator in plugin releases after 0.6.0, with the same body. Where the
-two differ is listed under **On the Node coordinator** below. Nothing sends
-the flag yet: the Claude Code hooks do not opt in, and no released client
-sends it. A coordinator that ignores the flag (the Node coordinator in plugin
-0.6.0 or earlier, or this package's coordinator through 0.15.0) admits an
-opted-in request it decides in time as it admits any other, and a client
-cannot yet tell that admit from a real one.
+two differ is listed under **On the Node coordinator** below.
+`CoherentVolume(on_held="refuse")` sends the flag on managed paths (see
+[Refusing a file another agent holds](#refusing-a-file-another-agent-holds)). The
+Claude Code hooks and the `stale-write-guard-fs` tools do not opt in.
+
+A coordinator that ignores the flag (the Node coordinator in plugin 0.6.0 or
+earlier, or this package's coordinator through 0.15.0) admits an opted-in request
+it decides in time as it admits any other, and displaces the holder. To tell
+before you rely on the refusal, read `pre_edit_if_unheld` from `/status`, at any
+tier: JSON `true` says this coordinator refuses, and a coordinator without the key
+may not. Versions do not separate them. The Node coordinator does not send the
+key, so the key cannot tell its releases apart. Read it once, when you attach;
+see **What it does not close** for what that leaves open.
 
 **Request.** `pre-edit` with `"if_unheld": true` in the body, carrying the
 [caller principal](#caller-principal) when the coordinator is the Python one.
@@ -3797,7 +3927,8 @@ carries no `hookSpecificOutput` and no `permissionDecision`. Python code can
 import the reason as `OTHER_HOLDER_REASON` from `ccs.core.exceptions`. In
 process, `CoordinatorService.write(..., if_unheld=True)` makes the same check
 and raises `OtherHolder`, from the same module, carrying `artifact_id` and
-`holder_agent_id`.
+`holder_agent_id`. A `CoherentVolume` with `on_held="refuse"` raises it too, with
+the path as `artifact_id`.
 
 `post-edit-cas` answers the same reason string when a commit meets a holder,
 and there it means something else: the commit lost, nothing was committed, and
@@ -3851,14 +3982,15 @@ arrived:
 answer whose body has `ok: true` and no `degraded` key. A row that names a
 coordinator applies to that coordinator only; every other row applies to both.
 The `/status` counters are the Python coordinator's: the Node coordinator
-keeps none of them.
+keeps none of them. A refuse-mode `CoherentVolume` types each answer for you; see
+[Refusing a file another agent holds](#refusing-a-file-another-agent-holds).
 
 | When the request is decided | Answer | `/status` counter | What the client does |
 |---|---|---|---|
 | Python coordinator: it presents no principal header, or an empty or whitespace-only one | HTTP `400`, `"reason": "caller_principal_absent"` | `caller_principal_refused_total` | claim a principal, then send again; claiming binds the session (see the client rules below) |
 | Python coordinator: it presents a principal that is not the one bound to the session | HTTP `400`, `"reason": "caller_principal_foreign"` | `caller_principal_refused_total` | claim again with the same nonce, then send again |
-| Python coordinator: the caller-principal check or the pre-edit work runs past the 4-second handler budget | `unavailable` (see **Under load**) | `watchdog_timeouts_total` | release, then back off |
-| Node coordinator: the store is busy before the grant, or (rarely) fails after it | `{"ok": false, "reason": "internal: SqliteError"}`; nothing is granted unless the failure came after the grant | none | release, then back off |
+| Python coordinator: the caller-principal check or the pre-edit work runs past the 4-second handler budget | `unavailable` (see **Under load**) | `watchdog_timeouts_total` | back off, then release |
+| Node coordinator: the store is busy before the grant, or (rarely) fails after it | `{"ok": false, "reason": "internal: SqliteError"}`; nothing is granted unless the failure came after the grant | none | back off, then release |
 | the path is not tracked | `{"ok": true}`, unchecked; it may carry re-grounding context | none, or `watchdog_timeouts_total` when delivering that context times out, which still answers `{"ok": true}` | proceed; the path is outside this contract (see **What it does not close**) |
 | Python coordinator: the caller is the giver of a live handoff of the path | the `handed_off` deny | `handoff_giver_denials_total` | stop: no retry clears it |
 | the path is in strict mode and the caller's read is stale | the strict deny: `"status": "stale"`, a deny in `hookSpecificOutput`, and no top-level `reason` | `strict_mode_denials_total` and `stale_warning_emitted_total` | re-read under a new `agent_id` with the same `session_id`, then send again: a deny never re-grants the identity it denied |
@@ -3866,7 +3998,7 @@ keeps none of them.
 | Node coordinator: another agent has held the path EXCLUSIVE or MODIFIED for 1800 s or more | the plain admit, with no collision warning: the coordinator reclaims that grant in the same decision (see **On the Node coordinator**) | none | proceed |
 | no other agent holds the path EXCLUSIVE or MODIFIED | the admit an ordinary `pre-edit` gets, but never with a collision warning: the decision displaced nobody, even when a holder let go just before it | as for an ordinary `pre-edit` | proceed |
 | Node coordinator: the grant is made, and only delivering the caller's queued notices finds the store busy | the admit, without the notices, which stay queued for the caller's next answer | none | proceed |
-| anything else: a `503` (the coordinator's queue or handler slots are full, or it is stopping or draining for a migration), an `internal:` failure ([details](#when-the-coordinator-answers-with-a-failure)), which a busy store can also cause on the Python coordinator (`internal: OperationalError`), an `ok: false` whose `reason` is prose, any other non-2xx status, no answer at all, or `{"ok": true, "degraded": true}`, which an older coordinator answers on a timeout because it never reads `if_unheld` | as for an ordinary `pre-edit` | as for an ordinary `pre-edit` | treat it as a refusal and back off; after no answer at all from the Node coordinator, release first (see the client rules) |
+| anything else: a `503` (the coordinator's queue or handler slots are full, or it is stopping or draining for a migration), an `internal:` failure ([details](#when-the-coordinator-answers-with-a-failure)), which a busy store can also cause on the Python coordinator (`internal: OperationalError`), an `ok: false` whose `reason` is prose, any other non-2xx status, no answer at all, or `{"ok": true, "degraded": true}`, which an older coordinator answers on a timeout because it never reads `if_unheld` | as for an ordinary `pre-edit` | as for an ordinary `pre-edit` | treat it as a refusal and back off; after no answer at all, then release (see the client rules) |
 
 **When the path comes free.** The refusal carries no retry hint because none
 exists. Committing does not end a grant: a holder that commits keeps the path
@@ -3893,15 +4025,19 @@ backoff rather than wait for a signal.
 - **Re-read after `other_holder`.** Once a later request is admitted, re-read
   the file before you build the write. Nothing marks a refused caller stale
   while it waits, so the copy it read before the refusal may be out of date.
-- **Release after `unavailable`, or after an `internal:` answer or no answer
-  from the Node coordinator.** Work the Python coordinator abandoned, a
-  request the Node coordinator was still holding when the client stopped
+- **Release after `unavailable`, after no answer, or after an `internal:`
+  answer from the Node coordinator.** Work the Python coordinator abandoned, a
+  request either coordinator was still working on when the client stopped
   waiting, or a Node request whose store failed after its grant (answered
   `internal:`), may still have taken the grant (see **Under load** and
   **On the Node coordinator**).
-  Send a failed `post-edit` (`"success": false`) for the path, with the same
-  `session_id` and `agent_id`. The release counts only when the answer says
-  `"released": true`.
+  Back off first: a coordinator too busy to decide the request is too busy to
+  decide the release. Then send a failed `post-edit` (`"success": false`) for the
+  path, with the same `session_id` and `agent_id`. The release counts only when
+  the answer says `"released": true`. A path the coordinator has never seen
+  answers `{"ok": true, "note": "untracked-at-commit"}`, with nothing to release,
+  and `{"ok": true, "degraded": true}` means the release did not run, so send it
+  again.
   That answer does not prove a grant existed, and it leaves the caller INVALID
   on the path. On a strict-mode path a deny never re-grants that identity, so
   its next `pre-edit`, and every later read under it, gets the strict deny.
@@ -3910,6 +4046,7 @@ backoff rather than wait for a signal.
   do.
 - **Send `session-stop` only when the work is done.** It releases every path
   the identity holds EXCLUSIVE or MODIFIED, not only the one in question.
+  `CoherentVolume.reacquire()` sends one, so it gives up those paths as well.
 - **Claiming a principal binds the session.** On the Python coordinator, a
   client that claims one to clear the `400` binds its session: from then on,
   every request naming that session on a route that requires a principal must
@@ -3949,6 +4086,9 @@ plugin releases after 0.6.0, refuses an opted-in `pre-edit` with the same body,
 in the same key order, and grants nothing. It differs from the Python
 coordinator in these ways:
 
+- **No volume.** A `CoherentVolume` with `managed` globs cannot attach to it,
+  because it does not serve the operator view, so `on_held="refuse"` does not
+  reach it. The requests below come from other clients.
 - **No principal.** It issues no principals, so an opted-in request needs
   none and never gets the `400`. A caller that sends the holder's own
   `session_id`, and the holder's subagent id if it has one, is the holder as
@@ -4029,6 +4169,21 @@ coordinator in these ways:
   With the sweep off (`sweep_interval_sec` set to `0`), it refuses until it
   releases the path. The Node coordinator has no sweep: its opted-in acquire
   reclaims a grant held 30 minutes or more (see **On the Node coordinator**).
+- **A client checks the coordinator once.** `CoherentVolume` reads
+  `pre_edit_if_unheld` when it attaches and keeps that endpoint, so a replacement
+  on a new port gets `CoordinatorUnreachable`. But a different coordinator on the
+  same port and secret goes unseen. An older build there displaces the holder: a
+  single request answers `collision: true`, which the volume refuses to write on,
+  though the holder has already lost the file, and two racing opted-in requests
+  can each get a bare `{"ok": true}`, which nothing shows. A build without the path
+  in its strict set answers `{"ok": true}` and the write lands over the holder.
+  The coordinator command has no port option, so locally this takes a port the
+  system reuses. A remote coordinator on a fixed port makes it the normal case,
+  which is why refuse mode is not available with `remote_endpoint`.
+- **Spelling aliases.** The coordinator tracks a path by its spelling. On a
+  case-insensitive filesystem, `data/X.TXT` and `DATA/x.txt` reach the file a
+  holder has as `data/x.txt`, get no refusal, and overwrite it. On APFS the two
+  Unicode forms of a name, NFC and NFD, do the same.
 - **A reclaimed holder's pending write can still land.** On both coordinators
   a reclaim does not stop a write the holder had already been admitted for:
   that write can reach the file after the reclaim. Its `post-edit` is refused,
@@ -5108,7 +5263,9 @@ serves the default and `metrics` views in a shape of its own and answers
 | `full`, the operator view | `?detail=full` with the `Coherence-Local-Operator: true` header; without the header the answer is `403` | session names, the absolute root, the pattern lists and the grant detail |
 
 **`metrics`** carries `coordinator_version`, `coordinator_backend`,
-`coordinator_uptime_seconds`, `registry_schema_version` and the counters:
+`coordinator_uptime_seconds`, `registry_schema_version`, `pre_edit_if_unheld`
+(JSON `true`: this coordinator refuses an opted-in `pre-edit`; see
+[Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)) and the counters:
 `endpoint_counters`, request counts by route, and the rest, such as
 `watchdog_timeouts_total`, `sweep_reclaims_total` and
 `caller_principal_absent_total`. It names no path, no process id and no
