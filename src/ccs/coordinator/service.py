@@ -2235,6 +2235,8 @@ class CoordinatorService:
                     new_version=artifact.version,
                     issued_at_tick=issued_at_tick,
                     issuer_agent_id=agent_id,
+                    victim_agent_id=peer_id,
+                    victim_state=state,
                 )
             )
 
@@ -2393,6 +2395,8 @@ class CoordinatorService:
                     new_version=next_version,
                     issued_at_tick=issued_at_tick,
                     issuer_agent_id=agent_id,
+                    victim_agent_id=peer_id,
+                    victim_state=state,
                 )
             )
         commit_hash = content_hash if content_hash is not None else compute_content_hash(content)
@@ -2532,6 +2536,9 @@ class CoordinatorService:
         self._refuse_handed_off_giver(artifact_id, identity)
         admitted = self._live_transfer_record(artifact_id)
 
+        # The abort guard keeps this snapshot consistent with the result for
+        # registry writes made through this process.
+        victim_states = self.registry.get_state_map(artifact_id)
         result = self.registry.commit_cas(
             artifact_id,
             agent_id,
@@ -2564,8 +2571,14 @@ class CoordinatorService:
                 new_version=updated.version,
                 issued_at_tick=issued_at_tick,
                 issuer_agent_id=agent_id,
+                victim_agent_id=invalidated_id,
+                # A second registry writer may add a peer after the snapshot
+                # and before the commit result is returned.  The commit has
+                # still landed; preserve that success and report the state as
+                # unknown instead of turning it into a KeyError.
+                victim_state=victim_states.get(invalidated_id),
             )
-            for _ in invalidated_ids
+            for invalidated_id in invalidated_ids
         ]
         self._validate_single_writer(artifact_id)
         self._label_live_transfer(admitted, identity)
@@ -2632,6 +2645,12 @@ class CoordinatorService:
             self._refuse_handed_off_giver(artifact_id, identity)
             admitted[artifact_id] = self._live_transfer_record(artifact_id)
 
+        # The abort guard serializes this snapshot and the batch against other
+        # registry writes made through this process.
+        victim_states = {
+            artifact_id: self.registry.get_state_map(artifact_id)
+            for artifact_id in writes
+        }
         result = self.registry.commit_all(agent_id, writes, tick=issued_at_tick)
 
         if isinstance(result, CasCorruption):
@@ -2655,6 +2674,8 @@ class CoordinatorService:
                         new_version=new_version,
                         issued_at_tick=issued_at_tick,
                         issuer_agent_id=agent_id,
+                        victim_agent_id=_peer,
+                        victim_state=victim_states[art_id].get(_peer),
                     )
                 )
             self._validate_single_writer(art_id)
@@ -3612,6 +3633,7 @@ class CoordinatorService:
             issuer_agent_id=issuer_agent_id,
         ):
             return None
+        victim_state = self.registry.get_agent_state(artifact_id, agent_id)
         self.registry.set_agent_state(
             artifact_id, agent_id, MESIState.INVALID, trigger="invalidate", tick=issued_at_tick
         )
@@ -3621,6 +3643,8 @@ class CoordinatorService:
             new_version=new_version,
             issued_at_tick=issued_at_tick,
             issuer_agent_id=issuer_agent_id,
+            victim_agent_id=agent_id,
+            victim_state=victim_state,
         )
 
     def _revoke_is_superseded(
@@ -3705,6 +3729,8 @@ class CoordinatorService:
                     new_version=artifact.version,
                     issued_at_tick=issued_at_tick,
                     issuer_agent_id=agent_id,
+                    victim_agent_id=holder_id,
+                    victim_state=state,
                 )
                 for holder_id, state in self.registry.get_state_map(artifact_id).items()
                 if state != MESIState.INVALID

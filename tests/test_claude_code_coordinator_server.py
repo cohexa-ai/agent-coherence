@@ -936,6 +936,42 @@ def test_the_policy_writer_refuses_a_file_it_cannot_read(tmp_path: Path) -> None
     assert policy_file.read_text() == "- runbook.md\n"
 
 
+def test_append_policy_yaml_refuses_a_link_to_a_device_and_keeps_it(tmp_path: Path) -> None:
+    """The routes share the merge's reader, so a policy file linked to a device is
+    refused there too. Prevents a route reading ``/dev/zero`` until memory runs
+    out; ``os.devnull`` takes the same path, and a regression here answers wrongly
+    instead."""
+    from ccs.adapters.claude_code.coordinator_server import _append_policy_yaml
+
+    policy_file = tmp_path / ".coherence" / "tracked.yaml"
+    policy_file.parent.mkdir()
+    policy_file.symlink_to(os.devnull)
+
+    with pytest.raises(ValueError) as raised:
+        _append_policy_yaml(policy_file, ["ok.md"])
+
+    assert str(raised.value) == ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."
+    assert policy_file.is_symlink()
+
+
+def test_a_policy_route_answers_400_for_a_policy_file_linked_to_a_device(
+    coordinator, client: _Client,
+) -> None:
+    """On the wire, a policy file linked to a device is the 400 every unreadable
+    file gets, naming it, with the link kept. ``os.devnull`` stands in for
+    ``/dev/zero``, so a regression answers wrongly instead of reading until memory
+    runs out."""
+    policy_file = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
+    policy_file.unlink(missing_ok=True)
+    policy_file.symlink_to(os.devnull)
+
+    s, b = client.post("/policy/track", {"paths": ["ok.md"]})
+
+    assert s == 400, b
+    assert b == {"error": ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."}, b
+    assert policy_file.is_symlink()
+
+
 def test_a_coordinator_over_a_broken_policy_file_counts_it_on_status(tmp_path: Path) -> None:
     """#284 at load time: a coordinator that starts over a tracked.yaml an
     earlier release broke serves, and /status counts the file as rejected,
@@ -1362,6 +1398,158 @@ def test_a1_fresh_with_notice_preserves_version_field(client: _Client) -> None:
         "fresh-with-notice response must preserve the Unit 6 version key "
         f"(OCC writers source expected_version from it); got {body}"
     )
+
+
+def test_a1_forced_pre_edit_interleaving_notifies_exactly_the_displaced_holder(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A1/#450: the acquire result, rather than a pre-acquire snapshot, names
+    the holder that was actually displaced under the registry lock."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    seed = _sid("forced-seed")
+    path = "plan.md"
+    status, _ = client.post(
+        "/hooks/pre-read", {"session_id": seed, "path": path, "content_hash": _hash(path)}
+    )
+    assert status == 200
+    status, _ = client.post("/hooks/session-stop", {"session_id": seed})
+    assert status == 200
+
+    original_holder = mod._exclusive_holder
+    reads_complete = threading.Barrier(2)
+
+    def force_read_interleaving(coordinator_arg, artifact_id, *, exclude_agent):
+        holder = original_holder(
+            coordinator_arg, artifact_id, exclude_agent=exclude_agent
+        )
+        reads_complete.wait(timeout=5)
+        return holder
+
+    # Keep the barrier at the pre-acquire read point: both requests finish their
+    # collision read before either can enter service.write.
+    monkeypatch.setattr(mod, "_exclusive_holder", force_read_interleaving)
+
+    sessions = (_sid("forced-A"), _sid("forced-B"))
+    results: dict[str, tuple[int, dict]] = {}
+    results_lock = threading.Lock()
+
+    def pre_edit(session_id: str) -> None:
+        result = client.post("/hooks/pre-edit", {"session_id": session_id, "path": path})
+        with results_lock:
+            results[session_id] = result
+
+    threads = [threading.Thread(target=pre_edit, args=(session_id,)) for session_id in sessions]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive(), f"pre-edit thread did not finish: {results}"
+
+    assert set(results) == set(sessions), results
+    assert all(status == 200 for status, _ in results.values()), results
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    assert artifact_id is not None
+    agent_ids = {session_to_agent_id(session_id) for session_id in sessions}
+    states = {
+        agent_id: coordinator.registry.get_agent_state(artifact_id, agent_id)
+        for agent_id in agent_ids
+    }
+    losers = [agent_id for agent_id, state in states.items() if state == MESIState.INVALID]
+    winners = [agent_id for agent_id, state in states.items() if state == MESIState.EXCLUSIVE]
+    assert len(losers) == len(winners) == 1, states
+    winner_session = next(
+        session_id for session_id in sessions if session_to_agent_id(session_id) == winners[0]
+    )
+    winner_body = results[winner_session][1]
+    loser_session = next(
+        session_id for session_id in sessions if session_to_agent_id(session_id) == losers[0]
+    )
+    loser_pre_edit_body = results[loser_session][1]
+    assert winner_body.get("collision") is True, winner_body
+    winner_context = winner_body["hookSpecificOutput"]["additionalContext"]
+    assert losers[0].hex[:8] in winner_context, winner_context
+    assert loser_pre_edit_body.get("collision") is not True, loser_pre_edit_body
+    status, loser_body = client.post(
+        "/hooks/pre-read", {"session_id": loser_session, "path": path}
+    )
+    assert status == 200, loser_body
+    notice_bodies = [
+        body for body in (loser_pre_edit_body, loser_body)
+        if "Coordinator notice" in body.get("hookSpecificOutput", {}).get("additionalContext", "")
+    ]
+    assert len(notice_bodies) == 1, (loser_pre_edit_body, loser_body)
+    notice_context = notice_bodies[0]["hookSpecificOutput"]["additionalContext"]
+    assert path in notice_context and "preempt" in notice_context.lower(), notice_context
+    assert coordinator.registry.pop_pending_notices(losers[0]) == []
+
+
+def test_a1_pre_edit_drops_a_holder_released_after_the_collision_lookup(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    holder = _sid("released-holder")
+    editor = _sid("released-editor")
+    path = "plan.md"
+    status, _ = client.post("/hooks/pre-edit", {"session_id": holder, "path": path})
+    assert status == 200
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    assert artifact_id is not None
+
+    original_holder = mod._exclusive_holder
+
+    def release_after_lookup(coordinator_arg, looked_up_artifact_id, *, exclude_agent):
+        result = original_holder(
+            coordinator_arg, looked_up_artifact_id, exclude_agent=exclude_agent
+        )
+        assert result[0] == session_to_agent_id(holder)
+        coordinator_arg.service.invalidate(
+            agent_id=result[0],
+            artifact_id=looked_up_artifact_id,
+            new_version=1,
+            issuer_agent_id=result[0],
+            issued_at_tick=2,
+        )
+        return result
+
+    monkeypatch.setattr(mod, "_exclusive_holder", release_after_lookup)
+    status, body = client.post("/hooks/pre-edit", {"session_id": editor, "path": path})
+
+    assert status == 200, body
+    assert body.get("ok") is True, body
+    assert body.get("collision") is not True, body
+    assert "hookSpecificOutput" not in body, body
+    assert coordinator.registry.pop_pending_notices(session_to_agent_id(holder)) == []
+
+
+def test_a1_preemption_notice_surfaces_for_modified_holder(client: _Client, coordinator) -> None:
+    editor = _sid("modified-holder")
+    preempter = _sid("modified-preempter")
+    path = "plan.md"
+
+    status, _ = client.post("/hooks/pre-edit", {"session_id": editor, "path": path})
+    assert status == 200
+    status, body = client.post(
+        "/hooks/post-edit",
+        {"session_id": editor, "path": path, "content_hash": _hash("edited"), "success": True},
+    )
+    assert status == 200, body
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    assert artifact_id is not None
+    editor_id = session_to_agent_id(editor)
+    assert coordinator.registry.get_agent_state(artifact_id, editor_id) == MESIState.MODIFIED
+
+    status, body = client.post("/hooks/pre-edit", {"session_id": preempter, "path": path})
+    assert status == 200, body
+    assert body.get("collision") is True, body
+    assert editor_id.hex[:8] in body["hookSpecificOutput"]["additionalContext"]
+
+    status, body = client.post("/hooks/pre-read", {"session_id": editor, "path": path})
+    assert status == 200, body
+    context = body.get("hookSpecificOutput", {}).get("additionalContext", "")
+    assert "Coordinator notice" in context and "preempt" in context.lower(), context
+    assert session_to_agent_id(preempter).hex[:8] in context, context
 
 
 def test_a1_preemption_surfaces_on_victim_next_pre_edit(client: _Client) -> None:
@@ -3468,6 +3656,215 @@ def test_read_policy_entries_refuses_a_file_that_loads_as_no_entries(text: str, 
         _read_policy_entries(text, ".coherence/tracked.yaml")
     assert str(raised.value).startswith(".coherence/tracked.yaml ")
     assert says in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("body", "says"),
+    [
+        (b"- docs/**\n- *.md\n", "is not valid YAML"),
+        (b"- !!bool x\n", "is not valid YAML"),
+        (b"\xff\xfe\x00not text\n", "holds a single string, not a list"),
+        (b"\xc3\x28 not utf-8\n", "is not valid YAML"),
+        (b"plain: mapping\n", "holds a mapping, not a list"),
+        (b"just a string\n", "holds a single string, not a list"),
+    ],
+    ids=["unquoted_star", "tagged", "utf16_mark", "undecodable", "mapping", "scalar"],
+)
+def test_merge_policy_globs_refuses_a_file_that_loads_as_no_entries_and_keeps_it(
+    tmp_path: Path, body: bytes, says: str,
+) -> None:
+    """#305: a volume or substrate session about to spawn the coordinator refuses
+    a policy file that loads as no entries, names it, and leaves its bytes alone.
+
+    Prevents the merge reading it as empty and replacing it with only the managed
+    globs, deleting every other entry with no log line. A file broken by a release
+    that wrote ``- *.md`` is exactly what the restart after it would have reported
+    as rejected."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked = coherence / "tracked.yaml"
+    tracked.write_bytes(body)
+
+    with pytest.raises(ValueError, match="nothing was written") as raised:
+        merge_policy_globs((tracked,), ("data/**",))
+
+    assert str(raised.value).startswith(".coherence/tracked.yaml ")
+    assert says in str(raised.value)
+    assert tracked.read_bytes() == body
+
+
+def test_merge_policy_globs_refuses_a_file_it_cannot_read(tmp_path: Path) -> None:
+    """#305: a read failure refuses too, as the routes do. Prevents it reading as
+    empty, which replaced a file holding every pattern. A directory stands in
+    for the failure so the test does not depend on the user running it."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    (coherence / "tracked.yaml").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match=r"could not be read \(EISDIR\); nothing was written"):
+        merge_policy_globs((coherence / "tracked.yaml",), ("data/**",))
+
+    assert (coherence / "tracked.yaml").is_dir()
+
+
+def test_merge_policy_globs_refuses_a_link_to_a_device_and_keeps_it(tmp_path: Path) -> None:
+    """A repository can commit a policy file as a link, and a device such as
+    ``/dev/zero`` never reaches EOF. Prevents the merge reading one until memory
+    runs out. ``os.devnull`` takes the same path, and a regression here answers
+    wrongly instead."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked = coherence / "tracked.yaml"
+    tracked.symlink_to(os.devnull)
+
+    with pytest.raises(ValueError) as raised:
+        merge_policy_globs((tracked,), ("data/**",))
+
+    assert str(raised.value) == ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."
+    assert tracked.is_symlink()
+
+
+def test_merge_policy_globs_works_where_the_platform_has_no_o_nonblock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``O_NONBLOCK`` is POSIX-only. Prevents its absence making the merge raise
+    AttributeError out of a volume's or a session's constructor, where degrade mode
+    promises to warn: a regular file still merges and a device is still refused."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked = coherence / "tracked.yaml"
+    tracked.write_text('- "docs/**"\n')
+    device = coherence / "strict_mode.yaml"
+    device.symlink_to(os.devnull)
+    monkeypatch.delattr(os, "O_NONBLOCK")
+
+    merge_policy_globs((tracked,), ("data/**",))
+    with pytest.raises(ValueError, match=r"strict_mode\.yaml could not be read \(not a regular file\)"):
+        merge_policy_globs((device,), ("data/**",))
+
+    assert yaml.safe_load(tracked.read_text()) == ["data/**", "docs/**"]
+
+
+@pytest.mark.parametrize("linked", [False, True], ids=["fifo", "link_to_fifo"])
+def test_merge_policy_globs_refuses_a_fifo_without_blocking(tmp_path: Path, linked: bool) -> None:
+    """Opening a FIFO with no writer blocks forever, which would hang a volume's or
+    a session's constructor with nothing named. The merge runs on a thread so a
+    regression fails here instead of hanging the suite."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked = coherence / "tracked.yaml"
+    fifo = tmp_path / "outside.fifo" if linked else tracked
+    os.mkfifo(fifo)
+    if linked:
+        tracked.symlink_to(fifo)
+    refusals: list[str] = []
+
+    def merge() -> None:
+        try:
+            merge_policy_globs((tracked,), ("data/**",))
+        except ValueError as exc:
+            refusals.append(str(exc))
+
+    worker = threading.Thread(target=merge, daemon=True)
+    worker.start()
+    worker.join(timeout=30)
+    if worker.is_alive():
+        # Opening the other end releases the blocked read so the thread can end.
+        os.close(os.open(fifo, os.O_RDWR | os.O_NONBLOCK))
+        worker.join(timeout=5)
+        pytest.fail("the merge blocked on a FIFO")
+
+    assert refusals == [".coherence/tracked.yaml could not be read (not a regular file); nothing was written."]
+    assert tracked.is_symlink() is linked
+
+
+@pytest.mark.parametrize("target_exists", [True, False], ids=["existing_target", "dangling"])
+def test_merge_policy_globs_leaves_a_linked_files_target_alone(tmp_path: Path, target_exists: bool) -> None:
+    """A merge renames over a policy file kept as a link, as the routes do. Prevents
+    it writing through a link a repository committed: the file the link names keeps
+    its bytes, or stays absent for a dangling link."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    target = tmp_path / "outside.yaml"
+    if target_exists:
+        target.write_text('- "docs/**"\n')
+    (coherence / "tracked.yaml").symlink_to(target)
+
+    merge_policy_globs((coherence / "tracked.yaml",), ("data/**",))
+
+    assert "data/**" in yaml.safe_load((coherence / "tracked.yaml").read_text())
+    assert (target.read_text() == '- "docs/**"\n') if target_exists else not target.exists()
+
+
+@pytest.mark.parametrize("broken_first", [True, False], ids=["broken_first", "broken_last"])
+def test_merge_policy_globs_writes_neither_file_when_it_refuses_one(
+    tmp_path: Path, broken_first: bool,
+) -> None:
+    """#305: the refusal says nothing was written, so it holds for every file in
+    the merge, in either order.
+
+    Prevents a refused attach leaving the managed globs tracked but not strict,
+    for the next coordinator to load."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    good, broken = coherence / "tracked.yaml", coherence / "strict_mode.yaml"
+    good.write_text('- "docs/**"\n')
+    broken.write_text("- *.md\n")
+
+    with pytest.raises(ValueError, match="strict_mode.yaml"):
+        merge_policy_globs((broken, good) if broken_first else (good, broken), ("data/**",))
+
+    assert good.read_text() == '- "docs/**"\n'
+    assert broken.read_text() == "- *.md\n"
+    assert sorted(path.name for path in coherence.iterdir()) == ["strict_mode.yaml", "tracked.yaml"]
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        (None, ["data/**"]),
+        ("", ["data/**"]),
+        ("~\n", ["data/**"]),
+        ('- "docs/**"\n', ["data/**", "docs/**"]),
+        ('- "*.md"\n', ["*.md", "data/**"]),
+    ],
+    ids=["absent", "empty", "null", "an_entry", "a_quoted_star"],
+)
+def test_merge_policy_globs_adds_to_a_file_that_loads(
+    tmp_path: Path, before: Optional[str], after: list[str],
+) -> None:
+    """A missing, empty or valid file takes the globs and keeps what it held, and
+    the result loads back. Prevents the refusal reaching a file with nothing
+    wrong with it: a fresh workspace has no policy file at all."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    tracked = tmp_path / "tracked.yaml"
+    if before is not None:
+        tracked.write_text(before)
+
+    merge_policy_globs((tracked,), ("data/**",))
+
+    assert yaml.safe_load(tracked.read_text()) == after
+    assert [path.name for path in tmp_path.iterdir()] == ["tracked.yaml"]
+
+
+def test_merge_policy_globs_leaves_a_file_that_already_holds_the_globs(tmp_path: Path) -> None:
+    """A merge that adds nothing does not rewrite, so a sibling's start does not
+    churn the file, or drop its comments, for nothing."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    tracked = tmp_path / "tracked.yaml"
+    tracked.write_text('# kept\n- "data/**"\n')
+    before = tracked.stat().st_ino
+
+    merge_policy_globs((tracked,), ("data/**",))
+
+    assert tracked.read_text() == '# kept\n- "data/**"\n'
+    assert tracked.stat().st_ino == before
 
 
 def test_read_policy_entries_blames_extra_documents_only_for_a_second_document() -> None:
@@ -17762,6 +18159,39 @@ def test_the_giver_of_a_live_handoff_editing_a_changed_file_gets_its_deny_unchan
 
     assert status == 200 and body["ok"] is False, body
     assert "disk_differs" not in body and "outside the coordinator" not in json.dumps(body), body
+
+
+def test_pre_edit_warns_when_in_flight_holder_releases_before_acquire(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    original = b"# plan\n"
+    _seed_with_disk(coordinator, client, "plan.md", original)
+    holder, editor = str(uuid.uuid4()), str(uuid.uuid4())
+    assert client.post("/hooks/pre-edit", {"session_id": holder, "path": "plan.md"})[1]["ok"]
+    (coordinator.coordinator_root / "plan.md").write_bytes(original + b"peer bytes\n")
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    holder_id = session_to_agent_id(holder)
+    real_check = mod._a_write_is_in_flight
+    seen: list[bool] = []
+
+    def release_after_check(*args: Any, **kwargs: Any) -> bool:
+        in_flight = real_check(*args, **kwargs)
+        seen.append(in_flight)
+        coordinator.service.invalidate(
+            agent_id=holder_id, artifact_id=artifact_id, new_version=1,
+            issuer_agent_id=holder_id, issued_at_tick=1,
+        )
+        return in_flight
+
+    monkeypatch.setattr(mod, "_a_write_is_in_flight", release_after_check)
+    status, body = client.post("/hooks/pre-edit", {"session_id": editor, "path": "plan.md"})
+
+    assert seen == [True]
+    assert status == 200 and body["ok"] is True and body["disk_differs"] is True
+    assert "collision" not in body
+    assert coordinator.registry.peek_preemption_notice(holder_id, artifact_id) is None
 
 
 @pytest.mark.parametrize("peer", ["writing", "committed", "gone-quiet"])

@@ -60,6 +60,7 @@ import os
 import re
 import secrets
 import socketserver
+import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -69,7 +70,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal, Protocol, TypeVar, runtime_checkable
+from typing import Any, Callable, Iterable, Iterator, Literal, Protocol, TypeVar, runtime_checkable
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import yaml
@@ -160,6 +161,7 @@ from ccs.core.types import (
     ConflictDetail,
     DataPlaneDeferredRead,
     FenceComparands,
+    InvalidationSignal,
     MultiCommitConflict,
     SessionCommitRejection,
     SessionReadRejection,
@@ -3513,10 +3515,8 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                     "summary": summary,
                 }
 
-        # A1: snapshot peers in M∪E BEFORE write so we can record preemption
-        # notices for victims after the side-effecting invalidation.
-        peers_in_me = _peers_in_me_excluding(coordinator, artifact_id, agent_id)
-        # Detect collision BEFORE acquiring: is any other session in M∪E?
+        # Retain the acquisition time only when this same holder is later
+        # confirmed in the write's lock-consistent invalidation signals.
         holder_id, holder_ts = _exclusive_holder(coordinator, artifact_id, exclude_agent=agent_id)
         # #278: also before the acquire, which revokes every peer's claim: a
         # peer's write still landing explains a mismatch on disk, by the rule
@@ -3534,7 +3534,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # (#185): the giver of a live handoff is refused whichever subagent or
         # incarnation it sends.
         try:
-            coordinator.service.write(
+            invalidation_signals = coordinator.service.write(
                 agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=now,
                 abort=abort, caller=caller, if_unheld=opted_in,
             )
@@ -3563,13 +3563,6 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
 
-        if opted_in:
-            # The write admits an opted-in request only when no other agent
-            # holds the path for writing, so it displaced nobody. The holders
-            # looked up above may have let go since; naming them would report a
-            # collision and a preemption that did not happen (#450).
-            peers_in_me, holder_id = [], None
-
         # #278: pre-edit carries no content hash, and post-edit records
         # whatever it is sent, so a write built from an earlier read replaced a
         # change made outside the coordinator with nothing to notice it. The
@@ -3578,21 +3571,37 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # the caller's write lands. It warns and never denies: in strict mode
         # a read is already refused until a commit lands, so a write is the
         # one way out.
-        if not peer_write_in_flight:
+        # Collision answers and notices share the acquire's lock-consistent
+        # list of holders whose M/E grants were actually displaced.
+        displaced: list[tuple[UUID, InvalidationSignal]] = []
+        for signal in invalidation_signals:
+            victim_id = signal.victim_agent_id
+            if victim_id is None or signal.victim_state not in (
+                MESIState.EXCLUSIVE,
+                MESIState.MODIFIED,
+            ):
+                continue
+            displaced.append((victim_id, signal))
+
+        if not (peer_write_in_flight and displaced):
             out_of_band_version = _recorded_content_missing_from_disk(
                 coordinator, artifact_id, agent_id, path=path, now_unix=_payloads.now_unix()
             )
 
-        # A1: record preemption notices for the agents whose M∪E grants we
-        # just silently revoked via the write() side effect. The victims
-        # will see these on their next pre-read / pre-edit hook.
-        for victim_id in peers_in_me:
+        for victim_id, signal in displaced:
             coordinator.registry.record_preemption_notice(
                 victim_agent_id=victim_id,
-                artifact_id=artifact_id,
-                preempter_agent_id=agent_id,
+                artifact_id=signal.artifact_id,
+                preempter_agent_id=signal.issuer_agent_id,
                 preempted_at_unix_ts=_payloads.now_unix(),
             )
+
+        # A stale or absent lookup cannot decide whether the write displaced a
+        # holder; only keep it as a timestamp hint for the matching signal.
+        if not displaced:
+            holder_id, holder_ts = None, None
+        elif holder_id != displaced[0][0]:
+            holder_id, holder_ts = displaced[0][0], None
 
         # Pop any notices for THIS session (the caller of pre-edit) and
         # merge into the response (A1: surface on the victim's next hook
@@ -8294,8 +8303,7 @@ def _exclusive_holder(
     *,
     exclude_agent: UUID,
 ) -> tuple[UUID | None, int | None]:
-    """Return (agent_id, granted_at_tick) of any current M∪E holder OTHER
-    than the given agent. Used for KTD-9 collision detection in pre-edit."""
+    """Return a current M/E holder and its acquisition-time hint for pre-edit."""
     state_map = coordinator.registry.get_state_map(artifact_id)
     for other_id, state in state_map.items():
         if other_id == exclude_agent:
@@ -8304,23 +8312,6 @@ def _exclusive_holder(
             granted_at = coordinator.registry.granted_at_tick(other_id, artifact_id)
             return other_id, granted_at
     return None, None
-
-
-def _peers_in_me_excluding(
-    coordinator: CoordinatorHTTPServer,
-    artifact_id: UUID,
-    agent_id: UUID,
-) -> list[UUID]:
-    """A1: return the list of agents currently in MODIFIED or EXCLUSIVE on
-    the given artifact, EXCLUDING the given agent. Used to snapshot victims
-    BEFORE service.write side-effects invalidate them, so the plugin can
-    record preemption notices for each."""
-    state_map = coordinator.registry.get_state_map(artifact_id)
-    return [
-        peer_id
-        for peer_id, state in state_map.items()
-        if peer_id != agent_id and state in (MESIState.EXCLUSIVE, MESIState.MODIFIED)
-    ]
 
 
 def _iso_utc(unix_ts: float) -> str:
@@ -9407,14 +9398,27 @@ def _read_policy_bytes(yaml_path: Path, name: str) -> bytes:
     whatever the locale), or none for a missing file. Raises ValueError (the
     routes answer 400) for any other read failure: reading it as empty would
     replace a file holding every pattern with one holding only the new ones.
-    The text matches the Node coordinator's."""
+    The text for a failed read matches the Node coordinator's.
+
+    Reads a regular file only, because a repository can commit this file as a
+    link: opening a FIFO with no writer blocks forever, and a device such as
+    ``/dev/zero`` never reaches EOF."""
     try:
-        return yaml_path.read_bytes()
+        with open(yaml_path, "rb", opener=_open_nonblocking) as handle:
+            if stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return handle.read()
     except FileNotFoundError:
         return b""
     except OSError as exc:
         code = errno.errorcode.get(exc.errno, str(exc)) if exc.errno else str(exc)
         raise ValueError(f"{name} could not be read ({code}); nothing was written.") from None
+    raise ValueError(f"{name} could not be read (not a regular file); nothing was written.")
+
+
+def _open_nonblocking(path: str, flags: int) -> int:
+    # O_NONBLOCK is POSIX-only; without it there are no FIFOs to block on, and
+    # the fstat check still refuses a device.
+    return os.open(path, flags | getattr(os, "O_NONBLOCK", 0))
 
 
 def _entries_or_none(text: str, name: str) -> list[str] | None:
@@ -9439,6 +9443,25 @@ def _replace_policy_file(yaml_path: Path, content: str) -> None:
         os.replace(tmp, yaml_path)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def merge_policy_globs(yaml_paths: Iterable[Path], globs: tuple[str, ...]) -> None:
+    """Merge ``globs`` into each policy file. A file that already holds them is
+    left as it is.
+
+    Raises ValueError, before writing any file, naming one that cannot be read, is
+    not valid YAML or is not a list, with the routes' own refusal (#305). Reading it
+    as empty would replace every entry in it with only these globs, at the restart
+    that would otherwise report it in ``rejected_pattern_count``."""
+    rewrites: list[tuple[Path, list[str]]] = []
+    for yaml_path in yaml_paths:
+        name = policy_file_name(yaml_path)
+        existing = _read_policy_entries(_read_policy_bytes(yaml_path, name), name)
+        merged = sorted(set(existing) | set(globs))
+        if merged != sorted(existing):
+            rewrites.append((yaml_path, merged))
+    for yaml_path, merged in rewrites:
+        _replace_policy_file(yaml_path, yaml.safe_dump(merged, default_flow_style=False))
 
 
 def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str], list[dict]]:

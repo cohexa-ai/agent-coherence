@@ -280,8 +280,9 @@ def ensure_coordinator_handle(
 
     Returns None (``-1`` from :func:`ensure_coordinator`) where the call can
     neither start nor join a coordinator: no fcntl, an unwritable parent
-    repo, an unopenable pid file, pid-file churn beyond the revalidation
-    budget, or a join whose retry budget ran out.
+    repo, an unopenable pid file (a symlink is refused, with a warning),
+    pid-file churn beyond the revalidation budget, or a join whose retry
+    budget ran out.
 
     Raises when a start fails, after stopping what it started and releasing
     the flock, so no coordinator is left running:
@@ -802,13 +803,30 @@ def _ensure_coherence_dir(coordinator_root: Path) -> Path | None:
 
 
 def _open_pidfile(pid_file: Path) -> int | None:
-    """Open (creating if needed) the pid file with mode 0600 for fcntl use."""
+    """Open (creating if needed) the pid file with mode 0600 for fcntl use.
+
+    ``O_NOFOLLOW``: a repository can commit ``server.pid`` as a symlink, and a
+    start would then write its pid and port over the file the link names, or
+    create that file (#464)."""
     try:
-        fd = os.open(pid_file, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = os.open(pid_file, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     except OSError as exc:
-        logger.warning("cannot open pid file %s: %s", pid_file, exc)
+        # os.path.islink: Path.is_symlink raises where it cannot look, and this
+        # path must return None.
+        if os.path.islink(pid_file):
+            logger.warning("%s", symlinked_pid_file_refusal(pid_file))
+        else:
+            logger.warning("cannot open pid file %s: %s", pid_file, exc)
         return None
     return fd
+
+
+def symlinked_pid_file_refusal(pid_file: Path) -> str:
+    """Why a start refuses ``pid_file``, a symlink (#464)."""
+    return (
+        f"refusing pid file {pid_file}: it is a symlink, and a coordinator start would "
+        "overwrite the file it names. Remove the link to start one here."
+    )
 
 
 def _close_quiet(fd: int) -> None:
