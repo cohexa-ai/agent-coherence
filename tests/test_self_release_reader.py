@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import sqlite3
 import threading
 import time
 import uuid
@@ -29,6 +30,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -40,7 +42,14 @@ from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.cli._coherence_client import CoordinatorUnavailable
 from ccs.coordinator.service import ReleaseRequest
 from ccs.core.clock import monotonic_seconds
-from ccs.core.exceptions import CommitUnconfirmed, WatchdogAbandoned
+from ccs.core.exceptions import (
+    SPLIT_PAIR_REASON,
+    CommitUnconfirmed,
+    CoordinatorUnreachable,
+    StaleView,
+    ViewWedged,
+    WatchdogAbandoned,
+)
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import ConflictDetail
 from tests.coordinator_helpers import recorded_version, serve_in_process
@@ -657,6 +666,49 @@ def test_a_release_whose_request_already_timed_out_changes_nothing(live: _Live) 
     assert registry.get_agent_state(artifact_id, holder.agent_id) == MESIState.SHARED
 
 
+def test_a_store_error_partway_through_a_stop_answers_internal_and_leaves_the_rest_held(
+    live: _Live, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stop's loop catches only coherence errors, so a store error from the
+    second of two releases ends its work: the answer is the generic internal
+    envelope, which names neither file, the file released before the raise
+    stays SHARED, because each release commits on its own, and the file the
+    raise hit keeps its write grant. A later stop, with the store answering
+    again, releases that one too."""
+    sid = _sid("store-error")
+    agent = session_to_agent_id(sid)
+    paths = ("data/first.json", "data/second.json")
+    for path in paths:
+        assert live.client.post("/hooks/pre-edit", {"session_id": sid, "path": path})[1].get("ok") is True
+    names = {_artifact_id(live, path): path for path in paths}
+    real_release = live.server.service.release_to_reader
+    reached: list[str] = []
+
+    # The held rows come back in no fixed order, so the raise follows the call
+    # count, not a path.
+    def fail_after_the_first(request: ReleaseRequest, **kwargs: object) -> bool:
+        reached.append(names[request.artifact_id])
+        if len(reached) > 1:
+            raise sqlite3.OperationalError("simulated: database is locked")
+        return real_release(request, **kwargs)
+
+    monkeypatch.setattr(live.server.service, "release_to_reader", fail_after_the_first)
+    mark = len(live.logged)
+
+    stop = live.client.post("/hooks/session-stop", {"session_id": sid})
+
+    assert stop == (200, {"ok": False, "reason": "internal: OperationalError"})
+    released, held = reached
+    assert _state(live, released, agent) == MESIState.SHARED
+    assert _state(live, held, agent) == MESIState.EXCLUSIVE
+    assert _entries_for(live.logged[mark:], agent) == [("EXCLUSIVE", "SHARED", "invalidate")]
+    monkeypatch.undo()
+    assert live.client.post("/hooks/session-stop", {"session_id": sid}) == (
+        200, {"ok": True, "released_artifacts": [held]},
+    )
+    assert _state(live, held, agent) == MESIState.SHARED
+
+
 def test_a_write_claim_captured_before_the_release_cannot_commit_after_it(live: _Live) -> None:
     """The release still moves the ownership epoch: a commit on the claim the
     holder captured at its acquire is refused ``stale_read_generation``, and a
@@ -716,6 +768,42 @@ def test_a_grant_the_sweep_reclaimed_before_the_stop_stays_reclaimed(live: _Live
     row = _row_for(_operator_status(live.client), holder.sid)
     assert row["states"] == {}
     assert row["reclaimed"] == {_STRICT: {"trigger": "reclaim_heartbeat", "reclaimed_at_unix_ts": reclaim_tick}}
+
+
+@pytest.mark.parametrize(
+    ("route", "transient"),
+    [("stop", None), ("failed-edit", None), ("stop", TransientState.MWB), ("failed-edit", TransientState.IED)],
+    ids=["stop", "failed-edit", "stop-over-a-pending-commit", "failed-edit-over-a-pending-write"],
+)
+def test_the_sweeps_leave_the_read_a_holders_own_release_left(
+    live: _Live, route: str, transient: TransientState | None,
+) -> None:
+    """Far past every timeout, neither sweep touches the read the release left:
+    it is no write grant for the stable-grant sweep to reclaim, and the release
+    cleared any in-progress marker the write left, which the transient sweep
+    would otherwise expire to INVALID. The row stays SHARED, the epoch stays
+    where the release moved it, and nothing is logged for the holder. A peer's
+    write grant on another file, reclaimed by the same pass, shows the pass
+    ran past the timeout."""
+    holder = _Holder(_sid(f"swept-{route}-{transient}"), route)
+    _take(live, holder, _STRICT)
+    registry = live.server.registry
+    artifact_id = _artifact_id(live, _STRICT)
+    if transient is not None:
+        registry.set_agent_transient(artifact_id, holder.agent_id, transient, entered_tick=monotonic_seconds())
+    _release(live, holder, _STRICT)
+    peer = _sid(f"swept-peer-{route}-{transient}")
+    assert live.client.post("/hooks/pre-edit", {"session_id": peer, "path": "data/held.json"})[1].get("ok") is True
+    epoch = registry.get_owner_generation(artifact_id)
+    mark = len(live.logged)
+    far_past = monotonic_seconds() + 999_999
+
+    assert live.server.service.enforce_transient_timeouts(current_tick=far_past, timeout_ticks=60) == 0
+    assert _sweep(live.server, far_past) == 1, "control: the pass reclaims the peer's write grant"
+
+    assert registry.get_agent_state(artifact_id, holder.agent_id) == MESIState.SHARED
+    assert registry.get_owner_generation(artifact_id) == epoch
+    assert _entries_for(live.logged[mark:], holder.agent_id) == []
 
 
 def test_the_operator_drain_still_leaves_an_orphaned_write_grant_invalid(live: _Live) -> None:
@@ -813,14 +901,58 @@ _FAST = LifecycleConfig(
 )
 
 
-def _volume_on(tmp_path: Path) -> tuple[CoordinatorHTTPServer, CoherentVolume, Path]:
+def _volume_on(
+    tmp_path: Path, *, on_stale_read: Literal["allow", "raise"] = "allow",
+) -> tuple[CoordinatorHTTPServer, CoherentVolume, Path]:
     target = tmp_path / _VOLUME_REL
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(b"v1")
     server = serve_in_process(tmp_path, "self-release-volume")
-    vol = CoherentVolume(tmp_path, managed=("data/**",), config=_FAST)
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=_FAST, on_stale_read=on_stale_read)
     vol.read(_VOLUME_REL)
     return server, vol, target
+
+
+class _Wire:
+    """Every request the volume sends from here on, with its answer, except the
+    next commit, whose answer is lost: after the coordinator ran it when
+    ``delivered``, or before the request left, so the coordinator never saw it,
+    when not. The release the volume sends next goes through."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, delivered: bool) -> None:
+        self._real_post = coherent_volume_module._coordinator_post
+        self._delivered = delivered
+        self._commit_lost = False
+        self._sent: list[tuple[str, dict, dict]] = []
+        monkeypatch.setattr(coherent_volume_module, "_coordinator_post", self._post)
+
+    def sent_to(self, route: str) -> list[tuple[dict, dict]]:
+        """Each request sent to ``route``, with its answer, in order."""
+        return [(payload, answer) for sent, payload, answer in self._sent if sent == route]
+
+    def answers(self, route: str) -> list[dict]:
+        return [answer for _, answer in self.sent_to(route)]
+
+    def _post(self, endpoint: object, route: str, payload: dict, **kwargs: object) -> dict:
+        if not self._commit_lost and route == "/hooks/post-edit" and payload.get("success") is True:
+            self._commit_lost = True
+            if not self._delivered:
+                raise CoordinatorUnavailable("simulated: the commit never left", never_sent=True)
+            self._real_post(endpoint, route, payload, **kwargs)
+            raise CoordinatorUnavailable("simulated: the commit's answer was lost")
+        answer = self._real_post(endpoint, route, payload, **kwargs)
+        self._sent.append((route, payload, answer))
+        return answer
+
+
+def _appending(seen: list[bytes]) -> Callable[[bytes], bytes]:
+    """A ``make_content`` that records the bytes each attempt derives from."""
+
+    def make_content(current: bytes) -> bytes:
+        seen.append(current)
+        return current + b"+cas"
+
+    return make_content
 
 
 def test_a_volume_writes_again_after_a_failed_write_without_reacquiring(
@@ -875,5 +1007,110 @@ def test_a_volume_writes_again_after_an_unconfirmed_commit_whose_release_was_ans
         assert target.read_bytes() == b"v3"
         assert recorded_version(server, _VOLUME_REL) == 3
         assert vol.incarnation == incarnation, "the volume re-minted"
+    finally:
+        server.shutdown()
+
+
+def test_a_volume_cas_after_an_unconfirmed_commit_whose_release_was_answered_is_refused_once_then_lands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """write()'s commit lands but its answer is lost, and the release it sends
+    next is answered, so the volume records no grant on the file and write_cas
+    starts without a re-mint, from the read the release left. That read's
+    claim predates the release, which moved the ownership epoch, so the first
+    commit is refused ``stale_read_generation``. The retry re-mints, and the
+    coordinator checks the new identity's read against the content it records,
+    so the commit that lands derives from the bytes recorded at its version."""
+    server, vol, target = _volume_on(tmp_path)
+    try:
+        wire = _Wire(monkeypatch, delivered=True)
+        with pytest.raises(CommitUnconfirmed):
+            vol.write(_VOLUME_REL, b"v2")
+        assert recorded_version(server, _VOLUME_REL) == 2, "control: the commit landed"
+        assert wire.answers("/hooks/post-edit") == [{"ok": True, "released": True}], "control: the release"
+        released = vol.incarnation
+        seen: list[bytes] = []
+
+        result = vol.write_cas(_VOLUME_REL, _appending(seen))
+
+        [(first, refused), (retry, won)] = wire.sent_to("/hooks/post-edit-cas")
+        assert first["agent_id"] == released and refused["reason"] == "stale_read_generation", refused
+        assert retry["agent_id"] != released and won["ok"] is True, won
+        [released_read, checked_read] = wire.answers("/hooks/pre-read")
+        assert released_read["status"] == "fresh", released_read
+        assert checked_read["status"] == "stale" and checked_read["summary"]["hash_differs"] is False, checked_read
+        assert seen == [b"v2", b"v2"]
+        assert (result.version, target.read_bytes()) == (3, b"v2+cas")
+        assert recorded_version(server, _VOLUME_REL) == 3
+    finally:
+        server.shutdown()
+
+
+def test_a_volume_cas_over_bytes_changed_after_an_unconfirmed_commit_never_lands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The row above with the file changed on disk after the commit whose answer
+    was lost. Inside the coordinator's commit-lag window the read the release
+    left is admitted fresh over bytes the coordinator does not record, and
+    make_content derives from them; only the moved epoch refuses that commit.
+    Every read after the re-mint is checked against the recorded content and
+    denied, so the call ends ``ViewWedged`` and nothing lands."""
+    server, vol, target = _volume_on(tmp_path)
+    try:
+        wire = _Wire(monkeypatch, delivered=True)
+        with pytest.raises(CommitUnconfirmed):
+            vol.write(_VOLUME_REL, b"v2")
+        target.write_bytes(b"changed outside")
+        seen: list[bytes] = []
+
+        with pytest.raises(ViewWedged):
+            vol.write_cas(_VOLUME_REL, _appending(seen))
+
+        [released_read, *checked_reads] = wire.answers("/hooks/pre-read")
+        assert released_read["status"] == "fresh" and released_read["hash_differs"] is True, released_read
+        assert seen == [b"changed outside"]
+        [refused] = wire.answers("/hooks/post-edit-cas")
+        assert refused["reason"] == "stale_read_generation", refused
+        assert checked_reads, "the retry never read"
+        for answer in checked_reads:
+            _denied_reason(answer)
+        assert (target.read_bytes(), recorded_version(server, _VOLUME_REL)) == (b"changed outside", 2)
+    finally:
+        server.shutdown()
+
+
+def test_a_volume_write_whose_commit_never_left_is_refused_on_read_until_its_next_write_records_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """write()'s bytes reach disk but its commit never leaves, and the release it
+    sends next is answered: the coordinator still records v1, and the volume
+    reads it with v2's bytes on disk. Under ``on_stale_read="raise"`` each read
+    is denied by the coordinator as a change made outside it, and the volume
+    raises its own split-pair refusal in place of that text; reading again
+    does not clear it. The next write is admitted with the coordinator's note
+    that the disk differs, which the volume does not pass on, and its commit
+    records the bytes, after which a read is fresh."""
+    server, vol, target = _volume_on(tmp_path, on_stale_read="raise")
+    try:
+        wire = _Wire(monkeypatch, delivered=False)
+        with pytest.raises(CoordinatorUnreachable):
+            vol.write(_VOLUME_REL, b"v2")
+        assert (target.read_bytes(), recorded_version(server, _VOLUME_REL)) == (b"v2", 1)
+        assert wire.answers("/hooks/post-edit") == [{"ok": True, "released": True}], "control: the release"
+        artifact_id = server.registry.lookup_artifact_id_by_name(_VOLUME_REL)
+        assert server.registry.get_agent_state(artifact_id, uuid.UUID(vol.agent_id)) == MESIState.SHARED
+
+        for _ in range(2):
+            with pytest.raises(StaleView) as refused:
+                vol.read(_VOLUME_REL)
+            assert refused.value.reason == SPLIT_PAIR_REASON, refused.value
+        denials = [_denied_reason(answer) for answer in wire.answers("/hooks/pre-read")]
+        assert len(denials) == 2 and all(_OUT_OF_BAND in denial for denial in denials), denials
+
+        vol.write(_VOLUME_REL, b"v3")
+
+        assert wire.answers("/hooks/pre-edit")[-1].get("disk_differs") is True
+        assert (target.read_bytes(), recorded_version(server, _VOLUME_REL)) == (b"v3", 2)
+        assert vol.read(_VOLUME_REL) == b"v3"
     finally:
         server.shutdown()

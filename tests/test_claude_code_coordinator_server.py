@@ -40,6 +40,7 @@ from ccs.adapters.claude_code.coordinator_server import (
     decide_tracked_read,
     session_to_agent_id,
 )
+from ccs.coordinator.service import ReleaseRequest
 from ccs.core.exceptions import (
     HOLD_REASONS,
     UNAVAILABLE_REASON,
@@ -1504,13 +1505,9 @@ def test_a1_pre_edit_drops_a_holder_released_after_the_collision_lookup(
             coordinator_arg, looked_up_artifact_id, exclude_agent=exclude_agent
         )
         assert result[0] == session_to_agent_id(holder)
-        coordinator_arg.service.invalidate(
-            agent_id=result[0],
-            artifact_id=looked_up_artifact_id,
-            new_version=1,
-            issuer_agent_id=result[0],
-            issued_at_tick=2,
-        )
+        coordinator_arg.service.release_to_reader(ReleaseRequest(
+            agent_id=result[0], artifact_id=looked_up_artifact_id, issued_at_tick=2,
+        ))
         return result
 
     monkeypatch.setattr(mod, "_exclusive_holder", release_after_lookup)
@@ -10896,11 +10893,10 @@ def test_the_refusal_names_the_holder_its_own_decision_read(
     def write_after_the_holder_changes(**kwargs: Any) -> Any:
         if kwargs["agent_id"] == caller_agent and not changed:
             changed.append(True)
-            version = coordinator.registry.get_artifact(artifact_id).version
-            service.invalidate(
-                agent_id=first_agent, artifact_id=artifact_id, new_version=version,
-                issuer_agent_id=first_agent, issued_at_tick=kwargs["issued_at_tick"],
-            )
+            service.release_to_reader(ReleaseRequest(
+                agent_id=first_agent, artifact_id=artifact_id,
+                issued_at_tick=kwargs["issued_at_tick"],
+            ))
             real_write(
                 agent_id=second_agent, artifact_id=artifact_id,
                 issued_at_tick=kwargs["issued_at_tick"],
@@ -10941,11 +10937,10 @@ def test_an_opted_in_admit_after_the_holder_released_carries_no_collision_or_not
     def write_after_the_holder_releases(**kwargs: Any) -> Any:
         if kwargs["agent_id"] == caller_agent and not released:
             released.append(True)
-            version = coordinator.registry.get_artifact(artifact_id).version
-            service.invalidate(
-                agent_id=holder_agent, artifact_id=artifact_id, new_version=version,
-                issuer_agent_id=holder_agent, issued_at_tick=kwargs["issued_at_tick"],
-            )
+            service.release_to_reader(ReleaseRequest(
+                agent_id=holder_agent, artifact_id=artifact_id,
+                issued_at_tick=kwargs["issued_at_tick"],
+            ))
         return real_write(**kwargs)
 
     monkeypatch.setattr(service, "write", write_after_the_holder_releases)
@@ -14336,6 +14331,21 @@ def test_a_snapshot_commit_without_a_principal_acts_as_the_bound_session_it_name
 # --- the release answer: per grant only when it is not a clean success -------
 
 
+def _record_watchdog_aborts(coordinator, monkeypatch: pytest.MonkeyPatch) -> list:
+    """Record the abort event each request hands the watchdog, so a test can
+    check that the release runs under that request's own event: only that
+    one is set when the request times out."""
+    aborts: list = []
+    run = coordinator.run_with_watchdog
+
+    def recording(fn, abort=None, **kwargs):
+        aborts.append(abort)
+        return run(fn, abort, **kwargs)
+
+    monkeypatch.setattr(coordinator, "run_with_watchdog", recording)
+    return aborts
+
+
 def test_a_clean_session_stop_answers_todays_exact_bytes(coordinator, client: _Client) -> None:
     """A stop that releases every grant answers
     the body the Node backend mirrors -- no per-grant list. The paths come
@@ -14363,9 +14373,11 @@ def test_a_session_stop_that_keeps_a_grant_answers_per_grant(
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "spec.md"})
     spec_id = coordinator.registry.lookup_artifact_id_by_name("spec.md")
     release = coordinator.service.release_to_reader
+    aborts = _record_watchdog_aborts(coordinator, monkeypatch)
 
     def failing_on_spec(request: Any, **kwargs: Any):
         assert kwargs.get("abort") is not None
+        assert kwargs["abort"] is aborts[-1]
         if request.artifact_id == spec_id:
             raise CoherenceError("release refused by the test")
         return release(request, **kwargs)
@@ -14397,9 +14409,11 @@ def test_a_failed_edit_release_that_keeps_its_grant_answers_per_grant(
     sid = _sid("failed-edit-held")
     agent_id = session_to_agent_id(sid)
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    aborts = _record_watchdog_aborts(coordinator, monkeypatch)
 
     def refusing(*_args: Any, **kwargs: Any):
         assert kwargs.get("abort") is not None
+        assert kwargs["abort"] is aborts[-1]
         raise CoherenceError("release refused by the test")
 
     monkeypatch.setattr(coordinator.service, "release_to_reader", refusing)
@@ -18181,10 +18195,9 @@ def test_pre_edit_warns_when_in_flight_holder_releases_before_acquire(
     def release_after_check(*args: Any, **kwargs: Any) -> bool:
         in_flight = real_check(*args, **kwargs)
         seen.append(in_flight)
-        coordinator.service.invalidate(
-            agent_id=holder_id, artifact_id=artifact_id, new_version=1,
-            issuer_agent_id=holder_id, issued_at_tick=1,
-        )
+        coordinator.service.release_to_reader(ReleaseRequest(
+            agent_id=holder_id, artifact_id=artifact_id, issued_at_tick=1,
+        ))
         return in_flight
 
     monkeypatch.setattr(mod, "_a_write_is_in_flight", release_after_check)
