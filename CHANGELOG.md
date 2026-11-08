@@ -31,14 +31,14 @@ Alpha — APIs may change before `v1.0`.
   it again, and degrade mode counts a degradation, warning on the first. In
   strict mode, when the volume's own local coordinator refuses the connect
   because nothing listens there, `close()` logs the paths left to the next
-  coordinator's sweep instead of raising; a connect that times out, a remote
-  coordinator, or a refusal after the coordinator reported a grant still held
-  earlier in the same `close()` raises. Nothing closes a volume at interpreter
-  exit: a close there fails in the process that hosts the coordinator. Against
-  a coordinator through 0.15.0
-  a release leaves the volume's copy `INVALID`, so call `reacquire()` before
-  writing the file again. The guide's new "Letting go: `release()` and
-  `close()`" section has the details.
+  coordinator's sweep instead of raising. It still raises for a connect that
+  times out, a remote coordinator, or a refusal after the coordinator reported a
+  grant still held earlier in the same `close()`. Nothing closes a volume at
+  interpreter exit: a close there fails in the process that hosts the
+  coordinator. Against a coordinator through 0.15.0 a release leaves the
+  volume's copy `INVALID`, so call `reacquire()` before writing the file again.
+  The guide's new "Letting go: `release()` and `close()`" section has the
+  details.
 
 - **A strict surface that gets no usable answer from its coordinator raises
   `CoordinatorUnreachable` (#376).** Until now a strict `CoherentVolume` or a
