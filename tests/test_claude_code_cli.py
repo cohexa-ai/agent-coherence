@@ -519,8 +519,13 @@ def test_a_link_made_after_the_cli_checked_is_still_refused_and_named(
     reads as "not in a git repository": it is printed, with exit 2."""
     coherence = git_workspace / ".coherence"
     plant_link(coherence, "hook.secret", "existing")
-    # Stands in for a link made after the CLI's check ran.
-    monkeypatch.setattr(coherence_coordinator, "check_coherence_dir", lambda root: None, raising=False)
+    cli_checks: list[Path] = []
+
+    def checked_before_the_link(root: Path) -> None:
+        # Stands in for a link made after the CLI's check ran.
+        cli_checks.append(root)
+
+    monkeypatch.setattr(coherence_coordinator, "check_coherence_dir", checked_before_the_link)
 
     def started(root: Path) -> None:
         stop_coordinator(root)
@@ -533,6 +538,8 @@ def test_a_link_made_after_the_cli_checked_is_still_refused_and_named(
     finally:
         stop_coordinator(git_workspace)
 
+    # The stand-in ran, so the refusal is the start's, not the CLI's own check.
+    assert len(cli_checks) == 1
     assert rc == 2
     assert ".coherence/hook.secret: it is a symlink" in capsys.readouterr().err
 

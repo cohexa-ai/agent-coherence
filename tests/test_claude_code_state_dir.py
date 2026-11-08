@@ -18,11 +18,13 @@ each builder is pinned to a full literal.
 from __future__ import annotations
 
 import builtins
+import errno
 import io
 import os
+import stat
 import subprocess
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -44,6 +46,7 @@ from ccs.core.exceptions import (
     CoherenceDirRefused,
     CoordinatorUnreachable,
 )
+from tests.coherence_link_helpers import release_fifo
 
 _DEADLINE_SEC = 5
 
@@ -53,18 +56,6 @@ _DEADLINE_SEC = 5
 _ENTRY_NAMES = [
     "server.pid", "hook.secret", ".gitignore", "state.db-wal", "tracked.yaml", "notes.txt", "..x",
 ]
-
-
-def _release_fifo(path: Path) -> None:
-    """Give anything blocked opening ``path`` a writer, then remove it."""
-    try:
-        fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
-    except OSError:
-        return
-    try:
-        path.unlink(missing_ok=True)
-    finally:
-        os.close(fd)
 
 
 def _check_bounded(root: Path, fifo: Path | None = None) -> CoherenceDirRefused | None:
@@ -86,7 +77,7 @@ def _check_bounded(root: Path, fifo: Path | None = None) -> CoherenceDirRefused 
         assert not worker.is_alive(), f"the check blocked for {_DEADLINE_SEC}s"
     finally:
         if fifo is not None:
-            _release_fifo(fifo)
+            release_fifo(fifo)
     assert len(answers) == 1
     return answers[0]
 
@@ -323,7 +314,7 @@ def test_the_check_opens_no_file_and_runs_no_git(tmp_path: Path, monkeypatch: py
             with pytest.raises(CoherenceDirRefused) as special:
                 check_coherence_dir(fifo_root)
     finally:
-        _release_fifo(fifo_dir / "audit.log")
+        release_fifo(fifo_dir / "audit.log")
 
     assert linked.value.kind == COHERENCE_LINK_KIND
     assert special.value.kind == COHERENCE_SPECIAL_ENTRY_KIND
@@ -389,6 +380,73 @@ def test_a_fifo_entry_is_refused_without_being_opened(tmp_path: Path) -> None:
 
     assert exc is not None
     assert (exc.kind, exc.path) == (COHERENCE_SPECIAL_ENTRY_KIND, str(fifo))
+
+
+class _UntypedEntry:
+    """A listing entry on a filesystem that reports no type in the listing
+    (``DT_UNKNOWN``), as ``os.scandir`` gives it: ``is_file`` and ``is_dir``
+    look the entry up and answer False both for a FIFO and for an entry
+    removed since the listing; only ``stat`` tells the two apart."""
+
+    def __init__(self, name: str, *, removed: bool) -> None:
+        self.name = name
+        self._removed = removed
+
+    def is_symlink(self) -> bool:
+        return False
+
+    def is_file(self, *, follow_symlinks: bool = True) -> bool:
+        return False
+
+    def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+        return False
+
+    def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
+        if self._removed:
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), self.name)
+        return os.stat_result((stat.S_IFIFO | 0o600, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+
+
+class _Listing:
+    """What ``os.scandir`` returns, holding the given entries."""
+
+    def __init__(self, entries: list[_UntypedEntry]) -> None:
+        self._entries = entries
+
+    def __enter__(self) -> Iterator[_UntypedEntry]:
+        return iter(self._entries)
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+
+@pytest.mark.parametrize("removed", [True, False], ids=["removed_mid_scan", "still_there"])
+def test_an_untyped_entry_is_special_only_while_it_is_still_there(
+    removed: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An entry removed between the listing and its type lookup (a policy
+    ``*.tmp`` renamed into place) passes; one still there that is neither a
+    file nor a directory is refused as special. Only a filesystem that
+    reports no type in the listing reaches this, so a stand-in listing gives
+    the check the entry. Prevents a start refusing a healthy workspace with
+    a false "FIFO, socket or device"."""
+    root, coherence_dir = _workspace(tmp_path)
+    entry = _UntypedEntry("tracked.yaml.tmp", removed=removed)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "scandir", lambda path: _Listing([entry]))
+        try:
+            check_coherence_dir(root)
+        except CoherenceDirRefused as exc:
+            refusal: CoherenceDirRefused | None = exc
+        else:
+            refusal = None
+
+    if removed:
+        assert refusal is None
+    else:
+        assert refusal is not None
+        assert (refusal.kind, refusal.path) == (COHERENCE_SPECIAL_ENTRY_KIND, str(coherence_dir / entry.name))
 
 
 def test_each_refusal_text_is_the_shared_literal() -> None:

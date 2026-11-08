@@ -2950,22 +2950,22 @@ def test_a_start_refuses_a_link_without_running_git(
         ensure_coordinator_handle(refusing_workspace, config=fast_cfg)
 
 
-def test_a_dangling_hook_secret_link_is_named_as_a_link_not_as_a_file_that_stayed_empty(
+def test_a_start_refuses_a_dangling_hook_secret_link_and_names_it_as_a_link(
     refusing_workspace: Path, fast_cfg: LifecycleConfig,
 ) -> None:
-    """#498: the secret is created with ``O_EXCL``, which a dangling link fails
-    without following it, so a start used to retry and then report a secret file
-    that "stayed empty".
+    """#498: the start check refuses a dangling ``hook.secret`` link before the
+    secret is created, and the refusal names the link as a link.
 
-    Prevents that message hiding the link: the refusal names it."""
+    Prevents a start that reaches the secret's ``O_EXCL`` create, which a
+    dangling link fails without following it, and then reports a secret file
+    that "stayed empty" instead of the link."""
     coherence_dir = refusing_workspace / ".coherence"
     plant_link(coherence_dir, "hook.secret", "dangling")
 
     with pytest.raises(CoherenceDirRefused) as refused:
         ensure_coordinator_handle(refusing_workspace, config=fast_cfg)
 
-    assert refused.value.path == str(coherence_dir / "hook.secret")
-    assert "stayed empty" not in str(refused.value)
+    assert (refused.value.kind, refused.value.path) == (COHERENCE_LINK_KIND, str(coherence_dir / "hook.secret"))
 
 
 def _start_with_a_deadline(root: Path, cfg: LifecycleConfig, fifo: Path) -> object:
@@ -3058,7 +3058,7 @@ def test_a_dangling_gitignore_link_made_after_the_check_is_not_followed(
     coherence_dir = workspace / ".coherence"
     target = plant_link(coherence_dir, ".gitignore", "dangling")
     # Stands in for a link made after the check ran.
-    monkeypatch.setattr(lifecycle, "check_coherence_dir", lambda root: None, raising=False)
+    monkeypatch.setattr(lifecycle, "check_coherence_dir", lambda root: None)
 
     assert lifecycle._ensure_coherence_dir(workspace) == coherence_dir
 
@@ -3087,11 +3087,13 @@ def test_a_coherence_linked_after_the_first_check_is_refused_before_gitignore_is
         if len(checks) > 1:
             state_dir.check_coherence_dir(root)
 
-    monkeypatch.setattr(lifecycle, "check_coherence_dir", check_after_the_first, raising=False)
+    monkeypatch.setattr(lifecycle, "check_coherence_dir", check_after_the_first)
 
     with pytest.raises(CoherenceDirRefused) as refused:
         lifecycle._ensure_coherence_dir(workspace)
 
+    # The stand-in ran both times: the refusal is the second check's, not the first.
+    assert len(checks) == 2
     assert refused.value.path == str(coherence_dir)
     assert os.listdir(named) == []
     assert stat.S_IMODE(os.lstat(named).st_mode) == 0o755

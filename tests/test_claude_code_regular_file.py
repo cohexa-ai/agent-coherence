@@ -32,23 +32,11 @@ from ccs.adapters.claude_code.regular_file import (
     read_regular_file,
     read_state_file,
 )
+from tests.coherence_link_helpers import release_fifo
 
 _DEADLINE_SEC = 10
 
 _DATA = b"line one\r\nline two\n\xff"
-
-
-def _release_fifo(path: Path) -> None:
-    """Give a reader that may be blocked in ``open`` a writer, then remove
-    the FIFO, so a regression ends instead of parking a thread forever."""
-    try:
-        fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
-    except OSError:
-        return
-    try:
-        path.unlink(missing_ok=True)
-    finally:
-        os.close(fd)
 
 
 def _bounded(call: Callable[[], RegularFileRead], fifo: Path | None = None) -> RegularFileRead:
@@ -61,7 +49,7 @@ def _bounded(call: Callable[[], RegularFileRead], fifo: Path | None = None) -> R
         assert not reader.is_alive(), f"the read blocked for {_DEADLINE_SEC}s"
     finally:
         if fifo is not None:
-            _release_fifo(fifo)
+            release_fifo(fifo)
     assert len(answers) == 1
     return answers[0]
 
@@ -146,6 +134,18 @@ def test_read_regular_file_classifies_each_path(
         assert isinstance(result.error, NotRegularFile)
 
 
+def _fstat_reporting_size(size: int) -> Callable[[int], os.stat_result]:
+    """An ``fstat`` that reports ``size``: the size a file had before it grew."""
+    real_fstat = os.fstat
+
+    def fstat_before_growth(fd: int) -> os.stat_result:
+        fields = list(real_fstat(fd))
+        fields[6] = size  # st_size
+        return os.stat_result(fields)
+
+    return fstat_before_growth
+
+
 def test_read_regular_file_refuses_a_file_that_grew_past_the_cap_while_it_was_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -156,18 +156,36 @@ def test_read_regular_file_refuses_a_file_that_grew_past_the_cap_while_it_was_re
     grows after the check."""
     path = tmp_path / "file"
     path.write_bytes(b"12345")
-    real_fstat = os.fstat
-
-    def fstat_before_growth(fd: int) -> os.stat_result:
-        fields = list(real_fstat(fd))
-        fields[6] = 4  # st_size
-        return os.stat_result(fields)
-
-    monkeypatch.setattr(os, "fstat", fstat_before_growth)
+    monkeypatch.setattr(os, "fstat", _fstat_reporting_size(4))
 
     result = read_regular_file(path, max_bytes=4)
 
     assert (result.status, result.data) == (ReadStatus.TOO_LARGE, None)
+
+
+#: Just over one read chunk (1 MiB), so the whole file takes three reads.
+_OVER_A_CHUNK = bytes(range(256)) * 4097
+
+
+@pytest.mark.parametrize("data", [_DATA, _OVER_A_CHUNK], ids=["small", "over_1_mib"])
+@pytest.mark.parametrize("capped", [False, True], ids=["no_cap", "cap_above_size"])
+def test_read_regular_file_reads_all_of_a_file_that_grew_after_its_size_was_taken(
+    data: bytes, capped: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first read is sized from ``fstat``, so a file that grew after it
+    is collected by the reads that follow. A client that opens ``hook.secret``
+    between its creator's ``O_EXCL`` open and its write sees size 0 and reads
+    one byte first. The growth is stood in for by an ``fstat`` that reports
+    0. Prevents a read that stops after its first read and hands a client a
+    one-byte bearer, or a policy file cut short."""
+    path = tmp_path / "file"
+    path.write_bytes(data)
+    monkeypatch.setattr(os, "fstat", _fstat_reporting_size(0))
+
+    result = read_regular_file(path, max_bytes=len(data) + 1 if capped else None)
+
+    assert result.status is ReadStatus.READ
+    assert result.data == data
 
 
 @pytest.mark.parametrize("shape", ["fifo", "link_to_fifo"])
