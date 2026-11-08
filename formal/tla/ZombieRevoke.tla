@@ -102,8 +102,11 @@ ZRInvalidateAction ==
            observedCurrent = FALSE. A target that has observed the current
            version cannot be behind any signal, so no signal is authority over
            ITS claim. A self-issued release (iss = ag: an agent handing back its
-           own claim -- a post-edit failure, a session-stop release, an operator
-           drain) is not a cross-agent revoke and is never pinned. Removing the
+           own claim to INVALID, such as an operator drain) is not a
+           cross-agent revoke and is never pinned. The holder's own release at
+           the end of a turn, when a subagent stops, or on a failed edit keeps
+           a read instead; that is FencingReleaseToReaderAction, also
+           self-issued and never pinned (ZRNext). Removing the
            ~observedCurrent disjunct is the mutant (recipe 16): it re-enables
            the zombie branch below and TLC reports NoZombieRevoke. *)
         /\ \/ iss = ag
@@ -129,7 +132,10 @@ ZRInvalidateAction ==
 --------------------------------------------------------------------
 (* Specification. Mirrors FencingNext with ZRInvalidateAction substituted for
    FencingInvalidateAction, and observedCurrent maintained on every step that
-   moves a grant or the version. *)
+   moves a grant or the version. The release that keeps a read is the
+   holder's own act on its own row, so it has no issuer to pin and can never
+   set zombieRevoke; it leaves observedCurrent as it was, since the holder
+   neither reads nor moves the version. *)
 --------------------------------------------------------------------
 
 ZRNext ==
@@ -139,6 +145,8 @@ ZRNext ==
     \/ (FencingWriteAction /\ UNCHANGED zombieRevoke
                            /\ observedCurrent' = ObservedCurrentNext)
     \/ ZRInvalidateAction
+    \/ (FencingReleaseToReaderAction /\ UNCHANGED zombieRevoke
+                                     /\ observedCurrent' = ObservedCurrentNext)
     \/ (CRTickAction       /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply,
                                           silentRevoke, observedCurrent, zombieRevoke>>)
     \/ (HeartbeatAction    /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply,

@@ -63,6 +63,11 @@
                            generation never moves at all -- a shipped-code defect
                            fixed alongside this amendment (EPOCH_BUMP_TRIGGERS
                            in registry_protocol.py).
+     - FencingReleaseToReaderAction: the holder's own release that keeps a
+                           read (M/E -> S), with the same generation bump. A
+                           release does not have to end in I to end a write
+                           claim, and the bump keys on leaving M/E, whatever
+                           the target state.
      - FencingCommitAction: the generation-guarded commit. WIN iff
                             readGeneration = ownerGeneration (strict-> reject,
                             EQUALITY ADMITS); a present-but-superseded
@@ -123,13 +128,13 @@ EXTENDS CrashRecovery
 
 (* Generation space bound for finite model checking.
 
-   MaxTicks alone is NOT enough. A sweep bump is tick-bounded, but
-   FencingInvalidateAction's release bump is not: acquire/release cycles bump
-   the epoch without advancing the clock, so the ceiling is reachable at
-   clock 0. Both bump sites carry a `< MaxGen` guard, and a guard that fails
-   DISABLES its action rather than violating anything -- so too low a ceiling
-   silently stops TLC exploring revoke transitions while the run still reports
-   success. Sized as MaxTicks + NumAgents, mirroring MESI.tla's MaxVersion,
+   MaxTicks alone is NOT enough. A sweep bump is tick-bounded, but the release
+   bumps (FencingInvalidateAction, FencingReleaseToReaderAction) are not:
+   acquire/release cycles bump the epoch without advancing the clock, so the
+   ceiling is reachable at clock 0. Every bump site carries a `< MaxGen`
+   guard, and a guard that fails DISABLES its action rather than violating
+   anything -- so too low a ceiling silently stops TLC exploring revoke
+   transitions while the run still reports success. Sized as MaxTicks + NumAgents, mirroring MESI.tla's MaxVersion,
    which solves the same problem (a counter advanced by agent actions rather
    than by the clock) the same way. *)
 MaxGen == MaxTicks + NumAgents
@@ -284,18 +289,44 @@ FencingSweepAction ==
     /\ UNCHANGED <<clock, version, lastHeartbeat, readGeneration, staleApply>>
 
 --------------------------------------------------------------------
-(* FencingInvalidateAction: the voluntary release (service.invalidate) + the
-   SAME generation bump the sweep performs, atomically with the M/E -> I
-   transition. Both operations revoke a write claim without moving the version,
-   which is the one condition version-CAS is structurally blind to, so both
-   must move the epoch. Keyed on the M/E -> I transition computed from
-   mesiState vs mesiState' (the UpdatedGrantedAtTick discipline), never reaching
-   into CRInvalidateAction's existential binding. A release from S or I leaves
-   the generation alone: no write claim was revoked. *)
+(* FencingInvalidateAction: a release to INVALID (service.invalidate, such as
+   the operator drain) + the SAME generation bump the sweep performs,
+   atomically with the M/E -> I transition. Both operations revoke a write
+   claim without moving the version, which is the one condition version-CAS is
+   structurally blind to, so both must move the epoch. Keyed on the M/E -> I
+   transition computed from mesiState vs mesiState' (the UpdatedGrantedAtTick
+   discipline), never reaching into CRInvalidateAction's existential binding.
+   An invalidation from S leaves the generation alone: no write claim was
+   revoked. The holder's own release that keeps a read is
+   FencingReleaseToReaderAction below. *)
 --------------------------------------------------------------------
 
 FencingInvalidateAction ==
     /\ CRInvalidateAction
+    /\ \A a2 \in RevokedMorE : ownerGeneration[a2] < MaxGen   (* finite bound *)
+    /\ ownerGeneration' = [a2 \in Artifacts |->
+         IF a2 \in RevokedMorE THEN ownerGeneration[a2] + 1
+         ELSE ownerGeneration[a2]]
+    /\ silentRevoke' = (silentRevoke
+                       \/ (\E a2 \in RevokedMorE :
+                             ownerGeneration'[a2] = ownerGeneration[a2]))
+    /\ UNCHANGED <<readGeneration, staleApply>>
+
+--------------------------------------------------------------------
+(* FencingReleaseToReaderAction: the holder's own release that keeps a read
+   (service.release_to_reader, at the end of a turn, when a subagent stops,
+   or on a failed edit) + the SAME generation bump, atomically with the
+   M/E -> S transition. The holder stays a reader, but its write claim ends
+   at an unchanged version exactly as a release to INVALID ends it, so the
+   epoch must move: a commit on a claim captured before the release is then
+   refused. The registry bumps on leaving M/E for this trigger whatever the
+   target state, and RevokedMorE keys on the same thing, so NoSilentRevoke
+   checks this action without change. The release captures no
+   read-generation (readGeneration UNCHANGED): the holder read nothing. *)
+--------------------------------------------------------------------
+
+FencingReleaseToReaderAction ==
+    /\ CRReleaseToReaderAction
     /\ \A a2 \in RevokedMorE : ownerGeneration[a2] < MaxGen   (* finite bound *)
     /\ ownerGeneration' = [a2 \in Artifacts |->
          IF a2 \in RevokedMorE THEN ownerGeneration[a2] + 1
@@ -316,7 +347,8 @@ FencingInvalidateAction ==
    FencingCommitAction, FencingWriteAction (which captures the read-generation
    at the E/M acquire), FencingSweepAction (the crux modeling decision above)
    and FencingInvalidateAction (which bumps the generation on the OTHER
-   grant-revoking operation).
+   grant-revoking operation). The inherited CRReleaseToReaderAction is
+   replaced by FencingReleaseToReaderAction for the same reason.
 
    The fetch leaves readGeneration UNCHANGED on purpose, for EVERY agent the
    step touches -- the requester AND the peers it downgrades M/E -> S. A fetch
@@ -333,6 +365,7 @@ FencingNext ==
                                         staleApply, silentRevoke>>)
     \/ FencingWriteAction
     \/ FencingInvalidateAction
+    \/ FencingReleaseToReaderAction
     \/ (CRTickAction       /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply,
                                         silentRevoke>>)
     \/ (HeartbeatAction    /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply,
@@ -386,12 +419,13 @@ NoStaleApply == staleApply = FALSE
    satisfied -- the model reported no error.) So state it directly: a write
    claim is never revoked without the ownership epoch moving.
 
-   Scoped to the two REVOKE actions (sweep reclaim, voluntary release), NOT to
-   every M/E -> I transition. The acquire leg (WriteAction invalidating peers)
-   also ends a claim at an unchanged version and deliberately does NOT bump, and
-   that is sound because every exit from the acquirer's grant is covered: it
-   commits (the version moves, version-CAS arbitrates), it is reclaimed (bump),
-   or it releases (bump, since this amendment). There is no fourth exit. *)
+   Scoped to the REVOKE actions (sweep reclaim, and a voluntary release to I
+   or, keeping a read, to S), NOT to every M/E -> I transition. The acquire
+   leg (WriteAction invalidating peers) also ends a claim at an unchanged
+   version and deliberately does NOT bump, and that is sound because every
+   exit from the acquirer's grant is covered: it commits (the version moves, version-CAS
+   arbitrates), it is reclaimed (bump), or it releases, keeping a read or not
+   (bump, since this amendment). There is no fourth exit. *)
 NoSilentRevoke == silentRevoke = FALSE
 
 (* The steps in which ag's fence claim on art is legitimately established or
