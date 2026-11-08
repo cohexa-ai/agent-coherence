@@ -3192,7 +3192,7 @@ def test_status_table_on_an_answer_with_one_list_null_exits_2(
 # ----------------------------------------------------------------------
 
 #: FROZEN duplicate of the --check-store exit-code contract a host hard-codes:
-#: 0 for a store a start opens unchanged, 10-16 for the rest, clear of 1 (not
+#: 0 for a store a start opens unchanged, 10-17 for the rest, clear of 1 (not
 #: a git repo) and 2 (usage) and of 3-9, which spawn mode may still claim.
 _CHECK_STORE_EXIT_CODES = {
     "current": 0,
@@ -3203,6 +3203,7 @@ _CHECK_STORE_EXIT_CODES = {
     "unusable": 14,
     "live": 15,
     "cannot_tell": 16,
+    "coherence_dir_refused": 17,
 }
 
 #: FROZEN duplicate of the --check-store --json object's key set. No bare
@@ -3216,13 +3217,21 @@ _CHECK_STORE_JSON_KEYS = {
 
 def _lay_store(shape: str, workspace: Path) -> None:
     """One store shape under ``workspace`` (the store-check test's builders,
-    plus an orphan WAL with no store beside it)."""
+    plus an orphan WAL with no store beside it and a ``state.db`` linked to a
+    v7 store outside ``.coherence``)."""
     from tests.test_claude_code_store_check import _build
 
     if shape == "orphan_wal":
         coherence_dir = workspace / ".coherence"
         coherence_dir.mkdir(mode=0o700)
         (coherence_dir / "state.db-wal").write_bytes(b"\x00" * 4096)
+        return
+    if shape == "linked_store":
+        elsewhere = workspace / "elsewhere"
+        _build("v7", elsewhere)
+        coherence_dir = workspace / ".coherence"
+        coherence_dir.mkdir(mode=0o700)
+        (coherence_dir / "state.db").symlink_to(elsewhere / ".coherence" / "state.db")
         return
     _build(shape, workspace)
 
@@ -3237,6 +3246,7 @@ def _lay_store(shape: str, workspace: Path) -> None:
         ("node_stamp", "foreign", None),
         ("text", "unusable", None),
         ("orphan_wal", "cannot_tell", None),
+        ("linked_store", "coherence_dir_refused", None),
     ],
 )
 def test_check_store_json_prints_one_object_and_exits_with_the_outcomes_code(
@@ -3411,6 +3421,57 @@ def test_check_store_on_an_absent_store_creates_no_coherence_dir(
     assert rc == _CHECK_STORE_EXIT_CODES["fresh"]
     assert json.loads(capsys.readouterr().out)["store_registry_schema_version"] is None
     assert not (git_workspace / ".coherence").exists()
+
+
+@pytest.mark.parametrize("name", [".coherence", "state.db", "hook.secret"])
+def test_check_store_and_a_start_agree_on_a_link(
+    git_workspace: Path, tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], name: str,
+) -> None:
+    """#511's contract: for a workspace a start refuses (#498), ``--check-store
+    --json`` answers ``coherence_dir_refused`` with exit 17, and the start
+    exits 2 printing the same refusal, which names the same path. Prevents a
+    host reading ``fresh``, ``current`` or ``unusable`` from the check and
+    then watching the start refuse."""
+    link, _target = _plant_cli_link(git_workspace, name, tmp_path_factory)
+    monkeypatch.setattr(coherence_coordinator.subprocess, "Popen", _fail_on_call("a spawn"))
+
+    check_rc = coherence_coordinator.main(["--root", str(git_workspace), "--check-store", "--json"])
+    body = json.loads(capsys.readouterr().out)
+    start_rc = coherence_coordinator.main(["--root", str(git_workspace)])
+    start = capsys.readouterr()
+
+    assert check_rc == body["exit_code"] == _CHECK_STORE_EXIT_CODES["coherence_dir_refused"]
+    assert (body["outcome"], body["reason"]) == ("coherence_dir_refused", "coherence_link")
+    assert body["store_registry_schema_version"] is None
+    shown = git_workspace.resolve() / link.relative_to(git_workspace)
+    assert body["message"].startswith(f"refusing {shown}: it is a symlink")
+    assert start_rc == 2
+    assert start.err == f"agent-coherence-coordinator: {escape_nonprintable(body['message'])}\n"
+
+
+def test_check_store_on_a_linked_coherence_changes_nothing_in_its_target(
+    git_workspace: Path, tmp_path_factory: pytest.TempPathFactory,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#511: a ``.coherence`` linked to an outside 0755 directory that holds a
+    store answers ``coherence_dir_refused``, and the check leaves that
+    directory's mode, its listing and the store as they were. Prevents the
+    check running a start's directory setup through the link, which would
+    tighten the target to 0700 or create files in it."""
+    outside = tmp_path_factory.mktemp("outside")
+    _lay_store("v10", outside)
+    target = outside / ".coherence"
+    target.chmod(0o755)
+    (git_workspace / ".coherence").symlink_to(target, target_is_directory=True)
+    before = (target_snapshot(target), target_snapshot(target / "state.db"))
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace), "--check-store", "--json"])
+
+    assert rc == _CHECK_STORE_EXIT_CODES["coherence_dir_refused"]
+    assert json.loads(capsys.readouterr().out)["outcome"] == "coherence_dir_refused"
+    assert (target_snapshot(target), target_snapshot(target / "state.db")) == before
+    assert (git_workspace / ".coherence").is_symlink()
 
 
 def test_check_store_ignores_the_bind_host_it_never_binds(

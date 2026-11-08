@@ -63,6 +63,9 @@ Exit codes (``--check-store``; 1 and 2 as above, 3-9 left to spawn mode):
 - 15: live — a coordinator is running; a start joins it, migrating nothing
   while it runs (the store is not read, so its schema is unknown)
 - 16: cannot_tell — the check could not observe the answer
+- 17: coherence_dir_refused — ``.coherence`` is a symlink or not a
+  directory, or holds a symlink (or a FIFO, socket or device); a start
+  refuses it
 """
 
 from __future__ import annotations
@@ -110,6 +113,7 @@ _CHECK_STORE_EXIT_CODES: dict[StoreCheckOutcome, int] = {
     StoreCheckOutcome.UNUSABLE: 14,
     StoreCheckOutcome.LIVE: 15,
     StoreCheckOutcome.CANNOT_TELL: 16,
+    StoreCheckOutcome.COHERENCE_DIR_REFUSED: 17,
 }
 
 # Import-time exhaustiveness pin (the coherence_replay pattern): an outcome
@@ -181,7 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
             ".coherence/state.db (open it as is, create it, migrate it, or "
             "refuse it) and exit with that outcome's code: 0 current, 10 fresh, "
             "11 will_migrate, 12 newer, 13 foreign, 14 unusable, 15 live, "
-            "16 cannot_tell."
+            "16 cannot_tell, 17 coherence_dir_refused."
         ),
     )
     parser.add_argument(
