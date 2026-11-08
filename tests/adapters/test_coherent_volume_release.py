@@ -865,7 +865,8 @@ def test_a_grant_reported_held_before_a_refused_connect_is_still_reported(
 ) -> None:
     """A coordinator answered during this close that a grant was still held, so
     the refusal that follows does not mean nothing was listening: the close
-    raises and names the held grant.
+    raises, says every recorded grant may still stand, and claims no answer
+    for the request that got none.
 
     Prevents a held grant reported only to a log because the next request
     found the coordinator gone."""
@@ -883,9 +884,9 @@ def test_a_grant_reported_held_before_a_refused_connect_is_still_reported(
 
     wire.answers[_SESSION_STOP] = held_then_refused
 
-    with pytest.raises(CoordinatorUnreachable, match="still held") as failure:
+    with pytest.raises(CoordinatorUnreachable, match="may still stand: data/x.txt, data/z.txt") as failure:
         holder.close()
-    assert path_of[answered[0]] in str(failure.value)
+    assert "answered" not in str(failure.value)
 
 
 def test_close_inside_an_operation_is_refused(
@@ -1058,37 +1059,48 @@ def test_a_coherent_workspace_whose_body_returned_raises_an_unconfirmed_close(
     assert open is _ORIGINAL_OPEN
 
 
-def test_install_replaces_a_shim_volume_that_was_closed(
+def test_install_over_a_closed_shim_volume_raises_until_uninstall(
     tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, shim_removed: None
 ) -> None:
     """A with block or close() on the volume install() returned ends that
-    volume, so the next install() builds a new one, and open() goes through it.
+    volume and leaves the shim, so managed opens fail closed. install() says
+    so instead of handing back the closed volume, and after uninstall() it
+    builds a new one.
 
-    Prevents every managed open() in the process raising over a closed volume
-    nothing replaces."""
+    Prevents install() returning a volume every operation of which raises."""
     closed = install(tmp_path, managed=_MANAGED, config=fast_cfg)
     with closed:
         closed.write(_X, b"from the first volume")
 
-    replacement = install(tmp_path, managed=_MANAGED, config=fast_cfg)
+    with pytest.raises(CoherenceError, match=r"uninstall\(\)"):
+        install(tmp_path, managed=_MANAGED, config=fast_cfg)
+    with pytest.raises(CoherenceError, match="closed"):
+        open(tmp_path / _X, "rb")
 
-    assert replacement is not closed and replacement.closed is False
+    uninstall()
+    replacement = install(tmp_path, managed=_MANAGED, config=fast_cfg)
+    assert replacement.closed is False
     with open(tmp_path / _X, "rb") as handle:
         assert handle.read() == b"from the first volume"
 
 
-def test_a_coherent_workspace_over_a_closed_shim_volume_owns_its_replacement(
+def test_a_coherent_workspace_nested_in_a_block_whose_volume_closed_raises(
     tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, shim_removed: None
 ) -> None:
-    """Prevents a block that yields a closed volume and leaves the shim
-    installed past its exit."""
-    install(tmp_path, managed=_MANAGED, config=fast_cfg).close()
+    """The outer block's volume was closed inside it. An inner block that
+    replaced the shim would remove it on exit and leave the outer block's
+    managed writes going to disk unrecorded; so the inner block raises, and
+    managed opens keep failing closed.
 
-    with coherent_workspace(tmp_path, managed=_MANAGED, config=fast_cfg) as volume:
-        assert volume.closed is False
-        volume.write(_X, b"from the block")
+    Prevents an inner block turning a fail-closed shim into no shim."""
+    with coherent_workspace(tmp_path, managed=_MANAGED, config=fast_cfg) as outer:
+        outer.close()
+        with pytest.raises(CoherenceError, match=r"uninstall\(\)"):
+            with coherent_workspace(tmp_path, managed=_MANAGED, config=fast_cfg):
+                pass
+        with pytest.raises(CoherenceError, match="closed"):
+            open(tmp_path / _X, "rb")
 
-    assert volume.closed is True
     assert open is _ORIGINAL_OPEN
 
 

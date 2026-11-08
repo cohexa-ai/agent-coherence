@@ -1629,14 +1629,16 @@ degradation instead, and warns on the volume's first one, as for any request. A
 closed volume stays closed whatever the answer. `close()` goes on to the
 volume's other attempts after a grant reported still held, and stops at a
 request with no usable answer, so a coordinator that has stopped answering costs
-one client timeout (6 s by default). When the connect to the volume's own local
-coordinator is refused because nothing listens there, for example after that
-coordinator shut down after `idle_shutdown_sec` with no requests, `close()` logs
-the paths it could not release and returns without raising: nothing the caller
-does can release them, and the next coordinator's sweep takes them back. A
-connect that times out, a name that does not resolve, a `remote_endpoint`
-coordinator, or a refusal after the coordinator answered earlier in the same
-`close()` that a grant was still held raises as above.
+one client timeout (6 s by default). Under `on_error="strict"`, when the
+connect to the volume's own local coordinator is refused because nothing
+listens there, for example after that coordinator shut down after
+`idle_shutdown_sec` with no requests, `close()` logs the paths it could not
+release and returns without raising: nothing the caller does can release them,
+and the next coordinator's sweep takes them back. A connect that times out, a
+name that does not resolve, a `remote_endpoint` coordinator, or a refusal after
+the coordinator answered earlier in the same `close()` that a grant was still
+held raises as above. In degrade mode a refused connect counts a degradation,
+as any unanswered request does.
 
 **What else to know.**
 
@@ -1652,9 +1654,9 @@ coordinator, or a refusal after the coordinator answered earlier in the same
 - A release records a heartbeat for the attempt that held the grant, which also
   resets the sweep's clock on that attempt's other grants.
 - The `stale-write-guard-fs` MCP server has no tool for `release()` or `close()`
-  yet (#504). It closes its volume when the host ends it; until then, an agent
-  gives grants back with `swg_reacquire`, which releases every grant of the
-  current attempt.
+  yet (#504). It closes its volume when the host ends it normally (a server
+  killed by a signal releases nothing); until then, an agent gives grants back
+  with `swg_reacquire`, which releases every grant of the current attempt.
 - After `release(path)`, a `write_cas` of the same path is refused once and
   retries from a new attempt, which releases the volume's other grants too.
 - Against this package's coordinator through 0.15.0, or the Claude Code
@@ -2196,8 +2198,8 @@ body's error, so prefer the block. A file opened for writing through the shim
 commits when it is closed, so close it inside the block: one still open when the
 volume closes is named in a warning, and closing it afterwards raises and writes
 nothing. Closing the volume `install()` returned, with its `close()` or a `with`
-block, ends it but leaves the shim installed; the next `install()` or
-`coherent_workspace()` replaces it with a new volume.
+block, ends it but leaves the shim installed: managed opens, `install()` and
+`coherent_workspace()` then raise until `uninstall()` removes the shim.
 
 Run the demo: `python -m examples.coherent_volume.main` (offline, deterministic,
 no keys) — it reproduces the silent lost update, then prevents it.

@@ -28,12 +28,14 @@ Alpha — APIs may change before `v1.0`.
   and raises in strict mode (`CoordinatorUnreachable` with no usable answer,
   `CoordinatorFailed` for an HTTP 5xx or the failure envelope, `CoherenceError`
   for a degraded answer or a grant reported still held); calling it again sends
-  it again, and degrade mode counts a degradation, warning on the first. When
-  the volume's own local coordinator refuses the connect because nothing listens
-  there, `close()` logs the paths left to the next coordinator's sweep instead
-  of raising; a connect that times out, a remote coordinator, or a refusal after
-  a grant was reported still held raises. Nothing closes a volume at interpreter exit: a close there fails in
-  the process that hosts the coordinator. Against a coordinator through 0.15.0
+  it again, and degrade mode counts a degradation, warning on the first. In
+  strict mode, when the volume's own local coordinator refuses the connect
+  because nothing listens there, `close()` logs the paths left to the next
+  coordinator's sweep instead of raising; a connect that times out, a remote
+  coordinator, or a refusal after the coordinator reported a grant still held
+  earlier in the same `close()` raises. Nothing closes a volume at interpreter
+  exit: a close there fails in the process that hosts the coordinator. Against
+  a coordinator through 0.15.0
   a release leaves the volume's copy `INVALID`, so call `reacquire()` before
   writing the file again. The guide's new "Letting go: `release()` and
   `close()`" section has the details.
@@ -234,8 +236,9 @@ Alpha — APIs may change before `v1.0`.
   error, so prefer `coherent_workspace()`, which logs it. A managed file the
   shim opened for writing must be closed inside the block: one still open when
   the volume closes is named in a warning, and closing it afterwards raises and
-  writes nothing. A shim whose volume was closed directly is replaced by the
-  next `install()` or `coherent_workspace()`. The server closes its volume only
+  writes nothing. While the shim's volume is closed (by its own `close()` or a
+  `with` block), managed opens, `install()` and `coherent_workspace()` raise
+  until `uninstall()` removes the shim. The server closes its volume only
   when the host ends it normally, before it stops a coordinator it started; a
   close that fails is logged to stderr, and the coordinator is stopped whatever
   the close does.

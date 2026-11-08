@@ -210,9 +210,10 @@ class _ReleaseFailure(NamedTuple):
     """Why a release request of :meth:`CoherentVolume.release` or
     :meth:`CoherentVolume.close` did not confirm: the error a strict volume
     raises for it, the failure that error chains to, whether the answer
-    reported the grant still held, whether ``_post`` already warned for it
-    (degrade mode, a request with no answer), and whether no coordinator was
-    listening at the volume's local endpoint (the connect was refused)."""
+    reported the grant still held, whether ``_post`` already counted a
+    degradation for it (degrade mode, a request with no answer), and whether
+    no coordinator was listening at the volume's local endpoint (the connect
+    was refused, and nothing answered earlier in the same close)."""
 
     error: type[CoherenceError]
     cause: BaseException | None = None
@@ -630,6 +631,13 @@ def _release_not_confirmed_message(rel: str, *, held: bool) -> str:
 
 #: What every operation but close() raises on a closed volume. Nothing is sent.
 _VOLUME_CLOSED_MESSAGE = "this CoherentVolume is closed. Build a new one."
+
+#: What install() and coherent_workspace() raise while the open() shim's volume
+#: is closed. Managed opens raise too, until uninstall() removes the shim.
+_SHIM_VOLUME_CLOSED_MESSAGE = (
+    "the open() shim's CoherentVolume is closed. Call uninstall() to remove the "
+    "shim, then install it again."
+)
 
 #: What close() raises from inside another operation of the same volume, such
 #: as a write_cas closure, whose commit is still in flight.
@@ -2605,8 +2613,9 @@ class CoherentVolume:
         goes through ``on_error``: strict raises (``CoordinatorUnreachable``
         with no usable answer, ``CoordinatorFailed`` for an HTTP 5xx or the
         coordinator's failure envelope, ``CoherenceError`` for a
-        watchdog-degraded answer or a grant reported still held), degrade warns.
-        Calling ``release()`` again sends it again.
+        watchdog-degraded answer or a grant reported still held), degrade
+        counts a degradation (warning on the volume's first). Calling
+        ``release()`` again sends it again.
         """
         with self._single_op_guard():
             self._require_open()
@@ -2701,8 +2710,8 @@ class CoherentVolume:
     def _release_failure_or_degrade(self, message: str, failure: _ReleaseFailure) -> None:
         """A release or close the coordinator did not confirm, through
         ``on_error``: strict raises the failure's type with ``message``,
-        chained to what failed; degrade warns, unless ``_post`` already warned
-        for the same request."""
+        chained to what failed; degrade counts a degradation, unless ``_post``
+        already counted one for the same request."""
         if self._on_error == "strict":
             raise failure.error(message) from failure.cause
         if not failure.already_warned:
@@ -2747,16 +2756,17 @@ class CoherentVolume:
 
         A close the coordinator does not confirm leaves the volume closed with
         the grant recorded, and goes through ``on_error`` with the types
-        :meth:`release` uses: strict raises, degrade warns. Calling ``close()``
-        again sends what is still recorded, and nothing once the record is
-        empty. A grant reported still held does not stop the other attempts'
-        releases; a request with no readable answer does, so a silent
-        coordinator costs one client timeout. When no coordinator is listening
-        at the volume's local endpoint (the connect was refused, as after the
-        volume's own coordinator shut down when idle), the grants cannot be
-        released by anyone but the next coordinator's sweep, so close() logs
-        them and returns, unless a coordinator answered earlier in the same
-        close() that a grant was still held.
+        :meth:`release` uses: strict raises, degrade counts a degradation
+        (warning on the volume's first). Calling ``close()`` again sends what
+        is still recorded, and nothing once the record is empty. A grant
+        reported still held does not stop the other attempts' releases; a
+        request with no readable answer does, so a silent coordinator costs one
+        client timeout. In strict mode, when no coordinator is listening at the
+        volume's local endpoint (the connect was refused, as after the volume's
+        own coordinator shut down when idle), the grants cannot be released by
+        anyone but the next coordinator's sweep, so close() logs them and
+        returns, unless a coordinator answered earlier in the same close() that
+        a grant was still held.
 
         Nothing calls this at interpreter exit: a volume that exits without
         ``close()``, or is dropped, leaves its grants to the sweep. A ``with``
@@ -2778,8 +2788,7 @@ class CoherentVolume:
         """One ``session-stop`` per attempt the write record lists, and what did
         not confirm. Each confirmed attempt leaves the record; an account of
         each grant drops what it reports released or handed off and lets the
-        walk go on; a request with no readable answer stops it, and keeps the
-        report of a grant an earlier answer said was still held."""
+        walk go on; a request with no readable answer stops it."""
         if self._endpoint is None:
             return None  # detached: no write of this volume recorded a grant
         held: _ReleaseFailure | None = None
@@ -2788,7 +2797,9 @@ class CoherentVolume:
                 "/hooks/session-stop", {"session_id": self._session_id, "agent_id": incarnation}
             )
             if isinstance(answer, _ReleaseFailure):
-                return answer._replace(held=True) if held is not None else answer
+                # A coordinator answered this close, so a refusal now does not
+                # mean nothing was listening: report it, never log it away.
+                return answer._replace(nobody_listening=False) if held is not None else answer
             if answer.get("ok") is True:
                 self._grant_incarnations.pop(incarnation, None)
                 continue
@@ -2799,13 +2810,14 @@ class CoherentVolume:
 
     def _close_not_confirmed(self, failure: _ReleaseFailure) -> None:
         """Report a close the coordinator did not confirm, through
-        ``on_error``, naming the paths still recorded. A request refused
-        because no coordinator listens at the volume's local endpoint is logged
-        instead: nothing the caller does can release those grants, and the
-        next coordinator's sweep will. Not when a coordinator answered earlier
-        in the walk that a grant was still held: that is reported."""
+        ``on_error``, naming the paths still recorded. In strict mode a
+        request refused because no coordinator listens at the volume's local
+        endpoint, with no answer earlier in the walk, is logged instead:
+        nothing the caller does can release those grants, and the next
+        coordinator's sweep will. Degrade mode never reaches that branch: the
+        refused request already counted a degradation."""
         rels = sorted({rel for written in self._grant_incarnations.values() for rel in written})
-        if failure.nobody_listening and not failure.held:
+        if failure.nobody_listening:
             logger.warning(
                 "CoherentVolume close reached no coordinator; its write grants on %s "
                 "are left to the next coordinator's sweep",
@@ -5102,18 +5114,20 @@ def install(
 ) -> CoherentVolume:
     """Patch ``builtins.open`` + ``io.open`` to route managed-path opens through
     a process-singleton :class:`CoherentVolume`. Idempotent — a second call
-    returns the already-installed volume (one workspace per process in v1),
-    unless that volume was closed, by its own ``close()`` or a ``with`` block:
-    then the shim is replaced with a new volume. Reverse with
-    :func:`uninstall`, which also closes the volume, or use the
-    :func:`coherent_workspace` context manager. Opt-in and demo-grade — see the
-    coverage matrix above.
+    returns the already-installed volume (one workspace per process in v1).
+    When that volume was closed, by its own ``close()`` or a ``with`` block,
+    this raises :class:`~ccs.core.exceptions.CoherenceError` instead, and
+    managed opens keep raising, until :func:`uninstall` removes the shim: a
+    replacement here would leave an enclosing :func:`coherent_workspace` with
+    no shim once the replacing block ends. Reverse with :func:`uninstall`,
+    which also closes the volume, or use the :func:`coherent_workspace`
+    context manager. Opt-in and demo-grade — see the coverage matrix above.
     """
     global _shim_state
     if _shim_state is not None:
-        if not _shim_state.volume.closed:
-            return _shim_state.volume
-        _retire_shim()
+        if _shim_state.volume.closed:
+            raise CoherenceError(_SHIM_VOLUME_CLOSED_MESSAGE)
+        return _shim_state.volume
     volume = CoherentVolume(
         root, managed=managed, on_error=on_error, on_stale_read=on_stale_read,
         on_stale_write=on_stale_write, config=config, bind_host=bind_host,
@@ -5176,11 +5190,10 @@ def coherent_workspace(
 
     Reentrant-safe: if a shim is already installed (e.g. a nested
     ``coherent_workspace``), this yields the existing volume and neither
-    uninstalls nor closes on exit — the outer context owns both. A shim whose
-    volume was closed counts as not installed: this block replaces it and owns
-    the new one.
+    uninstalls nor closes on exit — the outer context owns both. Over a shim
+    whose volume was closed, entering raises, as :func:`install` does.
     """
-    already_installed = _shim_state is not None and not _shim_state.volume.closed
+    already_installed = _shim_state is not None
     volume = install(
         root, managed=managed, on_error=on_error, on_stale_read=on_stale_read,
         on_stale_write=on_stale_write, config=config, bind_host=bind_host,
