@@ -4450,16 +4450,25 @@ def _regrant_unless_overtaken(
     exactly as if the commit had come right after the grant, and records no
     observation of a version it never read.
 
-    The SHARED grant also clears the pending-invalidation marker the peer's
-    write left: this read acknowledges it. Kept on a SHARED row, the transient
-    sweep expired it to INVALID a minute later, and the next read was warned
-    stale with no new version (#523).
+    A read of the bytes the coordinator recorded also clears the pending-
+    invalidation marker the peer's write left: it acknowledges that write. Kept
+    on a SHARED row, the transient sweep expired it to INVALID a minute later,
+    and the next read was warned stale with no new version (#523). A read of
+    other bytes -- taken before a commit it is now granted at -- keeps it, so an
+    optimistic commit built from those bytes is refused as mid-transition while
+    the marker stands and its writer reads again. A file with no recorded
+    content has had no commit since it was registered, so no read of it can
+    predate one, and any read of it acknowledges.
     """
     registry = coordinator.registry
     with registry.abort_guard():
         artifact = registry.get_artifact(artifact_id)
         overtaken = artifact is not None and artifact.version != classified_version
-        if not overtaken:
+        read_the_recorded_bytes = artifact is not None and (
+            not coordinator_holds_content_claim(artifact.content_hash)
+            or content_hash == artifact.content_hash
+        )
+        if read_the_recorded_bytes and not overtaken:
             _clear_acknowledged_marker(registry, artifact_id, agent_id)
         registry.set_agent_state(
             artifact_id, agent_id,

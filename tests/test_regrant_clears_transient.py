@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -162,12 +163,27 @@ def test_a_strict_bash_retry_a_minute_after_its_deny_still_goes_through(tmp_path
 # --- the grant itself, on both registries (the shared ``registry`` fixture) ------
 
 
+def _marked_reader(registry: object) -> tuple[uuid.UUID, uuid.UUID]:
+    """A reader a peer's write left INVALID with its marker, on ``plan.md`` at
+    v1 with the bytes ``v1``."""
+    artifact_id, reader = uuid.uuid4(), uuid.uuid4()
+    registry.register_artifact(  # type: ignore[attr-defined]
+        Artifact(id=artifact_id, name=_PATH, version=1, content_hash=_hash("v1")), content="",
+    )
+    registry.set_agent_state(artifact_id, reader, MESIState.INVALID, tick=1)  # type: ignore[attr-defined]
+    registry.set_agent_transient(artifact_id, reader, TransientState.SIA, entered_tick=1)  # type: ignore[attr-defined]
+    return artifact_id, reader
+
+
 def _grant(registry: object, grant: str, ids: tuple[uuid.UUID, uuid.UUID]) -> None:
-    """Grant SHARED after a stale read, the way the ``grant`` route does."""
+    """Grant SHARED after a stale read, the way the ``grant`` route does. The
+    read route reads the recorded bytes."""
     artifact_id, reader = ids
     server = SimpleNamespace(registry=registry)  # the grant reads only the registry
     if grant == "read":
-        _regrant_unless_overtaken(server, artifact_id, reader, classified_version=1, tick=2, content_hash=None)
+        _regrant_unless_overtaken(
+            server, artifact_id, reader, classified_version=1, tick=2, content_hash=_hash("v1"),
+        )
     else:
         command_runs = grant == "bash-or-grep-ran"
         _apply_bash_grep_regrants(
@@ -181,12 +197,7 @@ def test_the_grant_after_a_stale_read_clears_the_marker_on_either_registry(regis
     """Whichever route grants it, the reader ends SHARED with no marker, so the
     transient sweep has nothing to expire. A strict Bash or Grep deny grants
     the read too (the retry goes through), so it clears the marker as well."""
-    artifact_id, reader = uuid.uuid4(), uuid.uuid4()
-    registry.register_artifact(  # type: ignore[attr-defined]
-        Artifact(id=artifact_id, name=_PATH, version=1, content_hash=_hash("v1")), content="",
-    )
-    registry.set_agent_state(artifact_id, reader, MESIState.INVALID, tick=1)  # type: ignore[attr-defined]
-    registry.set_agent_transient(artifact_id, reader, TransientState.SIA, entered_tick=1)  # type: ignore[attr-defined]
+    artifact_id, reader = _marked_reader(registry)
 
     _grant(registry, grant, (artifact_id, reader))
 
@@ -195,3 +206,132 @@ def test_the_grant_after_a_stale_read_clears_the_marker_on_either_registry(regis
     service = CoordinatorService(registry)  # type: ignore[arg-type]
     assert service.enforce_transient_timeouts(current_tick=10**6, timeout_ticks=_TRANSIENT_TIMEOUT) == 0
     assert registry.get_agent_state(artifact_id, reader) == MESIState.SHARED  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("classified_version", "content_hash"),
+    [(0, _hash("v1")), (1, _hash("older")), (1, None)],
+    ids=["overtaken", "other-bytes", "no-hash"],
+)
+def test_a_read_that_did_not_see_the_recorded_bytes_keeps_the_marker_on_either_registry(
+    registry: object, classified_version: int, content_hash: str | None,
+) -> None:
+    """Only a read of the recorded bytes acknowledges the peer's write. A read
+    overtaken by a commit stays INVALID; a read of other bytes, or one that
+    sent no hash, is granted SHARED but keeps the marker, so an optimistic
+    commit built from it is still refused as mid-transition."""
+    artifact_id, reader = _marked_reader(registry)
+
+    _regrant_unless_overtaken(
+        SimpleNamespace(registry=registry), artifact_id, reader,
+        classified_version=classified_version, tick=2, content_hash=content_hash,
+    )
+
+    state = MESIState.INVALID if classified_version == 0 else MESIState.SHARED
+    assert registry.get_agent_state(artifact_id, reader) == state  # type: ignore[attr-defined]
+    assert registry.get_agent_transient(artifact_id, reader) == TransientState.SIA  # type: ignore[attr-defined]
+
+
+def test_a_read_of_a_file_with_no_recorded_content_clears_the_marker_on_either_registry(registry: object) -> None:
+    """A file registered with no content (first seen through Bash or an edit)
+    has had no commit since, so no read of it can predate one: any read of it,
+    hashed or not, acknowledges the peer's write."""
+    artifact_id, reader = uuid.uuid4(), uuid.uuid4()
+    registry.register_artifact(  # type: ignore[attr-defined]
+        Artifact(id=artifact_id, name=_PATH, version=1, content_hash=""), content="",
+    )
+    registry.set_agent_state(artifact_id, reader, MESIState.INVALID, tick=1)  # type: ignore[attr-defined]
+    registry.set_agent_transient(artifact_id, reader, TransientState.SIA, entered_tick=1)  # type: ignore[attr-defined]
+
+    _regrant_unless_overtaken(
+        SimpleNamespace(registry=registry), artifact_id, reader,
+        classified_version=1, tick=2, content_hash=_hash("on-disk"),
+    )
+
+    assert registry.get_agent_state(artifact_id, reader) == MESIState.SHARED  # type: ignore[attr-defined]
+    assert registry.get_agent_transient(artifact_id, reader) is None  # type: ignore[attr-defined]
+
+
+class _CommitAsTheGrantLocks:
+    """The registry, with a peer's optimistic commit landing just before the
+    grant takes the registry lock."""
+
+    def __init__(self, registry: object, artifact_id: uuid.UUID) -> None:
+        self._registry = registry
+        self._artifact_id = artifact_id
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._registry, name)
+
+    @contextmanager
+    def abort_guard(self, *args: object, **kwargs: object) -> Iterator[None]:
+        landed = self._registry.commit_cas(  # type: ignore[attr-defined]
+            self._artifact_id, uuid.uuid4(), expected_version=1, content_hash=_hash("v2"), tick=2,
+        )
+        assert isinstance(landed, tuple), landed
+        with self._registry.abort_guard(*args, **kwargs):  # type: ignore[attr-defined]
+            yield
+
+
+def test_a_commit_landing_as_the_grant_takes_the_lock_keeps_the_marker_on_either_registry(
+    registry: object,
+) -> None:
+    """The overtaken check and the clear run under the registry lock, so a
+    commit that lands just before it leaves the reader INVALID with its marker,
+    not INVALID with the marker cleared by a check made before the commit."""
+    artifact_id, reader = _marked_reader(registry)
+
+    _regrant_unless_overtaken(
+        SimpleNamespace(registry=_CommitAsTheGrantLocks(registry, artifact_id)), artifact_id, reader,
+        classified_version=1, tick=3, content_hash=_hash("v1"),
+    )
+
+    assert registry.get_agent_state(artifact_id, reader) == MESIState.INVALID  # type: ignore[attr-defined]
+    assert registry.get_agent_transient(artifact_id, reader) == TransientState.SIA  # type: ignore[attr-defined]
+
+
+# --- an optimistic commit after the re-read ---------------------------------------
+
+
+def _cas(http: _Client, sid: str, expected_version: int) -> dict:
+    return http.post("/hooks/post-edit-cas", {
+        "session_id": sid, "path": _PATH, "content_hash": _hash("cas"), "expected_version": expected_version,
+    })[1]
+
+
+@pytest.mark.parametrize("peer_lets_go", [True, False], ids=["peer-stopped", "peer-holds"])
+def test_a_cas_after_the_reread_is_arbitrated_by_version_not_refused_as_mid_transition(
+    live: _Live, peer_lets_go: bool,
+) -> None:
+    """After the re-read of the peer's committed bytes, the reader's optimistic
+    commit meets the version check and the holder check, not the marker: at the
+    version it re-read it lands once the peer has let go and is refused
+    ``other_holder`` while the peer still holds the file; at the version from
+    before the peer's write it is refused ``version_mismatch``. It used to be
+    refused ``caller_in_transient_state`` until the sweep ran."""
+    reader, peer = _sid(f"cas-reader-{peer_lets_go}"), _sid(f"cas-peer-{peer_lets_go}")
+    recorded = _peer_makes_reader_stale(live.client, "peer-committed", reader, peer)
+    if peer_lets_go:
+        assert live.client.post("/hooks/session-stop", {"session_id": peer})[0] == 200
+    _reread(live.client, "read", reader, recorded)
+
+    assert _cas(live.client, reader, 1).get("reason") == "version_mismatch"
+    if peer_lets_go:
+        assert _cas(live.client, reader, 2) == {"ok": True, "version": 3}
+    else:
+        assert _cas(live.client, reader, 2).get("reason") == "other_holder"
+
+
+def test_a_reread_of_older_bytes_keeps_the_marker_and_its_cas_is_refused(live: _Live) -> None:
+    """A read whose bytes were taken before the peer's commit -- a volume reads
+    the file before it asks the coordinator -- is granted SHARED at the new
+    version but does not acknowledge the peer's write, so its optimistic commit
+    is refused ``caller_in_transient_state`` and its writer reads again instead
+    of overwriting the peer's change."""
+    reader, peer = _sid("older-bytes-reader"), _sid("older-bytes-peer")
+    _peer_makes_reader_stale(live.client, "peer-committed", reader, peer)
+    assert live.client.post("/hooks/session-stop", {"session_id": peer})[0] == 200
+
+    _reread(live.client, "read", reader, _hash("v1"))
+    assert _marker(live.server, reader) == (MESIState.SHARED, TransientState.SIA)
+    assert _cas(live.client, reader, 2).get("reason") == "caller_in_transient_state"
