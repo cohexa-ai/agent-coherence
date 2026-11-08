@@ -6903,9 +6903,11 @@ _FAILED_COMMIT = "coordinator request to /hooks/post-edit failed: HTTP {status}"
 _REDIRECTED = ", a redirect, which this client never follows"
 _UNCONFIRMED_COMMIT = (
     "The write's bytes are on disk at {rel}, but its commit was answered with "
-    "HTTP {status}, so the coordinator may have recorded the write. One "
-    "best-effort release of its grant was attempted. Re-read the path before "
-    "writing it again."
+    "HTTP {status}, so the coordinator may have recorded the write. Its write "
+    "grant was released. If the coordinator did not record the write, a read "
+    "that refuses stale bytes refuses this path until a write() of it is "
+    "recorded, and reading again does not clear that; write() the path again, "
+    "with these bytes or a change built from them, which records it either way."
 )
 
 

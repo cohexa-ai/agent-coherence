@@ -19,12 +19,16 @@ from pathlib import Path
 
 import pytest
 
+import ccs.adapters.coherent_volume as coherent_volume_module
+import ccs.mcp.server as server_module
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
-from ccs.cli._coherence_client import escape_nonprintable
+from ccs.adapters.coherent_volume import CoherentVolume
+from ccs.cli._coherence_client import CoordinatorUnavailable, escape_nonprintable
 from ccs.core.exceptions import CoherenceDirRefused, CoherenceError, CoordinatorUnreachable
 from ccs.mcp.server import build_server, lifespan
 from ccs.mcp.session import SessionConfig, build_volume
 from tests.coherence_link_helpers import plant_link
+from tests.coordinator_helpers import serve_in_process, write_holders
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -206,6 +210,100 @@ def test_concurrent_volume_access_serializes_without_a5(tmp_path: Path, monkeypa
     results = asyncio.run(go())
     assert results == [b"v1", b"v1", b"v1"]
     assert stop_coordinator(tmp_path) is False
+
+
+# --- shutdown closes the volume ---------------------------------------------
+
+
+def _write_then_shut_down(tmp_path: Path, monkeypatch) -> str:
+    """Run the lifespan against a coordinator another process could own (one in
+    this process, which ``stop_coordinator`` leaves running), write a managed
+    file through the server's volume, and shut down. Returns the volume's
+    agent id."""
+    monkeypatch.setenv("SWG_ROOT", str(tmp_path))
+    monkeypatch.setenv("SWG_MANAGED", "data/**")
+    server = build_server()
+
+    async def go() -> str:
+        async with lifespan(server) as ctx:
+            async with ctx.lock:
+                ctx.volume.write("data/shared.txt", b"from the server")
+            return ctx.volume.agent_id
+
+    return asyncio.run(go())
+
+
+def test_shutting_down_the_server_gives_back_its_write_grants(tmp_path: Path, monkeypatch) -> None:
+    """A normal shutdown closes the server's volume before the coordinator is
+    stopped, so a refuse-mode peer is admitted at once instead of after the
+    coordinator's sweep.
+
+    Prevents every file the server wrote staying held after it exits."""
+    (tmp_path / "data").mkdir()
+    coordinator = serve_in_process(tmp_path, "mcp-shutdown")
+    try:
+        writer = _write_then_shut_down(tmp_path, monkeypatch)
+        assert write_holders(coordinator, "data/shared.txt") == set(), f"{writer} still holds the file"
+        peer = CoherentVolume(tmp_path, managed=("data/**",), on_held="refuse")
+        peer.write("data/shared.txt", b"from the peer")
+        assert write_holders(coordinator, "data/shared.txt") == {peer.agent_id}
+    finally:
+        coordinator.shutdown()
+
+
+def test_a_close_that_fails_at_shutdown_is_logged_and_the_coordinator_still_stops(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """Prevents a coordinator outage at shutdown leaving a coordinator this
+    server started running."""
+    (tmp_path / "data").mkdir()
+    coordinator = serve_in_process(tmp_path, "mcp-shutdown-fails")
+    real_post = coherent_volume_module._coordinator_post
+
+    def no_answer_to_the_stop(endpoint, path, payload, **kwargs):
+        if path == "/hooks/session-stop":
+            raise CoordinatorUnavailable("scripted: the answer was lost")
+        return real_post(endpoint, path, payload, **kwargs)
+
+    stopped: list[Path] = []
+    real_stop = server_module.stop_coordinator
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_post", no_answer_to_the_stop)
+    monkeypatch.setattr(server_module, "stop_coordinator", lambda root: stopped.append(root) or real_stop(root))
+    try:
+        with caplog.at_level("WARNING", logger="ccs.mcp.server"):
+            _write_then_shut_down(tmp_path, monkeypatch)
+        assert stopped == [tmp_path.resolve()]
+        assert any("close" in record.getMessage() for record in caplog.records)
+    finally:
+        coordinator.shutdown()
+
+
+def test_shutdown_closes_the_volume_before_it_stops_the_coordinator_whatever_the_close_raises(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An in-process coordinator must still answer the close, so the close
+    comes first; and an error the close does not expect still lets the
+    coordinator stop.
+
+    Prevents a close sent to a stopped coordinator, and a coordinator this
+    server started left running after an unexpected close error."""
+    (tmp_path / "data").mkdir()
+    coordinator = serve_in_process(tmp_path, "mcp-shutdown-order")
+    order: list[str] = []
+
+    def close_then_fail(volume: CoherentVolume) -> None:
+        order.append("close")
+        raise RuntimeError("unexpected close failure")
+
+    real_stop = server_module.stop_coordinator
+    monkeypatch.setattr(coherent_volume_module.CoherentVolume, "close", close_then_fail)
+    monkeypatch.setattr(server_module, "stop_coordinator", lambda root: order.append("stop") or real_stop(root))
+    try:
+        with pytest.raises(RuntimeError, match="unexpected close failure"):
+            _write_then_shut_down(tmp_path, monkeypatch)
+        assert order == ["close", "stop"]
+    finally:
+        coordinator.shutdown()
 
 
 # --- stdout purity (fd-level, via a real subprocess) -------------------------

@@ -194,6 +194,30 @@ def test_a_substrate_request_that_gets_no_answer_is_unreachable_within_the_timeo
     assert recorded_version(server, REL) == version, _BYPASSED
 
 
+@pytest.mark.parametrize("op", ["release", "close"])
+def test_a_volume_release_that_gets_no_answer_is_unreachable_within_the_timeout(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, monkeypatch: pytest.MonkeyPatch,
+    op: str,
+) -> None:
+    """``release()``, or ``close()``, sent to a coordinator that never answers
+    raises ``CoordinatorUnreachable`` once the client's read timeout runs out,
+    on one connection, and keeps the grant recorded for a second call. The
+    grant still stands at the coordinator."""
+    vol = _volume(tmp_path, fast_cfg)
+    vol.write(REL, b"v2")
+    holder = vol.agent_id
+    with SilentListener() as silent:
+        _point_at(vol, silent.port, monkeypatch)
+        exc, elapsed = _raised_in(lambda: vol.release(REL) if op == "release" else vol.close())
+
+    assert type(exc) is CoordinatorUnreachable, repr(exc)
+    _assert_ended_by_the_read_timeout(exc.__cause__, elapsed, waited=TIMEOUT_SEC)
+    assert silent.accepted == 1, "the request was retried"
+    assert _routes(silent.silenced) == ["/hooks/post-edit" if op == "release" else "/hooks/session-stop"]
+    assert write_holders(server, REL) == {holder}
+    assert vol._grant_incarnations.get(vol.incarnation) == {REL}, "an unanswered release dropped the grant"
+
+
 # --- a commit that reached the coordinator: CommitUnconfirmed ----------------
 
 

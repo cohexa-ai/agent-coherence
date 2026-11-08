@@ -148,10 +148,11 @@ _READ_DESC = (
     "swg_reacquire to recover before writing. If the bytes on disk are not the "
     "content at the current version, the read is DENIED with reason=stale_view "
     "and no version. A peer's commit still reaching disk clears on its own: "
-    "swg_reacquire, then swg_read again, retrying for a few seconds. Only if it "
-    "stays denied past that was the file changed outside the coordinator (an "
-    "out-of-band edit, or a commit whose disk write failed): swg_write the "
-    "content swg_reacquire returned (or your merge of it), then swg_read. A "
+    "swg_reacquire, then swg_read again, retrying for a few seconds. If it "
+    "stays denied past that, the bytes on disk were never recorded (an "
+    "out-of-band edit, a commit whose disk write failed, or a write whose commit "
+    "did not reach the coordinator); reading again does not clear it: swg_write "
+    "the content swg_reacquire returned (or your merge of it), then swg_read. A "
     "write made sooner can be overwritten by a peer commit still reaching "
     "disk." + _SCOPE_CLAUSE
 )
@@ -320,18 +321,29 @@ async def lifespan(server: FastMCP) -> AsyncIterator[ServerContext]:
     """Own the coordinator for the server's lifetime.
 
     Enter → construct the strict-only volume (self-spawns/attaches; raises
-    fail-closed if it can't). Exit → ``stop_coordinator``. Does NOT call
-    ``connect_or_spawn`` — construction already did, so calling it again would
-    double-spawn.
+    fail-closed if it can't). Exit → close the volume, which gives back its
+    write grants (a failed close is logged), then ``stop_coordinator``: an
+    in-process coordinator must still answer the close. The coordinator is
+    stopped whatever the close does. Only a normal end runs this; nothing
+    handles a signal. Does NOT call ``connect_or_spawn`` — construction
+    already did, so calling it again would double-spawn.
     """
     config = SessionConfig.from_env()
     volume = build_volume(config)  # blocking, fail-closed
     logger.info("stale-write-guard-fs attached: root=%s managed=%s", config.root, config.managed)
+    ctx = ServerContext(volume=volume, config=config, lock=asyncio.Lock())
     try:
-        yield ServerContext(volume=volume, config=config, lock=asyncio.Lock())
+        yield ctx
     finally:
-        stop_coordinator(config.root)
-        logger.info("stale-write-guard-fs coordinator stopped: root=%s", config.root)
+        try:
+            async with ctx.lock:
+                try:
+                    volume.close()
+                except CoherenceError as exc:
+                    logger.warning("stale-write-guard-fs could not close its volume: %s", exc)
+        finally:
+            stop_coordinator(config.root)
+            logger.info("stale-write-guard-fs coordinator stopped: root=%s", config.root)
 
 
 # --- result builders ---------------------------------------------------------

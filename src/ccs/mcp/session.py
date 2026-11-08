@@ -6,8 +6,9 @@
 The MCP client spawns this server as a stdio subprocess per session; the server
 owns exactly ONE :class:`~ccs.adapters.coherent_volume.CoherentVolume` for that
 session's workspace. Constructing the volume self-spawns/attaches the loopback
-coordinator (strict-only, fail-closed); the server lifespan calls
-``stop_coordinator`` on exit. The server NEVER constructs a degrade-mode volume —
+coordinator (strict-only, fail-closed); on a normal exit the server lifespan
+closes the volume, giving back its write grants, then calls
+``stop_coordinator``. The server NEVER constructs a degrade-mode volume —
 a degrade write skips the version check and silently re-opens the lost update, so
 strict-only is the honesty floor.
 """

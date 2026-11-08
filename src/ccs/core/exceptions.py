@@ -54,9 +54,9 @@ HOLD_VERSION_UNCONFIRMED = "version_unconfirmed"
 # The coordinator refused the re-validate read because the bytes are not the
 # content it records at the version, which has not moved: a peer's write()
 # whose bytes landed before its commit, a change made outside the coordinator,
-# or a commit's disk write failed (#405). The same answer a version-checked
-# read refuses as the split pair (#264), hence the same value as
-# SPLIT_PAIR_REASON. Split out of READ_DENIED because its recovery differs: a
+# a commit's disk write failed (#405), or a write whose commit never reached the
+# coordinator (#526). The same answer a version-checked read refuses as the
+# split pair (#264), hence the same value as SPLIT_PAIR_REASON. Split out of READ_DENIED because its recovery differs: a
 # reacquire returns the bytes on disk but does not record them, so the hold
 # repeats until the peer's commit lands or a write() records them.
 HOLD_SPLIT_PAIR = "split_pair"
@@ -1035,10 +1035,11 @@ class CasRetriesExhausted(_CarriesGenerationPair, CoherenceError):
     not: another agent holds the grant at an unchanged version. Against the
     cross-process coordinator (``CoherentVolume``) nothing the caller does
     releases it. The holder does: a Claude Code session at its turn end, a
-    ``CoherentVolume`` at its own next ``write_cas`` of that file or any
-    ``write_cas`` retry, ``write_cas_at``, ``atomic_publish`` or
-    ``reacquire()`` (a ``session-stop`` naming only that volume's
-    ``session_id`` releases nothing). Otherwise the coordinator's reclaim
+    ``CoherentVolume`` when it calls ``release()`` on the file or ``close()``,
+    or at its own next ``write_cas`` of that file or any ``write_cas`` retry,
+    ``write_cas_at``, ``atomic_publish`` or ``reacquire()`` (a
+    ``session-stop`` naming only that volume's ``session_id`` releases
+    nothing). Otherwise the coordinator's reclaim
     does. In process (``AgentRuntime``) the loop's own re-fetch
     downgrades the holder, so ``other_holder`` there clears on the next attempt
     unless the holder re-acquires.
@@ -1299,7 +1300,10 @@ class CommitUnconfirmed(CoherenceError):
     when the request was never sent, because the outcome they must reconcile is
     the same. The write
     may or may not have landed; reconcile by re-reading, then retry only if
-    absent. Carries :data:`COMMIT_UNCONFIRMED_REASON`."""
+    absent. A pessimistic ``write()`` is the exception: its bytes are already
+    on disk, a read that refuses stale bytes refuses them until a write of the
+    path is recorded, so write the path again, which records it either way.
+    Carries :data:`COMMIT_UNCONFIRMED_REASON`."""
 
     reason = COMMIT_UNCONFIRMED_REASON
 
@@ -1313,9 +1317,11 @@ class CoordinatorUnreachable(CoherenceError):
     :class:`CommitUnconfirmed` instead, because it may have landed.
 
     No write was version-committed. A pessimistic ``write()`` that raises it
-    from its commit has already put its bytes on disk, and its message says so.
-    One that raises it from its grant request has written nothing, though the
-    request may have taken the grant, which ``reacquire()`` releases. An attached
+    from its commit has already put its bytes on disk, unrecorded, and its
+    message says so: writing the path again records them, and re-reading does
+    not. One that raises it from its grant request has written nothing, though
+    the request may have taken the grant, which ``release()`` or
+    ``reacquire()`` releases. An attached
     volume or substrate session keeps the endpoint it attached to, so recovery
     depends on what happened to that coordinator. If it only stalled (for
     example, a stopped process that resumes) and comes back on the same port,
@@ -1357,7 +1363,7 @@ class CoordinatorFailed(CoherenceError):
     A refuse-mode ``write()`` raises it as well, with nothing written, for two
     answers to its grant request. ``unavailable``: the coordinator could not
     decide in time and the abandoned work may still take the grant, so retry, or
-    call ``reacquire()`` if giving up. And a refusal naming this volume's own
+    call ``release()`` on the path if giving up. And a refusal naming this volume's own
     earlier incarnation, whose release did not land: a plain retry never sends
     that release again, so call ``reacquire()``.
 

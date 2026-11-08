@@ -8,6 +8,38 @@ Alpha — APIs may change before `v1.0`.
 
 ### Added
 
+- **`CoherentVolume.release(path)` gives back the volume's write grant on one
+  file, and `close()` gives back all of them and ends the volume (#505).** A
+  successful `write()` keeps the file's write grant after it returns, and
+  until now the only way to give it back was `reacquire()`, which drops every
+  hold and starts a new attempt, so a refuse-mode peer waited for the
+  coordinator's sweep, about 600 s. `release(path)` releases the grant on one
+  file under every attempt of the volume that took one, and keeps every other
+  hold; the volume keeps a read of the version it held, so it reads and writes
+  the file again with no `reacquire()` until a peer writes it, and a refuse-mode
+  peer is admitted at once. The volume decides what to release from its own
+  record, so `release()` of a path it never wrote, or of another spelling of a
+  path it wrote (a different case or Unicode form, #506), sends nothing.
+  `close()` releases every grant; from then on every operation but `close()`
+  raises `CoherenceError` and sends nothing, and the new `closed` property says
+  so. `with CoherentVolume(...) as vol:` closes on exit, and when the body
+  raised, a close that fails is logged so the body's error propagates. A
+  release or close the coordinator does not confirm keeps the grant recorded
+  and raises in strict mode (`CoordinatorUnreachable` with no usable answer,
+  `CoordinatorFailed` for an HTTP 5xx or the failure envelope, `CoherenceError`
+  for a degraded answer or a grant reported still held); calling it again sends
+  it again, and degrade mode counts a degradation, warning on the first. In
+  strict mode, when the volume's own local coordinator refuses the connect
+  because nothing listens there, `close()` logs the paths left to the next
+  coordinator's sweep instead of raising. It still raises for a connect that
+  times out, a remote coordinator, or a refusal after the coordinator reported a
+  grant still held earlier in the same `close()`. Nothing closes a volume at
+  interpreter exit: a close there fails in the process that hosts the
+  coordinator. Against a coordinator through 0.15.0 a release leaves the
+  volume's copy `INVALID`, so call `reacquire()` before writing the file again.
+  The guide's new "Letting go: `release()` and `close()`" section has the
+  details.
+
 - **A strict surface that gets no usable answer from its coordinator raises
   `CoordinatorUnreachable` (#376).** Until now a strict `CoherentVolume` or a
   `CoordinatedSubstrate` whose coordinator was gone raised a bare
@@ -167,8 +199,9 @@ Alpha — APIs may change before `v1.0`.
   naming the holder, with nothing written and the holder untouched. The default,
   `on_held="displace"`, changes nothing. Refuse mode needs `on_error="strict"` and
   `managed` globs, and is not available with `remote_endpoint`. A successful
-  `write()` keeps its grant across later commits, and `reacquire()` is the
-  release; it releases every path the attempt holds. The other answers to the
+  `write()` keeps its grant across later commits until `release(path)` or
+  `close()` gives it back; `reacquire()` releases too, every path the attempt
+  holds. The other answers to the
   grant request are typed too, and none writes bytes: `unavailable` raises
   `CoordinatorFailed`, a refusal by this volume's own unreleased grant raises
   `CoordinatorFailed` pointing at `reacquire()`, and a body without `ok: true`
@@ -187,6 +220,37 @@ Alpha — APIs may change before `v1.0`.
   leaves open.
 
 ### Changed
+
+- **Leaving `coherent_workspace()`, calling `uninstall()` and shutting down the
+  `stale-write-guard-fs` server now close their volume, giving back its write
+  grants (#505).** Before, every file the volume wrote stayed held until the
+  coordinator's sweep took it back, about 600 s later, so a refuse-mode peer
+  waited that long. Now each grant becomes a read on the way out, peers are
+  admitted at once, and the volume raises `CoherenceError` if used again. A
+  block whose body returned raises if the coordinator does not confirm the
+  release, as `close()` does; a block whose body raised keeps that error and
+  logs the failed release. A nested `coherent_workspace()` leaves the outer
+  volume open. `uninstall()` restores `open()` before it closes, so a close that
+  raises leaves no shim behind; call the volume's `close()` to send it again.
+  In `try: ... finally: uninstall()` that close failure replaces the body's
+  error, so prefer `coherent_workspace()`, which logs it. A managed file the
+  shim opened for writing must be closed inside the block: one still open when
+  the volume closes is named in a warning, and closing it afterwards raises and
+  writes nothing. While the shim's volume is closed (by its own `close()` or a
+  `with` block), managed opens, `install()` and `coherent_workspace()` raise
+  until `uninstall()` removes the shim. The server closes its volume only
+  when the host ends it normally, before it stops a coordinator it started; a
+  close that fails is logged to stderr, and the coordinator is stopped whatever
+  the close does.
+
+- **`write()` returns a `WriteResult` (#526).** It returned `None`. Its
+  `disk_differs` is `True` when the coordinator reported, as it admitted the
+  write's grant request, that the file held bytes it had not recorded and the
+  write replaced them: this volume's own earlier write whose commit did not
+  reach the coordinator, or an edit made outside the coordinator that the write
+  overwrote. `False` says only that the coordinator did not report it. Code that
+  ignores the return value is unaffected. `WriteResult` is exported from
+  `ccs.adapters` and `ccs.adapters.coherent_volume`.
 
 - **A coordinator start refuses a workspace whose `.coherence` is a symbolic
   link or not a directory, or holds a link directly inside it (#498).** A
@@ -470,6 +534,21 @@ Alpha — APIs may change before `v1.0`.
   so nothing changes there. The guide's "Hold reasons" table has the details.
 
 ### Fixed
+
+- **A `write()` whose commit was not recorded says how to record it, instead of
+  telling the caller to re-read (#526).** When a strict `write()`'s commit got no
+  answer, an HTTP 5xx or the coordinator's failure envelope after its bytes
+  reached disk, the error said "Re-read the path before writing it again". When
+  the commit did not land, the coordinator still records the old content while
+  the new bytes are on disk, so every read that refuses stale bytes refuses the
+  path, as a `split_pair`, and reading again never clears that; only a write
+  that commits does. The error now says so, and says to write the path again,
+  with these bytes or a change built from them, which records them whether or
+  not the first commit landed. It also says whether the release of the write's
+  grant was confirmed, and names `release(path)` to send one that was not. The
+  split-pair refusal names this cause, a write whose commit did not reach the
+  coordinator, on every surface that lists the causes: the volume's read
+  refusal, the effect fence's hold, the `swg_read` description, and the guide.
 
 - **A warn-mode session that re-reads a file after another session edited it
   is no longer warned stale again a minute later (#523).** Another session's
