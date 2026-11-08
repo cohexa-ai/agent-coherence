@@ -5732,7 +5732,7 @@ class SqliteArtifactRegistry:
         """KTD-11 session-stop release iteration: return artifacts where the
         given agent holds any of the listed MESI states. Used by Unit 4's
         ``/hooks/session-stop`` handler to enumerate uncommitted grants for
-        release via :class:`CoordinatorService.invalidate`."""
+        release via :meth:`CoordinatorService.release_to_reader`."""
         state_names = [s.name for s in states]
         if not state_names:
             return []

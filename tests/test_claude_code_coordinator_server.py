@@ -14365,6 +14365,7 @@ def test_a_session_stop_that_keeps_a_grant_answers_per_grant(
     release = coordinator.service.release_to_reader
 
     def failing_on_spec(request: Any, **kwargs: Any):
+        assert kwargs.get("abort") is not None
         if request.artifact_id == spec_id:
             raise CoherenceError("release refused by the test")
         return release(request, **kwargs)
@@ -14397,7 +14398,8 @@ def test_a_failed_edit_release_that_keeps_its_grant_answers_per_grant(
     agent_id = session_to_agent_id(sid)
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
 
-    def refusing(*_args: Any, **_kwargs: Any):
+    def refusing(*_args: Any, **kwargs: Any):
+        assert kwargs.get("abort") is not None
         raise CoherenceError("release refused by the test")
 
     monkeypatch.setattr(coordinator.service, "release_to_reader", refusing)

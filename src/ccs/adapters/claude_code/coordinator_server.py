@@ -3742,8 +3742,7 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
             # bumping the version. It keeps a read of the version it held
             # (#513); a report from a caller holding no write grant changes
             # nothing.
-            artifact = coordinator.registry.get_artifact(artifact_id)
-            if artifact is not None:
+            if coordinator.registry.has_artifact(artifact_id):
                 # #185: the giver of a live handoff reporting a failed edit
                 # holds nothing here -- its grant went to the successor -- so
                 # this is not a clean release. Read BEFORE any release, and
@@ -3851,8 +3850,9 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
 
     # AC-05: post-edit's wire contract is {ok: bool}; ok-shape degraded
     # envelope keeps clients reading result.get("ok") safe on timeout.
-    # A6: abort threaded into invalidate/commit so a late post-edit aborts at
-    # the registry lock instead of landing a phantom version bump/invalidation.
+    # A6: abort threaded into the release and the commit so a late post-edit
+    # aborts at the registry lock instead of landing a phantom version bump or
+    # release.
     abort = WatchdogAbort()
     _run_or_degrade(
         req, coordinator, work_with_handoff, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort

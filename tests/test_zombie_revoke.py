@@ -558,10 +558,7 @@ def _renew_grant(reg, artifact_id: object, agent_id: object, tick: int) -> None:
     M<->E transitions deliberately preserve the original grant tick, because the
     agent has continuously held *some* write claim. So a holder refreshes its
     max-hold budget the only way the API allows, and the only way a real one
-    does: it releases and re-acquires. The transitions are exactly the ones
-    ``CoordinatorService`` uses -- SHARED under ``invalidate``, observing
-    nothing, to release (service.py, ``release_to_reader``) and ``write`` to
-    acquire EXCLUSIVE (service.py, the ``write`` grant).
+    does: it releases and re-acquires.
     """
     reg.set_agent_state(
         artifact_id, agent_id, MESIState.SHARED, trigger="invalidate", tick=tick, observed=False

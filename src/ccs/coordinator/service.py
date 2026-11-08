@@ -3598,6 +3598,13 @@ class CoordinatorService:
             if artifact is None:
                 return False
             state = self.registry.get_agent_state(request.artifact_id, request.agent_id)
+            if state in _M_OR_E_STATES:
+                self.registry.clear_agent_transient(request.artifact_id, request.agent_id)
+                self.registry.set_agent_state(
+                    request.artifact_id, request.agent_id, MESIState.SHARED,
+                    trigger="invalidate", tick=request.issued_at_tick, observed=False,
+                )
+                return True
             if state == MESIState.INVALID:
                 self._invalidate_impl(
                     agent_id=request.agent_id,
@@ -3606,14 +3613,7 @@ class CoordinatorService:
                     issuer_agent_id=request.agent_id,
                     issued_at_tick=request.issued_at_tick,
                 )
-            if state not in _M_OR_E_STATES:
-                return False
-            self.registry.clear_agent_transient(request.artifact_id, request.agent_id)
-            self.registry.set_agent_state(
-                request.artifact_id, request.agent_id, MESIState.SHARED,
-                trigger="invalidate", tick=request.issued_at_tick, observed=False,
-            )
-            return True
+            return False
 
     def _invalidate_impl(
         self,
