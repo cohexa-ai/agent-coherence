@@ -44,7 +44,9 @@ Exit codes:
      persist failure, member-path containment refusal — symlink component,
      hardlinked regular file (external co-owner), non-regular leaf
      (FIFO/socket/device), ``.coherence`` self-target, workspace escape, or an
-     unreadable non-file member)
+     unreadable non-file member), or a ``.coherence`` that is a symlink or not
+     a directory, or holds a symlink, FIFO, socket or device (#498), refused
+     before anything under it is opened
 - 3: restore CONCLUDED but at least one member ended in an absorbing/hold
      outcome (``conflict`` / ``target_lost`` / ``held_unconfirmed``) or the
      registration was refused — the report on stdout carries the per-member truth
@@ -89,7 +91,7 @@ from ccs.adapters.workspace import (
     WorkspaceRestoreReport,
     WorkspaceVersioner,
 )
-from ccs.cli._coherence_client import err, normalize_workspace_path
+from ccs.cli._coherence_client import err, escape_nonprintable, normalize_workspace_path
 from ccs.coordinator.registry_protocol import CheckpointMember, CheckpointRecord
 from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
@@ -106,6 +108,7 @@ from ccs.core.exceptions import (
     CasVersionConflict,
     CheckpointRegistrationRefused,
     CheckpointUnknown,
+    CoherenceDirRefused,
     CoherenceError,
     CommitUnconfirmed,
 )
@@ -1304,6 +1307,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     except CheckpointPersistFailed as exc:
         err(f"{_PROG}: failed ({exc.reason}): {exc}")
+        _emit_error_envelope(
+            args, exit_code=2, reason=exc.reason, message=str(exc), exc=exc
+        )
+        return 2
+    except CoherenceDirRefused as exc:
+        # A refusal a person must fix (#498), not contention: before the
+        # generic arm, which answers 1. The path came from the workspace, so
+        # it is printed escaped.
+        err(f"{_PROG}: refused ({exc.reason}): {escape_nonprintable(str(exc))}")
         _emit_error_envelope(
             args, exit_code=2, reason=exc.reason, message=str(exc), exc=exc
         )
