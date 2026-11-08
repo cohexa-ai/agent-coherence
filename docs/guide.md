@@ -4897,7 +4897,9 @@ formatter hook that runs after every edit, for example, rewrites the file
 after the edit's commit: on the next turn the session's Read of that file
 carries the warning in warn mode and is denied in strict mode, and its Edit is
 admitted with `"disk_differs": true`, and that edit's commit records the file
-as it then is.
+as it then is. An edit that reached the disk but whose commit never reached the
+coordinator, because the hook failed or the commit was refused, reads the same
+way on the next turn, even though the change is the session's own.
 
 **Reading the counts while the coordinator runs.** `/status?detail=full` adds
 `foreign_writes` to each tracked file the detector has counted anything for,
