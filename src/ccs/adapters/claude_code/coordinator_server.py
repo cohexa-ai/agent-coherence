@@ -95,6 +95,7 @@ from ccs.adapters.claude_code.policy import (
     TrackedArtifactPolicy,
     policy_file_name,
 )
+from ccs.adapters.claude_code.state_dir import check_coherence_dir
 from ccs.coordinator.registry_protocol import (
     RECLAIM_TRIGGERS,
     CheckpointMember,
@@ -1040,6 +1041,10 @@ class CoordinatorHTTPServer:
         on_migrated: Callable[[int], None] | None = None,
     ) -> None:
         self.coordinator_root = Path(coordinator_root).resolve()
+        # #498: before the store open, the policy load and the secret read
+        # below, any of which would follow a link in .coherence. Lifecycle
+        # checks first; this catches a link made since, and a direct build.
+        check_coherence_dir(self.coordinator_root)
         self.bind_host = bind_host
         # Host-header allowlist: loopback always, plus a validated non-loopback
         # bind (cross-host demo). Validates bind_host here at construction — a

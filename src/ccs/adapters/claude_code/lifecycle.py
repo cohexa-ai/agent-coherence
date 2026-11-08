@@ -30,9 +30,11 @@ Key correctness properties:
 from __future__ import annotations
 
 import errno
+import io
 import logging
 import os
 import socket
+import stat
 import sys
 import threading
 import time
@@ -43,7 +45,9 @@ from pathlib import Path
 from uuid import UUID
 
 from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
+from ccs.adapters.claude_code.state_dir import check_coherence_dir, entry_link_refusal
 from ccs.coordinator.sqlite_registry import SCHEMA_USER_VERSION
+from ccs.core.exceptions import COHERENCE_LINK_KIND, CoherenceDirRefused
 
 logger = logging.getLogger(__name__)
 
@@ -280,13 +284,17 @@ def ensure_coordinator_handle(
 
     Returns None (``-1`` from :func:`ensure_coordinator`) where the call can
     neither start nor join a coordinator: no fcntl, an unwritable parent
-    repo, an unopenable pid file (a symlink is refused, with a warning),
-    pid-file churn beyond the revalidation budget, or a join whose retry
-    budget ran out.
+    repo, a pid file it cannot open, pid-file churn beyond the revalidation
+    budget, or a join whose retry budget ran out.
 
     Raises when a start fails, after stopping what it started and releasing
     the flock, so no coordinator is left running:
 
+    - :class:`~ccs.core.exceptions.CoherenceDirRefused` before it creates,
+      writes, joins or probes anything, when ``.coherence`` is a symlink or
+      not a directory, or holds a symlink, FIFO, socket or device directly
+      inside it (#498). No retry clears it: a person replaces the link or
+      mounts a directory at ``.coherence``.
     - :class:`~ccs.coordinator.sqlite_registry.SchemaVersionError` when the
       store open refuses the store. Its ``reason`` says why; its
       :class:`~ccs.coordinator.sqlite_registry.CrossRuntimeSchemaError`
@@ -585,10 +593,16 @@ def connect_or_spawn(
     file and a TCP probe without reaching the spawn loop, so it cannot say
     who bound the coordinator. A caller that needs to know whether it
     started the coordinator calls :func:`ensure_coordinator_handle` (#348).
+
+    Raises :class:`~ccs.core.exceptions.CoherenceDirRefused` before the pid
+    file is read (#498), and what :func:`ensure_coordinator` raises.
     """
     if not _FCNTL_AVAILABLE:
         return -1
 
+    # The fast path never reaches the start's own check, and a linked pid file
+    # naming a live port would join another workspace's coordinator.
+    check_coherence_dir(coordinator_root)
     cfg = config or _DEFAULT_CONFIG
     pid_file = coordinator_root / ".coherence" / "server.pid"
     port = read_port_from_file(pid_file)
@@ -750,12 +764,20 @@ def _ensure_coherence_dir(coordinator_root: Path) -> Path | None:
     dir to 0700 if it pre-exists at a looser mode. Returns the dir path, or None
     if the parent repo is read-only.
 
+    Raises :class:`~ccs.core.exceptions.CoherenceDirRefused` before it creates
+    or changes anything when ``.coherence`` is a symlink or not a directory, or
+    holds a symlink, FIFO, socket or device (#498): a cloned repository can
+    commit one, and the start would then write its state where the link points.
+
     Also writes ``.coherence/.gitignore`` containing ``*`` per KTD-13 so
     a careless ``git add .`` doesn't accidentally commit the SQLite
     state.db (containing MESI state + agent UUIDs), the hook.secret
     (a credential), or the server.pid file. The README claims these are
     auto-gitignored — this is the implementation.
     """
+    # Before the mkdir: it follows a linked .coherence, and a dangling one would
+    # surface as EEXIST instead of as the link.
+    check_coherence_dir(coordinator_root)
     coherence_dir = coordinator_root / ".coherence"
     try:
         coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -765,6 +787,17 @@ def _ensure_coherence_dir(coordinator_root: Path) -> Path | None:
             coordinator_root, exc,
         )
         return None
+    if _tighten_mode(coherence_dir):
+        # The first check passes a .coherence it cannot list; after the repair it
+        # can list it, so a link there is refused before anything is written.
+        check_coherence_dir(coordinator_root)
+    _write_gitignore_once(coherence_dir)
+    return coherence_dir
+
+
+def _tighten_mode(coherence_dir: Path) -> bool:
+    """Re-assert 0700 on ``coherence_dir``. True when the caller must check it
+    again: the mode changed, or it is no longer a directory."""
     # ``mkdir(mode=0o700)`` does NOT chmod an ALREADY-EXISTING directory, so a
     # ``.coherence/`` that pre-existed at a looser mode (e.g. 0755 from a careless
     # ``mkdir`` or an older tool) would keep it — leaving the SQLite state.db,
@@ -772,34 +805,49 @@ def _ensure_coherence_dir(coordinator_root: Path) -> Path | None:
     # Re-assert the 0700 guarantee unconditionally (idempotent); warn once when
     # we actually had to tighten an existing dir from a more-permissive mode.
     try:
-        prior_mode = coherence_dir.stat().st_mode & 0o777
-        if prior_mode != 0o700:
-            os.chmod(coherence_dir, 0o700)
-            if prior_mode & 0o077:
-                logger.warning(
-                    "tightened existing .coherence directory %s from mode %o to "
-                    "0700 (it exposed group/world bits; the SQLite state, the "
-                    "hook.secret credential and the pidfile must not be readable "
-                    "outside the owner)",
-                    coherence_dir, prior_mode,
-                )
+        # lstat: stat follows a link made since the check, and so would the chmod.
+        prior = os.lstat(coherence_dir).st_mode
+        if not stat.S_ISDIR(prior):
+            return True
+        prior_mode = prior & 0o777
+        if prior_mode == 0o700:
+            return False
+        os.chmod(coherence_dir, 0o700)
     except OSError as exc:
         logger.warning(
             "could not re-assert 0700 on .coherence directory %s: %s",
             coherence_dir, exc,
         )
-    # Write .gitignore (idempotent — only write if missing to avoid
-    # clobbering any operator customization)
+        return False
+    if prior_mode & 0o077:
+        logger.warning(
+            "tightened existing .coherence directory %s from mode %o to "
+            "0700 (it exposed group/world bits; the SQLite state, the "
+            "hook.secret credential and the pidfile must not be readable "
+            "outside the owner)",
+            coherence_dir, prior_mode,
+        )
+    return True
+
+
+def _write_gitignore_once(coherence_dir: Path) -> None:
+    """Write ``.gitignore`` only if missing, to avoid clobbering any operator
+    customization. ``O_EXCL`` also never follows a link at the name, which the
+    start check refuses, so one made after it is left alone. The write and the
+    close go through ``FileIO``: an ``os.close`` here shifts the descriptor
+    numbers the lifecycle tests count closes by."""
     gitignore = coherence_dir / ".gitignore"
-    if not gitignore.exists():
-        try:
-            gitignore.write_text("*\n")
-        except OSError as exc:
-            logger.warning(
-                "could not write %s: %s — workspace data risks being committed",
-                gitignore, exc,
-            )
-    return coherence_dir
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        with io.FileIO(os.open(gitignore, flags, 0o666), "w", closefd=True) as handle:
+            handle.write(b"*\n")
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        logger.warning(
+            "could not write %s: %s — workspace data risks being committed",
+            gitignore, exc,
+        )
 
 
 def _open_pidfile(pid_file: Path) -> int | None:
@@ -807,16 +855,20 @@ def _open_pidfile(pid_file: Path) -> int | None:
 
     ``O_NOFOLLOW``: a repository can commit ``server.pid`` as a symlink, and a
     start would then write its pid and port over the file the link names, or
-    create that file (#464)."""
+    create that file (#464). The start check refuses such a link first, so one
+    met here was made since: it raises the same
+    :class:`~ccs.core.exceptions.CoherenceDirRefused` (#498). Any other failure
+    returns None."""
     try:
         fd = os.open(pid_file, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     except OSError as exc:
         # os.path.islink: Path.is_symlink raises where it cannot look, and this
         # path must return None.
         if os.path.islink(pid_file):
-            logger.warning("%s", symlinked_pid_file_refusal(pid_file))
-        else:
-            logger.warning("cannot open pid file %s: %s", pid_file, exc)
+            raise CoherenceDirRefused(
+                COHERENCE_LINK_KIND, str(pid_file), entry_link_refusal(pid_file)
+            ) from exc
+        logger.warning("cannot open pid file %s: %s", pid_file, exc)
         return None
     return fd
 

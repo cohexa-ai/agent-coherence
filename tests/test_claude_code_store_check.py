@@ -47,6 +47,7 @@ from ccs.coordinator.sqlite_registry import (
     SchemaVersionError,
     SqliteArtifactRegistry,
 )
+from ccs.core.exceptions import CoherenceDirRefused
 from tests.coordinator.test_checkpoint_registration_schema import (
     _revert_to_v7_shape,
     _revert_to_v9_shape,
@@ -563,10 +564,12 @@ def test_a_symlinked_store_is_read_with_the_sidecars_beside_its_target(
 ) -> None:
     """SQLite resolves a symlinked ``state.db`` and keeps its ``-wal`` and
     ``-journal`` beside the TARGET; the registry's own pre-create leaves only
-    empty ones beside the link. The check reads the sidecars SQLite reads, so
-    a symlinked store with a hot WAL gets the answer a start produces.
-    Prevents "fresh, nothing to migrate" for a symlinked store a start
-    migrates, and "will migrate" for one a start opens unchanged."""
+    empty ones beside the link. The check reads the sidecars SQLite reads.
+    Prevents "fresh, nothing to migrate" for a symlinked store with a hot WAL
+    that has migrated, and "will migrate" for one it has not.
+
+    A start now refuses a symlinked store before it opens it (#498); the
+    check does not yet answer that refusal (#511)."""
     root = parent / "ws"
     target = build(parent, root)
     assert _sidecar(target, "-wal").stat().st_size > 0
@@ -579,7 +582,8 @@ def test_a_symlinked_store_is_read_with_the_sidecars_beside_its_target(
     result = _assert_untouched_check(root, parent, check_tmp)
 
     assert (result.outcome.value, result.found_version) == (outcome, found)
-    assert _start_outcome(tmp_path / "twin" / "ws") == _truth(outcome, found)
+    with pytest.raises(CoherenceDirRefused):
+        _start_outcome(tmp_path / "twin" / "ws")
 
 
 def test_a_store_link_retargeted_during_the_copy_is_copied_again(

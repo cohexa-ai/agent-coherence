@@ -41,13 +41,16 @@ from ccs.adapters.claude_code.coordinator_server import (
     session_to_agent_id,
 )
 from ccs.core.exceptions import (
+    COHERENCE_LINK_KIND,
     HOLD_REASONS,
     UNAVAILABLE_REASON,
+    CoherenceDirRefused,
     CoherenceError,
     InvariantViolationError,
     StaleReadGeneration,
 )
 from ccs.core.states import MESIState
+from tests.coherence_link_helpers import plant_link, target_snapshot
 
 # Test helper: deterministic UUID4-shaped strings for short test labels.
 # Sessions now must be UUIDs (A3 validation); tests use this to keep label
@@ -970,6 +973,34 @@ def test_a_policy_route_answers_400_for_a_policy_file_linked_to_a_device(
     assert s == 400, b
     assert b == {"error": ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."}, b
     assert policy_file.is_symlink()
+
+
+def test_a_coordinator_built_over_a_link_in_coherence_refuses_before_opening_its_store(
+    tmp_path: Path,
+) -> None:
+    """#498: the server runs the start check before it opens its store, loads its
+    policy or reads its secret. It is the backstop for a link made after
+    lifecycle's own check, and what ``--check-store``'s answer is compared with.
+
+    Prevents a coordinator built over a link reading the file it names, or
+    creating ``state.db`` beside it."""
+    coherence_dir = tmp_path / ".coherence"
+    target = plant_link(coherence_dir, "tracked.yaml", "existing")
+    before = target_snapshot(target)
+
+    try:
+        server = CoordinatorHTTPServer(tmp_path, port=0)
+    except CoherenceDirRefused as exc:
+        refused = exc
+    else:
+        server.shutdown()
+        pytest.fail("built a coordinator over a link in .coherence")
+
+    assert (refused.kind, refused.path) == (
+        COHERENCE_LINK_KIND, str(tmp_path.resolve() / ".coherence" / "tracked.yaml"),
+    )
+    assert sorted(os.listdir(coherence_dir)) == ["tracked.yaml"]
+    assert target_snapshot(target) == before
 
 
 def test_a_coordinator_over_a_broken_policy_file_counts_it_on_status(tmp_path: Path) -> None:
