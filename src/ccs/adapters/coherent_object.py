@@ -249,6 +249,19 @@ class ConditionalPutRetriesExhausted(CasRetriesExhausted):
         self.attempts = attempts
         self.last_current_version = 0
 
+    def __reduce__(
+        self,
+    ) -> tuple[
+        type[ConditionalPutRetriesExhausted],
+        tuple[object, int],
+        dict[str, object],
+    ]:
+        return (
+            type(self),
+            (self.artifact_id, self.attempts),
+            {**self.__dict__, "args": self.args},
+        )
+
 
 # --- WV typed results (the versioned read/write/delete surfaces) ----------------
 
