@@ -61,6 +61,7 @@ from ccs.adapters.claude_code.lifecycle import (
     tcp_probe,
 )
 from ccs.adapters.claude_code.policy import matches_any
+from ccs.adapters.claude_code.state_dir import check_coherence_dir
 from ccs.cli._coherence_client import (
     NODE_BACKEND,
     PRINCIPAL_REFUSED_AGAIN,
@@ -73,6 +74,7 @@ from ccs.cli._coherence_client import (
     claim_caller_principal,
     coordinator_backend,
     decide_principal_recovery,
+    escape_nonprintable,
     principal_refusal_message,
     principal_refusal_reason,
     resolve_endpoint,
@@ -99,6 +101,7 @@ from ccs.core.exceptions import (
     CasRetriesExhausted,
     CasVersionConflict,
     CoherenceDegradedWarning,
+    CoherenceDirRefused,
     CoherenceError,
     CommitPreempted,
     CommitUnconfirmed,
@@ -458,6 +461,10 @@ _IF_UNHELD_NOT_ADVERTISED_MESSAGE = (
 #: What a degrade volume adds to a policy refusal (#305): the retry the refusal
 #: asks for is a new volume, because this one does not attach again.
 _POLICY_REFUSAL_DEGRADED_NOTE = "This volume stays detached: build a new one once the file is fixed."
+
+#: What a degrade volume adds to a refused ``.coherence`` (#498), for the same
+#: reason: the retry is a new volume.
+_STATE_DIR_REFUSAL_DEGRADED_NOTE = "This volume stays detached: build a new one once .coherence is fixed."
 
 
 def _no_principal_message(rel: str, outcome: str) -> str:
@@ -951,7 +958,11 @@ class CoherentVolume:
       a re-mint sends for an earlier attempt's write grant, before anything is
       committed; a commit it answers that way raises ``CommitUnconfirmed`` in
       both modes, because it may have landed. Every request that commits
-      nothing raises ``CoordinatorFailed`` for an HTTP 5xx too (#433).
+      nothing raises ``CoordinatorFailed`` for an HTTP 5xx too (#433). A
+      ``.coherence`` that is a symlink or not a directory, or that holds a
+      symlink, FIFO, socket or device, raises
+      :class:`~ccs.core.exceptions.CoherenceDirRefused` before anything is
+      probed or written (#498); no retry clears it.
     - ``"degrade"``: the same conditions warn once
       (:class:`~ccs.core.exceptions.CoherenceDegradedWarning`) and the appliance
       operates best-effort (coherence may be off). Mirrors the other adapters.
@@ -1444,6 +1455,15 @@ class CoherentVolume:
         pid_file = coherence_dir / "server.pid"
         cfg = self._config or LifecycleConfig()
 
+        # Before the pre-probe and the policy merge below (#498): through a link
+        # in .coherence the probe reaches another workspace's port and the merge
+        # writes where the link points, ahead of the start's own check.
+        try:
+            check_coherence_dir(self._root)
+        except CoherenceDirRefused as exc:
+            self._state_dir_refusal_or_degrade(exc)
+            return
+
         # Strict mode is load-once-at-startup, so only the process that SPAWNS
         # the coordinator can enable it. Write our policy YAML only when no
         # coordinator is running yet (we are about to spawn it). If one is
@@ -1468,7 +1488,12 @@ class CoherentVolume:
         # resolved, are the same fact for the caller as a coordinator that is
         # gone: nothing will answer. A raw spawn error is not one of them and
         # still propagates as itself.
-        port = connect_or_spawn(self._root, config=cfg, bind_host=self._bind_host)
+        try:
+            port = connect_or_spawn(self._root, config=cfg, bind_host=self._bind_host)
+        except CoherenceDirRefused as exc:
+            # A link made after the check above; the start checks again.
+            self._state_dir_refusal_or_degrade(exc)
+            return
         if port == -1:
             self._unreachable_or_degrade(
                 "coordinator unavailable (could not spawn or attach for this workspace)"
@@ -4440,6 +4465,18 @@ class CoherentVolume:
         if self._on_error == "strict":
             raise CoherenceError(message)
         self._record_degraded(f"{message} {_POLICY_REFUSAL_DEGRADED_NOTE}")
+
+    def _state_dir_refusal_or_degrade(self, refusal: CoherenceDirRefused) -> None:
+        """A ``.coherence`` a start refuses (#498), through ``on_error``. Strict
+        raises the refusal itself, typed so that no retry loop catches it, with
+        its raw path; degrade warns once and stays detached. Its text names the
+        refused path, so it needs no workspace prefix."""
+        self._endpoint = None
+        if self._on_error == "strict":
+            raise refusal
+        # The volume prints this text itself, and a cloned repository chose the
+        # name in it: escaped, it cannot drive the terminal or split the line.
+        self._record_degraded(f"{escape_nonprintable(str(refusal))} {_STATE_DIR_REFUSAL_DEGRADED_NOTE}")
 
     def _failed_read_or_degrade(self, resp: dict, rel: str) -> None:
         """A pre-read the coordinator answered with ``ok: false``, which it does

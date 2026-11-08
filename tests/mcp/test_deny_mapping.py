@@ -29,6 +29,7 @@ from ccs.core.exceptions import (
     CallerPrincipalRefused,
     CasRetriesExhausted,
     CasVersionConflict,
+    CoherenceDirRefused,
     CoherenceError,
     CommitPreempted,
     CommitUnconfirmed,
@@ -70,6 +71,10 @@ _HOLDER = "5d0f3c9a8b7e4d21a6c3b2e1f0d9c8b7"
 #: giver terminal uses, never that refusal's ``retry_later``.
 _UNREACHABLE_REASON = "coordinator_unavailable"
 _UNREACHABLE_RECOVER = "stop_and_report"
+#: FROZEN duplicate of the reason a workspace's ``.coherence`` refusal carries
+#: (#498); it takes the same stop verb.
+_DIR_REFUSED_REASON = "coherence_dir_refused"
+_DIR_REFUSED_PATH = "/ws/.coherence/tracked.yaml"
 
 
 def _principal_refusal(reason: str) -> CallerPrincipalRefused:
@@ -129,6 +134,12 @@ _TERMINALS = [
     (GiverFenced("data/x", _SUCCESSOR, 3), _GIVER_REASON, _GIVER_RECOVER, False),
     (OtherHolder("data/x", _HOLDER), "other_holder", "wait_and_retry", True),
     (CoordinatorUnreachable("coordinator gone"), _UNREACHABLE_REASON, _UNREACHABLE_RECOVER, False),
+    (
+        CoherenceDirRefused("coherence_link", _DIR_REFUSED_PATH, f"refusing {_DIR_REFUSED_PATH}: it is a symlink"),
+        _DIR_REFUSED_REASON,
+        _UNREACHABLE_RECOVER,
+        False,
+    ),
     (
         InternalConcurrencyError("concurrent use detected"),
         "internal_concurrency_error",
@@ -280,6 +291,27 @@ def test_a_coordinator_failed_read_is_a_stop_that_names_one_retry():
     assert [item.text for item in result.content[1:]] == [words]
     for phrase in ("once more", "stop", "report", "do not keep retrying"):
         assert phrase in words.lower(), phrase
+
+
+def test_a_coherence_dir_refusal_is_a_stop_that_says_a_person_must_fix_the_directory():
+    """#498. A strict volume whose workspace ``.coherence`` a start refuses raises
+    ``CoherenceDirRefused``. Without its own row it fell to ``internal_error`` /
+    ``none``. It maps to its own reason with the stop verb and ``retryable:
+    false``: no call in this server session clears it. The detail (the refusal,
+    naming the path) stays verbatim; the fixed next step says a person must put a
+    real directory there and restart the server, and never names a retry."""
+    exc = CoherenceDirRefused("coherence_link", _DIR_REFUSED_PATH, f"refusing {_DIR_REFUSED_PATH}: it is a symlink")
+
+    result = deny_result(exc)
+
+    sc = result.structuredContent
+    assert (sc["reason"], sc["recover"], sc["retryable"]) == (_DIR_REFUSED_REASON, "stop_and_report", False)
+    assert sc["detail"] == str(exc)
+    words = sc["next_step"]
+    assert [item.text for item in result.content[1:]] == [words]
+    for phrase in ("stop", "nothing was written", "report", "real directory", "mount", "restart", "other route"):
+        assert phrase in words.lower(), phrase
+    assert "retry" not in words.lower()
 
 
 def test_a_split_pair_refusal_keeps_the_stale_view_answer():

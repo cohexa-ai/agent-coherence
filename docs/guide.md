@@ -164,7 +164,9 @@ To take that copy:
    coordinator starts a 0.15.0 one, which migrates the store.
 
 To go back, stop the coordinator the same way, put the copy in place of
-`.coherence/`, and reinstall 0.14.1 and the plugin release you ran with it.
+`.coherence/` as a real directory, not a link to the copy (see
+[`.coherence` must be a real directory](#coherence-must-be-a-real-directory)),
+and reinstall 0.14.1 and the plugin release you ran with it.
 A 0.15.0 coordinator reports the schema of the store it serves as
 `registry_schema_version` in every `/status` view (see
 [Status, track and untrack commands](#status-track-and-untrack-commands)).
@@ -174,10 +176,9 @@ A 0.15.0 coordinator reports the schema of the store it serves as
 `agent-coherence-coordinator --check-store` says what starting a coordinator
 of the installed build would do to `.coherence/state.db`, without starting one
 and without creating or changing anything in the workspace. It copies the
-store (and any `-wal` or `-journal` file beside it; for a symlinked
-`state.db`, the target and the files beside the target, where SQLite keeps
-them) to a private temporary directory, runs the same open a coordinator start
-runs on the copy, and removes the copy when it finishes. A check that is
+store (and any `-wal` or `-journal` file beside it) to a private temporary
+directory, runs the same open a coordinator start runs on the copy, and
+removes the copy when it finishes. A check that is
 killed leaves the copy behind (see
 [security.md](security.md#store-check-copy)). Run it after upgrading the
 package and before any client starts a coordinator, and ask before a
@@ -193,6 +194,11 @@ migration: it is one-way.
 | `unusable` | 14 | fail on the store itself; `reason` says how |
 | `live` | 15 | join the Python coordinator already serving the workspace, and migrate nothing while it runs; the check does not read the store (see below) |
 | `cannot_tell` | 16 | unknown: the check could not observe the answer; `reason` says why |
+| `coherence_dir_refused` | 17 | refuse the workspace before it looks for a running coordinator or opens the store: `.coherence` is a symbolic link or not a directory, or holds a link, FIFO, socket or device directly inside it (see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory)); `message` is the text a start prints, naming the path |
+
+`coherence_dir_refused` comes before `live`: like a start, the check looks at
+`.coherence` before anything else, and it looks again before each copy of the
+store.
 
 `live` says only that a coordinator is running now, so it carries no store
 schema. After an upgrade, that coordinator can be one of the old build: it
@@ -231,10 +237,19 @@ and check again.
     coordinator cannot be ruled out.
   - `platform_unsupported`: this platform has no `fcntl`, so no coordinator
     starts here.
+- `coherence_dir_refused`, one of:
+  - `coherence_link`: `.coherence`, or an entry directly inside it, is a
+    symbolic link.
+  - `coherence_not_a_directory`: `.coherence` is a file, or anything else that
+    is not a directory.
+  - `coherence_special_entry`: an entry directly inside `.coherence` is a
+    FIFO, socket or device.
 
 The check's own reasons are constants in `ccs.adapters.claude_code.store_check`
 (`COORDINATOR_RUNNING_REASON` and the rest, collected in
-`STORE_CHECK_REASONS`); the store's are in `ccs.core.exceptions` (below).
+`STORE_CHECK_REASONS`, which also holds the three `coherence_dir_refused`
+reasons). Those three are in `ccs.core.exceptions` too, collected in
+`COHERENCE_DIR_REFUSAL_KINDS`, and so are the store's (below).
 
 Exit 1 means the directory is not a git repository, and exit 2 a usage error.
 `--json` prints one object with `kind` (always `"store_check"`), `outcome`,
@@ -244,7 +259,8 @@ is for a start of this build's Python coordinator), `registry_schema_version`
 `null`), `reason` and `message`. `--quiet` silences only the plain line;
 `--json` always prints its object. The plain line prints any non-printable
 character in the store's own text (an object name SQLite quotes in its error,
-say) escaped, as `\x1b` for an escape character (see
+say), or in a path a refusal names, escaped, as `\x1b` for an escape
+character (see
 [Status, track and untrack commands](#status-track-and-untrack-commands));
 `--json` keeps the message as it is, JSON-escaped. The answer holds only as of
 the check: nothing stops another process starting a coordinator after it.
@@ -1406,7 +1422,7 @@ data = vol.reacquire("plans/plan.md")       # recover: clear the stale view + fr
 |---|---|---|
 | `workspace_root` | — | Directory the volume manages; the coordinator's state lives in `<root>/.coherence/` |
 | `managed` | `()` | Glob patterns for the files under coordination; unmanaged paths bypass the volume |
-| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A read the coordinator answers with its failure envelope raises `CoordinatorFailed`, and so does the release of a write grant an earlier `write()` left held, every request that commits nothing answered with an HTTP 5xx, a commit refused by the volume's own unreleased write grant, and a refuse-mode grant request the coordinator could not decide in time; see [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
+| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A `.coherence` that a start refuses raises `CoherenceDirRefused` instead, which no retry clears; see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory). A read the coordinator answers with its failure envelope raises `CoordinatorFailed`, and so does the release of a write grant an earlier `write()` left held, every request that commits nothing answered with an HTTP 5xx, a commit refused by the volume's own unreleased write grant, and a refuse-mode grant request the coordinator could not decide in time; see [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
 | `on_held` | `"displace"` | `"refuse"` — on a managed path, raise `OtherHolder` instead of taking a file another agent holds; see [Refusing a file another agent holds](#refusing-a-file-another-agent-holds) |
@@ -1688,6 +1704,15 @@ commits nothing and `CommitUnconfirmed` on a commit (next paragraph). Its
 are covered in
 [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure).
 
+A workspace whose `.coherence` a start refuses, because it is a symbolic link
+or not a directory, or holds a link, FIFO, socket or device directly inside
+it, is not a coordinator that cannot be started: a strict volume raises
+`CoherenceDirRefused` instead, before it writes or probes anything, and no
+retry and no coordinator started later clears it. A volume in degrade mode
+warns once and stays detached. Fix `.coherence` first, then build a new
+`CoherentVolume`; see
+[`.coherence` must be a real directory](#coherence-must-be-a-real-directory).
+
 A commit is different, because its request may have reached the coordinator
 before the answer was lost. When the CAS of `write_cas` or `write_cas_at`, the
 commit of `atomic_publish`, or the post-edit of a plain `write()` was sent and
@@ -1828,10 +1853,13 @@ the call, not whether the coordinator still runs: idle shutdown can stop a
 coordinator the call started, and the next call reports `bound` again. Only a
 caller told `bound` should stop the coordinator with `stop_coordinator`. It
 returns `None` where `ensure_coordinator` returns `-1`; `ensure_coordinator`
-still returns a bare port. A `.coherence/server.pid` that is a symlink is one
-such case: the start logs a warning naming it and starts nothing, rather than
-write through the link, and `agent-coherence-coordinator` prints that text and
-exits `2`. A start that fails stops whatever it started and raises instead:
+still returns a bare port. Before it creates, writes, joins or probes
+anything, a start checks `.coherence`: when that is a symbolic link or not a
+directory, or holds a link, FIFO, socket or device directly inside it, both
+calls raise `CoherenceDirRefused` and start nothing (see
+[`.coherence` must be a real directory](#coherence-must-be-a-real-directory)),
+and `agent-coherence-coordinator` prints its text and exits `2`. A start that
+fails stops whatever it started and raises instead:
 `SchemaVersionError` on a store it refuses (its `reason` says why),
 `sqlite3.Error` on a file SQLite cannot open, `OSError` when the lock or
 the bind fails, `ValueError` on a `bind_host` it refuses, and `RuntimeError`
@@ -1839,6 +1867,104 @@ when it cannot read the hook secret or start a thread. A `KeyboardInterrupt` or
 `SystemExit` during a start gets the same cleanup and then propagates. To ask
 before a start migrates the store, call
 [`check_store`](#checking-a-store-before-a-coordinator-starts) first.
+
+### `.coherence` must be a real directory
+
+A coordinator keeps its state in `<root>/.coherence/`: the store
+(`state.db`), the workspace's secret (`hook.secret`), `server.pid`, the policy
+files and the rest. A repository can commit `.coherence`, or any file in it,
+as a symbolic link, and an archive can carry one too. A start that followed
+such a link would write its state where the link points, take the bytes of
+the file a linked `hook.secret` names as the workspace's secret, join whatever
+coordinator a linked `server.pid` names, or block on a link to a FIFO. So
+every start checks `.coherence` first, before it creates, writes, joins or
+probes anything:
+
+- `.coherence` must be absent, and a start then creates it, or a real
+  directory. A directory mounted at `.coherence`, such as another disk or a
+  container volume, is a real directory.
+- No entry directly inside it may be a symbolic link, whatever its name, even
+  a link that points nowhere.
+- No entry directly inside it may be a FIFO, socket or device. No coordinator
+  creates one, and opening one can block a start.
+
+Regular files, subdirectories and hard links pass. The check only looks: it
+opens no file, follows no link and runs no git command, so a refused start
+leaves `.coherence`, and everything a link in it names, as they were.
+
+| Surface | On a refused workspace |
+|---|---|
+| `ensure_coordinator_handle`, `ensure_coordinator` | raise `CoherenceDirRefused` |
+| strict `CoherentVolume`, `CoordinatedSubstrate` | raise `CoherenceDirRefused` before they write their policy files or look for a running coordinator |
+| `CoherentVolume(on_error="degrade")` | warns once with the same text, its control characters escaped, and `This volume stays detached: build a new one once .coherence is fixed.` |
+| the [`stale-write-guard-fs`](#stale-write-guard-fs-mcp-server) MCP server | prints the text on one line and exits `2` before it starts a coordinator or serves |
+| `agent-coherence-coordinator` | prints the text on one line and exits `2` before it probes a port or starts a worker, and so does `--prepare-for-migration` |
+| `agent-coherence-coordinator --check-store` | answers `coherence_dir_refused`, exit `17` (see [Checking a store](#checking-a-store-before-a-coordinator-starts)) |
+| `agent-coherence-workspace` | exits `2`; under `--json` the envelope's `reason` is `coherence_dir_refused` |
+| the Claude Code plugin's Node coordinator | refuses the same workspaces in plugin releases after 0.6.0 |
+
+The commands and hooks that talk to a coordinator already running
+(`agent-coherence-status`, `-track`, `-untrack`, the handoff commands and the
+Claude Code hook client) start nothing and do not run this check. They refuse
+a `.coherence` that is a link before they read `hook.secret` or connect, and
+never send the bytes of a file a linked `hook.secret` names as the secret:
+they answer as they do when no coordinator runs, and the commands print why.
+
+The text names the path and the way out. For a linked `hook.secret`, a start
+prints:
+
+```text
+agent-coherence-coordinator: refusing /work/repo/.coherence/hook.secret: it is a symlink, and .coherence must be a real directory with no link directly inside it. Replace the link with a copy of the file it names, or mount a directory at /work/repo/.coherence.
+```
+
+When several entries break the same rule, it names the first in sorted order
+and counts the rest. `CoherenceDirRefused` is a `CoherenceError` (import both
+from `ccs.core.exceptions`) whose `reason` is `coherence_dir_refused`. Its
+`kind` says which rule refused the workspace: `coherence_link`,
+`coherence_not_a_directory` or `coherence_special_entry`, collected in
+`COHERENCE_DIR_REFUSAL_KINDS`. Its `path` is the path it refused. It is not a
+`CoordinatorUnreachable`: no retry, and no coordinator started later, clears
+it. Branch on `reason` and `kind`, not on the text. A host that writes into
+`.coherence` itself before it starts a coordinator can run the same check
+first: `check_coherence_dir(root)` from `ccs.adapters.claude_code.state_dir`
+raises the same refusal and changes nothing.
+
+To fix a refused workspace:
+
+- To keep the state on another disk, mount a directory at `.coherence` instead
+  of linking it.
+- Otherwise replace each link with a copy of the file it names, or replace a
+  linked `.coherence` with a real directory and copy in the files you want to
+  keep. Move `state.db` together with its `-wal` and `-shm` files: moving
+  `state.db` alone can lose its latest changes without a word.
+- Move aside a `.coherence` that is not a directory; the next start creates a
+  real one.
+- Remove a FIFO, socket or device.
+- An editor's lock link counts too: Emacs leaves a dangling `.#name` link
+  beside a file it edits, and after a crash; close the editor or delete the
+  lock, then start again.
+
+Do this with no coordinator running for the workspace. One that an earlier
+release started through a link keeps running: stop it before you upgrade, or
+end it afterwards with `SIGTERM` (its process id is the first line of
+`.coherence/server.pid`). Then start again. A volume that was refused stays
+detached, so build a new one, and restart an MCP server.
+
+The check does not cover the following; see
+[A repository you clone](security.md#a-repository-you-clone) for the threat it
+answers.
+
+- A link above `.coherence`. The workspace root, or a directory above it, can
+  be a link (on macOS, `/tmp` is one); only `.coherence` and the entries
+  directly inside it are checked.
+- Anything inside a subdirectory of `.coherence`.
+- A link made after the check, while the coordinator runs. The coordinator
+  opens its policy files and `audit.log` without following a link, and clients
+  read `hook.secret` the same way.
+
+A Kubernetes secret or configMap volume mounted at `.coherence` is refused:
+such a volume is built from links (`..data` and one link per key). Mount a
+plain volume there instead.
 
 ### Atomic multi-file publish: `atomic_publish` (v0.12.0+)
 
@@ -2186,7 +2312,7 @@ Exit codes:
 |---|---|
 | `0` | the verb succeeded (restore: concluded with no member in `conflict` / `target_lost` / `held_unconfirmed`) — never a claim that nothing was overwritten: a restore that put a member back over content committed after the capture also exits `0`, and says so per member in the report |
 | `1` | not in a git repository, or a validation error (no members, a `..` traversal in a member argument), or a typed contention error |
-| `2` | a typed refusal: a non-UTF-8 member, an unknown checkpoint id, a checkpoint bound to another receiver or already registered by another controller, a persist failure, or a member path that fails containment at access time — a workspace escape, a symlink component, a hardlinked regular file with a co-owner outside the root, a non-regular file (FIFO, socket, device), or a `.coherence/**` self-target |
+| `2` | a typed refusal: a non-UTF-8 member, an unknown checkpoint id, a checkpoint bound to another receiver or already registered by another controller, a persist failure, or a member path that fails containment at access time — a workspace escape, a symlink component, a hardlinked regular file with a co-owner outside the root, a non-regular file (FIFO, socket, device), or a `.coherence/**` self-target; or a `.coherence` that is a symbolic link or not a directory, or holds a link, FIFO, socket or device directly inside it, refused before anything in it is opened, with `reason` `coherence_dir_refused` (see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory)) |
 | `3` | the restore **concluded**, but at least one member ended in `conflict` / `target_lost` / `held_unconfirmed`, or the restore registration was refused — the per-member report on stdout is the truth; the exit code just tells you to read it |
 | `4` | opt-in, and only with `restore --exit-nonzero-on-discarded-content`: the restore concluded clean by the codes above, but at least one member's write discarded content the checkpoint did not hold, or the run holds no record of what that member's write overwrote. Without the flag the same run exits `0`, and both producers of `3` take precedence over it. It is evaluated after the engine returns, so it reports the writes and never prevents one |
 
@@ -4388,6 +4514,16 @@ made at once only meets the refusal again, so an agent should not retry in a
 tight loop. During the drain `swg_write` is refused at its grant request: it
 answers `coordinator_failed` and writes nothing.
 
+**A workspace whose `.coherence` a start refuses.** When `.coherence` is a
+symbolic link or not a directory, or holds a link, FIFO, socket or device
+directly inside it, the server refuses to start before it serves: it prints
+one line to stderr, `stale-write-guard-fs:` and the refusal naming the path,
+and exits `2`; nothing is written. Fix `.coherence` (see
+[`.coherence` must be a real directory](#coherence-must-be-a-real-directory))
+and start the server again. No tool call carries this refusal: the server's
+tools answer only from an attached volume, so a detached one answers
+`coordinator_unavailable` as it does for any unattached volume.
+
 **A coordinator that fails while answering.** When the coordinator answers a
 read with its `internal:` failure envelope ([details](#when-the-coordinator-answers-with-a-failure)),
 the tool call answers `reason: coordinator_failed` with
@@ -5239,12 +5375,30 @@ such as `*.md`, `[abc].md`, `{a,b}.md`, `yes` or `2026-10-12`, reads back
 exactly as written. When the file cannot take a new entry, the coordinator
 answers HTTP 400 naming the file, writes nothing, and the command exits `2`
 with that text. That happens when the file cannot be read (on the Python
-coordinator, a FIFO or device, or a link to one, counts), when it is not valid
+coordinator, a FIFO or device counts), when it is not valid
 YAML or not a list, which the coordinator reads as no entries at all, or when an
 added line would break it: a `[ ... ]` list, an indented list, a `...` end marker
 or a lone `~`. Rewrite the file with one entry per line, each double-quoted, and
-retry. The coordinator replaces the file rather than
-writing into it, so a policy file kept as a symlink becomes a regular file.
+retry.
+
+A policy file that is a symbolic link is refused by the start itself, like any
+link in `.coherence` (see
+[`.coherence` must be a real directory](#coherence-must-be-a-real-directory)).
+One that becomes a link while the coordinator runs is never read or replaced.
+Track and untrack answer HTTP 400 naming it, for `tracked.yaml`:
+
+```text
+.coherence/tracked.yaml is a symlink; nothing was written. Replace it with a copy of the file it names, or mount a directory at .coherence.
+```
+
+When a track or untrack of the other policy file loads the policy again, the
+link loads as no entries and counts as a rejected pattern (below), and the
+file it names is not read. Both coordinators do this, the plugin's Node
+coordinator in plugin releases after 0.6.0. On the Python coordinator, a link
+at the lock file beside a policy file answers HTTP 400 with
+`.coherence/tracked.yaml.lock is a symlink; nothing was written. Remove the link.`
+A FIFO, socket or device there answers HTTP 400 with
+`.coherence/tracked.yaml.lock could not be read (not a regular file); nothing was written.`
 
 A `CoherentVolume` or substrate session about to start the coordinator merges
 its managed globs into `tracked.yaml` and `strict_mode.yaml`, and treats a file
@@ -5252,7 +5406,9 @@ that cannot be read, is not valid YAML or is not a list the same way: it names
 the file, writes neither one, and starts no coordinator. A strict volume or a
 session raises `CoherenceError` with that text, after the workspace root. A
 volume in degrade mode warns and stays detached, so build a new one once the
-file is fixed.
+file is fixed. A policy file that is a link never reaches the merge: the
+volume or session runs a start's own check first and refuses it with
+`CoherenceDirRefused`.
 
 Releases up to 0.14.1 wrote entries without quotes. An entry starting with
 `*`, `[`, `{`, `!`, `&`, `%`, `@`, `|`, `>` or a quote, written by one of them,

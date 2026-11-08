@@ -43,10 +43,12 @@ from ccs.adapters.substrate import (
     ReconcileVerdict,
     SubstrateCoordinatorSession,
 )
+from ccs.cli._coherence_client import get as coordinator_get
 from ccs.core.exceptions import (
     COMMIT_UNCONFIRMED_REASON,
     VERSION_MISMATCH_REASON,
     CasVersionConflict,
+    CoherenceDirRefused,
     CoherenceError,
     CommitUnconfirmed,
     CoordinatorFailed,
@@ -55,6 +57,7 @@ from ccs.core.exceptions import (
     ViewWedged,
 )
 from ccs.core.substrate import CapabilityDescriptor, Tier
+from tests.coherence_link_helpers import plant_link
 from tests.coordinator_helpers import serve_in_process
 from tests.loopback_helpers import refused_endpoint, refusing_port
 from tests.test_coherence_client_tls import (
@@ -261,20 +264,95 @@ def test_a_session_joining_a_running_coordinator_is_not_refused_over_a_policy_fi
 def test_a_session_refuses_a_symlinked_pid_file_and_leaves_its_target_alone(
     tmp_path: Path, fast_cfg: LifecycleConfig, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
-    """#464 through a session, which reads the pid file before it starts anything.
-    Prevents that path writing through the link: it raises, fail-closed, and the file
-    the link names keeps its bytes."""
+    """#464 and #498 through a session, which reads the pid file before it starts
+    anything. Prevents that path writing through the link: it raises the refusal no
+    retry clears, fail-closed, and the file the link names keeps its bytes. The
+    listing pins the order: the strict policy is written before the start, so a
+    check inside the start alone leaves policy files behind."""
     target = tmp_path_factory.mktemp("outside") / "target"
     target.write_bytes(b"keep\n")
     coherence_dir = tmp_path / ".coherence"
     coherence_dir.mkdir(mode=0o700)
     (coherence_dir / "server.pid").symlink_to(target)
 
-    with pytest.raises(CoordinatorUnreachable):
+    with pytest.raises(CoherenceDirRefused):
         _session(tmp_path, fast_cfg)
 
     assert (coherence_dir / "server.pid").is_symlink()
     assert target.read_bytes() == b"keep\n"
+    assert sorted(os.listdir(coherence_dir)) == ["server.pid"]
+
+
+def _session_refusal(root: Path, cfg: LifecycleConfig) -> CoherenceDirRefused:
+    """What a session over ``root`` raises; a session that attaches instead
+    stops the coordinator it started before the test fails."""
+    try:
+        with pytest.raises(CoherenceDirRefused) as raised:
+            _session(root, cfg)
+    finally:
+        stop_coordinator(root)
+    return raised.value
+
+
+@pytest.mark.parametrize("name", ["tracked.yaml", "notes.txt"])
+def test_a_session_refuses_a_link_before_it_writes_its_strict_policy(
+    tmp_path: Path, fast_cfg: LifecycleConfig, name: str
+) -> None:
+    """#498: a link in ``.coherence`` raises the typed refusal before the session
+    writes its strict policy. Prevents the merge replacing a linked policy file
+    with a regular one (the start then finds no link and runs), or leaving policy
+    files behind a refused start. Not a ``CoordinatorUnreachable``, so a caller's
+    retry loop does not catch it."""
+    coherence_dir = tmp_path / ".coherence"
+    target = plant_link(coherence_dir, name, "existing")
+    # A list the merge accepts, so the old order replaces the link and starts.
+    target.write_bytes(b'- "docs/**"\n')
+
+    refusal = _session_refusal(tmp_path, fast_cfg)
+
+    assert refusal.reason == "coherence_dir_refused"
+    assert not isinstance(refusal, CoordinatorUnreachable)
+    assert (refusal.kind, refusal.path) == ("coherence_link", str(tmp_path.resolve() / ".coherence" / name))
+    assert "mount a directory" in str(refusal)
+    assert (coherence_dir / name).is_symlink()
+    assert target.read_bytes() == b'- "docs/**"\n'
+    assert sorted(os.listdir(coherence_dir)) == [name]
+
+
+def test_a_session_does_not_join_the_coordinator_a_linked_pid_file_names(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#498: a workspace whose pid file and secret link to another workspace's
+    raises the refusal, and the other workspace's coordinator sees nothing of it.
+    Prevents a cloned link joining a coordinator that guards another tree, with
+    a bearer that coordinator accepts."""
+    peer = tmp_path / "peer"
+    root = tmp_path / "ws"
+    peer.mkdir()
+    peer_session = _session(peer, fast_cfg)
+    try:
+        coherence_dir = root / ".coherence"
+        coherence_dir.mkdir(mode=0o700, parents=True)
+        for link_name in ("hook.secret", "server.pid"):
+            (coherence_dir / link_name).symlink_to(peer / ".coherence" / link_name)
+        claims, statuses = _peer_requests(peer_session)
+
+        refusal = _session_refusal(root, fast_cfg)
+
+        assert refusal.path == str(root.resolve() / ".coherence" / "hook.secret")
+        # The one more /status is the read below.
+        assert _peer_requests(peer_session) == (claims, statuses + 1)
+    finally:
+        stop_coordinator(peer)
+
+
+def _peer_requests(session: SubstrateCoordinatorSession) -> tuple[int, int]:
+    """How many principal claims and ``/status`` reads a peer's coordinator has
+    answered, this read included. A session that joins it claims a principal at
+    start, before any read or write, so neither its sessions nor its files show
+    it."""
+    counters = coordinator_get(session._endpoint, "/status")["endpoint_counters"]
+    return counters["principal_claim_total"], counters["status_total"]
 
 
 # --- spawn: the pre-spawn policy write creates .coherence/ at 0700 ----------

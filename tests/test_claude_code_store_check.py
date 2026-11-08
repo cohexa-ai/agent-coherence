@@ -39,6 +39,7 @@ from ccs.adapters.claude_code.lifecycle import (
     ensure_coordinator,
     stop_coordinator,
 )
+from ccs.adapters.claude_code.state_dir import dir_link_refusal, entry_link_refusal
 from ccs.adapters.claude_code.store_check import StoreCheck, StoreCheckOutcome, check_store
 from ccs.coordinator import sqlite_registry
 from ccs.coordinator.sqlite_registry import (
@@ -47,6 +48,7 @@ from ccs.coordinator.sqlite_registry import (
     SchemaVersionError,
     SqliteArtifactRegistry,
 )
+from ccs.core.exceptions import CoherenceDirRefused
 from tests.coordinator.test_checkpoint_registration_schema import (
     _revert_to_v7_shape,
     _revert_to_v9_shape,
@@ -68,6 +70,12 @@ _FOREIGN = "foreign"
 _UNUSABLE = "unusable"
 _LIVE = "live"
 _CANNOT_TELL = "cannot_tell"
+_COHERENCE_DIR_REFUSED = "coherence_dir_refused"
+
+#: FROZEN duplicates of the reasons a ``coherence_dir_refused`` answer carries
+#: (#511): the start's own refusal kinds.
+_COHERENCE_LINK = "coherence_link"
+_COHERENCE_SPECIAL_ENTRY = "coherence_special_entry"
 
 #: FROZEN duplicates of the check's own reasons (#345).
 _COORDINATOR_RUNNING = "coordinator_running"
@@ -206,9 +214,10 @@ def _spawn_truth(root: Path, scratch: Path) -> tuple[str, int | None]:
 def _start_outcome(root: Path) -> tuple[str, int | None]:
     """What a coordinator start on ``root`` does, observed: the start's own
     ``CoordinatorHTTPServer`` built on it (never served), classified by what
-    its open did, with the schema the start says it migrated from. The real
-    server, not the registry the check calls, so a step the server adds
-    before or around its open shows up as a disagreement."""
+    its open did, or by its refusal of ``.coherence`` (#498), with the schema
+    the start says it migrated from. The real server, not the registry the
+    check calls, so a step the server adds before or around its open shows
+    up as a disagreement."""
     root.mkdir(parents=True, exist_ok=True)
     db = root / ".coherence" / "state.db"
     try:
@@ -217,6 +226,8 @@ def _start_outcome(root: Path) -> tuple[str, int | None]:
         before = None  # not a database: the start must refuse it too
     try:
         server = CoordinatorHTTPServer(root, port=0)
+    except CoherenceDirRefused:
+        return _COHERENCE_DIR_REFUSED, None
     except CrossRuntimeSchemaError:
         return _FOREIGN, None
     except SchemaVersionError:
@@ -369,12 +380,13 @@ def test_a_negative_user_version_reads_unusable_with_a_backup_remedy(
         assert wrong_advice not in message, result.message
 
 
-def test_the_outcome_vocabulary_is_exactly_the_eight_frozen_values() -> None:
-    """The outcome enum carries exactly the eight values a host hard-codes,
+def test_the_outcome_vocabulary_is_exactly_the_nine_frozen_values() -> None:
+    """The outcome enum carries exactly the nine values a host hard-codes,
     and each member is its own string. Prevents a renamed or added outcome
     reaching a host that maps them to actions."""
     assert {member.value for member in StoreCheckOutcome} == {
         _CURRENT, _FRESH, _WILL_MIGRATE, _NEWER, _FOREIGN, _UNUSABLE, _LIVE, _CANNOT_TELL,
+        _COHERENCE_DIR_REFUSED,
     }
     assert all(member == member.value for member in StoreCheckOutcome)
 
@@ -505,6 +517,11 @@ def test_check_store_reads_through_a_hot_wal_or_journal_like_the_spawn(
     assert _spawn_truth(root, tmp_path / "truth") == _truth(outcome, found)
 
 
+# ----------------------------------------------------------------------
+# A link in .coherence: a start refuses it, so the check answers that (#511)
+# ----------------------------------------------------------------------
+
+
 def _store_elsewhere(parent: Path, name: str, shape: str) -> Path:
     """``parent/elsewhere/<name>``, laid down as ``shape`` (or left for a
     writer to create when ``shape`` is ``absent``)."""
@@ -533,80 +550,162 @@ def _link_store_elsewhere(parent: Path, root: Path, shape: str) -> Path:
     return target
 
 
-def _hot_v7_migrated_in_target_wal(parent: Path, root: Path) -> Path:
-    target = _link_store_elsewhere(parent, root, "v7")
-    _kill_writer_mid_flight("migrate", _db(root))
-    assert _header_user_version(target) == 7  # the migration lives only in the WAL
-    return target
-
-
-def _hot_fresh_v9_in_target_wal(parent: Path, root: Path) -> Path:
-    target = _link_store_elsewhere(parent, root, "absent")
-    _kill_writer_mid_flight("fresh_v9", _db(root))
-    assert _header_user_version(target) in (0, None)  # the db file reads "fresh"
-    return target
-
-
-# A SIGKILLed child writer per case: run with -n 0 (tests/conftest.py).
-@pytest.mark.serial
-@pytest.mark.parametrize(
-    ("build", "outcome", "found"),
-    [
-        (_hot_v7_migrated_in_target_wal, _CURRENT, SCHEMA_USER_VERSION),
-        (_hot_fresh_v9_in_target_wal, _WILL_MIGRATE, 9),
-    ],
-    ids=["v7-migrated-only-in-wal", "fresh-v9-create"],
-)
-def test_a_symlinked_store_is_read_with_the_sidecars_beside_its_target(
-    build, outcome: str, found: int,
-    parent: Path, check_tmp: Path, tmp_path: Path,
-) -> None:
-    """SQLite resolves a symlinked ``state.db`` and keeps its ``-wal`` and
-    ``-journal`` beside the TARGET; the registry's own pre-create leaves only
-    empty ones beside the link. The check reads the sidecars SQLite reads, so
-    a symlinked store with a hot WAL gets the answer a start produces.
-    Prevents "fresh, nothing to migrate" for a symlinked store a start
-    migrates, and "will migrate" for one a start opens unchanged."""
-    root = parent / "ws"
-    target = build(parent, root)
+def _hot_target_wal(parent: Path, root: Path, shape: str, mode: str) -> Path:
+    """A linked store whose last writer, writing through the link, was
+    SIGKILLed: its truth sits in a hot ``-wal`` beside the TARGET, where
+    SQLite keeps it, and the registry's pre-create left at most an empty one
+    beside the link."""
+    target = _link_store_elsewhere(parent, root, shape)
+    _kill_writer_mid_flight(mode, _db(root))
     assert _sidecar(target, "-wal").stat().st_size > 0
     link_wal = _sidecar(_db(root), "-wal")
     assert not link_wal.exists() or link_wal.stat().st_size == 0
-    # The truth from a twin of the WHOLE parent, so the relative link
-    # resolves inside the twin and the start never touches the original.
+    return target
+
+
+def _hot_v7_migrated_in_target_wal(parent: Path, root: Path) -> Path:
+    target = _hot_target_wal(parent, root, "v7", "migrate")
+    assert _header_user_version(target) == 7  # the migration lives only in the WAL
+    return _db(root)
+
+
+def _hot_fresh_v9_in_target_wal(parent: Path, root: Path) -> Path:
+    target = _hot_target_wal(parent, root, "absent", "fresh_v9")
+    assert _header_user_version(target) in (0, None)  # the db file reads "fresh"
+    return _db(root)
+
+
+def _store_linked_to_nothing(parent: Path, root: Path) -> Path:
+    (parent / "elsewhere").mkdir()
+    _point_store_at(root, "real.db")
+    return _db(root)
+
+
+def _store_linked_into_a_removed_dir(parent: Path, root: Path) -> Path:
+    _store_elsewhere(parent, "real.db", "v10")
+    _point_store_at(root, "real.db")
+    shutil.rmtree(parent / "elsewhere")
+    return _db(root)
+
+
+def _store_linked_to_a_device(parent: Path, root: Path) -> Path:
+    # /dev/null stands in for a device such as /dev/zero, whose copy would
+    # never end: a regression answers wrongly instead of filling the disk.
+    _coherence_dir(root)
+    _db(root).symlink_to(os.devnull)
+    return _db(root)
+
+
+def _coherence_linked_to_nothing(parent: Path, root: Path) -> Path:
+    root.mkdir(parents=True)
+    (root / ".coherence").symlink_to(Path("..", "elsewhere"), target_is_directory=True)
+    return root / ".coherence"
+
+
+def _coherence_linked_to_a_store(parent: Path, root: Path) -> Path:
+    _build("v10", parent / "elsewhere")
+    root.mkdir(parents=True)
+    (root / ".coherence").symlink_to(
+        Path("..", "elsewhere", ".coherence"), target_is_directory=True
+    )
+    return root / ".coherence"
+
+
+def _entry_linked(name: str):
+    """A v10 workspace whose ``.coherence/<name>`` is a RELATIVE link to a
+    regular file outside ``.coherence``."""
+
+    def build(parent: Path, root: Path) -> Path:
+        _build("v10", root)
+        target = parent / "elsewhere" / name
+        target.parent.mkdir()
+        target.write_bytes(b"keep\n")
+        link = root / ".coherence" / name
+        link.symlink_to(Path("..", "..", "elsewhere", name))
+        return link
+
+    return build
+
+
+def _link_refusal(link: Path) -> str:
+    """The start's refusal text for ``link``, a ``.coherence`` or an entry."""
+    return dir_link_refusal(link) if link.name == ".coherence" else entry_link_refusal(link)
+
+
+@pytest.mark.parametrize(
+    ("build", "twin"),
+    [
+        # A SIGKILLed child writer per case: run with -n 0 (tests/conftest.py).
+        pytest.param(_hot_v7_migrated_in_target_wal, True, marks=pytest.mark.serial,
+                     id="state.db-v7-migrated-only-in-target-wal"),
+        pytest.param(_hot_fresh_v9_in_target_wal, True, marks=pytest.mark.serial,
+                     id="state.db-fresh-v9-in-target-wal"),
+        pytest.param(_store_linked_to_nothing, True, id="state.db-dangling"),
+        pytest.param(_store_linked_into_a_removed_dir, True, id="state.db-into-a-removed-dir"),
+        # No twin start: a regression would open /dev/null with SQLite.
+        pytest.param(_store_linked_to_a_device, False, id="state.db-to-a-device"),
+        pytest.param(_coherence_linked_to_nothing, True, id=".coherence-dangling"),
+        pytest.param(_coherence_linked_to_a_store, True, id=".coherence-to-a-v10-store"),
+        pytest.param(_entry_linked("server.pid"), True, id="server.pid"),
+        pytest.param(_entry_linked("hook.secret"), True, id="hook.secret"),
+        pytest.param(_entry_linked("notes.txt"), True, id="notes.txt"),
+    ],
+)
+def test_a_link_in_coherence_reads_coherence_dir_refused_and_copies_nothing(
+    build, twin: bool, parent: Path, check_tmp: Path, copies: list[str], tmp_path: Path,
+) -> None:
+    """#511: a start refuses a ``.coherence`` that is a link, or one that
+    holds a link at any name, before it probes the lock or opens the store
+    (#498), so the check answers ``coherence_dir_refused`` with the start's
+    own text, copies nothing and agrees with a start on a twin of the whole
+    parent, whose relative links resolve inside the twin. Prevents
+    ``fresh`` for a dangling link at ``.coherence`` or ``state.db``,
+    ``current`` or ``will_migrate`` read through a linked store (a hot WAL
+    beside its target included) or a linked ``.coherence``, and
+    ``cannot_tell`` for a linked pid file or a store linked to a device: all
+    workspaces a start refuses."""
+    root = parent / "ws"
+    link = build(parent, root)
     shutil.copytree(parent, tmp_path / "twin", symlinks=True)
 
     result = _assert_untouched_check(root, parent, check_tmp)
 
-    assert (result.outcome.value, result.found_version) == (outcome, found)
-    assert _start_outcome(tmp_path / "twin" / "ws") == _truth(outcome, found)
+    assert (result.outcome.value, result.reason, result.found_version) == (
+        _COHERENCE_DIR_REFUSED, _COHERENCE_LINK, None,
+    )
+    assert result.will_migrate is False
+    assert result.message == _link_refusal(link)
+    assert copies == []
+    if twin:
+        assert _start_outcome(tmp_path / "twin" / "ws") == (_COHERENCE_DIR_REFUSED, None)
 
 
-def test_a_store_link_retargeted_during_the_copy_is_copied_again(
+def test_a_link_planted_during_the_copy_reads_coherence_dir_refused(
     parent: Path, check_tmp: Path, copies: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A ``state.db`` symlink pointed at another store while the check copies
-    the old target leaves a copy of a store a start no longer reads, though
-    the old target itself never changed; the check copies again and answers
-    for the store the link names now. Prevents CURRENT from the old v10
-    target for a v7 store a start migrates."""
+    """#511: the check runs the start's check again before each copy. A
+    ``state.db`` replaced by a link while the first copy ran leaves a copy of
+    a store a start no longer reads, and the next attempt refuses the link
+    before it copies its target. Prevents ``will_migrate`` read from a v7
+    store the link names, for a start that refuses the link."""
     root = parent / "ws"
-    _link_store_elsewhere(parent, root, "v10")
+    _build("v10", root)
     _store_elsewhere(parent, "other.db", "v7")
     real_copy = store_check._copy_store
 
-    def copy_then_retarget(*args, **kwargs):
+    def copy_then_link(*args, **kwargs):
         copied = real_copy(*args, **kwargs)
         if len(copies) == 1:
             _point_store_at(root, "other.db")
         return copied
 
-    monkeypatch.setattr(store_check, "_copy_store", copy_then_retarget)
+    monkeypatch.setattr(store_check, "_copy_store", copy_then_link)
 
     result = check_store(root)
 
-    assert (result.outcome.value, result.found_version) == (_WILL_MIGRATE, 7)
-    assert len(copies) == 2
+    assert (result.outcome.value, result.reason) == (_COHERENCE_DIR_REFUSED, _COHERENCE_LINK)
+    assert result.message == entry_link_refusal(_db(root))
+    assert len(copies) == 1
     assert list(check_tmp.iterdir()) == []
 
 
@@ -657,6 +756,41 @@ def test_a_running_coordinator_reads_live_and_its_store_current_once_stopped(
     after = check_store(root)
     assert (after.outcome.value, after.found_version) == (_CURRENT, SCHEMA_USER_VERSION)
     assert list(check_tmp.iterdir()) == []
+
+
+# Starts a real coordinator: run with -n 0 (tests/conftest.py).
+@pytest.mark.serial
+@pytest.mark.parametrize("name", [".coherence", "server.pid"])
+def test_a_link_is_answered_before_the_lock_probe(
+    name: str, parent: Path, check_tmp: Path, copies: list[str], tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+) -> None:
+    """#511: a link to another workspace's ``.coherence``, or to its
+    ``server.pid``, names a lock that a live coordinator there holds. A start
+    refuses the link before it probes that lock (#498), so the check answers
+    the refusal. Prevents ``live`` ("a start joins it") read through a linked
+    ``.coherence``, and ``cannot_tell`` for a linked pid file, for a start
+    that joins nothing."""
+    other = tmp_path / "other"  # outside parent: its live store changes
+    assert ensure_coordinator(other, config=fast_cfg) > 0
+    try:
+        root = parent / "ws"
+        if name == ".coherence":
+            root.mkdir()
+            link = root / ".coherence"
+            link.symlink_to(other / ".coherence", target_is_directory=True)
+        else:
+            _build("v10", root)
+            link = root / ".coherence" / "server.pid"
+            link.symlink_to(other / ".coherence" / "server.pid")
+        result = _assert_untouched_check(root, parent, check_tmp)
+    finally:
+        stopped = stop_coordinator(other)
+
+    assert stopped
+    assert (result.outcome.value, result.reason) == (_COHERENCE_DIR_REFUSED, _COHERENCE_LINK)
+    assert result.message == _link_refusal(link)
+    assert copies == []
 
 
 def _pid_file(root: Path) -> Path:
@@ -829,15 +963,13 @@ def test_a_platform_without_fcntl_reads_cannot_tell(
 def test_a_pid_file_the_probe_cannot_open_reads_cannot_tell(
     parent: Path, check_tmp: Path
 ) -> None:
-    """A ``server.pid`` the probe cannot open (here a symlink, which it
-    refuses to follow) leaves the lock unknown, so the check cannot rule a
-    coordinator out. Prevents an answer that ignores a coordinator it could
-    not see."""
+    """A ``server.pid`` the probe cannot open (here a directory, which the
+    start's check lets through and the probe refuses to open as a lock file)
+    leaves the lock unknown, so the check cannot rule a coordinator out.
+    Prevents an answer that ignores a coordinator it could not see."""
     root = parent / "ws"
     _build("v10", root)
-    target = parent / "elsewhere.pid"
-    target.write_text("")
-    (root / ".coherence" / "server.pid").symlink_to(target)
+    (root / ".coherence" / "server.pid").mkdir()
 
     result = _assert_untouched_check(root, parent, check_tmp)
 
@@ -912,41 +1044,24 @@ def _check_in_child(root: Path, parent: Path, check_tmp: Path) -> tuple[str, str
 
 # A child process per case: run with -n 0 (tests/conftest.py).
 @pytest.mark.serial
-@pytest.mark.parametrize(
-    ("fifo", "reason"),
-    [("state.db", _STORE_UNREADABLE), ("server.pid", _LOCK_PROBE_FAILED)],
-    ids=["store", "pid-file"],
-)
-def test_a_fifo_in_place_of_the_store_or_pid_file_reads_cannot_tell_at_once(
-    fifo: str, reason: str, parent: Path, check_tmp: Path
+@pytest.mark.parametrize("fifo", ["state.db", "server.pid"], ids=["store", "pid-file"])
+def test_a_fifo_in_place_of_the_store_or_pid_file_is_refused_at_once(
+    fifo: str, parent: Path, check_tmp: Path
 ) -> None:
     """A FIFO at ``state.db`` or ``server.pid`` has no writer, so a plain
-    open of it blocks forever; the check opens without blocking and refuses
-    anything that is not a regular file. Prevents a pre-flight check that
-    leaves a host waiting forever (a start fails at once on such a pid
-    file)."""
+    open of it blocks forever. A start refuses a FIFO directly inside
+    ``.coherence`` (#498) from a listing that opens nothing, and so does the
+    check (#511). Prevents a pre-flight check that leaves a host waiting
+    forever, or one that answers ``cannot_tell`` for a workspace a start
+    refuses."""
     root = parent / "ws"
     if fifo == "server.pid":
         _build("v10", root)
     os.mkfifo(_coherence_dir(root) / fifo, 0o600)
 
-    assert _check_in_child(root, parent, check_tmp) == (_CANNOT_TELL, reason)
-
-
-def test_a_store_linked_to_a_device_reads_cannot_tell(
-    parent: Path, check_tmp: Path
-) -> None:
-    """A ``state.db`` that is a symlink to a device is no store: a git
-    checkout can carry one, and copying ``/dev/zero`` would never end and
-    fill the temp disk. ``/dev/null`` stands in for it here, so a regression
-    answers wrongly instead of filling the disk. Prevents a pre-flight check
-    that copies a device, or answers about one as if it were a store."""
-    root = parent / "ws"
-    (_coherence_dir(root) / "state.db").symlink_to(os.devnull)
-
-    result = _assert_untouched_check(root, parent, check_tmp)
-
-    assert (result.outcome.value, result.reason) == (_CANNOT_TELL, _STORE_UNREADABLE)
+    assert _check_in_child(root, parent, check_tmp) == (
+        _COHERENCE_DIR_REFUSED, _COHERENCE_SPECIAL_ENTRY,
+    )
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")

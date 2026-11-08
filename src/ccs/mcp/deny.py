@@ -67,6 +67,7 @@ from ccs.core.exceptions import (
     CallerPrincipalRefused,
     CasRetriesExhausted,
     CasVersionConflict,
+    CoherenceDirRefused,
     CommitPreempted,
     CommitUnconfirmed,
     CoordinatorFailed,
@@ -141,6 +142,19 @@ COORDINATOR_FAILED_NEXT_STEP = (
     "user or host that the coordinator is failing; do not keep retrying."
 )
 
+# A person must replace the workspace's .coherence (#498), so the verb is the
+# house stop. The row maps the refusal for library callers of deny_result: the
+# server itself refuses to start before any tool runs, and its tools answer only
+# from an attached volume, so no tool call carries this refusal.
+COHERENCE_DIR_REFUSED_RECOVER = GIVER_FENCED_RECOVER
+COHERENCE_DIR_REFUSED_NEXT_STEP = (
+    "Stop: nothing was written. This workspace's .coherence is a symlink or not a "
+    "directory, or holds a symlink, FIFO, socket or device directly inside it. Do not "
+    "write the managed files by any other route. Report to your user or host that a "
+    "person must replace it with a real directory, or mount one at .coherence, and "
+    "then restart this MCP server."
+)
+
 
 # A refuse-mode write another agent holds, from a volume that opted in. The verb
 # is the one a commit's ``other_holder`` takes, but only the words make it safe
@@ -188,6 +202,12 @@ _TERMINALS: dict[type, _Terminal] = {
         COORDINATOR_FAILED_RECOVER,
         False,
         COORDINATOR_FAILED_NEXT_STEP,
+    ),
+    CoherenceDirRefused: _Terminal(
+        CoherenceDirRefused.reason,
+        COHERENCE_DIR_REFUSED_RECOVER,
+        False,
+        COHERENCE_DIR_REFUSED_NEXT_STEP,
     ),
 }
 

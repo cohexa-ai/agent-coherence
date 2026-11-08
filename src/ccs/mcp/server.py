@@ -24,20 +24,24 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 from ccs.adapters.claude_code.lifecycle import stop_coordinator
+from ccs.adapters.claude_code.state_dir import check_coherence_dir
 from ccs.adapters.coherent_volume import (
     CoherentVolume,
     HandoffTransferResult,
     HandoffVerbResult,
 )
 from ccs.adapters.effect_gate import check_fence
+from ccs.cli._coherence_client import err, escape_nonprintable
 from ccs.core.exceptions import (
     HOLD_INPUT_VANISHED,
     CasVersionConflict,
+    CoherenceDirRefused,
     CoherenceError,
     HandoffPathsInvalid,
 )
@@ -832,9 +836,24 @@ def _configure_stderr_logging() -> None:
     root.setLevel(logging.INFO)
 
 
+def _exit_if_coherence_dir_refused(root: Path) -> None:
+    """Exit 2 on one stderr line when a start would refuse ``root``'s
+    ``.coherence`` (#498), as the other console scripts do, before the server
+    serves. The lifespan's own refusal stays the backstop for a link made after
+    this check."""
+    try:
+        check_coherence_dir(root)
+    except CoherenceDirRefused as exc:
+        # A cloned repository chose the name in this text, and a host runs the
+        # server unattended: escaped, it cannot drive a terminal or split a log line.
+        err(f"{SERVER_NAME}: {escape_nonprintable(str(exc))}")
+        raise SystemExit(2) from None
+
+
 def main() -> None:
     """Console-script entrypoint: run the server over stdio."""
     _configure_stderr_logging()
+    _exit_if_coherence_dir_refused(SessionConfig.from_env().root)
     build_server().run(transport="stdio")
 
 

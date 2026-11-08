@@ -17,6 +17,8 @@ Alpha — APIs may change before `v1.0`.
   coordinator cannot be started or attached, when the connection is refused or
   times out, and when a request that commits nothing gets no usable answer,
   including the caller-principal claim and the strict-glob check at attach. A
+  workspace whose `.coherence` a start refuses raises `CoherenceDirRefused`
+  instead, which no retry clears (#498, under Changed). A
   coordinator that answers with a refusal raises what it raised before, unless
   the claim sent to recover from a caller-principal refusal gets no answer; its
   failure envelope is typed separately (#259, under Changed), and so is an
@@ -89,16 +91,18 @@ Alpha — APIs may change before `v1.0`.
   files beside it, and older, newer and damaged stores raised the same
   untyped error. `agent-coherence-coordinator --check-store [--json]` and
   `check_store(root)` in `ccs.adapters.claude_code.store_check` now answer
-  `current`, `fresh`, `will_migrate`, `newer`, `foreign`, `unusable`, `live`
-  or `cannot_tell`, with exit codes 0 and 10–16. The check runs the start's
-  own open on a private copy, so it matches what a start would do even when a
-  killed writer left changes in the WAL, and it creates or changes nothing in
-  the workspace. `SchemaVersionError` now carries `reason`, `found_version`
-  and `expected_version`; a store whose `user_version` is negative, which no
-  build writes, is refused as unrecognized with advice to restore it from a
-  backup instead of to upgrade; and a start that migrates a store logs one
-  `INFO` line naming both schemas. The guide's "Checking a store before a
-  coordinator starts" section has the details.
+  `current`, `fresh`, `will_migrate`, `newer`, `foreign`, `unusable`, `live`,
+  `cannot_tell` or `coherence_dir_refused`, with exit codes 0 and 10–17
+  (`coherence_dir_refused`, #511, is described with #498 under Changed). The
+  check runs the start's own open on a private copy, so it matches what a
+  start would do even when a killed writer left changes in the WAL, and it
+  creates or changes nothing in the workspace. `SchemaVersionError` now
+  carries `reason`, `found_version` and `expected_version`; a store whose
+  `user_version` is negative, which no build writes, is refused as
+  unrecognized with advice to restore it from a backup instead of to upgrade;
+  and a start that migrates a store logs one `INFO` line naming both schemas.
+  The guide's "Checking a store before a coordinator starts" section has the
+  details.
 
 - **`ensure_coordinator_handle` tells a host whether its call started the
   coordinator or joined one already running (#348).** It returns a
@@ -183,6 +187,57 @@ Alpha — APIs may change before `v1.0`.
   leaves open.
 
 ### Changed
+
+- **A coordinator start refuses a workspace whose `.coherence` is a symbolic
+  link or not a directory, or holds a link directly inside it (#498).** A
+  repository can commit `.coherence`, or any file in it, as a link. A start
+  then wrote its state where the link pointed and tightened a directory a
+  linked `.coherence` named to `0700`, took the bytes of the file a linked
+  `hook.secret` named as the workspace's secret, joined whatever coordinator a
+  linked `server.pid` named, and blocked on a link to a FIFO. Every start now
+  checks `.coherence` before it creates, writes, joins or probes anything, and
+  refuses with one message that names the path and the way out. It also
+  refuses a FIFO, socket or device directly inside `.coherence`, which no
+  coordinator creates and whose open can block a start. The check opens no
+  file and follows no link, and a directory mounted at `.coherence` is a real
+  directory, so it keeps working. `ensure_coordinator_handle` and
+  `ensure_coordinator` raise the new `CoherenceDirRefused`, a `CoherenceError`
+  in `ccs.core.exceptions` whose `reason` is `coherence_dir_refused`, with a
+  `kind` (`coherence_link`, `coherence_not_a_directory` or
+  `coherence_special_entry`) and the refused `path`. It is not a
+  `CoordinatorUnreachable`: no retry, and no coordinator started later, clears
+  it. A strict `CoherentVolume` or `CoordinatedSubstrate` raises it before it
+  writes its policy files or looks for a running coordinator, and the
+  `stale-write-guard-fs` server prints the text on one stderr line and exits
+  `2` before it serves; a volume in degrade mode warns once and stays
+  detached. Wherever the library prints the text, it escapes the control
+  characters a repository can put in a file name. `agent-coherence-coordinator`
+  prints the text and exits `2` before it probes a port or spawns a worker, and
+  so does `--prepare-for-migration`. `--check-store` answers the new outcome
+  `coherence_dir_refused`, exit `17`, ahead of `live`, with the refusal's
+  `kind` as its `reason` (#511), and `agent-coherence-workspace` exits `2`
+  with `reason` `coherence_dir_refused`. `check_coherence_dir(root)` in
+  `ccs.adapters.claude_code.state_dir` runs the same check for a host that
+  writes into `.coherence` itself. The console scripts and the hook client,
+  which start nothing, refuse a `.coherence` that is a link before they read
+  `hook.secret` or connect, and read `hook.secret` without following a link.
+  The coordinator opens its policy files, their lock files and `audit.log` the
+  same way: track and untrack answer HTTP `400`, naming the file, for a policy
+  file that became a link after the start, or a lock file that became a link,
+  FIFO, socket or device, and loading the policy reads such a policy file as no
+  entries, counted as rejected. The plugin's
+  Node coordinator refuses the same workspaces in plugin releases after 0.6.0.
+  The guide's "`.coherence` must be a real directory" section has the details.
+
+  **Upgrade note.** These links worked before and stop working now:
+  `.coherence` itself, and a link at `state.db`, `hook.secret`, `audit.log` or
+  any other file in it. A linked policy file worked only until the first write
+  to it (a track or untrack, or a volume or session merging its globs), which
+  replaced the link with a regular file. To keep the state on another disk,
+  mount a directory at `.coherence`. Otherwise, with no coordinator running
+  for the workspace, put a copy of each file in place of its link. Move
+  `state.db` together with its `-wal` and `-shm`: moving `state.db` alone can
+  lose its latest changes without a word.
 
 - **A Claude Code session, a subagent or a `CoherentVolume` that lets go of a
   file it edited keeps a read of it, so it can read and edit the file again
@@ -451,12 +506,13 @@ Alpha — APIs may change before `v1.0`.
 - **A coordinator start no longer follows a symlinked `.coherence/server.pid`
   (#464).** A repository can commit that file as a link, and the first start in
   a clone truncated the file the link named and wrote its pid and port there, or
-  created it if the link dangled. A start now logs a warning naming the link and
-  starts nothing: `ensure_coordinator_handle` returns `None` and
-  `ensure_coordinator` returns `-1`, as for any pid file it cannot open.
-  `agent-coherence-coordinator` prints the same text and exits `2` at once, without
-  spawning a worker. The plugin's Node coordinator refuses one in plugin releases
-  after 0.6.0; up to 0.6.0 it writes through the link.
+  created it if the link dangled. A start now refuses the link before it writes
+  anything: `ensure_coordinator_handle` and `ensure_coordinator` raise
+  `CoherenceDirRefused`, naming the link, as for any link in `.coherence` (#498,
+  under Changed). `agent-coherence-coordinator` prints the same text and exits
+  `2` at once, without probing a port or spawning a worker. The plugin's Node
+  coordinator refuses one in plugin releases after 0.6.0; up to 0.6.0 it writes
+  through the link.
 
 - **A volume or substrate session no longer overwrites a policy file it cannot
   load (#305).** Before spawning the coordinator, both merge their managed globs
@@ -467,10 +523,12 @@ Alpha — APIs may change before `v1.0`.
   They now refuse such a file with the text the policy routes use, naming it and
   the workspace, and write neither file and start no coordinator. A strict volume
   or a session raises `CoherenceError`; a volume in degrade mode warns, stays
-  detached and says to build a new one once the file is fixed. A FIFO or
-  device at that path, or a link to one, counts as a file that cannot be read and
-  is not opened for a blocking read, so neither the merge nor a Python policy route
-  can hang on it.
+  detached and says to build a new one once the file is fixed. A link, FIFO or
+  device at that path is refused before the merge, by a start's own check (#498,
+  under Changed). A FIFO or device put there later counts as a file that cannot
+  be read and is not opened for a blocking read, so neither the merge nor a
+  Python policy route can hang on it; a link put there later is refused by
+  name.
 
 - **A coordinator start that fails after the bind stops what it started
   (#429).** A start that raised after the coordinator bound (a failed pid-file

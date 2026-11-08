@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeAlias, runtime_checkable
 
 from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+from ccs.adapters.claude_code.state_dir import check_coherence_dir
 from ccs.cli._coherence_client import (
     PRINCIPAL_REFUSED_AGAIN,
     CoordinatorEndpoint,
@@ -536,7 +537,10 @@ class SubstrateCoordinatorSession:
     :class:`~ccs.core.exceptions.CoordinatorUnreachable`, except after the
     substrate write landed, where it stays ``CommitUnconfirmed``. A policy file
     it cannot merge its globs into before spawning raises the plain error,
-    naming the file and the workspace (#305). The
+    naming the file and the workspace (#305). A ``.coherence`` that is a
+    symlink or not a directory, or that holds a symlink, FIFO, socket or
+    device, raises :class:`~ccs.core.exceptions.CoherenceDirRefused` before
+    anything is probed or written (#498); no retry clears it. The
     coordinator's failure envelope (#259) or an HTTP 5xx (#433) on a read leg
     raises the typed :class:`~ccs.core.exceptions.CoordinatorFailed`; any other
     answer that decides nothing keeps the plain error. A request refused for its caller
@@ -566,6 +570,9 @@ class SubstrateCoordinatorSession:
         self._managed = tuple(managed)
         cfg = config or LifecycleConfig()
         coherence_dir = self._root / ".coherence"
+        # Before the pre-probe and the policy write (#498): through a link in
+        # .coherence both would act on what the link names.
+        check_coherence_dir(self._root)
         pid_file = coherence_dir / "server.pid"
         pre_existing = (port := read_port_from_file(pid_file)) is not None and tcp_probe(
             port, cfg, bind_host=bind_host

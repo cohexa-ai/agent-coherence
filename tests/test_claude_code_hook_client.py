@@ -1219,3 +1219,182 @@ def test_pre_edit_delivers_the_freshness_advisory_when_the_coordinator_times_out
     assert hso["hookEventName"] == "PreToolUse"
     assert "permissionDecision" not in hso
     assert "could not verify" in hso["additionalContext"]
+
+
+# ----------------------------------------------------------------------
+# #498 -- hook.secret and .coherence are read without following a link
+#
+# A client reads them with no start before it, so a link a repository
+# committed would send the file it names as the bearer to whatever port
+# server.pid holds. server.pid itself is a regular file in these tests:
+# how it is read is not changed here.
+# ----------------------------------------------------------------------
+
+from tests.coherence_link_helpers import TARGET_BYTES, plant_link, release_fifo  # noqa: E402
+
+
+def _secret_link_refusal(coherence: Path) -> str:
+    """The refusal of a linked ``hook.secret``, written out: the Node client
+    prints the same text."""
+    return (
+        f"refusing {coherence / 'hook.secret'}: it is a symlink, and .coherence must be a real "
+        "directory with no link directly inside it. Replace the link with a copy of the file it "
+        f"names, or mount a directory at {coherence}."
+    )
+
+
+class _BearerRecorder(http.server.BaseHTTPRequestHandler):
+    """Records each request's path and ``Authorization``; answers 200 ``{}``."""
+
+    seen: list[tuple[str, str | None]] = []
+
+    def _answer(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.seen.append((self.path, self.headers.get("Authorization")))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def do_POST(self) -> None:  # noqa: N802 — stdlib name
+        self._answer()
+
+    def do_GET(self) -> None:  # noqa: N802 — stdlib name
+        self._answer()
+
+    def log_message(self, *_args: Any) -> None:
+        return
+
+
+def test_a_linked_hook_secret_is_never_sent_as_the_bearer(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#498: a ``hook.secret`` that is a link is refused before any request: the
+    hook fails open with ``{}``, nothing reaches the port ``server.pid`` names,
+    and ``resolve_endpoint`` names the link and the way out.
+
+    Prevents the bytes of the file a link names going out as ``Authorization:
+    Bearer`` to that port."""
+    _BearerRecorder.seen = []
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _BearerRecorder)
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    coherence = git_workspace / ".coherence"
+    try:
+        coherence.mkdir()
+        (coherence / "server.pid").write_text(f"12345\n{httpd.server_address[1]}\n")
+        plant_link(coherence, "hook.secret", "existing")
+        (git_workspace / "plan.md").write_text("plan")
+        read = {
+            "session_id": _sid(), "tool_name": "Read",
+            "tool_input": {"file_path": str(git_workspace / "plan.md")},
+        }
+        rc, out = _drive("pre-read", read, git_workspace, monkeypatch, capsys)
+        with pytest.raises(_coherence_client.CoordinatorUnavailable) as refused:
+            _coherence_client.resolve_endpoint(git_workspace)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert (rc, json.loads(out)) == (0, {})
+    assert _BearerRecorder.seen == []
+    assert str(refused.value) == _secret_link_refusal(coherence)
+
+
+@pytest.mark.parametrize("dangling", [False, True], ids=["to_another_workspace", "dangling"])
+def test_resolve_endpoint_refuses_a_linked_coherence_before_reading_server_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangling: bool,
+) -> None:
+    """#498: a ``.coherence`` that is a link is refused before ``server.pid`` is
+    read, naming the link and the way out. ``O_NOFOLLOW`` on each file guards
+    only the last component, so a client would read the port and the secret of
+    the directory the link names.
+
+    Prevents a client in one workspace joining another workspace's coordinator
+    with that coordinator's own valid bearer."""
+    peer = tmp_path / "peer" / ".coherence"
+    if not dangling:
+        peer.mkdir(parents=True)
+        (peer / "server.pid").write_text("12345\n50000\n")
+        (peer / "hook.secret").write_text("peer-secret\n")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    coherence = workspace / ".coherence"
+    coherence.symlink_to(peer)
+
+    def no_pid_read(path: Path) -> None:
+        pytest.fail(f"read {path} through a linked .coherence")
+
+    monkeypatch.setattr(_coherence_client, "_read_port_from_file", no_pid_read)
+
+    with pytest.raises(_coherence_client.CoordinatorUnavailable) as refused:
+        _coherence_client.resolve_endpoint(workspace)
+
+    assert str(refused.value) == (
+        f"refusing {coherence}: it is a symlink, and .coherence must be a real directory. "
+        "Replace the link with a real directory and copy in the files you want to keep (move "
+        f"state.db together with its -wal and -shm), or mount a directory at {coherence}."
+    )
+
+
+@pytest.mark.parametrize("linked", [False, True], ids=["fifo", "link_to_fifo"])
+def test_resolve_endpoint_answers_at_once_for_a_fifo_hook_secret(git_workspace: Path, linked: bool) -> None:
+    """#498: a FIFO at ``hook.secret``, or a link to one, is refused at once and
+    named: "not a regular file" for the FIFO, the link refusal for the link. The
+    call runs on a thread and the FIFO is released whatever happens, so a
+    regression fails here instead of hanging the suite.
+
+    Prevents a hook blocking on a FIFO's open, and a FIFO with no writer reading
+    as an empty secret."""
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir()
+    (coherence / "server.pid").write_text("12345\n50000\n")
+    secret = coherence / "hook.secret"
+    if linked:
+        fifo = plant_link(coherence, "hook.secret", "to_fifo")
+    else:
+        fifo = secret
+        os.mkfifo(fifo)
+    answers: list[str] = []
+
+    def resolve() -> None:
+        try:
+            _coherence_client.resolve_endpoint(git_workspace)
+        except _coherence_client.CoordinatorUnavailable as exc:
+            answers.append(str(exc))
+
+    worker = threading.Thread(target=resolve, daemon=True)
+    try:
+        worker.start()
+        worker.join(timeout=10)
+        blocked = worker.is_alive()
+    finally:
+        release_fifo(fifo)
+        worker.join(timeout=5)
+
+    assert not blocked, "resolve_endpoint blocked on a FIFO"
+    expected = (
+        _secret_link_refusal(coherence) if linked
+        else f"{secret} is not a regular file; restart with `agent-coherence-coordinator`"
+    )
+    assert answers == [expected]
+
+
+@pytest.mark.parametrize("linked", ["hook.secret", ".coherence"])
+def test_load_secret_never_reads_through_a_link(tmp_path: Path, linked: str) -> None:
+    """#498: ``load_secret`` answers None, as for a missing file, for a
+    ``hook.secret`` that is a link and for one in a ``.coherence`` that is a
+    link.
+
+    Prevents a hook client taking the bytes of the file a link names as the
+    workspace's secret."""
+    if linked == "hook.secret":
+        plant_link(tmp_path / ".coherence", "hook.secret", "existing")
+    else:
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "hook.secret").write_bytes(TARGET_BYTES)
+        (tmp_path / ".coherence").symlink_to(elsewhere)
+
+    assert load_secret(tmp_path) is None

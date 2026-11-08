@@ -60,7 +60,6 @@ import os
 import re
 import secrets
 import socketserver
-import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -95,6 +94,14 @@ from ccs.adapters.claude_code.policy import (
     TrackedArtifactPolicy,
     policy_file_name,
 )
+from ccs.adapters.claude_code.regular_file import (
+    LinkRefused,
+    NotRegularFile,
+    ReadStatus,
+    open_regular,
+    read_regular_file,
+)
+from ccs.adapters.claude_code.state_dir import check_coherence_dir, lock_link_refusal, policy_link_refusal
 from ccs.coordinator.registry_protocol import (
     RECLAIM_TRIGGERS,
     CheckpointMember,
@@ -1042,6 +1049,10 @@ class CoordinatorHTTPServer:
         on_migrated: Callable[[int], None] | None = None,
     ) -> None:
         self.coordinator_root = Path(coordinator_root).resolve()
+        # #498: before the store open, the policy load and the secret read
+        # below, any of which would follow a link in .coherence. Lifecycle
+        # checks first; this catches a link made since, and a direct build.
+        check_coherence_dir(self.coordinator_root)
         self.bind_host = bind_host
         # Host-header allowlist: loopback always, plus a validated non-loopback
         # bind (cross-host demo). Validates bind_host here at construction — a
@@ -9432,25 +9443,27 @@ def _read_policy_bytes(yaml_path: Path, name: str) -> bytes:
     replace a file holding every pattern with one holding only the new ones.
     The text for a failed read matches the Node coordinator's.
 
-    Reads a regular file only, because a repository can commit this file as a
-    link: opening a FIFO with no writer blocks forever, and a device such as
+    Reads a regular file only, and never through a link (#498), because a
+    repository can commit this file as one: the rename after the read would
+    replace the link with a regular file holding the entries of the file it
+    names, opening a FIFO with no writer blocks forever, and a device such as
     ``/dev/zero`` never reaches EOF."""
-    try:
-        with open(yaml_path, "rb", opener=_open_nonblocking) as handle:
-            if stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                return handle.read()
-    except FileNotFoundError:
+    result = read_regular_file(yaml_path)
+    if result.status is ReadStatus.READ:
+        return result.data
+    if result.status is ReadStatus.ABSENT:
         return b""
-    except OSError as exc:
+    if result.status is ReadStatus.LINK:
+        raise ValueError(policy_link_refusal(name))
+    exc = result.error
+    # A directory keeps its errno text, so the wire text matches the Node coordinator's.
+    if exc is not None and (
+        result.status is ReadStatus.UNREADABLE
+        or (result.status is ReadStatus.NOT_REGULAR and exc.errno == errno.EISDIR)
+    ):
         code = errno.errorcode.get(exc.errno, str(exc)) if exc.errno else str(exc)
-        raise ValueError(f"{name} could not be read ({code}); nothing was written.") from None
+        raise ValueError(f"{name} could not be read ({code}); nothing was written.")
     raise ValueError(f"{name} could not be read (not a regular file); nothing was written.")
-
-
-def _open_nonblocking(path: str, flags: int) -> int:
-    # O_NONBLOCK is POSIX-only; without it there are no FIFOs to block on, and
-    # the fstat check still refuses a device.
-    return os.open(path, flags | getattr(os, "O_NONBLOCK", 0))
 
 
 def _entries_or_none(text: str, name: str) -> list[str] | None:
@@ -9499,8 +9512,9 @@ def merge_policy_globs(yaml_paths: Iterable[Path], globs: tuple[str, ...]) -> No
 def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str], list[dict]]:
     """Append valid patterns to a YAML file. Returns (added, rejected).
     Raises ValueError, which the routes answer as HTTP 400, when the file
-    would exceed MAX_POLICY_YAML_BYTES or an entry could not take effect in
-    it (see :func:`_append_policy_entries`); nothing is written then.
+    would exceed MAX_POLICY_YAML_BYTES, an entry could not take effect in
+    it (see :func:`_append_policy_entries`), or its lock sidecar is a link
+    or not a regular file (#498); nothing is written then.
 
     R14 (Unit 6): the read-modify-write is wrapped in an ``fcntl.flock``
     exclusive lock on a sidecar ``<yaml_path>.lock`` file so two concurrent
@@ -9550,7 +9564,18 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
         # coordinator on Windows, but degrade defensively if reached.
         return _append_policy_entries(yaml_path, added), rejected
     lock_path = yaml_path.with_suffix(yaml_path.suffix + ".lock")
-    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        # No-follow (#498): O_CREAT through a dangling link creates the file it
+        # names, outside .coherence.
+        lock_fd = open_regular(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except LinkRefused:
+        raise ValueError(lock_link_refusal(policy_file_name(yaml_path))) from None
+    except NotRegularFile:
+        # A FIFO, socket or device put there while the coordinator runs (a start
+        # refuses one): the 400 a policy file that is not regular gets.
+        raise ValueError(
+            f"{policy_file_name(yaml_path)}.lock could not be read (not a regular file); nothing was written."
+        ) from None
     try:
         _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
         return _append_policy_entries(yaml_path, added), rejected

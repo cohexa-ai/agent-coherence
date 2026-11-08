@@ -2,7 +2,8 @@
 
 This document covers what end users need to know to install, configure, and run
 `agent-coherence` safely: the outbound-traffic posture, which callers the local
-coordinator can tell apart, the kill switches that disable telemetry-shaped
+coordinator can tell apart, what a coordinator start refuses in a repository
+you clone, the kill switches that disable telemetry-shaped
 behavior, the local files the package writes, how to install with hash pinning,
 and how to verify the cryptographic provenance of a published wheel.
 
@@ -277,6 +278,48 @@ so an answer cannot drive the terminal they print to. All of this is
 disclosure hygiene
 rather than a boundary: under the model above, knowing a session id grants
 nothing the secret does not already grant.
+
+## A repository you clone
+
+The model above trusts every process running as your OS user. A repository you
+clone, or an archive you unpack, is a different adversary: whoever wrote it
+runs no code, but chooses every path in the tree, and a clone checks out
+entries under `.coherence/` like any others. Any of them can be a symbolic
+link to a file or directory outside the workspace, or to a FIFO.
+
+Before a start writes anything, joins a coordinator or probes a port, both
+coordinators refuse a workspace whose `.coherence` is a symbolic link or not a
+directory, or that holds a link, FIFO, socket or device directly inside it
+(see [`.coherence` must be a real directory](guide.md#coherence-must-be-a-real-directory);
+the plugin's Node coordinator does so in plugin releases after 0.6.0). So a
+committed link cannot make a start:
+
+- write outside the workspace: truncate or create the file a link names, or
+  tighten the directory a linked `.coherence` names to `0700`;
+- take the bytes of the file a linked `hook.secret` names as the workspace's
+  secret;
+- join the coordinator a linked `server.pid` names;
+- hang on a FIFO a link names.
+
+The check only looks: it opens no file and follows no link. A directory
+mounted at `.coherence` is a real directory, and is not refused. The commands
+and hooks that only talk to a running coordinator refuse a `.coherence` that
+is a link before they read `hook.secret` or connect, and read `hook.secret`
+without following a link, so they never send the bytes of a file a link names
+as the secret.
+
+What it does not cover:
+
+- A repository that commits **regular** files under `.coherence`. That is out
+  of scope.
+- A link made after a start, while the coordinator runs. Making one takes a
+  process running as your OS user, which the model above already trusts. The
+  coordinator still opens its policy files and `audit.log` without following a
+  link.
+- A link at the workspace root or above it, or inside a subdirectory of
+  `.coherence`.
+- A command or hook that only reads `.coherence/server.pid` to find a running
+  coordinator, without starting one, still follows a link there.
 
 ## Env-var kill switches
 

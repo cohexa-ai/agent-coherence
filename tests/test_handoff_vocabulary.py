@@ -21,6 +21,11 @@ from ccs.adapters.coherent_object import ConditionalPutRetriesExhausted
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_REASONS,
     CAS_EXHAUSTED_REASON,
+    COHERENCE_DIR_REFUSAL_KINDS,
+    COHERENCE_DIR_REFUSED_REASON,
+    COHERENCE_LINK_KIND,
+    COHERENCE_NOT_A_DIRECTORY_KIND,
+    COHERENCE_SPECIAL_ENTRY_KIND,
     COMMIT_PREEMPTED_REASON,
     COMMIT_UNCONFIRMED_REASON,
     COORDINATOR_FAILED_REASON,
@@ -57,6 +62,7 @@ from ccs.core.exceptions import (
     CallerPrincipalRefused,
     CasRetriesExhausted,
     CasVersionConflict,
+    CoherenceDirRefused,
     CoherenceError,
     CoordinatorFailed,
     CoordinatorUnreachable,
@@ -164,6 +170,7 @@ def test_handoff_reasons_collide_with_no_existing_reason_or_status() -> None:
             COORDINATOR_FAILED_REASON,
             SPLIT_PAIR_REASON,
             UNAVAILABLE_REASON,
+            COHERENCE_DIR_REFUSED_REASON,
         }
     )
     assert HANDOFF_REASONS.isdisjoint(existing)
@@ -252,6 +259,49 @@ def test_client_exceptions_with_constructor_fields_cross_a_process_boundary(
 
     assert type(restored) is type(err)
     assert restored.args == err.args
+    assert restored.__dict__ == err.__dict__
+    assert restored.__notes__ == ["context"]
+
+
+def test_coherence_dir_refused_carries_its_reason_kind_and_path_and_crosses_a_process_boundary() -> None:
+    """A start's refusal of a linked or non-directory ``.coherence`` (#498) is
+    a typed terminal in the coherence family with one class-level reason, and
+    ``kind`` says which rule refused it. It is not a
+    :class:`CoordinatorUnreachable`, so no ``except CoordinatorUnreachable``
+    retry loop catches it: no retry clears a link a person must replace. A
+    worker process that raises it hands the parent the same refusal."""
+    assert COHERENCE_DIR_REFUSED_REASON == "coherence_dir_refused"
+    for constant, literal in [
+        (COHERENCE_LINK_KIND, "coherence_link"),
+        (COHERENCE_NOT_A_DIRECTORY_KIND, "coherence_not_a_directory"),
+        (COHERENCE_SPECIAL_ENTRY_KIND, "coherence_special_entry"),
+    ]:
+        assert constant == literal
+    assert COHERENCE_DIR_REFUSAL_KINDS == {
+        "coherence_link", "coherence_not_a_directory", "coherence_special_entry",
+    }
+    assert COHERENCE_DIR_REFUSED_REASON not in COHERENCE_DIR_REFUSAL_KINDS
+
+    err = CoherenceDirRefused(
+        COHERENCE_LINK_KIND, "/w/.coherence/hook.secret", "refusing /w/.coherence/hook.secret"
+    )
+    err.add_note("context")
+    assert CoherenceDirRefused.reason == COHERENCE_DIR_REFUSED_REASON
+    assert err.reason == COHERENCE_DIR_REFUSED_REASON
+    assert err.kind == COHERENCE_LINK_KIND
+    assert err.path == "/w/.coherence/hook.secret"
+    assert str(err) == "refusing /w/.coherence/hook.secret"
+    assert isinstance(err, CoherenceError)
+    assert not isinstance(err, CoordinatorUnreachable)
+
+    restored = pickle.loads(pickle.dumps(err))
+
+    assert type(restored) is CoherenceDirRefused
+    assert restored.args == err.args
+    assert restored.reason == COHERENCE_DIR_REFUSED_REASON
+    assert restored.kind == COHERENCE_LINK_KIND
+    assert restored.path == "/w/.coherence/hook.secret"
+    assert str(restored) == str(err)
     assert restored.__dict__ == err.__dict__
     assert restored.__notes__ == ["context"]
 

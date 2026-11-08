@@ -17,12 +17,14 @@ import shutil
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
 import time
 import uuid
 import warnings
+from collections.abc import Iterator
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,7 +33,7 @@ from typing import Optional
 import pytest
 
 import ccs
-from ccs.adapters.claude_code import coordinator_server, lifecycle
+from ccs.adapters.claude_code import coordinator_server, lifecycle, state_dir
 from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
 from ccs.adapters.claude_code.lifecycle import (
     CoordinatorHandle,
@@ -45,7 +47,16 @@ from ccs.adapters.claude_code.lifecycle import (
 from ccs.adapters.claude_code.lifecycle import (
     read_port_from_file as _read_port_from_file,
 )
+from ccs.adapters.claude_code.state_dir import entry_link_refusal
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+from ccs.core.exceptions import COHERENCE_LINK_KIND, COHERENCE_SPECIAL_ENTRY_KIND, CoherenceDirRefused
+from tests.coherence_link_helpers import (
+    LINK_NAMES,
+    TARGET_BYTES,
+    plant_link,
+    release_fifo,
+    target_snapshot,
+)
 
 #: FROZEN duplicates of the ``SpawnOutcome`` values (#348), written out as
 #: literals on purpose: the enum is a ``str`` Enum and a host compares the
@@ -2702,11 +2713,11 @@ def test_a_start_interrupted_just_after_it_took_the_flock_releases_it(
 @pytest.mark.parametrize("target_exists", [True, False], ids=["existing_target", "dangling"])
 def test_a_start_refuses_a_symlinked_pid_file_and_leaves_its_target_alone(
     workspace: Path, fast_cfg: LifecycleConfig, tmp_path_factory: pytest.TempPathFactory,
-    caplog: pytest.LogCaptureFixture, target_exists: bool,
+    target_exists: bool,
 ) -> None:
     """#464: a repository can commit ``server.pid`` as a symlink. The first start
-    in a clone refuses it, says why, and the file the link names is untouched, or
-    still absent for a dangling link.
+    in a clone raises the refusal naming it (#498), and the file the link names is
+    untouched, or still absent for a dangling link.
 
     Prevents a start truncating the link's target and writing its pid and port
     there, and its shutdown rewriting it, or creating that file outside the
@@ -2718,15 +2729,17 @@ def test_a_start_refuses_a_symlinked_pid_file_and_leaves_its_target_alone(
     coherence.mkdir(mode=0o700)
     pid_file = coherence / "server.pid"
     pid_file.symlink_to(target)
-    caplog.set_level("WARNING")
 
-    assert ensure_coordinator_handle(workspace, config=fast_cfg) is None
-    assert ensure_coordinator(workspace, config=fast_cfg) == -1
+    with pytest.raises(CoherenceDirRefused) as refused:
+        ensure_coordinator_handle(workspace, config=fast_cfg)
+    with pytest.raises(CoherenceDirRefused):
+        ensure_coordinator(workspace, config=fast_cfg)
 
+    assert (refused.value.kind, refused.value.path) == (COHERENCE_LINK_KIND, str(pid_file))
+    assert f"refusing {pid_file}: it is a symlink" in str(refused.value)
     assert pid_file.is_symlink()
     assert (target.read_bytes() == b"keep\n") if target_exists else not target.exists()
     assert str(workspace.resolve()) not in lifecycle._SPAWNED_REGISTRY
-    assert f"refusing pid file {pid_file}: it is a symlink" in caplog.text
 
 
 def test_a_start_that_cannot_open_its_pid_file_does_not_blame_a_symlink(
@@ -2767,6 +2780,323 @@ def test_a_pid_file_in_a_directory_it_cannot_search_is_not_blamed_on_a_link(
         coherence.chmod(0o700)
 
     assert "cannot open pid file" in caplog.text
+
+
+# ----------------------------------------------------------------------
+# #498: a link, FIFO, socket or device in .coherence is refused
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def refusing_workspace(workspace: Path) -> Iterator[Path]:
+    """The workspace of a start that must refuse. A regression that starts a
+    coordinator there is stopped, so it fails its own test only."""
+    yield workspace
+    stop_coordinator(workspace)
+
+
+@pytest.mark.parametrize("shape", ["existing", "dangling"])
+@pytest.mark.parametrize("name", LINK_NAMES)
+def test_a_start_refuses_a_link_at_any_name_in_coherence_and_changes_nothing(
+    refusing_workspace: Path, fast_cfg: LifecycleConfig, name: str, shape: str,
+) -> None:
+    """#498: a cloned repository can commit a symlink at any name in ``.coherence``.
+    A start raises the refusal naming it, with the way to keep the state elsewhere,
+    before it creates, writes or reads anything there.
+
+    Prevents a start writing into, creating or reading the file a link names, at a
+    name the check forgot, including one no code reads today."""
+    coherence_dir = refusing_workspace / ".coherence"
+    target = plant_link(coherence_dir, name, shape)
+    link = coherence_dir / name
+    named = os.readlink(link)
+    before = (target_snapshot(target), target_snapshot(target.parent))
+
+    with pytest.raises(CoherenceDirRefused) as refused:
+        ensure_coordinator_handle(refusing_workspace, config=fast_cfg)
+
+    assert (refused.value.kind, refused.value.path) == (COHERENCE_LINK_KIND, str(link))
+    assert "mount a directory" in str(refused.value)
+    assert os.readlink(link) == named
+    assert (target_snapshot(target), target_snapshot(target.parent)) == before
+    assert sorted(os.listdir(coherence_dir)) == [name]
+    assert str(refusing_workspace.resolve()) not in lifecycle._SPAWNED_REGISTRY
+
+
+def _outside_directory(root: Path, factory: pytest.TempPathFactory) -> tuple[Path, Path]:
+    named = factory.mktemp("outside")
+    return named, named
+
+
+def _the_root_itself(root: Path, factory: pytest.TempPathFactory) -> tuple[Path, Path]:
+    return root, Path(".")
+
+
+def _a_directory_in_the_workspace(root: Path, factory: pytest.TempPathFactory) -> tuple[Path, Path]:
+    named = root / "state-elsewhere"
+    named.mkdir()
+    return named, Path("state-elsewhere")
+
+
+def _nothing(root: Path, factory: pytest.TempPathFactory) -> tuple[Path, Path]:
+    named = factory.mktemp("outside") / "gone"
+    return named, named
+
+
+@pytest.mark.parametrize(
+    "name_target",
+    [_outside_directory, _the_root_itself, _a_directory_in_the_workspace, _nothing],
+    ids=["outside_0755", "the_root", "inside_the_workspace", "dangling"],
+)
+def test_a_start_refuses_a_linked_coherence_and_leaves_the_directory_it_names_alone(
+    refusing_workspace: Path, fast_cfg: LifecycleConfig, tmp_path_factory: pytest.TempPathFactory,
+    name_target,
+) -> None:
+    """#498: ``.coherence`` itself can be a committed link. A start refuses it before
+    its ``mkdir``, so the directory it names keeps its mode and gets no store, secret,
+    pid file or ``.gitignore``, and a dangling link's target is not created.
+
+    Prevents the start tightening the named directory from 0755 to 0700 and writing
+    its state files there."""
+    target, link_text = name_target(refusing_workspace, tmp_path_factory)
+    if target.is_dir():
+        target.chmod(0o755)
+    coherence_dir = refusing_workspace / ".coherence"
+    coherence_dir.symlink_to(link_text, target_is_directory=True)
+    before = target_snapshot(target)
+
+    with pytest.raises(CoherenceDirRefused) as refused:
+        ensure_coordinator_handle(refusing_workspace, config=fast_cfg)
+
+    assert (refused.value.kind, refused.value.path) == (COHERENCE_LINK_KIND, str(coherence_dir))
+    assert "mount a directory" in str(refused.value)
+    assert os.readlink(coherence_dir) == str(link_text)
+    assert target_snapshot(target) == before
+
+
+def test_a_start_does_not_read_a_device_change_as_a_link(
+    workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#498: a directory mounted at ``.coherence`` is a real directory on another
+    device, and a start uses it as one. A patched ``st_dev`` stands in for the mount,
+    which a test cannot make without root.
+
+    Prevents a check that compares devices refusing every mounted ``.coherence``."""
+    coherence_dir = workspace / ".coherence"
+    coherence_dir.mkdir(mode=0o700)
+    mounted = {os.fspath(coherence_dir), os.fspath(coherence_dir.resolve())}
+
+    def on_another_device(real):
+        def answer(path, *args, **kwargs):
+            result = real(path, *args, **kwargs)
+            if isinstance(path, (str, os.PathLike)) and os.fspath(path) in mounted:
+                fields = list(result)
+                fields[stat.ST_DEV] = result.st_dev + 1
+                return os.stat_result(fields)
+            return result
+        return answer
+
+    monkeypatch.setattr(os, "lstat", on_another_device(os.lstat))
+    monkeypatch.setattr(os, "stat", on_another_device(os.stat))
+
+    handle = ensure_coordinator_handle(workspace, config=fast_cfg)
+    try:
+        assert handle is not None and handle.outcome == _BOUND
+    finally:
+        stop_coordinator(workspace)
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root searches a mode-000 directory"
+)
+def test_a_start_that_must_repair_coherence_before_it_can_search_it_still_refuses_a_link_in_it(
+    refusing_workspace: Path, fast_cfg: LifecycleConfig,
+) -> None:
+    """#498: the check cannot list a ``.coherence`` the user owns but cannot search,
+    so it passes, and the start repairs the mode to 0700. The check then runs again
+    and refuses the link it can now see, before the start writes anything.
+
+    Prevents a permission error on the listing reading as "no link" for good."""
+    coherence_dir = refusing_workspace / ".coherence"
+    target = plant_link(coherence_dir, "hook.secret", "existing")
+    coherence_dir.chmod(0)
+    try:
+        with pytest.raises(CoherenceDirRefused) as refused:
+            ensure_coordinator_handle(refusing_workspace, config=fast_cfg)
+    finally:
+        coherence_dir.chmod(0o700)
+
+    assert refused.value.path == str(coherence_dir / "hook.secret")
+    assert sorted(os.listdir(coherence_dir)) == ["hook.secret"]
+    assert target.read_bytes() == TARGET_BYTES
+
+
+def test_a_start_refuses_a_link_without_running_git(
+    refusing_workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#498: the refusal comes from ``lstat`` and the directory listing alone.
+
+    Prevents a rule that asks git which files it tracks, which can run a
+    repository's own fsmonitor command, creeping back into the start."""
+    plant_link(refusing_workspace / ".coherence", "tracked.yaml", "existing")
+
+    def no_command(*args: object, **kwargs: object) -> None:
+        pytest.fail(f"the start ran a command: {args!r}")
+
+    monkeypatch.setattr(subprocess, "run", no_command)
+    monkeypatch.setattr(subprocess, "Popen", no_command)
+
+    with pytest.raises(CoherenceDirRefused):
+        ensure_coordinator_handle(refusing_workspace, config=fast_cfg)
+
+
+def test_a_start_refuses_a_dangling_hook_secret_link_and_names_it_as_a_link(
+    refusing_workspace: Path, fast_cfg: LifecycleConfig,
+) -> None:
+    """#498: the start check refuses a dangling ``hook.secret`` link before the
+    secret is created, and the refusal names the link as a link.
+
+    Prevents a start that reaches the secret's ``O_EXCL`` create, which a
+    dangling link fails without following it, and then reports a secret file
+    that "stayed empty" instead of the link."""
+    coherence_dir = refusing_workspace / ".coherence"
+    plant_link(coherence_dir, "hook.secret", "dangling")
+
+    with pytest.raises(CoherenceDirRefused) as refused:
+        ensure_coordinator_handle(refusing_workspace, config=fast_cfg)
+
+    assert (refused.value.kind, refused.value.path) == (COHERENCE_LINK_KIND, str(coherence_dir / "hook.secret"))
+
+
+def _start_with_a_deadline(root: Path, cfg: LifecycleConfig, fifo: Path) -> object:
+    """Run a start on a thread with a deadline, then release ``fifo``: the
+    handle or exception the start answered."""
+    answers: list[object] = []
+
+    def start() -> None:
+        try:
+            answers.append(ensure_coordinator_handle(root, config=cfg))
+        except BaseException as exc:  # the answer under test
+            answers.append(exc)
+
+    worker = threading.Thread(target=start, daemon=True)
+    try:
+        worker.start()
+        worker.join(timeout=30)
+        assert not worker.is_alive(), "the start blocked on a FIFO in .coherence"
+    finally:
+        release_fifo(fifo)
+    assert len(answers) == 1
+    return answers[0]
+
+
+def test_a_start_refuses_a_fifo_in_coherence_at_once_and_not_a_subdirectory(
+    refusing_workspace: Path, fast_cfg: LifecycleConfig,
+) -> None:
+    """#498: no coordinator creates a FIFO, socket or device in ``.coherence``, and
+    opening a FIFO blocks. A start refuses one at once, without opening it, and
+    starts once it is gone, beside a real subdirectory.
+
+    Prevents the check opening the entries it scans, and refusing a subdirectory
+    such as a mounted disk's ``lost+found``."""
+    coherence_dir = refusing_workspace / ".coherence"
+    coherence_dir.mkdir(mode=0o700)
+    (coherence_dir / "notes.d").mkdir()
+    fifo = coherence_dir / "notes.fifo"
+    os.mkfifo(fifo)
+
+    refused = _start_with_a_deadline(refusing_workspace, fast_cfg, fifo)
+
+    assert isinstance(refused, CoherenceDirRefused), refused
+    assert (refused.kind, refused.path) == (COHERENCE_SPECIAL_ENTRY_KIND, str(fifo))
+    handle = ensure_coordinator_handle(refusing_workspace, config=fast_cfg)
+    assert handle is not None and handle.outcome == _BOUND
+
+
+def test_a_pid_file_linked_after_the_start_check_is_refused_by_its_open(tmp_path: Path) -> None:
+    """#498: the start check runs before the pid-file open, so a link met there was
+    made in between. Prevents that race returning None, which a caller retries: the
+    open raises the same refusal, and the file the link names is not created."""
+    from ccs.adapters.claude_code.lifecycle import _open_pidfile
+
+    coherence_dir = tmp_path / ".coherence"
+    target = plant_link(coherence_dir, "server.pid", "dangling")
+    pid_file = coherence_dir / "server.pid"
+
+    with pytest.raises(CoherenceDirRefused) as refused:
+        _open_pidfile(pid_file)
+
+    assert (refused.value.kind, refused.value.path) == (COHERENCE_LINK_KIND, str(pid_file))
+    assert str(refused.value) == entry_link_refusal(pid_file)
+    assert not target.exists()
+
+
+def test_connect_or_spawn_refuses_a_link_before_it_reads_the_pid_file(
+    refusing_workspace: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#498: the hook entry point joins from the pid file and a TCP probe without
+    reaching the start, so a linked pid file naming a live port would join another
+    workspace's coordinator. Prevents that: the check runs first."""
+    plant_link(refusing_workspace / ".coherence", "server.pid", "existing")
+
+    def must_not_run(*args: object, **kwargs: object) -> None:
+        pytest.fail("connect_or_spawn read the pid file or probed a port before the check")
+
+    monkeypatch.setattr(lifecycle, "read_port_from_file", must_not_run)
+    monkeypatch.setattr(lifecycle, "tcp_probe", must_not_run)
+
+    with pytest.raises(CoherenceDirRefused):
+        connect_or_spawn(refusing_workspace, config=fast_cfg)
+
+
+def test_a_dangling_gitignore_link_made_after_the_check_is_not_followed(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#498: the check refuses a ``.gitignore`` link, so one met by the write was
+    made after it. The write creates the file only where nothing is, never through
+    a link. Prevents a start creating the file a dangling link names."""
+    coherence_dir = workspace / ".coherence"
+    target = plant_link(coherence_dir, ".gitignore", "dangling")
+    # Stands in for a link made after the check ran.
+    monkeypatch.setattr(lifecycle, "check_coherence_dir", lambda root: None)
+
+    assert lifecycle._ensure_coherence_dir(workspace) == coherence_dir
+
+    assert not target.exists()
+    assert (coherence_dir / ".gitignore").is_symlink()
+
+
+def test_a_coherence_linked_after_the_first_check_is_refused_before_gitignore_is_written(
+    workspace: Path, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#498: ``.coherence`` made a link between the check and the ``mkdir``. The mode
+    repair reads the mode with ``lstat``, sees no directory and changes nothing, and
+    the check after it refuses the link before ``.gitignore`` is written into the
+    directory it names.
+
+    Prevents a repair that reads the mode through the link tightening the named
+    directory to 0700, or skipping the check when that directory is already 0700."""
+    named = tmp_path_factory.mktemp("outside")
+    named.chmod(0o755)
+    coherence_dir = workspace / ".coherence"
+    coherence_dir.symlink_to(named, target_is_directory=True)
+    checks: list[Path] = []
+
+    def check_after_the_first(root: Path) -> None:
+        checks.append(root)
+        if len(checks) > 1:
+            state_dir.check_coherence_dir(root)
+
+    monkeypatch.setattr(lifecycle, "check_coherence_dir", check_after_the_first)
+
+    with pytest.raises(CoherenceDirRefused) as refused:
+        lifecycle._ensure_coherence_dir(workspace)
+
+    # The stand-in ran both times: the refusal is the second check's, not the first.
+    assert len(checks) == 2
+    assert refused.value.path == str(coherence_dir)
+    assert os.listdir(named) == []
+    assert stat.S_IMODE(os.lstat(named).st_mode) == 0o755
 
 
 def _hold_the_flock_with_no_port(root: Path) -> int:
