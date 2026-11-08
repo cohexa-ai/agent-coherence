@@ -294,16 +294,24 @@ SWEEP_RECLAIM_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS - {"timeout"}
 # act, never an eviction. Wire-stable: renaming it without EPOCH_BUMP_TRIGGERS
 # leaves the bump keyed on a string nothing emits.
 HANDOFF_TRIGGER: str = "handoff"
-# EPOCH_BUMP_TRIGGERS: the triggers whose M/E -> INVALID transition MOVES the
-# ownership epoch. The rule is not "the sweep did it" but "a write-claim was
+# EPOCH_BUMP_TRIGGERS: the triggers under which LEAVING M/E moves the ownership
+# epoch, whatever state the agent lands in: INVALID, or SHARED on the holder's
+# own release. The rule is not "the sweep did it" but "a write-claim was
 # revoked WITHOUT the version moving" -- the one condition version-CAS is
 # structurally blind to. That is every RECLAIM_TRIGGER plus "invalidate", the
-# voluntary release (service.invalidate: a post-edit failure, a session-stop
-# release, an operator drain), which likewise ends a claim at an unchanged
-# version. Leaving it out let a release SUPPRESS the fence: the holder is
-# already INVALID, so the sweep has no M/E grant left to reclaim and the epoch
-# never moves at all -- the identical end-state a sweep reclaim fences was
-# silently admitted (NoSilentRevoke, formal/tla/Fencing.tla).
+# voluntary release, which likewise ends a claim at an unchanged version. The
+# release has two end states. service.release_to_reader is the holder's own
+# release (a failed post-edit, the end of a turn, a subagent stopping): it
+# keeps a read, M/E -> SHARED (#513). service.invalidate moves the agent to
+# INVALID; the operator drain keeps using it, because the bytes behind an
+# orphaned grant may never have been committed. Leaving "invalidate" out let a
+# release SUPPRESS the fence: the holder is no longer in M/E, so the sweep has
+# no grant left to reclaim and the epoch never moves at all -- the identical
+# end-state a sweep reclaim fences was silently admitted (NoSilentRevoke,
+# formal/tla/Fencing.tla). Keying the bump on landing INVALID would reopen
+# that hole for the release to SHARED: the release reads nothing and captures
+# no read_generation, so only the moved epoch refuses the holder's late commit
+# on the claim it gave back.
 #
 # HANDOFF_TRIGGER joins for the same reason: a giver that hands a path off from
 # EXCLUSIVE or MODIFIED ends its write claim at an unchanged version exactly as
@@ -1118,6 +1126,11 @@ class RegistryBase(Protocol):
         INVALID does: the prior value kept, a never-observed pair still None.
         It never affects the state written, the grant tick, the epoch or the
         read-generation capture.
+
+        Leaving M/E under an :data:`EPOCH_BUMP_TRIGGERS` trigger moves the
+        artifact's ``owner_generation`` in the same write, whatever the target
+        state: INVALID, or SHARED when a holder gives back its own write grant
+        and keeps a read.
 
         An M/E -> INVALID transition under a :data:`SWEEP_RECLAIM_TRIGGERS`
         trigger also records the pair's reclaim slot, ``(trigger, tick)``, in
