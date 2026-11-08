@@ -666,33 +666,67 @@ def _cas_not_recorded_message(rel: str, detail: str) -> str:
     )
 
 
-def _unanswered_write_message(rel: str, no_answer: _CommitNotAnswered) -> str:
+#: What a write() whose commit certainly was not recorded says to do (#526).
+#: Re-reading cannot help: the bytes on disk are not the content the
+#: coordinator records, so a read that refuses stale bytes refuses them until
+#: a write records them. Not "every read": a read inside the volume's own 5 s
+#: commit window, or one under on_stale_read="allow", returns them.
+_UNRECORDED_WRITE_RECOVERY = (
+    "Until a write() of this path is recorded, a read that refuses stale bytes "
+    "refuses it, and reading again does not clear that: write() the path again, "
+    "with these bytes or a change built from them, to record it."
+)
+
+#: The same for a commit that may or may not have been recorded. A read that
+#: returns proves nothing either way, and the rewrite is right in both cases:
+#: if the commit landed, it commits the same content at the next version.
+_MAYBE_RECORDED_WRITE_RECOVERY = (
+    "If the coordinator did not record the write, a read that refuses stale "
+    "bytes refuses this path until a write() of it is recorded, and reading "
+    "again does not clear that; write() the path again, with these bytes or a "
+    "change built from them, which records it either way."
+)
+
+
+def _grant_release_sentence(released: bool) -> str:
+    """What became of the write grant of a write() whose commit was not
+    confirmed: the release write() sent first was confirmed, or it was not
+    and :meth:`CoherentVolume.release` sends it again."""
+    if released:
+        return "Its write grant was released."
+    return "The release of its write grant was not confirmed: release() sends it again."
+
+
+def _unanswered_write_message(rel: str, no_answer: _CommitNotAnswered, *, released: bool) -> str:
     """What a strict write() raises when its commit (post-edit) got no usable
     answer, or an HTTP 5xx, after its bytes reached disk (R8): that they are
-    there, and whether the coordinator certainly did not record the write or
-    may have. The release it sends first is best-effort and not reported, so
-    the text holds whether or not that release was answered (R9). ``detail``
-    is the client's own text, never the coordinator's; a 5xx is named by its
-    code alone."""
+    there, whether the coordinator certainly did not record the write or may
+    have, what became of its grant (``released``: the release sent first was
+    confirmed), and the write that records the bytes (#526). ``detail`` is the
+    client's own text, never the coordinator's; a 5xx is named by its code
+    alone."""
     if no_answer.never_sent:
         recorded = f"the coordinator did not record the write ({no_answer.detail})"
+        recovery = _UNRECORDED_WRITE_RECOVERY
     elif no_answer.status is not None:
         recorded = (
             f"its commit was answered with HTTP {no_answer.status}, so the "
             "coordinator may have recorded the write"
         )
+        recovery = _MAYBE_RECORDED_WRITE_RECOVERY
     else:
         recorded = (
             f"its commit got no usable answer ({no_answer.detail}), so the "
             "coordinator may have recorded the write"
         )
+        recovery = _MAYBE_RECORDED_WRITE_RECOVERY
     return (
-        f"The write's bytes are on disk at {rel}, but {recorded}. One best-effort "
-        "release of its grant was attempted. Re-read the path before writing it again."
+        f"The write's bytes are on disk at {rel}, but {recorded}. "
+        f"{_grant_release_sentence(released)} {recovery}"
     )
 
 
-def _failed_write_message(rel: str, reason: str) -> str:
+def _failed_write_message(rel: str, reason: str, *, released: bool) -> str:
     """What write() raises (:class:`~ccs.core.exceptions.CommitUnconfirmed`)
     when the coordinator answered its commit (post-edit) with its failure
     envelope: the bytes are on disk, and the work may have recorded the
@@ -701,9 +735,8 @@ def _failed_write_message(rel: str, reason: str) -> str:
     type."""
     return (
         f"The write's bytes are on disk at {rel}, but the coordinator answered its "
-        f"commit with a failure ({reason}), so it may have recorded the write. One "
-        "best-effort release of its grant was attempted. Re-read the path before "
-        "writing it again."
+        f"commit with a failure ({reason}), so it may have recorded the write. "
+        f"{_grant_release_sentence(released)} {_MAYBE_RECORDED_WRITE_RECOVERY}"
     )
 
 
@@ -774,8 +807,9 @@ _SPLIT_READ_DENY_REASON = (
     "records at its current version, so no version is returned for them. A "
     "peer's commit still reaching disk clears on its own: reacquire() and read "
     "again, retrying with backoff for a few seconds. Only a refusal that "
-    "outlasts that means the file was changed outside the coordinator (an "
-    "out-of-band edit, or a commit whose disk write failed): then write() the "
+    "outlasts that means the bytes on disk were never recorded (an out-of-band "
+    "edit, a commit whose disk write failed, or a write() whose commit did not "
+    "reach the coordinator), and reading again does not clear it: write() the "
     "bytes reacquire() returned, or your merge of them, to record them, and read "
     "again. A write made while a peer's commit is still reaching disk is "
     "overwritten when that commit lands."
@@ -2073,9 +2107,12 @@ class CoherentVolume:
         raises :class:`~ccs.core.exceptions.CoordinatorUnreachable` when the
         commit never left (the coordinator did not record the write) or
         :class:`~ccs.core.exceptions.CommitUnconfirmed` (it may have: a 5xx
-        says nothing of whether the commit ran); either way, re-read before
-        writing again. A 4xx or a redirect takes ``on_error``'s path, with no
-        release. A commit the coordinator answers
+        says nothing of whether the commit ran). Re-reading does not help:
+        until a write of the path is recorded, a read that refuses stale bytes
+        refuses it, so write the path again, which records it either way
+        (#526); the error says whether the release was confirmed, and
+        :meth:`release` sends one that was not. A 4xx or a redirect takes
+        ``on_error``'s path, with no release. A commit the coordinator answers
         with its failure envelope may have been recorded too, so it raises
         ``CommitUnconfirmed`` in both modes, after the same release, never the
         ``CommitPreempted`` of a post-edit preempt.
@@ -2211,9 +2248,10 @@ class CoherentVolume:
             # the coordinator may never have recorded. Release the grant
             # first, so it does not block every peer until a re-mint, then
             # say which: never sent, or delivered and maybe recorded.
-            self._release_unconfirmed_grant(rel)
+            released = self._release_unconfirmed_grant(rel)
             unconfirmed = CoordinatorUnreachable if no_answer.never_sent else CommitUnconfirmed
-            raise unconfirmed(_unanswered_write_message(rel, no_answer)) from no_answer.__cause__
+            message = _unanswered_write_message(rel, no_answer, released=released)
+            raise unconfirmed(message) from no_answer.__cause__
         except RedirectRefused as redirect:
             # A redirected commit is a failed commit like any other status
             # outside 2xx — refused, never followed — so, the bytes being on
@@ -2250,8 +2288,8 @@ class CoherentVolume:
             # not. In both modes, as a deny is. The grant is released first, as
             # for a commit that got no answer, so it does not block every peer
             # until a re-mint.
-            self._release_unconfirmed_grant(rel)
-            raise CommitUnconfirmed(_failed_write_message(rel, post_resp["reason"]))
+            released = self._release_unconfirmed_grant(rel)
+            raise CommitUnconfirmed(_failed_write_message(rel, post_resp["reason"], released=released))
         if post_resp is not None:
             # ok:false here means the grant was preempted / sweep-reclaimed mid-
             # write (a concurrent-writer case v1 does not claim to serialize);

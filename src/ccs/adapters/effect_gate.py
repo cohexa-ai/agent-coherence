@@ -129,7 +129,8 @@ def gate(
             and fire, or the capture read was refused before ``decide`` ran
             because the bytes on disk are not the content at the coordinator's
             version (a peer's commit still reaching disk, an out-of-band edit,
-            or a commit whose disk write failed). The effect did not run.
+            a commit whose disk write failed, or a write whose commit did not
+            reach the coordinator). The effect did not run.
             Recover via ``volume.reacquire(path)`` then re-decide. A refusal
             from a peer's commit clears within seconds, so retry that for a
             few seconds; if it outlasts that, re-reading will not clear it:
@@ -179,13 +180,14 @@ _HOLD_DETAILS: dict[str, Callable[[FenceComparands], str]] = {
     # The coordinator refused the re-read because the bytes on disk are not its
     # content at a version that has not moved (#405): a peer's write() whose
     # bytes landed before its commit, a change made outside the coordinator,
-    # or a commit whose disk write failed. Not "INVALID": the view may still be
-    # SHARED, and a reacquire does not clear it.
+    # a commit whose disk write failed, or a write whose commit never reached
+    # it (#526). Not "INVALID": the view may still be SHARED, and a reacquire
+    # does not clear it.
     HOLD_SPLIT_PAIR: (
         lambda c: (
             "is not on disk as the coordinator records it (a peer's write still "
-            "landing, a change made outside the coordinator, or a commit whose "
-            "disk write failed)"
+            "landing, a change made outside the coordinator, a commit whose disk "
+            "write failed, or a write whose commit did not reach the coordinator)"
         )
     ),
     # The coordinator REFUSED the re-read (strict mode). A distinct, recoverable
@@ -249,8 +251,8 @@ _HOLD_RECOVERIES: dict[str, str] = {
     # write() made while a peer's commit is still to land preempts it.
     HOLD_SPLIT_PAIR: (
         "a peer's write still landing clears by itself, so re-gate after a few "
-        "seconds; only a hold that outlasts that is a change outside the "
-        "coordinator: then reacquire() and write() the bytes it returns, or your "
+        "seconds; only a hold that outlasts that is a change the coordinator has "
+        "not recorded: then reacquire() and write() the bytes it returns, or your "
         "merge of them, to record them, then read and re-decide"
     ),
 }

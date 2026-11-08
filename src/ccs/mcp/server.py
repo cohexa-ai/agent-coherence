@@ -149,9 +149,10 @@ _READ_DESC = (
     "content at the current version, the read is DENIED with reason=stale_view "
     "and no version. A peer's commit still reaching disk clears on its own: "
     "swg_reacquire, then swg_read again, retrying for a few seconds. Only if it "
-    "stays denied past that was the file changed outside the coordinator (an "
-    "out-of-band edit, or a commit whose disk write failed): swg_write the "
-    "content swg_reacquire returned (or your merge of it), then swg_read. A "
+    "stays denied past that were the bytes on disk never recorded (an "
+    "out-of-band edit, a commit whose disk write failed, or a write whose commit "
+    "did not reach the coordinator); reading again does not clear it: swg_write "
+    "the content swg_reacquire returned (or your merge of it), then swg_read. A "
     "write made sooner can be overwritten by a peer commit still reaching "
     "disk." + _SCOPE_CLAUSE
 )

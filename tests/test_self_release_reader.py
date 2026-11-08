@@ -1079,6 +1079,12 @@ def test_a_volume_cas_over_bytes_changed_after_an_unconfirmed_commit_never_lands
         server.shutdown()
 
 
+#: What a write()'s error says to do when its commit may not be recorded.
+_WRITE_AGAIN = "write() the path again"
+#: The cause a split-pair refusal names for this volume's own unrecorded write.
+_UNRECORDED_CAUSE = "a write() whose commit did not reach the coordinator"
+
+
 def test_a_volume_write_whose_commit_never_left_is_refused_on_read_until_its_next_write_records_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1089,12 +1095,18 @@ def test_a_volume_write_whose_commit_never_left_is_refused_on_read_until_its_nex
     raises its own split-pair refusal in place of that text; reading again
     does not clear it. The next write is admitted with the coordinator's note
     that the disk differs, which the volume does not pass on, and its commit
-    records the bytes, after which a read is fresh."""
+    records the bytes, after which a read is fresh.
+
+    The error and the refusal say so: the bytes are unrecorded, reading again
+    does not clear the refusal, and writing the path again records them."""
     server, vol, target = _volume_on(tmp_path, on_stale_read="raise")
     try:
         wire = _Wire(monkeypatch, delivered=False)
-        with pytest.raises(CoordinatorUnreachable):
+        with pytest.raises(CoordinatorUnreachable) as unrecorded:
             vol.write(_VOLUME_REL, b"v2")
+        message = str(unrecorded.value)
+        assert "did not record the write" in message and _WRITE_AGAIN in message, message
+        assert "Re-read" not in message and "release() sends it again" not in message, message
         assert (target.read_bytes(), recorded_version(server, _VOLUME_REL)) == (b"v2", 1)
         assert wire.answers("/hooks/post-edit") == [{"ok": True, "released": True}], "control: the release"
         artifact_id = server.registry.lookup_artifact_id_by_name(_VOLUME_REL)
@@ -1104,6 +1116,7 @@ def test_a_volume_write_whose_commit_never_left_is_refused_on_read_until_its_nex
             with pytest.raises(StaleView) as refused:
                 vol.read(_VOLUME_REL)
             assert refused.value.reason == SPLIT_PAIR_REASON, refused.value
+            assert _UNRECORDED_CAUSE in str(refused.value), refused.value
         denials = [_denied_reason(answer) for answer in wire.answers("/hooks/pre-read")]
         assert len(denials) == 2 and all(_OUT_OF_BAND in denial for denial in denials), denials
 
@@ -1112,5 +1125,91 @@ def test_a_volume_write_whose_commit_never_left_is_refused_on_read_until_its_nex
         assert wire.answers("/hooks/pre-edit")[-1].get("disk_differs") is True
         assert (target.read_bytes(), recorded_version(server, _VOLUME_REL)) == (b"v3", 2)
         assert vol.read(_VOLUME_REL) == b"v3"
+    finally:
+        server.shutdown()
+
+
+def test_writing_the_same_bytes_again_records_a_write_whose_commit_never_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The error's advice works with the bytes already on disk: writing them
+    again commits them, and the refusal clears.
+
+    Prevents advice that cannot recover the state it describes."""
+    server, vol, target = _volume_on(tmp_path, on_stale_read="raise")
+    try:
+        _Wire(monkeypatch, delivered=False)
+        with pytest.raises(CoordinatorUnreachable):
+            vol.write(_VOLUME_REL, b"v2")
+        with pytest.raises(StaleView):
+            vol.reacquire(_VOLUME_REL)
+            vol.read(_VOLUME_REL)
+
+        vol.write(_VOLUME_REL, target.read_bytes())
+
+        assert (target.read_bytes(), recorded_version(server, _VOLUME_REL)) == (b"v2", 2)
+        assert vol.read(_VOLUME_REL) == b"v2"
+    finally:
+        server.shutdown()
+
+
+def test_a_write_whose_commit_landed_but_was_not_answered_recovers_the_same_way(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the commit landed and only its answer was lost, the error says the
+    coordinator may have recorded the write; a read is fresh, and following
+    the same advice commits the same bytes at the next version.
+
+    Prevents advice that holds only when the commit did not land."""
+    server, vol, target = _volume_on(tmp_path, on_stale_read="raise")
+    try:
+        _Wire(monkeypatch, delivered=True)
+        with pytest.raises(CommitUnconfirmed) as maybe:
+            vol.write(_VOLUME_REL, b"v2")
+        message = str(maybe.value)
+        assert "may have recorded the write" in message and _WRITE_AGAIN in message, message
+        assert vol.read(_VOLUME_REL) == b"v2"
+
+        vol.write(_VOLUME_REL, b"v2")
+
+        assert recorded_version(server, _VOLUME_REL) == 3
+    finally:
+        server.shutdown()
+
+
+class _ReleaseLostToo(_Wire):
+    """As :class:`_Wire`, and the release the volume sends after the lost commit
+    gets no answer either."""
+
+    _release_lost = False
+
+    def _post(self, endpoint: object, route: str, payload: dict, **kwargs: object) -> dict:
+        lost_release = self._commit_lost and not self._release_lost
+        if lost_release and route == "/hooks/post-edit" and payload.get("success") is False:
+            self._release_lost = True  # one lost release; later ones go through
+            raise CoordinatorUnavailable("simulated: the release's answer was lost")
+        return super()._post(endpoint, route, payload, **kwargs)
+
+
+def test_a_write_whose_release_was_not_confirmed_names_release_to_send_it_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The error says when the release of the write's grant was not confirmed,
+    and names ``release(path)`` as the way to send it again, which frees the
+    file for a refuse-mode peer.
+
+    Prevents a grant left standing with no step named to release it."""
+    server, vol, target = _volume_on(tmp_path)
+    try:
+        _ReleaseLostToo(monkeypatch, delivered=False)
+        with pytest.raises(CoordinatorUnreachable) as unrecorded:
+            vol.write(_VOLUME_REL, b"v2")
+        assert "release() sends it again" in str(unrecorded.value), unrecorded.value
+
+        vol.release(_VOLUME_REL)
+
+        peer = CoherentVolume(tmp_path, managed=("data/**",), config=_FAST, on_held="refuse")
+        peer.write(_VOLUME_REL, b"from the peer")
+        assert target.read_bytes() == b"from the peer"
     finally:
         server.shutdown()

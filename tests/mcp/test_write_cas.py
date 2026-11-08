@@ -358,6 +358,13 @@ def test_read_description_names_the_write_recovery_for_a_lasting_refusal() -> No
     assert "few seconds" in _READ_DESC
 
 
+def test_read_description_names_a_write_whose_commit_did_not_reach_the_coordinator() -> None:
+    """A write whose bytes reached disk but whose commit did not reach the
+    coordinator is refused the same way, and the description lists it among
+    the causes, as the volume's own refusal does."""
+    assert "a write whose commit did not reach the coordinator" in _READ_DESC
+
+
 # --- the refusal reason reaches the caller -----------------------------------
 #
 # The coordinator distinguishes four CAS refusals; each needs different

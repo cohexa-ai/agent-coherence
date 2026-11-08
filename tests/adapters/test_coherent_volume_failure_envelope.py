@@ -222,6 +222,7 @@ def test_a_write_whose_commit_is_answered_with_the_failure_envelope_is_unconfirm
         assert type(raised.value) is CommitUnconfirmed, type(raised.value)
         assert _ENVELOPE in str(raised.value)
         assert "on disk" in str(raised.value)
+        assert "write() the path again" in str(raised.value), "the error names no way to record the bytes"
         assert target.read_bytes() == b"v2", "control: the write's bytes reached disk"
         _assert_landed_iff_after(server, _REL, version, when)
         artifact_id = server.registry.lookup_artifact_id_by_name(_REL)
