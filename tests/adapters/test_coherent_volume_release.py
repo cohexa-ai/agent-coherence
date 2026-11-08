@@ -484,22 +484,31 @@ def test_close_goes_on_past_a_grant_reported_held_and_then_raises(
     Prevents one held grant leaving every later grant to the sweep."""
     holder, peer = _holder(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
     earlier = _two_attempts_with_grants(holder, wire)
+    path_of = {earlier: _X, holder.incarnation: _Z}
+    first: list[str] = []
 
-    def held_for_the_earlier_attempt(forward: Callable[..., object], payload: dict) -> object:
-        return _held_answer(_X) if payload["agent_id"] == earlier else forward()
+    def held_for_the_first_attempt(forward: Callable[..., object], payload: dict) -> object:
+        # Attempt ids are random, so hold whichever the walk visits first: the
+        # walk must then go on to the other one.
+        if first:
+            return forward()
+        first.append(payload["agent_id"])
+        return _held_answer(path_of[payload["agent_id"]])
 
-    wire.answers[_SESSION_STOP] = held_for_the_earlier_attempt
+    wire.answers[_SESSION_STOP] = held_for_the_first_attempt
 
     with pytest.raises(CoherenceError, match=r"close\(\) again") as failure:
         holder.close()
+    held_path = path_of[first[0]]
+    released_path = _Z if held_path == _X else _X
     assert type(failure.value) is CoherenceError
-    assert _X in str(failure.value)
-    peer.write(_Z, b"z from the peer")
+    assert held_path in str(failure.value)
+    peer.write(released_path, b"from the peer")
 
     wire.answers.pop(_SESSION_STOP)
     holder.close()
-    peer.write(_X, b"x from the peer")
-    assert write_holders(server, _X) == {peer.agent_id}
+    peer.write(held_path, b"from the peer")
+    assert write_holders(server, held_path) == {peer.agent_id}
 
 
 _AFTER_CLOSE: dict[str, Callable[[CoherentVolume], object]] = {
