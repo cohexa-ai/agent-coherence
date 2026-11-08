@@ -22,6 +22,7 @@ import pytest
 from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer, session_to_agent_id
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig
 from ccs.adapters.coherent_volume import CoherentVolume
+from ccs.adapters.effect_gate import gate
 from ccs.cli._coherence_client import CoordinatorUnavailable
 from ccs.core.exceptions import (
     CoherenceDegradedWarning,
@@ -438,3 +439,296 @@ def test_a_release_keeps_the_foreign_edit_guard(
     with pytest.raises(StaleView):
         holder.write(_X, b"over the edit")
     assert (tmp_path / _X).read_bytes() == b"edited outside the coordinator"
+
+
+# --- close() and with -------------------------------------------------------
+
+
+def _two_attempts_with_grants(holder: CoherentVolume, wire: _Wire) -> str:
+    """Leave ``holder`` with a grant on ``_X`` under an earlier attempt and one
+    on ``_Z`` under the current attempt. Returns the earlier attempt."""
+    earlier = _strand_a_grant(holder, wire)
+    holder.write(_Z, b"z from the holder")
+    return earlier
+
+
+def test_close_gives_back_every_write_grant(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """A volume with grants under two attempts closes: a refuse-mode peer is
+    admitted on both files, and the volume detaches.
+
+    Prevents a close that frees only the current attempt's grants."""
+    holder, peer = _holder(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
+    _two_attempts_with_grants(holder, wire)
+
+    holder.close()
+
+    assert holder.closed is True
+    assert holder.is_attached is False
+    peer.write(_X, b"x from the peer")
+    peer.write(_Z, b"z from the peer")
+    assert write_holders(server, _X) == write_holders(server, _Z) == {peer.agent_id}
+
+
+def test_close_goes_on_past_a_grant_reported_held_and_then_raises(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """The coordinator answered, so a grant it reports still held does not
+    stop the close: the other attempt's grants are released, then the close
+    raises, and a second close() sends what is still recorded.
+
+    Prevents one held grant leaving every later grant to the sweep."""
+    holder, peer = _holder(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
+    earlier = _two_attempts_with_grants(holder, wire)
+
+    def held_for_the_earlier_attempt(forward: Callable[..., object], payload: dict) -> object:
+        return _held_answer(_X) if payload["agent_id"] == earlier else forward()
+
+    wire.answers[_SESSION_STOP] = held_for_the_earlier_attempt
+
+    with pytest.raises(CoherenceError, match=r"close\(\) again") as failure:
+        holder.close()
+    assert type(failure.value) is CoherenceError
+    assert _X in str(failure.value)
+    peer.write(_Z, b"z from the peer")
+
+    wire.answers.pop(_SESSION_STOP)
+    holder.close()
+    peer.write(_X, b"x from the peer")
+    assert write_holders(server, _X) == {peer.agent_id}
+
+
+_AFTER_CLOSE: dict[str, Callable[[CoherentVolume], object]] = {
+    "read": lambda v: v.read(_X),
+    "write": lambda v: v.write(_X, b"new"),
+    "reacquire": lambda v: v.reacquire(_X),
+    "release": lambda v: v.release(_X),
+    "read_with_version": lambda v: v.read_with_version(_X),
+    "read_with_version_generation": lambda v: v.read_with_version_generation(_X),
+    "write_cas": lambda v: v.write_cas(_X, lambda current: current),
+    "write_cas_at": lambda v: v.write_cas_at(_X, 1, b"new"),
+    "atomic_publish": lambda v: v.atomic_publish([(_X, 1, b"new")]),
+    "transfer": lambda v: v.transfer(_X, successor="0" * 32),
+    "accept": lambda v: v.accept(_X),
+    "decline": lambda v: v.decline(_X),
+    "withdraw": lambda v: v.withdraw(_X),
+    "enter": lambda v: v.__enter__(),
+    "gate": lambda v: gate(v, _X, decide=lambda data: data, effect=lambda data: data),
+}
+
+
+@pytest.mark.parametrize("operation", list(_AFTER_CLOSE))
+def test_every_operation_but_close_raises_on_a_closed_volume_and_sends_nothing(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    server: CoordinatorHTTPServer,
+    wire: _Wire,
+    operation: str,
+) -> None:
+    """A closed volume refuses every operation without a request, and its
+    properties stay readable.
+
+    Prevents a closed volume taking a new grant nothing will ever release."""
+    holder = _holder(tmp_path, fast_cfg)
+    holder.write(_X, b"from the holder")
+    holder.close()
+    wire.sent.clear()
+
+    with pytest.raises(CoherenceError, match="closed"):
+        _AFTER_CLOSE[operation](holder)
+
+    assert wire.sent == []
+    assert (tmp_path / _X).read_bytes() == b"from the holder"
+    assert holder.session_id and holder.incarnation and holder.agent_id
+
+
+def test_closing_twice_sends_nothing_the_second_time(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """close() is the one operation a closed volume accepts: with nothing left
+    recorded it sends nothing, so a with block whose body closed the volume
+    exits cleanly.
+
+    Prevents an exit path raising over a volume its caller already closed."""
+    holder = _holder(tmp_path, fast_cfg)
+    with holder as volume:
+        volume.write(_X, b"from the holder")
+        volume.close()
+        wire.sent.clear()
+        volume.close()
+    assert wire.sent == []
+
+
+def test_a_volume_that_wrote_nothing_closes_without_a_request(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """Prevents a close spending a request on a volume that holds no grant."""
+    (tmp_path / _X).write_bytes(b"seed")
+    holder = _holder(tmp_path, fast_cfg)
+    holder.read(_X)
+    wire.sent.clear()
+
+    holder.close()
+
+    assert wire.sent == []
+    assert holder.closed is True
+
+
+_CLOSE_UNCONFIRMED = [
+    pytest.param({"ok": True, "degraded": True}, CoherenceError, id="degraded"),
+    pytest.param({"ok": False, "reason": "internal: RuntimeError"}, CoordinatorFailed, id="envelope"),
+    pytest.param(_status(503), CoordinatorFailed, id="http-503"),
+    pytest.param(_no_answer, CoordinatorUnreachable, id="no-answer"),
+]
+
+
+@pytest.mark.parametrize(("answer", "raised"), _CLOSE_UNCONFIRMED)
+def test_an_unconfirmed_close_raises_stays_closed_and_is_sent_again(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    server: CoordinatorHTTPServer,
+    wire: _Wire,
+    answer: object,
+    raised: type[CoherenceError],
+) -> None:
+    """A close the coordinator does not confirm raises in strict mode, typed by
+    what went wrong, and leaves the volume closed with the grant recorded; a
+    second close() sends it again and lands.
+
+    Prevents a close reported done while a grant stands."""
+    holder, peer = _holder(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
+    holder.write(_X, b"from the holder")
+    wire.answers[_SESSION_STOP] = answer
+
+    with pytest.raises(raised, match=r"close\(\) again") as failure:
+        holder.close()
+    assert type(failure.value) is raised
+    assert holder.closed is True
+    with pytest.raises(CoherenceError, match="closed"):
+        holder.read(_X)
+
+    wire.answers.pop(_SESSION_STOP)
+    holder.close()
+    assert holder.is_attached is False
+    peer.write(_X, b"from the peer")
+
+
+def test_an_unconfirmed_close_warns_in_degrade_mode(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """Prevents a degrade volume raising, or keeping quiet, over a close."""
+    holder = _holder(tmp_path, fast_cfg, on_error="degrade")
+    holder.write(_X, b"from the holder")
+    wire.answers[_SESSION_STOP] = {"ok": True, "degraded": True}
+
+    with pytest.warns(CoherenceDegradedWarning):
+        holder.close()
+    assert holder.closed is True
+
+
+def _refused_connection(forward: Callable[..., object], payload: dict) -> object:
+    raise CoordinatorUnavailable("scripted: connection refused", never_sent=True)
+
+
+def test_a_close_that_reaches_no_coordinator_logs_and_does_not_raise(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    server: CoordinatorHTTPServer,
+    wire: _Wire,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When no coordinator is listening, as after the volume's own coordinator
+    shut down when idle, the caller cannot release the grants and the next
+    coordinator's sweep takes them back: a strict close logs the paths and
+    returns, so a block whose writes all landed does not fail at its exit.
+
+    Prevents a strict exit raising over grants nothing can release."""
+    holder = _holder(tmp_path, fast_cfg)
+    holder.write(_X, b"from the holder")
+    wire.answers[_SESSION_STOP] = _refused_connection
+
+    with caplog.at_level("WARNING", logger="ccs.adapters.coherent_volume"):
+        holder.close()
+
+    assert holder.closed is True
+    assert any(_X in record.getMessage() for record in caplog.records)
+
+
+def test_close_inside_an_operation_is_refused(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer
+) -> None:
+    """Prevents a close from inside a write_cas closure ending the volume
+    under the commit that is still in flight."""
+    (tmp_path / _Z).write_bytes(b"z1")
+    holder = _holder(tmp_path, fast_cfg)
+
+    def close_then_append(current: bytes) -> bytes:
+        holder.close()
+        return current + b" + z2"
+
+    with pytest.raises(CoherenceError, match="inside"):
+        holder.write_cas(_Z, close_then_append)
+    assert holder.closed is False
+
+
+def test_a_with_block_closes_the_volume_on_exit(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer
+) -> None:
+    """Prevents a with block leaving its grants to the sweep."""
+    peer = _refuser(tmp_path, fast_cfg)
+    with _holder(tmp_path, fast_cfg) as holder:
+        holder.write(_X, b"from the holder")
+
+    assert holder.closed is True
+    peer.write(_X, b"from the peer")
+
+
+def test_a_with_block_whose_body_raised_keeps_that_error_and_logs_the_close(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    server: CoordinatorHTTPServer,
+    wire: _Wire,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The body's error is the one the caller needs: a close that fails on the
+    way out is logged instead of replacing it.
+
+    Prevents a coordinator outage hiding the error that ended the block."""
+    with caplog.at_level("WARNING", logger="ccs.adapters.coherent_volume"):
+        with pytest.raises(ValueError, match="the body failed"):
+            with _holder(tmp_path, fast_cfg) as holder:
+                holder.write(_X, b"from the holder")
+                wire.answers[_SESSION_STOP] = _no_answer
+                raise ValueError("the body failed")
+
+    assert holder.closed is True
+    assert any("close" in record.getMessage() for record in caplog.records)
+    with pytest.raises(CoherenceError, match="closed"):
+        holder.read(_X)
+
+
+def test_a_with_block_whose_body_returned_raises_an_unconfirmed_close(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """Prevents a clean-looking exit while a grant may still stand."""
+    with pytest.raises(CoordinatorUnreachable, match=r"close\(\) again"):
+        with _holder(tmp_path, fast_cfg) as holder:
+            holder.write(_X, b"from the holder")
+            wire.answers[_SESSION_STOP] = _no_answer
+
+
+def test_a_closed_volume_stays_closed_in_a_forked_child(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer
+) -> None:
+    """The fork handler re-mints a child's identity but leaves it closed.
+
+    Prevents a forked child of a closed volume taking grants again."""
+    holder = _holder(tmp_path, fast_cfg)
+    holder.close()
+
+    holder._after_fork()
+
+    assert holder.closed is True
+    with pytest.raises(CoherenceError, match="closed"):
+        holder.read(_X)

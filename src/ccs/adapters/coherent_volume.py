@@ -624,6 +624,37 @@ def _release_not_confirmed_message(rel: str, *, held: bool) -> str:
     return f"{state}. Call release() again to send it again."
 
 
+#: What every operation but close() raises on a closed volume. Nothing is sent.
+_VOLUME_CLOSED_MESSAGE = "this CoherentVolume is closed. Build a new one."
+
+#: What close() raises from inside another operation of the same volume, such
+#: as a write_cas closure, whose commit is still in flight.
+_CLOSE_INSIDE_AN_OPERATION_MESSAGE = (
+    "close() was called from inside another operation of this CoherentVolume, such "
+    "as a write_cas closure. Nothing was closed."
+)
+
+
+def _close_not_confirmed_message(rels: Sequence[str], *, held: bool) -> str:
+    """What :meth:`CoherentVolume.close` raises (strict) or warns (degrade)
+    when the coordinator did not confirm the release of every write grant the
+    volume recorded. ``rels``: the paths still recorded. ``held``: an answer
+    reported a grant still held. The volume is closed either way. Byte-stable
+    but for the paths."""
+    listed = ", ".join(sorted(rels))
+    if held:
+        state = (
+            "the coordinator answered the release of this volume's write grants with a "
+            f"grant still held ({listed})"
+        )
+    else:
+        state = (
+            "the coordinator did not confirm the release of every write grant this volume "
+            f"holds, so these may still stand: {listed}"
+        )
+    return f"{state}. The volume is closed; call close() again to send what is still recorded."
+
+
 def _cas_not_recorded_message(rel: str, detail: str) -> str:
     """What a strict OCC commit raises
     (:class:`~ccs.core.exceptions.CoordinatorUnreachable`) when the
@@ -1194,6 +1225,10 @@ class CoherentVolume:
         # read_handoff(), which is how the MCP read tool relays a read's
         # provenance without changing what the read calls return.
         self._read_handoffs: dict[str, dict] = {}
+        # close() has run: every operation but close() raises from here on, and
+        # a close the coordinator did not confirm sends what is still recorded
+        # when called again. A forked child inherits it.
+        self._closed = False
 
         self._mint_identity()
         self._attach()
@@ -1289,7 +1324,11 @@ class CoherentVolume:
         ``read_with_version``, ``read_with_version_generation``, ``write``,
         ``write_cas``, ``write_cas_at`` and ``atomic_publish`` retries until one
         attaches.
+
+        Every operation that sends a request passes through here first, so a
+        closed volume raises here, before anything is sent.
         """
+        self._require_open()
         if self._endpoint is None and self._needs_reattach:
             # Cleared BEFORE the attempt: _attach reads .coherence/ files, and
             # under the install() shim with a managed glob that matches them each
@@ -2314,6 +2353,7 @@ class CoherentVolume:
         # (the release of an abandoned grant), and every request this instance
         # sends is one operation's.
         with self._single_op_guard():
+            self._require_open()  # the re-mint below sends before any read would check
             self._remint()  # fresh identity -> no INVALID; has committed nothing
             # MANDATORY fresh read under the new identity -> SHARED@current.
             # Recovery bypasses on_stale_read='raise' (_enforce_stale=False) so a
@@ -2484,6 +2524,7 @@ class CoherentVolume:
         Calling ``release()`` again sends it again.
         """
         with self._single_op_guard():
+            self._require_open()
             _abs_path, rel = self._to_relative(path)
             failure = self._release_path(rel)
             if failure is not None:
@@ -2563,6 +2604,111 @@ class CoherentVolume:
         text, chained to what failed; degrade warns, unless ``_post`` already
         warned for the same request."""
         message = _release_not_confirmed_message(rel, held=failure.held)
+        if self._on_error == "strict":
+            raise failure.error(message) from failure.cause
+        if not failure.reported:
+            self._record_degraded(message)
+
+    @property
+    def closed(self) -> bool:
+        """Whether :meth:`close` has run on this volume."""
+        return self._closed
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise CoherenceError(_VOLUME_CLOSED_MESSAGE)
+
+    def __enter__(self) -> CoherentVolume:
+        self._require_open()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if exc_type is None:
+            self.close()
+            return
+        # The body's error is the one the caller needs: a close that fails on
+        # top of it is logged, so it cannot replace it.
+        try:
+            self.close()
+        except (CoherenceError, CoherenceDegradedWarning) as close_failure:
+            logger.warning("CoherentVolume close failed on the way out of an error: %s", close_failure)
+
+    def close(self) -> None:
+        """Give back every write grant this volume recorded, and end the volume
+        (#505).
+
+        One ``session-stop`` per attempt whose :meth:`write` took a grant: each
+        grant becomes a read, and a refuse-mode peer is admitted at once rather
+        than after the coordinator's sweep. From then on every operation but
+        ``close()`` raises :class:`~ccs.core.exceptions.CoherenceError` and
+        sends nothing; build a new volume to go on. Properties stay readable.
+
+        A close the coordinator does not confirm leaves the volume closed with
+        the grant recorded, and goes through ``on_error`` with the types
+        :meth:`release` uses: strict raises, degrade warns. Calling ``close()``
+        again sends what is still recorded, and nothing once the record is
+        empty. A grant reported still held does not stop the other attempts'
+        releases; a request with no readable answer does, so a silent
+        coordinator costs one client timeout. When no coordinator is listening
+        at all (the request was never sent, as after the volume's own
+        coordinator shut down when idle), the grants cannot be released by
+        anyone but the next coordinator's sweep, so close() logs them and
+        returns.
+
+        Nothing calls this at interpreter exit: a volume that exits without
+        ``close()``, or is dropped, leaves its grants to the sweep. A ``with``
+        block closes the volume on exit, and when its body raised, a close
+        failure is logged so the body's error propagates. Refused from inside
+        another operation of this volume, such as a ``write_cas`` closure.
+        """
+        with self._single_op_guard():
+            if self._guard_depth > 1:
+                raise CoherenceError(_CLOSE_INSIDE_AN_OPERATION_MESSAGE)
+            self._closed = True
+            failure = self._release_every_attempt()
+            if not self._grant_incarnations:
+                self._endpoint = None
+            if failure is not None:
+                self._close_not_confirmed(failure)
+
+    def _release_every_attempt(self) -> _ReleaseFailure | None:
+        """One ``session-stop`` per attempt the write record lists, and what did
+        not confirm. Each confirmed attempt leaves the record; an account of
+        each grant drops what it reports released or handed off and lets the
+        walk go on; a request with no readable answer stops it."""
+        if self._endpoint is None:
+            return None  # detached: no write of this volume recorded a grant
+        held: _ReleaseFailure | None = None
+        for incarnation in sorted(self._grant_incarnations):
+            resp, failure = self._send_release(
+                "/hooks/session-stop", {"session_id": self._session_id, "agent_id": incarnation}
+            )
+            failure = failure or _release_answer_failure(resp)
+            if failure is not None:
+                return failure
+            if isinstance(resp, dict) and resp.get("ok") is True:
+                self._grant_incarnations.pop(incarnation, None)
+                continue
+            self._drop_released_paths(incarnation, resp.get("grants") if isinstance(resp, dict) else None)
+            if incarnation in self._grant_incarnations:
+                held = _ReleaseFailure(CoherenceError, held=True)
+        return held
+
+    def _close_not_confirmed(self, failure: _ReleaseFailure) -> None:
+        """Report a close the coordinator did not confirm, through
+        ``on_error``, naming the paths still recorded. A request that never
+        reached a listening coordinator is logged instead: nothing the caller
+        does can release those grants, and the next coordinator's sweep will."""
+        rels = sorted({rel for written in self._grant_incarnations.values() for rel in written})
+        cause = failure.cause.__cause__ if failure.cause is not None else None
+        if isinstance(cause, CoordinatorUnavailable) and cause.never_sent:
+            logger.warning(
+                "CoherentVolume close reached no coordinator; its write grants on %s "
+                "are left to the next coordinator's sweep",
+                ", ".join(rels),
+            )
+            return
+        message = _close_not_confirmed_message(rels, held=failure.held)
         if self._on_error == "strict":
             raise failure.error(message) from failure.cause
         if not failure.reported:
