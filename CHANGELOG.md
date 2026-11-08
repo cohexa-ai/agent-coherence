@@ -416,6 +416,38 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **A warn-mode session that re-reads a file after another session edited it
+  is no longer warned stale again a minute later (#523).** Another session's
+  pre-edit leaves each reader INVALID with a pending-invalidation marker, which
+  the coordinator's transient sweep expires to INVALID after
+  `transient_timeout_sec` (60 s by default) if nothing acknowledges it. A
+  warn-mode Read, Bash command or Grep search of the file is allowed and grants
+  the reader SHARED again, but it kept that marker. About a minute after the
+  other session's pre-edit, the sweep made the reader INVALID, and its next
+  Read carried the stale warning that its grant was revoked and no new version
+  was committed, though nothing had changed since its re-read. The grant now
+  clears the marker in the same registry hold, as a fetch and a holder's own
+  release already did, when the re-read's `content_hash` is the one the
+  coordinator recorded, or the file has no recorded content yet. A re-read of
+  other bytes, or one that sent no hash, keeps it; so a file a formatter
+  rewrote after its commit is still warned this way (#527). Both "A reads, B
+  edits, A re-reads" and, since a holder's own Stop leaves it SHARED, "A edits
+  and stops, B edits, A re-reads" reached it. A
+  strict Bash command or Grep search is denied once and grants the read so its
+  retry goes through; that grant kept the marker too, so a retry made a minute
+  later was denied again, and it now clears it. A strict Read is unaffected: it
+  denies and grants nothing. The plugin's Node coordinator has no transient
+  sweep.
+
+  The marker also refused an optimistic commit: a `post-edit-cas` sent after
+  such a re-read was refused `caller_in_transient_state` even when nobody held
+  the file. It is now arbitrated by version and holder as any other: it lands
+  at the version the re-read saw, is refused `other_holder` while the other
+  session still holds the file, and `version_mismatch` at an older version. A
+  `CoherentVolume` reads the file before it asks the coordinator, so its
+  re-read can carry bytes from before a commit it is granted at; that re-read
+  keeps the marker, and its `write_cas` still reads again before it commits.
+
 - **A coordinator start no longer follows a symlinked `.coherence/server.pid`
   (#464).** A repository can commit that file as a link, and the first start in
   a clone truncated the file the link named and wrote its pid and port there, or
