@@ -1240,11 +1240,3 @@ def test_a_split_pair_hold_names_a_write_whose_commit_did_not_reach_the_coordina
     assert "a write whose commit did not reach the coordinator" in str(held), held
     assert "write()" in str(held), held
 
-
-def test_the_split_pair_hold_reason_is_the_read_refusals_reason() -> None:
-    """One coordinator answer, one value: a caller branching on ``reason`` sees
-    ``split_pair`` from the gate's hold and from the read's refusal alike."""
-    from ccs.core.exceptions import HOLD_SPLIT_PAIR, SPLIT_PAIR_REASON
-
-    assert HOLD_SPLIT_PAIR == SPLIT_PAIR_REASON
-

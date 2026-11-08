@@ -1624,15 +1624,19 @@ raises `CoordinatorUnreachable` when there was no usable answer,
 `CoordinatorFailed` for an HTTP `5xx` or the coordinator's failure envelope, and
 `CoherenceError` for a watchdog-degraded answer or a grant the coordinator
 reports still held; the message names the path and says to call `release()` or
-`close()` again, which sends the release again. Degrade mode warns. A closed
-volume stays closed whatever the answer. `close()` goes on to the volume's other
-attempts after a grant reported still held, and stops at a request with no
-usable answer, so a coordinator that has stopped answering costs one client
-timeout (6 s by default). When no coordinator is listening at all, for example
-after the volume's own coordinator shut down after `idle_shutdown_sec` with no
-requests, `close()` logs the paths it could not release and returns without
-raising: nothing the caller does can release them, and the next coordinator's
-sweep takes them back.
+`close()` again, which sends the release again. Degrade mode counts a
+degradation instead, and warns on the volume's first one, as for any request. A
+closed volume stays closed whatever the answer. `close()` goes on to the
+volume's other attempts after a grant reported still held, and stops at a
+request with no usable answer, so a coordinator that has stopped answering costs
+one client timeout (6 s by default). When the connect to the volume's own local
+coordinator is refused because nothing listens there, for example after that
+coordinator shut down after `idle_shutdown_sec` with no requests, `close()` logs
+the paths it could not release and returns without raising: nothing the caller
+does can release them, and the next coordinator's sweep takes them back. A
+connect that times out, a name that does not resolve, a `remote_endpoint`
+coordinator, or a refusal after the coordinator answered earlier in the same
+`close()` that a grant was still held raises as above.
 
 **What else to know.**
 
@@ -1647,6 +1651,10 @@ sweep takes them back.
 - A forked child of a closed volume is closed.
 - A release records a heartbeat for the attempt that held the grant, which also
   resets the sweep's clock on that attempt's other grants.
+- The `stale-write-guard-fs` MCP server has no tool for `release()` or `close()`
+  yet (#504). It closes its volume when the host ends it; until then, an agent
+  gives grants back with `swg_reacquire`, which releases every grant of the
+  current attempt.
 - After `release(path)`, a `write_cas` of the same path is refused once and
   retries from a new attempt, which releases the volume's other grants too.
 - Against this package's coordinator through 0.15.0, or the Claude Code
@@ -2183,9 +2191,13 @@ volume `install()` returned. So the files the shim wrote are given back as the
 block ends, and the volume raises if used afterwards; see
 [Letting go: `release()` and `close()`](#letting-go-release-and-close). When the
 block's body raised, a close that fails is logged and the body's error
-propagates. A file opened for writing through the shim commits when it is
-closed, so close it inside the block: one still open when the volume closes is
-named in a warning, and closing it afterwards raises and writes nothing.
+propagates; `uninstall()` in a `finally:` instead raises a failed close over the
+body's error, so prefer the block. A file opened for writing through the shim
+commits when it is closed, so close it inside the block: one still open when the
+volume closes is named in a warning, and closing it afterwards raises and writes
+nothing. Closing the volume `install()` returned, with its `close()` or a `with`
+block, ends it but leaves the shim installed; the next `install()` or
+`coherent_workspace()` replaces it with a new volume.
 
 Run the demo: `python -m examples.coherent_volume.main` (offline, deterministic,
 no keys) — it reproduces the silent lost update, then prevents it.

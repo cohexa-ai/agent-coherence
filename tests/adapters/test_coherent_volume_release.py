@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import builtins
 import contextlib
+import socket
 import threading
+import urllib.error
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -25,7 +27,7 @@ from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer, s
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig
 from ccs.adapters.coherent_volume import CoherentVolume, coherent_workspace, install, uninstall
 from ccs.adapters.effect_gate import gate
-from ccs.cli._coherence_client import CoordinatorUnavailable
+from ccs.cli._coherence_client import CoordinatorUnavailable, resolve_endpoint, resolve_remote_endpoint
 from ccs.core.exceptions import (
     CoherenceDegradedWarning,
     CoherenceError,
@@ -43,6 +45,7 @@ from tests.adapters.test_coherent_volume_other_holder import (
     _Wire,
 )
 from tests.coordinator_helpers import recorded_version, serve_in_process, write_holders
+from tests.loopback_helpers import refused_endpoint
 
 _X = "data/x.txt"
 _ORIGINAL_OPEN = builtins.open
@@ -292,6 +295,28 @@ def test_another_spelling_of_a_held_path_releases_nothing(
     assert write_holders(server, _X) == {holder.agent_id}
 
 
+@pytest.mark.parametrize("spelling", ["dot-slash", "absolute", "symlink"])
+def test_a_spelling_that_resolves_to_the_held_path_releases_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, spelling: str
+) -> None:
+    """A spelling the volume resolves to the path it recorded is that path.
+
+    Prevents a release that finds nothing for a path given another way."""
+    holder, peer = _holder(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
+    holder.write(_X, b"from the holder")
+    given: dict[str, object] = {"dot-slash": f"./{_X}", "absolute": tmp_path / _X}
+    if spelling == "symlink":
+        (tmp_path / "data" / "link.txt").symlink_to(tmp_path / _X)
+        given["symlink"] = tmp_path / "data" / "link.txt"
+
+    holder.release(given[spelling])  # type: ignore[arg-type]
+
+    peer.write(_X, b"from the peer")
+    assert write_holders(server, _X) == {peer.agent_id}
+
+
+_NO_ACCOUNT = {"ok": False, "reason": "release_failed"}
+
 _UNCONFIRMED = [
     pytest.param({"ok": True, "degraded": True}, CoherenceError, id="degraded"),
     pytest.param({"ok": False, "reason": "internal: RuntimeError"}, CoordinatorFailed, id="envelope"),
@@ -299,6 +324,7 @@ _UNCONFIRMED = [
     pytest.param(_no_answer, CoordinatorUnreachable, id="no-answer"),
     pytest.param(_not_an_object, CoordinatorUnreachable, id="not-an-object"),
     pytest.param(_held_answer(_X), CoherenceError, id="grant-still-held"),
+    pytest.param(_NO_ACCOUNT, CoherenceError, id="no-account-of-the-grant"),
 ]
 
 
@@ -352,6 +378,27 @@ def test_an_unconfirmed_release_warns_in_degrade_mode_and_keeps_the_record(
     wire.sent.clear()
     holder.release(_X)
     assert len(_releases(wire)) == 1
+
+
+@pytest.mark.parametrize("route", [_POST_EDIT, _SESSION_STOP])
+def test_an_unanswered_release_in_degrade_mode_counts_one_degradation(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire, route: str
+) -> None:
+    """The request already counted the degradation when it got no answer, so
+    the release or close that sent it does not count it again; the grant stays
+    recorded.
+
+    Prevents one lost answer counted as two degradations."""
+    holder = _holder(tmp_path, fast_cfg, on_error="degrade")
+    holder.write(_X, b"from the holder")
+    wire.answers[route] = _no_answer
+    let_go = (lambda: holder.release(_X)) if route == _POST_EDIT else holder.close
+
+    with pytest.warns(CoherenceDegradedWarning):
+        let_go()
+
+    assert holder.degradation_count == 1
+    assert holder._records_write_grant(_X)
 
 
 def test_a_handed_off_grant_counts_as_released(
@@ -474,6 +521,62 @@ def test_close_gives_back_every_write_grant(
     assert write_holders(server, _X) == write_holders(server, _Z) == {peer.agent_id}
 
 
+def test_close_stops_at_the_first_request_with_no_answer(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """With two attempts recorded, a session-stop that gets no answer ends the
+    walk, so a coordinator that stopped answering costs one client timeout.
+
+    Prevents a silent coordinator costing a timeout per recorded attempt."""
+    holder = _holder(tmp_path, fast_cfg)
+    _two_attempts_with_grants(holder, wire)
+    wire.sent.clear()
+    wire.answers[_SESSION_STOP] = _no_answer
+
+    with pytest.raises(CoordinatorUnreachable, match=r"close\(\) again"):
+        holder.close()
+
+    assert len(wire.bodies(_SESSION_STOP)) == 1
+
+
+def test_release_stops_at_the_first_request_with_no_answer(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """Prevents a release costing a client timeout per attempt that wrote the
+    path when the coordinator has stopped answering."""
+    holder = _holder(tmp_path, fast_cfg)
+    _strand_a_grant(holder, wire)
+    holder.write(_X, b"second")
+    wire.sent.clear()
+    wire.answers[_POST_EDIT] = _no_answer
+
+    with pytest.raises(CoordinatorUnreachable, match=r"release\(\) again"):
+        holder.release(_X)
+
+    assert len(_releases(wire)) == 1
+
+
+def test_a_close_answered_per_grant_as_released_or_handed_off_ends_cleanly(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """An account of each grant that reports none still held confirms the
+    close: nothing stays recorded and close() returns.
+
+    Prevents a close that raises over grants the coordinator let go."""
+    holder = _holder(tmp_path, fast_cfg)
+    holder.write(_X, b"from the holder")
+    wire.answers[_SESSION_STOP] = {
+        "ok": False,
+        "reason": "giver_fenced",
+        "grants": [{"path": _X, "held": False, "cause": "handoff"}],
+    }
+
+    holder.close()
+
+    assert holder.is_attached is False
+    assert not holder._records_write_grant(_X)
+
+
 def test_close_goes_on_past_a_grant_reported_held_and_then_raises(
     tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
 ) -> None:
@@ -527,6 +630,10 @@ _AFTER_CLOSE: dict[str, Callable[[CoherentVolume], object]] = {
     "withdraw": lambda v: v.withdraw(_X),
     "enter": lambda v: v.__enter__(),
     "gate": lambda v: gate(v, _X, decide=lambda data: data, effect=lambda data: data),
+    "strict_mode_active": lambda v: v.strict_mode_active(),
+    "coordinator_status": lambda v: v.coordinator_status(),
+    "managed_glob_enforcement": lambda v: v.managed_glob_enforcement(),
+    "read_handoff": lambda v: v.read_handoff(_X),
 }
 
 
@@ -592,6 +699,7 @@ _CLOSE_UNCONFIRMED = [
     pytest.param({"ok": False, "reason": "internal: RuntimeError"}, CoordinatorFailed, id="envelope"),
     pytest.param(_status(503), CoordinatorFailed, id="http-503"),
     pytest.param(_no_answer, CoordinatorUnreachable, id="no-answer"),
+    pytest.param(_NO_ACCOUNT, CoherenceError, id="no-account-of-the-grant"),
 ]
 
 
@@ -639,32 +747,123 @@ def test_an_unconfirmed_close_warns_in_degrade_mode(
     assert holder.closed is True
 
 
-def _refused_connection(forward: Callable[..., object], payload: dict) -> object:
-    raise CoordinatorUnavailable("scripted: connection refused", never_sent=True)
-
-
-def test_a_close_that_reaches_no_coordinator_logs_and_does_not_raise(
+def test_a_close_refused_at_the_local_endpoint_logs_and_does_not_raise(
     tmp_path: Path,
     fast_cfg: LifecycleConfig,
     server: CoordinatorHTTPServer,
     wire: _Wire,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """When no coordinator is listening, as after the volume's own coordinator
-    shut down when idle, the caller cannot release the grants and the next
-    coordinator's sweep takes them back: a strict close logs the paths and
-    returns, so a block whose writes all landed does not fail at its exit.
+    """When no coordinator listens at the volume's local endpoint, as after the
+    volume's own coordinator shut down when idle, the connect is refused, the
+    caller cannot release the grants, and the next coordinator's sweep takes
+    them back: a strict close logs the paths and returns, so a block whose
+    writes all landed does not fail at its exit.
 
     Prevents a strict exit raising over grants nothing can release."""
     holder = _holder(tmp_path, fast_cfg)
     holder.write(_X, b"from the holder")
-    wire.answers[_SESSION_STOP] = _refused_connection
+    holder._endpoint = refused_endpoint(holder._endpoint)
 
     with caplog.at_level("WARNING", logger="ccs.adapters.coherent_volume"):
         holder.close()
 
     assert holder.closed is True
     assert any(_X in record.getMessage() for record in caplog.records)
+
+
+def _connect_failed(reason: BaseException) -> Callable[[Callable[..., object], dict], object]:
+    """A request whose connect failed for ``reason``, chained as the client
+    chains it: never sent, from urllib's ``URLError``."""
+
+    def fail(forward: Callable[..., object], payload: dict) -> object:
+        raise CoordinatorUnavailable("scripted: connect failed", never_sent=True) from urllib.error.URLError(reason)
+
+    return fail
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        pytest.param(TimeoutError("timed out"), id="connect-timed-out"),
+        pytest.param(socket.gaierror("name did not resolve"), id="name-did-not-resolve"),
+    ],
+)
+def test_a_close_whose_connect_failed_otherwise_raises_and_keeps_the_record(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    server: CoordinatorHTTPServer,
+    wire: _Wire,
+    reason: BaseException,
+) -> None:
+    """A connect that timed out or a name that did not resolve may have a live
+    coordinator behind it, still holding the grants, so a strict close raises
+    and a second close() sends them again.
+
+    Prevents a close that returns quietly while a live coordinator still
+    refuses peers on the volume's files."""
+    holder, peer = _holder(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
+    holder.write(_X, b"from the holder")
+    wire.answers[_SESSION_STOP] = _connect_failed(reason)
+
+    with pytest.raises(CoordinatorUnreachable, match=r"close\(\) again"):
+        holder.close()
+    assert holder._records_write_grant(_X)
+
+    wire.answers.pop(_SESSION_STOP)
+    holder.close()
+    peer.write(_X, b"from the peer")
+
+
+def test_a_refused_close_of_a_remote_volume_raises(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    server: CoordinatorHTTPServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A remote coordinator that refuses a connect may be back a moment later
+    with the grants still held, so the exception for a local endpoint does not
+    apply.
+
+    Prevents a remote volume's close returning quietly over standing grants."""
+    monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
+    local = resolve_endpoint(tmp_path)
+    remote = resolve_remote_endpoint("127.0.0.1", local.port, local.bearer)
+    holder = CoherentVolume(tmp_path, config=fast_cfg, remote_endpoint=remote)
+    holder.write(_X, b"from the remote holder")
+    holder._endpoint = refused_endpoint(holder._endpoint)
+
+    with pytest.raises(CoordinatorUnreachable, match=r"close\(\) again"):
+        holder.close()
+    assert holder._records_write_grant(_X)
+
+
+def test_a_grant_reported_held_before_a_refused_connect_is_still_reported(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """A coordinator answered during this close that a grant was still held, so
+    the refusal that follows does not mean nothing was listening: the close
+    raises and names the held grant.
+
+    Prevents a held grant reported only to a log because the next request
+    found the coordinator gone."""
+    holder = _holder(tmp_path, fast_cfg)
+    earlier = _two_attempts_with_grants(holder, wire)
+    path_of = {earlier: _X, holder.incarnation: _Z}
+    refused = _connect_failed(ConnectionRefusedError(61, "Connection refused"))
+    answered: list[str] = []
+
+    def held_then_refused(forward: Callable[..., object], payload: dict) -> object:
+        if answered:
+            return refused(forward, payload)
+        answered.append(payload["agent_id"])
+        return _held_answer(path_of[payload["agent_id"]])
+
+    wire.answers[_SESSION_STOP] = held_then_refused
+
+    with pytest.raises(CoordinatorUnreachable, match="still held") as failure:
+        holder.close()
+    assert path_of[answered[0]] in str(failure.value)
 
 
 def test_close_inside_an_operation_is_refused(
@@ -758,17 +957,24 @@ def shim_removed() -> Iterator[None]:
 
 
 def test_leaving_coherent_workspace_closes_its_volume(
-    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, shim_removed: None
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    server: CoordinatorHTTPServer,
+    shim_removed: None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The block owns its volume, so leaving it gives back the volume's write
-    grants and ends the volume.
+    grants and ends the volume. A writer closed inside the block committed, so
+    the exit does not name it.
 
     Prevents every file the block wrote staying held until the sweep."""
     peer = _refuser(tmp_path, fast_cfg)
-    with coherent_workspace(tmp_path, managed=_MANAGED, config=fast_cfg) as volume:
-        with open(tmp_path / _X, "wb") as handle:
-            handle.write(b"through the shim")
+    with caplog.at_level("WARNING", logger="ccs.adapters.coherent_volume"):
+        with coherent_workspace(tmp_path, managed=_MANAGED, config=fast_cfg) as volume:
+            with open(tmp_path / _X, "wb") as handle:
+                handle.write(b"through the shim")
 
+    assert not any("still open" in record.getMessage() for record in caplog.records)
     assert volume.closed is True
     assert open is _ORIGINAL_OPEN
     peer.write(_X, b"from the peer")
@@ -813,6 +1019,55 @@ def test_a_coherent_workspace_whose_body_raised_keeps_that_error(
     assert open is _ORIGINAL_OPEN
     assert volume.closed is True
     assert any("close" in record.getMessage() for record in caplog.records)
+
+
+def test_a_coherent_workspace_whose_body_returned_raises_an_unconfirmed_close(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire, shim_removed: None
+) -> None:
+    """A block that ends normally raises a close the coordinator did not
+    confirm, as close() does, after open() is restored.
+
+    Prevents a clean-looking exit while the block's grants may still stand."""
+    with pytest.raises(CoordinatorUnreachable, match=r"close\(\) again"):
+        with coherent_workspace(tmp_path, managed=_MANAGED, config=fast_cfg) as volume:
+            volume.write(_X, b"from the block")
+            wire.answers[_SESSION_STOP] = _no_answer
+
+    assert open is _ORIGINAL_OPEN
+
+
+def test_install_replaces_a_shim_volume_that_was_closed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, shim_removed: None
+) -> None:
+    """A with block or close() on the volume install() returned ends that
+    volume, so the next install() builds a new one, and open() goes through it.
+
+    Prevents every managed open() in the process raising over a closed volume
+    nothing replaces."""
+    closed = install(tmp_path, managed=_MANAGED, config=fast_cfg)
+    with closed:
+        closed.write(_X, b"from the first volume")
+
+    replacement = install(tmp_path, managed=_MANAGED, config=fast_cfg)
+
+    assert replacement is not closed and replacement.closed is False
+    with open(tmp_path / _X, "rb") as handle:
+        assert handle.read() == b"from the first volume"
+
+
+def test_a_coherent_workspace_over_a_closed_shim_volume_owns_its_replacement(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, shim_removed: None
+) -> None:
+    """Prevents a block that yields a closed volume and leaves the shim
+    installed past its exit."""
+    install(tmp_path, managed=_MANAGED, config=fast_cfg).close()
+
+    with coherent_workspace(tmp_path, managed=_MANAGED, config=fast_cfg) as volume:
+        assert volume.closed is False
+        volume.write(_X, b"from the block")
+
+    assert volume.closed is True
+    assert open is _ORIGINAL_OPEN
 
 
 def test_uninstall_restores_open_and_closes_the_volume(

@@ -278,6 +278,34 @@ def test_a_close_that_fails_at_shutdown_is_logged_and_the_coordinator_still_stop
         coordinator.shutdown()
 
 
+def test_shutdown_closes_the_volume_before_it_stops_the_coordinator_whatever_the_close_raises(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An in-process coordinator must still answer the close, so the close
+    comes first; and an error the close does not expect still lets the
+    coordinator stop.
+
+    Prevents a close sent to a stopped coordinator, and a coordinator this
+    server started left running after an unexpected close error."""
+    (tmp_path / "data").mkdir()
+    coordinator = serve_in_process(tmp_path, "mcp-shutdown-order")
+    order: list[str] = []
+
+    def close_then_fail(volume: CoherentVolume) -> None:
+        order.append("close")
+        raise RuntimeError("unexpected close failure")
+
+    real_stop = server_module.stop_coordinator
+    monkeypatch.setattr(coherent_volume_module.CoherentVolume, "close", close_then_fail)
+    monkeypatch.setattr(server_module, "stop_coordinator", lambda root: order.append("stop") or real_stop(root))
+    try:
+        with pytest.raises(RuntimeError, match="unexpected close failure"):
+            _write_then_shut_down(tmp_path, monkeypatch)
+        assert order == ["close", "stop"]
+    finally:
+        coordinator.shutdown()
+
+
 # --- stdout purity (fd-level, via a real subprocess) -------------------------
 
 

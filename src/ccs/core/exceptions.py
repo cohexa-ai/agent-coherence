@@ -1363,7 +1363,7 @@ class CoordinatorFailed(CoherenceError):
     A refuse-mode ``write()`` raises it as well, with nothing written, for two
     answers to its grant request. ``unavailable``: the coordinator could not
     decide in time and the abandoned work may still take the grant, so retry, or
-    call ``reacquire()`` if giving up. And a refusal naming this volume's own
+    call ``release()`` on the path if giving up. And a refusal naming this volume's own
     earlier incarnation, whose release did not land: a plain retry never sends
     that release again, so call ``reacquire()``.
 

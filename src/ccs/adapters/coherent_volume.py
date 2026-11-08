@@ -211,14 +211,14 @@ class _ReleaseFailure(NamedTuple):
     :meth:`CoherentVolume.close` did not confirm: the error a strict volume
     raises for it, the failure that error chains to, whether the answer
     reported the grant still held, whether ``_post`` already warned for it
-    (degrade mode, a request with no answer), and whether the request was
-    never sent because no coordinator was listening."""
+    (degrade mode, a request with no answer), and whether no coordinator was
+    listening at the volume's local endpoint (the connect was refused)."""
 
     error: type[CoherenceError]
     cause: BaseException | None = None
     held: bool = False
     already_warned: bool = False
-    never_sent: bool = False
+    nobody_listening: bool = False
 
 
 def _read_release_answer(resp: object) -> dict | _ReleaseFailure:
@@ -677,8 +677,9 @@ def _cas_not_recorded_message(rel: str, detail: str) -> str:
 #: volume's own last commit, or one under on_stale_read="allow", returns them.
 _UNRECORDED_WRITE_RECOVERY = (
     "Until a write() of this path is recorded, a read that refuses stale bytes "
-    "refuses it, and reading again does not clear that: write() the path again, "
-    "with these bytes or a change built from them, to record it."
+    "refuses it, and reading again does not clear that: once the coordinator "
+    "answers, write() the path again, with these bytes or a change built from "
+    "them, to record it."
 )
 
 #: The same for a commit that may or may not have been recorded. A read that
@@ -1872,6 +1873,7 @@ class CoherentVolume:
         is concluded about the globs: the attach fails closed on it, and never
         takes a count for confirmation.
         """
+        self._require_open()
         try:
             return self._read_glob_enforcement()
         except CoordinatorUnavailable as exc:
@@ -1946,6 +1948,7 @@ class CoherentVolume:
         compares this volume's own globs against the published sets. Returns
         False if unattached or if the status surface is unavailable.
         """
+        self._require_open()
         if self._endpoint is None:
             return False
         count = self._policy_summary_value("strict_mode_pattern_count")
@@ -1974,6 +1977,7 @@ class CoherentVolume:
         (unreachable) — a distinction :meth:`strict_mode_active` collapses to
         ``False`` — and to read the tracked-artifact versions for ``per_path``.
         """
+        self._require_open()
         if self._endpoint is None:
             return None
         try:
@@ -2655,18 +2659,28 @@ class CoherentVolume:
         be read, else why it confirms nothing. The typed errors a strict
         request raises when it gets no usable answer or an HTTP 5xx come back
         as a failure instead, so the caller reports the release with its own
-        text and type; one whose connection never carried the request is
-        marked never sent. Any other error, a principal refusal among them,
-        propagates."""
+        text and type, marked when no coordinator listens at the endpoint. Any
+        other error, a principal refusal among them, propagates."""
         try:
             resp = self._post(route, body)
         except CoordinatorUnreachable as exc:
-            cause = exc.__cause__
-            never_sent = isinstance(cause, CoordinatorUnavailable) and cause.never_sent
-            return _ReleaseFailure(CoordinatorUnreachable, exc, never_sent=never_sent)
+            return _ReleaseFailure(CoordinatorUnreachable, exc, nobody_listening=self._nobody_listening(exc))
         except CoordinatorFailed as exc:
             return _ReleaseFailure(CoordinatorFailed, exc)
         return _read_release_answer(resp)
+
+    def _nobody_listening(self, exc: CoordinatorUnreachable) -> bool:
+        """Whether ``exc`` shows no coordinator listening at this volume's own
+        local endpoint: the connect was refused, as after the coordinator
+        shut down when idle. A connect that timed out, a name that did not
+        resolve, or a remote endpoint may still have a live coordinator
+        behind it, holding the grants."""
+        if self._remote_endpoint is not None:
+            return False
+        unavailable = exc.__cause__
+        if not (isinstance(unavailable, CoordinatorUnavailable) and unavailable.never_sent):
+            return False
+        return isinstance(getattr(unavailable.__cause__, "reason", None), ConnectionRefusedError)
 
     def _settle_path_release(self, incarnation: str, rel: str, answer: dict) -> bool:
         """Act on a readable answer to the release of ``rel`` under
@@ -2738,10 +2752,11 @@ class CoherentVolume:
         empty. A grant reported still held does not stop the other attempts'
         releases; a request with no readable answer does, so a silent
         coordinator costs one client timeout. When no coordinator is listening
-        at all (the request was never sent, as after the volume's own
-        coordinator shut down when idle), the grants cannot be released by
-        anyone but the next coordinator's sweep, so close() logs them and
-        returns.
+        at the volume's local endpoint (the connect was refused, as after the
+        volume's own coordinator shut down when idle), the grants cannot be
+        released by anyone but the next coordinator's sweep, so close() logs
+        them and returns, unless a coordinator answered earlier in the same
+        close() that a grant was still held.
 
         Nothing calls this at interpreter exit: a volume that exits without
         ``close()``, or is dropped, leaves its grants to the sweep. A ``with``
@@ -2763,7 +2778,8 @@ class CoherentVolume:
         """One ``session-stop`` per attempt the write record lists, and what did
         not confirm. Each confirmed attempt leaves the record; an account of
         each grant drops what it reports released or handed off and lets the
-        walk go on; a request with no readable answer stops it."""
+        walk go on; a request with no readable answer stops it, and keeps the
+        report of a grant an earlier answer said was still held."""
         if self._endpoint is None:
             return None  # detached: no write of this volume recorded a grant
         held: _ReleaseFailure | None = None
@@ -2772,7 +2788,7 @@ class CoherentVolume:
                 "/hooks/session-stop", {"session_id": self._session_id, "agent_id": incarnation}
             )
             if isinstance(answer, _ReleaseFailure):
-                return answer
+                return answer._replace(held=True) if held is not None else answer
             if answer.get("ok") is True:
                 self._grant_incarnations.pop(incarnation, None)
                 continue
@@ -2783,11 +2799,13 @@ class CoherentVolume:
 
     def _close_not_confirmed(self, failure: _ReleaseFailure) -> None:
         """Report a close the coordinator did not confirm, through
-        ``on_error``, naming the paths still recorded. A request that never
-        reached a listening coordinator is logged instead: nothing the caller
-        does can release those grants, and the next coordinator's sweep will."""
+        ``on_error``, naming the paths still recorded. A request refused
+        because no coordinator listens at the volume's local endpoint is logged
+        instead: nothing the caller does can release those grants, and the
+        next coordinator's sweep will. Not when a coordinator answered earlier
+        in the walk that a grant was still held: that is reported."""
         rels = sorted({rel for written in self._grant_incarnations.values() for rel in written})
-        if failure.never_sent:
+        if failure.nobody_listening and not failure.held:
             logger.warning(
                 "CoherentVolume close reached no coordinator; its write grants on %s "
                 "are left to the next coordinator's sweep",
@@ -3764,6 +3782,7 @@ class CoherentVolume:
         as the read's provenance. After a strict-denied read (see
         :attr:`last_read_denied`) ``None`` says nothing about the record: a
         strict deny's bytes never carry the key."""
+        self._require_open()
         _abs_path, rel = self._to_relative(path)
         handoff = self._read_handoffs.get(rel)
         return dict(handoff) if handoff is not None else None
@@ -5083,14 +5102,18 @@ def install(
 ) -> CoherentVolume:
     """Patch ``builtins.open`` + ``io.open`` to route managed-path opens through
     a process-singleton :class:`CoherentVolume`. Idempotent — a second call
-    returns the already-installed volume (one workspace per process in v1).
-    Reverse with :func:`uninstall`, which also closes the volume, or use the
+    returns the already-installed volume (one workspace per process in v1),
+    unless that volume was closed, by its own ``close()`` or a ``with`` block:
+    then the shim is replaced with a new volume. Reverse with
+    :func:`uninstall`, which also closes the volume, or use the
     :func:`coherent_workspace` context manager. Opt-in and demo-grade — see the
     coverage matrix above.
     """
     global _shim_state
     if _shim_state is not None:
-        return _shim_state.volume
+        if not _shim_state.volume.closed:
+            return _shim_state.volume
+        _retire_shim()
     volume = CoherentVolume(
         root, managed=managed, on_error=on_error, on_stale_read=on_stale_read,
         on_stale_write=on_stale_write, config=config, bind_host=bind_host,
@@ -5153,9 +5176,11 @@ def coherent_workspace(
 
     Reentrant-safe: if a shim is already installed (e.g. a nested
     ``coherent_workspace``), this yields the existing volume and neither
-    uninstalls nor closes on exit — the outer context owns both.
+    uninstalls nor closes on exit — the outer context owns both. A shim whose
+    volume was closed counts as not installed: this block replaces it and owns
+    the new one.
     """
-    already_installed = _shim_state is not None
+    already_installed = _shim_state is not None and not _shim_state.volume.closed
     volume = install(
         root, managed=managed, on_error=on_error, on_stale_read=on_stale_read,
         on_stale_write=on_stale_write, config=config, bind_host=bind_host,
