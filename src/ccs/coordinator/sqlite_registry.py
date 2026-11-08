@@ -4355,9 +4355,10 @@ class SqliteArtifactRegistry:
                     raise KeyError(f"artifact {artifact_id} not in registry")
                 version = version_row[0]
 
-                # Read-generation fence: when an M/E -> INVALID transition
-                # revokes the write claim WITHOUT moving the version (a sweep
-                # reclaim, the voluntary "invalidate" release, or a handoff
+                # Read-generation fence: when a transition out of M/E (to
+                # INVALID, or to SHARED when the holder releases its own grant
+                # and keeps a read) revokes the write claim WITHOUT moving the
+                # version (a sweep reclaim, the voluntary "invalidate" release, or a handoff
                 # under HANDOFF_TRIGGER — see EPOCH_BUMP_TRIGGERS), bump the
                 # artifact's ownership epoch atomically with the state
                 # transition in this BEGIN IMMEDIATE, so a commit by the

@@ -3654,9 +3654,10 @@ class CoordinatorService:
         layer exists to close):
 
         1. **Self-issued releases are always honoured.** ``issuer_agent_id ==
-           agent_id`` is an agent giving back its OWN claim (a post-edit
-           failure, a session-stop release, an operator drain), never a
-           cross-agent revoke. It is not pinned.
+           agent_id`` is an agent giving back its OWN claim (an operator
+           drain, or a post-edit failure or session-stop release whose row a
+           peer already made INVALID), never a cross-agent revoke. It is not
+           pinned.
         2. **Only a target currently holding a claim is pinned.** An already-
            INVALID target is pinned by nothing: applying is a state no-op, and
            the call still has to run — ``_write_impl`` / ``_commit_impl``
