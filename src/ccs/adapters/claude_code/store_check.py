@@ -350,9 +350,14 @@ def _sidecar(db_path: Path, suffix: str) -> Path:
 
 def _resolved(db_path: Path) -> Path:
     """``db_path`` with every symlink resolved, as SQLite's unix VFS resolves
-    it: SQLite names a symlinked store's ``-wal`` and ``-journal`` from the
-    TARGET, so those are the sidecars a start reads, never the (empty) ones
-    the registry's pre-create leaves beside the link."""
+    it, so each file the check stats and copies is the one a start reads.
+
+    :func:`check_store` refuses any link in ``.coherence`` before the lock
+    probe and before each copy (#511), so a linked ``state.db`` or sidecar is
+    never an input here. What is left to resolve is the root's own ancestors
+    (a linked home or temp directory), and a link made at ``state.db`` after
+    the check: SQLite names its ``-wal`` and ``-journal`` from the target, so
+    those are the sidecars a start would read."""
     with _oserror_means(STORE_UNREADABLE_REASON):
         return Path(os.path.realpath(db_path))
 

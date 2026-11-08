@@ -143,7 +143,9 @@ COORDINATOR_FAILED_NEXT_STEP = (
 )
 
 # A person must replace the workspace's .coherence (#498), so the verb is the
-# house stop. The server's own start refuses it before any tool runs.
+# house stop. The row maps the refusal for library callers of deny_result: the
+# server itself refuses to start before any tool runs, and its tools answer only
+# from an attached volume, so no tool call carries this refusal.
 COHERENCE_DIR_REFUSED_RECOVER = GIVER_FENCED_RECOVER
 COHERENCE_DIR_REFUSED_NEXT_STEP = (
     "Stop: nothing was written. This workspace's .coherence is a symlink or not a "

@@ -208,10 +208,12 @@ Alpha — APIs may change before `v1.0`.
   `CoordinatorUnreachable`: no retry, and no coordinator started later, clears
   it. A strict `CoherentVolume` or `CoordinatedSubstrate` raises it before it
   writes its policy files or looks for a running coordinator, and the
-  `stale-write-guard-fs` server refuses to start; a volume in degrade mode
-  warns once and stays detached. `agent-coherence-coordinator` prints the text
-  and exits `2` before it probes a port or spawns a worker, and so does
-  `--prepare-for-migration`. `--check-store` answers the new outcome
+  `stale-write-guard-fs` server prints the text on one stderr line and exits
+  `2` before it serves; a volume in degrade mode warns once and stays
+  detached. Wherever the library prints the text, it escapes the control
+  characters a repository can put in a file name. `agent-coherence-coordinator`
+  prints the text and exits `2` before it probes a port or spawns a worker, and
+  so does `--prepare-for-migration`. `--check-store` answers the new outcome
   `coherence_dir_refused`, exit `17`, ahead of `live`, with the refusal's
   `kind` as its `reason` (#511), and `agent-coherence-workspace` exits `2`
   with `reason` `coherence_dir_refused`. `check_coherence_dir(root)` in
@@ -221,8 +223,9 @@ Alpha — APIs may change before `v1.0`.
   `hook.secret` or connect, and read `hook.secret` without following a link.
   The coordinator opens its policy files, their lock files and `audit.log` the
   same way: track and untrack answer HTTP `400`, naming the file, for a policy
-  file that became a link after the start, and loading the policy reads such a
-  file as no entries, counted as rejected. The plugin's
+  file that became a link after the start, or a lock file that became a link,
+  FIFO, socket or device, and loading the policy reads such a policy file as no
+  entries, counted as rejected. The plugin's
   Node coordinator refuses the same workspaces in plugin releases after 0.6.0.
   The guide's "`.coherence` must be a real directory" section has the details.
 

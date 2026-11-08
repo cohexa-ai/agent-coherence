@@ -1887,8 +1887,8 @@ leaves `.coherence`, and everything a link in it names, as they were.
 |---|---|
 | `ensure_coordinator_handle`, `ensure_coordinator` | raise `CoherenceDirRefused` |
 | strict `CoherentVolume`, `CoordinatedSubstrate` | raise `CoherenceDirRefused` before they write their policy files or look for a running coordinator |
-| `CoherentVolume(on_error="degrade")` | warns once with the same text and `This volume stays detached: build a new one once .coherence is fixed.` |
-| the [`stale-write-guard-fs`](#stale-write-guard-fs-mcp-server) MCP server | refuses to start |
+| `CoherentVolume(on_error="degrade")` | warns once with the same text, its control characters escaped, and `This volume stays detached: build a new one once .coherence is fixed.` |
+| the [`stale-write-guard-fs`](#stale-write-guard-fs-mcp-server) MCP server | prints the text on one line and exits `2` before it starts a coordinator or serves |
 | `agent-coherence-coordinator` | prints the text on one line and exits `2` before it probes a port or starts a worker, and so does `--prepare-for-migration` |
 | `agent-coherence-coordinator --check-store` | answers `coherence_dir_refused`, exit `17` (see [Checking a store](#checking-a-store-before-a-coordinator-starts)) |
 | `agent-coherence-workspace` | exits `2`; under `--json` the envelope's `reason` is `coherence_dir_refused` |
@@ -1931,6 +1931,9 @@ To fix a refused workspace:
 - Move aside a `.coherence` that is not a directory; the next start creates a
   real one.
 - Remove a FIFO, socket or device.
+- An editor's lock link counts too: Emacs leaves a dangling `.#name` link
+  beside a file it edits, and after a crash; close the editor or delete the
+  lock, then start again.
 
 Do this with no coordinator running for the workspace. One that an earlier
 release started through a link keeps running: stop it before you upgrade, or
@@ -4482,12 +4485,13 @@ answers `coordinator_failed` and writes nothing.
 
 **A workspace whose `.coherence` a start refuses.** When `.coherence` is a
 symbolic link or not a directory, or holds a link, FIFO, socket or device
-directly inside it, the server refuses to start, with the error a coordinator
-start raises, naming the path; nothing is written. Fix `.coherence` (see
+directly inside it, the server refuses to start before it serves: it prints
+one line to stderr, `stale-write-guard-fs:` and the refusal naming the path,
+and exits `2`; nothing is written. Fix `.coherence` (see
 [`.coherence` must be a real directory](#coherence-must-be-a-real-directory))
-and start the server again. A tool call meets the refusal only when the
-server's volume attaches again in a forked process, and then answers `reason:
-coherence_dir_refused` with `recover: stop_and_report` and `retryable: false`.
+and start the server again. No tool call carries this refusal: the server's
+tools answer only from an attached volume, so a detached one answers
+`coordinator_unavailable` as it does for any unattached volume.
 
 **A coordinator that fails while answering.** When the coordinator answers a
 read with its `internal:` failure envelope ([details](#when-the-coordinator-answers-with-a-failure)),
@@ -5339,6 +5343,8 @@ file it names is not read. Both coordinators do this, the plugin's Node
 coordinator in plugin releases after 0.6.0. On the Python coordinator, a link
 at the lock file beside a policy file answers HTTP 400 with
 `.coherence/tracked.yaml.lock is a symlink; nothing was written. Remove the link.`
+A FIFO, socket or device there answers HTTP 400 with
+`.coherence/tracked.yaml.lock could not be read (not a regular file); nothing was written.`
 
 A `CoherentVolume` or substrate session about to start the coordinator merges
 its managed globs into `tracked.yaml` and `strict_mode.yaml`, and treats a file
