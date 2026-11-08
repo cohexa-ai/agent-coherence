@@ -294,6 +294,12 @@ SWEEP_RECLAIM_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS - {"timeout"}
 # act, never an eviction. Wire-stable: renaming it without EPOCH_BUMP_TRIGGERS
 # leaves the bump keyed on a string nothing emits.
 HANDOFF_TRIGGER: str = "handoff"
+# RELEASE_TRIGGER: the trigger a voluntary release moves its holder out of M/E
+# under -- to SHARED on the holder's own release, to INVALID on
+# service.invalidate. Named so every release site and EPOCH_BUMP_TRIGGERS share
+# one value: a site that spelled it differently would release without moving
+# the epoch. Wire-stable, as HANDOFF_TRIGGER is.
+RELEASE_TRIGGER: str = "invalidate"
 # EPOCH_BUMP_TRIGGERS: the triggers under which LEAVING M/E moves the ownership
 # epoch, whatever state the agent lands in: INVALID, or SHARED on the holder's
 # own release. The rule is not "the sweep did it" but "a write-claim was
@@ -335,7 +341,7 @@ HANDOFF_TRIGGER: str = "handoff"
 # (adapters.effect_gate.check_fence: a stale-status re-validate read HOLDs
 # even with the (version, generation) pair unchanged).
 EPOCH_BUMP_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS | frozenset(
-    {"invalidate", HANDOFF_TRIGGER}
+    {RELEASE_TRIGGER, HANDOFF_TRIGGER}
 )
 # CLAIM_CAPTURE_TRIGGERS: triggers under which a transition MAY be a genuine
 # content read for read-generation capture (the E/M-acquire capture is keyed

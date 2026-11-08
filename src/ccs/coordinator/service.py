@@ -91,6 +91,7 @@ from ccs.core.types import (
 )
 
 from .registry_protocol import (
+    RELEASE_TRIGGER,
     CheckpointMember,
     CheckpointRecord,
     RegistryBase,
@@ -3582,7 +3583,7 @@ class CoordinatorService:
         finds the row stale and leaves it, or wholly after, and makes the read
         stale as it would any reader's.
 
-        - EXCLUSIVE or MODIFIED: SHARED, under the ``"invalidate"`` trigger,
+        - EXCLUSIVE or MODIFIED: SHARED, under ``RELEASE_TRIGGER``,
           so leaving the write claim still moves the ownership epoch
           (``EPOCH_BUMP_TRIGGERS``) and a commit on the claim captured before
           the release is refused. ``observed=False``: the release reads
@@ -3602,7 +3603,7 @@ class CoordinatorService:
                 self.registry.clear_agent_transient(request.artifact_id, request.agent_id)
                 self.registry.set_agent_state(
                     request.artifact_id, request.agent_id, MESIState.SHARED,
-                    trigger="invalidate", tick=request.issued_at_tick, observed=False,
+                    trigger=RELEASE_TRIGGER, tick=request.issued_at_tick, observed=False,
                 )
                 return True
             if state == MESIState.INVALID:
@@ -3635,7 +3636,7 @@ class CoordinatorService:
             return None
         victim_state = self.registry.get_agent_state(artifact_id, agent_id)
         self.registry.set_agent_state(
-            artifact_id, agent_id, MESIState.INVALID, trigger="invalidate", tick=issued_at_tick
+            artifact_id, agent_id, MESIState.INVALID, trigger=RELEASE_TRIGGER, tick=issued_at_tick
         )
         self.registry.clear_agent_transient(artifact_id, agent_id)
         return InvalidationSignal(
