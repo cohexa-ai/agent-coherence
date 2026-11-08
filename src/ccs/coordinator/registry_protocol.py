@@ -824,6 +824,17 @@ def _ended(record: TransferRecord, *, successor: UUID, status: str) -> TransferG
     )
 
 
+def forget_refusal(agent_id: UUID, artifact_id: UUID) -> ValueError:
+    """The error :meth:`RegistryBase.forget_agent` raises, having deleted
+    nothing, while ``agent_id`` still holds a write grant. Built in one place
+    so both registries refuse in the same words; ``artifact_id`` is one of the
+    files the grant is held on."""
+    return ValueError(
+        f"forget_not_allowed: agent={agent_id} artifact={artifact_id} holds a "
+        "write grant (EXCLUSIVE or MODIFIED); nothing was forgotten"
+    )
+
+
 @runtime_checkable
 class RegistryBase(Protocol):
     """The registry contract the service layer (:class:`CoordinatorService`)
@@ -976,6 +987,30 @@ class RegistryBase(Protocol):
         ``session_read`` / ``session_commit``). Declared here so a backend typed
         against ``RegistryBase`` cannot omit it and pass ``isinstance`` yet fail
         at the first fence read."""
+        ...
+
+    def forget_agent(self, agent_id: UUID) -> int:
+        """Remove the records of an identity that has ended (#525) and return
+        how many of its per-file state rows went: its per-file states with
+        everything recorded on them, its heartbeat and, on a registry that
+        queues them, its preemption notices, all in one hold (sqlite: one
+        ``BEGIN IMMEDIATE``). Other identities' records are untouched, a
+        notice naming this identity as the preempter included, and a second
+        call removes nothing and returns 0.
+
+        A row that records a sweep reclaim stays, with that record, so
+        ``/status`` can still report the reclaim; it is left INVALID, because
+        an identity that has ended reads nothing and must stop counting as a
+        reader of that file.
+
+        Refused with :func:`forget_refusal`'s ``ValueError``, deleting
+        nothing, while the identity holds any EXCLUSIVE or MODIFIED row: that
+        grant is what its peers are refused on and what the sweep reclaims.
+
+        Only for an identity that can never act again. A deleted row reads as
+        never seen: a peer's write no longer invalidates the identity, and the
+        fence admits its commit on the version alone, as it admits any
+        committer with no recorded read generation."""
         ...
 
     def get_agent_state(self, artifact_id: UUID, agent_id: UUID) -> MESIState | None:

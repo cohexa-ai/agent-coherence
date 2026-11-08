@@ -8,7 +8,7 @@ frozen dataclasses, string constants) formalizing what a networked registry
 backend must provide to re-home the coordinator's atomic boundary. These tests
 are the DRIFT GUARDS the plan calls for:
 
-- the member-classification map covers EXACTLY the 75 ``RegistryBase`` +
+- the member-classification map covers EXACTLY the 76 ``RegistryBase`` +
   ``SqliteExtended`` members — no more, no fewer — so a Protocol member added or
   removed in ``registry_protocol.py`` without a matching contract update FAILS
   CI (bidirectional guard);
@@ -19,7 +19,7 @@ are the DRIFT GUARDS the plan calls for:
 - a classification value outside the enum is unrepresentable (typed);
 - the tier enum has exactly ``TIER_1`` and ``TIER_2``.
 
-The expected 75-member set is FROZEN here (imported from the parity test's own
+The expected 76-member set is FROZEN here (imported from the parity test's own
 frozen name-sets), NOT derived from the Protocol at runtime — so a silent
 Protocol edit cannot move the goalposts this test guards (the same discipline
 ``tests/test_registry_protocol_parity.py`` uses).
@@ -44,8 +44,8 @@ from ccs.coordinator.backend_contract import (
     Tier,
 )
 
-# The 75-member expected surface, imported from the parity test's FROZEN
-# name-sets (52 base + 13 extended + 9 detection methods + 1 base property). Reusing
+# The 76-member expected surface, imported from the parity test's FROZEN
+# name-sets (53 base + 13 extended + 9 detection methods + 1 base property). Reusing
 # those frozensets means this contract and the Protocol parity share ONE
 # source of truth for the surface: if either the parity test or the Protocol
 # changes the surface, the two drift guards fire together.
@@ -62,31 +62,32 @@ EXPECTED_MEMBERS = (
 
 
 # ---------------------------------------------------------------------------
-# Member classification — exactly the 75 Protocol members, no drift
+# Member classification — exactly the 76 Protocol members, no drift
 # ---------------------------------------------------------------------------
 
 
 def test_member_map_covers_exactly_the_protocol_surface() -> None:
-    """The classification map keys equal the 75-member Protocol surface EXACTLY
+    """The classification map keys equal the 76-member Protocol surface EXACTLY
     — no more, no fewer. A member added to (or removed from) ``registry_protocol.py``
     without a matching contract update fails HERE (bidirectional drift guard)."""
     assert set(MEMBER_CLASSIFICATION) == EXPECTED_MEMBERS
 
 
-def test_member_map_has_exactly_75_members() -> None:
-    """Pin the count explicitly: 52 base methods (SB-18 ``commit_all``, the
+def test_member_map_has_exactly_76_members() -> None:
+    """Pin the count explicitly: 53 base methods (SB-18 ``commit_all``, the
     WV Unit-2 checkpoint surface — 8 members — then the effect-gate pair read
     ``get_artifact_and_generation``, then the SB-10 comparand read
     ``last_observed_version_for``, then the caller-principal pair
     ``bind_caller_principal`` / ``get_caller_principal``, then the grant
     handoff's transfer-record four ``transfer_grants`` /
     ``get_transfer_record`` / ``set_transfer_status`` /
-    ``evict_transfer_records``, then #191's ``claim_checkpoint_registration``
-    added) + 13 extended methods + 9 foreign-write detection methods on their
-    own Protocol + 1 base property = 75. Guards against a same-size add+remove
-    that would slip past the set-equality check on cardinality alone."""
-    assert len(MEMBER_CLASSIFICATION) == 75
-    assert len(EXPECTED_MEMBERS) == 75
+    ``evict_transfer_records``, then #191's ``claim_checkpoint_registration``,
+    then #525's ``forget_agent`` added) + 13 extended methods + 9 foreign-write
+    detection methods on their own Protocol + 1 base property = 76. Guards
+    against a same-size add+remove that would slip past the set-equality check
+    on cardinality alone."""
+    assert len(MEMBER_CLASSIFICATION) == 76
+    assert len(EXPECTED_MEMBERS) == 76
 
 
 def test_coordinator_epoch_property_is_in_the_map() -> None:
@@ -147,6 +148,13 @@ def test_the_atomic_class_boundary_members_are_classified_atomic() -> None:
         if contract.member_class is MemberClass.ATOMIC_CLASS
     }
     assert actual_atomic == expected_atomic
+
+
+def test_forget_agent_is_classified_independent() -> None:
+    """``forget_agent`` runs outside the atomic boundary: it never removes a
+    write grant, the only row ``other_holder`` arbitrates on. Pins the
+    classification so a later edit that moves it fails here."""
+    assert MEMBER_CLASSIFICATION["forget_agent"].member_class is MemberClass.INDEPENDENT
 
 
 def test_classification_enum_has_exactly_three_classes() -> None:
