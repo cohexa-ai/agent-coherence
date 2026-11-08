@@ -184,6 +184,50 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **A Claude Code session, a subagent or a `CoherentVolume` that lets go of a
+  file it edited keeps a read of it, so it can read and edit the file again
+  without a new session (#513).** A Stop, a SubagentStop and a failed edit
+  (`post-edit` with `success: false`) release the caller's write grant and now
+  leave it a reader (`SHARED`) of the version it held. Before, they left it
+  `INVALID`: with no other session involved, a strict-mode session's
+  next-turn Read of the file was denied on every retry, by a deny that begins
+  `Stale read denied: your grant on plan.md was revoked and no new version
+  was committed`, its Edit was denied too, and a warn-mode session was warned
+  that its grant on its own edit had been revoked. A `CoherentVolume` whose
+  `write()` failed can now write the file again without `reacquire()`. A copy
+  another agent's acquire or commit made stale is still denied, a release
+  still moves the ownership epoch, and every answer body and deny text is
+  unchanged. A failed-edit report from a caller that holds no write grant
+  changes nothing; it used to demote a reader to `INVALID`. `/status` lists
+  the released session as `SHARED`, session-start re-grounding shows the file
+  as a held `SHARED` grant, and a transfer in a later turn hands that read on
+  where it was refused as `handoff_not_held`, so `agent-coherence-transfer`'s
+  not-held hint no longer says a session's write grant ends with its turn.
+  The operator drain (`agent-coherence-coordinator --prepare-for-migration`)
+  still leaves each holder `INVALID`. A change made after the commit, such as
+  a formatter hook that runs after every edit, still reads as a change outside
+  the coordinator. A session that an older coordinator already locked out of
+  its own file stays locked out after the upgrade, because nothing records
+  whether the holder or another agent made its copy stale: start a new
+  session. The Claude Code plugin's Node coordinator makes the same change in
+  its releases after 0.6.0. The guide's "Foreign-write detection" section has
+  the details, and its "Targeted grant handoff" section covers the later-turn
+  transfer.
+
+- **The protocol corpus pins, on both backends, that a holder's own release
+  leaves it a reader (#513).** Session A edits `notes.md` and lets go of it.
+  Its next Read is fresh after its stop (strict_mode/28), after its own failed
+  edit (strict_mode/30) and, for a subagent, after its SubagentStop
+  (strict_mode/31), and in warn mode it carries no warning (warn_mode/40). Its
+  Edit after a stop and a read is admitted with the bare `{"ok": true}`
+  (strict_mode/29), and a failed-edit report from a session that only read
+  the file leaves it a reader (strict_mode/34). A peer's commit or acquire
+  after the release still makes A's copy stale: its Read is denied with the
+  write wording (strict_mode/32) or the grant-change wording (strict_mode/33).
+  Session-start re-grounding renders a file released in an earlier turn as a
+  held `SHARED` grant line (session_start/07). The Node rows need the Claude
+  Code plugin's matching change, in its releases after 0.6.0.
+
 - **New tests pin what each strict surface does when the coordinator takes a request and never
   answers it.** `tests/test_silent_coordinator.py` points a strict `CoherentVolume` and a
   `CoordinatedSubstrate` at a loopback listener that holds the connection open without writing a

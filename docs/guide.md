@@ -563,7 +563,7 @@ Each entry is a flat `dict` with exactly these eight keys:
 | `"fetch"` | Fetch grant; the requester transitions to SHARED or EXCLUSIVE, and a peer holding EXCLUSIVE/MODIFIED is downgraded to SHARED under the same trigger (a peer already in SHARED is not touched) |
 | `"write"` | Write request; peers are invalidated (→ INVALID), requester receives EXCLUSIVE |
 | `"commit"` | Write commit; peers are invalidated (→ INVALID), committer transitions to MODIFIED |
-| `"invalidate"` | Explicit invalidation signal; agent transitions to INVALID |
+| `"invalidate"` | Explicit invalidation signal; agent transitions to INVALID. A holder's own release of a write grant (a `session-stop`, a `subagent-stop` or a failed `post-edit`) fires it too, and moves that holder from EXCLUSIVE/MODIFIED to SHARED instead: it keeps a read of the version it held |
 | `"handoff"` | [Targeted grant handoff](#targeted-grant-handoff): the giver hands its claim (EXCLUSIVE, MODIFIED or a standing SHARED read) to a successor and transitions to INVALID |
 | `"timeout"` | Transient state timeout; agent force-invalidated (→ INVALID) |
 | `"reclaim_heartbeat"` | Crash recovery: agent's heartbeat older than `heartbeat_timeout_ticks` |
@@ -825,8 +825,10 @@ This applies to the Python coordinator. The Claude Code plugin's Node
 coordinator runs no grant sweep, so it has nothing to report.
 
 When the sweep takes a write grant back, the holder drops out of `states`
-exactly as it would after a release. Two things let anyone other than that
-holder tell the two apart:
+exactly as it would after another session's edit took the path from it. A
+release looks different: the holder stays listed, as `SHARED`, because it
+keeps a read of the version it held. Two things let anyone other than that
+holder tell a reclaim from a path taken by another session's edit:
 
 - **The operator view.** `GET /status?detail=full`, sent with the
   `Coherence-Local-Operator: true` header, gives each `sessions[]` row a
@@ -866,8 +868,9 @@ it, so do not hand the path to another session on the strength of an empty
 
 A reclaimed session gets its write back by editing the path again: the edit
 takes the write grant (`EXCLUSIVE`), which clears the entry, and commits like
-any other edit. `states` then shows the holder holding the path, so it does
-not read as released. The map
+any other edit. `states` then shows the holder with a write grant on the path
+(`EXCLUSIVE`, then `MODIFIED` once it commits), so it does not read as
+released: a release leaves `SHARED`. The map
 tells you a reclaim happened; whether its edit has been dealt with since is
 yours to decide. One clue: if the path's `last_writer_at_unix_ts` in the same
 response is later than the entry's `reclaimed_at_unix_ts`, someone has committed
@@ -1014,7 +1017,10 @@ moving, which a version comparison cannot see. That happens on:
 - the transient timeout taking a write grant back (`timeout`);
 - a voluntary release (`invalidate`): a failed post-edit, a session-stop, or
   the release of every grant by `agent-coherence-coordinator
-  --prepare-for-migration`;
+  --prepare-for-migration`. A failed post-edit or a session-stop leaves the
+  holder a reader (`SHARED`) of the version it held, and the generation still
+  moves; the drain still leaves each holder `INVALID`, because the bytes on
+  disk may never have been committed;
 - a handoff from a giver holding the path `EXCLUSIVE` or `MODIFIED`
   (`handoff`).
 
@@ -1524,7 +1530,8 @@ though nothing else touched it. Recover with `reacquire()`, and write from the
 bytes it returns. The operator view of `/status` then
 lists the file under that holder's `reclaimed` map (see [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status)).
 Both are `LifecycleConfig` fields, passed as `config` to the volume that starts
-the coordinator. A Claude Code session releases what it holds when its turn ends.
+the coordinator. A Claude Code session releases its write grants when its turn
+ends, and keeps a read of each file.
 So after `other_holder`, retry once the holder has released, not in a tight loop,
 or use a plain `write()`, which takes the file over (the previous holder's next
 write is then refused until it re-reads). A volume with `on_held="refuse"` gets
@@ -1711,8 +1718,10 @@ it never finds a coordinator started after the old one went away:
   goes through.
 - Otherwise build a new `CoherentVolume`. It attaches to the running
   coordinator, or starts one.
-- If the release was answered, the volume gave up its own grant as well, so
-  `reacquire()` and re-read before writing that file again.
+- If the release was answered, the volume gave up its write grant and kept a
+  read of the file at the version it held, so its next `write()` of that
+  file goes through without `reacquire()`, while no other agent has written
+  the file since.
 
 A coordinator goes away when it is killed or crashes, when the session or
 process hosting it exits, or after `idle_shutdown_sec` (900 s by default) with
@@ -2766,9 +2775,10 @@ A transfer names one successor and one or more paths. For each path the giver
 must hold a claim: a write grant (EXCLUSIVE, or MODIFIED after a commit) or a
 standing SHARED read. The transfer then, for every path it admits, in one step:
 
-- moves the giver's claim to INVALID under the `handoff` trigger, giving it up
-  as a release would (see the [trigger vocabulary](#trigger-vocabulary) for
-  what that does to the ownership epoch);
+- moves the giver's claim to INVALID under the `handoff` trigger. For the
+  ownership epoch this counts as a release (see the
+  [trigger vocabulary](#trigger-vocabulary) for what that does to it), but
+  the giver keeps no read of the path, where a release leaves one;
 - stores one **transfer record** for the path: the giver, the successor, the
   version at transfer, the hold shape given up, and a status;
 - fences the giver, which can no longer write the path while the record is
@@ -3092,8 +3102,9 @@ coordinator still holds:
   grant it tried to release, in no guaranteed order (match entries by `path`):
   `{"path", "held": false, "cause": "release"}` for a grant it released, and
   `{"path", "held": true, "reason"}` for one still held (with `detail` when the
-  reason is a typed one). It used to answer `ok: true` and only log the
-  failure.
+  reason is a typed one). `held` is about the write grant: a session whose
+  write grant was released still keeps a read of the path. It used to answer
+  `ok: true` and only log the failure.
 - **`POST /hooks/post-edit` with `success: false` whose release is refused**
   keeps its `ok: false` and `reason`, and adds the same `grants` list.
 - **The giver's own failed-edit report on a path it handed off** — while the
@@ -3308,25 +3319,27 @@ and answer as before apart from the giver's shell write, which is denied.
 
 **Which claim a Claude Code session can hand on.** A transfer needs the giver
 to hold a claim on the path when it runs (see
-[What a transfer does](#what-a-transfer-does)), and a Claude Code session's
-write grant ends with its turn:
+[What a transfer does](#what-a-transfer-does)). A Claude Code session's write
+grant ends with its turn, and the session keeps a read of the file:
 
 - **A file the session edited this turn.** Have the session run the transfer
   in the same turn, right after the edit. The transfer hands on the write
   grant (`MODIFIED` once the edit is committed).
-- **After that turn has ended**, the end-of-turn hook has released the write
-  grant, and the transfer is refused as `handoff_not_held`. On a warn-mode
-  path, have the session read the file again: the read gives it a standing
-  read, and a transfer then hands that on (`SHARED`).
+- **A file the session edited in an earlier turn.** The end-of-turn hook
+  released the write grant and left the session a standing read of the
+  version it held, so a transfer in a later turn hands that on (`SHARED`).
 - **A file the session has only read**, and nobody has written since, is a
   standing read that outlives the turn. The session can hand it on at any
   time.
-- **On a strict-mode path**, a session whose write grant was released is
-  denied its `Read` of the file by the strict-mode stale-view deny, and that
-  denied read grants nothing. A shell read of the file (`cat`, for example) is
-  denied too, but its deny re-grants a standing read without recording a read
-  of the current version, and a transfer hands that on as `SHARED`. Handing
-  the path on in the same turn as the edit avoids both.
+- **A file another session has taken or changed since.** Another session's
+  edit ends this session's read, and the transfer is refused as
+  `handoff_not_held`. On a warn-mode path, have the session read the file
+  again: the read gives it a standing read, and a transfer then hands that on
+  (`SHARED`). On a strict-mode path that `Read` is denied by the strict-mode
+  stale-view deny, and the denied read grants nothing. A shell read of the
+  file (`cat`, for example) is denied too, but its deny re-grants a standing
+  read without recording a read of the current version, and a transfer hands
+  that on as `SHARED`.
 
 ### Handoff commands
 
@@ -3423,12 +3436,15 @@ hint:
 
 ```text
 agent-coherence-transfer: notes.md not transferred (handoff_not_held)
-agent-coherence-transfer: hint: a Claude Code session's write grant ends when its turn ends. If an earlier transfer of notes.md may have landed, check the path's handoff in agent-coherence-status output first: a handoff from this session to that successor made at the version it held, live or ended, means it landed, so do not transfer again, and if it shows another session's handoff, ask before transferring; otherwise have the giver session read notes.md, then transfer it again (on a strict-mode path that read is denied: hand the path on in the same turn as its edit)
+agent-coherence-transfer: hint: this session holds no claim on notes.md: an earlier transfer of it may have landed, another session may have taken or changed it since this session read it, or this session may never have read it. Check the path's handoff in agent-coherence-status output first: a handoff from this session to that successor made at the version it held, live or ended, means it landed, so do not transfer again, and if it shows another session's handoff, ask before transferring; otherwise have the giver session read notes.md, then transfer it again (on a strict-mode path that read is denied, and grants nothing, when another session took or changed notes.md after this session read it)
 ```
 
-On a strict-mode path the hint's `Read` is denied and grants nothing, as the
-hint's last clause says; see [Claude Code sessions](#claude-code-sessions) for
-what a shell read does there.
+A session's own earlier edit is not a cause: the end of the turn leaves it a
+read of the file, which a transfer hands on. On a strict-mode path, when
+another session took or changed the file after this session read it, the
+hint's `Read` is denied and grants nothing, as the hint's last clause says;
+see [Claude Code sessions](#claude-code-sessions) for what a shell read does
+there.
 
 **Python coordinator only.** Against the Claude Code plugin's Node coordinator
 the commands exit `4`. A plugin workspace created fresh runs the Node
@@ -3497,6 +3513,10 @@ run in one workspace with the plugin's hooks and the Python coordinator.
    agent-coherence-transfer: acting as session agent bd35b34c-f785-51c6-a184-5922aee7cbea (session from CLAUDE_CODE_SESSION_ID)
    agent-coherence-transfer: transferred plan.md to 6e271ee6-5a71-5508-bedf-ffd46d8898ce at version 2 (gave up MODIFIED; status pending)
    ```
+
+   Run in a later turn of A, while no other session has edited `plan.md`
+   since, the same transfer hands on the read A kept when its turn ended, and
+   the line ends `(gave up SHARED; status pending)`.
 
 3. **Check it.** `agent-coherence-status` lists
    `plan.md: bd35b34c → 6e271ee6 at version 2 (pending)` under Handoffs, and
@@ -4009,8 +4029,9 @@ completes normally, or a failed `post-edit` — or hands it on with a
 [transfer](#targeted-grant-handoff) (Python coordinator only), or when the
 coordinator reclaims it: the Python coordinator's sweep from a silent holder
 (see **What it does not close**), the Node coordinator's opted-in acquire from
-a holder of 30 minutes or more (see **On the Node coordinator**). Poll with
-backoff rather than wait for a signal.
+a holder of 30 minutes or more (see **On the Node coordinator**). A release
+leaves the holder a reader of the path (`SHARED`), and a reader refuses no
+one. Poll with backoff rather than wait for a signal.
 
 **Client rules.**
 
@@ -4038,14 +4059,20 @@ backoff rather than wait for a signal.
   answers `{"ok": true, "note": "untracked-at-commit"}`, with nothing to release,
   and `{"ok": true, "degraded": true}` means the release did not run, so send it
   again.
-  That answer does not prove a grant existed, and it leaves the caller INVALID
-  on the path. On a strict-mode path a deny never re-grants that identity, so
-  its next `pre-edit`, and every later read under it, gets the strict deny.
-  Re-read under a new `agent_id` with the same `session_id`, as the
+  That answer does not prove a grant existed. A caller that held the grant is
+  left a reader of the version it held (`SHARED`). A caller that held none
+  keeps the state it had: a reader stays a reader, and a caller with no record
+  on the path gets none. While no other agent has taken or written the path
+  since, the caller's next `pre-edit` is not denied as stale. A caller another
+  agent's acquire or commit left INVALID stays INVALID, and on a strict-mode
+  path a deny never re-grants that identity, so its next `pre-edit`, and every
+  later read under it, gets the strict deny. Re-read under a new `agent_id`
+  with the same `session_id`, as the
   [capture rule](#capturing-the-comparands) and `CoherentVolume.reacquire()`
   do.
 - **Send `session-stop` only when the work is done.** It releases every path
-  the identity holds EXCLUSIVE or MODIFIED, not only the one in question.
+  the identity holds EXCLUSIVE or MODIFIED, not only the one in question, and
+  leaves the identity a reader of each.
   `CoherentVolume.reacquire()` sends one, so it gives up those paths as well.
 - **Claiming a principal binds the session.** On the Python coordinator, a
   client that claims one to clear the `400` binds its session: from then on,
@@ -4400,7 +4427,8 @@ same artifact are detected as a collision instead of passing as one writer.
 With no `agent_id` in the payload the derivation is unchanged, byte-for-byte —
 main-thread sessions behave exactly as before. On Claude Code's
 `SubagentStop` event, the hook client's `subagent-stop` subcommand releases
-just that subagent's grants; the `agent_id` is required there, so a payload
+just that subagent's write grants and leaves it a reader of each file; the
+`agent_id` is required there, so a payload
 without one skips the release rather than stripping the parent's grants
 mid-session. The Python and Node coordinator backends derive the identity
 byte-identically; the protocol corpus pins the parity (sibling collision,
@@ -4416,7 +4444,11 @@ compaction, event-anchored ("At compaction you held EXCLUSIVE on `plan.md`
 (v7) — re-acquire before writing."), and each touched artifact's current
 coordinated version — with a stale flag when a peer advanced it past the
 session's last-observed version ("`plan.md` advanced to v9 past your
-last-observed v7 — re-read before relying on it."). The payload is
+last-observed v7 — re-read before relying on it."). A file the session
+edited in an earlier turn, and no other session has written since, renders as
+a held `SHARED` grant ("At compaction you held SHARED on `plan.md` (v7) —
+re-acquire before writing."), because the end of that turn left the session
+a read of it. The payload is
 session-scoped: the parent's lines render first, then each registered
 subagent's under a `Subagent <name>:` prefix. The subcommand gates on
 `source: "compact"` client-side, so ordinary starts, resumes, and clears
@@ -4845,6 +4877,16 @@ no commit of its own to explain them, is told so:
   until a commit lands, and a write is the one way to commit the change. A
   client that writes whole files should re-read before it writes when it sees
   the key.
+
+A Claude Code session that edited a file keeps a read of it when its turn
+ends, so on its next turn, while nothing has changed the file since, its Read
+is fresh and its Edit is admitted. A change made after the session's commit is
+still a change outside the coordinator, and the rules above apply to it. A
+formatter hook that runs after every edit, for example, rewrites the file
+after the edit's commit: on the next turn the session's Read of that file
+carries the warning in warn mode and is denied in strict mode, and its Edit is
+admitted with `"disk_differs": true`, and that edit's commit records the file
+as it then is.
 
 **Reading the counts while the coordinator runs.** `/status?detail=full` adds
 `foreign_writes` to each tracked file the detector has counted anything for,
@@ -5279,9 +5321,11 @@ session. It does not read the registry, so it is never degraded.
   transfer record. Untracking a path does not remove its entry;
 - `sessions`: one row per agent that this coordinator process has seen or
   that holds a path, with its `agent_id`, its `states` (each path it holds, as
-  `SHARED`, `EXCLUSIVE` or `MODIFIED`), and `agent_name` set to `null`. An
-  agent id is derived one way from the session id, which no row at this view
-  shows;
+  `SHARED`, `EXCLUSIVE` or `MODIFIED`), and `agent_name` set to `null`. A
+  session or subagent that released a write grant, at the end of a turn, when
+  it stopped, or on a failed edit, still lists the path as `SHARED`; a path
+  another agent's acquire or commit made stale for it is left out. An agent id
+  is derived one way from the session id, which no row at this view shows;
 - `policy_summary`: the five pattern counts (`default_pattern_count`,
   `user_added_pattern_count`, `ignored_pattern_count`,
   `strict_mode_pattern_count`, `rejected_pattern_count`) and `coordinator_root`
