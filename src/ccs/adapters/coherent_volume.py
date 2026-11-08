@@ -129,6 +129,7 @@ __all__ = [
     "HandoffTransferResult",
     "HandoffVerbResult",
     "HandoffWinOutcome",
+    "WriteResult",
     "coherent_workspace",
     "install",
     "uninstall",
@@ -963,6 +964,28 @@ class CasCommitResult:
     path: str
     version: int | None
     handoff: HandoffWinOutcome | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class WriteResult:
+    """What a :meth:`CoherentVolume.write` of ``path`` learned from the
+    coordinator (#526).
+
+    ``disk_differs`` is ``True`` when the coordinator reported, as it admitted
+    this write's grant request, that the file on disk held bytes it had not
+    recorded, and this write replaced them. That can be this volume's own
+    write whose commit did not reach the coordinator, which this write now
+    records, or an edit made outside the coordinator, which this write
+    overwrote: a path this volume never read has no baseline for its
+    foreign-edit check to deny on. ``False`` says only that the coordinator
+    did not report it. It does not report it on a path it does not track,
+    within a few seconds of this volume's own last commit of the file, while a
+    peer's write of the file is in flight, or when no coordinator answered (a
+    degrade-mode volume writing best-effort). It never means that an earlier
+    write is now recorded."""
+
+    path: str
+    disk_differs: bool
 
 
 _HANDOFF_VERB_REFUSALS: frozenset[str] = frozenset(
@@ -2056,8 +2079,10 @@ class CoherentVolume:
         self._last_observed_hash[rel] = content_hash
         return data
 
-    def write(self, path: str | os.PathLike[str], data: bytes | bytearray) -> None:
-        """Write bytes to a workspace file under the single-writer guard.
+    def write(self, path: str | os.PathLike[str], data: bytes | bytearray) -> WriteResult:
+        """Write bytes to a workspace file under the single-writer guard, and
+        return what the coordinator reported about the bytes it replaced
+        (:class:`WriteResult`).
 
         Prevents the **sequential** stale-read→write lost update: if a peer
         committed a newer version since this instance last read, this instance
@@ -2122,9 +2147,9 @@ class CoherentVolume:
         thread.
         """
         with self._single_op_guard():
-            self._write_impl(path, data)
+            return self._write_impl(path, data)
 
-    def _write_impl(self, path: str | os.PathLike[str], data: bytes | bytearray) -> None:
+    def _write_impl(self, path: str | os.PathLike[str], data: bytes | bytearray) -> WriteResult:
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError("CoherentVolume.write expects bytes")
         data = bytes(data)
@@ -2139,7 +2164,7 @@ class CoherentVolume:
             self._check_foreign_edit(rel, self._disk_hash(abs_path))
             self._atomic_write(abs_path, data)
             self._record_own_write(rel, self._sha256_bytes(data))
-            return
+            return WriteResult(path=rel, disk_differs=False)
 
         opts_in = self._opts_in(rel)
 
@@ -2296,6 +2321,9 @@ class CoherentVolume:
             # fail closed so the caller knows the commit did not register.
             self._check_grant(post_resp, rel, phase="post-edit")
         self._last_committed_hash[rel] = new_hash
+        # Relayed, never acted on: the coordinator's note does not move the
+        # observed baseline the foreign-edit check compares against.
+        return WriteResult(path=rel, disk_differs=isinstance(resp, dict) and resp.get("disk_differs") is True)
 
     def _opts_in(self, rel: str) -> bool:
         """Whether this write asks for ``rel`` only if nobody holds it: refuse mode,

@@ -1094,8 +1094,8 @@ def test_a_volume_write_whose_commit_never_left_is_refused_on_read_until_its_nex
     is denied by the coordinator as a change made outside it, and the volume
     raises its own split-pair refusal in place of that text; reading again
     does not clear it. The next write is admitted with the coordinator's note
-    that the disk differs, which the volume does not pass on, and its commit
-    records the bytes, after which a read is fresh.
+    that the disk differs, which its result carries, and its commit records the
+    bytes, after which a read is fresh.
 
     The error and the refusal say so: the bytes are unrecorded, reading again
     does not clear the refusal, and writing the path again records them."""
@@ -1120,9 +1120,10 @@ def test_a_volume_write_whose_commit_never_left_is_refused_on_read_until_its_nex
         denials = [_denied_reason(answer) for answer in wire.answers("/hooks/pre-read")]
         assert len(denials) == 2 and all(_OUT_OF_BAND in denial for denial in denials), denials
 
-        vol.write(_VOLUME_REL, b"v3")
+        result = vol.write(_VOLUME_REL, b"v3")
 
         assert wire.answers("/hooks/pre-edit")[-1].get("disk_differs") is True
+        assert result.disk_differs is True
         assert (target.read_bytes(), recorded_version(server, _VOLUME_REL)) == (b"v3", 2)
         assert vol.read(_VOLUME_REL) == b"v3"
     finally:

@@ -24,6 +24,7 @@ __all__ = [
     "HandoffTransferResult",
     "HandoffVerbResult",
     "HandoffWinOutcome",
+    "WriteResult",
     "gate",
     "coherent_workspace",
     "install",
@@ -54,13 +55,14 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "CrashRecoveryConfig": ("..coordinator.service", "CrashRecoveryConfig"),
     "CoherenceSession": (".openai_agents", "CoherenceSession"),
     "CoherentVolume": (".coherent_volume", "CoherentVolume"),
-    # The typed results of the volume's handoff verbs and of a
-    # compare-and-swap win (#185).
+    # The typed results of the volume's handoff verbs, of a
+    # compare-and-swap win (#185), and of a write (#526).
     "CasCommitResult": (".coherent_volume", "CasCommitResult"),
     "HandoffGrantResult": (".coherent_volume", "HandoffGrantResult"),
     "HandoffTransferResult": (".coherent_volume", "HandoffTransferResult"),
     "HandoffVerbResult": (".coherent_volume", "HandoffVerbResult"),
     "HandoffWinOutcome": (".coherent_volume", "HandoffWinOutcome"),
+    "WriteResult": (".coherent_volume", "WriteResult"),
     "gate": (".effect_gate", "gate"),
     "coherent_workspace": (".coherent_volume", "coherent_workspace"),
     "install": (".coherent_volume", "install"),
