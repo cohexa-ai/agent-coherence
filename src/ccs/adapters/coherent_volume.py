@@ -455,6 +455,10 @@ _IF_UNHELD_NOT_ADVERTISED_MESSAGE = (
     "to see its version, then upgrade it or use on_held='displace'."
 )
 
+#: What a degrade volume adds to a policy refusal (#305): the retry the refusal
+#: asks for is a new volume, because this one does not attach again.
+_POLICY_REFUSAL_DEGRADED_NOTE = "This volume stays detached: build a new one once the file is fixed."
+
 
 def _no_principal_message(rel: str, outcome: str) -> str:
     """What an opted-in :meth:`CoherentVolume.write` raises when its session holds
@@ -930,7 +934,8 @@ class CoherentVolume:
     ``on_error``:
 
     - ``"strict"`` (default): any coherence failure — a coordinator that is
-      unavailable, or one already running that we cannot enable strict on —
+      unavailable, one already running that we cannot enable strict on, or a
+      policy file the volume cannot merge its globs into before spawning one —
       raises :class:`~ccs.core.exceptions.CoherenceError`. Fail-closed. A
       request that gets no usable answer from the coordinator raises its
       subclass :class:`~ccs.core.exceptions.CoordinatorUnreachable`, except
@@ -1456,7 +1461,7 @@ class CoherentVolume:
             except ValueError as exc:
                 # A policy file it cannot merge into (#305). It is the user's to
                 # rewrite, so start nothing: the refusal names the file.
-                self._fail_closed_or_degrade(str(exc))
+                self._policy_refusal_or_degrade(exc)
                 return
 
         # No coordinator to spawn or attach, and an endpoint that cannot be
@@ -4426,6 +4431,15 @@ class CoherentVolume:
         if self._on_error == "strict":
             raise CoherenceError(message)
         self._record_degraded(message)
+
+    def _policy_refusal_or_degrade(self, refusal: ValueError) -> None:
+        """A policy file this volume cannot merge its globs into, through
+        ``on_error``. The text names the workspace, because a caller can hold
+        volumes over several roots."""
+        message = f"{self._root}: {refusal}"
+        if self._on_error == "strict":
+            raise CoherenceError(message)
+        self._record_degraded(f"{message} {_POLICY_REFUSAL_DEGRADED_NOTE}")
 
     def _failed_read_or_degrade(self, resp: dict, rel: str) -> None:
         """A pre-read the coordinator answered with ``ok: false``, which it does

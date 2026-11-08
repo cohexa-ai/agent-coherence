@@ -366,7 +366,8 @@ Alpha — APIs may change before `v1.0`.
   starts nothing: `ensure_coordinator_handle` returns `None` and
   `ensure_coordinator` returns `-1`, as for any pid file it cannot open.
   `agent-coherence-coordinator` prints the same text and exits `2` at once, without
-  spawning a worker. The plugin's Node coordinator already refuses one.
+  spawning a worker. The plugin's Node coordinator refuses one in plugin releases
+  after 0.6.0; up to 0.6.0 it writes through the link.
 
 - **A volume or substrate session no longer overwrites a policy file it cannot
   load (#305).** Before spawning the coordinator, both merge their managed globs
@@ -374,9 +375,10 @@ Alpha — APIs may change before `v1.0`.
   could not be read, was not valid YAML or was not a list read as empty and was
   replaced with only those globs, deleting every other entry with no log line. A
   value such as `!!bool x` or bytes that are not UTF-8 raised an unrelated error.
-  They now refuse such a file with the text the policy routes use, naming it, and
-  write neither file and start no coordinator. A strict volume or a session raises
-  `CoherenceError`; a volume in degrade mode warns and stays detached. A FIFO or
+  They now refuse such a file with the text the policy routes use, naming it and
+  the workspace, and write neither file and start no coordinator. A strict volume
+  or a session raises `CoherenceError`; a volume in degrade mode warns, stays
+  detached and says to build a new one once the file is fixed. A FIFO or
   device at that path, or a link to one, counts as a file that cannot be read and
   is not opened for a blocking read, so neither the merge nor a Python policy route
   can hang on it.

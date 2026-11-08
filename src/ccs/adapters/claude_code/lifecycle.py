@@ -811,7 +811,9 @@ def _open_pidfile(pid_file: Path) -> int | None:
     try:
         fd = os.open(pid_file, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     except OSError as exc:
-        if pid_file.is_symlink():
+        # os.path.islink: Path.is_symlink raises where it cannot look, and this
+        # path must return None.
+        if os.path.islink(pid_file):
             logger.warning("%s", symlinked_pid_file_refusal(pid_file))
         else:
             logger.warning("cannot open pid file %s: %s", pid_file, exc)

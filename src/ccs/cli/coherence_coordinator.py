@@ -70,6 +70,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -266,8 +267,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     # The child would refuse this too, but its stderr is /dev/null: the user
-    # would wait out the window and never learn why.
-    if pid_file.is_symlink():
+    # would wait out the window and never learn why. os.path.islink, because
+    # Path.is_symlink raises on a .coherence it cannot search, which the child
+    # repairs when the user owns it.
+    if os.path.islink(pid_file):
         err(f"agent-coherence-coordinator: {escape_nonprintable(symlinked_pid_file_refusal(pid_file))}")
         return 2
 

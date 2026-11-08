@@ -386,6 +386,85 @@ def test_coordinator_names_a_symlinked_pid_file_without_spawning(
     assert (target.read_bytes() == b"keep\n") if target_exists else not target.exists()
 
 
+def test_coordinator_joins_a_live_coordinator_through_a_symlinked_pid_file(
+    git_workspace: Path, tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The link refusal runs after the reuse probe, so a link naming a coordinator
+    that answers still joins it, as before #464. Prevents the refusal moving ahead
+    of the probe and turning away a workspace whose coordinator is live. Whether
+    the read itself should follow the link is #498's."""
+    target = tmp_path_factory.mktemp("outside") / "server.pid"
+    target.write_text("999\n54321\n", encoding="utf-8")
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir(mode=0o700)
+    (coherence / "server.pid").symlink_to(target)
+    monkeypatch.setattr(coherence_coordinator, "_tcp_probe", _capture_probe({}, reachable=True))
+
+    def spawn(*args: object, **kwargs: object) -> None:
+        pytest.fail("spawned a detached worker")
+
+    monkeypatch.setattr(coherence_coordinator.subprocess, "Popen", spawn)
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace)])
+
+    assert rc == 0
+    assert "port=54321" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root searches a mode-000 directory"
+)
+def test_coordinator_still_spawns_when_it_cannot_search_coherence(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``.coherence`` the user cannot search (another user's, or one that lost its
+    x bit) makes ``Path.is_symlink`` raise. Prevents the link check crashing the CLI
+    with a traceback and exit 1, which means "not in a git repository": the worker
+    repairs a mode the user owns, and reports any other failure as exit 2."""
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir(mode=0o700)
+    spawned: list[Path] = []
+    monkeypatch.setattr(
+        coherence_coordinator, "_spawn_detached", lambda root, **kwargs: spawned.append(root) or 0,
+    )
+
+    coherence.chmod(0)
+    try:
+        rc = coherence_coordinator.main(["--root", str(git_workspace)])
+    finally:
+        coherence.chmod(0o700)
+
+    assert rc == 0
+    assert len(spawned) == 1
+
+
+def test_the_detached_worker_refuses_a_symlinked_pid_file(
+    git_workspace: Path, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#464 through the entry the CLI spawns, ``--_daemonized``. Prevents a worker
+    writing through a link the parent's check did not see, such as one made after
+    that check ran."""
+    target = tmp_path_factory.mktemp("outside") / "target"
+    target.write_bytes(b"keep\n")
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir(mode=0o700)
+    (coherence / "server.pid").symlink_to(target)
+
+    def started(root: Path) -> None:
+        stop_coordinator(root)
+        pytest.fail("the worker started a coordinator over a symlinked pid file")
+
+    # A worker that binds then waits forever: fail a regression instead of hanging.
+    monkeypatch.setattr("ccs.adapters.claude_code.lifecycle.wait_for_shutdown", started)
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace), "--_daemonized"])
+
+    assert rc == 2
+    assert target.read_bytes() == b"keep\n"
+    assert (coherence / "server.pid").is_symlink()
+
+
 def test_wildcard_bind_host_rejected_before_any_dial(
     git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

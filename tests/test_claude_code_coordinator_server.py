@@ -954,6 +954,24 @@ def test_append_policy_yaml_refuses_a_link_to_a_device_and_keeps_it(tmp_path: Pa
     assert policy_file.is_symlink()
 
 
+def test_a_policy_route_answers_400_for_a_policy_file_linked_to_a_device(
+    coordinator, client: _Client,
+) -> None:
+    """On the wire, a policy file linked to a device is the 400 every unreadable
+    file gets, naming it, with the link kept. ``os.devnull`` stands in for
+    ``/dev/zero``, so a regression answers wrongly instead of reading until memory
+    runs out."""
+    policy_file = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
+    policy_file.unlink(missing_ok=True)
+    policy_file.symlink_to(os.devnull)
+
+    s, b = client.post("/policy/track", {"paths": ["ok.md"]})
+
+    assert s == 400, b
+    assert b == {"error": ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."}, b
+    assert policy_file.is_symlink()
+
+
 def test_a_coordinator_over_a_broken_policy_file_counts_it_on_status(tmp_path: Path) -> None:
     """#284 at load time: a coordinator that starts over a tracked.yaml an
     earlier release broke serves, and /status counts the file as rejected,
@@ -3554,6 +3572,28 @@ def test_merge_policy_globs_refuses_a_link_to_a_device_and_keeps_it(tmp_path: Pa
 
     assert str(raised.value) == ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."
     assert tracked.is_symlink()
+
+
+def test_merge_policy_globs_works_where_the_platform_has_no_o_nonblock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``O_NONBLOCK`` is POSIX-only. Prevents its absence making the merge raise
+    AttributeError out of a volume's or a session's constructor, where degrade mode
+    promises to warn: a regular file still merges and a device is still refused."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked = coherence / "tracked.yaml"
+    tracked.write_text('- "docs/**"\n')
+    device = coherence / "strict_mode.yaml"
+    device.symlink_to(os.devnull)
+    monkeypatch.delattr(os, "O_NONBLOCK")
+
+    merge_policy_globs((tracked,), ("data/**",))
+    with pytest.raises(ValueError, match=r"strict_mode\.yaml could not be read \(not a regular file\)"):
+        merge_policy_globs((device,), ("data/**",))
+
+    assert yaml.safe_load(tracked.read_text()) == ["data/**", "docs/**"]
 
 
 @pytest.mark.parametrize("linked", [False, True], ids=["fifo", "link_to_fifo"])

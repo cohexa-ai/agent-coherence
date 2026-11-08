@@ -534,7 +534,9 @@ class SubstrateCoordinatorSession:
     client never silently degrades open. A call that gets no usable answer, at
     start or after, raises the typed
     :class:`~ccs.core.exceptions.CoordinatorUnreachable`, except after the
-    substrate write landed, where it stays ``CommitUnconfirmed``. The
+    substrate write landed, where it stays ``CommitUnconfirmed``. A policy file
+    it cannot merge its globs into before spawning raises the plain error,
+    naming the file and the workspace (#305). The
     coordinator's failure envelope (#259) or an HTTP 5xx (#433) on a read leg
     raises the typed :class:`~ccs.core.exceptions.CoordinatorFailed`; any other
     answer that decides nothing keeps the plain error. A request refused for its caller
@@ -575,7 +577,7 @@ class SubstrateCoordinatorSession:
             except ValueError as exc:
                 # Fail closed: a session has no check after it attaches, so going
                 # on without the merge would run it unenforced with no signal.
-                raise CoherenceError(str(exc)) from exc
+                raise CoherenceError(f"{self._root}: {exc}") from exc
         # No coordinator to spawn or attach, or none to name, is the same fact
         # to this caller as one that will not answer: nothing will.
         if connect_or_spawn(self._root, config=cfg, bind_host=bind_host) == -1:

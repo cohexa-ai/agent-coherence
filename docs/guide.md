@@ -5196,8 +5196,9 @@ A `CoherentVolume` or substrate session about to start the coordinator merges
 its managed globs into `tracked.yaml` and `strict_mode.yaml`, and treats a file
 that cannot be read, is not valid YAML or is not a list the same way: it names
 the file, writes neither one, and starts no coordinator. A strict volume or a
-session raises `CoherenceError` with that text. A volume in degrade mode warns
-and stays detached.
+session raises `CoherenceError` with that text, after the workspace root. A
+volume in degrade mode warns and stays detached, so build a new one once the
+file is fixed.
 
 Releases up to 0.14.1 wrote entries without quotes. An entry starting with
 `*`, `[`, `{`, `!`, `&`, `%`, `@`, `|`, `>` or a quote, written by one of them,

@@ -9427,7 +9427,9 @@ def _read_policy_bytes(yaml_path: Path, name: str) -> bytes:
 
 
 def _open_nonblocking(path: str, flags: int) -> int:
-    return os.open(path, flags | os.O_NONBLOCK)
+    # O_NONBLOCK is POSIX-only; without it there are no FIFOs to block on, and
+    # the fstat check still refuses a device.
+    return os.open(path, flags | getattr(os, "O_NONBLOCK", 0))
 
 
 def _entries_or_none(text: str, name: str) -> list[str] | None:

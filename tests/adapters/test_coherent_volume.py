@@ -1131,11 +1131,12 @@ def test_a_strict_volume_refuses_a_policy_file_it_cannot_load_and_keeps_it(
     tmp_path: Path, fast_cfg: LifecycleConfig, name: str
 ) -> None:
     """#305: a strict volume about to spawn the coordinator raises naming a policy
-    file that loads as no entries, leaves it and the other file as they were, and
-    starts no coordinator.
+    file that loads as no entries, and its workspace, leaves it and the other file
+    as they were, and starts no coordinator.
 
     Prevents the spawn replacing the file with only this volume's globs, which
-    deleted the user's other entries with no signal."""
+    deleted the user's other entries with no signal. The workspace is named because
+    a caller can hold volumes over several roots."""
     _seed(tmp_path)
     coherence_dir = tmp_path / ".coherence"
     coherence_dir.mkdir(parents=True, exist_ok=True)
@@ -1145,7 +1146,7 @@ def test_a_strict_volume_refuses_a_policy_file_it_cannot_load_and_keeps_it(
     with pytest.raises(CoherenceError, match="is not valid YAML") as raised:
         CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
 
-    assert f".coherence/{name}" in str(raised.value)
+    assert str(raised.value).startswith(f"{tmp_path.resolve()}: .coherence/{name} is not valid YAML")
     assert broken.read_text() == "- docs/**\n- *.md\n"
     assert [path.name for path in coherence_dir.glob("*.yaml")] == [name]
     assert not (coherence_dir / "server.pid").exists()
@@ -1154,18 +1155,23 @@ def test_a_strict_volume_refuses_a_policy_file_it_cannot_load_and_keeps_it(
 def test_a_degrade_volume_warns_about_a_policy_file_it_cannot_load_and_keeps_it(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:
-    """#305: a degrade volume keeps the file too, warns naming it, and stays
-    detached like its other failed attaches. Prevents degrade mode, which promises
-    only to run without enforcement, destroying a policy file to get there."""
+    """#305: a degrade volume keeps the file too, warns naming it and its workspace,
+    and stays detached like its other failed attaches. Prevents degrade mode, which
+    promises only to run without enforcement, destroying a policy file to get
+    there. The warning says a new volume is the retry, because this one does not
+    attach again."""
     _seed(tmp_path)
     coherence_dir = tmp_path / ".coherence"
     coherence_dir.mkdir(parents=True, exist_ok=True)
     broken = coherence_dir / "tracked.yaml"
     broken.write_text("- docs/**\n- *.md\n")
 
-    with pytest.warns(CoherenceDegradedWarning, match=r"\.coherence/tracked\.yaml is not valid YAML"):
+    with pytest.warns(CoherenceDegradedWarning, match=r"\.coherence/tracked\.yaml is not valid YAML") as caught:
         vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
 
+    message = next(str(w.message) for w in caught if issubclass(w.category, CoherenceDegradedWarning))
+    assert f"{tmp_path.resolve()}: .coherence/tracked.yaml" in message, message
+    assert message.endswith("This volume stays detached: build a new one once the file is fixed."), message
     assert not vol.is_attached
     assert broken.read_text() == "- docs/**\n- *.md\n"
     assert not (coherence_dir / "server.pid").exists()

@@ -2746,6 +2746,29 @@ def test_a_start_that_cannot_open_its_pid_file_does_not_blame_a_symlink(
     assert "it is a symlink" not in caplog.text
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root searches a mode-000 directory"
+)
+def test_a_pid_file_in_a_directory_it_cannot_search_is_not_blamed_on_a_link(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``Path.is_symlink`` raises where it cannot look. Prevents the check that names
+    a link raising out of a pid-file open whose callers expect None."""
+    from ccs.adapters.claude_code.lifecycle import _open_pidfile
+
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir(mode=0o700)
+    caplog.set_level("WARNING")
+
+    coherence.chmod(0)
+    try:
+        assert _open_pidfile(coherence / "server.pid") is None
+    finally:
+        coherence.chmod(0o700)
+
+    assert "cannot open pid file" in caplog.text
+
+
 def _hold_the_flock_with_no_port(root: Path) -> int:
     """Hold server.pid's flock through a separate open in this process, with
     no port line: every call then loses the flock and never reads a port."""
