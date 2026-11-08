@@ -205,6 +205,35 @@ class _Sent(NamedTuple):
     principal_refusal: str | None
 
 
+class _ReleaseFailure(NamedTuple):
+    """Why one of :meth:`CoherentVolume.release`'s requests did not confirm its
+    release: the error a strict volume raises for it, the failure that error
+    chains to, whether the answer reported the grant still held, and whether
+    ``_post`` already warned for it (degrade mode, a request with no answer)."""
+
+    error: type[CoherenceError]
+    cause: BaseException | None = None
+    held: bool = False
+    reported: bool = False
+
+
+def _release_answer_failure(resp: object) -> _ReleaseFailure | None:
+    """What stops a walk of release requests in ``resp``, or ``None`` when the
+    answer can be read: ``ok: true``, or an account of each grant. ``None`` as
+    ``resp`` is a degrade-mode request ``_post`` already warned about. A
+    watchdog-degraded answer reads ``ok: true`` whether or not the release ran,
+    so it confirms nothing."""
+    if resp is None:
+        return _ReleaseFailure(CoordinatorUnreachable, reported=True)
+    if isinstance(resp, dict) and resp.get("degraded"):
+        return _ReleaseFailure(CoherenceError)
+    if _is_failure_envelope(resp):
+        return _ReleaseFailure(CoordinatorFailed)
+    if isinstance(resp, dict) and (resp.get("ok") is True or isinstance(resp.get("grants"), list)):
+        return None
+    return _ReleaseFailure(CoherenceError)
+
+
 def _is_commit_leg(endpoint_path: str, payload: dict) -> bool:
     """Whether a request is a commit leg: write()'s ``success: true``
     post-edit (not the release it sends on the same route), the
@@ -574,6 +603,25 @@ def _own_grant_message(rel: str, *, held: bool) -> str:
         f"{claim} Nothing was committed. Retry once after a short wait, which "
         "sends the release again; if it fails again, report it to the operator."
     )
+
+
+def _release_not_confirmed_message(rel: str, *, held: bool) -> str:
+    """What :meth:`CoherentVolume.release` raises (strict) or warns (degrade)
+    when the coordinator did not confirm the release of this volume's write
+    grant on ``rel``. ``held``: its answer reported the grant still held;
+    otherwise the release may or may not have run. Not the commit refusal's
+    text: nothing was being committed. Byte-stable but for the path."""
+    if held:
+        state = (
+            f"the coordinator answered the release of this volume's write grant on {rel} "
+            "with the grant still held"
+        )
+    else:
+        state = (
+            f"the coordinator did not confirm the release of this volume's write grant "
+            f"on {rel}, so the grant may still stand"
+        )
+    return f"{state}. Call release() again to send it again."
 
 
 def _cas_not_recorded_message(rel: str, detail: str) -> str:
@@ -2409,6 +2457,116 @@ class CoherentVolume:
                 self._release_held_paths.add(path)
         if not written:
             del self._grant_incarnations[incarnation]
+
+    # --- letting go ------------------------------------------------------------
+
+    def release(self, path: str | os.PathLike[str]) -> None:
+        """Give back this volume's write grant on ``path`` and keep every other
+        hold (#505).
+
+        The volume keeps a read of the version it held, so it reads and writes
+        the file again with no :meth:`reacquire`, until a peer writes it; a
+        refuse-mode peer is admitted to the file at once. Nothing else changes:
+        no new attempt starts, and the volume's other grants stand.
+
+        The volume decides what to release from its own record, because the
+        coordinator answers a release the same way whether it released a grant
+        or held nothing: one release per attempt whose :meth:`write` took a
+        grant on ``path``, and none for a path no write of this volume recorded.
+        That includes another spelling of a recorded path, such as a different
+        case or Unicode form, which releases nothing (#506).
+
+        A release the coordinator does not confirm keeps the path recorded and
+        goes through ``on_error``: strict raises (``CoordinatorUnreachable``
+        with no usable answer, ``CoordinatorFailed`` for an HTTP 5xx or the
+        coordinator's failure envelope, ``CoherenceError`` for a
+        watchdog-degraded answer or a grant reported still held), degrade warns.
+        Calling ``release()`` again sends it again.
+        """
+        with self._single_op_guard():
+            _abs_path, rel = self._to_relative(path)
+            failure = self._release_path(rel)
+            if failure is not None:
+                self._release_not_confirmed(rel, failure)
+
+    def _release_path(self, rel: str) -> _ReleaseFailure | None:
+        """Send one ``success: false`` post-edit for each attempt that records
+        ``rel``, in the order :meth:`_claim_incarnation` prefers them, and say
+        what did not confirm. The walk stops at a request with no readable
+        answer; an answer that reports the grant still held lets it go on,
+        since the coordinator answered. The volume's read moves to the first
+        attempt released: the one that held the grant, as the others were
+        displaced by it, so a later transfer presents a claim that holds."""
+        if self._endpoint is None:
+            return None  # detached: no write of this volume recorded a grant
+        held: _ReleaseFailure | None = None
+        released_first = False
+        for incarnation in self._attempts_recording(rel):
+            resp, failure = self._send_release(
+                "/hooks/post-edit",
+                {"session_id": self._session_id, "agent_id": incarnation, "path": rel, "success": False},
+            )
+            failure = failure or _release_answer_failure(resp)
+            if failure is not None:
+                return failure
+            if self._settle_path_release(incarnation, rel, resp) and not released_first:
+                self._read_incarnations[rel] = incarnation
+                released_first = True
+            if rel in self._grant_incarnations.get(incarnation, ()):
+                held = _ReleaseFailure(CoherenceError, held=True)
+        if not self._records_write_grant(rel):
+            self._release_held_paths.discard(rel)
+        return held
+
+    def _attempts_recording(self, rel: str) -> list[str]:
+        """The attempts whose write() recorded a grant on ``rel``: the current
+        one first, then the latest, as :meth:`_claim_incarnation` orders them."""
+        writers = [inc for inc, written in self._grant_incarnations.items() if rel in written]
+        ordered = list(reversed(writers))
+        if self._incarnation in ordered:
+            ordered.remove(self._incarnation)
+            ordered.insert(0, self._incarnation)
+        return ordered
+
+    def _send_release(self, route: str, body: dict) -> tuple[object, _ReleaseFailure | None]:
+        """One release request through :meth:`_post`. The typed errors a
+        strict request raises when it gets no usable answer or an HTTP 5xx come
+        back as a failure instead, so the caller reports the release with its
+        own text and type. Any other error, a principal refusal among them,
+        propagates."""
+        try:
+            return self._post(route, body), None
+        except CoordinatorUnreachable as exc:
+            return None, _ReleaseFailure(CoordinatorUnreachable, exc)
+        except CoordinatorFailed as exc:
+            return None, _ReleaseFailure(CoordinatorFailed, exc)
+
+    def _settle_path_release(self, incarnation: str, rel: str, resp: object) -> bool:
+        """Act on a readable answer to the release of ``rel`` under
+        ``incarnation``; whether the coordinator released it to a read. ``ok:
+        true`` drops the path from that attempt's record; an account of each
+        grant drops what it reports released or handed off and keeps a grant
+        it reports still held."""
+        if not (isinstance(resp, dict) and resp.get("ok") is True):
+            self._drop_released_paths(incarnation, resp.get("grants") if isinstance(resp, dict) else None)
+            return False
+        written = self._grant_incarnations.get(incarnation)
+        if written is not None:
+            written.discard(rel)
+            if not written:
+                del self._grant_incarnations[incarnation]
+        return True
+
+    def _release_not_confirmed(self, rel: str, failure: _ReleaseFailure) -> None:
+        """Report a release of ``rel`` the coordinator did not confirm, through
+        ``on_error``: strict raises the failure's type with the release's own
+        text, chained to what failed; degrade warns, unless ``_post`` already
+        warned for the same request."""
+        message = _release_not_confirmed_message(rel, held=failure.held)
+        if self._on_error == "strict":
+            raise failure.error(message) from failure.cause
+        if not failure.reported:
+            self._record_degraded(message)
 
     def write_cas(
         self,
