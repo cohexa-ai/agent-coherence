@@ -13,6 +13,8 @@ only the answers a test needs the coordinator to give.
 
 from __future__ import annotations
 
+import builtins
+import contextlib
 import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -21,7 +23,7 @@ import pytest
 
 from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer, session_to_agent_id
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig
-from ccs.adapters.coherent_volume import CoherentVolume
+from ccs.adapters.coherent_volume import CoherentVolume, coherent_workspace, install, uninstall
 from ccs.adapters.effect_gate import gate
 from ccs.cli._coherence_client import CoordinatorUnavailable
 from ccs.core.exceptions import (
@@ -43,6 +45,7 @@ from tests.adapters.test_coherent_volume_other_holder import (
 from tests.coordinator_helpers import recorded_version, serve_in_process, write_holders
 
 _X = "data/x.txt"
+_ORIGINAL_OPEN = builtins.open
 _Z = "data/z.txt"
 
 
@@ -732,3 +735,132 @@ def test_a_closed_volume_stays_closed_in_a_forked_child(
     assert holder.closed is True
     with pytest.raises(CoherenceError, match="closed"):
         holder.read(_X)
+
+
+# --- exits that close their volume -------------------------------------------
+
+
+@pytest.fixture
+def shim_removed() -> Iterator[None]:
+    """Never let an installed open() shim outlive the test."""
+    yield
+    with contextlib.suppress(CoherenceError):
+        uninstall()
+
+
+def test_leaving_coherent_workspace_closes_its_volume(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, shim_removed: None
+) -> None:
+    """The block owns its volume, so leaving it gives back the volume's write
+    grants and ends the volume.
+
+    Prevents every file the block wrote staying held until the sweep."""
+    peer = _refuser(tmp_path, fast_cfg)
+    with coherent_workspace(tmp_path, managed=_MANAGED, config=fast_cfg) as volume:
+        with open(tmp_path / _X, "wb") as handle:
+            handle.write(b"through the shim")
+
+    assert volume.closed is True
+    assert open is _ORIGINAL_OPEN
+    peer.write(_X, b"from the peer")
+    assert write_holders(server, _X) == {peer.agent_id}
+    with pytest.raises(CoherenceError, match="closed"):
+        volume.read(_X)
+
+
+def test_a_nested_coherent_workspace_closes_nothing(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, shim_removed: None
+) -> None:
+    """The outer block owns the volume; the inner one only yields it.
+
+    Prevents an inner block ending the outer block's volume."""
+    with coherent_workspace(tmp_path, managed=_MANAGED, config=fast_cfg) as outer:
+        with coherent_workspace(tmp_path, managed=_MANAGED, config=fast_cfg) as inner:
+            assert inner is outer
+        assert outer.closed is False
+        outer.write(_X, b"after the inner block")
+    assert outer.closed is True
+
+
+def test_a_coherent_workspace_whose_body_raised_keeps_that_error(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    server: CoordinatorHTTPServer,
+    wire: _Wire,
+    shim_removed: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """open() is restored and the body's error propagates; a close that fails
+    on the way out is logged.
+
+    Prevents a coordinator outage replacing the error that ended the block."""
+    with caplog.at_level("WARNING", logger="ccs.adapters.coherent_volume"):
+        with pytest.raises(ValueError, match="the body failed"):
+            with coherent_workspace(tmp_path, managed=_MANAGED, config=fast_cfg) as volume:
+                volume.write(_X, b"from the block")
+                wire.answers[_SESSION_STOP] = _no_answer
+                raise ValueError("the body failed")
+
+    assert open is _ORIGINAL_OPEN
+    assert volume.closed is True
+    assert any("close" in record.getMessage() for record in caplog.records)
+
+
+def test_uninstall_restores_open_and_closes_the_volume(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, shim_removed: None
+) -> None:
+    """install() builds the volume and owns it, so uninstall() closes it.
+
+    Prevents an install() volume that nobody ever closes."""
+    peer = _refuser(tmp_path, fast_cfg)
+    volume = install(tmp_path, managed=_MANAGED, config=fast_cfg)
+    volume.write(_X, b"from the shim's volume")
+
+    uninstall()
+
+    assert open is _ORIGINAL_OPEN
+    assert volume.closed is True
+    peer.write(_X, b"from the peer")
+    uninstall()  # nothing installed: does nothing
+
+
+def test_a_strict_close_failure_from_uninstall_raises_after_open_is_restored(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire, shim_removed: None
+) -> None:
+    """Prevents a failed close leaving open() patched, and a second
+    uninstall() that cannot retry: the retry is the volume's close()."""
+    volume = install(tmp_path, managed=_MANAGED, config=fast_cfg)
+    volume.write(_X, b"from the shim's volume")
+    wire.answers[_SESSION_STOP] = _no_answer
+
+    with pytest.raises(CoordinatorUnreachable, match=r"close\(\) again"):
+        uninstall()
+
+    assert open is _ORIGINAL_OPEN
+    wire.answers.pop(_SESSION_STOP)
+    volume.close()
+    assert volume.is_attached is False
+
+
+def test_a_file_left_open_for_writing_past_the_block_is_named_and_writes_nothing(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    server: CoordinatorHTTPServer,
+    shim_removed: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A shim writer commits through the volume when it closes, so one still
+    open when the block closes the volume has nowhere to commit: the exit names
+    it, and closing it afterwards raises and leaves the file as it was.
+
+    Prevents bytes lost with no sign when a writer outlives its block."""
+    (tmp_path / _X).write_bytes(b"before the block")
+    with caplog.at_level("WARNING", logger="ccs.adapters.coherent_volume"):
+        with coherent_workspace(tmp_path, managed=_MANAGED, config=fast_cfg):
+            handle = open(tmp_path / _X, "wb")
+            handle.write(b"never committed")
+
+    assert any(_X in record.getMessage() for record in caplog.records)
+    with pytest.raises(CoherenceError, match="closed"):
+        handle.close()
+    assert (tmp_path / _X).read_bytes() == b"before the block"

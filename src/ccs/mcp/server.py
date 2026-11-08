@@ -320,16 +320,24 @@ async def lifespan(server: FastMCP) -> AsyncIterator[ServerContext]:
     """Own the coordinator for the server's lifetime.
 
     Enter → construct the strict-only volume (self-spawns/attaches; raises
-    fail-closed if it can't). Exit → ``stop_coordinator``. Does NOT call
-    ``connect_or_spawn`` — construction already did, so calling it again would
-    double-spawn.
+    fail-closed if it can't). Exit → close the volume, which gives back its
+    write grants (a failed close is logged), then ``stop_coordinator``: an
+    in-process coordinator must still answer the close. Only a normal end runs
+    this; nothing handles a signal. Does NOT call ``connect_or_spawn`` —
+    construction already did, so calling it again would double-spawn.
     """
     config = SessionConfig.from_env()
     volume = build_volume(config)  # blocking, fail-closed
     logger.info("stale-write-guard-fs attached: root=%s managed=%s", config.root, config.managed)
+    ctx = ServerContext(volume=volume, config=config, lock=asyncio.Lock())
     try:
-        yield ServerContext(volume=volume, config=config, lock=asyncio.Lock())
+        yield ctx
     finally:
+        async with ctx.lock:
+            try:
+                volume.close()
+            except CoherenceError as exc:
+                logger.warning("stale-write-guard-fs could not close its volume: %s", exc)
         stop_coordinator(config.root)
         logger.info("stale-write-guard-fs coordinator stopped: root=%s", config.root)
 

@@ -4917,6 +4917,20 @@ class _ShimState:
     def __init__(self, volume: CoherentVolume, original_open: Callable) -> None:
         self.volume = volume
         self.original_open = original_open
+        # Every writer the shim handed out. One still open when the volume
+        # closes has nowhere to commit, so the exit names it.
+        self.writers: weakref.WeakSet[_CommitOnCloseMixin] = weakref.WeakSet()
+
+    def warn_open_writers(self) -> None:
+        """Name every writer still open as the volume closes: closing it later
+        raises and writes nothing."""
+        pending = sorted(writer._rel for writer in self.writers if not writer._committed)
+        if pending:
+            logger.warning(
+                "managed files still open for writing as the shim's volume closes: %s. "
+                "Closing them now raises and writes nothing; close them inside the block.",
+                ", ".join(pending),
+            )
 
 
 _shim_state: _ShimState | None = None
@@ -4948,7 +4962,9 @@ def _managed_rel(volume: CoherentVolume, file: object) -> str | None:
     return rel if matches_any(rel, volume._managed) else None
 
 
-def _make_open_wrapper(volume: CoherentVolume, original_open: Callable) -> Callable:
+def _make_open_wrapper(
+    volume: CoherentVolume, original_open: Callable, writers: weakref.WeakSet[_CommitOnCloseMixin]
+) -> Callable:
     def coherent_open(file, mode="r", *args, **kwargs):
         rel = _managed_rel(volume, file)
         if rel is None:
@@ -4959,8 +4975,11 @@ def _make_open_wrapper(volume: CoherentVolume, original_open: Callable) -> Calla
             return original_open(file, mode, *args, **kwargs)
         if "w" in mode:
             if "b" in mode:
-                return _CoherentBytesWriter(volume, rel)
-            return _CoherentTextWriter(volume, rel, kwargs.get("encoding") or "utf-8")
+                writer: _CommitOnCloseMixin = _CoherentBytesWriter(volume, rel)
+            else:
+                writer = _CoherentTextWriter(volume, rel, kwargs.get("encoding") or "utf-8")
+            writers.add(writer)
+            return writer
         if "r" in mode:
             # Register the SHARED view (raises FileNotFoundError if missing, like
             # open()), then return a real handle over the same on-disk bytes.
@@ -4984,8 +5003,9 @@ def install(
     """Patch ``builtins.open`` + ``io.open`` to route managed-path opens through
     a process-singleton :class:`CoherentVolume`. Idempotent — a second call
     returns the already-installed volume (one workspace per process in v1).
-    Reverse with :func:`uninstall`, or use the :func:`coherent_workspace` context
-    manager. Opt-in and demo-grade — see the coverage matrix above.
+    Reverse with :func:`uninstall`, which also closes the volume, or use the
+    :func:`coherent_workspace` context manager. Opt-in and demo-grade — see the
+    coverage matrix above.
     """
     global _shim_state
     if _shim_state is not None:
@@ -4995,21 +5015,40 @@ def install(
         on_stale_write=on_stale_write, config=config, bind_host=bind_host,
     )
     original_open = builtins.open  # is io.open (same object) at install time
-    wrapper = _make_open_wrapper(volume, original_open)
+    state = _ShimState(volume, original_open)
+    wrapper = _make_open_wrapper(volume, original_open, state.writers)
     builtins.open = wrapper  # type: ignore[assignment]
     io.open = wrapper  # type: ignore[assignment]  # pathlib routes here, not builtins.open
-    _shim_state = _ShimState(volume, original_open)
+    _shim_state = state
     return volume
 
 
-def uninstall() -> None:
-    """Restore the original ``builtins.open`` / ``io.open``. Idempotent."""
+def _restore_open() -> _ShimState | None:
+    """Put the original ``builtins.open`` / ``io.open`` back and clear the shim;
+    the state it cleared, or ``None`` when no shim was installed."""
     global _shim_state
-    if _shim_state is None:
-        return
-    builtins.open = _shim_state.original_open  # type: ignore[assignment]
-    io.open = _shim_state.original_open  # type: ignore[assignment]
+    state = _shim_state
+    if state is None:
+        return None
+    builtins.open = state.original_open  # type: ignore[assignment]
+    io.open = state.original_open  # type: ignore[assignment]
     _shim_state = None
+    return state
+
+
+def uninstall() -> None:
+    """Restore the original ``builtins.open`` / ``io.open``, then close the
+    volume :func:`install` returned (see :meth:`CoherentVolume.close`), so its
+    write grants are given back. Idempotent: with nothing installed it does
+    nothing. ``open()`` is restored before the close, so a close that raises
+    leaves no shim behind; call the volume's ``close()`` to send it again. A
+    managed file still open for writing is named in a warning: closing it later
+    raises and writes nothing."""
+    state = _restore_open()
+    if state is None:
+        return
+    state.warn_open_writers()
+    state.volume.close()
 
 
 @contextlib.contextmanager
@@ -5025,11 +5064,15 @@ def coherent_workspace(
 ) -> Iterator[CoherentVolume]:
     """Context manager wrapping :func:`install`/:func:`uninstall`; yields the
     process-singleton :class:`CoherentVolume`. Guarantees the ``open()`` patch is
-    reversed on exit even if the body raises.
+    reversed on exit even if the body raises, and closes the volume on exit
+    (see :meth:`CoherentVolume.close`), so its write grants are given back and
+    using it afterwards raises. When the body raised, a close that fails is
+    logged and the body's error propagates. A managed file still open for
+    writing at exit is named in a warning: close such files inside the block.
 
     Reentrant-safe: if a shim is already installed (e.g. a nested
-    ``coherent_workspace``), this yields the existing volume and does NOT
-    uninstall on exit — the outer context owns the patch.
+    ``coherent_workspace``), this yields the existing volume and neither
+    uninstalls nor closes on exit — the outer context owns both.
     """
     already_installed = _shim_state is not None
     volume = install(
@@ -5038,6 +5081,13 @@ def coherent_workspace(
     )
     try:
         yield volume
-    finally:
+    except BaseException as body_error:
+        if not already_installed:
+            state = _restore_open()
+            if state is not None:
+                state.warn_open_writers()
+            volume.__exit__(type(body_error), body_error, body_error.__traceback__)
+        raise
+    else:
         if not already_installed:
             uninstall()
