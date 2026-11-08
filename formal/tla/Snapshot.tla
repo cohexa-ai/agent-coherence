@@ -234,6 +234,7 @@ SnapshotNext ==
     \/ (CRFetchAction       /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, silentRevoke, history, collectedRead, snapshot, sessionLive, readSkew>>)
     \/ (FencingWriteAction  /\ UNCHANGED <<history, collectedRead, snapshot, sessionLive, readSkew>>)
     \/ (FencingInvalidateAction /\ UNCHANGED <<history, collectedRead, snapshot, sessionLive, readSkew>>)
+    \/ (FencingReleaseToReaderAction /\ UNCHANGED <<history, collectedRead, snapshot, sessionLive, readSkew>>)
     \/ (CRTickAction        /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, silentRevoke, history, collectedRead, snapshot, sessionLive, readSkew>>)
     \/ (HeartbeatAction     /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, silentRevoke, history, collectedRead, snapshot, sessionLive, readSkew>>)
     \/ (FencingSweepAction  /\ UNCHANGED <<history, collectedRead, snapshot, sessionLive, readSkew>>)

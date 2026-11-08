@@ -224,7 +224,7 @@ Target: **5 minutes** total across the specs run in CI (the original five measur
 | EffectGate (local) | `EffectGate.cfg` | 3 | 1 | 6 | — | overnight |
 | Retention (CI) | `Retention_CI.cfg` | 2 | 1 | 4 | 5,723,640 | ~161s |
 | Retention (local) | `Retention.cfg` | 3 | 1 | 6 | >95M | hours |
-| Snapshot (CI) | `Snapshot_CI.cfg` | 1 | 2 | 2 | 1,363,115 | ~39s |
+| Snapshot (CI) | `Snapshot_CI.cfg` | 1 | 2 | 2 | 2,565,875 | ~39s |
 | Snapshot (local) | `Snapshot.cfg` | 2 | 2 | 4 | — | minutes |
 | WorkspaceVersion (CI) | `WorkspaceVersion_CI.cfg` | — | 2 members | MaxVersion=3 | 104,738 | ~4s |
 | WorkspaceVersion (local) | `WorkspaceVersion.cfg` | — | 2 members | MaxVersion=4 | 204,216 | ~6s |
@@ -259,8 +259,11 @@ EffectGate (10,036,000) and CrashRecovery (258,854) keep their distinct counts: 
 state the new step reaches was already reachable by other steps. They generate ~3%,
 ~3% and ~9% more states. The wall times in the table are still the 2026-09-03 ones: the
 2026-11-08 runs shared the machine with other heavy work, so their times are not
-comparable. Retention, Snapshot and OCC write out their own next-state relations and do
-not include the new step.
+comparable. Retention, Snapshot and OCC write out their own next-state relations, and
+`MESI_Standalone` assembles its own `Next`; each now includes the step too. Only
+Snapshot's distinct-state count moves, by ~88% (1,363,115 → 2,565,875); it still checked
+in about two minutes on the loaded machine. Retention (5,723,640), OCC (1,678,120) and
+MESI_Standalone (557,037) keep theirs.
 
 Since 2026-10, CI does not run the sweep in one job. It runs the three Makefile bins
 (`tla-check-1`..`3`, same specs and configs) as parallel jobs, each capped at 20 minutes;

@@ -295,6 +295,7 @@ RetentionNext ==
     \/ (CRFetchAction      /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, silentRevoke, history, collectedRead>>)
     \/ (FencingWriteAction /\ UNCHANGED <<history, collectedRead>>)
     \/ (FencingInvalidateAction /\ UNCHANGED <<history, collectedRead>>)
+    \/ (FencingReleaseToReaderAction /\ UNCHANGED <<history, collectedRead>>)
     \/ (CRTickAction       /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, silentRevoke, history, collectedRead>>)
     \/ (HeartbeatAction    /\ UNCHANGED <<ownerGeneration, readGeneration, staleApply, silentRevoke, history, collectedRead>>)
     \/ (FencingSweepAction /\ UNCHANGED <<history, collectedRead>>)
