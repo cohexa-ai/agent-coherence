@@ -383,6 +383,16 @@ def _same_secret(expected: str, presented: str) -> bool:
     return hmac.compare_digest(expected.encode("utf-8"), presented.encode("utf-8"))
 
 
+@dataclass(frozen=True)
+class ReleaseRequest:
+    """An identity giving back its own write grant on one artifact: a failed
+    edit's report or the end of a turn (see :meth:`CoordinatorService.release_to_reader`)."""
+
+    agent_id: UUID
+    artifact_id: UUID
+    issued_at_tick: int
+
+
 class CallerPrincipalUncached(Exception):
     """A ``cached_only`` caller-principal lookup that the service's in-process
     cache cannot answer.
@@ -3520,7 +3530,7 @@ class CoordinatorService:
         NoZombieRevoke pin.
 
         Wrapped in :meth:`registry.abort_guard` (finding A6): a late
-        session-stop release whose handler already timed out aborts here rather
+        release whose handler already timed out aborts here rather
         than revoking a grant the registry has since handed to another session.
         That guard is a *time* predicate on the local watchdog, so it covers
         only the callers that thread an ``abort`` Event; a PEER-issued
@@ -3540,6 +3550,49 @@ class CoordinatorService:
                 issuer_agent_id=issuer_agent_id,
                 issued_at_tick=issued_at_tick,
             )
+
+    def release_to_reader(self, request: ReleaseRequest, *, abort: threading.Event | None = None) -> bool:
+        """Give back the caller's own write grant and keep a read of the
+        version it held (#513). Returns whether a write grant was released.
+
+        Read, decide and apply run in one :meth:`registry.abort_guard` hold,
+        under the request's watchdog abort, deciding from the state read there:
+        a peer's acquire or commit lands wholly before the release, which then
+        finds the row stale and leaves it, or wholly after, and makes the read
+        stale as it would any reader's.
+
+        - EXCLUSIVE or MODIFIED: SHARED, under the ``"invalidate"`` trigger,
+          so leaving the write claim still moves the ownership epoch
+          (``EPOCH_BUMP_TRIGGERS``) and a commit on the claim captured before
+          the release is refused. ``observed=False``: the release reads
+          nothing, and the version the grant recorded is the one held.
+        - INVALID: unchanged; the self-issued invalidation still runs, which
+          clears the acknowledgement a peer's write left pending.
+        - SHARED, no row, or no artifact: nothing changes and no row is made.
+
+        The operator drain keeps :meth:`invalidate`: the bytes on disk behind
+        an orphaned grant may never have been committed."""
+        with self.registry.abort_guard(abort):
+            artifact = self.registry.get_artifact(request.artifact_id)
+            if artifact is None:
+                return False
+            state = self.registry.get_agent_state(request.artifact_id, request.agent_id)
+            if state == MESIState.INVALID:
+                self._invalidate_impl(
+                    agent_id=request.agent_id,
+                    artifact_id=request.artifact_id,
+                    new_version=artifact.version,
+                    issuer_agent_id=request.agent_id,
+                    issued_at_tick=request.issued_at_tick,
+                )
+            if state not in _M_OR_E_STATES:
+                return False
+            self.registry.clear_agent_transient(request.artifact_id, request.agent_id)
+            self.registry.set_agent_state(
+                request.artifact_id, request.agent_id, MESIState.SHARED,
+                trigger="invalidate", tick=request.issued_at_tick, observed=False,
+            )
+            return True
 
     def _invalidate_impl(
         self,

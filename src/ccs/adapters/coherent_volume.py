@@ -2194,10 +2194,10 @@ class CoherentVolume:
         failure routing would raise over the typed error write() raises next,
         and with its own short timeout, so a silent coordinator costs one full
         timeout and one short one, not two full ones. The coordinator's
-        release invalidates the holder's own row and never touches the
-        version, hash or last writer, so it cannot revert a commit that
-        landed. The path leaves the grant record only on a confirmed release,
-        ``ok: true`` without ``degraded`` (as in
+        release ends the holder's own write grant, leaving it a reader, and
+        never touches the version, hash or last writer, so it cannot revert
+        a commit that landed. The path leaves the grant record only on a
+        confirmed release, ``ok: true`` without ``degraded`` (as in
         :meth:`_release_abandoned_grants`); otherwise the next re-mint
         releases it. Returns whether the release was confirmed."""
         incarnation = self._incarnation

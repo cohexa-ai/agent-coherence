@@ -103,6 +103,7 @@ from ccs.coordinator.registry_protocol import (
 from ccs.coordinator.service import (
     CallerPrincipalUncached,
     CoordinatorService,
+    ReleaseRequest,
     mint_nonce_problem,
 )
 from ccs.coordinator.sqlite_registry import SCHEMA_USER_VERSION, SqliteArtifactRegistry
@@ -3728,7 +3729,10 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
             return {"ok": True, "note": "untracked-at-commit"}
 
         if not success:
-            # Tool failure path — release the EXCLUSIVE grant without bumping version.
+            # Tool failure path — release the caller's own write grant without
+            # bumping the version. It keeps a read of the version it held
+            # (#513); a report from a caller holding no write grant changes
+            # nothing.
             artifact = coordinator.registry.get_artifact(artifact_id)
             if artifact is not None:
                 # #185: the giver of a live handoff reporting a failed edit
@@ -3739,12 +3743,8 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
                 if handed is not None:
                     return _handed_off_release(path, handed)
                 try:
-                    coordinator.service.invalidate(
-                        agent_id=agent_id,
-                        artifact_id=artifact_id,
-                        new_version=artifact.version,
-                        issuer_agent_id=agent_id,
-                        issued_at_tick=now,
+                    coordinator.service.release_to_reader(
+                        ReleaseRequest(agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=now),
                         abort=abort,
                     )
                 except CoherenceError as exc:
@@ -4092,13 +4092,12 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
             artifact = coordinator.registry.get_artifact(artifact_id)
             if artifact is None:
                 continue
+            # The release decides from the state it reads inside its own hold,
+            # not from this list, which is read before it: a row a peer's
+            # acquire or commit left stale in between stays stale (#513).
             try:
-                coordinator.service.invalidate(
-                    agent_id=agent_id,
-                    artifact_id=artifact_id,
-                    new_version=artifact.version,
-                    issuer_agent_id=agent_id,
-                    issued_at_tick=now,
+                coordinator.service.release_to_reader(
+                    ReleaseRequest(agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=now),
                     abort=abort,
                 )
             except CoherenceError as exc:
@@ -4161,7 +4160,7 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
 
     # AC-05: session-stop's wire contract is {ok: bool}; ok-shape degraded
     # envelope keeps clients reading result.get("ok") safe on timeout.
-    # A6: abort threaded into the per-artifact invalidate so a late release
+    # A6: abort threaded into the per-artifact release so a late release
     # aborts before revoking a grant the registry handed to the next session.
     abort = WatchdogAbort()
     _run_or_degrade(req, coordinator, work, degraded_response=_OK_DEGRADED_RESPONSE, abort=abort)
