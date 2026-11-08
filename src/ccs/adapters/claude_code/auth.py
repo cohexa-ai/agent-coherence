@@ -269,8 +269,15 @@ def ensure_secret(coordinator_root: Path) -> str:
             if attempt + 1 < ENSURE_SECRET_MAX_RETRIES:
                 time.sleep(ENSURE_SECRET_RETRY_SLEEP_SEC)
             continue
-        with os.fdopen(fd, "w") as f:
-            f.write(new_token + "\n")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(new_token + "\n")
+        except BaseException:
+            # This call created the file, so no other process is writing it.
+            # Left empty, it would make every later start refuse it (#488).
+            with contextlib.suppress(OSError):
+                os.unlink(secret_path)
+            raise
         logger.info("generated shared secret at %s", secret_path)
         return new_token
 

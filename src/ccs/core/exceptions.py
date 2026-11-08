@@ -628,7 +628,8 @@ VERSION_MISMATCH_REASON = "version_mismatch"
 COORDINATOR_UNAVAILABLE_REASON = "coordinator_unavailable"
 #: The class reason of :class:`CoordinatorFailed`: the coordinator answered a
 #: read, or a volume's release of an earlier attempt's write grant (#401), with
-#: its failure envelope (#259).
+#: its failure envelope (#259), or could not decide a refuse-mode grant request
+#: in time.
 COORDINATOR_FAILED_REASON = "coordinator_failed"
 #: The coordinator's refusal of a ``pre-edit`` that opted in with
 #: ``if_unheld: true`` and that it could not decide in time. A live, busy
@@ -890,8 +891,10 @@ class OtherHolder(CoherenceError):
     asked to take it only if nobody holds it is refused, and nothing changed
     hands: the holder keeps its grant and the caller gains none.
 
-    The caller backs off and asks again. The holder lets go when it releases
-    the artifact, hands it on, or is reclaimed by the coordinator's sweep.
+    The caller backs off, then reads the artifact again before it writes: a write
+    built without reading overwrites whatever the holder committed once the
+    artifact comes free. The holder lets go when it releases the artifact, hands
+    it on, or is reclaimed by the coordinator's sweep.
 
     Carries :data:`OTHER_HOLDER_REASON` on the class, so a consumer classifies
     it by type or ``.reason``, never by the message, plus ``holder_agent_id``,
@@ -908,9 +911,10 @@ class OtherHolder(CoherenceError):
     def __init__(self, artifact_id: object, holder_agent_id: UUID | str | None) -> None:
         super().__init__(
             f"{OTHER_HOLDER_REASON} artifact={artifact_id} holder={holder_agent_id} "
-            "(nothing changed hands: another agent holds this for writing. Back off "
-            "and ask again; it is free once the holder releases it, hands it on, or "
-            "is reclaimed)"
+            "(nothing changed hands: another agent holds this for writing. Back off, "
+            "then read the file again before you write: a write built without reading "
+            "overwrites what the holder committed. It is free once the holder releases "
+            "it, hands it on, or is reclaimed)"
         )
         self.artifact_id = artifact_id
         self.holder_agent_id = holder_agent_id
@@ -1255,7 +1259,9 @@ class CoordinatorUnreachable(CoherenceError):
     :class:`CommitUnconfirmed` instead, because it may have landed.
 
     No write was version-committed. A pessimistic ``write()`` that raises it
-    has already put its bytes on disk, and its message says so. An attached
+    from its commit has already put its bytes on disk, and its message says so.
+    One that raises it from its grant request has written nothing, though the
+    request may have taken the grant, which ``reacquire()`` releases. An attached
     volume or substrate session keeps the endpoint it attached to, so recovery
     depends on what happened to that coordinator. If it only stalled (for
     example, a stopped process that resumes) and comes back on the same port,
@@ -1293,6 +1299,13 @@ class CoordinatorFailed(CoherenceError):
     raises it, in either ``on_error`` mode, naming that grant (#434): a retry
     sends the release again, where waiting for the holder waits on a peer
     that does not exist.
+
+    A refuse-mode ``write()`` raises it as well, with nothing written, for two
+    answers to its grant request. ``unavailable``: the coordinator could not
+    decide in time and the abandoned work may still take the grant, so retry, or
+    call ``reacquire()`` if giving up. And a refusal naming this volume's own
+    earlier incarnation, whose release did not land: a plain retry never sends
+    that release again, so call ``reacquire()``.
 
     The envelope names only the exception's type, so nothing here tells a
     busy store, which clears by itself, from a fault that repeats on every
