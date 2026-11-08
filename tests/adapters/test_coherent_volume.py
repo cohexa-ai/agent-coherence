@@ -61,6 +61,7 @@ from ccs.core.exceptions import (
     CasRetriesExhausted,
     CasVersionConflict,
     CoherenceDegradedWarning,
+    CoherenceDirRefused,
     CoherenceError,
     CommitPreempted,
     CoordinatorFailed,
@@ -68,6 +69,7 @@ from ccs.core.exceptions import (
     StaleView,
     ViewWedged,
 )
+from tests.coherence_link_helpers import TARGET_BYTES, plant_link, target_snapshot
 from tests.coordinator_helpers import ANSWERED_TEXT, answer_with_status, serve_in_process, write_holders
 from tests.loopback_helpers import refused_endpoint, refusing_port
 
@@ -1244,9 +1246,12 @@ def test_a_forked_child_refuses_a_policy_file_until_it_is_fixed(
 def test_a_volume_refuses_a_symlinked_pid_file_and_leaves_its_target_alone(
     tmp_path: Path, fast_cfg: LifecycleConfig, tmp_path_factory: pytest.TempPathFactory, on_error: str
 ) -> None:
-    """#464 through a volume, which reads the pid file before it starts anything.
-    Prevents that path writing through the link: a strict volume raises, a degrade
-    volume warns and stays detached, and the file the link names keeps its bytes."""
+    """#464 and #498 through a volume, which reads the pid file before it starts
+    anything. Prevents that path writing through the link: a strict volume raises
+    the refusal no retry clears, a degrade volume warns and stays detached, and the
+    file the link names keeps its bytes. The listing pins the order: the policy
+    merge runs before the start, so a check inside the start alone leaves policy
+    files behind."""
     _seed(tmp_path)
     target = tmp_path_factory.mktemp("outside") / "target"
     target.write_bytes(b"keep\n")
@@ -1255,7 +1260,7 @@ def test_a_volume_refuses_a_symlinked_pid_file_and_leaves_its_target_alone(
     (coherence_dir / "server.pid").symlink_to(target)
 
     if on_error == "strict":
-        with pytest.raises(CoordinatorUnreachable):
+        with pytest.raises(CoherenceDirRefused):
             CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
     else:
         with pytest.warns(CoherenceDegradedWarning):
@@ -1264,6 +1269,170 @@ def test_a_volume_refuses_a_symlinked_pid_file_and_leaves_its_target_alone(
 
     assert (coherence_dir / "server.pid").is_symlink()
     assert target.read_bytes() == b"keep\n"
+    assert sorted(os.listdir(coherence_dir)) == ["server.pid"]
+
+
+def _strict_refusal(root: Path, cfg: LifecycleConfig) -> CoherenceDirRefused:
+    """What a strict volume over ``root`` raises; a volume that attaches instead
+    stops the coordinator it started before the test fails."""
+    try:
+        with pytest.raises(CoherenceDirRefused) as raised:
+            CoherentVolume(root, managed=("data/**",), on_error="strict", config=cfg)
+    finally:
+        stop_coordinator(root)
+    return raised.value
+
+
+@pytest.mark.parametrize("name", ["tracked.yaml", ".coherence", "notes.txt"])
+def test_a_strict_volume_refuses_a_link_before_it_merges_its_policy(
+    tmp_path: Path, fast_cfg: LifecycleConfig, name: str
+) -> None:
+    """#498: a link at a policy file, at ``.coherence`` itself or at a name no
+    code reads raises the typed refusal before the volume merges its globs.
+    Prevents the merge replacing a linked policy file with a regular one (the
+    start then finds no link and runs), or writing the policy into the directory
+    a linked ``.coherence`` names. Not a ``CoordinatorUnreachable``, so a caller's
+    retry loop does not catch it."""
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    if name == ".coherence":
+        target = tmp_path / "link-targets" / "state"
+        target.mkdir(parents=True)
+        target.chmod(0o755)
+        coherence_dir.symlink_to(target, target_is_directory=True)
+        link = coherence_dir
+    else:
+        target = plant_link(coherence_dir, name, "existing")
+        # A list the merge accepts, so the old order replaces the link and starts.
+        target.write_bytes(b'- "docs/**"\n')
+        link = coherence_dir / name
+    before = target_snapshot(target)
+    readlink = os.readlink(link)
+
+    refusal = _strict_refusal(tmp_path, fast_cfg)
+
+    assert refusal.reason == "coherence_dir_refused"
+    assert not isinstance(refusal, CoordinatorUnreachable)
+    assert (refusal.kind, refusal.path) == ("coherence_link", str(tmp_path.resolve() / link.relative_to(tmp_path)))
+    assert os.readlink(link) == readlink
+    assert target_snapshot(target) == before
+    if name != ".coherence":
+        assert sorted(os.listdir(coherence_dir)) == [name]
+
+
+def test_a_degrade_volume_warns_naming_the_link_and_stays_detached(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#498 under ``on_error="degrade"``: one warning names the link and the way
+    out, says a new volume is the retry, and the volume stays detached with
+    nothing written. Prevents the refusal escaping raw from a volume that
+    promises to warn, or a degrade volume merging its policy through the link."""
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    target = plant_link(coherence_dir, "hook.secret", "existing")
+
+    try:
+        with pytest.warns(CoherenceDegradedWarning) as caught:
+            vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    finally:
+        stop_coordinator(tmp_path)
+
+    messages = [str(w.message) for w in caught if issubclass(w.category, CoherenceDegradedWarning)]
+    assert len(messages) == 1, messages
+    assert f"refusing {tmp_path.resolve() / '.coherence' / 'hook.secret'}: it is a symlink" in messages[0]
+    assert "mount a directory" in messages[0]
+    assert messages[0].endswith("This volume stays detached: build a new one once .coherence is fixed.")
+    assert not vol.is_attached
+    assert vol.degradation_count == 1
+    assert sorted(os.listdir(coherence_dir)) == ["hook.secret"]
+    assert target.read_bytes() == TARGET_BYTES
+
+
+def test_a_degrade_volume_warns_for_a_link_made_after_its_check(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#498: a link the volume's own check did not see (made after it) is refused
+    by the start, and a degrade volume still warns and stays detached. Prevents
+    the start's refusal escaping raw from a volume that promises to warn."""
+    _seed(tmp_path)
+    plant_link(tmp_path / ".coherence", "hook.secret", "existing")
+    monkeypatch.setattr(coherent_volume_module, "check_coherence_dir", lambda root: None)
+
+    try:
+        with pytest.warns(CoherenceDegradedWarning) as caught:
+            vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    finally:
+        stop_coordinator(tmp_path)
+
+    messages = [str(w.message) for w in caught if issubclass(w.category, CoherenceDegradedWarning)]
+    assert len(messages) == 1, messages
+    assert f"refusing {tmp_path.resolve() / '.coherence' / 'hook.secret'}: it is a symlink" in messages[0]
+    assert messages[0].endswith("This volume stays detached: build a new one once .coherence is fixed.")
+    assert not vol.is_attached
+
+
+def _link_to_peer_state(root: Path, peer: Path) -> None:
+    """Link ``root``'s pid file and secret to ``peer``'s: what a cloned
+    repository can commit so that a start would join the peer's coordinator."""
+    coherence_dir = root / ".coherence"
+    coherence_dir.mkdir(mode=0o700, parents=True)
+    for name in ("hook.secret", "server.pid"):
+        (coherence_dir / name).symlink_to(peer / ".coherence" / name)
+
+
+def _peer_requests(endpoint: CoordinatorEndpoint) -> tuple[int, int]:
+    """How many principal claims and ``/status`` reads a peer's coordinator has
+    answered, this read included. A volume that joins it does both at attach,
+    before any read or write, so neither its sessions nor its files show it."""
+    counters = coherent_volume_module._coordinator_get(endpoint, "/status")["endpoint_counters"]
+    return counters["principal_claim_total"], counters["status_total"]
+
+
+def test_a_volume_does_not_join_the_coordinator_a_linked_pid_file_names(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#498: a workspace whose pid file and secret link to another workspace's
+    raises the refusal, and the other workspace's coordinator sees nothing of it.
+    Prevents a cloned link joining a coordinator that guards another tree, with
+    a bearer that coordinator accepts."""
+    peer = tmp_path / "peer"
+    root = tmp_path / "ws"
+    _seed(peer)
+    _seed(root)
+    peer_vol = CoherentVolume(peer, managed=("data/**",), config=fast_cfg)
+    try:
+        _link_to_peer_state(root, peer)
+        claims, statuses = _peer_requests(peer_vol._endpoint)
+
+        refusal = _strict_refusal(root, fast_cfg)
+
+        assert refusal.path == str(root.resolve() / ".coherence" / "hook.secret")
+        # The one more /status is the read below.
+        assert _peer_requests(peer_vol._endpoint) == (claims, statuses + 1)
+    finally:
+        stop_coordinator(peer)
+
+
+def test_a_volume_checks_for_links_before_it_probes_a_port(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#498: the refusal comes before the volume's own pre-probe of the port its
+    pid file names, and before the start's. Prevents a probe, or a join, of a
+    port that a workspace holding a link names."""
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    plant_link(coherence_dir, "hook.secret", "existing")
+    (coherence_dir / "server.pid").write_text(f"{os.getpid()}\n45678\n")
+
+    def no_probe(*args: object, **kwargs: object) -> bool:
+        pytest.fail("probed a port before refusing the link")
+
+    monkeypatch.setattr(coherent_volume_module, "tcp_probe", no_probe)
+    monkeypatch.setattr("ccs.adapters.claude_code.lifecycle.tcp_probe", no_probe)
+
+    refusal = _strict_refusal(tmp_path, fast_cfg)
+
+    assert refusal.path == str(tmp_path.resolve() / ".coherence" / "hook.secret")
 
 
 def _untrack_refusal(vol: CoherentVolume, paths: list[str]) -> tuple[int, dict]:

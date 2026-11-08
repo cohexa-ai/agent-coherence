@@ -20,9 +20,10 @@ from pathlib import Path
 import pytest
 
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
-from ccs.core.exceptions import CoherenceError
+from ccs.core.exceptions import CoherenceDirRefused, CoherenceError, CoordinatorUnreachable
 from ccs.mcp.server import build_server, lifespan
 from ccs.mcp.session import SessionConfig, build_volume
+from tests.coherence_link_helpers import plant_link
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -100,6 +101,37 @@ def test_lifespan_refuses_a_policy_file_it_cannot_load_and_keeps_it(tmp_path: Pa
         asyncio.run(go())
 
     assert broken.read_text() == "- docs/**\n- *.md\n"
+
+
+def test_lifespan_refuses_a_link_in_coherence_and_names_it(tmp_path: Path, monkeypatch) -> None:
+    """#498 at server startup: a linked policy file stops the server with the typed
+    refusal, which names the link and the way out, and leaves the link and the file
+    it names as they were. Prevents startup merging through the link (the merge
+    replaced it with a regular file, so the start found no link and served) and a
+    refusal a client would read as a coordinator to wait for."""
+    monkeypatch.setenv("SWG_ROOT", str(tmp_path))
+    monkeypatch.setenv("SWG_MANAGED", "data/**")
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    target = plant_link(coherence_dir, "tracked.yaml", "existing")
+    target.write_bytes(b'- "docs/**"\n')
+    server = build_server()
+
+    async def go() -> None:
+        async with lifespan(server):
+            pytest.fail("attached over a link in .coherence")
+
+    with pytest.raises(CoherenceDirRefused) as raised:
+        asyncio.run(go())
+
+    refusal = raised.value
+    assert not isinstance(refusal, CoordinatorUnreachable)
+    assert (refusal.kind, refusal.path) == ("coherence_link", str(tmp_path.resolve() / ".coherence" / "tracked.yaml"))
+    assert "mount a directory" in str(refusal)
+    assert (coherence_dir / "tracked.yaml").is_symlink()
+    assert target.read_bytes() == b'- "docs/**"\n'
+    assert sorted(os.listdir(coherence_dir)) == ["tracked.yaml"]
+    assert stop_coordinator(tmp_path) is False
 
 
 # --- strict-only construction (no degrade-mode volume) -----------------------
