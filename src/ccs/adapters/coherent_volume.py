@@ -85,6 +85,7 @@ from ccs.cli._coherence_client import (
 from ccs.cli._coherence_client import (
     post as _coordinator_post,
 )
+from ccs.coordinator.sqlite_registry import StoreHeldError
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_CLAIMED_REASON,
     COMMIT_UNCONFIRMED_REASON,
@@ -514,6 +515,7 @@ _POLICY_REFUSAL_DEGRADED_NOTE = "This volume stays detached: build a new one onc
 #: What a degrade volume adds to a refused ``.coherence`` (#498), for the same
 #: reason: the retry is a new volume.
 _STATE_DIR_REFUSAL_DEGRADED_NOTE = "This volume stays detached: build a new one once .coherence is fixed."
+_STORE_HELD_DEGRADED_NOTE = "This volume stays detached: build a new one once that handle closes."
 
 
 def _no_principal_message(rel: str, outcome: str) -> str:
@@ -1693,6 +1695,9 @@ class CoherentVolume:
         except CoherenceDirRefused as exc:
             # A link made after the check above; the start checks again.
             self._state_dir_refusal_or_degrade(exc)
+            return
+        except StoreHeldError as exc:
+            self._store_held_or_degrade(exc)
             return
         if port == -1:
             self._unreachable_or_degrade(
@@ -5065,6 +5070,16 @@ class CoherentVolume:
         # The volume prints this text itself, and a cloned repository chose the
         # name in it: escaped, it cannot drive the terminal or split the line.
         self._record_degraded(f"{escape_nonprintable(str(refusal))} {_STATE_DIR_REFUSAL_DEGRADED_NOTE}")
+
+    def _store_held_or_degrade(self, refusal: StoreHeldError) -> None:
+        """Another read-write handle kept the workspace's store past the
+        start's wait (#453), so no coordinator started. Strict raises the typed
+        refusal; degrade warns once and stays detached. Its text names the
+        store's path, so it is escaped like a ``.coherence`` refusal."""
+        self._endpoint = None
+        if self._on_error == "strict":
+            raise refusal
+        self._record_degraded(f"{escape_nonprintable(str(refusal))} {_STORE_HELD_DEGRADED_NOTE}")
 
     def _failed_read_or_degrade(self, resp: dict, rel: str) -> None:
         """A pre-read the coordinator answered with ``ok: false``, which it does

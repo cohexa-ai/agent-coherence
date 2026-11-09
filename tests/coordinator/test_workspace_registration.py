@@ -985,6 +985,7 @@ def _claims_overlapped(spans: list[tuple[float, float]]) -> bool:
     )
 
 
+@pytest.mark.usefixtures("two_writer_store")
 @pytest.mark.parametrize("backend", ["in_memory", "sqlite"])
 def test_concurrent_claimants_have_exactly_one_winner(tmp_path: Path, backend: str) -> None:
     """First-claim-wins under real concurrency: claimants released together on

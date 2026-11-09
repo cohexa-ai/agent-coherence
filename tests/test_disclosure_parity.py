@@ -68,7 +68,7 @@ PINS: tuple[Pin, ...] = (
         source="src/ccs/adapters/workspace.py",
         source_marker="Idempotent means REPEAT calls, not concurrent ones",
         doc="docs/guide.md",
-        doc_phrase="two processes releasing one checkpoint both decrement its pin refcount",
+        doc_phrase="two versioners releasing one checkpoint both decrement its pin refcount",
     ),
     Pin(
         name="volume: the same requirement on the project's front page",

@@ -48,11 +48,16 @@ _ARMS = {
 
 
 @pytest.fixture(params=sorted(_ARMS))
-def factory(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[RegistryFactory]:
+def factory(
+    request: pytest.FixtureRequest, tmp_path: Path, two_writer_store: None
+) -> Iterator[RegistryFactory]:
     """A registry factory for one arm. The sqlite arm mints handles over an
     isolated ``tmp_path`` db and closes them all at teardown; the in-memory arm
     holds no OS resource. Every scenario runs against BOTH arms via this fixture's
-    parametrization — that is where the MUST-MATCH universality lives."""
+    parametrization — that is where the MUST-MATCH universality lives. The
+    sqlite arm's handles share one store, which the single-writer lock would
+    refuse, so they run without it: what they prove is what the store's own
+    transactions arbitrate."""
     arm: str = request.param
     fac: RegistryFactory = InMemoryFactory() if arm == "in_memory" else SqliteFactory(tmp_path)
     try:

@@ -57,6 +57,7 @@ from ccs.adapters.coherent_volume import (
     uninstall,
 )
 from ccs.cli._coherence_client import CoordinatorEndpoint, CoordinatorUnavailable, escape_nonprintable
+from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry, StoreHeldError
 from ccs.core.exceptions import (
     CasRetriesExhausted,
     CasVersionConflict,
@@ -1277,6 +1278,29 @@ def test_a_volume_refuses_a_symlinked_pid_file_and_leaves_its_target_alone(
     assert (coherence_dir / "server.pid").is_symlink()
     assert target.read_bytes() == b"keep\n"
     assert sorted(os.listdir(coherence_dir)) == ["server.pid"]
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+def test_a_volume_over_a_store_another_writer_holds_refuses_or_detaches(
+    tmp_path: Path, fast_cfg: LifecycleConfig, on_error: str
+) -> None:
+    """#453: a start that still finds another read-write handle on state.db
+    after its wait starts nothing. A strict volume raises the typed
+    StoreHeldError; a degrade volume warns once and stays detached."""
+    _seed(tmp_path)
+    cfg = replace(fast_cfg, store_holder_wait_sec=0.1)
+    try:
+        with SqliteArtifactRegistry(tmp_path / ".coherence" / "state.db"):
+            if on_error == "strict":
+                with pytest.raises(StoreHeldError):
+                    CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=cfg)
+            else:
+                with pytest.warns(CoherenceDegradedWarning, match="open for writing") as caught:
+                    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=cfg)
+                assert not vol.is_attached
+                assert [w.category for w in caught].count(CoherenceDegradedWarning) == 1
+    finally:
+        stop_coordinator(tmp_path)
 
 
 def _strict_refusal(root: Path, cfg: LifecycleConfig) -> CoherenceDirRefused:

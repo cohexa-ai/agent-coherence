@@ -44,9 +44,13 @@ from functools import partial
 from pathlib import Path
 from uuid import UUID
 
-from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
+from ccs.adapters.claude_code.coordinator_server import (
+    HANDLER_TIMEOUT_SEC,
+    IN_FLIGHT_DRAIN_TIMEOUT_SEC,
+    CoordinatorHTTPServer,
+)
 from ccs.adapters.claude_code.state_dir import check_coherence_dir, entry_link_refused
-from ccs.coordinator.sqlite_registry import SCHEMA_USER_VERSION
+from ccs.coordinator.sqlite_registry import SCHEMA_USER_VERSION, open_waiting_out_a_holder
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +201,15 @@ class LifecycleConfig:
     #: process; the coordinator returns -1 and lets the hook degrade.
     inode_revalidation_budget: int = 5
 
+    #: #453 — how long a start that won the workspace lock waits for another
+    #: read-write handle to close the store before it raises
+    #: :class:`~ccs.coordinator.sqlite_registry.StoreHeldError`. A stop that
+    #: meets a shutdown already draining returns at once, so the lock can
+    #: come free while the old coordinator closes with the store open: its
+    #: drain, then its watchdog's wait for a handler still running. Longer
+    #: than both, so a start waits it out.
+    store_holder_wait_sec: float = IN_FLIGHT_DRAIN_TIMEOUT_SEC + HANDLER_TIMEOUT_SEC + 1.0
+
 
 _DEFAULT_CONFIG = LifecycleConfig()
 
@@ -300,6 +313,9 @@ def ensure_coordinator_handle(
       subclass marks a Node coordinator's store.
       :func:`~ccs.adapters.claude_code.store_check.check_store` asks before
       a start.
+    - :class:`~ccs.coordinator.sqlite_registry.StoreHeldError` when another
+      read-write handle (a script, a coordinator in another process) still
+      has ``state.db`` open after ``config.store_holder_wait_sec`` (#453).
     - :class:`sqlite3.Error` when SQLite cannot open ``state.db``, such as a
       file that is not a database.
     - :class:`OSError` when ``flock`` fails for a reason other than
@@ -454,12 +470,7 @@ def ensure_coordinator_handle(
             # can still read the old lines; that window is not closed here.
             if not _names_another_runtime(fd):
                 os.ftruncate(fd, 0)
-            coordinator = CoordinatorHTTPServer(
-                coordinator_root,
-                port=0,
-                bind_host=bind_host,
-                on_migrated=partial(_log_store_migration, coordinator_root),
-            )
+            coordinator = _build_waiting_out_a_store_holder(coordinator_root, cfg, bind_host)
             port = coordinator.port
             # KTD-H Unit 5 L1: close the construct->write TOCTOU window. The
             # top-of-loop inode check ran BEFORE this construction, which opens
@@ -552,6 +563,28 @@ def ensure_coordinator_handle(
     )
     _record_spawn_join_exhaustion("retry_budget")  # L3 observability
     return None
+
+
+def _build_waiting_out_a_store_holder(
+    coordinator_root: Path, cfg: LifecycleConfig, bind_host: str
+) -> CoordinatorHTTPServer:
+    """Build the coordinator, waiting up to ``cfg.store_holder_wait_sec`` while
+    another read-write handle has the store open (#453).
+
+    The workspace lock can come free before the store does: a stop that meets
+    a shutdown already draining returns at once. A holder still there after
+    the wait is not closing, and its ``StoreHeldError`` propagates.
+    """
+    build = partial(
+        CoordinatorHTTPServer,
+        coordinator_root,
+        port=0,
+        bind_host=bind_host,
+        on_migrated=partial(_log_store_migration, coordinator_root),
+    )
+    return open_waiting_out_a_holder(
+        build, cfg.store_holder_wait_sec, cfg.port_file_retry_interval_sec
+    )
 
 
 def ensure_coordinator(

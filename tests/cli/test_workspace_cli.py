@@ -34,6 +34,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -41,6 +42,7 @@ import pytest
 
 import ccs
 from ccs.adapters.workspace import MemberRestoreOutcome, RestoreObservation
+from ccs.cli import workspace as workspace_cli
 from ccs.cli.workspace import (
     CLAIMED_NOT_BACKED_LABEL,
     FILE_RETENTION_CAVEAT,
@@ -1801,3 +1803,64 @@ def test_restore_of_a_checkpoint_bound_to_another_receiver_is_refused(
     rc, out, _ = _run(capsys, "status", ckpt, "--json", "--root", str(tmp_path))
     assert rc == 0
     assert json.loads(out)["checkpoint"]["restore_status"] == "none"
+
+
+# --- one writer per store (#453) ------------------------------------------------
+
+
+def _hold_workspace_store(root: Path) -> SqliteArtifactRegistry:
+    """Another verb's open: the read-write handle a running verb holds."""
+    return SqliteArtifactRegistry(root / ".coherence" / "workspace.db", retain_versions=True)
+
+
+def test_a_verb_waits_for_another_verb_holding_the_store(tmp_path: Path, capsys) -> None:
+    _seed_file(tmp_path)
+    _run(capsys, "list", "--root", str(tmp_path))
+    holder = _hold_workspace_store(tmp_path)
+    release = threading.Timer(0.5, holder.close)
+    release.start()
+    try:
+        rc, _, err = _run(capsys, "checkpoint", "cp1", "--file", "docs/plan.md", "--root", str(tmp_path))
+    finally:
+        release.join()
+    assert (rc, err) == (0, "")
+    assert _checkpoint_id(capsys, tmp_path)
+
+
+def test_a_verb_still_held_after_its_wait_exits_2_store_held(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workspace_cli, "_PEER_VERB_WAIT_SEC", 0.1)
+    _seed_file(tmp_path)
+    _run(capsys, "list", "--root", str(tmp_path))
+    with _hold_workspace_store(tmp_path):
+        rc, out, err = _run(
+            capsys, "checkpoint", "cp1", "--file", "docs/plan.md", "--json", "--root", str(tmp_path)
+        )
+    assert rc == 2
+    envelope = json.loads(out)
+    assert (envelope["reason"], envelope["exception"]) == ("store_held", "StoreHeldError")
+    assert "refused (store_held)" in err
+
+
+def test_read_verbs_answer_while_another_verb_holds_the_store(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workspace_cli, "_PEER_VERB_WAIT_SEC", 0.1)
+    _seed_file(tmp_path)
+    _run(capsys, "checkpoint", "cp1", "--file", "docs/plan.md", "--root", str(tmp_path))
+    ckpt = _checkpoint_id(capsys, tmp_path)
+    with _hold_workspace_store(tmp_path):
+        rc_list, out_list, _ = _run(capsys, "list", "--json", "--root", str(tmp_path))
+        rc_status, out_status, _ = _run(capsys, "status", ckpt, "--json", "--root", str(tmp_path))
+    assert (rc_list, rc_status) == (0, 0)
+    assert json.loads(out_list)["checkpoints"][0]["checkpoint_id"] == ckpt
+    assert json.loads(out_status)["checkpoint"]["name"] == "cp1"
+
+
+def test_a_read_verb_on_a_store_needing_a_writer_opens_one(tmp_path: Path, capsys) -> None:
+    """A read verb opens read-only, and a store it cannot read that way (none
+    yet, here) gets the writer open every verb used before."""
+    rc, out, _ = _run(capsys, "list", "--root", str(tmp_path))
+    assert (rc, "no checkpoints persisted" in out) == (0, True)
+    assert (tmp_path / ".coherence" / "workspace.db").exists()
