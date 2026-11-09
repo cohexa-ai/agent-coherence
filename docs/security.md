@@ -427,6 +427,24 @@ you purge a store's content, also remove any `ccs-store-check-*` directory left
 in the temporary directory. To keep the copy on the same volume or encrypted
 disk as the workspace, run the check with `TMPDIR` pointing there.
 
+### Single-writer lock files
+
+A store has one read-write registry at a time
+([One writer per store](guide.md#durability)): each read-write open of a
+SQLite store locks a file beside it, so a second writer is refused.
+
+| File | Path | Mode | Created when |
+|---|---|---|---|
+| Writer lock | `<store>.writer-lock` beside the resolved store path: `<workspace>/.coherence/state.db.writer-lock` for a coordinator, `<workspace>/.coherence/workspace.db.writer-lock` for `agent-coherence-workspace`, and beside any store an embedder opens | `0600` | The first read-write open of that store. Kept after close; it is empty and holds no data |
+
+The open refuses, creating neither the lock nor the store, when the lock
+file's path is a symbolic link (`ELOOP`, never followed), a directory, a FIFO
+or anything else that is not a regular file, or a file this user cannot open.
+A lock file that already exists is made `0600` when it is opened. Deleting the
+file while a writer holds it lets a second writer lock a new file of the same
+name, so leave it in place. `--check-store` probes the lock with a shared lock it
+drops at once, and creates nothing.
+
 ### Durable version retention (opt-in)
 
 `SqliteArtifactRegistry` can durably retain a bounded history of committed
