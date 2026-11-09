@@ -43,6 +43,7 @@ from ccs.adapters.claude_code.coordinator_server import (
     caller_principal_identity,
 )
 from ccs.cli import _coherence_client, coherence_hook_client, coherence_status
+from tests.pid_lock_helpers import write_coordinator_pid_file
 
 _PRINCIPAL_HEADER = "Coherence-Caller-Principal"  # frozen duplicate of the wire name
 _FOREIGN = "caller_principal_foreign"  # frozen duplicates of the wire reasons
@@ -128,7 +129,7 @@ def scripted(tmp_path: Path):
     coherence.mkdir(mode=0o700)
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _Scripted)
     threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
-    (coherence / "server.pid").write_text(f"12345\n{httpd.server_address[1]}\n")
+    write_coordinator_pid_file(coherence, httpd.server_address[1])
     (coherence / "hook.secret").write_text("test-secret")
     sid = _sid()
     nonce_file, principal_file = _files(tmp_path, sid)
@@ -621,7 +622,7 @@ def test_the_watchdog_claim_reason_is_the_coordinators() -> None:
 def _start(workspace: Path) -> CoordinatorHTTPServer:
     server = CoordinatorHTTPServer(workspace, port=0, instance_id="principal-recovery")
     server.serve_in_thread()
-    (workspace / ".coherence" / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
+    write_coordinator_pid_file(workspace / ".coherence", server.port, pid=os.getpid())
     return server
 
 
@@ -1197,7 +1198,7 @@ def raw_workspace(tmp_path: Path):
     (tmp_path / ".git").mkdir()
     (tmp_path / ".coherence").mkdir(mode=0o700)
     raw = _RawCoordinator([])
-    (tmp_path / ".coherence" / "server.pid").write_text(f"12345\n{raw.port}\n")
+    write_coordinator_pid_file(tmp_path / ".coherence", raw.port)
     (tmp_path / ".coherence" / "hook.secret").write_text("test-secret")
     try:
         yield tmp_path, raw
@@ -1651,7 +1652,7 @@ def test_the_self_test_reports_a_failed_step_by_status_and_known_tokens_only(
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _EchoCoordinator)
     threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     (workspace / ".coherence").mkdir(mode=0o700)
-    (workspace / ".coherence" / "server.pid").write_text(f"12345\n{httpd.server_address[1]}\n")
+    write_coordinator_pid_file(workspace / ".coherence", httpd.server_address[1])
     (workspace / ".coherence" / "hook.secret").write_text("test-secret")
     try:
         rc = coherence_status._run_self_test(workspace)

@@ -65,6 +65,7 @@ from ccs.core.exceptions import (
     CoherenceDegradedWarning,
     CoherenceError,
 )
+from tests.pid_lock_helpers import write_coordinator_pid_file
 from tests.test_caller_principal_client_recovery import (
     _ABSENT,
     _CLAIMED,
@@ -332,7 +333,7 @@ def _scripted_coordinator(root: Path, script: _Script) -> Iterator[None]:
     coherence.mkdir(mode=0o700)
     httpd = _ScriptedServer(_Coordinator, script)
     threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
-    (coherence / "server.pid").write_text(f"12345\n{httpd.server_address[1]}\n")
+    write_coordinator_pid_file(coherence, httpd.server_address[1])
     (coherence / "hook.secret").write_text("test-secret")
     try:
         yield

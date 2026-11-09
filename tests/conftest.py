@@ -241,6 +241,16 @@ def _neutralize_v090_first_use_warning():
 
 
 @pytest.fixture(autouse=True)
+def _release_stand_in_coordinator_locks():
+    """Release the workspace locks a test took for coordinators it stood in
+    (``tests/pid_lock_helpers.py``), so no lock outlives its test."""
+    from tests.pid_lock_helpers import release_coordinator_locks
+
+    yield
+    release_coordinator_locks()
+
+
+@pytest.fixture(autouse=True)
 def _restore_sigpipe_disposition():
     """Put SIGPIPE's disposition back after every test.
 

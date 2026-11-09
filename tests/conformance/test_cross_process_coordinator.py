@@ -744,9 +744,11 @@ def test_sigkilled_coordinator_refuses_both_strict_surfaces_typed(
     """A coordinator launched through the shipped entry point is SIGKILLed while
     a child holds a strict volume and a substrate session, each read once. Once
     the port refuses, the child's volume read, volume write, substrate read and
-    substrate commit each raise ``CoordinatorUnreachable`` after exactly one
-    connection attempt and no spawn or ensure call; the file, the substrate
-    token and server.pid are as they were before the kill.
+    substrate commit each raise ``CoordinatorUnreachable`` with no connection
+    attempt and no spawn or ensure call: server.pid still names the killed
+    coordinator, which no longer holds the workspace lock, so nothing is sent
+    to its port (#503). The file, the substrate token and server.pid are as
+    they were before the kill.
 
     What this does not prove: one machine and loopback only; no network
     partition; the hook client still fails open; attach-leg respawn is
@@ -770,7 +772,7 @@ def test_sigkilled_coordinator_refuses_both_strict_surfaces_typed(
     assert list(result.value) == ["volume read", "volume write", "substrate read", "substrate commit"]
     for name, op in result.value.items():
         assert op["raised"] == _UNREACHABLE, (name, op)
-        assert op["calls"]["connections"] == 1, (name, op)
+        assert op["calls"]["connections"] == 0, (name, op)
         assert all(op["calls"][key] == 0 for key in _SPAWN_CALLS), (name, op)
         assert op["after"] == op["before"], (name, op)
     assert _pid_file(launched.root).read_bytes() == result.window["pid_file_bytes"]

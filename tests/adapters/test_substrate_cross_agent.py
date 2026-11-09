@@ -23,6 +23,9 @@ import hashlib
 import http.server
 import logging
 import os
+import socket
+import subprocess
+import sys
 import threading
 import traceback
 from pathlib import Path
@@ -258,6 +261,28 @@ def test_a_session_joining_a_running_coordinator_is_not_refused_over_a_policy_fi
 
         assert broken.read_text() == "- docs/**\n- *.md\n"
     finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_session_over_an_exited_coordinators_pid_file_writes_its_policy(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#503: a stranger on a dead coordinator's port is not a coordinator
+    already running. A session has no check after it attaches, so it must
+    write its strict policy and start its own coordinator."""
+    stranger = socket.socket()
+    stranger.bind(("127.0.0.1", 0))
+    stranger.listen()
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(60)
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir(mode=0o700)
+    (coherence / "server.pid").write_text(f"{child.pid}\n{stranger.getsockname()[1]}\n")
+    try:
+        assert _session(tmp_path, fast_cfg).session_id
+        assert "**" in (coherence / "tracked.yaml").read_text()
+    finally:
+        stranger.close()
         stop_coordinator(tmp_path)
 
 

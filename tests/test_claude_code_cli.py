@@ -47,6 +47,7 @@ from ccs.cli._coherence_client import (
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import TlsConfigError, TlsVerificationFailed
 from tests.coherence_link_helpers import plant_link, target_snapshot
+from tests.pid_lock_helpers import hold_coordinator_lock, write_coordinator_pid_file
 
 
 @pytest.fixture
@@ -227,7 +228,8 @@ def test_coordinator_second_invocation_reuses_existing(
 
 
 def _capture_probe(seen: dict, *, reachable: bool):
-    """Stub for coherence_coordinator._tcp_probe that records bind_host."""
+    """Stub for a port probe (``lifecycle.tcp_probe``, or the CLI's own
+    ``_tcp_probe`` on the migration path) that records bind_host."""
     def probe(port: int, cfg: LifecycleConfig, *, bind_host: str = "127.0.0.1") -> bool:
         seen["bind_host"] = bind_host
         return reachable
@@ -238,6 +240,7 @@ def _write_port_file(workspace: Path, port: int) -> Path:
     pid_file = workspace / ".coherence" / "server.pid"
     pid_file.parent.mkdir(exist_ok=True)
     pid_file.write_text(f"999\n{port}\n", encoding="utf-8")
+    hold_coordinator_lock(pid_file)
     return pid_file
 
 
@@ -258,9 +261,8 @@ def test_coordinator_reuse_probe_targets_routed_bind_host(
     monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
     _write_port_file(git_workspace, 54321)
     seen: dict = {}
-    monkeypatch.setattr(
-        coherence_coordinator, "_tcp_probe", _capture_probe(seen, reachable=True)
-    )
+    monkeypatch.setattr(lifecycle, "tcp_probe", _capture_probe(seen, reachable=True))
+    monkeypatch.setattr(coherence_coordinator.subprocess, "Popen", _fail_on_call("a spawn"))
 
     rc = coherence_coordinator.main([
         "--root", str(git_workspace), "--bind-host", "10.0.0.5", "--quiet",
@@ -279,9 +281,7 @@ def test_spawn_detached_probe_targets_routed_bind_host(
     daemon orphaned behind the port file."""
     _write_port_file(git_workspace, 54321)
     seen: dict = {}
-    monkeypatch.setattr(
-        coherence_coordinator, "_tcp_probe", _capture_probe(seen, reachable=True)
-    )
+    monkeypatch.setattr(lifecycle, "tcp_probe", _capture_probe(seen, reachable=True))
     monkeypatch.setattr(
         coherence_coordinator.subprocess, "Popen",
         lambda *a, **kw: None,  # the pre-written port file stands in for the child
@@ -310,7 +310,7 @@ def test_spawn_detached_routed_bind_reports_loopback_conflict(
     def split_probe(port, cfg, *, bind_host="127.0.0.1"):
         return bind_host == "127.0.0.1"  # loopback answers, routed host doesn't
 
-    monkeypatch.setattr(coherence_coordinator, "_tcp_probe", split_probe)
+    monkeypatch.setattr(lifecycle, "tcp_probe", split_probe)
     monkeypatch.setattr(
         coherence_coordinator.subprocess, "Popen", lambda *a, **kw: None,
     )
@@ -344,7 +344,7 @@ def test_spawn_detached_wait_is_wall_clock_bounded(
         time.sleep(0.2)  # stand-in for the probe's own retry budget
         return False
 
-    monkeypatch.setattr(coherence_coordinator, "_tcp_probe", slow_dead_probe)
+    monkeypatch.setattr(lifecycle, "tcp_probe", slow_dead_probe)
     monkeypatch.setattr(
         coherence_coordinator.subprocess, "Popen", lambda *a, **kw: None,
     )
@@ -412,6 +412,7 @@ def test_coordinator_refuses_a_symlinked_pid_file_that_names_a_live_coordinator(
     coherence.mkdir(mode=0o700)
     (coherence / "server.pid").symlink_to(target)
     monkeypatch.setattr(coherence_coordinator, "_tcp_probe", _fail_on_call("a port probe"))
+    monkeypatch.setattr(lifecycle, "tcp_probe", _fail_on_call("a port probe"))
     monkeypatch.setattr(coherence_coordinator.subprocess, "Popen", _fail_on_call("a spawn"))
 
     rc = coherence_coordinator.main(["--root", str(git_workspace)])
@@ -638,6 +639,7 @@ def test_wildcard_bind_host_rejected_before_any_dial(
         pytest.fail(f"probe dialed {bind_host!r} before bind-host validation")
 
     monkeypatch.setattr(coherence_coordinator, "_tcp_probe", must_not_dial)
+    monkeypatch.setattr(lifecycle, "tcp_probe", must_not_dial)
 
     rc = coherence_coordinator.main([
         "--root", str(git_workspace), "--bind-host", "0.0.0.0",
@@ -1388,7 +1390,7 @@ def test_resolve_endpoint_missing_pid_file(git_workspace: Path) -> None:
 def test_resolve_endpoint_missing_secret_file(git_workspace: Path) -> None:
     """Port file present but hook.secret missing → CoordinatorUnavailable."""
     (git_workspace / ".coherence").mkdir(parents=True, exist_ok=True, mode=0o700)
-    (git_workspace / ".coherence" / "server.pid").write_text("12345\n50000\n")
+    write_coordinator_pid_file(git_workspace / ".coherence", 50000)
     with pytest.raises(CoordinatorUnavailable) as excinfo:
         resolve_endpoint(git_workspace)
     assert "authentication unavailable" in str(excinfo.value)
@@ -1398,7 +1400,7 @@ def test_resolve_endpoint_empty_secret(git_workspace: Path) -> None:
     """hook.secret exists but is empty → CoordinatorUnavailable."""
     coh = git_workspace / ".coherence"
     coh.mkdir(parents=True, exist_ok=True, mode=0o700)
-    (coh / "server.pid").write_text("12345\n50000\n")
+    write_coordinator_pid_file(coh, 50000)
     (coh / "hook.secret").write_text("")
     with pytest.raises(CoordinatorUnavailable) as excinfo:
         resolve_endpoint(git_workspace)
@@ -1947,7 +1949,7 @@ def stub_coordinator(git_workspace: Path):
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _StubCoordinator)
     threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     port = httpd.server_address[1]
-    (coherence / "server.pid").write_text(f"999\n{port}\n")
+    write_coordinator_pid_file(coherence, port, pid=999)
     (coherence / "hook.secret").write_text("test-secret")
     _StubCoordinator.answers, _StubCoordinator.seen = {}, []
     try:
@@ -3588,3 +3590,72 @@ def test_spawn_detached_names_a_held_store_when_its_wait_ends(
     assert rc == 2
     assert "open for writing by another handle" in err
     assert "did not become reachable" not in err
+
+
+def test_the_coordinator_command_starts_one_rather_than_report_an_exited_ones_port(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#503: a stranger listening on a dead coordinator's port is not a running
+    coordinator, so the command starts one instead of printing that port."""
+    import socket
+    import subprocess
+    import sys
+
+    stranger = socket.socket()
+    stranger.bind(("127.0.0.1", 0))
+    stranger.listen()
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(60)
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir(mode=0o700, exist_ok=True)
+    (coherence / "server.pid").write_text(f"{child.pid}\n{stranger.getsockname()[1]}\n")
+    stranger_port = stranger.getsockname()[1]
+    spawned: list[Path] = []
+    monkeypatch.setattr(
+        coherence_coordinator, "_spawn_detached", lambda root, **_kw: spawned.append(root) or 0
+    )
+    try:
+        assert coherence_coordinator.main(["--root", str(git_workspace)]) == 0
+    finally:
+        stranger.close()
+    assert [path.resolve() for path in spawned] == [git_workspace.resolve()]
+    assert f"port={stranger_port}" not in capsys.readouterr().out
+
+
+def test_the_detached_start_waits_for_its_own_coordinator_not_an_exited_ones_port(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#503: while the detached worker starts, ``server.pid`` still names the
+    exited coordinator and a stranger listens on its port. The command waits
+    for the worker's own lines and prints the worker's port, never the
+    stranger's."""
+    import socket
+    import subprocess
+    import sys
+    import threading
+
+    from tests.pid_lock_helpers import write_coordinator_pid_file
+
+    stranger, worker = socket.socket(), socket.socket()
+    for listener in (stranger, worker):
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+    stranger_port, worker_port = stranger.getsockname()[1], worker.getsockname()[1]
+    exited = subprocess.Popen([sys.executable, "-c", "pass"])
+    exited.wait(60)
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir(mode=0o700, exist_ok=True)
+    (coherence / "server.pid").write_text(f"{exited.pid}\n{stranger_port}\n")
+
+    def start_worker(*_args: object, **_kwargs: object) -> None:
+        threading.Timer(
+            0.3, write_coordinator_pid_file, (coherence, worker_port, os.getpid())
+        ).start()
+
+    monkeypatch.setattr(coherence_coordinator.subprocess, "Popen", start_worker)
+    try:
+        assert coherence_coordinator._spawn_detached(git_workspace, quiet=False) == 0
+    finally:
+        stranger.close()
+        worker.close()
+    assert capsys.readouterr().out.strip() == f"port={worker_port}"

@@ -34,6 +34,7 @@ from ccs.core.exceptions import CoherenceError, CoordinatorFailed
 from tests.adapters.test_coherent_volume_other_holder import _status
 from tests.coordinator_helpers import serve_in_process
 from tests.loopback_helpers import refused_endpoint
+from tests.pid_lock_helpers import hold_coordinator_lock, release_coordinator_locks
 
 _MANAGED = ("data/**",)
 _X = "data/x.txt"
@@ -626,6 +627,36 @@ def test_a_close_refused_at_the_local_endpoint_logs_the_attempts_once_and_detach
     log.sent.clear()
     vol.close()
     assert log.sent == []
+
+
+def test_a_close_after_its_coordinator_exited_gives_the_attempts_up_and_detaches(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    server: CoordinatorHTTPServer,
+    log: _Log,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The volume's coordinator exits, and something still answers on its
+    port. The client sends no end there (#503), so the close gives the
+    attempts up once, as when no coordinator listens at the port, and
+    detaches.
+
+    Prevents the close of a volume whose coordinator is gone staying attached
+    and trying its ends again at every close()."""
+    vol = _volume(tmp_path, fast_cfg)
+    vol.read(_Z)
+    reader = vol.incarnation
+    vol.reacquire(_X)
+    release_coordinator_locks()
+
+    with caplog.at_level("WARNING", logger=_LOGGER):
+        vol.close()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("were not ended" in message for message in messages) == 1, messages
+    assert vol.is_attached is False
+    hold_coordinator_lock(tmp_path / ".coherence" / "server.pid")
+    assert _identity(vol, reader) in _status_sessions(tmp_path), "control: no end reached the port"
 
 
 def test_a_re_mint_whose_release_is_held_ends_nothing_else(
