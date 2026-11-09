@@ -237,6 +237,9 @@ and check again.
     coordinator cannot be ruled out.
   - `platform_unsupported`: this platform has no `fcntl`, so no coordinator
     starts here.
+  - `store_held`: a read-write handle that is not a running coordinator has
+    the store open: a script, or a coordinator still closing. A start waits
+    for it to close, then refuses the store. Check again once it closes.
 - `coherence_dir_refused`, one of:
   - `coherence_link`: `.coherence`, or an entry directly inside it, is a
     symbolic link.
@@ -1315,6 +1318,29 @@ no version content. (The Claude Code hook/HTTP coordinator carries only content
 hashes on the wire, so durable retention there is inert: there are no bodies to
 store. It is an in-process-embedder feature.)
 
+**One writer per store.** A store has one read-write `SqliteArtifactRegistry`
+at a time. Each read-write open takes an exclusive lock on a file beside the
+store, `<store>.writer-lock`, before it touches the store, and a second
+read-write open of the same store, in this process or another, raises
+`StoreHeldError` (a `RuntimeError` from `ccs.coordinator.sqlite_registry`;
+`reason` is `store_held` and `lock_path` names the lock file). The lock is
+keyed on the store's resolved path, so a symbolic link to the store meets the
+same lock. `close()` frees it, and so do a failed open, a handle that is
+garbage-collected and a process that exits; a forked child does not keep its
+parent's lock. `read_only=True` takes no lock, so readers open beside the
+writer. To share one store between processes, run one coordinator and send
+the others through it, or open them read-only. A writer open that lands while
+`--check-store` probes the lock retries for a tenth of a second before it
+refuses; to wait longer for a holder that is closing, open through
+`open_waiting_out_a_holder(open_store, wait_sec, poll_sec)` from the same
+module, as a coordinator start and the workspace CLI do. A lock file that
+cannot be opened, or that is not a regular file (a directory or FIFO at that
+path, or a file another user owns), refuses the open with an `OSError` and
+creates nothing. Only where `flock` does not exist (Windows, or a file system
+whose `flock` does not work, which logs one warning) does the open proceed
+without the lock, and a second writer is not refused there
+([#453](https://github.com/Cohexa-ai/agent-coherence/issues/453)).
+
 ### Reading a version
 
 ```python
@@ -2089,10 +2115,17 @@ calls raise `CoherenceDirRefused` and start nothing (see
 and `agent-coherence-coordinator` prints its text and exits `2`. A start that
 fails stops whatever it started and raises instead:
 `SchemaVersionError` on a store it refuses (its `reason` says why),
-`sqlite3.Error` on a file SQLite cannot open, `OSError` when the lock or
+`StoreHeldError` when another read-write handle (a script, or a coordinator in
+another process) still has `state.db` open after
+`LifecycleConfig.store_holder_wait_sec` (10 seconds by default, longer than a
+closing coordinator keeps its store open: its drain, then its wait for a
+handler still running, so a start right after a stop waits it out), `sqlite3.Error` on a file SQLite cannot open, `OSError` when the lock or
 the bind fails, `ValueError` on a `bind_host` it refuses, and `RuntimeError`
 when it cannot read the hook secret or start a thread. A `KeyboardInterrupt` or
-`SystemExit` during a start gets the same cleanup and then propagates. To ask
+`SystemExit` during a start gets the same cleanup and then propagates. On a
+held store a strict `CoherentVolume` raises the `StoreHeldError`, a degrade one
+warns once and stays detached, the `stale-write-guard-fs` server does not
+start, and `agent-coherence-coordinator` prints one line and exits `2`. To ask
 before a start migrates the store, call
 [`check_store`](#checking-a-store-before-a-coordinator-starts) first.
 
@@ -2535,7 +2568,7 @@ The durable truth is the **pair** `(restore_tier, pin_state)`. `restorable` is b
 
 **The file-member retention caveat, precisely.** File members ride the coordinator's [declared version retention](#version-retention-and-read-at-version), which is a bounded window (a count/age policy), not a per-version hold. A checkpoint pin on a file member **verifies** — it checks the captured version is currently retained and still matches its fingerprint — it **cannot extend** the window or exempt the version from the policy. If the version has aged out by restore time, the restore reports that member `target_lost` rather than restoring different content; expiry always surfaces, never silently. S3 members are the stronger case: their pin is a legal hold in *your* bucket on the captured version — the substrate's own retention, at your bucket's configuration and cost.
 
-**Dropping a pin.** `WorkspaceVersioner.release_checkpoint(checkpoint_id)` releases the pins a checkpoint holds — the S3 legal holds it placed, and file members' verification pins. The manifest survives: this releases pins, it does not delete the checkpoint. Four things to know before calling it. It is **one-way** — a released member is terminal, `pin_checkpoint` will not re-drive it, and the captured version becomes eligible for lifecycle expiry and version-targeted delete from that instant. S3 members must be **re-declared on the versioner you release from** (`add_object_member`), through the **same binding and key that placed the hold**: the pre-flight only checks that an object member is declared at that member path, so a mismatched binding or key records the member `released` while the hold quietly survives. And a hold **shared** with another checkpoint survives until the last holder releases — with two bounds worth knowing, since a legal hold is a retention control: the sharing scan walks only that versioner's registry, so a holder recorded elsewhere (another workspace, a person, another tool) is invisible to it, and the scan alone cannot cover the instant between its last check and the drop itself — that instant is handled by re-reading *after* the drop and putting the hold back if a peer claimed it, so what remains is the narrower case where putting it back also fails, which is logged. Finally, it is **idempotent but not self-healing**: the release records `released` before it drops the substrate hold, so a crash or an untyped substrate error between the two strands a live hold on an already-terminal row — retrying `release_checkpoint` will not detect or repair it, since the row already reads terminal. Calling it **concurrently** fails differently, and no longer strands: two processes releasing one checkpoint both decrement its pin refcount, and the registry fails the surplus decrement with a `ValueError` — but that raise lands after the hold has already been dropped, so it costs you bookkeeping accuracy rather than a live hold. It does abort the rest of that checkpoint's members, which stay `held` for a later call. Treat a `ValueError` as "some members may have been released", never as "nothing happened". The recovery in both cases is calling `CoherentObject.release_legal_hold` directly on the binding, by version — the released row keeps the `native_token` you need for it.
+**Dropping a pin.** `WorkspaceVersioner.release_checkpoint(checkpoint_id)` releases the pins a checkpoint holds — the S3 legal holds it placed, and file members' verification pins. The manifest survives: this releases pins, it does not delete the checkpoint. Four things to know before calling it. It is **one-way** — a released member is terminal, `pin_checkpoint` will not re-drive it, and the captured version becomes eligible for lifecycle expiry and version-targeted delete from that instant. S3 members must be **re-declared on the versioner you release from** (`add_object_member`), through the **same binding and key that placed the hold**: the pre-flight only checks that an object member is declared at that member path, so a mismatched binding or key records the member `released` while the hold quietly survives. And a hold **shared** with another checkpoint survives until the last holder releases — with two bounds worth knowing, since a legal hold is a retention control: the sharing scan walks only that versioner's registry, so a holder recorded elsewhere (another workspace, a person, another tool) is invisible to it, and the scan alone cannot cover the instant between its last check and the drop itself — that instant is handled by re-reading *after* the drop and putting the hold back if a peer claimed it, so what remains is the narrower case where putting it back also fails, which is logged. Finally, it is **idempotent but not self-healing**: the release records `released` before it drops the substrate hold, so a crash or an untyped substrate error between the two strands a live hold on an already-terminal row — retrying `release_checkpoint` will not detect or repair it, since the row already reads terminal. Calling it **concurrently** fails differently, and no longer strands: two versioners releasing one checkpoint both decrement its pin refcount (two processes cannot both open a SQLite store for writing where `flock` exists), and the registry fails the surplus decrement with a `ValueError` — but that raise lands after the hold has already been dropped, so it costs you bookkeeping accuracy rather than a live hold. It does abort the rest of that checkpoint's members, which stay `held` for a later call. Treat a `ValueError` as "some members may have been released", never as "nothing happened". The recovery in both cases is calling `CoherentObject.release_legal_hold` directly on the binding, by version — the released row keeps the `native_token` you need for it.
 
 **Binary members (v1 limitation).** A file member whose bytes are not UTF-8 text is refused at capture with a typed error — before anything persists. The file restore path rides a text wire, so capturing a member that could never be restored would be a silent over-claim.
 
@@ -2550,6 +2583,8 @@ agent-coherence-workspace restore <checkpoint-id>
 
 Four verbs — `checkpoint` (with repeatable `--file` / `--forward-only`, and `--no-pin` for capture-only), `list`, `status`, `restore`. Every verb takes `--root` (override the workspace root; default walks up to the git root) and `--json` (machine-parseable output). `status` renders every member's `(restore_tier, pin_state)` pair — including the claimed-but-not-yet-backed label — plus torn-cut flags and restore outcomes; `checkpoint` output always carries the file-retention caveat. The CLI keeps its own durable state in `<root>/.coherence/workspace.db`.
 
+**Verbs take turns.** The CLI keeps its store in `.coherence/workspace.db`, and a store has one writer (see **One writer per store**). `checkpoint` and `restore` hold it for their whole run; another verb that writes waits up to 30 seconds for it, then exits `2` with `reason` `store_held`. `list` and `status` open the store read-only and do not wait for a verb that writes; when the store does not exist yet or needs a writer to open it (an older schema, or recovery after a crash), they open it as a writer and wait like any verb.
+
 Under `--json`, every error path *also* emits a one-line JSON envelope on stdout — `{"kind": "error", "exit_code": …, "reason": …, "message": …}` — so a script never has to parse stderr prose; the human message stays on stderr unchanged. Capturing a second checkpoint under an existing name is never refused (names are labels, not unique keys), but the prior ids are printed so the ambiguity is never silent — `status` and `restore` always target an id, not a name.
 
 Exit codes:
@@ -2558,7 +2593,7 @@ Exit codes:
 |---|---|
 | `0` | the verb succeeded (restore: concluded with no member in `conflict` / `target_lost` / `held_unconfirmed`) — never a claim that nothing was overwritten: a restore that put a member back over content committed after the capture also exits `0`, and says so per member in the report |
 | `1` | not in a git repository, or a validation error (no members, a `..` traversal in a member argument), or a typed contention error |
-| `2` | a typed refusal: a non-UTF-8 member, an unknown checkpoint id, a checkpoint bound to another receiver or already registered by another controller, a persist failure, or a member path that fails containment at access time — a workspace escape, a symlink component, a hardlinked regular file with a co-owner outside the root, a non-regular file (FIFO, socket, device), or a `.coherence/**` self-target; or a `.coherence` that is a symbolic link or not a directory, or holds a link, FIFO, socket or device directly inside it, refused before anything in it is opened, with `reason` `coherence_dir_refused` (see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory)) |
+| `2` | a typed refusal: another verb kept the store past the 30-second wait (`store_held`), a non-UTF-8 member, an unknown checkpoint id, a checkpoint bound to another receiver or already registered by another controller, a persist failure, or a member path that fails containment at access time — a workspace escape, a symlink component, a hardlinked regular file with a co-owner outside the root, a non-regular file (FIFO, socket, device), or a `.coherence/**` self-target; or a `.coherence` that is a symbolic link or not a directory, or holds a link, FIFO, socket or device directly inside it, refused before anything in it is opened, with `reason` `coherence_dir_refused` (see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory)) |
 | `3` | the restore **concluded**, but at least one member ended in `conflict` / `target_lost` / `held_unconfirmed`, or the restore registration was refused — the per-member report on stdout is the truth; the exit code just tells you to read it |
 | `4` | opt-in, and only with `restore --exit-nonzero-on-discarded-content`: the restore concluded clean by the codes above, but at least one member's write discarded content the checkpoint did not hold, or the run holds no record of what that member's write overwrote. Without the flag the same run exits `0`, and both producers of `3` take precedence over it. It is evaluated after the engine returns, so it reports the writes and never prevents one |
 
@@ -2977,9 +3012,10 @@ offers a session-based gate in Python — `CoordinatorService.effect_gate`, whic
 pins a read-set and re-validates every member's *version* at the effect
 boundary, holding the effect if any moved, whether the effect is a callable or
 a commit of one of the members. In the commit form the check and the commit
-are one step for every writer that goes through the same coordinator; a writer
-on a second handle to the same store can still change a member other than the
-one written. It checks versions only: it does not apply the grant-standing leg, so
+are one step for every writer that goes through the same coordinator. A second
+read-write handle on the same store, which could change a member other than the
+one written, is refused at open wherever `flock` exists (see **One writer per
+store**). It checks versions only: it does not apply the grant-standing leg, so
 a peer's write-acquire that preempts the session's grant without moving any
 version lets that gate fire where this fence holds. It is in-process Python
 only — no HTTP route and no tool reaches it — and it answers in its own
@@ -4640,10 +4676,13 @@ coordinator in these ways:
   a reclaim does not stop a write the holder had already been admitted for:
   that write can reach the file after the reclaim. Its `post-edit` is refused,
   so no version records those bytes.
-- **One coordinator process.** On the Python coordinator the check and the
+- **One writer per store.** On the Python coordinator the check and the
   grant are one decision inside the coordinator process that holds the
-  workspace's store. A second writer opened on the same `state.db` is outside
-  that decision ([#453](https://github.com/Cohexa-ai/agent-coherence/issues/453)).
+  workspace's store, and a second read-write open of that `state.db` is
+  refused with `StoreHeldError`
+  ([#453](https://github.com/Cohexa-ai/agent-coherence/issues/453)). Where
+  `flock` does not exist (Windows, or a file system that refuses it), a second
+  writer is not refused and is outside that decision.
   On the Node coordinator they are one SQLite transaction, and the plugin runs
   one coordinator per workspace (see **On the Node coordinator**).
 - **A malformed subagent id is read as the parent.** An `agent_id` that is not

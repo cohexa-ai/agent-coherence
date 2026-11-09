@@ -85,6 +85,7 @@ _STORE_UNREADABLE = "store_unreadable"
 _CHECK_ENVIRONMENT_FAILED = "check_environment_failed"
 _LOCK_PROBE_FAILED = "lock_probe_failed"
 _PLATFORM_UNSUPPORTED = "platform_unsupported"
+_STORE_HELD = "store_held"
 
 #: FROZEN duplicate of the prefix of the check's private copy directory.
 _PRIVATE_DIR_PREFIX = "ccs-store-check-"
@@ -842,6 +843,71 @@ def test_a_coordinator_that_binds_while_the_check_copies_reads_live(
         os.close(holder)
 
     assert (result.outcome.value, result.reason) == (_LIVE, _COORDINATOR_RUNNING)
+    assert list(check_tmp.iterdir()) == []
+
+
+# ----------------------------------------------------------------------
+# One writer per store (#453)
+# ----------------------------------------------------------------------
+
+
+def _writer_lock(root: Path) -> Path:
+    return _coherence_dir(root) / "state.db.writer-lock"
+
+
+def test_a_store_another_writer_holds_reads_cannot_tell_and_copies_nothing(
+    parent: Path, check_tmp: Path, copies: list[str]
+) -> None:
+    """A read-write registry that is not a running coordinator (a script, or a
+    coordinator still closing after its workspace lock came free) holds the
+    store's single-writer lock. A start waits for it and then refuses, so the
+    check cannot tell what a start does. Prevents an answer read from a store
+    a live writer is changing, and the probe creating or locking anything."""
+    root = parent / "ws"
+    _build("v10", root)
+    with SqliteArtifactRegistry(_db(root)):
+        result = _assert_untouched_check(root, parent, check_tmp)
+    assert (result.outcome.value, result.reason, result.found_version) == (
+        _CANNOT_TELL, _STORE_HELD, None,
+    )
+    assert copies == []
+    assert check_store(root).outcome.value == _CURRENT
+
+
+def test_a_writer_lock_its_holder_released_is_not_a_holder(
+    parent: Path, check_tmp: Path
+) -> None:
+    """Every read-write open leaves the lock file behind; only a held lock
+    is a holder."""
+    root = parent / "ws"
+    _build("v10", root)
+    SqliteArtifactRegistry(_db(root)).close()
+    assert _writer_lock(root).is_file()
+    assert _assert_untouched_check(root, parent, check_tmp).outcome.value == _CURRENT
+
+
+def test_a_writer_that_opens_the_store_while_the_check_copies_reads_cannot_tell(
+    parent: Path, check_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store's lock is probed again after the copy, as the workspace lock
+    is: a writer that opened the store during the copy may already have
+    changed it."""
+    root = parent / "ws"
+    _build("v7", root)
+    holder = os.open(_writer_lock(root), os.O_RDWR | os.O_CREAT, 0o600)
+    real_copy = store_check._copy_store
+
+    def copy_then_open(*args, **kwargs):
+        copied = real_copy(*args, **kwargs)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)  # as a writer's open does
+        return copied
+
+    monkeypatch.setattr(store_check, "_copy_store", copy_then_open)
+    try:
+        result = check_store(root)
+    finally:
+        os.close(holder)
+    assert (result.outcome.value, result.reason) == (_CANNOT_TELL, _STORE_HELD)
     assert list(check_tmp.iterdir()) == []
 
 

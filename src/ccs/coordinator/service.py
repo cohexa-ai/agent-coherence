@@ -559,7 +559,8 @@ class CoordinatorService:
         # goes stale, and an UNBOUND one goes stale only when this service binds
         # the identity — which replaces it (see :meth:`_record_bind_attempt`).
         # A second writer of bindings into the same store would not be seen
-        # here; there is none. ``_caller_principal_binds`` counts finished bind
+        # here; a second read-write open of a SQLite store is refused (#453).
+        # ``_caller_principal_binds`` counts finished bind
         # attempts, so a lookup whose durable read raced one never caches the
         # UNBOUND answer it read before that bind. Deliberately separate from
         # every session map above and from ``_session_lock``: a principal's
@@ -1646,11 +1647,11 @@ class CoordinatorService:
           The target is also CAS-guarded inside the registry's own transaction,
           so a writer on another store handle that moves it loses cleanly
           (:class:`ConflictDetail`, surfaced as :class:`EffectHeld` with
-          ``conflict`` set). This is the STRONG guarantee, with one residual: a
-          writer on another handle to the same store (a second process, or a
-          second registry instance on the same SQLite file) can still move a
-          NON-target member between the re-validate and the CAS. A store has one
-          writer by contract.
+          ``conflict`` set). This is the STRONG guarantee. A writer on another
+          handle to the same store could move a NON-target member between the
+          re-validate and the CAS; a second read-write handle on a SQLite store
+          is refused at open where ``flock`` exists (#453), so that residual
+          remains only without ``flock``.
         - **ESCAPING** (``effect=callable``) — the effect is a non-commit side
           effect (deploy / charge / click). The gate re-validates, then fires the
           callable. **The guarantee is "the read-set was unchanged AS OF the
@@ -1825,11 +1826,12 @@ class CoordinatorService:
         target is also CAS-guarded inside the registry's own transaction, against
         every writer.
 
-        Residual: a writer on another handle to the same store (a second
-        process, or a second registry instance on the same SQLite file) is
-        outside the hold and can move a NON-target member between the re-validate
-        and the CAS. A store has one writer by contract; checking the read-set inside
-        the registry's commit transaction would close it. ``decide`` has already
+        Residual, only where ``flock`` does not exist: a writer on another
+        handle to the same store is outside the hold and can move a NON-target
+        member between the re-validate and the CAS. Elsewhere a second
+        read-write handle on a SQLite store is refused at open (#453); checking
+        the read-set inside the registry's commit transaction would close it
+        everywhere. ``decide`` has already
         run, so no caller code runs under the hold."""
         artifact_id, content = commit
         # Service lock first, then the registry lock: the documented order (see
@@ -2340,7 +2342,8 @@ class CoordinatorService:
         if agent_state not in {MESIState.EXCLUSIVE, MESIState.MODIFIED}:
             # Read under commit()'s abort_guard hold, the one this refusal is
             # decided in, so no reclaim or release can land between the state
-            # check and the pair the refusal reports.
+            # check and the pair the refusal reports: the store has no other
+            # writer, since a second read-write open is refused (#453, #364).
             pair = {
                 "captured_generation": self.registry.get_read_generation(
                     artifact_id, agent_id
@@ -2594,8 +2597,9 @@ class CoordinatorService:
                 issued_at_tick=issued_at_tick,
                 issuer_agent_id=agent_id,
                 victim_agent_id=invalidated_id,
-                # A second registry writer may add a peer after the snapshot
-                # and before the commit result is returned.  The commit has
+                # A second registry writer (only where no single-writer lock
+                # holds, #453) may add a peer after the snapshot and before the
+                # commit result is returned.  The commit has
                 # still landed; preserve that success and report the state as
                 # unknown instead of turning it into a KeyError.
                 victim_state=victim_states.get(invalidated_id),

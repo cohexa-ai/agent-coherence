@@ -48,7 +48,7 @@ from ccs.adapters.claude_code.lifecycle import (
     read_port_from_file as _read_port_from_file,
 )
 from ccs.adapters.claude_code.state_dir import entry_link_refusal
-from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry, StoreHeldError
 from ccs.core.exceptions import COHERENCE_LINK_KIND, COHERENCE_SPECIAL_ENTRY_KIND, CoherenceDirRefused
 from tests.coherence_link_helpers import (
     LINK_NAMES,
@@ -3409,3 +3409,95 @@ def test_a_start_that_fails_after_migrating_the_store_logs_the_migration_once(
     assert [name for name, _ in records] == [_LIFECYCLE_LOGGER], records
     assert f"from registry schema 7 to {SCHEMA_USER_VERSION}" in records[0][1]
     assert str(db) in records[0][1]
+
+
+# ----------------------------------------------------------------------
+# One writer per store (#453)
+# ----------------------------------------------------------------------
+
+
+def _wait_for(predicate, timeout_sec: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout_sec
+    while not predicate():
+        assert time.monotonic() < deadline, "condition never held"
+        time.sleep(0.01)
+
+
+def test_a_start_waits_out_a_coordinator_still_closing_its_store(
+    workspace: Path, fast_cfg: LifecycleConfig,
+) -> None:
+    """A stop that meets a shutdown already draining returns at once, so the
+    workspace lock comes free while the old coordinator still has the store
+    open. The next start waits for that store to close instead of failing."""
+    cfg = replace(fast_cfg, store_holder_wait_sec=10.0)
+    assert ensure_coordinator_handle(workspace, config=cfg).outcome is SpawnOutcome.BOUND
+    old = lifecycle._SPAWNED_REGISTRY[str(workspace.resolve())].coordinator
+    assert old.acquire_handler_slot()
+    drain = threading.Thread(target=old.shutdown)
+    drain.start()
+    release = threading.Timer(0.5, old.release_handler_slot)
+    try:
+        _wait_for(lambda: old.shutting_down)
+        stop_coordinator(workspace)
+        release.start()
+        started = time.monotonic()
+        assert ensure_coordinator_handle(workspace, config=cfg).outcome is SpawnOutcome.BOUND
+        assert time.monotonic() - started >= 0.4, "the start must have waited for the old store"
+    finally:
+        # A slot never released ends the drain at its own timeout.
+        release.cancel()
+        drain.join(60)
+        stop_coordinator(workspace)
+
+
+def test_a_start_waits_longer_than_a_coordinator_takes_to_close() -> None:
+    """A closing coordinator holds its store through the drain and then the
+    watchdog's wait for one more handler, so the default wait covers both."""
+    close = coordinator_server.IN_FLIGHT_DRAIN_TIMEOUT_SEC + coordinator_server.HANDLER_TIMEOUT_SEC
+    assert LifecycleConfig().store_holder_wait_sec > close
+
+
+def test_a_start_refuses_a_store_another_writer_holds_and_starts_nothing(
+    workspace: Path, fast_cfg: LifecycleConfig,
+) -> None:
+    cfg = replace(fast_cfg, store_holder_wait_sec=0.3)
+    db = workspace / ".coherence" / "state.db"
+    started = time.monotonic()
+    with SqliteArtifactRegistry(db):
+        with pytest.raises(StoreHeldError):
+            ensure_coordinator_handle(workspace, config=cfg)
+    assert time.monotonic() - started >= 0.3, "the start must wait before refusing"
+    assert (workspace / ".coherence" / "server.pid").read_text() == ""
+    assert ensure_coordinator_handle(workspace, config=cfg).outcome is SpawnOutcome.BOUND
+    stop_coordinator(workspace)
+
+
+_START_AFTER_PID_UNLINK = """
+import sys
+from pathlib import Path
+from ccs.adapters.claude_code.lifecycle import LifecycleConfig, ensure_coordinator_handle
+from ccs.coordinator.sqlite_registry import StoreHeldError
+try:
+    cfg = LifecycleConfig(store_holder_wait_sec=0.2)
+    print(ensure_coordinator_handle(Path(sys.argv[1]), config=cfg).outcome.value)
+except StoreHeldError as exc:
+    print(exc.reason)
+"""
+
+
+@pytest.mark.serial
+def test_a_second_coordinator_cannot_open_the_store_after_server_pid_is_unlinked(
+    workspace: Path, fast_cfg: LifecycleConfig,
+) -> None:
+    """Unlinking server.pid frees the workspace lock for a new file, so a
+    second start binds; the store's own lock still refuses its open."""
+    assert ensure_coordinator_handle(workspace, config=fast_cfg).outcome is SpawnOutcome.BOUND
+    try:
+        (workspace / ".coherence" / "server.pid").unlink()
+        done = subprocess.run(
+            [sys.executable, "-c", _START_AFTER_PID_UNLINK, str(workspace)],
+            capture_output=True, text=True, timeout=240, check=True, env=_child_env(),
+        )
+        assert done.stdout.strip() == "store_held"
+    finally:
+        stop_coordinator(workspace)

@@ -401,6 +401,20 @@ SCHEMA_VERSION_REASONS: frozenset[str] = frozenset(
 )
 
 # ---------------------------------------------------------------------------
+# one read-write handle per store (#453)
+# ---------------------------------------------------------------------------
+#
+# ``StoreHeldError.reason`` (defined in ``ccs.coordinator.sqlite_registry`` for
+# the same layering reason as the schema classes above). The workspace CLI's
+# JSON envelope and the store check carry it, so it is wire-stable: add, do
+# not mutate.
+STORE_HELD_REASON = "store_held"
+"""Another read-write handle has the store open: a coordinator, or a registry
+in this or another process. A store has one writer. Remedy: go through that
+handle (a coordinator's routes), open with ``read_only=True`` to read, or
+retry once it closes."""
+
+# ---------------------------------------------------------------------------
 # caller-principal refusal reasons (coordinator caller principal, U4)
 # ---------------------------------------------------------------------------
 #

@@ -285,3 +285,17 @@ def registry(request, tmp_path: Path):
         reg = SqliteArtifactRegistry(tmp_path / "shared-registry-arm.db")
         yield reg
         reg.close()
+
+
+@pytest.fixture
+def two_writer_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let a test open more than one read-write handle on one store.
+
+    Every read-write ``SqliteArtifactRegistry`` takes the store's single-writer
+    lock (#453), so a second one is refused. A test that proves what the
+    store's own SQLite transactions arbitrate between two writers, as on a
+    platform or file system with no ``flock``, opens them without it.
+    """
+    monkeypatch.setattr(
+        "ccs.coordinator.sqlite_registry._take_writer_lock", lambda _db_path: None
+    )

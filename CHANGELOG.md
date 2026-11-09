@@ -221,6 +221,44 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **A store has one read-write `SqliteArtifactRegistry` at a time (#453).** A
+  second read-write open of the same SQLite store, in this process or another,
+  now raises `StoreHeldError`, a `RuntimeError` in
+  `ccs.coordinator.sqlite_registry` whose `reason` is `store_held` and whose
+  `lock_path` names the lock file. Before, the second open succeeded and its
+  writes landed between the first handle's checks and grants, with no error on
+  either side: a coordinator's grant set a write grant the second handle had
+  just recorded to `INVALID`, or left two holders of one file. A second open in
+  the same process could also drop the first handle's SQLite locks, so another
+  process committed inside the first handle's transaction and the first
+  handle's commit was lost. Each read-write open now takes an exclusive `flock`
+  on `<store>.writer-lock` (mode `0600`) before it touches the store, keyed on
+  the store's resolved path (`writer_lock_path(db_path)` names it), and frees
+  it on `close()`, on a failed or interrupted open, when the handle is
+  garbage-collected and when the process exits; a forked child does not keep
+  it. A lock file that cannot be opened, or that is not a regular file (a
+  directory or FIFO at that path), refuses the open with an `OSError`, and an
+  existing one is made `0600`. `read_only=True` takes no lock and still opens
+  beside the writer. Only where `flock` does not exist (no `fcntl`, or a file
+  system whose `flock` does not work, which logs one warning) does the open
+  proceed without the lock, as before. A writer open that meets the store
+  check's probe of the lock retries for 0.1 s before it refuses, and
+  `open_waiting_out_a_holder(open_store, wait_sec, poll_sec)` waits longer for
+  a holder that is closing. Code that opened two read-write handles on one
+  store keeps one, and opens the others with `read_only=True` or goes through
+  a coordinator. A coordinator start waits up to the new
+  `LifecycleConfig.store_holder_wait_sec` (10 s, longer than a closing
+  coordinator keeps its store open) for another handle to close the store,
+  then raises `StoreHeldError`: a strict `CoherentVolume` raises it,
+  a degrade one warns once and stays detached, the `stale-write-guard-fs`
+  server does not start, and `agent-coherence-coordinator` prints one line and
+  exits `2`, also when its detached worker could not start for that reason.
+  `--check-store` answers `cannot_tell` with the new reason `store_held`.
+  `agent-coherence-workspace` verbs that write now wait up to 30 s for one
+  another and then exit `2` with `reason` `store_held`, and `list` and `status`
+  open the store read-only. This also fixes #364: a commit refusal's generation
+  pair can no longer be torn by a second writer.
+
 - **Leaving `coherent_workspace()`, calling `uninstall()` and shutting down the
   `stale-write-guard-fs` server now close their volume, giving back its write
   grants (#505).** Before, every file the volume wrote stayed held until the

@@ -94,8 +94,9 @@ from ccs.adapters.claude_code.lifecycle import (
 )
 from ccs.adapters.claude_code.resolver import find_coordinator_root
 from ccs.adapters.claude_code.state_dir import check_coherence_dir
-from ccs.adapters.claude_code.store_check import StoreCheckOutcome, check_store
+from ccs.adapters.claude_code.store_check import StoreCheckOutcome, check_store, store_is_held
 from ccs.cli._coherence_client import err, escape_nonprintable
+from ccs.coordinator.sqlite_registry import StoreHeldError
 from ccs.core.exceptions import CoherenceDirRefused
 
 logger = logging.getLogger(__name__)
@@ -263,7 +264,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.no_detach:
         try:
             port = ensure_coordinator(root, bind_host=args.bind_host)
-        except CoherenceDirRefused as exc:
+        except (CoherenceDirRefused, StoreHeldError) as exc:
             return _print_refusal(exc)
         if port == -1:
             err("agent-coherence-coordinator: coordinator could not be spawned")
@@ -287,9 +288,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     return _spawn_detached(root, quiet=args.quiet, bind_host=args.bind_host)
 
 
-def _print_refusal(exc: CoherenceDirRefused) -> int:
-    """Print a start's refusal of ``.coherence`` (#498) on one line and
-    return exit 2. The path comes from a directory listing, so it is escaped."""
+def _print_refusal(exc: CoherenceDirRefused | StoreHeldError) -> int:
+    """Print a start's refusal on one line and return exit 2: of
+    ``.coherence`` (#498), or of a store another read-write handle holds
+    (#453). The path in it comes from the workspace, so it is escaped."""
     err(f"agent-coherence-coordinator: {escape_nonprintable(str(exc))}")
     return 2
 
@@ -456,7 +458,7 @@ def _run_daemonized(root: Path, *, bind_host: str = "127.0.0.1") -> int:
     ``return`` in its loop, leaving the main thread to block here)."""
     try:
         port = ensure_coordinator(root, bind_host=bind_host)
-    except CoherenceDirRefused as exc:
+    except (CoherenceDirRefused, StoreHeldError) as exc:
         # A link made after main's check. Spawned detached, this line goes to
         # /dev/null and the parent reports its timeout; run directly, it shows.
         return _print_refusal(exc)
@@ -527,6 +529,15 @@ def _spawn_detached(root: Path, *, quiet: bool, bind_host: str = "127.0.0.1") ->
                 return 2
         time.sleep(_DETACH_PORT_WAIT_INTERVAL_SEC)
 
+    # The worker's stderr is /dev/null: name a store it could not open (#453).
+    if store_is_held(root):
+        db_path = escape_nonprintable(str(root / ".coherence" / "state.db"))
+        err(
+            f"agent-coherence-coordinator: {db_path} is open for writing by another "
+            "handle (a script, or a coordinator still closing), so no coordinator "
+            "could start; start again once it closes"
+        )
+        return 2
     err(
         "agent-coherence-coordinator: detached worker did not become reachable "
         f"within {_DETACH_PORT_WAIT_TIMEOUT_SEC:.0f}s"

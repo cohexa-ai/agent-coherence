@@ -516,8 +516,9 @@ class EffectFired:
       re-validated and the commit rode the shipped ``commit_cas`` at the pinned
       base under one hold of the coordinator's locks, so for every writer using
       the same registry instance "unchanged" and "fire" are one atomic event —
-      there is NO window. (A writer on another handle to the same store is
-      outside that hold; see :meth:`CoordinatorService.effect_gate`.) ``commit``
+      there is NO window. (A second read-write handle on the same SQLite store,
+      which would be outside that hold, is refused at open where ``flock``
+      exists (#453); see :meth:`CoordinatorService.effect_gate`.) ``commit``
       carries the ``(updated_artifact, signals)`` WIN tuple.
     - **ESCAPING mode** (the effect is a non-commit side effect — deploy / charge
       / click — a caller-supplied callable): the gate re-validated the whole

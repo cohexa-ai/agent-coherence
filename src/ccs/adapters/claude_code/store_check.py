@@ -67,7 +67,6 @@ Outcomes (:class:`StoreCheckOutcome`):
 
 from __future__ import annotations
 
-import errno
 import os
 import shutil
 import tempfile
@@ -85,16 +84,19 @@ from ccs.adapters.claude_code.state_dir import check_coherence_dir
 # stays out of adapters, cli and mcp; tests/coordinator/test_caller_principal.py
 # sweeps them); their failures arrive here typed as StoreSqliteError.
 from ccs.coordinator.sqlite_registry import (
+    LOCK_CONTENDED_ERRNOS,
     SCHEMA_USER_VERSION,
     CrossRuntimeSchemaError,
     SchemaVersionError,
     StoreSqliteError,
     read_copy_user_version,
     trial_writer_open,
+    writer_lock_path,
 )
 from ccs.core.exceptions import (
     COHERENCE_DIR_REFUSAL_KINDS,
     SCHEMA_NEWER_REASON,
+    STORE_HELD_REASON,
     CoherenceDirRefused,
 )
 
@@ -158,6 +160,7 @@ STORE_CHECK_REASONS: frozenset[str] = frozenset(
         CHECK_ENVIRONMENT_FAILED_REASON,
         LOCK_PROBE_FAILED_REASON,
         PLATFORM_UNSUPPORTED_REASON,
+        STORE_HELD_REASON,
         *COHERENCE_DIR_REFUSAL_KINDS,
     }
 )
@@ -174,8 +177,6 @@ _SIDECAR_SUFFIXES = ("-wal", "-journal")
 _PRIVATE_DIR_PREFIX = "ccs-store-check-"
 _COPY_CHUNK_BYTES = 1 << 20
 
-#: flock's "someone else holds a conflicting lock" errnos.
-_LOCK_CONTENDED_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
 
 
 class StoreCheckOutcome(str, Enum):
@@ -254,14 +255,20 @@ def check_store(coordinator_root: Path) -> StoreCheck:
        other as a coordinator. A start that lands inside a probe (microseconds,
        once up front and once per copy) finds the lock held and joins whatever
        port ``server.pid`` names, as it does while any other start holds the
-       lock; after a crash, that port is a dead one.
+       lock; after a crash, that port is a dead one. Then probe the store's
+       single-writer lock (``state.db.writer-lock``) the same way: held means a
+       read-write handle that is not a running coordinator has the store open
+       (``cannot_tell(store_held)``, #453). A writer open that lands inside
+       that probe retries for a tenth of a second before it reads the probe
+       as a holder.
     3. Resolve ``state.db``'s path (the root's own ancestors may be links)
        and name every file read below from it; a link made at ``state.db``
        after the check resolves to its target, beside which SQLite keeps the
        sidecars. A sidecar holding data beside an absent or empty store is
        ``cannot_tell(orphan_sidecar)``; otherwise no store is ``fresh``.
     4. Stat the store and its sidecars, copy them (regular files only), stat
-       again and re-probe the lock. A held lock is ``live``; a changed stat,
+       again and re-probe both locks. A held workspace lock is ``live``, a
+       held store lock ``cannot_tell(store_held)``; a changed stat,
        or a link that now resolves elsewhere, retries the copy, up to
        :data:`_COPY_ATTEMPTS` in all, then ``cannot_tell(store_changed)``.
     5. Read the copy's ``user_version`` and run the writer open on the copy.
@@ -278,6 +285,8 @@ def check_store(coordinator_root: Path) -> StoreCheck:
         check_coherence_dir(coordinator_root)
         if _coordinator_holds_lock(pid_file):
             return _live(db_path, pid_file)
+        if _store_held(db_path):
+            return _held(db_path)
         uncopied = _answer_from_stat(db_path)
         if uncopied is not None:
             return uncopied
@@ -303,25 +312,52 @@ def check_store(coordinator_root: Path) -> StoreCheck:
 
 
 def _coordinator_holds_lock(pid_file: Path) -> bool:
-    """True when another open file holds the workspace flock exclusively.
+    """True when another open file holds the workspace flock on
+    ``server.pid`` exclusively: a coordinator runs."""
+    return _held_exclusively(pid_file)
 
-    Opens ``server.pid`` read-only WITHOUT ``O_CREAT`` (an absent file is a
-    free lock, and the check must not create one), without following a
-    symlink, and as a regular file only (a FIFO there would block the open).
-    flock locks belong to the open file, so the probe sees a coordinator
-    running in this very process too. Raises :class:`_CheckStopped` when the
+
+def store_is_held(coordinator_root: Path) -> bool:
+    """True when a read-write handle holds the single-writer lock of
+    ``coordinator_root``'s ``.coherence/state.db`` (#453), as the check's own
+    probe reads it. Creates nothing; a probe that fails, or no ``fcntl``,
+    reads as not held."""
+    if not _FCNTL_AVAILABLE:
+        return False
+    try:
+        return _store_held(Path(coordinator_root) / ".coherence" / "state.db")
+    except _CheckStopped:
+        return False
+
+
+def _store_held(db_path: Path) -> bool:
+    """True when a read-write registry holds the store's single-writer lock
+    (#453): a script, or a coordinator still closing after its workspace lock
+    came free. A start waits for it, then refuses the store."""
+    return _held_exclusively(writer_lock_path(db_path))
+
+
+def _held_exclusively(lock_file: Path) -> bool:
+    """True when another open file holds an exclusive flock on ``lock_file``.
+
+    Opens it read-only WITHOUT ``O_CREAT`` (an absent file is a free lock,
+    and the check must not create one), without following a symlink, and as
+    a regular file only (a FIFO there would block the open). Probes with a
+    SHARED non-blocking lock released at once, so two checks never read each
+    other as a holder. flock locks belong to the open file, so the probe sees
+    a holder in this very process too. Raises :class:`_CheckStopped` when the
     probe itself fails.
     """
     with _oserror_means(LOCK_PROBE_FAILED_REASON):
         try:
-            fd = open_regular(pid_file)
+            fd = open_regular(lock_file)
         except FileNotFoundError:
             return False
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
             except OSError as exc:
-                if exc.errno in _LOCK_CONTENDED_ERRNOS:
+                if exc.errno in LOCK_CONTENDED_ERRNOS:
                     return True
                 raise
             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -428,6 +464,9 @@ def _check_one_copy(db_path: Path, pid_file: Path) -> StoreCheck | None:
         # any change, and a start would join it.
         if _coordinator_holds_lock(pid_file):
             return _live(db_path, pid_file)
+        # So may a writer that opened the store during the copy.
+        if _store_held(db_path):
+            return _held(db_path)
         # A link retargeted during the copy changed which store a start reads.
         if _resolved(db_path) != store_file or _fence(store_file) != before:
             return None
@@ -563,6 +602,15 @@ def _live(db_path: Path, pid_file: Path) -> StoreCheck:
         f"a coordinator holds {pid_file}; a start joins it and migrates nothing "
         "while it runs. The store was not read: stop the coordinator and check "
         "again to learn what a start after it would do",
+    )
+
+
+def _held(db_path: Path) -> StoreCheck:
+    return _cannot_tell(
+        db_path, STORE_HELD_REASON,
+        "another read-write handle (a script, or a coordinator still closing) has "
+        "the store open; a start waits for it to close, then refuses the store. "
+        "Check again once it closes",
     )
 
 

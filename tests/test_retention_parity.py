@@ -299,6 +299,7 @@ class TestPeerInterleavingParity:
     interleave actually overlap" check is a ``RuntimeWarning``, never an assert.
     """
 
+    @pytest.mark.usefixtures("two_writer_store")
     def test_sqlite_two_handles_reads_reflect_peer_commit(
         self, tmp_path: Path
     ) -> None:
@@ -359,6 +360,7 @@ class TestPeerInterleavingParity:
             reader_b.close()
             writer_a.close()
 
+    @pytest.mark.usefixtures("two_writer_store")
     def test_sqlite_two_handles_peer_gc_evicts_from_readers_view(
         self, tmp_path: Path
     ) -> None:
@@ -404,6 +406,7 @@ class TestPeerInterleavingParity:
             reader_b.close()
             writer_a.close()
 
+    @pytest.mark.usefixtures("two_writer_store")
     def test_sqlite_two_handles_concurrent_interleave_barrier(
         self, tmp_path: Path
     ) -> None:
