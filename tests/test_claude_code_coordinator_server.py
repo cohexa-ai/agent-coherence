@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import statistics
 import sys
 import threading
@@ -14778,6 +14779,464 @@ def test_a_failed_edit_report_off_a_handoff_keeps_todays_bytes(
     assert client.post("/hooks/post-edit", {
         "session_id": sid, "path": "plan.md", "success": False,
     }) == (200, {"ok": True, "released": True})
+
+
+# --- an ended attempt: the stop that reports it forgets it (#525) -------------
+#
+# A CoherentVolume starts a new attempt (a composite agent id) on every
+# compare-and-swap conflict and re-mint. A stop carrying ``ended: true`` and
+# the attempt's agent_id reports that attempt over: after the stop's releases,
+# the coordinator deletes its records and drops its display name and its
+# stale-warning markers. Nothing else ends an identity: a parent Stop is a
+# session between turns, and a SubagentStop can be blocked and the subagent
+# resumed under the same id.
+
+_STOP = "/hooks/session-stop"
+
+
+@dataclasses.dataclass(frozen=True)
+class _Identity:
+    """One identity of a claimed session, posting hooks through ``client``:
+    the session itself, or with ``subagent`` one of its attempts, a composite
+    agent id."""
+
+    client: _Client
+    who: _Session
+    subagent: str | None = None
+
+    @property
+    def agent_id(self) -> uuid.UUID:
+        return session_to_agent_id(self.who.sid, self.subagent)
+
+    def post(self, route: str, fields: dict) -> tuple[int, dict]:
+        """POST ``fields`` to ``route`` as this identity, presenting its
+        session's principal."""
+        body: dict = {"session_id": self.who.sid, **fields}
+        if self.subagent is not None:
+            body["agent_id"] = self.subagent
+        return self.client.post(route, body, principal=self.who.principal)
+
+
+def _stop(identity: _Identity, extra: dict | None = None) -> tuple[int, dict]:
+    """A session-stop for ``identity``, ``extra`` added to its body."""
+    return identity.post(_STOP, extra or {})
+
+
+def _edit_as(identity: _Identity, path: str) -> None:
+    status, answer = identity.post("/hooks/pre-edit", {"path": path})
+    assert status == 200 and answer.get("ok") is True, answer
+
+
+def _outwrite(writer: _Identity, path: str) -> None:
+    """``writer`` edits ``path`` and commits it, a version past every read."""
+    _edit_as(writer, path)
+    status, answer = writer.post("/hooks/post-edit", {"path": path, "content_hash": _hash("v2"), "success": True})
+    assert status == 200 and answer.get("ok") is True, answer
+
+
+def _status_row_of(client: _Client, agent_id: uuid.UUID) -> dict | None:
+    """The operator-tier ``/status`` row for ``agent_id``, or None when the
+    payload does not list it."""
+    rows = [row for row in _operator_status(client)["sessions"] if row["agent_id"] == str(agent_id)]
+    assert len(rows) <= 1, rows
+    return rows[0] if rows else None
+
+
+def _attempt_in_every_state(coordinator, client: _Client) -> tuple[_Identity, _Identity]:
+    """An attempt holding spec.md EXCLUSIVE, task.md SHARED and plan.md
+    INVALID with a notice queued, a peer session having taken plan.md from
+    it. Returns the attempt and that peer."""
+    attempt, peer = _Identity(client, _claimed(client), "inc-1"), _Identity(client, _claimed(client))
+    _edit_as(attempt, "spec.md")
+    _read(client, attempt.who, "task.md", "inc-1")
+    _edit_as(attempt, "plan.md")
+    _edit_as(peer, "plan.md")
+    assert _status_row_of(client, attempt.agent_id)["states"] == {"spec.md": "EXCLUSIVE", "task.md": "SHARED"}
+    assert _state(coordinator, "plan.md", attempt.agent_id) == MESIState.INVALID
+    return attempt, peer
+
+
+def _mark_warned(coordinator, identity: _Identity, paths: list[str]) -> None:
+    """Mark ``identity`` stale-warned on each of ``paths``, as a stale
+    pre-read does."""
+    for path in paths:
+        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        coordinator.mark_stale_warned(identity.agent_id, artifact_id)
+
+
+def _warned_paths(coordinator, identity: _Identity) -> set[str]:
+    """The paths ``identity`` holds a stale-warning marker on."""
+    with coordinator._stale_warned_pairs_lock:
+        files = [artifact for agent, artifact in coordinator._stale_warned_pairs if agent == identity.agent_id]
+    return {coordinator.registry.get_artifact(artifact_id).name for artifact_id in files}
+
+
+def test_an_ended_stop_releases_the_attempt_then_forgets_its_records_and_name(
+    coordinator, client: _Client
+) -> None:
+    """The stop releases the attempt's write grant and answers as any stop
+    does, its notice included; then the attempt's rows in every state, its
+    heartbeat, its display name and its stale-warning markers are gone, so
+    ``/status`` no longer lists it, while a peer's grant and marker stay.
+    Prevents every ended attempt staying in the coordinator and in
+    ``/status`` for good."""
+    attempt, peer = _attempt_in_every_state(coordinator, client)
+    _mark_warned(coordinator, attempt, ["spec.md", "task.md"])
+    _mark_warned(coordinator, peer, ["spec.md"])
+
+    status, body = _stop(attempt, {"ended": True})
+
+    assert status == 200, body
+    assert (body["ok"], body["released_artifacts"]) == (True, ["spec.md"])
+    assert [notice["path"] for notice in body["notices"]] == ["plan.md"]
+    for path in ("spec.md", "plan.md", "task.md"):
+        assert _state(coordinator, path, attempt.agent_id) is None, path
+    assert coordinator.registry.last_heartbeat_tick(attempt.agent_id) is None
+    assert coordinator.agent_name_for(attempt.agent_id) is None
+    assert _status_row_of(client, attempt.agent_id) is None
+    assert (_warned_paths(coordinator, attempt), _warned_paths(coordinator, peer)) == (set(), {"spec.md"})
+    assert _state(coordinator, "plan.md", peer.agent_id) == MESIState.EXCLUSIVE
+
+
+def test_a_malformed_ended_is_refused_400_and_releases_nothing(
+    coordinator, client: _Client
+) -> None:
+    """``ended`` that is not a boolean (null included), or true on a stop
+    that names no agent_id, answers 400 in the Node backend's words. A stop
+    with no agent_id is a parent Stop, a session between turns, so it can
+    never end. Neither the attempt's nor the session's grant is released."""
+    owner = _claimed(client)
+    attempt, session = _Identity(client, owner, "inc-1"), _Identity(client, owner)
+    _edit_as(attempt, "plan.md")
+    _edit_as(session, "spec.md")
+
+    for ended in ("yes", 1, 0, None, {}, []):
+        assert _stop(attempt, {"ended": ended}) == (
+            400, {"error": "ended must be a boolean"}), ended
+    for subagent in (None, ""):
+        assert _stop(_Identity(client, owner, subagent), {"ended": True}) == (
+            400, {"error": "ended requires agent_id"}), subagent
+
+    assert _state(coordinator, "plan.md", attempt.agent_id) == MESIState.EXCLUSIVE
+    assert _state(coordinator, "spec.md", session.agent_id) == MESIState.EXCLUSIVE
+    assert coordinator.agent_name_for(attempt.agent_id) is not None
+
+
+def test_ended_is_checked_before_the_agent_id_and_the_principal(client: _Client) -> None:
+    """The order the Node backend checks in: the session_id first, then a
+    malformed ``ended``, so a body malformed in two of them gets one answer
+    from both backends; a well-formed ``ended`` leaves a malformed agent_id
+    to its own refusal. Like that refusal, it comes before the principal
+    gate."""
+    owner = _claimed(client)
+    body = {"session_id": owner.sid, "agent_id": "not an id"}
+    assert client.post(_STOP, {**body, "session_id": "not-a-uuid", "ended": "yes"}, principal=owner.principal) == (
+        400, {"error": "session_id must be a UUID (8-4-4-4-12 hex with hyphens)"})
+    assert client.post(_STOP, {**body, "ended": "yes"}, principal=owner.principal) == (
+        400, {"error": "ended must be a boolean"})
+    assert client.post(_STOP, {**body, "ended": True}, principal=owner.principal) == (
+        400, _MALFORMED_SUBAGENT_ERROR)
+    assert client.post(
+        _STOP, {"session_id": owner.sid, "agent_id": "inc-1", "ended": 1}, principal="not-its-principal",
+    ) == (400, {"error": "ended must be a boolean"})
+
+
+@pytest.mark.parametrize(
+    "extra", [{}, {"ended": False}, {"some_later_field": 1}], ids=["no-ended", "ended-false", "unknown-key"]
+)
+def test_a_stop_that_reports_no_end_keeps_the_attempts_rows(
+    extra: dict, coordinator, client: _Client
+) -> None:
+    """Without ``ended: true`` an attempt's stop answers today's bytes and
+    forgets nothing: its rows stay SHARED and ``/status`` keeps listing it.
+    A key the handler does not know is ignored, which is why a volume that
+    sends ``ended`` to a coordinator predating it gets this same answer."""
+    attempt = _Identity(client, _claimed(client), "inc-1")
+    _edit_as(attempt, "plan.md")
+    _read(client, attempt.who, "task.md", "inc-1")
+
+    assert _stop(attempt, extra) == (200, {"ok": True, "released_artifacts": ["plan.md"]})
+
+    assert _status_row_of(client, attempt.agent_id)["states"] == {"plan.md": "SHARED", "task.md": "SHARED"}
+    assert coordinator.registry.last_heartbeat_tick(attempt.agent_id) is not None
+    assert coordinator.agent_name_for(attempt.agent_id) is not None
+
+
+def test_a_parent_stop_reporting_no_end_needs_no_agent_id(coordinator, client: _Client) -> None:
+    """Only ``ended: true`` needs an agent_id. A parent Stop carrying
+    ``ended: false`` and no agent_id answers today's bytes and releases the
+    session's grant. Prevents a parent Stop that reports no end being
+    refused for the agent_id it never names."""
+    session = _Identity(client, _claimed(client))
+    _edit_as(session, "spec.md")
+
+    assert _stop(session, {"ended": False}) == (200, {"ok": True, "released_artifacts": ["spec.md"]})
+
+    assert _state(coordinator, "spec.md", session.agent_id) == MESIState.SHARED
+
+
+@pytest.mark.parametrize("subagent", [None, "worker-1"], ids=["parent-stop", "subagent-stop"])
+def test_a_stopped_identity_a_peer_then_outwrites_is_still_denied_its_edit(
+    subagent: str | None, strict_plan_coordinator, strict_plan_client: _Client
+) -> None:
+    """A parent Stop and a plain SubagentStop end nothing: the identity keeps
+    its row and its name, and after a peer commits the strict file it read,
+    its edit is denied stale, as before. A SubagentStop can be blocked and
+    the subagent resumed under the same id; a deleted row would turn this
+    deny into an admit."""
+    client = strict_plan_client
+    stopped, writer = _Identity(client, _claimed(client), subagent), _Identity(client, _claimed(client))
+    status, read = stopped.post("/hooks/pre-read", {"path": "plan.md", "content_hash": _hash("v1")})
+    assert status == 200 and read.get("status") == "fresh", read
+
+    assert _stop(stopped) == (200, {"ok": True, "released_artifacts": []})
+    assert _state(strict_plan_coordinator, "plan.md", stopped.agent_id) == MESIState.SHARED
+    assert strict_plan_coordinator.agent_name_for(stopped.agent_id) is not None
+    _outwrite(writer, "plan.md")
+
+    status, edit = stopped.post("/hooks/pre-edit", {"path": "plan.md"})
+
+    assert status == 200 and edit.get("ok") is False, edit
+    reason = edit["hookSpecificOutput"]["permissionDecisionReason"]
+    assert reason.startswith("Stale read denied: plan.md was updated by agent "), reason
+
+
+def _refuse_release(*_args: Any, **_kwargs: Any) -> bool:
+    raise CoherenceError("release refused by the test")
+
+
+def test_an_ended_stop_whose_release_fails_keeps_every_row_and_the_name(
+    coordinator, client: _Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A release that fails inside the stop leaves its grant held, so the
+    forget is refused: the answer lists that grant held, no row of the
+    attempt is deleted, its name stays in ``/status``, and the refusal is
+    logged. Prevents an ended stop dropping the records of a grant the
+    coordinator still enforces."""
+    attempt = _Identity(client, _claimed(client), "inc-1")
+    _edit_as(attempt, "plan.md")
+    _read(client, attempt.who, "task.md", "inc-1")
+
+    with pytest.MonkeyPatch.context() as patch, caplog.at_level(logging.WARNING, logger=_CSRV):
+        patch.setattr(coordinator.service, "release_to_reader", _refuse_release)
+        answer = _stop(attempt, {"ended": True})
+
+    assert answer == (200, {"ok": False, "released_artifacts": [], "grants": [
+        {"path": "plan.md", "held": True, "reason": "release refused by the test"},
+    ]})
+    assert _state(coordinator, "plan.md", attempt.agent_id) == MESIState.EXCLUSIVE
+    assert _state(coordinator, "task.md", attempt.agent_id) == MESIState.SHARED
+    assert coordinator.registry.last_heartbeat_tick(attempt.agent_id) is not None
+    row = _status_row_of(client, attempt.agent_id)
+    assert row is not None and row["agent_name"] is not None
+    assert row["states"] == {"plan.md": "EXCLUSIVE", "task.md": "SHARED"}
+    assert "forget_not_allowed" in caplog.text
+
+
+@pytest.mark.parametrize("presented", ["absent", "foreign"])
+def test_an_ended_stop_refused_for_its_principal_forgets_nothing(
+    presented: str, coordinator, client: _Client
+) -> None:
+    """An ended stop naming a claimed session's attempt, with no principal or
+    with another session's, is refused HTTP 400 at the caller-principal gate,
+    and the gate comes before the forget: the attempt's row, heartbeat,
+    display name and stale-warning marker all stay. The attempt holds no
+    write grant, so only the gate stands between the stop and the forget.
+    Control: the same stop with the session's own principal forgets them.
+
+    Prevents a caller that cannot present a session's principal forgetting
+    that session's attempts."""
+    attempt = _Identity(client, _claimed(client), "inc-1")
+    _read(client, attempt.who, "task.md", "inc-1")
+    _mark_warned(coordinator, attempt, ["task.md"])
+    principal, refusal = {
+        "absent": (None, _PRINCIPAL_ABSENT_REFUSAL),
+        "foreign": (_claimed(client).principal, _PRINCIPAL_FOREIGN_REFUSAL),
+    }[presented]
+    body = {"session_id": attempt.who.sid, "agent_id": attempt.subagent, "ended": True}
+
+    assert client.post(_STOP, body, principal=principal) == (400, refusal)
+
+    assert _state(coordinator, "task.md", attempt.agent_id) == MESIState.SHARED
+    assert coordinator.registry.last_heartbeat_tick(attempt.agent_id) is not None
+    assert coordinator.agent_name_for(attempt.agent_id) is not None
+    assert _warned_paths(coordinator, attempt) == {"task.md"}
+    assert _stop(attempt, {"ended": True}) == (200, {"ok": True, "released_artifacts": []})
+    assert (_state(coordinator, "task.md", attempt.agent_id), _warned_paths(coordinator, attempt)) == (None, set()), (
+        "control: the same stop, admitted, forgets the attempt")
+
+
+@pytest.mark.parametrize(("fault", "message"), [
+    pytest.param(sqlite3.OperationalError, "database is locked", id="store-fault"),
+    pytest.param(ValueError, "a backend's own error", id="value-error-not-the-refusal"),
+])
+def test_an_ended_stop_whose_forget_fails_answers_the_failure_envelope(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, fault: type[Exception], message: str
+) -> None:
+    """Only the forget's refusal, a ``ForgetRefused``, is logged and passed
+    over. Any other fault in the forget, a store fault or a ``ValueError``
+    that is not the refusal, fails the stop as one anywhere in its body does,
+    HTTP 200 with the internal-error envelope, never a clean answer, and the
+    attempt keeps its name. Prevents an ended stop answering a forget that
+    never happened as done."""
+    attempt = _Identity(client, _claimed(client), "inc-1")
+    _edit_as(attempt, "plan.md")
+
+    def failing(*_args: Any, **_kwargs: Any) -> int:
+        raise fault(message)
+
+    monkeypatch.setattr(coordinator.service, "forget_agent", failing)
+
+    envelope = {**_INTERNAL_ERROR_ENVELOPE, "reason": f"internal: {fault.__name__}"}
+    assert _stop(attempt, {"ended": True}) == (200, envelope)
+    assert coordinator.agent_name_for(attempt.agent_id) is not None
+
+
+def _late_counts(coordinator) -> tuple[int, int]:
+    """The watchdog's late-abort and late-completion counts."""
+    return coordinator._watchdog_late_aborts_total, coordinator._watchdog_late_completion_total
+
+
+def _assert_the_late_forget_aborted(coordinator, attempt: _Identity, before: tuple[int, int]) -> None:
+    """Once the abandoned stop body settles, it aborted at the forget, which
+    was all it had left to do: the attempt keeps its task.md read and its
+    name. ``before`` is :func:`_late_counts` from before the stop."""
+    aborts_before, completions_before = before
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+    assert _late_counts(coordinator) == (aborts_before + 1, completions_before)
+    assert _state(coordinator, "task.md", attempt.agent_id) == MESIState.SHARED
+    assert coordinator.agent_name_for(attempt.agent_id) is not None
+
+
+def test_an_ended_stop_the_watchdog_already_answered_forgets_nothing(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the registry lock held past the watchdog deadline, an ended stop
+    answers the degraded body, and once the lock frees its abandoned body
+    aborts at the forget. The attempt holds no write grant and no peer has
+    written, so the forget is the only change left for the body to make: the
+    attempt keeps its row and its name. The real watchdog is driven."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    attempt = _Identity(client, _claimed(client), "inc-1")
+    _read(client, attempt.who, "task.md", "inc-1")
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    before = _late_counts(coordinator)
+
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _stop(attempt, {"ended": True})
+        held.release()
+
+    assert answer == (200, {"ok": True, "degraded": True})
+    _assert_the_late_forget_aborted(coordinator, attempt, before)
+
+
+class _HeldAfterTheDrain:
+    """Hold the registry lock from a helper thread from the moment the stop
+    has drained its notices until the block exits. The stop calls its forget
+    right after the drain, before the watchdog deadline and with no abort
+    set, and the forget waits for the lock past that deadline."""
+
+    def __init__(self, coordinator: CoordinatorHTTPServer) -> None:
+        self._lock = coordinator.registry._lock
+        self._drained, self._held, self._done = threading.Event(), threading.Event(), threading.Event()
+        self._thread = threading.Thread(target=self._hold, daemon=True)
+
+    def _hold(self) -> None:
+        self._drained.wait(timeout=30.0)
+        with self._lock:
+            self._held.set()
+            self._done.wait(timeout=30.0)
+
+    def after(self, drain: Callable[..., list]) -> Callable[..., list]:
+        """``drain``, returning only once the helper holds the lock."""
+        def drained_then_held(*args: Any, **kwargs: Any) -> list:
+            notices = drain(*args, **kwargs)
+            self._drained.set()
+            if not self._held.wait(timeout=5.0):
+                pytest.fail("the helper thread never took the registry lock after the drain")
+            return notices
+        return drained_then_held
+
+    def __enter__(self) -> "_HeldAfterTheDrain":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._drained.set()
+        self._done.set()
+        self._thread.join(timeout=5.0)
+
+
+def test_an_ended_stop_whose_forget_waits_out_the_deadline_forgets_nothing(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The registry lock is taken only once the stop has drained its notices,
+    so its forget starts before the watchdog deadline, with no abort set, and
+    waits for the lock past it. The forget checks the abort once it holds the
+    lock, so the abandoned body aborts there: the attempt keeps its row and
+    its name. Prevents a forget that checks the abort only before it waits."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    attempt = _Identity(client, _claimed(client), "inc-1")
+    _read(client, attempt.who, "task.md", "inc-1")
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    before = _late_counts(coordinator)
+
+    with _HeldAfterTheDrain(coordinator) as hold:
+        monkeypatch.setattr(mod, "_pop_notices_for_answer", hold.after(mod._pop_notices_for_answer))
+        answer = _stop(attempt, {"ended": True})
+
+    assert answer == (200, {"ok": True, "degraded": True})
+    _assert_the_late_forget_aborted(coordinator, attempt, before)
+
+
+def test_an_ended_attempts_id_no_longer_resolves_as_a_handoff_successor(
+    coordinator, client: _Client
+) -> None:
+    """While the attempt's name is held, a transfer naming its composite id
+    hands the path to its session; once the attempt has ended, the same id is
+    refused as unknown and the giver's read is left alone."""
+    giver, successor = _claimed(client), _claimed(client)
+    _read(client, successor, "task.md", "inc-b")
+    _read(client, giver, "plan.md", "inc-a")
+    _read(client, giver, "spec.md", "inc-a")
+    named = str(successor.composite("inc-b"))
+    assert _transfer(client, giver, named, [{"path": "plan.md", "agent_id": "inc-a"}]) == (
+        200, {"ok": True, "grants": [_handed(giver, successor, "plan.md")]})
+
+    assert _stop(_Identity(client, successor, "inc-b"), {"ended": True}) == (
+        200, {"ok": True, "released_artifacts": []})
+
+    assert _transfer(client, giver, named, [{"path": "spec.md", "agent_id": "inc-a"}]) == (
+        200, {"ok": False, "grants": [
+            {"path": "spec.md", "transferred": False, "reason": "handoff_successor_unknown"},
+        ]})
+    assert _state(coordinator, "spec.md", giver.composite("inc-a")) == MESIState.SHARED
+    assert _record(coordinator, "spec.md") is None
+
+
+def test_an_ended_attempts_sweep_reclaim_stays_listed_without_a_name(
+    coordinator, client: _Client
+) -> None:
+    """A row that records a sweep reclaim outlives the forget, left INVALID,
+    so the operator tier still reports the reclaim for its window, on a row
+    with no name, as after a restart. Every other trace of the attempt goes."""
+    attempt = _Identity(client, _claimed(client), "inc-1")
+    _edit_as(attempt, "plan.md")
+    assert _sweep(coordinator, int(time.time()) + 999_999) == 1
+
+    status, body = _stop(attempt, {"ended": True})
+
+    assert status == 200 and (body["ok"], body["released_artifacts"]) == (True, []), body
+    assert _state(coordinator, "plan.md", attempt.agent_id) == MESIState.INVALID
+    assert coordinator.agent_name_for(attempt.agent_id) is None
+    row = _status_row_of(client, attempt.agent_id)
+    assert row is not None, "the reclaim was dropped with the attempt"
+    assert (row["agent_name"], row["states"], row["grants"]) == (None, {}, {})
+    assert list(row["reclaimed"]) == ["plan.md"]
+    assert row["last_heartbeat_unix_ts"] is None
 
 
 # --- the handoff key on the four existing bodies -----------------------------

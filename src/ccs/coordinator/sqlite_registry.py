@@ -154,6 +154,7 @@ from .registry_protocol import (
     UncoverableRun,
     acquire_by_deadline,
     decide_transfer_grant,
+    forget_refusal,
     note_guard_won,
     refusal_with_generation_pair,
     require_storable_transfer_status,
@@ -4724,6 +4725,46 @@ class SqliteArtifactRegistry:
                 (artifact_id.hex, MESIState.INVALID.name),
             ).fetchall()
         return [UUID(hex=r[0]) for r in rows]
+
+    def forget_agent(self, agent_id: UUID) -> int:
+        """Forget an identity that has ended; see
+        :meth:`RegistryBase.forget_agent`. One ``BEGIN IMMEDIATE``: the
+        write-grant check and every delete commit together, and a refusal
+        rolls back having deleted nothing. The ``agent_id`` index serves the
+        deletes; no schema change."""
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                removed = self._forget_agent_in_txn(agent_id)
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        return removed
+
+    def _forget_agent_in_txn(self, agent_id: UUID) -> int:
+        """The forget's statements, inside the caller's open transaction."""
+        held = self._conn.execute(
+            "SELECT artifact_id FROM agent_states "
+            "WHERE agent_id = ? AND state IN (?, ?) LIMIT 1",
+            (agent_id.hex, MESIState.EXCLUSIVE.name, MESIState.MODIFIED.name),
+        ).fetchone()
+        if held is not None:
+            raise forget_refusal(agent_id, UUID(hex=held[0]))
+        removed = self._conn.execute(
+            "DELETE FROM agent_states WHERE agent_id = ? AND last_reclaim_trigger IS NULL",
+            (agent_id.hex,),
+        ).rowcount
+        # The rows left record a reclaim. One the identity read again is
+        # SHARED; an ended identity reads nothing, so it stays as the record only.
+        self._conn.execute(
+            "UPDATE agent_states SET state = ? WHERE agent_id = ? AND state != ?",
+            (MESIState.INVALID.name, agent_id.hex, MESIState.INVALID.name),
+        )
+        self._conn.execute("DELETE FROM heartbeats WHERE agent_id = ?", (agent_id.hex,))
+        self._conn.execute("DELETE FROM pending_notices WHERE agent_id = ?", (agent_id.hex,))
+        return removed
 
     # ------------------------------------------------------------------
     # Plugin-only extensions (KTD-9 + KTD-11)

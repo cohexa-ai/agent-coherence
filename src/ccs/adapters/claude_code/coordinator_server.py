@@ -146,6 +146,7 @@ from ccs.core.exceptions import (
     CheckpointUnknown,
     CoherenceError,
     CommitNotAllowed,
+    ForgetRefused,
     GiverFenced,
     OccCallerTransientError,
     OtherHolder,
@@ -582,8 +583,8 @@ _CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
         "under the named identity")),
     ("POST", "/hooks/session-stop"): RoutePrincipalPosture(_REQUIRE, (
         "releases every EXCLUSIVE/MODIFIED grant the named identity holds and "
-        "drains its notices: a caller without a claimed peer's principal could "
-        "end the peer's work")),
+        "drains its notices, and with ended: true forgets its records: a caller "
+        "without a claimed peer's principal could end the peer's work")),
     ("POST", "/hooks/session-start"): RoutePrincipalPosture(_ACCEPT, (
         "re-grounding of the named session; names peers only by agent id (R7). "
         "It shows the named identity's pending notices without draining them "
@@ -1327,11 +1328,11 @@ class CoordinatorHTTPServer:
 
         # KTD-J re-read detection: a stale warning marks an (agent, artifact)
         # pair as "warned"; the next pre-read on that pair consumes the
-        # marker and bumps :attr:`_stale_warning_reread_total`. The set
-        # cannot grow without bound — any subsequent pre-read clears the
-        # entry, and a worst-case scenario of one entry per active
-        # (agent, artifact) pair is the same upper bound as the registry's
-        # own state map.
+        # marker and bumps :attr:`_stale_warning_reread_total`. Only that
+        # agent's own pre-read clears an entry, so an agent that reads no
+        # more keeps its entries, at most one per file it was warned on; a
+        # stop that reports the agent ended (#525) drops them all with its
+        # records (:meth:`forget_stale_warnings`).
         self._stale_warned_pairs: set[tuple[UUID, UUID]] = set()
         self._stale_warned_pairs_lock = threading.Lock()
 
@@ -1625,6 +1626,15 @@ class CoordinatorHTTPServer:
         if session_to_agent_id(session_id, subagent_id or None) != agent_id:
             return None
         return caller_principal_identity(session_id)
+
+    def forget_name(self, agent_id: UUID) -> None:
+        """Drop the display name of an identity that has ended (#525).
+        ``/status`` lists every named agent, and :meth:`session_identity_for`
+        resolves a composite only while its name is held, so after this the
+        identity is neither listed nor accepted as a handoff successor. A
+        later hook call from the same id would register it afresh."""
+        with self._agent_names_lock:
+            self._agent_names.pop(agent_id, None)
 
     def agent_names_snapshot(self) -> list[tuple[UUID, str]]:
         """R10 (Unit 6): return a stable list snapshot of (agent_id, name)
@@ -1965,6 +1975,15 @@ class CoordinatorHTTPServer:
                 self._stale_warned_pairs.remove(pair)
                 return True
             return False
+
+    def forget_stale_warnings(self, agent_id: UUID) -> None:
+        """Drop every stale-warning marker of an identity that has ended
+        (#525). Only the identity's own next pre-read on a file consumes its
+        marker there, and an ended identity sends none, so without this its
+        markers would stay for the life of the process."""
+        with self._stale_warned_pairs_lock:
+            ended = [pair for pair in self._stale_warned_pairs if pair[0] == agent_id]
+            self._stale_warned_pairs.difference_update(ended)
 
     def mark_compact_pending(self, session_id: str) -> None:
         """SB-10 (KTD5): flag the session for deferred re-grounding delivery.
@@ -4053,6 +4072,38 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
     )
 
 
+def _ended_error(body: dict) -> str | None:
+    """The HTTP 400 ``error`` for a session-stop's malformed ``ended``, or
+    ``None`` when it is absent or usable, in the Node backend's words. A JSON
+    null is present, not absent. ``ended: true`` needs an ``agent_id``: a stop
+    without one is a parent Stop, a session between turns, never an end."""
+    if "ended" not in body:
+        return None
+    if not isinstance(body["ended"], bool):
+        return "ended must be a boolean"
+    if body["ended"] and not has_subagent_id_field(body):
+        return "ended requires agent_id"
+    return None
+
+
+def _forget_ended_agent(
+    coordinator: CoordinatorHTTPServer, agent_id: UUID, abort: threading.Event
+) -> None:
+    """Forget an identity its client reported ended (#525): its rows, its
+    heartbeat and its notices, then its display name and its stale-warning
+    markers. A grant still held after the stop's releases refuses the forget:
+    the refusal is logged, every record stays, and the stop answers as it
+    would have. Runs under the request's watchdog abort, so a stop the
+    watchdog already answered forgets nothing."""
+    try:
+        coordinator.service.forget_agent(agent_id, abort=abort)
+    except ForgetRefused as exc:
+        logger.warning("session-stop kept the records of an ended agent: %s", exc)
+        return
+    coordinator.forget_name(agent_id)
+    coordinator.forget_stale_warnings(agent_id)
+
+
 def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /hooks/session-stop — release uncommitted EXCLUSIVE grants (KTD-11)."""
     body = req._read_json()
@@ -4063,6 +4114,17 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     if sid_err:
         req._json(400, {"error": sid_err[1]})
         return
+    # ``ended: true`` with an agent_id reports a CoherentVolume attempt the
+    # volume no longer uses (#525): after the releases below, the identity is
+    # forgotten (:func:`_forget_ended_agent`); absent or false, the stop
+    # answers as before. Checked before the agent_id and principal checks, the
+    # Node backend's order, so a body malformed in both gets one answer from
+    # either backend; a stop without the key passes untouched.
+    ended_err = _ended_error(body)
+    if ended_err:
+        req._json(400, {"error": ended_err})
+        return
+    ended = body.get("ended") is True
 
     subagent_id = read_subagent_id(body)
     # P1 subagent-stop safety: session-stop RELEASES grants, so a malformed
@@ -4158,6 +4220,12 @@ def _handle_session_stop(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
                 "preempted_at_unix_ts": ts,
                 "preempted_at_iso": _iso_utc(ts),
             })
+
+        # After the releases and the drain, so the answer is the one a stop
+        # without the flag gets. A release refused above left its grant held,
+        # so the forget refuses.
+        if ended:
+            _forget_ended_agent(coordinator, agent_id, abort)
 
         # A clean release keeps today's bytes, which the Node backend mirrors
         # (corpus warn_mode/18); only a stop that left a grant held answers
@@ -8584,7 +8652,7 @@ def _build_session_start_context(
     with _abort_guard_without_mark(coordinator.registry, abort):
         # Scoped to THIS session's agents (SB-10 review): the walk below can
         # only render rows belonging to `agents`, this runs on a hook path
-        # twice per compaction, and nothing garbage-collects `agent_states` —
+        # twice per compaction, and `agent_states` drops only an ended identity's rows —
         # so an unscoped read would pull the workspace's whole history through
         # the registry lock only to discard it. The artifact half stays
         # workspace-wide: R8's breadcrumb asks about the WORKSPACE.
@@ -8608,9 +8676,11 @@ def _build_session_start_context(
                 state = state_by_artifact.get(artifact_id, {}).get(agent_id)
                 if state is None:
                     # A pending notice implies the victim held a grant, so its
-                    # state row exists (rows are never deleted; preemption
-                    # transitions them to INVALID) -- stateless pairs cannot
-                    # carry a notice and are skipped before any per-pair SQL.
+                    # state row exists: preemption transitions the row to
+                    # INVALID, and the only delete, forgetting an identity
+                    # that ended, deletes its notices in the same hold.
+                    # Stateless pairs cannot carry a notice and are skipped
+                    # before any per-pair SQL.
                     continue
                 pending = coordinator.registry.peek_preemption_notice(
                     agent_id, artifact_id

@@ -136,6 +136,10 @@ def test_session_fail_closed_on_foreign_and_reaped(factory: RegistryFactory) -> 
     kit.assert_session_fail_closed_on_foreign_and_reaped(factory)
 
 
+def test_forget_agent_forgets_only_an_ended_identity(factory: RegistryFactory) -> None:
+    kit.assert_forget_agent_forgets_only_an_ended_identity(factory)
+
+
 # ---------------------------------------------------------------------------
 # R18 — declared liveness source matches the Unit-4 contract + observed behavior.
 # ---------------------------------------------------------------------------

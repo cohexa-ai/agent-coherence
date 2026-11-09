@@ -453,7 +453,10 @@ def test_a_write_another_agent_holds_is_refused_naming_the_holder(
 
     wire.sent.clear()
     refused.reacquire(_PATH)
-    assert _SESSION_STOP not in wire.routes(), "nothing to release: no grant was taken"
+    # The re-mint ends the refused attempt (#525), and releases nothing.
+    assert wire.bodies(_SESSION_STOP) == [
+        {"session_id": refused.session_id, "agent_id": incarnation, "ended": True},
+    ], "nothing to release: no grant was taken"
     assert write_holders(server, _PATH) == {holder_id}
 
 
@@ -1132,8 +1135,12 @@ def test_an_admit_over_a_holder_releases_and_raises(
     assert write_holders(server, _PATH) == set()
     wire.answers.pop(_PRE_EDIT)
     wire.sent.clear()
+    attempt = writer.incarnation
     writer.reacquire(_PATH)
-    assert _SESSION_STOP not in wire.routes()
+    # The re-mint ends the attempt (#525), and releases nothing.
+    assert wire.bodies(_SESSION_STOP) == [
+        {"session_id": writer.session_id, "agent_id": attempt, "ended": True},
+    ]
 
 
 def test_an_unanswered_release_after_a_displacing_admit_keeps_the_record(

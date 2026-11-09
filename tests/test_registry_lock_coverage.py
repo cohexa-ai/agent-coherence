@@ -273,7 +273,7 @@ INMEM_SURFACE = frozenset({
     "artifacts_with_detection_edge", "clear_detection_edges",
     "close_detection_run", "create_checkpoint", "detection_runs",
     "detection_uncoverable", "evict_transfer_records", "foreign_write_totals",
-    "get_agent_state", "get_agent_transient", "get_artifact",
+    "forget_agent", "get_agent_state", "get_agent_transient", "get_artifact",
     "get_artifact_and_generation", "get_caller_principal", "get_checkpoint",
     "get_checkpoint_members",
     "get_content", "get_content_at_version", "get_last_reclamation",
