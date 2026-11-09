@@ -228,6 +228,40 @@ What follows from that:
   issued for. That stops one snapshot session committing through another's
   token; it does not verify the `session_id` named at `/session/begin`.
 
+**A process on the coordinator's port.** A client finds the coordinator
+through the port in `.coherence/server.pid` and sends the secret with every
+request, and the coordinator proves nothing back. Once a coordinator exits, its
+port is free and any local process can bind it. So before each request this
+package's local clients (the hook client, `CoherentVolume`, the MCP server, a
+substrate session and the console scripts) check that the pid file still names
+the coordinator they resolved, and that this coordinator still holds the
+workspace lock, the `flock` a start takes on `server.pid`. A Node coordinator
+that runs without the lock is judged by its pid instead, also once it has
+removed `server.pid` at its stop. Where the check can see, a dead coordinator's
+port receives nothing, and a coordinator started later on the same port is
+treated as one on a new port. A pid file that is gone or cannot be read does
+not stop a request (for a Node coordinator, only while its pid still runs), so
+an attached client keeps working; a pid file that has become a link, or
+anything but a pid file, stops it.
+
+The check is not proof of the secret, and it cannot see everything:
+
+- A coordinator that dies between the check and the send can still lose that
+  one request to a new listener.
+- A start that has taken the workspace lock but not yet emptied a dead
+  coordinator's lines makes those lines read as running, so a request in that
+  moment can go to the dead coordinator's port.
+- A coordinator restarted in the same process that gets the same port back
+  reads as the one the client resolved.
+- Where the lock cannot be probed (no `fcntl`, or a file system whose `flock`
+  fails), the request goes.
+- A Node coordinator's pid, once any other process carries it, reads as that
+  coordinator.
+
+A remote coordinator over verified TLS does not have this gap, because a
+listener without the certificate never receives the request. A plaintext remote
+link does, and this check does not apply to it.
+
 What the coordinator does not publish: `/status` shows session names — which
 embed the raw session id — and the policy's pattern lists (the tracked, user-added,
 ignored and strict globs, which are the operator's directory layout) only in the
@@ -304,9 +338,9 @@ committed link cannot make a start:
 The check only looks: it opens no file and follows no link. A directory
 mounted at `.coherence` is a real directory, and is not refused. The commands
 and hooks that only talk to a running coordinator refuse a `.coherence` that
-is a link before they read `hook.secret` or connect, and read `hook.secret`
-without following a link, so they never send the bytes of a file a link names
-as the secret.
+is a link before they read `hook.secret` or connect, and read `hook.secret` and
+`server.pid` without following a link, so they never send the bytes of a file a
+link names as the secret, nor send it to the port a linked `server.pid` names.
 
 What it does not cover:
 
@@ -318,8 +352,6 @@ What it does not cover:
   link.
 - A link at the workspace root or above it, or inside a subdirectory of
   `.coherence`.
-- A command or hook that only reads `.coherence/server.pid` to find a running
-  coordinator, without starting one, still follows a link there.
 
 ## Env-var kill switches
 

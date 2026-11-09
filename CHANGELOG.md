@@ -221,6 +221,58 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **A local client sends nothing to a coordinator that has exited (#503).** A
+  client finds the coordinator through the port in `.coherence/server.pid` and
+  sends the workspace secret with every request. A coordinator that exited
+  without a stop left that file behind, so a process that later bound its port
+  received the secret with the next request and its answers were believed, and
+  a coordinator started later on the same port, possibly an older build that
+  displaces a refuse-mode holder, was taken for the one the client had
+  attached to. Now, before each request, the hook client, `CoherentVolume`, the
+  MCP server, a substrate session and the console scripts check that
+  `server.pid` still names the coordinator they resolved and that it still
+  holds the workspace lock, the `flock` every Python coordinator holds on that
+  file; a Node coordinator running without the lock is checked by its pid,
+  also after it removes `server.pid` at its stop. If not, nothing is sent and
+  the request fails as for an unreachable coordinator: `CoordinatorDeparted`,
+  a `CoordinatorUnavailable` with `never_sent` true, which a strict volume
+  raises as `CoordinatorUnreachable` (`CommitUnconfirmed` from a handoff verb)
+  and a degrade volume counts as a degradation; a substrate session raises
+  `CoordinatorUnreachable`, or `CommitUnconfirmed` once its substrate write has
+  landed. A strict volume's `close()` then logs the grants it could not give
+  back and returns, as when nothing listens on the port; a coordinator started
+  since keeps them until its sweep. A pid file that is gone or cannot be read does
+  not stop a request (for a Node coordinator, only while its pid runs); one
+  that has become a link or anything but a pid file does. Clients also read `server.pid`
+  without following a link. The same check means `connect_or_spawn`, a volume,
+  a substrate session and `agent-coherence-coordinator` (also while it waits
+  for the worker it started) start a coordinator instead of taking a process
+  on a dead coordinator's port for a running one, and a start that loses the
+  workspace lock no longer joins the port of a binder whose pid no longer runs
+  (#428).
+
+  Compatibility: a `CoherentVolume` or substrate session attached to a
+  coordinator that restarts, even on the same port and secret, is refused from
+  then on and must be built again. `lifecycle.read_port_from_file` and
+  `coordinator_backend` answer `None` for a `server.pid` that is a link or over
+  4096 bytes. A `server.pid` written by hand for a coordinator that does not
+  hold its lock and has no `backend=node` line no longer counts as a running
+  coordinator, so clients refuse it and a start runs its own beside it. A Node
+  coordinator running without the lock in another PID namespace reads as
+  exited the same way, and a start that loses the lock to a coordinator in
+  another PID namespace sharing the workspace no longer joins it through the
+  pid file.
+
+  What remains, stated in `docs/security.md`: a coordinator that dies between
+  the check and the send can still lose that one request to a new listener, a
+  start that holds the lock before it empties a dead coordinator's lines makes
+  them read as running for that moment, a coordinator restarted in the same
+  process on the same port reads as the one resolved, a Node coordinator's pid
+  carried by another process reads as that coordinator, a host where the lock
+  cannot be probed sends, and a remote coordinator has no such check. New helpers:
+  `lifecycle.running_coordinator_port` and the
+  `ccs.adapters.claude_code.coordinator_pin` module.
+
 - **A store has one read-write `SqliteArtifactRegistry` at a time (#453).** A
   second read-write open of the same SQLite store, in this process or another,
   now raises `StoreHeldError`, a `RuntimeError` in
