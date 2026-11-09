@@ -146,6 +146,7 @@ from ccs.core.exceptions import (
     CheckpointUnknown,
     CoherenceError,
     CommitNotAllowed,
+    ForgetRefused,
     GiverFenced,
     OccCallerTransientError,
     OtherHolder,
@@ -4096,7 +4097,7 @@ def _forget_ended_agent(
     watchdog already answered forgets nothing."""
     try:
         coordinator.service.forget_agent(agent_id, abort=abort)
-    except ValueError as exc:
+    except ForgetRefused as exc:
         logger.warning("session-stop kept the records of an ended agent: %s", exc)
         return
     coordinator.forget_name(agent_id)

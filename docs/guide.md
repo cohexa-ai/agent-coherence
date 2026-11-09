@@ -1696,11 +1696,14 @@ Each attempt a volume starts is its own agent to the coordinator, and each one
 that sends a request leaves records there: its state on every file it read or
 wrote, its heartbeat, its queued notices, and a row in `/status`
 `sessions[]`. The volume ends each attempt once it no longer uses it, and the
-coordinator then forgets that attempt: its records leave the store and
+coordinator then forgets that attempt: those records leave the store and
 `/status`, and the volume sends nothing under it again. Before, they stayed
 for good. Two volumes forcing 50 `write_cas` conflicts on one file left 101
-agents in the store and in `/status`; now they leave 4 while both volumes are
-open and none after both close.
+agents in the store and in `/status`; now they leave those records for 4
+while both volumes are open and for none after both close. The
+[conflict-outcome counters](#conflict-outcome-counters--how-often-did-it-actually-fire)
+are not forgotten: this package's coordinator keeps a count in its `state.db`
+for each attempt that was refused a commit (#539).
 
 When the volume ends an attempt:
 

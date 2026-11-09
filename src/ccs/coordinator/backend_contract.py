@@ -428,15 +428,16 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "Deletes the records of an identity that has ended (#525) -- its "
         "agent-state rows, heartbeat and queued notices -- in one serialized "
         "step (sqlite: one BEGIN IMMEDIATE; in-memory: one _lock hold), and "
-        "refuses, deleting nothing, while the identity holds an EXCLUSIVE or "
-        "MODIFIED row. A row that records a sweep reclaim stays, left "
-        "INVALID. Not part of the boundary: it never removes a write grant, "
-        "the only row other_holder arbitrates on, and the fence row it "
-        "removes belongs to an identity that sends nothing more. That is "
-        "also its obligation on the caller: a deleted row admits on absent, "
-        "so only an identity that provably ended may be forgotten. A caller "
-        "under a watchdog runs it inside abort_guard(abort), so a forget "
-        "that arrives late deletes nothing.",
+        "refuses with ForgetRefused (a ValueError), deleting nothing, while "
+        "the identity holds an EXCLUSIVE or MODIFIED row; the coordinator "
+        "treats any other error from it as a fault. A row that records a "
+        "sweep reclaim stays, left INVALID. Not part of the boundary: it "
+        "never removes a write grant, the only row other_holder arbitrates "
+        "on, and the fence row it removes belongs to an identity that sends "
+        "nothing more. That is also its obligation on the caller: a deleted "
+        "row admits on absent, so only an identity that provably ended may "
+        "be forgotten. A caller under a watchdog runs it inside "
+        "abort_guard(abort), so a forget that arrives late deletes nothing.",
     ),
     # ---- READ_ONLY (base) --------------------------------------------------
     MemberContract(

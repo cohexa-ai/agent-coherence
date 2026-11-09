@@ -57,9 +57,10 @@ its actor, and the race MUST FAIL it as starved, not as a snapshot violation.
 The forget stub (:class:`_ForgetDroppingRegistry`) gives the forget scenario
 its teeth, once per obligation: it forgets past a held write grant, deletes
 the row that records a reclaim, leaves that row as a reader, deletes before
-it refuses, keeps the heartbeat, miscounts the rows it removed, deletes a
-peer's row, or refuses on a peer's write grant. The scenario MUST FAIL each,
-naming the obligation dropped.
+it refuses, refuses with a plain ``ValueError``, keeps the heartbeat, keeps a
+transient state, miscounts the rows it removed, deletes a peer's row, or
+refuses on a peer's write grant. The scenario MUST FAIL each, naming the
+obligation dropped.
 """
 
 from __future__ import annotations
@@ -74,7 +75,7 @@ import pytest
 
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.registry_protocol import CLAIM_CAPTURE_TRIGGERS, CasResult, forget_refusal
-from ccs.core.exceptions import STALE_READ_GENERATION_REASON, StaleReadGeneration
+from ccs.core.exceptions import STALE_READ_GENERATION_REASON, ForgetRefused, StaleReadGeneration
 from ccs.core.states import MESIState
 from ccs.core.types import CasCorruption, ConflictDetail, MultiCommitConflict
 from tests.backend_conformance import kit
@@ -786,6 +787,28 @@ def _forget_after_a_partial_delete(inner: ArtifactRegistry, agent_id: UUID) -> i
         raise
 
 
+def _forget_refusing_untyped(inner: ArtifactRegistry, agent_id: UUID) -> int:
+    """Refuses a writer in the same words, but as a plain ``ValueError``."""
+    try:
+        return inner.forget_agent(agent_id)
+    except ForgetRefused as exc:
+        raise ValueError(str(exc)) from None
+
+
+def _forget_keeping_the_transient(inner: ArtifactRegistry, agent_id: UUID) -> int:
+    """Forgets correctly, then puts back each transient state and its tick."""
+    kept = [
+        (record, record.transient_by_agent[agent_id], record.transient_tick_by_agent[agent_id])
+        for record in inner._records.values()  # noqa: SLF001 - test stub reaches in
+        if agent_id in record.transient_by_agent
+    ]
+    removed = inner.forget_agent(agent_id)
+    for record, transient, tick in kept:
+        record.transient_by_agent[agent_id] = transient
+        record.transient_tick_by_agent[agent_id] = tick
+    return removed
+
+
 def _forget_keeping_the_heartbeat(inner: ArtifactRegistry, agent_id: UUID) -> int:
     """Forgets correctly, then puts the heartbeat back."""
     heartbeats = inner._heartbeat_by_agent  # noqa: SLF001 - test stub reaches in
@@ -831,7 +854,9 @@ _FORGET_VARIANTS = {
     "no_reclaim_row": _forget_dropping_reclaim_rows,
     "reader_kept": _forget_keeping_a_reader,
     "partial_refusal": _forget_after_a_partial_delete,
+    "untyped_refusal": _forget_refusing_untyped,
     "heartbeat_kept": _forget_keeping_the_heartbeat,
+    "transient_kept": _forget_keeping_the_transient,
     "miscounted": _forget_counting_kept_rows,
     "peer_touched": _forget_by_file,
     "peer_refused": _forget_refusing_beside_a_writer,
@@ -861,7 +886,9 @@ class _ForgetDroppingRegistry:
         ("no_reclaim_row", kit.FORGET_DROPPED_RECLAIM_ROW),
         ("reader_kept", kit.FORGET_KEPT_A_READER),
         ("partial_refusal", kit.FORGET_CHANGED_WHILE_REFUSING),
+        ("untyped_refusal", kit.FORGET_REFUSED_UNTYPED),
         ("heartbeat_kept", kit.FORGET_KEPT_THE_HEARTBEAT),
+        ("transient_kept", kit.FORGET_KEPT_THE_TRANSIENT),
         ("miscounted", kit.FORGET_MISCOUNTED),
         ("peer_touched", kit.FORGET_TOUCHED_A_PEER),
         ("peer_refused", kit.FORGET_REFUSED_FOR_A_PEER),
@@ -872,8 +899,9 @@ def test_forget_dropping_stub_fails_the_forget_scenario(dropped: str, named: str
     forget's obligations MUST FAIL the kit, and the failure names the one it
     dropped: forgetting past a held write grant, deleting the row that records
     a reclaim, leaving that row as a reader, deleting before a refusal,
-    keeping the heartbeat, miscounting, touching a peer's row, or refusing on
-    a peer's write grant."""
+    refusing with a plain ``ValueError``, keeping the heartbeat, keeping a
+    transient state, miscounting, touching a peer's row, or refusing on a
+    peer's write grant."""
     factory: RegistryFactory = _OneStoreFactory(partial(_ForgetDroppingRegistry, dropped))  # type: ignore[arg-type]
     with pytest.raises(AssertionError) as excinfo:
         kit.assert_forget_agent_forgets_only_an_ended_identity(factory)

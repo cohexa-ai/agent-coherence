@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import statistics
 import sys
 import threading
@@ -15032,25 +15033,62 @@ def test_an_ended_stop_whose_release_fails_keeps_every_row_and_the_name(
     assert "forget_not_allowed" in caplog.text
 
 
-def test_an_ended_stop_whose_forget_fails_answers_the_store_fault(
-    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("presented", ["absent", "foreign"])
+def test_an_ended_stop_refused_for_its_principal_forgets_nothing(
+    presented: str, coordinator, client: _Client
 ) -> None:
-    """Only the forget's refusal is logged and passed over. A store fault in
-    the forget fails the stop as one anywhere in its body does, HTTP 200
-    with the internal-error envelope, never a clean answer, and the attempt
-    keeps its name. Prevents an ended stop answering a forget that never
-    happened as done."""
-    import sqlite3
+    """An ended stop naming a claimed session's attempt, with no principal or
+    with another session's, is refused HTTP 400 at the caller-principal gate,
+    and the gate comes before the forget: the attempt's row, heartbeat,
+    display name and stale-warning marker all stay. The attempt holds no
+    write grant, so only the gate stands between the stop and the forget.
+    Control: the same stop with the session's own principal forgets them.
 
+    Prevents a caller that cannot present a session's principal forgetting
+    that session's attempts."""
+    attempt = _Identity(client, _claimed(client), "inc-1")
+    _read(client, attempt.who, "task.md", "inc-1")
+    _mark_warned(coordinator, attempt, ["task.md"])
+    principal, refusal = {
+        "absent": (None, _PRINCIPAL_ABSENT_REFUSAL),
+        "foreign": (_claimed(client).principal, _PRINCIPAL_FOREIGN_REFUSAL),
+    }[presented]
+    body = {"session_id": attempt.who.sid, "agent_id": attempt.subagent, "ended": True}
+
+    assert client.post(_STOP, body, principal=principal) == (400, refusal)
+
+    assert _state(coordinator, "task.md", attempt.agent_id) == MESIState.SHARED
+    assert coordinator.registry.last_heartbeat_tick(attempt.agent_id) is not None
+    assert coordinator.agent_name_for(attempt.agent_id) is not None
+    assert _warned_paths(coordinator, attempt) == {"task.md"}
+    assert _stop(attempt, {"ended": True}) == (200, {"ok": True, "released_artifacts": []})
+    assert (_state(coordinator, "task.md", attempt.agent_id), _warned_paths(coordinator, attempt)) == (None, set()), (
+        "control: the same stop, admitted, forgets the attempt")
+
+
+@pytest.mark.parametrize(("fault", "message"), [
+    pytest.param(sqlite3.OperationalError, "database is locked", id="store-fault"),
+    pytest.param(ValueError, "a backend's own error", id="value-error-not-the-refusal"),
+])
+def test_an_ended_stop_whose_forget_fails_answers_the_failure_envelope(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, fault: type[Exception], message: str
+) -> None:
+    """Only the forget's refusal, a ``ForgetRefused``, is logged and passed
+    over. Any other fault in the forget, a store fault or a ``ValueError``
+    that is not the refusal, fails the stop as one anywhere in its body does,
+    HTTP 200 with the internal-error envelope, never a clean answer, and the
+    attempt keeps its name. Prevents an ended stop answering a forget that
+    never happened as done."""
     attempt = _Identity(client, _claimed(client), "inc-1")
     _edit_as(attempt, "plan.md")
 
     def failing(*_args: Any, **_kwargs: Any) -> int:
-        raise sqlite3.OperationalError("database is locked")
+        raise fault(message)
 
     monkeypatch.setattr(coordinator.service, "forget_agent", failing)
 
-    assert _stop(attempt, {"ended": True}) == (200, _INTERNAL_ERROR_ENVELOPE)
+    envelope = {**_INTERNAL_ERROR_ENVELOPE, "reason": f"internal: {fault.__name__}"}
+    assert _stop(attempt, {"ended": True}) == (200, envelope)
     assert coordinator.agent_name_for(attempt.agent_id) is not None
 
 

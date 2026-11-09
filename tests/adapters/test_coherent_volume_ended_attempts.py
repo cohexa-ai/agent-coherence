@@ -316,6 +316,48 @@ def test_closing_a_read_only_volume_ends_its_attempt_and_the_records_go(
     assert _records(tmp_path) == {"agent_states": 0, "heartbeats": 0, "pending_notices": 0, "status_sessions": 0}
 
 
+def _forwarded_then(answer: Callable[[Callable[..., object], dict], object]) -> Callable[..., object]:
+    """Send the request on to the coordinator, then give ``answer`` in place of
+    the one it sent back."""
+
+    def decide(forward: Callable[..., object], payload: dict) -> object:
+        forward()
+        return answer(forward, payload)
+
+    return decide
+
+
+@pytest.mark.parametrize("answer", [
+    pytest.param(_no_answer, id="answer-lost"),
+    pytest.param(_status(503), id="http-503"),
+])
+def test_an_attempt_whose_only_request_went_unanswered_is_ended_at_close(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    server: CoordinatorHTTPServer,
+    log: _Log,
+    answer: Callable[[Callable[..., object], dict], object],
+) -> None:
+    """A strict volume's first read reaches the coordinator, which records the
+    attempt's row and heartbeat, but its answer is lost or comes back HTTP
+    503, so the read raises. The volume recorded the attempt before sending
+    the read, so close() ends it and the coordinator keeps nothing for it.
+
+    Prevents an attempt whose only request got no usable answer staying in
+    the coordinator for good: the volume cannot tell whether it arrived."""
+    vol = _volume(tmp_path, fast_cfg, on_error="strict")
+    log.answers["/hooks/pre-read"] = _forwarded_then(answer)
+    with pytest.raises(CoherenceError):
+        vol.read(_X)
+    assert _status_sessions(tmp_path) == [vol.agent_id], "control: the read reached the coordinator"
+    log.answers.pop("/hooks/pre-read")
+
+    vol.close()
+
+    assert vol.incarnation in log.ends()
+    assert _records(tmp_path) == {"agent_states": 0, "heartbeats": 0, "pending_notices": 0, "status_sessions": 0}
+
+
 def test_close_ends_every_attempt_that_reached_the_coordinator(
     tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, log: _Log
 ) -> None:

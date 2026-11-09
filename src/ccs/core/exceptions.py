@@ -1004,6 +1004,13 @@ class HandoffPathsInvalid(ValueError):
     the request went out, which must read as an unknown outcome instead."""
 
 
+class ForgetRefused(ValueError):
+    """A registry's ``forget_agent`` refused, deleting nothing, because the
+    identity still holds a write grant (EXCLUSIVE or MODIFIED). A
+    ``ValueError``, and its own type so the coordinator logs and passes over
+    exactly this refusal: any other error inside a forget is a fault."""
+
+
 class InvalidTransitionError(CoherenceError):
     """Raised when the MESI transition table rejects a state transition."""
 

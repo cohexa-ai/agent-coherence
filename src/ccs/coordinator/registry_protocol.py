@@ -61,6 +61,7 @@ from ccs.core.exceptions import (
     HANDOFF_SUCCESSOR_UNKNOWN_REASON,
     HANDOFF_VERSION_UNCONFIRMED_REASON,
     CheckpointRegistrationRefused,
+    ForgetRefused,
     RegistryLockTimeout,
 )
 from ccs.core.states import MESIState, TransientState
@@ -824,12 +825,12 @@ def _ended(record: TransferRecord, *, successor: UUID, status: str) -> TransferG
     )
 
 
-def forget_refusal(agent_id: UUID, artifact_id: UUID) -> ValueError:
+def forget_refusal(agent_id: UUID, artifact_id: UUID) -> ForgetRefused:
     """The error :meth:`RegistryBase.forget_agent` raises, having deleted
     nothing, while ``agent_id`` still holds a write grant. Built in one place
     so both registries refuse in the same words; ``artifact_id`` is one of the
     files the grant is held on."""
-    return ValueError(
+    return ForgetRefused(
         f"forget_not_allowed: agent={agent_id} artifact={artifact_id} holds a "
         "write grant (EXCLUSIVE or MODIFIED); nothing was forgotten"
     )
@@ -1003,9 +1004,12 @@ class RegistryBase(Protocol):
         an identity that has ended reads nothing and must stop counting as a
         reader of that file.
 
-        Refused with :func:`forget_refusal`'s ``ValueError``, deleting
-        nothing, while the identity holds any EXCLUSIVE or MODIFIED row: that
-        grant is what its peers are refused on and what the sweep reclaims.
+        Refused with :func:`forget_refusal`'s
+        :class:`~ccs.core.exceptions.ForgetRefused` (a ``ValueError``),
+        deleting nothing, while the identity holds any EXCLUSIVE or MODIFIED
+        row: that grant is what its peers are refused on and what the sweep
+        reclaims. The coordinator logs and passes over that refusal alone, so
+        any other error raised here reads as a fault.
 
         Only for an identity that can never act again. A deleted row reads as
         never seen: a peer's write no longer invalidates the identity, and the

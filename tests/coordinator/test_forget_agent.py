@@ -27,7 +27,7 @@ import pytest
 
 from ccs.coordinator.service import CoordinatorService, SessionCapsConfig
 from ccs.coordinator.sqlite_registry import ReadOnlyMutationError, SqliteArtifactRegistry
-from ccs.core.exceptions import WatchdogAbandoned
+from ccs.core.exceptions import ForgetRefused, WatchdogAbandoned
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, EffectFired
 
@@ -225,7 +225,8 @@ def test_a_reclaim_row_the_identity_read_again_stays_as_invalid(registry: object
 @pytest.mark.parametrize("held", [MESIState.EXCLUSIVE, MESIState.MODIFIED])
 def test_an_identity_that_holds_a_write_grant_is_not_forgotten(registry: object, held: MESIState) -> None:
     """A write grant is what peers are refused on and what the sweep reclaims,
-    so its holder's records all stay, the other files' included.
+    so its holder's records all stay, the other files' included. The refusal
+    is a ``ForgetRefused``, the one error the coordinator logs and passes over.
 
     Prevents a forget that hides a held grant from its peers."""
     writing, reading = _register(registry, "a.md"), _register(registry, "b.md")
@@ -237,7 +238,7 @@ def test_an_identity_that_holds_a_write_grant_is_not_forgotten(registry: object,
         _queue_notice(registry, holder, (reading, preempter))
     before = _records_of(registry, holder, [writing, reading])
 
-    with pytest.raises(ValueError, match="write grant"):
+    with pytest.raises(ForgetRefused, match="write grant"):
         registry.forget_agent(holder)  # type: ignore[attr-defined]
 
     assert _records_of(registry, holder, [writing, reading]) == before
@@ -369,24 +370,29 @@ def test_a_dropped_sessions_committer_holding_a_write_grant_is_kept(
     assert "forget_not_allowed" in caplog.text
 
 
-def test_a_store_fault_in_the_committer_forget_fails_the_sweep(
-    registry: object, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(("fault", "message"), [
+    pytest.param(sqlite3.OperationalError, "disk I/O error", id="store-fault"),
+    pytest.param(ValueError, "a backend's own error", id="value-error-not-the-refusal"),
+])
+def test_a_fault_in_the_committer_forget_fails_the_sweep(
+    registry: object, monkeypatch: pytest.MonkeyPatch, fault: type[Exception], message: str
 ) -> None:
-    """Only the forget's refusal is logged and passed over. A store fault in
-    the committer's forget raises out of the sweep, as one anywhere else in
-    the sweep does.
+    """Only the forget's refusal, a ``ForgetRefused``, is logged and passed
+    over. Any other fault in the committer's forget, a store fault or a
+    ``ValueError`` that is not the refusal, raises out of the sweep, as one
+    anywhere else in the sweep does.
 
-    Prevents a failing store being logged as a committer merely kept while
-    the sweep reports the session reaped."""
+    Prevents a failing store, or a backend's own error, being logged as a
+    committer merely kept while the sweep reports the session reaped."""
     service = CoordinatorService(registry)  # type: ignore[arg-type]
     _committed_session(service, _register(registry))
 
     def failing(_agent_id: UUID) -> int:
-        raise sqlite3.OperationalError("disk I/O error")
+        raise fault(message)
 
     monkeypatch.setattr(registry, "forget_agent", failing)
 
-    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+    with pytest.raises(fault, match=message):
         service.enforce_session_liveness(current_tick=_HB_TIMEOUT, heartbeat_timeout_ticks=_HB_TIMEOUT)
 
 

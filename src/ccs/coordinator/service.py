@@ -51,6 +51,7 @@ from ccs.core.exceptions import (
     CheckpointUnknown,
     CoherenceError,
     CommitNotAllowed,
+    ForgetRefused,
     GiverFenced,
     OccCallerTransientError,
     OtherHolder,
@@ -2120,7 +2121,7 @@ class CoordinatorService:
         committer = self._session_committer_id(session_token)
         try:
             self.forget_agent(committer)
-        except ValueError as exc:
+        except ForgetRefused as exc:
             logger.warning("a dropped snapshot session kept its committer's records: %s", exc)
 
     def _reap_session(self, session_token: str) -> None:
@@ -3642,8 +3643,8 @@ class CoordinatorService:
         in one :meth:`registry.abort_guard` hold under the caller's watchdog
         abort, so a request the watchdog already answered deletes nothing.
         Returns how many per-file state rows went, and raises the registry's
-        ``ValueError``, having deleted nothing, while the identity holds a
-        write grant.
+        :class:`~ccs.core.exceptions.ForgetRefused`, having deleted nothing,
+        while the identity holds a write grant.
 
         Only for an identity that can never act again: a deleted row reads as
         never seen, so the fence admits its commit on the version alone."""
