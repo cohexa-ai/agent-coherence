@@ -120,11 +120,11 @@ PINS: tuple[Pin, ...] = (
         doc_phrase="So re-read every other path before you write it",
     ),
     Pin(
-        name="refuse mode: the capability check cannot see a same-port replacement",
+        name="refuse mode: a remote coordinator's same-port replacement goes unseen",
         source="src/ccs/adapters/coherent_volume.py",
         source_marker="a fixed-port replacement goes unseen",
         doc="docs/guide.md",
-        doc_phrase="same port and secret goes unseen",
+        doc_phrase="coordinator on a fixed port has no such check",
     ),
     Pin(
         name="refuse mode: a blind retry overwrites the holder's commit",

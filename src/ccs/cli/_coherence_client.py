@@ -40,11 +40,18 @@ from ccs.adapters.claude_code.auth import (
     load_mint_nonce,
     store_caller_principal,
 )
+from ccs.adapters.claude_code.coordinator_pin import (
+    NODE_BACKEND,
+    CoordinatorPin,
+    PidFileLines,
+    exit_evidence,
+    lines_of,
+    read_pid_file,
+)
 from ccs.adapters.claude_code.coordinator_server import (
     caller_principal_identity,
     validate_session_id,
 )
-from ccs.adapters.claude_code.lifecycle import read_port_from_file as _read_port_from_file
 from ccs.adapters.claude_code.regular_file import ReadStatus, read_state_file
 from ccs.adapters.claude_code.state_dir import dir_link_refusal, state_file_link_refusal
 from ccs.core.exceptions import (
@@ -214,6 +221,9 @@ class CoordinatorEndpoint:
     host: str = "127.0.0.1"
     scheme: str = "http"
     ca_file: str | None = None
+    #: The coordinator :func:`resolve_endpoint` found, checked before every
+    #: request (#503). ``None`` for a remote endpoint, which has no pid file.
+    pin: CoordinatorPin | None = field(default=None, compare=False, repr=False)
 
     @property
     def base_url(self) -> str:
@@ -248,6 +258,14 @@ class CoordinatorUnavailable(Exception):
     def __init__(self, *args: object, never_sent: bool = False) -> None:
         super().__init__(*args)
         self.never_sent = never_sent
+
+
+class CoordinatorDeparted(CoordinatorUnavailable):
+    """The coordinator a local endpoint was resolved from has exited or been
+    replaced, so the request was not sent (#503). Always ``never_sent``."""
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args, never_sent=True)
 
 
 class CoordinatorMalformedAnswer(CoordinatorUnavailable):
@@ -364,20 +382,55 @@ def resolve_endpoint(coordinator_root: Path) -> CoordinatorEndpoint:
     another directory, whose ``server.pid`` and ``hook.secret`` would join
     this client to that coordinator with a valid bearer."""
     coherence_dir = coordinator_root / ".coherence"
-    pid_file = coherence_dir / "server.pid"
     secret_file = coherence_dir / "hook.secret"
 
     if os.path.islink(coherence_dir):
         raise CoordinatorUnavailable(dir_link_refusal(coherence_dir))
 
-    port = _read_port_from_file(pid_file)
-    if port is None:
+    lines = _running_coordinator_lines(coherence_dir)
+    return CoordinatorEndpoint(
+        port=lines.port,
+        bearer=_read_bearer(coherence_dir, secret_file),
+        pin=CoordinatorPin(coherence_dir, lines),
+    )
+
+
+def _running_coordinator_lines(coherence_dir: Path) -> PidFileLines:
+    """``server.pid``'s lines, read as a regular file only: a link there would
+    send the bearer to whatever port the file it names holds."""
+    read = read_pid_file(coherence_dir)
+    pid_file = read.path
+    if read.status is ReadStatus.LINK:
+        raise CoordinatorUnavailable(state_file_link_refusal(read.path, coherence_dir))
+    if read.status is ReadStatus.NOT_REGULAR:
+        raise CoordinatorUnavailable(
+            f"{pid_file} is not a regular file; restart with `agent-coherence-coordinator`"
+        )
+    lines = lines_of(read)
+    if lines.port is None:
         raise CoordinatorUnavailable(
             "no coordinator running for this workspace "
             f"(no port in {pid_file}); start one with `agent-coherence-coordinator`"
         )
+    evidence = exit_evidence(pid_file, lines)
+    if evidence is not None:
+        raise CoordinatorUnavailable(
+            f"no coordinator running for this workspace ({pid_file} names pid "
+            f"{lines.pid}, which {evidence}); start one with "
+            "`agent-coherence-coordinator`",
+            never_sent=True,
+        )
+    return lines
 
-    return CoordinatorEndpoint(port=port, bearer=_read_bearer(coherence_dir, secret_file))
+
+def _refuse_if_coordinator_departed(endpoint: CoordinatorEndpoint) -> None:
+    """A process that took the resolved coordinator's port, with or without
+    the secret, never receives the bearer."""
+    if endpoint.pin is None:
+        return
+    departure = endpoint.pin.departure()
+    if departure is not None:
+        raise CoordinatorDeparted(f"{departure}; nothing was sent")
 
 
 def _read_bearer(coherence_dir: Path, secret_file: Path) -> str:
@@ -609,6 +662,7 @@ def get(
     ``agent-coherence-status``) add ``Coherence-Local-Operator: true``
     for the elevated ``/status?detail=full`` tier without hard-coding
     that header here."""
+    _refuse_if_coordinator_departed(endpoint)
     headers: dict[str, str] = {
         "Authorization": f"Bearer {endpoint.bearer}",
         "Host": endpoint.host,
@@ -643,6 +697,7 @@ def post(
     cost a full timeout on top of the failure it follows; ``None`` means
     :data:`CLI_HTTP_TIMEOUT_SEC` as it is when the request is made.
     """
+    _refuse_if_coordinator_departed(endpoint)
     payload = json.dumps(body).encode("utf-8")
     headers: dict[str, str] = {
         "Authorization": f"Bearer {endpoint.bearer}",
@@ -780,9 +835,6 @@ def claim_caller_principal(
     return PrincipalClaim("unconfirmed", detail=f"claim not confirmed (reason={reason})")
 
 
-NODE_BACKEND = "node"
-
-
 def coordinator_backend(coordinator_root: Path) -> str | None:
     """The ``backend=<name>`` a coordinator recorded on the third line of
     ``.coherence/server.pid``, or ``None`` when there is none.
@@ -790,16 +842,9 @@ def coordinator_backend(coordinator_root: Path) -> str | None:
     The Node coordinator writes ``<pid>\\n<port>\\nbackend=node\\n``; the
     Python coordinator writes ``<pid>\\n<port>\\n`` with no backend line. Only
     the port line is load-bearing for reaching a coordinator — this is read
-    solely to skip work a Node coordinator could never answer."""
-    try:
-        lines = (coordinator_root / ".coherence" / "server.pid").read_text(
-            encoding="utf-8"
-        ).splitlines()
-    except (OSError, UnicodeDecodeError):
-        return None
-    if len(lines) < 3 or not lines[2].startswith("backend="):
-        return None
-    return lines[2][len("backend="):].strip() or None
+    solely to skip work a Node coordinator could never answer. Read as a
+    regular file only, never through a link (#503)."""
+    return lines_of(read_pid_file(coordinator_root / ".coherence")).backend
 
 
 def caller_principal_headers(principal: str | None) -> dict[str, str] | None:

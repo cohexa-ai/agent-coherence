@@ -44,6 +44,11 @@ from functools import partial
 from pathlib import Path
 from uuid import UUID
 
+from ccs.adapters.claude_code.coordinator_pin import (
+    exit_evidence,
+    pid_is_alive,
+    read_pid_lines,
+)
 from ccs.adapters.claude_code.coordinator_server import (
     HANDLER_TIMEOUT_SEC,
     IN_FLIGHT_DRAIN_TIMEOUT_SEC,
@@ -429,7 +434,9 @@ def ensure_coordinator_handle(
             # ONE read, so the join is attributed to the pid that wrote the
             # port it returns, not to whichever bind a second read would see.
             binder_pid, port = _read_pidfile(pid_file)
-            if port is not None:
+            # #428: a winner that has not yet emptied a dead coordinator's
+            # file still shows that coordinator's lines; never join them.
+            if port is not None and not _names_an_exited_binder(binder_pid):
                 _close_quiet(fd)
                 return CoordinatorHandle(
                     port, _classify_join(resolved_key, binder_pid, port), binder_pid
@@ -637,8 +644,8 @@ def connect_or_spawn(
     check_coherence_dir(coordinator_root)
     cfg = config or _DEFAULT_CONFIG
     pid_file = coordinator_root / ".coherence" / "server.pid"
-    port = read_port_from_file(pid_file)
-    if port is not None and tcp_probe(port, cfg, bind_host=bind_host):
+    port = running_coordinator_port(pid_file, cfg, bind_host=bind_host)
+    if port is not None:
         return port
 
     # Stale or absent — spawn (or join existing holder via fcntl race).
@@ -992,28 +999,28 @@ def _read_pidfile(pid_file: Path) -> tuple[int | None, int | None]:
     when its line is absent or malformed, and both are when the file cannot
     be read. The port is validated exactly as :func:`read_port_from_file`
     always has; a pid must be positive."""
-    try:
-        text = pid_file.read_text(encoding="utf-8")
-    except OSError:  # FileNotFoundError included
-        return None, None
-    lines = text.splitlines()
-    pid = _int_line(lines, 0)
-    port = _int_line(lines, 1)
-    return (
-        pid if pid is not None and pid > 0 else None,
-        port if port is not None and 1 <= port <= 65535 else None,
-    )
+    lines = read_pid_lines(pid_file)
+    return lines.pid, lines.port
 
 
-def _int_line(lines: list[str], index: int) -> int | None:
-    """The integer on ``lines[index]``, or None when that line is absent or
-    is not an integer."""
-    if len(lines) <= index:
+def _names_an_exited_binder(binder_pid: int | None) -> bool:
+    return binder_pid is not None and not pid_is_alive(binder_pid)
+
+
+def running_coordinator_port(
+    pid_file: Path, cfg: LifecycleConfig, *, bind_host: str = "127.0.0.1"
+) -> int | None:
+    """The port of the coordinator ``pid_file`` names, when that coordinator
+    still runs and its port answers; otherwise None.
+
+    A coordinator that exited without a stop leaves its pid file behind, and
+    another process may then listen on its port. That process is not the
+    coordinator (#503): it neither counts as one already running nor gets a
+    request."""
+    lines = read_pid_lines(pid_file)
+    if lines.port is None or exit_evidence(pid_file, lines) is not None:
         return None
-    try:
-        return int(lines[index].strip())
-    except ValueError:
-        return None
+    return lines.port if tcp_probe(lines.port, cfg, bind_host=bind_host) else None
 
 
 def _read_port_with_retry(pid_file: Path, cfg: LifecycleConfig) -> int:

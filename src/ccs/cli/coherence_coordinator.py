@@ -84,6 +84,7 @@ from ccs.adapters.claude_code.auth import is_loopback_host, validate_bind_host
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     ensure_coordinator,
+    running_coordinator_port,
     stop_coordinator,
 )
 from ccs.adapters.claude_code.lifecycle import (
@@ -275,11 +276,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # Normal user path: probe for an existing coordinator first.
     pid_file = root / ".coherence" / "server.pid"
-    existing_port = _read_port_from_file(pid_file)
-    cfg = LifecycleConfig()
-    if existing_port is not None and _tcp_probe(
-        existing_port, cfg, bind_host=args.bind_host
-    ):
+    existing_port = running_coordinator_port(pid_file, LifecycleConfig(), bind_host=args.bind_host)
+    if existing_port is not None:
         if not args.quiet:
             print(f"port={existing_port}", flush=True)
         return 0
@@ -505,29 +503,9 @@ def _spawn_detached(root: Path, *, quiet: bool, bind_host: str = "127.0.0.1") ->
         err(f"agent-coherence-coordinator: could not spawn detached worker: {exc}")
         return 2
 
-    cfg = LifecycleConfig()
-    deadline = time.monotonic() + _DETACH_PORT_WAIT_TIMEOUT_SEC
-    while time.monotonic() < deadline:
-        port = _read_port_from_file(pid_file)
-        if port is not None:
-            if _tcp_probe(port, cfg, bind_host=bind_host):
-                if not quiet:
-                    print(f"port={port}", flush=True)
-                return 0
-            # A routed bind can never converge while a loopback-bound
-            # coordinator holds the workspace flock: the child joins it via
-            # the loser path and exits without binding the routed host.
-            # Name the mismatch now instead of stalling out the window.
-            if not is_loopback_host(bind_host) and _tcp_probe(
-                port, cfg, bind_host="127.0.0.1"
-            ):
-                err(
-                    "agent-coherence-coordinator: a coordinator for this "
-                    f"workspace is already running on 127.0.0.1:{port}; stop "
-                    f"it before re-binding to {bind_host}"
-                )
-                return 2
-        time.sleep(_DETACH_PORT_WAIT_INTERVAL_SEC)
+    exit_code = _await_detached_port(pid_file, quiet=quiet, bind_host=bind_host)
+    if exit_code is not None:
+        return exit_code
 
     # The worker's stderr is /dev/null: name a store it could not open (#453).
     if store_is_held(root):
@@ -543,6 +521,36 @@ def _spawn_detached(root: Path, *, quiet: bool, bind_host: str = "127.0.0.1") ->
         f"within {_DETACH_PORT_WAIT_TIMEOUT_SEC:.0f}s"
     )
     return 2
+
+
+def _await_detached_port(pid_file: Path, *, quiet: bool, bind_host: str) -> int | None:
+    """Wait for the detached worker's coordinator to answer; its exit code, or
+    None when the wait runs out. Until the worker holds the workspace lock,
+    ``server.pid`` may still name a coordinator that exited, whose port
+    another process can hold (#503), so only a running coordinator counts."""
+    cfg = LifecycleConfig()
+    deadline = time.monotonic() + _DETACH_PORT_WAIT_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        port = running_coordinator_port(pid_file, cfg, bind_host=bind_host)
+        if port is not None:
+            if not quiet:
+                print(f"port={port}", flush=True)
+            return 0
+        # A routed bind can never converge while a loopback-bound
+        # coordinator holds the workspace flock: the child joins it via
+        # the loser path and exits without binding the routed host.
+        # Name the mismatch now instead of stalling out the window.
+        if not is_loopback_host(bind_host):
+            port = running_coordinator_port(pid_file, cfg, bind_host="127.0.0.1")
+            if port is not None:
+                err(
+                    "agent-coherence-coordinator: a coordinator for this "
+                    f"workspace is already running on 127.0.0.1:{port}; stop "
+                    f"it before re-binding to {bind_host}"
+                )
+                return 2
+        time.sleep(_DETACH_PORT_WAIT_INTERVAL_SEC)
+    return None
 
 
 if __name__ == "__main__":

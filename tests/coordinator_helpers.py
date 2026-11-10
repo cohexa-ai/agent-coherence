@@ -23,6 +23,7 @@ import pytest
 import ccs.adapters.coherent_volume as coherent_volume_module
 from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
 from ccs.core.states import MESIState
+from tests.pid_lock_helpers import write_coordinator_pid_file
 
 #: What a status answer's reason phrase and body say. The volume reports a
 #: status answer by its code alone, so none of this may reach what it raises
@@ -75,7 +76,7 @@ def serve_in_process(tmp_path: Path, instance_id: str, tracked: str = "data/**")
         (coherence / name).write_text(f"- {tracked}\n")
     server = CoordinatorHTTPServer(tmp_path, port=0, instance_id=instance_id)
     server.serve_in_thread()
-    (coherence / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
+    write_coordinator_pid_file(coherence, server.port, pid=os.getpid())
     return server
 
 

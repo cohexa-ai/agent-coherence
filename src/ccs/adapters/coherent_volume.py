@@ -57,14 +57,14 @@ from ccs.adapters.claude_code.coordinator_server import (
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     connect_or_spawn,
-    read_port_from_file,
-    tcp_probe,
+    running_coordinator_port,
 )
 from ccs.adapters.claude_code.policy import matches_any
 from ccs.adapters.claude_code.state_dir import check_coherence_dir
 from ccs.cli._coherence_client import (
     NODE_BACKEND,
     PRINCIPAL_REFUSED_AGAIN,
+    CoordinatorDeparted,
     CoordinatorEndpoint,
     CoordinatorUnavailable,
     PrincipalClaim,
@@ -213,8 +213,9 @@ class _ReleaseFailure(NamedTuple):
     raises for it, the failure that error chains to, whether the answer
     reported the grant still held, whether ``_post`` already counted a
     degradation for it (degrade mode, a request with no answer), and whether
-    no coordinator was listening at the volume's local endpoint (the connect
-    was refused, and nothing answered earlier in the same close)."""
+    the volume's local coordinator is gone (the connect was refused, or the
+    client sent nothing because the coordinator it attached to has exited or
+    been replaced, #503) with nothing answering earlier in the same close."""
 
     error: type[CoherenceError]
     cause: BaseException | None = None
@@ -590,7 +591,9 @@ def _check_refuse_mode(
     ``on_held="refuse"``. Degrade mode would write best-effort when detached.
     No managed globs means nothing ever opts in, so every write would displace
     in silence. A remote coordinator's capability cannot be trusted for the
-    volume's life, because a fixed-port replacement goes unseen."""
+    volume's life: a local client checks before each request that the
+    coordinator it attached to still runs (#503), but a remote endpoint has no
+    pid file to check, so a fixed-port replacement goes unseen."""
     if on_error != "strict":
         raise ValueError("on_held='refuse' is strict-only (on_error must be 'strict')")
     if not managed:
@@ -1195,7 +1198,9 @@ class CoherentVolume:
     (typed reason ``untrack_strict_path``), an ignore pattern never overrides a
     strict one, and its hot reloads never drop a strict or tracked pattern
     (#261); a strict path stops being enforced only when the coordinator
-    restarts without its strict entry. Before this check existed a sibling whose globs differed from the
+    restarts without its strict entry, and a local volume sends a restarted
+    coordinator nothing, so it is checked again only by a new volume (#503).
+    Before this check existed a sibling whose globs differed from the
     spawner's passed on the spawner's pattern *count*, and its stale writes
     landed with no signal (#190).
     """
@@ -1673,10 +1678,7 @@ class CoherentVolume:
         # take effect (load-once), and clobbering a foreign coordinator's policy
         # is a side effect on someone else's workspace. We verify enforcement
         # after attaching instead.
-        pre_port = read_port_from_file(pid_file)
-        pre_existing = pre_port is not None and tcp_probe(
-            pre_port, cfg, bind_host=self._bind_host
-        )
+        pre_existing = running_coordinator_port(pid_file, cfg, bind_host=self._bind_host) is not None
         if not pre_existing:
             try:
                 self._write_policy_yaml()
@@ -2595,8 +2597,9 @@ class CoherentVolume:
         stopped answering costs one short timeout, and logs it: an end releases
         nothing, so it never raises or counts a degradation, and what is still
         recorded is ended at the next re-mint or :meth:`close`. At close, an end
-        refused because no coordinator listens at the volume's local endpoint
-        gives the rest up instead (:meth:`_give_up_ends`)."""
+        that finds the volume's local coordinator gone (see
+        :meth:`_refused_at_local_endpoint`) gives the rest up instead
+        (:meth:`_give_up_ends`)."""
         if self._endpoint is None:
             return
         for index, incarnation in enumerate(incarnations):
@@ -2616,7 +2619,7 @@ class CoherentVolume:
 
     def _give_up_ends(self, incarnations: list[str]) -> None:
         """Drop ``incarnations`` from the unended record at a close that found
-        no coordinator listening at the volume's local endpoint, and log them
+        the volume's local coordinator gone, and log them
         once. Nothing the caller does can end them, so the volume does not keep
         its endpoint for them and a later close() sends nothing for them; their
         records stay with the coordinator."""
@@ -2834,13 +2837,17 @@ class CoherentVolume:
     def _refused_at_local_endpoint(self, failure: object) -> bool:
         """Whether ``failure``, the client's error for one request, shows no
         coordinator listening at this volume's own local endpoint: the connect
-        was refused, as after the coordinator shut down when idle. A connect
-        that timed out, a name that did not resolve, or a remote endpoint may
-        still have a live coordinator behind it, holding the grants."""
+        was refused, as after the coordinator shut down when idle, or the
+        client sent nothing because the coordinator it resolved has exited or
+        been replaced (#503). A connect that timed out, a name that did not
+        resolve, or a remote endpoint may still have a live coordinator behind
+        it, holding the grants."""
         if self._remote_endpoint is not None:
             return False
         if not (isinstance(failure, CoordinatorUnavailable) and failure.never_sent):
             return False
+        if isinstance(failure, CoordinatorDeparted):
+            return True
         return isinstance(getattr(failure.__cause__, "reason", None), ConnectionRefusedError)
 
     def _settle_path_release(self, incarnation: str, rel: str, answer: dict) -> bool:
@@ -2913,12 +2920,13 @@ class CoherentVolume:
         is still recorded, and nothing once the record is empty. A grant
         reported still held does not stop the other attempts' releases; a
         request with no readable answer does, so a silent coordinator costs one
-        client timeout. In strict mode, when no coordinator is listening at the
-        volume's local endpoint (the connect was refused, as after the volume's
-        own coordinator shut down when idle), the grants cannot be released by
-        anyone but the next coordinator's sweep, so close() logs them and
-        returns, unless a coordinator answered earlier in the same close() that
-        a grant was still held.
+        client timeout. In strict mode, when the volume's local coordinator is
+        gone (the connect was refused, or the client sent nothing because the
+        coordinator it attached to has exited or been replaced, #503, as after
+        it shut down when idle), only a coordinator's sweep can release the
+        grants, so close() logs them and returns, unless a coordinator answered
+        earlier in the same close() that a grant was still held. A coordinator
+        started since, even on the same port, keeps them until its sweep.
 
         Every stop also ends its attempt (#525), and so does one more
         ``session-stop`` for each other attempt a request of this volume named,
@@ -2927,8 +2935,8 @@ class CoherentVolume:
         its rows, heartbeat and ``/status`` entry. An end releases nothing, so
         one the coordinator does not confirm is only logged, never raised or
         counted; the volume keeps that attempt and its endpoint, and calling
-        ``close()`` again sends it again. When an end is refused because no
-        coordinator listens at the volume's local endpoint, as above, the
+        ``close()`` again sends it again. When an end finds the volume's local
+        coordinator gone, as above, the
         attempts not yet ended are logged once and given up instead, so a
         later ``close()`` sends nothing for them. An attempt that never sent a
         request costs nothing. The endpoint is dropped once nothing is left to
@@ -2984,11 +2992,11 @@ class CoherentVolume:
     def _close_not_confirmed(self, failure: _ReleaseFailure) -> None:
         """Report a close the coordinator did not confirm, through
         ``on_error``, naming the paths still recorded. In strict mode a
-        request refused because no coordinator listens at the volume's local
-        endpoint, with no answer earlier in the walk, is logged instead:
-        nothing the caller does can release those grants, and the next
-        coordinator's sweep will. Degrade mode never reaches that branch: the
-        refused request already counted a degradation."""
+        request that found the volume's local coordinator gone (see
+        :meth:`_refused_at_local_endpoint`), with no answer earlier in the
+        walk, is logged instead: nothing the caller does can release those
+        grants, and a coordinator's sweep will. Degrade mode never reaches that
+        branch: the refused request already counted a degradation."""
         rels = sorted({rel for written in self._grant_incarnations.values() for rel in written})
         if failure.nobody_listening:
             logger.warning(
