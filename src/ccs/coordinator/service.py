@@ -51,6 +51,7 @@ from ccs.core.exceptions import (
     CheckpointUnknown,
     CoherenceError,
     CommitNotAllowed,
+    ForgetRefused,
     GiverFenced,
     OccCallerTransientError,
     OtherHolder,
@@ -558,7 +559,8 @@ class CoordinatorService:
         # goes stale, and an UNBOUND one goes stale only when this service binds
         # the identity — which replaces it (see :meth:`_record_bind_attempt`).
         # A second writer of bindings into the same store would not be seen
-        # here; there is none. ``_caller_principal_binds`` counts finished bind
+        # here; a second read-write open of a SQLite store is refused (#453).
+        # ``_caller_principal_binds`` counts finished bind
         # attempts, so a lookup whose durable read raced one never caches the
         # UNBOUND answer it read before that bind. Deliberately separate from
         # every session map above and from ``_session_lock``: a principal's
@@ -1645,11 +1647,11 @@ class CoordinatorService:
           The target is also CAS-guarded inside the registry's own transaction,
           so a writer on another store handle that moves it loses cleanly
           (:class:`ConflictDetail`, surfaced as :class:`EffectHeld` with
-          ``conflict`` set). This is the STRONG guarantee, with one residual: a
-          writer on another handle to the same store (a second process, or a
-          second registry instance on the same SQLite file) can still move a
-          NON-target member between the re-validate and the CAS. A store has one
-          writer by contract.
+          ``conflict`` set). This is the STRONG guarantee. A writer on another
+          handle to the same store could move a NON-target member between the
+          re-validate and the CAS; a second read-write handle on a SQLite store
+          is refused at open where ``flock`` exists (#453), so that residual
+          remains only without ``flock``.
         - **ESCAPING** (``effect=callable``) — the effect is a non-commit side
           effect (deploy / charge / click). The gate re-validates, then fires the
           callable. **The guarantee is "the read-set was unchanged AS OF the
@@ -1824,11 +1826,12 @@ class CoordinatorService:
         target is also CAS-guarded inside the registry's own transaction, against
         every writer.
 
-        Residual: a writer on another handle to the same store (a second
-        process, or a second registry instance on the same SQLite file) is
-        outside the hold and can move a NON-target member between the re-validate
-        and the CAS. A store has one writer by contract; checking the read-set inside
-        the registry's commit transaction would close it. ``decide`` has already
+        Residual, only where ``flock`` does not exist: a writer on another
+        handle to the same store is outside the hold and can move a NON-target
+        member between the re-validate and the CAS. Elsewhere a second
+        read-write handle on a SQLite store is refused at open (#453); checking
+        the read-set inside the registry's commit transaction would close it
+        everywhere. ``decide`` has already
         run, so no caller code runs under the hold."""
         artifact_id, content = commit
         # Service lock first, then the registry lock: the documented order (see
@@ -2017,7 +2020,8 @@ class CoordinatorService:
         Reaping a session: :meth:`registry.release_session` drops its pins AND its
         durable owner-binding (so its pinned versions become collectible again and
         no orphaned owner remains), then its in-memory owner binding, heartbeat
-        lease, and creation tick are cleared and the token is recorded in the
+        lease, and creation tick are cleared, its committer identity's rows are
+        forgotten (it can never commit again), and the token is recorded in the
         bounded reaped tombstone. After reaping, a ``session_read`` /
         ``session_commit`` on that token fails closed with ``session_invalidated``
         (the cut is gone).
@@ -2096,12 +2100,31 @@ class CoordinatorService:
         registry is the authoritative pin store, idempotent on an unknown token, so
         a crash mid-teardown leaves no live-pin-without-owner leak on sqlite), then
         drop the in-memory maps. Holds ``_session_lock`` (re-entrant — the sweep
-        already holds it) so the in-memory drops never race a concurrent handler."""
+        already holds it) so the in-memory drops never race a concurrent handler.
+
+        Last, still under ``_session_lock`` so the lock order stays service →
+        registry, it forgets the session's committer identity (#525): a commit
+        on a dropped token fails closed and no hook route names a raw agent
+        id, so the committer can never act again, and its rows would otherwise
+        stay for good. A coordinator restart drops no session, so it forgets
+        nothing on its own."""
         self.registry.release_session(session_token)
         with self._session_lock:
             self._session_heartbeats.pop(session_token, None)
             self._session_owners.pop(session_token, None)
             self._session_created.pop(session_token, None)
+            self._forget_session_committer(session_token)
+
+    def _forget_session_committer(self, session_token: str) -> None:
+        """Forget the committer of a dropped snapshot session. Its commits
+        end SHARED, so a refusal (a write grant it holds) means a ledger
+        something else wrote: logged, its rows kept, and the teardown of the
+        session, and of any sweep running it, goes on."""
+        committer = self._session_committer_id(session_token)
+        try:
+            self.forget_agent(committer)
+        except ForgetRefused as exc:
+            logger.warning("a dropped snapshot session kept its committer's records: %s", exc)
 
     def _reap_session(self, session_token: str) -> None:
         """Drop a session's pins + lease + owner binding and tombstone the token
@@ -2319,7 +2342,8 @@ class CoordinatorService:
         if agent_state not in {MESIState.EXCLUSIVE, MESIState.MODIFIED}:
             # Read under commit()'s abort_guard hold, the one this refusal is
             # decided in, so no reclaim or release can land between the state
-            # check and the pair the refusal reports.
+            # check and the pair the refusal reports: the store has no other
+            # writer, since a second read-write open is refused (#453, #364).
             pair = {
                 "captured_generation": self.registry.get_read_generation(
                     artifact_id, agent_id
@@ -2573,8 +2597,9 @@ class CoordinatorService:
                 issued_at_tick=issued_at_tick,
                 issuer_agent_id=agent_id,
                 victim_agent_id=invalidated_id,
-                # A second registry writer may add a peer after the snapshot
-                # and before the commit result is returned.  The commit has
+                # A second registry writer (only where no single-writer lock
+                # holds, #453) may add a peer after the snapshot and before the
+                # commit result is returned.  The commit has
                 # still landed; preserve that success and report the state as
                 # unknown instead of turning it into a KeyError.
                 victim_state=victim_states.get(invalidated_id),
@@ -3615,6 +3640,20 @@ class CoordinatorService:
                     issued_at_tick=request.issued_at_tick,
                 )
             return False
+
+    def forget_agent(self, agent_id: UUID, *, abort: threading.Event | None = None) -> int:
+        """Forget an identity that has ended (#525): the registry's
+        :meth:`~ccs.coordinator.registry_protocol.RegistryBase.forget_agent`
+        in one :meth:`registry.abort_guard` hold under the caller's watchdog
+        abort, so a request the watchdog already answered deletes nothing.
+        Returns how many per-file state rows went, and raises the registry's
+        :class:`~ccs.core.exceptions.ForgetRefused`, having deleted nothing,
+        while the identity holds a write grant.
+
+        Only for an identity that can never act again: a deleted row reads as
+        never seen, so the fence admits its commit on the version alone."""
+        with self.registry.abort_guard(abort):
+            return self.registry.forget_agent(agent_id)
 
     def _invalidate_impl(
         self,

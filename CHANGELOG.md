@@ -221,6 +221,44 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **A store has one read-write `SqliteArtifactRegistry` at a time (#453).** A
+  second read-write open of the same SQLite store, in this process or another,
+  now raises `StoreHeldError`, a `RuntimeError` in
+  `ccs.coordinator.sqlite_registry` whose `reason` is `store_held` and whose
+  `lock_path` names the lock file. Before, the second open succeeded and its
+  writes landed between the first handle's checks and grants, with no error on
+  either side: a coordinator's grant set a write grant the second handle had
+  just recorded to `INVALID`, or left two holders of one file. A second open in
+  the same process could also drop the first handle's SQLite locks, so another
+  process committed inside the first handle's transaction and the first
+  handle's commit was lost. Each read-write open now takes an exclusive `flock`
+  on `<store>.writer-lock` (mode `0600`) before it touches the store, keyed on
+  the store's resolved path (`writer_lock_path(db_path)` names it), and frees
+  it on `close()`, on a failed or interrupted open, when the handle is
+  garbage-collected and when the process exits; a forked child does not keep
+  it. A lock file that cannot be opened, or that is not a regular file (a
+  directory or FIFO at that path), refuses the open with an `OSError`, and an
+  existing one is made `0600`. `read_only=True` takes no lock and still opens
+  beside the writer. Only where `flock` does not exist (no `fcntl`, or a file
+  system whose `flock` does not work, which logs one warning) does the open
+  proceed without the lock, as before. A writer open that meets the store
+  check's probe of the lock retries for 0.1 s before it refuses, and
+  `open_waiting_out_a_holder(open_store, wait_sec, poll_sec)` waits longer for
+  a holder that is closing. Code that opened two read-write handles on one
+  store keeps one, and opens the others with `read_only=True` or goes through
+  a coordinator. A coordinator start waits up to the new
+  `LifecycleConfig.store_holder_wait_sec` (10 s, longer than a closing
+  coordinator keeps its store open) for another handle to close the store,
+  then raises `StoreHeldError`: a strict `CoherentVolume` raises it,
+  a degrade one warns once and stays detached, the `stale-write-guard-fs`
+  server does not start, and `agent-coherence-coordinator` prints one line and
+  exits `2`, also when its detached worker could not start for that reason.
+  `--check-store` answers `cannot_tell` with the new reason `store_held`.
+  `agent-coherence-workspace` verbs that write now wait up to 30 s for one
+  another and then exit `2` with `reason` `store_held`, and `list` and `status`
+  open the store read-only. This also fixes #364: a commit refusal's generation
+  pair can no longer be torn by a second writer.
+
 - **Leaving `coherent_workspace()`, calling `uninstall()` and shutting down the
   `stale-write-guard-fs` server now close their volume, giving back its write
   grants (#505).** Before, every file the volume wrote stayed held until the
@@ -242,6 +280,53 @@ Alpha — APIs may change before `v1.0`.
   when the host ends it normally, before it stops a coordinator it started; a
   close that fails is logged to stderr, and the coordinator is stopped whatever
   the close does.
+
+- **A `CoherentVolume` ends each attempt it no longer uses, and the
+  coordinator forgets it: the attempt's state on each file, its heartbeat,
+  its queued notices and its `/status` row go (#525).**
+  Every attempt a volume starts, as it does at each `write_cas` conflict and
+  each `reacquire()`, is its own agent to the coordinator, and each one that
+  sent a request kept its state on each file, its heartbeat, its queued
+  notices and its `/status` row for good: two volumes forcing 50 `write_cas`
+  conflicts on one file left 101 agents. A `session-stop` can now
+  carry `"ended": true` with an `agent_id`; after the stop's releases, the
+  coordinator forgets that identity, unless it still holds a write grant. A
+  file state that records a sweep reclaim stays, as `INVALID`, with its
+  record. The volume sends the flag at each fresh attempt for every older
+  attempt it no longer references, and at `close()` for every attempt. The
+  same 50 conflicts now leave those records for 4 agents while both volumes
+  are open and for none after both close. The conflict-outcome counters are
+  not forgotten: this package's coordinator keeps a count in its `state.db`
+  for each attempt that was refused a commit, and
+  `ccs.diagnose.conflict_counters.read_conflict_totals` still lists it
+  (#539). An open volume still keeps, for each file it holds a read
+  on, the attempt that read it, which `transfer()` presents; `write_cas_at`
+  and the MCP server's `swg_write_cas` commit from a fresh attempt each time,
+  so that can be one attempt per file. A fresh attempt now sends one request
+  for each attempt it ends, where it sent none for an attempt that only read or
+  committed through `write_cas`, and `close()` sends one for each attempt of a
+  volume that only read. An end that releases nothing is best effort: one the
+  coordinator does not confirm is logged and sent again at the next fresh
+  attempt or `close()`. An `ended` that is not a boolean answers HTTP `400`
+  with "ended must be a boolean", and `true` without an `agent_id` with "ended
+  requires agent_id"; a stop without the field answers as before. When the
+  coordinator drops a snapshot session, it also forgets the identity the
+  session committed as, which can never commit again. Records that attempts
+  left before the upgrade stay, since nothing can prove those attempts ended.
+  A coordinator through 0.15.0 and the plugin's Node coordinator through
+  0.6.0 ignore the field; this package's coordinator after 0.15.0 and plugin
+  releases after 0.6.0 forget the identity. Claude Code sessions and
+  subagents are unchanged: their stops never carry the field, so a stopped
+  session or subagent keeps its records (#537). A registry built on
+  `RegistryBase` must implement `forget_agent(agent_id) -> int`, which
+  returns how many state rows it removed, refuses with `ForgetRefused` (a
+  `ValueError`, from `ccs.core.exceptions`), deleting nothing, while the
+  identity holds an `EXCLUSIVE` or `MODIFIED` row, and keeps a row that
+  records a sweep reclaim, left `INVALID`. The coordinator logs and passes
+  over that refusal alone and treats any other error from `forget_agent` as
+  a fault. The backend conformance kit now checks it, so a backend that
+  passed the kit before must add it. The guide's "Attempts a volume ends"
+  section has the details.
 
 - **`write()` returns a `WriteResult` (#526).** It returned `None`. Its
   `disk_differs` is `True` when the coordinator reported, as it admitted the

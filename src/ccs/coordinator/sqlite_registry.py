@@ -75,6 +75,15 @@ Thread safety: process-level RLock guards all mutating methods. SQLite
 connection opened with ``check_same_thread=False`` so handler threads share
 one connection (mutation-then-log invariant preserved by RLock + BEGIN
 IMMEDIATE transactions).
+
+One writer per store (#453): the RLock serializes only the callers of one
+handle, so every read-write open takes an exclusive ``flock`` on
+``<store>.writer-lock`` (:func:`writer_lock_path`) before it touches the store,
+and a second one, in this or another process, raises :class:`StoreHeldError`.
+``read_only=True`` takes no lock. A lock file that cannot be opened, or is not a
+regular file, refuses the open. Only where ``flock`` does not exist (no
+``fcntl``, or a file system whose flock does not work) does the open proceed
+unlocked.
 """
 
 from __future__ import annotations
@@ -87,7 +96,8 @@ import stat
 import threading
 import time
 import warnings
-from contextlib import contextmanager
+import weakref
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -100,9 +110,15 @@ from typing import (
     NoReturn,
     Optional,
     Sequence,
+    TypeVar,
 )
 from urllib.parse import quote
 from uuid import UUID, uuid4
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no flock
+    fcntl = None  # type: ignore[assignment]
 
 from ccs.core.exceptions import (
     CROSS_RUNTIME_SCHEMA_REASON,
@@ -111,6 +127,7 @@ from ccs.core.exceptions import (
     SCHEMA_OLDER_REASON,
     SCHEMA_UNRECOGNIZED_REASON,
     STALE_READ_GENERATION_REASON,
+    STORE_HELD_REASON,
     STORE_SIGNAL_BUSY,
     STORE_SIGNAL_UNREADABLE,
     STORE_SIGNAL_WAL_RECOVERY,
@@ -154,6 +171,7 @@ from .registry_protocol import (
     UncoverableRun,
     acquire_by_deadline,
     decide_transfer_grant,
+    forget_refusal,
     note_guard_won,
     refusal_with_generation_pair,
     require_storable_transfer_status,
@@ -920,6 +938,193 @@ class StoreSqliteError(RuntimeError):
         )
 
 
+class StoreHeldError(RuntimeError):
+    """A read-write open found another live read-write handle on the store.
+
+    A store has one writer: a coordinator, or one registry in this or another
+    process. The refused open touched nothing in the store. A
+    ``read_only=True`` open takes no lock and stays allowed.
+
+    - ``reason`` — always :data:`ccs.core.exceptions.STORE_HELD_REASON`.
+    - ``lock_path`` — the lock file beside the store that the holder has
+      locked.
+    """
+
+    reason = STORE_HELD_REASON
+
+    def __init__(self, message: str, lock_path: str) -> None:
+        super().__init__(message)
+        self.lock_path = lock_path
+
+    def __reduce__(self) -> tuple[type["StoreHeldError"], tuple[str, str]]:
+        return type(self), (str(self), self.lock_path)
+
+
+_WRITER_LOCK_SUFFIX = ".writer-lock"
+_OpenedT = TypeVar("_OpenedT")
+
+#: flock's "someone else holds a conflicting lock" errnos. EACCES: some systems
+#: answer a conflicting non-blocking flock with it.
+LOCK_CONTENDED_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
+#: flock's "this file system has no working flock" errnos: the only failures
+#: that let a writer open go ahead without the lock.
+_NO_FLOCK_ERRNOS = frozenset({errno.ENOLCK, errno.ENOTSUP, errno.EOPNOTSUPP})
+#: The store check probes the lock with a shared lock it drops at once; a writer
+#: open retries a contended lock this long before it reads it as a holder.
+_CONTENDED_RETRY_SEC = 0.1
+_CONTENDED_POLL_SEC = 0.01
+
+
+class _WriterLock:
+    """The open file description that holds ``flock`` on a store's lock file."""
+
+    __slots__ = ("fd",)
+
+    def __init__(self, fd: int) -> None:
+        self.fd: int | None = fd
+        _HELD_WRITER_LOCKS.add(self)
+
+    def release(self) -> None:
+        """Unlock and close. Idempotent, so a second close of a registry never
+        frees a lock a later handle took."""
+        fd, self.fd = self.fd, None
+        _HELD_WRITER_LOCKS.discard(self)
+        if fd is None:
+            return
+        if fcntl is not None:
+            with suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+#: Every writer lock this process holds, so a forked child can drop its copies.
+_HELD_WRITER_LOCKS: "set[_WriterLock]" = set()
+
+
+def _drop_writer_locks_in_child() -> None:
+    """Close a forked child's copies of its parent's writer locks.
+
+    A flock belongs to the open file description, which a forked child shares:
+    its copy would keep the store locked after the parent exits, and an unlock
+    from it would free the live parent's lock. So close, never unlock.
+    """
+    for lock in tuple(_HELD_WRITER_LOCKS):
+        fd, lock.fd = lock.fd, None
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
+    _HELD_WRITER_LOCKS.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_drop_writer_locks_in_child)
+
+
+def _warn_unlocked(path: str | Path, exc: OSError) -> None:
+    logger.warning(
+        "opening %s without the single-writer lock (%s): a second read-write "
+        "open of this store will not be refused",
+        path,
+        exc,
+    )
+
+
+def _open_lock_file(lock_path: Path) -> int:
+    """The lock file's descriptor, made private (0600). Raises ``OSError`` when
+    the path cannot be opened or is not a regular file: a store whose lock
+    cannot be taken is never opened unlocked. ``O_NOFOLLOW``: a link planted at
+    the path is refused (ELOOP), never followed. ``O_NONBLOCK``: a FIFO there
+    cannot hang the open."""
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open(lock_path, flags, _DB_FILE_MODE)
+    try:
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            code = errno.EISDIR if stat.S_ISDIR(mode) else errno.EINVAL
+            raise OSError(code, "not a regular file, so it cannot hold the store's lock", str(lock_path))
+        # A lock file that already existed keeps its mode through O_CREAT.
+        with suppress(OSError):
+            os.fchmod(fd, _DB_FILE_MODE)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _flock_exclusive(fd: int) -> None:
+    """``flock(LOCK_EX)``, retried for :data:`_CONTENDED_RETRY_SEC` while it is
+    contended, so a shared probe held for an instant is not read as a holder."""
+    deadline = time.monotonic() + _CONTENDED_RETRY_SEC
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            if exc.errno not in LOCK_CONTENDED_ERRNOS or time.monotonic() >= deadline:
+                raise
+            time.sleep(_CONTENDED_POLL_SEC)
+
+
+def writer_lock_path(db_path: str | Path) -> Path:
+    """The single-writer lock file of the store at ``db_path``: beside the
+    store with every symlink resolved, so each path to one store names the
+    same lock."""
+    return Path(os.path.realpath(db_path) + _WRITER_LOCK_SUFFIX)
+
+
+def _take_writer_lock(db_path: Path) -> _WriterLock | None:
+    """Take the store's single-writer lock, or raise :class:`StoreHeldError`.
+
+    The lock is ``flock`` on a lock file beside the store, never on the store:
+    on Darwin a flock on the database file conflicts with SQLite's own locks.
+    It is keyed on the resolved path, so a symlink to the store meets the same
+    lock. None where there is no flock: no ``fcntl``, or a file system whose
+    flock does not work (one WARNING), and for a bare ``:memory:`` path, which
+    is a private store for each connection. Any other failure raises.
+    """
+    if fcntl is None or str(db_path) == ":memory:":
+        return None
+    lock_path = writer_lock_path(db_path)
+    # Tracked from the open, so a fork or an interrupt mid-take frees it.
+    lock = _WriterLock(_open_lock_file(lock_path))
+    try:
+        _flock_exclusive(lock.fd)
+    except BaseException as exc:
+        lock.release()
+        if not isinstance(exc, OSError) or exc.errno not in (LOCK_CONTENDED_ERRNOS | _NO_FLOCK_ERRNOS):
+            raise
+        if exc.errno in LOCK_CONTENDED_ERRNOS:
+            raise StoreHeldError(_store_held_message(db_path), str(lock_path)) from None
+        _warn_unlocked(db_path, exc)
+        return None
+    return lock
+
+
+def open_waiting_out_a_holder(
+    open_store: Callable[[], _OpenedT], wait_sec: float, poll_sec: float
+) -> _OpenedT:
+    """``open_store()``, tried again every ``poll_sec`` while it raises
+    :class:`StoreHeldError`, for up to ``wait_sec``; past that the error
+    propagates."""
+    deadline = time.monotonic() + wait_sec
+    while True:
+        try:
+            return open_store()
+        except StoreHeldError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(poll_sec)
+
+
+def _store_held_message(db_path: Path) -> str:
+    return (
+        f"{db_path} is open for writing by another handle: a coordinator, or a "
+        "registry in this or another process. A store has one writer: go "
+        "through that handle, open with read_only=True to read, or retry once "
+        "it closes."
+    )
+
+
 def read_copy_user_version(copy_path: str | Path) -> int:
     """``PRAGMA user_version`` of a store COPY as a writer open would read it:
     committed WAL frames applied, a hot journal rolled back (#345).
@@ -1072,12 +1277,39 @@ class SqliteArtifactRegistry:
         # "migrated from N" line; the dispatch's pre-lock read cannot, since a
         # loser dispatches on a version it then never migrates.
         self.migrated_from_version: int | None = None
+        self._writer_lock: _WriterLock | None = None
 
         if read_only:
             self._open_read_only(instance_id)
             return
 
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Before the first descriptor on the store opens: closing any descriptor
+        # on a file drops this process's POSIX locks on it, so an open that
+        # touched the store and then refused would free a holder's SQLite locks.
+        try:
+            self._writer_lock = _take_writer_lock(self._db_path)
+            if self._writer_lock is not None:
+                # A registry dropped without close() frees its lock when collected.
+                weakref.finalize(self, self._writer_lock.release)
+            self._conn = self._precreate_and_connect()
+        except BaseException:
+            self._release_writer_lock()
+            raise
+        # Every step past the connect can raise, and the caller then never gets
+        # a registry to .close(): a kept exception's traceback would hold the
+        # store open (#426), and its lock with it. The BaseException breadth
+        # mirrors _open_read_only.
+        try:
+            self._finish_writer_open(instance_id, on_migrated)
+        except BaseException:
+            self._conn.close()
+            self._release_writer_lock()
+            raise
+
+    def _precreate_and_connect(self) -> sqlite3.Connection:
+        """The writer's connection, with the store and its sidecars created at
+        0600 first."""
         # Race-free 0600: pre-create state.db at 0o600 via os.open BEFORE
         # sqlite3.connect, so the file never exists at a broader umask mode in
         # the window between creation and an explicit chmod (the audit_log
@@ -1095,23 +1327,18 @@ class SqliteArtifactRegistry:
         # below stays as belt-and-suspenders.
         self._precreate_file_0600(self._wal_path())
         self._precreate_file_0600(self._shm_path())
-
         # check_same_thread=False because ThreadingHTTPServer handler threads
         # all share one registry instance. Coupled with the RLock on every
         # mutating method, this preserves the mutation-then-log invariant.
-        self._conn = sqlite3.connect(
+        return sqlite3.connect(
             str(self._db_path),
             check_same_thread=False,
             isolation_level=None,  # autocommit; we manage transactions explicitly
         )
-        # Every step past the connect can raise, and the caller then never gets
-        # a registry to .close(): a kept exception's traceback would hold the
-        # store open (#426). The BaseException breadth mirrors _open_read_only.
-        try:
-            self._finish_writer_open(instance_id, on_migrated)
-        except BaseException:
-            self._conn.close()
-            raise
+
+    def _release_writer_lock(self) -> None:
+        if self._writer_lock is not None:
+            self._writer_lock.release()
 
     def _finish_writer_open(
         self, instance_id: str | None, on_migrated: Callable[[int], None] | None
@@ -1401,9 +1628,11 @@ class SqliteArtifactRegistry:
 
         Residual (documented, finding A6): a ``BEGIN IMMEDIATE`` that starts
         AFTER this check and then blocks on CROSS-PROCESS SQLite write
-        contention is not covered. That window is narrow — the coordinator is
-        single-process, so the RLock already serializes in-process writers — and
-        remains observed by ``watchdog_late_completion_total``.
+        contention is not covered. That window is narrow — the RLock serializes
+        this handle's writers, and the store has no other read-write handle: a
+        second read-write open is refused while this one is open (#453), except
+        where ``flock`` does not exist — and remains observed by
+        ``watchdog_late_completion_total``.
 
         ``deadline`` (keyword-only, #238) bounds the wait for the lock: a
         :func:`time.monotonic` instant past which the guard stops waiting and
@@ -2997,12 +3226,14 @@ class SqliteArtifactRegistry:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Close the underlying SQLite connection. Idempotent."""
+        """Close the underlying SQLite connection, then free the single-writer
+        lock. Idempotent."""
         with self._lock:
             try:
                 self._conn.close()
             except sqlite3.ProgrammingError:
                 pass
+            self._release_writer_lock()
 
     def __enter__(self) -> "SqliteArtifactRegistry":
         return self
@@ -4724,6 +4955,46 @@ class SqliteArtifactRegistry:
                 (artifact_id.hex, MESIState.INVALID.name),
             ).fetchall()
         return [UUID(hex=r[0]) for r in rows]
+
+    def forget_agent(self, agent_id: UUID) -> int:
+        """Forget an identity that has ended; see
+        :meth:`RegistryBase.forget_agent`. One ``BEGIN IMMEDIATE``: the
+        write-grant check and every delete commit together, and a refusal
+        rolls back having deleted nothing. The ``agent_id`` index serves the
+        deletes; no schema change."""
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                removed = self._forget_agent_in_txn(agent_id)
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        return removed
+
+    def _forget_agent_in_txn(self, agent_id: UUID) -> int:
+        """The forget's statements, inside the caller's open transaction."""
+        held = self._conn.execute(
+            "SELECT artifact_id FROM agent_states "
+            "WHERE agent_id = ? AND state IN (?, ?) LIMIT 1",
+            (agent_id.hex, MESIState.EXCLUSIVE.name, MESIState.MODIFIED.name),
+        ).fetchone()
+        if held is not None:
+            raise forget_refusal(agent_id, UUID(hex=held[0]))
+        removed = self._conn.execute(
+            "DELETE FROM agent_states WHERE agent_id = ? AND last_reclaim_trigger IS NULL",
+            (agent_id.hex,),
+        ).rowcount
+        # The rows left record a reclaim. One the identity read again is
+        # SHARED; an ended identity reads nothing, so it stays as the record only.
+        self._conn.execute(
+            "UPDATE agent_states SET state = ? WHERE agent_id = ? AND state != ?",
+            (MESIState.INVALID.name, agent_id.hex, MESIState.INVALID.name),
+        )
+        self._conn.execute("DELETE FROM heartbeats WHERE agent_id = ?", (agent_id.hex,))
+        self._conn.execute("DELETE FROM pending_notices WHERE agent_id = ?", (agent_id.hex,))
+        return removed
 
     # ------------------------------------------------------------------
     # Plugin-only extensions (KTD-9 + KTD-11)

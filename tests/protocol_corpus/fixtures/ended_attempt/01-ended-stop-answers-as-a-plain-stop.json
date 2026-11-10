@@ -1,0 +1,47 @@
+{
+  "name": "ended-stop-answers-as-a-plain-stop",
+  "description": "A CoherentVolume reports an attempt it no longer uses by sending \"ended\": true with the attempt's agent_id on a session-stop (#525). The stop answers exactly as one without the flag: attempt a0826622451ec196f of session 66666666 holds EXCLUSIVE on notes.md, and its ended stop releases it and lists it in released_artifacts, in the shape warn_mode's session-stop-releases-two-held-paths pins for a stop without the flag. A peer session holds a read of other.md, as in the two status rows, so all three run the same setup. Forgetting the attempt's records happens after the releases and changes nothing in the answer; ended-stop-removes-the-attempt-from-status shows what it removes. Both backends.",
+  "setup": {
+    "tracked": ["notes.md", "other.md"],
+    "files": {
+      "notes.md": "# Notes\n",
+      "other.md": "# Other\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "99999999-9999-4999-8999-999999999999",
+          "path": "other.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "66666666-6666-4666-8666-666666666666",
+          "agent_id": "a0826622451ec196f",
+          "path": "notes.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/session-stop",
+    "body": {
+      "session_id": "66666666-6666-4666-8666-666666666666",
+      "agent_id": "a0826622451ec196f",
+      "ended": true
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "released_artifacts": ["notes.md"]
+    }
+  },
+  "backends": ["python", "node"]
+}

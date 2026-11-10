@@ -237,6 +237,9 @@ and check again.
     coordinator cannot be ruled out.
   - `platform_unsupported`: this platform has no `fcntl`, so no coordinator
     starts here.
+  - `store_held`: a read-write handle that is not a running coordinator has
+    the store open: a script, or a coordinator still closing. A start waits
+    for it to close, then refuses the store. Check again once it closes.
 - `coherence_dir_refused`, one of:
   - `coherence_link`: `.coherence`, or an entry directly inside it, is a
     symbolic link.
@@ -880,7 +883,13 @@ it, so do not hand the path to another session on the strength of an empty
 - while the holder's compare-and-swap commits of the path are refused with
   `stale_read_generation`. A re-read does not lift that refusal;
 - after a peer writes or commits the path, and after the holder's session
-  ends.
+  ends;
+- after the holder ends, when it is a `CoherentVolume` attempt the volume has
+  ended (see [Attempts a volume ends](#attempts-a-volume-ends)). The
+  coordinator forgets the attempt's other records and its name, and keeps its
+  state on this path, as `INVALID`, with the reclaim record: the attempt gets
+  a row with a `null` `agent_name` and empty `states` until 24 hours after its
+  newest reclaim, as after a restart (below).
 
 A reclaimed session gets its write back by editing the path again: the edit
 takes the write grant (`EXCLUSIVE`), which clears the entry, and commits like
@@ -1041,10 +1050,13 @@ moving, which a version comparison cannot see. That happens on:
   (`handoff`).
 
 It does not move when a peer's write-acquire preempts the holder, on a commit
-(the version moves instead), or when a giver hands off a `SHARED` read. The
-names in parentheses are the [state-transition triggers](#trigger-vocabulary).
-Compare generations per artifact `id`, not per path: a path that is removed
-and registered again gets a new `id`, and its generation starts again at 0.
+(the version moves instead), when a giver hands off a `SHARED` read, or when
+the coordinator forgets an identity that has ended (see
+[Attempts a volume ends](#attempts-a-volume-ends)), which it never does while
+that identity holds a write claim. The names in parentheses are the
+[state-transition triggers](#trigger-vocabulary). Compare generations per
+artifact `id`, not per path: a path that is removed and registered again gets
+a new `id`, and its generation starts again at 0.
 
 None of these fields appear below the operator view; the default and `metrics`
 views are unchanged. The table that `agent-coherence-status` prints does not
@@ -1306,6 +1318,29 @@ no version content. (The Claude Code hook/HTTP coordinator carries only content
 hashes on the wire, so durable retention there is inert: there are no bodies to
 store. It is an in-process-embedder feature.)
 
+**One writer per store.** A store has one read-write `SqliteArtifactRegistry`
+at a time. Each read-write open takes an exclusive lock on a file beside the
+store, `<store>.writer-lock`, before it touches the store, and a second
+read-write open of the same store, in this process or another, raises
+`StoreHeldError` (a `RuntimeError` from `ccs.coordinator.sqlite_registry`;
+`reason` is `store_held` and `lock_path` names the lock file). The lock is
+keyed on the store's resolved path, so a symbolic link to the store meets the
+same lock. `close()` frees it, and so do a failed open, a handle that is
+garbage-collected and a process that exits; a forked child does not keep its
+parent's lock. `read_only=True` takes no lock, so readers open beside the
+writer. To share one store between processes, run one coordinator and send
+the others through it, or open them read-only. A writer open that lands while
+`--check-store` probes the lock retries for a tenth of a second before it
+refuses; to wait longer for a holder that is closing, open through
+`open_waiting_out_a_holder(open_store, wait_sec, poll_sec)` from the same
+module, as a coordinator start and the workspace CLI do. A lock file that
+cannot be opened, or that is not a regular file (a directory or FIFO at that
+path, or a file another user owns), refuses the open with an `OSError` and
+creates nothing. Only where `flock` does not exist (Windows, or a file system
+whose `flock` does not work, which logs one warning) does the open proceed
+without the lock, and a second writer is not refused there
+([#453](https://github.com/Cohexa-ai/agent-coherence/issues/453)).
+
 ### Reading a version
 
 ```python
@@ -1453,7 +1488,12 @@ claim there, which can be an earlier one). Both change
 only when an attempt starts (`reacquire()`, `write_cas_at`, `atomic_publish`, a
 `write_cas` that retries or first releases its own `write()` grant, and a forked
 child) and are stable in between, so read them after the operation whose
-attempt you are reporting. `release()` and `close()` start no attempt.
+attempt you are reporting. `release()` and `close()` start no attempt. An
+attempt's row leaves the default view of `/status` once the volume ends that
+attempt, so a join against that view finds only attempts the volume has not
+ended. The operator view also lists an ended attempt that lost a grant to the
+sweep, for 24 hours after its newest reclaim; see
+[Attempts a volume ends](#attempts-a-volume-ends).
 `vol.root` is the workspace root as the volume resolved it at construction
 (absolute, symlinks followed); it never changes.
 
@@ -1496,6 +1536,10 @@ a volume that only reads and commits optimistically never pays for it. Each of
 these starts a fresh attempt, as `reacquire()` and every `write_cas` retry do,
 and a fresh attempt clears every refusal the volume had, not only the one on the
 file it commits. Re-read any other file before a plain `write()` of it.
+
+Ending older attempts does cost requests, even in a volume that only reads and
+commits optimistically: a fresh attempt sends one request for each older
+attempt it ends (see [Attempts a volume ends](#attempts-a-volume-ends)).
 
 If the coordinator does not confirm that release, the volume keeps the grant
 on its record and sends the release again at its next fresh attempt. A release
@@ -1607,7 +1651,10 @@ done with them:
 
 A peer with `on_held="refuse"` is admitted to a released file at once, instead
 of after the coordinator's sweep. `release()` and `close()` start no attempt, so
-`vol.agent_id` and `vol.incarnation` do not change.
+`vol.agent_id` and `vol.incarnation` do not change. `close()` also ends every
+attempt of the volume, so the coordinator forgets them; that costs a request
+even for a volume that only read (see
+[Attempts a volume ends](#attempts-a-volume-ends)).
 
 The volume decides what to release from its own record of the grants its
 `write()` calls took, because the coordinator answers a release the same way
@@ -1668,6 +1715,91 @@ request does.
   in it failed, so `close()` can count a grant as released that still stands,
   and a release that fails on its failed-edit route answers with no account of
   the grant, so `release()` raises `CoherenceError`.
+
+### Attempts a volume ends
+
+Each attempt a volume starts is its own agent to the coordinator, and each one
+that sends a request leaves records there: its state on every file it read or
+wrote, its heartbeat, its queued notices, and a row in `/status`
+`sessions[]`. The volume ends each attempt once it no longer uses it, and the
+coordinator then forgets that attempt: those records leave the store and
+`/status`, and the volume sends nothing under it again. Before, they stayed
+for good. Two volumes forcing 50 `write_cas` conflicts on one file left 101
+agents in the store and in `/status`; now they leave those records for 4
+while both volumes are open and for none after both close. The
+[conflict-outcome counters](#conflict-outcome-counters--how-often-did-it-actually-fire)
+are not forgotten: this package's coordinator keeps a count in its `state.db`
+for each attempt that was refused a commit (#539).
+
+When the volume ends an attempt:
+
+- **At a fresh attempt** (`reacquire()`, `write_cas_at`, `atomic_publish`, and
+  a `write_cas` that retries or first releases the volume's own `write()`
+  grant). It ends every older attempt that is neither the current one nor one
+  holding a read that [`transfer()`](#from-a-coherentvolume) would present. Of
+  those, one that holds a write grant carries the end on the stop that
+  releases the grant; each other one gets an end request of its own, with a
+  short timeout, after the releases and only when every release was
+  confirmed. So a fresh attempt now costs one request for each attempt it
+  ends, where it cost none for an attempt that only read or committed through
+  `write_cas`.
+- **At `close()`.** Every attempt, those holding write grants first. A volume
+  that only read still sends one end request for each of its attempts.
+  Leaving a `with` block or `coherent_workspace()`, `uninstall()`, and a
+  normal end of the `stale-write-guard-fs` server close the volume, so they
+  end its attempts too.
+
+An open volume can still keep one attempt for each file it holds a read on:
+`write_cas_at`, and the MCP server's `swg_write_cas`, commit from a fresh
+attempt each time, and the attempt that read a file is the one `transfer()`
+presents for it. `close()` ends them all.
+
+What the coordinator does with an ended attempt:
+
+- It forgets the attempt's state on each file, its heartbeat and its queued
+  notices, and drops its row from `/status`. No other agent's records change.
+- It forgets nothing while the attempt still holds a write grant, for example
+  after a release it refused: every record stays, and the stop answers as it
+  would without the end.
+- A file state that records a sweep reclaim stays, as `INVALID`, with that
+  record, so the operator view still reports the reclaim (see
+  [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status)).
+- The attempt's id no longer names a handoff successor (see
+  [Naming the successor](#naming-the-successor)).
+
+An end request of its own releases nothing, so it is best effort: one the
+coordinator does not confirm is logged, never raised or counted as a
+degradation, and sent again at the next fresh attempt or `close()`. A
+`close()` that leaves one unconfirmed keeps the volume's endpoint, so calling
+`close()` again sends it. An end carried on a release is confirmed or not with
+that release, which follows `on_error` as before. A `close()` whose end
+request finds nothing listening at the volume's own local coordinator logs the
+attempts it could not end and gives them up. When a write grant's release
+finds nothing listening first, `close()` sends no end and handles the grants
+as [Letting go: `release()` and `close()`](#letting-go-release-and-close)
+describes. Either way the records stay. A forked child ends none of its
+parent's attempts.
+
+Limits:
+
+- Records left by attempts that ended before you upgraded stay. Nothing can
+  prove those attempts are over, so nothing removes them.
+- A volume that exits without `close()`, or an MCP server killed by a signal,
+  ends nothing, and its attempts' records stay.
+- Claude Code sessions and stopped subagents keep their records (#537). A
+  session sends its Stop between turns, and a stopped subagent can be resumed
+  under the same id, so neither stop ends anything.
+- A coordinator that predates the end ignores it and keeps the records: this
+  package's coordinator through 0.15.0, and the Claude Code plugin's Node
+  coordinator through 0.6.0. Plugin releases after 0.6.0 forget an ended
+  attempt's file states, heartbeat, notices and `/status` row the same way.
+- On the Node coordinator a stop answers `ok: true` even when a release in it
+  failed. The volume then counts that attempt as ended while the coordinator
+  keeps its records, because the grant the failed release left standing
+  refuses the forget.
+
+The request the volume sends is described under
+[Release answers, per grant](#release-answers-per-grant).
 
 ### Refusing a file another agent holds
 
@@ -1754,7 +1886,9 @@ with the volume; see [Letting go: `release()` and `close()`](#letting-go-release
   the default one made while a `write_cas` peer's bytes are on their way to disk
   is acknowledged and then overwritten.
 - It forces a read, raises on a deleted file after it has released, and adds one
-  row to the coordinator's store per call.
+  row to the coordinator's store per call, which stays until the volume ends
+  that attempt. It also sends one request for each older attempt it ends (see
+  [Attempts a volume ends](#attempts-a-volume-ends)).
 - It is best-effort in both directions: a return can follow a release the
   coordinator did not confirm, and a raise can follow one it did.
 
@@ -1981,10 +2115,17 @@ calls raise `CoherenceDirRefused` and start nothing (see
 and `agent-coherence-coordinator` prints its text and exits `2`. A start that
 fails stops whatever it started and raises instead:
 `SchemaVersionError` on a store it refuses (its `reason` says why),
-`sqlite3.Error` on a file SQLite cannot open, `OSError` when the lock or
+`StoreHeldError` when another read-write handle (a script, or a coordinator in
+another process) still has `state.db` open after
+`LifecycleConfig.store_holder_wait_sec` (10 seconds by default, longer than a
+closing coordinator keeps its store open: its drain, then its wait for a
+handler still running, so a start right after a stop waits it out), `sqlite3.Error` on a file SQLite cannot open, `OSError` when the lock or
 the bind fails, `ValueError` on a `bind_host` it refuses, and `RuntimeError`
 when it cannot read the hook secret or start a thread. A `KeyboardInterrupt` or
-`SystemExit` during a start gets the same cleanup and then propagates. To ask
+`SystemExit` during a start gets the same cleanup and then propagates. On a
+held store a strict `CoherentVolume` raises the `StoreHeldError`, a degrade one
+warns once and stays detached, the `stale-write-guard-fs` server does not
+start, and `agent-coherence-coordinator` prints one line and exits `2`. To ask
 before a start migrates the store, call
 [`check_store`](#checking-a-store-before-a-coordinator-starts) first.
 
@@ -2427,7 +2568,7 @@ The durable truth is the **pair** `(restore_tier, pin_state)`. `restorable` is b
 
 **The file-member retention caveat, precisely.** File members ride the coordinator's [declared version retention](#version-retention-and-read-at-version), which is a bounded window (a count/age policy), not a per-version hold. A checkpoint pin on a file member **verifies** — it checks the captured version is currently retained and still matches its fingerprint — it **cannot extend** the window or exempt the version from the policy. If the version has aged out by restore time, the restore reports that member `target_lost` rather than restoring different content; expiry always surfaces, never silently. S3 members are the stronger case: their pin is a legal hold in *your* bucket on the captured version — the substrate's own retention, at your bucket's configuration and cost.
 
-**Dropping a pin.** `WorkspaceVersioner.release_checkpoint(checkpoint_id)` releases the pins a checkpoint holds — the S3 legal holds it placed, and file members' verification pins. The manifest survives: this releases pins, it does not delete the checkpoint. Four things to know before calling it. It is **one-way** — a released member is terminal, `pin_checkpoint` will not re-drive it, and the captured version becomes eligible for lifecycle expiry and version-targeted delete from that instant. S3 members must be **re-declared on the versioner you release from** (`add_object_member`), through the **same binding and key that placed the hold**: the pre-flight only checks that an object member is declared at that member path, so a mismatched binding or key records the member `released` while the hold quietly survives. And a hold **shared** with another checkpoint survives until the last holder releases — with two bounds worth knowing, since a legal hold is a retention control: the sharing scan walks only that versioner's registry, so a holder recorded elsewhere (another workspace, a person, another tool) is invisible to it, and the scan alone cannot cover the instant between its last check and the drop itself — that instant is handled by re-reading *after* the drop and putting the hold back if a peer claimed it, so what remains is the narrower case where putting it back also fails, which is logged. Finally, it is **idempotent but not self-healing**: the release records `released` before it drops the substrate hold, so a crash or an untyped substrate error between the two strands a live hold on an already-terminal row — retrying `release_checkpoint` will not detect or repair it, since the row already reads terminal. Calling it **concurrently** fails differently, and no longer strands: two processes releasing one checkpoint both decrement its pin refcount, and the registry fails the surplus decrement with a `ValueError` — but that raise lands after the hold has already been dropped, so it costs you bookkeeping accuracy rather than a live hold. It does abort the rest of that checkpoint's members, which stay `held` for a later call. Treat a `ValueError` as "some members may have been released", never as "nothing happened". The recovery in both cases is calling `CoherentObject.release_legal_hold` directly on the binding, by version — the released row keeps the `native_token` you need for it.
+**Dropping a pin.** `WorkspaceVersioner.release_checkpoint(checkpoint_id)` releases the pins a checkpoint holds — the S3 legal holds it placed, and file members' verification pins. The manifest survives: this releases pins, it does not delete the checkpoint. Four things to know before calling it. It is **one-way** — a released member is terminal, `pin_checkpoint` will not re-drive it, and the captured version becomes eligible for lifecycle expiry and version-targeted delete from that instant. S3 members must be **re-declared on the versioner you release from** (`add_object_member`), through the **same binding and key that placed the hold**: the pre-flight only checks that an object member is declared at that member path, so a mismatched binding or key records the member `released` while the hold quietly survives. And a hold **shared** with another checkpoint survives until the last holder releases — with two bounds worth knowing, since a legal hold is a retention control: the sharing scan walks only that versioner's registry, so a holder recorded elsewhere (another workspace, a person, another tool) is invisible to it, and the scan alone cannot cover the instant between its last check and the drop itself — that instant is handled by re-reading *after* the drop and putting the hold back if a peer claimed it, so what remains is the narrower case where putting it back also fails, which is logged. Finally, it is **idempotent but not self-healing**: the release records `released` before it drops the substrate hold, so a crash or an untyped substrate error between the two strands a live hold on an already-terminal row — retrying `release_checkpoint` will not detect or repair it, since the row already reads terminal. Calling it **concurrently** fails differently, and no longer strands: two versioners releasing one checkpoint both decrement its pin refcount (two processes cannot both open a SQLite store for writing where `flock` exists), and the registry fails the surplus decrement with a `ValueError` — but that raise lands after the hold has already been dropped, so it costs you bookkeeping accuracy rather than a live hold. It does abort the rest of that checkpoint's members, which stay `held` for a later call. Treat a `ValueError` as "some members may have been released", never as "nothing happened". The recovery in both cases is calling `CoherentObject.release_legal_hold` directly on the binding, by version — the released row keeps the `native_token` you need for it.
 
 **Binary members (v1 limitation).** A file member whose bytes are not UTF-8 text is refused at capture with a typed error — before anything persists. The file restore path rides a text wire, so capturing a member that could never be restored would be a silent over-claim.
 
@@ -2442,6 +2583,8 @@ agent-coherence-workspace restore <checkpoint-id>
 
 Four verbs — `checkpoint` (with repeatable `--file` / `--forward-only`, and `--no-pin` for capture-only), `list`, `status`, `restore`. Every verb takes `--root` (override the workspace root; default walks up to the git root) and `--json` (machine-parseable output). `status` renders every member's `(restore_tier, pin_state)` pair — including the claimed-but-not-yet-backed label — plus torn-cut flags and restore outcomes; `checkpoint` output always carries the file-retention caveat. The CLI keeps its own durable state in `<root>/.coherence/workspace.db`.
 
+**Verbs take turns.** The CLI keeps its store in `.coherence/workspace.db`, and a store has one writer (see **One writer per store**). `checkpoint` and `restore` hold it for their whole run; another verb that writes waits up to 30 seconds for it, then exits `2` with `reason` `store_held`. `list` and `status` open the store read-only and do not wait for a verb that writes; when the store does not exist yet or needs a writer to open it (an older schema, or recovery after a crash), they open it as a writer and wait like any verb.
+
 Under `--json`, every error path *also* emits a one-line JSON envelope on stdout — `{"kind": "error", "exit_code": …, "reason": …, "message": …}` — so a script never has to parse stderr prose; the human message stays on stderr unchanged. Capturing a second checkpoint under an existing name is never refused (names are labels, not unique keys), but the prior ids are printed so the ambiguity is never silent — `status` and `restore` always target an id, not a name.
 
 Exit codes:
@@ -2450,7 +2593,7 @@ Exit codes:
 |---|---|
 | `0` | the verb succeeded (restore: concluded with no member in `conflict` / `target_lost` / `held_unconfirmed`) — never a claim that nothing was overwritten: a restore that put a member back over content committed after the capture also exits `0`, and says so per member in the report |
 | `1` | not in a git repository, or a validation error (no members, a `..` traversal in a member argument), or a typed contention error |
-| `2` | a typed refusal: a non-UTF-8 member, an unknown checkpoint id, a checkpoint bound to another receiver or already registered by another controller, a persist failure, or a member path that fails containment at access time — a workspace escape, a symlink component, a hardlinked regular file with a co-owner outside the root, a non-regular file (FIFO, socket, device), or a `.coherence/**` self-target; or a `.coherence` that is a symbolic link or not a directory, or holds a link, FIFO, socket or device directly inside it, refused before anything in it is opened, with `reason` `coherence_dir_refused` (see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory)) |
+| `2` | a typed refusal: another verb kept the store past the 30-second wait (`store_held`), a non-UTF-8 member, an unknown checkpoint id, a checkpoint bound to another receiver or already registered by another controller, a persist failure, or a member path that fails containment at access time — a workspace escape, a symlink component, a hardlinked regular file with a co-owner outside the root, a non-regular file (FIFO, socket, device), or a `.coherence/**` self-target; or a `.coherence` that is a symbolic link or not a directory, or holds a link, FIFO, socket or device directly inside it, refused before anything in it is opened, with `reason` `coherence_dir_refused` (see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory)) |
 | `3` | the restore **concluded**, but at least one member ended in `conflict` / `target_lost` / `held_unconfirmed`, or the restore registration was refused — the per-member report on stdout is the truth; the exit code just tells you to read it |
 | `4` | opt-in, and only with `restore --exit-nonzero-on-discarded-content`: the restore concluded clean by the codes above, but at least one member's write discarded content the checkpoint did not hold, or the run holds no record of what that member's write overwrote. Without the flag the same run exits `0`, and both producers of `3` take precedence over it. It is evaluated after the engine returns, so it reports the writes and never prevents one |
 
@@ -2589,6 +2732,12 @@ Semantics, precisely:
   rejection telling the agent to re-establish, never a quiet fall-through to
   whatever is current. A token that was never a session at all (malformed, or
   never opened) is distinguished as `session_not_found`.
+- **A dropped session's committer is forgotten.** A session commits as an
+  identity minted from its token. Once the coordinator drops the session, as
+  its liveness sweep does after the heartbeat lapses, that identity can never
+  commit again, so the coordinator forgets its state on each file and its
+  heartbeat, and `/status` stops listing it. A restart by itself forgets
+  nothing.
 - **Bytes vs versions.** When the coordinator retains version bodies
   ([version retention](#version-retention-and-read-at-version)), a session read
   serves the pinned bytes directly. Otherwise it returns the pinned version and
@@ -2863,9 +3012,10 @@ offers a session-based gate in Python — `CoordinatorService.effect_gate`, whic
 pins a read-set and re-validates every member's *version* at the effect
 boundary, holding the effect if any moved, whether the effect is a callable or
 a commit of one of the members. In the commit form the check and the commit
-are one step for every writer that goes through the same coordinator; a writer
-on a second handle to the same store can still change a member other than the
-one written. It checks versions only: it does not apply the grant-standing leg, so
+are one step for every writer that goes through the same coordinator. A second
+read-write handle on the same store, which could change a member other than the
+one written, is refused at open wherever `flock` exists (see **One writer per
+store**). It checks versions only: it does not apply the grant-standing leg, so
 a peer's write-acquire that preempts the session's grant without moving any
 version lets that gate fire where this fence holds. It is in-process Python
 only — no HTTP route and no tool reaches it — and it answers in its own
@@ -3194,18 +3344,24 @@ The coordinator must know the id, or every grant of the transfer is refused as
   path to that whole session. It is known only while the coordinator's
   in-memory name map holds it. The coordinator fills that map as identities
   make requests and loses it when its process exits, so after a restart a
-  composite id is refused as unknown, even while it still holds a grant.
+  composite id is refused as unknown, even while it still holds a grant. It
+  also drops a volume's attempt from the map when the volume ends that
+  attempt (see [Attempts a volume ends](#attempts-a-volume-ends)), so an
+  ended attempt's id is refused as unknown too.
 
 So name the session-level id, which needs no live name map when the successor
-has claimed a principal. Where each kind of session's id comes from:
+has claimed a principal. A volume's current `vol.agent_id` is known too while
+the volume is open, from that attempt's first request until a coordinator
+restart: a volume never ends the attempt it is using. Where each kind of
+session's id comes from:
 
 - **A Claude Code session**: derive it from the session's id, which Claude
   Code sets as `CLAUDE_CODE_SESSION_ID` in the session's shells (see the
   [example](#example-handing-a-file-between-claude-code-sessions)).
 - **A `CoherentVolume`**: `str(session_to_agent_id(vol.session_id))`, with the
   function above. Do not take a volume's id from `sessions[]` on `/status`:
-  the ids listed there for a volume are its per-attempt composite ids, which a
-  restart of the coordinator forgets.
+  the ids listed there for a volume are its per-attempt composite ids, which
+  the coordinator forgets at a restart or when the volume ends that attempt.
 - **An MCP session**: the `session_agent_id` its own `swg_status` reports (see
   [From the MCP server](#from-the-mcp-server)).
 
@@ -3389,6 +3545,31 @@ again at its next fresh attempt.
 `session-stop` now refuses a malformed `agent_id` with HTTP `400`, before the
 principal check. It used to answer `{"ok": true, "released_artifacts": []}`,
 which reads as a release that found nothing to release.
+
+**Ending an identity.** `session-stop` also takes an optional `"ended": true`,
+sent with an `agent_id`: the identity that `agent_id` names will send nothing
+more. A `CoherentVolume` sends it for each attempt it no longer uses (see
+[Attempts a volume ends](#attempts-a-volume-ends)). The stop releases and
+answers exactly as one without the field. Then, unless a grant is still held,
+the coordinator forgets the identity: its state on each file, its heartbeat,
+its queued notices and its `/status` row. A file state that records a sweep
+reclaim stays, as `INVALID`, with that record. Send it only for an identity that
+will never act again: the coordinator then treats it as never seen, so a later
+request under that id is no longer checked against what it read, and a
+compare-and-swap commit, for one, is decided on the version alone.
+
+| `ended` | Answer |
+|---|---|
+| absent or `false` | as before the field existed |
+| `true`, with an `agent_id` | the stop's usual answer, and the identity is forgotten |
+| `true`, with no `agent_id` | HTTP `400`, `{"error": "ended requires agent_id"}`. A stop with no `agent_id` is a Claude Code session's own Stop, sent between turns, which never ends it |
+| anything else, `null` included | HTTP `400`, `{"error": "ended must be a boolean"}` |
+
+Both `400`s come before the `agent_id` check (and, on this package's
+coordinator, the principal check), and nothing is released. Both coordinators
+answer the same: this package's in releases after 0.15.0, and the Claude Code
+plugin's Node coordinator in plugin releases after 0.6.0. An earlier
+coordinator ignores the field, answers as to any stop, and keeps the records.
 
 ### Ended records and eviction
 
@@ -4086,6 +4267,13 @@ is still running:
   attached to the stopped coordinator does not come back, and its replacement
   is a new session. Stop that process last.
 
+Closing a volume also ends each of its attempts, and the coordinator forgets
+them (see [Attempts a volume ends](#attempts-a-volume-ends)): they leave
+`/status`, and their ids no longer name a successor. A transfer record names
+session-level ids, so it stays and is served as described here. A volume
+whose process exits without `close()`, or an MCP server killed by a signal,
+ends nothing, and its attempts' records stay.
+
 If the giver is gone, its record ends when the successor declines or when any
 session commits a write to the path. Until then no other session can hand the
 path on (its transfer is refused as `handoff_in_flight`), bystanders keep
@@ -4488,10 +4676,13 @@ coordinator in these ways:
   a reclaim does not stop a write the holder had already been admitted for:
   that write can reach the file after the reclaim. Its `post-edit` is refused,
   so no version records those bytes.
-- **One coordinator process.** On the Python coordinator the check and the
+- **One writer per store.** On the Python coordinator the check and the
   grant are one decision inside the coordinator process that holds the
-  workspace's store. A second writer opened on the same `state.db` is outside
-  that decision ([#453](https://github.com/Cohexa-ai/agent-coherence/issues/453)).
+  workspace's store, and a second read-write open of that `state.db` is
+  refused with `StoreHeldError`
+  ([#453](https://github.com/Cohexa-ai/agent-coherence/issues/453)). Where
+  `flock` does not exist (Windows, or a file system that refuses it), a second
+  writer is not refused and is outside that decision.
   On the Node coordinator they are one SQLite transaction, and the plugin runs
   one coordinator per workspace (see **On the Node coordinator**).
 - **A malformed subagent id is read as the parent.** An `agent_id` that is not
@@ -4685,15 +4876,17 @@ with `recover: read_then_retry`, where `swg_write` answered `commit_preempted`
 and `swg_write_cas` answered `internal_error`.
 
 **Multiple sessions, one workspace.** Multiple `stale-write-guard-fs` instances
-pointed at the same `SWG_ROOT` attach to one coordinator, so a stale write is denied
-across sessions; if the coordinator's session exits, peers fail closed. When
-the host ends a server normally, the server closes its volume before it stops a
-coordinator it started, so the files its `swg_write` calls took are given back
-to the other sessions at once, not after the sweep; a close that fails is logged
-to stderr, and a coordinator that does not answer costs one client timeout
-(6 s by default) at shutdown. A server killed by a signal releases nothing. One
-session hands a path to another with `swg_transfer`; see
-[From the MCP server](#from-the-mcp-server).
+pointed at the same `SWG_ROOT` attach to one coordinator, so a stale write is
+denied across sessions; if the coordinator's session exits, peers fail closed.
+When the host ends a server normally, the server closes its volume before it
+stops a coordinator it started, so the files its `swg_write` calls took are
+given back to the other sessions at once, not after the sweep, and the
+coordinator forgets the volume's attempts (see
+[Attempts a volume ends](#attempts-a-volume-ends)); a close that fails is
+logged to stderr, and a coordinator that does not answer costs one client
+timeout (6 s by default) at shutdown. A server killed by a signal releases
+nothing and ends nothing. One session hands a path to another with
+`swg_transfer`; see [From the MCP server](#from-the-mcp-server).
 
 **Wiring a client to prefer `swg_*` over native file tools.** Registering the
 server exposes the `swg_*` tools, but an agent will still reach for its native
@@ -5646,7 +5839,11 @@ session. It does not read the registry, so it is never degraded.
   artifact `id`, and a [`handoff` key](#the-handoff-key) while the path has a
   transfer record. Untracking a path does not remove its entry;
 - `sessions`: one row per agent that this coordinator process has seen or
-  that holds a path, with its `agent_id`, its `states` (each path it holds, as
+  that holds a path, except an agent that has ended: a `CoherentVolume`
+  attempt the volume has ended (see
+  [Attempts a volume ends](#attempts-a-volume-ends)), or the identity a
+  dropped [snapshot session](#multi-artifact-snapshot-sessions) committed as.
+  Each row has its `agent_id`, its `states` (each path it holds, as
   `SHARED`, `EXCLUSIVE` or `MODIFIED`), and `agent_name` set to `null`. A
   session or subagent that released a write grant, at the end of a turn, when
   it stopped, or on a failed edit, still lists the path as `SHARED`; a path

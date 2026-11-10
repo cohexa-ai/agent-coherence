@@ -12,7 +12,7 @@ shipped. Nothing here connects to, reads from, or writes to any store.
 
 It follows the :mod:`ccs.coordinator.registry_protocol` precedent (a module that
 owns Protocols + shared types the two registries re-export). Where that module
-names the registry SURFACE (the 66-member ``RegistryBase`` + ``SqliteExtended``
+names the registry SURFACE (the 67-member ``RegistryBase`` + ``SqliteExtended``
 Protocols; the 9 detection members sit on their own ``ForeignWriteDetection``),
 this module names the CONTRACT that surface must satisfy for a
 backend to host the atomic boundary: which members participate in the
@@ -110,7 +110,7 @@ class MemberContract:
     rationale: str
 
 
-# The 75 members of RegistryBase (52 methods + 1 property), SqliteExtended
+# The 76 members of RegistryBase (53 methods + 1 property), SqliteExtended
 # (+13 methods) and ForeignWriteDetection (+9 methods), classified against the CoordinatorService call sites. The
 # ATOMIC_CLASS members are the ones the service touches INSIDE its atomic
 # mutation paths (``write`` / ``commit`` / ``commit_cas`` under ``abort_guard``;
@@ -420,6 +420,24 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "(the sweep's eviction, beside the notice eviction). Liveness is the "
         "read's, so a live record is never evicted. Durable maintenance "
         "delete; not part of the boundary.",
+    ),
+    MemberContract(
+        "forget_agent",
+        MemberClass.INDEPENDENT,
+        "base",
+        "Deletes the records of an identity that has ended (#525) -- its "
+        "agent-state rows, heartbeat and queued notices -- in one serialized "
+        "step (sqlite: one BEGIN IMMEDIATE; in-memory: one _lock hold), and "
+        "refuses with ForgetRefused (a ValueError), deleting nothing, while "
+        "the identity holds an EXCLUSIVE or MODIFIED row; the coordinator "
+        "treats any other error from it as a fault. A row that records a "
+        "sweep reclaim stays, left INVALID. Not part of the boundary: it "
+        "never removes a write grant, the only row other_holder arbitrates "
+        "on, and the fence row it removes belongs to an identity that sends "
+        "nothing more. That is also its obligation on the caller: a deleted "
+        "row admits on absent, so only an identity that provably ended may "
+        "be forgotten. A caller under a watchdog runs it inside "
+        "abort_guard(abort), so a forget that arrives late deletes nothing.",
     ),
     # ---- READ_ONLY (base) --------------------------------------------------
     MemberContract(
@@ -828,7 +846,7 @@ MEMBER_CLASSIFICATION: dict[str, MemberContract] = {
     contract.name: contract for contract in _MEMBER_CONTRACTS
 }
 """Every ``RegistryBase`` + ``SqliteExtended`` member → its :class:`MemberContract`
-(R8). Keyed by member name. The key set must equal the 75-member Protocol surface
+(R8). Keyed by member name. The key set must equal the 76-member Protocol surface
 exactly — :mod:`tests.test_backend_contract` fails if ``registry_protocol.py``
 gains or loses a member without a matching update here (bidirectional drift
 guard). Includes the ``coordinator_epoch`` property (property-omission teeth)."""

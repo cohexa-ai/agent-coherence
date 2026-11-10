@@ -845,6 +845,7 @@ class TestRevalidateFireWindow:
             if not deadlocked:
                 sql.close()
 
+    @pytest.mark.usefixtures("two_writer_store")
     def test_atomic_second_store_handle_window_is_observed(
         self, tmp_path: Path
     ) -> None:

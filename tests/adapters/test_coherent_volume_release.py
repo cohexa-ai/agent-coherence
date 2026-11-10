@@ -701,10 +701,14 @@ def test_closing_twice_sends_nothing_the_second_time(
     assert wire.sent == []
 
 
-def test_a_volume_that_wrote_nothing_closes_without_a_request(
+def test_a_volume_that_wrote_nothing_closes_with_one_end(
     tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
 ) -> None:
-    """Prevents a close spending a request on a volume that holds no grant."""
+    """A volume that only read holds no grant, so its close releases nothing:
+    its one request ends the attempt that read (#525).
+
+    Prevents a close spending more than that one request on a volume that
+    holds no grant."""
     (tmp_path / _X).write_bytes(b"seed")
     holder = _holder(tmp_path, fast_cfg)
     holder.read(_X)
@@ -712,7 +716,9 @@ def test_a_volume_that_wrote_nothing_closes_without_a_request(
 
     holder.close()
 
-    assert wire.sent == []
+    assert wire.sent == [
+        (_SESSION_STOP, {"session_id": holder.session_id, "agent_id": holder.incarnation, "ended": True}),
+    ]
     assert holder.closed is True
 
 

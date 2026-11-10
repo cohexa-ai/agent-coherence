@@ -57,6 +57,7 @@ from ccs.adapters.coherent_volume import (
     uninstall,
 )
 from ccs.cli._coherence_client import CoordinatorEndpoint, CoordinatorUnavailable, escape_nonprintable
+from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry, StoreHeldError
 from ccs.core.exceptions import (
     CasRetriesExhausted,
     CasVersionConflict,
@@ -1277,6 +1278,29 @@ def test_a_volume_refuses_a_symlinked_pid_file_and_leaves_its_target_alone(
     assert (coherence_dir / "server.pid").is_symlink()
     assert target.read_bytes() == b"keep\n"
     assert sorted(os.listdir(coherence_dir)) == ["server.pid"]
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+def test_a_volume_over_a_store_another_writer_holds_refuses_or_detaches(
+    tmp_path: Path, fast_cfg: LifecycleConfig, on_error: str
+) -> None:
+    """#453: a start that still finds another read-write handle on state.db
+    after its wait starts nothing. A strict volume raises the typed
+    StoreHeldError; a degrade volume warns once and stays detached."""
+    _seed(tmp_path)
+    cfg = replace(fast_cfg, store_holder_wait_sec=0.1)
+    try:
+        with SqliteArtifactRegistry(tmp_path / ".coherence" / "state.db"):
+            if on_error == "strict":
+                with pytest.raises(StoreHeldError):
+                    CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=cfg)
+            else:
+                with pytest.warns(CoherenceDegradedWarning, match="open for writing") as caught:
+                    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=cfg)
+                assert not vol.is_attached
+                assert [w.category for w in caught].count(CoherenceDegradedWarning) == 1
+    finally:
+        stop_coordinator(tmp_path)
 
 
 def _strict_refusal(root: Path, cfg: LifecycleConfig) -> CoherenceDirRefused:
@@ -3943,9 +3967,10 @@ def test_identity_accessors_are_read_only(
 def test_every_request_names_the_current_incarnation(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every request the volume sends names its CURRENT incarnation; the one
-    exception is the release of an abandoned write grant, which names the
-    abandoned one. A request without it lands on the session's parent row: a read
+    """Every request the volume sends names its CURRENT incarnation; the
+    exceptions are the release of an abandoned write grant and the end of an
+    incarnation the volume no longer uses, which name that older one. A
+    request without it lands on the session's parent row: a read
     there registers a view the next attempt does not own, and a release there
     releases nothing."""
     rel, other = "data/shared.txt", "data/other.txt"
@@ -3982,9 +4007,16 @@ def test_every_request_names_the_current_incarnation(
             body["agent_id"] for route, body, _c in sent if route == "/hooks/pre-edit"
         }
         stops = [body for route, body, _c in sent if route == "/hooks/session-stop"]
-        assert [body["agent_id"] for body in stops] == [write_incarnation], (
+        assert [body["agent_id"] for body in stops if "ended" not in body] == [write_incarnation], (
             "the release did not name the incarnation write() left holding the grant"
         )
+        # The other stops end the incarnations the volume no longer uses
+        # (#525): the one that wrote, at reacquire(), and write_cas_at's, at
+        # atomic_publish's re-mint.
+        _cas, cas_at_incarnation = [body["agent_id"] for route, body, _c in sent if route == "/hooks/post-edit-cas"]
+        assert [(body["agent_id"], body.get("ended")) for body in stops] == [
+            (write_incarnation, None), (write_incarnation, True), (cas_at_incarnation, True),
+        ]
         for route, body, current in sent:
             assert body["session_id"] == vol.session_id, route
             if route != "/hooks/session-stop":
@@ -4468,46 +4500,70 @@ def test_write_cas_after_write_and_reacquire_on_the_same_volume_commits(
         stop_coordinator(tmp_path)
 
 
-def test_re_mint_spends_no_request_on_an_incarnation_without_a_write_grant(
+def test_re_mint_ends_the_attempts_it_no_longer_references_and_none_that_sent_nothing(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An incarnation that only read, committed optimistically, or had its write
-    DENIED holds at most SHARED/INVALID and blocks nothing; releasing it anyway
-    would add a round trip to every re-mint — every optimistic retry — for
-    nothing. The requests are COUNTED, so an unconditional release cannot pass.
-    The second half keeps the zero honest: a write() that takes a grant costs
-    exactly ONE release at the transition, however many re-mints follow it."""
+    DENIED holds at most SHARED/INVALID and blocks nothing, but the coordinator
+    keeps its rows, heartbeat and ``/status`` entry until the volume ends it
+    (#525). A re-mint ends, with one ``ended`` stop each, the incarnations a
+    request named that the volume no longer references: neither the current one
+    nor one holding a read a transfer would present. One that never sent a
+    request never reached the coordinator, and nothing is spent on it. The
+    requests are COUNTED, so an end per re-mint, or none, cannot pass. The
+    second half keeps a write() grant's cost honest: exactly ONE release at the
+    transition, and the end of that incarnation once nothing references it."""
     rel = "data/shared.txt"
     target = _seed(tmp_path, content=b"v1")
     vol, peer = _pair(tmp_path, fast_cfg)
     try:
         vol.read(rel)
+        first = vol._incarnation
         peer.read(rel)
         peer.write(rel, b"v2-peer")  # vol -> INVALID
         _end_turn(peer)
         sent: list[tuple[str, dict, str]] = []
         _count_stops(monkeypatch, sent, vol)
 
-        def stops() -> int:
-            return sum(1 for route, _b, _c in sent if route == "/hooks/session-stop")
+        def stops() -> list[tuple[str, bool]]:
+            return [
+                (body["agent_id"], body.get("ended") is True)
+                for route, body, _c in sent if route == "/hooks/session-stop"
+            ]
+
+        def listed(incarnation: str) -> bool:
+            status = vol.coordinator_status()
+            assert status is not None
+            row = str(session_to_agent_id(vol.session_id, incarnation))
+            return row in {session["agent_id"] for session in status["sessions"]}
 
         with pytest.raises(StaleView):
             vol.write(rel, b"stale")  # denied: no grant was taken
         assert _held(vol, _agent_id(vol)) == {}  # the denied incarnation is INVALID
-        assert vol.reacquire(rel) == b"v2-peer"  # re-mint 1 abandons an INVALID row
+        assert vol.reacquire(rel) == b"v2-peer"  # re-mint 1: the first still holds the read
+        second = vol._incarnation
         assert _held(vol, _agent_id(vol)) == {rel: "SHARED"}
+        assert stops() == [], "a re-mint ended the incarnation holding the volume's read"
+        with pytest.raises(FileNotFoundError):
+            vol.write_cas_at("data/missing.txt", 0, b"never sent")  # re-mint 2 ends the first
+        unsent = vol._incarnation
+        assert stops() == [(first, True)]
+        assert not listed(first)
+        assert vol.reacquire(rel) == b"v2-peer"  # re-mint 3 abandons one that sent nothing
+        assert stops() == [(first, True)], "a re-mint spent a request on an incarnation that sent none"
         _data, version = vol.read_with_version(rel)
-        vol.write_cas_at(rel, version, b"v3-cas")  # re-mint 2 abandons a SHARED row
-        vol.reacquire(rel)  # re-mint 3
-        rows = {body["agent_id"] for _r, body, _c in sent if "agent_id" in body}
-        assert len(rows) == 4, f"expected four incarnations across three re-mints, saw {len(rows)}"
-        assert stops() == 0, "a re-mint released an incarnation that held no write grant"
+        vol.write_cas_at(rel, version, b"v3-cas")  # re-mint 4 ends the second
+        assert stops() == [(first, True), (second, True)]
+        assert unsent not in {body.get("agent_id") for _r, body, _c in sent}
 
         vol.write(rel, b"v4-pessimistic")
+        writer = vol._incarnation
         for _ in range(2):
             _data, version = vol.read_with_version(rel)
             vol.write_cas_at(rel, version, b"v5-cas")
-        assert stops() == 1, "a write() grant costs exactly one release at the transition"
+        released = [incarnation for incarnation, ended in stops() if not ended]
+        assert released == [writer], "a write() grant costs exactly one release at the transition"
+        assert stops()[-1] == (writer, True)
         assert target.read_bytes() == b"v5-cas"
     finally:
         stop_coordinator(tmp_path)
@@ -5735,17 +5791,23 @@ def test_a_refused_acquire_leaves_no_grant_for_a_re_mint_to_release(
         vol._mint_nonce, vol._principal = "Z" * 43, None
         with pytest.raises(CallerPrincipalRefused):
             vol.write(rel, b"v2")
+        refused = vol._incarnation
         vol._mint_nonce, vol._principal = nonce, bound
-        sent: list[tuple[str, str | None]] = []
-        _record_principals(monkeypatch, sent)
+        sent: list[tuple[str, dict, str]] = []
+        _count_stops(monkeypatch, sent, vol)
+
+        def stops() -> list[dict]:
+            return [body for route, body, _c in sent if route == "/hooks/session-stop"]
 
         vol.reacquire(rel)
-        assert "/hooks/session-stop" not in {r for r, _p in sent}
+        # The refused acquire was sent, so the re-mint ends its incarnation
+        # (#525), but it releases nothing.
+        assert stops() == [{"session_id": vol.session_id, "agent_id": refused, "ended": True}]
 
         vol.write(rel, b"v2")
         sent.clear()
         vol.reacquire(rel)
-        assert "/hooks/session-stop" in {r for r, _p in sent}, "control: a real grant is released"
+        assert [body for body in stops() if "ended" not in body], "control: a real grant is released"
     finally:
         stop_coordinator(tmp_path)
 

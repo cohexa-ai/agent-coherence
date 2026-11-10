@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 
+from ccs.adapters.claude_code import lifecycle
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, ensure_coordinator, stop_coordinator
 from ccs.cli import (
     coherence_coordinator,
@@ -43,6 +44,7 @@ from ccs.cli._coherence_client import (
     post_with_stored_principal,
     resolve_endpoint,
 )
+from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import TlsConfigError, TlsVerificationFailed
 from tests.coherence_link_helpers import plant_link, target_snapshot
 
@@ -3548,3 +3550,41 @@ def test_the_check_store_exit_map_covers_every_outcome_and_avoids_1_and_2() -> N
     assert set(codes) == {outcome.value for outcome in StoreCheckOutcome}
     assert len(set(codes.values())) == len(codes)
     assert not set(codes.values()) & {1, 2}
+
+
+# --- one writer per store (#453) ------------------------------------------------
+
+
+def test_coordinator_no_detach_names_a_store_another_writer_holds(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A start that still finds another read-write handle on state.db after its
+    wait exits 2 with one line naming it, never a traceback."""
+    monkeypatch.setattr(
+        lifecycle, "_DEFAULT_CONFIG", LifecycleConfig(store_holder_wait_sec=0.1)
+    )
+    try:
+        with SqliteArtifactRegistry(git_workspace / ".coherence" / "state.db"):
+            rc = coherence_coordinator.main(["--root", str(git_workspace), "--no-detach"])
+    finally:
+        stop_coordinator(git_workspace)
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "open for writing by another handle" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_spawn_detached_names_a_held_store_when_its_wait_ends(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The detached worker's stderr is /dev/null, so when the wait ends the
+    parent probes the store's lock itself and names a holder, instead of the
+    bare 'did not become reachable'."""
+    monkeypatch.setattr(coherence_coordinator, "_DETACH_PORT_WAIT_TIMEOUT_SEC", 0.3)
+    monkeypatch.setattr(coherence_coordinator.subprocess, "Popen", lambda *a, **kw: None)
+    with SqliteArtifactRegistry(git_workspace / ".coherence" / "state.db"):
+        rc = coherence_coordinator._spawn_detached(git_workspace, quiet=True)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "open for writing by another handle" in err
+    assert "did not become reachable" not in err

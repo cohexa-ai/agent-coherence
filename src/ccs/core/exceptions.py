@@ -401,6 +401,20 @@ SCHEMA_VERSION_REASONS: frozenset[str] = frozenset(
 )
 
 # ---------------------------------------------------------------------------
+# one read-write handle per store (#453)
+# ---------------------------------------------------------------------------
+#
+# ``StoreHeldError.reason`` (defined in ``ccs.coordinator.sqlite_registry`` for
+# the same layering reason as the schema classes above). The workspace CLI's
+# JSON envelope and the store check carry it, so it is wire-stable: add, do
+# not mutate.
+STORE_HELD_REASON = "store_held"
+"""Another read-write handle has the store open: a coordinator, or a registry
+in this or another process. A store has one writer. Remedy: go through that
+handle (a coordinator's routes), open with ``read_only=True`` to read, or
+retry once it closes."""
+
+# ---------------------------------------------------------------------------
 # caller-principal refusal reasons (coordinator caller principal, U4)
 # ---------------------------------------------------------------------------
 #
@@ -1002,6 +1016,13 @@ class HandoffPathsInvalid(ValueError):
     write-set is, and its own type so a caller catches exactly it: a broader
     ``except ValueError`` around a transfer would also swallow a fault after
     the request went out, which must read as an unknown outcome instead."""
+
+
+class ForgetRefused(ValueError):
+    """A registry's ``forget_agent`` refused, deleting nothing, because the
+    identity still holds a write grant (EXCLUSIVE or MODIFIED). A
+    ``ValueError``, and its own type so the coordinator logs and passes over
+    exactly this refusal: any other error inside a forget is a fault."""
 
 
 class InvalidTransitionError(CoherenceError):
