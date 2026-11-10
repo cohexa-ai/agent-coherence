@@ -457,8 +457,7 @@ def _fake_coherence_dir(workspace: Path, port: int) -> None:
     reachable without spawning a real coordinator."""
     coherence = workspace / ".coherence"
     coherence.mkdir(exist_ok=True)
-    # Port-file format per lifecycle.read_port_from_file: line 1 pid, line 2 port.
-    (coherence / "server.pid").write_text(f"12345\n{port}\n")
+    write_coordinator_pid_file(coherence, port)
     (coherence / "hook.secret").write_text("test-secret")
 
 
@@ -766,7 +765,7 @@ def inproc_coordinator(git_workspace: Path):
     server = CoordinatorHTTPServer(git_workspace, port=0, instance_id="hook-principal")
     server.serve_in_thread()
     assert load_secret(server.coordinator_root)
-    (git_workspace / ".coherence" / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
+    write_coordinator_pid_file(git_workspace / ".coherence", server.port, pid=os.getpid())
     try:
         yield git_workspace, server
     finally:
@@ -1231,6 +1230,7 @@ def test_pre_edit_delivers_the_freshness_advisory_when_the_coordinator_times_out
 # ----------------------------------------------------------------------
 
 from tests.coherence_link_helpers import TARGET_BYTES, plant_link, release_fifo  # noqa: E402
+from tests.pid_lock_helpers import write_coordinator_pid_file
 
 
 def _secret_link_refusal(coherence: Path) -> str:
@@ -1283,7 +1283,7 @@ def test_a_linked_hook_secret_is_never_sent_as_the_bearer(
     coherence = git_workspace / ".coherence"
     try:
         coherence.mkdir()
-        (coherence / "server.pid").write_text(f"12345\n{httpd.server_address[1]}\n")
+        write_coordinator_pid_file(coherence, httpd.server_address[1])
         plant_link(coherence, "hook.secret", "existing")
         (git_workspace / "plan.md").write_text("plan")
         read = {
@@ -1326,7 +1326,7 @@ def test_resolve_endpoint_refuses_a_linked_coherence_before_reading_server_pid(
     def no_pid_read(path: Path) -> None:
         pytest.fail(f"read {path} through a linked .coherence")
 
-    monkeypatch.setattr(_coherence_client, "_read_port_from_file", no_pid_read)
+    monkeypatch.setattr(_coherence_client, "read_pid_file", no_pid_read)
 
     with pytest.raises(_coherence_client.CoordinatorUnavailable) as refused:
         _coherence_client.resolve_endpoint(workspace)
@@ -1349,7 +1349,7 @@ def test_resolve_endpoint_answers_at_once_for_a_fifo_hook_secret(git_workspace: 
     as an empty secret."""
     coherence = git_workspace / ".coherence"
     coherence.mkdir()
-    (coherence / "server.pid").write_text("12345\n50000\n")
+    write_coordinator_pid_file(coherence, 50000)
     secret = coherence / "hook.secret"
     if linked:
         fifo = plant_link(coherence, "hook.secret", "to_fifo")

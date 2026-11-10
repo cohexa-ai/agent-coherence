@@ -46,6 +46,7 @@ from tests.adapters.test_coherent_volume_other_holder import (
 )
 from tests.coordinator_helpers import recorded_version, serve_in_process, write_holders
 from tests.loopback_helpers import refused_endpoint
+from tests.pid_lock_helpers import release_coordinator_locks
 
 _X = "data/x.txt"
 _ORIGINAL_OPEN = builtins.open
@@ -798,6 +799,31 @@ def test_a_close_refused_at_the_local_endpoint_logs_and_does_not_raise(
 
     assert holder.closed is True
     assert any(_X in record.getMessage() for record in caplog.records)
+
+
+def test_a_close_after_its_coordinator_exited_logs_and_sends_nothing(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    server: CoordinatorHTTPServer,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The volume's coordinator exits after the write, and something still
+    answers on its port. The client sends nothing there (#503), and the strict
+    close logs the paths and returns, as when no coordinator listens at the
+    port.
+
+    Prevents a strict exit raising over grants nothing can release once the
+    coordinator that held them is gone."""
+    holder = _holder(tmp_path, fast_cfg)
+    holder.write(_X, b"from the holder")
+    release_coordinator_locks()
+
+    with caplog.at_level("WARNING", logger="ccs.adapters.coherent_volume"):
+        holder.close()
+
+    assert holder.closed is True
+    assert any(_X in record.getMessage() for record in caplog.records)
+    assert write_holders(server, _X), "control: no release reached the port"
 
 
 def _connect_failed(reason: BaseException) -> Callable[[Callable[..., object], dict], object]:

@@ -37,6 +37,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.pid_lock_helpers import write_coordinator_pid_file
 from tests.protocol_corpus.harness import (
     ALL_BACKENDS,
     BACKEND_NODE,
@@ -369,7 +370,7 @@ def test_the_node_hook_client_is_attributed_through_the_python_coordinator(
     server.serve_in_thread()
     try:
         assert load_secret(server.coordinator_root)
-        (tmp_path / ".coherence" / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
+        write_coordinator_pid_file(tmp_path / ".coherence", server.port, pid=os.getpid())
         sid = str(uuid.uuid4())
         edit = {"session_id": sid, "tool_input": {"file_path": str(tmp_path / "plan.md")}}
 

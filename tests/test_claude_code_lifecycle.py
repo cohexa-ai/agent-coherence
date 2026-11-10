@@ -10,6 +10,7 @@ the 10-process race integration test that gives Unit 5 its main signal.
 from __future__ import annotations
 
 import errno
+import fcntl
 import multiprocessing as mp
 import os
 import select
@@ -3043,6 +3044,7 @@ def test_connect_or_spawn_refuses_a_link_before_it_reads_the_pid_file(
         pytest.fail("connect_or_spawn read the pid file or probed a port before the check")
 
     monkeypatch.setattr(lifecycle, "read_port_from_file", must_not_run)
+    monkeypatch.setattr(lifecycle, "read_pid_lines", must_not_run)
     monkeypatch.setattr(lifecycle, "tcp_probe", must_not_run)
 
     with pytest.raises(CoherenceDirRefused):
@@ -3501,3 +3503,55 @@ def test_a_second_coordinator_cannot_open_the_store_after_server_pid_is_unlinked
         assert done.stdout.strip() == "store_held"
     finally:
         stop_coordinator(workspace)
+
+
+# ----------------------------------------------------------------------
+# A coordinator that has exited is never joined (#503, #428)
+# ----------------------------------------------------------------------
+
+
+def _exited_pid() -> int:
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(60)
+    return child.pid
+
+
+def test_a_start_that_loses_the_lock_never_joins_an_exited_binders_port(
+    workspace: Path, fast_cfg: LifecycleConfig,
+) -> None:
+    """#428: a start that loses the workspace lock while the winner has not yet
+    emptied a dead coordinator's pid file must not join the dead port."""
+    coherence = workspace / ".coherence"
+    coherence.mkdir(mode=0o700)
+    pid_file = coherence / "server.pid"
+    pid_file.write_text(f"{_exited_pid()}\n1\n")
+    holder = os.open(pid_file, os.O_RDWR)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        handle = ensure_coordinator_handle(
+            workspace, config=replace(fast_cfg, port_file_retry_attempts=3)
+        )
+    finally:
+        os.close(holder)
+    assert handle is None or handle.port != 1
+
+
+def test_connect_or_spawn_starts_a_coordinator_rather_than_reach_an_exited_ones_port(
+    workspace: Path, fast_cfg: LifecycleConfig,
+) -> None:
+    """A coordinator that died left its pid file; something else listens on its
+    port. A start must not treat that listener as the coordinator."""
+    stranger = socket.socket()
+    stranger.bind(("127.0.0.1", 0))
+    stranger.listen()
+    try:
+        coherence = workspace / ".coherence"
+        coherence.mkdir(mode=0o700)
+        (coherence / "server.pid").write_text(f"{_exited_pid()}\n{stranger.getsockname()[1]}\n")
+        port = connect_or_spawn(workspace, config=fast_cfg)
+        try:
+            assert port not in (-1, stranger.getsockname()[1])
+        finally:
+            stop_coordinator(workspace)
+    finally:
+        stranger.close()

@@ -22,6 +22,7 @@ import select
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 import warnings
@@ -1250,6 +1251,39 @@ def test_a_forked_child_refuses_a_policy_file_until_it_is_fixed(
     assert report == {"kept": True, "read": "v1", "attached": True}
 
 
+def _stranger_on_an_exited_coordinators_port(root: Path) -> socket.socket:
+    """A coordinator that died left its pid file, and another process listens
+    on its port."""
+    stranger = socket.socket()
+    stranger.bind(("127.0.0.1", 0))
+    stranger.listen()
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(60)
+    coherence = root / ".coherence"
+    coherence.mkdir(mode=0o700, exist_ok=True)
+    (coherence / "server.pid").write_text(f"{child.pid}\n{stranger.getsockname()[1]}\n")
+    return stranger
+
+
+def test_a_volume_over_an_exited_coordinators_pid_file_starts_its_own_coordinator(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#503: a stranger on a dead coordinator's port is not a coordinator
+    already running, so the volume writes its policy and starts one."""
+    _seed(tmp_path)
+    stranger = _stranger_on_an_exited_coordinators_port(tmp_path)
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        try:
+            assert vol.is_attached
+            assert "data/**" in (tmp_path / ".coherence" / "tracked.yaml").read_text()
+        finally:
+            vol.close()
+    finally:
+        stranger.close()
+        stop_coordinator(tmp_path)
+
+
 @pytest.mark.parametrize("on_error", ["strict", "degrade"])
 def test_a_volume_refuses_a_symlinked_pid_file_and_leaves_its_target_alone(
     tmp_path: Path, fast_cfg: LifecycleConfig, tmp_path_factory: pytest.TempPathFactory, on_error: str
@@ -1495,7 +1529,7 @@ def test_a_volume_checks_for_links_before_it_probes_a_port(
     def no_probe(*args: object, **kwargs: object) -> bool:
         pytest.fail("probed a port before refusing the link")
 
-    monkeypatch.setattr(coherent_volume_module, "tcp_probe", no_probe)
+    monkeypatch.setattr(coherent_volume_module, "running_coordinator_port", no_probe)
     monkeypatch.setattr("ccs.adapters.claude_code.lifecycle.tcp_probe", no_probe)
 
     refusal = _strict_refusal(tmp_path, fast_cfg)

@@ -1677,13 +1677,18 @@ closed volume stays closed whatever the answer. `close()` goes on to the
 volume's other attempts after a grant reported still held, and stops at a
 request with no usable answer, so a coordinator that has stopped answering costs
 one client timeout (6 s by default). A strict `close()` logs the paths it
-could not release and returns without raising when the connect to the volume's
-own local coordinator is refused because nothing listens there, for example
-after that coordinator shut down after `idle_shutdown_sec` with no requests.
-Nothing the caller does can release those grants, and the next coordinator's
-sweep takes them back. `close()` still raises as above when the connect times
-out, the name does not resolve, the volume uses `remote_endpoint`, or the
-coordinator answered earlier in the same `close()` that a grant was still held.
+could not release and returns without raising when the volume's own local
+coordinator is gone: the connect is refused because nothing listens there, or
+the client sends nothing because the coordinator it attached to has exited or
+been replaced (see
+[A client sends nothing to a coordinator that exited](#a-client-sends-nothing-to-a-coordinator-that-exited)),
+for example after that coordinator shut down after `idle_shutdown_sec` with no
+requests. Nothing the caller does can release those grants, and a
+coordinator's sweep takes them back; a coordinator started since, even on the
+same port, keeps them until its sweep, so a refuse-mode peer waits for it.
+`close()` still raises as above when the connect times out, the name does not
+resolve, the volume uses `remote_endpoint`, or the coordinator answered earlier
+in the same `close()` that a grant was still held.
 In degrade mode a refused connect counts a degradation, as any unanswered
 request does.
 
@@ -1991,7 +1996,9 @@ To recover, keep in mind that a volume keeps the endpoint it attached to, so
 it never finds a coordinator started after the old one went away:
 
 - If the coordinator stalled and comes back on the same port, the next call
-  goes through.
+  goes through. A coordinator started later in its place is a new one, even
+  on the same port: the volume sends it nothing (see
+  [A client sends nothing to a coordinator that exited](#a-client-sends-nothing-to-a-coordinator-that-exited)).
 - Otherwise build a new `CoherentVolume`. It attaches to the running
   coordinator, or starts one.
 - If the release was answered, the volume gave up its write grant and kept a
@@ -2167,9 +2174,11 @@ leaves `.coherence`, and everything a link in it names, as they were.
 The commands and hooks that talk to a coordinator already running
 (`agent-coherence-status`, `-track`, `-untrack`, the handoff commands and the
 Claude Code hook client) start nothing and do not run this check. They refuse
-a `.coherence` that is a link before they read `hook.secret` or connect, and
-never send the bytes of a file a linked `hook.secret` names as the secret:
-they answer as they do when no coordinator runs, and the commands print why.
+a `.coherence` that is a link before they read `hook.secret` or connect, read
+`hook.secret` and `server.pid` without following a link, and never send the
+bytes of a file a linked `hook.secret` names as the secret, nor send it to the
+port a linked `server.pid` names: they answer as they do when no coordinator
+runs, and the commands print why.
 
 The text names the path and the way out. For a linked `hook.secret`, a start
 prints:
@@ -2226,6 +2235,69 @@ answers.
 A Kubernetes secret or configMap volume mounted at `.coherence` is refused:
 such a volume is built from links (`..data` and one link per key). Mount a
 plain volume there instead.
+
+### A client sends nothing to a coordinator that exited
+
+A client finds the coordinator through the port in `.coherence/server.pid` and
+sends the workspace secret with every request. A coordinator that exits without
+a stop (killed, crashed, or the machine rebooted) leaves its pid file behind,
+and once its port is free any local process can bind it. So before each
+request this package's local clients (the hook client, `CoherentVolume`, the MCP
+server, a substrate session and the console scripts) check that `server.pid`
+still names the coordinator they resolved, and that this coordinator still
+holds the workspace lock, the `flock` every Python coordinator holds on
+`server.pid` ([#503](https://github.com/Cohexa-ai/agent-coherence/issues/503)):
+
+| What `server.pid` shows | What the client does |
+|---|---|
+| The same pid and port, and the lock is held | sends the request |
+| The same pid and port, and the lock is free | sends nothing and raises `CoordinatorDeparted`, a `CoordinatorUnavailable` with `never_sent` true (for a `backend=node` file, only once its pid no longer runs) |
+| Another pid or port, or no port (a stop has begun) | sends nothing, the same way: a coordinator started later on the same port is a new one |
+| No file, or a file it cannot read | sends the request: it cannot tell, so an attached client keeps working (for a `backend=node` file, only while its pid runs) |
+| A link, or anything but a pid file (a directory, a file over 4096 bytes) | sends nothing |
+
+The plugin's Node coordinator writes `backend=node` in its pid file and runs
+without the lock where it cannot take one (no flock helper, or a file system
+that refuses it); for that file the client checks that the pid still runs, also
+once the coordinator has removed the file at its stop. Where `fcntl` does not
+exist the lock cannot be probed, and the request goes.
+
+A strict `CoherentVolume` raises the refusal as `CoordinatorUnreachable`, or as
+`CommitUnconfirmed` from a handoff verb; a degrade volume warns and counts a
+degradation. A substrate session raises `CoordinatorUnreachable`, or
+`CommitUnconfirmed` once its substrate write has landed. The volume or session
+keeps the endpoint it attached to, so its later requests are refused for as
+long as `server.pid` shows that coordinator gone or replaced: build a new one to
+reach a coordinator started since. A strict volume's `close()` logs the write
+grants it could not give back and returns, as when nothing listens on the port;
+a coordinator started since keeps those grants until its sweep.
+
+The same check keeps a start from taking a process on a dead coordinator's
+port for a running coordinator. `connect_or_spawn`, a `CoherentVolume`, a
+substrate session and `agent-coherence-coordinator` start a coordinator
+instead (a volume and a session write their policy first), and a start that
+loses the workspace lock never joins a binder whose pid no longer runs
+([#428](https://github.com/Cohexa-ai/agent-coherence/issues/428)).
+
+The check is not proof of the secret, and it cannot see every case (the same
+list is in [A process on the coordinator's port](security.md#who-the-coordinator-can-tell-apart)):
+
+- A coordinator that dies between the check and the send can still lose that
+  one request to a new listener.
+- A start that has taken the workspace lock but not yet emptied a dead
+  coordinator's lines makes those lines read as running for that moment.
+- A coordinator restarted in the same process that gets the same port back
+  reads as the one the client resolved.
+- A Node coordinator's pid, once another process carries it, reads as that
+  coordinator. A Node coordinator running without the lock whose pid does not
+  exist where the client runs (another PID namespace) reads as exited, so
+  clients refuse it and a start runs its own.
+- A start that loses the workspace lock to a coordinator in another PID
+  namespace that shares the workspace does not join it through the pid file;
+  clients still reach it through its port while it holds the lock.
+
+A remote coordinator has no pid file on this host and no such check; reach it
+over verified TLS.
 
 ### Atomic multi-file publish: `atomic_publish` (v0.12.0+)
 
@@ -4657,17 +4729,24 @@ coordinator in these ways:
   With the sweep off (`sweep_interval_sec` set to `0`), it refuses until it
   releases the path. The Node coordinator has no sweep: its opted-in acquire
   reclaims a grant held 30 minutes or more (see **On the Node coordinator**).
-- **A client checks the coordinator once.** `CoherentVolume` reads
-  `pre_edit_if_unheld` when it attaches and keeps that endpoint, so a replacement
-  on a new port gets `CoordinatorUnreachable`. But a different coordinator on the
-  same port and secret goes unseen. An older build there displaces the holder: a
-  single request answers `collision: true`, which the volume refuses to write on,
-  though the holder has already lost the file, and two racing opted-in requests
-  can each get a bare `{"ok": true}`, which nothing shows. A build without the path
-  in its strict set answers `{"ok": true}` and the write lands over the holder.
-  The coordinator command has no port option, so locally this takes a port the
-  system reuses. A remote coordinator on a fixed port makes it the normal case,
-  which is why refuse mode is not available with `remote_endpoint`.
+- **A client checks the coordinator's capability once.** `CoherentVolume` reads
+  `pre_edit_if_unheld` when it attaches and keeps that endpoint. A replacement,
+  on a new port or the same one, gets `CoordinatorUnreachable` before anything
+  is sent: before each request a local client checks that `server.pid` still
+  names the coordinator it attached to and that this coordinator still holds the
+  workspace lock (see
+  [A client sends nothing to a coordinator that exited](#a-client-sends-nothing-to-a-coordinator-that-exited)).
+  What is left are the cases that check cannot see, listed in that section: a
+  coordinator that dies between the check and the send, a start that holds the
+  lock before it empties a dead coordinator's lines, and a host where the lock
+  cannot be probed (no `fcntl`). There, an older build on the same port
+  displaces the holder: a single request answers
+  `collision: true`, which the volume refuses to write on, though the holder has
+  already lost the file, and two racing opted-in requests can each get a bare
+  `{"ok": true}`, which nothing shows. A build without the path in its strict
+  set answers `{"ok": true}` and the write lands over the holder. A remote
+  coordinator on a fixed port has no such check, which is why refuse mode is not
+  available with `remote_endpoint`.
 - **Spelling aliases.** The coordinator tracks a path by its spelling. On a
   case-insensitive filesystem, `data/X.TXT` and `DATA/x.txt` reach the file a
   holder has as `data/x.txt`, get no refusal, and overwrite it. On APFS the two

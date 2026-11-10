@@ -562,8 +562,7 @@ class SubstrateCoordinatorSession:
         from ccs.adapters.claude_code.lifecycle import (  # noqa: PLC0415
             LifecycleConfig,
             connect_or_spawn,
-            read_port_from_file,
-            tcp_probe,
+            running_coordinator_port,
         )
 
         self._root = Path(root).resolve()
@@ -574,9 +573,7 @@ class SubstrateCoordinatorSession:
         # .coherence both would act on what the link names.
         check_coherence_dir(self._root)
         pid_file = coherence_dir / "server.pid"
-        pre_existing = (port := read_port_from_file(pid_file)) is not None and tcp_probe(
-            port, cfg, bind_host=bind_host
-        )
+        pre_existing = running_coordinator_port(pid_file, cfg, bind_host=bind_host) is not None
         # Only the SPAWNER writes policy (load-once); a sibling must not clobber it.
         if not pre_existing:
             try:
