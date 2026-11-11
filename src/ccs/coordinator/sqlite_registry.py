@@ -3159,6 +3159,14 @@ class SqliteArtifactRegistry:
         field. Seeded at first create, stable across reopens."""
         return self._instance_id
 
+    @property
+    def holds_writer_lock(self) -> bool:
+        """Whether this handle holds the store's single-writer lock: False for
+        a read-only open, after close, and for a read-write open that
+        proceeded unlocked where ``flock`` does not exist."""
+        with self._lock:
+            return self._writer_lock is not None and self._writer_lock.fd is not None
+
     def get_owner_generation(self, artifact_id: UUID) -> int:
         """Return the artifact's ownership epoch (read-generation fence)."""
         with self._lock:

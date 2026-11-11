@@ -75,6 +75,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 import yaml
 
 from ccs.adapters.claude_code import audit_log as _audit_log
+from ccs.adapters.claude_code import fs_profile as _fs_profile
 from ccs.adapters.claude_code import hook_payloads as _payloads
 from ccs.adapters.claude_code import session_audit_log as _session_audit
 from ccs.adapters.claude_code.auth import (
@@ -1036,7 +1037,9 @@ class CoordinatorHTTPServer:
 
     Caller (Unit 5 ``lifecycle.ensure_coordinator``) instantiates this then
     calls :meth:`serve_in_thread` to start a daemon-thread serving loop. The
-    ``port`` attribute is populated once the OS picks one (port=0 binding)."""
+    ``port`` attribute is populated once the OS picks one (port=0 binding).
+    ``fold_profile`` is the workspace disk's fold profile, found once at
+    construction (:mod:`ccs.adapters.claude_code.fs_profile`)."""
 
     def __init__(
         self,
@@ -1367,6 +1370,10 @@ class CoordinatorHTTPServer:
 
     def _finish_construction(self, port: int) -> None:
         """The steps of the constructor past the store open."""
+        # After the store open, whose writer lock lets the probe sweep what a
+        # crashed start left, and before the port exists, so every request is
+        # answered with the profile known.
+        self.fold_profile = self._probe_fold_profile()
         self.service = CoordinatorService(self.registry)
         self.policy = TrackedArtifactPolicy.load(self.coordinator_root)
 
@@ -1394,6 +1401,21 @@ class CoordinatorHTTPServer:
         self.port = self._server.server_port
         self._serve_thread: threading.Thread | None = None
         self._serve_loop_committed = False
+
+    def _probe_fold_profile(self) -> _fs_profile.FoldProfileResult:
+        """Classify the workspace disk once, logging one line that names the
+        profile, or why the disk could not be classified."""
+        result = _fs_profile.probe_fold_profile(
+            _fs_profile.FoldProbeInput(
+                root=self.coordinator_root,
+                coherence_dir=self.coordinator_root / ".coherence",
+                lock_state="held" if self.registry.holds_writer_lock else "unlocked",
+                log=lambda line: logger.warning("fold probe: %s", line),
+            )
+        )
+        log = logger.info if result.status == "classified" else logger.warning
+        log("%s", _fs_profile.fold_profile_log_line(result))
+        return result
 
     def serve_in_thread(self) -> None:
         """Start the serving loop in a daemon thread."""

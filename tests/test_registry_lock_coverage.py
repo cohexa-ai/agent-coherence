@@ -293,7 +293,7 @@ INMEM_SURFACE = frozenset({
 })
 SQLITE_SURFACE = INMEM_SURFACE | frozenset({
     "artifact_names_under_prefix", "artifacts_held_by_agent", "close",
-    "evict_stale_notices", "get_artifact_updated_at", "last_writer_for",
+    "evict_stale_notices", "get_artifact_updated_at", "holds_writer_lock", "last_writer_for",
     "lookup_artifact_id_by_name", "peek_preemption_notice",
     "pop_pending_notices", "pop_preemption_notice", "record_preemption_notice",
     "resolve_or_register", "status_snapshot",

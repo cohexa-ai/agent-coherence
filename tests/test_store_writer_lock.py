@@ -262,6 +262,21 @@ def test_a_refused_open_leaves_the_holders_write_transaction_locked(tmp_path: Pa
     assert third == "locked"
 
 
+def test_a_registry_says_whether_it_holds_the_writer_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "state.db"
+    writer = SqliteArtifactRegistry(db)
+    with SqliteArtifactRegistry(db, read_only=True) as reader:
+        assert reader.holds_writer_lock is False
+    assert writer.holds_writer_lock is True
+    writer.close()
+    assert writer.holds_writer_lock is False
+    monkeypatch.setattr(sqlite_registry, "fcntl", None)
+    with SqliteArtifactRegistry(db) as unlocked:
+        assert unlocked.holds_writer_lock is False
+
+
 def test_without_fcntl_a_second_open_proceeds_as_before(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
