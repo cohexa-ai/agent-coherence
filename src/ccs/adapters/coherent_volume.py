@@ -49,19 +49,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NamedTuple
 
-import yaml
-
-from ccs.adapters.claude_code.coordinator_server import parse_agent_id, session_to_agent_id
+from ccs.adapters.claude_code.coordinator_server import (
+    merge_policy_globs,
+    parse_agent_id,
+    session_to_agent_id,
+)
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     connect_or_spawn,
-    read_port_from_file,
-    tcp_probe,
+    running_coordinator_port,
 )
-from ccs.adapters.claude_code.policy import matches_any
+from ccs.adapters.claude_code.policy import PolicyMatchContext, TrackedArtifactPolicy
+from ccs.adapters.claude_code.state_dir import check_coherence_dir
 from ccs.cli._coherence_client import (
     NODE_BACKEND,
     PRINCIPAL_REFUSED_AGAIN,
+    CoordinatorDeparted,
     CoordinatorEndpoint,
     CoordinatorUnavailable,
     PrincipalClaim,
@@ -71,6 +74,7 @@ from ccs.cli._coherence_client import (
     claim_caller_principal,
     coordinator_backend,
     decide_principal_recovery,
+    escape_nonprintable,
     principal_refusal_message,
     principal_refusal_reason,
     resolve_endpoint,
@@ -81,6 +85,9 @@ from ccs.cli._coherence_client import (
 from ccs.cli._coherence_client import (
     post as _coordinator_post,
 )
+from ccs.coordinator.fold_merge import index_key_of
+from ccs.coordinator.sqlite_registry import StoreHeldError
+from ccs.core.disk_spelling import native_spelling
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_CLAIMED_REASON,
     COMMIT_UNCONFIRMED_REASON,
@@ -97,6 +104,7 @@ from ccs.core.exceptions import (
     CasRetriesExhausted,
     CasVersionConflict,
     CoherenceDegradedWarning,
+    CoherenceDirRefused,
     CoherenceError,
     CommitPreempted,
     CommitUnconfirmed,
@@ -105,6 +113,7 @@ from ccs.core.exceptions import (
     GiverFenced,
     HandoffPathsInvalid,
     InternalConcurrencyError,
+    LinkOutOfManaged,
     OtherHolder,
     PublishMaterializationError,
     RedirectRefused,
@@ -114,6 +123,7 @@ from ccs.core.exceptions import (
     _is_handler_failure_reason,
 )
 from ccs.core.fence import confirmed_generation
+from ccs.core.path_fold import FOLD_TABLE_UNICODE_VERSION, FoldProfile
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +134,7 @@ __all__ = [
     "HandoffTransferResult",
     "HandoffVerbResult",
     "HandoffWinOutcome",
+    "WriteResult",
     "coherent_workspace",
     "install",
     "uninstall",
@@ -198,6 +209,55 @@ class _Sent(NamedTuple):
 
     body: dict | None
     principal_refusal: str | None
+
+
+class _ReleaseFailure(NamedTuple):
+    """Why a release request of :meth:`CoherentVolume.release` or
+    :meth:`CoherentVolume.close` did not confirm: the error a strict volume
+    raises for it, the failure that error chains to, whether the answer
+    reported the grant still held, whether ``_post`` already counted a
+    degradation for it (degrade mode, a request with no answer), and whether
+    the volume's local coordinator is gone (the connect was refused, or the
+    client sent nothing because the coordinator it attached to has exited or
+    been replaced, #503) with nothing answering earlier in the same close."""
+
+    error: type[CoherenceError]
+    cause: BaseException | None = None
+    held: bool = False
+    already_warned: bool = False
+    nobody_listening: bool = False
+
+
+def _read_release_answer(resp: object) -> dict | _ReleaseFailure:
+    """``resp`` when a release's answer can be read (``ok: true``, or an
+    account of each grant), else why it confirms nothing. ``None`` as ``resp``
+    is a degrade-mode request ``_post`` already warned about. A
+    watchdog-degraded answer reads ``ok: true`` whether or not the release ran,
+    so it confirms nothing."""
+    if resp is None:
+        return _ReleaseFailure(CoordinatorUnreachable, already_warned=True)
+    if not isinstance(resp, dict) or resp.get("degraded"):
+        return _ReleaseFailure(CoherenceError)
+    if _is_failure_envelope(resp):
+        return _ReleaseFailure(CoordinatorFailed)
+    if resp.get("ok") is True or isinstance(resp.get("grants"), list):
+        return resp
+    return _ReleaseFailure(CoherenceError)
+
+
+def _confirms_end(resp: object) -> bool:
+    """Whether the answer to a session-stop carrying ``ended`` confirms that
+    the attempt it named is over (#525): an answer :func:`_read_release_answer`
+    can read that reports no grant still held. The coordinator keeps every
+    record of an attempt that still holds a grant, so that answer ends nothing.
+    A coordinator that predates the flag answers as to any stop, and its
+    records stay as they always did."""
+    answer = _read_release_answer(resp)
+    if isinstance(answer, _ReleaseFailure):
+        return False
+    if answer.get("ok") is True:
+        return True
+    return not any(isinstance(grant, dict) and grant.get("held") is True for grant in answer["grants"])
 
 
 def _is_commit_leg(endpoint_path: str, payload: dict) -> bool:
@@ -342,6 +402,23 @@ def _publish_unanswered_message(status: int | None = None) -> str:
     )
 
 
+#: The snapshot-session and handoff routes, none of which the Node coordinator
+#: serves. Either coordinator answers 404 only from its router, for a route it
+#: does not serve, so a 404 on one of these means nothing ran.
+_SESSION_AND_HANDOFF_ROUTES = frozenset({
+    "/session/begin", "/session/commit_all",
+    "/handoff/transfer", "/handoff/accept", "/handoff/decline", "/handoff/withdraw",
+})
+
+
+def _route_not_served_message(route: str) -> str:
+    """What a request to ``route`` raises when the coordinator answers it 404."""
+    return (
+        f"the coordinator does not serve {route} (HTTP 404), so nothing ran and a retry "
+        "gets the same answer. The Node coordinator has no snapshot sessions or handoffs."
+    )
+
+
 def _publish_failed_message(reason: str) -> str:
     """What a multi-member atomic_publish raises
     (:class:`~ccs.core.exceptions.CommitUnconfirmed`) when the coordinator
@@ -453,10 +530,21 @@ _IF_UNHELD_NOT_ADVERTISED_MESSAGE = (
     "to see its version, then upgrade it or use on_held='displace'."
 )
 
+#: What a degrade volume adds to a policy refusal (#305): the retry the refusal
+#: asks for is a new volume, because this one does not attach again.
+_POLICY_REFUSAL_DEGRADED_NOTE = "This volume stays detached: build a new one once the file is fixed."
+
+#: What a degrade volume adds to a refused ``.coherence`` (#498), for the same
+#: reason: the retry is a new volume.
+_STATE_DIR_REFUSAL_DEGRADED_NOTE = "This volume stays detached: build a new one once .coherence is fixed."
+_STORE_HELD_DEGRADED_NOTE = "This volume stays detached: build a new one once that handle closes."
+
 
 def _no_principal_message(rel: str, outcome: str) -> str:
     """What an opted-in :meth:`CoherentVolume.write` raises when its session holds
-    no caller principal: the coordinator refuses such a request, so none is sent."""
+    no caller principal and its claim did not show that the coordinator issues
+    none: a coordinator that issues principals refuses such a request, so none
+    is sent."""
     return (
         f"on_held='refuse' needs a caller principal, and this session holds none "
         f"(claim outcome: {outcome}). Nothing was sent for {rel}."
@@ -470,7 +558,7 @@ def _undecided_grant_message(rel: str) -> str:
     return (
         f"the coordinator could not decide the grant request for {rel} in time. Nothing "
         "was written, but the request may still take the grant. Back off, then retry "
-        "the write; if you give up instead, call reacquire(), which releases it."
+        "the write; if you give up instead, call release() on the path, which releases it."
     )
 
 
@@ -526,13 +614,93 @@ def _check_refuse_mode(
     ``on_held="refuse"``. Degrade mode would write best-effort when detached.
     No managed globs means nothing ever opts in, so every write would displace
     in silence. A remote coordinator's capability cannot be trusted for the
-    volume's life, because a fixed-port replacement goes unseen."""
+    volume's life: a local client checks before each request that the
+    coordinator it attached to still runs (#503), but a remote endpoint has no
+    pid file to check, so a fixed-port replacement goes unseen."""
     if on_error != "strict":
         raise ValueError("on_held='refuse' is strict-only (on_error must be 'strict')")
     if not managed:
         raise ValueError("on_held='refuse' opts in on managed paths, so it needs managed globs")
     if remote_endpoint is not None:
         raise ValueError("on_held='refuse' is not supported with remote_endpoint")
+
+
+#: The ``/status`` ``fold_profile`` values a volume keys by. ``cannot_tell`` and
+#: any value it does not know key as ``none``, as the coordinator keys
+#: ``cannot_tell``: folding a name the coordinator keeps apart would be a guess.
+_FOLD_PROFILES: dict[str, FoldProfile] = {"caseless": "caseless", "nfd": "nfd", "none": "none"}
+
+
+class _FoldView(NamedTuple):
+    """What an attach read of how the coordinator keys file names: the profile
+    the volume keys its records by, and ``doubt``, why the volume cannot rely
+    on it, which a refuse-mode attach refuses on. ``unanswered``: the read got
+    no usable answer at all."""
+
+    profile: FoldProfile
+    doubt: str | None = None
+    unanswered: bool = False
+
+
+def _fold_view_of(status: object) -> _FoldView:
+    """Read the fold fields of a default-tier ``/status`` answer. No
+    ``fold_profile`` is an older coordinator, which keys names exactly. A
+    fold table of another Unicode version may key a name another way, so the
+    volume keys exactly and says why."""
+    if not isinstance(status, dict):
+        return _FoldView("none", "the /status answer is not a JSON object")
+    if "fold_profile" not in status:
+        return _FoldView("none")
+    table = status.get("fold_table_unicode")
+    if table != FOLD_TABLE_UNICODE_VERSION:
+        return _FoldView(
+            "none",
+            f"the coordinator folds names by the Unicode {table!r} table and this "
+            f"library by Unicode {FOLD_TABLE_UNICODE_VERSION}",
+        )
+    profile = status.get("fold_profile")
+    return _FoldView(_FOLD_PROFILES.get(profile, "none") if isinstance(profile, str) else "none")
+
+
+#: How to make a coordinator a volume starts enforce the volume's globs.
+_SPAWNED_COORDINATOR_REMEDY = (
+    "Every volume on a workspace must declare the globs the coordinator was "
+    "started with; an attaching volume adds none to a running coordinator's "
+    "policy. Stop it, or use a dedicated workspace root."
+)
+#: The same for the Node coordinator, which no volume starts. A successful track
+#: or untrack request reloads its policy, and a reload takes up what was added on
+#: disk.
+_NODE_COORDINATOR_REMEDY = (
+    "The Node coordinator enforces the globs in its own policy files, and an "
+    "attaching volume adds none to them: add these globs to .coherence/tracked.yaml "
+    "and .coherence/strict_mode.yaml, then reload its policy (a successful track or "
+    "untrack request does) or restart it, or use a dedicated workspace root."
+)
+_ENFORCEMENT_OFF_IN_DEGRADE = (
+    "In degrade mode the volume operates best-effort with coherence enforcement off."
+)
+
+
+def _operator_view_refusal(status: int) -> str:
+    """Why the operator view could not be read, from the status of the answer
+    that refused it. A 501 comes from a Node coordinator of agent-coherence
+    plugin 0.6.0 or earlier, which predates the view; later ones serve it."""
+    if status == 501:
+        return (
+            "the coordinator predates the operator view (HTTP 501), as the Node "
+            "coordinator of agent-coherence plugin 0.6.0 and earlier does, so "
+            "upgrade the agent-coherence plugin"
+        )
+    return f"the operator view was refused (HTTP {status})"
+
+
+def _fold_profile_refusal_message(doubt: str) -> str:
+    return (
+        "on_held='refuse' keys each file as the coordinator does, by the fold profile "
+        f"it advertises, and cannot rely on it: {doubt}. Nothing was sent. Run this "
+        "library and the coordinator from the same release, or use on_held='displace'."
+    )
 
 
 def _own_grant_message(rel: str, *, held: bool) -> str:
@@ -563,6 +731,63 @@ def _own_grant_message(rel: str, *, held: bool) -> str:
     )
 
 
+def _release_not_confirmed_message(rel: str, *, held: bool) -> str:
+    """What :meth:`CoherentVolume.release` raises (strict) or warns (degrade)
+    when the coordinator did not confirm the release of this volume's write
+    grant on ``rel``. ``held``: its answer reported the grant still held;
+    otherwise the release may or may not have run. Not the commit refusal's
+    text: nothing was being committed. Byte-stable but for the path."""
+    if held:
+        state = (
+            f"the coordinator answered the release of this volume's write grant on {rel} "
+            "with the grant still held"
+        )
+    else:
+        state = (
+            f"the coordinator did not confirm the release of this volume's write grant "
+            f"on {rel}, so the grant may still stand"
+        )
+    return f"{state}. Call release() again to send it again."
+
+
+#: What every operation but close() raises on a closed volume. Nothing is sent.
+_VOLUME_CLOSED_MESSAGE = "this CoherentVolume is closed. Build a new one."
+
+#: What install() and coherent_workspace() raise while the open() shim's volume
+#: is closed. Managed opens raise too, until uninstall() removes the shim.
+_SHIM_VOLUME_CLOSED_MESSAGE = (
+    "the open() shim's CoherentVolume is closed. Call uninstall() to remove the "
+    "shim, then install it again."
+)
+
+#: What close() raises from inside another operation of the same volume, such
+#: as a write_cas closure, whose commit is still in flight.
+_CLOSE_INSIDE_AN_OPERATION_MESSAGE = (
+    "close() was called from inside another operation of this CoherentVolume, such "
+    "as a write_cas closure. Nothing was closed."
+)
+
+
+def _close_not_confirmed_message(rels: Sequence[str], *, held: bool) -> str:
+    """What :meth:`CoherentVolume.close` raises (strict) or warns (degrade)
+    when the coordinator did not confirm the release of every write grant the
+    volume recorded. ``rels``: the paths still recorded, sorted. ``held``: an
+    answer reported a grant still held. The volume is closed either way.
+    Byte-stable but for the paths."""
+    listed = ", ".join(rels)
+    if held:
+        state = (
+            "the coordinator answered the release of this volume's write grants with a "
+            f"grant still held ({listed})"
+        )
+    else:
+        state = (
+            "the coordinator did not confirm the release of every write grant this volume "
+            f"holds, so these may still stand: {listed}"
+        )
+    return f"{state}. The volume is closed; call close() again to send what is still recorded."
+
+
 def _cas_not_recorded_message(rel: str, detail: str) -> str:
     """What a strict OCC commit raises
     (:class:`~ccs.core.exceptions.CoordinatorUnreachable`) when the
@@ -574,14 +799,46 @@ def _cas_not_recorded_message(rel: str, detail: str) -> str:
     )
 
 
-def _unanswered_write_message(rel: str, no_answer: _CommitNotAnswered) -> str:
+#: What a write() whose commit certainly was not recorded says to do (#526).
+#: Re-reading cannot help: the bytes on disk are not the content the
+#: coordinator records, so a read that refuses stale bytes refuses them until
+#: a write records them. Not "every read": a read within a few seconds of the
+#: volume's own last commit, or one under on_stale_read="allow", returns them.
+_UNRECORDED_WRITE_RECOVERY = (
+    "Until a write() of this path is recorded, a read that refuses stale bytes "
+    "refuses it, and reading again does not clear that: once the coordinator "
+    "answers, write() the path again, with these bytes or a change built from "
+    "them, to record it."
+)
+
+#: The same for a commit that may or may not have been recorded. A read that
+#: returns proves nothing either way, and the rewrite is right in both cases:
+#: if the commit landed, it commits the same content at the next version.
+_MAYBE_RECORDED_WRITE_RECOVERY = (
+    "If the coordinator did not record the write, a read that refuses stale "
+    "bytes refuses this path until a write() of it is recorded, and reading "
+    "again does not clear that; write() the path again, with these bytes or a "
+    "change built from them, which records it either way."
+)
+
+
+def _grant_release_sentence(released: bool) -> str:
+    """What became of the write grant of a write() whose commit was not
+    confirmed: the release write() sent first was confirmed, or it was not
+    and :meth:`CoherentVolume.release` sends it again."""
+    if released:
+        return "Its write grant was released."
+    return "The release of its write grant was not confirmed: release() sends it again."
+
+
+def _unanswered_write_message(rel: str, no_answer: _CommitNotAnswered, *, released: bool) -> str:
     """What a strict write() raises when its commit (post-edit) got no usable
     answer, or an HTTP 5xx, after its bytes reached disk (R8): that they are
-    there, and whether the coordinator certainly did not record the write or
-    may have. The release it sends first is best-effort and not reported, so
-    the text holds whether or not that release was answered (R9). ``detail``
-    is the client's own text, never the coordinator's; a 5xx is named by its
-    code alone."""
+    there, whether the coordinator certainly did not record the write or may
+    have, what became of its grant (``released``: the release sent first was
+    confirmed), and the write that records the bytes (#526). ``detail`` is the
+    client's own text, never the coordinator's; a 5xx is named by its code
+    alone."""
     if no_answer.never_sent:
         recorded = f"the coordinator did not record the write ({no_answer.detail})"
     elif no_answer.status is not None:
@@ -594,13 +851,14 @@ def _unanswered_write_message(rel: str, no_answer: _CommitNotAnswered) -> str:
             f"its commit got no usable answer ({no_answer.detail}), so the "
             "coordinator may have recorded the write"
         )
+    recovery = _UNRECORDED_WRITE_RECOVERY if no_answer.never_sent else _MAYBE_RECORDED_WRITE_RECOVERY
     return (
-        f"The write's bytes are on disk at {rel}, but {recorded}. One best-effort "
-        "release of its grant was attempted. Re-read the path before writing it again."
+        f"The write's bytes are on disk at {rel}, but {recorded}. "
+        f"{_grant_release_sentence(released)} {recovery}"
     )
 
 
-def _failed_write_message(rel: str, reason: str) -> str:
+def _failed_write_message(rel: str, reason: str, *, released: bool) -> str:
     """What write() raises (:class:`~ccs.core.exceptions.CommitUnconfirmed`)
     when the coordinator answered its commit (post-edit) with its failure
     envelope: the bytes are on disk, and the work may have recorded the
@@ -609,9 +867,8 @@ def _failed_write_message(rel: str, reason: str) -> str:
     type."""
     return (
         f"The write's bytes are on disk at {rel}, but the coordinator answered its "
-        f"commit with a failure ({reason}), so it may have recorded the write. One "
-        "best-effort release of its grant was attempted. Re-read the path before "
-        "writing it again."
+        f"commit with a failure ({reason}), so it may have recorded the write. "
+        f"{_grant_release_sentence(released)} {_MAYBE_RECORDED_WRITE_RECOVERY}"
     )
 
 
@@ -682,8 +939,9 @@ _SPLIT_READ_DENY_REASON = (
     "records at its current version, so no version is returned for them. A "
     "peer's commit still reaching disk clears on its own: reacquire() and read "
     "again, retrying with backoff for a few seconds. Only a refusal that "
-    "outlasts that means the file was changed outside the coordinator (an "
-    "out-of-band edit, or a commit whose disk write failed): then write() the "
+    "outlasts that means the bytes on disk were never recorded (an out-of-band "
+    "edit, a commit whose disk write failed, or a write() whose commit did not "
+    "reach the coordinator), and reading again does not clear it: write() the "
     "bytes reacquire() returned, or your merge of them, to record them, and read "
     "again. A write made while a peer's commit is still reaching disk is "
     "overwritten when that commit lands."
@@ -839,6 +1097,28 @@ class CasCommitResult:
     handoff: HandoffWinOutcome | None = None
 
 
+@dataclass(frozen=True, kw_only=True)
+class WriteResult:
+    """What a :meth:`CoherentVolume.write` of ``path`` learned from the
+    coordinator (#526).
+
+    ``disk_differs`` is ``True`` when the coordinator reported, as it admitted
+    this write's grant request, that the file on disk held bytes it had not
+    recorded, and this write replaced them. That can be this volume's own
+    write whose commit did not reach the coordinator, which this write now
+    records, or an edit made outside the coordinator, which this write
+    overwrote: a path this volume never read has no baseline for its
+    foreign-edit check to deny on. ``False`` says only that the coordinator
+    did not report it. It does not report it on a path it does not track,
+    within a few seconds of this volume's own last commit of the file, while a
+    peer's write of the file is in flight, or when no coordinator answered (a
+    degrade-mode volume writing best-effort). It never means that an earlier
+    write is now recorded."""
+
+    path: str
+    disk_differs: bool
+
+
 _HANDOFF_VERB_REFUSALS: frozenset[str] = frozenset(
     {HANDOFF_NOT_SUCCESSOR_REASON, HANDOFF_NOT_GIVER_REASON, HANDOFF_NOT_LIVE_REASON}
 )
@@ -883,9 +1163,10 @@ class ManagedGlobEnforcement:
     untracks a strict path — strict wins — so an ignore covering a managed glob
     under another spelling is harmless there; a literal ignore of the glob is
     still reported as not enforced, which is conservative for an older one.)
-    ``unavailable`` is set when the sets could not be read at all — an older
-    coordinator whose summary publishes only counts, the Node coordinator, which
-    does not serve the operator view, or a ``/status`` that failed — and then
+    ``unavailable`` is set when the sets could not be read at all -- an older
+    coordinator whose summary publishes only counts, a Node coordinator of
+    plugin 0.6.0 or earlier, which predates the operator view, a coordinator
+    that refuses the view, or a ``/status`` that failed -- and then
     both lists are empty and say nothing: "cannot tell" is not "not enforced",
     and it is never "enforced".
     """
@@ -928,7 +1209,8 @@ class CoherentVolume:
     ``on_error``:
 
     - ``"strict"`` (default): any coherence failure — a coordinator that is
-      unavailable, or one already running that we cannot enable strict on —
+      unavailable, one already running that we cannot enable strict on, or a
+      policy file the volume cannot merge its globs into before spawning one —
       raises :class:`~ccs.core.exceptions.CoherenceError`. Fail-closed. A
       request that gets no usable answer from the coordinator raises its
       subclass :class:`~ccs.core.exceptions.CoordinatorUnreachable`, except
@@ -938,13 +1220,18 @@ class CoherentVolume:
       coordinator answers with an HTTP 5xx, which says nothing of whether it
       ran; a 4xx keeps the plain error. A :meth:`write` whose commit gets no
       answer or a 5xx first sends one best-effort release of its grant, and
-      its error says the bytes are on disk. A read the coordinator answers
+      its error says the bytes are on disk and that writing the path again
+      records them. A read the coordinator answers
       with its failure envelope raises
       :class:`~ccs.core.exceptions.CoordinatorFailed`, and so does the release
       a re-mint sends for an earlier attempt's write grant, before anything is
       committed; a commit it answers that way raises ``CommitUnconfirmed`` in
       both modes, because it may have landed. Every request that commits
-      nothing raises ``CoordinatorFailed`` for an HTTP 5xx too (#433).
+      nothing raises ``CoordinatorFailed`` for an HTTP 5xx too (#433). A
+      ``.coherence`` that is a symlink or not a directory, or that holds a
+      symlink, FIFO, socket or device, raises
+      :class:`~ccs.core.exceptions.CoherenceDirRefused` before anything is
+      probed or written (#498); no retry clears it.
     - ``"degrade"``: the same conditions warn once
       (:class:`~ccs.core.exceptions.CoherenceDegradedWarning`) and the appliance
       operates best-effort (coherence may be off). Mirrors the other adapters.
@@ -987,10 +1274,36 @@ class CoherentVolume:
       file, leaving it with its holder. Strict-only, needs ``managed`` globs,
       not available with ``remote_endpoint``. At attach the coordinator must
       advertise ``pre_edit_if_unheld``; otherwise the attach raises
-      :class:`~ccs.core.exceptions.CoherenceError` before it sends anything. A
-      write outside ``managed`` sends no flag and still displaces. The check
-      reads the resolved path, so a link under ``managed`` to a file outside
-      it is such a write.
+      :class:`~ccs.core.exceptions.CoherenceError` before it sends anything,
+      and so does an attach that cannot read the coordinator's fold profile or
+      finds it folding by another Unicode table (see below). A
+      write outside ``managed`` sends no flag and still displaces. A write
+      through a link whose name is under ``managed`` to a file outside it
+      raises :class:`~ccs.core.exceptions.LinkOutOfManaged` before it sends
+      anything, decided against the links as they stand when :meth:`write` is
+      called.
+
+    **One identity per file (#506).** At every local attach the volume reads
+    the coordinator's ``fold_profile`` and ``fold_table_unicode`` from the
+    default ``/status`` tier, and keys everything it records per file (grants,
+    reads, hashes, read handoffs, held paths) by that profile's fold key, as
+    the coordinator keys file names: on a case-insensitive disk ``DATA/x.txt``
+    and ``data/x.txt`` are one file to both, and :meth:`release` of either
+    releases it. Its managed checks read a name as the coordinator's policy
+    does, so ``DATA/x.txt`` is under ``data/**`` there. An older coordinator
+    without the fields, an unreadable ``/status``, ``cannot_tell``, a profile
+    it does not know, or a table of another Unicode version all key names
+    exactly (``none``). A ``remote_endpoint`` volume keys exactly too, and
+    marks each path it sends a key (``name_kind``): the remote disk is not
+    its own.
+
+    **Letting go (#505).** A successful :meth:`write` keeps the file's write
+    grant after it returns. :meth:`release` gives back one file's grant and
+    keeps the volume's other holds; :meth:`close` gives back every grant and
+    ends the volume, after which every operation but ``close()`` raises; a
+    ``with`` block closes the volume on exit. Nothing closes a volume when its
+    process exits or its last reference is dropped: its grants then wait for
+    the coordinator's sweep.
 
     **Fleet requirement (hard, v1).** Every instance coordinating a given
     workspace MUST declare the **same** ``managed`` globs: an attaching instance
@@ -1005,7 +1318,9 @@ class CoherentVolume:
     (typed reason ``untrack_strict_path``), an ignore pattern never overrides a
     strict one, and its hot reloads never drop a strict or tracked pattern
     (#261); a strict path stops being enforced only when the coordinator
-    restarts without its strict entry. Before this check existed a sibling whose globs differed from the
+    restarts without its strict entry, and a local volume sends a restarted
+    coordinator nothing, so it is checked again only by a new volume (#503).
+    Before this check existed a sibling whose globs differed from the
     spawner's passed on the spawner's pattern *count*, and its stale writes
     landed with no signal (#190).
     """
@@ -1062,6 +1377,21 @@ class CoherentVolume:
         # same grammar as tracked.yaml). They must be tracked AND strict for the
         # INVALID-deny to fire (is_strict_mode ⊂ is_tracked).
         self._managed: tuple[str, ...] = tuple(managed)
+        # The managed globs as the coordinator's own policy reads them, built
+        # once: a name is managed when any of its readings matches (as typed,
+        # as the disk spells it, folded by the profile), so every spelling the
+        # coordinator treats as a managed file counts here too. The volume puts
+        # these globs in both the tracked and the strict set, so "strict" under
+        # this policy is "managed".
+        self._managed_policy = TrackedArtifactPolicy(
+            coordinator_root=self._root,
+            tracked_patterns=self._managed,
+            strict_mode_paths=self._managed,
+        )
+        # How the attached coordinator keys file names, read at every local
+        # attach (_attach): every per-file record below is keyed by this
+        # profile's fold key, so each spelling of one file reaches one record.
+        self._fold_profile: FoldProfile = "none"
         self._on_held = on_held
         # What the latest operator view said about the opted-in refusal. Only
         # refuse mode reads it, right after the view that set it.
@@ -1128,6 +1458,18 @@ class CoherentVolume:
         # read_handoff(), which is how the MCP read tool relays a read's
         # provenance without changing what the read calls return.
         self._read_handoffs: dict[str, dict] = {}
+        # Every incarnation a request of this volume named whose end the
+        # coordinator has not confirmed (#525). Each one that reached the
+        # coordinator left records there; a re-mint ends those the volume no
+        # longer references, and close() ends them all. An incarnation never
+        # named never reached it and is never sent anything. Once its end is
+        # confirmed the coordinator has forgotten it, so nothing is sent under
+        # it again: a strict pre-edit would admit what it denied before.
+        self._unended_incarnations: set[str] = set()
+        # close() has run: every operation but close() raises from here on, and
+        # a close the coordinator did not confirm sends what is still recorded
+        # when called again. A forked child inherits it.
+        self._closed = False
 
         self._mint_identity()
         self._attach()
@@ -1195,7 +1537,8 @@ class CoherentVolume:
         # (its connection/secret context belongs to the parent), and clear
         # per-path beliefs the child has not established itself. Releases
         # NOTHING, and forgets the grants write() recorded: those belong to the
-        # parent's identity, which is still live in the parent.
+        # parent's identity, which is still live in the parent. It ends none
+        # of the parent's incarnations either: the parent still owns them.
         self._session_id = str(uuid.uuid4())
         self._incarnation = self._new_incarnation()
         # The parent's principal is bound to the parent's session: discard it
@@ -1203,6 +1546,7 @@ class CoherentVolume:
         # re-attaches.
         self._new_principal_claim()
         self._grant_incarnations.clear()
+        self._unended_incarnations.clear()
         self._release_held_paths.clear()
         self._read_incarnations.clear()
         self._read_handoffs.clear()
@@ -1223,7 +1567,13 @@ class CoherentVolume:
         ``read_with_version``, ``read_with_version_generation``, ``write``,
         ``write_cas``, ``write_cas_at`` and ``atomic_publish`` retries until one
         attaches.
+
+        The operations that send a request pass through here first, so a
+        closed volume raises here, before anything is sent. :meth:`release`
+        and :meth:`reacquire` check for themselves, and :meth:`close` is the
+        one operation a closed volume accepts.
         """
+        self._require_open()
         if self._endpoint is None and self._needs_reattach:
             # Cleared BEFORE the attempt: _attach reads .coherence/ files, and
             # under the install() shim with a managed glob that matches them each
@@ -1280,10 +1630,20 @@ class CoherentVolume:
         file; and in a forked child, which also gets a new :attr:`session_id`.
         Nothing else changes it, so it is stable between those points, and a
         value read after an operation returns names the attempt that operation
-        finished on. Two requests can name an older incarnation: the release
-        of a write grant that incarnation abandoned, and a :meth:`transfer`,
-        whose grants each name the incarnation that holds this volume's claim
-        on that path."""
+        finished on. :meth:`release` and :meth:`close` start no attempt.
+        Several requests can name an older incarnation: the release of a write
+        grant that incarnation abandoned, a :meth:`release` or :meth:`close` of
+        a grant it holds, a :meth:`transfer`, whose grants each name the
+        incarnation that holds this volume's claim on that path, and the end
+        of one the volume no longer uses (#525).
+
+        Each incarnation a request named leaves records at the coordinator.
+        A new attempt ends every older one the volume no longer references:
+        neither the current one nor one holding a read a :meth:`transfer`
+        would present. :meth:`close` ends them all. The coordinator then
+        forgets an ended incarnation, so its rows, heartbeat and ``/status``
+        entry go, and no request names it again. An incarnation that never sent
+        a request costs nothing."""
         return self._incarnation
 
     @property
@@ -1384,7 +1744,11 @@ class CoherentVolume:
     def _attach(self) -> None:
         """Dispatch attach: local spawn-with-strict, or remote connect-only.
 
-        Remote mode (the cross-host demo) NEVER spawns a local coordinator."""
+        Remote mode (the cross-host demo) NEVER spawns a local coordinator.
+
+        A remote coordinator's disk is not this volume's, so its records stay
+        keyed exactly and its paths are sent as keys; a local attach keys them
+        by the profile the coordinator advertises."""
         if self._remote_endpoint is not None:
             self._attach_remote()
         else:
@@ -1437,6 +1801,15 @@ class CoherentVolume:
         pid_file = coherence_dir / "server.pid"
         cfg = self._config or LifecycleConfig()
 
+        # Before the pre-probe and the policy merge below (#498): through a link
+        # in .coherence the probe reaches another workspace's port and the merge
+        # writes where the link points, ahead of the start's own check.
+        try:
+            check_coherence_dir(self._root)
+        except CoherenceDirRefused as exc:
+            self._state_dir_refusal_or_degrade(exc)
+            return
+
         # Strict mode is load-once-at-startup, so only the process that SPAWNS
         # the coordinator can enable it. Write our policy YAML only when no
         # coordinator is running yet (we are about to spawn it). If one is
@@ -1444,18 +1817,29 @@ class CoherentVolume:
         # take effect (load-once), and clobbering a foreign coordinator's policy
         # is a side effect on someone else's workspace. We verify enforcement
         # after attaching instead.
-        pre_port = read_port_from_file(pid_file)
-        pre_existing = pre_port is not None and tcp_probe(
-            pre_port, cfg, bind_host=self._bind_host
-        )
+        pre_existing = running_coordinator_port(pid_file, cfg, bind_host=self._bind_host) is not None
         if not pre_existing:
-            self._write_policy_yaml()
+            try:
+                self._write_policy_yaml()
+            except ValueError as exc:
+                # A policy file it cannot merge into (#305). It is the user's to
+                # rewrite, so start nothing: the refusal names the file.
+                self._policy_refusal_or_degrade(exc)
+                return
 
         # No coordinator to spawn or attach, and an endpoint that cannot be
         # resolved, are the same fact for the caller as a coordinator that is
         # gone: nothing will answer. A raw spawn error is not one of them and
         # still propagates as itself.
-        port = connect_or_spawn(self._root, config=cfg, bind_host=self._bind_host)
+        try:
+            port = connect_or_spawn(self._root, config=cfg, bind_host=self._bind_host)
+        except CoherenceDirRefused as exc:
+            # A link made after the check above; the start checks again.
+            self._state_dir_refusal_or_degrade(exc)
+            return
+        except StoreHeldError as exc:
+            self._store_held_or_degrade(exc)
+            return
         if port == -1:
             self._unreachable_or_degrade(
                 "coordinator unavailable (could not spawn or attach for this workspace)"
@@ -1483,8 +1867,9 @@ class CoherentVolume:
         #     strict wins over ignore, /policy/untrack refuses a strict path,
         #     a reload never drops a strict pattern).
         #   * the sets cannot be read (an older coordinator publishing counts
-        #     only, the Node coordinator, a failed /status) -> cannot tell ->
-        #     fail closed, saying so; never read as enforced.
+        #     only, a Node coordinator of plugin 0.6.0 or earlier, a failed
+        #     /status) -> cannot tell -> fail closed, saying so; never read as
+        #     enforced.
         # A pattern COUNT is not a check: the spawner's one pattern satisfied
         # every later attacher, whose untracked paths then answered every hook
         # as if enforced, so its stale writes landed with no signal (#190).
@@ -1514,17 +1899,41 @@ class CoherentVolume:
                 # receives nothing.
                 self._endpoint = None
                 raise CoherenceError(_IF_UNHELD_NOT_ADVERTISED_MESSAGE)
+        self._adopt_fold_profile()
         self._claim_principal()
+
+    def _adopt_fold_profile(self) -> None:
+        """Key this volume's records as the attached coordinator keys file
+        names. Refuse mode, which promises a holder its file under every
+        spelling, cannot rely on a profile it could not read or one folded by
+        another table, so it fails closed, detached, before the claim, as the
+        capability check above does."""
+        view = self._read_fold_view()
+        self._fold_profile = view.profile
+        if self._on_held != "refuse" or view.doubt is None:
+            return
+        self._endpoint = None
+        refusal = CoordinatorUnreachable if view.unanswered else CoherenceError
+        raise refusal(_fold_profile_refusal_message(view.doubt))
+
+    def _read_fold_view(self) -> _FoldView:
+        """The fold fields of the default ``/status`` tier, which every
+        coordinator serves; the operator tier the glob check reads is not
+        served by a Node coordinator of plugin 0.6.0 or earlier. Only the
+        failure's type is named, never its text."""
+        try:
+            status = _coordinator_get(self._endpoint, "/status")
+        except CoordinatorUnavailable as exc:
+            return _FoldView("none", f"{type(exc).__name__} reading /status", unanswered=True)
+        except Exception as exc:  # any other failure to read it is "cannot tell"
+            return _FoldView("none", f"{type(exc).__name__} reading /status")
+        return _fold_view_of(status)
 
     def _enforcement_failure(self, enforcement: ManagedGlobEnforcement) -> str:
         """The message for an attach the per-glob check did not confirm: which
-        globs are not enforced, or why enforcement could not be told."""
-        tail = (
-            " Every volume on a workspace must declare the globs the coordinator was "
-            "started with; an attaching volume adds none to a running coordinator's "
-            "policy. Stop it, or use a dedicated workspace root. In degrade mode the "
-            "volume operates best-effort with coherence enforcement off."
-        )
+        globs are not enforced, or why enforcement could not be told, and how
+        to make the coordinator enforce them."""
+        tail = f" {self._enforcement_remedy()} {_ENFORCEMENT_OFF_IN_DEGRADE}"
         if enforcement.unavailable is not None:
             globs = ", ".join(self._managed)
             return (
@@ -1538,6 +1947,15 @@ class CoherentVolume:
             "or ignored."
             + tail
         )
+
+    def _enforcement_remedy(self) -> str:
+        """How to make the attached coordinator enforce this volume's globs, by
+        the backend its pid file names. The Node coordinator, which no volume
+        starts, is never told to stop: the next volume would then start the
+        Python coordinator on the store Node created, which refuses it."""
+        if coordinator_backend(self._root) == NODE_BACKEND:
+            return _NODE_COORDINATOR_REMEDY
+        return _SPAWNED_COORDINATOR_REMEDY
 
     def _claim_principal(self) -> None:
         """Obtain this session's caller principal: once per session, at attach.
@@ -1624,7 +2042,8 @@ class CoherentVolume:
 
         Writes the managed globs to both ``tracked.yaml`` and ``strict_mode.yaml``
         (a path must be tracked AND strict for the deny to fire). Idempotent —
-        merges with any existing entries. No-op when ``managed`` is empty.
+        merges with any existing entries. No-op when ``managed`` is empty. Raises
+        ValueError naming a policy file it cannot merge into (#305).
         """
         if not self._managed:
             return
@@ -1637,29 +2056,9 @@ class CoherentVolume:
         # earlier. An existing directory is left as-is (mkdir never chmods);
         # re-tightening stays the lifecycle's job.
         coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._merge_yaml_list(coherence_dir / "tracked.yaml", self._managed)
-        self._merge_yaml_list(coherence_dir / "strict_mode.yaml", self._managed)
-
-    @staticmethod
-    def _merge_yaml_list(path: Path, globs: tuple[str, ...]) -> None:
-        existing: list[str] = []
-        if path.is_file():
-            try:
-                loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
-            except (yaml.YAMLError, OSError):
-                loaded = None
-            if isinstance(loaded, list):
-                existing = [x for x in loaded if isinstance(x, str)]
-        merged = sorted(set(existing) | set(globs))
-        if merged == sorted(existing):
-            return  # nothing new — avoid a needless rewrite
-        # Atomic write so a concurrent coordinator spawn never reads a partial file.
-        # UUID-suffix the temp name (like _atomic_write) so a predictable ``.tmp``
-        # path can't be pre-placed as a symlink by a local same-uid process (the
-        # write_text would otherwise follow it).
-        tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(yaml.safe_dump(merged, default_flow_style=False), encoding="utf-8")
-        os.replace(tmp, path)
+        merge_policy_globs(
+            (coherence_dir / "tracked.yaml", coherence_dir / "strict_mode.yaml"), self._managed
+        )
 
     # --- strict-mode verification (used by tests + callers) -----------------
 
@@ -1696,6 +2095,7 @@ class CoherentVolume:
         is concluded about the globs: the attach fails closed on it, and never
         takes a count for confirmation.
         """
+        self._require_open()
         try:
             return self._read_glob_enforcement()
         except CoordinatorUnavailable as exc:
@@ -1725,15 +2125,8 @@ class CoherentVolume:
         except CoordinatorUnavailable:
             raise
         except urllib.error.HTTPError as exc:
-            # The Node coordinator answers 501 to the operator view and
-            # publishes no strict patterns at any tier; name it when the pid
-            # file says so. Only the status code is relayed, never the body.
-            who = (
-                "the Node coordinator does not serve the operator view"
-                if coordinator_backend(self._root) == NODE_BACKEND
-                else "the operator view was refused"
-            )
-            return ManagedGlobEnforcement((), (), f"{who} (HTTP {exc.code})")
+            # Only the status code is relayed, never the body.
+            return ManagedGlobEnforcement((), (), _operator_view_refusal(exc.code))
         except Exception as exc:  # any other failure to read the view is "cannot tell"
             return self._unreadable_view(exc)
         self._advertises_if_unheld = (
@@ -1770,6 +2163,7 @@ class CoherentVolume:
         compares this volume's own globs against the published sets. Returns
         False if unattached or if the status surface is unavailable.
         """
+        self._require_open()
         if self._endpoint is None:
             return False
         count = self._policy_summary_value("strict_mode_pattern_count")
@@ -1798,6 +2192,7 @@ class CoherentVolume:
         (unreachable) — a distinction :meth:`strict_mode_active` collapses to
         ``False`` — and to read the tracked-artifact versions for ``per_path``.
         """
+        self._require_open()
         if self._endpoint is None:
             return None
         try:
@@ -1854,15 +2249,16 @@ class CoherentVolume:
             raise FileNotFoundError(f"no such file in workspace: {rel}")
         data = self._read_file_bytes(abs_path)  # empty file -> b"" -> sha256(b"")
         content_hash = self._sha256_bytes(data)
+        key = self._key_of(rel)
         # SB-23: a path this volume has no baseline for takes these bytes as its
         # first one even if the read is refused below. Without it a refused first
         # read leaves a later write unchecked, and a peer commit that reached disk
         # after the refusal is overwritten. setdefault never replaces an earlier
         # observation, so the refused bytes cannot absolve an edit made after one.
-        self._last_observed_hash.setdefault(rel, content_hash)
+        self._last_observed_hash.setdefault(key, content_hash)
         # This read's answer replaces both: its handoff key and whether it was
         # a strict deny. An unanswered or failed read leaves neither set.
-        self._read_handoffs.pop(rel, None)
+        self._read_handoffs.pop(key, None)
         self._last_read_denied = False
         self._last_read_split = False
         if self._endpoint is not None:
@@ -1904,7 +2300,7 @@ class CoherentVolume:
                     raise _split_pair_refusal()
                 raise StaleView(self._deny_reason(resp))
             if self._read_registered(resp):
-                self._read_incarnations[rel] = reader
+                self._read_incarnations[key] = reader
         # SB-23: advance the foreign-edit baseline only HERE, where the bytes
         # reach the caller. Every raise above leaves the caller without them: a
         # request refused for its caller principal (raised out of _post in both
@@ -1913,11 +2309,13 @@ class CoherentVolume:
         # the caller never saw, and its next write() would clobber it instead of
         # being denied. (A path with no baseline yet was already given one by the
         # setdefault above.)
-        self._last_observed_hash[rel] = content_hash
+        self._last_observed_hash[key] = content_hash
         return data
 
-    def write(self, path: str | os.PathLike[str], data: bytes | bytearray) -> None:
-        """Write bytes to a workspace file under the single-writer guard.
+    def write(self, path: str | os.PathLike[str], data: bytes | bytearray) -> WriteResult:
+        """Write bytes to a workspace file under the single-writer guard, and
+        return what the coordinator reported about the bytes it replaced
+        (:class:`WriteResult`).
 
         Prevents the **sequential** stale-read→write lost update: if a peer
         committed a newer version since this instance last read, this instance
@@ -1939,9 +2337,10 @@ class CoherentVolume:
         not decide in time raises :class:`~ccs.core.exceptions.CoordinatorFailed`,
         and one with no usable answer raises
         :class:`~ccs.core.exceptions.CoordinatorUnreachable`. Neither writes
-        anything, but either may leave a grant, so retry, or call :meth:`reacquire`
-        if you give up. A successful write keeps its grant, across later commits,
-        until :meth:`reacquire` or another verb that starts a new attempt.
+        anything, but either may leave a grant, so retry, or call :meth:`release`
+        on the path if you give up. A successful write keeps its grant, across later
+        commits, until :meth:`release` or :meth:`close` gives it back, or
+        :meth:`reacquire` or another verb that starts a new attempt releases it.
 
         Also prevents the **foreign-edit clobber** (content-CAS, write surface):
         on a managed (strict) path, if the file on disk changed out-of-band since
@@ -1967,9 +2366,12 @@ class CoherentVolume:
         raises :class:`~ccs.core.exceptions.CoordinatorUnreachable` when the
         commit never left (the coordinator did not record the write) or
         :class:`~ccs.core.exceptions.CommitUnconfirmed` (it may have: a 5xx
-        says nothing of whether the commit ran); either way, re-read before
-        writing again. A 4xx or a redirect takes ``on_error``'s path, with no
-        release. A commit the coordinator answers
+        says nothing of whether the commit ran). Re-reading does not help:
+        until a write of the path is recorded, a read that refuses stale bytes
+        refuses it, so write the path again, which records it either way
+        (#526); the error says whether the release was confirmed, and
+        :meth:`release` sends one that was not. A 4xx or a redirect takes
+        ``on_error``'s path, with no release. A commit the coordinator answers
         with its failure envelope may have been recorded too, so it raises
         ``CommitUnconfirmed`` in both modes, after the same release, never the
         ``CommitPreempted`` of a post-edit preempt.
@@ -1979,14 +2381,18 @@ class CoherentVolume:
         thread.
         """
         with self._single_op_guard():
-            self._write_impl(path, data)
+            return self._write_impl(path, data)
 
-    def _write_impl(self, path: str | os.PathLike[str], data: bytes | bytearray) -> None:
+    def _write_impl(self, path: str | os.PathLike[str], data: bytes | bytearray) -> WriteResult:
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError("CoherentVolume.write expects bytes")
         data = bytes(data)
         self._ensure_attached()
         abs_path, rel = self._to_relative(path)
+        if self._on_held == "refuse":
+            # Decided now, against the links as they stand, before any request.
+            self._refuse_link_out_of_managed(path, rel)
+        key = self._key_of(rel)
 
         if self._endpoint is None:
             # Unattached / degraded coordinator (strict already raised at
@@ -1996,7 +2402,7 @@ class CoherentVolume:
             self._check_foreign_edit(rel, self._disk_hash(abs_path))
             self._atomic_write(abs_path, data)
             self._record_own_write(rel, self._sha256_bytes(data))
-            return
+            return WriteResult(path=rel, disk_differs=False)
 
         opts_in = self._opts_in(rel)
 
@@ -2014,13 +2420,13 @@ class CoherentVolume:
         # bare ok:true as an acquire, so the volume cannot tell that no grant was
         # taken.
         written = self._grant_incarnations.setdefault(self._incarnation, set())
-        recorded_before = rel in written
-        written.add(rel)
+        recorded_before = key in written
+        written.add(key)
 
         def withdraw_record() -> None:
             if recorded_before:
                 return
-            written.discard(rel)
+            written.discard(key)
             if not written:
                 self._grant_incarnations.pop(self._incarnation, None)
 
@@ -2066,7 +2472,7 @@ class CoherentVolume:
             # ALREADY holds these bytes. _last_committed_hash is a cheap fast-path
             # gate; the CURRENT on-disk hash is the authority (see _disk_hash).
             already_on_disk = (
-                self._last_committed_hash.get(rel) == new_hash
+                self._last_committed_hash.get(key) == new_hash
                 and disk_hash == new_hash
             )
             if not already_on_disk:
@@ -2077,7 +2483,7 @@ class CoherentVolume:
             # is DELIBERATELY split from the _last_committed_hash advance below (after
             # the post-edit POST); the other own-write sites advance both caches
             # together, so do not "fix" this into a pair — the ordering is load-bearing.
-            self._last_observed_hash[rel] = new_hash
+            self._last_observed_hash[key] = new_hash
         except Exception:
             # Release the grant so it is not orphaned until the sweep, then
             # re-raise the original error. Best-effort release — a release failure
@@ -2105,9 +2511,10 @@ class CoherentVolume:
             # the coordinator may never have recorded. Release the grant
             # first, so it does not block every peer until a re-mint, then
             # say which: never sent, or delivered and maybe recorded.
-            self._release_unconfirmed_grant(rel)
+            released = self._release_unconfirmed_grant(rel)
             unconfirmed = CoordinatorUnreachable if no_answer.never_sent else CommitUnconfirmed
-            raise unconfirmed(_unanswered_write_message(rel, no_answer)) from no_answer.__cause__
+            message = _unanswered_write_message(rel, no_answer, released=released)
+            raise unconfirmed(message) from no_answer.__cause__
         except RedirectRefused as redirect:
             # A redirected commit is a failed commit like any other status
             # outside 2xx — refused, never followed — so, the bytes being on
@@ -2144,24 +2551,29 @@ class CoherentVolume:
             # not. In both modes, as a deny is. The grant is released first, as
             # for a commit that got no answer, so it does not block every peer
             # until a re-mint.
-            self._release_unconfirmed_grant(rel)
-            raise CommitUnconfirmed(_failed_write_message(rel, post_resp["reason"]))
+            released = self._release_unconfirmed_grant(rel)
+            raise CommitUnconfirmed(_failed_write_message(rel, post_resp["reason"], released=released))
         if post_resp is not None:
             # ok:false here means the grant was preempted / sweep-reclaimed mid-
             # write (a concurrent-writer case v1 does not claim to serialize);
             # fail closed so the caller knows the commit did not register.
             self._check_grant(post_resp, rel, phase="post-edit")
-        self._last_committed_hash[rel] = new_hash
+        self._last_committed_hash[key] = new_hash
+        # Relayed, never acted on: the coordinator's note does not move the
+        # observed baseline the foreign-edit check compares against.
+        return WriteResult(path=rel, disk_differs=isinstance(resp, dict) and resp.get("disk_differs") is True)
 
     def _opts_in(self, rel: str) -> bool:
         """Whether this write asks for ``rel`` only if nobody holds it: refuse mode,
         on a managed path. Any other path takes no flag, because an untrack could
         send it through the untracked exit, around the check. A session with no
-        caller principal raises, with nothing sent, because the coordinator would
-        refuse the request."""
-        if self._on_held != "refuse" or not matches_any(rel, self._managed):
+        caller principal raises, with nothing sent, because a coordinator that
+        issues principals refuses the request without one. Only a claim answered
+        404 (``unsupported``) shows that the coordinator issues none, as the Node
+        coordinator does; that one decides the request without a principal."""
+        if self._on_held != "refuse" or not self._matches_managed(rel):
             return False
-        if self._principal is None:
+        if self._principal is None and self._claim_outcome != "unsupported":
             raise CoherenceError(_no_principal_message(rel, self.principal_claim_outcome))
         return True
 
@@ -2174,12 +2586,14 @@ class CoherentVolume:
             return _coordinator_post(
                 self._endpoint,
                 "/hooks/post-edit",
-                {
-                    "session_id": self._session_id,
-                    "agent_id": self._incarnation,
-                    "path": rel,
-                    "success": False,
-                },
+                self._named(
+                    {
+                        "session_id": self._session_id,
+                        "agent_id": self._incarnation,
+                        "path": rel,
+                        "success": False,
+                    }
+                ),
                 extra_headers=caller_principal_headers(self._principal),
                 **post_kwargs,
             )
@@ -2194,10 +2608,10 @@ class CoherentVolume:
         failure routing would raise over the typed error write() raises next,
         and with its own short timeout, so a silent coordinator costs one full
         timeout and one short one, not two full ones. The coordinator's
-        release invalidates the holder's own row and never touches the
-        version, hash or last writer, so it cannot revert a commit that
-        landed. The path leaves the grant record only on a confirmed release,
-        ``ok: true`` without ``degraded`` (as in
+        release ends the holder's own write grant, leaving it a reader, and
+        never touches the version, hash or last writer, so it cannot revert
+        a commit that landed. The path leaves the grant record only on a
+        confirmed release, ``ok: true`` without ``degraded`` (as in
         :meth:`_release_abandoned_grants`); otherwise the next re-mint
         releases it. Returns whether the release was confirmed."""
         incarnation = self._incarnation
@@ -2208,7 +2622,7 @@ class CoherentVolume:
         # write() calls took on other paths, which this release did not touch.
         written = self._grant_incarnations.get(incarnation)
         if written is not None:
-            written.discard(rel)
+            written.discard(self._key_of(rel))
             if not written:
                 del self._grant_incarnations[incarnation]
         return True
@@ -2233,11 +2647,12 @@ class CoherentVolume:
         Re-minting the identity resets this instance's view of *every* path, not
         just ``path`` — other tracked paths should be re-read before writing.
 
-        It is also how a holder lets go under ``on_held="refuse"``: it releases every
-        path this attempt holds, not only ``path``, and a peer can then be admitted
-        to each. Best-effort in both directions: a return can follow a release the
-        coordinator did not confirm, which the next re-mint sends again, and a raise
-        can follow one it did, as on a file that was deleted.
+        It also releases: every path this attempt holds, not only ``path``, and a
+        peer can then be admitted to each. To give back one file without a new
+        attempt, call :meth:`release`; to give back every file and end the volume,
+        :meth:`close`. Best-effort in both directions: a return can follow a release
+        the coordinator did not confirm, which the next re-mint sends again, and a
+        raise can follow one it did, as on a file that was deleted.
 
         Always returns the current bytes without raising, even under
         ``on_stale_read="raise"`` — recovery must never be blocked by the deny
@@ -2247,6 +2662,7 @@ class CoherentVolume:
         # (the release of an abandoned grant), and every request this instance
         # sends is one operation's.
         with self._single_op_guard():
+            self._require_open()  # the re-mint below sends before any read would check
             self._remint()  # fresh identity -> no INVALID; has committed nothing
             # MANDATORY fresh read under the new identity -> SHARED@current.
             # Recovery bypasses on_stale_read='raise' (_enforce_stale=False) so a
@@ -2288,14 +2704,28 @@ class CoherentVolume:
         after the rotation (see :meth:`_release_abandoned_grants` for what
         counts as one): under strict the operation that re-minted raises before
         it commits anything, ``CoordinatorFailed`` for the coordinator's failure
-        envelope (#401). An incarnation that did only reads and
-        optimistic commits holds at most SHARED/INVALID, blocks nothing, and is
-        never released — no request is spent on it.
+        envelope (#401).
+
+        The re-mint also ends every older incarnation the volume no longer
+        references (#525): one a request named, that is neither the current
+        one nor one holding a read a :meth:`transfer` would present. Ending it
+        lets the coordinator forget its rows, heartbeat, notices and
+        ``/status`` entry, which otherwise stay for good. One with a recorded
+        grant carries ``ended`` on its release above, in the same request. One
+        that did only reads and optimistic commits holds at most
+        SHARED/INVALID and blocks nothing, so its end follows the release
+        pass, and only when every release in it was confirmed; it is sent like
+        :meth:`_send_grant_release`, raw and with the same short timeout as
+        write()'s best-effort release, so it never raises or counts a
+        degradation, and one not confirmed is logged and sent again at the
+        next re-mint or :meth:`close`. An incarnation that never sent a request
+        never reached the coordinator: no request is spent on it.
         """
         with self._lock:
             self._incarnation = self._new_incarnation()  # fresh row -> no INVALID
             self._last_committed_hash.clear()  # the new identity has committed nothing
             abandoned = sorted(self._grant_incarnations)
+            unreferenced = self._unreferenced_incarnations()
             # SB-23: do NOT clear _last_observed_hash here. The observed-disk
             # baselines are DISK-scoped (what disk looked like when this instance
             # last read/wrote a path), not identity-scoped — a re-mint changes the
@@ -2309,9 +2739,90 @@ class CoherentVolume:
         # request in degrade mode re-enters it (_post -> _fail_closed_or_degrade
         # -> _record_degraded takes self._lock), so holding it here would
         # deadlock on the first failed release.
-        self._release_abandoned_grants(abandoned)
+        if self._release_abandoned_grants(abandoned, unreferenced):
+            # The pass released every grant it holds, so what is left unended
+            # of the unreferenced incarnations holds none.
+            self._end_incarnations(sorted(unreferenced & self._unended_incarnations))
 
-    def _release_abandoned_grants(self, incarnations: list[str]) -> None:
+    def _unreferenced_incarnations(self) -> set[str]:
+        """The incarnations a request named and nothing ended that this volume
+        no longer references: neither the current one nor one that holds a
+        read a :meth:`transfer` would present. Ending one of those would
+        refuse the transfer while the volume still holds the read.
+
+        Leaving out the current one is a guard only: :meth:`_remint` computes
+        this after its rotation, when the current one has sent nothing and so
+        is not yet recorded. That order is what keeps the attempt in use from
+        being ended."""
+        return self._unended_incarnations - {self._incarnation, *self._read_incarnations.values()}
+
+    def _stop_body(self, incarnation: str, *, ended: bool) -> dict:
+        """A ``session-stop`` naming ``incarnation``; with ``ended``, one that
+        also tells the coordinator the volume is done with it (#525)."""
+        body: dict[str, object] = {"session_id": self._session_id, "agent_id": incarnation}
+        if ended:
+            body["ended"] = True
+        return body
+
+    def _end_incarnations(self, incarnations: list[str], *, at_close: bool = False) -> None:
+        """End each of ``incarnations``, which hold no recorded grant: one raw
+        ``session-stop`` with ``ended`` per incarnation (:meth:`_send_end`).
+        One whose end is confirmed (see :func:`_confirms_end`) leaves the
+        record. The walk stops at the first that is not, so a coordinator that
+        stopped answering costs one short timeout, and logs it: an end releases
+        nothing, so it never raises or counts a degradation, and what is still
+        recorded is ended at the next re-mint or :meth:`close`. At close, an end
+        that finds the volume's local coordinator gone (see
+        :meth:`_refused_at_local_endpoint`) gives the rest up instead
+        (:meth:`_give_up_ends`)."""
+        if self._endpoint is None:
+            return
+        for index, incarnation in enumerate(incarnations):
+            answer = self._send_end(incarnation)
+            if _confirms_end(answer):
+                self._unended_incarnations.discard(incarnation)
+                continue
+            if at_close and self._refused_at_local_endpoint(answer):
+                self._give_up_ends(incarnations[index:])
+                return
+            logger.warning(
+                "CoherentVolume could not confirm the end of an attempt it no longer uses; "
+                "the end is sent again at the next re-mint or close(): %r",
+                answer,
+            )
+            return
+
+    def _give_up_ends(self, incarnations: list[str]) -> None:
+        """Drop ``incarnations`` from the unended record at a close that found
+        the volume's local coordinator gone, and log them
+        once. Nothing the caller does can end them, so the volume does not keep
+        its endpoint for them and a later close() sends nothing for them; their
+        records stay with the coordinator."""
+        logger.warning(
+            "CoherentVolume close reached no coordinator, so these attempts it no longer uses "
+            "were not ended and their records stay with the coordinator: %s",
+            ", ".join(incarnations),
+        )
+        self._unended_incarnations.difference_update(incarnations)
+
+    def _send_end(self, incarnation: str) -> object:
+        """One raw ``session-stop`` ending ``incarnation``, presenting the
+        session's caller principal, with the short timeout of
+        :meth:`_release_unconfirmed_grant`: the answer, or the error the post
+        raised. Best-effort, as :meth:`_send_grant_release` is: it never
+        raises, and the caller only reads what it returns."""
+        try:
+            return _coordinator_post(
+                self._endpoint,
+                "/hooks/session-stop",
+                self._stop_body(incarnation, ended=True),
+                extra_headers=caller_principal_headers(self._principal),
+                timeout=_GRANT_RELEASE_TIMEOUT_SEC,
+            )
+        except Exception as failed:
+            return failed
+
+    def _release_abandoned_grants(self, incarnations: list[str], ending: set[str]) -> bool:
         """Release every grant each abandoned incarnation holds: one
         ``session-stop`` naming it in ``agent_id``, which releases all of that
         row's EXCLUSIVE/MODIFIED grants (every path it wrote) and nothing else.
@@ -2333,39 +2844,52 @@ class CoherentVolume:
         as another agent's.
         The pass stops at the first release not confirmed — the rest would meet
         the same coordinator — so one re-mint spends at most one failed request.
+
+        An incarnation in ``ending`` carries ``ended`` on its stop (#525), and
+        leaves the unended record when the answer confirms the end (see
+        :func:`_confirms_end`); the release is read as above either way.
+        Returns whether the pass ran to the end with every release confirmed.
         """
         self._release_held_paths.clear()
         if self._endpoint is None:
-            return  # nothing to send it to; the record waits for an attached re-mint
+            return False  # nothing to send it to; the record waits for an attached re-mint
         for incarnation in incarnations:
-            resp = self._post(
-                "/hooks/session-stop",
-                {"session_id": self._session_id, "agent_id": incarnation},
+            ended = incarnation in ending
+            resp = self._post("/hooks/session-stop", self._stop_body(incarnation, ended=ended))
+            if ended and _confirms_end(resp):
+                self._unended_incarnations.discard(incarnation)
+            if not self._settle_abandoned_release(incarnation, resp):
+                return False
+        return True
+
+    def _settle_abandoned_release(self, incarnation: str, resp: dict | None) -> bool:
+        """Act on the answer to one stop of :meth:`_release_abandoned_grants`,
+        and say whether the pass goes on: only a confirmed release lets it."""
+        if isinstance(resp, dict) and resp.get("degraded"):
+            self._fail_closed_or_degrade(
+                "coordinator watchdog timeout releasing an abandoned write grant"
             )
-            if isinstance(resp, dict) and resp.get("degraded"):
-                self._fail_closed_or_degrade(
-                    "coordinator watchdog timeout releasing an abandoned write grant"
+            return False
+        if _is_failure_envelope(resp):
+            # The stop raised inside the coordinator, so the envelope reports
+            # no grant: the record stays whole for the next re-mint.
+            self._failed_release_or_degrade(resp["reason"])
+            return False
+        if not (isinstance(resp, dict) and resp.get("ok") is True):
+            # None follows a degrade-mode transport failure _post already
+            # warned about. A stop that left a grant held answers each grant
+            # (#185): the ones it released leave the record, the rest stay.
+            if isinstance(resp, dict):
+                self._drop_released_paths(incarnation, resp.get("grants"))
+            if resp is not None:
+                logger.warning(
+                    "release of an abandoned write grant was not confirmed; "
+                    "it will be retried at the next re-mint: %r",
+                    resp,
                 )
-                return
-            if _is_failure_envelope(resp):
-                # The stop raised inside the coordinator, so the envelope reports
-                # no grant: the record stays whole for the next re-mint.
-                self._failed_release_or_degrade(resp["reason"])
-                return
-            if not (isinstance(resp, dict) and resp.get("ok") is True):
-                # None follows a degrade-mode transport failure _post already
-                # warned about. A stop that left a grant held answers each grant
-                # (#185): the ones it released leave the record, the rest stay.
-                if isinstance(resp, dict):
-                    self._drop_released_paths(incarnation, resp.get("grants"))
-                if resp is not None:
-                    logger.warning(
-                        "release of an abandoned write grant was not confirmed; "
-                        "it will be retried at the next re-mint: %r",
-                        resp,
-                    )
-                return
-            self._grant_incarnations.pop(incarnation, None)
+            return False
+        self._grant_incarnations.pop(incarnation, None)
+        return True
 
     def _drop_released_paths(self, incarnation: str, grants: object) -> None:
         """Act on a release answered per grant (#185): drop from
@@ -2383,13 +2907,283 @@ class CoherentVolume:
             path = entry.get("path")
             if not isinstance(path, str):
                 continue
-            held = entry.get("held")
+            key, held = self._key_of(path), entry.get("held")
             if held is False:
-                written.discard(path)
-            elif held is True and path in written:
-                self._release_held_paths.add(path)
+                written.discard(key)
+            elif held is True and key in written:
+                self._release_held_paths.add(key)
         if not written:
             del self._grant_incarnations[incarnation]
+
+    # --- letting go ------------------------------------------------------------
+
+    def release(self, path: str | os.PathLike[str]) -> None:
+        """Give back this volume's write grant on ``path`` and keep every other
+        hold (#505).
+
+        The volume keeps a read of the version it held, so it reads and writes
+        the file again with no :meth:`reacquire`, until a peer writes it; a
+        refuse-mode peer is admitted to the file at once. Nothing else changes:
+        no new attempt starts, and the volume's other grants stand.
+
+        The volume decides what to release from its own record, because the
+        coordinator answers a release the same way whether it released a grant
+        or held nothing: one release per attempt whose :meth:`write` took a
+        grant on ``path``, and none for a path no write of this volume recorded.
+        A spelling the attached coordinator keys as a recorded file, such as
+        another case on a case-insensitive disk, is that file (#506); on a disk
+        that keeps spellings apart it is another file, and releases nothing.
+
+        A release the coordinator does not confirm keeps the path recorded and
+        goes through ``on_error``: strict raises (``CoordinatorUnreachable``
+        with no usable answer, ``CoordinatorFailed`` for an HTTP 5xx or the
+        coordinator's failure envelope, ``CoherenceError`` for a
+        watchdog-degraded answer or a grant reported still held), degrade
+        counts a degradation (warning on the volume's first). Calling
+        ``release()`` again sends it again.
+        """
+        with self._single_op_guard():
+            self._require_open()
+            _abs_path, rel = self._to_relative(path)
+            failure = self._release_path(rel)
+            if failure is not None:
+                self._release_failure_or_degrade(_release_not_confirmed_message(rel, held=failure.held), failure)
+
+    def _release_path(self, rel: str) -> _ReleaseFailure | None:
+        """Send one ``success: false`` post-edit for each attempt that records
+        ``rel``, in the order :meth:`_claim_incarnation` prefers them, and say
+        what did not confirm. The walk stops at a request with no readable
+        answer; an answer that reports the grant still held lets it go on,
+        since the coordinator answered. The volume's read moves to the first
+        attempt released: the one that held the grant, as the others were
+        displaced by it, so a later transfer presents a claim that holds."""
+        if self._endpoint is None:
+            return None  # detached: no write of this volume recorded a grant
+        key = self._key_of(rel)
+        held: _ReleaseFailure | None = None
+        released_first = False
+        for incarnation in self._writer_incarnations(rel):
+            answer = self._send_release(
+                "/hooks/post-edit",
+                {"session_id": self._session_id, "agent_id": incarnation, "path": rel, "success": False},
+            )
+            if isinstance(answer, _ReleaseFailure):
+                return answer
+            if self._settle_path_release(incarnation, rel, answer) and not released_first:
+                self._read_incarnations[key] = incarnation
+                released_first = True
+            if key in self._grant_incarnations.get(incarnation, ()):
+                held = _ReleaseFailure(CoherenceError, held=True)
+        if not self._records_write_grant(rel):
+            self._release_held_paths.discard(key)
+        return held
+
+    def _writer_incarnations(self, rel: str) -> list[str]:
+        """The incarnations whose write() recorded a grant on ``rel``: the
+        current one first, then the latest. The first holds the grant, since
+        each later acquire took it from the earlier ones."""
+        key = self._key_of(rel)
+        writers = [inc for inc, written in self._grant_incarnations.items() if key in written]
+        ordered = list(reversed(writers))
+        if self._incarnation in ordered:
+            ordered.remove(self._incarnation)
+            ordered.insert(0, self._incarnation)
+        return ordered
+
+    def _send_release(self, route: str, body: dict) -> dict | _ReleaseFailure:
+        """One release request through :meth:`_post`: its answer when it can
+        be read, else why it confirms nothing. The typed errors a strict
+        request raises when it gets no usable answer or an HTTP 5xx come back
+        as a failure instead, so the caller reports the release with its own
+        text and type, marked when no coordinator listens at the endpoint. Any
+        other error, a principal refusal among them, propagates."""
+        try:
+            resp = self._post(route, body)
+        except CoordinatorUnreachable as exc:
+            return _ReleaseFailure(CoordinatorUnreachable, exc, nobody_listening=self._nobody_listening(exc))
+        except CoordinatorFailed as exc:
+            return _ReleaseFailure(CoordinatorFailed, exc)
+        return _read_release_answer(resp)
+
+    def _nobody_listening(self, exc: CoordinatorUnreachable) -> bool:
+        """Whether ``exc``, raised for a request through :meth:`_post`, shows
+        no coordinator listening at this volume's own local endpoint (see
+        :meth:`_refused_at_local_endpoint`, which reads the client's error it
+        chains to)."""
+        return self._refused_at_local_endpoint(exc.__cause__)
+
+    def _refused_at_local_endpoint(self, failure: object) -> bool:
+        """Whether ``failure``, the client's error for one request, shows no
+        coordinator listening at this volume's own local endpoint: the connect
+        was refused, as after the coordinator shut down when idle, or the
+        client sent nothing because the coordinator it resolved has exited or
+        been replaced (#503). A connect that timed out, a name that did not
+        resolve, or a remote endpoint may still have a live coordinator behind
+        it, holding the grants."""
+        if self._remote_endpoint is not None:
+            return False
+        if not (isinstance(failure, CoordinatorUnavailable) and failure.never_sent):
+            return False
+        if isinstance(failure, CoordinatorDeparted):
+            return True
+        return isinstance(getattr(failure.__cause__, "reason", None), ConnectionRefusedError)
+
+    def _settle_path_release(self, incarnation: str, rel: str, answer: dict) -> bool:
+        """Act on a readable answer to the release of ``rel`` under
+        ``incarnation``; whether the coordinator released it to a read. ``ok:
+        true`` drops the path from that attempt's record; an account of each
+        grant drops what it reports released or handed off and keeps a grant
+        it reports still held."""
+        if answer.get("ok") is not True:
+            self._drop_released_paths(incarnation, answer.get("grants"))
+            return False
+        written = self._grant_incarnations.get(incarnation)
+        if written is not None:
+            written.discard(self._key_of(rel))
+            if not written:
+                del self._grant_incarnations[incarnation]
+        return True
+
+    def _release_failure_or_degrade(self, message: str, failure: _ReleaseFailure) -> None:
+        """A release or close the coordinator did not confirm, through
+        ``on_error``: strict raises the failure's type with ``message``,
+        chained to what failed; degrade counts a degradation, unless ``_post``
+        already counted one for the same request."""
+        if self._on_error == "strict":
+            raise failure.error(message) from failure.cause
+        if not failure.already_warned:
+            self._record_degraded(message)
+
+    @property
+    def closed(self) -> bool:
+        """Whether :meth:`close` has run on this volume."""
+        return self._closed
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise CoherenceError(_VOLUME_CLOSED_MESSAGE)
+
+    def __enter__(self) -> CoherentVolume:
+        self._require_open()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            self._close_while_unwinding()
+
+    def _close_while_unwinding(self) -> None:
+        """Close while another error unwinds. That error is the one the caller
+        needs, so a close that fails on top of it is logged, not raised."""
+        try:
+            self.close()
+        except (CoherenceError, CoherenceDegradedWarning) as close_failure:
+            logger.warning("CoherentVolume close failed on the way out of an error: %s", close_failure)
+
+    def close(self) -> None:
+        """Give back every write grant this volume recorded, and end the volume
+        (#505).
+
+        One ``session-stop`` per attempt whose :meth:`write` took a grant: each
+        grant becomes a read, and a refuse-mode peer is admitted at once rather
+        than after the coordinator's sweep. From then on every operation but
+        ``close()`` raises :class:`~ccs.core.exceptions.CoherenceError` and
+        sends nothing; build a new volume to go on. Properties stay readable.
+
+        A close the coordinator does not confirm leaves the volume closed with
+        the grant recorded, and goes through ``on_error`` with the types
+        :meth:`release` uses: strict raises, degrade counts a degradation
+        (warning on the volume's first). Calling ``close()`` again sends what
+        is still recorded, and nothing once the record is empty. A grant
+        reported still held does not stop the other attempts' releases; a
+        request with no readable answer does, so a silent coordinator costs one
+        client timeout. In strict mode, when the volume's local coordinator is
+        gone (the connect was refused, or the client sent nothing because the
+        coordinator it attached to has exited or been replaced, #503, as after
+        it shut down when idle), only a coordinator's sweep can release the
+        grants, so close() logs them and returns, unless a coordinator answered
+        earlier in the same close() that a grant was still held. A coordinator
+        started since, even on the same port, keeps them until its sweep.
+
+        Every stop also ends its attempt (#525), and so does one more
+        ``session-stop`` for each other attempt a request of this volume named,
+        sent after the releases with a short timeout, unless a request with no
+        readable answer stopped them: the coordinator then forgets each one,
+        its rows, heartbeat and ``/status`` entry. An end releases nothing, so
+        one the coordinator does not confirm is only logged, never raised or
+        counted; the volume keeps that attempt and its endpoint, and calling
+        ``close()`` again sends it again. When an end finds the volume's local
+        coordinator gone, as above, the
+        attempts not yet ended are logged once and given up instead, so a
+        later ``close()`` sends nothing for them. An attempt that never sent a
+        request costs nothing. The endpoint is dropped once nothing is left to
+        release or end.
+
+        Nothing calls this at interpreter exit: a volume that exits without
+        ``close()``, or is dropped, leaves its grants to the sweep. A ``with``
+        block closes the volume on exit, and when its body raised, a close
+        failure is logged so the body's error propagates. Refused from inside
+        another operation of this volume, such as a ``write_cas`` closure.
+        """
+        with self._single_op_guard():
+            if self._guard_depth > 1:
+                raise CoherenceError(_CLOSE_INSIDE_AN_OPERATION_MESSAGE)
+            self._closed = True
+            failure = self._release_every_attempt()
+            if failure is None or failure.held:
+                # No release went unanswered, so the ends have a coordinator to
+                # reach; after one that did, they would only wait it out again.
+                ending = sorted(self._unended_incarnations - self._grant_incarnations.keys())
+                self._end_incarnations(ending, at_close=True)
+            if not self._grant_incarnations and not self._unended_incarnations:
+                self._endpoint = None
+            if failure is not None:
+                self._close_not_confirmed(failure)
+
+    def _release_every_attempt(self) -> _ReleaseFailure | None:
+        """One ``session-stop`` per attempt the write record lists, each ending
+        its attempt, and what did not confirm. Each confirmed attempt leaves
+        the record; an account of each grant drops what it reports released or
+        handed off and lets the walk go on; a request with no readable answer
+        stops it. An answer that confirms the end (see :func:`_confirms_end`)
+        drops the attempt from the unended record."""
+        if self._endpoint is None:
+            return None  # detached: no write of this volume recorded a grant
+        held: _ReleaseFailure | None = None
+        for incarnation in sorted(self._grant_incarnations):
+            answer = self._send_release("/hooks/session-stop", self._stop_body(incarnation, ended=True))
+            if isinstance(answer, _ReleaseFailure):
+                # A coordinator answered this close, so a refusal now does not
+                # mean nothing was listening: report it, never log it away.
+                return answer._replace(nobody_listening=False) if held is not None else answer
+            if _confirms_end(answer):
+                self._unended_incarnations.discard(incarnation)
+            if answer.get("ok") is True:
+                self._grant_incarnations.pop(incarnation, None)
+                continue
+            self._drop_released_paths(incarnation, answer.get("grants"))
+            if incarnation in self._grant_incarnations:
+                held = _ReleaseFailure(CoherenceError, held=True)
+        return held
+
+    def _close_not_confirmed(self, failure: _ReleaseFailure) -> None:
+        """Report a close the coordinator did not confirm, through
+        ``on_error``, naming the paths still recorded. In strict mode a
+        request that found the volume's local coordinator gone (see
+        :meth:`_refused_at_local_endpoint`), with no answer earlier in the
+        walk, is logged instead: nothing the caller does can release those
+        grants, and a coordinator's sweep will. Degrade mode never reaches that
+        branch: the refused request already counted a degradation."""
+        rels = sorted({rel for written in self._grant_incarnations.values() for rel in written})
+        if failure.nobody_listening:
+            logger.warning(
+                "CoherentVolume close reached no coordinator; its write grants on %s "
+                "are left to the next coordinator's sweep",
+                ", ".join(rels),
+            )
+            return
+        self._release_failure_or_degrade(_close_not_confirmed_message(rels, held=failure.held), failure)
 
     def write_cas(
         self,
@@ -2441,10 +3235,11 @@ class CoherentVolume:
         pessimistic ``write()`` keeps that grant until the coordinator reclaims it
         (after ``grant_heartbeat_timeout_sec`` without a coordinator call, 600 s
         by default, or ``grant_max_hold_sec`` of holding, 1800 s by default) or
-        the holder releases it, which a ``CoherentVolume`` holder does only at
-        its own next re-mint: a ``write_cas`` of that file or any ``write_cas``
-        retry, ``write_cas_at``, ``atomic_publish`` or :meth:`reacquire` (the
-        re-mint releases what its ``write()`` left held; see :meth:`_remint`). A
+        the holder releases it, which a ``CoherentVolume`` holder does when it
+        calls :meth:`release` on the file or :meth:`close`, or at its own next
+        re-mint: a ``write_cas`` of that file or any ``write_cas`` retry,
+        ``write_cas_at``, ``atomic_publish`` or :meth:`reacquire` (the re-mint
+        releases what its ``write()`` left held; see :meth:`_remint`). A
         ``session-stop`` naming only its :attr:`session_id` releases nothing,
         because each attempt holds its grants under its own incarnation. A
         peer's reads and CAS attempts never release it, and a peer's ``write()``
@@ -2606,7 +3401,7 @@ class CoherentVolume:
             # make_content, so they become the foreign-edit baseline — and only
             # here: a denied read (above) was never handed to it, and seeding
             # from one would absolve the out-of-band edit that got it denied.
-            self._last_observed_hash[rel] = self._sha256_bytes(current_bytes)
+            self._last_observed_hash[self._key_of(rel)] = self._sha256_bytes(current_bytes)
             data = bytes(make_content(current_bytes))
             new_hash = self._sha256_bytes(data)
 
@@ -2853,7 +3648,8 @@ class CoherentVolume:
         answered reaches the text."""
         if reason != "other_holder" or not self._records_write_grant(rel):
             return None
-        return CoordinatorFailed(_own_grant_message(rel, held=rel in self._release_held_paths))
+        held = self._key_of(rel) in self._release_held_paths
+        return CoordinatorFailed(_own_grant_message(rel, held=held))
 
     def _raise_if_refused_by_own_grant(self, rel: str, reason: object) -> None:
         """Raise :meth:`_own_grant_refusal`'s error, when there is one."""
@@ -2876,7 +3672,8 @@ class CoherentVolume:
     def _records_write_grant(self, rel: str) -> bool:
         """Whether this volume's record holds a write grant on ``rel`` that no
         confirmed release has cleared, under any incarnation."""
-        return any(rel in written for written in self._grant_incarnations.values())
+        key = self._key_of(rel)
+        return any(key in written for written in self._grant_incarnations.values())
 
     def atomic_publish(
         self,
@@ -2913,6 +3710,11 @@ class CoherentVolume:
             :class:`~ccs.core.exceptions.CoordinatorUnreachable` when the
             request never left (nothing committed), else ``CommitUnconfirmed``;
             under ``"degrade"``, ``CommitUnconfirmed``. NO file written.
+          - a coordinator without snapshot sessions (the Node coordinator)
+            answers a multi-member publish's session request 404 ->
+            :class:`~ccs.core.exceptions.CoherenceError` naming the route, in
+            both ``on_error`` modes, and the volume is not counted degraded;
+            NOTHING committed, NO file written, and a retry gets the same.
           - the release the publish first sends for a grant an earlier
             :meth:`write` left held (see :meth:`_remint`) fails → under
             ``"strict"`` the publish raises before its commit,
@@ -3016,9 +3818,10 @@ class CoherentVolume:
                     f"got {type(content).__name__}"
                 )
             abs_path, rel = self._to_relative(path)
-            if rel in seen:
+            key = self._key_of(rel)
+            if key in seen:
                 raise ValueError(f"atomic_publish write-set has a duplicate path: {rel}")
-            seen.add(rel)
+            seen.add(key)
             resolved.append((abs_path, rel, int(expected_version), disk_bytes))
         return resolved
 
@@ -3281,7 +4084,10 @@ class CoherentVolume:
         A request the coordinator refused outright (HTTP 4xx) raises
         :class:`~ccs.core.exceptions.CoherenceError` under ``on_error="strict"``;
         under ``"degrade"`` it warns and raises ``CommitUnconfirmed``, since
-        degrade mode does not tell a refusal from a failure.
+        degrade mode does not tell a refusal from a failure. The one exception
+        is a 404, which a coordinator without handoffs (the Node coordinator)
+        answers on every verb: it raises ``CoherenceError`` naming the route in
+        both modes, because nothing ran.
         No path, or one path named twice (after normalising, so two spellings
         of one file count), is the caller's error:
         :class:`~ccs.core.exceptions.HandoffPathsInvalid`, a ``ValueError``,
@@ -3298,9 +4104,10 @@ class CoherentVolume:
                 raise HandoffPathsInvalid("transfer requires at least one path")
             seen: set[str] = set()
             for rel in rels:
-                if rel in seen:
+                key = self._key_of(rel)
+                if key in seen:
                     raise HandoffPathsInvalid(f"transfer names a path more than once: {rel}")
-                seen.add(rel)
+                seen.add(key)
             self._require_attached_for("transfer", rels)
             resp = self._post(
                 "/handoff/transfer",
@@ -3358,8 +4165,9 @@ class CoherentVolume:
         as the read's provenance. After a strict-denied read (see
         :attr:`last_read_denied`) ``None`` says nothing about the record: a
         strict deny's bytes never carry the key."""
+        self._require_open()
         _abs_path, rel = self._to_relative(path)
-        handoff = self._read_handoffs.get(rel)
+        handoff = self._read_handoffs.get(self._key_of(rel))
         return dict(handoff) if handoff is not None else None
 
     @property
@@ -3385,7 +4193,7 @@ class CoherentVolume:
         before sending, so an answer without a key leaves none."""
         handoff = resp.get("handoff") if isinstance(resp, dict) else None
         if isinstance(handoff, dict):
-            self._read_handoffs[rel] = handoff
+            self._read_handoffs[self._key_of(rel)] = handoff
 
     def _settle_handoff(
         self, verb: Literal["accept", "decline", "withdraw"], path: str | os.PathLike[str]
@@ -3452,22 +4260,21 @@ class CoherentVolume:
         registered the standing view, else, for a path neither written nor
         read, the current one. A presented incarnation that holds nothing is
         refused as not held, which changes nothing."""
-        writers = [inc for inc, written in self._grant_incarnations.items() if rel in written]
-        if self._incarnation in writers:
-            return self._incarnation
+        writers = self._writer_incarnations(rel)
         if writers:
-            return writers[-1]
-        return self._read_incarnations.get(rel, self._incarnation)
+            return writers[0]
+        return self._read_incarnations.get(self._key_of(rel), self._incarnation)
 
     def _forget_claim(self, rel: str) -> None:
         """Drop ``rel`` from what this volume records holding, once a transfer
         handed its claim on: the coordinator moved that claim to INVALID. An
         incarnation stays in the write record while it records another path,
         which a re-mint must still release."""
-        self._read_incarnations.pop(rel, None)
+        key = self._key_of(rel)
+        self._read_incarnations.pop(key, None)
         for incarnation in list(self._grant_incarnations):
             written = self._grant_incarnations[incarnation]
-            written.discard(rel)
+            written.discard(key)
             if not written:
                 del self._grant_incarnations[incarnation]
 
@@ -3573,6 +4380,69 @@ class CoherentVolume:
             ) from exc
         return abs_path, rel.as_posix()
 
+    def _key_of(self, rel: str) -> str:
+        """The key this volume records ``rel`` under: the one the attached
+        coordinator looks the file up by, so every spelling it treats as this
+        file reaches the same record, and no other file's."""
+        return index_key_of(rel, self._fold_profile)
+
+    def _matches_managed(self, rel: str) -> bool:
+        """Whether ``rel``, a path :meth:`_to_relative` resolved, is managed.
+        It crosses no link, so the disk's spelling of it is the same file."""
+        if not self._managed:
+            return False
+        return self._matches_globs(rel, self._disk_spelling_of(rel))
+
+    def _matches_globs(self, name: str, disk_spelling: str | None) -> bool:
+        """Whether ``name`` matches ``managed`` by the coordinator's own readings
+        of a file name under the attached profile: ``DATA/x.md`` is under
+        ``data/**`` on a disk that folds case, as the coordinator holds it
+        strict there."""
+        context = PolicyMatchContext(self._fold_profile, "file", disk_spelling)
+        return self._managed_policy.is_strict_mode(name, context)
+
+    def _disk_spelling_of(self, rel: str) -> str | None:
+        """The disk's own spelling of ``rel``, relative to the root, which only
+        a folding profile reads, so the resolver is skipped otherwise. One it
+        cannot find leaves the other readings, as on the coordinator: the
+        shim's managed check must never raise."""
+        if self._fold_profile == "none":
+            return None
+        try:
+            return os.path.relpath(native_spelling(self._root / rel), native_spelling(self._root))
+        except (OSError, ValueError):
+            return None
+
+    def _refuse_link_out_of_managed(self, path: str | os.PathLike[str], rel: str) -> None:
+        """Refuse mode: raise :class:`~ccs.core.exceptions.LinkOutOfManaged`
+        when ``path`` reaches ``rel``, a file outside ``managed``, through a link
+        whose name, as ``path`` writes through it, is managed. The refusal of a
+        held file applies to managed files only, so such a write would take
+        ``rel`` from its holder under a name that promised otherwise."""
+        if self._matches_managed(rel):
+            return
+        for link, written in self._links_on(path):
+            # A name through a link has no disk spelling: the disk's is the target's.
+            if self._matches_globs(written, None):
+                raise LinkOutOfManaged(os.fspath(path), link, rel)
+
+    def _links_on(self, path: str | os.PathLike[str]) -> Iterator[tuple[str, str]]:
+        """Each link on ``path`` inside the root, from the root down: where it
+        lies, relative to the root with the links above it followed, and the
+        name ``path`` writes through it. A ``..`` step is never read as text
+        before a link: each link's place comes from its resolved parent."""
+        typed = Path(path)
+        parts = (typed if typed.is_absolute() else self._root / typed).parts
+        for depth in range(1, len(parts) + 1):
+            entry = Path(*parts[:depth])
+            if not entry.is_symlink():
+                continue
+            try:
+                link = (entry.parent.resolve() / entry.name).relative_to(self._root).as_posix()
+            except ValueError:
+                continue  # above or outside the root: not under managed
+            yield link, "/".join((link, *parts[depth:]))
+
     @staticmethod
     def _sha256_bytes(data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()
@@ -3631,12 +4501,12 @@ class CoherentVolume:
         peer write, so a disk mismatch could be that coordinated change — not foreign
         — and must NOT be denied (the no-op-skip handles it). The caller fetches
         ``disk_hash`` once via :meth:`_disk_hash` and reuses it for the no-op-skip."""
-        baseline = self._last_observed_hash.get(rel)
+        baseline = self._last_observed_hash.get(self._key_of(rel))
         diverged = (
             baseline is not None and disk_hash is not None and disk_hash != baseline
         )
-        # matches_any (the glob scan) is evaluated last — the cheap checks short-circuit.
-        if diverged and self._on_stale_write == "raise" and matches_any(rel, self._managed):
+        # The managed check (the glob scan) is evaluated last — the cheap checks short-circuit.
+        if diverged and self._on_stale_write == "raise" and self._matches_managed(rel):
             raise StaleView(_STALE_WRITE_DENY_REASON)
 
     def _record_own_write(self, rel: str, content_hash: str) -> None:
@@ -3646,8 +4516,9 @@ class CoherentVolume:
         Use at the own-write sites where the two advance in lockstep. The main
         :meth:`write` path advances them SEPARATELY (observed before the post-edit
         POST, committed after — see :meth:`_write_impl`), so it does NOT use this."""
-        self._last_committed_hash[rel] = content_hash
-        self._last_observed_hash[rel] = content_hash
+        key = self._key_of(rel)
+        self._last_committed_hash[key] = content_hash
+        self._last_observed_hash[key] = content_hash
 
     def _stage_tmp(self, abs_path: Path, data: bytes) -> Path:
         """Durably write ``data`` to a unique ``.tmp`` beside ``abs_path`` (mkdir +
@@ -3720,9 +4591,12 @@ class CoherentVolume:
         Every request names the current incarnation in the subagent field
         (``agent_id``), which the coordinator folds into the grant-row key; a
         body that already names one — the release of an abandoned incarnation —
-        keeps its own. Every request presents the session's caller principal
-        (header), which a require-class route checks the session against; an
-        incarnation is a subagent component, so it shares the session's.
+        keeps its own. The incarnation named is recorded as one the coordinator
+        may now keep records for, which a re-mint or :meth:`close` ends once
+        nothing references it (#525). Every request presents the session's
+        caller principal (header), which a require-class route checks the
+        session against; an incarnation is a subagent component, so it shares
+        the session's.
 
         A request refused for its principal (a typed ``caller_principal_*``
         reason) is recovered as R20 describes: the SAME nonce claims again, and
@@ -3737,7 +4611,8 @@ class CoherentVolume:
         failure, so degrade mode does not soften it into a ``None`` that the
         caller would read as an unanswered request (a degraded read, a
         ``CommitUnconfirmed``, bytes written to disk unrecorded)."""
-        payload = {"agent_id": self._incarnation, **payload}
+        payload = self._named({"agent_id": self._incarnation, **payload})
+        self._unended_incarnations.add(payload["agent_id"])
         commit_leg = _is_commit_leg(endpoint_path, payload)
         self._settle_unconfirmed_claim()
         sent = self._send(
@@ -3779,6 +4654,15 @@ class CoherentVolume:
             reason, principal_refusal_message(reason, detail), settled=recovery.settled
         )
 
+    def _named(self, body: dict) -> dict:
+        """``body``, its ``path`` marked a key (``name_kind``) for a remote
+        coordinator: its disk is not this volume's, so the volume's paths are
+        names to it, never folded, tidied or merged as its own files. Only
+        the hook routes read the field; the others ignore it."""
+        if self._remote_endpoint is None or "path" not in body:
+            return body
+        return {**body, "name_kind": "key"}
+
     def _recover_principal(self) -> PrincipalRecovery:
         """Claim again with the session's SAME nonce after a principal refusal
         and adopt what that settles (:func:`decide_principal_recovery` says
@@ -3814,7 +4698,10 @@ class CoherentVolume:
         as delivered, with the status: a 5xx says nothing of whether the
         commit ran. Any other strict request answered with a 5xx raises
         :class:`~ccs.core.exceptions.CoordinatorFailed`, as the coordinator's
-        failure envelope does (#433). Any other status follows ``on_error``.
+        failure envelope does (#433). A 404 on a snapshot-session or handoff
+        route raises :class:`~ccs.core.exceptions.CoherenceError` naming the
+        route, in both modes: a coordinator answers 404 only for a route it
+        does not serve, so nothing ran. Any other status follows ``on_error``.
 
         Every raise for a rejected request happens OUTSIDE the ``except``
         block, so the ``HTTPError`` never rides the raised error's chain: its
@@ -3868,6 +4755,10 @@ class CoherentVolume:
             )
         if reason is not None:
             return _Sent(None, reason)
+        if status == 404 and endpoint_path in _SESSION_AND_HANDOFF_ROUTES:
+            # The coordinator answered, and nothing ran: neither a degradation
+            # nor an outcome left unknown, in either mode.
+            raise CoherenceError(_route_not_served_message(endpoint_path))
         message = f"coordinator request to {endpoint_path} failed: HTTP {status}"
         if typed and commit_leg and status >= 500:
             # A 5xx says nothing of whether the commit ran: the coordinator's
@@ -4068,6 +4959,7 @@ class CoherentVolume:
             raise FileNotFoundError(f"no such file in workspace: {_rel}")
         data = self._read_file_bytes(abs_path)
         content_hash = self._sha256_bytes(data)
+        key = self._key_of(_rel)
         # A path's FIRST observing read records what the disk held, before the
         # response can refuse or fail it (a strict deny, a request refused for
         # its caller principal, a strict transport or watchdog failure). It
@@ -4077,7 +4969,7 @@ class CoherentVolume:
         # refused or failed — from having no baseline at all, which would let a
         # later write() land over a peer commit or an out-of-band edit unchecked.
         if observe:
-            self._last_observed_hash.setdefault(_rel, content_hash)
+            self._last_observed_hash.setdefault(key, content_hash)
         version = 0
         stale_denied = False
         stale_status = False
@@ -4085,7 +4977,7 @@ class CoherentVolume:
         owner_generation: int | None = None
         # This read's answer replaces both: its handoff key and whether it was
         # a strict deny. An unanswered or failed read leaves neither set.
-        self._read_handoffs.pop(_rel, None)
+        self._read_handoffs.pop(key, None)
         self._last_read_denied = False
         self._last_read_split = False
         if self._endpoint is not None:
@@ -4146,7 +5038,7 @@ class CoherentVolume:
                 # winning incarnation. A verification read asked the
                 # coordinator not to register one, so it records nothing.
                 if observe and self._read_registered(resp):
-                    self._read_incarnations[_rel] = reader
+                    self._read_incarnations[key] = reader
         result = _ReadResult(
             data, version, stale_denied, owner_generation, stale_status, content_differs
         )
@@ -4170,7 +5062,7 @@ class CoherentVolume:
         # effect. The first-read seed above still applies to every observing
         # read.
         if observe and advance_baseline and not result.split_pair:
-            self._last_observed_hash[_rel] = content_hash
+            self._last_observed_hash[key] = content_hash
         return result
 
     @staticmethod
@@ -4438,6 +5330,37 @@ class CoherentVolume:
             raise CoherenceError(message)
         self._record_degraded(message)
 
+    def _policy_refusal_or_degrade(self, refusal: ValueError) -> None:
+        """A policy file this volume cannot merge its globs into, through
+        ``on_error``. The text names the workspace, because a caller can hold
+        volumes over several roots."""
+        message = f"{self._root}: {refusal}"
+        if self._on_error == "strict":
+            raise CoherenceError(message)
+        self._record_degraded(f"{message} {_POLICY_REFUSAL_DEGRADED_NOTE}")
+
+    def _state_dir_refusal_or_degrade(self, refusal: CoherenceDirRefused) -> None:
+        """A ``.coherence`` a start refuses (#498), through ``on_error``. Strict
+        raises the refusal itself, typed so that no retry loop catches it, with
+        its raw path; degrade warns once and stays detached. Its text names the
+        refused path, so it needs no workspace prefix."""
+        self._endpoint = None
+        if self._on_error == "strict":
+            raise refusal
+        # The volume prints this text itself, and a cloned repository chose the
+        # name in it: escaped, it cannot drive the terminal or split the line.
+        self._record_degraded(f"{escape_nonprintable(str(refusal))} {_STATE_DIR_REFUSAL_DEGRADED_NOTE}")
+
+    def _store_held_or_degrade(self, refusal: StoreHeldError) -> None:
+        """Another read-write handle kept the workspace's store past the
+        start's wait (#453), so no coordinator started. Strict raises the typed
+        refusal; degrade warns once and stays detached. Its text names the
+        store's path, so it is escaped like a ``.coherence`` refusal."""
+        self._endpoint = None
+        if self._on_error == "strict":
+            raise refusal
+        self._record_degraded(f"{escape_nonprintable(str(refusal))} {_STORE_HELD_DEGRADED_NOTE}")
+
     def _failed_read_or_degrade(self, resp: dict, rel: str) -> None:
         """A pre-read the coordinator answered with ``ok: false``, which it does
         only with its failure envelope. Strict raises the typed
@@ -4573,6 +5496,20 @@ class _ShimState:
     def __init__(self, volume: CoherentVolume, original_open: Callable) -> None:
         self.volume = volume
         self.original_open = original_open
+        # Every writer the shim handed out. One still open when the volume
+        # closes has nowhere to commit, so the exit names it.
+        self.writers: weakref.WeakSet[_CommitOnCloseMixin] = weakref.WeakSet()
+
+    def warn_open_writers(self) -> None:
+        """Name every writer still open as the volume closes: closing it later
+        raises and writes nothing."""
+        pending = sorted(writer._rel for writer in self.writers if not writer._committed)
+        if pending:
+            logger.warning(
+                "managed files still open for writing as the shim's volume closes: %s. "
+                "Closing them now raises and writes nothing; close them inside the block.",
+                ", ".join(pending),
+            )
 
 
 _shim_state: _ShimState | None = None
@@ -4595,16 +5532,21 @@ def _managed_rel(volume: CoherentVolume, file: object) -> str | None:
         return None
     try:
         # Resolve like builtins.open (relative → against CWD), then require it be
-        # under the volume root.
-        rel = Path(raw).resolve().relative_to(volume._root).as_posix()
+        # under the volume root. realpath, not Path.resolve(): on Python 3.11
+        # and 3.12 a non-strict resolve() raises RuntimeError on a link that
+        # loops, where realpath, like 3.13's resolve(), keeps the loop's name.
+        rel = Path(os.path.realpath(raw)).relative_to(volume._root).as_posix()
     except (ValueError, OSError):
         return None
-    # Use the coordinator's own glob matcher so the shim's notion of "managed" is
-    # exactly the coordinator's tracked set (handles ``**`` segment globs).
-    return rel if matches_any(rel, volume._managed) else None
+    # The coordinator's own readings of a name, so the shim's notion of "managed"
+    # is exactly the coordinator's (``**`` segment globs, and every spelling the
+    # attached profile folds onto a managed file).
+    return rel if volume._matches_managed(rel) else None
 
 
-def _make_open_wrapper(volume: CoherentVolume, original_open: Callable) -> Callable:
+def _make_open_wrapper(state: _ShimState) -> Callable:
+    volume, original_open, writers = state.volume, state.original_open, state.writers
+
     def coherent_open(file, mode="r", *args, **kwargs):
         rel = _managed_rel(volume, file)
         if rel is None:
@@ -4615,8 +5557,11 @@ def _make_open_wrapper(volume: CoherentVolume, original_open: Callable) -> Calla
             return original_open(file, mode, *args, **kwargs)
         if "w" in mode:
             if "b" in mode:
-                return _CoherentBytesWriter(volume, rel)
-            return _CoherentTextWriter(volume, rel, kwargs.get("encoding") or "utf-8")
+                writer: _CommitOnCloseMixin = _CoherentBytesWriter(volume, rel)
+            else:
+                writer = _CoherentTextWriter(volume, rel, kwargs.get("encoding") or "utf-8")
+            writers.add(writer)
+            return writer
         if "r" in mode:
             # Register the SHARED view (raises FileNotFoundError if missing, like
             # open()), then return a real handle over the same on-disk bytes.
@@ -4640,32 +5585,58 @@ def install(
     """Patch ``builtins.open`` + ``io.open`` to route managed-path opens through
     a process-singleton :class:`CoherentVolume`. Idempotent — a second call
     returns the already-installed volume (one workspace per process in v1).
-    Reverse with :func:`uninstall`, or use the :func:`coherent_workspace` context
-    manager. Opt-in and demo-grade — see the coverage matrix above.
+    When that volume was closed, by its own ``close()`` or a ``with`` block,
+    this raises :class:`~ccs.core.exceptions.CoherenceError` instead, and
+    managed opens keep raising, until :func:`uninstall` removes the shim: a
+    replacement here would leave an enclosing :func:`coherent_workspace` with
+    no shim once the replacing block ends. Reverse with :func:`uninstall`,
+    which also closes the volume, or use the :func:`coherent_workspace`
+    context manager. Opt-in and demo-grade — see the coverage matrix above.
     """
     global _shim_state
     if _shim_state is not None:
+        if _shim_state.volume.closed:
+            raise CoherenceError(_SHIM_VOLUME_CLOSED_MESSAGE)
         return _shim_state.volume
     volume = CoherentVolume(
         root, managed=managed, on_error=on_error, on_stale_read=on_stale_read,
         on_stale_write=on_stale_write, config=config, bind_host=bind_host,
     )
     original_open = builtins.open  # is io.open (same object) at install time
-    wrapper = _make_open_wrapper(volume, original_open)
+    state = _ShimState(volume, original_open)
+    wrapper = _make_open_wrapper(state)
     builtins.open = wrapper  # type: ignore[assignment]
     io.open = wrapper  # type: ignore[assignment]  # pathlib routes here, not builtins.open
-    _shim_state = _ShimState(volume, original_open)
+    _shim_state = state
     return volume
 
 
-def uninstall() -> None:
-    """Restore the original ``builtins.open`` / ``io.open``. Idempotent."""
+def _retire_shim() -> _ShimState | None:
+    """Put the original ``builtins.open`` / ``io.open`` back, clear the shim and
+    name every writer still open; the state it cleared, or ``None`` when no
+    shim was installed. The caller closes the volume."""
     global _shim_state
-    if _shim_state is None:
-        return
-    builtins.open = _shim_state.original_open  # type: ignore[assignment]
-    io.open = _shim_state.original_open  # type: ignore[assignment]
+    state = _shim_state
+    if state is None:
+        return None
+    builtins.open = state.original_open  # type: ignore[assignment]
+    io.open = state.original_open  # type: ignore[assignment]
     _shim_state = None
+    state.warn_open_writers()
+    return state
+
+
+def uninstall() -> None:
+    """Restore the original ``builtins.open`` / ``io.open``, then close the
+    volume :func:`install` returned (see :meth:`CoherentVolume.close`), so its
+    write grants are given back. Idempotent: with nothing installed it does
+    nothing. ``open()`` is restored before the close, so a close that raises
+    leaves no shim behind; call the volume's ``close()`` to send it again. A
+    managed file still open for writing is named in a warning: closing it later
+    raises and writes nothing."""
+    state = _retire_shim()
+    if state is not None:
+        state.volume.close()
 
 
 @contextlib.contextmanager
@@ -4681,11 +5652,16 @@ def coherent_workspace(
 ) -> Iterator[CoherentVolume]:
     """Context manager wrapping :func:`install`/:func:`uninstall`; yields the
     process-singleton :class:`CoherentVolume`. Guarantees the ``open()`` patch is
-    reversed on exit even if the body raises.
+    reversed on exit even if the body raises, and closes the volume on exit
+    (see :meth:`CoherentVolume.close`), so its write grants are given back and
+    using it afterwards raises. When the body raised, a close that fails is
+    logged and the body's error propagates. A managed file still open for
+    writing at exit is named in a warning: close such files inside the block.
 
     Reentrant-safe: if a shim is already installed (e.g. a nested
-    ``coherent_workspace``), this yields the existing volume and does NOT
-    uninstall on exit — the outer context owns the patch.
+    ``coherent_workspace``), this yields the existing volume and neither
+    uninstalls nor closes on exit — the outer context owns both. Over a shim
+    whose volume was closed, entering raises, as :func:`install` does.
     """
     already_installed = _shim_state is not None
     volume = install(
@@ -4694,6 +5670,11 @@ def coherent_workspace(
     )
     try:
         yield volume
-    finally:
+    except BaseException:
+        if not already_installed:
+            _retire_shim()
+            volume._close_while_unwinding()
+        raise
+    else:
         if not already_installed:
             uninstall()

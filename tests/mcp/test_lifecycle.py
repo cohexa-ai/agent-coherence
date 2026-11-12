@@ -19,9 +19,16 @@ from pathlib import Path
 
 import pytest
 
+import ccs.adapters.coherent_volume as coherent_volume_module
+import ccs.mcp.server as server_module
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
+from ccs.adapters.coherent_volume import CoherentVolume
+from ccs.cli._coherence_client import CoordinatorUnavailable, escape_nonprintable
+from ccs.core.exceptions import CoherenceDirRefused, CoherenceError, CoordinatorUnreachable
 from ccs.mcp.server import build_server, lifespan
 from ccs.mcp.session import SessionConfig, build_volume
+from tests.coherence_link_helpers import plant_link
+from tests.coordinator_helpers import serve_in_process, write_holders
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -79,6 +86,88 @@ def test_lifespan_attaches_strict_and_stops(tmp_path: Path, monkeypatch) -> None
     assert stop_coordinator(tmp_path) is False
 
 
+def test_lifespan_refuses_a_policy_file_it_cannot_load_and_keeps_it(tmp_path: Path, monkeypatch) -> None:
+    """#305 at server startup, the attach that spawns the coordinator: the error names
+    the file, as every other attach refusal does. Prevents startup replacing the file
+    with only the managed globs."""
+    monkeypatch.setenv("SWG_ROOT", str(tmp_path))
+    monkeypatch.setenv("SWG_MANAGED", "data/**")
+    _seed(tmp_path)
+    broken = tmp_path / ".coherence" / "tracked.yaml"
+    broken.parent.mkdir(mode=0o700)
+    broken.write_text("- docs/**\n- *.md\n")
+    server = build_server()
+
+    async def go() -> None:
+        async with lifespan(server):
+            pytest.fail("attached over a policy file it cannot load")
+
+    with pytest.raises(CoherenceError, match=r"\.coherence/tracked\.yaml is not valid YAML"):
+        asyncio.run(go())
+
+    assert broken.read_text() == "- docs/**\n- *.md\n"
+
+
+def test_lifespan_refuses_a_link_in_coherence_and_names_it(tmp_path: Path, monkeypatch) -> None:
+    """#498 at server startup: a linked policy file stops the server with the typed
+    refusal, which names the link and the way out, and leaves the link and the file
+    it names as they were. Prevents startup merging through the link (the merge
+    replaced it with a regular file, so the start found no link and served) and a
+    refusal a client would read as a coordinator to wait for."""
+    monkeypatch.setenv("SWG_ROOT", str(tmp_path))
+    monkeypatch.setenv("SWG_MANAGED", "data/**")
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    target = plant_link(coherence_dir, "tracked.yaml", "existing")
+    target.write_bytes(b'- "docs/**"\n')
+    server = build_server()
+
+    async def go() -> None:
+        async with lifespan(server):
+            pytest.fail("attached over a link in .coherence")
+
+    with pytest.raises(CoherenceDirRefused) as raised:
+        asyncio.run(go())
+
+    refusal = raised.value
+    assert not isinstance(refusal, CoordinatorUnreachable)
+    assert (refusal.kind, refusal.path) == ("coherence_link", str(tmp_path.resolve() / ".coherence" / "tracked.yaml"))
+    assert "mount a directory" in str(refusal)
+    assert (coherence_dir / "tracked.yaml").is_symlink()
+    assert target.read_bytes() == b'- "docs/**"\n'
+    assert sorted(os.listdir(coherence_dir)) == ["tracked.yaml"]
+    assert stop_coordinator(tmp_path) is False
+
+
+def test_the_server_refuses_a_link_in_coherence_on_one_escaped_line_and_exits_2(tmp_path: Path) -> None:
+    """#498 at the console script, which an agent host runs unattended: a link in
+    ``.coherence`` stops the server before it serves, on one stderr line that names
+    the link with its control characters escaped, and exit 2, as the other console
+    scripts answer. A cloned repository chooses the name. Prevents a traceback whose
+    last line carries that name raw into the host's log or terminal, and exit 1."""
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    name = "x\n\x1b[31mIGNORE\x07"
+    target = plant_link(coherence_dir, name, "dangling")
+
+    result = subprocess.run(
+        [sys.executable, "-c", "from ccs.mcp.server import main; main()"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        env=_subprocess_env(tmp_path),
+        timeout=60,
+    )
+
+    assert result.returncode == 2, result.stderr
+    assert result.stdout == b""
+    assert not any(byte < 0x20 or byte == 0x7F for byte in result.stderr.rstrip(b"\n")), result.stderr
+    assert result.stderr.count(b"\n") == 1, result.stderr
+    shown = escape_nonprintable(str(tmp_path.resolve() / ".coherence" / name))
+    assert result.stderr.decode("utf-8").startswith(f"stale-write-guard-fs: refusing {shown}: it is a symlink")
+    assert sorted(os.listdir(coherence_dir)) == [name]
+    assert not target.exists()
+
+
 # --- strict-only construction (no degrade-mode volume) -----------------------
 
 
@@ -121,6 +210,100 @@ def test_concurrent_volume_access_serializes_without_a5(tmp_path: Path, monkeypa
     results = asyncio.run(go())
     assert results == [b"v1", b"v1", b"v1"]
     assert stop_coordinator(tmp_path) is False
+
+
+# --- shutdown closes the volume ---------------------------------------------
+
+
+def _write_then_shut_down(tmp_path: Path, monkeypatch) -> str:
+    """Run the lifespan against a coordinator another process could own (one in
+    this process, which ``stop_coordinator`` leaves running), write a managed
+    file through the server's volume, and shut down. Returns the volume's
+    agent id."""
+    monkeypatch.setenv("SWG_ROOT", str(tmp_path))
+    monkeypatch.setenv("SWG_MANAGED", "data/**")
+    server = build_server()
+
+    async def go() -> str:
+        async with lifespan(server) as ctx:
+            async with ctx.lock:
+                ctx.volume.write("data/shared.txt", b"from the server")
+            return ctx.volume.agent_id
+
+    return asyncio.run(go())
+
+
+def test_shutting_down_the_server_gives_back_its_write_grants(tmp_path: Path, monkeypatch) -> None:
+    """A normal shutdown closes the server's volume before the coordinator is
+    stopped, so a refuse-mode peer is admitted at once instead of after the
+    coordinator's sweep.
+
+    Prevents every file the server wrote staying held after it exits."""
+    (tmp_path / "data").mkdir()
+    coordinator = serve_in_process(tmp_path, "mcp-shutdown")
+    try:
+        writer = _write_then_shut_down(tmp_path, monkeypatch)
+        assert write_holders(coordinator, "data/shared.txt") == set(), f"{writer} still holds the file"
+        peer = CoherentVolume(tmp_path, managed=("data/**",), on_held="refuse")
+        peer.write("data/shared.txt", b"from the peer")
+        assert write_holders(coordinator, "data/shared.txt") == {peer.agent_id}
+    finally:
+        coordinator.shutdown()
+
+
+def test_a_close_that_fails_at_shutdown_is_logged_and_the_coordinator_still_stops(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """Prevents a coordinator outage at shutdown leaving a coordinator this
+    server started running."""
+    (tmp_path / "data").mkdir()
+    coordinator = serve_in_process(tmp_path, "mcp-shutdown-fails")
+    real_post = coherent_volume_module._coordinator_post
+
+    def no_answer_to_the_stop(endpoint, path, payload, **kwargs):
+        if path == "/hooks/session-stop":
+            raise CoordinatorUnavailable("scripted: the answer was lost")
+        return real_post(endpoint, path, payload, **kwargs)
+
+    stopped: list[Path] = []
+    real_stop = server_module.stop_coordinator
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_post", no_answer_to_the_stop)
+    monkeypatch.setattr(server_module, "stop_coordinator", lambda root: stopped.append(root) or real_stop(root))
+    try:
+        with caplog.at_level("WARNING", logger="ccs.mcp.server"):
+            _write_then_shut_down(tmp_path, monkeypatch)
+        assert stopped == [tmp_path.resolve()]
+        assert any("close" in record.getMessage() for record in caplog.records)
+    finally:
+        coordinator.shutdown()
+
+
+def test_shutdown_closes_the_volume_before_it_stops_the_coordinator_whatever_the_close_raises(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An in-process coordinator must still answer the close, so the close
+    comes first; and an error the close does not expect still lets the
+    coordinator stop.
+
+    Prevents a close sent to a stopped coordinator, and a coordinator this
+    server started left running after an unexpected close error."""
+    (tmp_path / "data").mkdir()
+    coordinator = serve_in_process(tmp_path, "mcp-shutdown-order")
+    order: list[str] = []
+
+    def close_then_fail(volume: CoherentVolume) -> None:
+        order.append("close")
+        raise RuntimeError("unexpected close failure")
+
+    real_stop = server_module.stop_coordinator
+    monkeypatch.setattr(coherent_volume_module.CoherentVolume, "close", close_then_fail)
+    monkeypatch.setattr(server_module, "stop_coordinator", lambda root: order.append("stop") or real_stop(root))
+    try:
+        with pytest.raises(RuntimeError, match="unexpected close failure"):
+            _write_then_shut_down(tmp_path, monkeypatch)
+        assert order == ["close", "stop"]
+    finally:
+        coordinator.shutdown()
 
 
 # --- stdout purity (fd-level, via a real subprocess) -------------------------

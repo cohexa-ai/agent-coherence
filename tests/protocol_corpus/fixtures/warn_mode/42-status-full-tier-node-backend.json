@@ -1,0 +1,71 @@
+{
+  "name": "status-full-tier-node-backend",
+  "description": "GET /status?detail=full on the Node coordinator, with the operator opt-in header spelled TRUE: the header's value is matched ignoring case. The operator view is the default body (fixture 09) with the four pattern lists the live policy enforces added to policy_summary, each as written, and nothing else: no pid, no session names, and coordinator_root stays '.'. pre_edit_if_unheld is true, as at every tier. Every top-level key is listed, so a key the view gains or loses fails the row. tracked.yaml, ignored.yaml and strict_mode.yaml each hold user patterns; tracked_patterns and default_pattern_count are the coordinator's own defaults and are ignored here. Node only: the Python coordinator's operator view carries many more keys (fixture 27); fixture 43 pins what both views share.",
+  "setup": {
+    "tracked": [
+      "data/**",
+      "notes/*.md"
+    ],
+    "ignored": [
+      "data/tmp/**"
+    ],
+    "strict_mode": [
+      "data/**"
+    ]
+  },
+  "request": {
+    "method": "GET",
+    "path": "/status?detail=full",
+    "headers": {
+      "Coherence-Local-Operator": "TRUE"
+    }
+  },
+  "ignore_keys": [
+    "tracked_artifacts",
+    "sessions",
+    "default_pattern_count",
+    "tracked_patterns",
+    "counts",
+    "version",
+    "fold_profile",
+    "fold_table_unicode"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "backend": "node",
+      "counts": "<IGNORED>",
+      "coordinator_uptime_seconds": "<UPTIME>",
+      "fold_profile": "<IGNORED>",
+      "fold_table_unicode": "<IGNORED>",
+      "policy_summary": {
+        "coordinator_root": ".",
+        "default_pattern_count": "<IGNORED>",
+        "ignored_pattern_count": 1,
+        "ignored_patterns": [
+          "data/tmp/**"
+        ],
+        "rejected_pattern_count": 0,
+        "strict_mode_pattern_count": 1,
+        "strict_mode_patterns": [
+          "data/**"
+        ],
+        "tracked_patterns": "<IGNORED>",
+        "user_added_pattern_count": 2,
+        "user_added_patterns": [
+          "data/**",
+          "notes/*.md"
+        ]
+      },
+      "pre_edit_if_unheld": true,
+      "schema_version": 5,
+      "sessions": "<IGNORED>",
+      "status": "ok",
+      "tracked_artifacts": "<IGNORED>",
+      "version": "<IGNORED>"
+    }
+  },
+  "backends": [
+    "node"
+  ]
+}

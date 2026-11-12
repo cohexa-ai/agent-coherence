@@ -1,0 +1,58 @@
+{
+  "name": "fold-opted-in-pre-edit-of-a-key-is-not-refused-by-a-holder-of-another-case",
+  "description": "Session A takes EXCLUSIVE on the key ws-42 (\"name_kind\": \"key\"); session B pre-edits the key WS-42 with if_unheld: true and is admitted on every disk: keys are exact, so A holds another record. The control is fold 05, where the same opted-in pre-edit of a file spelled in another case is refused on a caseless disk. B presents its principal on Python only, as there. Both backends.",
+  "setup": {
+    "tracked": [
+      "ws-42",
+      "WS-42"
+    ],
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "backends": [
+          "python"
+        ],
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "path": "ws-42",
+          "name_kind": "key"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+      "path": "WS-42",
+      "name_kind": "key",
+      "if_unheld": true
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_b}"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

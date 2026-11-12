@@ -235,8 +235,11 @@ def test_the_givers_pre_edit_raises_the_same_terminal_without_a_reacquire(
 
         sent.clear()
         giver.reacquire(_PLAN)
-        assert "/hooks/session-stop" not in [route for route, _b in sent], (
-            "the refused pre-edit took no grant, yet the re-mint released one")
+        # The re-mint ends the incarnation the transfer left unreferenced
+        # (#525), and releases nothing.
+        assert [body for route, body in sent if route == "/hooks/session-stop"] == [
+            {"session_id": giver.session_id, "agent_id": incarnation, "ended": True},
+        ], "the refused pre-edit took no grant, yet the re-mint released one"
     finally:
         stop_coordinator(tmp_path)
 
@@ -423,7 +426,10 @@ def test_a_write_of_a_path_never_read_presents_the_writing_incarnation(
         assert _presented(sent) == [{"path": _PLAN, "agent_id": writer}]
         sent.clear()
         giver.reacquire(_OTHER)
-        assert "/hooks/session-stop" not in [route for route, _b in sent]
+        # The re-mint ends the writing incarnation (#525), and releases nothing.
+        assert [body for route, body in sent if route == "/hooks/session-stop"] == [
+            {"session_id": giver.session_id, "agent_id": writer, "ended": True},
+        ]
     finally:
         stop_coordinator(tmp_path)
 
@@ -434,7 +440,7 @@ def test_a_transferred_path_leaves_the_write_record_and_the_rest_stays(
     """One incarnation wrote two paths and hands one of them on. The record
     keeps that incarnation for the other path, which it still holds: the next
     re-mint releases it, one stop naming the writing incarnation, and the
-    grant is gone afterwards."""
+    write grant is gone afterwards (the release keeps a read, #513)."""
     _seed(tmp_path, _PLAN, b"plan v1")
     _seed(tmp_path, _OTHER, b"other v1")
     spare = "data/spare.md"
@@ -452,7 +458,8 @@ def test_a_transferred_path_leaves_the_write_record_and_the_rest_stays(
 
         stops = [body for route, body in sent if route == "/hooks/session-stop"]
         assert [body["agent_id"] for body in stops] == [writer]
-        assert _held(giver, str(session_to_agent_id(giver.session_id, writer))) == {}
+        held = _held(giver, str(session_to_agent_id(giver.session_id, writer)))
+        assert not [state for state in held.values() if state in ("EXCLUSIVE", "MODIFIED")], held
     finally:
         stop_coordinator(tmp_path)
 
@@ -506,7 +513,10 @@ def test_a_stranded_write_grant_is_presented_ahead_of_the_current_incarnation(
         assert _presented(sent) == [{"path": _PLAN, "agent_id": writer}]
         sent.clear()
         giver.reacquire(_OTHER)
-        assert "/hooks/session-stop" not in [route for route, _b in sent]
+        # The re-mint ends the handed-on incarnation (#525), and releases nothing.
+        assert [body for route, body in sent if route == "/hooks/session-stop"] == [
+            {"session_id": giver.session_id, "agent_id": writer, "ended": True},
+        ]
     finally:
         stop_coordinator(tmp_path)
 

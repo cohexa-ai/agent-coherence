@@ -22,6 +22,7 @@ import select
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 import warnings
@@ -36,6 +37,7 @@ import pytest
 import ccs.adapters.claude_code.coordinator_server as coordinator_server_module
 import ccs.adapters.coherent_volume as coherent_volume_module
 from ccs.adapters.claude_code.coordinator_server import (
+    merge_policy_globs,
     read_subagent_id,
     session_to_agent_id,
 )
@@ -55,11 +57,13 @@ from ccs.adapters.coherent_volume import (
     install,
     uninstall,
 )
-from ccs.cli._coherence_client import CoordinatorEndpoint, CoordinatorUnavailable
+from ccs.cli._coherence_client import CoordinatorEndpoint, CoordinatorUnavailable, escape_nonprintable
+from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry, StoreHeldError
 from ccs.core.exceptions import (
     CasRetriesExhausted,
     CasVersionConflict,
     CoherenceDegradedWarning,
+    CoherenceDirRefused,
     CoherenceError,
     CommitPreempted,
     CoordinatorFailed,
@@ -67,6 +71,7 @@ from ccs.core.exceptions import (
     StaleView,
     ViewWedged,
 )
+from tests.coherence_link_helpers import TARGET_BYTES, plant_link, target_snapshot
 from tests.coordinator_helpers import ANSWERED_TEXT, answer_with_status, serve_in_process, write_holders
 from tests.loopback_helpers import refused_endpoint, refusing_port
 
@@ -947,12 +952,12 @@ def _track_only(tmp_path: Path, glob: str = "data/**") -> None:
     view) while deliberately leaving ``strict_mode.yaml`` absent (so the re-grant
     is warn-mode — never denied). ``managed=()`` volumes then attach to this
     coordinator without the strict-mode requirement that ``managed`` globs carry.
-    Reuses the coordinator's own ``_merge_yaml_list`` writer so the fixture tracks
+    Reuses the coordinator's own ``merge_policy_globs`` writer so the fixture tracks
     the real tracked.yaml format instead of duplicating it.
     """
     coherence_dir = tmp_path / ".coherence"
     coherence_dir.mkdir(parents=True, exist_ok=True)
-    CoherentVolume._merge_yaml_list(coherence_dir / "tracked.yaml", (glob,))
+    merge_policy_globs((coherence_dir / "tracked.yaml",), (glob,))
 
 
 def _agent_id(vol: CoherentVolume) -> str:
@@ -965,13 +970,20 @@ def _agent_id(vol: CoherentVolume) -> str:
 def _held(vol: CoherentVolume, agent_id: str) -> dict[str, str]:
     """What the COORDINATOR says ``agent_id`` holds, ``{path: state}``, read from
     ``/status`` — which lists every non-INVALID row, so ``{}`` means the row holds
-    nothing (released, or never taken)."""
+    nothing (never taken, or made stale by a peer). A released write grant stays
+    listed as SHARED (#513)."""
     status = vol.coordinator_status()
     assert status is not None, "the coordinator must be reachable to read its grant rows"
     for session in status["sessions"]:
         if session["agent_id"] == agent_id:
             return dict(session["states"])
     return {}
+
+
+def _write_held(vol: CoherentVolume, agent_id: str) -> dict[str, str]:
+    """The EXCLUSIVE and MODIFIED rows of :func:`_held`: the grants a release
+    gives back, so ``{}`` means the row holds no write grant."""
+    return {path: state for path, state in _held(vol, agent_id).items() if state in ("EXCLUSIVE", "MODIFIED")}
 
 
 def _end_turn(vol: CoherentVolume) -> None:
@@ -988,7 +1000,7 @@ def _end_turn(vol: CoherentVolume) -> None:
         {"session_id": vol.session_id, "agent_id": vol._incarnation},
         extra_headers=caller_principal_headers(vol._principal),
     )
-    assert _held(vol, _agent_id(vol)) == {}, "the turn-end stop released nothing"
+    assert _write_held(vol, _agent_id(vol)) == {}, "the turn-end stop released nothing"
 
 
 def test_sibling_volume_attaches_to_strict_coordinator(
@@ -1016,7 +1028,8 @@ def test_a_sibling_with_different_managed_globs_is_refused_not_silently_unenforc
 ) -> None:
     """A volume that attaches to a coordinator a sibling spawned with DIFFERENT
     managed globs is refused: strict raises, degrade warns and runs detached.
-    The message names the globs the coordinator does not enforce.
+    The message names the globs the coordinator does not enforce, and, the
+    coordinator being one a volume starts, says to stop it.
 
     Prevents the silent lost update in #190: the sibling passed the attach
     check because the coordinator's /status reported only a COUNT of strict
@@ -1044,6 +1057,7 @@ def test_a_sibling_with_different_managed_globs_is_refused_not_silently_unenforc
             message = str(warned[0].message)
         assert "b/**" in message, message
         assert "does not enforce strict mode for" in message, message
+        assert "Stop it, or use a dedicated workspace root." in message, message
         # Control: the spawner's own glob is enforced by the same coordinator.
         assert spawner.is_attached and spawner.strict_mode_active()
         _data, version = spawner.read_with_version("a/plan.md")
@@ -1087,7 +1101,7 @@ def test_a_managed_glob_the_coordinator_carries_in_only_one_set_is_not_enforced(
     coherence_dir = tmp_path / ".coherence"
     coherence_dir.mkdir(parents=True, exist_ok=True)
     only = "tracked.yaml" if policy == "tracked-not-strict" else "strict_mode.yaml"
-    CoherentVolume._merge_yaml_list(coherence_dir / only, ("data/**",))
+    merge_policy_globs((coherence_dir / only,), ("data/**",))
     assert ensure_coordinator(tmp_path, config=fast_cfg) > 0  # loads that policy
     try:
         with pytest.raises(CoherenceError) as raised:
@@ -1114,7 +1128,7 @@ def test_a_managed_glob_the_coordinator_ignores_is_not_enforced(
     _seed(tmp_path)
     coherence_dir = tmp_path / ".coherence"
     coherence_dir.mkdir(parents=True, exist_ok=True)
-    CoherentVolume._merge_yaml_list(coherence_dir / "ignored.yaml", ("data/**",))
+    merge_policy_globs((coherence_dir / "ignored.yaml",), ("data/**",))
     try:
         with pytest.raises(CoherenceError) as raised:
             CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
@@ -1123,6 +1137,406 @@ def test_a_managed_glob_the_coordinator_ignores_is_not_enforced(
         assert "ignored" in message, message
     finally:
         stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("name", ["tracked.yaml", "strict_mode.yaml"])
+def test_a_strict_volume_refuses_a_policy_file_it_cannot_load_and_keeps_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig, name: str
+) -> None:
+    """#305: a strict volume about to spawn the coordinator raises naming a policy
+    file that loads as no entries, and its workspace, leaves it and the other file
+    as they were, and starts no coordinator.
+
+    Prevents the spawn replacing the file with only this volume's globs, which
+    deleted the user's other entries with no signal. The workspace is named because
+    a caller can hold volumes over several roots."""
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True)
+    broken = coherence_dir / name
+    broken.write_text("- docs/**\n- *.md\n")
+
+    with pytest.raises(CoherenceError, match="is not valid YAML") as raised:
+        CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+
+    assert str(raised.value).startswith(f"{tmp_path.resolve()}: .coherence/{name} is not valid YAML")
+    assert broken.read_text() == "- docs/**\n- *.md\n"
+    assert [path.name for path in coherence_dir.glob("*.yaml")] == [name]
+    assert not (coherence_dir / "server.pid").exists()
+
+
+def test_a_degrade_volume_warns_about_a_policy_file_it_cannot_load_and_keeps_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#305: a degrade volume keeps the file too, warns naming it and its workspace,
+    and stays detached like its other failed attaches. Prevents degrade mode, which
+    promises only to run without enforcement, destroying a policy file to get
+    there. The warning says a new volume is the retry, because this one does not
+    attach again."""
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True)
+    broken = coherence_dir / "tracked.yaml"
+    broken.write_text("- docs/**\n- *.md\n")
+
+    with pytest.warns(CoherenceDegradedWarning, match=r"\.coherence/tracked\.yaml is not valid YAML") as caught:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+
+    message = next(str(w.message) for w in caught if issubclass(w.category, CoherenceDegradedWarning))
+    assert f"{tmp_path.resolve()}: .coherence/tracked.yaml" in message, message
+    assert message.endswith("This volume stays detached: build a new one once the file is fixed."), message
+    assert not vol.is_attached
+    assert broken.read_text() == "- docs/**\n- *.md\n"
+    assert not (coherence_dir / "server.pid").exists()
+
+
+def test_a_volume_joining_a_running_coordinator_is_not_refused_over_a_policy_file(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """Only the spawner merges: a coordinator loads its policy once, so a file broken
+    after that changes nothing for a volume joining it. Prevents the #305 refusal
+    reaching a sibling, or the sibling rewriting the file."""
+    _seed(tmp_path)
+    CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    try:
+        broken = tmp_path / ".coherence" / "tracked.yaml"
+        broken.write_text("- docs/**\n- *.md\n")
+
+        sibling = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+
+        assert sibling.is_attached
+        assert broken.read_text() == "- docs/**\n- *.md\n"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork (POSIX)")
+def test_a_forked_child_refuses_a_policy_file_until_it_is_fixed(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A strict child's lazy re-attach spawns a coordinator when the parent's is
+    gone, so it reaches the #305 refusal. Prevents the refusal sticking: it re-arms
+    the re-attach, so the operation after the user fixes the file attaches."""
+    rel = "data/shared.txt"
+    _seed(tmp_path, content=b"v1")
+    vol = CoherentVolume(tmp_path, managed=("data/**",), config=fast_cfg)
+    stop_coordinator(tmp_path)
+    broken = tmp_path / ".coherence" / "tracked.yaml"
+    broken.write_text("- docs/**\n- *.md\n")
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        os.close(read_fd)
+        try:
+            with pytest.raises(CoherenceError, match=r"\.coherence/tracked\.yaml is not valid YAML"):
+                vol.read(rel)
+            kept = broken.read_text() == "- docs/**\n- *.md\n"
+            broken.write_text('- "docs/**"\n')
+            report = {"kept": kept, "read": vol.read(rel).decode(), "attached": vol.is_attached}
+            stop_coordinator(tmp_path)
+            os.write(write_fd, json.dumps(report).encode())
+        except BaseException as exc:  # report, never hang the parent
+            os.write(write_fd, json.dumps({"error": repr(exc)}).encode())
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+    os.close(write_fd)
+    ready, _w, _x = select.select([read_fd], [], [], 60)
+    if not ready:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        pytest.fail("timed out waiting for the forked child's report")
+    report = json.loads(os.read(read_fd, 4096).decode("utf-8"))
+    os.close(read_fd)
+    os.waitpid(pid, 0)
+
+    assert report == {"kept": True, "read": "v1", "attached": True}
+
+
+def _stranger_on_an_exited_coordinators_port(root: Path) -> socket.socket:
+    """A coordinator that died left its pid file, and another process listens
+    on its port."""
+    stranger = socket.socket()
+    stranger.bind(("127.0.0.1", 0))
+    stranger.listen()
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(60)
+    coherence = root / ".coherence"
+    coherence.mkdir(mode=0o700, exist_ok=True)
+    (coherence / "server.pid").write_text(f"{child.pid}\n{stranger.getsockname()[1]}\n")
+    return stranger
+
+
+def test_a_volume_over_an_exited_coordinators_pid_file_starts_its_own_coordinator(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#503: a stranger on a dead coordinator's port is not a coordinator
+    already running, so the volume writes its policy and starts one."""
+    _seed(tmp_path)
+    stranger = _stranger_on_an_exited_coordinators_port(tmp_path)
+    try:
+        vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        try:
+            assert vol.is_attached
+            assert "data/**" in (tmp_path / ".coherence" / "tracked.yaml").read_text()
+        finally:
+            vol.close()
+    finally:
+        stranger.close()
+        stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+def test_a_volume_refuses_a_symlinked_pid_file_and_leaves_its_target_alone(
+    tmp_path: Path, fast_cfg: LifecycleConfig, tmp_path_factory: pytest.TempPathFactory, on_error: str
+) -> None:
+    """#464 and #498 through a volume, which reads the pid file before it starts
+    anything. Prevents that path writing through the link: a strict volume raises
+    the refusal no retry clears, a degrade volume warns and stays detached, and the
+    file the link names keeps its bytes. The listing pins the order: the policy
+    merge runs before the start, so a check inside the start alone leaves policy
+    files behind."""
+    _seed(tmp_path)
+    target = tmp_path_factory.mktemp("outside") / "target"
+    target.write_bytes(b"keep\n")
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(parents=True, exist_ok=True)
+    (coherence_dir / "server.pid").symlink_to(target)
+
+    if on_error == "strict":
+        with pytest.raises(CoherenceDirRefused):
+            CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+    else:
+        with pytest.warns(CoherenceDegradedWarning):
+            vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+        assert not vol.is_attached
+
+    assert (coherence_dir / "server.pid").is_symlink()
+    assert target.read_bytes() == b"keep\n"
+    assert sorted(os.listdir(coherence_dir)) == ["server.pid"]
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+def test_a_volume_over_a_store_another_writer_holds_refuses_or_detaches(
+    tmp_path: Path, fast_cfg: LifecycleConfig, on_error: str
+) -> None:
+    """#453: a start that still finds another read-write handle on state.db
+    after its wait starts nothing. A strict volume raises the typed
+    StoreHeldError; a degrade volume warns once and stays detached."""
+    _seed(tmp_path)
+    cfg = replace(fast_cfg, store_holder_wait_sec=0.1)
+    try:
+        with SqliteArtifactRegistry(tmp_path / ".coherence" / "state.db"):
+            if on_error == "strict":
+                with pytest.raises(StoreHeldError):
+                    CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=cfg)
+            else:
+                with pytest.warns(CoherenceDegradedWarning, match="open for writing") as caught:
+                    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=cfg)
+                assert not vol.is_attached
+                assert [w.category for w in caught].count(CoherenceDegradedWarning) == 1
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def _strict_refusal(root: Path, cfg: LifecycleConfig) -> CoherenceDirRefused:
+    """What a strict volume over ``root`` raises; a volume that attaches instead
+    stops the coordinator it started before the test fails."""
+    try:
+        with pytest.raises(CoherenceDirRefused) as raised:
+            CoherentVolume(root, managed=("data/**",), on_error="strict", config=cfg)
+    finally:
+        stop_coordinator(root)
+    return raised.value
+
+
+@pytest.mark.parametrize("name", ["tracked.yaml", ".coherence", "notes.txt"])
+def test_a_strict_volume_refuses_a_link_before_it_merges_its_policy(
+    tmp_path: Path, fast_cfg: LifecycleConfig, name: str
+) -> None:
+    """#498: a link at a policy file, at ``.coherence`` itself or at a name no
+    code reads raises the typed refusal before the volume merges its globs.
+    Prevents the merge replacing a linked policy file with a regular one (the
+    start then finds no link and runs), or writing the policy into the directory
+    a linked ``.coherence`` names. Not a ``CoordinatorUnreachable``, so a caller's
+    retry loop does not catch it."""
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    if name == ".coherence":
+        target = tmp_path / "link-targets" / "state"
+        target.mkdir(parents=True)
+        target.chmod(0o755)
+        coherence_dir.symlink_to(target, target_is_directory=True)
+        link = coherence_dir
+    else:
+        target = plant_link(coherence_dir, name, "existing")
+        # A list the merge accepts, so the old order replaces the link and starts.
+        target.write_bytes(b'- "docs/**"\n')
+        link = coherence_dir / name
+    before = target_snapshot(target)
+    readlink = os.readlink(link)
+
+    refusal = _strict_refusal(tmp_path, fast_cfg)
+
+    assert refusal.reason == "coherence_dir_refused"
+    assert not isinstance(refusal, CoordinatorUnreachable)
+    assert (refusal.kind, refusal.path) == ("coherence_link", str(tmp_path.resolve() / link.relative_to(tmp_path)))
+    assert os.readlink(link) == readlink
+    assert target_snapshot(target) == before
+    if name != ".coherence":
+        assert sorted(os.listdir(coherence_dir)) == [name]
+
+
+def test_a_degrade_volume_warns_naming_the_link_and_stays_detached(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#498 under ``on_error="degrade"``: one warning names the link and the way
+    out, says a new volume is the retry, and the volume stays detached with
+    nothing written. Prevents the refusal escaping raw from a volume that
+    promises to warn, or a degrade volume merging its policy through the link."""
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    target = plant_link(coherence_dir, "hook.secret", "existing")
+
+    try:
+        with pytest.warns(CoherenceDegradedWarning) as caught:
+            vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    finally:
+        stop_coordinator(tmp_path)
+
+    messages = [str(w.message) for w in caught if issubclass(w.category, CoherenceDegradedWarning)]
+    assert len(messages) == 1, messages
+    assert f"refusing {tmp_path.resolve() / '.coherence' / 'hook.secret'}: it is a symlink" in messages[0]
+    assert "mount a directory" in messages[0]
+    assert messages[0].endswith("This volume stays detached: build a new one once .coherence is fixed.")
+    assert not vol.is_attached
+    assert vol.degradation_count == 1
+    assert sorted(os.listdir(coherence_dir)) == ["hook.secret"]
+    assert target.read_bytes() == TARGET_BYTES
+
+
+@pytest.mark.parametrize("on_error", ["degrade", "strict"])
+def test_a_refused_name_with_control_characters_is_escaped_where_the_volume_prints_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig, caplog: pytest.LogCaptureFixture, on_error: str
+) -> None:
+    """#498: a cloned repository chooses the names in ``.coherence``. A degrade
+    volume prints the refusal itself, as a warning and a log line, so it escapes
+    the name; a strict volume raises the refusal with the raw path, which a
+    caller matches and a CLI escapes. Prevents a name that retitles or clears
+    the terminal, or splits the line, in the one line that says coherence is
+    off."""
+    _seed(tmp_path)
+    name = "x\n\x1b]0;PWNED\x07\x1b[2Jy"
+    plant_link(tmp_path / ".coherence", name, "dangling")
+    link = tmp_path.resolve() / ".coherence" / name
+
+    if on_error == "strict":
+        refusal = _strict_refusal(tmp_path, fast_cfg)
+        assert refusal.path == str(link)
+        assert f"refusing {link}: it is a symlink" in str(refusal)
+        return
+
+    caplog.set_level(logging.WARNING, logger="ccs.adapters.coherent_volume")
+    try:
+        with pytest.warns(CoherenceDegradedWarning) as caught:
+            vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    finally:
+        stop_coordinator(tmp_path)
+
+    messages = [str(w.message) for w in caught if issubclass(w.category, CoherenceDegradedWarning)]
+    logged = [r.getMessage() for r in caplog.records if r.name == "ccs.adapters.coherent_volume"]
+    assert len(messages) == 1 and len(logged) == 1, (messages, logged)
+    for printed in (messages[0], logged[0]):
+        assert printed.isprintable(), printed
+        assert f"refusing {escape_nonprintable(str(link))}: it is a symlink" in printed
+    assert not vol.is_attached
+
+
+def test_a_degrade_volume_warns_for_a_link_made_after_its_check(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#498: a link the volume's own check did not see (made after it) is refused
+    by the start, and a degrade volume still warns and stays detached. Prevents
+    the start's refusal escaping raw from a volume that promises to warn."""
+    _seed(tmp_path)
+    plant_link(tmp_path / ".coherence", "hook.secret", "existing")
+    monkeypatch.setattr(coherent_volume_module, "check_coherence_dir", lambda root: None)
+
+    try:
+        with pytest.warns(CoherenceDegradedWarning) as caught:
+            vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="degrade", config=fast_cfg)
+    finally:
+        stop_coordinator(tmp_path)
+
+    messages = [str(w.message) for w in caught if issubclass(w.category, CoherenceDegradedWarning)]
+    assert len(messages) == 1, messages
+    assert f"refusing {tmp_path.resolve() / '.coherence' / 'hook.secret'}: it is a symlink" in messages[0]
+    assert messages[0].endswith("This volume stays detached: build a new one once .coherence is fixed.")
+    assert not vol.is_attached
+
+
+def _link_to_peer_state(root: Path, peer: Path) -> None:
+    """Link ``root``'s pid file and secret to ``peer``'s: what a cloned
+    repository can commit so that a start would join the peer's coordinator."""
+    coherence_dir = root / ".coherence"
+    coherence_dir.mkdir(mode=0o700, parents=True)
+    for name in ("hook.secret", "server.pid"):
+        (coherence_dir / name).symlink_to(peer / ".coherence" / name)
+
+
+def _peer_requests(endpoint: CoordinatorEndpoint) -> tuple[int, int]:
+    """How many principal claims and ``/status`` reads a peer's coordinator has
+    answered, this read included. A volume that joins it does both at attach,
+    before any read or write, so neither its sessions nor its files show it."""
+    counters = coherent_volume_module._coordinator_get(endpoint, "/status")["endpoint_counters"]
+    return counters["principal_claim_total"], counters["status_total"]
+
+
+def test_a_volume_does_not_join_the_coordinator_a_linked_pid_file_names(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#498: a workspace whose pid file and secret link to another workspace's
+    raises the refusal, and the other workspace's coordinator sees nothing of it.
+    Prevents a cloned link joining a coordinator that guards another tree, with
+    a bearer that coordinator accepts."""
+    peer = tmp_path / "peer"
+    root = tmp_path / "ws"
+    _seed(peer)
+    _seed(root)
+    peer_vol = CoherentVolume(peer, managed=("data/**",), config=fast_cfg)
+    try:
+        _link_to_peer_state(root, peer)
+        claims, statuses = _peer_requests(peer_vol._endpoint)
+
+        refusal = _strict_refusal(root, fast_cfg)
+
+        assert refusal.path == str(root.resolve() / ".coherence" / "hook.secret")
+        # The one more /status is the read below.
+        assert _peer_requests(peer_vol._endpoint) == (claims, statuses + 1)
+    finally:
+        stop_coordinator(peer)
+
+
+def test_a_volume_checks_for_links_before_it_probes_a_port(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#498: the refusal comes before the volume's own pre-probe of the port its
+    pid file names, and before the start's. Prevents a probe, or a join, of a
+    port that a workspace holding a link names."""
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    plant_link(coherence_dir, "hook.secret", "existing")
+    (coherence_dir / "server.pid").write_text(f"{os.getpid()}\n45678\n")
+
+    def no_probe(*args: object, **kwargs: object) -> bool:
+        pytest.fail("probed a port before refusing the link")
+
+    monkeypatch.setattr(coherent_volume_module, "running_coordinator_port", no_probe)
+    monkeypatch.setattr("ccs.adapters.claude_code.lifecycle.tcp_probe", no_probe)
+
+    refusal = _strict_refusal(tmp_path, fast_cfg)
+
+    assert refusal.path == str(tmp_path.resolve() / ".coherence" / "hook.secret")
 
 
 def _untrack_refusal(vol: CoherentVolume, paths: list[str]) -> tuple[int, dict]:
@@ -1183,7 +1597,7 @@ def test_a_broader_ignore_pattern_at_spawn_does_not_unguard_a_managed_path(
     target = _seed(tmp_path, content=b"v1")
     coherence_dir = tmp_path / ".coherence"
     coherence_dir.mkdir(parents=True, exist_ok=True)
-    CoherentVolume._merge_yaml_list(coherence_dir / "ignored.yaml", ("**",))
+    merge_policy_globs((coherence_dir / "ignored.yaml",), ("**",))
     vol, peer = _pair(tmp_path, fast_cfg)
     try:
         assert vol.is_attached and not vol.is_degraded
@@ -1215,25 +1629,28 @@ def test_untracking_an_unmanaged_path_on_a_strict_coordinator_still_works(
 # How the operator view fails to answer, and the reason the volume must name.
 _UNCONFIRMABLE_VIEWS = {
     "absent": "publishes no glob sets",
-    "refused": "the operator view was refused (HTTP 501)",
-    "refused-node": "the Node coordinator does not serve the operator view (HTTP 501)",
+    "refused": "the operator view was refused (HTTP 403)",
+    "predates": "the coordinator predates the operator view (HTTP 501)",
     "transport": "CoordinatorUnavailable reading the operator view",
 }
+#: The status each answered refusal of the operator view carries.
+_VIEW_REFUSAL_STATUS = {"refused": 403, "predates": 501}
 
 
 @pytest.mark.parametrize("sets", list(_UNCONFIRMABLE_VIEWS))
 def test_a_coordinator_that_does_not_publish_its_glob_sets_cannot_confirm_enforcement(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, sets: str
 ) -> None:
-    """When the operator view cannot be read — an older Python coordinator
-    whose summary carries only counts, a coordinator that refuses the view,
-    the Node coordinator (which answers 501, and is named from the pid file's
-    backend line), or a transport failure during that one GET (a refused
-    connect, through the real client) — the volume cannot tell whether its
-    globs are enforced. It fails closed, detached, and says which: "cannot
-    tell" is never reported as "not enforced", nor as enforced. Only the GET
-    that got no answer at all raises ``CoordinatorUnreachable`` (AE5); the
-    answered ones keep the plain error.
+    """When the operator view cannot be read -- an older Python coordinator
+    whose summary carries only counts, a coordinator that refuses the view
+    (403), one that predates it (501, the Node coordinator of plugin 0.6.0 and
+    earlier), or a transport failure during that one GET (a refused connect,
+    through the real client) -- the volume cannot tell whether its globs are
+    enforced. It fails closed, detached, and says which: "cannot tell" is
+    never reported as "not enforced", nor as enforced, and a 501 tells the
+    caller to upgrade the plugin rather than that the view is not served.
+    Only the GET that got no answer at all raises ``CoordinatorUnreachable``;
+    the answered ones keep the plain error.
 
     Prevents a count, nothing at all, or a raised transport error being read
     as confirmation, and a coordinator dying mid-attach escaping the
@@ -1242,17 +1659,12 @@ def test_a_coordinator_that_does_not_publish_its_glob_sets_cannot_confirm_enforc
 
     _seed(tmp_path, content=b"v1")
     real_get = coherent_volume_module._coordinator_get
-    if sets == "refused-node":
-        monkeypatch.setattr(
-            coherent_volume_module, "coordinator_backend",
-            lambda root: coherent_volume_module.NODE_BACKEND,
-        )
 
     def operator_view_unavailable(endpoint, path, **kwargs):  # noqa: ANN001, ANN003, ANN202
         if "detail=full" not in path:
             return real_get(endpoint, path, **kwargs)
-        if sets in ("refused", "refused-node"):
-            raise urllib.error.HTTPError(path, 501, "Not Implemented", {}, None)  # type: ignore[arg-type]
+        if sets in _VIEW_REFUSAL_STATUS:
+            raise urllib.error.HTTPError(path, _VIEW_REFUSAL_STATUS[sets], "refused", {}, None)  # type: ignore[arg-type]
         if sets == "transport":
             return real_get(refused_endpoint(endpoint), path, **kwargs)
         doc = real_get(endpoint, path, **kwargs)
@@ -1271,6 +1683,8 @@ def test_a_coordinator_that_does_not_publish_its_glob_sets_cannot_confirm_enforc
         assert "cannot be confirmed" in message, message
         assert _UNCONFIRMABLE_VIEWS[sets] in message, message
         assert "does not enforce strict mode for" not in message, message
+        assert "does not serve" not in message, message
+        assert ("upgrade the agent-coherence plugin" in message) is (sets == "predates"), message
         assert "data/**" in message, message
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_get", real_get)
@@ -2356,7 +2770,7 @@ def test_fs_write_failure_releases_grant(
         assert any(
             p == "/hooks/post-edit" and pay.get("success") is False for p, pay in posts
         ), "FS-write failure must release the grant via post-edit success=false"
-        assert _held(vol, _agent_id(vol)) == {}, (
+        assert _write_held(vol, _agent_id(vol)) == {}, (
             "the failure release reached the coordinator but left the grant held"
         )
     finally:
@@ -3589,9 +4003,10 @@ def test_identity_accessors_are_read_only(
 def test_every_request_names_the_current_incarnation(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every request the volume sends names its CURRENT incarnation; the one
-    exception is the release of an abandoned write grant, which names the
-    abandoned one. A request without it lands on the session's parent row: a read
+    """Every request the volume sends names its CURRENT incarnation; the
+    exceptions are the release of an abandoned write grant and the end of an
+    incarnation the volume no longer uses, which name that older one. A
+    request without it lands on the session's parent row: a read
     there registers a view the next attempt does not own, and a release there
     releases nothing."""
     rel, other = "data/shared.txt", "data/other.txt"
@@ -3628,9 +4043,16 @@ def test_every_request_names_the_current_incarnation(
             body["agent_id"] for route, body, _c in sent if route == "/hooks/pre-edit"
         }
         stops = [body for route, body, _c in sent if route == "/hooks/session-stop"]
-        assert [body["agent_id"] for body in stops] == [write_incarnation], (
+        assert [body["agent_id"] for body in stops if "ended" not in body] == [write_incarnation], (
             "the release did not name the incarnation write() left holding the grant"
         )
+        # The other stops end the incarnations the volume no longer uses
+        # (#525): the one that wrote, at reacquire(), and write_cas_at's, at
+        # atomic_publish's re-mint.
+        _cas, cas_at_incarnation = [body["agent_id"] for route, body, _c in sent if route == "/hooks/post-edit-cas"]
+        assert [(body["agent_id"], body.get("ended")) for body in stops] == [
+            (write_incarnation, None), (write_incarnation, True), (cas_at_incarnation, True),
+        ]
         for route, body, current in sent:
             assert body["session_id"] == vol.session_id, route
             if route != "/hooks/session-stop":
@@ -3681,7 +4103,7 @@ def test_write_cas_at_commits_over_a_grant_its_own_write_left_standing(
         vol.write_cas_at(rel, version, b"v2-cas")
 
         assert target.read_bytes() == b"v2-cas"
-        assert _held(vol, stranded) == {}, "the abandoned incarnation still holds a grant"
+        assert _write_held(vol, stranded) == {}, "the abandoned incarnation still holds a grant"
     finally:
         stop_coordinator(tmp_path)
 
@@ -3706,7 +4128,7 @@ def test_write_cas_at_after_a_committed_write_on_the_same_volume_commits(
         vol.write_cas_at(rel, version, b"v3-cas")
 
         assert target.read_bytes() == b"v3-cas"
-        assert _held(vol, writer_row) == {}, "the abandoned incarnation still holds a grant"
+        assert _write_held(vol, writer_row) == {}, "the abandoned incarnation still holds a grant"
     finally:
         stop_coordinator(tmp_path)
 
@@ -3732,7 +4154,7 @@ def test_write_cas_directly_after_a_committed_write_on_the_same_volume_commits(
         vol.write_cas(rel, lambda cur: cur + b"+cas")
 
         assert target.read_bytes() == b"v2-pessimistic+cas"
-        assert _held(vol, writer_row) == {}, "the abandoned incarnation still holds a grant"
+        assert _write_held(vol, writer_row) == {}, "the abandoned incarnation still holds a grant"
     finally:
         stop_coordinator(tmp_path)
 
@@ -3791,7 +4213,7 @@ def test_a_denied_write_on_another_path_keeps_the_grant_record(
         vol.write_cas(p, lambda cur: cur + b"+cas")
 
         assert target.read_bytes() == b"p2+cas"
-        assert _held(vol, writer_row) == {}, "the grant on the first path was never released"
+        assert _write_held(vol, writer_row) == {}, "the grant on the first path was never released"
     finally:
         stop_coordinator(tmp_path)
 
@@ -3878,7 +4300,7 @@ def test_an_error_answer_after_the_acquire_keeps_the_grant_record(
         vol.write_cas(p, lambda cur: cur + b"+cas")
 
         assert target.read_bytes() == b"p1+cas"
-        assert p not in _held(vol, stranded), "the grant the failed write() took was never released"
+        assert p not in _write_held(vol, stranded), "the grant the failed write() took was never released"
     finally:
         stop_coordinator(tmp_path)
 
@@ -3928,7 +4350,7 @@ def test_write_cas_rotates_for_a_file_an_earlier_attempt_still_holds(
 
         assert target.read_bytes() == b"p2+cas"
         assert len(commits) == 1, f"the volume's own grant refused a commit: {commits}"
-        assert p not in _held(vol, first_row)
+        assert p not in _write_held(vol, first_row)
     finally:
         stop_coordinator(tmp_path)
 
@@ -3969,7 +4391,7 @@ def test_a_degraded_release_answer_is_not_a_confirmed_release(
         vol.write_cas_at(rel, version, b"v3")
 
         assert target.read_bytes() == b"v3"
-        assert _held(vol, writer_row) == {}
+        assert _write_held(vol, writer_row) == {}
     finally:
         stop_coordinator(tmp_path)
 
@@ -4114,46 +4536,70 @@ def test_write_cas_after_write_and_reacquire_on_the_same_volume_commits(
         stop_coordinator(tmp_path)
 
 
-def test_re_mint_spends_no_request_on_an_incarnation_without_a_write_grant(
+def test_re_mint_ends_the_attempts_it_no_longer_references_and_none_that_sent_nothing(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An incarnation that only read, committed optimistically, or had its write
-    DENIED holds at most SHARED/INVALID and blocks nothing; releasing it anyway
-    would add a round trip to every re-mint — every optimistic retry — for
-    nothing. The requests are COUNTED, so an unconditional release cannot pass.
-    The second half keeps the zero honest: a write() that takes a grant costs
-    exactly ONE release at the transition, however many re-mints follow it."""
+    DENIED holds at most SHARED/INVALID and blocks nothing, but the coordinator
+    keeps its rows, heartbeat and ``/status`` entry until the volume ends it
+    (#525). A re-mint ends, with one ``ended`` stop each, the incarnations a
+    request named that the volume no longer references: neither the current one
+    nor one holding a read a transfer would present. One that never sent a
+    request never reached the coordinator, and nothing is spent on it. The
+    requests are COUNTED, so an end per re-mint, or none, cannot pass. The
+    second half keeps a write() grant's cost honest: exactly ONE release at the
+    transition, and the end of that incarnation once nothing references it."""
     rel = "data/shared.txt"
     target = _seed(tmp_path, content=b"v1")
     vol, peer = _pair(tmp_path, fast_cfg)
     try:
         vol.read(rel)
+        first = vol._incarnation
         peer.read(rel)
         peer.write(rel, b"v2-peer")  # vol -> INVALID
         _end_turn(peer)
         sent: list[tuple[str, dict, str]] = []
         _count_stops(monkeypatch, sent, vol)
 
-        def stops() -> int:
-            return sum(1 for route, _b, _c in sent if route == "/hooks/session-stop")
+        def stops() -> list[tuple[str, bool]]:
+            return [
+                (body["agent_id"], body.get("ended") is True)
+                for route, body, _c in sent if route == "/hooks/session-stop"
+            ]
+
+        def listed(incarnation: str) -> bool:
+            status = vol.coordinator_status()
+            assert status is not None
+            row = str(session_to_agent_id(vol.session_id, incarnation))
+            return row in {session["agent_id"] for session in status["sessions"]}
 
         with pytest.raises(StaleView):
             vol.write(rel, b"stale")  # denied: no grant was taken
         assert _held(vol, _agent_id(vol)) == {}  # the denied incarnation is INVALID
-        assert vol.reacquire(rel) == b"v2-peer"  # re-mint 1 abandons an INVALID row
+        assert vol.reacquire(rel) == b"v2-peer"  # re-mint 1: the first still holds the read
+        second = vol._incarnation
         assert _held(vol, _agent_id(vol)) == {rel: "SHARED"}
+        assert stops() == [], "a re-mint ended the incarnation holding the volume's read"
+        with pytest.raises(FileNotFoundError):
+            vol.write_cas_at("data/missing.txt", 0, b"never sent")  # re-mint 2 ends the first
+        unsent = vol._incarnation
+        assert stops() == [(first, True)]
+        assert not listed(first)
+        assert vol.reacquire(rel) == b"v2-peer"  # re-mint 3 abandons one that sent nothing
+        assert stops() == [(first, True)], "a re-mint spent a request on an incarnation that sent none"
         _data, version = vol.read_with_version(rel)
-        vol.write_cas_at(rel, version, b"v3-cas")  # re-mint 2 abandons a SHARED row
-        vol.reacquire(rel)  # re-mint 3
-        rows = {body["agent_id"] for _r, body, _c in sent if "agent_id" in body}
-        assert len(rows) == 4, f"expected four incarnations across three re-mints, saw {len(rows)}"
-        assert stops() == 0, "a re-mint released an incarnation that held no write grant"
+        vol.write_cas_at(rel, version, b"v3-cas")  # re-mint 4 ends the second
+        assert stops() == [(first, True), (second, True)]
+        assert unsent not in {body.get("agent_id") for _r, body, _c in sent}
 
         vol.write(rel, b"v4-pessimistic")
+        writer = vol._incarnation
         for _ in range(2):
             _data, version = vol.read_with_version(rel)
             vol.write_cas_at(rel, version, b"v5-cas")
-        assert stops() == 1, "a write() grant costs exactly one release at the transition"
+        released = [incarnation for incarnation, ended in stops() if not ended]
+        assert released == [writer], "a write() grant costs exactly one release at the transition"
+        assert stops()[-1] == (writer, True)
         assert target.read_bytes() == b"v5-cas"
     finally:
         stop_coordinator(tmp_path)
@@ -4229,7 +4675,7 @@ def test_failed_release_is_kept_and_retried_at_the_next_re_mint(
         vol.write_cas_at(rel, version, b"v3-cas")
 
         assert target.read_bytes() == b"v3-cas"
-        assert _held(vol, writer_row) == {}
+        assert _write_held(vol, writer_row) == {}
     finally:
         stop_coordinator(tmp_path)
 
@@ -5381,17 +5827,23 @@ def test_a_refused_acquire_leaves_no_grant_for_a_re_mint_to_release(
         vol._mint_nonce, vol._principal = "Z" * 43, None
         with pytest.raises(CallerPrincipalRefused):
             vol.write(rel, b"v2")
+        refused = vol._incarnation
         vol._mint_nonce, vol._principal = nonce, bound
-        sent: list[tuple[str, str | None]] = []
-        _record_principals(monkeypatch, sent)
+        sent: list[tuple[str, dict, str]] = []
+        _count_stops(monkeypatch, sent, vol)
+
+        def stops() -> list[dict]:
+            return [body for route, body, _c in sent if route == "/hooks/session-stop"]
 
         vol.reacquire(rel)
-        assert "/hooks/session-stop" not in {r for r, _p in sent}
+        # The refused acquire was sent, so the re-mint ends its incarnation
+        # (#525), but it releases nothing.
+        assert stops() == [{"session_id": vol.session_id, "agent_id": refused, "ended": True}]
 
         vol.write(rel, b"v2")
         sent.clear()
         vol.reacquire(rel)
-        assert "/hooks/session-stop" in {r for r, _p in sent}, "control: a real grant is released"
+        assert [body for body in stops() if "ended" not in body], "control: a real grant is released"
     finally:
         stop_coordinator(tmp_path)
 
@@ -6549,9 +7001,11 @@ _FAILED_COMMIT = "coordinator request to /hooks/post-edit failed: HTTP {status}"
 _REDIRECTED = ", a redirect, which this client never follows"
 _UNCONFIRMED_COMMIT = (
     "The write's bytes are on disk at {rel}, but its commit was answered with "
-    "HTTP {status}, so the coordinator may have recorded the write. One "
-    "best-effort release of its grant was attempted. Re-read the path before "
-    "writing it again."
+    "HTTP {status}, so the coordinator may have recorded the write. Its write "
+    "grant was released. If the coordinator did not record the write, a read "
+    "that refuses stale bytes refuses this path until a write() of it is "
+    "recorded, and reading again does not clear that; write() the path again, "
+    "with these bytes or a change built from them, which records it either way."
 )
 
 
@@ -7302,7 +7756,7 @@ def test_a_write_whose_commit_gets_no_answer_releases_its_grant_and_never_return
         (release, kwargs), = _releases(calls)
         assert release == {"session_id": vol.session_id, "agent_id": holder, "path": rel, "success": False}
         assert kwargs["timeout"] == coherent_volume_module._GRANT_RELEASE_TIMEOUT_SEC < CLI_HTTP_TIMEOUT_SEC
-        assert _held(vol, str(session_to_agent_id(vol.session_id, holder))) == {}, "the grant stands"
+        assert _write_held(vol, str(session_to_agent_id(vol.session_id, holder))) == {}, "the grant stands"
         assert holder not in vol._grant_incarnations, "an answered release left the grant recorded"
     finally:
         silent.close()
@@ -7337,7 +7791,7 @@ def test_a_write_keeps_its_grant_on_record_until_a_release_is_answered(
         assert len(_releases(calls)) == 1, "control: one release was sent"
         if release == "answered":
             assert holder not in vol._grant_incarnations
-            assert _held(vol, holder_row) == {}
+            assert _write_held(vol, holder_row) == {}
         else:
             assert vol._grant_incarnations.get(holder) == {rel}
             assert _held(vol, holder_row) == {rel: "EXCLUSIVE"}, "control: the grant still stands"
@@ -7346,7 +7800,7 @@ def test_a_write_keeps_its_grant_on_record_until_a_release_is_answered(
 
         stops = [body["agent_id"] for path, body, _k in calls if path == "/hooks/session-stop"]
         assert stops == ([] if release == "answered" else [holder])
-        assert _held(vol, holder_row) == {}
+        assert _write_held(vol, holder_row) == {}
         assert holder not in vol._grant_incarnations
     finally:
         stop_coordinator(tmp_path)
@@ -7382,13 +7836,13 @@ def test_a_released_grant_leaves_the_record_of_the_incarnation_s_other_paths_alo
 
         assert len(_releases(calls)) == 1, "control: one release was sent"
         assert vol._grant_incarnations == {holder: {other}}, "the release took more than its own path"
-        assert rel not in _held(vol, holder_row), "control: the coordinator released the path"
+        assert rel not in _write_held(vol, holder_row), "control: the coordinator released the path"
         calls.clear()
         vol.reacquire(rel)
 
         stops = [body["agent_id"] for path, body, _k in calls if path == "/hooks/session-stop"]
         assert stops == [holder], "the record of the other path was lost, so no re-mint released it"
-        assert _held(vol, holder_row) == {}
+        assert _write_held(vol, holder_row) == {}
         assert holder not in vol._grant_incarnations
     finally:
         stop_coordinator(tmp_path)
@@ -7425,7 +7879,7 @@ def test_a_release_that_is_not_a_clean_ok_leaves_the_grant_on_record(
 
         stops = [body["agent_id"] for path, body, _k in calls if path == "/hooks/session-stop"]
         assert stops == [holder]
-        assert _held(vol, holder_row) == {}
+        assert _write_held(vol, holder_row) == {}
         assert holder not in vol._grant_incarnations
     finally:
         stop_coordinator(tmp_path)
@@ -7657,7 +8111,7 @@ def test_a_release_after_a_commit_that_landed_leaves_the_commit_as_it_is(
         (after_commit,) = landed
         assert after_commit == (2, _sha(b"v2"), holder_row.replace("-", "")), "control: the commit landed"
         assert record_of() == after_commit, "the release changed what the commit recorded"
-        assert _held(vol, holder_row) == {}, "control: the release was answered and gave up the grant"
+        assert _write_held(vol, holder_row) == {}, "control: the release was answered and gave up the grant"
     finally:
         server.shutdown()
 

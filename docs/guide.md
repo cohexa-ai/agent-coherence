@@ -164,7 +164,9 @@ To take that copy:
    coordinator starts a 0.15.0 one, which migrates the store.
 
 To go back, stop the coordinator the same way, put the copy in place of
-`.coherence/`, and reinstall 0.14.1 and the plugin release you ran with it.
+`.coherence/` as a real directory, not a link to the copy (see
+[`.coherence` must be a real directory](#coherence-must-be-a-real-directory)),
+and reinstall 0.14.1 and the plugin release you ran with it.
 A 0.15.0 coordinator reports the schema of the store it serves as
 `registry_schema_version` in every `/status` view (see
 [Status, track and untrack commands](#status-track-and-untrack-commands)).
@@ -174,10 +176,9 @@ A 0.15.0 coordinator reports the schema of the store it serves as
 `agent-coherence-coordinator --check-store` says what starting a coordinator
 of the installed build would do to `.coherence/state.db`, without starting one
 and without creating or changing anything in the workspace. It copies the
-store (and any `-wal` or `-journal` file beside it; for a symlinked
-`state.db`, the target and the files beside the target, where SQLite keeps
-them) to a private temporary directory, runs the same open a coordinator start
-runs on the copy, and removes the copy when it finishes. A check that is
+store (and any `-wal` or `-journal` file beside it) to a private temporary
+directory, runs the same open a coordinator start runs on the copy, and
+removes the copy when it finishes. A check that is
 killed leaves the copy behind (see
 [security.md](security.md#store-check-copy)). Run it after upgrading the
 package and before any client starts a coordinator, and ask before a
@@ -193,6 +194,11 @@ migration: it is one-way.
 | `unusable` | 14 | fail on the store itself; `reason` says how |
 | `live` | 15 | join the Python coordinator already serving the workspace, and migrate nothing while it runs; the check does not read the store (see below) |
 | `cannot_tell` | 16 | unknown: the check could not observe the answer; `reason` says why |
+| `coherence_dir_refused` | 17 | refuse the workspace before it looks for a running coordinator or opens the store: `.coherence` is a symbolic link or not a directory, or holds a link, FIFO, socket or device directly inside it (see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory)); `message` is the text a start prints, naming the path |
+
+`coherence_dir_refused` comes before `live`: like a start, the check looks at
+`.coherence` before anything else, and it looks again before each copy of the
+store.
 
 `live` says only that a coordinator is running now, so it carries no store
 schema. After an upgrade, that coordinator can be one of the old build: it
@@ -231,10 +237,22 @@ and check again.
     coordinator cannot be ruled out.
   - `platform_unsupported`: this platform has no `fcntl`, so no coordinator
     starts here.
+  - `store_held`: a read-write handle that is not a running coordinator has
+    the store open: a script, or a coordinator still closing. A start waits
+    for it to close, then refuses the store. Check again once it closes.
+- `coherence_dir_refused`, one of:
+  - `coherence_link`: `.coherence`, or an entry directly inside it, is a
+    symbolic link.
+  - `coherence_not_a_directory`: `.coherence` is a file, or anything else that
+    is not a directory.
+  - `coherence_special_entry`: an entry directly inside `.coherence` is a
+    FIFO, socket or device.
 
 The check's own reasons are constants in `ccs.adapters.claude_code.store_check`
 (`COORDINATOR_RUNNING_REASON` and the rest, collected in
-`STORE_CHECK_REASONS`); the store's are in `ccs.core.exceptions` (below).
+`STORE_CHECK_REASONS`, which also holds the three `coherence_dir_refused`
+reasons). Those three are in `ccs.core.exceptions` too, collected in
+`COHERENCE_DIR_REFUSAL_KINDS`, and so are the store's (below).
 
 Exit 1 means the directory is not a git repository, and exit 2 a usage error.
 `--json` prints one object with `kind` (always `"store_check"`), `outcome`,
@@ -244,7 +262,8 @@ is for a start of this build's Python coordinator), `registry_schema_version`
 `null`), `reason` and `message`. `--quiet` silences only the plain line;
 `--json` always prints its object. The plain line prints any non-printable
 character in the store's own text (an object name SQLite quotes in its error,
-say) escaped, as `\x1b` for an escape character (see
+say), or in a path a refusal names, escaped, as `\x1b` for an escape
+character (see
 [Status, track and untrack commands](#status-track-and-untrack-commands));
 `--json` keeps the message as it is, JSON-escaped. The answer holds only as of
 the check: nothing stops another process starting a coordinator after it.
@@ -563,13 +582,14 @@ Each entry is a flat `dict` with exactly these eight keys:
 | `"fetch"` | Fetch grant; the requester transitions to SHARED or EXCLUSIVE, and a peer holding EXCLUSIVE/MODIFIED is downgraded to SHARED under the same trigger (a peer already in SHARED is not touched) |
 | `"write"` | Write request; peers are invalidated (→ INVALID), requester receives EXCLUSIVE |
 | `"commit"` | Write commit; peers are invalidated (→ INVALID), committer transitions to MODIFIED |
-| `"invalidate"` | Explicit invalidation signal; agent transitions to INVALID |
+| `"invalidate"` | Explicit invalidation signal; agent transitions to INVALID. A holder's own release of a write grant (a `session-stop`, a `subagent-stop` or a failed `post-edit`) fires it too, and moves that holder from EXCLUSIVE/MODIFIED to SHARED instead: it keeps a read of the version it held |
 | `"handoff"` | [Targeted grant handoff](#targeted-grant-handoff): the giver hands its claim (EXCLUSIVE, MODIFIED or a standing SHARED read) to a successor and transitions to INVALID |
 | `"timeout"` | Transient state timeout; agent force-invalidated (→ INVALID) |
 | `"reclaim_heartbeat"` | Crash recovery: agent's heartbeat older than `heartbeat_timeout_ticks` |
 | `"reclaim_max_hold"` | Crash recovery: grant held for at least `max_hold_ticks` |
+| `"fold_merge"` | A coordinator start merged records an older build kept for one file under several spellings (see [One file, many spellings](#one-file-many-spellings)): every agent on them moves to the record kept, and every one but the write holder kept, if any (the single one whose record matches the file on disk), goes INVALID (stale), readers included. It also fires when a write grant on one of several records still kept for one file takes that file from a write holder on another |
 
-The last five triggers move the artifact's **ownership epoch** when they take a
+The five triggers from `"invalidate"` to `"reclaim_max_hold"` move the artifact's **ownership epoch** when they take a
 holder out of EXCLUSIVE/MODIFIED, because each of them ends a write claim
 *without the version moving* — the one case a version check cannot see. A later
 commit from that ex-holder is then rejected with `stale_read_generation` rather
@@ -585,6 +605,12 @@ giver that hands off a write grant moves the epoch exactly as a release does; a
 giver that hands off a standing SHARED read takes no one out of
 EXCLUSIVE/MODIFIED and moves no epoch, so sessions that read the path are not
 fenced as though a writer had been reclaimed.
+
+`"fold_merge"` sets both numbers itself: the record a merge keeps takes a
+version and an ownership epoch one past the highest of the records it merged.
+The write holder that keeps its grant moves to both, so its next commit is
+admitted; every other agent's recorded version and captured generation stay
+below them, so its next commit is refused until it reads the file again.
 
 An explicit invalidation is also **pinned**: one issued by a peer is dropped as
 obsolete if the agent it names has since observed a version at least as new as
@@ -825,8 +851,10 @@ This applies to the Python coordinator. The Claude Code plugin's Node
 coordinator runs no grant sweep, so it has nothing to report.
 
 When the sweep takes a write grant back, the holder drops out of `states`
-exactly as it would after a release. Two things let anyone other than that
-holder tell the two apart:
+exactly as it would after another session's edit took the path from it. A
+release looks different: the holder stays listed, as `SHARED`, because it
+keeps a read of the version it held. Two things let anyone other than that
+holder tell a reclaim from a path taken by another session's edit:
 
 - **The operator view.** `GET /status?detail=full`, sent with the
   `Coherence-Local-Operator: true` header, gives each `sessions[]` row a
@@ -846,7 +874,11 @@ holder tell the two apart:
   [which requests record one](#reading-when-the-sweep-will-reclaim-a-grant))
   or `reclaim_max_hold` (held past
   `grant_max_hold_sec`), and `reclaimed_at_unix_ts` is when the reclaim
-  happened, in unix seconds.
+  happened, in unix seconds. A third trigger, `fold_merge`, is not the sweep's:
+  a start merged records an older build kept for one file under several
+  spellings, and this holder lost its write grant there, or another agent's
+  write grant on another record still kept for the same file took it (see
+  [One file, many spellings](#one-file-many-spellings)).
 - **The counters.** Every view, the default one and `?detail=metrics`
   included, carries `sweep_reclaims_total` and `sweep_reclaims_by_trigger`.
   They name no session or path: a count that rose tells you the sweep pulled
@@ -862,12 +894,19 @@ it, so do not hand the path to another session on the strength of an empty
 - while the holder's compare-and-swap commits of the path are refused with
   `stale_read_generation`. A re-read does not lift that refusal;
 - after a peer writes or commits the path, and after the holder's session
-  ends.
+  ends;
+- after the holder ends, when it is a `CoherentVolume` attempt the volume has
+  ended (see [Attempts a volume ends](#attempts-a-volume-ends)). The
+  coordinator forgets the attempt's other records and its name, and keeps its
+  state on this path, as `INVALID`, with the reclaim record: the attempt gets
+  a row with a `null` `agent_name` and empty `states` until 24 hours after its
+  newest reclaim, as after a restart (below).
 
 A reclaimed session gets its write back by editing the path again: the edit
 takes the write grant (`EXCLUSIVE`), which clears the entry, and commits like
-any other edit. `states` then shows the holder holding the path, so it does
-not read as released. The map
+any other edit. `states` then shows the holder with a write grant on the path
+(`EXCLUSIVE`, then `MODIFIED` once it commits), so it does not read as
+released: a release leaves `SHARED`. The map
 tells you a reclaim happened; whether its edit has been dealt with since is
 yours to decide. One clue: if the path's `last_writer_at_unix_ts` in the same
 response is later than the entry's `reclaimed_at_unix_ts`, someone has committed
@@ -883,7 +922,8 @@ Limits:
   row is dropped.
 - A zero count does not prove the sweep is running: it reads the same when
   there was nothing to reclaim.
-- Only the grant sweep's two triggers are recorded. A holder the coordinator
+- Only the grant sweep's two triggers and `fold_merge` are recorded, and only
+  the sweep's two are counted. A holder the coordinator
   invalidates because it sat mid-transition past `transient_timeout_sec` gets
   no `reclaimed` entry and no count.
 - The Python console script, run as `agent-coherence-status --detail full`,
@@ -911,8 +951,8 @@ thresholds in the same view; see
 
 ### Reading when the sweep will reclaim a grant
 
-This applies to the Python coordinator. The Node coordinator answers
-`detail=full` with `501`.
+This applies to the Python coordinator. The Node coordinator runs no sweep,
+and its operator view carries none of these fields.
 
 The operator view (`GET /status?detail=full` with the
 `Coherence-Local-Operator: true` header) also carries what the sweep decides
@@ -1014,15 +1054,21 @@ moving, which a version comparison cannot see. That happens on:
 - the transient timeout taking a write grant back (`timeout`);
 - a voluntary release (`invalidate`): a failed post-edit, a session-stop, or
   the release of every grant by `agent-coherence-coordinator
-  --prepare-for-migration`;
+  --prepare-for-migration`. A failed post-edit or a session-stop leaves the
+  holder a reader (`SHARED`) of the version it held, and the generation still
+  moves; the drain still leaves each holder `INVALID`, because the bytes on
+  disk may never have been committed;
 - a handoff from a giver holding the path `EXCLUSIVE` or `MODIFIED`
   (`handoff`).
 
 It does not move when a peer's write-acquire preempts the holder, on a commit
-(the version moves instead), or when a giver hands off a `SHARED` read. The
-names in parentheses are the [state-transition triggers](#trigger-vocabulary).
-Compare generations per artifact `id`, not per path: a path that is removed
-and registered again gets a new `id`, and its generation starts again at 0.
+(the version moves instead), when a giver hands off a `SHARED` read, or when
+the coordinator forgets an identity that has ended (see
+[Attempts a volume ends](#attempts-a-volume-ends)), which it never does while
+that identity holds a write claim. The names in parentheses are the
+[state-transition triggers](#trigger-vocabulary). Compare generations per
+artifact `id`, not per path: a path that is removed and registered again gets
+a new `id`, and its generation starts again at 0.
 
 None of these fields appear below the operator view; the default and `metrics`
 views are unchanged. The table that `agent-coherence-status` prints does not
@@ -1284,6 +1330,29 @@ no version content. (The Claude Code hook/HTTP coordinator carries only content
 hashes on the wire, so durable retention there is inert: there are no bodies to
 store. It is an in-process-embedder feature.)
 
+**One writer per store.** A store has one read-write `SqliteArtifactRegistry`
+at a time. Each read-write open takes an exclusive lock on a file beside the
+store, `<store>.writer-lock`, before it touches the store, and a second
+read-write open of the same store, in this process or another, raises
+`StoreHeldError` (a `RuntimeError` from `ccs.coordinator.sqlite_registry`;
+`reason` is `store_held` and `lock_path` names the lock file). The lock is
+keyed on the store's resolved path, so a symbolic link to the store meets the
+same lock. `close()` frees it, and so do a failed open, a handle that is
+garbage-collected and a process that exits; a forked child does not keep its
+parent's lock. `read_only=True` takes no lock, so readers open beside the
+writer. To share one store between processes, run one coordinator and send
+the others through it, or open them read-only. A writer open that lands while
+`--check-store` probes the lock retries for a tenth of a second before it
+refuses; to wait longer for a holder that is closing, open through
+`open_waiting_out_a_holder(open_store, wait_sec, poll_sec)` from the same
+module, as a coordinator start and the workspace CLI do. A lock file that
+cannot be opened, or that is not a regular file (a directory or FIFO at that
+path, or a file another user owns), refuses the open with an `OSError` and
+creates nothing. Only where `flock` does not exist (Windows, or a file system
+whose `flock` does not work, which logs one warning) does the open proceed
+without the lock, and a second writer is not refused there
+([#453](https://github.com/Cohexa-ai/agent-coherence/issues/453)).
+
 ### Reading a version
 
 ```python
@@ -1362,8 +1431,13 @@ coordinator's strict set and its tracked set and not in its ignored set. A glob
 that is not fails the volume closed, naming it: under `on_error="strict"`
 construction raises, and under `"degrade"` the volume warns once and runs
 detached. When the sets cannot be read at all, because the coordinator is older
-and publishes only counts, or is the Node coordinator, the volume fails closed
-the same way and says that enforcement could not be confirmed.
+and publishes only counts, or is the Claude Code plugin's Node coordinator of
+plugin 0.6.0 or earlier, which answers the operator view `501`, the volume
+fails closed the same way and says that enforcement could not be confirmed.
+Later plugin releases serve the view, and a volume attaches to their Node
+coordinator by the same check, but only to one already running whose policy
+files list its globs (see
+[A volume on the Node coordinator](#a-volume-on-the-node-coordinator)).
 `vol.managed_glob_enforcement()` returns the same three-way answer. The
 comparison is literal and taken once, at attach, and the coordinator keeps the
 answer true while it runs. A strict path stays enforced for the coordinator's
@@ -1394,13 +1468,19 @@ vol = CoherentVolume(workspace_root, managed=("plans/**", "memory/**"))
 data = vol.read("plans/plan.md")            # bytes — registers a SHARED view
 vol.write("plans/plan.md", revise(data))    # stale view? denied fail-closed
 data = vol.reacquire("plans/plan.md")       # recover: clear the stale view + fresh read
+vol.release("plans/plan.md")                # done with one file: give its grant back
+vol.close()                                 # done with the volume: give every grant back
+
+with CoherentVolume(workspace_root, managed=("plans/**",)) as vol:
+    vol.write("plans/plan.md", revise(vol.read("plans/plan.md")))
+# leaving the block closed the volume
 ```
 
 | Parameter | Default | Meaning |
 |---|---|---|
 | `workspace_root` | — | Directory the volume manages; the coordinator's state lives in `<root>/.coherence/` |
 | `managed` | `()` | Glob patterns for the files under coordination; unmanaged paths bypass the volume |
-| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A read the coordinator answers with its failure envelope raises `CoordinatorFailed`, and so does the release of a write grant an earlier `write()` left held, every request that commits nothing answered with an HTTP 5xx, a commit refused by the volume's own unreleased write grant, and a refuse-mode grant request the coordinator could not decide in time; see [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
+| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A `.coherence` that a start refuses raises `CoherenceDirRefused` instead, which no retry clears; see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory). A read the coordinator answers with its failure envelope raises `CoordinatorFailed`, and so does the release of a write grant an earlier `write()` left held, every request that commits nothing answered with an HTTP 5xx, a commit refused by the volume's own unreleased write grant, and a refuse-mode grant request the coordinator could not decide in time; see [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
 | `on_held` | `"displace"` | `"refuse"` — on a managed path, raise `OtherHolder` instead of taking a file another agent holds; see [Refusing a file another agent holds](#refusing-a-file-another-agent-holds) |
@@ -1425,8 +1505,26 @@ claim there, which can be an earlier one). Both change
 only when an attempt starts (`reacquire()`, `write_cas_at`, `atomic_publish`, a
 `write_cas` that retries or first releases its own `write()` grant, and a forked
 child) and are stable in between, so read them after the operation whose
-attempt you are reporting. `vol.root` is the workspace root as the volume
-resolved it at construction (absolute, symlinks followed); it never changes.
+attempt you are reporting. `release()` and `close()` start no attempt. An
+attempt's row leaves the default view of `/status` once the volume ends that
+attempt, so a join against that view finds only attempts the volume has not
+ended. The operator view also lists an ended attempt that lost a grant to the
+sweep, for 24 hours after its newest reclaim; see
+[Attempts a volume ends](#attempts-a-volume-ends).
+`vol.root` is the workspace root as the volume resolved it at construction
+(absolute, symlinks followed); it never changes.
+
+`write()` returns a `WriteResult` (from `ccs.adapters.coherent_volume`). Its
+`disk_differs` is `True` when the coordinator reported, as it admitted the
+write's grant request, that the file held bytes it had not recorded, and the
+write replaced them. That is either this volume's own earlier write whose
+commit did not reach the coordinator, which this write now records, or an edit
+made outside the coordinator, which this write overwrote: a path the volume
+never read gives its foreign-edit check nothing to compare against. `False`
+says only that the coordinator did not report it, which it does not on a path
+it does not track, within a few seconds of the volume's own last commit of the
+file, while a peer's write is in flight, or when no coordinator answered. It
+never means an earlier write is now recorded.
 
 ### Concurrent writers: `write_cas`
 
@@ -1455,6 +1553,10 @@ a volume that only reads and commits optimistically never pays for it. Each of
 these starts a fresh attempt, as `reacquire()` and every `write_cas` retry do,
 and a fresh attempt clears every refusal the volume had, not only the one on the
 file it commits. Re-read any other file before a plain `write()` of it.
+
+Ending older attempts does cost requests, even in a volume that only reads and
+commits optimistically: a fresh attempt sends one request for each older
+attempt it ends (see [Attempts a volume ends](#attempts-a-volume-ends)).
 
 If the coordinator does not confirm that release, the volume keeps the grant
 on its record and sends the release again at its next fresh attempt. A release
@@ -1508,11 +1610,13 @@ fresh attempt whose read records no claim. In process,
 refusal's pair. Recover by `last_conflict_reason` (or `reason`), never by the
 pair.
 
-A `CoherentVolume` that wrote a file keeps holding it until its own next
-`write_cas` of that file or any `write_cas` retry, `write_cas_at`,
-`atomic_publish` or `reacquire()` releases it. Closing the volume or exiting the process does not release it, and
-neither does a `session-stop` that names only `vol.session_id`, because each
-attempt holds its grants under its own `agent_id`. The coordinator
+A `CoherentVolume` that wrote a file keeps holding it until it calls
+`release()` on the file or `close()`, or its own next `write_cas` of that file
+or any `write_cas` retry, `write_cas_at`, `atomic_publish` or `reacquire()`
+releases it; see [Letting go: `release()` and `close()`](#letting-go-release-and-close).
+Exiting the process without `close()` does not release it, and neither does a
+`session-stop` that names only `vol.session_id`, because each attempt holds its
+grants under its own `agent_id`. The coordinator
 takes the file back once the holder has recorded no heartbeat for
 `grant_heartbeat_timeout_sec` (600 s by default; only its reads, writes and
 commits of tracked files record one), or has held it for
@@ -1524,7 +1628,8 @@ though nothing else touched it. Recover with `reacquire()`, and write from the
 bytes it returns. The operator view of `/status` then
 lists the file under that holder's `reclaimed` map (see [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status)).
 Both are `LifecycleConfig` fields, passed as `config` to the volume that starts
-the coordinator. A Claude Code session releases what it holds when its turn ends.
+the coordinator. A Claude Code session releases its write grants when its turn
+ends, and keeps a read of each file.
 So after `other_holder`, retry once the holder has released, not in a tight loop,
 or use a plain `write()`, which takes the file over (the previous holder's next
 write is then refused until it re-reads). A volume with `on_held="refuse"` gets
@@ -1547,6 +1652,177 @@ which says whether the sweep reclaimed the grant or a peer took it. Its
 `captured_generation` and `owner_generation` are that refusal's pair: after a
 reclaim, for example, `0` and `1`. Both are `None` when the refusal carried
 none. The recovery is the same whatever they say.
+
+### Letting go: `release()` and `close()`
+
+A successful `write()` keeps the file's write grant after it returns, so a peer
+that waits for a held file waits for this volume. Give grants back when you are
+done with them:
+
+| Call | Gives back | Then |
+|---|---|---|
+| `vol.release(path)` | the write grant on `path`, under every attempt of this volume that took one | the volume keeps a read of the version it held, so it reads and writes the file again with no `reacquire()` until a peer writes it; its other grants stand |
+| `vol.close()` | every write grant the volume holds | every operation but `close()` raises `CoherenceError`; build a new volume to go on. Properties stay readable |
+| leaving `with CoherentVolume(...) as vol:` | as `close()` | when the body raised, a close that fails is logged and the body's error propagates |
+| `vol.reacquire(path)` | every write grant of the current attempt | starts a new attempt and reads `path`; see [Refusing a file another agent holds](#refusing-a-file-another-agent-holds) for what that costs |
+
+A peer with `on_held="refuse"` is admitted to a released file at once, instead
+of after the coordinator's sweep. `release()` and `close()` start no attempt, so
+`vol.agent_id` and `vol.incarnation` do not change. `close()` also ends every
+attempt of the volume, so the coordinator forgets them; that costs a request
+even for a volume that only read (see
+[Attempts a volume ends](#attempts-a-volume-ends)).
+
+The volume decides what to release from its own record of the grants its
+`write()` calls took, because the coordinator answers a release the same way
+whether it released a grant or held nothing. So `release()` sends nothing for a
+path this volume never wrote. Another spelling of a path it wrote is that path
+when the attached coordinator keys the two as one file: on a disk that folds
+case, `release("data/X.TXT")` gives back the grant a write of `data/x.txt`
+took. On a disk that keeps them apart it is another path, and sends nothing
+(see [One file, many spellings](#one-file-many-spellings)). `./data/x.txt` and a
+symbolic link to the file resolve to the same path and are released.
+
+**When the release is not confirmed.** A release the coordinator does not
+confirm keeps the grant on the volume's record. Under `on_error="strict"` it
+raises `CoordinatorUnreachable` when there was no usable answer,
+`CoordinatorFailed` for an HTTP `5xx` or the coordinator's failure envelope, and
+`CoherenceError` for a watchdog-degraded answer or a grant the coordinator
+reports still held; the message names the path and says to call `release()` or
+`close()` again, which sends the release again. Degrade mode counts a
+degradation instead, and warns on the volume's first one, as for any request. A
+closed volume stays closed whatever the answer. `close()` goes on to the
+volume's other attempts after a grant reported still held, and stops at a
+request with no usable answer, so a coordinator that has stopped answering costs
+one client timeout (6 s by default). A strict `close()` logs the paths it
+could not release and returns without raising when the volume's own local
+coordinator is gone: the connect is refused because nothing listens there, or
+the client sends nothing because the coordinator it attached to has exited or
+been replaced (see
+[A client sends nothing to a coordinator that exited](#a-client-sends-nothing-to-a-coordinator-that-exited)),
+for example after that coordinator shut down after `idle_shutdown_sec` with no
+requests. Nothing the caller does can release those grants, and a
+coordinator's sweep takes them back; a coordinator started since, even on the
+same port, keeps them until its sweep, so a refuse-mode peer waits for it.
+`close()` still raises as above when the connect times out, the name does not
+resolve, the volume uses `remote_endpoint`, or the coordinator answered earlier
+in the same `close()` that a grant was still held.
+In degrade mode a refused connect counts a degradation, as any unanswered
+request does.
+
+**What else to know.**
+
+- Nothing closes a volume when its process exits, and dropping the last
+  reference to a volume does not close it either: its grants wait for the sweep
+  (600 s by default). There is no exit hook, because a close at interpreter
+  exit fails in the process that hosts the coordinator. A `with` block inside a
+  generator that is never run to its end closes only when the generator is
+  collected, which can be at interpreter exit.
+- `close()` from inside another operation of the same volume, such as a
+  `write_cas` closure, raises and closes nothing. `release()` works there.
+- A forked child of a closed volume is closed.
+- A release records a heartbeat for the attempt that held the grant, which also
+  resets the sweep's clock on that attempt's other grants.
+- The `stale-write-guard-fs` MCP server has no tool for `release()` or `close()`
+  yet (#504). It closes its volume when the host ends it normally; a server
+  killed by a signal releases nothing. Until that tool exists, an agent gives
+  grants back with `swg_reacquire`, which releases every grant of the current
+  attempt.
+- After `release(path)`, a `write_cas` of the same path is refused once and
+  retries from a new attempt, which releases the volume's other grants too.
+- Against this package's coordinator through 0.15.0, or the Claude Code
+  plugin's Node coordinator through 0.6.0, a release leaves the volume's copy
+  `INVALID`, so its next `write()` of the file raises `StaleView`: call
+  `reacquire()` before writing it again.
+- On the Node coordinator a session-stop answers `ok: true` even when a release
+  in it failed, so `close()` can count a grant as released that still stands,
+  and a release that fails on its failed-edit route answers with no account of
+  the grant, so `release()` raises `CoherenceError`.
+
+### Attempts a volume ends
+
+Each attempt a volume starts is its own agent to the coordinator, and each one
+that sends a request leaves records there: its state on every file it read or
+wrote, its heartbeat, its queued notices, and a row in `/status`
+`sessions[]`. The volume ends each attempt once it no longer uses it, and the
+coordinator then forgets that attempt: those records leave the store and
+`/status`, and the volume sends nothing under it again. Before, they stayed
+for good. Two volumes forcing 50 `write_cas` conflicts on one file left 101
+agents in the store and in `/status`; now they leave those records for 4
+while both volumes are open and for none after both close. The
+[conflict-outcome counters](#conflict-outcome-counters--how-often-did-it-actually-fire)
+are not forgotten: this package's coordinator keeps a count in its `state.db`
+for each attempt that was refused a commit (#539).
+
+When the volume ends an attempt:
+
+- **At a fresh attempt** (`reacquire()`, `write_cas_at`, `atomic_publish`, and
+  a `write_cas` that retries or first releases the volume's own `write()`
+  grant). It ends every older attempt that is neither the current one nor one
+  holding a read that [`transfer()`](#from-a-coherentvolume) would present. Of
+  those, one that holds a write grant carries the end on the stop that
+  releases the grant; each other one gets an end request of its own, with a
+  short timeout, after the releases and only when every release was
+  confirmed. So a fresh attempt now costs one request for each attempt it
+  ends, where it cost none for an attempt that only read or committed through
+  `write_cas`.
+- **At `close()`.** Every attempt, those holding write grants first. A volume
+  that only read still sends one end request for each of its attempts.
+  Leaving a `with` block or `coherent_workspace()`, `uninstall()`, and a
+  normal end of the `stale-write-guard-fs` server close the volume, so they
+  end its attempts too.
+
+An open volume can still keep one attempt for each file it holds a read on:
+`write_cas_at`, and the MCP server's `swg_write_cas`, commit from a fresh
+attempt each time, and the attempt that read a file is the one `transfer()`
+presents for it. `close()` ends them all.
+
+What the coordinator does with an ended attempt:
+
+- It forgets the attempt's state on each file, its heartbeat and its queued
+  notices, and drops its row from `/status`. No other agent's records change.
+- It forgets nothing while the attempt still holds a write grant, for example
+  after a release it refused: every record stays, and the stop answers as it
+  would without the end.
+- A file state that records a sweep reclaim stays, as `INVALID`, with that
+  record, so the operator view still reports the reclaim (see
+  [Reading a sweep reclaim from `/status`](#reading-a-sweep-reclaim-from-status)).
+- The attempt's id no longer names a handoff successor (see
+  [Naming the successor](#naming-the-successor)).
+
+An end request of its own releases nothing, so it is best effort: one the
+coordinator does not confirm is logged, never raised or counted as a
+degradation, and sent again at the next fresh attempt or `close()`. A
+`close()` that leaves one unconfirmed keeps the volume's endpoint, so calling
+`close()` again sends it. An end carried on a release is confirmed or not with
+that release, which follows `on_error` as before. A `close()` whose end
+request finds nothing listening at the volume's own local coordinator logs the
+attempts it could not end and gives them up. When a write grant's release
+finds nothing listening first, `close()` sends no end and handles the grants
+as [Letting go: `release()` and `close()`](#letting-go-release-and-close)
+describes. Either way the records stay. A forked child ends none of its
+parent's attempts.
+
+Limits:
+
+- Records left by attempts that ended before you upgraded stay. Nothing can
+  prove those attempts are over, so nothing removes them.
+- A volume that exits without `close()`, or an MCP server killed by a signal,
+  ends nothing, and its attempts' records stay.
+- Claude Code sessions and stopped subagents keep their records (#537). A
+  session sends its Stop between turns, and a stopped subagent can be resumed
+  under the same id, so neither stop ends anything.
+- A coordinator that predates the end ignores it and keeps the records: this
+  package's coordinator through 0.15.0, and the Claude Code plugin's Node
+  coordinator through 0.6.0. Plugin releases after 0.6.0 forget an ended
+  attempt's file states, heartbeat, notices and `/status` row the same way.
+- On the Node coordinator a stop answers `ok: true` even when a release in it
+  failed. The volume then counts that attempt as ended while the coordinator
+  keeps its records, because the grant the failed release left standing
+  refuses the forget.
+
+The request the volume sends is described under
+[Release answers, per grant](#release-answers-per-grant).
 
 ### Refusing a file another agent holds
 
@@ -1578,10 +1854,18 @@ attach the volume reads `pre_edit_if_unheld` from the operator view of `/status`
 and attaches only when it is JSON `true`. Otherwise it raises `CoherenceError`
 before it sends anything, because a coordinator that ignores the flag would take
 the file from its holder. That rules out this package's coordinator through
-0.15.0. A forked child checks again on its first read or write. A volume with
-`managed` globs cannot attach to the Claude Code plugin's Node coordinator in
-either mode, because it does not serve the operator view, so refuse mode does
-not reach it.
+0.15.0, and the Claude Code plugin's Node coordinator through 0.6.0, which does
+not serve the operator view. The volume also reads `fold_profile` and
+`fold_table_unicode` from the default view, so it keys each file as the
+coordinator does (see
+[One file, many spellings](#one-file-many-spellings)). When it cannot read them
+it raises `CoordinatorUnreachable` for no answer and `CoherenceError` for an
+unusable one, and it raises `CoherenceError` for a fold table of another
+Unicode version, both before it sends anything: a refusal it promises under
+every spelling of a file needs the coordinator's own fold. A forked child
+checks again on its first read or write. On the Node coordinator of later
+plugin releases, refuse mode works with the differences listed in
+[A volume on the Node coordinator](#a-volume-on-the-node-coordinator).
 
 **What a refuse-mode `write()` raises.** In every row, no bytes reach the file.
 
@@ -1596,7 +1880,8 @@ not reach it.
 | you handed the file off | `GiverFenced` | stop: no retry clears it |
 | `collision: true`, which only a coordinator that ignores the flag sends | `CoherenceError` | build a new volume: the coordinator changed after this one attached, and the holder may have lost the file. If the message says the release was not confirmed, call `reacquire()` first, or that grant refuses the new volume |
 | `degraded: true` beside `ok: true`, which only a coordinator that ignores the flag sends | `CoherenceError` | call `reacquire()`, because the abandoned request may still take the grant, then build a new volume |
-| none: the session holds no [caller principal](#caller-principal), so nothing is sent | `CoherenceError` | build a new volume |
+| none: the coordinator issues [caller principals](#caller-principal) and the session holds none, so nothing is sent | `CoherenceError` | build a new volume |
+| none: the path goes through a link whose name is under `managed` to a file outside it, so nothing is sent | `LinkOutOfManaged` | write the file by its own path from a volume that may displace its holder, or point the link inside `managed` |
 
 **Polling.**
 
@@ -1614,13 +1899,17 @@ not reach it.
   can also meet `CoordinatorUnreachable`: the first volume hosts the coordinator
   in its own process, so the holder exiting can end it, and a volume never finds
   the next coordinator. Build a new volume then. It is a new agent, so a grant
-  its predecessor left refuses it until the sweep reclaims that grant.
-- **If you give up, call `reacquire()` once.** After `unavailable` or no answer,
-  a grant you do not know about may stand, and it refuses peers until the sweep.
+  its predecessor left refuses it until the sweep reclaims that grant, unless
+  the predecessor called `close()` before it exited.
+- **If you give up, call `release(path)` once.** After `unavailable` or no
+  answer, a grant you do not know about may stand, and it refuses peers until
+  the sweep. `release(path)` sends its release; `close()` does for every file.
 
 **Letting go.** A successful `write()` keeps its grant across later commits, so
-a refuse-mode volume protects its work between writes, and peers wait.
-`reacquire()` is the release, and it has costs:
+a refuse-mode volume protects its work between writes, and peers wait. Call
+`release(path)` when you are done with a file and `close()` when you are done
+with the volume; see [Letting go: `release()` and `close()`](#letting-go-release-and-close).
+`reacquire()` releases too, and it has costs:
 
 - `reacquire()` releases every path this attempt holds, not only the one you
   name, and a peer can then be admitted to each. A plain retry keeps them.
@@ -1629,22 +1918,26 @@ a refuse-mode volume protects its work between writes, and peers wait.
   the default one made while a `write_cas` peer's bytes are on their way to disk
   is acknowledged and then overwritten.
 - It forces a read, raises on a deleted file after it has released, and adds one
-  row to the coordinator's store per call.
+  row to the coordinator's store per call, which stays until the volume ends
+  that attempt. It also sends one request for each older attempt it ends (see
+  [Attempts a volume ends](#attempts-a-volume-ends)).
 - It is best-effort in both directions: a return can follow a release the
   coordinator did not confirm, and a raise can follow one it did.
 
 `write_cas` of a file this volume holds, any `write_cas` retry, `write_cas_at`
-and `atomic_publish` drop every hold too. A volume has no `close()`, and exiting
-the process releases nothing.
+and `atomic_publish` drop every hold too. Exiting the process without `close()`
+releases nothing.
 
 **How long a holder refuses.** A holder that goes quiet refuses for about 600 s
 (`grant_heartbeat_timeout_sec`) plus the next sweep pass. A commit, or any other
 request on a tracked file, resets that clock, and a refused request counts: a
 volume polling for one file keeps its own holds on others alive. Let go of those
-before you poll, because two holders polling each other both wait for the
+with `release(path)` before you poll, because two holders polling each other both wait for the
 ceiling, `grant_max_hold_sec` (1800 s), which nothing resets. With the sweep off,
 a holder refuses until it releases. A reclaimed holder's next write raises
-`StaleView` or `CommitPreempted`, depending on where the reclaim falls.
+`StaleView` or `CommitPreempted`, depending on where the reclaim falls. The
+Node coordinator has no sweep and counts no heartbeat; see
+[A volume on the Node coordinator](#a-volume-on-the-node-coordinator).
 
 **What it does not cover.** The limits under
 [acquire-or-fail](#acquire-or-fail-on-pre-edit) apply, and:
@@ -1653,17 +1946,96 @@ a holder refuses until it releases. A reclaimed holder's next write raises
   default-tracked file such as `plan.md` loses it, and so does a holder of a file
   a peer's narrower `managed` does not cover. The flag stays off those paths
   because an untrack could send them around the check.
-  The check reads the resolved path, so a link under `managed` to a file outside
-  it is a write outside `managed`, whatever its name matches.
+- A write through
+  a link whose name is under `managed` to a file outside it
+  raises `LinkOutOfManaged` (from `ccs.core.exceptions`, `reason`
+  `link_out_of_managed`, with `path`, `link` and `target`) and sends nothing,
+  where it used to take that file from its holder. The check
+  reads the links as they stand when `write()` is called, so a link put in
+  place while the write runs is not seen; only a process running as your OS
+  user can do that, which the [trust model](security.md#who-the-coordinator-can-tell-apart)
+  already trusts. A link under `managed` to a file under `managed` writes as
+  before, refused while another agent holds the file.
 - `install()`, `coherent_workspace()` and the `stale-write-guard-fs` tools take
   no `on_held`, so they displace.
 - A forked child is another agent: it is refused while its parent holds the file,
-  naming an id it cannot map. Let go before you fork.
+  naming an id it cannot map. Call `release(path)`, or `close()`, before you
+  fork.
 - During a live [handoff](#targeted-grant-handoff) with nobody holding the file,
   a refuse-mode write is admitted and overtakes the handoff with no signal, and
   the successor is then refused by it. `OtherHolder` carries no handoff record.
   Call `read()` on the path, then `read_handoff()`. `None` after a never-read path
   or a strict-denied read says nothing about the record.
+
+### A volume on the Node coordinator
+
+The Claude Code plugin's Node coordinator, in plugin releases after 0.6.0,
+serves the operator view of `/status` that a volume with `managed` globs reads
+at attach, and sends `pre_edit_if_unheld: true` at every tier. Such a volume
+attaches to it by the same glob check it applies to this package's
+coordinator, under `on_error="strict"` or `"degrade"`, and with
+`on_held="refuse"` too; no option turns this on. A refuse-mode `write()` there
+raises `OtherHolder` on a file another agent holds. The `stale-write-guard-fs`
+MCP server, whose volume reads the same view, attaches the same way. A Node
+coordinator of plugin 0.6.0 or earlier answers the operator view `501`; the
+volume then fails closed, saying the coordinator predates the view and to
+upgrade the agent-coherence plugin.
+
+**What it needs.** A Node coordinator already running for the workspace, whose
+`.coherence/tracked.yaml` and `.coherence/strict_mode.yaml` list every glob the
+volume declares. A volume never starts the Node coordinator, and it adds no
+glob to a running coordinator's policy files. A volume built while no
+coordinator runs writes its globs to those files and starts this package's
+coordinator, which refuses the store the Node coordinator created (`foreign`,
+see [Checking a store before a coordinator starts](#checking-a-store-before-a-coordinator-starts)),
+so the volume reports the coordinator unavailable. Start the Node coordinator
+first: a Claude Code session with the plugin starts it when the session opens
+in the workspace. To add globs while it runs, add them to both files, then have
+it reload its policy, which a successful track or untrack request does, or
+restart it. When the Node coordinator does not enforce a volume's globs, the
+volume fails closed and its message gives that remedy. Do not stop the Node
+coordinator to fix it: the next volume would then start this package's
+coordinator on its store, which refuses it.
+
+**What differs there.**
+
+- **No caller principals.** The Node coordinator answers the principal claim
+  `404`, so `principal_claim_outcome` reads `unsupported` and the volume sends
+  its requests without one. An opted-in write
+  goes without one only when its claim was answered `404`; a volume that holds
+  no principal after any other claim outcome still raises `CoherenceError`
+  before it sends an opted-in write. With no principal, a caller that sends
+  the holder's own session id is the holder as far as the coordinator can tell
+  (see **On the Node coordinator** under
+  [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)).
+- **No sweep.** The Node coordinator records no heartbeats and reclaims
+  nothing on its own. A refuse-mode volume that goes quiet, or exits without
+  `close()`, keeps refusing other refuse-mode writers on its files until one
+  of their opted-in requests takes the grant back, once it has been held
+  1800 s (30 minutes). That reclaim takes a live holder too: the 30 minutes
+  count from the holder's first grant in its continuous hold, and a commit does
+  not restart them. A reclaimed holder's next write raises `StaleView` or
+  `CommitPreempted`, depending on where the reclaim falls; the coordinator
+  answers its commit `commit_not_allowed`, without the `reclaimed` key this
+  package's coordinator adds. Call `release(path)` and `close()` when you are
+  done, so peers do not wait out the 30 minutes.
+- **Claude Code sessions displace.** The hook clients never opt in, so a
+  Claude Code session's edit takes a file a refuse-mode volume holds, as on
+  this package's coordinator. On a workspace the Node coordinator serves,
+  those sessions are usually the other writers, so there refuse mode protects
+  a volume's files only from other refuse-mode volumes.
+- **Snapshot sessions and handoffs.**
+  The Node coordinator has no snapshot sessions or handoffs, so a multi-file
+  `atomic_publish` and the handoff methods (`transfer`, `accept`, `decline`,
+  `withdraw`) raise `CoherenceError` naming the route it answered `404`, under
+  either `on_error`: nothing ran, and a retry gets the same answer. The volume
+  stays attached and is not counted degraded. A single-file `atomic_publish`
+  takes the direct compare-and-swap path and lands there.
+- **`gate()` always holds.** The Node coordinator reports no ownership
+  generation, so `gate()` can never confirm the grant leg and holds every time
+  (see **Fail-closed comparands** under
+  [`gate()`](#gatevolume-path--decide-effect)). Use `write_cas_at` for an
+  effect that is itself a write.
 
 ### When the coordinator does not answer
 
@@ -1681,11 +2053,21 @@ commits nothing and `CommitUnconfirmed` on a commit (next paragraph). Its
 are covered in
 [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure).
 
+A workspace whose `.coherence` a start refuses, because it is a symbolic link
+or not a directory, or holds a link, FIFO, socket or device directly inside
+it, is not a coordinator that cannot be started: a strict volume raises
+`CoherenceDirRefused` instead, before it writes or probes anything, and no
+retry and no coordinator started later clears it. A volume in degrade mode
+warns once and stays detached. Fix `.coherence` first, then build a new
+`CoherentVolume`; see
+[`.coherence` must be a real directory](#coherence-must-be-a-real-directory).
+
 A commit is different, because its request may have reached the coordinator
 before the answer was lost. When the CAS of `write_cas` or `write_cas_at`, the
 commit of `atomic_publish`, or the post-edit of a plain `write()` was sent and
 got no usable answer, the volume raises `CommitUnconfirmed`: the commit may or
-may not have landed, so re-read before retrying. When the request never left,
+may not have landed, so re-read before retrying a compare-and-swap (a plain
+`write()` recovers differently; see below). When the request never left,
 because the connection was refused, it raises `CoordinatorUnreachable`.
 A commit the coordinator answers with an HTTP `5xx` raises `CommitUnconfirmed`
 too, and its message names the status. A `5xx` does not say whether the commit
@@ -1702,23 +2084,41 @@ A plain `write()` has already put its bytes on disk when its post-edit gets no
 usable answer or a `5xx`. Its error says so, and says whether the coordinator
 certainly did not record the write or may have. Before raising, the volume
 sends one short, best-effort request to release its write grant, so peers are
-not held off until the sweep takes the file back.
+not held off until the sweep takes the file back; the error says whether that
+release was confirmed, and `release(path)` sends one that was not.
+
+Re-reading does not recover such a write. While the coordinator has not
+recorded it, the bytes on disk are not the content it records, so
+`read_with_version()`, `read_with_version_generation()`, `swg_read`, the effect
+fence and `read()` under `on_stale_read="raise"` refuse the path as a
+`split_pair` every time (under the default `on_stale_read="allow"`, `read()`
+returns the bytes with no signal). Write the path again, with these bytes or a
+change built from them: that write records them, and if the first commit did
+land after all, it commits the same content at the next version. Within a few
+seconds of the volume's own last commit of the file, a versioned read can
+return such bytes with the old version, so a read that returns does not show
+that the commit landed.
 
 To recover, keep in mind that a volume keeps the endpoint it attached to, so
 it never finds a coordinator started after the old one went away:
 
 - If the coordinator stalled and comes back on the same port, the next call
-  goes through.
+  goes through. A coordinator started later in its place is a new one, even
+  on the same port: the volume sends it nothing (see
+  [A client sends nothing to a coordinator that exited](#a-client-sends-nothing-to-a-coordinator-that-exited)).
 - Otherwise build a new `CoherentVolume`. It attaches to the running
   coordinator, or starts one.
-- If the release was answered, the volume gave up its own grant as well, so
-  `reacquire()` and re-read before writing that file again.
+- If the release was answered, the volume gave up its write grant and kept a
+  read of the file at the version it held, so its next `write()` of that
+  file goes through without `reacquire()`, while no other agent has written
+  the file since.
 
 A coordinator goes away when it is killed or crashes, when the session or
 process hosting it exits, or after `idle_shutdown_sec` (900 s by default) with
 no requests. During a graceful stop it answers `503` for a moment before it
 stops listening. A commit in that moment raises `CommitUnconfirmed`, as on any
-`5xx`, so re-read before retrying; any other request raises
+`5xx`: re-read before retrying a compare-and-swap, and write the path again
+after a plain `write()`; any other request raises
 `CoordinatorFailed`, as on any `5xx` that answers a request that commits
 nothing.
 
@@ -1763,7 +2163,9 @@ may have recorded the commit before the error.
   commit, so a commit the coordinator recorded moves the version while the old
   bytes are still on disk. A plain `write()` has already put its bytes on disk;
   its error says so, and it first releases its grant, as it does when a commit
-  gets no answer.
+  gets no answer. Recover it as you would that write: re-reading does not clear
+  the refusal of a path whose bytes the coordinator did not record, and writing
+  the path again records them.
 - **A write's grant request** (the pre-edit of `write()`) answered this way
   still raises `StaleView` and lands nothing. The `unavailable` refusal is a
   different answer, and raises `CoordinatorFailed` from a refuse-mode `write()`;
@@ -1819,14 +2221,190 @@ the call, not whether the coordinator still runs: idle shutdown can stop a
 coordinator the call started, and the next call reports `bound` again. Only a
 caller told `bound` should stop the coordinator with `stop_coordinator`. It
 returns `None` where `ensure_coordinator` returns `-1`; `ensure_coordinator`
-still returns a bare port. A start that fails stops whatever it started and
-raises instead: `SchemaVersionError` on a store it refuses (its `reason` says
-why), `sqlite3.Error` on a file SQLite cannot open, `OSError` when the lock or
+still returns a bare port. Before it creates, writes, joins or probes
+anything, a start checks `.coherence`: when that is a symbolic link or not a
+directory, or holds a link, FIFO, socket or device directly inside it, both
+calls raise `CoherenceDirRefused` and start nothing (see
+[`.coherence` must be a real directory](#coherence-must-be-a-real-directory)),
+and `agent-coherence-coordinator` prints its text and exits `2`. A start that
+fails stops whatever it started and raises instead:
+`SchemaVersionError` on a store it refuses (its `reason` says why),
+`StoreHeldError` when another read-write handle (a script, or a coordinator in
+another process) still has `state.db` open after
+`LifecycleConfig.store_holder_wait_sec` (10 seconds by default, longer than a
+closing coordinator keeps its store open: its drain, then its wait for a
+handler still running, so a start right after a stop waits it out), `sqlite3.Error` on a file SQLite cannot open, `OSError` when the lock or
 the bind fails, `ValueError` on a `bind_host` it refuses, and `RuntimeError`
 when it cannot read the hook secret or start a thread. A `KeyboardInterrupt` or
-`SystemExit` during a start gets the same cleanup and then propagates. To ask
+`SystemExit` during a start gets the same cleanup and then propagates. On a
+held store a strict `CoherentVolume` raises the `StoreHeldError`, a degrade one
+warns once and stays detached, the `stale-write-guard-fs` server does not
+start, and `agent-coherence-coordinator` prints one line and exits `2`. To ask
 before a start migrates the store, call
 [`check_store`](#checking-a-store-before-a-coordinator-starts) first.
+
+### `.coherence` must be a real directory
+
+A coordinator keeps its state in `<root>/.coherence/`: the store
+(`state.db`), the workspace's secret (`hook.secret`), `server.pid`, the policy
+files and the rest. A repository can commit `.coherence`, or any file in it,
+as a symbolic link, and an archive can carry one too. A start that followed
+such a link would write its state where the link points, take the bytes of
+the file a linked `hook.secret` names as the workspace's secret, join whatever
+coordinator a linked `server.pid` names, or block on a link to a FIFO. So
+every start checks `.coherence` first, before it creates, writes, joins or
+probes anything:
+
+- `.coherence` must be absent, and a start then creates it, or a real
+  directory. A directory mounted at `.coherence`, such as another disk or a
+  container volume, is a real directory.
+- No entry directly inside it may be a symbolic link, whatever its name, even
+  a link that points nowhere.
+- No entry directly inside it may be a FIFO, socket or device. No coordinator
+  creates one, and opening one can block a start.
+
+Regular files, subdirectories and hard links pass. The check only looks: it
+opens no file, follows no link and runs no git command, so a refused start
+leaves `.coherence`, and everything a link in it names, as they were.
+
+| Surface | On a refused workspace |
+|---|---|
+| `ensure_coordinator_handle`, `ensure_coordinator` | raise `CoherenceDirRefused` |
+| strict `CoherentVolume`, `CoordinatedSubstrate` | raise `CoherenceDirRefused` before they write their policy files or look for a running coordinator |
+| `CoherentVolume(on_error="degrade")` | warns once with the same text, its control characters escaped, and `This volume stays detached: build a new one once .coherence is fixed.` |
+| the [`stale-write-guard-fs`](#stale-write-guard-fs-mcp-server) MCP server | prints the text on one line and exits `2` before it starts a coordinator or serves |
+| `agent-coherence-coordinator` | prints the text on one line and exits `2` before it probes a port or starts a worker, and so does `--prepare-for-migration` |
+| `agent-coherence-coordinator --check-store` | answers `coherence_dir_refused`, exit `17` (see [Checking a store](#checking-a-store-before-a-coordinator-starts)) |
+| `agent-coherence-workspace` | exits `2`; under `--json` the envelope's `reason` is `coherence_dir_refused` |
+| the Claude Code plugin's Node coordinator | refuses the same workspaces in plugin releases after 0.6.0 |
+
+The commands and hooks that talk to a coordinator already running
+(`agent-coherence-status`, `-track`, `-untrack`, the handoff commands and the
+Claude Code hook client) start nothing and do not run this check. They refuse
+a `.coherence` that is a link before they read `hook.secret` or connect, read
+`hook.secret` and `server.pid` without following a link, and never send the
+bytes of a file a linked `hook.secret` names as the secret, nor send it to the
+port a linked `server.pid` names: they answer as they do when no coordinator
+runs, and the commands print why.
+
+The text names the path and the way out. For a linked `hook.secret`, a start
+prints:
+
+```text
+agent-coherence-coordinator: refusing /work/repo/.coherence/hook.secret: it is a symlink, and .coherence must be a real directory with no link directly inside it. Replace the link with a copy of the file it names, or mount a directory at /work/repo/.coherence.
+```
+
+When several entries break the same rule, it names the first in sorted order
+and counts the rest. `CoherenceDirRefused` is a `CoherenceError` (import both
+from `ccs.core.exceptions`) whose `reason` is `coherence_dir_refused`. Its
+`kind` says which rule refused the workspace: `coherence_link`,
+`coherence_not_a_directory` or `coherence_special_entry`, collected in
+`COHERENCE_DIR_REFUSAL_KINDS`. Its `path` is the path it refused. It is not a
+`CoordinatorUnreachable`: no retry, and no coordinator started later, clears
+it. Branch on `reason` and `kind`, not on the text. A host that writes into
+`.coherence` itself before it starts a coordinator can run the same check
+first: `check_coherence_dir(root)` from `ccs.adapters.claude_code.state_dir`
+raises the same refusal and changes nothing.
+
+To fix a refused workspace:
+
+- To keep the state on another disk, mount a directory at `.coherence` instead
+  of linking it.
+- Otherwise replace each link with a copy of the file it names, or replace a
+  linked `.coherence` with a real directory and copy in the files you want to
+  keep. Move `state.db` together with its `-wal` and `-shm` files: moving
+  `state.db` alone can lose its latest changes without a word.
+- Move aside a `.coherence` that is not a directory; the next start creates a
+  real one.
+- Remove a FIFO, socket or device.
+- An editor's lock link counts too: Emacs leaves a dangling `.#name` link
+  beside a file it edits, and after a crash; close the editor or delete the
+  lock, then start again.
+
+Do this with no coordinator running for the workspace. One that an earlier
+release started through a link keeps running: stop it before you upgrade, or
+end it afterwards with `SIGTERM` (its process id is the first line of
+`.coherence/server.pid`). Then start again. A volume that was refused stays
+detached, so build a new one, and restart an MCP server.
+
+The check does not cover the following; see
+[A repository you clone](security.md#a-repository-you-clone) for the threat it
+answers.
+
+- A link above `.coherence`. The workspace root, or a directory above it, can
+  be a link (on macOS, `/tmp` is one); only `.coherence` and the entries
+  directly inside it are checked.
+- Anything inside a subdirectory of `.coherence`.
+- A link made after the check, while the coordinator runs. The coordinator
+  opens its policy files and `audit.log` without following a link, and clients
+  read `hook.secret` the same way.
+
+A Kubernetes secret or configMap volume mounted at `.coherence` is refused:
+such a volume is built from links (`..data` and one link per key). Mount a
+plain volume there instead.
+
+### A client sends nothing to a coordinator that exited
+
+A client finds the coordinator through the port in `.coherence/server.pid` and
+sends the workspace secret with every request. A coordinator that exits without
+a stop (killed, crashed, or the machine rebooted) leaves its pid file behind,
+and once its port is free any local process can bind it. So before each
+request this package's local clients (the hook client, `CoherentVolume`, the MCP
+server, a substrate session and the console scripts) check that `server.pid`
+still names the coordinator they resolved, and that this coordinator still
+holds the workspace lock, the `flock` every Python coordinator holds on
+`server.pid` ([#503](https://github.com/Cohexa-ai/agent-coherence/issues/503)):
+
+| What `server.pid` shows | What the client does |
+|---|---|
+| The same pid and port, and the lock is held | sends the request |
+| The same pid and port, and the lock is free | sends nothing and raises `CoordinatorDeparted`, a `CoordinatorUnavailable` with `never_sent` true (for a `backend=node` file, only once its pid no longer runs) |
+| Another pid or port, or no port (a stop has begun) | sends nothing, the same way: a coordinator started later on the same port is a new one |
+| No file, or a file it cannot read | sends the request: it cannot tell, so an attached client keeps working (for a `backend=node` file, only while its pid runs) |
+| A link, or anything but a pid file (a directory, a file over 4096 bytes) | sends nothing |
+
+The plugin's Node coordinator writes `backend=node` in its pid file and runs
+without the lock where it cannot take one (no flock helper, or a file system
+that refuses it); for that file the client checks that the pid still runs, also
+once the coordinator has removed the file at its stop. Where `fcntl` does not
+exist the lock cannot be probed, and the request goes.
+
+A strict `CoherentVolume` raises the refusal as `CoordinatorUnreachable`, or as
+`CommitUnconfirmed` from a handoff verb; a degrade volume warns and counts a
+degradation. A substrate session raises `CoordinatorUnreachable`, or
+`CommitUnconfirmed` once its substrate write has landed. The volume or session
+keeps the endpoint it attached to, so its later requests are refused for as
+long as `server.pid` shows that coordinator gone or replaced: build a new one to
+reach a coordinator started since. A strict volume's `close()` logs the write
+grants it could not give back and returns, as when nothing listens on the port;
+a coordinator started since keeps those grants until its sweep.
+
+The same check keeps a start from taking a process on a dead coordinator's
+port for a running coordinator. `connect_or_spawn`, a `CoherentVolume`, a
+substrate session and `agent-coherence-coordinator` start a coordinator
+instead (a volume and a session write their policy first), and a start that
+loses the workspace lock never joins a binder whose pid no longer runs
+([#428](https://github.com/Cohexa-ai/agent-coherence/issues/428)).
+
+The check is not proof of the secret, and it cannot see every case (the same
+list is in [A process on the coordinator's port](security.md#who-the-coordinator-can-tell-apart)):
+
+- A coordinator that dies between the check and the send can still lose that
+  one request to a new listener.
+- A start that has taken the workspace lock but not yet emptied a dead
+  coordinator's lines makes those lines read as running for that moment.
+- A coordinator restarted in the same process that gets the same port back
+  reads as the one the client resolved.
+- A Node coordinator's pid, once another process carries it, reads as that
+  coordinator. A Node coordinator running without the lock whose pid does not
+  exist where the client runs (another PID namespace) reads as exited, so
+  clients refuse it and a start runs its own.
+- A start that loses the workspace lock to a coordinator in another PID
+  namespace that shares the workspace does not join it through the pid file;
+  clients still reach it through its port while it holds the lock.
+
+A remote coordinator has no pid file on this host and no such check; reach it
+over verified TLS.
 
 ### Atomic multi-file publish: `atomic_publish` (v0.12.0+)
 
@@ -1852,7 +2430,13 @@ are captured at one point (no member read across a peer commit), which adds a
 small capture→commit window — a peer winning it holds the publish rather than
 tearing it. Recover the same way as a denied write: `reacquire()`, re-read the
 fresh versions, and re-publish from them. A single-member publish accepts
-arbitrary bytes; a multi-member publish requires UTF-8 text content.
+arbitrary bytes; a multi-member publish requires UTF-8 text content. The Claude
+Code plugin's Node coordinator has no snapshot sessions: it answers the
+multi-member publish's `/session/begin` with `404`, and the publish raises
+`CoherenceError` naming that route under either `on_error`, with nothing
+committed and no file written. A retry gets the same answer; a single-member
+publish lands there (see
+[A volume on the Node coordinator](#a-volume-on-the-node-coordinator)).
 
 The all-or-nothing guarantee is at the **coordinator commit**. Disk materialization
 runs after it and is best-effort: every file is staged to a temp then renamed, so a
@@ -1893,8 +2477,11 @@ script. The volume checks a content hash at both boundaries:
   bytes the rest of your state wasn't computed from. In strict mode the
   coordinator enforces the same check server-side.
 
-A volume never denies its own just-written bytes: the benign window between a
-commit and its disk write is recognized and suppressed.
+A volume does not deny its own just-written bytes once their commit is
+recorded: the benign window between a commit and its disk write is recognized
+and suppressed. Bytes whose commit did not reach the coordinator are refused
+like any bytes it has not recorded, until a `write()` records them (see
+[When the coordinator does not answer](#when-the-coordinator-does-not-answer)).
 
 Whatever `on_stale_read` says, the versioned reads (`read_with_version()`,
 `read_with_version_generation()` and the MCP `swg_read`) refuse a managed file
@@ -1923,8 +2510,23 @@ For code you'd rather not rewrite, `coherent_workspace()` / `install()` patch
 `open()` and `pathlib` so managed-path opens route through the volume unchanged.
 It covers text and binary read/write via `open()`/`pathlib` — not raw `os.open`,
 subprocess redirection, `mmap`, or append/update modes, which delegate to the
-original `open()` unchanged. The explicit `read`/`write`/`reacquire`/`write_cas`
-API is the supported contract; the shim is a convenience.
+original `open()` unchanged. The explicit
+`read`/`write`/`reacquire`/`write_cas`/`release`/`close` API is the supported
+contract; the shim is a convenience.
+
+Leaving the outermost `coherent_workspace()` block closes its volume, and a
+nested block closes nothing; `uninstall()` restores `open()` and then closes the
+volume `install()` returned. So the files the shim wrote are given back as the
+block ends, and the volume raises if used afterwards; see
+[Letting go: `release()` and `close()`](#letting-go-release-and-close). When the
+block's body raised, a close that fails is logged and the body's error
+propagates. With `uninstall()` in a `finally:`, a failed close replaces the
+body's error instead, so prefer the block. A file opened for writing through the shim
+commits when it is closed, so close it inside the block: one still open when the
+volume closes is named in a warning, and closing it afterwards raises and writes
+nothing. Closing the volume `install()` returned, with its `close()` or a `with`
+block, ends it but leaves the shim installed: managed opens, `install()` and
+`coherent_workspace()` then raise until `uninstall()` removes the shim.
 
 Run the demo: `python -m examples.coherent_volume.main` (offline, deterministic,
 no keys) — it reproduces the silent lost update, then prevents it.
@@ -1943,6 +2545,193 @@ coordinator (`src/ccs/adapters/claude_code/resolver.py`). With one common root
 above the worktrees, the Python coordinator's
 [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)
 does not watch the files inside them yet ([#241](https://github.com/Cohexa-ai/agent-coherence/issues/241)).
+
+### One file, many spellings
+
+A macOS disk opens `PLAN.MD` and `plan.md`, or a composed and a decomposed `é`,
+as one file. This package's coordinator newer than 0.15.0 treats every spelling
+the workspace disk opens as one file, plus its `./` and `//` variants, as that
+one file ([#506](https://github.com/Cohexa-ai/agent-coherence/issues/506)): the
+same holder, the same refusal, the same strict-mode rule and the same version,
+for Claude Code hook sessions, `CoherentVolume`, snapshot sessions, handoffs,
+workspace checkpoints and the effect fence. A `tracked.yaml`, `ignored.yaml` or
+`strict_mode.yaml` pattern, and so a volume's `managed` glob, matches every
+spelling of the files it names. On a disk that folds nothing, such as a typical
+Linux disk, names that differ only by case or accent form stay separate files:
+only `./` segments and repeated `/` are tidied, and a pattern that matched a
+name before still matches it. There is no flag. The Claude Code plugin's Node
+coordinator does the same in plugin releases after 0.6.0.
+
+**How the coordinator learns the disk.** Once per start, while it holds the
+store's single-writer lock and before it answers any request, the coordinator
+creates a few probe files under `.coherence`, looks each one up under another
+spelling, and removes them. It creates nothing anywhere else, and no hook
+creates a file to find out. The answers give the profile it keys file names by,
+which `/status` reports as `fold_profile` in every view and in a degraded
+answer:
+
+| `fold_profile` | The disk | One file is |
+|---|---|---|
+| `caseless` | case-insensitive APFS, the macOS default | every spelling that differs by case or accent form |
+| `nfd` | case-sensitive APFS | every spelling that differs by accent form |
+| `none` | a disk that folds nothing, such as a typical Linux disk | one spelling, tidied |
+| `cannot_tell` | a disk the probe could not classify | one spelling, tidied, as for `none` |
+
+Beside it, `fold_table_unicode` is the Unicode version of the fold table that
+both coordinators and this package's clients fold by, `17.0.0`. The start logs
+one line naming the profile, or why it could not tell.
+A disk the start probe cannot classify folds nothing: HFS+, exFAT and FAT
+answer with no profile the probe knows, and so does a `.coherence` on another
+device than the workspace, or a probe step that fails. A coordinator that runs
+without its single-writer lock folds nothing and merges nothing, and reports
+`cannot_tell`: that is a start where `flock` does not exist or does not work
+(see **One writer per store** under [Durability](#durability)).
+
+**What a request gets.** A new record takes the disk's own spelling when the
+file exists: where `data/x.txt` exists on a `caseless` disk, a first edit of
+`DATA/X.TXT` is listed in `/status` as `data/x.txt`. Every answer repeats the
+path exactly as the request sent it. On such a disk a Grep of `DATA/` also
+reaches the tracked files under `data/`. Two spellings of one file in one request are handled as
+one name sent twice: `/session/begin` pins the file once, a Bash command reads
+it as one file, and `/session/commit_all`, `/handoff/transfer`, a checkpoint's
+file members and a restore registration refuse the pair with their existing
+duplicate error. On a folding disk the untrack command also refuses an entry
+that covers a strict path under another spelling.
+
+**Names that are not files.** A hook request that sends `"name_kind": "key"`
+names an object or row key: it is kept and matched exactly, never tidied,
+folded or merged, and a record it creates stays a key across restarts.
+`CoherentRow` and `CoherentObject` send it with every key, so `ws-42` and
+`WS-42` stay two artifacts on any disk. A `CoherentVolume` built with
+`remote_endpoint` sends it with each path it sends to a hook route, because the
+remote coordinator's disk is not the volume's. A checkpoint member is a file
+only when its `arbitration_tier` is `no-arbiter` and its `restore_tier` is not
+`forward_only`; every other member, such as an S3 object, stays exact. Any
+other `name_kind` value gets the route's HTTP `400` path error. The Claude Code
+hooks never send the field.
+
+**Clients.**
+
+- `CoherentVolume` reads `fold_profile` and `fold_table_unicode` from the
+  default view of `/status` at every local attach, and keys everything it
+  records per file by that profile, as the coordinator does: grants, reads,
+  content hashes, read handoffs and held paths. On a `caseless` disk,
+  `release("data/x.txt")` gives back the grant a write of `DATA/x.txt` took,
+  `DATA/x.txt` is under `managed=("data/**",)`, and `transfer()` and
+  `atomic_publish()` refuse `a.txt` beside `A.txt` as one path named twice. A
+  coordinator without the fields, `cannot_tell`, a value the volume does not
+  know and a fold table of another Unicode version all key names exactly. A
+  refuse-mode volume does not attach in the last case, or when it cannot read
+  `/status` (see
+  [Refusing a file another agent holds](#refusing-a-file-another-agent-holds)).
+- The MCP server compares names by the profile `/status` advertises: after a
+  denied read, `swg_read` finds the path's handoff record under any spelling of
+  the file, and `swg_write_cas` counts consecutive conflicts on every spelling
+  of one file toward one limit.
+- The Claude Code hook client, and the console scripts that take a workspace
+  path (`agent-coherence-track`, `agent-coherence-untrack`, the handoff commands
+  and `agent-coherence-workspace checkpoint`), follow links and keep the case a
+  path was typed in, as before. A tool path that spells the workspace root in
+  another case than the disk (`REPO` for `Repo`) now reaches the coordinator,
+  where the hook skipped it, and the console scripts accept a root typed in
+  another case. A `/var` path for a root under `/private/var` on macOS already
+  reached it, since the client resolves both the root and the path. A Read, Edit or Write
+  through a link that does not resolve is no longer sent, and the console
+  scripts refuse such a path with `link does not resolve`.
+- [Foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back),
+  on a disk that folds names, reads git's index first and checks each file
+  under git's own spelling of it, so an outside edit of a file whose record is
+  spelled otherwise than in git's index (`PLAN.MD` for `plan.md`, or another
+  Unicode form) is counted.
+
+**Links.** A Read, Edit or Write through a link reaches the coordinator under
+the path of the file the link names: from this package's hook client as
+before, and from the plugin's Node hook client in plugin releases after 0.6.0.
+A file reached through a linked directory therefore matches patterns written
+against its target's path, not the link's. When it loads or reloads the
+policy, the coordinator logs each tracked or strict pattern whose directories
+pass through a link inside the workspace, or that names a link to a file, and
+says when the link's target is outside the workspace, where
+a Read, Edit or Write through such a link is not coordinated and no pattern
+can cover it. A Bash command's file arguments are matched as typed, and so is
+a Grep's search directory given relative to the workspace: they are folded by
+spelling but not resolved, so a Bash read through a link reaches the link's own
+path, not the file it names.
+
+**Records an older build split.** A coordinator through 0.15.0 could keep one
+file as several records, one per spelling, each with its own write grant. At
+the first start of a newer coordinator they are merged into one record when
+their names still reach the same file on disk, `./` and `//` splits included:
+
+- At most one write grant survives: the single write holder of the record
+  whose content matches the file on disk keeps it, and when no single holder
+  fits, nobody does.
+- Every other agent on the file stays on it as stale. A holder that lost its
+  write grant gets a notice, and its next commit is refused until it reads the
+  file again. The operator view of `/status` lists it under `reclaimed` with
+  the trigger `fold_merge`, and the [state log](#trigger-vocabulary) records
+  every agent the merge moves under that trigger.
+- A snapshot session that pinned one of the records is ended, every handoff
+  record on them ends withdrawn, and their conflict and foreign-write counts
+  are added together.
+- Records whose file is missing at the start are not merged, and neither are
+  records other than the one kept that hold retained versions. Such records act
+  as one file for grants and refusals.
+
+The coordinator logs each merge, each group it left apart, and each name that
+still has several records.
+
+**What it does not cover.**
+
+- **A mount that folds names otherwise.** The coordinator
+  classifies only the disk that holds the workspace and its `.coherence`.
+  Under a folding mount inside a workspace whose disk folds nothing, spellings
+  of one file stay separate records, so they do not meet each other's grants.
+  Under a mount that folds nothing inside a folding workspace, two files that
+  differ only by case or accent form share one record: spurious conflicts,
+  never a lost write.
+- **Linux disks that fold names.** Linux ext4's per-directory case folding
+  (the casefold attribute, `chattr +F`) is not detected, so spellings of one
+  file in such a directory can get separate records. The probe knows only the
+  answers measured on case-insensitive APFS, case-sensitive APFS and a disk
+  that folds nothing; a whole Linux disk that folds names is expected to match
+  none of them and fold nothing, but
+  no CI job runs on a Linux disk that folds names.
+- **A disk the probe cannot classify, or a coordinator without its lock.**
+  Each spelling keeps a record of its own there, as on a coordinator through
+  0.15.0, except for `./` and `//` variants. Read `fold_profile` from `/status`
+  to see which applies.
+- **Characters newer than Unicode 17.0.0** are left as sent, even where the
+  disk folds them.
+- **A `?` or a `[...]` class stands for one character.** Where one character
+  folds to several, a pattern can miss a spelling: a strict `stra?e.md` does
+  not match a request spelled `STRASSE.MD` unless the file on disk is spelled
+  `straße.md`. Add the spelled-out form (`strasse.md`) as its own entry.
+- **A `[...]` class that names more than 64 characters, or with a range
+  written high to low** (`[z-a]`), meets the folded name as written, so it can
+  miss a spelling in another case. A narrower class, a negated one included,
+  is folded with the name: on a disk that folds case, a strict
+  `docs/[A-Z]*.md` holds `docs/plan.md` and `docs/[!a-z]*.md` does too.
+- **A hard link** is a second name, with a record of its own.
+- **A key record an older build created** carries no kind, so a key spelled
+  like an existing workspace file is treated as that file.
+- **A checkpoint an older build recorded** with two spellings of one file
+  refuses restore with the duplicate error.
+- **A `remote_endpoint` volume's handoffs and `atomic_publish` members** are
+  sent as files, not keys, so the remote coordinator folds them by its own
+  disk: spurious conflicts at worst.
+
+**Versions.** One identity per file needs this package's coordinator newer than
+0.15.0, or the Claude Code plugin's Node coordinator in plugin releases after
+0.6.0. Use `CoherentVolume`, the MCP server, `CoherentRow` and `CoherentObject`
+from a release newer than 0.15.0 with such a coordinator. Older ones compare
+paths exactly as they spelled them, so they can miss a file the coordinator
+records under the disk's spelling; an older `CoherentRow` or `CoherentObject`
+sends its keys as file names, so two keys that differ only by `./` or a
+repeated `/`, or by case or Unicode form on a disk that folds names, share one
+record there: spurious conflicts, never a lost write. Against a
+coordinator through 0.15.0, which sends no `fold_profile`, a newer client keys
+names exactly.
 
 ### When you don't need this
 
@@ -2054,6 +2843,7 @@ A declarative manifest binds each artifact to a substrate + connection + tier, a
 - **`native-CAS`, with the timeout asterisk.** The substrate CAS prevents the concurrent single-host lost update on the token axis; an unconfirmed substrate write is reconverged inside `commit()` by a token-identity re-read, but a coordinator timeout *after* a durable substrate write is not, and registry↔substrate agreement is a *detectable signal*, not a held guarantee (see the coordinator-behind bullet below).
 - **Single-host, subtractive.** When the substrate is itself distributed (S3, managed Postgres), the no-lost-update guarantee is the *substrate's* and is identical with or without this layer; the adapter's contribution (invalidation, uniformity) is single-host. Never run the S3 CAS loop through a Multi-Region Access Point / cross-Region replica, and never place agents on two hosts against one distributed substrate.
 - **Coordinator-behind-substrate wedges the artifact.** If a writer's substrate write lands but the coordinator never records its version bump (the process dies between the two legs, or the bump is lost or refused), or a foreign write moves the substrate, every agent's next binding-mediated read of that artifact raises `ViewWedged`, and so does every read or commit after `reacquire()`, across coordinator restarts. It fails closed — no commit through the binding lands on stale bytes — but no binding call clears it yet ([#240](https://github.com/Cohexa-ai/agent-coherence/issues/240)).
+- **Keys are matched exactly, from releases newer than 0.15.0.** A session sends each key with `"name_kind": "key"`, so a coordinator newer than 0.15.0 (or the Claude Code plugin's Node coordinator after plugin 0.6.0) keeps it exactly as sent: `ws-42` and `WS-42` stay two artifacts even where the workspace disk folds case. A session from 0.15.0 or earlier sends no such field, so such a coordinator keys its keys as file names: two keys that differ only by `./` or a repeated `/`, or, on a disk that folds names, by case or Unicode form, share one record there, which gives spurious conflicts, never a lost write. A record an older coordinator created carries no kind, so a key spelled like an existing workspace file is treated as that file (see [One file, many spellings](#one-file-many-spellings)).
 - **More backends are demand-gated, not shipped.** A Letta vendor-memory sidecar is a post-v1 candidate: Letta exposes no atomic conditional-write token, so a binding could only *detect* a sequential stale write via a client-held content shadow, not prevent a concurrent one — it would be a `detect-only` tier and lands only when a concrete need pulls it in.
 
 ### Try it, then harden
@@ -2151,7 +2941,7 @@ The durable truth is the **pair** `(restore_tier, pin_state)`. `restorable` is b
 
 **The file-member retention caveat, precisely.** File members ride the coordinator's [declared version retention](#version-retention-and-read-at-version), which is a bounded window (a count/age policy), not a per-version hold. A checkpoint pin on a file member **verifies** — it checks the captured version is currently retained and still matches its fingerprint — it **cannot extend** the window or exempt the version from the policy. If the version has aged out by restore time, the restore reports that member `target_lost` rather than restoring different content; expiry always surfaces, never silently. S3 members are the stronger case: their pin is a legal hold in *your* bucket on the captured version — the substrate's own retention, at your bucket's configuration and cost.
 
-**Dropping a pin.** `WorkspaceVersioner.release_checkpoint(checkpoint_id)` releases the pins a checkpoint holds — the S3 legal holds it placed, and file members' verification pins. The manifest survives: this releases pins, it does not delete the checkpoint. Four things to know before calling it. It is **one-way** — a released member is terminal, `pin_checkpoint` will not re-drive it, and the captured version becomes eligible for lifecycle expiry and version-targeted delete from that instant. S3 members must be **re-declared on the versioner you release from** (`add_object_member`), through the **same binding and key that placed the hold**: the pre-flight only checks that an object member is declared at that member path, so a mismatched binding or key records the member `released` while the hold quietly survives. And a hold **shared** with another checkpoint survives until the last holder releases — with two bounds worth knowing, since a legal hold is a retention control: the sharing scan walks only that versioner's registry, so a holder recorded elsewhere (another workspace, a person, another tool) is invisible to it, and the scan alone cannot cover the instant between its last check and the drop itself — that instant is handled by re-reading *after* the drop and putting the hold back if a peer claimed it, so what remains is the narrower case where putting it back also fails, which is logged. Finally, it is **idempotent but not self-healing**: the release records `released` before it drops the substrate hold, so a crash or an untyped substrate error between the two strands a live hold on an already-terminal row — retrying `release_checkpoint` will not detect or repair it, since the row already reads terminal. Calling it **concurrently** fails differently, and no longer strands: two processes releasing one checkpoint both decrement its pin refcount, and the registry fails the surplus decrement with a `ValueError` — but that raise lands after the hold has already been dropped, so it costs you bookkeeping accuracy rather than a live hold. It does abort the rest of that checkpoint's members, which stay `held` for a later call. Treat a `ValueError` as "some members may have been released", never as "nothing happened". The recovery in both cases is calling `CoherentObject.release_legal_hold` directly on the binding, by version — the released row keeps the `native_token` you need for it.
+**Dropping a pin.** `WorkspaceVersioner.release_checkpoint(checkpoint_id)` releases the pins a checkpoint holds — the S3 legal holds it placed, and file members' verification pins. The manifest survives: this releases pins, it does not delete the checkpoint. Four things to know before calling it. It is **one-way** — a released member is terminal, `pin_checkpoint` will not re-drive it, and the captured version becomes eligible for lifecycle expiry and version-targeted delete from that instant. S3 members must be **re-declared on the versioner you release from** (`add_object_member`), through the **same binding and key that placed the hold**: the pre-flight only checks that an object member is declared at that member path, so a mismatched binding or key records the member `released` while the hold quietly survives. And a hold **shared** with another checkpoint survives until the last holder releases — with two bounds worth knowing, since a legal hold is a retention control: the sharing scan walks only that versioner's registry, so a holder recorded elsewhere (another workspace, a person, another tool) is invisible to it, and the scan alone cannot cover the instant between its last check and the drop itself — that instant is handled by re-reading *after* the drop and putting the hold back if a peer claimed it, so what remains is the narrower case where putting it back also fails, which is logged. Finally, it is **idempotent but not self-healing**: the release records `released` before it drops the substrate hold, so a crash or an untyped substrate error between the two strands a live hold on an already-terminal row — retrying `release_checkpoint` will not detect or repair it, since the row already reads terminal. Calling it **concurrently** fails differently, and no longer strands: two versioners releasing one checkpoint both decrement its pin refcount (two processes cannot both open a SQLite store for writing where `flock` exists), and the registry fails the surplus decrement with a `ValueError` — but that raise lands after the hold has already been dropped, so it costs you bookkeeping accuracy rather than a live hold. It does abort the rest of that checkpoint's members, which stay `held` for a later call. Treat a `ValueError` as "some members may have been released", never as "nothing happened". The recovery in both cases is calling `CoherentObject.release_legal_hold` directly on the binding, by version — the released row keeps the `native_token` you need for it.
 
 **Binary members (v1 limitation).** A file member whose bytes are not UTF-8 text is refused at capture with a typed error — before anything persists. The file restore path rides a text wire, so capturing a member that could never be restored would be a silent over-claim.
 
@@ -2166,6 +2956,8 @@ agent-coherence-workspace restore <checkpoint-id>
 
 Four verbs — `checkpoint` (with repeatable `--file` / `--forward-only`, and `--no-pin` for capture-only), `list`, `status`, `restore`. Every verb takes `--root` (override the workspace root; default walks up to the git root) and `--json` (machine-parseable output). `status` renders every member's `(restore_tier, pin_state)` pair — including the claimed-but-not-yet-backed label — plus torn-cut flags and restore outcomes; `checkpoint` output always carries the file-retention caveat. The CLI keeps its own durable state in `<root>/.coherence/workspace.db`.
 
+**Verbs take turns.** The CLI keeps its store in `.coherence/workspace.db`, and a store has one writer (see **One writer per store**). `checkpoint` and `restore` hold it for their whole run; another verb that writes waits up to 30 seconds for it, then exits `2` with `reason` `store_held`. `list` and `status` open the store read-only and do not wait for a verb that writes; when the store does not exist yet or needs a writer to open it (an older schema, or recovery after a crash), they open it as a writer and wait like any verb.
+
 Under `--json`, every error path *also* emits a one-line JSON envelope on stdout — `{"kind": "error", "exit_code": …, "reason": …, "message": …}` — so a script never has to parse stderr prose; the human message stays on stderr unchanged. Capturing a second checkpoint under an existing name is never refused (names are labels, not unique keys), but the prior ids are printed so the ambiguity is never silent — `status` and `restore` always target an id, not a name.
 
 Exit codes:
@@ -2174,7 +2966,7 @@ Exit codes:
 |---|---|
 | `0` | the verb succeeded (restore: concluded with no member in `conflict` / `target_lost` / `held_unconfirmed`) — never a claim that nothing was overwritten: a restore that put a member back over content committed after the capture also exits `0`, and says so per member in the report |
 | `1` | not in a git repository, or a validation error (no members, a `..` traversal in a member argument), or a typed contention error |
-| `2` | a typed refusal: a non-UTF-8 member, an unknown checkpoint id, a checkpoint bound to another receiver or already registered by another controller, a persist failure, or a member path that fails containment at access time — a workspace escape, a symlink component, a hardlinked regular file with a co-owner outside the root, a non-regular file (FIFO, socket, device), or a `.coherence/**` self-target |
+| `2` | a typed refusal: another verb kept the store past the 30-second wait (`store_held`), a non-UTF-8 member, an unknown checkpoint id, a checkpoint bound to another receiver or already registered by another controller, a persist failure, or a member path that fails containment at access time — a workspace escape, a symlink component, a hardlinked regular file with a co-owner outside the root, a non-regular file (FIFO, socket, device), or a `.coherence/**` self-target; or a `.coherence` that is a symbolic link or not a directory, or holds a link, FIFO, socket or device directly inside it, refused before anything in it is opened, with `reason` `coherence_dir_refused` (see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory)) |
 | `3` | the restore **concluded**, but at least one member ended in `conflict` / `target_lost` / `held_unconfirmed`, or the restore registration was refused — the per-member report on stdout is the truth; the exit code just tells you to read it |
 | `4` | opt-in, and only with `restore --exit-nonzero-on-discarded-content`: the restore concluded clean by the codes above, but at least one member's write discarded content the checkpoint did not hold, or the run holds no record of what that member's write overwrote. Without the flag the same run exits `0`, and both producers of `3` take precedence over it. It is evaluated after the engine returns, so it reports the writes and never prevents one |
 
@@ -2313,6 +3105,12 @@ Semantics, precisely:
   rejection telling the agent to re-establish, never a quiet fall-through to
   whatever is current. A token that was never a session at all (malformed, or
   never opened) is distinguished as `session_not_found`.
+- **A dropped session's committer is forgotten.** A session commits as an
+  identity minted from its token. Once the coordinator drops the session, as
+  its liveness sweep does after the heartbeat lapses, that identity can never
+  commit again, so the coordinator forgets its state on each file and its
+  heartbeat, and `/status` stops listing it. A restart by itself forgets
+  nothing.
 - **Bytes vs versions.** When the coordinator retains version bodies
   ([version retention](#version-retention-and-read-at-version)), a session read
   serves the pinned bytes directly. Otherwise it returns the pinned version and
@@ -2514,7 +3312,7 @@ reasons exist.
 | `reason` | Established by | What it means | How you clear it |
 |---|---|---|---|
 | `version_moved` | the coordinator | a peer committed a newer version than the one the decision was derived from | re-read the input, re-decide, re-gate |
-| `split_pair` | the coordinator | it refused the re-validate read because the bytes are not the content it records at that version, which has not moved: a peer's `write()` whose bytes landed before its commit, a change made outside the coordinator, or a commit's disk write failed (strict mode). The `StaleView`'s `reason` is `split_pair` too | re-gate after a few seconds first: a peer's write still landing clears by itself, or moves the version. A hold that outlasts that is a change outside the coordinator, and a reacquire alone does not clear it, because it does not record the bytes on disk: reacquire, `write()` the bytes it returns (or your merge of them) to record them, then read, re-decide and re-gate |
+| `split_pair` | the coordinator | it refused the re-validate read because the bytes are not the content it records at that version, which has not moved: a peer's `write()` whose bytes landed before its commit, a change made outside the coordinator, a commit's disk write failed, or a `write()` whose commit did not reach the coordinator (strict mode). The `StaleView`'s `reason` is `split_pair` too | re-gate after a few seconds first: a peer's write still landing clears by itself, or moves the version. A hold that outlasts that is a change the coordinator has not recorded, and a reacquire alone does not clear it, because it does not record the bytes on disk: reacquire, `write()` the bytes it returns (or your merge of them) to record them, then read, re-decide and re-gate |
 | `read_denied` | the coordinator | it refused the re-validate read outright — this view is invalid (strict mode; on a strict-mode workspace this is how a reclaim usually surfaces) | reacquire, take a fresh read, re-decide, re-gate |
 | `grant_reclaimed` | the coordinator | both generations are confirmed and they differ: a sweep reclaimed the grant the decision was read under, while the version never moved | reacquire, re-decide, re-gate |
 | `grant_preempted` | the coordinator | neither comparand moved, yet the re-validate read was served without a standing grant — a peer's write-claim acquire took the grant with no commit behind it yet | reacquire. A bare re-ask holds again: the fence does not re-grant on the read it checks with |
@@ -2587,9 +3385,10 @@ offers a session-based gate in Python — `CoordinatorService.effect_gate`, whic
 pins a read-set and re-validates every member's *version* at the effect
 boundary, holding the effect if any moved, whether the effect is a callable or
 a commit of one of the members. In the commit form the check and the commit
-are one step for every writer that goes through the same coordinator; a writer
-on a second handle to the same store can still change a member other than the
-one written. It checks versions only: it does not apply the grant-standing leg, so
+are one step for every writer that goes through the same coordinator. A second
+read-write handle on the same store, which could change a member other than the
+one written, is refused at open wherever `flock` exists (see **One writer per
+store**). It checks versions only: it does not apply the grant-standing leg, so
 a peer's write-acquire that preempts the session's grant without moving any
 version lets that gate fire where this fence holds. It is in-process Python
 only — no HTTP route and no tool reaches it — and it answers in its own
@@ -2766,9 +3565,10 @@ A transfer names one successor and one or more paths. For each path the giver
 must hold a claim: a write grant (EXCLUSIVE, or MODIFIED after a commit) or a
 standing SHARED read. The transfer then, for every path it admits, in one step:
 
-- moves the giver's claim to INVALID under the `handoff` trigger, giving it up
-  as a release would (see the [trigger vocabulary](#trigger-vocabulary) for
-  what that does to the ownership epoch);
+- moves the giver's claim to INVALID under the `handoff` trigger. For the
+  ownership epoch this counts as a release (see the
+  [trigger vocabulary](#trigger-vocabulary) for what that does to it), but
+  the giver keeps no read of the path, where a release leaves one;
 - stores one **transfer record** for the path: the giver, the successor, the
   version at transfer, the hold shape given up, and a status;
 - fences the giver, which can no longer write the path while the record is
@@ -2917,18 +3717,24 @@ The coordinator must know the id, or every grant of the transfer is refused as
   path to that whole session. It is known only while the coordinator's
   in-memory name map holds it. The coordinator fills that map as identities
   make requests and loses it when its process exits, so after a restart a
-  composite id is refused as unknown, even while it still holds a grant.
+  composite id is refused as unknown, even while it still holds a grant. It
+  also drops a volume's attempt from the map when the volume ends that
+  attempt (see [Attempts a volume ends](#attempts-a-volume-ends)), so an
+  ended attempt's id is refused as unknown too.
 
 So name the session-level id, which needs no live name map when the successor
-has claimed a principal. Where each kind of session's id comes from:
+has claimed a principal. A volume's current `vol.agent_id` is known too while
+the volume is open, from that attempt's first request until a coordinator
+restart: a volume never ends the attempt it is using. Where each kind of
+session's id comes from:
 
 - **A Claude Code session**: derive it from the session's id, which Claude
   Code sets as `CLAUDE_CODE_SESSION_ID` in the session's shells (see the
   [example](#example-handing-a-file-between-claude-code-sessions)).
 - **A `CoherentVolume`**: `str(session_to_agent_id(vol.session_id))`, with the
   function above. Do not take a volume's id from `sessions[]` on `/status`:
-  the ids listed there for a volume are its per-attempt composite ids, which a
-  restart of the coordinator forgets.
+  the ids listed there for a volume are its per-attempt composite ids, which
+  the coordinator forgets at a restart or when the volume ends that attempt.
 - **An MCP session**: the `session_agent_id` its own `swg_status` reports (see
   [From the MCP server](#from-the-mcp-server)).
 
@@ -3092,8 +3898,9 @@ coordinator still holds:
   grant it tried to release, in no guaranteed order (match entries by `path`):
   `{"path", "held": false, "cause": "release"}` for a grant it released, and
   `{"path", "held": true, "reason"}` for one still held (with `detail` when the
-  reason is a typed one). It used to answer `ok: true` and only log the
-  failure.
+  reason is a typed one). `held` is about the write grant: a session whose
+  write grant was released still keeps a read of the path. It used to answer
+  `ok: true` and only log the failure.
 - **`POST /hooks/post-edit` with `success: false` whose release is refused**
   keeps its `ok: false` and `reason`, and adds the same `grants` list.
 - **The giver's own failed-edit report on a path it handed off** — while the
@@ -3111,6 +3918,31 @@ again at its next fresh attempt.
 `session-stop` now refuses a malformed `agent_id` with HTTP `400`, before the
 principal check. It used to answer `{"ok": true, "released_artifacts": []}`,
 which reads as a release that found nothing to release.
+
+**Ending an identity.** `session-stop` also takes an optional `"ended": true`,
+sent with an `agent_id`: the identity that `agent_id` names will send nothing
+more. A `CoherentVolume` sends it for each attempt it no longer uses (see
+[Attempts a volume ends](#attempts-a-volume-ends)). The stop releases and
+answers exactly as one without the field. Then, unless a grant is still held,
+the coordinator forgets the identity: its state on each file, its heartbeat,
+its queued notices and its `/status` row. A file state that records a sweep
+reclaim stays, as `INVALID`, with that record. Send it only for an identity that
+will never act again: the coordinator then treats it as never seen, so a later
+request under that id is no longer checked against what it read, and a
+compare-and-swap commit, for one, is decided on the version alone.
+
+| `ended` | Answer |
+|---|---|
+| absent or `false` | as before the field existed |
+| `true`, with an `agent_id` | the stop's usual answer, and the identity is forgotten |
+| `true`, with no `agent_id` | HTTP `400`, `{"error": "ended requires agent_id"}`. A stop with no `agent_id` is a Claude Code session's own Stop, sent between turns, which never ends it |
+| anything else, `null` included | HTTP `400`, `{"error": "ended must be a boolean"}` |
+
+Both `400`s come before the `agent_id` check (and, on this package's
+coordinator, the principal check), and nothing is released. Both coordinators
+answer the same: this package's in releases after 0.15.0, and the Claude Code
+plugin's Node coordinator in plugin releases after 0.6.0. An earlier
+coordinator ignores the field, answers as to any stop, and keeps the records.
 
 ### Ended records and eviction
 
@@ -3308,25 +4140,27 @@ and answer as before apart from the giver's shell write, which is denied.
 
 **Which claim a Claude Code session can hand on.** A transfer needs the giver
 to hold a claim on the path when it runs (see
-[What a transfer does](#what-a-transfer-does)), and a Claude Code session's
-write grant ends with its turn:
+[What a transfer does](#what-a-transfer-does)). A Claude Code session's write
+grant ends with its turn, and the session keeps a read of the file:
 
 - **A file the session edited this turn.** Have the session run the transfer
   in the same turn, right after the edit. The transfer hands on the write
   grant (`MODIFIED` once the edit is committed).
-- **After that turn has ended**, the end-of-turn hook has released the write
-  grant, and the transfer is refused as `handoff_not_held`. On a warn-mode
-  path, have the session read the file again: the read gives it a standing
-  read, and a transfer then hands that on (`SHARED`).
+- **A file the session edited in an earlier turn.** The end-of-turn hook
+  released the write grant and left the session a standing read of the
+  version it held, so a transfer in a later turn hands that on (`SHARED`).
 - **A file the session has only read**, and nobody has written since, is a
   standing read that outlives the turn. The session can hand it on at any
   time.
-- **On a strict-mode path**, a session whose write grant was released is
-  denied its `Read` of the file by the strict-mode stale-view deny, and that
-  denied read grants nothing. A shell read of the file (`cat`, for example) is
-  denied too, but its deny re-grants a standing read without recording a read
-  of the current version, and a transfer hands that on as `SHARED`. Handing
-  the path on in the same turn as the edit avoids both.
+- **A file another session has taken or changed since.** Another session's
+  edit ends this session's read, and the transfer is refused as
+  `handoff_not_held`. On a warn-mode path, have the session read the file
+  again: the read gives it a standing read, and a transfer then hands that on
+  (`SHARED`). On a strict-mode path that `Read` is denied by the strict-mode
+  stale-view deny, and the denied read grants nothing. A shell read of the
+  file (`cat`, for example) is denied too, but its deny re-grants a standing
+  read without recording a read of the current version, and a transfer hands
+  that on as `SHARED`.
 
 ### Handoff commands
 
@@ -3423,12 +4257,15 @@ hint:
 
 ```text
 agent-coherence-transfer: notes.md not transferred (handoff_not_held)
-agent-coherence-transfer: hint: a Claude Code session's write grant ends when its turn ends. If an earlier transfer of notes.md may have landed, check the path's handoff in agent-coherence-status output first: a handoff from this session to that successor made at the version it held, live or ended, means it landed, so do not transfer again, and if it shows another session's handoff, ask before transferring; otherwise have the giver session read notes.md, then transfer it again (on a strict-mode path that read is denied: hand the path on in the same turn as its edit)
+agent-coherence-transfer: hint: this session holds no claim on notes.md: an earlier transfer of it may have landed, another session may have taken or changed it since this session read it, or this session may never have read it. Check the path's handoff in agent-coherence-status output first: a handoff from this session to that successor made at the version it held, live or ended, means it landed, so do not transfer again, and if it shows another session's handoff, ask before transferring; otherwise have the giver session read notes.md, then transfer it again (on a strict-mode path that read is denied, and grants nothing, when another session took or changed notes.md after this session read it)
 ```
 
-On a strict-mode path the hint's `Read` is denied and grants nothing, as the
-hint's last clause says; see [Claude Code sessions](#claude-code-sessions) for
-what a shell read does there.
+A session's own earlier edit is not a cause: the end of the turn leaves it a
+read of the file, which a transfer hands on. On a strict-mode path, when
+another session took or changed the file after this session read it, the
+hint's `Read` is denied and grants nothing, as the hint's last clause says;
+see [Claude Code sessions](#claude-code-sessions) for what a shell read does
+there.
 
 **Python coordinator only.** Against the Claude Code plugin's Node coordinator
 the commands exit `4`. A plugin workspace created fresh runs the Node
@@ -3497,6 +4334,10 @@ run in one workspace with the plugin's hooks and the Python coordinator.
    agent-coherence-transfer: acting as session agent bd35b34c-f785-51c6-a184-5922aee7cbea (session from CLAUDE_CODE_SESSION_ID)
    agent-coherence-transfer: transferred plan.md to 6e271ee6-5a71-5508-bedf-ffd46d8898ce at version 2 (gave up MODIFIED; status pending)
    ```
+
+   Run in a later turn of A, while no other session has edited `plan.md`
+   since, the same transfer hands on the read A kept when its turn ended, and
+   the line ends `(gave up SHARED; status pending)`.
 
 3. **Check it.** `agent-coherence-status` lists
    `plan.md: bd35b34c → 6e271ee6 at version 2 (pending)` under Handoffs, and
@@ -3567,7 +4408,10 @@ outcome, or there is no coordinator to ask:
   `on_error="strict"`; and, in both modes, a volume with no coordinator
   attached. With `on_error="degrade"` a 4xx warns and raises
   `CommitUnconfirmed` instead: degrade mode does not tell a refusal from a
-  failure.
+  failure. A `404` is the exception: a coordinator without handoffs, such as
+  the Claude Code plugin's Node coordinator, answers it on every verb, so it
+  raises `CoherenceError` naming the route in both modes, because nothing ran.
+  The volume is not counted degraded.
 - `HandoffPathsInvalid` (from `ccs.core.exceptions`, a `ValueError`): a
   transfer of no path, or of one path named twice (two spellings of one file
   count), in both modes; nothing is sent.
@@ -3774,14 +4618,16 @@ recommends, keeps such a model's writes on the MCP session.
 
 A `CoherentVolume`'s session id and principal live only in its process, and an
 MCP session is one volume; a forked child of a volume is a new session too.
-After the process exits nothing can act as that session: the
+After the volume is closed, or its process exits, nothing can act as that
+session: a closed volume raises on every handoff command, and the
 [handoff commands](#handoff-commands) cannot, and a writer started in its place
 is a new session. A new session cannot withdraw, accept or decline a record
 that names its predecessor (`handoff_not_giver`, `handoff_not_successor`), is
 not fenced as the giver, and its write of the path is recorded as overtaking
 the handoff, not completing it, even when it carries on the successor's work.
 
-So settle a handoff while the giver's process is still running:
+So settle a handoff before the giver closes its volume, and while its process
+is still running:
 
 - **If the successor is gone**, have the giver withdraw, or transfer the path
   again to the replacement's session-level id (while the record is live, the
@@ -3796,6 +4642,13 @@ So settle a handoff while the giver's process is still running:
   coordinator serves them, but a successor that was a volume or MCP session
   attached to the stopped coordinator does not come back, and its replacement
   is a new session. Stop that process last.
+
+Closing a volume also ends each of its attempts, and the coordinator forgets
+them (see [Attempts a volume ends](#attempts-a-volume-ends)): they leave
+`/status`, and their ids no longer name a successor. A transfer record names
+session-level ids, so it stays and is served as described here. A volume
+whose process exits without `close()`, or an MCP server killed by a signal,
+ends nothing, and its attempts' records stay.
 
 If the giver is gone, its record ends when the successor declines or when any
 session commits a write to the path. Until then no other session can hand the
@@ -3897,8 +4750,9 @@ earlier, or this package's coordinator through 0.15.0) admits an opted-in reques
 it decides in time as it admits any other, and displaces the holder. To tell
 before you rely on the refusal, read `pre_edit_if_unheld` from `/status`, at any
 tier: JSON `true` says this coordinator refuses, and a coordinator without the key
-may not. Versions do not separate them. The Node coordinator does not send the
-key, so the key cannot tell its releases apart. Read it once, when you attach;
+may not. Versions do not separate them. The Node coordinator sends the key at
+every tier from plugin releases after 0.6.0, and plugin 0.6.0 and earlier send
+none. Read it once, when you attach;
 see **What it does not close** for what that leaves open.
 
 **Request.** `pre-edit` with `"if_unheld": true` in the body, carrying the
@@ -4009,8 +4863,9 @@ completes normally, or a failed `post-edit` — or hands it on with a
 [transfer](#targeted-grant-handoff) (Python coordinator only), or when the
 coordinator reclaims it: the Python coordinator's sweep from a silent holder
 (see **What it does not close**), the Node coordinator's opted-in acquire from
-a holder of 30 minutes or more (see **On the Node coordinator**). Poll with
-backoff rather than wait for a signal.
+a holder of 30 minutes or more (see **On the Node coordinator**). A release
+leaves the holder a reader of the path (`SHARED`), and a reader refuses no
+one. Poll with backoff rather than wait for a signal.
 
 **Client rules.**
 
@@ -4038,14 +4893,24 @@ backoff rather than wait for a signal.
   answers `{"ok": true, "note": "untracked-at-commit"}`, with nothing to release,
   and `{"ok": true, "degraded": true}` means the release did not run, so send it
   again.
-  That answer does not prove a grant existed, and it leaves the caller INVALID
-  on the path. On a strict-mode path a deny never re-grants that identity, so
-  its next `pre-edit`, and every later read under it, gets the strict deny.
-  Re-read under a new `agent_id` with the same `session_id`, as the
+  That answer does not prove a grant existed. A caller that held the grant is
+  left a reader of the version it held (`SHARED`). A caller that held none
+  keeps the state it had: a reader stays a reader, and a caller with no record
+  on the path gets none. While no other agent has taken or written the path
+  since, the caller's next `pre-edit` is not denied as stale. A caller another
+  agent's acquire or commit left INVALID stays INVALID, and on a strict-mode
+  path a deny never re-grants that identity, so its next `pre-edit`, and every
+  later read under it, gets the strict deny. Re-read under a new `agent_id`
+  with the same `session_id`, as the
   [capture rule](#capturing-the-comparands) and `CoherentVolume.reacquire()`
-  do.
+  do. In warn mode a caller can still edit a path another agent changed since
+  its last read, and that `pre-edit` takes the grant; if the edit then fails
+  or the turn ends, the release leaves the caller a reader of the current
+  version, so its next read is fresh and shows no stale warning. Strict mode
+  denies that `pre-edit`, so this never happens there.
 - **Send `session-stop` only when the work is done.** It releases every path
-  the identity holds EXCLUSIVE or MODIFIED, not only the one in question.
+  the identity holds EXCLUSIVE or MODIFIED, not only the one in question, and
+  leaves the identity a reader of each.
   `CoherentVolume.reacquire()` sends one, so it gives up those paths as well.
 - **Claiming a principal binds the session.** On the Python coordinator, a
   client that claims one to clear the `400` binds its session: from then on,
@@ -4086,9 +4951,10 @@ plugin releases after 0.6.0, refuses an opted-in `pre-edit` with the same body,
 in the same key order, and grants nothing. It differs from the Python
 coordinator in these ways:
 
-- **No volume.** A `CoherentVolume` with `managed` globs cannot attach to it,
-  because it does not serve the operator view, so `on_held="refuse"` does not
-  reach it. The requests below come from other clients.
+- **A volume.** A `CoherentVolume` with `managed` globs attaches to it, and
+  `on_held="refuse"` sends its opted-in requests there with no principal;
+  [A volume on the Node coordinator](#a-volume-on-the-node-coordinator) lists
+  what the volume needs and meets there.
 - **No principal.** It issues no principals, so an opted-in request needs
   none and never gets the `400`. A caller that sends the holder's own
   `session_id`, and the holder's subagent id if it has one, is the holder as
@@ -4169,29 +5035,46 @@ coordinator in these ways:
   With the sweep off (`sweep_interval_sec` set to `0`), it refuses until it
   releases the path. The Node coordinator has no sweep: its opted-in acquire
   reclaims a grant held 30 minutes or more (see **On the Node coordinator**).
-- **A client checks the coordinator once.** `CoherentVolume` reads
-  `pre_edit_if_unheld` when it attaches and keeps that endpoint, so a replacement
-  on a new port gets `CoordinatorUnreachable`. But a different coordinator on the
-  same port and secret goes unseen. An older build there displaces the holder: a
-  single request answers `collision: true`, which the volume refuses to write on,
-  though the holder has already lost the file, and two racing opted-in requests
-  can each get a bare `{"ok": true}`, which nothing shows. A build without the path
-  in its strict set answers `{"ok": true}` and the write lands over the holder.
-  The coordinator command has no port option, so locally this takes a port the
-  system reuses. A remote coordinator on a fixed port makes it the normal case,
-  which is why refuse mode is not available with `remote_endpoint`.
-- **Spelling aliases.** The coordinator tracks a path by its spelling. On a
-  case-insensitive filesystem, `data/X.TXT` and `DATA/x.txt` reach the file a
-  holder has as `data/x.txt`, get no refusal, and overwrite it. On APFS the two
-  Unicode forms of a name, NFC and NFD, do the same.
+- **A client checks the coordinator's capability once.** `CoherentVolume` reads
+  `pre_edit_if_unheld` when it attaches and keeps that endpoint. A replacement,
+  on a new port or the same one, gets `CoordinatorUnreachable` before anything
+  is sent: before each request a local client checks that `server.pid` still
+  names the coordinator it attached to and that this coordinator still holds the
+  workspace lock (see
+  [A client sends nothing to a coordinator that exited](#a-client-sends-nothing-to-a-coordinator-that-exited)).
+  What is left are the cases that check cannot see, listed in that section: a
+  coordinator that dies between the check and the send, a start that holds the
+  lock before it empties a dead coordinator's lines, and a host where the lock
+  cannot be probed (no `fcntl`). There, an older build on the same port
+  displaces the holder: a single request answers
+  `collision: true`, which the volume refuses to write on, though the holder has
+  already lost the file, and two racing opted-in requests can each get a bare
+  `{"ok": true}`, which nothing shows. A build without the path in its strict
+  set answers `{"ok": true}` and the write lands over the holder. A remote
+  coordinator on a fixed port has no such check, which is why refuse mode is not
+  available with `remote_endpoint`.
+- **Spellings the coordinator does not fold together.** A coordinator newer
+  than 0.15.0, and the Node coordinator in plugin releases after 0.6.0, key a
+  path by the fold the workspace disk applies: on case-insensitive APFS,
+  `data/X.TXT` and `DATA/x.txt` meet a holder of `data/x.txt` and are refused
+  as a request for `data/x.txt` would be, and so are the composed and
+  decomposed forms of a name on any APFS disk. Where the coordinator folds nothing (`fold_profile` `none` or
+  `cannot_tell`), and in the other cases
+  [One file, many spellings](#one-file-many-spellings) lists, another
+  spelling is another file: on a disk that still opens it as the holder's
+  file, it gets no refusal and overwrites that file. An older coordinator
+  tracks a path by its spelling, `./` and `//` included.
 - **A reclaimed holder's pending write can still land.** On both coordinators
   a reclaim does not stop a write the holder had already been admitted for:
   that write can reach the file after the reclaim. Its `post-edit` is refused,
   so no version records those bytes.
-- **One coordinator process.** On the Python coordinator the check and the
+- **One writer per store.** On the Python coordinator the check and the
   grant are one decision inside the coordinator process that holds the
-  workspace's store. A second writer opened on the same `state.db` is outside
-  that decision ([#453](https://github.com/Cohexa-ai/agent-coherence/issues/453)).
+  workspace's store, and a second read-write open of that `state.db` is
+  refused with `StoreHeldError`
+  ([#453](https://github.com/Cohexa-ai/agent-coherence/issues/453)). Where
+  `flock` does not exist (Windows, or a file system that refuses it), a second
+  writer is not refused and is outside that decision.
   On the Node coordinator they are one SQLite transaction, and the plugin runs
   one coordinator per workspace (see **On the Node coordinator**).
 - **A malformed subagent id is read as the parent.** An `agent_id` that is not
@@ -4264,7 +5147,7 @@ comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
 
 | Tool | What it does |
 |---|---|
-| `swg_read` | Tracked read — registers the agent's view of the file. If the bytes on disk are not what the coordinator recorded, the read returns a `stale_view` deny with no version. Retry `swg_reacquire` + `swg_read` for a few seconds first, since a peer's commit may still be reaching disk; if it stays denied, the file was changed outside the coordinator (an out-of-band edit, or a commit whose disk write failed), so `swg_write` the reacquired content to record it. When the path has a [handoff](#from-the-mcp-server) record, the result carries its `handoff` key |
+| `swg_read` | Tracked read — registers the agent's view of the file. If the bytes on disk are not what the coordinator recorded, the read returns a `stale_view` deny with no version. Retry `swg_reacquire` + `swg_read` for a few seconds first, since a peer's commit may still be reaching disk; if it stays denied, the bytes on disk were never recorded (an out-of-band edit, a commit whose disk write failed, or a write whose commit did not reach the coordinator), and reading again does not clear it, so `swg_write` the reacquired content to record it. When the path has a [handoff](#from-the-mcp-server) record, the result carries its `handoff` key |
 | `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite. On a path this session handed off, a `handed_off` deny with `recover: stop_and_report` |
 | `swg_reacquire` | Recovery after a deny — clears the stale view + mandatory fresh read |
 | `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention. A win that completed or overtook a live handoff says which, in `handoff`; on a path this session handed off, the same `handed_off` deny as `swg_write` |
@@ -4354,6 +5237,16 @@ made at once only meets the refusal again, so an agent should not retry in a
 tight loop. During the drain `swg_write` is refused at its grant request: it
 answers `coordinator_failed` and writes nothing.
 
+**A workspace whose `.coherence` a start refuses.** When `.coherence` is a
+symbolic link or not a directory, or holds a link, FIFO, socket or device
+directly inside it, the server refuses to start before it serves: it prints
+one line to stderr, `stale-write-guard-fs:` and the refusal naming the path,
+and exits `2`; nothing is written. Fix `.coherence` (see
+[`.coherence` must be a real directory](#coherence-must-be-a-real-directory))
+and start the server again. No tool call carries this refusal: the server's
+tools answer only from an attached volume, so a detached one answers
+`coordinator_unavailable` as it does for any unattached volume.
+
 **A coordinator that fails while answering.** When the coordinator answers a
 read with its `internal:` failure envelope ([details](#when-the-coordinator-answers-with-a-failure)),
 the tool call answers `reason: coordinator_failed` with
@@ -4375,10 +5268,17 @@ with `recover: read_then_retry`, where `swg_write` answered `commit_preempted`
 and `swg_write_cas` answered `internal_error`.
 
 **Multiple sessions, one workspace.** Multiple `stale-write-guard-fs` instances
-pointed at the same `SWG_ROOT` attach to one coordinator, so a stale write is denied
-across sessions; if the coordinator's session exits, peers fail closed. One
-session hands a path to another with `swg_transfer`; see
-[From the MCP server](#from-the-mcp-server).
+pointed at the same `SWG_ROOT` attach to one coordinator, so a stale write is
+denied across sessions; if the coordinator's session exits, peers fail closed.
+When the host ends a server normally, the server closes its volume before it
+stops a coordinator it started, so the files its `swg_write` calls took are
+given back to the other sessions at once, not after the sweep, and the
+coordinator forgets the volume's attempts (see
+[Attempts a volume ends](#attempts-a-volume-ends)); a close that fails is
+logged to stderr, and a coordinator that does not answer costs one client
+timeout (6 s by default) at shutdown. A server killed by a signal releases
+nothing and ends nothing. One session hands a path to another with
+`swg_transfer`; see [From the MCP server](#from-the-mcp-server).
 
 **Wiring a client to prefer `swg_*` over native file tools.** Registering the
 server exposes the `swg_*` tools, but an agent will still reach for its native
@@ -4400,7 +5300,8 @@ same artifact are detected as a collision instead of passing as one writer.
 With no `agent_id` in the payload the derivation is unchanged, byte-for-byte —
 main-thread sessions behave exactly as before. On Claude Code's
 `SubagentStop` event, the hook client's `subagent-stop` subcommand releases
-just that subagent's grants; the `agent_id` is required there, so a payload
+just that subagent's write grants and leaves it a reader of each file; the
+`agent_id` is required there, so a payload
 without one skips the release rather than stripping the parent's grants
 mid-session. The Python and Node coordinator backends derive the identity
 byte-identically; the protocol corpus pins the parity (sibling collision,
@@ -4416,7 +5317,11 @@ compaction, event-anchored ("At compaction you held EXCLUSIVE on `plan.md`
 (v7) — re-acquire before writing."), and each touched artifact's current
 coordinated version — with a stale flag when a peer advanced it past the
 session's last-observed version ("`plan.md` advanced to v9 past your
-last-observed v7 — re-read before relying on it."). The payload is
+last-observed v7 — re-read before relying on it."). A file the session
+edited in an earlier turn, and no other session has written since, renders as
+a held `SHARED` grant ("At compaction you held SHARED on `plan.md` (v7) —
+re-acquire before writing."), because the end of that turn left the session
+a read of it. The payload is
 session-scoped: the parent's lines render first, then each registered
 subagent's under a `Subagent <name>:` prefix. The subcommand gates on
 `source: "compact"` client-side, so ordinary starts, resumes, and clears
@@ -4844,7 +5749,26 @@ no commit of its own to explain them, is told so:
   it. It never denies, in strict mode either: a read is already denied there
   until a commit lands, and a write is the one way to commit the change. A
   client that writes whole files should re-read before it writes when it sees
-  the key.
+  the key. A `CoherentVolume` passes it on as `WriteResult.disk_differs`, after
+  the write: see [Coherent workspace](#coherent-workspace-coherentvolume).
+
+A Claude Code session that edited a file keeps a read of it when its turn
+ends, so on its next turn, while nothing has changed the file since, its Read
+is fresh and its Edit is admitted. The plugin's built-in Node coordinator
+does the same from its releases after 0.6.0; on an older one, a strict-mode
+session's Read of its own file is denied as revoked. In warn mode a session can still edit a
+file another session changed since its last read; if that edit fails or its
+turn ends, the session keeps a read of the current version, so its next Read
+is fresh and no stale warning is shown. Strict mode denies that edit, so this
+never happens there. A change made after the session's commit is
+still a change outside the coordinator, and the rules above apply to it. A
+formatter hook that runs after every edit, for example, rewrites the file
+after the edit's commit: on the next turn the session's Read of that file
+carries the warning in warn mode and is denied in strict mode, and its Edit is
+admitted with `"disk_differs": true`, and that edit's commit records the file
+as it then is. An edit that reached the disk but whose commit never reached the
+coordinator, because the hook failed or the commit was refused, reads the same
+way on the next turn, even though the change is the session's own.
 
 **Reading the counts while the coordinator runs.** `/status?detail=full` adds
 `foreign_writes` to each tracked file the detector has counted anything for,
@@ -4917,6 +5841,16 @@ plainly:**
   Under a subdirectory root that holds a directory of its own name, such as
   `repo/sub/sub/`, a write to one file can be checked against another and read
   as no foreign write.
+- **On a disk that folds names, a file is checked under git's spelling.** Git
+  reports a file only under the name in its index: asked about `PLAN.MD` when
+  the index has `plan.md`, it reports nothing. So on a coordinator
+  newer than 0.15.0 whose disk folds names (see
+  [One file, many spellings](#one-file-many-spellings)), each check reads
+  git's index first and asks about each file under the index's own spelling
+  of it: an outside edit of a file the coordinator records as `PLAN.MD`, or in
+  another Unicode form, while git's index has `plan.md` is counted. A file no
+  index name folds to is checked under its own name and counts only when git
+  reports that exact name, such as a staged deletion or a rename's old side.
 - **A suppression expires.** A mismatch excused as a write still landing is
   re-examined once the window passes. If no write ever landed, it becomes a
   foreign write and is counted as one. The benefit of the doubt is temporary.
@@ -5138,7 +6072,7 @@ inside it.
 
 | Command | What it does |
 |---|---|
-| `agent-coherence-status [--detail LEVEL] [--json] [--show-policy]` | prints `/status` as a table, or with `--json` as the body itself. `LEVEL` picks the view: `minimal`, which names no session; `full`, the operator view, asked for with the `Coherence-Local-Operator: true` header; or `metrics`, the counters only. With no `--detail` it asks for the coordinator's default view, which is `minimal`, and sends no operator header. `--show-policy` adds the user-added tracked paths no hook has seen yet; it needs `--detail full`, because only the operator view carries them |
+| `agent-coherence-status [--detail LEVEL] [--json] [--show-policy]` | prints `/status` as a table, or with `--json` as the body itself. `LEVEL` picks the view: `minimal`, which names no session; `full`, the operator view, asked for with the `Coherence-Local-Operator: true` header; or `metrics`, the counters and facts about the coordinator, with no path or session. With no `--detail` it asks for the coordinator's default view, which is `minimal`, and sends no operator header. `--show-policy` adds the user-added tracked paths no hook has seen yet; it needs `--detail full`, because only the operator view carries them |
 | `agent-coherence-track path [path ...]` | adds the paths to the coordinator's tracked set (`POST /policy/track`) |
 | `agent-coherence-untrack path [path ...]` | adds the paths to the coordinator's ignored set (`POST /policy/untrack`); a path enforced in strict mode is refused, and then nothing is untracked |
 
@@ -5181,12 +6115,41 @@ string (`- "*.md"`). A glob that YAML would otherwise read as something else,
 such as `*.md`, `[abc].md`, `{a,b}.md`, `yes` or `2026-10-12`, reads back
 exactly as written. When the file cannot take a new entry, the coordinator
 answers HTTP 400 naming the file, writes nothing, and the command exits `2`
-with that text. That happens when the file cannot be read, when it is not
-valid YAML or not a list, which the coordinator reads as no entries at all, or
-when an added line would break it: a `[ ... ]` list, an indented list, a `...`
-end marker or a lone `~`. Rewrite the file with one entry per line, each
-double-quoted, and retry. The coordinator replaces the file rather than
-writing into it, so a policy file kept as a symlink becomes a regular file.
+with that text. That happens when the file cannot be read (on the Python
+coordinator, a FIFO or device counts), when it is not valid
+YAML or not a list, which the coordinator reads as no entries at all, or when an
+added line would break it: a `[ ... ]` list, an indented list, a `...` end marker
+or a lone `~`. Rewrite the file with one entry per line, each double-quoted, and
+retry.
+
+A policy file that is a symbolic link is refused by the start itself, like any
+link in `.coherence` (see
+[`.coherence` must be a real directory](#coherence-must-be-a-real-directory)).
+One that becomes a link while the coordinator runs is never read or replaced.
+Track and untrack answer HTTP 400 naming it, for `tracked.yaml`:
+
+```text
+.coherence/tracked.yaml is a symlink; nothing was written. Replace it with a copy of the file it names, or mount a directory at .coherence.
+```
+
+When a track or untrack of the other policy file loads the policy again, the
+link loads as no entries and counts as a rejected pattern (below), and the
+file it names is not read. Both coordinators do this, the plugin's Node
+coordinator in plugin releases after 0.6.0. On the Python coordinator, a link
+at the lock file beside a policy file answers HTTP 400 with
+`.coherence/tracked.yaml.lock is a symlink; nothing was written. Remove the link.`
+A FIFO, socket or device there answers HTTP 400 with
+`.coherence/tracked.yaml.lock could not be read (not a regular file); nothing was written.`
+
+A `CoherentVolume` or substrate session about to start the coordinator merges
+its managed globs into `tracked.yaml` and `strict_mode.yaml`, and treats a file
+that cannot be read, is not valid YAML or is not a list the same way: it names
+the file, writes neither one, and starts no coordinator. A strict volume or a
+session raises `CoherenceError` with that text, after the workspace root. A
+volume in degrade mode warns and stays detached, so build a new one once the
+file is fixed. A policy file that is a link never reaches the merge: the
+volume or session runs a start's own check first and refuses it with
+`CoherenceDirRefused`.
 
 Releases up to 0.14.1 wrote entries without quotes. An entry starting with
 `*`, `[`, `{`, `!`, `&`, `%`, `@`, `|`, `>` or a quote, written by one of them,
@@ -5235,37 +6198,54 @@ against the workspace. v0.14.0 and v0.14.1 write schema 7 and refuse a store at
 a higher number. `coordinator_version` cannot tell you this: between releases
 one version string covers several schema steps. The number counts the Python
 coordinator's own schema steps. The Claude Code plugin's Node coordinator does
-not send it, and the `schema_version` that coordinator sends counts a
-different set of steps, so the two are not comparable.
+not send it; it sends `schema_version`, which counts that coordinator's own
+migration steps.
 `agent-coherence-status` prints the number at the end of its `Coordinator:`
 header line, for example `schema=10`, and at the end of the summary line with
-`--detail metrics`; `--json` prints the field itself. A coordinator that does
-not send the field gets no `schema=` in either line. The MCP server's
+`--detail metrics`; `--json` prints the field itself. Against the Node
+coordinator it prints that coordinator's `schema_version` there instead, beside
+`backend=node` and its `version`; Node's `metrics` view carries no schema
+number, so that line shows none. The two backends count different migration
+steps, so a number from one is not comparable with a number from the other. A
+coordinator that sends neither field gets no `schema=` in either line. The
+command takes `backend=node` from the `.coherence/server.pid` that gave it the
+port, which the Node coordinator writes with a `backend=node` line; a body that
+names its own `coordinator_backend` keeps that name. The MCP server's
 `swg_status` forwards the field as `registry_schema_version`. It is `null` when
 the coordinator is unreachable, which `coordinator` `unknown` shows, or when the
-coordinator's answer carries no such field. The MCP server does not attach to
-the Node coordinator or to a release up to v0.14.1 at all, because it cannot
-confirm their managed globs.
+coordinator's answer carries no such field, as the Node coordinator's never
+does: `swg_status` does not read its `schema_version` in its place. The MCP
+server does not attach to a release up to v0.14.1, or to the Node coordinator
+of plugin 0.6.0 or earlier, at all, because it cannot confirm their managed
+globs.
 
 ### What each `/status` view carries
 
 `GET /status` answers one of three views, picked with `?detail=`. Every view
 needs the workspace's bearer secret, and every body names its view in
 `detail`. A `detail` value other than these three gets the default view. This
-is the Python coordinator's answer; the Claude Code plugin's Node coordinator
-serves the default and `metrics` views in a shape of its own and answers
-`detail=full` with `501`.
+is the Python coordinator's answer. The Claude Code plugin's Node coordinator
+serves every view in a shape of its own. From plugin releases after 0.6.0 its
+operator view, behind the same header and `403` without it, is its default
+view plus the four pattern lists in `policy_summary` (`tracked_patterns`,
+`user_added_patterns`, `ignored_patterns` and `strict_mode_patterns`, each
+listing the patterns it enforces, as written), and nothing else: no session
+names, no absolute root and no process id. Every view of those releases carries
+`pre_edit_if_unheld: true`. Plugin 0.6.0 and earlier answer `detail=full` with
+`501`.
 
 | View | Ask with | Carries |
 |---|---|---|
-| `metrics` | `?detail=metrics` | counters only |
+| `metrics` | `?detail=metrics` | the counters and facts about the coordinator, with no path or session |
 | `minimal`, the default | no `detail`, or `?detail=minimal` | the tracked paths and who holds them, without session names or absolute paths |
 | `full`, the operator view | `?detail=full` with the `Coherence-Local-Operator: true` header; without the header the answer is `403` | session names, the absolute root, the pattern lists and the grant detail |
 
 **`metrics`** carries `coordinator_version`, `coordinator_backend`,
 `coordinator_uptime_seconds`, `registry_schema_version`, `pre_edit_if_unheld`
 (JSON `true`: this coordinator refuses an opted-in `pre-edit`; see
-[Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)) and the counters:
+[Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)), `fold_profile`
+and `fold_table_unicode` (how this coordinator keys file names; see
+[One file, many spellings](#one-file-many-spellings)) and the counters:
 `endpoint_counters`, request counts by route, and the rest, such as
 `watchdog_timeouts_total`, `sweep_reclaims_total` and
 `caller_principal_absent_total`. It names no path, no process id and no
@@ -5276,12 +6256,21 @@ session. It does not read the registry, so it is never degraded.
 - `tracked_artifacts`: one entry per path the coordinator has a record for,
   with the `path` relative to the workspace root, its `version` and its
   artifact `id`, and a [`handoff` key](#the-handoff-key) while the path has a
-  transfer record. Untracking a path does not remove its entry;
+  transfer record. Untracking a path does not remove its entry. On a disk
+  that folds names, a coordinator newer than 0.15.0 lists a record it made
+  for an existing file under the disk's spelling of that file, whatever
+  spelling first reached it;
 - `sessions`: one row per agent that this coordinator process has seen or
-  that holds a path, with its `agent_id`, its `states` (each path it holds, as
-  `SHARED`, `EXCLUSIVE` or `MODIFIED`), and `agent_name` set to `null`. An
-  agent id is derived one way from the session id, which no row at this view
-  shows;
+  that holds a path, except an agent that has ended: a `CoherentVolume`
+  attempt the volume has ended (see
+  [Attempts a volume ends](#attempts-a-volume-ends)), or the identity a
+  dropped [snapshot session](#multi-artifact-snapshot-sessions) committed as.
+  Each row has its `agent_id`, its `states` (each path it holds, as
+  `SHARED`, `EXCLUSIVE` or `MODIFIED`), and `agent_name` set to `null`. A
+  session or subagent that released a write grant, at the end of a turn, when
+  it stopped, or on a failed edit, still lists the path as `SHARED`; a path
+  another agent's acquire or commit made stale for it is left out. An agent id
+  is derived one way from the session id, which no row at this view shows;
 - `policy_summary`: the five pattern counts (`default_pattern_count`,
   `user_added_pattern_count`, `ignored_pattern_count`,
   `strict_mode_pattern_count`, `rejected_pattern_count`) and `coordinator_root`
@@ -5424,7 +6413,7 @@ one value and the wrapper assumes a claim exists. The
 [HTTP fence](#effect-fence-over-http) reads the coordinator's own record and is
 the surface that can answer that leg.
 
-**Fail-closed comparands.** An unconfirmed version (`0` — a degraded read) or an unconfirmed generation (`None` — a coordinator deny, a degraded read, an out-of-band edit the coordinator could not confirm, or an older coordinator daemon from before this release's generation reporting) always HOLDs. In particular, this gate against an older coordinator daemon HOLDs loudly rather than silently reverting to the generation-blind check — restart the coordinator on the current version to clear it.
+**Fail-closed comparands.** An unconfirmed version (`0` — a degraded read) or an unconfirmed generation (`None` — a coordinator deny, a degraded read, an out-of-band edit the coordinator could not confirm, an older coordinator daemon from before this release's generation reporting, or the Claude Code plugin's Node coordinator, which reports no generation at all) always HOLDs, so `gate()` on a volume attached to the Node coordinator holds every time. In particular, this gate against an older coordinator daemon HOLDs loudly rather than silently reverting to the generation-blind check — restart the coordinator on the current version to clear it.
 
 **Scope.** Escaping effects only — a pure *write* effect uses `volume.write_cas_at(path, expected_version, content)` directly. The gate *orders* effects and never rolls one back, so for an escaping effect there is a residual re-read→fire window it narrows but cannot close. Single-host and cooperative (the caller opts in). Gating several mutually-consistent inputs at once is a coordinator-side operation, not this single-input wrapper.
 

@@ -241,6 +241,46 @@ def _neutralize_v090_first_use_warning():
 
 
 @pytest.fixture(autouse=True)
+def _release_stand_in_coordinator_locks():
+    """Release the workspace locks a test took for coordinators it stood in
+    (``tests/pid_lock_helpers.py``), so no lock outlives its test."""
+    from tests.pid_lock_helpers import release_coordinator_locks
+
+    yield
+    release_coordinator_locks()
+
+
+@pytest.fixture(autouse=True)
+def _no_fold_probe_left_in_coherence():
+    """Fail a test that leaves a fold probe directory in a ``.coherence`` a
+    coordinator built in this process probed.
+
+    Every in-process coordinator start probes its disk through
+    ``fs_profile.probe_fold_profile``, so recording each ``.coherence`` the
+    probe was given is the one choke point; the check runs after the test's
+    own fixtures, and a directory already removed has nothing left in it. A
+    coordinator in a child process is not seen here, nor a test that calls
+    the probe by a name it imported (``tests/test_fs_profile.py`` checks its
+    own directories). Its own patcher, not the ``monkeypatch`` fixture: an
+    autouse request would set that fixture up first and so tear it down last,
+    after the fixtures a test relies on it to undo before theirs."""
+    from ccs.adapters.claude_code import fs_profile
+
+    probed: list[Path] = []
+    probe = fs_profile.probe_fold_profile
+
+    def recording_probe(probe_input: fs_profile.FoldProbeInput) -> fs_profile.FoldProfileResult:
+        probed.append(Path(probe_input.coherence_dir))
+        return probe(probe_input)
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(fs_profile, "probe_fold_profile", recording_probe)
+        yield
+    left = sorted({str(entry) for directory in probed for entry in directory.glob(f"{fs_profile.PROBE_DIR_PREFIX}*")})
+    assert not left, f"fold probe entries left in .coherence: {left}"
+
+
+@pytest.fixture(autouse=True)
 def _restore_sigpipe_disposition():
     """Put SIGPIPE's disposition back after every test.
 
@@ -285,3 +325,17 @@ def registry(request, tmp_path: Path):
         reg = SqliteArtifactRegistry(tmp_path / "shared-registry-arm.db")
         yield reg
         reg.close()
+
+
+@pytest.fixture
+def two_writer_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let a test open more than one read-write handle on one store.
+
+    Every read-write ``SqliteArtifactRegistry`` takes the store's single-writer
+    lock (#453), so a second one is refused. A test that proves what the
+    store's own SQLite transactions arbitrate between two writers, as on a
+    platform or file system with no ``flock``, opens them without it.
+    """
+    monkeypatch.setattr(
+        "ccs.coordinator.sqlite_registry._take_writer_lock", lambda _db_path: None
+    )

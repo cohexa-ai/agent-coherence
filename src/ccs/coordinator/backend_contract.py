@@ -12,7 +12,7 @@ shipped. Nothing here connects to, reads from, or writes to any store.
 
 It follows the :mod:`ccs.coordinator.registry_protocol` precedent (a module that
 owns Protocols + shared types the two registries re-export). Where that module
-names the registry SURFACE (the 66-member ``RegistryBase`` + ``SqliteExtended``
+names the registry SURFACE (the 68-member ``RegistryBase`` + ``SqliteExtended``
 Protocols; the 9 detection members sit on their own ``ForeignWriteDetection``),
 this module names the CONTRACT that surface must satisfy for a
 backend to host the atomic boundary: which members participate in the
@@ -110,11 +110,12 @@ class MemberContract:
     rationale: str
 
 
-# The 75 members of RegistryBase (52 methods + 1 property), SqliteExtended
-# (+13 methods) and ForeignWriteDetection (+9 methods), classified against the CoordinatorService call sites. The
+# The 77 members of RegistryBase (53 methods + 1 property), SqliteExtended
+# (+14 methods) and ForeignWriteDetection (+9 methods), classified against the CoordinatorService call sites. The
 # ATOMIC_CLASS members are the ones the service touches INSIDE its atomic
 # mutation paths (``write`` / ``commit`` / ``commit_cas`` under ``abort_guard``;
-# ``invalidate``; the same-lock ``enforce_stable_grant_timeouts`` sweep; the
+# ``invalidate``; ``release_to_reader``; the same-lock
+# ``enforce_stable_grant_timeouts`` sweep; the
 # session capture). INDEPENDENT members are individually-durable mutations that
 # do not compose into the R9 RMW. READ_ONLY members never mutate.
 #
@@ -182,10 +183,13 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "base",
         "The MESI grant transition — the grant-arbitration leg of the boundary. "
         "Called inside every atomic mutation path (write/commit peer-invalidation "
-        "+ grant, invalidate, and the same-lock sweep's M/E->INVALID reclaim). "
-        "An M/E->INVALID transition that revokes the write claim WITHOUT moving "
-        "the version bumps owner_generation for the fence — the sweep reclaims, "
-        "the voluntary invalidate release AND the handoff trigger "
+        "+ grant, invalidate, release_to_reader, and the same-lock sweep's "
+        "M/E->INVALID reclaim). "
+        "A transition that leaves M/E, revoking the write claim WITHOUT moving "
+        "the version, bumps owner_generation for the fence whatever state it "
+        "lands in — the sweep reclaims (to INVALID), the voluntary invalidate "
+        "release (to INVALID, or to SHARED when the holder gives back its own "
+        "write grant and keeps a read) AND the handoff trigger "
         "(EPOCH_BUMP_TRIGGERS); the "
         "version-moving peer invalidations do not, because version-CAS already "
         "arbitrates those. Single-writer is checked after each such transition. "
@@ -198,8 +202,8 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "the agent's OWN claim: an I/S->M/E acquire, or a genuine read the agent "
         "requested (CLAIM_CAPTURE_TRIGGERS plus the not-previously-in-M/E "
         "guard); a transition that takes the agent OUT of M/E captures nothing, "
-        "so a peer's fetch that downgrades a holder never refreshes its "
-        "captured generation.",
+        "so neither a peer's fetch that downgrades a holder nor the holder's "
+        "own release to SHARED refreshes its captured generation.",
     ),
     MemberContract(
         "set_agent_transient",
@@ -215,7 +219,8 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         MemberClass.ATOMIC_CLASS,
         "base",
         "Clears the arbitration transient at the end of a grant transition, "
-        "under abort_guard inside write/commit/invalidate. The completing half of "
+        "under abort_guard inside write/commit/invalidate/release_to_reader. "
+        "The completing half of "
         "the transient leg of the boundary.",
     ),
     MemberContract(
@@ -232,7 +237,8 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         MemberClass.ATOMIC_CLASS,
         "base",
         "The context manager that wraps EVERY atomic mutation (write / commit / "
-        "commit_cas / invalidate). It is the boundary's serialization + fail-shut "
+        "commit_cas / invalidate / release_to_reader). It is the boundary's "
+        "serialization + fail-shut "
         "seam: a watchdog-aborted mutation fails closed at the write lock instead "
         "of landing as a phantom write. A backend re-homing the boundary must "
         "provide the equivalent atomic-or-abort envelope. Its keyword-only "
@@ -414,6 +420,24 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "(the sweep's eviction, beside the notice eviction). Liveness is the "
         "read's, so a live record is never evicted. Durable maintenance "
         "delete; not part of the boundary.",
+    ),
+    MemberContract(
+        "forget_agent",
+        MemberClass.INDEPENDENT,
+        "base",
+        "Deletes the records of an identity that has ended (#525) -- its "
+        "agent-state rows, heartbeat and queued notices -- in one serialized "
+        "step (sqlite: one BEGIN IMMEDIATE; in-memory: one _lock hold), and "
+        "refuses with ForgetRefused (a ValueError), deleting nothing, while "
+        "the identity holds an EXCLUSIVE or MODIFIED row; the coordinator "
+        "treats any other error from it as a fault. A row that records a "
+        "sweep reclaim stays, left INVALID. Not part of the boundary: it "
+        "never removes a write grant, the only row other_holder arbitrates "
+        "on, and the fence row it removes belongs to an identity that sends "
+        "nothing more. That is also its obligation on the caller: a deleted "
+        "row admits on absent, so only an identity that provably ended may "
+        "be forgotten. A caller under a watchdog runs it inside "
+        "abort_guard(abort), so a forget that arrives late deletes nothing.",
     ),
     # ---- READ_ONLY (base) --------------------------------------------------
     MemberContract(
@@ -723,7 +747,19 @@ _MEMBER_CONTRACTS: tuple[MemberContract, ...] = (
         "lookup_artifact_id_by_name",
         MemberClass.READ_ONLY,
         "sqlite_extended",
-        "Resolves a durable name to an artifact id. Non-mutating.",
+        "Resolves a durable name to an artifact id: a key exactly, a file "
+        "name through the coordinator's fold index when one is built. "
+        "Non-mutating.",
+    ),
+    MemberContract(
+        "fold_bucket_peers",
+        MemberClass.READ_ONLY,
+        "sqlite_extended",
+        "Lists the other rows of an artifact's fold bucket (spellings of one "
+        "file a start-time merge left apart), read from the coordinator's "
+        "in-memory index. Read inside service.write's hold to refuse an "
+        "opted-in writer on, or demote, another row's write holder; the read "
+        "itself never mutates.",
     ),
     MemberContract(
         "status_snapshot",
@@ -822,7 +858,7 @@ MEMBER_CLASSIFICATION: dict[str, MemberContract] = {
     contract.name: contract for contract in _MEMBER_CONTRACTS
 }
 """Every ``RegistryBase`` + ``SqliteExtended`` member → its :class:`MemberContract`
-(R8). Keyed by member name. The key set must equal the 75-member Protocol surface
+(R8). Keyed by member name. The key set must equal the 77-member Protocol surface
 exactly — :mod:`tests.test_backend_contract` fails if ``registry_protocol.py``
 gains or loses a member without a matching update here (bidirectional drift
 guard). Includes the ``coordinator_epoch`` property (property-omission teeth)."""
@@ -868,8 +904,9 @@ R9_ATOMIC_BOUNDARY = AtomicBoundary(
         "transition is part of the same step)",
         "read-generation fence (owner_generation vs the committer's captured "
         "read_generation: reject a writer whose M/E grant was revoked without "
-        "the version moving — by the sweep OR by a voluntary invalidate release "
-        "— since version-CAS alone cannot see that; the captured operand is "
+        "the version moving — by the sweep OR by a voluntary invalidate release, "
+        "whether that release leaves the holder INVALID or keeps it a reader "
+        "(SHARED) — since version-CAS alone cannot see that; the captured operand is "
         "written only at the committer's own claim-establishing transitions, "
         "never by a peer's fetch)",
     ),
@@ -909,7 +946,8 @@ R9_ATOMIC_BOUNDARY = AtomicBoundary(
         "(enforce_stable_grant_timeouts), NOT read inside commit_cas's "
         "transaction. It reclaims stale M/E grants (heartbeat / max-hold) and "
         "bumps owner_generation atomically with the M/E->INVALID transition — as "
-        "does the voluntary invalidate release, so a release can never SUPPRESS "
+        "does the voluntary invalidate release, to INVALID or to SHARED, so a "
+        "release can never SUPPRESS "
         "the epoch move by getting there before the sweep — both "
         "serialized under the SAME registry lock as the atomic mutations. Per "
         "tier, a backend states whether liveness folds into the atomic RMW "

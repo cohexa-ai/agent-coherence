@@ -1,0 +1,80 @@
+{
+  "name": "pre-read-after-own-failed-edit-over-a-peer-commit-is-fresh",
+  "description": "A known warn-mode limitation of a holder's own release keeping a read (#513). Session A reads notes.md (v1). Session B pre-edits it and commits v2, which makes A's copy stale. A's warn-mode pre-edit is still admitted, with the concurrent-edit note, and takes the write grant, which records v2 as the version A has although A never read it. A's edit then fails (post-edit with success false), and that release leaves A a reader of v2, so A's next Read is the bare fresh answer, with no hookSpecificOutput and so no stale warning. Strict mode denies A's pre-edit before any grant is taken, so this cannot happen there. The file on disk holds the bytes B commits. Both backends.",
+  "setup": {
+    "tracked": [
+      "notes.md"
+    ],
+    "files": {
+      "notes.md": "# Notes\nv2 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md",
+          "content_hash": "0fbc0f11a1c83d2e4cf01f6567b65e159ee71173e31172dedfe00a27f7a30bcb"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "notes.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "notes.md",
+          "success": true,
+          "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md",
+          "success": false
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "notes.md",
+      "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+    }
+  },
+  "optional_keys": [
+    "version"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "status": "fresh"
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

@@ -30,12 +30,10 @@ So the check copies ``state.db`` plus any non-empty ``-wal``/``-journal``
 0700 temp directory, runs the very writer open a start reaches — the
 ``SqliteArtifactRegistry`` that ``coordinator_server`` constructs, via
 :func:`~ccs.coordinator.sqlite_registry.trial_writer_open` — on the COPY, and
-removes the copy. A symlinked ``state.db`` is read as SQLite reads it: the
-target, with the sidecars beside the TARGET. The dry run is the spawn by
-construction on every store the check copies. An absent store is answered
-from a stat (``fresh``), and a sidecar holding data beside an absent or empty
-store is flagged (``orphan_sidecar``) rather than dry-run: a start deletes
-that sidecar unread.
+removes the copy. The dry run is the spawn by construction on every store
+the check copies. An absent store is answered from a stat (``fresh``), and a
+sidecar holding data beside an absent or empty store is flagged
+(``orphan_sidecar``) rather than dry-run: a start deletes that sidecar unread.
 
 The answer is relative to a Python coordinator of THIS build, and valid only
 as of the check: nothing holds a lock between the check and a later start.
@@ -59,14 +57,18 @@ Outcomes (:class:`StoreCheckOutcome`):
   an upgrade keeps the store at that build's schema, and the first start of
   this build after it exits migrates it.
 - ``cannot_tell`` — the check could not observe the answer (``reason``).
+- ``coherence_dir_refused`` — ``.coherence`` is a symlink or not a
+  directory, or holds a symlink, FIFO, socket or device directly inside it
+  (#511): a start refuses the workspace before it probes the lock or opens
+  the store (#498), so this answer comes before ``live``. ``reason`` is the
+  refusal's ``kind``, and ``message`` is the start's own text, naming the
+  path and the way out.
 """
 
 from __future__ import annotations
 
-import errno
 import os
 import shutil
-import stat
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -75,18 +77,28 @@ from enum import Enum
 from pathlib import Path
 from typing import BinaryIO
 
+from ccs.adapters.claude_code.regular_file import open_regular
+from ccs.adapters.claude_code.state_dir import check_coherence_dir
+
 # The check's SQLite calls live in the registry module (the sqlite3 module
 # stays out of adapters, cli and mcp; tests/coordinator/test_caller_principal.py
 # sweeps them); their failures arrive here typed as StoreSqliteError.
 from ccs.coordinator.sqlite_registry import (
+    LOCK_CONTENDED_ERRNOS,
     SCHEMA_USER_VERSION,
     CrossRuntimeSchemaError,
     SchemaVersionError,
     StoreSqliteError,
     read_copy_user_version,
     trial_writer_open,
+    writer_lock_path,
 )
-from ccs.core.exceptions import SCHEMA_NEWER_REASON
+from ccs.core.exceptions import (
+    COHERENCE_DIR_REFUSAL_KINDS,
+    SCHEMA_NEWER_REASON,
+    STORE_HELD_REASON,
+    CoherenceDirRefused,
+)
 
 # fcntl is POSIX-only, like the lifecycle that owns the workspace lock: without
 # it no coordinator starts at all, so the check has nothing to predict.
@@ -102,10 +114,12 @@ except ImportError:  # pragma: no cover — exercised only on Windows
 # Check reasons (#345)
 # ---------------------------------------------------------------------------
 #
-# ``StoreCheck.reason`` for ``live`` and ``cannot_tell``. The other outcomes
-# carry the store-open reason the dry run raised (``SchemaVersionError.reason``
-# — one of ``ccs.core.exceptions.SCHEMA_VERSION_REASONS``) or ``sqlite_<code>``
-# for a SQLite failure on the store itself. Wire-stable: a host matches
+# ``StoreCheck.reason`` for ``live`` and ``cannot_tell``, plus the start's
+# refusal kinds (``ccs.core.exceptions.COHERENCE_DIR_REFUSAL_KINDS``) for
+# ``coherence_dir_refused`` (#511). The other outcomes carry the store-open
+# reason the dry run raised (``SchemaVersionError.reason`` — one of
+# ``ccs.core.exceptions.SCHEMA_VERSION_REASONS``) or ``sqlite_<code>`` for a
+# SQLite failure on the store itself. Wire-stable: a host matches
 # ``reason == CONSTANT``; add, do not mutate.
 COORDINATOR_RUNNING_REASON = "coordinator_running"
 """A Python coordinator holds the workspace lock (``live``)."""
@@ -146,6 +160,8 @@ STORE_CHECK_REASONS: frozenset[str] = frozenset(
         CHECK_ENVIRONMENT_FAILED_REASON,
         LOCK_PROBE_FAILED_REASON,
         PLATFORM_UNSUPPORTED_REASON,
+        STORE_HELD_REASON,
+        *COHERENCE_DIR_REFUSAL_KINDS,
     }
 )
 
@@ -161,8 +177,6 @@ _SIDECAR_SUFFIXES = ("-wal", "-journal")
 _PRIVATE_DIR_PREFIX = "ccs-store-check-"
 _COPY_CHUNK_BYTES = 1 << 20
 
-#: flock's "someone else holds a conflicting lock" errnos.
-_LOCK_CONTENDED_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
 
 
 class StoreCheckOutcome(str, Enum):
@@ -176,6 +190,7 @@ class StoreCheckOutcome(str, Enum):
     UNUSABLE = "unusable"
     LIVE = "live"
     CANNOT_TELL = "cannot_tell"
+    COHERENCE_DIR_REFUSED = "coherence_dir_refused"
 
 
 @dataclass(frozen=True)
@@ -187,11 +202,12 @@ class StoreCheck:
     ``newer``, and negative under ``unusable``/``schema_unrecognized``. It is
     ``None`` for an absent store, for ``foreign`` (a Node ledger number is not
     comparable, #294), for ``unusable`` when the copy's ``user_version``
-    cannot be read (``sqlite_notadb`` and similar), and for ``live`` and
-    ``cannot_tell``. ``expected_version`` is the schema this build serves.
-    ``reason`` is ``None`` for ``current``, ``fresh`` and ``will_migrate``.
-    ``message`` is one line of prose for a human. Branch on ``outcome`` and
-    ``reason``: never on ``message``, nor on ``found_version`` alone.
+    cannot be read (``sqlite_notadb`` and similar), and for ``live``,
+    ``cannot_tell`` and ``coherence_dir_refused``. ``expected_version`` is
+    the schema this build serves. ``reason`` is ``None`` for ``current``,
+    ``fresh`` and ``will_migrate``. ``message`` is one line of prose for a
+    human. Branch on ``outcome`` and ``reason``: never on ``message``, nor on
+    ``found_version`` alone.
     """
 
     outcome: StoreCheckOutcome
@@ -226,22 +242,36 @@ def check_store(coordinator_root: Path) -> StoreCheck:
     ``.coherence/state.db``, without creating or changing anything under the
     root (no ``.coherence/``, no sidecar, no lock file).
 
-    1. Probe the workspace lock (``server.pid``) with a SHARED, non-blocking
+    1. Run a start's own check on ``.coherence``
+       (:func:`~ccs.adapters.claude_code.state_dir.check_coherence_dir`). A
+       ``.coherence`` that is a symlink or not a directory, or that holds a
+       symlink, FIFO, socket or device directly inside it, is
+       ``coherence_dir_refused`` (#511): a start refuses it before it probes
+       the lock or opens the store. The check opens nothing, and runs again
+       before each copy, so a link made in between is refused too.
+    2. Probe the workspace lock (``server.pid``) with a SHARED, non-blocking
        flock released at once: held means a start joins the running
        coordinator (``live``). Shared, so two concurrent checks never read each
        other as a coordinator. A start that lands inside a probe (microseconds,
        once up front and once per copy) finds the lock held and joins whatever
        port ``server.pid`` names, as it does while any other start holds the
-       lock; after a crash, that port is a dead one.
-    2. Resolve ``state.db`` as SQLite does (a symlink to its target) and name
-       every file read below from the target, where SQLite keeps the sidecars.
-       A sidecar holding data beside an absent or empty store is
+       lock; after a crash, that port is a dead one. Then probe the store's
+       single-writer lock (``state.db.writer-lock``) the same way: held means a
+       read-write handle that is not a running coordinator has the store open
+       (``cannot_tell(store_held)``, #453). A writer open that lands inside
+       that probe retries for a tenth of a second before it reads the probe
+       as a holder.
+    3. Resolve ``state.db``'s path (the root's own ancestors may be links)
+       and name every file read below from it; a link made at ``state.db``
+       after the check resolves to its target, beside which SQLite keeps the
+       sidecars. A sidecar holding data beside an absent or empty store is
        ``cannot_tell(orphan_sidecar)``; otherwise no store is ``fresh``.
-    3. Stat the store and its sidecars, copy them (regular files only), stat
-       again and re-probe the lock. A held lock is ``live``; a changed stat,
+    4. Stat the store and its sidecars, copy them (regular files only), stat
+       again and re-probe both locks. A held workspace lock is ``live``, a
+       held store lock ``cannot_tell(store_held)``; a changed stat,
        or a link that now resolves elsewhere, retries the copy, up to
        :data:`_COPY_ATTEMPTS` in all, then ``cannot_tell(store_changed)``.
-    4. Read the copy's ``user_version`` and run the writer open on the copy.
+    5. Read the copy's ``user_version`` and run the writer open on the copy.
     """
     coherence_dir = Path(coordinator_root) / ".coherence"
     db_path = coherence_dir / "state.db"
@@ -252,15 +282,21 @@ def check_store(coordinator_root: Path) -> StoreCheck:
             "this platform has no fcntl, so no coordinator starts here",
         )
     try:
+        check_coherence_dir(coordinator_root)
         if _coordinator_holds_lock(pid_file):
             return _live(db_path, pid_file)
+        if _store_held(db_path):
+            return _held(db_path)
         uncopied = _answer_from_stat(db_path)
         if uncopied is not None:
             return uncopied
         for _attempt in range(_COPY_ATTEMPTS):
+            check_coherence_dir(coordinator_root)
             answer = _check_one_copy(db_path, pid_file)
             if answer is not None:
                 return answer
+    except CoherenceDirRefused as refusal:
+        return _refused(db_path, refusal)
     except _CheckStopped as stopped:
         return _cannot_tell(db_path, stopped.reason, f"{stopped.error}")
     return _cannot_tell(
@@ -276,25 +312,52 @@ def check_store(coordinator_root: Path) -> StoreCheck:
 
 
 def _coordinator_holds_lock(pid_file: Path) -> bool:
-    """True when another open file holds the workspace flock exclusively.
+    """True when another open file holds the workspace flock on
+    ``server.pid`` exclusively: a coordinator runs."""
+    return _held_exclusively(pid_file)
 
-    Opens ``server.pid`` read-only WITHOUT ``O_CREAT`` (an absent file is a
-    free lock, and the check must not create one), without following a
-    symlink, and as a regular file only (a FIFO there would block the open).
-    flock locks belong to the open file, so the probe sees a coordinator
-    running in this very process too. Raises :class:`_CheckStopped` when the
+
+def store_is_held(coordinator_root: Path) -> bool:
+    """True when a read-write handle holds the single-writer lock of
+    ``coordinator_root``'s ``.coherence/state.db`` (#453), as the check's own
+    probe reads it. Creates nothing; a probe that fails, or no ``fcntl``,
+    reads as not held."""
+    if not _FCNTL_AVAILABLE:
+        return False
+    try:
+        return _store_held(Path(coordinator_root) / ".coherence" / "state.db")
+    except _CheckStopped:
+        return False
+
+
+def _store_held(db_path: Path) -> bool:
+    """True when a read-write registry holds the store's single-writer lock
+    (#453): a script, or a coordinator still closing after its workspace lock
+    came free. A start waits for it, then refuses the store."""
+    return _held_exclusively(writer_lock_path(db_path))
+
+
+def _held_exclusively(lock_file: Path) -> bool:
+    """True when another open file holds an exclusive flock on ``lock_file``.
+
+    Opens it read-only WITHOUT ``O_CREAT`` (an absent file is a free lock,
+    and the check must not create one), without following a symlink, and as
+    a regular file only (a FIFO there would block the open). Probes with a
+    SHARED non-blocking lock released at once, so two checks never read each
+    other as a holder. flock locks belong to the open file, so the probe sees
+    a holder in this very process too. Raises :class:`_CheckStopped` when the
     probe itself fails.
     """
     with _oserror_means(LOCK_PROBE_FAILED_REASON):
         try:
-            fd = _open_regular(pid_file, os.O_NOFOLLOW)
+            fd = open_regular(lock_file)
         except FileNotFoundError:
             return False
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
             except OSError as exc:
-                if exc.errno in _LOCK_CONTENDED_ERRNOS:
+                if exc.errno in LOCK_CONTENDED_ERRNOS:
                     return True
                 raise
             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -323,30 +386,16 @@ def _sidecar(db_path: Path, suffix: str) -> Path:
 
 def _resolved(db_path: Path) -> Path:
     """``db_path`` with every symlink resolved, as SQLite's unix VFS resolves
-    it: SQLite names a symlinked store's ``-wal`` and ``-journal`` from the
-    TARGET, so those are the sidecars a start reads, never the (empty) ones
-    the registry's pre-create leaves beside the link."""
+    it, so each file the check stats and copies is the one a start reads.
+
+    :func:`check_store` refuses any link in ``.coherence`` before the lock
+    probe and before each copy (#511), so a linked ``state.db`` or sidecar is
+    never an input here. What is left to resolve is the root's own ancestors
+    (a linked home or temp directory), and a link made at ``state.db`` after
+    the check: SQLite names its ``-wal`` and ``-journal`` from the target, so
+    those are the sidecars a start would read."""
     with _oserror_means(STORE_UNREADABLE_REASON):
         return Path(os.path.realpath(db_path))
-
-
-def _open_regular(path: Path, extra_flags: int = 0) -> int:
-    """Open ``path`` read-only and return the descriptor, or raise
-    ``OSError(EINVAL)`` when it is not a regular file. Non-blocking, because
-    opening a FIFO that has no writer blocks forever; checked on the
-    descriptor, because a device such as ``/dev/zero`` never reaches EOF and
-    copying it would fill the temp disk. ``O_NONBLOCK`` changes nothing for a
-    regular file, nor for flock."""
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | extra_flags)
-    try:
-        mode = os.fstat(fd).st_mode
-    except OSError:
-        os.close(fd)
-        raise
-    if not stat.S_ISREG(mode):
-        os.close(fd)
-        raise OSError(errno.EINVAL, f"{path} is not a regular file")
-    return fd
 
 
 def _stat_key(path: Path) -> tuple[int, int, int, int, int] | None:
@@ -415,6 +464,9 @@ def _check_one_copy(db_path: Path, pid_file: Path) -> StoreCheck | None:
         # any change, and a start would join it.
         if _coordinator_holds_lock(pid_file):
             return _live(db_path, pid_file)
+        # So may a writer that opened the store during the copy.
+        if _store_held(db_path):
+            return _held(db_path)
         # A link retargeted during the copy changed which store a start reads.
         if _resolved(db_path) != store_file or _fence(store_file) != before:
             return None
@@ -442,7 +494,7 @@ def _copy_file(source: Path, target: Path) -> None:
     read as an unreadable store, target failures as the check's environment,
     and a vanished source as a change."""
     try:
-        source_file = os.fdopen(_open_regular(source), "rb")
+        source_file = os.fdopen(open_regular(source), "rb")
     except FileNotFoundError as exc:
         raise _SourceChanged from exc
     except OSError as exc:
@@ -553,10 +605,28 @@ def _live(db_path: Path, pid_file: Path) -> StoreCheck:
     )
 
 
+def _held(db_path: Path) -> StoreCheck:
+    return _cannot_tell(
+        db_path, STORE_HELD_REASON,
+        "another read-write handle (a script, or a coordinator still closing) has "
+        "the store open; a start waits for it to close, then refuses the store. "
+        "Check again once it closes",
+    )
+
+
 def _cannot_tell(db_path: Path, reason: str, detail: str) -> StoreCheck:
     return _result(
         StoreCheckOutcome.CANNOT_TELL, db_path, None, reason,
         f"cannot tell what a start would do to {db_path} ({reason}): {_one_line(detail)}",
+    )
+
+
+def _refused(db_path: Path, refusal: CoherenceDirRefused) -> StoreCheck:
+    """A start's refusal of ``.coherence``, in the start's own words. The
+    text is kept whole: a path in it may hold any byte, and a printer escapes
+    it."""
+    return _result(
+        StoreCheckOutcome.COHERENCE_DIR_REFUSED, db_path, None, refusal.kind, str(refusal),
     )
 
 

@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import statistics
 import sys
 import threading
@@ -40,14 +41,19 @@ from ccs.adapters.claude_code.coordinator_server import (
     decide_tracked_read,
     session_to_agent_id,
 )
+from ccs.adapters.claude_code.fs_profile import FoldProfileResult
+from ccs.coordinator.service import ReleaseRequest
 from ccs.core.exceptions import (
+    COHERENCE_LINK_KIND,
     HOLD_REASONS,
     UNAVAILABLE_REASON,
+    CoherenceDirRefused,
     CoherenceError,
     InvariantViolationError,
     StaleReadGeneration,
 )
 from ccs.core.states import MESIState
+from tests.coherence_link_helpers import TARGET_BYTES, plant_link, release_fifo, target_snapshot
 
 # Test helper: deterministic UUID4-shaped strings for short test labels.
 # Sessions now must be UUIDs (A3 validation); tests use this to keep label
@@ -786,6 +792,18 @@ _POLICY_FILES = [
 ]
 
 
+def _policy_link_refusal(file_name: str) -> str:
+    """The routes' and merges' refusal of a linked ``.coherence/<file_name>``
+    (#498), written out here: the Node coordinator prints the same text."""
+    return (
+        f".coherence/{file_name} is a symlink; nothing was written. Replace it with a copy of "
+        "the file it names, or mount a directory at .coherence."
+    )
+
+
+_TRACKED_YAML_LINK_REFUSAL = _policy_link_refusal("tracked.yaml")
+
+
 @pytest.mark.parametrize(("file_name", "loaded_as"), [
     ("tracked.yaml", "user_added_patterns"), ("ignored.yaml", "ignored_patterns"),
 ])
@@ -936,6 +954,226 @@ def test_the_policy_writer_refuses_a_file_it_cannot_read(tmp_path: Path) -> None
     assert policy_file.read_text() == "- runbook.md\n"
 
 
+def test_append_policy_yaml_refuses_a_link_to_a_device_and_keeps_it(tmp_path: Path) -> None:
+    """The routes share the merge's reader, so a policy file linked to a device is
+    refused there too, as a link, before the device is opened (#498). Prevents a
+    route reading ``/dev/zero`` until memory runs out; ``os.devnull`` takes the same
+    path, and a regression here answers wrongly instead."""
+    from ccs.adapters.claude_code.coordinator_server import _append_policy_yaml
+
+    policy_file = tmp_path / ".coherence" / "tracked.yaml"
+    policy_file.parent.mkdir()
+    policy_file.symlink_to(os.devnull)
+
+    with pytest.raises(ValueError) as raised:
+        _append_policy_yaml(policy_file, ["ok.md"])
+
+    assert str(raised.value) == _TRACKED_YAML_LINK_REFUSAL
+    assert policy_file.is_symlink()
+
+
+def test_a_policy_route_answers_400_for_a_policy_file_linked_to_a_device(
+    coordinator, client: _Client,
+) -> None:
+    """On the wire, a policy file linked to a device is the 400 every linked
+    policy file gets, naming it and the way out, with the link kept (#498).
+    ``os.devnull`` stands in for ``/dev/zero``, so a regression answers wrongly
+    instead of reading until memory runs out."""
+    policy_file = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
+    policy_file.unlink(missing_ok=True)
+    policy_file.symlink_to(os.devnull)
+
+    s, b = client.post("/policy/track", {"paths": ["ok.md"]})
+
+    assert s == 400, b
+    assert b == {"error": _TRACKED_YAML_LINK_REFUSAL}, b
+    assert policy_file.is_symlink()
+
+
+@pytest.mark.parametrize(("endpoint", "file_name", "answer_key", "loaded_as"), _POLICY_FILES)
+def test_a_policy_route_refuses_a_policy_file_linked_after_the_start(
+    coordinator, client: _Client, endpoint: str, file_name: str, answer_key: str,
+    loaded_as: str,
+) -> None:
+    """#498: a start refuses a link in ``.coherence``, but a checkout can put one
+    there while the coordinator runs. The route answers 400 naming the link and
+    the way out, and leaves the link and the file it names alone.
+
+    Prevents the route reading the linked file's entries, renaming a regular file
+    holding them over the link, and loading them into the live policy."""
+    coherence_dir = coordinator.coordinator_root / ".coherence"
+    (coherence_dir / file_name).unlink(missing_ok=True)
+    target = plant_link(coherence_dir, file_name, "existing")
+    target.write_text('- "secret/**"\n')
+    before = target_snapshot(target)
+    link = os.readlink(coherence_dir / file_name)
+
+    s, b = client.post(endpoint, {"paths": ["ok.md"]})
+
+    assert (s, b) == (400, {"error": _policy_link_refusal(file_name)})
+    assert os.readlink(coherence_dir / file_name) == link
+    assert target_snapshot(target) == before
+    assert "secret/**" not in getattr(coordinator.policy, loaded_as)
+
+
+def test_a_policy_reload_does_not_read_a_policy_file_linked_after_the_start(
+    coordinator, client: _Client,
+) -> None:
+    """#498: a track reloads all three policy files. One linked while the
+    coordinator runs loads as no entries and is counted on ``/status`` as
+    rejected, naming it; the route still answers 200 for its own regular file.
+
+    Prevents a reload reading the entries of the file the link names: here an
+    ignore pattern that would stop tracking ``data/**``."""
+    coherence_dir = coordinator.coordinator_root / ".coherence"
+    (coherence_dir / "ignored.yaml").unlink(missing_ok=True)
+    target = plant_link(coherence_dir, "ignored.yaml", "existing")
+    target.write_text('- "data/**"\n')
+
+    s, b = client.post("/policy/track", {"paths": ["ok.md"]})
+    assert (s, b) == (200, {"ok": True, "added": ["ok.md"], "rejected": []}), b
+
+    assert coordinator.policy.ignored_patterns == ()
+    assert coordinator.policy.rejected() == (
+        (".coherence/ignored.yaml", "a symlink, so the file loads as no entries"),
+    )
+    s, status = client.get("/status")
+    assert s == 200 and status["policy_summary"]["rejected_pattern_count"] == 1, status
+
+
+def test_a_policy_file_linked_after_the_start_check_loads_as_no_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#498: the server's own start check refuses a linked policy file. This one
+    is linked after that check (patched out here), so the policy load meets it:
+    it loads as no entries and is counted as rejected, naming it.
+
+    Prevents the load reading the entries of the file the link names."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    target = plant_link(tmp_path / ".coherence", "tracked.yaml", "existing")
+    target.write_text('- "secret/**"\n')
+    monkeypatch.setattr(mod, "check_coherence_dir", lambda root: None)
+
+    server = CoordinatorHTTPServer(tmp_path, port=0)
+    try:
+        assert server.policy.user_added_patterns == ()
+        assert server.policy.rejected() == (
+            (".coherence/tracked.yaml", "a symlink, so the file loads as no entries"),
+        )
+    finally:
+        server.shutdown()
+    assert target.read_text() == '- "secret/**"\n'
+
+
+def test_a_policy_route_refuses_a_dangling_lock_sidecar_link_and_creates_nothing(
+    coordinator, client: _Client,
+) -> None:
+    """#498: the route locks its policy file through a ``<name>.lock`` sidecar it
+    opens with ``O_CREAT``. A link there, made while the coordinator runs, is
+    refused with 400 naming it, and the policy file is left as it was.
+
+    Prevents the lock open following a dangling link and creating the file it
+    names outside ``.coherence``."""
+    coherence_dir = coordinator.coordinator_root / ".coherence"
+    policy_before = target_snapshot(coherence_dir / "tracked.yaml")
+    target = plant_link(coherence_dir, "tracked.yaml.lock", "dangling")
+
+    s, b = client.post("/policy/track", {"paths": ["ok.md"]})
+
+    assert (s, b) == (
+        400, {"error": ".coherence/tracked.yaml.lock is a symlink; nothing was written. Remove the link."},
+    )
+    assert not os.path.lexists(target)
+    assert (coherence_dir / "tracked.yaml.lock").is_symlink()
+    assert target_snapshot(coherence_dir / "tracked.yaml") == policy_before
+
+
+@pytest.mark.parametrize(("endpoint", "file_name", "answer_key", "loaded_as"), _POLICY_FILES)
+def test_a_policy_route_refuses_a_fifo_lock_sidecar_made_after_the_start(
+    coordinator, client: _Client, endpoint: str, file_name: str, answer_key: str,
+    loaded_as: str,
+) -> None:
+    """#498: a start refuses a FIFO, socket or device in ``.coherence``, but one can
+    be put at the ``<name>.lock`` sidecar while the coordinator runs. The route
+    answers the 400 a policy file that is not regular gets, naming the sidecar,
+    and writes nothing.
+
+    Prevents a server error with nothing named. The request runs on a thread with
+    a deadline and the FIFO is released whatever happens, so a regression fails
+    here instead of hanging the run."""
+    coherence_dir = coordinator.coordinator_root / ".coherence"
+    policy_before = target_snapshot(coherence_dir / file_name)
+    lock = coherence_dir / f"{file_name}.lock"
+    lock.unlink(missing_ok=True)
+    os.mkfifo(lock)
+    answers: list[tuple[int, dict]] = []
+    worker = threading.Thread(
+        target=lambda: answers.append(client.post(endpoint, {"paths": ["ok.md"]})), daemon=True,
+    )
+    try:
+        worker.start()
+        worker.join(timeout=30)
+        assert not worker.is_alive(), "the route blocked on a FIFO lock sidecar"
+    finally:
+        release_fifo(lock)
+
+    assert answers == [(400, {
+        "error": f".coherence/{file_name}.lock could not be read (not a regular file); nothing was written.",
+    })]
+    assert target_snapshot(coherence_dir / file_name) == policy_before
+    assert "ok.md" not in getattr(coordinator.policy, loaded_as)
+
+
+def test_a_policy_route_over_a_fifo_made_after_the_start_answers_at_once(
+    coordinator, client: _Client,
+) -> None:
+    """A FIFO put at a policy file while the coordinator runs is refused at once
+    with the 400 every file that is not regular gets. Prevents the route opening
+    it for reading and blocking its handler with nothing named. The FIFO is
+    released whatever happens, so a regression fails here instead of hanging the
+    coordinator's shutdown."""
+    policy_file = coordinator.coordinator_root / ".coherence" / "tracked.yaml"
+    policy_file.unlink(missing_ok=True)
+    os.mkfifo(policy_file)
+    try:
+        s, b = client.post("/policy/track", {"paths": ["ok.md"]})
+    finally:
+        release_fifo(policy_file)
+
+    assert (s, b) == (
+        400, {"error": ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."},
+    )
+
+
+def test_a_coordinator_built_over_a_link_in_coherence_refuses_before_opening_its_store(
+    tmp_path: Path,
+) -> None:
+    """#498: the server runs the start check before it opens its store, loads its
+    policy or reads its secret. It is the backstop for a link made after
+    lifecycle's own check, and what ``--check-store``'s answer is compared with.
+
+    Prevents a coordinator built over a link reading the file it names, or
+    creating ``state.db`` beside it."""
+    coherence_dir = tmp_path / ".coherence"
+    target = plant_link(coherence_dir, "tracked.yaml", "existing")
+    before = target_snapshot(target)
+
+    try:
+        server = CoordinatorHTTPServer(tmp_path, port=0)
+    except CoherenceDirRefused as exc:
+        refused = exc
+    else:
+        server.shutdown()
+        pytest.fail("built a coordinator over a link in .coherence")
+
+    assert (refused.kind, refused.path) == (
+        COHERENCE_LINK_KIND, str(tmp_path.resolve() / ".coherence" / "tracked.yaml"),
+    )
+    assert sorted(os.listdir(coherence_dir)) == ["tracked.yaml"]
+    assert target_snapshot(target) == before
+
+
 def test_a_coordinator_over_a_broken_policy_file_counts_it_on_status(tmp_path: Path) -> None:
     """#284 at load time: a coordinator that starts over a tracked.yaml an
     earlier release broke serves, and /status counts the file as rejected,
@@ -1022,6 +1260,9 @@ def test_policy_untrack_decides_the_request_under_one_budget(
     it carries. Once that budget runs out, a later entry is refused (the
     check errs toward refusing) and nothing is written."""
     # data/[0-9] covers nothing; only a search of about 460 steps shows it.
+    # On a disk that folds names the search runs again folded, at twice the
+    # cost, so the budget below is sized for a disk that folds nothing.
+    monkeypatch.setattr(strict_coordinator, "fold_profile", FoldProfileResult(profile="none", status="classified"))
     monkeypatch.setattr(policy_module, "GLOB_INTERSECT_REQUEST_BUDGET", 700)
     s, b = strict_client.post("/policy/untrack", {"paths": ["data/[0-9]", "data/[0-8]"]})
     assert s == 409, b
@@ -1468,13 +1709,9 @@ def test_a1_pre_edit_drops_a_holder_released_after_the_collision_lookup(
             coordinator_arg, looked_up_artifact_id, exclude_agent=exclude_agent
         )
         assert result[0] == session_to_agent_id(holder)
-        coordinator_arg.service.invalidate(
-            agent_id=result[0],
-            artifact_id=looked_up_artifact_id,
-            new_version=1,
-            issuer_agent_id=result[0],
-            issued_at_tick=2,
-        )
+        coordinator_arg.service.release_to_reader(ReleaseRequest(
+            agent_id=result[0], artifact_id=looked_up_artifact_id, issued_at_tick=2,
+        ))
         return result
 
     monkeypatch.setattr(mod, "_exclusive_holder", release_after_lookup)
@@ -3622,6 +3859,258 @@ def test_read_policy_entries_refuses_a_file_that_loads_as_no_entries(text: str, 
     assert says in str(raised.value)
 
 
+@pytest.mark.parametrize(
+    ("body", "says"),
+    [
+        (b"- docs/**\n- *.md\n", "is not valid YAML"),
+        (b"- !!bool x\n", "is not valid YAML"),
+        (b"\xff\xfe\x00not text\n", "holds a single string, not a list"),
+        (b"\xc3\x28 not utf-8\n", "is not valid YAML"),
+        (b"plain: mapping\n", "holds a mapping, not a list"),
+        (b"just a string\n", "holds a single string, not a list"),
+    ],
+    ids=["unquoted_star", "tagged", "utf16_mark", "undecodable", "mapping", "scalar"],
+)
+def test_merge_policy_globs_refuses_a_file_that_loads_as_no_entries_and_keeps_it(
+    tmp_path: Path, body: bytes, says: str,
+) -> None:
+    """#305: a volume or substrate session about to spawn the coordinator refuses
+    a policy file that loads as no entries, names it, and leaves its bytes alone.
+
+    Prevents the merge reading it as empty and replacing it with only the managed
+    globs, deleting every other entry with no log line. A file broken by a release
+    that wrote ``- *.md`` is exactly what the restart after it would have reported
+    as rejected."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked = coherence / "tracked.yaml"
+    tracked.write_bytes(body)
+
+    with pytest.raises(ValueError, match="nothing was written") as raised:
+        merge_policy_globs((tracked,), ("data/**",))
+
+    assert str(raised.value).startswith(".coherence/tracked.yaml ")
+    assert says in str(raised.value)
+    assert tracked.read_bytes() == body
+
+
+def test_merge_policy_globs_refuses_a_file_it_cannot_read(tmp_path: Path) -> None:
+    """#305: a read failure refuses too, as the routes do. Prevents it reading as
+    empty, which replaced a file holding every pattern. A directory stands in
+    for the failure so the test does not depend on the user running it."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    (coherence / "tracked.yaml").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match=r"could not be read \(EISDIR\); nothing was written"):
+        merge_policy_globs((coherence / "tracked.yaml",), ("data/**",))
+
+    assert (coherence / "tracked.yaml").is_dir()
+
+
+def test_merge_policy_globs_refuses_a_link_to_a_device_and_keeps_it(tmp_path: Path) -> None:
+    """A repository can commit a policy file as a link, and a device such as
+    ``/dev/zero`` never reaches EOF. Prevents the merge reading one until memory
+    runs out: it refuses the link before the device is opened (#498).
+    ``os.devnull`` takes the same path, and a regression here answers wrongly
+    instead."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked = coherence / "tracked.yaml"
+    tracked.symlink_to(os.devnull)
+
+    with pytest.raises(ValueError) as raised:
+        merge_policy_globs((tracked,), ("data/**",))
+
+    assert str(raised.value) == _TRACKED_YAML_LINK_REFUSAL
+    assert tracked.is_symlink()
+
+
+def test_merge_policy_globs_works_where_the_platform_has_no_o_nonblock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``O_NONBLOCK`` is POSIX-only. Prevents its absence making the merge raise
+    AttributeError out of a volume's or a session's constructor, where degrade mode
+    promises to warn: a regular file still merges and a link is still refused."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked = coherence / "tracked.yaml"
+    tracked.write_text('- "docs/**"\n')
+    device = coherence / "strict_mode.yaml"
+    device.symlink_to(os.devnull)
+    monkeypatch.delattr(os, "O_NONBLOCK")
+
+    merge_policy_globs((tracked,), ("data/**",))
+    with pytest.raises(ValueError) as raised:
+        merge_policy_globs((device,), ("data/**",))
+
+    assert str(raised.value) == _policy_link_refusal("strict_mode.yaml")
+    assert yaml.safe_load(tracked.read_text()) == ["data/**", "docs/**"]
+
+
+@pytest.mark.parametrize("o_nonblock", [True, False], ids=["o_nonblock", "no_o_nonblock"])
+def test_the_policy_reader_refuses_a_device_given_directly(
+    monkeypatch: pytest.MonkeyPatch, o_nonblock: bool,
+) -> None:
+    """The routes and merges share this reader. A device at the path itself is
+    refused as not a regular file, with ``O_NONBLOCK`` and on a platform without
+    it: the protection the linked-device tests above carried before a link was
+    refused as a link (#498). Only the reader runs, so a regression here cannot
+    write anything at ``/dev``.
+
+    Prevents a route or a merge reading ``/dev/zero`` until memory runs out."""
+    from ccs.adapters.claude_code.coordinator_server import _read_policy_bytes
+
+    if not o_nonblock:
+        monkeypatch.delattr(os, "O_NONBLOCK")
+
+    with pytest.raises(ValueError) as raised:
+        _read_policy_bytes(Path(os.devnull), ".coherence/tracked.yaml")
+
+    assert str(raised.value) == (
+        ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."
+    )
+
+
+@pytest.mark.parametrize("linked", [False, True], ids=["fifo", "link_to_fifo"])
+def test_merge_policy_globs_refuses_a_fifo_without_blocking(tmp_path: Path, linked: bool) -> None:
+    """Opening a FIFO with no writer blocks forever, which would hang a volume's or
+    a session's constructor with nothing named. The merge runs on a thread so a
+    regression fails here instead of hanging the suite."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked = coherence / "tracked.yaml"
+    fifo = tmp_path / "outside.fifo" if linked else tracked
+    os.mkfifo(fifo)
+    if linked:
+        tracked.symlink_to(fifo)
+    refusals: list[str] = []
+
+    def merge() -> None:
+        try:
+            merge_policy_globs((tracked,), ("data/**",))
+        except ValueError as exc:
+            refusals.append(str(exc))
+
+    worker = threading.Thread(target=merge, daemon=True)
+    worker.start()
+    worker.join(timeout=30)
+    if worker.is_alive():
+        # Opening the other end releases the blocked read so the thread can end.
+        os.close(os.open(fifo, os.O_RDWR | os.O_NONBLOCK))
+        worker.join(timeout=5)
+        pytest.fail("the merge blocked on a FIFO")
+
+    expected = (
+        _TRACKED_YAML_LINK_REFUSAL if linked
+        else ".coherence/tracked.yaml could not be read (not a regular file); nothing was written."
+    )
+    assert refusals == [expected]
+    assert tracked.is_symlink() is linked
+
+
+@pytest.mark.parametrize("shape", ["existing", "dangling"], ids=["existing_target", "dangling"])
+def test_merge_policy_globs_refuses_a_linked_policy_file_and_writes_nothing(
+    tmp_path: Path, shape: str,
+) -> None:
+    """#498: a repository can commit a policy file as a link. The merge refuses
+    it, naming it and the way out, before it writes any file: the regular file
+    merged beside it keeps its bytes too (#305), the link is kept, and the file it
+    names keeps its bytes or stays absent.
+
+    Prevents the merge reading the entries of the file a link names and renaming
+    a regular file holding them over the link."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    strict = coherence / "strict_mode.yaml"
+    target = plant_link(coherence, "tracked.yaml", shape)
+    if shape == "existing":
+        # A list the merge could take, so only the link stops it.
+        target.write_text('- "secret/**"\n')
+    strict.write_text('- "docs/**"\n')
+    before = target_snapshot(target)
+    link = os.readlink(coherence / "tracked.yaml")
+
+    with pytest.raises(ValueError) as raised:
+        merge_policy_globs((strict, coherence / "tracked.yaml"), ("data/**",))
+
+    assert str(raised.value) == _TRACKED_YAML_LINK_REFUSAL
+    assert os.readlink(coherence / "tracked.yaml") == link
+    assert target_snapshot(target) == before
+    assert strict.read_text() == '- "docs/**"\n'
+    assert sorted(os.listdir(coherence)) == ["strict_mode.yaml", "tracked.yaml"]
+
+
+@pytest.mark.parametrize("broken_first", [True, False], ids=["broken_first", "broken_last"])
+def test_merge_policy_globs_writes_neither_file_when_it_refuses_one(
+    tmp_path: Path, broken_first: bool,
+) -> None:
+    """#305: the refusal says nothing was written, so it holds for every file in
+    the merge, in either order.
+
+    Prevents a refused attach leaving the managed globs tracked but not strict,
+    for the next coordinator to load."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    good, broken = coherence / "tracked.yaml", coherence / "strict_mode.yaml"
+    good.write_text('- "docs/**"\n')
+    broken.write_text("- *.md\n")
+
+    with pytest.raises(ValueError, match="strict_mode.yaml"):
+        merge_policy_globs((broken, good) if broken_first else (good, broken), ("data/**",))
+
+    assert good.read_text() == '- "docs/**"\n'
+    assert broken.read_text() == "- *.md\n"
+    assert sorted(path.name for path in coherence.iterdir()) == ["strict_mode.yaml", "tracked.yaml"]
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        (None, ["data/**"]),
+        ("", ["data/**"]),
+        ("~\n", ["data/**"]),
+        ('- "docs/**"\n', ["data/**", "docs/**"]),
+        ('- "*.md"\n', ["*.md", "data/**"]),
+    ],
+    ids=["absent", "empty", "null", "an_entry", "a_quoted_star"],
+)
+def test_merge_policy_globs_adds_to_a_file_that_loads(
+    tmp_path: Path, before: Optional[str], after: list[str],
+) -> None:
+    """A missing, empty or valid file takes the globs and keeps what it held, and
+    the result loads back. Prevents the refusal reaching a file with nothing
+    wrong with it: a fresh workspace has no policy file at all."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    tracked = tmp_path / "tracked.yaml"
+    if before is not None:
+        tracked.write_text(before)
+
+    merge_policy_globs((tracked,), ("data/**",))
+
+    assert yaml.safe_load(tracked.read_text()) == after
+    assert [path.name for path in tmp_path.iterdir()] == ["tracked.yaml"]
+
+
+def test_merge_policy_globs_leaves_a_file_that_already_holds_the_globs(tmp_path: Path) -> None:
+    """A merge that adds nothing does not rewrite, so a sibling's start does not
+    churn the file, or drop its comments, for nothing."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+    tracked = tmp_path / "tracked.yaml"
+    tracked.write_text('# kept\n- "data/**"\n')
+    before = tracked.stat().st_ino
+
+    merge_policy_globs((tracked,), ("data/**",))
+
+    assert tracked.read_text() == '# kept\n- "data/**"\n'
+    assert tracked.stat().st_ino == before
+
+
 def test_read_policy_entries_blames_extra_documents_only_for_a_second_document() -> None:
     """The refusal says the file holds more than one YAML document only when
     it does. The parser's problem text quotes file content, so a tag that
@@ -3752,6 +4241,60 @@ def test_r11_ensure_secret_fails_closed_when_empty_file_persists(
     assert "stayed empty" in str(exc.value)
     # The file must remain empty — we did NOT O_TRUNC over it.
     assert secret_path.stat().st_size == 0
+
+
+@pytest.mark.parametrize("shape", ["existing", "dangling"])
+def test_ensure_secret_refuses_a_linked_secret_and_names_it(tmp_path: Path, shape: str) -> None:
+    """#498: a start refuses a linked ``hook.secret`` before it builds a server;
+    ``ensure_secret`` is the backstop for one linked after that check. It raises
+    at once, naming the link and the way out, and leaves the link and the file it
+    names alone.
+
+    Prevents the file a link names becoming the bearer, and a dangling link being
+    reported as a secret that stayed empty across five attempts."""
+    from ccs.adapters.claude_code.auth import EnsureSecretError, ensure_secret
+
+    coherence_dir = tmp_path / ".coherence"
+    secret = coherence_dir / "hook.secret"
+    target = plant_link(coherence_dir, "hook.secret", shape)
+    before = target_snapshot(target)
+
+    with pytest.raises(EnsureSecretError) as refused:
+        ensure_secret(tmp_path)
+
+    assert str(refused.value) == (
+        f"refusing {secret}: it is a symlink, and .coherence must be a real directory with no link "
+        "directly inside it. Replace the link with a copy of the file it names, or mount a directory "
+        f"at {coherence_dir}."
+    )
+    assert secret.is_symlink()
+    assert target_snapshot(target) == before
+
+
+def test_ensure_secret_never_reads_the_secret_of_a_linked_coherence(tmp_path: Path) -> None:
+    """#498: the backstop also looks at ``.coherence`` itself, since ``O_NOFOLLOW``
+    guards only the last component. A ``.coherence`` linked to another
+    directory is refused, naming it, and that directory's secret is never read.
+
+    Prevents a start taking another workspace's secret as its own."""
+    from ccs.adapters.claude_code.auth import EnsureSecretError, ensure_secret
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "hook.secret").write_bytes(TARGET_BYTES)
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.symlink_to(elsewhere)
+
+    with pytest.raises(EnsureSecretError) as refused:
+        ensure_secret(tmp_path)
+
+    assert str(refused.value) == (
+        f"refusing {coherence_dir}: it is a symlink, and .coherence must be a real directory. "
+        "Replace the link with a real directory and copy in the files you want to keep (move "
+        f"state.db together with its -wal and -shm), or mount a directory at {coherence_dir}."
+    )
+    assert sorted(os.listdir(elsewhere)) == ["hook.secret"]
+    assert (elsewhere / "hook.secret").read_bytes() == TARGET_BYTES
 
 
 # ----------------------------------------------------------------------
@@ -5322,12 +5865,13 @@ def test_session_start_pending_notice_rendered_read_only(
     assert "AGENTS.md" in body["hookSpecificOutput"]["additionalContext"]
 
 
-def test_session_start_subagent_grants_grouped_and_released_absent(
+def test_session_start_subagent_grants_grouped_and_a_released_grant_rendered_as_a_read(
     coordinator, client: _Client
 ) -> None:
     """R3 + KTD8: the parent's lines render first, then subagent groups
-    under a `Subagent {name}:` prefix. After the subagent stops (grants
-    released), its grant line disappears from the next payload."""
+    under a `Subagent {name}:` prefix. After the subagent stops, its write
+    grant is released to a read (#513), so its EXCLUSIVE line gives way to a
+    SHARED grant line in the next payload."""
     sid = _sid("ss-sub")
     client.post("/hooks/pre-read",
                 {"session_id": sid, "path": "CLAUDE.md", "content_hash": _hash("c1")})
@@ -5342,15 +5886,16 @@ def test_session_start_subagent_grants_grouped_and_released_absent(
     sub_at = text.index("At compaction you held EXCLUSIVE on plan.md (v1)")
     assert parent_at < prefix_at < sub_at
 
-    # Stop the subagent — its E grant is released (row goes INVALID).
+    # Stop the subagent — its E grant is released to a read (row goes SHARED).
     client.post("/hooks/session-stop", {"session_id": sid, "agent_id": "worker-1"})
     status, body = client.post("/hooks/session-start", {"session_id": sid})
     assert status == 200
     text = _session_start_text(body)
     assert "At compaction you held EXCLUSIVE on plan.md" not in text
-    # The released row is still a touched row — rendered without a flag.
+    # The released row is a held read, rendered as a grant line.
     assert "Subagent worker-1:" in text
-    assert "plan.md is at v1." in text
+    assert "At compaction you held SHARED on plan.md (v1) — re-acquire before writing." in text
+    assert "plan.md is at v1." not in text
 
 
 def test_session_start_two_identical_calls_byte_identical(
@@ -10649,11 +11194,10 @@ def test_the_refusal_names_the_holder_its_own_decision_read(
     def write_after_the_holder_changes(**kwargs: Any) -> Any:
         if kwargs["agent_id"] == caller_agent and not changed:
             changed.append(True)
-            version = coordinator.registry.get_artifact(artifact_id).version
-            service.invalidate(
-                agent_id=first_agent, artifact_id=artifact_id, new_version=version,
-                issuer_agent_id=first_agent, issued_at_tick=kwargs["issued_at_tick"],
-            )
+            service.release_to_reader(ReleaseRequest(
+                agent_id=first_agent, artifact_id=artifact_id,
+                issued_at_tick=kwargs["issued_at_tick"],
+            ))
             real_write(
                 agent_id=second_agent, artifact_id=artifact_id,
                 issued_at_tick=kwargs["issued_at_tick"],
@@ -10694,11 +11238,10 @@ def test_an_opted_in_admit_after_the_holder_released_carries_no_collision_or_not
     def write_after_the_holder_releases(**kwargs: Any) -> Any:
         if kwargs["agent_id"] == caller_agent and not released:
             released.append(True)
-            version = coordinator.registry.get_artifact(artifact_id).version
-            service.invalidate(
-                agent_id=holder_agent, artifact_id=artifact_id, new_version=version,
-                issuer_agent_id=holder_agent, issued_at_tick=kwargs["issued_at_tick"],
-            )
+            service.release_to_reader(ReleaseRequest(
+                agent_id=holder_agent, artifact_id=artifact_id,
+                issued_at_tick=kwargs["issued_at_tick"],
+            ))
         return real_write(**kwargs)
 
     monkeypatch.setattr(service, "write", write_after_the_holder_releases)
@@ -11138,19 +11681,18 @@ def test_an_untracked_opted_in_pre_edit_whose_re_grounding_times_out_answers_the
     assert coordinator._watchdog_timeouts_total == timeouts_before + 1
 
 
-def test_on_a_strict_path_a_release_after_unavailable_leaves_that_identity_denied(
+def test_on_a_strict_path_a_release_after_unavailable_changes_nothing_for_that_identity(
     strict_plan_coordinator, strict_plan_client: _Client, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The release a client makes after ``unavailable``, on a strict path that
-    has a version: the failed post-edit answers ``released: true`` and leaves
-    the caller INVALID, so the same identity's next opted-in pre-edit gets
-    the strict deny, and so does its read, and it stays INVALID. The same
-    pre-edit under a new ``agent_id``, with the same session and principal,
-    is admitted while nobody holds the file.
+    has a version: the abandoned work took no grant, so the failed post-edit
+    answers ``released: true`` and changes nothing, making no row for the
+    caller (#513), and the same identity's next opted-in pre-edit is admitted
+    while nobody holds the file.
 
-    Pins why a client re-reads under a new ``agent_id`` after releasing: a
-    deny never re-grants the identity it denies, so every retry under the
-    released one is denied."""
+    Pins that the release costs the client nothing: it used to leave the
+    caller INVALID, and as a deny never re-grants the identity it denies,
+    every later pre-edit and read under it got the strict deny."""
     import ccs.adapters.claude_code.coordinator_server as mod
 
     coordinator, client = strict_plan_coordinator, strict_plan_client
@@ -11171,19 +11713,11 @@ def test_on_a_strict_path_a_release_after_unavailable_leaves_that_identity_denie
         "/hooks/post-edit", {"session_id": caller.sid, "path": "plan.md", "success": False},
         principal=caller.principal)
     assert released == (200, {"ok": True, "released": True}), released
-    assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.INVALID
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) is None
 
-    status, denied = client.post("/hooks/pre-edit", request, principal=caller.principal)
-    assert status == 200 and denied.get("status") == "stale", denied
-    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny", denied
-    read = _read(client, caller, "plan.md")
-    assert read["hookSpecificOutput"]["permissionDecision"] == "deny", read
-    assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.INVALID
-
-    status, admitted = client.post(
-        "/hooks/pre-edit", {**request, "agent_id": "reread-1"}, principal=caller.principal)
+    status, admitted = client.post("/hooks/pre-edit", request, principal=caller.principal)
     assert status == 200 and admitted.get("ok") is True, admitted
-    assert _state(coordinator, "plan.md", caller.composite("reread-1")) == MESIState.EXCLUSIVE
+    assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.EXCLUSIVE
 
 
 # --- the gate's store read RAISES: the route's own internal-error answer ------
@@ -12562,12 +13096,13 @@ def test_status_full_tier_does_not_report_a_voluntary_release_as_a_reclaim(
     sid = _sid("release-195")
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
     assert client.post("/hooks/session-stop", {"session_id": sid})[0] == 200
-    # Nothing for the sweep to pull: the release already left INVALID.
+    # Nothing for the sweep to pull: the release left a read, never reclaimed.
     assert _sweep(coordinator, int(time.time()) + 999_999) == 0
 
     row = _row_for(_operator_status(client), sid)
-    assert row["states"] == {}
+    assert row["states"] == {"plan.md": "SHARED"}
     assert row["reclaimed"] == {}
+    assert row["grants"] == {}
     _, metrics = client.get("/status?detail=metrics")
     assert metrics["sweep_reclaims_total"] == 0
 
@@ -12662,7 +13197,7 @@ def test_a_reclaimed_path_stays_listed_through_a_reread_and_clears_on_reacquire(
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
     client.post("/hooks/session-stop", {"session_id": sid})
     row = _row_for(_operator_status(client), sid)
-    assert row["states"] == {}
+    assert row["states"] == {"plan.md": "SHARED"}
     assert row["reclaimed"] == {}, "a re-acquire clears the slot; the later exit was a release"
 
 
@@ -14097,6 +14632,21 @@ def test_a_snapshot_commit_without_a_principal_acts_as_the_bound_session_it_name
 # --- the release answer: per grant only when it is not a clean success -------
 
 
+def _record_watchdog_aborts(coordinator, monkeypatch: pytest.MonkeyPatch) -> list:
+    """Record the abort event each request hands the watchdog, so a test can
+    check that the release runs under that request's own event: only that
+    one is set when the request times out."""
+    aborts: list = []
+    run = coordinator.run_with_watchdog
+
+    def recording(fn, abort=None, **kwargs):
+        aborts.append(abort)
+        return run(fn, abort, **kwargs)
+
+    monkeypatch.setattr(coordinator, "run_with_watchdog", recording)
+    return aborts
+
+
 def test_a_clean_session_stop_answers_todays_exact_bytes(coordinator, client: _Client) -> None:
     """A stop that releases every grant answers
     the body the Node backend mirrors -- no per-grant list. The paths come
@@ -14123,14 +14673,17 @@ def test_a_session_stop_that_keeps_a_grant_answers_per_grant(
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "spec.md"})
     spec_id = coordinator.registry.lookup_artifact_id_by_name("spec.md")
-    release = coordinator.service.invalidate
+    release = coordinator.service.release_to_reader
+    aborts = _record_watchdog_aborts(coordinator, monkeypatch)
 
-    def failing_on_spec(**kwargs: Any):
-        if kwargs["artifact_id"] == spec_id:
+    def failing_on_spec(request: Any, **kwargs: Any):
+        assert kwargs.get("abort") is not None
+        assert kwargs["abort"] is aborts[-1]
+        if request.artifact_id == spec_id:
             raise CoherenceError("release refused by the test")
-        return release(**kwargs)
+        return release(request, **kwargs)
 
-    monkeypatch.setattr(coordinator.service, "invalidate", failing_on_spec)
+    monkeypatch.setattr(coordinator.service, "release_to_reader", failing_on_spec)
     answer = client.post("/hooks/session-stop", {"session_id": sid})
 
     assert answer == (200, {
@@ -14141,7 +14694,7 @@ def test_a_session_stop_that_keeps_a_grant_answers_per_grant(
             {"path": "spec.md", "held": True, "reason": "release refused by the test"},
         ],
     })
-    assert _state(coordinator, "plan.md", agent_id) == MESIState.INVALID
+    assert _state(coordinator, "plan.md", agent_id) == MESIState.SHARED
     assert _state(coordinator, "spec.md", agent_id) == MESIState.EXCLUSIVE
 
 
@@ -14157,11 +14710,14 @@ def test_a_failed_edit_release_that_keeps_its_grant_answers_per_grant(
     sid = _sid("failed-edit-held")
     agent_id = session_to_agent_id(sid)
     client.post("/hooks/pre-edit", {"session_id": sid, "path": "plan.md"})
+    aborts = _record_watchdog_aborts(coordinator, monkeypatch)
 
-    def refusing(**kwargs: Any):
+    def refusing(*_args: Any, **kwargs: Any):
+        assert kwargs.get("abort") is not None
+        assert kwargs["abort"] is aborts[-1]
         raise CoherenceError("release refused by the test")
 
-    monkeypatch.setattr(coordinator.service, "invalidate", refusing)
+    monkeypatch.setattr(coordinator.service, "release_to_reader", refusing)
     answer = client.post("/hooks/post-edit", {
         "session_id": sid, "path": "plan.md", "success": False,
     })
@@ -14227,6 +14783,464 @@ def test_a_failed_edit_report_off_a_handoff_keeps_todays_bytes(
     assert client.post("/hooks/post-edit", {
         "session_id": sid, "path": "plan.md", "success": False,
     }) == (200, {"ok": True, "released": True})
+
+
+# --- an ended attempt: the stop that reports it forgets it (#525) -------------
+#
+# A CoherentVolume starts a new attempt (a composite agent id) on every
+# compare-and-swap conflict and re-mint. A stop carrying ``ended: true`` and
+# the attempt's agent_id reports that attempt over: after the stop's releases,
+# the coordinator deletes its records and drops its display name and its
+# stale-warning markers. Nothing else ends an identity: a parent Stop is a
+# session between turns, and a SubagentStop can be blocked and the subagent
+# resumed under the same id.
+
+_STOP = "/hooks/session-stop"
+
+
+@dataclasses.dataclass(frozen=True)
+class _Identity:
+    """One identity of a claimed session, posting hooks through ``client``:
+    the session itself, or with ``subagent`` one of its attempts, a composite
+    agent id."""
+
+    client: _Client
+    who: _Session
+    subagent: str | None = None
+
+    @property
+    def agent_id(self) -> uuid.UUID:
+        return session_to_agent_id(self.who.sid, self.subagent)
+
+    def post(self, route: str, fields: dict) -> tuple[int, dict]:
+        """POST ``fields`` to ``route`` as this identity, presenting its
+        session's principal."""
+        body: dict = {"session_id": self.who.sid, **fields}
+        if self.subagent is not None:
+            body["agent_id"] = self.subagent
+        return self.client.post(route, body, principal=self.who.principal)
+
+
+def _stop(identity: _Identity, extra: dict | None = None) -> tuple[int, dict]:
+    """A session-stop for ``identity``, ``extra`` added to its body."""
+    return identity.post(_STOP, extra or {})
+
+
+def _edit_as(identity: _Identity, path: str) -> None:
+    status, answer = identity.post("/hooks/pre-edit", {"path": path})
+    assert status == 200 and answer.get("ok") is True, answer
+
+
+def _outwrite(writer: _Identity, path: str) -> None:
+    """``writer`` edits ``path`` and commits it, a version past every read."""
+    _edit_as(writer, path)
+    status, answer = writer.post("/hooks/post-edit", {"path": path, "content_hash": _hash("v2"), "success": True})
+    assert status == 200 and answer.get("ok") is True, answer
+
+
+def _status_row_of(client: _Client, agent_id: uuid.UUID) -> dict | None:
+    """The operator-tier ``/status`` row for ``agent_id``, or None when the
+    payload does not list it."""
+    rows = [row for row in _operator_status(client)["sessions"] if row["agent_id"] == str(agent_id)]
+    assert len(rows) <= 1, rows
+    return rows[0] if rows else None
+
+
+def _attempt_in_every_state(coordinator, client: _Client) -> tuple[_Identity, _Identity]:
+    """An attempt holding spec.md EXCLUSIVE, task.md SHARED and plan.md
+    INVALID with a notice queued, a peer session having taken plan.md from
+    it. Returns the attempt and that peer."""
+    attempt, peer = _Identity(client, _claimed(client), "inc-1"), _Identity(client, _claimed(client))
+    _edit_as(attempt, "spec.md")
+    _read(client, attempt.who, "task.md", "inc-1")
+    _edit_as(attempt, "plan.md")
+    _edit_as(peer, "plan.md")
+    assert _status_row_of(client, attempt.agent_id)["states"] == {"spec.md": "EXCLUSIVE", "task.md": "SHARED"}
+    assert _state(coordinator, "plan.md", attempt.agent_id) == MESIState.INVALID
+    return attempt, peer
+
+
+def _mark_warned(coordinator, identity: _Identity, paths: list[str]) -> None:
+    """Mark ``identity`` stale-warned on each of ``paths``, as a stale
+    pre-read does."""
+    for path in paths:
+        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        coordinator.mark_stale_warned(identity.agent_id, artifact_id)
+
+
+def _warned_paths(coordinator, identity: _Identity) -> set[str]:
+    """The paths ``identity`` holds a stale-warning marker on."""
+    with coordinator._stale_warned_pairs_lock:
+        files = [artifact for agent, artifact in coordinator._stale_warned_pairs if agent == identity.agent_id]
+    return {coordinator.registry.get_artifact(artifact_id).name for artifact_id in files}
+
+
+def test_an_ended_stop_releases_the_attempt_then_forgets_its_records_and_name(
+    coordinator, client: _Client
+) -> None:
+    """The stop releases the attempt's write grant and answers as any stop
+    does, its notice included; then the attempt's rows in every state, its
+    heartbeat, its display name and its stale-warning markers are gone, so
+    ``/status`` no longer lists it, while a peer's grant and marker stay.
+    Prevents every ended attempt staying in the coordinator and in
+    ``/status`` for good."""
+    attempt, peer = _attempt_in_every_state(coordinator, client)
+    _mark_warned(coordinator, attempt, ["spec.md", "task.md"])
+    _mark_warned(coordinator, peer, ["spec.md"])
+
+    status, body = _stop(attempt, {"ended": True})
+
+    assert status == 200, body
+    assert (body["ok"], body["released_artifacts"]) == (True, ["spec.md"])
+    assert [notice["path"] for notice in body["notices"]] == ["plan.md"]
+    for path in ("spec.md", "plan.md", "task.md"):
+        assert _state(coordinator, path, attempt.agent_id) is None, path
+    assert coordinator.registry.last_heartbeat_tick(attempt.agent_id) is None
+    assert coordinator.agent_name_for(attempt.agent_id) is None
+    assert _status_row_of(client, attempt.agent_id) is None
+    assert (_warned_paths(coordinator, attempt), _warned_paths(coordinator, peer)) == (set(), {"spec.md"})
+    assert _state(coordinator, "plan.md", peer.agent_id) == MESIState.EXCLUSIVE
+
+
+def test_a_malformed_ended_is_refused_400_and_releases_nothing(
+    coordinator, client: _Client
+) -> None:
+    """``ended`` that is not a boolean (null included), or true on a stop
+    that names no agent_id, answers 400 in the Node backend's words. A stop
+    with no agent_id is a parent Stop, a session between turns, so it can
+    never end. Neither the attempt's nor the session's grant is released."""
+    owner = _claimed(client)
+    attempt, session = _Identity(client, owner, "inc-1"), _Identity(client, owner)
+    _edit_as(attempt, "plan.md")
+    _edit_as(session, "spec.md")
+
+    for ended in ("yes", 1, 0, None, {}, []):
+        assert _stop(attempt, {"ended": ended}) == (
+            400, {"error": "ended must be a boolean"}), ended
+    for subagent in (None, ""):
+        assert _stop(_Identity(client, owner, subagent), {"ended": True}) == (
+            400, {"error": "ended requires agent_id"}), subagent
+
+    assert _state(coordinator, "plan.md", attempt.agent_id) == MESIState.EXCLUSIVE
+    assert _state(coordinator, "spec.md", session.agent_id) == MESIState.EXCLUSIVE
+    assert coordinator.agent_name_for(attempt.agent_id) is not None
+
+
+def test_ended_is_checked_before_the_agent_id_and_the_principal(client: _Client) -> None:
+    """The order the Node backend checks in: the session_id first, then a
+    malformed ``ended``, so a body malformed in two of them gets one answer
+    from both backends; a well-formed ``ended`` leaves a malformed agent_id
+    to its own refusal. Like that refusal, it comes before the principal
+    gate."""
+    owner = _claimed(client)
+    body = {"session_id": owner.sid, "agent_id": "not an id"}
+    assert client.post(_STOP, {**body, "session_id": "not-a-uuid", "ended": "yes"}, principal=owner.principal) == (
+        400, {"error": "session_id must be a UUID (8-4-4-4-12 hex with hyphens)"})
+    assert client.post(_STOP, {**body, "ended": "yes"}, principal=owner.principal) == (
+        400, {"error": "ended must be a boolean"})
+    assert client.post(_STOP, {**body, "ended": True}, principal=owner.principal) == (
+        400, _MALFORMED_SUBAGENT_ERROR)
+    assert client.post(
+        _STOP, {"session_id": owner.sid, "agent_id": "inc-1", "ended": 1}, principal="not-its-principal",
+    ) == (400, {"error": "ended must be a boolean"})
+
+
+@pytest.mark.parametrize(
+    "extra", [{}, {"ended": False}, {"some_later_field": 1}], ids=["no-ended", "ended-false", "unknown-key"]
+)
+def test_a_stop_that_reports_no_end_keeps_the_attempts_rows(
+    extra: dict, coordinator, client: _Client
+) -> None:
+    """Without ``ended: true`` an attempt's stop answers today's bytes and
+    forgets nothing: its rows stay SHARED and ``/status`` keeps listing it.
+    A key the handler does not know is ignored, which is why a volume that
+    sends ``ended`` to a coordinator predating it gets this same answer."""
+    attempt = _Identity(client, _claimed(client), "inc-1")
+    _edit_as(attempt, "plan.md")
+    _read(client, attempt.who, "task.md", "inc-1")
+
+    assert _stop(attempt, extra) == (200, {"ok": True, "released_artifacts": ["plan.md"]})
+
+    assert _status_row_of(client, attempt.agent_id)["states"] == {"plan.md": "SHARED", "task.md": "SHARED"}
+    assert coordinator.registry.last_heartbeat_tick(attempt.agent_id) is not None
+    assert coordinator.agent_name_for(attempt.agent_id) is not None
+
+
+def test_a_parent_stop_reporting_no_end_needs_no_agent_id(coordinator, client: _Client) -> None:
+    """Only ``ended: true`` needs an agent_id. A parent Stop carrying
+    ``ended: false`` and no agent_id answers today's bytes and releases the
+    session's grant. Prevents a parent Stop that reports no end being
+    refused for the agent_id it never names."""
+    session = _Identity(client, _claimed(client))
+    _edit_as(session, "spec.md")
+
+    assert _stop(session, {"ended": False}) == (200, {"ok": True, "released_artifacts": ["spec.md"]})
+
+    assert _state(coordinator, "spec.md", session.agent_id) == MESIState.SHARED
+
+
+@pytest.mark.parametrize("subagent", [None, "worker-1"], ids=["parent-stop", "subagent-stop"])
+def test_a_stopped_identity_a_peer_then_outwrites_is_still_denied_its_edit(
+    subagent: str | None, strict_plan_coordinator, strict_plan_client: _Client
+) -> None:
+    """A parent Stop and a plain SubagentStop end nothing: the identity keeps
+    its row and its name, and after a peer commits the strict file it read,
+    its edit is denied stale, as before. A SubagentStop can be blocked and
+    the subagent resumed under the same id; a deleted row would turn this
+    deny into an admit."""
+    client = strict_plan_client
+    stopped, writer = _Identity(client, _claimed(client), subagent), _Identity(client, _claimed(client))
+    status, read = stopped.post("/hooks/pre-read", {"path": "plan.md", "content_hash": _hash("v1")})
+    assert status == 200 and read.get("status") == "fresh", read
+
+    assert _stop(stopped) == (200, {"ok": True, "released_artifacts": []})
+    assert _state(strict_plan_coordinator, "plan.md", stopped.agent_id) == MESIState.SHARED
+    assert strict_plan_coordinator.agent_name_for(stopped.agent_id) is not None
+    _outwrite(writer, "plan.md")
+
+    status, edit = stopped.post("/hooks/pre-edit", {"path": "plan.md"})
+
+    assert status == 200 and edit.get("ok") is False, edit
+    reason = edit["hookSpecificOutput"]["permissionDecisionReason"]
+    assert reason.startswith("Stale read denied: plan.md was updated by agent "), reason
+
+
+def _refuse_release(*_args: Any, **_kwargs: Any) -> bool:
+    raise CoherenceError("release refused by the test")
+
+
+def test_an_ended_stop_whose_release_fails_keeps_every_row_and_the_name(
+    coordinator, client: _Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A release that fails inside the stop leaves its grant held, so the
+    forget is refused: the answer lists that grant held, no row of the
+    attempt is deleted, its name stays in ``/status``, and the refusal is
+    logged. Prevents an ended stop dropping the records of a grant the
+    coordinator still enforces."""
+    attempt = _Identity(client, _claimed(client), "inc-1")
+    _edit_as(attempt, "plan.md")
+    _read(client, attempt.who, "task.md", "inc-1")
+
+    with pytest.MonkeyPatch.context() as patch, caplog.at_level(logging.WARNING, logger=_CSRV):
+        patch.setattr(coordinator.service, "release_to_reader", _refuse_release)
+        answer = _stop(attempt, {"ended": True})
+
+    assert answer == (200, {"ok": False, "released_artifacts": [], "grants": [
+        {"path": "plan.md", "held": True, "reason": "release refused by the test"},
+    ]})
+    assert _state(coordinator, "plan.md", attempt.agent_id) == MESIState.EXCLUSIVE
+    assert _state(coordinator, "task.md", attempt.agent_id) == MESIState.SHARED
+    assert coordinator.registry.last_heartbeat_tick(attempt.agent_id) is not None
+    row = _status_row_of(client, attempt.agent_id)
+    assert row is not None and row["agent_name"] is not None
+    assert row["states"] == {"plan.md": "EXCLUSIVE", "task.md": "SHARED"}
+    assert "forget_not_allowed" in caplog.text
+
+
+@pytest.mark.parametrize("presented", ["absent", "foreign"])
+def test_an_ended_stop_refused_for_its_principal_forgets_nothing(
+    presented: str, coordinator, client: _Client
+) -> None:
+    """An ended stop naming a claimed session's attempt, with no principal or
+    with another session's, is refused HTTP 400 at the caller-principal gate,
+    and the gate comes before the forget: the attempt's row, heartbeat,
+    display name and stale-warning marker all stay. The attempt holds no
+    write grant, so only the gate stands between the stop and the forget.
+    Control: the same stop with the session's own principal forgets them.
+
+    Prevents a caller that cannot present a session's principal forgetting
+    that session's attempts."""
+    attempt = _Identity(client, _claimed(client), "inc-1")
+    _read(client, attempt.who, "task.md", "inc-1")
+    _mark_warned(coordinator, attempt, ["task.md"])
+    principal, refusal = {
+        "absent": (None, _PRINCIPAL_ABSENT_REFUSAL),
+        "foreign": (_claimed(client).principal, _PRINCIPAL_FOREIGN_REFUSAL),
+    }[presented]
+    body = {"session_id": attempt.who.sid, "agent_id": attempt.subagent, "ended": True}
+
+    assert client.post(_STOP, body, principal=principal) == (400, refusal)
+
+    assert _state(coordinator, "task.md", attempt.agent_id) == MESIState.SHARED
+    assert coordinator.registry.last_heartbeat_tick(attempt.agent_id) is not None
+    assert coordinator.agent_name_for(attempt.agent_id) is not None
+    assert _warned_paths(coordinator, attempt) == {"task.md"}
+    assert _stop(attempt, {"ended": True}) == (200, {"ok": True, "released_artifacts": []})
+    assert (_state(coordinator, "task.md", attempt.agent_id), _warned_paths(coordinator, attempt)) == (None, set()), (
+        "control: the same stop, admitted, forgets the attempt")
+
+
+@pytest.mark.parametrize(("fault", "message"), [
+    pytest.param(sqlite3.OperationalError, "database is locked", id="store-fault"),
+    pytest.param(ValueError, "a backend's own error", id="value-error-not-the-refusal"),
+])
+def test_an_ended_stop_whose_forget_fails_answers_the_failure_envelope(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, fault: type[Exception], message: str
+) -> None:
+    """Only the forget's refusal, a ``ForgetRefused``, is logged and passed
+    over. Any other fault in the forget, a store fault or a ``ValueError``
+    that is not the refusal, fails the stop as one anywhere in its body does,
+    HTTP 200 with the internal-error envelope, never a clean answer, and the
+    attempt keeps its name. Prevents an ended stop answering a forget that
+    never happened as done."""
+    attempt = _Identity(client, _claimed(client), "inc-1")
+    _edit_as(attempt, "plan.md")
+
+    def failing(*_args: Any, **_kwargs: Any) -> int:
+        raise fault(message)
+
+    monkeypatch.setattr(coordinator.service, "forget_agent", failing)
+
+    envelope = {**_INTERNAL_ERROR_ENVELOPE, "reason": f"internal: {fault.__name__}"}
+    assert _stop(attempt, {"ended": True}) == (200, envelope)
+    assert coordinator.agent_name_for(attempt.agent_id) is not None
+
+
+def _late_counts(coordinator) -> tuple[int, int]:
+    """The watchdog's late-abort and late-completion counts."""
+    return coordinator._watchdog_late_aborts_total, coordinator._watchdog_late_completion_total
+
+
+def _assert_the_late_forget_aborted(coordinator, attempt: _Identity, before: tuple[int, int]) -> None:
+    """Once the abandoned stop body settles, it aborted at the forget, which
+    was all it had left to do: the attempt keeps its task.md read and its
+    name. ``before`` is :func:`_late_counts` from before the stop."""
+    aborts_before, completions_before = before
+    _await_abandoned_body_settled(
+        coordinator, aborts_before=aborts_before, completions_before=completions_before)
+    assert _late_counts(coordinator) == (aborts_before + 1, completions_before)
+    assert _state(coordinator, "task.md", attempt.agent_id) == MESIState.SHARED
+    assert coordinator.agent_name_for(attempt.agent_id) is not None
+
+
+def test_an_ended_stop_the_watchdog_already_answered_forgets_nothing(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the registry lock held past the watchdog deadline, an ended stop
+    answers the degraded body, and once the lock frees its abandoned body
+    aborts at the forget. The attempt holds no write grant and no peer has
+    written, so the forget is the only change left for the body to make: the
+    attempt keeps its row and its name. The real watchdog is driven."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    attempt = _Identity(client, _claimed(client), "inc-1")
+    _read(client, attempt.who, "task.md", "inc-1")
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    before = _late_counts(coordinator)
+
+    with _HeldRegistryLock(coordinator) as held:
+        answer = _stop(attempt, {"ended": True})
+        held.release()
+
+    assert answer == (200, {"ok": True, "degraded": True})
+    _assert_the_late_forget_aborted(coordinator, attempt, before)
+
+
+class _HeldAfterTheDrain:
+    """Hold the registry lock from a helper thread from the moment the stop
+    has drained its notices until the block exits. The stop calls its forget
+    right after the drain, before the watchdog deadline and with no abort
+    set, and the forget waits for the lock past that deadline."""
+
+    def __init__(self, coordinator: CoordinatorHTTPServer) -> None:
+        self._lock = coordinator.registry._lock
+        self._drained, self._held, self._done = threading.Event(), threading.Event(), threading.Event()
+        self._thread = threading.Thread(target=self._hold, daemon=True)
+
+    def _hold(self) -> None:
+        self._drained.wait(timeout=30.0)
+        with self._lock:
+            self._held.set()
+            self._done.wait(timeout=30.0)
+
+    def after(self, drain: Callable[..., list]) -> Callable[..., list]:
+        """``drain``, returning only once the helper holds the lock."""
+        def drained_then_held(*args: Any, **kwargs: Any) -> list:
+            notices = drain(*args, **kwargs)
+            self._drained.set()
+            if not self._held.wait(timeout=5.0):
+                pytest.fail("the helper thread never took the registry lock after the drain")
+            return notices
+        return drained_then_held
+
+    def __enter__(self) -> "_HeldAfterTheDrain":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._drained.set()
+        self._done.set()
+        self._thread.join(timeout=5.0)
+
+
+def test_an_ended_stop_whose_forget_waits_out_the_deadline_forgets_nothing(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The registry lock is taken only once the stop has drained its notices,
+    so its forget starts before the watchdog deadline, with no abort set, and
+    waits for the lock past it. The forget checks the abort once it holds the
+    lock, so the abandoned body aborts there: the attempt keeps its row and
+    its name. Prevents a forget that checks the abort only before it waits."""
+    import ccs.adapters.claude_code.coordinator_server as mod
+
+    attempt = _Identity(client, _claimed(client), "inc-1")
+    _read(client, attempt.who, "task.md", "inc-1")
+    monkeypatch.setattr(mod, "HANDLER_TIMEOUT_SEC", _DEGRADE_DEADLINE_SEC)
+    before = _late_counts(coordinator)
+
+    with _HeldAfterTheDrain(coordinator) as hold:
+        monkeypatch.setattr(mod, "_pop_notices_for_answer", hold.after(mod._pop_notices_for_answer))
+        answer = _stop(attempt, {"ended": True})
+
+    assert answer == (200, {"ok": True, "degraded": True})
+    _assert_the_late_forget_aborted(coordinator, attempt, before)
+
+
+def test_an_ended_attempts_id_no_longer_resolves_as_a_handoff_successor(
+    coordinator, client: _Client
+) -> None:
+    """While the attempt's name is held, a transfer naming its composite id
+    hands the path to its session; once the attempt has ended, the same id is
+    refused as unknown and the giver's read is left alone."""
+    giver, successor = _claimed(client), _claimed(client)
+    _read(client, successor, "task.md", "inc-b")
+    _read(client, giver, "plan.md", "inc-a")
+    _read(client, giver, "spec.md", "inc-a")
+    named = str(successor.composite("inc-b"))
+    assert _transfer(client, giver, named, [{"path": "plan.md", "agent_id": "inc-a"}]) == (
+        200, {"ok": True, "grants": [_handed(giver, successor, "plan.md")]})
+
+    assert _stop(_Identity(client, successor, "inc-b"), {"ended": True}) == (
+        200, {"ok": True, "released_artifacts": []})
+
+    assert _transfer(client, giver, named, [{"path": "spec.md", "agent_id": "inc-a"}]) == (
+        200, {"ok": False, "grants": [
+            {"path": "spec.md", "transferred": False, "reason": "handoff_successor_unknown"},
+        ]})
+    assert _state(coordinator, "spec.md", giver.composite("inc-a")) == MESIState.SHARED
+    assert _record(coordinator, "spec.md") is None
+
+
+def test_an_ended_attempts_sweep_reclaim_stays_listed_without_a_name(
+    coordinator, client: _Client
+) -> None:
+    """A row that records a sweep reclaim outlives the forget, left INVALID,
+    so the operator tier still reports the reclaim for its window, on a row
+    with no name, as after a restart. Every other trace of the attempt goes."""
+    attempt = _Identity(client, _claimed(client), "inc-1")
+    _edit_as(attempt, "plan.md")
+    assert _sweep(coordinator, int(time.time()) + 999_999) == 1
+
+    status, body = _stop(attempt, {"ended": True})
+
+    assert status == 200 and (body["ok"], body["released_artifacts"]) == (True, []), body
+    assert _state(coordinator, "plan.md", attempt.agent_id) == MESIState.INVALID
+    assert coordinator.agent_name_for(attempt.agent_id) is None
+    row = _status_row_of(client, attempt.agent_id)
+    assert row is not None, "the reclaim was dropped with the attempt"
+    assert (row["agent_name"], row["states"], row["grants"]) == (None, {}, {})
+    assert list(row["reclaimed"]) == ["plan.md"]
+    assert row["last_heartbeat_unix_ts"] is None
 
 
 # --- the handoff key on the four existing bodies -----------------------------
@@ -17940,10 +18954,9 @@ def test_pre_edit_warns_when_in_flight_holder_releases_before_acquire(
     def release_after_check(*args: Any, **kwargs: Any) -> bool:
         in_flight = real_check(*args, **kwargs)
         seen.append(in_flight)
-        coordinator.service.invalidate(
-            agent_id=holder_id, artifact_id=artifact_id, new_version=1,
-            issuer_agent_id=holder_id, issued_at_tick=1,
-        )
+        coordinator.service.release_to_reader(ReleaseRequest(
+            agent_id=holder_id, artifact_id=artifact_id, issued_at_tick=1,
+        ))
         return in_flight
 
     monkeypatch.setattr(mod, "_a_write_is_in_flight", release_after_check)

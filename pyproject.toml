@@ -127,15 +127,6 @@ coherent-row = ["psycopg[binary]>=3.1"]
 coherent-object = ["boto3>=1.34"]
 all = ["agent-coherence[langgraph,crewai,otel,langsmith,benchmark,diagnose,openai-agents,mistral,mcp,coherent-row,coherent-object]"]
 
-# Lock-only (#408): crewai 1.15.28 pins `mcp~=1.28.1` and, through crewai-cli,
-# `uv~=0.11.6`, which keeps both below their security fixes. crewai's main
-# already requires these ranges, but no release carries them yet. An override
-# replaces every requirement on the package, our own `<2` included, so the
-# bound is repeated here. Published metadata is unaffected. Delete this block
-# and re-lock once a crewai release past 1.15.28 is locked.
-[tool.uv]
-override-dependencies = ["mcp>=1.30,<2", "uv>=0.13.4"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "."]
@@ -185,6 +176,9 @@ where = ["src"]
 # subdirectory has to be named. tests/test_packaging_data_files.py fails if any
 # future non-.py asset under src/ccs/ is left undeclared here.
 [tool.setuptools.package-data]
+# The fold table ccs/core/path_fold.py loads at import, and the Unicode License
+# notice that covers it.
+"ccs.core" = ["fold_data/*.json", "fold_data/LICENSE-UNICODE"]
 "ccs.diagnose" = ["templates/*.html"]
 "ccs.output" = ["templates/*.html"]
 

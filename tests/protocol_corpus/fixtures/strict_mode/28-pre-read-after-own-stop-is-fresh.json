@@ -1,0 +1,73 @@
+{
+  "name": "pre-read-after-own-stop-is-fresh",
+  "description": "A session keeps a read of a file it edited when its turn ends (#513). Session A reads notes.md (v1), pre-edits it and commits v2, so it holds MODIFIED, then its turn ends (session-stop). On A's next turn its Read is fresh. Before, the stop left A INVALID and this read was denied with the 'revoked and no new version' text on every retry, with no other session involved. The file on disk holds the bytes A commits, and every hash in this row is theirs, because the setup cannot change the file mid-run. Both backends.",
+  "setup": {
+    "tracked": [
+      "notes.md"
+    ],
+    "strict_mode": [
+      "notes.md"
+    ],
+    "files": {
+      "notes.md": "# Notes\nv2 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md",
+          "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "notes.md",
+          "success": true,
+          "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/session-stop",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "notes.md",
+      "content_hash": "9a1c15bdf42246dcba3499756541cdbae4ed36a10dc7c584084e447ba4a00afa"
+    }
+  },
+  "optional_keys": [
+    "version"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "status": "fresh"
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

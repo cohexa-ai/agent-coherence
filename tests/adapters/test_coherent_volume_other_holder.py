@@ -15,11 +15,13 @@ proved here.
 
 from __future__ import annotations
 
+import http.server
 import io
 import json
 import os
 import select
 import signal
+import threading
 import time
 import urllib.error
 from collections.abc import Callable, Iterator
@@ -32,6 +34,7 @@ import pytest
 import ccs.adapters.claude_code.coordinator_server as server_module
 import ccs.adapters.coherent_volume as coherent_volume_module
 import ccs.cli._coherence_client as client_module
+from ccs.adapters.claude_code.auth import CALLER_PRINCIPAL_HEADER
 from ccs.adapters.claude_code.coordinator_server import (
     CoordinatorHTTPServer,
     session_to_agent_id,
@@ -45,9 +48,11 @@ from ccs.core.exceptions import (
     CoordinatorFailed,
     CoordinatorUnreachable,
     GiverFenced,
+    LinkOutOfManaged,
     OtherHolder,
     StaleView,
 )
+from ccs.core.path_fold import fold_key
 from ccs.testing.silent_listener import SilentListener
 from tests.coordinator_helpers import serve_in_process, write_holders
 
@@ -64,6 +69,14 @@ _WIRE = Path(__file__).parents[1] / "fixtures" / "wire"
 _UNAVAILABLE = json.loads((_WIRE / "pre_edit_unavailable.json").read_text())
 #: A holder id in the refusal's spelling that names no agent in these tests.
 _SOME_HOLDER = "5d0f3c9a8b7e4d21a6c3b2e1f0d9c8b7"
+#: FROZEN duplicate of what a refuse volume raises at attach to a coordinator
+#: that does not advertise the refusal.
+_NOT_ADVERTISED = (
+    "on_held='refuse' needs a coordinator that refuses an opted-in pre-edit. The one "
+    "running for this workspace does not advertise pre_edit_if_unheld, so it could "
+    "take a file from its holder instead. Nothing was sent. Run agent-coherence-status "
+    "to see its version, then upgrade it or use on_held='displace'."
+)
 
 
 @pytest.fixture
@@ -91,16 +104,21 @@ def server(tmp_path: Path) -> Iterator[CoordinatorHTTPServer]:
 class _Wire:
     """Every POST the volume sends, and the answers a test puts in place of the
     coordinator's. ``answers`` maps a route to the answer's body, or to a
-    callable ``(forward, payload)`` that decides for itself."""
+    callable ``(forward, payload)`` that decides for itself. ``headers`` holds
+    each POST's route and the extra headers it carried (``None`` for none)."""
 
     sent: list[tuple[str, dict]] = field(default_factory=list)
     answers: dict[str, object] = field(default_factory=dict)
+    headers: list[tuple[str, object]] = field(default_factory=list)
 
     def routes(self) -> list[str]:
         return _routes(self.sent)
 
     def bodies(self, route: str) -> list[dict]:
         return [body for sent_route, body in self.sent if sent_route == route]
+
+    def headers_of(self, route: str) -> list[object]:
+        return [headers for sent_route, headers in self.headers if sent_route == route]
 
 
 @pytest.fixture
@@ -112,6 +130,7 @@ def wire(monkeypatch: pytest.MonkeyPatch) -> _Wire:
 
     def spy(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
         recorded.sent.append((path, dict(payload)))
+        recorded.headers.append((path, kwargs.get("extra_headers")))
         scripted = recorded.answers.get(path)
         if callable(scripted):
             return scripted(lambda body=payload: real_post(endpoint, path, body, **kwargs), payload)
@@ -205,6 +224,71 @@ def _without_the_key(doc: dict) -> dict:
     return {k: v for k, v in doc.items() if k != "pre_edit_if_unheld"}
 
 
+class _NodeLike(http.server.HTTPServer):
+    """A coordinator that answers as the Node one does where a refuse volume
+    meets it: the principal claim is a 404, because it issues none; its
+    operator view publishes ``strict`` as its tracked and strict globs and
+    ``pre_edit_if_unheld``, unless ``view_status`` answers that view instead;
+    an opted-in pre-edit of a path in ``held`` is refused ``other_holder``,
+    naming ``_SOME_HOLDER``. Every other hook is admitted."""
+
+    strict: tuple[str, ...] = _MANAGED
+    held: frozenset[str] = frozenset()
+    view_status = 200
+
+
+class _NodeLikeAnswers(http.server.BaseHTTPRequestHandler):
+    server: _NodeLike
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib name
+        if "detail=full" in self.path and self.server.view_status != 200:
+            self._answer(self.server.view_status, {"error": "scripted"})
+            return
+        globs = list(self.server.strict)
+        summary = {
+            "tracked_patterns": [], "user_added_patterns": globs,
+            "ignored_patterns": [], "strict_mode_patterns": globs,
+        }
+        self._answer(200, {"backend": "node", "pre_edit_if_unheld": True, "policy_summary": summary})
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib name
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+        if self.path == _CLAIM_ROUTE:
+            self._answer(404, {"error": "not found"})
+        elif self.path == _PRE_EDIT and body.get("path") in self.server.held:
+            self._answer(200, {"ok": False, "reason": "other_holder", "holder_agent_id": _SOME_HOLDER})
+        else:
+            self._answer(200, {"ok": True})
+
+    def _answer(self, status: int, body: dict) -> None:
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *_args: object) -> None:
+        return
+
+
+@pytest.fixture
+def node_like(tmp_path: Path) -> Iterator[_NodeLike]:
+    """A ``_NodeLike`` coordinator for ``tmp_path``, found the way a running
+    Node coordinator is: a ``server.pid`` naming this process, the stub's port
+    and the Node backend, beside a ``hook.secret``."""
+    (tmp_path / "data").mkdir()
+    httpd = _NodeLike(("127.0.0.1", 0), _NodeLikeAnswers)
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir(mode=0o700)
+    (coherence / "hook.secret").write_text("not-a-real-secret\n")
+    (coherence / "server.pid").write_text(f"{os.getpid()}\n{httpd.server_address[1]}\nbackend=node\n")
+    yield httpd
+    httpd.shutdown()
+    httpd.server_close()
+
+
 # --- what a refuse volume needs -------------------------------------------
 
 
@@ -271,6 +355,7 @@ def test_a_coordinator_that_does_not_advertise_the_refusal_is_refused_at_attach(
     with pytest.raises(CoherenceError, match="pre_edit_if_unheld") as refused:
         _refuser(tmp_path, fast_cfg)
     assert type(refused.value) is CoherenceError
+    assert str(refused.value) == _NOT_ADVERTISED, "only a Python coordinator meets this, so it names no plugin"
     assert sent == [], "the check runs before the claim and before any pre-edit"
 
 
@@ -391,30 +476,60 @@ def test_a_forked_child_is_refused_while_its_parent_holds_the_file(
     assert (tmp_path / _PATH).read_bytes() == b"from-the-parent"
 
 
+#: What the volume names for each answered refusal of the operator view.
+_VIEW_REFUSALS = {
+    501: "the coordinator predates the operator view (HTTP 501)",
+    403: "the operator view was refused (HTTP 403)",
+}
+
+
+@pytest.mark.parametrize("status", list(_VIEW_REFUSALS))
 def test_a_refused_operator_view_keeps_its_own_message(
     tmp_path: Path,
     fast_cfg: LifecycleConfig,
-    server: CoordinatorHTTPServer,
+    node_like: _NodeLike,
     sent: list[tuple[str, dict]],
-    monkeypatch: pytest.MonkeyPatch,
+    status: int,
 ) -> None:
-    """The Node coordinator answers 501 to the operator view, so a managed
-    volume cannot attach to it in either mode. The glob check reports that
-    first, naming the status, and the capability check does not cover it up.
+    """A Node coordinator of plugin 0.6.0 or earlier answers the operator view
+    501, and a coordinator that refuses the view answers 403. The glob check
+    reports either first, naming the status, and the capability check does
+    not cover it up. A 501 says to upgrade the plugin; neither says that the
+    Node coordinator does not serve the view, which a current one does.
 
     Prevents a caller on Node being told to upgrade a coordinator that honours
-    the flag, when what is missing is the operator view."""
-    real_get = coherent_volume_module._coordinator_get
-
-    def not_served(endpoint: object, path: str, **kwargs: object) -> object:
-        if "detail=full" in path:
-            raise urllib.error.HTTPError(path, 501, "not served", {}, io.BytesIO(b"{}"))  # type: ignore[arg-type]
-        return real_get(endpoint, path, **kwargs)
-
-    monkeypatch.setattr(coherent_volume_module, "_coordinator_get", not_served)
-    with pytest.raises(CoherenceError, match="HTTP 501") as refused:
+    the flag, or that Node cannot take a managed volume, when what is missing
+    is the operator view."""
+    node_like.view_status = status
+    with pytest.raises(CoherenceError) as refused:
         _refuser(tmp_path, fast_cfg)
-    assert "pre_edit_if_unheld" not in str(refused.value)
+    message = str(refused.value)
+    assert _VIEW_REFUSALS[status] in message, message
+    assert ("upgrade the agent-coherence plugin" in message) is (status == 501), message
+    assert "does not serve" not in message, message
+    assert "pre_edit_if_unheld" not in message, message
+    assert sent == []
+
+
+def test_a_node_coordinator_that_does_not_enforce_the_globs_names_its_policy_files(
+    tmp_path: Path, fast_cfg: LifecycleConfig, node_like: _NodeLike, sent: list[tuple[str, dict]]
+) -> None:
+    """A volume never starts the Node coordinator, and an attaching volume adds
+    no globs to its policy. When that policy does not enforce them, the remedy
+    names the Node coordinator's policy files and a reload or restart, and
+    never says to stop it: the next volume would then start the Python
+    coordinator on the store Node created, which refuses it.
+
+    Prevents a caller told to stop the Node coordinator, which leaves the
+    workspace to a coordinator that cannot open its store."""
+    node_like.strict = ()
+    with pytest.raises(CoherenceError) as refused:
+        _refuser(tmp_path, fast_cfg)
+    message = str(refused.value)
+    assert "does not enforce strict mode for managed glob(s) data/**" in message, message
+    assert ".coherence/tracked.yaml" in message and ".coherence/strict_mode.yaml" in message, message
+    assert "reload" in message and "restart" in message, message
+    assert "stop" not in message.lower(), message
     assert sent == []
 
 
@@ -453,7 +568,10 @@ def test_a_write_another_agent_holds_is_refused_naming_the_holder(
 
     wire.sent.clear()
     refused.reacquire(_PATH)
-    assert _SESSION_STOP not in wire.routes(), "nothing to release: no grant was taken"
+    # The re-mint ends the refused attempt (#525), and releases nothing.
+    assert wire.bodies(_SESSION_STOP) == [
+        {"session_id": refused.session_id, "agent_id": incarnation, "ended": True},
+    ], "nothing to release: no grant was taken"
     assert write_holders(server, _PATH) == {holder_id}
 
 
@@ -927,21 +1045,49 @@ def test_a_default_volume_still_writes_on_those_answers(
 # --- what opting in needs, on the path ------------------------------------
 
 
-def test_a_session_with_no_principal_sends_nothing(
-    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+def test_an_opted_in_write_goes_without_a_principal_to_a_coordinator_that_issues_none(
+    tmp_path: Path, fast_cfg: LifecycleConfig, node_like: _NodeLike, wire: _Wire
 ) -> None:
-    """The Python coordinator refuses an opted-in request without a principal,
-    so a claim that settled as unsupported fails closed here. Reached by
-    answering the claim 404: a coordinator that publishes its glob sets also
-    issues principals.
+    """The Node coordinator answers the claim 404, so it issues no caller
+    principals, and it decides an opted-in pre-edit without one. A refuse
+    volume sends it the write's ``if_unheld`` with no principal header, and a
+    file another agent holds is refused naming that agent.
 
-    Prevents a request the coordinator is bound to refuse, and a claim sent to
-    work around it."""
+    Prevents refuse mode raising on Node before anything is sent."""
     (tmp_path / _PATH).write_bytes(b"seed")
-    wire.answers[_CLAIM_ROUTE] = _status(404)
+    node_like.held = frozenset({_PATH})
     volume = _refuser(tmp_path, fast_cfg)
     assert volume.principal_claim_outcome == "unsupported"
-    wire.answers.pop(_CLAIM_ROUTE)
+    wire.sent.clear()
+
+    with pytest.raises(OtherHolder) as raised:
+        volume.write(_PATH, b"from-the-volume")
+
+    assert raised.value.holder_agent_id == _SOME_HOLDER
+    assert wire.routes() == [_PRE_EDIT], "one request: no retry, no release, no commit"
+    assert wire.bodies(_PRE_EDIT)[0]["if_unheld"] is True
+    assert wire.headers_of(_PRE_EDIT) == [None], "the write carried a principal header"
+    assert (tmp_path / _PATH).read_bytes() == b"seed"
+
+
+@pytest.mark.parametrize(
+    "outcome", ["unconfirmed", "refused", None], ids=["unconfirmed", "refused", "never-attempted"]
+)
+def test_a_session_without_a_principal_sends_nothing_unless_the_claim_was_404(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire, outcome: str | None
+) -> None:
+    """Only a claim answered 404 shows that the coordinator issues no caller
+    principals. A claim whose answer was lost, one refused, or none made at all
+    shows nothing, and the Python coordinator refuses an opted-in request
+    without a principal, so the write fails closed with nothing sent.
+    White-box: a strict attach raises before a session reaches these outcomes
+    without a principal, so each is set on an attached volume.
+
+    Prevents an opted-in write without a principal reaching a coordinator that
+    may issue them."""
+    (tmp_path / _PATH).write_bytes(b"seed")
+    volume = _refuser(tmp_path, fast_cfg)
+    volume._claim_outcome, volume._principal = outcome, None
     wire.sent.clear()
 
     with pytest.raises(CoherenceError, match="principal") as raised:
@@ -950,8 +1096,23 @@ def test_a_session_with_no_principal_sends_nothing(
     assert type(raised.value) is CoherenceError
     assert wire.sent == []
     assert (tmp_path / _PATH).read_bytes() == b"seed"
-    volume.reacquire(_PATH)
-    assert _SESSION_STOP not in wire.routes(), "nothing was recorded"
+    assert volume._grant_incarnations == {}, "the refused write recorded a grant"
+
+
+def test_a_bound_principal_rides_the_opted_in_write(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """Control: on a coordinator that issues principals, the opted-in write
+    presents the session's own, as before."""
+    volume = _refuser(tmp_path, fast_cfg)
+    assert volume.principal_claim_outcome == "bound" and volume._principal
+    wire.sent.clear()
+
+    volume.write(_PATH, b"from-the-volume")
+
+    assert wire.bodies(_PRE_EDIT)[0]["if_unheld"] is True
+    assert wire.headers_of(_PRE_EDIT) == [{CALLER_PRINCIPAL_HEADER: volume._principal}]
+    assert (tmp_path / _PATH).read_bytes() == b"from-the-volume"
 
 
 def test_a_write_outside_managed_sends_no_flag_and_displaces(
@@ -972,24 +1133,26 @@ def test_a_write_outside_managed_sends_no_flag_and_displaces(
     assert write_holders(server, "plan.md") == {writer.agent_id}
 
 
-def test_a_link_under_managed_to_a_file_outside_it_sends_no_flag(
+def test_a_link_under_managed_to_a_file_outside_it_raises_and_sends_nothing(
     tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
 ) -> None:
-    """The managed check reads the resolved path, so a link whose name matches
-    ``managed`` is a write outside it and displaces the file's holder.
+    """A link whose name matches ``managed`` leads to a file outside it, where
+    the opted-in refusal does not apply, so the write raises before any request
+    and the file's holder keeps it, on every disk.
 
-    Pins the limit the docs state, so a change to it is seen."""
+    Prevents a refuse-mode write that takes a file from its holder."""
     (tmp_path / "plan.md").write_bytes(b"seed")
     (tmp_path / "data" / "plan-link.md").symlink_to(tmp_path / "plan.md")
     holder, writer = _displacer(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
     holder.write("plan.md", b"from-the-holder")
     wire.sent.clear()
 
-    writer.write("data/plan-link.md", b"through-the-link")
+    with pytest.raises(LinkOutOfManaged):
+        writer.write("data/plan-link.md", b"through-the-link")
 
-    assert "if_unheld" not in wire.bodies(_PRE_EDIT)[0]
-    assert (tmp_path / "plan.md").read_bytes() == b"through-the-link"
-    assert write_holders(server, "plan.md") == {writer.agent_id}
+    assert wire.sent == []
+    assert (tmp_path / "plan.md").read_bytes() == b"from-the-holder"
+    assert write_holders(server, "plan.md") == {holder.agent_id}
 
 
 @pytest.mark.parametrize(
@@ -997,25 +1160,31 @@ def test_a_link_under_managed_to_a_file_outside_it_sends_no_flag(
     [("data/shared.txt", "data/SHARED.txt"), ("data/café.txt", "data/café.txt")],
     ids=["case", "unicode-form"],
 )
-def test_another_spelling_of_a_held_path_gets_no_refusal(
+def test_another_spelling_of_a_held_path_is_refused_where_the_disk_folds_it(
     tmp_path: Path,
     fast_cfg: LifecycleConfig,
     server: CoordinatorHTTPServer,
     spelling: str,
     alias: str,
 ) -> None:
-    """The coordinator tracks a path by its spelling, so each spelling has its own
-    holder. Where the filesystem folds the two, as a default Mac volume does, the
-    second write lands on the first holder's file.
+    """Where the coordinator's profile folds the two spellings into one file,
+    as on a default Mac volume, they share one holder and the second write is
+    refused. Where it keeps them apart, they are two files with a holder each.
 
-    Pins the limit the docs state, so a change to it is seen."""
+    Prevents a second spelling that takes a file from its holder."""
+    profile = server.fold_index_profile or "none"
     holder, writer = _refuser(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
     holder.write(spelling, b"from-the-holder")
 
-    writer.write(alias, b"from-the-writer")
-
+    if fold_key(spelling, profile) == fold_key(alias, profile):
+        with pytest.raises(OtherHolder):
+            writer.write(alias, b"from-the-writer")
+        assert write_holders(server, alias) == {holder.agent_id}
+        assert (tmp_path / spelling).read_bytes() == b"from-the-holder"
+    else:
+        writer.write(alias, b"from-the-writer")
+        assert write_holders(server, alias) == {writer.agent_id}
     assert write_holders(server, spelling) == {holder.agent_id}
-    assert write_holders(server, alias) == {writer.agent_id}
 
 
 # --- this volume's own abandoned grant ------------------------------------
@@ -1132,8 +1301,12 @@ def test_an_admit_over_a_holder_releases_and_raises(
     assert write_holders(server, _PATH) == set()
     wire.answers.pop(_PRE_EDIT)
     wire.sent.clear()
+    attempt = writer.incarnation
     writer.reacquire(_PATH)
-    assert _SESSION_STOP not in wire.routes()
+    # The re-mint ends the attempt (#525), and releases nothing.
+    assert wire.bodies(_SESSION_STOP) == [
+        {"session_id": writer.session_id, "agent_id": attempt, "ended": True},
+    ]
 
 
 def test_an_unanswered_release_after_a_displacing_admit_keeps_the_record(

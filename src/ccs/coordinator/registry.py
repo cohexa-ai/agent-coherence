@@ -63,6 +63,7 @@ from .registry_protocol import (
     UncoverableRun,
     acquire_by_deadline,
     decide_transfer_grant,
+    forget_refusal,
     note_guard_won,
     refusal_with_generation_pair,
     require_storable_transfer_status,
@@ -130,6 +131,30 @@ class ArtifactRecord:
     # never liveness: liveness is read against ``artifact.version``
     # (``ArtifactRegistry._transfer_read``).
     transfer: TransferRecord | None = None
+
+
+def _forget_on_record(record: ArtifactRecord, agent_id: UUID) -> int:
+    """Drop one ended identity's state from one record, returning 1 when it
+    removed a row here and 0 when it removed none, a kept reclaim row
+    included. What a sqlite row holds is spread over the per-agent maps
+    below, so they go together. A pair that records a sweep reclaim keeps all
+    of them, as the sqlite row is kept whole, and only stops reading."""
+    if agent_id in record.last_reclamation_by_agent:
+        if agent_id in record.state_by_agent:
+            record.state_by_agent[agent_id] = MESIState.INVALID
+        return 0
+    # A transient with no state is a row too: sqlite inserts one INVALID.
+    had_row = agent_id in record.state_by_agent or agent_id in record.transient_by_agent
+    for per_agent in (
+        record.state_by_agent,
+        record.transient_by_agent,
+        record.transient_tick_by_agent,
+        record.granted_at_tick_by_agent,
+        record.read_generation_by_agent,
+        record.last_observed_version_by_agent,
+    ):
+        per_agent.pop(agent_id, None)
+    return int(had_row)
 
 
 class ArtifactRegistry:
@@ -656,9 +681,11 @@ class ArtifactRegistry:
                 record.granted_at_tick_by_agent.pop(agent_id, None)
                 # Read-generation fence: revoking this M/E grant WITHOUT moving the
                 # version bumps the artifact's ownership epoch, atomically (GIL)
-                # with the INVALID transition, so a commit by the ex-holder (or any
-                # pre-revocation holder) fails the generation check. The sweep
-                # reclaims, the voluntary release ("invalidate") and the handoff
+                # with the transition out of M/E (to INVALID, or to SHARED when
+                # the holder releases its own grant and keeps a read), so a commit
+                # by the ex-holder (or any pre-revocation holder) fails the
+                # generation check. The sweep reclaims, the voluntary release
+                # ("invalidate", whichever state it lands in) and the handoff
                 # (HANDOFF_TRIGGER, a giver ending its write claim) all qualify —
                 # see EPOCH_BUMP_TRIGGERS. The peer invalidations ("write" /
                 # "commit") do not -- a "commit" moves the version and a
@@ -1899,6 +1926,19 @@ class ArtifactRegistry:
                 for agent_id, state in record.state_by_agent.items()
                 if state != MESIState.INVALID
             ]
+
+    def forget_agent(self, agent_id: UUID) -> int:
+        """Forget an identity that has ended; see
+        :meth:`RegistryBase.forget_agent`. One hold of the lock: every record
+        is checked for a write grant before any is touched, so a refusal
+        leaves them all as they were. This registry queues no notices."""
+        with self._lock:
+            for artifact_id, record in self._records.items():
+                if record.state_by_agent.get(agent_id) in _M_OR_E_STATES:
+                    raise forget_refusal(agent_id, artifact_id)
+            removed = sum(_forget_on_record(record, agent_id) for record in self._records.values())
+            self._heartbeat_by_agent.pop(agent_id, None)
+            return removed
 
 
 if TYPE_CHECKING:

@@ -36,6 +36,9 @@ import secrets
 import time
 from pathlib import Path
 
+from ccs.adapters.claude_code.regular_file import ReadStatus, read_state_file
+from ccs.adapters.claude_code.state_dir import state_file_link_refusal
+
 logger = logging.getLogger(__name__)
 
 
@@ -215,7 +218,10 @@ class EnsureSecretError(RuntimeError):
     coordinator startup path should treat this as fatal; the alternative
     (O_TRUNC re-write of a file another process may have just populated)
     risks clobbering a concurrent racer's valid secret and giving two
-    spawn-side processes different secrets for the same workspace."""
+    spawn-side processes different secrets for the same workspace.
+
+    Also raised at once, naming the link, for a ``hook.secret`` that is a
+    symlink or one in a ``.coherence`` that is (#498)."""
 
 
 def ensure_secret(coordinator_root: Path) -> str:
@@ -227,7 +233,9 @@ def ensure_secret(coordinator_root: Path) -> str:
     lifecycle layer, not here). Raises :class:`EnsureSecretError` if a
     ``hook.secret`` file exists but stays empty across
     ``ENSURE_SECRET_MAX_RETRIES`` attempts — see R11 for the rationale
-    on failing closed instead of falling back to O_TRUNC.
+    on failing closed instead of falling back to O_TRUNC — and at once for
+    a ``hook.secret`` that is a symlink, or one in a ``.coherence`` that is
+    (#498).
 
     R11 (Unit 6): the empty-file recovery branch is now a bounded
     O_EXCL retry loop instead of the prior O_TRUNC re-write. The
@@ -241,16 +249,18 @@ def ensure_secret(coordinator_root: Path) -> str:
     secret_path = coherence_dir / SECRET_FILENAME
 
     for attempt in range(ENSURE_SECRET_MAX_RETRIES):
-        # Fast path: file exists and is populated.
-        # SEC-02 / finding #40: wrap read_text() in try/except so that a
-        # same-UID concurrent unlink between is_file() and read_text()
-        # (TOCTOU) causes a retry instead of a propagated FileNotFoundError
-        # that would crash coordinator startup.
-        if secret_path.is_file():
-            try:
-                token = secret_path.read_text().strip()
-            except (FileNotFoundError, OSError):
-                continue
+        # Fast path: file exists and is populated. One no-follow open, so a
+        # same-UID concurrent unlink reads as absent (SEC-02 / finding #40),
+        # and a file that cannot be read is retried. A link is refused at once
+        # (#498): the file it names would become the bearer, and a dangling
+        # one fails the O_EXCL create below on every attempt.
+        existing = read_state_file(coherence_dir, SECRET_FILENAME)
+        if existing.status is ReadStatus.LINK:
+            raise EnsureSecretError(state_file_link_refusal(existing.path, coherence_dir))
+        if existing.status is ReadStatus.UNREADABLE:
+            continue
+        if existing.status is ReadStatus.READ and existing.data is not None:
+            token = existing.data.decode("utf-8").strip()
             if token:
                 return token
 
@@ -294,19 +304,15 @@ def ensure_secret(coordinator_root: Path) -> str:
 
 
 def load_secret(coordinator_root: Path) -> str | None:
-    """Load the secret if it exists. Returns None if the file is missing.
+    """Load the secret if it exists. Returns None if the file is missing,
+    cannot be read or is not a regular file, and for a link (#498): a
+    ``hook.secret`` that is a symlink, or one in a ``.coherence`` that is.
     Used by hook clients (CLI scripts, console-script entry points) that
     should NEVER create the secret — only the coordinator-spawn path does."""
-    secret_path = coordinator_root / ".coherence" / SECRET_FILENAME
-    if not secret_path.is_file():
+    result = read_state_file(coordinator_root / ".coherence", SECRET_FILENAME)
+    if result.status is not ReadStatus.READ or result.data is None:
         return None
-    # SEC-02 / finding #40: same TOCTOU guard as ensure_secret — a concurrent
-    # unlink between is_file() and read_text() returns None instead of raising.
-    try:
-        token = secret_path.read_text().strip()
-    except (FileNotFoundError, OSError):
-        return None
-    return token or None
+    return result.data.decode("utf-8").strip() or None
 
 
 # ---------------------------------------------------------------------------

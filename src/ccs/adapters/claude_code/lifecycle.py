@@ -30,9 +30,11 @@ Key correctness properties:
 from __future__ import annotations
 
 import errno
+import io
 import logging
 import os
 import socket
+import stat
 import sys
 import threading
 import time
@@ -42,8 +44,18 @@ from functools import partial
 from pathlib import Path
 from uuid import UUID
 
-from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
-from ccs.coordinator.sqlite_registry import SCHEMA_USER_VERSION
+from ccs.adapters.claude_code.coordinator_pin import (
+    exit_evidence,
+    pid_is_alive,
+    read_pid_lines,
+)
+from ccs.adapters.claude_code.coordinator_server import (
+    HANDLER_TIMEOUT_SEC,
+    IN_FLIGHT_DRAIN_TIMEOUT_SEC,
+    CoordinatorHTTPServer,
+)
+from ccs.adapters.claude_code.state_dir import check_coherence_dir, entry_link_refused
+from ccs.coordinator.sqlite_registry import SCHEMA_USER_VERSION, open_waiting_out_a_holder
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +206,15 @@ class LifecycleConfig:
     #: process; the coordinator returns -1 and lets the hook degrade.
     inode_revalidation_budget: int = 5
 
+    #: #453 — how long a start that won the workspace lock waits for another
+    #: read-write handle to close the store before it raises
+    #: :class:`~ccs.coordinator.sqlite_registry.StoreHeldError`. A stop that
+    #: meets a shutdown already draining returns at once, so the lock can
+    #: come free while the old coordinator closes with the store open: its
+    #: drain, then its watchdog's wait for a handler still running. Longer
+    #: than both, so a start waits it out.
+    store_holder_wait_sec: float = IN_FLIGHT_DRAIN_TIMEOUT_SEC + HANDLER_TIMEOUT_SEC + 1.0
+
 
 _DEFAULT_CONFIG = LifecycleConfig()
 
@@ -280,18 +301,26 @@ def ensure_coordinator_handle(
 
     Returns None (``-1`` from :func:`ensure_coordinator`) where the call can
     neither start nor join a coordinator: no fcntl, an unwritable parent
-    repo, an unopenable pid file, pid-file churn beyond the revalidation
+    repo, a pid file it cannot open, pid-file churn beyond the revalidation
     budget, or a join whose retry budget ran out.
 
     Raises when a start fails, after stopping what it started and releasing
     the flock, so no coordinator is left running:
 
+    - :class:`~ccs.core.exceptions.CoherenceDirRefused` before it creates,
+      writes, joins or probes anything, when ``.coherence`` is a symlink or
+      not a directory, or holds a symlink, FIFO, socket or device directly
+      inside it (#498). No retry clears it: a person replaces the link or
+      mounts a directory at ``.coherence``.
     - :class:`~ccs.coordinator.sqlite_registry.SchemaVersionError` when the
       store open refuses the store. Its ``reason`` says why; its
       :class:`~ccs.coordinator.sqlite_registry.CrossRuntimeSchemaError`
       subclass marks a Node coordinator's store.
       :func:`~ccs.adapters.claude_code.store_check.check_store` asks before
       a start.
+    - :class:`~ccs.coordinator.sqlite_registry.StoreHeldError` when another
+      read-write handle (a script, a coordinator in another process) still
+      has ``state.db`` open after ``config.store_holder_wait_sec`` (#453).
     - :class:`sqlite3.Error` when SQLite cannot open ``state.db``, such as a
       file that is not a database.
     - :class:`OSError` when ``flock`` fails for a reason other than
@@ -405,7 +434,9 @@ def ensure_coordinator_handle(
             # ONE read, so the join is attributed to the pid that wrote the
             # port it returns, not to whichever bind a second read would see.
             binder_pid, port = _read_pidfile(pid_file)
-            if port is not None:
+            # #428: a winner that has not yet emptied a dead coordinator's
+            # file still shows that coordinator's lines; never join them.
+            if port is not None and not _names_an_exited_binder(binder_pid):
                 _close_quiet(fd)
                 return CoordinatorHandle(
                     port, _classify_join(resolved_key, binder_pid, port), binder_pid
@@ -446,12 +477,7 @@ def ensure_coordinator_handle(
             # can still read the old lines; that window is not closed here.
             if not _names_another_runtime(fd):
                 os.ftruncate(fd, 0)
-            coordinator = CoordinatorHTTPServer(
-                coordinator_root,
-                port=0,
-                bind_host=bind_host,
-                on_migrated=partial(_log_store_migration, coordinator_root),
-            )
+            coordinator = _build_waiting_out_a_store_holder(coordinator_root, cfg, bind_host)
             port = coordinator.port
             # KTD-H Unit 5 L1: close the construct->write TOCTOU window. The
             # top-of-loop inode check ran BEFORE this construction, which opens
@@ -546,6 +572,28 @@ def ensure_coordinator_handle(
     return None
 
 
+def _build_waiting_out_a_store_holder(
+    coordinator_root: Path, cfg: LifecycleConfig, bind_host: str
+) -> CoordinatorHTTPServer:
+    """Build the coordinator, waiting up to ``cfg.store_holder_wait_sec`` while
+    another read-write handle has the store open (#453).
+
+    The workspace lock can come free before the store does: a stop that meets
+    a shutdown already draining returns at once. A holder still there after
+    the wait is not closing, and its ``StoreHeldError`` propagates.
+    """
+    build = partial(
+        CoordinatorHTTPServer,
+        coordinator_root,
+        port=0,
+        bind_host=bind_host,
+        on_migrated=partial(_log_store_migration, coordinator_root),
+    )
+    return open_waiting_out_a_holder(
+        build, cfg.store_holder_wait_sec, cfg.port_file_retry_interval_sec
+    )
+
+
 def ensure_coordinator(
     coordinator_root: Path,
     *,
@@ -584,14 +632,20 @@ def connect_or_spawn(
     file and a TCP probe without reaching the spawn loop, so it cannot say
     who bound the coordinator. A caller that needs to know whether it
     started the coordinator calls :func:`ensure_coordinator_handle` (#348).
+
+    Raises :class:`~ccs.core.exceptions.CoherenceDirRefused` before the pid
+    file is read (#498), and what :func:`ensure_coordinator` raises.
     """
     if not _FCNTL_AVAILABLE:
         return -1
 
+    # The fast path never reaches the start's own check, and a linked pid file
+    # naming a live port would join another workspace's coordinator.
+    check_coherence_dir(coordinator_root)
     cfg = config or _DEFAULT_CONFIG
     pid_file = coordinator_root / ".coherence" / "server.pid"
-    port = read_port_from_file(pid_file)
-    if port is not None and tcp_probe(port, cfg, bind_host=bind_host):
+    port = running_coordinator_port(pid_file, cfg, bind_host=bind_host)
+    if port is not None:
         return port
 
     # Stale or absent — spawn (or join existing holder via fcntl race).
@@ -749,12 +803,20 @@ def _ensure_coherence_dir(coordinator_root: Path) -> Path | None:
     dir to 0700 if it pre-exists at a looser mode. Returns the dir path, or None
     if the parent repo is read-only.
 
+    Raises :class:`~ccs.core.exceptions.CoherenceDirRefused` before it creates
+    or changes anything when ``.coherence`` is a symlink or not a directory, or
+    holds a symlink, FIFO, socket or device (#498): a cloned repository can
+    commit one, and the start would then write its state where the link points.
+
     Also writes ``.coherence/.gitignore`` containing ``*`` per KTD-13 so
     a careless ``git add .`` doesn't accidentally commit the SQLite
     state.db (containing MESI state + agent UUIDs), the hook.secret
     (a credential), or the server.pid file. The README claims these are
     auto-gitignored — this is the implementation.
     """
+    # Before the mkdir: it follows a linked .coherence, and a dangling one would
+    # surface as EEXIST instead of as the link.
+    check_coherence_dir(coordinator_root)
     coherence_dir = coordinator_root / ".coherence"
     try:
         coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -764,6 +826,17 @@ def _ensure_coherence_dir(coordinator_root: Path) -> Path | None:
             coordinator_root, exc,
         )
         return None
+    if _tighten_mode(coherence_dir):
+        # The first check passes a .coherence it cannot list; after the repair it
+        # can list it, so a link there is refused before anything is written.
+        check_coherence_dir(coordinator_root)
+    _write_gitignore_once(coherence_dir)
+    return coherence_dir
+
+
+def _tighten_mode(coherence_dir: Path) -> bool:
+    """Re-assert 0700 on ``coherence_dir``. True when the caller must check it
+    again: the mode changed, or it is no longer a directory."""
     # ``mkdir(mode=0o700)`` does NOT chmod an ALREADY-EXISTING directory, so a
     # ``.coherence/`` that pre-existed at a looser mode (e.g. 0755 from a careless
     # ``mkdir`` or an older tool) would keep it — leaving the SQLite state.db,
@@ -771,41 +844,67 @@ def _ensure_coherence_dir(coordinator_root: Path) -> Path | None:
     # Re-assert the 0700 guarantee unconditionally (idempotent); warn once when
     # we actually had to tighten an existing dir from a more-permissive mode.
     try:
-        prior_mode = coherence_dir.stat().st_mode & 0o777
-        if prior_mode != 0o700:
-            os.chmod(coherence_dir, 0o700)
-            if prior_mode & 0o077:
-                logger.warning(
-                    "tightened existing .coherence directory %s from mode %o to "
-                    "0700 (it exposed group/world bits; the SQLite state, the "
-                    "hook.secret credential and the pidfile must not be readable "
-                    "outside the owner)",
-                    coherence_dir, prior_mode,
-                )
+        # lstat: stat follows a link made since the check, and so would the chmod.
+        prior = os.lstat(coherence_dir).st_mode
+        if not stat.S_ISDIR(prior):
+            return True
+        prior_mode = prior & 0o777
+        if prior_mode == 0o700:
+            return False
+        os.chmod(coherence_dir, 0o700)
     except OSError as exc:
         logger.warning(
             "could not re-assert 0700 on .coherence directory %s: %s",
             coherence_dir, exc,
         )
-    # Write .gitignore (idempotent — only write if missing to avoid
-    # clobbering any operator customization)
+        return False
+    if prior_mode & 0o077:
+        logger.warning(
+            "tightened existing .coherence directory %s from mode %o to "
+            "0700 (it exposed group/world bits; the SQLite state, the "
+            "hook.secret credential and the pidfile must not be readable "
+            "outside the owner)",
+            coherence_dir, prior_mode,
+        )
+    return True
+
+
+def _write_gitignore_once(coherence_dir: Path) -> None:
+    """Write ``.gitignore`` only if missing, to avoid clobbering any operator
+    customization. ``O_EXCL`` also never follows a link at the name, which the
+    start check refuses, so one made after it is left alone. The write and the
+    close go through ``FileIO``: an ``os.close`` here shifts the descriptor
+    numbers the lifecycle tests count closes by."""
     gitignore = coherence_dir / ".gitignore"
-    if not gitignore.exists():
-        try:
-            gitignore.write_text("*\n")
-        except OSError as exc:
-            logger.warning(
-                "could not write %s: %s — workspace data risks being committed",
-                gitignore, exc,
-            )
-    return coherence_dir
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        with io.FileIO(os.open(gitignore, flags, 0o666), "w", closefd=True) as handle:
+            handle.write(b"*\n")
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        logger.warning(
+            "could not write %s: %s — workspace data risks being committed",
+            gitignore, exc,
+        )
 
 
 def _open_pidfile(pid_file: Path) -> int | None:
-    """Open (creating if needed) the pid file with mode 0600 for fcntl use."""
+    """Open (creating if needed) the pid file with mode 0600 for fcntl use.
+
+    ``O_NOFOLLOW``: a repository can commit ``server.pid`` as a symlink, and a
+    start would then write its pid and port over the file the link names, or
+    create that file (#464). The start check refuses such a link first, so one
+    met here was made since: it raises the same
+    :class:`~ccs.core.exceptions.CoherenceDirRefused` (#498). Any other failure
+    returns None."""
     try:
-        fd = os.open(pid_file, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = os.open(pid_file, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     except OSError as exc:
+        # os.path.islink: Path.is_symlink raises where it cannot look, and this
+        # path must return None.
+        if os.path.islink(pid_file):
+            raise entry_link_refused(pid_file) from exc
         logger.warning("cannot open pid file %s: %s", pid_file, exc)
         return None
     return fd
@@ -900,28 +999,28 @@ def _read_pidfile(pid_file: Path) -> tuple[int | None, int | None]:
     when its line is absent or malformed, and both are when the file cannot
     be read. The port is validated exactly as :func:`read_port_from_file`
     always has; a pid must be positive."""
-    try:
-        text = pid_file.read_text(encoding="utf-8")
-    except OSError:  # FileNotFoundError included
-        return None, None
-    lines = text.splitlines()
-    pid = _int_line(lines, 0)
-    port = _int_line(lines, 1)
-    return (
-        pid if pid is not None and pid > 0 else None,
-        port if port is not None and 1 <= port <= 65535 else None,
-    )
+    lines = read_pid_lines(pid_file)
+    return lines.pid, lines.port
 
 
-def _int_line(lines: list[str], index: int) -> int | None:
-    """The integer on ``lines[index]``, or None when that line is absent or
-    is not an integer."""
-    if len(lines) <= index:
+def _names_an_exited_binder(binder_pid: int | None) -> bool:
+    return binder_pid is not None and not pid_is_alive(binder_pid)
+
+
+def running_coordinator_port(
+    pid_file: Path, cfg: LifecycleConfig, *, bind_host: str = "127.0.0.1"
+) -> int | None:
+    """The port of the coordinator ``pid_file`` names, when that coordinator
+    still runs and its port answers; otherwise None.
+
+    A coordinator that exited without a stop leaves its pid file behind, and
+    another process may then listen on its port. That process is not the
+    coordinator (#503): it neither counts as one already running nor gets a
+    request."""
+    lines = read_pid_lines(pid_file)
+    if lines.port is None or exit_evidence(pid_file, lines) is not None:
         return None
-    try:
-        return int(lines[index].strip())
-    except ValueError:
-        return None
+    return lines.port if tcp_probe(lines.port, cfg, bind_host=bind_host) else None
 
 
 def _read_port_with_retry(pid_file: Path, cfg: LifecycleConfig) -> int:

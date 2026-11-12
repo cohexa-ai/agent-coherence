@@ -47,6 +47,14 @@ deciding passes every sequential check. Each race fails a starved run, one that 
 decision states to prove anything, with its own message, never as a snapshot
 violation.
 
+:func:`assert_forget_agent_forgets_only_an_ended_identity` certifies the
+member that removes an ended identity's records (#525), driven through
+:class:`CoordinatorService` so the rows it removes are the ones a
+coordinator leaves: refused with ``ForgetRefused`` while the identity holds a
+write grant and not for a peer's, its transient state gone with its rows,
+the row that records a sweep reclaim kept and left INVALID, and nobody
+else's records touched.
+
 **BACKEND-DEFINED** (``assert_declared_*`` functions taking a
 :class:`RegistryFactory` AND a :class:`RestartDeclaration`): behaviors the
 contract explicitly lets backends DIVERGE on — restart survival, sweep timing.
@@ -82,16 +90,17 @@ from uuid import UUID, uuid4
 from ccs.coordinator.backend_contract import R18_LIVENESS_SOURCE, LivenessSourceObligation
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.registry_protocol import TransferRequest
-from ccs.coordinator.service import CoordinatorService
+from ccs.coordinator.service import CoordinatorService, ReleaseRequest
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import (
     SESSION_INVALIDATED_REASON,
     STALE_READ_GENERATION_REASON,
     VERSION_MISMATCH_REASON,
+    ForgetRefused,
     SessionInvalidated,
     StaleReadGeneration,
 )
-from ccs.core.states import MESIState
+from ccs.core.states import MESIState, TransientState
 from ccs.core.types import (
     Artifact,
     CommitAllEntry,
@@ -110,8 +119,10 @@ _RECLAIM_TRIGGER = "reclaim_heartbeat"
 
 # The voluntary-release trigger. It is NOT a reclaim, but it ends a write claim
 # at an UNCHANGED version exactly as a reclaim does, so R9 requires it to move
-# the ownership epoch too (EPOCH_BUMP_TRIGGERS = RECLAIM_TRIGGERS + this). Named
-# here as the wire-stable constant, matched by identity, never by substring.
+# the ownership epoch too (EPOCH_BUMP_TRIGGERS = RECLAIM_TRIGGERS + this),
+# whether the release leaves the holder INVALID or, when the holder gives back
+# its own write grant, SHARED. Named here as the wire-stable constant, matched
+# by identity, never by substring.
 _RELEASE_TRIGGER = "invalidate"
 
 # The handoff trigger: a transfer moves its giver INVALID under this trigger,
@@ -512,7 +523,12 @@ def assert_epoch_moves_on_voluntary_release(factory: RegistryFactory) -> None:
     epoch never moves, so the fence has nothing to compare.
 
     Contrast with :func:`assert_fence_rejects_superseded_read_generation`: that
-    leg pins the fence's VERDICT, this one pins the operand the verdict needs."""
+    leg pins the fence's VERDICT, this one pins the operand the verdict needs.
+
+    A release has two end states, and both are checked. The move to INVALID is
+    the operator drain's. The move to SHARED is the holder's own release, at a
+    failed edit or at the end of a turn, which gives the write claim back and
+    keeps a read (:func:`_assert_release_to_reader_moves_epoch`)."""
     reg = factory()
     artifact_id = uuid4()
     _register(reg, artifact_id, version=1)
@@ -558,6 +574,113 @@ def assert_epoch_moves_on_voluntary_release(factory: RegistryFactory) -> None:
     assert reg.get_owner_generation(artifact_id) == steady, (  # type: ignore[attr-defined]
         "a version-moving peer invalidation must NOT move the epoch"
     )
+
+    _assert_release_to_reader_moves_epoch(reg)
+
+
+@dataclass(frozen=True)
+class _HeldWriteClaim:
+    """A write claim set up to be released, and the two generations the
+    release is checked against."""
+
+    artifact_id: UUID
+    holder: UUID
+    epoch: int  # owner_generation while the claim was held
+    read_generation: int  # captured by the acquire
+
+
+def _hold_write_claim(reg: object, shape: MESIState, name: str) -> _HeldWriteClaim:
+    """Register ``name`` at version 1 and give a fresh holder an EXCLUSIVE or
+    MODIFIED grant on it: the two shapes a release starts from."""
+    artifact_id, holder = uuid4(), uuid4()
+    _register(reg, artifact_id, version=1, name=name)
+    reg.set_agent_state(artifact_id, holder, MESIState.EXCLUSIVE, tick=1)  # type: ignore[attr-defined]
+    if shape == MESIState.MODIFIED:
+        reg.set_agent_state(artifact_id, holder, MESIState.MODIFIED, tick=2)  # type: ignore[attr-defined]
+    captured = reg.get_read_generation(artifact_id, holder)  # type: ignore[attr-defined]
+    assert captured is not None, "an M/E acquire must capture a read_generation"
+    assert reg.granted_at_tick(holder, artifact_id) is not None, (  # type: ignore[attr-defined]
+        "scenario precondition: an M/E grant must record the tick it was granted at"
+    )
+    epoch = reg.get_owner_generation(artifact_id)  # type: ignore[attr-defined]
+    return _HeldWriteClaim(artifact_id, holder, epoch, captured)
+
+
+def _assert_kept_as_reader(reg: object, claim: _HeldWriteClaim, route: str) -> None:
+    """The holder is a reader at the version it held, and its write grant is
+    gone without a trace of a reclaim."""
+    artifact_id, holder = claim.artifact_id, claim.holder
+    state = reg.get_agent_state(artifact_id, holder)  # type: ignore[attr-defined]
+    assert state == MESIState.SHARED, f"{route}: the released holder is {state}, not SHARED"
+    assert reg.get_artifact(artifact_id).version == 1, (  # type: ignore[attr-defined]
+        f"{route}: a release must not move the version"
+    )
+    assert reg.last_observed_version_for(artifact_id, holder) == 1, (  # type: ignore[attr-defined]
+        f"{route}: the released holder no longer records the version it held"
+    )
+    assert reg.granted_at_tick(holder, artifact_id) is None, (  # type: ignore[attr-defined]
+        f"{route}: the released holder still carries its write grant's tick"
+    )
+    assert reg.get_last_reclamation(holder, artifact_id) is None, (  # type: ignore[attr-defined]
+        f"{route}: a release recorded a reclamation slot; only a sweep reclaim may"
+    )
+
+
+def _assert_old_claim_fenced(reg: object, claim: _HeldWriteClaim, route: str) -> None:
+    """The epoch moved past the claim given back, the release captured nothing,
+    and so the holder's commit on that claim is refused at the unchanged
+    version."""
+    artifact_id, holder = claim.artifact_id, claim.holder
+    assert reg.get_owner_generation(artifact_id) > claim.epoch, (  # type: ignore[attr-defined]
+        f"{route}: a release to SHARED gave up a write claim without moving "
+        "owner_generation; landing SHARED instead of INVALID does not exempt it"
+    )
+    kept = reg.get_read_generation(artifact_id, holder)  # type: ignore[attr-defined]
+    assert kept == claim.read_generation, (
+        f"{route}: the release captured a read_generation ({claim.read_generation} "
+        f"-> {kept}); a transition out of M/E captures nothing"
+    )
+    result = reg.commit_cas(  # type: ignore[attr-defined]
+        artifact_id, holder, expected_version=1, content_hash=_hash(f"kept-{route}"), tick=9
+    )
+    assert isinstance(result, ConflictDetail), (
+        f"{route}: the holder's commit on the claim it gave back was ADMITTED at "
+        f"an unchanged version, got {result!r}"
+    )
+    assert result.reason == STALE_READ_GENERATION_REASON, f"{route}: {result.reason}"
+    assert reg.get_artifact(artifact_id).version == 1  # type: ignore[attr-defined]
+
+
+def _assert_release_to_reader_moves_epoch(reg: object) -> None:
+    """Release-to-reader leg of :func:`assert_epoch_moves_on_voluntary_release`.
+    A holder that gives back its own write grant keeps a read: EXCLUSIVE or
+    MODIFIED to SHARED under the release trigger. Leaving M/E is what revokes
+    the claim, so the epoch MUST move whichever state the holder lands in. A
+    backend that bumps only on landing INVALID passes the leg above and ADMITS
+    the given-back claim's commit here, at a version that never moved.
+
+    Each shape runs twice: as the bare registry write, and through
+    ``CoordinatorService.release_to_reader``, the operation the coordinator
+    calls, which builds that write from this backend's own members."""
+    for shape in (MESIState.EXCLUSIVE, MESIState.MODIFIED):
+        label = shape.name.lower()
+        claim = _hold_write_claim(reg, shape, f"kept-{label}.md")
+        reg.set_agent_state(  # type: ignore[attr-defined]
+            claim.artifact_id, claim.holder, MESIState.SHARED,
+            trigger=_RELEASE_TRIGGER, tick=3, observed=False,
+        )
+        route = f"set_agent_state from {shape.name}"
+        _assert_kept_as_reader(reg, claim, route)
+        _assert_old_claim_fenced(reg, claim, route)
+
+        claim = _hold_write_claim(reg, shape, f"kept-by-service-{label}.md")
+        released = CoordinatorService(reg).release_to_reader(
+            ReleaseRequest(agent_id=claim.holder, artifact_id=claim.artifact_id, issued_at_tick=3)
+        )
+        route = f"release_to_reader from {shape.name}"
+        assert released, f"{route}: reported no write grant to release"
+        _assert_kept_as_reader(reg, claim, route)
+        _assert_old_claim_fenced(reg, claim, route)
 
 
 def assert_epoch_moves_on_handoff(factory: RegistryFactory) -> None:
@@ -1604,6 +1727,211 @@ def assert_session_fail_closed_on_foreign_and_reaped(factory: RegistryFactory) -
         "a released session token served (or crashed) instead of failing closed"
     )
     assert result.reason == SESSION_INVALIDATED_REASON, result.reason
+
+
+# ---------------------------------------------------------------------------
+# Forgetting an ended identity. Each obligation's failure text is named here
+# so the teeth tests can tell which one a stub was caught dropping.
+# ---------------------------------------------------------------------------
+
+FORGET_REFUSED_WHILE_WRITING = "forgot an identity that holds a write grant"
+FORGET_CHANGED_WHILE_REFUSING = "changed the identity's records and still refused"
+FORGET_REFUSED_UNTYPED = "refused with a plain ValueError, not ForgetRefused"
+FORGET_REFUSED_FOR_A_PEER = "refused on another identity's write grant"
+FORGET_MISCOUNTED = "misreported how many rows it removed"
+FORGET_KEPT_THE_HEARTBEAT = "left the ended identity's heartbeat"
+FORGET_KEPT_THE_TRANSIENT = "left the ended identity's transient state"
+FORGET_TOUCHED_A_PEER = "changed another identity's records"
+FORGET_DROPPED_RECLAIM_ROW = "deleted the row that records a sweep reclaim"
+FORGET_KEPT_A_READER = "left the ended identity reading"
+
+
+@dataclass(frozen=True)
+class _EndedIdentity:
+    """An identity seeded through the service on three files beside a peer:
+    ``read``, which both read and the peer then writes, so the peer holds a
+    write grant there, and on which the identity is left mid-transition;
+    ``reclaimed``, whose write grant the sweep took and which it then read
+    again; ``held``, on which it holds a write grant."""
+
+    ended: UUID
+    peer: UUID
+    read: UUID
+    reclaimed: UUID
+    held: UUID
+
+    @property
+    def files(self) -> tuple[UUID, UUID, UUID]:
+        return (self.read, self.reclaimed, self.held)
+
+
+def _read_as(svc: CoordinatorService, agent: UUID, artifact_id: UUID) -> MESIState:
+    """Read ``artifact_id`` as ``agent`` through the service, returning the grant."""
+    request = FetchRequest(artifact_id=artifact_id, requesting_agent_id=agent, requested_at_tick=1)
+    return svc.fetch(request).state_grant
+
+
+def _identity_records(reg: object, agent: UUID, files: tuple[UUID, ...]) -> tuple[object, ...]:
+    """Every value the base contract reads back for one identity."""
+    per_file = tuple(
+        (
+            reg.get_agent_state(artifact_id, agent),  # type: ignore[attr-defined]
+            reg.get_agent_transient(artifact_id, agent),  # type: ignore[attr-defined]
+            reg.get_transient_tick(artifact_id, agent),  # type: ignore[attr-defined]
+            reg.get_read_generation(artifact_id, agent),  # type: ignore[attr-defined]
+            reg.last_observed_version_for(artifact_id, agent),  # type: ignore[attr-defined]
+            reg.get_last_reclamation(agent, artifact_id),  # type: ignore[attr-defined]
+            reg.granted_at_tick(agent, artifact_id),  # type: ignore[attr-defined]
+        )
+        for artifact_id in files
+    )
+    return per_file, reg.last_heartbeat_tick(agent)  # type: ignore[attr-defined]
+
+
+def _seed_ended_identity(reg: object, svc: CoordinatorService) -> _EndedIdentity:
+    """Lay the identity's rows down with the service's own reads, writes and
+    sweep, the way a coordinator does. It never sends a heartbeat before the
+    sweep, so the sweep takes its write grant on ``reclaimed``. The peer,
+    which sends none either, writes ``read`` only after the sweep, so its
+    grant survives to the forget. Last, the identity starts a read of
+    ``read`` again that has not completed: a transient state, with its tick."""
+    world = _EndedIdentity(*(uuid4() for _ in range(5)))
+    for name, artifact_id in zip(("forget-read.md", "forget-reclaimed.md", "forget-held.md"), world.files):
+        _register(reg, artifact_id, name=name)
+    _read_as(svc, world.peer, world.read)
+    _read_as(svc, world.ended, world.read)
+    svc.write(agent_id=world.ended, artifact_id=world.reclaimed, issued_at_tick=2)
+    swept = svc.enforce_stable_grant_timeouts(current_tick=10, heartbeat_timeout_ticks=5, max_hold_ticks=1_000)
+    assert swept == 1, f"scenario precondition: the sweep reclaims one grant, reclaimed {swept}"
+    _read_as(svc, world.peer, world.reclaimed)
+    reread = _read_as(svc, world.ended, world.reclaimed)
+    assert reread == MESIState.SHARED and reg.get_last_reclamation(world.ended, world.reclaimed), (  # type: ignore[attr-defined]
+        "scenario precondition: a read after the reclaim is SHARED and keeps the reclaim record"
+    )
+    svc.write(agent_id=world.ended, artifact_id=world.held, issued_at_tick=11)
+    svc.record_heartbeat(agent_id=world.ended, now_tick=11)
+    svc.write(agent_id=world.peer, artifact_id=world.read, issued_at_tick=11)
+    assert reg.get_agent_state(world.read, world.peer) == MESIState.EXCLUSIVE, (  # type: ignore[attr-defined]
+        "scenario precondition: the peer holds a write grant on the file both read"
+    )
+    reg.set_agent_transient(world.read, world.ended, TransientState.ISG, entered_tick=11)  # type: ignore[attr-defined]
+    return world
+
+
+def _assert_forget_refused_while_writing(reg: object, world: _EndedIdentity) -> None:
+    """While ``held`` is EXCLUSIVE the forget raises ``ForgetRefused`` naming
+    the write grant and changes nothing, the other files' rows included."""
+    before = _identity_records(reg, world.ended, world.files)
+    try:
+        removed = reg.forget_agent(world.ended)  # type: ignore[attr-defined]
+    except ValueError as exc:
+        assert isinstance(exc, ForgetRefused), (
+            f"forget_agent {FORGET_REFUSED_UNTYPED} ({type(exc).__name__}): the coordinator "
+            "passes over that refusal alone and answers any other error as a fault"
+        )
+        assert "write grant" in str(exc), f"forget_agent refused without naming the write grant: {exc}"
+    else:
+        raise AssertionError(
+            f"forget_agent {FORGET_REFUSED_WHILE_WRITING} and removed {removed} rows: it must "
+            "refuse, deleting nothing, while the identity is EXCLUSIVE or MODIFIED anywhere, "
+            "or the grant its peers are refused on stops being visible to them"
+        )
+    assert _identity_records(reg, world.ended, world.files) == before, (
+        f"forget_agent {FORGET_CHANGED_WHILE_REFUSING}: a refusal must delete nothing"
+    )
+
+
+def _forget_beside_a_peer_grant(reg: object, world: _EndedIdentity) -> int:
+    """Forget the identity while the peer holds its write grant on ``read``.
+    That grant is not the identity's, so it must not refuse the forget."""
+    try:
+        return reg.forget_agent(world.ended)  # type: ignore[attr-defined]
+    except ValueError as exc:
+        raise AssertionError(
+            f"forget_agent {FORGET_REFUSED_FOR_A_PEER} ({exc}): only the identity's own "
+            "EXCLUSIVE or MODIFIED row refuses its forget"
+        ) from exc
+
+
+def _assert_forget_removes_the_rest(reg: object, world: _EndedIdentity) -> None:
+    """With the grant released, the read and released rows, the transient
+    state on ``read`` and the heartbeat go, and the peer's records, its write
+    grant included, stay as they were."""
+    peer_before = _identity_records(reg, world.peer, world.files)
+    removed = _forget_beside_a_peer_grant(reg, world)
+    assert removed == 2, f"forget_agent {FORGET_MISCOUNTED}: it reported {removed}; the identity had 2"
+    for artifact_id in (world.read, world.held):
+        state = reg.get_agent_state(artifact_id, world.ended)  # type: ignore[attr-defined]
+        assert state is None, f"forget_agent left the ended identity's {state} row"
+    transient = (
+        reg.get_agent_transient(world.read, world.ended),  # type: ignore[attr-defined]
+        reg.get_transient_tick(world.read, world.ended),  # type: ignore[attr-defined]
+    )
+    assert transient == (None, None), f"forget_agent {FORGET_KEPT_THE_TRANSIENT} {transient}"
+    heartbeat = reg.last_heartbeat_tick(world.ended)  # type: ignore[attr-defined]
+    assert heartbeat is None, f"forget_agent {FORGET_KEPT_THE_HEARTBEAT} (tick {heartbeat})"
+    assert _identity_records(reg, world.peer, world.files) == peer_before, (
+        f"forget_agent {FORGET_TOUCHED_A_PEER}: it must remove the ended identity's records only"
+    )
+
+
+def _assert_reclaim_row_kept_unread(reg: object, world: _EndedIdentity) -> None:
+    """The row recording the reclaim stays with its record, and INVALID."""
+    slot = reg.get_last_reclamation(world.ended, world.reclaimed)  # type: ignore[attr-defined]
+    assert slot is not None and slot[0] == _RECLAIM_TRIGGER, (
+        f"forget_agent {FORGET_DROPPED_RECLAIM_ROW} (its record is now {slot!r}): /status "
+        "reports a reclaim for a while after the holder is gone, so that row stays"
+    )
+    state = reg.get_agent_state(world.reclaimed, world.ended)  # type: ignore[attr-defined]
+    assert state == MESIState.INVALID, (
+        f"forget_agent {FORGET_KEPT_A_READER}: the reclaim row it kept is {state}, not "
+        "INVALID, so an identity that reads nothing more still counts as a reader"
+    )
+
+
+def _assert_peers_no_longer_count_it(svc: CoordinatorService, world: _EndedIdentity) -> None:
+    """What the forget is for: a peer's read of the released file is granted
+    it alone, and a peer's write invalidates nothing of the ended identity."""
+    grant = _read_as(svc, world.peer, world.held)
+    assert grant == MESIState.EXCLUSIVE, f"a peer's read still shared the released file ({grant})"
+    for artifact_id in (world.read, world.reclaimed):
+        signals = svc.write(agent_id=world.peer, artifact_id=artifact_id, issued_at_tick=30)
+        victims = {signal.victim_agent_id for signal in signals}
+        assert world.ended not in victims, "a peer's write still invalidated the forgotten identity"
+
+
+def assert_forget_agent_forgets_only_an_ended_identity(factory: RegistryFactory) -> None:
+    """Forgetting an ended identity (MUST-MATCH), driven through
+    :class:`CoordinatorService`, so the rows forgotten are the ones a
+    coordinator's reads, writes, releases and sweep leave. ``forget_agent``
+    must refuse with ``ForgetRefused``, deleting nothing, while the identity
+    holds a write grant; once that grant is released, and although a peer
+    holds one on a file both read, delete its other rows, its transient state
+    and its heartbeat, report how many rows went, and change no one else's
+    records; keep the row that records a sweep reclaim, with the record, and
+    leave it INVALID although the identity had read the file again; and
+    remove nothing on a second call.
+
+    Each obligation fails a different backend. One that forgets past a held
+    grant hides it from the peers it is refused to; one that deletes the
+    reclaim row loses a reclaim ``/status`` still reports; one that keeps that
+    row as it was leaves an identity that reads nothing listed as a reader;
+    one that refuses on a peer's grant never forgets anyone beside a writer;
+    one that refuses with a plain ``ValueError`` turns each refusal into a
+    failed stop or sweep; one that keeps the transient state leaves part of
+    the identity behind."""
+    reg = factory()
+    svc = CoordinatorService(reg)
+    world = _seed_ended_identity(reg, svc)
+    _assert_forget_refused_while_writing(reg, world)
+    released = svc.release_to_reader(
+        ReleaseRequest(agent_id=world.ended, artifact_id=world.held, issued_at_tick=12)
+    )
+    assert released, "scenario precondition: the identity's write grant is released"
+    _assert_forget_removes_the_rest(reg, world)
+    _assert_reclaim_row_kept_unread(reg, world)
+    _assert_peers_no_longer_count_it(svc, world)
+    assert reg.forget_agent(world.ended) == 0, "a second forget_agent removed rows"  # type: ignore[attr-defined]
 
 
 # ===========================================================================

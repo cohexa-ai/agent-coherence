@@ -32,8 +32,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeAlias, runtime_checkable
 
-import yaml
-
+from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+from ccs.adapters.claude_code.state_dir import check_coherence_dir
 from ccs.cli._coherence_client import (
     PRINCIPAL_REFUSED_AGAIN,
     CoordinatorEndpoint,
@@ -309,6 +309,13 @@ class CoherenceSubstrate(Protocol):
 # admit-on-absent path by design, the same posture as ``CoherentVolume.write_cas``.
 # ---------------------------------------------------------------------------
 
+# Every request names its artifact as a key: a row or an object, never a
+# workspace file. A coordinator keeps a key exactly as sent, so ``ws-42`` and
+# ``WS-42`` stay two artifacts even where the workspace disk folds case; sent
+# as file names, they would share one row and conflict with each other.
+# Coordinators older than the field ignore it.
+_NAME_KIND = "key"
+
 
 @runtime_checkable
 class ReconcilingSubstrate(CoherenceSubstrate, Protocol):
@@ -387,28 +394,11 @@ def _deny_is_peer_invalidation(version: int, prior_seen: int | None) -> bool:
     return prior_seen is not None and prior_seen < version
 
 
-def _merge_yaml_list(path: Path, globs: tuple[str, ...]) -> None:
-    """Idempotently merge ``globs`` into a coordinator policy YAML list file."""
-    existing: list[str] = []
-    if path.is_file():
-        try:
-            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except (yaml.YAMLError, OSError):
-            loaded = None
-        if isinstance(loaded, list):
-            existing = [x for x in loaded if isinstance(x, str)]
-    merged = sorted(set(existing) | set(globs))
-    if merged == sorted(existing):
-        return
-    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-    tmp.write_text(yaml.safe_dump(merged, default_flow_style=False), encoding="utf-8")
-    os.replace(tmp, path)
-
-
 def _write_strict_policy(coherence_dir: Path, managed: tuple[str, ...]) -> None:
     """Enable strict mode on the managed artifact globs BEFORE the coordinator
     spawns (policy is load-once-at-startup): a path must be tracked AND strict
-    for a peer commit to invalidate this reader's cached view."""
+    for a peer commit to invalidate this reader's cached view. Raises ValueError
+    naming a policy file it cannot merge into (#305)."""
     if not managed:
         return
     # Runs BEFORE the lifecycle creates the directory, so on a fresh workspace
@@ -417,8 +407,7 @@ def _write_strict_policy(coherence_dir: Path, managed: tuple[str, ...]) -> None:
     # about a directory this call made a moment earlier. An existing directory
     # is left as-is (mkdir never chmods); re-tightening is the lifecycle's job.
     coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for name in ("tracked.yaml", "strict_mode.yaml"):
-        _merge_yaml_list(coherence_dir / name, managed)
+    merge_policy_globs((coherence_dir / "tracked.yaml", coherence_dir / "strict_mode.yaml"), managed)
 
 
 @dataclass(frozen=True)
@@ -553,7 +542,12 @@ class SubstrateCoordinatorSession:
     client never silently degrades open. A call that gets no usable answer, at
     start or after, raises the typed
     :class:`~ccs.core.exceptions.CoordinatorUnreachable`, except after the
-    substrate write landed, where it stays ``CommitUnconfirmed``. The
+    substrate write landed, where it stays ``CommitUnconfirmed``. A policy file
+    it cannot merge its globs into before spawning raises the plain error,
+    naming the file and the workspace (#305). A ``.coherence`` that is a
+    symlink or not a directory, or that holds a symlink, FIFO, socket or
+    device, raises :class:`~ccs.core.exceptions.CoherenceDirRefused` before
+    anything is probed or written (#498); no retry clears it. The
     coordinator's failure envelope (#259) or an HTTP 5xx (#433) on a read leg
     raises the typed :class:`~ccs.core.exceptions.CoordinatorFailed`; any other
     answer that decides nothing keeps the plain error. A request refused for its caller
@@ -572,25 +566,29 @@ class SubstrateCoordinatorSession:
         config: LifecycleConfig | None = None,
         bind_host: str = "127.0.0.1",
     ) -> None:
-        # Deferred so importing a binding never pulls in the coordinator server.
         from ccs.adapters.claude_code.lifecycle import (  # noqa: PLC0415
             LifecycleConfig,
             connect_or_spawn,
-            read_port_from_file,
-            tcp_probe,
+            running_coordinator_port,
         )
 
         self._root = Path(root).resolve()
         self._managed = tuple(managed)
         cfg = config or LifecycleConfig()
         coherence_dir = self._root / ".coherence"
+        # Before the pre-probe and the policy write (#498): through a link in
+        # .coherence both would act on what the link names.
+        check_coherence_dir(self._root)
         pid_file = coherence_dir / "server.pid"
-        pre_existing = (port := read_port_from_file(pid_file)) is not None and tcp_probe(
-            port, cfg, bind_host=bind_host
-        )
+        pre_existing = running_coordinator_port(pid_file, cfg, bind_host=bind_host) is not None
         # Only the SPAWNER writes policy (load-once); a sibling must not clobber it.
         if not pre_existing:
-            _write_strict_policy(coherence_dir, self._managed)
+            try:
+                _write_strict_policy(coherence_dir, self._managed)
+            except ValueError as exc:
+                # Fail closed: a session has no check after it attaches, so going
+                # on without the merge would run it unenforced with no signal.
+                raise CoherenceError(f"{self._root}: {exc}") from exc
         # No coordinator to spawn or attach, or none to name, is the same fact
         # to this caller as one that will not answer: nothing will.
         if connect_or_spawn(self._root, config=cfg, bind_host=bind_host) == -1:
@@ -676,7 +674,11 @@ class SubstrateCoordinatorSession:
         coordinator's failure envelope (#259) or an HTTP 5xx (#433) raises
         ``CoordinatorFailed``, as the volume's strict reads do.
         """
-        payload: dict[str, object] = {"session_id": self._session_id, "path": artifact_ref}
+        payload: dict[str, object] = {
+            "session_id": self._session_id,
+            "path": artifact_ref,
+            "name_kind": _NAME_KIND,
+        }
         if content_hash is not None:
             payload["content_hash"] = content_hash
         resp = self._post("/hooks/pre-read", payload, unknown=unknown)
@@ -715,6 +717,7 @@ class SubstrateCoordinatorSession:
         payload = {
             "session_id": self._session_id,
             "path": artifact_ref,
+            "name_kind": _NAME_KIND,
             "success": True,
             "content_hash": content_hash,
             "expected_version": expected_version,

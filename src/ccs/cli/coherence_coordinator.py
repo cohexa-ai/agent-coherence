@@ -49,8 +49,9 @@ Exit codes (spawn mode):
 - 0: coordinator is up and reachable (port printed to stdout)
 - 1: not in a git repository (no coordinator root resolved)
 - 2: coordinator failed to spawn (platform unsupported, FS read-only,
-     port never appeared in the file, or detached child crashed), or a
-     usage error
+     port never appeared in the file, or detached child crashed),
+     ``.coherence`` is a symlink or not a directory, or holds a symlink
+     (or a FIFO, socket or device), or a usage error
 
 Exit codes (``--check-store``; 1 and 2 as above, 3-9 left to spawn mode):
 - 0: current — a start opens the store unchanged
@@ -62,6 +63,9 @@ Exit codes (``--check-store``; 1 and 2 as above, 3-9 left to spawn mode):
 - 15: live — a coordinator is running; a start joins it, migrating nothing
   while it runs (the store is not read, so its schema is unknown)
 - 16: cannot_tell — the check could not observe the answer
+- 17: coherence_dir_refused — ``.coherence`` is a symlink or not a
+  directory, or holds a symlink (or a FIFO, socket or device); a start
+  refuses it
 """
 
 from __future__ import annotations
@@ -80,6 +84,7 @@ from ccs.adapters.claude_code.auth import is_loopback_host, validate_bind_host
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     ensure_coordinator,
+    running_coordinator_port,
     stop_coordinator,
 )
 from ccs.adapters.claude_code.lifecycle import (
@@ -89,8 +94,11 @@ from ccs.adapters.claude_code.lifecycle import (
     tcp_probe as _tcp_probe,
 )
 from ccs.adapters.claude_code.resolver import find_coordinator_root
-from ccs.adapters.claude_code.store_check import StoreCheckOutcome, check_store
+from ccs.adapters.claude_code.state_dir import check_coherence_dir
+from ccs.adapters.claude_code.store_check import StoreCheckOutcome, check_store, store_is_held
 from ccs.cli._coherence_client import err, escape_nonprintable
+from ccs.coordinator.sqlite_registry import StoreHeldError
+from ccs.core.exceptions import CoherenceDirRefused
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +115,7 @@ _CHECK_STORE_EXIT_CODES: dict[StoreCheckOutcome, int] = {
     StoreCheckOutcome.UNUSABLE: 14,
     StoreCheckOutcome.LIVE: 15,
     StoreCheckOutcome.CANNOT_TELL: 16,
+    StoreCheckOutcome.COHERENCE_DIR_REFUSED: 17,
 }
 
 # Import-time exhaustiveness pin (the coherence_replay pattern): an outcome
@@ -178,7 +187,7 @@ def build_parser() -> argparse.ArgumentParser:
             ".coherence/state.db (open it as is, create it, migrate it, or "
             "refuse it) and exit with that outcome's code: 0 current, 10 fresh, "
             "11 will_migrate, 12 newer, 13 foreign, 14 unusable, 15 live, "
-            "16 cannot_tell."
+            "16 cannot_tell, 17 coherence_dir_refused."
         ),
     )
     parser.add_argument(
@@ -227,6 +236,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         err(f"agent-coherence-coordinator: {exc}")
         return 2
 
+    # #498: before every spawn-side mode and the reuse probe, so a link in
+    # .coherence is named here and nothing is read, probed, drained or spawned.
+    # The detached worker's stderr is /dev/null: this parent's line is the one
+    # the user reads.
+    try:
+        check_coherence_dir(root)
+    except CoherenceDirRefused as exc:
+        return _print_refusal(exc)
+
     # Daemonized worker mode: bind + serve, then block forever so the
     # daemon HTTP/sweep/idle threads stay alive.
     if args._daemonized:
@@ -245,7 +263,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Test mode: keep the legacy in-process behavior so test_claude_code_cli
     # can spawn + assert in the same Python process. Not for users.
     if args.no_detach:
-        port = ensure_coordinator(root, bind_host=args.bind_host)
+        try:
+            port = ensure_coordinator(root, bind_host=args.bind_host)
+        except (CoherenceDirRefused, StoreHeldError) as exc:
+            return _print_refusal(exc)
         if port == -1:
             err("agent-coherence-coordinator: coordinator could not be spawned")
             return 2
@@ -255,17 +276,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # Normal user path: probe for an existing coordinator first.
     pid_file = root / ".coherence" / "server.pid"
-    existing_port = _read_port_from_file(pid_file)
-    cfg = LifecycleConfig()
-    if existing_port is not None and _tcp_probe(
-        existing_port, cfg, bind_host=args.bind_host
-    ):
+    existing_port = running_coordinator_port(pid_file, LifecycleConfig(), bind_host=args.bind_host)
+    if existing_port is not None:
         if not args.quiet:
             print(f"port={existing_port}", flush=True)
         return 0
 
     # No live coordinator — fork a detached child to run it.
     return _spawn_detached(root, quiet=args.quiet, bind_host=args.bind_host)
+
+
+def _print_refusal(exc: CoherenceDirRefused | StoreHeldError) -> int:
+    """Print a start's refusal on one line and return exit 2: of
+    ``.coherence`` (#498), or of a store another read-write handle holds
+    (#453). The path in it comes from the workspace, so it is escaped."""
+    err(f"agent-coherence-coordinator: {escape_nonprintable(str(exc))}")
+    return 2
 
 
 def _reject_check_store_misuse(
@@ -428,7 +454,12 @@ def _run_daemonized(root: Path, *, bind_host: str = "127.0.0.1") -> int:
     and block indefinitely. Exits on SIGTERM (sent by stop_coordinator)
     or natural idle-shutdown (lifecycle's idle loop also detaches via
     ``return`` in its loop, leaving the main thread to block here)."""
-    port = ensure_coordinator(root, bind_host=bind_host)
+    try:
+        port = ensure_coordinator(root, bind_host=bind_host)
+    except (CoherenceDirRefused, StoreHeldError) as exc:
+        # A link made after main's check. Spawned detached, this line goes to
+        # /dev/null and the parent reports its timeout; run directly, it shows.
+        return _print_refusal(exc)
     if port == -1:
         return 2
 
@@ -472,22 +503,46 @@ def _spawn_detached(root: Path, *, quiet: bool, bind_host: str = "127.0.0.1") ->
         err(f"agent-coherence-coordinator: could not spawn detached worker: {exc}")
         return 2
 
+    exit_code = _await_detached_port(pid_file, quiet=quiet, bind_host=bind_host)
+    if exit_code is not None:
+        return exit_code
+
+    # The worker's stderr is /dev/null: name a store it could not open (#453).
+    if store_is_held(root):
+        db_path = escape_nonprintable(str(root / ".coherence" / "state.db"))
+        err(
+            f"agent-coherence-coordinator: {db_path} is open for writing by another "
+            "handle (a script, or a coordinator still closing), so no coordinator "
+            "could start; start again once it closes"
+        )
+        return 2
+    err(
+        "agent-coherence-coordinator: detached worker did not become reachable "
+        f"within {_DETACH_PORT_WAIT_TIMEOUT_SEC:.0f}s"
+    )
+    return 2
+
+
+def _await_detached_port(pid_file: Path, *, quiet: bool, bind_host: str) -> int | None:
+    """Wait for the detached worker's coordinator to answer; its exit code, or
+    None when the wait runs out. Until the worker holds the workspace lock,
+    ``server.pid`` may still name a coordinator that exited, whose port
+    another process can hold (#503), so only a running coordinator counts."""
     cfg = LifecycleConfig()
     deadline = time.monotonic() + _DETACH_PORT_WAIT_TIMEOUT_SEC
     while time.monotonic() < deadline:
-        port = _read_port_from_file(pid_file)
+        port = running_coordinator_port(pid_file, cfg, bind_host=bind_host)
         if port is not None:
-            if _tcp_probe(port, cfg, bind_host=bind_host):
-                if not quiet:
-                    print(f"port={port}", flush=True)
-                return 0
-            # A routed bind can never converge while a loopback-bound
-            # coordinator holds the workspace flock: the child joins it via
-            # the loser path and exits without binding the routed host.
-            # Name the mismatch now instead of stalling out the window.
-            if not is_loopback_host(bind_host) and _tcp_probe(
-                port, cfg, bind_host="127.0.0.1"
-            ):
+            if not quiet:
+                print(f"port={port}", flush=True)
+            return 0
+        # A routed bind can never converge while a loopback-bound
+        # coordinator holds the workspace flock: the child joins it via
+        # the loser path and exits without binding the routed host.
+        # Name the mismatch now instead of stalling out the window.
+        if not is_loopback_host(bind_host):
+            port = running_coordinator_port(pid_file, cfg, bind_host="127.0.0.1")
+            if port is not None:
                 err(
                     "agent-coherence-coordinator: a coordinator for this "
                     f"workspace is already running on 127.0.0.1:{port}; stop "
@@ -495,12 +550,7 @@ def _spawn_detached(root: Path, *, quiet: bool, bind_host: str = "127.0.0.1") ->
                 )
                 return 2
         time.sleep(_DETACH_PORT_WAIT_INTERVAL_SEC)
-
-    err(
-        "agent-coherence-coordinator: detached worker did not become reachable "
-        f"within {_DETACH_PORT_WAIT_TIMEOUT_SEC:.0f}s"
-    )
-    return 2
+    return None
 
 
 if __name__ == "__main__":

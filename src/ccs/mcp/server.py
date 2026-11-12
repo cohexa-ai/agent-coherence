@@ -24,20 +24,25 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 from ccs.adapters.claude_code.lifecycle import stop_coordinator
+from ccs.adapters.claude_code.state_dir import check_coherence_dir
 from ccs.adapters.coherent_volume import (
     CoherentVolume,
     HandoffTransferResult,
     HandoffVerbResult,
 )
 from ccs.adapters.effect_gate import check_fence
+from ccs.cli._coherence_client import err, escape_nonprintable
+from ccs.coordinator.fold_merge import index_key_of
 from ccs.core.exceptions import (
     HOLD_INPUT_VANISHED,
     CasVersionConflict,
+    CoherenceDirRefused,
     CoherenceError,
     HandoffPathsInvalid,
 )
@@ -51,7 +56,12 @@ from ccs.mcp.deny import (
     handoff_verb_refusal_result,
 )
 from ccs.mcp.session import SessionConfig, build_volume
-from ccs.mcp.status import PER_PATH_UNAVAILABLE_TEXT, build_status, handoff_from_status
+from ccs.mcp.status import (
+    PER_PATH_UNAVAILABLE_TEXT,
+    build_status,
+    fold_profile_of,
+    handoff_from_status,
+)
 from ccs.mcp.uri import UriValidationError, validate_uri
 
 logger = logging.getLogger(__name__)
@@ -144,10 +154,11 @@ _READ_DESC = (
     "swg_reacquire to recover before writing. If the bytes on disk are not the "
     "content at the current version, the read is DENIED with reason=stale_view "
     "and no version. A peer's commit still reaching disk clears on its own: "
-    "swg_reacquire, then swg_read again, retrying for a few seconds. Only if it "
-    "stays denied past that was the file changed outside the coordinator (an "
-    "out-of-band edit, or a commit whose disk write failed): swg_write the "
-    "content swg_reacquire returned (or your merge of it), then swg_read. A "
+    "swg_reacquire, then swg_read again, retrying for a few seconds. If it "
+    "stays denied past that, the bytes on disk were never recorded (an "
+    "out-of-band edit, a commit whose disk write failed, or a write whose commit "
+    "did not reach the coordinator); reading again does not clear it: swg_write "
+    "the content swg_reacquire returned (or your merge of it), then swg_read. A "
     "write made sooner can be overwritten by a peer commit still reaching "
     "disk." + _SCOPE_CLAUSE
 )
@@ -306,8 +317,9 @@ class ServerContext:
     volume: CoherentVolume
     config: SessionConfig
     lock: asyncio.Lock
-    # path → consecutive CAS-conflict count, the cooperating-agent livelock bound
-    # for swg_write_cas (reset on a win; survives only within one stdio session).
+    # file's fold key → consecutive CAS-conflict count, the cooperating-agent
+    # livelock bound for swg_write_cas (reset on a win; survives only within one
+    # stdio session).
     cas_conflicts: dict[str, int] = field(default_factory=dict)
 
 
@@ -316,18 +328,29 @@ async def lifespan(server: FastMCP) -> AsyncIterator[ServerContext]:
     """Own the coordinator for the server's lifetime.
 
     Enter → construct the strict-only volume (self-spawns/attaches; raises
-    fail-closed if it can't). Exit → ``stop_coordinator``. Does NOT call
-    ``connect_or_spawn`` — construction already did, so calling it again would
-    double-spawn.
+    fail-closed if it can't). Exit → close the volume, which gives back its
+    write grants (a failed close is logged), then ``stop_coordinator``: an
+    in-process coordinator must still answer the close. The coordinator is
+    stopped whatever the close does. Only a normal end runs this; nothing
+    handles a signal. Does NOT call ``connect_or_spawn`` — construction
+    already did, so calling it again would double-spawn.
     """
     config = SessionConfig.from_env()
     volume = build_volume(config)  # blocking, fail-closed
     logger.info("stale-write-guard-fs attached: root=%s managed=%s", config.root, config.managed)
+    ctx = ServerContext(volume=volume, config=config, lock=asyncio.Lock())
     try:
-        yield ServerContext(volume=volume, config=config, lock=asyncio.Lock())
+        yield ctx
     finally:
-        stop_coordinator(config.root)
-        logger.info("stale-write-guard-fs coordinator stopped: root=%s", config.root)
+        try:
+            async with ctx.lock:
+                try:
+                    volume.close()
+                except CoherenceError as exc:
+                    logger.warning("stale-write-guard-fs could not close its volume: %s", exc)
+        finally:
+            stop_coordinator(config.root)
+            logger.info("stale-write-guard-fs coordinator stopped: root=%s", config.root)
 
 
 # --- result builders ---------------------------------------------------------
@@ -562,15 +585,17 @@ def _do_write_cas(
         won = volume.write_cas_at(key, expected_version, new_content.encode("utf-8"))
     except CasVersionConflict as exc:
         # Bound a COOPERATING agent's retry loop: too many consecutive conflicts
-        # on one path in this session → tell it to stop (retryable=false).
-        count = conflicts.get(key, 0) + 1
+        # on one file in this session, under any of its spellings → tell it to
+        # stop (retryable=false).
+        streak = _conflict_streak_key(volume, key)
+        count = conflicts.get(streak, 0) + 1
         if count > MAX_CAS_CONFLICTS:
-            conflicts.pop(key, None)
+            conflicts.pop(streak, None)
             return cas_exhausted_result(
                 f"{key}: {count} consecutive CAS conflicts in this session — stop "
                 "(the cooperating-agent livelock bound; coordinator-side fencing is v1.1)"
             )
-        conflicts[key] = count
+        conflicts[streak] = count
         return deny_result(exc)
     except FileNotFoundError as exc:
         return _client_error_result("file_not_found", "check_path", str(exc))
@@ -578,13 +603,24 @@ def _do_write_cas(
         return deny_result(exc)
     except OSError as exc:  # disk/permission failure → fail closed, never escape to FastMCP
         return _client_error_result("io_error", "none", str(exc))
-    conflicts.pop(key, None)  # a win resets the cooperating-agent conflict streak
+    if conflicts:  # a win resets the file's conflict streak; with none open, no /status read
+        conflicts.pop(_conflict_streak_key(volume, key), None)
     structured: dict = {"ok": True, "path": key}
     if won.handoff is not None:
         # What the win did to a live handoff of the path (#185): completed it
         # (this session is the successor) or overtook it (a bystander).
         structured["handoff"] = _present(asdict(won.handoff))
     return _ok_result(structured, f"committed {key}")
+
+
+def _conflict_streak_key(volume: CoherentVolume, key: str) -> str:
+    """The name ``key``'s consecutive CAS conflicts are counted under: its
+    fold key by the profile the coordinator's default ``/status`` tier
+    advertises, read each time it is needed, so two spellings the
+    coordinator keys as one file share one streak. A coordinator restarted
+    on a disk it classifies differently is then followed, not the profile
+    of an earlier start."""
+    return index_key_of(key, fold_profile_of(volume.coordinator_status()))
 
 
 def _present(fields: dict) -> dict:
@@ -832,9 +868,24 @@ def _configure_stderr_logging() -> None:
     root.setLevel(logging.INFO)
 
 
+def _exit_if_coherence_dir_refused(root: Path) -> None:
+    """Exit 2 on one stderr line when a start would refuse ``root``'s
+    ``.coherence`` (#498), as the other console scripts do, before the server
+    serves. The lifespan's own refusal stays the backstop for a link made after
+    this check."""
+    try:
+        check_coherence_dir(root)
+    except CoherenceDirRefused as exc:
+        # A cloned repository chose the name in this text, and a host runs the
+        # server unattended: escaped, it cannot drive a terminal or split a log line.
+        err(f"{SERVER_NAME}: {escape_nonprintable(str(exc))}")
+        raise SystemExit(2) from None
+
+
 def main() -> None:
     """Console-script entrypoint: run the server over stdio."""
     _configure_stderr_logging()
+    _exit_if_coherence_dir_refused(SessionConfig.from_env().root)
     build_server().run(transport="stdio")
 
 

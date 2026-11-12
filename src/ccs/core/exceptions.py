@@ -54,9 +54,9 @@ HOLD_VERSION_UNCONFIRMED = "version_unconfirmed"
 # The coordinator refused the re-validate read because the bytes are not the
 # content it records at the version, which has not moved: a peer's write()
 # whose bytes landed before its commit, a change made outside the coordinator,
-# or a commit's disk write failed (#405). The same answer a version-checked
-# read refuses as the split pair (#264), hence the same value as
-# SPLIT_PAIR_REASON. Split out of READ_DENIED because its recovery differs: a
+# a commit's disk write failed (#405), or a write whose commit never reached the
+# coordinator (#526). The same answer a version-checked read refuses as the
+# split pair (#264), hence the same value as SPLIT_PAIR_REASON. Split out of READ_DENIED because its recovery differs: a
 # reacquire returns the bytes on disk but does not record them, so the hold
 # repeats until the peer's commit lands or a write() records them.
 HOLD_SPLIT_PAIR = "split_pair"
@@ -399,6 +399,20 @@ SCHEMA_VERSION_REASONS: frozenset[str] = frozenset(
         CROSS_RUNTIME_SCHEMA_REASON,
     }
 )
+
+# ---------------------------------------------------------------------------
+# one read-write handle per store (#453)
+# ---------------------------------------------------------------------------
+#
+# ``StoreHeldError.reason`` (defined in ``ccs.coordinator.sqlite_registry`` for
+# the same layering reason as the schema classes above). The workspace CLI's
+# JSON envelope and the store check carry it, so it is wire-stable: add, do
+# not mutate.
+STORE_HELD_REASON = "store_held"
+"""Another read-write handle has the store open: a coordinator, or a registry
+in this or another process. A store has one writer. Remedy: go through that
+handle (a coordinator's routes), open with ``read_only=True`` to read, or
+retry once it closes."""
 
 # ---------------------------------------------------------------------------
 # caller-principal refusal reasons (coordinator caller principal, U4)
@@ -835,6 +849,60 @@ class CallerPrincipalRefused(CoherenceError):
         return type(self), (self.reason, str(self)), {**self.__dict__, "args": self.args}
 
 
+# A start's refusal of this workspace's ``.coherence`` (#498). One class-level
+# reason, so every surface (the exception, ``--check-store``, the workspace
+# envelope) answers one token; ``kind`` says which rule refused it. Wire-stable
+# and ADDITIVE, matched by ``reason == CONSTANT`` / ``kind in KINDS``, never by
+# a substring of the message.
+COHERENCE_DIR_REFUSED_REASON = "coherence_dir_refused"
+COHERENCE_LINK_KIND = "coherence_link"
+"""``.coherence`` is a symlink, or an entry directly inside it is one."""
+
+COHERENCE_NOT_A_DIRECTORY_KIND = "coherence_not_a_directory"
+"""``.coherence`` exists and is not a directory: a regular file, FIFO, socket or
+device."""
+
+COHERENCE_SPECIAL_ENTRY_KIND = "coherence_special_entry"
+"""An entry directly inside ``.coherence`` is a FIFO, socket or device, which no
+coordinator creates and whose open can block a start."""
+
+COHERENCE_DIR_REFUSAL_KINDS: frozenset[str] = frozenset(
+    {
+        COHERENCE_LINK_KIND,
+        COHERENCE_NOT_A_DIRECTORY_KIND,
+        COHERENCE_SPECIAL_ENTRY_KIND,
+    }
+)
+
+
+class CoherenceDirRefused(CoherenceError):
+    """A coordinator start refused this workspace's ``.coherence`` (#498): it is
+    a symlink or not a directory, or it holds a symlink, FIFO, socket or device
+    directly inside it. Nothing was written, joined or probed.
+
+    Not a :class:`CoordinatorUnreachable`: no retry, and no coordinator started
+    later, clears it. A person replaces the link or mounts a directory at
+    ``.coherence``, then builds a new volume or session. Carries
+    :data:`COHERENCE_DIR_REFUSED_REASON` on the class; ``kind`` (one of
+    :data:`COHERENCE_DIR_REFUSAL_KINDS`) says which rule refused it, and
+    ``path`` is the refused path, raw: a CLI escapes it before printing. It
+    rebuilds from its three fields, so it pickles whole across a process
+    boundary.
+    """
+
+    reason = COHERENCE_DIR_REFUSED_REASON
+
+    def __init__(self, kind: str, path: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.path = path
+
+    def __reduce__(
+        self,
+    ) -> tuple[type[CoherenceDirRefused], tuple[str, str, str], dict[str, object]]:
+        return type(self), (self.kind, self.path, str(self)), {**self.__dict__, "args": self.args}
+
+
 class GiverFenced(CoherenceError):
     """The committer handed this path off, and the handoff is still live: its
     write is refused, on the pessimistic route and the compare-and-swap route
@@ -894,7 +962,8 @@ class OtherHolder(CoherenceError):
     The caller backs off, then reads the artifact again before it writes: a write
     built without reading overwrites whatever the holder committed once the
     artifact comes free. The holder lets go when it releases the artifact, hands
-    it on, or is reclaimed by the coordinator's sweep.
+    it on, or is reclaimed: by the Python coordinator's sweep, or, on the Node
+    coordinator, by an opted-in request once the grant is 30 minutes old.
 
     Carries :data:`OTHER_HOLDER_REASON` on the class, so a consumer classifies
     it by type or ``.reason``, never by the message, plus ``holder_agent_id``,
@@ -923,6 +992,46 @@ class OtherHolder(CoherenceError):
         return (type(self), (self.artifact_id, self.holder_agent_id))
 
 
+#: Why a refuse-mode volume refused a write through a link out of its managed set.
+LINK_OUT_OF_MANAGED_REASON = "link_out_of_managed"
+
+
+class LinkOutOfManaged(CoherenceError):
+    """A volume built with ``on_held="refuse"`` was asked to write a path whose
+    name lies under its managed globs but which reaches, through a link on the
+    path, a file outside them. Nothing was sent and nothing was written.
+
+    The refusal of a held file applies on managed paths only, so the write would
+    take the file from whichever agent holds it, outside the guarantee the
+    volume was built for. Write the target by its own path from a volume that
+    may displace its holder, or point the link inside the managed set.
+
+    Carries :data:`LINK_OUT_OF_MANAGED_REASON` on the class, so a consumer
+    classifies it by type or ``.reason``, never by the message, plus ``path``
+    (as the caller wrote it), ``link`` (the link on it, relative to the
+    workspace root) and ``target`` (the file the write reaches, relative to the
+    root). It rebuilds from those three, so it pickles whole across a process
+    boundary.
+    """
+
+    reason = LINK_OUT_OF_MANAGED_REASON
+
+    def __init__(self, path: str, link: str, target: str) -> None:
+        super().__init__(
+            f"{LINK_OUT_OF_MANAGED_REASON} path={path} link={link} target={target} "
+            "(nothing was sent or written: the link lies under managed and leads to a "
+            "file outside it, where refuse mode cannot keep the file from its holder. "
+            "Write the target by its own path from a volume that may displace its "
+            "holder, or point the link inside managed)"
+        )
+        self.path = path
+        self.link = link
+        self.target = target
+
+    def __reduce__(self) -> tuple[type[LinkOutOfManaged], tuple[str, str, str]]:
+        return (type(self), (self.path, self.link, self.target))
+
+
 class CoherenceDegradedWarning(UserWarning):
     """Emitted once per adapter instance when a coherence error degrades to fallback.
 
@@ -948,6 +1057,13 @@ class HandoffPathsInvalid(ValueError):
     write-set is, and its own type so a caller catches exactly it: a broader
     ``except ValueError`` around a transfer would also swallow a fault after
     the request went out, which must read as an unknown outcome instead."""
+
+
+class ForgetRefused(ValueError):
+    """A registry's ``forget_agent`` refused, deleting nothing, because the
+    identity still holds a write grant (EXCLUSIVE or MODIFIED). A
+    ``ValueError``, and its own type so the coordinator logs and passes over
+    exactly this refusal: any other error inside a forget is a fault."""
 
 
 class InvalidTransitionError(CoherenceError):
@@ -981,10 +1097,11 @@ class CasRetriesExhausted(_CarriesGenerationPair, CoherenceError):
     not: another agent holds the grant at an unchanged version. Against the
     cross-process coordinator (``CoherentVolume``) nothing the caller does
     releases it. The holder does: a Claude Code session at its turn end, a
-    ``CoherentVolume`` at its own next ``write_cas`` of that file or any
-    ``write_cas`` retry, ``write_cas_at``, ``atomic_publish`` or
-    ``reacquire()`` (a ``session-stop`` naming only that volume's
-    ``session_id`` releases nothing). Otherwise the coordinator's reclaim
+    ``CoherentVolume`` when it calls ``release()`` on the file or ``close()``,
+    or at its own next ``write_cas`` of that file or any ``write_cas`` retry,
+    ``write_cas_at``, ``atomic_publish`` or ``reacquire()`` (a
+    ``session-stop`` naming only that volume's ``session_id`` releases
+    nothing). Otherwise the coordinator's reclaim
     does. In process (``AgentRuntime``) the loop's own re-fetch
     downgrades the holder, so ``other_holder`` there clears on the next attempt
     unless the holder re-acquires.
@@ -1245,7 +1362,10 @@ class CommitUnconfirmed(CoherenceError):
     when the request was never sent, because the outcome they must reconcile is
     the same. The write
     may or may not have landed; reconcile by re-reading, then retry only if
-    absent. Carries :data:`COMMIT_UNCONFIRMED_REASON`."""
+    absent. A pessimistic ``write()`` is the exception: its bytes are already
+    on disk, a read that refuses stale bytes refuses them until a write of the
+    path is recorded, so write the path again, which records it either way.
+    Carries :data:`COMMIT_UNCONFIRMED_REASON`."""
 
     reason = COMMIT_UNCONFIRMED_REASON
 
@@ -1259,9 +1379,11 @@ class CoordinatorUnreachable(CoherenceError):
     :class:`CommitUnconfirmed` instead, because it may have landed.
 
     No write was version-committed. A pessimistic ``write()`` that raises it
-    from its commit has already put its bytes on disk, and its message says so.
-    One that raises it from its grant request has written nothing, though the
-    request may have taken the grant, which ``reacquire()`` releases. An attached
+    from its commit has already put its bytes on disk, unrecorded, and its
+    message says so: writing the path again records them, and re-reading does
+    not. One that raises it from its grant request has written nothing, though
+    the request may have taken the grant, which ``release()`` or
+    ``reacquire()`` releases. An attached
     volume or substrate session keeps the endpoint it attached to, so recovery
     depends on what happened to that coordinator. If it only stalled (for
     example, a stopped process that resumes) and comes back on the same port,
@@ -1303,7 +1425,7 @@ class CoordinatorFailed(CoherenceError):
     A refuse-mode ``write()`` raises it as well, with nothing written, for two
     answers to its grant request. ``unavailable``: the coordinator could not
     decide in time and the abandoned work may still take the grant, so retry, or
-    call ``reacquire()`` if giving up. And a refusal naming this volume's own
+    call ``release()`` on the path if giving up. And a refusal naming this volume's own
     earlier incarnation, whose release did not land: a plain retry never sends
     that release again, so call ``reacquire()``.
 

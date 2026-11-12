@@ -1,0 +1,35 @@
+{
+  "name": "ended-without-agent-id-is-refused-400",
+  "description": "\"ended\": true on a stop that names no agent_id is refused with HTTP 400. A stop without an agent_id is a Claude Code session's own Stop, sent between turns, and a session between turns has not ended; only an attempt named by its agent_id can be reported ended (#525). The session holds EXCLUSIVE on notes.md first, so a backend that took the stop as a plain one would answer 200 listing it. Both backends answer in the same words.",
+  "setup": {
+    "tracked": ["notes.md"],
+    "files": {
+      "notes.md": "# Notes\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "66666666-6666-4666-8666-666666666666",
+          "path": "notes.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/session-stop",
+    "body": {
+      "session_id": "66666666-6666-4666-8666-666666666666",
+      "ended": true
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": "ended requires agent_id"
+    }
+  },
+  "backends": ["python", "node"]
+}

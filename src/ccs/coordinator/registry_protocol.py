@@ -61,6 +61,7 @@ from ccs.core.exceptions import (
     HANDOFF_SUCCESSOR_UNKNOWN_REASON,
     HANDOFF_VERSION_UNCONFIRMED_REASON,
     CheckpointRegistrationRefused,
+    ForgetRefused,
     RegistryLockTimeout,
 )
 from ccs.core.states import MESIState, TransientState
@@ -80,6 +81,7 @@ from ccs.core.types import (
     VersionedReadRejection,
 )
 
+from .fold_merge import NameKind
 from .retention import RetentionPolicy
 
 # Contract return types — DEFINED here in the contract module and re-exported by
@@ -294,16 +296,30 @@ SWEEP_RECLAIM_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS - {"timeout"}
 # act, never an eviction. Wire-stable: renaming it without EPOCH_BUMP_TRIGGERS
 # leaves the bump keyed on a string nothing emits.
 HANDOFF_TRIGGER: str = "handoff"
-# EPOCH_BUMP_TRIGGERS: the triggers whose M/E -> INVALID transition MOVES the
-# ownership epoch. The rule is not "the sweep did it" but "a write-claim was
+# RELEASE_TRIGGER: the trigger a voluntary release moves its holder out of M/E
+# under -- to SHARED on the holder's own release, to INVALID on
+# service.invalidate. Named so every release site and EPOCH_BUMP_TRIGGERS share
+# one value: a site that spelled it differently would release without moving
+# the epoch. Wire-stable, as HANDOFF_TRIGGER is.
+RELEASE_TRIGGER: str = "invalidate"
+# EPOCH_BUMP_TRIGGERS: the triggers under which LEAVING M/E moves the ownership
+# epoch, whatever state the agent lands in: INVALID, or SHARED on the holder's
+# own release. The rule is not "the sweep did it" but "a write-claim was
 # revoked WITHOUT the version moving" -- the one condition version-CAS is
 # structurally blind to. That is every RECLAIM_TRIGGER plus "invalidate", the
-# voluntary release (service.invalidate: a post-edit failure, a session-stop
-# release, an operator drain), which likewise ends a claim at an unchanged
-# version. Leaving it out let a release SUPPRESS the fence: the holder is
-# already INVALID, so the sweep has no M/E grant left to reclaim and the epoch
-# never moves at all -- the identical end-state a sweep reclaim fences was
-# silently admitted (NoSilentRevoke, formal/tla/Fencing.tla).
+# voluntary release, which likewise ends a claim at an unchanged version. The
+# release has two end states. service.release_to_reader is the holder's own
+# release (a failed post-edit, the end of a turn, a subagent stopping): it
+# keeps a read, M/E -> SHARED (#513). service.invalidate moves the agent to
+# INVALID; the operator drain keeps using it, because the bytes behind an
+# orphaned grant may never have been committed. Leaving "invalidate" out let a
+# release SUPPRESS the fence: the holder is no longer in M/E, so the sweep has
+# no grant left to reclaim and the epoch never moves at all -- the identical
+# end-state a sweep reclaim fences was silently admitted (NoSilentRevoke,
+# formal/tla/Fencing.tla). Keying the bump on landing INVALID would reopen
+# that hole for the release to SHARED: the release reads nothing and captures
+# no read_generation, so only the moved epoch refuses the holder's late commit
+# on the claim it gave back.
 #
 # HANDOFF_TRIGGER joins for the same reason: a giver that hands a path off from
 # EXCLUSIVE or MODIFIED ends its write claim at an unchanged version exactly as
@@ -327,7 +343,7 @@ HANDOFF_TRIGGER: str = "handoff"
 # (adapters.effect_gate.check_fence: a stale-status re-validate read HOLDs
 # even with the (version, generation) pair unchanged).
 EPOCH_BUMP_TRIGGERS: frozenset[str] = RECLAIM_TRIGGERS | frozenset(
-    {"invalidate", HANDOFF_TRIGGER}
+    {RELEASE_TRIGGER, HANDOFF_TRIGGER}
 )
 # CLAIM_CAPTURE_TRIGGERS: triggers under which a transition MAY be a genuine
 # content read for read-generation capture (the E/M-acquire capture is keyed
@@ -810,6 +826,17 @@ def _ended(record: TransferRecord, *, successor: UUID, status: str) -> TransferG
     )
 
 
+def forget_refusal(agent_id: UUID, artifact_id: UUID) -> ForgetRefused:
+    """The error :meth:`RegistryBase.forget_agent` raises, having deleted
+    nothing, while ``agent_id`` still holds a write grant. Built in one place
+    so both registries refuse in the same words; ``artifact_id`` is one of the
+    files the grant is held on."""
+    return ForgetRefused(
+        f"forget_not_allowed: agent={agent_id} artifact={artifact_id} holds a "
+        "write grant (EXCLUSIVE or MODIFIED); nothing was forgotten"
+    )
+
+
 @runtime_checkable
 class RegistryBase(Protocol):
     """The registry contract the service layer (:class:`CoordinatorService`)
@@ -962,6 +989,33 @@ class RegistryBase(Protocol):
         ``session_read`` / ``session_commit``). Declared here so a backend typed
         against ``RegistryBase`` cannot omit it and pass ``isinstance`` yet fail
         at the first fence read."""
+        ...
+
+    def forget_agent(self, agent_id: UUID) -> int:
+        """Remove the records of an identity that has ended (#525) and return
+        how many of its per-file state rows went: its per-file states with
+        everything recorded on them, its heartbeat and, on a registry that
+        queues them, its preemption notices, all in one hold (sqlite: one
+        ``BEGIN IMMEDIATE``). Other identities' records are untouched, a
+        notice naming this identity as the preempter included, and a second
+        call removes nothing and returns 0.
+
+        A row that records a sweep reclaim stays, with that record, so
+        ``/status`` can still report the reclaim; it is left INVALID, because
+        an identity that has ended reads nothing and must stop counting as a
+        reader of that file.
+
+        Refused with :func:`forget_refusal`'s
+        :class:`~ccs.core.exceptions.ForgetRefused` (a ``ValueError``),
+        deleting nothing, while the identity holds any EXCLUSIVE or MODIFIED
+        row: that grant is what its peers are refused on and what the sweep
+        reclaims. The coordinator logs and passes over that refusal alone, so
+        any other error raised here reads as a fault.
+
+        Only for an identity that can never act again. A deleted row reads as
+        never seen: a peer's write no longer invalidates the identity, and the
+        fence admits its commit on the version alone, as it admits any
+        committer with no recorded read generation."""
         ...
 
     def get_agent_state(self, artifact_id: UUID, agent_id: UUID) -> MESIState | None:
@@ -1118,6 +1172,11 @@ class RegistryBase(Protocol):
         INVALID does: the prior value kept, a never-observed pair still None.
         It never affects the state written, the grant tick, the epoch or the
         read-generation capture.
+
+        Leaving M/E under an :data:`EPOCH_BUMP_TRIGGERS` trigger moves the
+        artifact's ``owner_generation`` in the same write, whatever the target
+        state: INVALID, or SHARED when a holder gives back its own write grant
+        and keeps a read.
 
         An M/E -> INVALID transition under a :data:`SWEEP_RECLAIM_TRIGGERS`
         trigger also records the pair's reclaim slot, ``(trigger, tick)``, in
@@ -1285,8 +1344,9 @@ class SqliteExtended(RegistryBase, Protocol):
 
     These cover the durable-store-only concerns: connection ``close``, durable
     name/prefix lookups, the preemption-notice surface (record/peek/pop/evict),
-    ``resolve_or_register`` first-observation seeding, and the ``status_snapshot``
-    batch. Extracted as a pure refactor (no behavior change).
+    ``resolve_or_register`` first-observation seeding, the ``status_snapshot``
+    batch, and ``fold_bucket_peers``, the other rows of a file's fold bucket
+    that the write path treats as the same file.
     """
 
     def artifact_names_under_prefix(self, prefix: str) -> list[str]:
@@ -1305,13 +1365,23 @@ class SqliteExtended(RegistryBase, Protocol):
     ) -> int:
         ...
 
+    def fold_bucket_peers(self, artifact_id: UUID) -> list[UUID]:
+        ...
+
     def get_artifact_updated_at(self, artifact_id: UUID) -> Optional[float]:
         ...
 
     def last_writer_for(self, artifact_id: UUID) -> Optional[UUID]:
         ...
 
-    def lookup_artifact_id_by_name(self, parent_rel_path: str) -> UUID | None:
+    def lookup_artifact_id_by_name(
+        self,
+        parent_rel_path: str,
+        *,
+        key: str | None = None,
+        disk_spelling: str | None = None,
+        name_kind: NameKind = "file",
+    ) -> UUID | None:
         ...
 
     def peek_preemption_notice(
@@ -1345,6 +1415,9 @@ class SqliteExtended(RegistryBase, Protocol):
         content_hash: str,
         *,
         initial_owner: Optional[UUID] = None,
+        key: str | None = None,
+        disk_spelling: str | None = None,
+        name_kind: NameKind = "file",
     ) -> UUID:
         ...
 

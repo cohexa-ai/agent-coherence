@@ -17,6 +17,7 @@ import pytest
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.core.exceptions import CasVersionConflict
+from ccs.core.path_fold import FOLD_TABLE_UNICODE_VERSION
 from ccs.mcp.server import (
     _READ_DESC,
     _WRITE_CAS_DESC,
@@ -249,6 +250,114 @@ def test_write_cas_counter_resets_after_a_win(tmp_path: Path, fast_cfg: Lifecycl
         stop_coordinator(tmp_path)
 
 
+# --- one streak per file, whatever spelling the agent uses -------------------
+
+#: Two spellings a case-folding disk opens as one file.
+_SPELLINGS = ("data/shared.txt", "DATA/Shared.TXT")
+
+
+class _ScriptedCasVolume:
+    """Just what ``_do_write_cas`` touches of a volume: an attached session
+    whose compare-and-set loses every race until ``wins_next`` is set, against
+    a coordinator whose default ``/status`` tier answers ``status_doc``
+    (``None``: unreadable). Free of any disk, so the spellings below name one
+    file wherever the test runs."""
+
+    is_attached = True
+
+    def __init__(self, status_doc: dict | None) -> None:
+        self._status_doc = status_doc
+        self.wins_next = False
+        self.status_reads = 0
+
+    def coordinator_status(self) -> dict | None:
+        self.status_reads += 1
+        return self._status_doc
+
+    def write_cas_at(self, key: str, expected_version: int, data: bytes) -> object:
+        if self.wins_next:
+            return type("Won", (), {"handoff": None})()
+        raise CasVersionConflict(key, expected_version, expected_version + 1)
+
+
+def _advertising(profile: str, table: str = FOLD_TABLE_UNICODE_VERSION) -> dict:
+    return {"fold_profile": profile, "fold_table_unicode": table}
+
+
+def _reason(result: object) -> str:
+    return result.structuredContent["reason"]  # type: ignore[attr-defined]
+
+
+def test_conflicts_under_two_spellings_of_one_file_count_toward_one_limit(tmp_path: Path) -> None:
+    """An agent retrying one file under two spellings its coordinator folds
+    together is still one retry loop. Counted per spelling, it ran twice as
+    long as the bound before it was told to stop."""
+    volume = _ScriptedCasVolume(_advertising("caseless"))
+    config = _config(tmp_path)
+    conflicts: dict[str, int] = {}
+
+    for attempt in range(MAX_CAS_CONFLICTS):
+        result = _do_write_cas(volume, config, conflicts, _SPELLINGS[attempt % 2], 1, "x")  # type: ignore[arg-type]
+        assert _reason(result) == "version_mismatch"
+    exhausted = _do_write_cas(volume, config, conflicts, _SPELLINGS[MAX_CAS_CONFLICTS % 2], 1, "x")  # type: ignore[arg-type]
+
+    assert _reason(exhausted) == "cas_exhausted"
+
+
+@pytest.mark.parametrize(
+    "status_doc",
+    [
+        None,
+        {},
+        _advertising("none"),
+        _advertising("cannot_tell"),
+        _advertising("folds-everything"),
+        _advertising("caseless", table="16.0.0"),
+    ],
+    ids=["unreadable", "older-coordinator", "none", "cannot-tell", "unknown-profile", "another-table"],
+)
+def test_two_spellings_keep_two_limits_where_names_are_compared_as_typed(
+    tmp_path: Path, status_doc: dict | None
+) -> None:
+    """Where the coordinator keys names as typed (or this server cannot fold
+    as it does), two spellings are two files, each with its own streak."""
+    volume = _ScriptedCasVolume(status_doc)
+    config = _config(tmp_path)
+    conflicts: dict[str, int] = {}
+
+    for attempt in range(2 * MAX_CAS_CONFLICTS):
+        result = _do_write_cas(volume, config, conflicts, _SPELLINGS[attempt % 2], 1, "x")  # type: ignore[arg-type]
+        assert _reason(result) == "version_mismatch", attempt
+
+
+def test_a_win_under_one_spelling_ends_the_streak_counted_under_the_other(tmp_path: Path) -> None:
+    """A win resets the file's streak whichever spelling the conflicts and
+    the win came under, so the next conflict does not start near the bound."""
+    volume = _ScriptedCasVolume(_advertising("caseless"))
+    config = _config(tmp_path)
+    conflicts: dict[str, int] = {}
+    for _ in range(MAX_CAS_CONFLICTS):
+        _do_write_cas(volume, config, conflicts, _SPELLINGS[0], 1, "x")  # type: ignore[arg-type]
+
+    # The win comes under the spelling that differs from the file's fold key.
+    volume.wins_next = True
+    assert _do_write_cas(volume, config, conflicts, _SPELLINGS[1], 1, "won").isError is False  # type: ignore[arg-type]
+    volume.wins_next = False
+
+    assert _reason(_do_write_cas(volume, config, conflicts, _SPELLINGS[0], 1, "x")) == "version_mismatch"  # type: ignore[arg-type]
+
+
+def test_a_win_with_no_open_streak_reads_no_status(tmp_path: Path) -> None:
+    """Finding a file's streak costs a ``/status`` request, whose default tier
+    lists every tracked artifact. A win with no streak open has none to reset,
+    so the common case (a write that wins at once) sends no such request."""
+    volume = _ScriptedCasVolume(_advertising("caseless"))
+    volume.wins_next = True
+
+    assert _do_write_cas(volume, _config(tmp_path), {}, _SPELLINGS[0], 1, "won").isError is False  # type: ignore[arg-type]
+    assert volume.status_reads == 0
+
+
 # --- SB-23: foreign-edit-at-write via swg_write -------------------------------
 
 
@@ -356,6 +465,13 @@ def test_read_description_names_the_write_recovery_for_a_lasting_refusal() -> No
     # ...and only after retrying, since a peer's commit still reaching disk
     # clears on its own and a write made inside that window is overwritten.
     assert "few seconds" in _READ_DESC
+
+
+def test_read_description_names_a_write_whose_commit_did_not_reach_the_coordinator() -> None:
+    """A write whose bytes reached disk but whose commit did not reach the
+    coordinator is refused the same way, and the description lists it among
+    the causes, as the volume's own refusal does."""
+    assert "a write whose commit did not reach the coordinator" in _READ_DESC
 
 
 # --- the refusal reason reaches the caller -----------------------------------

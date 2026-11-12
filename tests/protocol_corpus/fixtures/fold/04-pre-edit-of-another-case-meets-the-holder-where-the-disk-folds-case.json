@@ -1,0 +1,61 @@
+{
+  "name": "fold-pre-edit-of-another-case-meets-the-holder-where-the-disk-folds-case",
+  "description": "Session A takes EXCLUSIVE on data/x.txt; session B then pre-edits DATA/X.TXT. On a case-insensitive disk (caseless) the two spellings open one file, so B meets A's hold exactly as a pre-edit of data/x.txt would: allowed with the collision warning. On a disk that keeps case apart (nfd, none) DATA/X.TXT is another file and B gets the plain {ok: true}: no collision. Both spellings are listed in tracked.yaml, so DATA/X.TXT is tracked on every disk by its own literal pattern; this row cannot tell that admission from an untracked one, which answers the same {ok: true}. Fold 06 is the row that shows the second spelling is its own tracked record there. The warning echoes the path as B sent it, DATA/X.TXT, not the stored data/x.txt. It is compared in full: the holder's short id is derived from A's fixed session id and both timestamps are ISO, which the harness scrubs. Both backends.",
+  "setup": {
+    "tracked": [
+      "data/x.txt",
+      "DATA/X.TXT"
+    ],
+    "files": {
+      "data/x.txt": "x\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "path": "data/x.txt"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+      "path": "DATA/X.TXT"
+    }
+  },
+  "expected_by_fold_profile": {
+    "caseless": {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "collision": true,
+        "hookSpecificOutput": {
+          "hookEventName": "PreToolUse",
+          "permissionDecision": "allow",
+          "additionalContext": "\u26a0 Concurrent edit detected at <TS> (UTC): another agent (80cbc93d) has been editing DATA/X.TXT since <TS>. Your edit will land in your own worktree, but only one session's commit will be accepted by the coordinator. Consider waiting for the other session to finish or coordinating which one should proceed."
+        }
+      }
+    },
+    "nfd": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    },
+    "none": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

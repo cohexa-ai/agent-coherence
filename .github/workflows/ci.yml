@@ -432,27 +432,12 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
-      # Which Node backend does this gate prove parity against?
-      #
-      # Pinning `main` unconditionally makes a PAIRED cross-repo change
-      # unverifiable before merge: the sibling Node half sits on its own
-      # plugin branch, so every fixture the pair adds fails here until a
-      # plugin release promotes dev to main — long after review. The pair is
-      # then merged on a maintainer's local run, which is the one place the
-      # parity contract must not be taken on trust.
-      #
-      # So: build the plugin branch whose name matches the branch under
-      # test — the PR's head branch on pull_request (`head_ref`), the pushed
-      # branch on push (`ref_name`, so a push to `dev` pairs with the
-      # plugin's `dev` and a push to `main` with its `main`). With no
-      # same-named plugin branch, fall back to the plugin branch named like
-      # the line the change is heading for: a PR into `dev` (`base_ref`) and
-      # a hand-dispatched run on a feature branch -- stacked PRs get no PR
-      # checks, so their CI is dispatched -- pair with the plugin's `dev`,
-      # because that is what this repo's `dev` push will pair with after the
-      # merge. A PR into `main`, a dispatch on `main` and a tag fall back to
-      # the plugin's `main` (no plugin branch is named `v*`). An absent or
-      # unreachable fallback degrades to `main` rather than failing the job.
+      # Which Node backend does this gate prove parity against? The plugin
+      # branch named like the branch under test, else the plugin branch of
+      # the line the change merges into; the script holds the rules and
+      # why. The folding job runs the same step, so both pick the plugin
+      # branch by the same rules; each picks it on its own, so a push to
+      # that branch between the two can hand them different commits.
       #
       # `head_ref` is attacker-controlled on a fork PR, so it reaches the
       # script through the environment and is never interpolated into it.
@@ -463,67 +448,7 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
-        run: |
-          remote=https://github.com/Cohexa-ai/agent-coherence-plugin.git
-          ref=main
-          # Whether we FELL BACK is a property of the path taken, not of the
-          # value landed on: a push to this repo's `main` pairs with the
-          # plugin's `main` deliberately (see above), so `$ref = main` alone
-          # cannot tell the intended pairing from a fallback.
-          fellback=yes
-          if [ -n "$SIBLING_REF" ] &&
-             git ls-remote --exit-code --heads "$remote" "$SIBLING_REF" \
-               >/dev/null 2>&1; then
-            ref="$SIBLING_REF"
-            fellback=no
-          else
-            # The fallback follows the integration line: `dev` for a PR into
-            # `dev` or a dispatch on a non-`main` branch, `main` otherwise.
-            fallback=main
-            if [ "$BASE_REF" = dev ] ||
-               { [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REF_NAME" != main ]; }; then
-              fallback=dev
-            fi
-            if [ "$fallback" != main ] &&
-               git ls-remote --exit-code --heads "$remote" "$fallback" \
-                 >/dev/null 2>&1; then
-              ref="$fallback"
-            fi
-          fi
-          # Record the SHA too: the sibling branch can move without a commit
-          # here, so the ref name alone does not identify what was proven.
-          sha=$(git ls-remote "$remote" "refs/heads/$ref" | cut -f1)
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
-          echo "Node backend: agent-coherence-plugin@$ref ($sha)"
-          # When this is the FALLBACK, say how far behind it is. "Parity
-          # proven against `main`" is true and reads like reassurance, and a
-          # `main` trailing the plugin's own `dev` by a release is a weaker
-          # claim than it sounds -- the reader cannot tell the difference
-          # from the ref name, and this job's whole job is to be believable.
-          # Advisory only: every failure path below leaves $note empty, so a
-          # rate-limited or unreachable API never turns a passing parity run
-          # red. `|| true` is load-bearing under the default `bash -e`.
-          note=""
-          if [ "$fellback" = yes ] && [ "$ref" = dev ]; then
-            note=" — the fallback, the plugin's \`dev\` (the line this change merges into)"
-          elif [ "$fellback" = yes ]; then
-            # `.ahead_by` on a three-dot compare is how far `dev` leads, i.e.
-            # how far `main` trails. `.behind_by` would report the opposite
-            # and is wrong here -- today the two are diverged (33 / 2).
-            behind=$(curl -sS --max-time 10 -H 'Accept: application/vnd.github+json' \
-              "https://api.github.com/repos/Cohexa-ai/agent-coherence-plugin/compare/main...dev" \
-              2>/dev/null | jq -r '.ahead_by // empty' 2>/dev/null || true)
-            # Three outcomes, kept distinct. Folding the first into the second
-            # would let a rate-limited lookup read as reassurance -- the exact
-            # bare sentence this note exists to qualify.
-            case "$behind" in
-              ''|*[!0-9]*) note=" — the fallback; staleness check unavailable" ;;
-              0)           note=" — the fallback, level with the plugin's \`dev\`" ;;
-              *)           note=" — the fallback, $behind commit(s) behind the plugin's \`dev\`" ;;
-            esac
-          fi
-          echo "Parity proven against \`agent-coherence-plugin@$ref\` \`$sha\`$note." \
-            >> "$GITHUB_STEP_SUMMARY"
+        run: bash .github/scripts/resolve-plugin-ref.sh
 
       # Check out the plugin repo INSIDE the workspace so actions/checkout
       # accepts the path (it rejects paths outside $GITHUB_WORKSPACE). The
@@ -552,6 +477,99 @@ jobs:
           npm run build
 
       - name: Run protocol corpus
+        env:
+          AGENT_COHERENCE_PLUGIN_DIST_PATH: ${{ github.workspace }}/_plugin_checkout/dist/coordinator.js
+        run: pytest -m protocol_corpus -v --tb=short
+
+  # Every other job runs on Ubuntu, whose disk folds no file name, so there
+  # the folding suites and the corpus only see a disk that keeps every
+  # spelling apart. This job runs them on the runner's case-insensitive APFS
+  # disk, where one file has many spellings. Naming the expected profile
+  # makes the probe test in tests/test_fs_profile.py FAIL, never skip, when
+  # the runner's disk does not classify as caseless.
+  #
+  # Pinned to a named image, as ubuntu-24.04 is: `macos-latest` moves to a
+  # new macOS (and APFS) on GitHub's schedule, not this repo's. macos-26 is
+  # the newest GA image, the one `macos-latest` names today.
+  #
+  # Its steps are the corpus job's plus the folding step
+  # (tests/test_ci_workflow_structure.py holds them equal), so it picks and
+  # builds the plugin branch by the same rules. Like the corpus job it needs
+  # nothing.
+  folding-macos:
+    name: Folding tests (macOS)
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      AGENT_COHERENCE_EXPECT_FOLD_PROFILE: caseless
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install library + dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      # The same step as the corpus job's: `head_ref` reaches the script
+      # through the environment only.
+      - name: Resolve plugin ref
+        id: plugin_ref
+        env:
+          SIBLING_REF: ${{ github.head_ref || github.ref_name }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: bash .github/scripts/resolve-plugin-ref.sh
+
+      - name: Check out agent-coherence-plugin
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: Cohexa-ai/agent-coherence-plugin
+          ref: ${{ steps.plugin_ref.outputs.ref }}
+          path: _plugin_checkout
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: _plugin_checkout/package-lock.json
+
+      - name: Build Node coordinator
+        working-directory: _plugin_checkout
+        run: |
+          npm ci
+          npm run build
+
+      # Each suite here takes another branch, or stops skipping, on a disk
+      # that folds names: the new fold suites, the hook client's link and
+      # root tests, the CLI's root-spelling test and the volume's
+      # other-spelling tests. Whole files, so no selection can go stale.
+      - name: Run the folding tests on the runner's disk
+        run: >-
+          pytest -v -rs --tb=short
+          tests/test_path_fold.py
+          tests/test_fs_profile.py
+          tests/test_disk_spelling.py
+          tests/test_registry_fold_merge.py
+          tests/test_coordinator_door_fold.py
+          tests/test_policy_fold.py
+          tests/test_foreign_write_detector_fold.py
+          tests/test_coordinator_session_fold.py
+          tests/adapters/test_coherent_volume_fold.py
+          tests/test_claude_code_hook_client.py
+          tests/test_claude_code_cli.py
+          tests/adapters/test_coherent_volume_other_holder.py
+          tests/adapters/test_coherent_volume_release.py
+
+      # Runs after a folding failure too, so one run shows both.
+      - name: Run protocol corpus
+        if: ${{ !cancelled() }}
         env:
           AGENT_COHERENCE_PLUGIN_DIST_PATH: ${{ github.workspace }}/_plugin_checkout/dist/coordinator.js
         run: pytest -m protocol_corpus -v --tb=short

@@ -1,0 +1,37 @@
+{
+  "name": "ended-that-is-not-a-boolean-is-refused-400",
+  "description": "An \"ended\" that is not a JSON boolean is refused with HTTP 400, here the string \"true\" beside a well-formed agent_id. Neither backend reads a truthy value as an end: a stop that forgets an identity's records has to say so exactly (#525). The attempt holds EXCLUSIVE on notes.md first, so a backend that ignored the bad field would answer 200 listing it. Both backends answer in the same words.",
+  "setup": {
+    "tracked": ["notes.md"],
+    "files": {
+      "notes.md": "# Notes\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "66666666-6666-4666-8666-666666666666",
+          "agent_id": "a0826622451ec196f",
+          "path": "notes.md"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/session-stop",
+    "body": {
+      "session_id": "66666666-6666-4666-8666-666666666666",
+      "agent_id": "a0826622451ec196f",
+      "ended": "true"
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": "ended must be a boolean"
+    }
+  },
+  "backends": ["python", "node"]
+}

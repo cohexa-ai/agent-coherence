@@ -297,8 +297,11 @@ def test_release_by_invalidate_arms_the_fence_like_a_sweep_reclaim(registry) -> 
     )
 
     # A peer takes the artifact and releases it without moving the version —
-    # the shape a post-edit failure / session-stop release produces, and the
-    # window in which the peer may have mutated shared bytes.
+    # the shape the operator drain's release produces, and the window in which
+    # the peer may have mutated shared bytes. A Stop or a failed post-edit
+    # releases through release_to_reader instead, which leaves the peer a
+    # reader and moves the epoch the same way
+    # (tests/test_self_release_reader.py).
     reg.set_agent_state(art.id, b, MESIState.EXCLUSIVE, trigger="write", tick=101)
     svc.invalidate(
         agent_id=b, artifact_id=art.id, new_version=1, issuer_agent_id=b, issued_at_tick=102
@@ -461,11 +464,12 @@ def test_eager_update_then_declined_invalidation_leaves_no_transient() -> None:
 
 
 def test_self_issued_release_is_never_pinned(registry) -> None:
-    """An agent handing back its OWN claim is not a cross-agent revoke and is
-    never dropped — this is the shape every Claude Code adapter call site uses
-    (post-edit failure, session-stop release, operator drain). Its
-    ``last_observed_version`` always equals the current version, so a pin that
-    did not exempt it would make session-stop unable to release anything."""
+    """An agent handing back its OWN claim through ``invalidate`` is not a
+    cross-agent revoke and is never dropped — this is the shape the operator
+    drain's release uses. Its ``last_observed_version`` always equals the
+    current version, so a pin that did not exempt it would leave the drain
+    unable to release anything. A Stop, a SubagentStop and a failed post-edit
+    release through ``release_to_reader``, which never reaches the pin."""
     svc = CoordinatorService(registry)
     art = svc.register_artifact(name="plan.md", content="v1")
     a = uuid4()
@@ -558,13 +562,10 @@ def _renew_grant(reg, artifact_id: object, agent_id: object, tick: int) -> None:
     M<->E transitions deliberately preserve the original grant tick, because the
     agent has continuously held *some* write claim. So a holder refreshes its
     max-hold budget the only way the API allows, and the only way a real one
-    does: it releases and re-acquires. The (state, trigger) pairs are exactly
-    the ones ``CoordinatorService`` uses -- ``invalidate`` to release
-    (service.py, the ``_invalidate_impl`` write) and ``write`` to acquire
-    EXCLUSIVE (service.py, the ``write`` grant).
+    does: it releases and re-acquires.
     """
     reg.set_agent_state(
-        artifact_id, agent_id, MESIState.INVALID, trigger="invalidate", tick=tick
+        artifact_id, agent_id, MESIState.SHARED, trigger="invalidate", tick=tick, observed=False
     )
     reg.set_agent_state(
         artifact_id, agent_id, MESIState.EXCLUSIVE, trigger="write", tick=tick

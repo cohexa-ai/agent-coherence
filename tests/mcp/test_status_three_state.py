@@ -13,10 +13,19 @@ from pathlib import Path
 
 import pytest
 
+from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
+from ccs.adapters.claude_code.fs_profile import FoldProfileResult
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.mcp.server import _STATUS_DESC, _do_status
 from ccs.mcp.session import SessionConfig
-from ccs.mcp.status import _coordinator_state, _per_path, build_status, handoff_from_status
+from ccs.mcp.status import (
+    _coordinator_state,
+    _per_path,
+    build_status,
+    fold_profile_of,
+    handoff_from_status,
+)
+from tests.coordinator_helpers import serve_in_process
 
 
 class _StubVolume:
@@ -327,6 +336,41 @@ def test_build_status_live_reports_on(tmp_path: Path, fast_cfg: LifecycleConfig)
         assert status["caller_principal_refused_total"] == 0
     finally:
         stop_coordinator(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("probed", "compared_by"),
+    [
+        (FoldProfileResult(profile="caseless", status="classified"), "caseless"),
+        (FoldProfileResult(profile="nfd", status="classified"), "nfd"),
+        (FoldProfileResult(profile="none", status="cannot_tell", reason="test"), "none"),
+    ],
+    ids=["caseless", "nfd", "cannot-tell"],
+)
+def test_names_are_compared_by_the_profile_a_live_status_advertises(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    probed: FoldProfileResult,
+    compared_by: str,
+) -> None:
+    """Against a real coordinator, the profile the MCP server compares names
+    by is the one its start found, read off the default ``/status`` tier the
+    volume reads. A disk the start could not classify is compared as typed.
+    Prevents reading fields the coordinator does not send, which the stub
+    documents cannot see."""
+    monkeypatch.setattr(CoordinatorHTTPServer, "_probe_fold_profile", lambda _self: probed)
+    server = serve_in_process(tmp_path, "mcp-fold-profile", tracked="data/**")
+    try:
+        from ccs.adapters.coherent_volume import CoherentVolume
+
+        volume = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+        try:
+            assert fold_profile_of(volume.coordinator_status()) == compared_by
+        finally:
+            volume.close()
+    finally:
+        server.shutdown()
 
 
 def test_build_status_live_forwards_the_stores_schema_version(tmp_path: Path, fast_cfg: LifecycleConfig) -> None:

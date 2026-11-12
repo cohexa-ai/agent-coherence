@@ -23,6 +23,9 @@ import hashlib
 import http.server
 import logging
 import os
+import socket
+import subprocess
+import sys
 import threading
 import traceback
 from pathlib import Path
@@ -30,6 +33,8 @@ from pathlib import Path
 import pytest
 
 import ccs.adapters.substrate as substrate_module
+from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
+from ccs.adapters.claude_code.fs_profile import FoldProfileResult
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.substrate import (
     CasConflict,
@@ -43,10 +48,12 @@ from ccs.adapters.substrate import (
     ReconcileVerdict,
     SubstrateCoordinatorSession,
 )
+from ccs.cli._coherence_client import get as coordinator_get
 from ccs.core.exceptions import (
     COMMIT_UNCONFIRMED_REASON,
     VERSION_MISMATCH_REASON,
     CasVersionConflict,
+    CoherenceDirRefused,
     CoherenceError,
     CommitUnconfirmed,
     CoordinatorFailed,
@@ -55,8 +62,10 @@ from ccs.core.exceptions import (
     ViewWedged,
 )
 from ccs.core.substrate import CapabilityDescriptor, Tier
+from tests.coherence_link_helpers import plant_link
 from tests.coordinator_helpers import serve_in_process
 from tests.loopback_helpers import refused_endpoint, refusing_port
+from tests.pid_lock_helpers import write_coordinator_pid_file
 from tests.test_coherence_client_tls import (
     _make_handler_class,
     _mint_bundle,
@@ -213,6 +222,165 @@ def _agent(
 
 def _session(tmp_path: Path, fast_cfg: LifecycleConfig) -> SubstrateCoordinatorSession:
     return SubstrateCoordinatorSession(tmp_path, managed=("**",), config=fast_cfg)
+
+
+@pytest.mark.parametrize("name", ["tracked.yaml", "strict_mode.yaml"])
+def test_a_session_refuses_a_policy_file_it_cannot_load_and_keeps_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig, name: str
+) -> None:
+    """#305: a session about to spawn the coordinator raises naming a policy file
+    that loads as no entries, and its workspace, leaves it and the other file as
+    they were, and starts no coordinator.
+
+    Prevents the spawn deleting the user's entries. Refusing, not skipping the
+    merge, because a session has no check after it attaches: a skipped merge would
+    run it unenforced with no signal."""
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(mode=0o700)
+    broken = coherence_dir / name
+    broken.write_text("- docs/**\n- *.md\n")
+
+    with pytest.raises(CoherenceError, match="is not valid YAML") as raised:
+        SubstrateCoordinatorSession(tmp_path, managed=("data/**",), config=fast_cfg)
+
+    assert str(raised.value).startswith(f"{tmp_path.resolve()}: .coherence/{name} is not valid YAML")
+    assert broken.read_text() == "- docs/**\n- *.md\n"
+    assert [path.name for path in coherence_dir.glob("*.yaml")] == [name]
+    assert not (coherence_dir / "server.pid").exists()
+
+
+def test_a_session_joining_a_running_coordinator_is_not_refused_over_a_policy_file(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """Only the spawner merges: a coordinator loads its policy once, so a file broken
+    after that changes nothing for a session joining it. Prevents the #305 refusal
+    reaching a sibling, or the sibling rewriting the file."""
+    _session(tmp_path, fast_cfg)
+    try:
+        broken = tmp_path / ".coherence" / "tracked.yaml"
+        broken.write_text("- docs/**\n- *.md\n")
+
+        assert _session(tmp_path, fast_cfg).session_id
+
+        assert broken.read_text() == "- docs/**\n- *.md\n"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_session_over_an_exited_coordinators_pid_file_writes_its_policy(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#503: a stranger on a dead coordinator's port is not a coordinator
+    already running. A session has no check after it attaches, so it must
+    write its strict policy and start its own coordinator."""
+    stranger = socket.socket()
+    stranger.bind(("127.0.0.1", 0))
+    stranger.listen()
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(60)
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir(mode=0o700)
+    (coherence / "server.pid").write_text(f"{child.pid}\n{stranger.getsockname()[1]}\n")
+    try:
+        assert _session(tmp_path, fast_cfg).session_id
+        assert "**" in (coherence / "tracked.yaml").read_text()
+    finally:
+        stranger.close()
+        stop_coordinator(tmp_path)
+
+
+def test_a_session_refuses_a_symlinked_pid_file_and_leaves_its_target_alone(
+    tmp_path: Path, fast_cfg: LifecycleConfig, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """#464 and #498 through a session, which reads the pid file before it starts
+    anything. Prevents that path writing through the link: it raises the refusal no
+    retry clears, fail-closed, and the file the link names keeps its bytes. The
+    listing pins the order: the strict policy is written before the start, so a
+    check inside the start alone leaves policy files behind."""
+    target = tmp_path_factory.mktemp("outside") / "target"
+    target.write_bytes(b"keep\n")
+    coherence_dir = tmp_path / ".coherence"
+    coherence_dir.mkdir(mode=0o700)
+    (coherence_dir / "server.pid").symlink_to(target)
+
+    with pytest.raises(CoherenceDirRefused):
+        _session(tmp_path, fast_cfg)
+
+    assert (coherence_dir / "server.pid").is_symlink()
+    assert target.read_bytes() == b"keep\n"
+    assert sorted(os.listdir(coherence_dir)) == ["server.pid"]
+
+
+def _session_refusal(root: Path, cfg: LifecycleConfig) -> CoherenceDirRefused:
+    """What a session over ``root`` raises; a session that attaches instead
+    stops the coordinator it started before the test fails."""
+    try:
+        with pytest.raises(CoherenceDirRefused) as raised:
+            _session(root, cfg)
+    finally:
+        stop_coordinator(root)
+    return raised.value
+
+
+@pytest.mark.parametrize("name", ["tracked.yaml", "notes.txt"])
+def test_a_session_refuses_a_link_before_it_writes_its_strict_policy(
+    tmp_path: Path, fast_cfg: LifecycleConfig, name: str
+) -> None:
+    """#498: a link in ``.coherence`` raises the typed refusal before the session
+    writes its strict policy. Prevents the merge replacing a linked policy file
+    with a regular one (the start then finds no link and runs), or leaving policy
+    files behind a refused start. Not a ``CoordinatorUnreachable``, so a caller's
+    retry loop does not catch it."""
+    coherence_dir = tmp_path / ".coherence"
+    target = plant_link(coherence_dir, name, "existing")
+    # A list the merge accepts, so the old order replaces the link and starts.
+    target.write_bytes(b'- "docs/**"\n')
+
+    refusal = _session_refusal(tmp_path, fast_cfg)
+
+    assert refusal.reason == "coherence_dir_refused"
+    assert not isinstance(refusal, CoordinatorUnreachable)
+    assert (refusal.kind, refusal.path) == ("coherence_link", str(tmp_path.resolve() / ".coherence" / name))
+    assert "mount a directory" in str(refusal)
+    assert (coherence_dir / name).is_symlink()
+    assert target.read_bytes() == b'- "docs/**"\n'
+    assert sorted(os.listdir(coherence_dir)) == [name]
+
+
+def test_a_session_does_not_join_the_coordinator_a_linked_pid_file_names(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#498: a workspace whose pid file and secret link to another workspace's
+    raises the refusal, and the other workspace's coordinator sees nothing of it.
+    Prevents a cloned link joining a coordinator that guards another tree, with
+    a bearer that coordinator accepts."""
+    peer = tmp_path / "peer"
+    root = tmp_path / "ws"
+    peer.mkdir()
+    peer_session = _session(peer, fast_cfg)
+    try:
+        coherence_dir = root / ".coherence"
+        coherence_dir.mkdir(mode=0o700, parents=True)
+        for link_name in ("hook.secret", "server.pid"):
+            (coherence_dir / link_name).symlink_to(peer / ".coherence" / link_name)
+        claims, statuses = _peer_requests(peer_session)
+
+        refusal = _session_refusal(root, fast_cfg)
+
+        assert refusal.path == str(root.resolve() / ".coherence" / "hook.secret")
+        # The one more /status is the read below.
+        assert _peer_requests(peer_session) == (claims, statuses + 1)
+    finally:
+        stop_coordinator(peer)
+
+
+def _peer_requests(session: SubstrateCoordinatorSession) -> tuple[int, int]:
+    """How many principal claims and ``/status`` reads a peer's coordinator has
+    answered, this read included. A session that joins it claims a principal at
+    start, before any read or write, so neither its sessions nor its files show
+    it."""
+    counters = coordinator_get(session._endpoint, "/status")["endpoint_counters"]
+    return counters["principal_claim_total"], counters["status_total"]
 
 
 # --- spawn: the pre-spawn policy write creates .coherence/ at 0700 ----------
@@ -499,6 +667,99 @@ def test_commit_wire_payload_carries_hash_not_content(
             assert "content" not in payload  # bytes are NEVER sent
     finally:
         stop_coordinator(tmp_path)
+
+
+# --- a substrate's names are keys, not workspace files ----------------------
+
+#: A workspace disk that folds case, forced whatever disk the test runs on:
+#: what is under test is how the substrate's names are keyed, not the disk.
+_CASELESS = FoldProfileResult(profile="caseless", status="classified")
+#: Two names a case-folding disk would take for one file.
+_CASE_PAIR = ("ws-42", "WS-42")
+
+
+def test_a_sessions_read_and_commit_send_their_name_as_a_key(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A substrate names a row or an object, never a workspace file, so both of
+    its requests say so: the coordinator then keeps the name exactly as sent,
+    neither tidied nor folded by what its workspace disk folds."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    sent: list[tuple[str, object]] = []
+    real_post = substrate_module._coordinator_post
+
+    def spy(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        if path in ("/hooks/pre-read", "/hooks/post-edit-cas"):
+            sent.append((path, payload.get("name_kind")))
+        return real_post(endpoint, path, payload, **kwargs)
+
+    monkeypatch.setattr(substrate_module, "_coordinator_post", spy)
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, _fa = _agent(store, sa)
+        _bytes, token = a.read(REF)
+        a.commit(REF, expected_token=token, new_bytes=b"v2")
+
+        assert {route for route, _kind in sent} == {"/hooks/pre-read", "/hooks/post-edit-cas"}
+        assert all(kind == "key" for _route, kind in sent), sent
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def _commit_each_of_the_pair(store: _FakeStore, root: Path, cfg: LifecycleConfig) -> None:
+    """Session A reads and commits ``ws-42`` while session B holds a read of
+    ``WS-42``, then B commits ``WS-42``. Were the two one row, A's commit
+    would invalidate B's read and B's commit would be refused as stale. Each
+    commit changes the bytes it read, so none is a no-op."""
+    a, _fa = _agent(store, _session(root, cfg))
+    b, _fb = _agent(store, _session(root, cfg))
+    a_bytes, a_token = a.read("ws-42")
+    b_bytes, b_token = b.read("WS-42")
+    a.commit("ws-42", expected_token=a_token, new_bytes=a_bytes + b"+lower")
+    b.commit("WS-42", expected_token=b_token, new_bytes=b_bytes + b"+upper")
+
+
+def _rows_of_the_pair(server: CoordinatorHTTPServer) -> dict[str, tuple[object, int]]:
+    """Each name's own row, as ``(id, version)``, looked up as a key."""
+    rows = {}
+    for name in _CASE_PAIR:
+        artifact_id = server.registry.lookup_artifact_id_by_name(name, name_kind="key")
+        assert artifact_id is not None, f"{name} has no row of its own"
+        rows[name] = (artifact_id, server.registry.get_artifact(artifact_id).version)
+    return rows
+
+
+def test_keys_that_differ_only_by_case_stay_two_rows_on_a_caseless_coordinator_across_a_restart(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ws-42`` and ``WS-42`` are two rows of a table (or two objects), so a
+    coordinator whose disk folds case still keeps them apart,
+    and its next start, which merges rows that spell one file, leaves them
+    apart too. Keyed as files, they shared one row: one session's commit
+    refused the other's as a stale view."""
+    monkeypatch.setattr(CoordinatorHTTPServer, "_probe_fold_profile", lambda _self: _CASELESS)
+    store = _FakeStore()
+    for name in _CASE_PAIR:
+        store.seed(name, b"v1")
+    server = serve_in_process(tmp_path, "substrate-keys-before", tracked='"**"')
+    try:
+        assert server.registry.fold_index_profile == "caseless", "control: the coordinator folds case"
+        _commit_each_of_the_pair(store, tmp_path, fast_cfg)
+        before = _rows_of_the_pair(server)
+    finally:
+        server.shutdown()
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="substrate-keys-after")
+    server.serve_in_thread()
+    write_coordinator_pid_file(tmp_path / ".coherence", server.port, pid=os.getpid())
+    try:
+        _commit_each_of_the_pair(store, tmp_path, fast_cfg)
+        after = _rows_of_the_pair(server)
+    finally:
+        server.shutdown()
+
+    assert before["ws-42"][0] != before["WS-42"][0]
+    assert after == {name: (row, version + 1) for name, (row, version) in before.items()}
 
 
 # --- forbidden: coordinator-bump-first --------------------------------------

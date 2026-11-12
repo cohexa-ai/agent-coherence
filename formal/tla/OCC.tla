@@ -121,6 +121,7 @@ OCCNext ==
     \/ (CRWriteAction      /\ UNCHANGED <<observedVersion, lostUpdate>>)
     \/ (CRCommitAction     /\ UNCHANGED <<observedVersion, lostUpdate>>)
     \/ (CRInvalidateAction /\ UNCHANGED <<observedVersion, lostUpdate>>)
+    \/ (CRReleaseToReaderAction /\ UNCHANGED <<observedVersion, lostUpdate>>)
     \/ (CRTickAction       /\ UNCHANGED <<observedVersion, lostUpdate>>)
     \/ (HeartbeatAction    /\ UNCHANGED <<observedVersion, lostUpdate>>)
     \/ (SweepAction        /\ UNCHANGED <<observedVersion, lostUpdate>>)

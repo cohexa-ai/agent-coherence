@@ -2,7 +2,8 @@
 
 This document covers what end users need to know to install, configure, and run
 `agent-coherence` safely: the outbound-traffic posture, which callers the local
-coordinator can tell apart, the kill switches that disable telemetry-shaped
+coordinator can tell apart, what a coordinator start refuses in a repository
+you clone, the kill switches that disable telemetry-shaped
 behavior, the local files the package writes, how to install with hash pinning,
 and how to verify the cryptographic provenance of a published wheel.
 
@@ -227,13 +228,54 @@ What follows from that:
   issued for. That stops one snapshot session committing through another's
   token; it does not verify the `session_id` named at `/session/begin`.
 
+**A process on the coordinator's port.** A client finds the coordinator
+through the port in `.coherence/server.pid` and sends the secret with every
+request, and the coordinator proves nothing back. Once a coordinator exits, its
+port is free and any local process can bind it. So before each request this
+package's local clients (the hook client, `CoherentVolume`, the MCP server, a
+substrate session and the console scripts) check that the pid file still names
+the coordinator they resolved, and that this coordinator still holds the
+workspace lock, the `flock` a start takes on `server.pid`. A Node coordinator
+that runs without the lock is judged by its pid instead, also once it has
+removed `server.pid` at its stop. Where the check can see, a dead coordinator's
+port receives nothing, and a coordinator started later on the same port is
+treated as one on a new port. A pid file that is gone or cannot be read does
+not stop a request (for a Node coordinator, only while its pid still runs), so
+an attached client keeps working; a pid file that has become a link, or
+anything but a pid file, stops it.
+
+The check is not proof of the secret, and it cannot see everything:
+
+- A coordinator that dies between the check and the send can still lose that
+  one request to a new listener.
+- A start that has taken the workspace lock but not yet emptied a dead
+  coordinator's lines makes those lines read as running, so a request in that
+  moment can go to the dead coordinator's port.
+- A coordinator restarted in the same process that gets the same port back
+  reads as the one the client resolved.
+- Where the lock cannot be probed (no `fcntl`, or a file system whose `flock`
+  fails), the request goes.
+- A Node coordinator's pid, once any other process carries it, reads as that
+  coordinator.
+
+A remote coordinator over verified TLS does not have this gap, because a
+listener without the certificate never receives the request. A plaintext remote
+link does, and this check does not apply to it.
+
 What the coordinator does not publish: `/status` shows session names — which
 embed the raw session id — and the policy's pattern lists (the tracked, user-added,
 ignored and strict globs, which are the operator's directory layout) only in the
 operator view (`?detail=full` plus the `Coherence-Local-Operator: true` header). A
 `CoherentVolume` reads that view once, at attach, to check that the coordinator
-enforces the globs it declared. Which paths each session lost to the
-coordinator's grant sweep, and why (`sessions[].reclaimed`), is likewise in the
+enforces the globs it declared. The header is an opt-in that keeps the view out
+of output fetched and pasted by accident, not a second factor: its value is a
+well-known string, and the bearer secret is the only gate on both
+coordinators. The Claude Code plugin's Node coordinator serves the operator
+view from plugin releases after 0.6.0, behind the same header and `403`
+without it, as its default view plus the four pattern lists and nothing else:
+its session names stay `null`, its root stays `.`, it carries no process id,
+and a pattern it rejected shows only in a count. Which paths each session lost
+to the coordinator's grant sweep, and why (`sessions[].reclaimed`), is likewise in the
 operator view only; the other views carry just the reclaim counts
 (`sweep_reclaims_total`, `sweep_reclaims_by_trigger`). The inputs to a
 reclaim are in the operator view only too: each tracked artifact's
@@ -246,9 +288,9 @@ view reports `agent_name` as `null`, the workspace root as `.` (both
 counts without the patterns. It still lists each tracked path relative to the
 root, each session's agent id with the states it holds, and the Python
 coordinator's process id (`coordinator_pid`), which the operator view carries
-too. The `metrics` view carries counters only: no paths, no process id and no
-sessions. When the Python coordinator's registry is busy, its default and
-operator views answer with their usual keys, `"degraded": true` and `null`
+too. The `metrics` view carries no paths, no process id and no sessions.
+When the Python coordinator's registry is busy, its default and operator views
+answer with their usual keys, `"degraded": true` and `null`
 path and session lists (see [When the registry is busy](guide.md#when-the-registry-is-busy)),
 so a degraded answer discloses nothing its view does not. A tracked artifact that
 has a handoff record
@@ -277,6 +319,125 @@ so an answer cannot drive the terminal they print to. All of this is
 disclosure hygiene
 rather than a boundary: under the model above, knowing a session id grants
 nothing the secret does not already grant.
+
+## A repository you clone
+
+The model above trusts every process running as your OS user. A repository you
+clone, or an archive you unpack, is a different adversary: whoever wrote it
+runs no code, but chooses every path in the tree, and a clone checks out
+entries under `.coherence/` like any others. Any of them can be a symbolic
+link to a file or directory outside the workspace, or to a FIFO.
+
+Before a start writes anything, joins a coordinator or probes a port, both
+coordinators refuse a workspace whose `.coherence` is a symbolic link or not a
+directory, or that holds a link, FIFO, socket or device directly inside it
+(see [`.coherence` must be a real directory](guide.md#coherence-must-be-a-real-directory);
+the plugin's Node coordinator does so in plugin releases after 0.6.0). So a
+committed link cannot make a start:
+
+- write outside the workspace: truncate or create the file a link names, or
+  tighten the directory a linked `.coherence` names to `0700`;
+- take the bytes of the file a linked `hook.secret` names as the workspace's
+  secret;
+- join the coordinator a linked `server.pid` names;
+- hang on a FIFO a link names.
+
+The check only looks: it opens no file and follows no link. A directory
+mounted at `.coherence` is a real directory, and is not refused. The commands
+and hooks that only talk to a running coordinator refuse a `.coherence` that
+is a link before they read `hook.secret` or connect, and read `hook.secret` and
+`server.pid` without following a link, so they never send the bytes of a file a
+link names as the secret, nor send it to the port a linked `server.pid` names.
+
+What it does not cover:
+
+- A repository that commits **regular** files under `.coherence`. That is out
+  of scope.
+- A link made after a start, while the coordinator runs. Making one takes a
+  process running as your OS user, which the model above already trusts. The
+  coordinator still opens its policy files and `audit.log` without following a
+  link.
+- A link at the workspace root or above it, or inside a subdirectory of
+  `.coherence`.
+
+## Other spellings of one file
+
+A session whose copy of a strict file is stale is denied a Read, Edit or Write
+of it. Through 0.15.0 the coordinator matched strict patterns, and keyed
+grants, by the path exactly as a request sent it, so that session could reach
+the file under another spelling and be admitted: `PLAN.MD` for a strict
+`plan.md` on a macOS disk that folds case, a composed or a decomposed accent,
+or `.//plan.md` on any disk
+([#506](https://github.com/Cohexa-ai/agent-coherence/issues/506)). A
+coordinator newer than 0.15.0 tidies `./` and `//` in every route that takes a
+file name, and keys the name by the fold the workspace disk applies, before
+strict mode and the records see it (`src/ccs/adapters/claude_code/door.py`).
+So every spelling the disk opens as that file is denied alike, and a
+refuse-mode `CoherentVolume`, which needs such a coordinator, is refused a
+file another agent holds under any of its spellings. On a disk that folds
+nothing, only `./` and `//` are tidied. The Claude Code
+plugin's Node coordinator does the same in plugin releases after 0.6.0.
+
+The coordinator learns the disk's fold once per start
+(`src/ccs/adapters/claude_code/fs_profile.py`):
+
+- it probes only while it holds the store's single-writer lock, and creates
+  nothing outside `.coherence`;
+- it compares `.COHERENCE` with `.coherence` by `lstat`, so a committed
+  `.COHERENCE` link to `.coherence` reads as a link, not as case folding;
+- it creates each probe file with `O_CREAT | O_EXCL` and mode `0600` in a
+  fresh `0700` directory under `.coherence` named `fold-probe-<pid>-<random>`,
+  and compares two spellings by the device and inode `lstat` reports, never
+  following a link;
+- from a `fold-probe-` directory a crashed start left, it removes the regular
+  files directly inside, then the directory once it is empty; it leaves
+  anything else under that prefix in place, a link included, without
+  following it.
+
+A planted entry under the probe prefix, a `.coherence` on another device than
+the workspace, or a probe step that fails at worst makes the start
+cannot-tell, and the coordinator logs why:
+a disk the start probe cannot classify folds nothing, as before this change.
+`/status` names the result as `fold_profile`, beside `fold_table_unicode`, in
+every view, the `metrics` view included: it says how the workspace disk folds
+names, and nothing about any file.
+
+Names that are not files stay exact. A request that marks its name a key
+(`"name_kind": "key"`), as `CoherentRow` and `CoherentObject` do, is never
+tidied, folded or merged, so a row or object key is never taken for a workspace
+file. A client that marks a real file as a key gains nothing the model above
+does not already grant: any process running as your OS user can skip the
+coordinator.
+
+A `CoherentVolume` built with `on_held="refuse"` promises a holder its managed
+files. A write through a link whose name is under the volume's `managed` globs
+to a file outside them would take that file from its holder under a name that
+promised the refusal, so the volume
+raises `LinkOutOfManaged` and sends nothing
+(`src/ccs/adapters/coherent_volume.py`). It decides this from the links as they
+stand when `write()` is called. On the Claude Code plugin's Node coordinator,
+which issues no caller principals, a refuse-mode volume's requests carry none,
+so the refusal there separates callers only by the session ids they send: a
+caller that sends the holder's own session id is admitted as the holder (see
+[A volume on the Node coordinator](guide.md#a-volume-on-the-node-coordinator)).
+
+Not covered:
+
+- A hook Read, Edit or Write through a link inside the workspace that points
+  outside it, or through a link that does not resolve. The hook client stays
+  out of such a call, as for any path outside the workspace, so no grant,
+  warning or strict-mode deny applies to it; a repository can commit such a
+  link. The coordinator logs each tracked or strict pattern that passes
+  through a link when it loads or reloads its policy.
+- A Bash command's file arguments, which are matched as typed: through a
+  link, a Bash read reaches the link's own path, not the file it names.
+- A hard link, which is a second name with a record of its own.
+- A link put in place while a refuse-mode `write()` runs, after its check.
+  Making one takes a process running as your OS user, which the model above
+  already trusts.
+- A disk the coordinator cannot classify, or a coordinator running without
+  its lock: there another spelling of a strict file is still a different file,
+  except for `./` and `//`.
 
 ## Env-var kill switches
 
@@ -383,6 +544,24 @@ timeout), leaves the directory behind; one stopped with Ctrl-C does not. When
 you purge a store's content, also remove any `ccs-store-check-*` directory left
 in the temporary directory. To keep the copy on the same volume or encrypted
 disk as the workspace, run the check with `TMPDIR` pointing there.
+
+### Single-writer lock files
+
+A store has one read-write registry at a time
+([One writer per store](guide.md#durability)): each read-write open of a
+SQLite store locks a file beside it, so a second writer is refused.
+
+| File | Path | Mode | Created when |
+|---|---|---|---|
+| Writer lock | `<store>.writer-lock` beside the resolved store path: `<workspace>/.coherence/state.db.writer-lock` for a coordinator, `<workspace>/.coherence/workspace.db.writer-lock` for `agent-coherence-workspace`, and beside any store an embedder opens | `0600` | The first read-write open of that store. Kept after close; it is empty and holds no data |
+
+The open refuses, creating neither the lock nor the store, when the lock
+file's path is a symbolic link (`ELOOP`, never followed), a directory, a FIFO
+or anything else that is not a regular file, or a file this user cannot open.
+A lock file that already exists is made `0600` when it is opened. Deleting the
+file while a writer holds it lets a second writer lock a new file of the same
+name, so leave it in place. `--check-store` probes the lock with a shared lock it
+drops at once, and creates nothing.
 
 ### Durable version retention (opt-in)
 

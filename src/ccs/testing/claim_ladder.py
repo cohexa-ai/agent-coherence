@@ -106,6 +106,10 @@ CLAIM_LADDER: tuple[ClaimRung, ...] = (
             "test_invalidate_rejects_issuer_from_a_superseded_generation",
             "tests/test_zombie_revoke.py::"
             "test_release_by_invalidate_arms_the_fence_like_a_sweep_reclaim",
+            "tests/test_self_release_reader.py::"
+            "test_a_write_claim_captured_before_the_release_cannot_commit_after_it",
+            "tests/backend_conformance/test_shipped_backends.py::"
+            "test_epoch_moves_on_voluntary_release",
             "tests/test_zombie_revoke.py::"
             "test_adapter_concurrent_publish_does_not_revoke_a_fresher_grant",
             "tests/test_fetch_peer_leg_fence.py::"

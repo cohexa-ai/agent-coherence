@@ -32,9 +32,11 @@ claims again with the same nonce by itself before it runs. The two
 them. ``registry_schema_version``, the schema version of the coordinator's
 store (#294), is forwarded the same way: ``None`` when the coordinator is
 unreachable or its answer carries no such field. The strict volume this server
-runs never attaches to the Node coordinator or to a release up to v0.14.1, and
-the Node coordinator's own ``schema_version`` counts a different ledger and is
-never read in its place.
+runs never attaches to a release up to v0.14.1, or to a Node coordinator of
+plugin 0.6.0 or earlier, which does not serve the operator view. It attaches to
+a later Node coordinator, whose answer carries no such field: that
+coordinator's own ``schema_version`` counts a different ledger and is never
+read in its place.
 
 ``session_agent_id`` is this session's session-level agent id: the value
 another session names as the successor when it hands this session a path
@@ -59,6 +61,8 @@ from ccs.adapters.claude_code.hook_payloads import (
     HANDOFF_ROLE_SUCCESSOR,
 )
 from ccs.adapters.claude_code.policy import matches_any
+from ccs.coordinator.fold_merge import index_key_of
+from ccs.core.path_fold import FOLD_TABLE_UNICODE_VERSION, FoldProfile
 
 if TYPE_CHECKING:
     from ccs.adapters.coherent_volume import CoherentVolume
@@ -70,6 +74,11 @@ PER_PATH_UNAVAILABLE_TEXT = (
     "per_path=unavailable: the coordinator could not report which paths are "
     "tracked; retry shortly and do not treat this as nothing tracked"
 )
+
+# The advertised profiles that fold. A tuple, not a set: ``fold_profile``
+# comes off the wire, and an unhashable value there must compare unequal,
+# not raise.
+_FOLDING_PROFILES: tuple[FoldProfile, ...] = ("caseless", "nfd")
 
 
 def build_status(volume: CoherentVolume, config: SessionConfig) -> dict:
@@ -171,24 +180,49 @@ def handoff_from_status(volume: CoherentVolume, path: str) -> tuple[bool, dict |
     session-level agent id, else ``bystander``. ``/status`` carries no role,
     because it has no caller to be a party to the record.
 
-    ``/status`` lists the file under the name the volume sends, resolved
-    against its root with symlinks followed, so ``path`` is matched under
-    that name: under an in-root link's own name it matches nothing and a
-    live record would read as none."""
+    ``/status`` lists the file under the name its coordinator stores, the
+    spelling on disk, resolved against the root with symlinks followed. So
+    ``path`` is resolved the same way and compared by its fold key under
+    :func:`fold_profile_of` the same document: under an in-root link's own
+    name, or a spelling the disk opens as the file, it matched nothing and a
+    live record read as none. Rows a start left unmerged are listed under
+    each spelling, so the record is taken from whichever of them carries
+    one."""
     status_doc = volume.coordinator_status()
     artifacts = status_doc.get("tracked_artifacts") if isinstance(status_doc, dict) else None
     if not isinstance(artifacts, list):
         return False, None
+    profile = fold_profile_of(status_doc)
     resolved = (volume.root / path).resolve()
     known_as = resolved.relative_to(volume.root).as_posix() if resolved.is_relative_to(volume.root) else path
+    wanted = index_key_of(known_as, profile)
     for artifact in artifacts:
-        if not isinstance(artifact, dict) or artifact.get("path") != known_as:
+        listed = artifact.get("path") if isinstance(artifact, dict) else None
+        if not isinstance(listed, str) or index_key_of(listed, profile) != wanted:
             continue
         record = artifact.get("handoff")
-        if not isinstance(record, dict):
-            return True, None
-        return True, {"role": _handoff_role(volume, record), **record}
+        if isinstance(record, dict):
+            return True, {"role": _handoff_role(volume, record), **record}
     return True, None
+
+
+def fold_profile_of(status_doc: object) -> FoldProfile:
+    """The profile to compare file names by, as the coordinator's default
+    ``/status`` tier advertises it in ``fold_profile``, so two spellings it
+    keys as one file compare equal here too.
+
+    ``none`` (names compared as typed, tidied) whenever this server cannot
+    fold as the coordinator does: ``/status`` unread, no ``fold_profile`` (a
+    coordinator that stores names as sent), ``cannot_tell`` (a disk its start
+    could not classify, keyed as ``none``), a value this build does not know,
+    or a ``fold_table_unicode`` other than this build's table, whose keys
+    could differ from the coordinator's."""
+    if not isinstance(status_doc, dict):
+        return "none"
+    if status_doc.get("fold_table_unicode") != FOLD_TABLE_UNICODE_VERSION:
+        return "none"
+    profile = status_doc.get("fold_profile")
+    return profile if profile in _FOLDING_PROFILES else "none"
 
 
 def _handoff_role(volume: CoherentVolume, record: dict) -> str:
