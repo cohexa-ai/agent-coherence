@@ -135,8 +135,11 @@ from ccs.core.exceptions import (
     StaleReadGeneration,
     WatchdogAbandoned,
 )
+from ccs.core.invariants import check_monotonic_version, check_single_writer
+from ccs.core.path_fold import FoldProfile, tidy_path
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import (
+    TRANSFER_STATUS_WITHDRAWN,
     Artifact,
     CasCorruption,
     CommitAllEntry,
@@ -145,6 +148,23 @@ from ccs.core.types import (
     MultiCommitResult,
     TransferGrantOutcome,
     VersionedReadRejection,
+)
+
+from .fold_merge import (
+    FOLD_MERGE_TRIGGER,
+    FoldBucket,
+    FoldGroup,
+    FoldMergeOutcome,
+    FoldRow,
+    MergeArtifactRow,
+    MergeFacts,
+    MergeNoticeRow,
+    MergePlan,
+    MergeSnapshot,
+    MergeStateRow,
+    NameKind,
+    index_key_of,
+    plan_fold_merge,
 )
 
 # Contract return types (ReclamationSlot / CasResult / CaptureResult) live in the
@@ -604,6 +624,77 @@ ON CONFLICT(artifact_id) DO UPDATE SET
 _WORKSPACE_CHECKPOINTS_NAME_INDEX_DDL = (
     "CREATE INDEX idx_workspace_checkpoints_name ON workspace_checkpoints(name)"
 )
+
+# The rows a request for a name that is not a file (a key: a substrate row or
+# object, a remote-endpoint volume's name) created. Listed rows keep their
+# exact name: they stay out of the fold index and the start-time merge. The
+# same shape as the Node coordinator's, so whichever opens the store first
+# creates the table the other reads.
+_ARTIFACT_NAME_KINDS_DDL = """
+CREATE TABLE IF NOT EXISTS artifact_name_kinds (
+    artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL
+)
+"""
+
+_GROUPED_STATE_COLUMNS = (
+    "artifact_id", "agent_id", "state", "transient_state", "transient_tick",
+    "granted_at_tick", "last_reclaim_trigger", "last_reclaim_tick",
+    "read_generation", "last_observed_version",
+)
+
+
+def _in_clause(values: Sequence[object]) -> str:
+    """``IN (?, ?, ...)`` placeholders for ``values``."""
+    return f"IN ({', '.join('?' for _ in values)})"
+
+
+@dataclass
+class _FoldIndex:
+    """Fold key -> file-row ids (hex), lowest rowid first, each file row
+    listed once under the key of its stored name by ``profile``. Built once
+    per start after the merge; changed only after a commit that inserts or
+    deletes a row, always under the registry lock."""
+
+    profile: FoldProfile
+    by_key: dict[str, list[str]]
+    key_by_id: dict[str, str]
+
+    def add(self, row_id: str, stored_name: str) -> None:
+        key = index_key_of(stored_name, self.profile)
+        self.by_key.setdefault(key, []).append(row_id)
+        self.key_by_id[row_id] = key
+
+    def forget(self, row_id: str) -> None:
+        key = self.key_by_id.pop(row_id, None)
+        if key is None:
+            return
+        remaining = [other for other in self.by_key.get(key, []) if other != row_id]
+        if remaining:
+            self.by_key[key] = remaining
+        else:
+            self.by_key.pop(key, None)
+
+
+def _state_row_values(row: MergeStateRow) -> tuple[object, ...]:
+    """``row`` in ``_GROUPED_STATE_COLUMNS`` order, the state stored by name."""
+    return (
+        row.artifact_id, row.agent_id, row.state.name, row.transient_state, row.transient_tick,
+        row.granted_at_tick, row.last_reclaim_trigger, row.last_reclaim_tick,
+        row.read_generation, row.last_observed_version,
+    )
+
+
+@dataclass(frozen=True)
+class _NameRequest:
+    """How one request names its row. ``stored_name`` is looked up exactly
+    when ``index_key`` is None, is the name a new row takes, and is the name
+    re-read after a lost insert race."""
+
+    stored_name: str
+    index_key: str | None
+    is_key: bool
+
 
 # registry_meta keys persisting the retention policy on writer open (plan item
 # N v1, Unit 3). ``retention_enabled`` is the explicit marker set even in the
@@ -1278,6 +1369,10 @@ class SqliteArtifactRegistry:
         # loser dispatches on a version it then never migrates.
         self.migrated_from_version: int | None = None
         self._writer_lock: _WriterLock | None = None
+        # One identity per file: None until the coordinator's start builds it
+        # (build_fold_index); until then, and on every other handle, file
+        # names are looked up exactly as given.
+        self._fold_index: _FoldIndex | None = None
 
         if read_only:
             self._open_read_only(instance_id)
@@ -1396,6 +1491,10 @@ class SqliteArtifactRegistry:
         # mean "the detector ran". Only an observation ROW can, which is what
         # ``detection_runs`` reads.
         self._ensure_foreign_write_tables()
+        # The rows created for names that are not files (keys). Same posture
+        # as the two ensures above: a new user_version would make an older
+        # build refuse or re-stamp the store, an extra table does neither.
+        self._conn.execute(_ARTIFACT_NAME_KINDS_DDL)
         # Persist the retention policy on writer open (incl. the explicit
         # unbounded marker) so a read-only resolver can derive T-expiry + the
         # retention_off reason from the store, not a process-local object.
@@ -3259,7 +3358,10 @@ class SqliteArtifactRegistry:
         retention is active (``retain_versions=True``) — otherwise discarded.
 
         Threat-model note: with retention on, ``register_artifact`` puts the v1
-        body of a merely-OBSERVED artifact on disk (per plan R2 + docs/security)."""
+        body of a merely-OBSERVED artifact on disk (per plan R2 + docs/security).
+
+        With the fold index built, the new row is listed under the key of its
+        name once the insert commits."""
         self._guard_writable()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -3289,6 +3391,7 @@ class SqliteArtifactRegistry:
                 # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
+            self._index_add(artifact.id.hex, artifact.name)
 
     def has_artifact(self, artifact_id: UUID) -> bool:
         """Return whether an artifact exists in registry."""
@@ -3469,6 +3572,8 @@ class SqliteArtifactRegistry:
                 # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
+            # After the commit: a delete that rolled back keeps its row listed.
+            self._index_forget(artifact_id.hex)
 
     # ------------------------------------------------------------------
     # Snapshot consistent-cut capture + pin store (SB-17 / TX-1, Unit 2)
@@ -5014,15 +5119,35 @@ class SqliteArtifactRegistry:
         content_hash: str,
         *,
         initial_owner: Optional[UUID] = None,
+        key: str | None = None,
+        disk_spelling: str | None = None,
+        name_kind: NameKind = "file",
     ) -> UUID:
         """KTD-9 first-observation seeding for the plugin's pre-read handler.
 
-        Atomically: SELECT artifact by name → if found, return its id;
+        Atomically: look the artifact up → if found, return its id;
         otherwise INSERT a new artifact at version 1 with the given content_hash
         and return the new id. Concurrent first-Reads from two sessions on
         the same fresh path converge to one row (BEGIN IMMEDIATE + UNIQUE
         constraint on artifacts.name absorbs the race; the second caller's
         INSERT raises IntegrityError, which we catch and re-fetch).
+
+        How the name is looked up (one identity per file):
+
+        - ``name_kind="key"``, a name that is not a file: exactly as given,
+          and a new row is listed in ``artifact_name_kinds`` so it stays out
+          of the fold index and the start-time merge. A file row of the same
+          exact name is shared.
+        - a file name, with the fold index built: by ``key`` (the request's
+          fold key, computed from ``parent_rel_path`` when not given), so every
+          spelling of one file reaches one row: a key with several rows (a
+          bucket) reaches its lowest-rowid row and never mints another. A new
+          row takes ``disk_spelling`` when the caller found one, else the
+          tidied request. The lookup, the insert and the index update all run
+          under the registry lock, so two threads registering two spellings
+          get one row.
+        - a file name without the index (a coordinator without its writer
+          lock, any other handle): exactly as given, as before.
 
         The ``initial_owner`` parameter is accepted for API symmetry with
         ``CoordinatorService.register_artifact`` but does NOT set a MESI grant
@@ -5032,57 +5157,77 @@ class SqliteArtifactRegistry:
         del initial_owner  # parameter symmetry only; plugin handler sets state explicitly
         self._guard_writable()
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                row = self._conn.execute(
-                    "SELECT id FROM artifacts WHERE name = ?", (parent_rel_path,)
-                ).fetchone()
-                if row is not None:
-                    self._conn.execute("COMMIT")
-                    return UUID(hex=row[0])
-                # First observation — insert.
-                new_id = uuid4()
-                self._conn.execute(
-                    """
-                    INSERT INTO artifacts (id, name, version, content_hash, size_tokens,
-                                           last_writer_id, updated_at)
-                    VALUES (?, ?, ?, ?, NULL, NULL, ?)
-                    """,
-                    (new_id.hex, parent_rel_path, 1, content_hash, time.time()),
-                )
+            request = self._name_request(parent_rel_path, key, name_kind)
+            if disk_spelling is not None and request.index_key is not None:
+                request = _NameRequest(disk_spelling, request.index_key, is_key=False)
+            row_id, inserted = self._resolve_or_insert(request, content_hash)
+            if inserted and not request.is_key:
+                self._index_add(row_id, request.stored_name)
+            return UUID(hex=row_id)
+
+    def _resolve_or_insert(self, request: _NameRequest, content_hash: str) -> tuple[str, bool]:
+        """The request's row id, inserting it at version 1 on a miss, and
+        whether this call inserted it. Caller holds the lock."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row_id = self._find_row_id(request)
+            if row_id is not None:
                 self._conn.execute("COMMIT")
-                return new_id
-            except sqlite3.IntegrityError as exc:
-                # Lost the UNIQUE-on-name race; another caller inserted between
-                # our SELECT and INSERT. ROLLBACK and re-fetch.
-                #
-                # COR-04: a concurrent remove_artifact between ROLLBACK and
-                # re-fetch can leave the row absent. Old behaviour: re-raise
-                # the original IntegrityError with no context — operator sees
-                # a confusing "UNIQUE constraint failed" trace for what's
-                # really a delete race. New behaviour: raise an explicit
-                # informative RuntimeError so the operator knows exactly
-                # what happened.
-                self._conn.execute("ROLLBACK")
-                row = self._conn.execute(
-                    "SELECT id FROM artifacts WHERE name = ?", (parent_rel_path,)
-                ).fetchone()
-                if row is None:
-                    raise RuntimeError(
-                        f"resolve_or_register: lost INSERT race on {parent_rel_path!r} "
-                        "but the winning row was deleted before re-fetch. This "
-                        "indicates a concurrent remove_artifact running against the "
-                        "same name — caller should retry or treat the artifact as "
-                        f"absent. Original IntegrityError: {exc}"
-                    ) from exc
-                return UUID(hex=row[0])
-            except BaseException:
-                # P2 ce-review fix #14 (kieran-python): BaseException catches
-                # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
-                # before propagation — otherwise the connection is left with an
-                # uncommitted transaction that the next BEGIN IMMEDIATE sees.
-                self._conn.execute("ROLLBACK")
-                raise
+                return row_id, False
+            # First observation — insert.
+            new_id = uuid4().hex
+            self._insert_first_observation(new_id, request, content_hash)
+            self._conn.execute("COMMIT")
+            return new_id, True
+        except sqlite3.IntegrityError as exc:
+            # A row of exactly this name that the lookup does not reach: a key
+            # row met by a file request under the index, or a racing insert.
+            return self._winner_of_lost_insert(request.stored_name, exc), False
+        except BaseException:
+            # BaseException catches KeyboardInterrupt/SystemExit mid-transaction
+            # so ROLLBACK fires before propagation.
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def _insert_first_observation(
+        self, row_id: str, request: _NameRequest, content_hash: str
+    ) -> None:
+        """The new row at version 1, listed as a key when it is one. Caller
+        holds the lock inside its transaction."""
+        self._conn.execute(
+            """
+            INSERT INTO artifacts (id, name, version, content_hash, size_tokens,
+                                   last_writer_id, updated_at)
+            VALUES (?, ?, ?, ?, NULL, NULL, ?)
+            """,
+            (row_id, request.stored_name, 1, content_hash, time.time()),
+        )
+        if request.is_key:
+            self._conn.execute(
+                "INSERT INTO artifact_name_kinds (artifact_id, kind) VALUES (?, 'key')",
+                (row_id,),
+            )
+
+    def _winner_of_lost_insert(self, parent_rel_path: str, exc: sqlite3.IntegrityError) -> str:
+        """The row whose name the insert collided with, re-read after the
+        rollback. Caller holds the lock inside the failed transaction.
+
+        COR-04: a concurrent remove_artifact between ROLLBACK and re-fetch can
+        leave the row absent; an explicit RuntimeError then says what happened
+        instead of a bare "UNIQUE constraint failed" trace."""
+        self._conn.execute("ROLLBACK")
+        row = self._conn.execute(
+            "SELECT id FROM artifacts WHERE name = ?", (parent_rel_path,)
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"resolve_or_register: lost INSERT race on {parent_rel_path!r} "
+                "but the winning row was deleted before re-fetch. This "
+                "indicates a concurrent remove_artifact running against the "
+                "same name — caller should retry or treat the artifact as "
+                f"absent. Original IntegrityError: {exc}"
+            ) from exc
+        return row[0]
 
     def _ensure_conflict_counters_table(self) -> None:
         """Create the conflict-counter table if absent (writer open only).
@@ -6026,13 +6171,20 @@ class SqliteArtifactRegistry:
             ).fetchall()
         return [UUID(hex=r[0]) for r in rows]
 
-    def lookup_artifact_id_by_name(self, parent_rel_path: str) -> UUID | None:
-        """Read-only path lookup; used by status endpoint and tests."""
+    def lookup_artifact_id_by_name(
+        self,
+        parent_rel_path: str,
+        *,
+        key: str | None = None,
+        name_kind: NameKind = "file",
+    ) -> UUID | None:
+        """Read-only lookup of the row a name reaches, by the rules
+        :meth:`resolve_or_register` uses: a key exactly, a file name through
+        the fold index when it is built (``key``, or the key of
+        ``parent_rel_path``), otherwise exactly as given."""
         with self._lock:
-            row = self._conn.execute(
-                "SELECT id FROM artifacts WHERE name = ?", (parent_rel_path,)
-            ).fetchone()
-        return UUID(hex=row[0]) if row else None
+            row_id = self._find_row_id(self._name_request(parent_rel_path, key, name_kind))
+        return None if row_id is None else UUID(hex=row_id)
 
     def artifact_names_under_prefix(self, prefix: str) -> list[str]:
         """Return tracked-artifact paths registered under a directory prefix.
@@ -6042,11 +6194,23 @@ class SqliteArtifactRegistry:
         ``escape`` to defang any ``%``/``_`` wildcards in the operator-
         supplied search root. Empty/``.``/``./`` prefix returns all
         registered artifacts (Grep over workspace root).
+
+        On a disk that folds names (the fold index built under ``caseless``
+        or ``nfd``), instead every file row whose fold key is the prefix's or
+        lies under it, once per key: the key's lowest-rowid row, the one every
+        other lookup reaches, sorted by UTF-8 bytes. Key rows are not listed.
         """
+        with self._lock:
+            index = self._fold_index
+            if index is not None and index.profile != "none":
+                return self._indexed_names_under(prefix, index)
+            return self._names_like_prefix(prefix)
+
+    def _names_like_prefix(self, prefix: str) -> list[str]:
+        """The SQL prefix match. Caller holds the lock."""
         # Normalize prefix. Treat empty / "." / "./" as "all artifacts".
         if prefix in ("", ".", "./"):
-            with self._lock:
-                rows = self._conn.execute("SELECT name FROM artifacts").fetchall()
+            rows = self._conn.execute("SELECT name FROM artifacts").fetchall()
             return [r[0] for r in rows]
         # Strip trailing slash; ensure we don't accidentally claim
         # "docs/specs-internal/" as a child of "docs/specs/".
@@ -6055,22 +6219,365 @@ class SqliteArtifactRegistry:
         escaped = normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = escaped + "%"
         exact_match = prefix.rstrip("/")
-        # REL-08: combine the LIKE-prefix query and the exact-match query
-        # into a single UNION under one lock acquisition. The prior
-        # two-step pattern released the lock between queries — a
-        # concurrent delete or rename could remove an artifact between
-        # them, producing a torn result set (LIKE row gone but exact-
-        # match row appears, or vice versa). Single query closes the gap.
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT name FROM artifacts WHERE name LIKE ? ESCAPE '\\'
-                UNION
-                SELECT name FROM artifacts WHERE name = ?
-                """,
-                (pattern, exact_match),
-            ).fetchall()
+        # REL-08: the LIKE-prefix query and the exact-match query are one
+        # UNION under one lock hold, so a concurrent delete cannot tear the
+        # result set between them.
+        rows = self._conn.execute(
+            """
+            SELECT name FROM artifacts WHERE name LIKE ? ESCAPE '\\'
+            UNION
+            SELECT name FROM artifacts WHERE name = ?
+            """,
+            (pattern, exact_match),
+        ).fetchall()
         return [r[0] for r in rows]
+
+    def _indexed_names_under(self, prefix: str, index: _FoldIndex) -> list[str]:
+        """Each bucket's head under ``prefix``. Caller holds the lock."""
+        # Folding is per segment, so a key under the root's key starts with it and "/".
+        root_key = index_key_of(tidy_path(prefix).rstrip("/"), index.profile)
+        names_by_id = dict(self._conn.execute("SELECT id, name FROM artifacts").fetchall())
+        heads: list[str] = []
+        for key, ids in index.by_key.items():
+            if root_key and key != root_key and not key.startswith(f"{root_key}/"):
+                continue
+            # A head gone from the store gives way to the bucket's next row.
+            head = next((row_id for row_id in ids if row_id in names_by_id), None)
+            if head is not None:
+                heads.append(names_by_id[head])
+        return sorted(heads, key=lambda name: name.encode("utf-8"))
+
+    # ------------------------------------------------------------------
+    # One identity per file: the fold index, key rows, the start merge
+    # ------------------------------------------------------------------
+
+    def build_fold_index(self, profile: FoldProfile) -> list[FoldBucket]:
+        """Key file rows by ``profile``: every row not listed as a key, in
+        rowid order, once, under the fold of its stored name. Called once per
+        start, after the merge, by a coordinator that holds the single-writer
+        lock; until then names stay exact. Returns each key several file rows
+        share (a bucket)."""
+        with self._lock:
+            index = _FoldIndex(profile=profile, by_key={}, key_by_id={})
+            for row in self._file_rows_for_fold():
+                index.add(row.id.hex, row.name)
+            self._fold_index = index
+            return [
+                FoldBucket(key=key, ids=tuple(UUID(hex=row_id) for row_id in ids))
+                for key, ids in index.by_key.items()
+                if len(ids) > 1
+            ]
+
+    @property
+    def fold_index_profile(self) -> FoldProfile | None:
+        """The profile the fold index keys by, or None while names are exact."""
+        with self._lock:
+            return None if self._fold_index is None else self._fold_index.profile
+
+    def file_rows_for_fold(self) -> list[FoldRow]:
+        """Every row not listed as a key, lowest rowid first. Rowid order is
+        insertion order: no AUTOINCREMENT, no VACUUM."""
+        with self._lock:
+            return self._file_rows_for_fold()
+
+    def _file_rows_for_fold(self) -> list[FoldRow]:
+        rows = self._conn.execute(
+            "SELECT rowid, id, name FROM artifacts "
+            "WHERE id NOT IN (SELECT artifact_id FROM artifact_name_kinds) ORDER BY rowid"
+        ).fetchall()
+        return [FoldRow(rowid=row[0], id=UUID(hex=row[1]), name=row[2]) for row in rows]
+
+    def fold_bucket_peers(self, artifact_id: UUID) -> list[UUID]:
+        """The other rows of the artifact's fold bucket (spellings of one file
+        a merge left apart), lowest rowid first; empty without the index or
+        when the artifact's key has one row."""
+        with self._lock:
+            index = self._fold_index
+            key = None if index is None else index.key_by_id.get(artifact_id.hex)
+            if index is None or key is None:
+                return []
+            return [UUID(hex=row_id) for row_id in index.by_key[key] if row_id != artifact_id.hex]
+
+    def _name_request(self, name: str, key: str | None, name_kind: NameKind) -> _NameRequest:
+        """How ``name`` is looked up and stored. Caller holds the lock."""
+        index = self._fold_index
+        if name_kind == "key" or index is None:
+            return _NameRequest(name, None, is_key=name_kind == "key")
+        fold = key if key is not None else index_key_of(name, index.profile)
+        return _NameRequest(tidy_path(name), fold, is_key=False)
+
+    def _find_row_id(self, request: _NameRequest) -> str | None:
+        """The request's row id, or None. Caller holds the lock."""
+        if request.index_key is not None:
+            return self._indexed_row_id(request.index_key)
+        row = self._conn.execute(
+            "SELECT id FROM artifacts WHERE name = ?", (request.stored_name,)
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def _indexed_row_id(self, key: str) -> str | None:
+        """The lowest-rowid row of ``key``'s bucket. Each hit is re-read by id,
+        inside the caller's transaction when it has one, and a row no longer in
+        the store leaves the index, so the lookup moves on to the bucket's next
+        row or misses. Caller holds the lock."""
+        index = self._fold_index
+        for row_id in list(index.by_key.get(key, ())) if index is not None else ():
+            if self._conn.execute("SELECT 1 FROM artifacts WHERE id = ?", (row_id,)).fetchone():
+                return row_id
+            index.forget(row_id)
+        return None
+
+    def _index_add(self, row_id: str, stored_name: str) -> None:
+        """List a committed file row. Caller holds the lock."""
+        if self._fold_index is not None:
+            self._fold_index.add(row_id, stored_name)
+
+    def _index_forget(self, row_id: str) -> None:
+        """Drop a committed delete from the index. Caller holds the lock."""
+        if self._fold_index is not None:
+            self._fold_index.forget(row_id)
+
+    def merge_fold_group(self, group: FoldGroup, now_unix: float) -> FoldMergeOutcome:
+        """Merge one group the start found, in one BEGIN IMMEDIATE that
+        re-reads it: a group whose rows are gone, are listed as keys or no
+        longer share the key, or whose rows to merge away hold retained
+        history, is skipped and changes nothing. Every referencing table is
+        rewritten before any row is deleted, the single-writer check runs
+        before COMMIT, and one state-log entry per moved or demoted agent is
+        written under ``fold_merge``; any failure rolls all of it back."""
+        with self._lock:
+            self._guard_writable()
+            seq_before = self._seq
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                outcome = self._merge_group_in_txn(group, now_unix)
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                self._seq = seq_before
+                raise
+            for removed_id in outcome.removed_ids:
+                self._index_forget(removed_id.hex)
+            return outcome
+
+    def _merge_group_in_txn(self, group: FoldGroup, now_unix: float) -> FoldMergeOutcome:
+        artifacts = self._group_artifacts(group.ids)
+        stale = self._stale_group_reason(group, artifacts)
+        if stale is not None:
+            return FoldMergeOutcome(merged=False, reason=stale)
+        facts = MergeFacts(group.disk_spelling, group.disk_hash, now_unix)
+        plan = plan_fold_merge(self._group_snapshot(artifacts), facts)
+        if self._holds_retained_history(plan.removed_ids):
+            return FoldMergeOutcome(merged=False, reason="a row to merge away holds retained history")
+        self._apply_merge_plan(plan, tuple(row.id for row in artifacts), now_unix)
+        return FoldMergeOutcome(
+            merged=True,
+            survivor_id=UUID(hex=plan.survivor_id),
+            removed_ids=tuple(UUID(hex=row_id) for row_id in plan.removed_ids),
+            keeper_agent_id=None if plan.keeper_agent_id is None else UUID(hex=plan.keeper_agent_id),
+            demoted_writers=tuple(UUID(hex=agent_id) for agent_id in plan.demoted_writers),
+        )
+
+    def _group_artifacts(self, ids: Sequence[UUID]) -> list[MergeArtifactRow]:
+        hexes = [artifact_id.hex for artifact_id in ids]
+        rows = self._conn.execute(
+            "SELECT rowid, id, name, version, owner_generation, content_hash, size_tokens, "
+            f"last_writer_id, updated_at FROM artifacts WHERE id {_in_clause(hexes)} "
+            "ORDER BY rowid",
+            hexes,
+        ).fetchall()
+        return [MergeArtifactRow(*row) for row in rows]
+
+    def _stale_group_reason(
+        self, group: FoldGroup, artifacts: Sequence[MergeArtifactRow]
+    ) -> str | None:
+        """Why the group the start found no longer holds, or None."""
+        if len(group.ids) < 2 or len(artifacts) != len(set(group.ids)):
+            return "a row is gone"
+        hexes = [row.id for row in artifacts]
+        listed = self._conn.execute(
+            f"SELECT 1 FROM artifact_name_kinds WHERE artifact_id {_in_clause(hexes)}", hexes
+        ).fetchone()
+        if listed is not None:
+            return "a row is listed as a key"
+        if any(index_key_of(row.name, group.profile) != group.key for row in artifacts):
+            return "a row no longer shares the key"
+        return None
+
+    def _group_snapshot(self, artifacts: Sequence[MergeArtifactRow]) -> MergeSnapshot:
+        hexes = [row.id for row in artifacts]
+        states = self._conn.execute(
+            f"SELECT {', '.join(_GROUPED_STATE_COLUMNS)} FROM agent_states "
+            f"WHERE artifact_id {_in_clause(hexes)}",
+            hexes,
+        ).fetchall()
+        notices = self._conn.execute(
+            "SELECT agent_id, artifact_id, preempter_agent_id, preempted_at_unix_ts "
+            f"FROM pending_notices WHERE artifact_id {_in_clause(hexes)}",
+            hexes,
+        ).fetchall()
+        return MergeSnapshot(
+            artifacts=tuple(artifacts),
+            states=tuple(
+                MergeStateRow(row[0], row[1], MESIState[row[2]], *row[3:]) for row in states
+            ),
+            notices=tuple(MergeNoticeRow(*row) for row in notices),
+        )
+
+    def _holds_retained_history(self, row_ids: Sequence[str]) -> bool:
+        """Whether a row to merge away holds retained versions: their numbers
+        are that row's own, so they can neither move to the survivor nor be
+        deleted with it without losing a committed write."""
+        if not row_ids:
+            return False
+        return self._conn.execute(
+            f"SELECT 1 FROM artifact_versions WHERE artifact_id {_in_clause(row_ids)} LIMIT 1",
+            list(row_ids),
+        ).fetchone() is not None
+
+    def _apply_merge_plan(
+        self, plan: MergePlan, group_ids: Sequence[str], now_unix: float
+    ) -> None:
+        """Write ``plan`` inside the merge's transaction: every referencing
+        table first, the single-writer check, then the delete of the rows
+        merged away, then the state log."""
+        self._write_survivor_values(plan)
+        self._replace_group_states(plan, group_ids)
+        self._conn.execute(
+            f"UPDATE transfer_records SET status = ?, updated_at = ? "
+            f"WHERE artifact_id {_in_clause(group_ids)}",
+            [TRANSFER_STATUS_WITHDRAWN, now_unix, *group_ids],
+        )
+        self._end_sessions_pinning(group_ids)
+        if plan.removed_ids:
+            self._conn.execute(
+                "UPDATE workspace_checkpoint_members SET artifact_id = ? "
+                f"WHERE artifact_id {_in_clause(plan.removed_ids)}",
+                [plan.survivor_id, *plan.removed_ids],
+            )
+        self._sum_conflict_counters(plan.survivor_id, group_ids)
+        self._sum_foreign_write_counters(plan, group_ids)
+        check_single_writer(self._state_map_in_txn(plan.survivor_id))
+        if plan.removed_ids:
+            self._conn.execute(
+                f"DELETE FROM artifacts WHERE id {_in_clause(plan.removed_ids)}",
+                list(plan.removed_ids),
+            )
+        self._log_merge_transitions(plan, int(now_unix))
+
+    def _write_survivor_values(self, plan: MergePlan) -> None:
+        current = self._conn.execute(
+            "SELECT version FROM artifacts WHERE id = ?", (plan.survivor_id,)
+        ).fetchone()
+        values = plan.values
+        check_monotonic_version(current[0], values.version)
+        self._conn.execute(
+            "UPDATE artifacts SET version = ?, owner_generation = ?, content_hash = ?, "
+            "size_tokens = ?, last_writer_id = ?, updated_at = ? WHERE id = ?",
+            (
+                values.version, values.owner_generation, values.content_hash,
+                values.size_tokens, values.last_writer_id, values.updated_at, plan.survivor_id,
+            ),
+        )
+
+    def _replace_group_states(self, plan: MergePlan, group_ids: Sequence[str]) -> None:
+        """One state row and at most one notice per agent, on the survivor:
+        an agent with rows on two spellings would otherwise collide on both
+        tables' primary keys."""
+        for table in ("pending_notices", "agent_states"):
+            self._conn.execute(
+                f"DELETE FROM {table} WHERE artifact_id {_in_clause(group_ids)}", list(group_ids)
+            )
+        columns = ", ".join(_GROUPED_STATE_COLUMNS)
+        self._conn.executemany(
+            f"INSERT INTO agent_states ({columns}) "
+            f"VALUES ({', '.join('?' for _ in _GROUPED_STATE_COLUMNS)})",
+            [_state_row_values(row) for row in plan.states],
+        )
+        self._conn.executemany(
+            "INSERT INTO pending_notices (agent_id, artifact_id, preempter_agent_id, "
+            "preempted_at_unix_ts) VALUES (?, ?, ?, ?)",
+            [
+                (row.agent_id, row.artifact_id, row.preempter_agent_id, row.preempted_at_unix_ts)
+                for row in plan.notices
+            ],
+        )
+
+    def _end_sessions_pinning(self, group_ids: Sequence[str]) -> None:
+        """End every snapshot session whose cut pins a grouped row: a pinned
+        version is a number in that row's own numbering, so it is never
+        re-pointed. Its next call finds no session."""
+        tokens = [
+            row[0]
+            for row in self._conn.execute(
+                f"SELECT DISTINCT session_token FROM session_pins "
+                f"WHERE artifact_id {_in_clause(group_ids)}",
+                list(group_ids),
+            ).fetchall()
+        ]
+        if not tokens:
+            return
+        for table in ("session_pins", "session_meta"):
+            self._conn.execute(
+                f"DELETE FROM {table} WHERE session_token {_in_clause(tokens)}", tokens
+            )
+
+    def _sum_conflict_counters(self, survivor_id: str, group_ids: Sequence[str]) -> None:
+        in_group = _in_clause(group_ids)
+        sums = self._conn.execute(
+            f"SELECT agent_id, reason, SUM(count) FROM conflict_counters "
+            f"WHERE artifact_id {in_group} GROUP BY agent_id, reason",
+            list(group_ids),
+        ).fetchall()
+        self._conn.execute(
+            f"DELETE FROM conflict_counters WHERE artifact_id {in_group}", list(group_ids)
+        )
+        self._conn.executemany(
+            "INSERT INTO conflict_counters (artifact_id, agent_id, reason, count) "
+            "VALUES (?, ?, ?, ?)",
+            [(survivor_id, *row) for row in sums],
+        )
+
+    def _sum_foreign_write_counters(self, plan: MergePlan, group_ids: Sequence[str]) -> None:
+        """Summed onto the survivor. The edge value takes the survivor's hash
+        with no outcome, so a disk that differs from it is counted once
+        more rather than suppressed by another spelling's gate."""
+        in_group = _in_clause(group_ids)
+        rows, *sums = self._conn.execute(
+            "SELECT COUNT(*), SUM(foreign_count), SUM(mediated_count), SUM(lag_suppressed_count) "
+            f"FROM foreign_write_counters WHERE artifact_id {in_group}",
+            list(group_ids),
+        ).fetchone()
+        if rows == 0:
+            return
+        self._conn.execute(
+            f"DELETE FROM foreign_write_counters WHERE artifact_id {in_group}", list(group_ids)
+        )
+        self._conn.execute(
+            "INSERT INTO foreign_write_counters (artifact_id, foreign_count, mediated_count, "
+            "lag_suppressed_count, last_counted_hash, last_counted_outcome) "
+            "VALUES (?, ?, ?, ?, ?, '')",
+            (plan.survivor_id, *sums, plan.values.content_hash),
+        )
+
+    def _state_map_in_txn(self, artifact_id: str) -> dict[str, MESIState]:
+        rows = self._conn.execute(
+            "SELECT agent_id, state FROM agent_states WHERE artifact_id = ?", (artifact_id,)
+        ).fetchall()
+        return {row[0]: MESIState[row[1]] for row in rows}
+
+    def _log_merge_transitions(self, plan: MergePlan, tick: int) -> None:
+        for transition in plan.transitions:
+            self._emit_state_log(
+                artifact_id=UUID(hex=plan.survivor_id),
+                agent_id=UUID(hex=transition.agent_id),
+                from_state=transition.from_state,
+                to_state=transition.to_state,
+                trigger=FOLD_MERGE_TRIGGER,
+                tick=tick,
+                version=plan.values.version,
+                content_hash=None,
+            )
 
     # ------------------------------------------------------------------
     # A1 — Preemption notices (silent-grant-revocation surfacing)

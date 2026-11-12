@@ -292,8 +292,9 @@ INMEM_SURFACE = frozenset({
     "valid_holders",
 })
 SQLITE_SURFACE = INMEM_SURFACE | frozenset({
-    "artifact_names_under_prefix", "artifacts_held_by_agent", "close",
-    "evict_stale_notices", "get_artifact_updated_at", "holds_writer_lock", "last_writer_for",
+    "artifact_names_under_prefix", "artifacts_held_by_agent", "build_fold_index", "close",
+    "evict_stale_notices", "file_rows_for_fold", "fold_bucket_peers", "fold_index_profile",
+    "get_artifact_updated_at", "holds_writer_lock", "last_writer_for", "merge_fold_group",
     "lookup_artifact_id_by_name", "peek_preemption_notice",
     "pop_pending_notices", "pop_preemption_notice", "record_preemption_notice",
     "resolve_or_register", "status_snapshot",

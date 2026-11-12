@@ -69,7 +69,17 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Literal, Protocol, TypeVar, runtime_checkable
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    Literal,
+    Protocol,
+    Sequence,
+    TypeVar,
+    runtime_checkable,
+)
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import yaml
@@ -103,6 +113,14 @@ from ccs.adapters.claude_code.regular_file import (
     read_regular_file,
 )
 from ccs.adapters.claude_code.state_dir import check_coherence_dir, lock_link_refusal, policy_link_refusal
+from ccs.coordinator.fold_merge import (
+    FoldGroup,
+    FoldRow,
+    ResolvedFile,
+    colliding_rows,
+    is_inside_root,
+    same_file_groups,
+)
 from ccs.coordinator.registry_protocol import (
     RECLAIM_TRIGGERS,
     CheckpointMember,
@@ -118,6 +136,7 @@ from ccs.coordinator.service import (
 )
 from ccs.coordinator.sqlite_registry import SCHEMA_USER_VERSION, SqliteArtifactRegistry
 from ccs.core.clock import monotonic_seconds
+from ccs.core.disk_spelling import native_spelling
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_ABSENT_REASON,
     CALLER_PRINCIPAL_FOREIGN_REASON,
@@ -162,6 +181,7 @@ from ccs.core.fence import (
     confirmed_generation,
     coordinator_holds_content_claim,
 )
+from ccs.core.path_fold import FoldProfile
 from ccs.core.states import MESIState
 from ccs.core.substrate import ArbitrationTier, RestoreTier
 from ccs.core.types import (
@@ -1028,6 +1048,101 @@ _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC = 5.0
 
 
 # ----------------------------------------------------------------------
+# One identity per file: the start-time merge and the fold index
+# ----------------------------------------------------------------------
+
+
+def _resolve_row_file(canonical_root: str, name: str) -> ResolvedFile | None:
+    """The file ``name`` reaches under the canonical root, through the
+    platform's own resolver, so the spelling is the one the disk stores. None
+    when the name reaches nothing, or something outside the root."""
+    try:
+        real_path = native_spelling(os.path.join(canonical_root, name))
+        spelling = os.path.relpath(real_path, canonical_root)
+        if not is_inside_root(spelling):
+            return None
+        info = os.stat(real_path)
+    except (OSError, ValueError):
+        # A name that reaches nothing (or holds a NUL a path cannot carry)
+        # confirms nothing: it stays out of every group.
+        return None
+    return ResolvedFile(
+        dev=info.st_dev, ino=info.st_ino, real_path=real_path, disk_spelling=spelling
+    )
+
+
+def find_fold_groups(
+    rows: Sequence[FoldRow], profile: FoldProfile, root: Path
+) -> list[FoldGroup]:
+    """Read-only: the groups of file rows the disk confirms as one file, each
+    with the disk's spelling of the file and the hash of its bytes in the
+    format the hook clients and the volume record."""
+    try:
+        canonical_root = native_spelling(root)
+    except OSError:
+        return []
+    groups: list[FoldGroup] = []
+    for key, keyed in colliding_rows(rows, profile).items():
+        resolved = [_resolve_row_file(canonical_root, row.name) for row in keyed]
+        for grouped, file in same_file_groups(keyed, resolved):
+            groups.append(FoldGroup(
+                profile=profile, key=key, ids=tuple(row.id for row in grouped),
+                disk_spelling=file.disk_spelling,
+                disk_hash=hash_regular_file(Path(file.real_path)),
+            ))
+    return groups
+
+
+def _merge_one_group(
+    registry: SqliteArtifactRegistry, group: FoldGroup, now_unix: float
+) -> None:
+    rows = ", ".join(row_id.hex for row_id in group.ids)
+    try:
+        outcome = registry.merge_fold_group(group, now_unix)
+    except Exception as exc:  # noqa: BLE001 — any failure, a state-log callback's included
+        # The rows stay apart and the index serves them as one file; the next start retries.
+        logger.warning("fold merge of rows %s failed and was rolled back: %s", rows, exc)
+        return
+    if not outcome.merged:
+        logger.warning("fold merge of rows %s skipped: %s", rows, outcome.reason)
+        return
+    survivor = outcome.survivor_id.hex if outcome.survivor_id is not None else "?"
+    keeper = outcome.keeper_agent_id.hex if outcome.keeper_agent_id is not None else "nobody"
+    demoted = ", ".join(agent_id.hex for agent_id in outcome.demoted_writers) or "none"
+    logger.info(
+        "fold merge: rows %s merged into %s; write grant kept by %s; demoted writers: %s",
+        rows, survivor, keeper, demoted,
+    )
+
+
+def prepare_fold_index(
+    registry: SqliteArtifactRegistry, root: Path, fold_profile: _fs_profile.FoldProfileResult
+) -> None:
+    """Once per start, after the store opened and the probe ran and before the
+    service exists: merge the groups the disk confirms, then build the fold
+    index and log each key several rows still share. Without the
+    single-writer lock another coordinator may hold the same store, so names
+    stay exact: nothing merges and no index is built."""
+    if not registry.holds_writer_lock:
+        logger.warning(
+            "fold index: not built; without the single-writer lock names match exactly as given"
+        )
+        return
+    profile = fold_profile.profile
+    now_unix = time.time()
+    for group in find_fold_groups(registry.file_rows_for_fold(), profile, root):
+        _merge_one_group(registry, group, now_unix)
+    for bucket in registry.build_fold_index(profile):
+        # JSON keeps a newline in a name from splitting the log line.
+        logger.warning(
+            "fold bucket %s: rows %s resolve to %s",
+            json.dumps(bucket.key, ensure_ascii=False),
+            ", ".join(row_id.hex for row_id in bucket.ids),
+            bucket.ids[0].hex,
+        )
+
+
+# ----------------------------------------------------------------------
 # Server shell
 # ----------------------------------------------------------------------
 
@@ -1374,6 +1489,9 @@ class CoordinatorHTTPServer:
         # crashed start left, and before the port exists, so every request is
         # answered with the profile known.
         self.fold_profile = self._probe_fold_profile()
+        # Before the service, the sweeps and the watchdog pool exist, so no
+        # request, reclaim or sweep can touch a row the merge is rewriting.
+        prepare_fold_index(self.registry, self.coordinator_root, self.fold_profile)
         self.service = CoordinatorService(self.registry)
         self.policy = TrackedArtifactPolicy.load(self.coordinator_root)
 
@@ -8436,15 +8554,24 @@ def _exclusive_holder(
     *,
     exclude_agent: UUID,
 ) -> tuple[UUID | None, int | None]:
-    """Return a current M/E holder and its acquisition-time hint for pre-edit."""
-    state_map = coordinator.registry.get_state_map(artifact_id)
-    for other_id, state in state_map.items():
-        if other_id == exclude_agent:
-            continue
-        if state in (MESIState.EXCLUSIVE, MESIState.MODIFIED):
-            granted_at = coordinator.registry.granted_at_tick(other_id, artifact_id)
-            return other_id, granted_at
+    """Return a current M/E holder and its acquisition-time hint for pre-edit.
+    A holder of another row of the artifact's fold bucket counts: the
+    acquire that follows takes that grant too."""
+    for row_id in _file_rows(coordinator.registry, artifact_id):
+        for other_id, state in coordinator.registry.get_state_map(row_id).items():
+            if other_id == exclude_agent:
+                continue
+            if state in (MESIState.EXCLUSIVE, MESIState.MODIFIED):
+                granted_at = coordinator.registry.granted_at_tick(other_id, row_id)
+                return other_id, granted_at
     return None, None
+
+
+def _file_rows(registry: SqliteArtifactRegistry, artifact_id: UUID) -> tuple[UUID, ...]:
+    """The artifact and the other rows of its fold bucket (spellings of one
+    file a start-time merge left apart), which the coordinator serves as one
+    file."""
+    return (artifact_id, *registry.fold_bucket_peers(artifact_id))
 
 
 def _iso_utc(unix_ts: float) -> str:
@@ -9166,13 +9293,15 @@ def _a_write_is_in_flight(
     died before its commit -- explains nothing on disk, and its row stands until
     the sweep reclaims it. A holder with no heartbeat on record is given the
     benefit of the doubt, as every holder was before: only a recorded silence
-    longer than the window ends it."""
-    for agent_id, state in registry.get_state_map(artifact_id).items():
-        if state != _WRITE_IN_FLIGHT_STATE or agent_id == exclude_agent:
-            continue
-        last_heartbeat = registry.last_heartbeat_tick(agent_id)
-        if last_heartbeat is None or (now_unix - last_heartbeat) <= window_sec:
-            return True
+    longer than the window ends it. A holder of another row of the artifact's
+    fold bucket counts, since its bytes land on the same file."""
+    for row_id in _file_rows(registry, artifact_id):
+        for agent_id, state in registry.get_state_map(row_id).items():
+            if state != _WRITE_IN_FLIGHT_STATE or agent_id == exclude_agent:
+                continue
+            last_heartbeat = registry.last_heartbeat_tick(agent_id)
+            if last_heartbeat is None or (now_unix - last_heartbeat) <= window_sec:
+                return True
     return False
 
 
