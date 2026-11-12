@@ -181,8 +181,9 @@ def test_two_servers_waiting_on_each_other_both_finish_once_each_has_released(tm
 #: The heartbeat timer of the reclaim journey, in the coordinator's whole
 #: seconds. A grant is taken back once its holder's last heartbeat is this
 #: many ticks old, so a poll at least every ``_HEARTBEAT_SEC - 1`` seconds
-#: would keep it if a poll refreshed the heartbeat.
-_HEARTBEAT_SEC = 3
+#: would keep it if a poll refreshed the heartbeat. Six seconds leave the
+#: setup and every poll room on a loaded machine.
+_HEARTBEAT_SEC = 6
 
 
 async def _hold_while_polling(root: Path, logs: Path, host: CoherentVolume) -> list[float]:

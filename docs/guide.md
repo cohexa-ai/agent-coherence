@@ -5267,7 +5267,7 @@ started with `SWG_ON_HELD=refuse`.
 | `coordinator_failed` | `reacquire`, `false` | refuse mode: an earlier attempt of this session still holds the path, because its release was not confirmed | no other agent holds it, so do not wait: `swg_reacquire` the path, which sends that release again, rebuild from its bytes, and `swg_write` once |
 | `coordinator_failed` | `stop_and_report`, `false` | the coordinator failed while answering the grant request: an HTTP `5xx`, the `503` of a drain, or, in refuse mode on this package's coordinator, `unavailable` (it could not decide in time) | the same call once more after a few seconds; if it fails the same way, stop and report that the coordinator is failing |
 | `coordinator_unavailable` | `stop_and_report`, `false` | refuse mode: the coordinator answered the grant request with neither an admit nor a refusal; nothing was written | the coordinator is running, so no restart: the same `swg_write` once more after a few seconds, then stop and report |
-| `coordinator_unavailable` | `stop_and_report`, `false` | no usable answer: the coordinator is gone or wedged | stop and report that the server must be restarted; once it is back, `swg_write` the path again if the detail says this write's bytes are on disk, since reading first does not record them; on a refuse-mode server, how long the restarted server can be refused by this one's grants (see **A coordinator that stops answering** below) |
+| `coordinator_unavailable` | `stop_and_report`, `false` | no usable answer: the coordinator is gone or wedged | stop and report that the server must be restarted; if the detail says this write's bytes are on disk, then once it is back, `swg_reacquire` the path and compare its bytes with the ones the write sent: rebuild from them if they differ, since another agent has written the path, and `swg_write` them if they match, which records them; on a refuse-mode server, how long the restarted server can be refused by this one's grants (see **A coordinator that stops answering** below) |
 | `coordinator_unavailable` | `retry_later`, `false` | the server's volume never attached | none |
 | `commit_unconfirmed` | `write_again`, `false` | the commit got no answer, an HTTP `5xx` or the coordinator's failure envelope after the bytes reached disk, so they may be unrecorded | `swg_write` the path once more, with the same content or a change built from it, which records it either way; reading first does not help. If that fails the same way, stop and report |
 | `commit_preempted` | `reacquire_and_reconcile`, `false` | the write lost its grant mid-write, and its bytes may be on disk unrecorded | none; the result carries the generation pair below |
@@ -5290,14 +5290,15 @@ every tool. Every row not marked refuse mode, `swg_release`, and the
 
 1. Before waiting, `swg_release` every path `swg_status` lists in `held`,
    including any an earlier attempt of this session holds, and `swg_reacquire`
-   a path whose release answers `release_unconfirmed` twice. Two agents that
+   the path instead when a release answers `release_unconfirmed` twice or
+   `held` is `null` because `swg_status` cannot tell who holds each path. Two agents that
    keep their holds while each waits for the other wait 30 minutes and then
    overwrite each other's work.
 2. Poll `swg_status`, which changes nothing, and not `swg_write`, whose refusal
    keeps the waiter's other holds alive. Wait at least 4 seconds before each
-   poll and double the wait each time, with jitter, until `swg_status` lists
-   the path and no longer shows it `held_by: another_agent`, or 30 minutes have
-   passed.
+   poll and double the wait each time up to 60 seconds, with jitter, until
+   `swg_status` lists the path, with `held` not `null`, and no longer shows it
+   `held_by: another_agent`, or 30 minutes have passed.
 3. Then `swg_reacquire` the path, rebuild from the bytes it returns, and
    `swg_write` once. On `other_holder` again, go back to step 2.
 
@@ -5406,9 +5407,12 @@ usable answer from its coordinator, the tool call answers `reason:
 coordinator_unavailable` with `recover: stop_and_report` and
 `retryable: false`, and a `next_step` that tells the agent to stop, not to
 write the managed files by any other route, and to report that the server must
-be restarted. `swg_write`'s step adds that a write whose bytes are on disk is
-written again once the server is back, and that a write grant this server
-holds stays until the coordinator takes it back: `swg_release` cannot reach a
+be restarted. `swg_write`'s step adds that, for a write whose bytes are on
+disk, the agent `swg_reacquire`s the path once the server is back and writes
+those bytes again only if the file still holds them, rebuilding from what it
+returns otherwise: the restarted server has no record of what the agent read, so
+a write without that check could land over another agent's later commit. It
+also says that a write grant this server holds stays until the coordinator takes it back: `swg_release` cannot reach a
 coordinator that is gone, and a restarted server cannot release this one's
 grants. On a refuse-mode server it also says that the restarted server's writes
 to paths this one held can be refused `other_holder` until then: for about 10

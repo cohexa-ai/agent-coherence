@@ -398,8 +398,10 @@ def test_a_commit_never_sent_answers_the_gone_row_with_the_rewrite_and_the_resta
     on_held: str,
 ) -> None:
     """The commit never left, so the coordinator did not record the bytes on
-    disk. The row stays the stop that says to restart this server, names the
-    swg_write that records the bytes once it is back, and says swg_release
+    disk. The row stays the stop that says to restart this server, sends the
+    agent to swg_reacquire and compare before the swg_write that records the
+    bytes once it is back (a restarted server has no record of what was read,
+    so a write without that check could land over a later commit), and says swg_release
     cannot reach a coordinator that is gone. On a refuse-mode server it adds
     how long the restarted server can be refused by this run's grants; a
     displace-mode server displaces them, so its row has no window.
@@ -416,7 +418,7 @@ def test_a_commit_never_sent_answers_the_gone_row_with_the_rewrite_and_the_resta
     assert _flags(row) == ("coordinator_unavailable", "stop_and_report", False)
     words = row["next_step"]
     assert "restart this MCP server" in words
-    assert "call swg_write on the path again" in words
+    assert words.index("call swg_reacquire on the path first") < words.index("swg_write them, which records them")
     assert "swg_release cannot reach" in words
     windowed = all(phrase in words for phrase in ("other_holder", "about 10 minutes", "up to 30 minutes"))
     assert windowed is (on_held == "refuse")

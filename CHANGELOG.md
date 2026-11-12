@@ -329,8 +329,10 @@ Alpha — APIs may change before `v1.0`.
   - `coordinator_failed` keeps its one retry, and its step now ends by telling
     the agent to `swg_release` the path if it stops.
   - `coordinator_unavailable` for a coordinator that is gone keeps its stop and
-    restart, and adds that a write whose bytes are on disk is written again
-    once the server is back and that this server's grants stand until the
+    restart, and adds that, for a write whose bytes are on disk, the agent
+    `swg_reacquire`s the path once the server is back and writes those bytes
+    again only if the file still holds them, rebuilding from what it returns
+    otherwise, and that this server's grants stand until the
     coordinator takes them back; on a refuse-mode server, that the restarted
     server can be refused by them for about 10 minutes on this package's
     coordinator and up to 30 minutes on the Claude Code plugin's.

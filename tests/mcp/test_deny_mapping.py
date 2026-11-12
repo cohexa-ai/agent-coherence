@@ -715,7 +715,8 @@ def test_the_other_holder_terminal_names_the_holder_and_the_wait_in_order():
     for phrase in (
         "Nothing was written", "holder_agent_id", "Do not send this write again",
         "held", "earlier attempt", "release_unconfirmed twice",
-        "which changes nothing", "at least 4 seconds", "double the wait", "jitter",
+        "which changes nothing", "at least 4 seconds", "double the wait", "up to 60 seconds", "jitter",
+        "held is null", "with held not null",
         "go back to step 2", "up to 30 minutes", "about 10 minutes on this package's coordinator",
         "up to 30 minutes on the Claude Code plugin's", "Claude Code hooks session",
         "restarted in the last 30 minutes", "previous run", "your own bound", "report",
@@ -875,7 +876,9 @@ def test_the_gone_row_adds_the_restart_window_only_on_a_refuse_mode_server():
 
     for words in (refuse, displace):
         assert "restart this MCP server" in words
-        assert "call swg_write on the path again" in words
+        assert "call swg_reacquire on the path first" in words
+        assert "If they differ, another agent has written the path since" in words
+        assert "Never write your bytes again without that check" in words
         assert "swg_release cannot reach" in words
     for phrase in ("other_holder", "about 10 minutes on this package's coordinator",
                    "up to 30 minutes on the Claude Code plugin's"):
