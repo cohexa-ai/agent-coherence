@@ -643,6 +643,9 @@ _GROUPED_STATE_COLUMNS = (
     "read_generation", "last_observed_version",
 )
 
+# Row ids bound by one name read; under the 999 variables older SQLite builds allow.
+_NAMES_PER_QUERY = 500
+
 
 def _in_clause(values: Sequence[object]) -> str:
     """``IN (?, ?, ...)`` placeholders for ``values``."""
@@ -6252,16 +6255,37 @@ class SqliteArtifactRegistry:
         """Each bucket's head under ``prefix``. Caller holds the lock."""
         # Folding is per segment, so a key under the root's key starts with it and "/".
         root_key = index_key_of(tidy_path(prefix).rstrip("/"), index.profile)
-        names_by_id = dict(self._conn.execute("SELECT id, name FROM artifacts").fetchall())
+        buckets = [
+            ids for key, ids in index.by_key.items()
+            if not root_key or key == root_key or key.startswith(f"{root_key}/")
+        ]
+        wanted = [row_id for ids in buckets for row_id in ids]
+        # Past about half the indexed rows, one scan of the store costs less
+        # than a lookup per row (measured at 50k rows).
+        scan = 2 * len(wanted) > len(index.key_by_id)
+        names_by_id = self._names_by_id(None if scan else wanted)
         heads: list[str] = []
-        for key, ids in index.by_key.items():
-            if root_key and key != root_key and not key.startswith(f"{root_key}/"):
-                continue
+        for ids in buckets:
             # A head gone from the store gives way to the bucket's next row.
             head = next((row_id for row_id in ids if row_id in names_by_id), None)
             if head is not None:
                 heads.append(names_by_id[head])
         return sorted(heads, key=lambda name: name.encode("utf-8"))
+
+    def _names_by_id(self, row_ids: list[str] | None) -> dict[str, str]:
+        """Stored names by row id: of ``row_ids``, or of every row given None.
+        Caller holds the lock."""
+        if row_ids is None:
+            return dict(self._conn.execute("SELECT id, name FROM artifacts").fetchall())
+        names: dict[str, str] = {}
+        for start in range(0, len(row_ids), _NAMES_PER_QUERY):
+            batch = row_ids[start : start + _NAMES_PER_QUERY]
+            names.update(
+                self._conn.execute(
+                    f"SELECT id, name FROM artifacts WHERE id {_in_clause(batch)}", batch
+                ).fetchall()
+            )
+        return names
 
     # ------------------------------------------------------------------
     # One identity per file: the fold index, key rows, the start merge

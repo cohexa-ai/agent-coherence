@@ -425,6 +425,98 @@ def test_a_prefix_listing_on_a_folding_profile_names_one_row_per_key(raw, opened
     assert len(registry.artifact_names_under_prefix(".")) == 3
 
 
+def test_a_prefix_listing_names_a_buckets_next_row_when_its_head_is_gone(raw, opened) -> None:
+    """A row deleted behind the index gives way to the next row of its
+    bucket, as a lookup does; a bucket with no row left is not listed.
+
+    Prevents a pre-grep that misses a file whose oldest spelling is gone."""
+    head = seed_artifact(raw, "Docs/A.md")
+    seed_artifact(raw, "DOCS/a.md")
+    alone = seed_artifact(raw, "docs/b.md")
+    registry = opened()
+    registry.build_fold_index("caseless")
+    raw.execute("DELETE FROM artifacts WHERE id IN (?, ?)", (head.hex, alone.hex))
+
+    assert registry.artifact_names_under_prefix("docs") == ["DOCS/a.md"]
+    assert registry.artifact_names_under_prefix("") == ["DOCS/a.md"]
+
+
+def test_a_prefix_listing_is_sorted_by_the_stored_names_utf8_bytes(raw, opened) -> None:
+    """Neither insertion order nor key order: ``Z`` sorts before ``a``, and a
+    letter beyond the BMP after U+FF21, as UTF-8 orders them (UTF-16 would
+    put the surrogate pair first).
+
+    Prevents a listing whose order depends on the order rows were written."""
+    for name in ("docs/b.md", "docs/\U0001d400.md", "docs/a.md", "docs/\uff21.md", "docs/Z.md"):
+        seed_artifact(raw, name)
+    registry = opened()
+    registry.build_fold_index("caseless")
+
+    assert registry.artifact_names_under_prefix("DOCS") == [
+        "docs/Z.md", "docs/a.md", "docs/b.md", "docs/\uff21.md", "docs/\U0001d400.md",
+    ]
+
+
+def seed_names(conn: sqlite3.Connection, counts: dict[str, int]) -> None:
+    """``counts[top]`` file rows under each ``top``, in one transaction."""
+    conn.execute("BEGIN")
+    for top, count in counts.items():
+        for index in range(count):
+            seed_artifact(conn, f"{top}/{index:04d}.md")
+    conn.execute("COMMIT")
+
+
+def listed_and_rows_read(registry: SqliteArtifactRegistry, prefix: str) -> tuple[list[str], int]:
+    """The listing under ``prefix``, and how many rows it read from the store."""
+    rows_read: list[tuple] = []
+
+    def counting(_cursor: sqlite3.Cursor, row: tuple) -> tuple:
+        rows_read.append(row)
+        return row
+
+    registry._conn.row_factory = counting  # noqa: SLF001 - the rows read are the subject
+    try:
+        return registry.artifact_names_under_prefix(prefix), len(rows_read)
+    finally:
+        registry._conn.row_factory = None  # noqa: SLF001
+
+
+def test_a_subtree_listing_on_a_folding_profile_reads_only_the_subtrees_rows(
+    raw, opened
+) -> None:
+    """A subtree that is a small part of the store reads only its own rows'
+    names, by id, in more than one batch when there are many.
+
+    Prevents a pre-grep that reads every name in the store under the
+    registry lock, whose cost grows with the whole store."""
+    seed_names(raw, {"other": 600, "Docs": 520})
+    registry = opened()
+    registry.build_fold_index("caseless")
+
+    listed, rows_read = listed_and_rows_read(registry, "docs/")
+
+    assert listed == [f"Docs/{index:04d}.md" for index in range(520)]
+    assert rows_read == 520
+
+
+def test_a_subtree_holding_most_of_the_store_is_read_by_one_scan(raw, opened) -> None:
+    """Past half the store one scan of every row costs less than a lookup
+    per row, so the listing reads the store once, as a listing of the root
+    does, and names the same rows.
+
+    Prevents a pre-grep over most of a large store taking longer than the
+    scan it replaced."""
+    seed_names(raw, {"other": 20, "Docs": 520})
+    registry = opened()
+    registry.build_fold_index("caseless")
+
+    listed, rows_read = listed_and_rows_read(registry, "docs")
+
+    assert listed == [f"Docs/{index:04d}.md" for index in range(520)]
+    assert rows_read == 540
+    assert listed_and_rows_read(registry, "")[1] == 540
+
+
 # ---------------------------------------------------------------------------
 # Names kept exact as keys
 # ---------------------------------------------------------------------------
