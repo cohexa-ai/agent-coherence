@@ -6457,9 +6457,12 @@ class SqliteArtifactRegistry:
             f"WHERE artifact_id {_in_clause(hexes)}",
             hexes,
         ).fetchall()
+        # The planner keeps the last of an agent's equal-time notices, so the
+        # order is explicit, and the plugin's coordinator reads the same one.
         notices = self._conn.execute(
             "SELECT agent_id, artifact_id, preempter_agent_id, preempted_at_unix_ts "
-            f"FROM pending_notices WHERE artifact_id {_in_clause(hexes)}",
+            f"FROM pending_notices WHERE artifact_id {_in_clause(hexes)} "
+            "ORDER BY agent_id, artifact_id",
             hexes,
         ).fetchall()
         return MergeSnapshot(

@@ -929,6 +929,76 @@ def test_one_agent_with_rows_on_both_spellings_ends_with_one_state_row_and_one_n
     assert_at_most_one_writer(registry, first)
 
 
+def test_on_equal_write_times_the_survivor_takes_the_oldest_rows_values(raw, opened) -> None:
+    """Neither row's hash is the disk's and both were last written at the
+    same time: the values come from the oldest row, not from the survivor or
+    the row read last, as the plugin's coordinator chooses.
+
+    Prevents a merged hash and last writer that depend on read order."""
+    first = seed_artifact(raw, "data/x.txt", hash=sha256("one"), updated_at=100.0,
+                          last_writer=AGENT_A, size_tokens=3)
+    second = seed_artifact(raw, "DATA/X.TXT", hash=sha256("two"), updated_at=100.0,
+                           last_writer=AGENT_B, size_tokens=7)
+    registry = opened()
+
+    outcome = registry.merge_fold_group(
+        group_of("caseless", [first, second], name="data/x.txt", disk_spelling="DATA/X.TXT",
+                 disk_hash=sha256("neither")),
+        NOW,
+    )
+
+    assert outcome.survivor_id == second
+    assert artifact_row(raw, second) == {
+        "name": "DATA/X.TXT", "version": 2, "generation": 1, "hash": sha256("one"),
+        "size_tokens": 3, "last_writer": AGENT_A.hex, "updated_at": 100.0,
+    }
+
+
+def test_a_demoted_writers_notice_names_the_merge_over_an_older_notice_of_the_same_time(
+    raw, opened
+) -> None:
+    """A writer the merge demotes already holds a notice stamped the second
+    the merge runs: the merge's own notice, counted last, wins the tie.
+
+    Prevents a demoted writer told another agent took its grant when the
+    merge did."""
+    first = seed_artifact(raw, "data/x.txt")
+    second = seed_artifact(raw, "DATA/X.TXT")
+    seed_state(raw, (second, AGENT_A), MESIState.EXCLUSIVE, granted_at=90, observed=1,
+               read_generation=0)
+    seed_notice(raw, (AGENT_A, first), AGENT_B, NOW)
+    registry = opened()
+
+    outcome = registry.merge_fold_group(
+        group_of("caseless", [first, second], name="data/x.txt"), NOW
+    )
+
+    assert outcome.demoted_writers == (AGENT_A,)
+    assert notices_of(raw, AGENT_A) == [(first, FOLD_MERGE_PREEMPTER_ID, NOW)]
+
+
+def test_equal_time_notices_of_one_agent_name_the_preempter_on_the_greatest_row_id(
+    raw, opened
+) -> None:
+    """An agent preempted on both spellings in the same second keeps one
+    notice, naming the preempter on the row whose id sorts last: the merge
+    reads notices by agent and row id, as the plugin's coordinator does,
+    not in whatever order the store returns them.
+
+    Prevents a merged notice whose preempter depends on SQLite's read order."""
+    first = seed_artifact(raw, "data/x.txt")
+    second = seed_artifact(raw, "DATA/X.TXT")
+    low, high = sorted((first, second), key=lambda artifact_id: artifact_id.hex)
+    # Stored highest id first, so a read in storage order meets it first.
+    seed_notice(raw, (AGENT_C, high), AGENT_B, 80.0)
+    seed_notice(raw, (AGENT_C, low), AGENT_A, 80.0)
+    registry = opened()
+
+    registry.merge_fold_group(group_of("caseless", [first, second], name="data/x.txt"), NOW)
+
+    assert notices_of(raw, AGENT_C) == [(first, AGENT_B, 80.0)]
+
+
 def test_the_merge_preempter_id_is_the_uuid5_of_its_name() -> None:
     assert FOLD_MERGE_PREEMPTER_ID == uuid5(
         NAMESPACE_URL, "ccs-coordinator-fold-merge:merged-spellings"
