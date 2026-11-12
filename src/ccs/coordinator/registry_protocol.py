@@ -1346,8 +1346,7 @@ class SqliteExtended(RegistryBase, Protocol):
     name/prefix lookups, the preemption-notice surface (record/peek/pop/evict),
     ``resolve_or_register`` first-observation seeding, the ``status_snapshot``
     batch, and ``fold_bucket_peers``, the other rows of a file's fold bucket
-    that the write path treats as the same file. Extracted as a pure refactor
-    (no behavior change).
+    that the write path treats as the same file.
     """
 
     def artifact_names_under_prefix(self, prefix: str) -> list[str]:
