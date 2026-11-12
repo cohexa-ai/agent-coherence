@@ -37,9 +37,10 @@ Two input types (plan §"Deny reason-flow"):
 
 Some tools map through their own function first. ``swg_write`` goes through
 :func:`write_deny_result`, whose rows differ where a write may leave a grant
-standing or its bytes on disk, or meets a refuse-mode answer, and the handoff
-tools through :func:`handoff_deny_result`; anything else falls to
-:func:`deny_result`.
+standing or its bytes on disk, or meets a refuse-mode answer; ``swg_release``
+through :func:`release_deny_result`, whose unconfirmed release is safe to
+send again; and the handoff tools through :func:`handoff_deny_result`.
+Anything else falls to :func:`deny_result`.
 
 The ``reason`` token is NEVER substring-matched off the message (the
 typed-signal-not-substring house rule).
@@ -74,6 +75,7 @@ from ccs.core.exceptions import (
     CasRetriesExhausted,
     CasVersionConflict,
     CoherenceDirRefused,
+    CoherenceError,
     CommitPreempted,
     CommitUnconfirmed,
     CoordinatorFailed,
@@ -82,6 +84,7 @@ from ccs.core.exceptions import (
     InternalConcurrencyError,
     LinkOutOfManaged,
     OtherHolder,
+    RedirectRefused,
     StaleView,
     ViewWedged,
     _generation_pair_fields,
@@ -735,6 +738,51 @@ def _write_terminal(exc: BaseException, on_held: str) -> _Terminal | None:
             return _WRITE_ANSWERED_UNUSABLE
         return _WRITE_GONE_REFUSE if on_held == "refuse" else _WRITE_GONE
     return _WRITE_TERMINALS.get(type(exc))
+
+
+# --- swg_release's own rows ---------------------------------------------------
+#
+# A release the coordinator did not confirm: no usable answer, its failure
+# envelope, an HTTP 5xx or 4xx, a watchdog-degraded answer, an answer that
+# reports the grant still held, or a redirect this client refuses to follow.
+# The volume keeps the path recorded in each case, so a repeat sends the
+# release again, and a release of a grant already given back changes nothing:
+# the flag is true and the verb is the repeat. A coordinator that keeps failing
+# answers every repeat the same, so the words bound the repeats and say what
+# to report, never a restart: the coordinator answered, or may answer the next.
+RELEASE_UNCONFIRMED_REASON = "release_unconfirmed"
+RELEASE_AGAIN_RECOVER = "release_again"
+RELEASE_UNCONFIRMED_NEXT_STEP = (
+    "The coordinator did not confirm this release, so this session's write grant on the "
+    "path may still stand; this session's other holds are as they were. Calling "
+    "swg_release on the path again is safe: it sends the release again, and a release of a "
+    "grant already given back changes nothing. Try it at most twice more. If it still is "
+    "not confirmed, stop and report to your user or host that this session's write grant "
+    "on the path may still stand, which can keep other agents that write the path waiting. "
+    "swg_reacquire on the path is the step that drops every hold this session has, this "
+    "one included."
+)
+_RELEASE_UNCONFIRMED = _Terminal(
+    RELEASE_UNCONFIRMED_REASON, RELEASE_AGAIN_RECOVER, True, RELEASE_UNCONFIRMED_NEXT_STEP
+)
+# By exact type, like ``_TERMINALS``: the plain ``CoherenceError`` is a 4xx, a
+# degraded answer or a grant reported still held, and a subclass with a meaning
+# of its own must not inherit the repeat.
+_RELEASE_UNCONFIRMED_TYPES: frozenset[type] = frozenset(
+    {CoordinatorUnreachable, CoordinatorFailed, CoherenceError, RedirectRefused}
+)
+
+
+def release_deny_result(exc: BaseException) -> CallToolResult:
+    """``swg_release``'s answer to a release that raised: the
+    ``release_unconfirmed`` row for each exact type a release the coordinator
+    did not confirm raises, the shared rows for a caller-principal refusal,
+    and ``internal_error`` for any other type."""
+    if type(exc) in _RELEASE_UNCONFIRMED_TYPES:
+        return _result(_RELEASE_UNCONFIRMED, str(exc))
+    if type(exc) is CallerPrincipalRefused:
+        return deny_result(exc)
+    return _result(_UNRECOGNIZED, str(exc))
 
 
 def handoff_verb_refusal_result(reason: object, detail: str, extra: dict) -> CallToolResult:

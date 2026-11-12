@@ -55,6 +55,7 @@ from ccs.mcp.deny import (
     handoff_deny_result,
     handoff_transfer_refusal_result,
     handoff_verb_refusal_result,
+    release_deny_result,
     write_deny_result,
 )
 from ccs.mcp.session import SessionConfig, build_volume
@@ -188,6 +189,22 @@ _REACQUIRE_DESC = (
     "Recover from a stale_view deny: re-mint identity and return the CURRENT "
     "bytes. You MUST write FROM these exact bytes — the server enforces version "
     "lineage, NOT that your content was derived from what you read." + _SCOPE_CLAUSE
+)
+_RELEASE_DESC = (
+    "Give back this session's write grant on one path and keep every other hold. "
+    "swg_write takes a write grant on the path it writes and keeps it after the "
+    "write. When you finish writing a path, swg_release it: until you do, other "
+    "opted-in agents that write it wait, for up to 30 minutes. Answers {ok, path, "
+    "released}. released=true means this session gave a grant back; it does not "
+    "mean the path is free (another agent may hold it), and this session keeps a "
+    "read at the version it held, so its next swg_write of the path needs no "
+    "swg_reacquire unless the file changed since. released=false means this "
+    "session had no write grant recorded on the path and nothing was sent, as on "
+    "a repeat. A release the coordinator did not confirm answers "
+    "reason=release_unconfirmed, recover=release_again, retryable=true: calling "
+    "swg_release again is safe, at most twice more; if it still is not confirmed, "
+    "report that this session's write grant on the path may still stand "
+    "(swg_reacquire drops every hold, this one included)." + _SCOPE_CLAUSE
 )
 _STATUS_DESC = (
     "Report coherence state: coordinator on|off|unknown (unknown is NOT off), "
@@ -569,6 +586,33 @@ def _do_reacquire(volume: CoherentVolume, config: SessionConfig, path: str) -> C
     return _ok_result({"content": text, "encoding": "utf-8", "note": _REACQUIRE_NOTE}, text)
 
 
+def _do_release(volume: CoherentVolume, config: SessionConfig, path: str) -> CallToolResult:
+    try:
+        key = validate_uri(path, root=config.root)
+    except UriValidationError as exc:
+        return _client_error_result("invalid_path", "fix_path", str(exc))
+    # A volume with no endpoint sends nothing and still answers True for a
+    # grant it recorded, which would report a release no coordinator saw.
+    if not volume.is_attached:
+        return coordinator_unavailable_result(f"coordinator unattached; cannot release {key}")
+    try:
+        released = volume.release(key)
+    except CoherenceError as exc:
+        return release_deny_result(exc)
+    return _ok_result({"ok": True, "path": key, "released": released}, _release_text(key, released))
+
+
+def _release_text(key: str, released: bool) -> str:
+    """What a client that shows only the text channel learns of a release:
+    whether a grant went back, and never that the path is free."""
+    if not released:
+        return f"released nothing on {key}: this session has no write grant recorded there, so nothing was sent"
+    return (
+        f"released this session's write grant on {key}. The path is not necessarily free: "
+        "another agent may hold it. This session keeps a read of it at the version it held."
+    )
+
+
 def _do_status(volume: CoherentVolume, config: SessionConfig) -> CallToolResult:
     status = build_status(volume, config)
     # A client that shows only the text channel must still see what an agent
@@ -739,6 +783,8 @@ def register_tools(server: FastMCP) -> None:
 
     ``swg_write_cas`` is the concurrent regime; ``swg_gate`` is the
     pull-based effect fence agents call before an irreversible dispatch;
+    ``swg_release`` gives back this session's write grant on one path and
+    keeps every other hold (#504);
     ``swg_transfer``/``swg_accept``/``swg_decline``/``swg_withdraw`` hand this
     session's own claims to another session (#185).
     """
@@ -775,6 +821,17 @@ def register_tools(server: FastMCP) -> None:
         sctx = _server_context(ctx)
         async with sctx.lock:
             return _do_reacquire(sctx.volume, sctx.config, path)
+
+    @server.tool(
+        name="swg_release",
+        description=_RELEASE_DESC,
+        annotations=ToolAnnotations(readOnlyHint=False),
+        structured_output=False,
+    )
+    async def swg_release(path: str, ctx: Context) -> CallToolResult:
+        sctx = _server_context(ctx)
+        async with sctx.lock:
+            return _do_release(sctx.volume, sctx.config, path)
 
     @server.tool(
         name="swg_status",
