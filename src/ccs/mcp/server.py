@@ -99,6 +99,30 @@ Three guarantees, all single-host and fail-closed:
      re-decide.
      The verdict is true as of that call; the dispatch after it is still yours.
 
+WRITE HOLDS, in both modes: swg_write takes a write grant on the path it writes
+and keeps it after the write. swg_release(path) gives back that one path and
+keeps your other holds; swg_reacquire and swg_write_cas, of any path, drop every
+hold this session has, and so does this server's normal exit. When you finish
+writing a path, swg_release it: until you do, other opted-in agents that write
+it wait, for up to 30 minutes. swg_status lists your holds in held (null means
+it cannot tell, never that you hold nothing).
+
+REFUSE MODE is the operator's setting, SWG_ON_HELD=refuse; swg_status reports
+the mode as on_held. In it, a swg_write of a managed path that another agent
+holds is refused with reason=other_holder, recover=wait_then_reacquire,
+retryable=false: nothing was written, nothing changed hands, and its next_step
+gives the wait. Any writer's grant counts as a hold, but only opted-in writers
+honour a hold, such as a refuse-mode server writing one of its managed paths:
+the Claude Code plugin's hooks, displace-mode servers (the default) and older
+volumes take the file anyway, and the holder then sees stale_view on its next
+swg_write. A hold is not a lock.
+
+WHO HOLDS A PATH: holder ids are per attempt and never equal your
+session_agent_id, so tell your own holds by held_by in swg_status
+(this_attempt, earlier_attempt or another_agent), never by comparing ids.
+Every caller of one server process is one agent to the coordinator, so
+this_attempt can be another caller sharing this server.
+
 HANDOFF between sessions: swg_transfer(paths, successor) hands this session's
 claim on each path (the write grant from swg_write, or the standing read from
 swg_read) to another session, the successor, named by the session_agent_id the
@@ -115,6 +139,42 @@ any route. The successor sees the handoff in the handoff key of its
 swg_read and swg_status, and takes it with swg_accept or a write, or refuses it
 with swg_decline. swg_withdraw is taken only on the user's or host's explicit
 instruction, never as the recovery for a handed_off deny.
+
+REFUSALS are error results whose structuredContent carries reason, recover,
+retryable and detail, and often next_step: when next_step is present it is the
+procedure, so follow it. retryable=true means only that sending the identical
+call again is safe; it is not the next step. retryable=false means do not send
+it again unless next_step says to. The recover verbs:
+  reacquire: swg_reacquire the path, then write FROM the bytes it returns.
+  wait_then_reacquire: another agent holds the path; release your holds, poll
+    swg_status, then swg_reacquire and swg_write once (next_step has the steps).
+  write_again: the bytes swg_write put on disk may be unrecorded; swg_write the
+    path once more, which records them.
+  release_again: the release was not confirmed; swg_release the path again,
+    at most twice more.
+  reacquire_and_reconcile: the write lost its grant mid-write and its bytes may
+    be on disk unrecorded; swg_reacquire, reconcile your change with the bytes
+    it returns, and write that.
+  read_then_merge: swg_read the path, merge into what it returns, then
+    swg_write_cas at its version.
+  reacquire_and_reread: swg_reacquire the path, then swg_read it for a fresh
+    version.
+  read_then_retry: the commit may have landed; swg_read the path and retry only
+    if your change is not there.
+  wait_and_retry: wait a few seconds, then send the same call again.
+  wait_or_escalate: wait a while before trying again; if it persists, report it.
+  retry_later: this server has no coordinator attached; try later, and report
+    it if it persists.
+  check_handoff: look at the path's handoff in swg_status before you act.
+  fix_successor: name the successor by the session_agent_id its own swg_status
+    reports.
+  fix_path, check_path, use_text, reread: fix the path; check that the file
+    exists; the file is not UTF-8 text; swg_read again and pass both comparands
+    it returns.
+  restart_session: this server session lost coordination; report it, since
+    only a new server session regains it.
+  stop, stop_and_report, none: stop, do not write the path by any other route,
+    and report the detail to your user or host.
 
 OUT OF GUARANTEE (do not rely on this server for): writers on DIFFERENT hosts or
 across a synced/network mount; divergent-history reconciliation; semantic/content
@@ -179,16 +239,38 @@ _GATE_DESC = (
     "take the action — swg_reacquire, re-read, re-decide." + _SCOPE_CLAUSE
 )
 _WRITE_DESC = (
-    "Write a workspace text file (acquire -> write -> commit). DENIED with "
-    "reason=stale_view if the file changed since you read it — a peer commit OR an "
-    "out-of-band edit (another tool/editor): recover with swg_reacquire, then write "
-    "FROM its bytes. A mid-write preempt returns reason=commit_preempted (disk may "
-    "hold un-versioned bytes; reacquire_and_reconcile)." + _SCOPE_CLAUSE
+    "Write a workspace text file (acquire -> write -> commit). In either mode the "
+    "write takes a write grant on the path and keeps it after the write. When you "
+    "finish writing a path, swg_release it: until you do, other opted-in agents that "
+    "write it wait, for up to 30 minutes. On a refuse-mode server (SWG_ON_HELD=refuse) "
+    "a success also carries opted_in: true when the write asked first, false when the "
+    "path is not among the managed files, so the write took the file from any agent "
+    "that held it. A refusal carries reason, recover and retryable; follow its "
+    "next_step when it has one. DENIED with reason=stale_view if the file changed "
+    "since you read it — a peer commit OR an out-of-band edit (another tool/editor): "
+    "recover with swg_reacquire, then write FROM its bytes, never the content you "
+    "just sent. The other reasons: other_holder (refuse mode only), another agent "
+    "holds the path and nothing was written (recover=wait_then_reacquire); "
+    "commit_preempted, a mid-write preempt (disk may hold un-versioned bytes; "
+    "reacquire_and_reconcile); commit_unconfirmed, the bytes are on disk but may be "
+    "unrecorded (recover=write_again); link_out_of_managed (refuse mode only), the "
+    "path goes through a link to a file outside the managed files; handed_off, this "
+    "session handed the path off; coordinator_failed, the coordinator failed while "
+    "answering (recover=reacquire when an earlier attempt of this session still "
+    "holds the path); coordinator_unavailable, it gave no usable answer or is not "
+    "attached; caller_principal_absent, caller_principal_foreign or "
+    "caller_principal_claimed, this session's caller principal was refused "
+    "(swg_status shows principal_claim); internal_error, a failure with no "
+    "recovery; invalid_path or io_error, a bad path or a disk failure." + _SCOPE_CLAUSE
 )
 _REACQUIRE_DESC = (
     "Recover from a stale_view deny: re-mint identity and return the CURRENT "
     "bytes. You MUST write FROM these exact bytes — the server enforces version "
-    "lineage, NOT that your content was derived from what you read." + _SCOPE_CLAUSE
+    "lineage, NOT that your content was derived from what you read. It is also the "
+    "step a swg_write refusal names with recover=reacquire or wait_then_reacquire. "
+    "The re-mint drops every hold this session has: the write grant on every path, "
+    "not only this one, so other agents can then write those paths. To give back "
+    "one path and keep the others, use swg_release." + _SCOPE_CLAUSE
 )
 _RELEASE_DESC = (
     "Give back this session's write grant on one path and keep every other hold. "
@@ -216,6 +298,19 @@ _STATUS_DESC = (
     "tracked; the text result then says per_path=unavailable. With "
     "coordinator=unknown, per_path is {} and says nothing about what is "
     "tracked), "
+    "the write holder on each per_path entry someone holds for writing: "
+    "holder_agent_id (the holder's attempt id, in the 32-hex spelling an "
+    "other_holder refusal names; ids are per attempt, so it never equals "
+    "session_agent_id) and held_by (this_attempt; earlier_attempt, an earlier "
+    "attempt of this session whose grant still stands, which you release; or "
+    "another_agent), neither key on an entry nobody holds, and this_attempt "
+    "covering another caller sharing this server, since every caller of one "
+    "server process is one agent to the coordinator; "
+    "on_held (this server's mode: refuse when the operator set SWG_ON_HELD=refuse, "
+    "else displace), held (the sorted paths this session holds for writing, "
+    "either attempt; null when the coordinator cannot say who holds each path: "
+    "null means cannot tell, never that nothing is held; the text result gives "
+    "on_held, held, and a line per path held_by another_agent or earlier_attempt), "
     "is_attached/is_degraded/session_id, session_agent_id (this "
     "session's id as a handoff successor: the value another session passes to "
     "swg_transfer to hand this session a path; it does not change when this "
@@ -249,7 +344,9 @@ _WRITE_CAS_DESC = (
     "this session is its successor, overtaken (with counterparty) otherwise. The "
     "per-session conflict counter bounds only a COOPERATING agent (one session, "
     "stops on retryable=false); it is NOT livelock-proof against a fresh session "
-    "or one that ignores retryable=false." + _SCOPE_CLAUSE
+    "or one that ignores retryable=false. A call that reaches the coordinator drops "
+    "every hold this session has: it starts a new attempt, which gives back the write grant swg_write took "
+    "on every path, as swg_reacquire does." + _SCOPE_CLAUSE
 )
 
 # Appended to each of the four handoff tools' descriptions: what a transfer
