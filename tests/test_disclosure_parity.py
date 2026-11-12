@@ -224,6 +224,34 @@ PINS: tuple[Pin, ...] = (
         doc="docs/guide.md",
         doc_phrase="write, so a write built without reading lands over whatever the holder",
     ),
+    Pin(
+        name="node: a volume never starts the Node coordinator",
+        source="src/ccs/adapters/coherent_volume.py",
+        source_marker="The same for the Node coordinator, which no volume starts.",
+        doc="docs/guide.md",
+        doc_phrase="A volume never starts the Node coordinator",
+    ),
+    Pin(
+        name="node: the same on the project's front page",
+        source="src/ccs/adapters/coherent_volume.py",
+        source_marker="The same for the Node coordinator, which no volume starts.",
+        doc="README.md",
+        doc_phrase="a volume never starts the Node coordinator",
+    ),
+    Pin(
+        name="node: no snapshot sessions or handoffs, so their routes raise",
+        source="src/ccs/adapters/coherent_volume.py",
+        source_marker="The Node coordinator has no snapshot sessions or handoffs.",
+        doc="docs/guide.md",
+        doc_phrase="The Node coordinator has no snapshot sessions or handoffs",
+    ),
+    Pin(
+        name="node: an opted-in write carries no principal where the claim was answered 404",
+        source="src/ccs/adapters/coherent_volume.py",
+        source_marker="404 (``unsupported``) shows that the coordinator issues none, as the Node",
+        doc="docs/guide.md",
+        doc_phrase="goes without one only when its claim was answered `404`",
+    ),
 )
 
 

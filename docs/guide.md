@@ -951,8 +951,8 @@ thresholds in the same view; see
 
 ### Reading when the sweep will reclaim a grant
 
-This applies to the Python coordinator. The Node coordinator answers
-`detail=full` with `501`.
+This applies to the Python coordinator. The Node coordinator runs no sweep,
+and its operator view carries none of these fields.
 
 The operator view (`GET /status?detail=full` with the
 `Coherence-Local-Operator: true` header) also carries what the sweep decides
@@ -1431,8 +1431,13 @@ coordinator's strict set and its tracked set and not in its ignored set. A glob
 that is not fails the volume closed, naming it: under `on_error="strict"`
 construction raises, and under `"degrade"` the volume warns once and runs
 detached. When the sets cannot be read at all, because the coordinator is older
-and publishes only counts, or is the Node coordinator, the volume fails closed
-the same way and says that enforcement could not be confirmed.
+and publishes only counts, or is the Claude Code plugin's Node coordinator of
+plugin 0.6.0 or earlier, which answers the operator view `501`, the volume
+fails closed the same way and says that enforcement could not be confirmed.
+Later plugin releases serve the view, and a volume attaches to their Node
+coordinator by the same check, but only to one already running whose policy
+files list its globs (see
+[A volume on the Node coordinator](#a-volume-on-the-node-coordinator)).
 `vol.managed_glob_enforcement()` returns the same three-way answer. The
 comparison is literal and taken once, at attach, and the coordinator keeps the
 answer true while it runs. A strict path stays enforced for the coordinator's
@@ -1849,17 +1854,18 @@ attach the volume reads `pre_edit_if_unheld` from the operator view of `/status`
 and attaches only when it is JSON `true`. Otherwise it raises `CoherenceError`
 before it sends anything, because a coordinator that ignores the flag would take
 the file from its holder. That rules out this package's coordinator through
-0.15.0. The volume also reads `fold_profile` and `fold_table_unicode` from the
-default view, so it keys each file as the coordinator does (see
+0.15.0, and the Claude Code plugin's Node coordinator through 0.6.0, which does
+not serve the operator view. The volume also reads `fold_profile` and
+`fold_table_unicode` from the default view, so it keys each file as the
+coordinator does (see
 [One file, many spellings](#one-file-many-spellings)). When it cannot read them
 it raises `CoordinatorUnreachable` for no answer and `CoherenceError` for an
 unusable one, and it raises `CoherenceError` for a fold table of another
 Unicode version, both before it sends anything: a refusal it promises under
 every spelling of a file needs the coordinator's own fold. A forked child
-checks again on its first read or write. A volume with
-`managed` globs cannot attach to the Claude Code plugin's Node coordinator in
-either mode, because it does not serve the operator view, so refuse mode does
-not reach it.
+checks again on its first read or write. On the Node coordinator of later
+plugin releases, refuse mode works with the differences listed in
+[A volume on the Node coordinator](#a-volume-on-the-node-coordinator).
 
 **What a refuse-mode `write()` raises.** In every row, no bytes reach the file.
 
@@ -1874,7 +1880,7 @@ not reach it.
 | you handed the file off | `GiverFenced` | stop: no retry clears it |
 | `collision: true`, which only a coordinator that ignores the flag sends | `CoherenceError` | build a new volume: the coordinator changed after this one attached, and the holder may have lost the file. If the message says the release was not confirmed, call `reacquire()` first, or that grant refuses the new volume |
 | `degraded: true` beside `ok: true`, which only a coordinator that ignores the flag sends | `CoherenceError` | call `reacquire()`, because the abandoned request may still take the grant, then build a new volume |
-| none: the session holds no [caller principal](#caller-principal), so nothing is sent | `CoherenceError` | build a new volume |
+| none: the coordinator issues [caller principals](#caller-principal) and the session holds none, so nothing is sent | `CoherenceError` | build a new volume |
 | none: the path goes through a link whose name is under `managed` to a file outside it, so nothing is sent | `LinkOutOfManaged` | write the file by its own path from a volume that may displace its holder, or point the link inside `managed` |
 
 **Polling.**
@@ -1929,7 +1935,9 @@ volume polling for one file keeps its own holds on others alive. Let go of those
 with `release(path)` before you poll, because two holders polling each other both wait for the
 ceiling, `grant_max_hold_sec` (1800 s), which nothing resets. With the sweep off,
 a holder refuses until it releases. A reclaimed holder's next write raises
-`StaleView` or `CommitPreempted`, depending on where the reclaim falls.
+`StaleView` or `CommitPreempted`, depending on where the reclaim falls. The
+Node coordinator has no sweep and counts no heartbeat; see
+[A volume on the Node coordinator](#a-volume-on-the-node-coordinator).
 
 **What it does not cover.** The limits under
 [acquire-or-fail](#acquire-or-fail-on-pre-edit) apply, and:
@@ -1958,6 +1966,76 @@ a holder refuses until it releases. A reclaimed holder's next write raises
   the successor is then refused by it. `OtherHolder` carries no handoff record.
   Call `read()` on the path, then `read_handoff()`. `None` after a never-read path
   or a strict-denied read says nothing about the record.
+
+### A volume on the Node coordinator
+
+The Claude Code plugin's Node coordinator, in plugin releases after 0.6.0,
+serves the operator view of `/status` that a volume with `managed` globs reads
+at attach, and sends `pre_edit_if_unheld: true` at every tier. Such a volume
+attaches to it by the same glob check it applies to this package's
+coordinator, under `on_error="strict"` or `"degrade"`, and with
+`on_held="refuse"` too; no option turns this on. A refuse-mode `write()` there
+raises `OtherHolder` on a file another agent holds. The `stale-write-guard-fs`
+MCP server, whose volume reads the same view, attaches the same way. A Node
+coordinator of plugin 0.6.0 or earlier answers the operator view `501`; the
+volume then fails closed, saying the coordinator predates the view and to
+upgrade the agent-coherence plugin.
+
+**What it needs.** A Node coordinator already running for the workspace, whose
+`.coherence/tracked.yaml` and `.coherence/strict_mode.yaml` list every glob the
+volume declares. A volume never starts the Node coordinator, and it adds no
+glob to a running coordinator's policy files. A volume built while no
+coordinator runs writes its globs to those files and starts this package's
+coordinator, which refuses the store the Node coordinator created (`foreign`,
+see [Checking a store before a coordinator starts](#checking-a-store-before-a-coordinator-starts)),
+so the volume reports the coordinator unavailable. Start the Node coordinator
+first: a Claude Code session with the plugin starts it when the session opens
+in the workspace. To add globs while it runs, add them to both files, then have
+it reload its policy, which a successful track or untrack request does, or
+restart it. When the Node coordinator does not enforce a volume's globs, the
+volume fails closed and its message gives that remedy. Do not stop the Node
+coordinator to fix it: the next volume would then start this package's
+coordinator on its store, which refuses it.
+
+**What differs there.**
+
+- **No caller principals.** The Node coordinator answers the principal claim
+  `404`, so `principal_claim_outcome` reads `unsupported` and the volume sends
+  its requests without one. An opted-in write
+  goes without one only when its claim was answered `404`; a volume that holds
+  no principal after any other claim outcome still raises `CoherenceError`
+  before it sends an opted-in write. With no principal, a caller that sends
+  the holder's own session id is the holder as far as the coordinator can tell
+  (see **On the Node coordinator** under
+  [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)).
+- **No sweep.** The Node coordinator records no heartbeats and reclaims
+  nothing on its own. A refuse-mode volume that goes quiet, or exits without
+  `close()`, keeps refusing other refuse-mode writers on its files until one
+  of their opted-in requests takes the grant back, once it has been held
+  1800 s (30 minutes). That reclaim takes a live holder too: the 30 minutes
+  count from the holder's first grant in its continuous hold, and a commit does
+  not restart them. A reclaimed holder's next write raises `StaleView` or
+  `CommitPreempted`, depending on where the reclaim falls; the coordinator
+  answers its commit `commit_not_allowed`, without the `reclaimed` key this
+  package's coordinator adds. Call `release(path)` and `close()` when you are
+  done, so peers do not wait out the 30 minutes.
+- **Claude Code sessions displace.** The hook clients never opt in, so a
+  Claude Code session's edit takes a file a refuse-mode volume holds, as on
+  this package's coordinator. On a workspace the Node coordinator serves,
+  those sessions are usually the other writers, so there refuse mode protects
+  a volume's files only from other refuse-mode volumes.
+- **Snapshot sessions and handoffs.**
+  The Node coordinator has no snapshot sessions or handoffs, so a multi-file
+  `atomic_publish` and the handoff methods (`transfer`, `accept`, `decline`,
+  `withdraw`) raise `CoherenceError` naming the route it answered `404`, under
+  either `on_error`: nothing ran, and a retry gets the same answer. The volume
+  stays attached and is not counted degraded. A single-file `atomic_publish`
+  takes the direct compare-and-swap path and lands there.
+- **`gate()` always holds.** The Node coordinator reports no ownership
+  generation, so `gate()` can never confirm the grant leg and holds every time
+  (see **Fail-closed comparands** under
+  [`gate()`](#gatevolume-path--decide-effect)). Use `write_cas_at` for an
+  effect that is itself a write.
 
 ### When the coordinator does not answer
 
@@ -2352,7 +2430,13 @@ are captured at one point (no member read across a peer commit), which adds a
 small capture→commit window — a peer winning it holds the publish rather than
 tearing it. Recover the same way as a denied write: `reacquire()`, re-read the
 fresh versions, and re-publish from them. A single-member publish accepts
-arbitrary bytes; a multi-member publish requires UTF-8 text content.
+arbitrary bytes; a multi-member publish requires UTF-8 text content. The Claude
+Code plugin's Node coordinator has no snapshot sessions: it answers the
+multi-member publish's `/session/begin` with `404`, and the publish raises
+`CoherenceError` naming that route under either `on_error`, with nothing
+committed and no file written. A retry gets the same answer; a single-member
+publish lands there (see
+[A volume on the Node coordinator](#a-volume-on-the-node-coordinator)).
 
 The all-or-nothing guarantee is at the **coordinator commit**. Disk materialization
 runs after it and is best-effort: every file is staged to a temp then renamed, so a
@@ -4324,7 +4408,10 @@ outcome, or there is no coordinator to ask:
   `on_error="strict"`; and, in both modes, a volume with no coordinator
   attached. With `on_error="degrade"` a 4xx warns and raises
   `CommitUnconfirmed` instead: degrade mode does not tell a refusal from a
-  failure.
+  failure. A `404` is the exception: a coordinator without handoffs, such as
+  the Claude Code plugin's Node coordinator, answers it on every verb, so it
+  raises `CoherenceError` naming the route in both modes, because nothing ran.
+  The volume is not counted degraded.
 - `HandoffPathsInvalid` (from `ccs.core.exceptions`, a `ValueError`): a
   transfer of no path, or of one path named twice (two spellings of one file
   count), in both modes; nothing is sent.
@@ -4663,8 +4750,9 @@ earlier, or this package's coordinator through 0.15.0) admits an opted-in reques
 it decides in time as it admits any other, and displaces the holder. To tell
 before you rely on the refusal, read `pre_edit_if_unheld` from `/status`, at any
 tier: JSON `true` says this coordinator refuses, and a coordinator without the key
-may not. Versions do not separate them. The Node coordinator does not send the
-key, so the key cannot tell its releases apart. Read it once, when you attach;
+may not. Versions do not separate them. The Node coordinator sends the key at
+every tier from plugin releases after 0.6.0, and plugin 0.6.0 and earlier send
+none. Read it once, when you attach;
 see **What it does not close** for what that leaves open.
 
 **Request.** `pre-edit` with `"if_unheld": true` in the body, carrying the
@@ -4863,9 +4951,10 @@ plugin releases after 0.6.0, refuses an opted-in `pre-edit` with the same body,
 in the same key order, and grants nothing. It differs from the Python
 coordinator in these ways:
 
-- **No volume.** A `CoherentVolume` with `managed` globs cannot attach to it,
-  because it does not serve the operator view, so `on_held="refuse"` does not
-  reach it. The requests below come from other clients.
+- **A volume.** A `CoherentVolume` with `managed` globs attaches to it, and
+  `on_held="refuse"` sends its opted-in requests there with no principal;
+  [A volume on the Node coordinator](#a-volume-on-the-node-coordinator) lists
+  what the volume needs and meets there.
 - **No principal.** It issues no principals, so an opted-in request needs
   none and never gets the `400`. A caller that sends the holder's own
   `session_id`, and the holder's subagent id if it has one, is the holder as
@@ -6109,26 +6198,41 @@ against the workspace. v0.14.0 and v0.14.1 write schema 7 and refuse a store at
 a higher number. `coordinator_version` cannot tell you this: between releases
 one version string covers several schema steps. The number counts the Python
 coordinator's own schema steps. The Claude Code plugin's Node coordinator does
-not send it, and the `schema_version` that coordinator sends counts a
-different set of steps, so the two are not comparable.
+not send it; it sends `schema_version`, which counts that coordinator's own
+migration steps.
 `agent-coherence-status` prints the number at the end of its `Coordinator:`
 header line, for example `schema=10`, and at the end of the summary line with
-`--detail metrics`; `--json` prints the field itself. A coordinator that does
-not send the field gets no `schema=` in either line. The MCP server's
+`--detail metrics`; `--json` prints the field itself. Against the Node
+coordinator it prints that coordinator's `schema_version` there instead, beside
+`backend=node` and its `version`; Node's `metrics` view carries no schema
+number, so that line shows none. The two backends count different migration
+steps, so a number from one is not comparable with a number from the other. A
+coordinator that sends neither field gets no `schema=` in either line. The
+command takes `backend=node` from the `.coherence/server.pid` that gave it the
+port, which the Node coordinator writes with a `backend=node` line; a body that
+names its own `coordinator_backend` keeps that name. The MCP server's
 `swg_status` forwards the field as `registry_schema_version`. It is `null` when
 the coordinator is unreachable, which `coordinator` `unknown` shows, or when the
-coordinator's answer carries no such field. The MCP server does not attach to
-the Node coordinator or to a release up to v0.14.1 at all, because it cannot
-confirm their managed globs.
+coordinator's answer carries no such field, as the Node coordinator's never
+does: `swg_status` does not read its `schema_version` in its place. The MCP
+server does not attach to a release up to v0.14.1, or to the Node coordinator
+of plugin 0.6.0 or earlier, at all, because it cannot confirm their managed
+globs.
 
 ### What each `/status` view carries
 
 `GET /status` answers one of three views, picked with `?detail=`. Every view
 needs the workspace's bearer secret, and every body names its view in
 `detail`. A `detail` value other than these three gets the default view. This
-is the Python coordinator's answer; the Claude Code plugin's Node coordinator
-serves the default and `metrics` views in a shape of its own and answers
-`detail=full` with `501`.
+is the Python coordinator's answer. The Claude Code plugin's Node coordinator
+serves every view in a shape of its own. From plugin releases after 0.6.0 its
+operator view, behind the same header and `403` without it, is its default
+view plus the four pattern lists in `policy_summary` (`tracked_patterns`,
+`user_added_patterns`, `ignored_patterns` and `strict_mode_patterns`, each
+listing the patterns it enforces, as written), and nothing else: no session
+names, no absolute root and no process id. Every view of those releases carries
+`pre_edit_if_unheld: true`. Plugin 0.6.0 and earlier answer `detail=full` with
+`501`.
 
 | View | Ask with | Carries |
 |---|---|---|
@@ -6309,7 +6413,7 @@ one value and the wrapper assumes a claim exists. The
 [HTTP fence](#effect-fence-over-http) reads the coordinator's own record and is
 the surface that can answer that leg.
 
-**Fail-closed comparands.** An unconfirmed version (`0` — a degraded read) or an unconfirmed generation (`None` — a coordinator deny, a degraded read, an out-of-band edit the coordinator could not confirm, or an older coordinator daemon from before this release's generation reporting) always HOLDs. In particular, this gate against an older coordinator daemon HOLDs loudly rather than silently reverting to the generation-blind check — restart the coordinator on the current version to clear it.
+**Fail-closed comparands.** An unconfirmed version (`0` — a degraded read) or an unconfirmed generation (`None` — a coordinator deny, a degraded read, an out-of-band edit the coordinator could not confirm, an older coordinator daemon from before this release's generation reporting, or the Claude Code plugin's Node coordinator, which reports no generation at all) always HOLDs, so `gate()` on a volume attached to the Node coordinator holds every time. In particular, this gate against an older coordinator daemon HOLDs loudly rather than silently reverting to the generation-blind check — restart the coordinator on the current version to clear it.
 
 **Scope.** Escaping effects only — a pure *write* effect uses `volume.write_cas_at(path, expected_version, content)` directly. The gate *orders* effects and never rolls one back, so for an escaping effect there is a residual re-read→fire window it narrows but cannot close. Single-host and cooperative (the caller opts in). Gating several mutually-consistent inputs at once is a coordinator-side operation, not this single-input wrapper.
 

@@ -962,7 +962,8 @@ class OtherHolder(CoherenceError):
     The caller backs off, then reads the artifact again before it writes: a write
     built without reading overwrites whatever the holder committed once the
     artifact comes free. The holder lets go when it releases the artifact, hands
-    it on, or is reclaimed by the coordinator's sweep.
+    it on, or is reclaimed: by the Python coordinator's sweep, or, on the Node
+    coordinator, by an opted-in request once the grant is 30 minutes old.
 
     Carries :data:`OTHER_HOLDER_REASON` on the class, so a consumer classifies
     it by type or ``.reason``, never by the message, plus ``holder_agent_id``,

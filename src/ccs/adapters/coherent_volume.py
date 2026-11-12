@@ -542,7 +542,9 @@ _STORE_HELD_DEGRADED_NOTE = "This volume stays detached: build a new one once th
 
 def _no_principal_message(rel: str, outcome: str) -> str:
     """What an opted-in :meth:`CoherentVolume.write` raises when its session holds
-    no caller principal: the coordinator refuses such a request, so none is sent."""
+    no caller principal and its claim did not show that the coordinator issues
+    none: a coordinator that issues principals refuses such a request, so none
+    is sent."""
     return (
         f"on_held='refuse' needs a caller principal, and this session holds none "
         f"(claim outcome: {outcome}). Nothing was sent for {rel}."
@@ -1917,8 +1919,8 @@ class CoherentVolume:
     def _read_fold_view(self) -> _FoldView:
         """The fold fields of the default ``/status`` tier, which every
         coordinator serves; the operator tier the glob check reads is not
-        served by the Node coordinator. Only the failure's type is named,
-        never its text."""
+        served by a Node coordinator of plugin 0.6.0 or earlier. Only the
+        failure's type is named, never its text."""
         try:
             status = _coordinator_get(self._endpoint, "/status")
         except CoordinatorUnavailable as exc:
