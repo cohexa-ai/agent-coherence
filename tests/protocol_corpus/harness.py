@@ -331,8 +331,8 @@ def normalize_response(
     ``optional_keys`` — per-fixture opt-in set of key names DROPPED entirely
     from the normalized dict (on both actual and expected), for backend-specific
     optional extension fields whose shared baseline both backends must still
-    match (e.g. a Python-only OCC ``version`` field on a pre-read response that
-    the Node coordinator does not emit). **Scoped to the TOP-LEVEL response body
+    match (e.g. the OCC ``version`` field on a fresh pre-read answer, which a
+    Node coordinator of plugin 0.6.0 or earlier does not emit). **Scoped to the TOP-LEVEL response body
     only** (AC3) — a nested key that happens to share a name with an optional_key
     is still compared, so a real nested divergence is never masked.
 

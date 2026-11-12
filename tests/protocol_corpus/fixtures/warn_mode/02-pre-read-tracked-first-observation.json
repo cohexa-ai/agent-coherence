@@ -23,5 +23,5 @@
       "status": "fresh"
     }
   },
-  "_comment": "Unit 6: the Python coordinator's fresh pre-read additively carries the artifact version (so OCC writers can source expected_version). version is in optional_keys, so it is DROPPED from both actual and expected before comparison — the shared baseline {status:fresh} stays parity-checked while the Python-only OCC extension field is tolerated (the Node coordinator does not emit it)."
+  "_comment": "A fresh pre-read carries the artifact version on both backends, so an OCC writer can take its expected_version from it; fixture 44 pins that version on both. Here version stays in optional_keys, so it is DROPPED from both actual and expected before comparison, and this row checks only the baseline {status: fresh}, which a Node coordinator of plugin 0.6.0 or earlier, sending no version, answers too."
 }
