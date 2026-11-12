@@ -211,6 +211,10 @@ _ALLOWED_IGNORE_KEYS: frozenset[str] = frozenset({
     "policy_summary",
     "coordinator_version",
     "coordinator_root",
+    # /status: how the disk under the run's tmp dir folds names, which the
+    # fold rows assert per profile (fixtures/fold/).
+    "fold_profile",
+    "fold_table_unicode",
 })
 
 _NODE_ROUTES = frozenset({

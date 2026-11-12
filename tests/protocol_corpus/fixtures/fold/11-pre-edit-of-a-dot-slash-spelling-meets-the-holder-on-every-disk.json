@@ -1,0 +1,46 @@
+{
+  "name": "fold-pre-edit-of-a-dot-slash-spelling-meets-the-holder-on-every-disk",
+  "description": "Session A takes EXCLUSIVE on data/x.txt; session B then pre-edits ./data/x.txt. Dropping a ./ segment is tidying, which every profile does, none included, so on every disk B meets A's hold with the collision warning, which echoes ./data/x.txt as B sent it. One expectation for every profile. Both backends.",
+  "setup": {
+    "tracked": [
+      "data/x.txt"
+    ],
+    "files": {
+      "data/x.txt": "x\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "path": "data/x.txt"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+      "path": "./data/x.txt"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true,
+      "collision": true,
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "additionalContext": "\u26a0 Concurrent edit detected at <TS> (UTC): another agent (80cbc93d) has been editing ./data/x.txt since <TS>. Your edit will land in your own worktree, but only one session's commit will be accepted by the coordinator. Consider waiting for the other session to finish or coordinating which one should proceed."
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

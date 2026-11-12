@@ -78,6 +78,8 @@
     "detail",
     "effect_fence_holds_total",
     "endpoint_counters",
+    "fold_profile",
+    "fold_table_unicode",
     "fresh_shared_hash_mismatch_total",
     "handler_concurrency_overflows_total",
     "handoff_giver_denials_total",

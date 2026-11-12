@@ -15,7 +15,9 @@
     "sessions",
     "default_pattern_count",
     "counts",
-    "version"
+    "version",
+    "fold_profile",
+    "fold_table_unicode"
   ],
   "expected": {
     "status": 200,
@@ -23,6 +25,8 @@
       "backend": "node",
       "counts": "<IGNORED>",
       "coordinator_uptime_seconds": "<UPTIME>",
+      "fold_profile": "<IGNORED>",
+      "fold_table_unicode": "<IGNORED>",
       "policy_summary": {
         "coordinator_root": ".",
         "default_pattern_count": "<IGNORED>",
@@ -38,6 +42,6 @@
       "version": "<IGNORED>"
     }
   },
-  "_comment": "Copies fixture 09's envelope. Only policy_summary differs from 09: rejected_pattern_count is 1 and user_added_pattern_count stays 0. The rejected entry's reason never reaches the wire on either backend, so the corpus pins the count; the plugin's unit tests pin the reason text.",
+  "_comment": "Copies fixture 09's envelope. Only policy_summary differs from 09: rejected_pattern_count is 1 and user_added_pattern_count stays 0. The rejected entry's reason never reaches the wire on either backend, so the corpus pins the count; the plugin's unit tests pin the reason text. fold_profile and fold_table_unicode are ignored but kept in the body, so both keys stay required in this tier: the profile is whatever the disk under the run's tmp dir folds (caseless on a Mac, none on Linux CI), and the fold rows assert both fields per profile.",
   "backends": ["node"]
 }

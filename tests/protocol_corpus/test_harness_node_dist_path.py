@@ -35,6 +35,7 @@ _CORPUS_MODULES = frozenset({
     "test_acquire_or_fail_corpus.py",
     "test_caller_principal_corpus.py",
     "test_effect_fence_corpus.py",
+    "test_fold_corpus.py",
     "test_session_start_corpus.py",
     "test_strict_mode_corpus.py",
     "test_warn_mode_corpus.py",
