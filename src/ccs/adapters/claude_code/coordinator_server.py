@@ -4613,8 +4613,12 @@ def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     # strict_mode.yaml inside that window can be lost; strict-wins still holds
     # for every pattern that survives. A change that lets a reload drop a
     # spawn-time strict pattern must make this check-then-append atomic with it.
+    # The entries are patterns: validated, never tidied or folded here. On a
+    # disk that folds names the coverage search folds both sides itself, so
+    # an entry covers a strict path it reaches under any spelling the disk
+    # treats as the same.
     policy = coordinator.policy
-    coverage = policy.strict_patterns_covering_each(safe_paths)
+    coverage = policy.strict_patterns_covering_each(safe_paths, coordinator.fold_profile.profile)
     refused = [
         {"path": p, "strict_patterns": list(covering)}
         for p, covering in zip(safe_paths, coverage)

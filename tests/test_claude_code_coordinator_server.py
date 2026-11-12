@@ -41,6 +41,7 @@ from ccs.adapters.claude_code.coordinator_server import (
     decide_tracked_read,
     session_to_agent_id,
 )
+from ccs.adapters.claude_code.fs_profile import FoldProfileResult
 from ccs.coordinator.service import ReleaseRequest
 from ccs.core.exceptions import (
     COHERENCE_LINK_KIND,
@@ -1259,6 +1260,9 @@ def test_policy_untrack_decides_the_request_under_one_budget(
     it carries. Once that budget runs out, a later entry is refused (the
     check errs toward refusing) and nothing is written."""
     # data/[0-9] covers nothing; only a search of about 460 steps shows it.
+    # On a disk that folds names the search runs again folded, at twice the
+    # cost, so the budget below is sized for a disk that folds nothing.
+    monkeypatch.setattr(strict_coordinator, "fold_profile", FoldProfileResult(profile="none", status="classified"))
     monkeypatch.setattr(policy_module, "GLOB_INTERSECT_REQUEST_BUDGET", 700)
     s, b = strict_client.post("/policy/untrack", {"paths": ["data/[0-9]", "data/[0-8]"]})
     assert s == 409, b

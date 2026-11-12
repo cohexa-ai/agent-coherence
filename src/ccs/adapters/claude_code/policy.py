@@ -29,23 +29,62 @@ Design constraints:
   entry that would cover a strict path (:meth:`TrackedArtifactPolicy.strict_patterns_covering`).
   The one way to stop enforcing a strict path is to restart the coordinator
   without its strict entry.
+- **Every spelling of a file meets the same globs** on a disk that folds names
+  (``caseless``, ``nfd``). A file name matches a pattern when any of its
+  readings does: the pattern as written against the name as requested, tidied
+  (:func:`ccs.core.path_fold.tidy_path`), and as typed; the pattern as written
+  against the spelling the disk stores, when the coordinator has one; and the
+  pattern with its literal characters folded against the folded name. A disk
+  that folds nothing uses the first two readings alone, so folding only ever
+  adds matches. A key, a name that is not a workspace file, is matched as
+  requested only (:class:`PolicyMatchContext`).
 """
 
 from __future__ import annotations
 
 import fnmatch
+import json
 import logging
+import os
 import re
+import stat
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, NamedTuple, Sequence
+from typing import Callable, Iterable, Iterator, Literal, NamedTuple, Sequence
 
 import yaml
 
 from ccs.adapters.claude_code.regular_file import ReadStatus, read_regular_file
+from ccs.core.disk_spelling import native_spelling, resolve_links
+from ccs.core.path_fold import (
+    FoldingProfile,
+    FoldProfile,
+    exceeds_fold_limit,
+    policy_fold,
+    policy_fold_text,
+    tidy_path,
+)
 
 logger = logging.getLogger(__name__)
+
+NameKind = Literal["file", "key"]
+
+
+@dataclass(frozen=True)
+class PolicyMatchContext:
+    """What the coordinator knows about a name it asks the policy about: the
+    fold profile of the workspace disk, whether the name is a file or a key,
+    and, for a file, the spelling the disk stores it under (relative to the
+    workspace root) when the coordinator has one. The default is a file on a
+    disk that folds nothing, which is how every name was matched before."""
+
+    profile: FoldProfile = "none"
+    kind: NameKind = "file"
+    disk_spelling: str | None = None
+
+
+UNFOLDED_FILE = PolicyMatchContext()
 
 
 STRICT_MODE_PATH_WARN_THRESHOLD: int = 50
@@ -136,15 +175,25 @@ class TrackedArtifactPolicy:
     _compiled_patterns: dict[str, Callable[[str], bool]] = field(
         default_factory=dict, repr=False, compare=False
     )
-    # What the strict-coverage check (strict_patterns_covering) reads from the
-    # strict and tracked patterns, built once in __post_init__: an untrack
-    # request or the spawn diagnostic decides every entry against the same
-    # patterns, and re-reading them per entry cost more than the search.
-    _coverage_strict: tuple["_Glob", ...] = field(
-        default=(), init=False, repr=False, compare=False
+    # Patterns already logged as reaching their files through a link, shared
+    # with every policy reloaded from this one so each is logged once.
+    _linked_prefixes_logged: set[str] = field(
+        default_factory=set, repr=False, compare=False
     )
-    _coverage_tracked: tuple["_Glob", ...] = field(
-        default=(), init=False, repr=False, compare=False
+    # What the strict-coverage check (strict_patterns_covering) reads from the
+    # strict and tracked patterns as written, built once in __post_init__: an
+    # untrack request or the spawn diagnostic decides every entry against the
+    # same patterns, and re-reading them per entry cost more than the search.
+    _coverage: "_CoverageView" = field(init=False, repr=False, compare=False)
+    # The patterns with their literals folded, and the coverage view built from
+    # them, per folding profile: built on first use, since a policy loaded on a
+    # disk that folds nothing never needs them. Each is built whole and then
+    # stored, so a handler thread never reads a half-built one.
+    _folded_patterns: dict[str, "_FoldedPatterns"] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _folded_coverage: dict[str, "_CoverageView"] = field(
+        default_factory=dict, init=False, repr=False, compare=False
     )
     # KTD-O one-shot threshold-warning guard. Reset on every reload() so a
     # post-track policy swap can re-emit the warning if the operator widened
@@ -156,35 +205,29 @@ class TrackedArtifactPolicy:
     def __post_init__(self) -> None:
         """Pre-compile all ``**``-containing patterns across all pattern sets,
         and index the strict and tracked patterns for the coverage check."""
-        for patterns in (
-            self.tracked_patterns,
-            self.ignored_patterns,
-            self.user_added_patterns,
-            self.strict_mode_paths,
-        ):
-            for p in patterns:
-                if p not in self._compiled_patterns:
-                    compiled = _compile_glob_pattern(p)
-                    if compiled is not None:
-                        self._compiled_patterns[p] = compiled
-        # A literal strict path no tracked pattern reaches puts nothing in
-        # strict mode (an intersection), so no entry can cover it.
-        self._coverage_strict = tuple(
-            _Glob.of(s)
-            for s in self.strict_mode_paths
-            if not _is_literal_glob(s) or self._matches_tracked(s)
-        )
-        self._coverage_tracked = tuple(
-            _Glob.of(t) for t in _union(self.user_added_patterns, self.tracked_patterns)
-        )
+        for p in self._all_patterns():
+            if p not in self._compiled_patterns:
+                compiled = _compile_glob_pattern(p)
+                if compiled is not None:
+                    self._compiled_patterns[p] = compiled
+        self._coverage = self._build_coverage("none")
+
+    def _all_patterns(self) -> Iterator[str]:
+        yield from self.tracked_patterns
+        yield from self.ignored_patterns
+        yield from self.user_added_patterns
+        yield from self.strict_mode_paths
 
     @classmethod
     def load(cls, coordinator_root: Path | str) -> "TrackedArtifactPolicy":
         """Load policy: defaults + ``.coherence/tracked.yaml`` opt-in +
         ``.coherence/ignored.yaml`` opt-out + ``.coherence/strict_mode.yaml``
         v0.2 opt-in (KTD-O). All YAML files are optional. Patterns failing
-        the path-traversal guard are rejected with WARNING."""
+        the path-traversal guard are rejected with WARNING. Each tracked or
+        strict pattern whose literal segments pass through a link is logged
+        (:meth:`_log_linked_prefixes`)."""
         policy = cls._read(coordinator_root)
+        policy._log_linked_prefixes()
         overridden = policy.ignored_patterns_overridden_by_strict()
         if overridden:
             logger.warning(
@@ -197,9 +240,12 @@ class TrackedArtifactPolicy:
         return policy
 
     @classmethod
-    def _read(cls, coordinator_root: Path | str) -> "TrackedArtifactPolicy":
-        """Read the policy files without :meth:`load`'s strict-override
-        diagnostic, which hot reloads (:meth:`reloaded`) skip."""
+    def _read(
+        cls, coordinator_root: Path | str, linked_prefixes_logged: set[str] | None = None
+    ) -> "TrackedArtifactPolicy":
+        """Read the policy files without :meth:`load`'s diagnostics; a hot
+        reload (:meth:`reloaded`) passes the patterns already logged as
+        reaching their files through a link."""
         root = Path(coordinator_root).resolve()
         rejected: list[tuple[str, str]] = []
 
@@ -213,23 +259,39 @@ class TrackedArtifactPolicy:
             user_added_patterns=tuple(added),
             strict_mode_paths=tuple(strict),
             rejected_patterns=tuple(rejected),
+            _linked_prefixes_logged=set() if linked_prefixes_logged is None else linked_prefixes_logged,
         )
 
-    def _matches_tracked(self, normalized: str) -> bool:
+    def _matches_tracked(self, name: "_NameReadings") -> bool:
+        return self._readings_match(name, self.tracked_patterns) or self._readings_match(
+            name, self.user_added_patterns
+        )
+
+    def _matches_strict(self, name: "_NameReadings") -> bool:
+        return bool(self.strict_mode_paths) and self._readings_match(name, self.strict_mode_paths)
+
+    def _readings_match(self, name: "_NameReadings", patterns: tuple[str, ...]) -> bool:
+        """Whether any reading of ``name`` matches any of ``patterns``, one of
+        this policy's pattern sets."""
         # PERF-2 / finding #16: pass pre-compiled cache so _glob_match skips
         # the string-build loop for ``**`` patterns.
         cache = self._compiled_patterns
-        return (
-            matches_any(normalized, self.tracked_patterns, cache)
-            or matches_any(normalized, self.user_added_patterns, cache)
-        )
+        as_written = (name.requested, name.as_typed, name.on_disk)
+        if any(reading is not None and matches_any(reading, patterns, cache) for reading in as_written):
+            return True
+        if name.folded is None:
+            return False
+        folded = self._folded_patterns_for(name.folded.profile)
+        return matches_any(name.folded.text, (folded.text_of[p] for p in patterns), folded.compiled)
 
-    def _matches_strict(self, normalized: str) -> bool:
-        return bool(self.strict_mode_paths) and matches_any(
-            normalized, self.strict_mode_paths, self._compiled_patterns
-        )
+    def _folded_patterns_for(self, profile: FoldingProfile) -> "_FoldedPatterns":
+        folded = self._folded_patterns.get(profile)
+        if folded is None:
+            folded = _fold_patterns(self._all_patterns(), profile)
+            self._folded_patterns[profile] = folded
+        return folded
 
-    def is_tracked(self, parent_relative_path: str) -> bool:
+    def is_tracked(self, parent_relative_path: str, context: PolicyMatchContext = UNFOLDED_FILE) -> bool:
         """Return True if the given parent-repo-relative path is coordinated.
 
         Algorithm: path is tracked if it matches any default OR user-added
@@ -240,18 +302,25 @@ class TrackedArtifactPolicy:
         silently drops a strict path onto the untracked fast path, where a read
         reports version 0 and a CAS commit is accepted at any expected version.
         For every path no strict pattern matches, ignore wins ties as before.
+
+        Tracked, ignored and strict patterns all meet the name under the same
+        readings (``context``; without one, a file on a disk that folds
+        nothing), so a spelling an ignored pattern reaches is still held by a
+        strict pattern that reaches any other.
         """
-        normalized = _normalize_relative(parent_relative_path)
-        if normalized is None:
+        name = _readings_of(parent_relative_path, context)
+        if name is None:
             # Absolute path or .. traversal — never tracked.
             return False
-        if not self._matches_tracked(normalized):
+        if not self._matches_tracked(name):
             return False
-        if not matches_any(normalized, self.ignored_patterns, self._compiled_patterns):
+        if not self._readings_match(name, self.ignored_patterns):
             return True
-        return self._matches_strict(normalized)
+        return self._matches_strict(name)
 
-    def is_strict_mode(self, parent_relative_path: str) -> bool:
+    def is_strict_mode(
+        self, parent_relative_path: str, context: PolicyMatchContext = UNFOLDED_FILE
+    ) -> bool:
         """v0.2 KTD-O: return True iff the path is in strict mode.
 
         Strict-mode contract: a path is in strict mode iff it is in the
@@ -264,16 +333,17 @@ class TrackedArtifactPolicy:
 
         Hooks gate strict-mode behavior (``permissionDecision: "deny"``) on
         this method only; the v0.1.1 warn-mode allow path is preserved for
-        every artifact that returns False here."""
+        every artifact that returns False here. Every pattern meets the name
+        under each of its readings, as in :meth:`is_tracked`."""
         if not self.strict_mode_paths:
             # Fast path — no strict-mode opt-in; v0.1.1 behavior preserved.
             return False
-        normalized = _normalize_relative(parent_relative_path)
-        if normalized is None:
+        name = _readings_of(parent_relative_path, context)
+        if name is None:
             return False
-        return self._matches_tracked(normalized) and self._matches_strict(normalized)
+        return self._matches_tracked(name) and self._matches_strict(name)
 
-    def strict_patterns_covering(self, pattern: str) -> tuple[str, ...]:
+    def strict_patterns_covering(self, pattern: str, profile: FoldProfile = "none") -> tuple[str, ...]:
         """The strict patterns under which ``pattern`` — a path or a glob, as
         ``/policy/untrack`` receives it — matches at least one path this policy
         puts in strict mode: some path matches ``pattern``, a strict pattern,
@@ -294,11 +364,17 @@ class TrackedArtifactPolicy:
         entry's budget runs out so does every strict pattern not yet decided
         and not ruled out by literal prefixes and suffixes. Empty when no
         strict path is covered, which is always the case with no strict
-        patterns."""
-        return self.strict_patterns_covering_each((pattern,))[0]
+        patterns.
+
+        On a folding ``profile`` the search runs as written first, then again
+        with the literal characters of both sides folded for each strict
+        pattern not yet covered, under the same budgets: a name still matches
+        a pattern as written, so the search as written keeps every refusal it
+        makes, and the folded search only adds refusals."""
+        return self.strict_patterns_covering_each((pattern,), profile)[0]
 
     def strict_patterns_covering_each(
-        self, patterns: Sequence[str]
+        self, patterns: Sequence[str], profile: FoldProfile = "none"
     ) -> tuple[tuple[str, ...], ...]:
         """:meth:`strict_patterns_covering` for each of ``patterns``, in order:
         one ``/policy/untrack`` request, decided under one
@@ -310,61 +386,50 @@ class TrackedArtifactPolicy:
         refused rather than held past the client's timeout."""
         request_budget = _SearchBudget(GLOB_INTERSECT_REQUEST_BUDGET)
         return tuple(
-            tuple(
-                self._iter_strict_patterns_covering(
-                    p, _SearchBudget(GLOB_INTERSECT_CALL_BUDGET, parent=request_budget)
-                )
+            self._strict_patterns_covering_within(
+                p, _SearchBudget(GLOB_INTERSECT_CALL_BUDGET, parent=request_budget), profile
             )
             for p in patterns
         )
 
-    def _iter_strict_patterns_covering(
-        self, pattern: str, call_budget: "_SearchBudget"
-    ) -> Iterator[str]:
-        if not self._coverage_strict:
-            return
-        # Paths are matched with a leading "./" stripped (_normalize_relative),
-        # so an entry spelled that way names the same paths.
-        entry = _Glob.of(_normalize_relative(pattern) or pattern)
-        for strict in self._coverage_strict:
-            # A path both match carries both literal prefixes and suffixes;
-            # if they do not nest, the strict pattern is exactly not covered,
-            # at no cost.
-            if not _affixes_nest([entry.affixes, strict.affixes]):
-                continue
-            try:
-                if _is_literal_glob(strict.pattern):
-                    # Its language is the one path (tracked: the index keeps
-                    # no other), so matching it decides it exactly.
-                    covered = _matches_charged(entry, strict.pattern, call_budget)
-                else:
-                    covered = self._strict_glob_covered(entry, strict, call_budget)
-            except _BudgetExhausted:
-                covered = True
-            if covered:
-                yield strict.pattern
+    def _strict_patterns_covering_within(
+        self, pattern: str, call_budget: "_SearchBudget", profile: FoldProfile
+    ) -> tuple[str, ...]:
+        if not self.strict_mode_paths:
+            return ()
+        covered = tuple(_iter_covered(self._coverage, _entry_glob(pattern), call_budget))
+        if profile == "none":
+            return covered
+        folded = self._folded_coverage_for(profile)
+        undecided = folded._replace(strict=tuple(s for s in folded.strict if s.source not in covered))
+        reported = {*covered, *_iter_covered(undecided, _entry_glob(pattern, profile), call_budget)}
+        return tuple(p for p in self.strict_mode_paths if p in reported)
 
-    def _strict_glob_covered(
-        self, entry: "_Glob", strict: "_Glob", call_budget: "_SearchBudget"
-    ) -> bool:
-        # Only a tracked pattern whose literal ends nest with the entry's and
-        # the strict glob's can share a path with both; with none, the strict
-        # glob is exactly not covered, at no search cost.
-        tracked = [
-            t
-            for t in self._coverage_tracked
-            if _affixes_nest([entry.affixes, strict.affixes, t.affixes])
-        ]
-        if not tracked:
-            return False
-        # A budget per strict glob, so one costly pattern (or many cheap ones)
-        # never decides the others: a shared budget marked every pattern after
-        # the point it ran out as covering.
-        budget = _SearchBudget(GLOB_INTERSECT_PATTERN_BUDGET, parent=call_budget)
-        return _globs_intersect((entry.tokens, strict.tokens), budget) and any(
-            _globs_intersect((entry.tokens, strict.tokens, t.tokens), budget)
-            for t in tracked
+    def _build_coverage(self, profile: FoldProfile) -> "_CoverageView":
+        """The strict and tracked patterns the coverage search reads under
+        ``profile``: as written for ``none``, with their literal characters
+        folded for a folding profile. Each glob reports the pattern as
+        written."""
+        text_of = None if profile == "none" else self._folded_patterns_for(profile).text_of
+        return _CoverageView(
+            # A literal strict path no tracked pattern reaches puts nothing in
+            # strict mode (an intersection), so no entry can cover it.
+            strict=tuple(
+                _coverage_glob(s, text_of)
+                for s in self.strict_mode_paths
+                if not _is_literal_glob(s) or self._matches_tracked(_literal_readings(s, profile))
+            ),
+            tracked=tuple(
+                _coverage_glob(t, text_of) for t in _union(self.user_added_patterns, self.tracked_patterns)
+            ),
         )
+
+    def _folded_coverage_for(self, profile: FoldingProfile) -> "_CoverageView":
+        view = self._folded_coverage.get(profile)
+        if view is None:
+            view = self._build_coverage(profile)
+            self._folded_coverage[profile] = view
+        return view
 
     def ignored_patterns_overridden_by_strict(self) -> tuple[str, ...]:
         """Ignored patterns that cover a strict path, which strict therefore
@@ -380,7 +445,7 @@ class TrackedArtifactPolicy:
         return tuple(
             p
             for p in self.ignored_patterns
-            if next(self._iter_strict_patterns_covering(p, total), None) is not None
+            if next(_iter_covered(self._coverage, _entry_glob(p), total), None) is not None
         )
 
     def reloaded(self) -> "TrackedArtifactPolicy":
@@ -394,8 +459,14 @@ class TrackedArtifactPolicy:
         ``strict_mode.yaml`` or ``tracked.yaml`` followed by any track or
         untrack cannot end enforcement mid-run. Additions on disk still take
         effect. Without strict patterns a reload reads the files verbatim, as
-        before."""
-        fresh = TrackedArtifactPolicy._read(self.coordinator_root)
+        before. A pattern that newly reaches its files through a link is
+        logged."""
+        fresh = TrackedArtifactPolicy._read(self.coordinator_root, self._linked_prefixes_logged)
+        reloaded = self._merged_with(fresh)
+        reloaded._log_linked_prefixes()
+        return reloaded
+
+    def _merged_with(self, fresh: "TrackedArtifactPolicy") -> "TrackedArtifactPolicy":
         if not self.strict_mode_paths:
             return fresh
         return TrackedArtifactPolicy(
@@ -405,7 +476,30 @@ class TrackedArtifactPolicy:
             user_added_patterns=_union(self.user_added_patterns, fresh.user_added_patterns),
             strict_mode_paths=_union(self.strict_mode_paths, fresh.strict_mode_paths),
             rejected_patterns=fresh.rejected_patterns,
+            _linked_prefixes_logged=self._linked_prefixes_logged,
         )
+
+    def _log_linked_prefixes(self) -> None:
+        """Log, once, each tracked or strict pattern whose literal segments
+        pass through a link inside the workspace, a fully literal pattern's
+        last one included: the hook client follows a link, so its Read, Edit
+        and Write reach the coordinator under the target's path, which a
+        pattern written against the link's path does not match. An ignored
+        pattern that misses only leaves more coordinated, so ignored patterns
+        are not checked."""
+        labelled = [
+            *(("tracked", p) for p in _union(self.tracked_patterns, self.user_added_patterns)),
+            *(("strict", p) for p in self.strict_mode_paths),
+        ]
+        for label, pattern in labelled:
+            if pattern in self._linked_prefixes_logged:
+                continue
+            link = _first_linked_segment(self.coordinator_root, _literal_segments(pattern))
+            if link is None:
+                continue
+            self._linked_prefixes_logged.add(pattern)
+            target = _link_target_of(self.coordinator_root, link)
+            logger.warning("%s", _linked_pattern_message(f"{label} pattern {_quoted(pattern)}", link, target))
 
     def count_strict_mode_matches(self, candidate_paths: Iterable[str]) -> int:
         """Count how many of ``candidate_paths`` are in strict mode.
@@ -514,6 +608,21 @@ walks the whole alphabet, so an unbounded class made one untrack entry cost
 minutes."""
 
 
+def _class_close(pattern: str, start: int) -> int:
+    """Where the class opened just before ``start`` closes, or -1 when it does
+    not: fnmatch skips a leading ``!``, then a leading ``]``, before looking
+    for ``]``. The tokens and the literal fold read classes by this one rule,
+    so a folded pattern keeps every class the pattern as written has."""
+    j = start
+    if j < len(pattern) and pattern[j] == "!":
+        j += 1
+    if j < len(pattern) and pattern[j] == "]":
+        j += 1
+    # find, not a character loop: an entry of many unterminated '[' rescans
+    # the rest of the pattern once per '['.
+    return pattern.find("]", j)
+
+
 def _glob_tokens(pattern: str) -> list[tuple]:
     tokens: list[tuple] = []
     i = 0
@@ -545,14 +654,7 @@ def _glob_tokens(pattern: str) -> list[tuple]:
         elif c == "[":
             # fnmatch.translate: '!' negates, a leading ']' is literal, and an
             # unterminated '[' is a literal '['.
-            j = i
-            if j < len(pattern) and pattern[j] == "!":
-                j += 1
-            if j < len(pattern) and pattern[j] == "]":
-                j += 1
-            # find, not a character loop: an entry of many unterminated '['
-            # rescans the rest of the pattern once per '['.
-            j = pattern.find("]", j)
+            j = _class_close(pattern, i)
             if j < 0:
                 tokens.append((_LIT, "["))
                 continue
@@ -695,16 +797,91 @@ class _SearchBudget:
 
 
 class _Glob(NamedTuple):
-    """A pattern with what the strict-coverage check reads from it."""
+    """A pattern with what the strict-coverage check reads from it.
+    ``pattern`` is the text searched and matched, the pattern as written or
+    with its literals folded; ``source`` is the pattern as written, which the
+    check reports."""
 
     pattern: str
     tokens: list[tuple]
     affixes: tuple[str, str]
+    source: str
 
     @classmethod
-    def of(cls, pattern: str) -> "_Glob":
+    def of(cls, pattern: str, source: str | None = None) -> "_Glob":
         tokens = _glob_tokens(pattern)
-        return cls(pattern, tokens, _literal_affixes(tokens))
+        return cls(pattern, tokens, _literal_affixes(tokens), pattern if source is None else source)
+
+
+class _CoverageView(NamedTuple):
+    """The strict globs an untrack entry is checked against, and the tracked
+    globs a strict glob must share a path with."""
+
+    strict: tuple[_Glob, ...]
+    tracked: tuple[_Glob, ...]
+
+
+class _CoverageSearch(NamedTuple):
+    tracked: tuple[_Glob, ...]
+    budget: _SearchBudget
+
+
+def _coverage_glob(pattern: str, text_of: dict[str, str] | None) -> _Glob:
+    """``pattern`` as the coverage search reads it: as written, or by its
+    folded text when ``text_of`` maps it."""
+    return _Glob.of(pattern) if text_of is None else _Glob.of(text_of[pattern], source=pattern)
+
+
+def _entry_glob(pattern: str, profile: FoldProfile = "none") -> _Glob:
+    """An untrack entry as a glob. Paths are matched with a leading "./"
+    stripped, so an entry spelled that way names the same paths; the entry is
+    not tidied, so the search reads it as written. On a folding ``profile``
+    its literal characters are folded, as the strict and tracked patterns it
+    is searched against are, and uncached, so a client cannot grow a cache."""
+    entry = _strip_leading_dot_slash(pattern) or pattern
+    return _Glob.of(entry) if profile == "none" else _Glob.of(_fold_glob_literals(entry, profile), source=entry)
+
+
+def _iter_covered(view: _CoverageView, entry: _Glob, budget: _SearchBudget) -> Iterator[str]:
+    """The strict patterns of ``view``, as written, under which ``entry``
+    matches a path in strict mode."""
+    search = _CoverageSearch(view.tracked, budget)
+    for strict in view.strict:
+        if _entry_covers_strict(entry, strict, search):
+            yield strict.source
+
+
+def _entry_covers_strict(entry: _Glob, strict: _Glob, search: _CoverageSearch) -> bool:
+    """Whether ``entry`` covers a path ``strict`` puts in strict mode; out of
+    budget counts as covers."""
+    # A path both match carries both literal prefixes and suffixes; if they do
+    # not nest, the strict pattern is exactly not covered, at no cost.
+    if not _affixes_nest([entry.affixes, strict.affixes]):
+        return False
+    try:
+        if _is_literal_glob(strict.pattern):
+            # Its language is the one path (tracked: the index keeps no other),
+            # so matching it decides it exactly.
+            return _matches_charged(entry, strict.pattern, search.budget)
+        return _strict_glob_covered(entry, strict, search)
+    except _BudgetExhausted:
+        return True
+
+
+def _strict_glob_covered(entry: _Glob, strict: _Glob, search: _CoverageSearch) -> bool:
+    # Only a tracked pattern whose literal ends nest with the entry's and the
+    # strict glob's can share a path with both; with none, the strict glob is
+    # exactly not covered, at no search cost.
+    tracked = [t for t in search.tracked if _affixes_nest([entry.affixes, strict.affixes, t.affixes])]
+    if not tracked:
+        return False
+    # A budget per strict glob, so one costly pattern (or many cheap ones)
+    # never decides the others: a shared budget marked every pattern after the
+    # point it ran out as covering.
+    budget = _SearchBudget(GLOB_INTERSECT_PATTERN_BUDGET, parent=search.budget)
+    return _globs_intersect((entry.tokens, strict.tokens), budget) and any(
+        _globs_intersect((entry.tokens, strict.tokens, t.tokens), budget) for t in tracked
+    )
 
 
 def _is_literal_glob(pattern: str) -> bool:
@@ -795,7 +972,16 @@ def _globs_intersect(token_lists: Sequence[list[tuple]], budget: _SearchBudget) 
     return False
 
 
-def _normalize_relative(p: str) -> str | None:
+def _normalize_relative(p: str, kind: NameKind = "file") -> str | None:
+    """Normalize a relative name for matching. A file is tidied first
+    (:func:`ccs.core.path_fold.tidy_path`: repeated ``/`` and ``.`` segments
+    dropped, as the kernel reads them), so ``.//data/x.txt`` meets the globs
+    ``data/x.txt`` meets. A key keeps its exact name. Returns None if the name
+    is absolute, contains ``..`` components, or is empty."""
+    return _strip_leading_dot_slash(tidy_path(p) if kind == "file" else p)
+
+
+def _strip_leading_dot_slash(p: str) -> str | None:
     """Return the path with leading ``./`` stripped, or None if the path
     is absolute or contains ``..`` components (defense-in-depth even
     though the hook handler also normalizes upstream)."""
@@ -815,6 +1001,210 @@ def _normalize_relative(p: str) -> str | None:
     if ".." in Path(cleaned).parts:
         return None
     return cleaned
+
+
+# ----------------------------------------------------------------------
+# The readings a name is matched under
+# ----------------------------------------------------------------------
+
+
+class _FoldedName(NamedTuple):
+    text: str
+    profile: FoldingProfile
+
+
+class _NameReadings(NamedTuple):
+    """The readings of one name; a pattern any of them matches matches the
+    name. ``requested``: tidied for a file, exact for a key. ``as_typed``: a
+    file before tidying, when that differs, so a glob written with ``//`` or
+    ``/./`` keeps matching a request typed the same way. ``on_disk``: as the
+    disk stores it, on a folding disk, when the coordinator has it.
+    ``folded``: the name folded, for the patterns folded the same way."""
+
+    requested: str
+    as_typed: str | None = None
+    on_disk: str | None = None
+    folded: _FoldedName | None = None
+
+
+def _readings_of(name: str, context: PolicyMatchContext) -> _NameReadings | None:
+    """The readings of ``name`` under ``context``, or None when it is not a
+    relative name."""
+    requested = _normalize_relative(name, context.kind)
+    if requested is None:
+        return None
+    typed = _strip_leading_dot_slash(name) if context.kind == "file" else None
+    as_typed = typed if typed != requested else None
+    profile = _folding_profile_of(requested, context)
+    if profile is None:
+        return _NameReadings(requested, as_typed)
+    folded = _FoldedName(policy_fold(requested, profile), profile)
+    return _NameReadings(requested, as_typed, context.disk_spelling, folded)
+
+
+def _folding_profile_of(name: str, context: PolicyMatchContext) -> FoldingProfile | None:
+    """The profile a name's disk and folded readings apply under, or None when
+    it is read as requested only: a key is an exact name, a disk that folds
+    nothing keeps every spelling apart in policy as well, and a name over the
+    fold limit is never folded (the coordinator refuses such a path, so only a
+    Bash or Grep token gets here, matched as typed)."""
+    if context.kind == "key" or context.profile == "none" or exceeds_fold_limit(name):
+        return None
+    return context.profile
+
+
+def _literal_readings(path: str, profile: FoldProfile) -> _NameReadings:
+    """A literal strict path's readings for the coverage search: as written,
+    the way the search reads it, and folded where its characters stand."""
+    if profile == "none":
+        return _NameReadings(path)
+    return _NameReadings(path, folded=_FoldedName(policy_fold_text(path, profile), profile))
+
+
+class _FoldedPatterns(NamedTuple):
+    """A policy's patterns with their literals folded for one profile:
+    ``text_of`` maps each pattern as written to its folded text, and
+    ``compiled`` holds the matchers of the folded ``**`` patterns."""
+
+    text_of: dict[str, str]
+    compiled: dict[str, Callable[[str], bool]]
+
+
+def _fold_patterns(patterns: Iterable[str], profile: FoldingProfile) -> _FoldedPatterns:
+    text_of = {pattern: _fold_glob_literals(pattern, profile) for pattern in patterns}
+    compiled = {}
+    for folded in text_of.values():
+        matcher = _compile_glob_pattern(folded)
+        if matcher is not None:
+            compiled[folded] = matcher
+    return _FoldedPatterns(text_of, compiled)
+
+
+def _fold_glob_literals(pattern: str, profile: FoldingProfile) -> str:
+    """``pattern`` with each run of literal characters folded where it stands:
+    ``*``, ``?`` and, in a pattern without ``**``, each ``[...]`` class stay
+    as written (with ``**``, ``[`` is a literal). No fold produces
+    ``* ? [ ] ! /``, so the folded pattern parses into the same wildcards and
+    classes, and the same matcher reads it. Not tidied: tidying the lone
+    ``.`` in ``*.*`` would change what the pattern matches."""
+    has_classes = "**" not in pattern
+    parts: list[str] = []
+    literal_start = i = 0
+    while i < len(pattern):
+        end = _wildcard_end(pattern, i, has_classes)
+        if end is None:
+            i += 1
+            continue
+        parts += [policy_fold_text(pattern[literal_start:i], profile), pattern[i:end]]
+        literal_start = i = end
+    parts.append(policy_fold_text(pattern[literal_start:], profile))
+    return "".join(parts)
+
+
+def _wildcard_end(pattern: str, at: int, has_classes: bool) -> int | None:
+    """Where the wildcard or class starting at ``at`` ends, or None when the
+    character there is a literal."""
+    if pattern[at] in "*?":
+        return at + 1
+    if pattern[at] == "[" and has_classes:
+        close = _class_close(pattern, at + 1)
+        return None if close < 0 else close + 1
+    return None
+
+
+# ----------------------------------------------------------------------
+# Patterns whose literal segments pass through a link
+# ----------------------------------------------------------------------
+
+
+class _LinkTarget(NamedTuple):
+    """Where a link inside the workspace leads: ``path``, its target relative
+    to the root, or None when the target is outside the workspace;
+    ``resolves`` is False for a dangling or looping link."""
+
+    path: str | None
+    resolves: bool = True
+
+
+#: Resolvers in the order the hook client tries them: links followed with the
+#: typed case kept, then the disk's own spelling for a path the first leaves
+#: outside the root.
+_LINK_RESOLVERS: tuple[Callable[[str], str], ...] = (resolve_links, native_spelling)
+
+
+def _literal_segments(pattern: str) -> list[str]:
+    """The literal segments of ``pattern`` a link can sit on: its literal
+    directories, and its last segment as well when the whole pattern is
+    literal, since that segment then names one entry, which can be a link to
+    a file."""
+    segments = _literal_run(_glob_tokens(pattern)).split("/")
+    named = segments if _is_literal_glob(pattern) else segments[:-1]
+    return [segment for segment in named if segment not in ("", ".")]
+
+
+def _first_linked_segment(root: Path, segments: Sequence[str]) -> str | None:
+    for depth in range(1, len(segments) + 1):
+        prefix = "/".join(segments[:depth])
+        entry = _lstat_if_readable(root / prefix)
+        if entry is not None and stat.S_ISLNK(entry.st_mode):
+            return prefix
+        # Past a missing entry or a file, no link further down is on any path.
+        if entry is None or not stat.S_ISDIR(entry.st_mode):
+            return None
+    return None
+
+
+def _lstat_if_readable(path: Path) -> os.stat_result | None:
+    """``lstat`` of ``path``, or None when it cannot be read. The link check
+    only informs, so a name the disk refuses (too long, under an unreadable
+    directory, holding a NUL from a hand-edited policy file) must not stop the
+    coordinator starting or a policy reloading."""
+    try:
+        return os.lstat(path)
+    except (OSError, ValueError):
+        return None
+
+
+def _link_target_of(root: Path, link: str) -> _LinkTarget:
+    """The workspace path the hook client sends for ``link``: its target
+    relative to the root, none when the target is outside the workspace (the
+    client then sends nothing), or unresolved for a dangling or looping
+    link."""
+    for resolve in _LINK_RESOLVERS:
+        try:
+            target = os.path.relpath(resolve(str(root / link)), resolve(str(root)))
+        except OSError:
+            return _LinkTarget(None, resolves=False)
+        if target != os.pardir and not target.startswith(os.pardir + os.sep) and not os.path.isabs(target):
+            return _LinkTarget("" if target == os.curdir else target)
+    return _LinkTarget(None)
+
+
+def _quoted(text: str) -> str:
+    return json.dumps(text, ensure_ascii=False)
+
+
+def _linked_pattern_message(subject: str, link: str, target: _LinkTarget) -> str:
+    """The log line for a pattern (``subject``) that passes through ``link``,
+    by where its target lies."""
+    head = f"{subject} goes through the link {_quoted(link)}"
+    if not target.resolves:
+        return (
+            f"{head} inside the workspace, which does not resolve. The hook client sends nothing for a "
+            "Read, Edit or Write through it until its target exists, then follows it to the target's "
+            "path, which this entry does not match; name the target to cover them."
+        )
+    if target.path is None:
+        return (
+            f"{head}, whose target is outside the workspace. A Read, Edit or Write through it is not "
+            "coordinated at all: the hook client sends nothing for a path outside the workspace, so no "
+            "rewrite of this entry covers them."
+        )
+    return (
+        f"{head} inside the workspace. The hook client follows the link, so a Read, Edit or Write "
+        f"through it reaches the coordinator under the path of its target {_quoted(target.path)}, "
+        "which this entry does not match; name the target to cover them."
+    )
 
 
 def matches_any(
