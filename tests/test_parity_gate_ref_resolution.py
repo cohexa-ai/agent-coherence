@@ -8,9 +8,9 @@ which ref it proved against, and -- when it fell back to ``main`` -- how far
 that ref trails the plugin's own ``dev``.
 
 Nothing exercised that shell block, so a wrong answer could only be found by
-reading it. These tests extract the step's ``run`` script straight from
-``ci.yml`` and run it under bash with ``git`` and ``curl`` stubbed, asserting
-the sentence it writes to ``$GITHUB_STEP_SUMMARY``.
+reading it. These tests take the step's ``run`` command straight from
+``ci.yml`` and run it, and the script it starts, under bash with ``git`` and
+``curl`` stubbed, asserting the sentence it writes to ``$GITHUB_STEP_SUMMARY``.
 
 The case that motivates the file: a push to this repo's ``main`` pairs with
 the plugin's ``main`` DELIBERATELY (the step's own comment says so), and a
@@ -40,18 +40,39 @@ pytestmark = pytest.mark.skipif(
 
 
 def _resolve_step_script() -> str:
-    """The `run:` body of the Resolve plugin ref step, from the workflow itself.
+    """The `run:` command of the Resolve plugin ref step, from the workflow itself.
 
     Read from ci.yml rather than duplicated here: a copy would keep passing
     after the real step changed, which is the failure mode this file exists
-    to prevent.
+    to prevent. Every job with the step must run the same command, or the
+    one tested here would prove nothing about the others.
     """
     parsed = yaml.safe_load(CI_WORKFLOW.read_text())
-    for job in parsed["jobs"].values():
-        for step in job.get("steps") or []:
-            if step.get("name") == STEP_NAME:
-                return step["run"]
-    raise AssertionError(f"no {STEP_NAME!r} step in {CI_WORKFLOW}")
+    runs = {
+        step["run"]
+        for job in parsed["jobs"].values()
+        for step in job.get("steps") or []
+        if step.get("name") == STEP_NAME
+    }
+    assert len(runs) == 1, f"expected one {STEP_NAME!r} command in {CI_WORKFLOW}, found {sorted(runs)}"
+    return runs.pop()
+
+
+def _run_resolve(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """Run the step's command as the runner does.
+
+    A ``run:`` that names no ``shell:`` runs as ``bash -e {0}``: -e, and no
+    pipefail, so a failure inside a pipe does not stop it. The runner starts
+    the step in the checkout's root, where the command finds its script.
+    """
+    return subprocess.run(
+        ["bash", "-e", "-c", _resolve_step_script()],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
 
 
 def _run_step(
@@ -129,14 +150,7 @@ def _run_step(
         "AC_STUB_CURL_BODY": curl_body,
         **({"AC_STUB_CURL_FAIL": "1"} if curl_fails else {}),
     }
-    # -e -o pipefail matches the GitHub runner's default shell for `run:`.
-    proc = subprocess.run(
-        ["bash", "-e", "-o", "pipefail", "-c", _resolve_step_script()],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+    proc = _run_resolve(env)
     assert proc.returncode == 0, (
         "the resolve step must never fail the parity job:\n"
         f"exit={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
@@ -282,6 +296,51 @@ def test_changes_bound_for_main_still_fall_back_to_plugin_main(
     assert _resolved_ref(tmp_path) == "main"
     assert "the fallback" in summary
     assert "33 commit(s) behind" in summary
+
+
+def _env_where_every_lookup_fails(tmp_path: Path) -> dict[str, str]:
+    """A pull request into ``dev`` whose git and curl fail every call."""
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    for name, code in (("git", 128), ("curl", 6)):
+        (stub_bin / name).write_text(f"#!/usr/bin/env bash\nexit {code}\n")
+        (stub_bin / name).chmod(0o755)
+    return {
+        **os.environ,
+        "PATH": f"{stub_bin}:{os.environ.get('PATH', '')}",
+        "SIBLING_REF": "fix/no-such-plugin-branch",
+        "BASE_REF": "dev",
+        "EVENT_NAME": "pull_request",
+        "REF_NAME": "fix/no-such-plugin-branch",
+        "GITHUB_OUTPUT": str(tmp_path / "output.txt"),
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
+    }
+
+
+def test_a_plugin_whose_commit_cannot_be_read_still_hands_on_a_ref(tmp_path: Path) -> None:
+    """With every lookup failing, the step still hands the checkout a ref and
+    says the staleness check was unavailable, as the inline step did: the
+    SHA's failed lookup sits inside a pipe, which only pipefail stops on.
+    An unreachable plugin repository fails the checkout that follows instead."""
+    proc = _run_resolve(_env_where_every_lookup_fails(tmp_path))
+
+    assert proc.returncode == 0, proc.stderr
+    assert _resolved_ref(tmp_path) == "main"
+    assert "staleness check unavailable" in (tmp_path / "summary.md").read_text()
+
+
+def test_a_step_that_cannot_record_its_ref_fails(tmp_path: Path) -> None:
+    """The runner's -e does not reach the bash the step starts, so the script
+    sets its own: an output it cannot write stops it, as it stopped the
+    inline step, rather than the step passing with no ref for the checkout."""
+    env = {
+        **_env_where_every_lookup_fails(tmp_path),
+        "GITHUB_OUTPUT": str(tmp_path / "missing" / "output.txt"),
+    }
+    proc = _run_resolve(env)
+
+    assert proc.returncode != 0
+    assert not (tmp_path / "summary.md").exists()
 
 
 def test_a_plugin_without_dev_degrades_to_main_rather_than_failing(tmp_path: Path) -> None:
