@@ -402,6 +402,23 @@ def _publish_unanswered_message(status: int | None = None) -> str:
     )
 
 
+#: The snapshot-session and handoff routes, none of which the Node coordinator
+#: serves. Either coordinator answers 404 only from its router, for a route it
+#: does not serve, so a 404 on one of these means nothing ran.
+_SESSION_AND_HANDOFF_ROUTES = frozenset({
+    "/session/begin", "/session/commit_all",
+    "/handoff/transfer", "/handoff/accept", "/handoff/decline", "/handoff/withdraw",
+})
+
+
+def _route_not_served_message(route: str) -> str:
+    """What a request to ``route`` raises when the coordinator answers it 404."""
+    return (
+        f"the coordinator does not serve {route} (HTTP 404), so nothing ran and a retry "
+        "gets the same answer. The Node coordinator has no snapshot sessions or handoffs."
+    )
+
+
 def _publish_failed_message(reason: str) -> str:
     """What a multi-member atomic_publish raises
     (:class:`~ccs.core.exceptions.CommitUnconfirmed`) when the coordinator
@@ -3691,6 +3708,11 @@ class CoherentVolume:
             :class:`~ccs.core.exceptions.CoordinatorUnreachable` when the
             request never left (nothing committed), else ``CommitUnconfirmed``;
             under ``"degrade"``, ``CommitUnconfirmed``. NO file written.
+          - a coordinator without snapshot sessions (the Node coordinator)
+            answers a multi-member publish's session request 404 ->
+            :class:`~ccs.core.exceptions.CoherenceError` naming the route, in
+            both ``on_error`` modes, and the volume is not counted degraded;
+            NOTHING committed, NO file written, and a retry gets the same.
           - the release the publish first sends for a grant an earlier
             :meth:`write` left held (see :meth:`_remint`) fails → under
             ``"strict"`` the publish raises before its commit,
@@ -4060,7 +4082,10 @@ class CoherentVolume:
         A request the coordinator refused outright (HTTP 4xx) raises
         :class:`~ccs.core.exceptions.CoherenceError` under ``on_error="strict"``;
         under ``"degrade"`` it warns and raises ``CommitUnconfirmed``, since
-        degrade mode does not tell a refusal from a failure.
+        degrade mode does not tell a refusal from a failure. The one exception
+        is a 404, which a coordinator without handoffs (the Node coordinator)
+        answers on every verb: it raises ``CoherenceError`` naming the route in
+        both modes, because nothing ran.
         No path, or one path named twice (after normalising, so two spellings
         of one file count), is the caller's error:
         :class:`~ccs.core.exceptions.HandoffPathsInvalid`, a ``ValueError``,
@@ -4671,7 +4696,10 @@ class CoherentVolume:
         as delivered, with the status: a 5xx says nothing of whether the
         commit ran. Any other strict request answered with a 5xx raises
         :class:`~ccs.core.exceptions.CoordinatorFailed`, as the coordinator's
-        failure envelope does (#433). Any other status follows ``on_error``.
+        failure envelope does (#433). A 404 on a snapshot-session or handoff
+        route raises :class:`~ccs.core.exceptions.CoherenceError` naming the
+        route, in both modes: a coordinator answers 404 only for a route it
+        does not serve, so nothing ran. Any other status follows ``on_error``.
 
         Every raise for a rejected request happens OUTSIDE the ``except``
         block, so the ``HTTPError`` never rides the raised error's chain: its
@@ -4725,6 +4753,10 @@ class CoherentVolume:
             )
         if reason is not None:
             return _Sent(None, reason)
+        if status == 404 and endpoint_path in _SESSION_AND_HANDOFF_ROUTES:
+            # The coordinator answered, and nothing ran: neither a degradation
+            # nor an outcome left unknown, in either mode.
+            raise CoherenceError(_route_not_served_message(endpoint_path))
         message = f"coordinator request to {endpoint_path} failed: HTTP {status}"
         if typed and commit_leg and status >= 500:
             # A 5xx says nothing of whether the commit ran: the coordinator's
