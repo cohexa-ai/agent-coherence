@@ -1613,6 +1613,38 @@ def test_todays_paths_are_sent_as_before(
     assert coherence_hook_client._to_workspace_relative(file_path, root) == expected
 
 
+@pytest.mark.parametrize(
+    "typed, key",
+    [
+        ("sub/link/../plan.md", "sub/plan.md"),
+        ("sub/link/../new.md", "sub/new.md"),
+        ("missing/../w2.md", "w2.md"),
+    ],
+)
+def test_a_parent_step_is_folded_by_text_before_links_are_followed(
+    tmp_path: Path, typed: str, key: str
+) -> None:
+    """A ``..`` in a tool path is folded by text before any link is followed,
+    so the key names the file Claude Code's tools open, not the one the shell
+    opens. Measured on this layout (sub/link -> other/dir): a Read of
+    sub/link/../plan.md returned sub/plan.md, an Edit of it changed
+    sub/plan.md, a Write of sub/link/../new.md created sub/new.md and a Write
+    of missing/../w2.md created w2.md; only the shell opened other/plan.md.
+    Claude Code normalizes an absolute tool path before opening it; the
+    shell's ``..`` is coordinated by the Bash routes. Following the link
+    first would key other/plan.md for a Read that opened sub/plan.md."""
+    root = tmp_path / "ws"
+    (root / "sub").mkdir(parents=True)
+    (root / "other" / "dir").mkdir(parents=True)
+    (root / "sub" / "plan.md").write_text("lexical")
+    (root / "other" / "plan.md").write_text("physical")
+    (root / "sub" / "link").symlink_to(root / "other" / "dir")
+    file_path = os.path.join(str(root), typed)
+
+    assert coherence_hook_client._to_workspace_relative(file_path, root) == key
+    assert _coherence_client.normalize_workspace_path(file_path, root) == (key, None)
+
+
 def test_no_payload_carries_a_name_kind_field(linked_workspace: Path) -> None:
     """Each coordinator works out a name's kind itself; the hook client
     never sends one."""

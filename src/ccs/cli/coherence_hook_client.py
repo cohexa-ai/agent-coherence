@@ -513,6 +513,8 @@ def _to_workspace_relative(file_path: str, root: Path) -> str:
     the workspace, through a link or not, skips the hook rather than send
     garbage."""
     try:
+        # '..' is folded by text before links are followed: Claude Code opens the
+        # normalized path, and the Bash routes coordinate the shell's own '..'.
         rel = workspace_relative(file_path, root)
     except LinkDoesNotResolve:
         # Keying the missing target, or the link's own path, would give its

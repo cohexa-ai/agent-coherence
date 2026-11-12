@@ -171,6 +171,8 @@ def workspace_relative(path: str, root: Path) -> str | None:
     file apart on a coordinator that folds nothing. Raises
     :class:`~ccs.core.disk_spelling.LinkDoesNotResolve` for a dangling or
     looping link, and ``OSError`` for a path the resolvers cannot walk."""
+    # abspath folds '..' by text BEFORE links are followed: Claude Code opens the
+    # normalized tool path, so this keys that file; the Bash routes cover the shell's '..'.
     absolute, absolute_root = os.path.abspath(path), os.path.abspath(root)
     for resolver in (resolve_links, native_spelling):
         relative = _relative_inside(resolver(absolute_root), resolver(absolute))
@@ -224,6 +226,8 @@ def normalize_workspace_path(p: str, root: Path) -> tuple[str, str | None]:
         return p, "empty"
     if Path(p).is_absolute():
         try:
+            # '..' is folded by text as for a tool path, so a tracked name is
+            # the key the hook client sends when a tool opens that path.
             normalized = workspace_relative(p, root)
         except OSError as exc:
             # A dangling or looping link (or a path the resolvers cannot walk)
