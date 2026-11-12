@@ -437,6 +437,30 @@ def test_the_shims_managed_check_never_raises_on_a_link_that_does_not_resolve(
     assert coherent_volume_module._managed_rel(volume, tmp_path / "data" / "loop") == "data/loop"
 
 
+@pytest.fixture
+def none_keyed_server(server: CoordinatorHTTPServer, monkeypatch: pytest.MonkeyPatch) -> CoordinatorHTTPServer:
+    """The ``server``, read by every volume as keyed by ``none``, whatever the disk."""
+    _status_changed_to(monkeypatch, _without_fold_fields)
+    return server
+
+
+def test_the_shims_managed_check_names_a_looping_link_on_every_python(
+    tmp_path: Path, fast_cfg: LifecycleConfig, none_keyed_server: CoordinatorHTTPServer
+) -> None:
+    """A link that loops resolves to its own name on every Python the
+    package supports, so the check answers on a volume keyed by ``none``,
+    where no disk spelling is read, as on every Linux disk.
+
+    Prevents the check raising on Python 3.11 and 3.12, whose non-strict
+    ``Path.resolve()`` raises RuntimeError on a loop where 3.13 keeps the
+    name."""
+    (tmp_path / "data" / "loop").symlink_to("loop")
+    volume = _holder(tmp_path, fast_cfg)
+
+    assert volume._fold_profile == "none"
+    assert coherent_volume_module._managed_rel(volume, tmp_path / "data" / "loop") == "data/loop"
+
+
 # --- what the attach reads ---------------------------------------------------
 
 

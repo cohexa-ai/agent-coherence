@@ -5461,8 +5461,10 @@ def _managed_rel(volume: CoherentVolume, file: object) -> str | None:
         return None
     try:
         # Resolve like builtins.open (relative → against CWD), then require it be
-        # under the volume root.
-        rel = Path(raw).resolve().relative_to(volume._root).as_posix()
+        # under the volume root. realpath, not Path.resolve(): on Python 3.11
+        # and 3.12 a non-strict resolve() raises RuntimeError on a link that
+        # loops, where realpath, like 3.13's resolve(), keeps the loop's name.
+        rel = Path(os.path.realpath(raw)).relative_to(volume._root).as_posix()
     except (ValueError, OSError):
         return None
     # The coordinator's own readings of a name, so the shim's notion of "managed"
