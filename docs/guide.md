@@ -329,8 +329,8 @@ start fails (see [Reclamation diagnostics](#reclamation-diagnostics)).
   `preempter_session_short` to `preempter_agent_id` and
   `preempter_agent_short`, with no alias. `last_writer_session_id`, on
   stale-read answers and strict denies, keeps its name but now carries the last
-  writer's agent id. Both ids are 32 hex characters without hyphens; `/status`
-  writes the same id with hyphens.
+  writer's agent id. Both ids are 32 hex characters without hyphens; this
+  package's `/status` writes the same id with hyphens.
 - **Strict mode after a refused read.** Strict `pre-edit` now denies a session
   holding `SHARED` whose last observed version is older than the current one,
   which is the state a strict Bash or Grep deny leaves behind. Re-run the Bash
@@ -1218,7 +1218,9 @@ What the shipped readers do with a degraded answer:
 - The MCP server's `swg_status` reports `per_path` as `null`, not `{}`, and its
   text result adds `per_path=unavailable` after the coordinator state, for
   clients that show only text. (An unreachable coordinator still gives `{}`,
-  with `coordinator` reported as `unknown`.) When `swg_read` falls back to
+  with `coordinator` reported as `unknown`.) It reports `held` as `null` too,
+  never `[]`, and its text result says `held=unavailable`, since the answer
+  cannot say who holds each path. When `swg_read` falls back to
   `/status` for a handoff record, it adds `handoff_unknown: true`.
 - A `CoherentVolume` attaching meanwhile still checks its managed globs: it
   reads them from `policy_summary`, which a degraded answer carries.
@@ -1498,7 +1500,7 @@ another session with `vol.transfer()`; see
 To name the attempt to something else — a registry that joins the coordinator's
 `/status` `sessions[].agent_id` against its writers, for example — read
 `vol.agent_id`: the identity the coordinator keys the volume's next request on,
-in the same string form `/status` reports. `vol.incarnation` is the per-attempt
+in the same string form this package's `/status` reports. `vol.incarnation` is the per-attempt
 part of it, the value every request carries in its `agent_id` field (a
 `transfer()` also names, per path, the incarnation that holds the volume's
 claim there, which can be an earlier one). Both change
@@ -1511,6 +1513,14 @@ attempt, so a join against that view finds only attempts the volume has not
 ended. The operator view also lists an ended attempt that lost a grant to the
 sweep, for 24 hours after its newest reclaim; see
 [Attempts a volume ends](#attempts-a-volume-ends).
+To tell whether an agent id you were given is the volume's own, call
+`vol.attempt_of(agent_id)`, which takes it hyphenated, as `/status` lists it on
+this package's coordinator, or as 32 hex, as a refusal names a holder. It
+answers `"current"` for the attempt `vol.agent_id` names now, `"earlier"` for
+any attempt the volume's session started before it, whether or not a grant
+under it is still recorded, and `None` for any other id, another agent's or one
+that does not parse; a forked child's parent's attempts are `None` to the child.
+It sends nothing and never raises.
 `vol.root` is the workspace root as the volume resolved it at construction
 (absolute, symlinks followed); it never changes.
 
@@ -1683,6 +1693,15 @@ took. On a disk that keeps them apart it is another path, and sends nothing
 (see [One file, many spellings](#one-file-many-spellings)). `./data/x.txt` and a
 symbolic link to the file resolve to the same path and are released.
 
+`release(path)` returns whether it gave a grant back. `True` means the volume
+recorded a grant on `path` and the coordinator confirmed every release it sent
+for it, or reported the grant no longer held because it was handed off; the
+volume holds no write grant there now. That says nothing of whether the file
+is free: a peer that took the grant still holds it, and on a path the
+coordinator does not track the recorded grant was never held there. `False`
+means no write of this volume recorded a grant on `path`, and nothing was sent;
+in degrade mode it also means a release that was not confirmed.
+
 **When the release is not confirmed.** A release the coordinator does not
 confirm keeps the grant on the volume's record. Under `on_error="strict"` it
 raises `CoordinatorUnreachable` when there was no usable answer,
@@ -1723,11 +1742,10 @@ request does.
 - A forked child of a closed volume is closed.
 - A release records a heartbeat for the attempt that held the grant, which also
   resets the sweep's clock on that attempt's other grants.
-- The `stale-write-guard-fs` MCP server has no tool for `release()` or `close()`
-  yet (#504). It closes its volume when the host ends it normally; a server
-  killed by a signal releases nothing. Until that tool exists, an agent gives
-  grants back with `swg_reacquire`, which releases every grant of the current
-  attempt.
+- The `stale-write-guard-fs` MCP server gives an agent `release(path)` as the
+  `swg_release` tool (see
+  [the MCP server](#stale-write-guard-fs-mcp-server)). It closes its volume
+  when the host ends it normally; a server killed by a signal releases nothing.
 - After `release(path)`, a `write_cas` of the same path is refused once and
   retries from a new attempt, which releases the volume's other grants too.
 - Against this package's coordinator through 0.15.0, or the Claude Code
@@ -1851,7 +1869,8 @@ another volume still takes the file. On the wire this is
 **What it needs.** `on_error="strict"` and `managed` globs, without
 `remote_endpoint`; anything else raises `ValueError` before anything starts. At
 attach the volume reads `pre_edit_if_unheld` from the operator view of `/status`
-and attaches only when it is JSON `true`. Otherwise it raises `CoherenceError`
+and attaches only when it is JSON `true`. Otherwise it raises
+`RefuseModeUnsupported` (from `ccs.core.exceptions`, a `CoherenceError`)
 before it sends anything, because a coordinator that ignores the flag would take
 the file from its holder. That rules out this package's coordinator through
 0.15.0, and the Claude Code plugin's Node coordinator through 0.6.0, which does
@@ -1859,10 +1878,12 @@ not serve the operator view. The volume also reads `fold_profile` and
 `fold_table_unicode` from the default view, so it keys each file as the
 coordinator does (see
 [One file, many spellings](#one-file-many-spellings)). When it cannot read them
-it raises `CoordinatorUnreachable` for no answer and `CoherenceError` for an
-unusable one, and it raises `CoherenceError` for a fold table of another
-Unicode version, both before it sends anything: a refusal it promises under
-every spelling of a file needs the coordinator's own fold. A forked child
+it raises `CoordinatorUnreachable` for no answer and `RefuseModeUnsupported` for
+an unusable one, and it raises `RefuseModeUnsupported` for a fold table of
+another Unicode version, both before it sends anything: a refusal it promises
+under every spelling of a file needs the coordinator's own fold. No retry
+clears `RefuseModeUnsupported`: run a coordinator that can refuse, or use
+`on_held="displace"`. A forked child
 checks again on its first read or write. On the Node coordinator of later
 plugin releases, refuse mode works with the differences listed in
 [A volume on the Node coordinator](#a-volume-on-the-node-coordinator).
@@ -1872,16 +1893,32 @@ plugin releases, refuse mode works with the differences listed in
 | The answer to its grant request | Raises | What to do |
 |---|---|---|
 | another agent holds the file | `OtherHolder` | back off, then read the file again before you write |
-| the holder is this volume's own earlier attempt, whose release did not land | `CoordinatorFailed` | call `reacquire()` and write from the bytes it returns: no peer exists to wait for, and a plain retry does not send that release again |
+| the holder is this volume's own earlier attempt, whose release did not land | `CoordinatorFailed`, with `needs_reacquire` `True` | call `reacquire()` and write from the bytes it returns: no peer exists to wait for, and a plain retry does not send that release again |
 | `unavailable`: the coordinator could not decide in time | `CoordinatorFailed` | back off, then retry; the abandoned request may still take the grant |
 | an HTTP `5xx` | `CoordinatorFailed` | as for `unavailable` |
-| no answer, or a body without `ok: true` | `CoordinatorUnreachable` | a grant may have landed: retry, or see below if the coordinator is gone |
+| no answer | `CoordinatorUnreachable` | a grant may have landed: retry, or see below if the coordinator is gone |
+| a body without `ok: true` | `CoordinatorUnreachable`, with `answered` `True` | the coordinator answered, so it is running and needs no restart: retry; the request may have taken the grant |
 | your copy is stale, or any other `ok: false`, such as an `internal:` failure | `StaleView` | call `reacquire()` and rebuild from the bytes it returns |
 | you handed the file off | `GiverFenced` | stop: no retry clears it |
 | `collision: true`, which only a coordinator that ignores the flag sends | `CoherenceError` | build a new volume: the coordinator changed after this one attached, and the holder may have lost the file. If the message says the release was not confirmed, call `reacquire()` first, or that grant refuses the new volume |
 | `degraded: true` beside `ok: true`, which only a coordinator that ignores the flag sends | `CoherenceError` | call `reacquire()`, because the abandoned request may still take the grant, then build a new volume |
 | none: the coordinator issues [caller principals](#caller-principal) and the session holds none, so nothing is sent | `CoherenceError` | build a new volume |
 | none: the path goes through a link whose name is under `managed` to a file outside it, so nothing is sent | `LinkOutOfManaged` | write the file by its own path from a volume that may displace its holder, or point the link inside `managed` |
+
+Tell the rows of one type apart by the attribute, never by the message:
+`needs_reacquire` on `CoordinatorFailed` and `answered` on
+`CoordinatorUnreachable` are `False` for every other cause, a commit refused by
+the volume's own grant included, whose retry does send the release again.
+
+To know before a write whether it asks first, call `vol.asks_if_unheld(path)`:
+`True` on a refuse-mode volume for a managed file, and `False` on a displacing
+volume, for a path outside `managed`, and for a link that `write()` refuses with
+`LinkOutOfManaged`. `vol.is_managed(path)` answers whether the path reaches a
+file under `managed`, in either mode, judged as `write()` judges it: links
+followed and the name read as the coordinator's policy reads it, so on a disk
+that folds case `DATA/x.md` is under `data/**`. Both read the links as they
+stand when called and send nothing; `is_managed()` raises `CoherenceError` for a
+path outside the root, as every operation does.
 
 **Polling.**
 
@@ -1956,8 +1993,10 @@ Node coordinator has no sweep and counts no heartbeat; see
   user can do that, which the [trust model](security.md#who-the-coordinator-can-tell-apart)
   already trusts. A link under `managed` to a file under `managed` writes as
   before, refused while another agent holds the file.
-- `install()`, `coherent_workspace()` and the `stale-write-guard-fs` tools take
-  no `on_held`, so they displace.
+- `install()` and `coherent_workspace()` take no `on_held`, so they displace.
+  The `stale-write-guard-fs` server displaces too unless its operator sets
+  `SWG_ON_HELD=refuse` (see
+  [the MCP server](#stale-write-guard-fs-mcp-server)).
 - A forked child is another agent: it is refused while its parent holds the file,
   naming an id it cannot map. Call `release(path)`, or `close()`, before you
   fork.
@@ -1976,7 +2015,8 @@ attaches to it by the same glob check it applies to this package's
 coordinator, under `on_error="strict"` or `"degrade"`, and with
 `on_held="refuse"` too; no option turns this on. A refuse-mode `write()` there
 raises `OtherHolder` on a file another agent holds. The `stale-write-guard-fs`
-MCP server, whose volume reads the same view, attaches the same way. A Node
+MCP server, whose volume reads the same view, attaches the same way, started
+with `SWG_ON_HELD=refuse` too. A Node
 coordinator of plugin 0.6.0 or earlier answers the operator view `501`; the
 volume then fails closed, saying the coordinator predates the view and to
 upgrade the agent-coherence plugin.
@@ -2052,6 +2092,11 @@ commits nothing and `CommitUnconfirmed` on a commit (next paragraph). Its
 `internal:` failure envelope, and the `5xx` on a request that commits nothing,
 are covered in
 [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure).
+A refuse-mode `write()` whose grant request is answered with a body that
+neither admits nor refuses raises `CoordinatorUnreachable` too, with its
+`answered` attribute `True`, where every other cause leaves it `False`: that
+coordinator is running, so the recovery below does not apply (see
+[Refusing a file another agent holds](#refusing-a-file-another-agent-holds)).
 
 A workspace whose `.coherence` a start refuses, because it is a symbolic link
 or not a directory, or holds a link, FIFO, socket or device directly inside
@@ -2627,7 +2672,10 @@ hooks never send the field.
 - The MCP server compares names by the profile `/status` advertises: after a
   denied read, `swg_read` finds the path's handoff record under any spelling of
   the file, and `swg_write_cas` counts consecutive conflicts on every spelling
-  of one file toward one limit.
+  of one file toward one limit. `swg_status` judges each listed path
+  `enforced` by the volume's own rule, so a managed file stored as `DATA/x.md`
+  reads `enforced` under `SWG_MANAGED=data/**` on a disk that folds case, and
+  it shows a held file's holder whichever spelling `/status` lists it under.
 - The Claude Code hook client, and the console scripts that take a workspace
   path (`agent-coherence-track`, `agent-coherence-untrack`, the handoff commands
   and `agent-coherence-workspace checkpoint`), follow links and keep the case a
@@ -4742,8 +4790,10 @@ The Python coordinator refuses this way, and so does the Claude Code plugin's
 Node coordinator in plugin releases after 0.6.0, with the same body. Where the
 two differ is listed under **On the Node coordinator** below.
 `CoherentVolume(on_held="refuse")` sends the flag on managed paths (see
-[Refusing a file another agent holds](#refusing-a-file-another-agent-holds)). The
-Claude Code hooks and the `stale-write-guard-fs` tools do not opt in.
+[Refusing a file another agent holds](#refusing-a-file-another-agent-holds)), and
+so does the `stale-write-guard-fs` server's `swg_write` when its operator sets
+`SWG_ON_HELD=refuse` (see [the MCP server](#stale-write-guard-fs-mcp-server)).
+The Claude Code hooks do not opt in.
 
 A coordinator that ignores the flag (the Node coordinator in plugin 0.6.0 or
 earlier, or this package's coordinator through 0.15.0) admits an opted-in request
@@ -4773,8 +4823,11 @@ coordinator issues no principals, so it asks for none; see
 ```
 
 The holder is named by agent id, never by session id, as 32 lowercase hex
-characters without hyphens. `/status` and the `handoff` key write agent ids
-with hyphens, so compare parsed UUIDs, not strings. On a path with a transfer
+characters without hyphens. This package's `/status` and the `handoff` key
+write agent ids with hyphens, and the Claude Code plugin's Node coordinator
+writes them in `/status` as 32 hex, so compare parsed UUIDs, not strings; the
+MCP server's `swg_status` names each holder in the refusal's spelling on both
+coordinators. On a path with a transfer
 record the Python coordinator's body also carries the
 [`handoff` key](#the-handoff-key), last. It
 carries no `hookSpecificOutput` and no `permissionDecision`. Python code can
@@ -5144,15 +5197,19 @@ Register it with your MCP client (the exact file depends on the client):
 `SWG_ROOT` selects the workspace (defaulting to the server's working directory).
 By default the whole workspace is guarded; narrow it with `SWG_MANAGED`, a
 comma-separated glob list (for example `SWG_MANAGED=plans/**,memory/**`).
+`SWG_ON_HELD=refuse` makes `swg_write` refuse a managed file another agent
+holds instead of taking it (see **Refuse mode** below); unset, empty or
+`displace` keeps the default.
 
 | Tool | What it does |
 |---|---|
 | `swg_read` | Tracked read — registers the agent's view of the file. If the bytes on disk are not what the coordinator recorded, the read returns a `stale_view` deny with no version. Retry `swg_reacquire` + `swg_read` for a few seconds first, since a peer's commit may still be reaching disk; if it stays denied, the bytes on disk were never recorded (an out-of-band edit, a commit whose disk write failed, or a write whose commit did not reach the coordinator), and reading again does not clear it, so `swg_write` the reacquired content to record it. When the path has a [handoff](#from-the-mcp-server) record, the result carries its `handoff` key |
-| `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite. On a path this session handed off, a `handed_off` deny with `recover: stop_and_report` |
-| `swg_reacquire` | Recovery after a deny — clears the stale view + mandatory fresh read |
-| `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention. A win that completed or overtook a live handoff says which, in `handoff`; on a path this session handed off, the same `handed_off` deny as `swg_write` |
+| `swg_write` | Guarded write — a stale view or foreign edit returns a typed `stale_view` deny with `recover: reacquire`, never a silent overwrite. On a path this session handed off, a `handed_off` deny with `recover: stop_and_report`. In refuse mode, a path another agent holds gets an `other_holder` deny with `recover: wait_then_reacquire` and nothing is written, and a success carries `opted_in`. The write keeps its write grant afterwards, until `swg_release`. Every answer is listed under **What `swg_write` answers** below |
+| `swg_reacquire` | Recovery after a deny — clears the stale view + mandatory fresh read. It drops every hold this session has, the write grant on every path, not only this one |
+| `swg_release` | Gives back this session's write grant on one path and keeps every other hold, in either mode. Answers `released: true` when a grant went back and `released: false` when this session had none recorded there, with nothing sent; neither says the path is free. See **Giving a path back** below |
+| `swg_write_cas` | Single-shot version-checked write for concurrent same-key contention. A win that completed or overtook a live handoff says which, in `handoff`; on a path this session handed off, the same `handed_off` deny as `swg_write`. A call that reaches the coordinator drops every hold this session has, as `swg_reacquire` does |
 | `swg_gate` | Effect fence — re-checks the `(version, owner_generation)` pair from your `swg_read` right before an irreversible external action (a webhook, a deploy, an opened PR), and denies if the value moved OR the grant it was read under was reclaimed OR a peer's write-claim preempted it (which moves neither comparand — the fence also re-checks that the grant still stands) |
-| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `principal_claim`, its `session_agent_id` (the id another session names to hand it a path), the coordinator's two caller-principal counters, its `registry_schema_version` (the schema version of its store; `null` when the coordinator is unreachable, which `coordinator` `unknown` shows, or when its answer carries no such field, as a coordinator built before the field does), and each path's handoff record. `per_path` is `null`, not `{}`, when the coordinator's `/status` answer carries no list of tracked paths, as a [degraded](#when-the-registry-is-busy) answer does when its registry was busy; the text result then says `per_path=unavailable`. Retry shortly and do not read it as nothing tracked. With `coordinator` `unknown`, `per_path` is `{}` and says nothing about what is tracked |
+| `swg_status` | Three-state coordination health: `on` / `off` / `unknown`, plus this session's `principal_claim`, its `session_agent_id` (the id another session names to hand it a path), the coordinator's two caller-principal counters, its `registry_schema_version` (the schema version of its store; `null` when the coordinator is unreachable, which `coordinator` `unknown` shows, or when its answer carries no such field, as a coordinator built before the field does), and each path's handoff record. `per_path` is `null`, not `{}`, when the coordinator's `/status` answer carries no list of tracked paths, as a [degraded](#when-the-registry-is-busy) answer does when its registry was busy; the text result then says `per_path=unavailable`. Retry shortly and do not read it as nothing tracked. With `coordinator` `unknown`, `per_path` is `{}` and says nothing about what is tracked. It also reports the server's mode as `on_held`, the paths this session holds for writing as `held`, and on each `per_path` entry someone holds for writing, `holder_agent_id` and `held_by`; see **Who holds a path** below |
 | `swg_transfer` | Hands this session's claim on one or more paths to another session, named by that session's `session_agent_id`; see [From the MCP server](#from-the-mcp-server) |
 | `swg_accept` | As the successor, accepts a handoff without writing the path |
 | `swg_decline` | As the successor, declines a handoff; the giver may write the path again |
@@ -5164,6 +5221,142 @@ Denials are machine-readable: an agent parses the typed payload (for example
 blindly. The server validates every file URI — path traversal and any access to
 the coordinator's own state directory are rejected — and fails closed on IO
 errors. Strict-mode, managed-path scoped.
+
+**Refuse mode: `SWG_ON_HELD=refuse`.** By default `swg_write` takes a file from
+whoever holds it, and the holder finds out at its next write. Start the server
+with `SWG_ON_HELD=refuse` and its volume is built with `on_held="refuse"` (see
+[Refusing a file another agent holds](#refusing-a-file-another-agent-holds)): a
+`swg_write` of a managed path that another agent holds is refused with
+`reason: other_holder`, nothing is written, and the holder keeps the file. It
+is opt-in, and the value is matched exactly: unset, empty or `displace` keeps
+the default, and such a server sends exactly the requests it sent before. Any
+other value, `Refuse` included, stops the server before anything starts, with
+one line on stderr naming the accepted values and exit code `2`. `swg_status`
+reports the mode as `on_held`. A hold is honoured only among opted-in writers,
+such as other refuse-mode servers and refuse-mode volumes: the Claude Code
+hooks, displace-mode servers and older volumes take the file anyway, and the
+holder then meets `stale_view` at its next `swg_write`. A hold is not a lock.
+A write of a path outside `SWG_MANAGED` asks nothing and takes the file; on a
+refuse-mode server every successful `swg_write` carries `opted_in`, `true` when
+the write asked first and `false` for such a path.
+
+Refuse mode needs a coordinator that refuses: this package's after 0.15.0, or
+the Claude Code plugin's Node coordinator after 0.6.0, whose policy files must
+list the server's globs (see
+[A volume on the Node coordinator](#a-volume-on-the-node-coordinator)). When
+the workspace's coordinator does not advertise `pre_edit_if_unheld`, or the
+volume cannot rely on the fold profile it advertises, the server refuses to
+start rather than fall back to displace mode, which would leave you believing
+holds are honoured. After any `INFO` lines its start-up logged, stderr carries
+one line: `stale-write-guard-fs: refusing to start with SWG_ON_HELD=refuse:`,
+the volume's reason, and the fix (run a coordinator that can refuse, or unset
+`SWG_ON_HELD`). The server exits `2` before it serves, with no traceback and
+nothing on stdout.
+
+**What `swg_write` answers.** Every refusal carries `reason`, `recover`,
+`retryable` and the `detail`, the volume's or coordinator's own text,
+unchanged; most also carry a `next_step`, which is the procedure to follow.
+`retryable: true` means only that sending the identical call again is safe,
+not that it is the next step. Rows marked refuse mode come only from a server
+started with `SWG_ON_HELD=refuse`.
+
+| `reason` | `recover`, `retryable` | When | What `next_step` says |
+|---|---|---|---|
+| `stale_view` | `reacquire`, `true` | the file changed since this session last read or wrote it: another agent's commit or an edit made outside the server | `swg_reacquire` the path, rebuild from the bytes it returns, and `swg_write` that; never send the old content again, and do not re-read the file with your own file tools instead |
+| `other_holder` | `wait_then_reacquire`, `false` | refuse mode: another agent holds the path, named in `holder_agent_id`; nothing was written and nothing changed hands | the wait in **Waiting for another agent's hold** below; never send the same write again as it is |
+| `coordinator_failed` | `reacquire`, `false` | refuse mode: an earlier attempt of this session still holds the path, because its release was not confirmed | no other agent holds it, so do not wait: `swg_reacquire` the path, which sends that release again, rebuild from its bytes, and `swg_write` once |
+| `coordinator_failed` | `stop_and_report`, `false` | the coordinator failed while answering the grant request: an HTTP `5xx`, the `503` of a drain, or, in refuse mode on this package's coordinator, `unavailable` (it could not decide in time) | the same call once more after a few seconds; if it fails the same way, stop and report that the coordinator is failing |
+| `coordinator_unavailable` | `stop_and_report`, `false` | refuse mode: the coordinator answered the grant request with neither an admit nor a refusal; nothing was written | the coordinator is running, so no restart: the same `swg_write` once more after a few seconds, then stop and report |
+| `coordinator_unavailable` | `stop_and_report`, `false` | no usable answer: the coordinator is gone or wedged | stop and report that the server must be restarted; once it is back, `swg_write` the path again if the detail says this write's bytes are on disk, since reading first does not record them; on a refuse-mode server, how long the restarted server can be refused by this one's grants (see **A coordinator that stops answering** below) |
+| `coordinator_unavailable` | `retry_later`, `false` | the server's volume never attached | none |
+| `commit_unconfirmed` | `write_again`, `false` | the commit got no answer, an HTTP `5xx` or the coordinator's failure envelope after the bytes reached disk, so they may be unrecorded | `swg_write` the path once more, with the same content or a change built from it, which records it either way; reading first does not help. If that fails the same way, stop and report |
+| `commit_preempted` | `reacquire_and_reconcile`, `false` | the write lost its grant mid-write, and its bytes may be on disk unrecorded | none; the result carries the generation pair below |
+| `link_out_of_managed` | `stop_and_report`, `false` | refuse mode: the path goes through a link whose name is managed to a file outside the managed globs; nothing was sent or written | stop, and do not write that file by any other route: not by its own path, not through another server, not with your own file tools or a shell. Report the link |
+| `handed_off` | `stop_and_report`, `false` | this session handed the path off | stop and report; see [From the MCP server](#from-the-mcp-server) |
+| `internal_error` | `none`, `false` | any other failure, such as an HTTP `4xx` or a watchdog-degraded answer | stop; `swg_release` the path first (`swg_reacquire` it instead if the release answers `release_unconfirmed` twice), then report the detail |
+
+Each answer after which this write may have left a write grant standing (the
+`stale_view`, both `coordinator_failed` rows, the answered
+`coordinator_unavailable` row and `commit_unconfirmed`) ends by telling the
+agent that, if it stops there, it should `swg_release` the path first. Where a
+`detail` names a library call, the `next_step` names the tool that makes it:
+`swg_release` for `release()`, `swg_reacquire` for `reacquire()`. The
+caller-principal refusals, `invalid_path` and `io_error` answer as they do for
+every tool. Every row not marked refuse mode, `swg_release`, and the
+`swg_status` keys below apply on a displace-mode server too.
+
+**Waiting for another agent's hold.** The server never waits by itself; the
+`other_holder` step gives the agent the wait, in order:
+
+1. Before waiting, `swg_release` every path `swg_status` lists in `held`,
+   including any an earlier attempt of this session holds, and `swg_reacquire`
+   a path whose release answers `release_unconfirmed` twice. Two agents that
+   keep their holds while each waits for the other wait 30 minutes and then
+   overwrite each other's work.
+2. Poll `swg_status`, which changes nothing, and not `swg_write`, whose refusal
+   keeps the waiter's other holds alive. Wait at least 4 seconds before each
+   poll and double the wait each time, with jitter, until `swg_status` lists
+   the path and no longer shows it `held_by: another_agent`, or 30 minutes have
+   passed.
+3. Then `swg_reacquire` the path, rebuild from the bytes it returns, and
+   `swg_write` once. On `other_holder` again, go back to step 2.
+
+A live holder can keep a path for up to 30 minutes, and the next holder starts
+a new clock. A holder that stopped clears in about 10 minutes on this
+package's coordinator, and in up to 30 minutes on the Claude Code plugin's,
+which takes back a grant that old only when an opted-in write asks for the
+path. The holder may be the agent itself: its own Claude Code hooks session, if
+it edited the file with its own file tools this turn, which lets go when the
+turn ends, or this server's previous run, if the server restarted in the last
+30 minutes. When the agent's own bound on the wait runs out, it stops and
+reports that another agent holds the path.
+
+**Giving a path back: `swg_release`.** `swg_write` takes a write grant on the
+path it writes and keeps it after the write, in either mode, so other opted-in
+agents that write the path wait until it comes back, for up to 30 minutes.
+`swg_release(path)` gives back this session's write grant on that one path,
+under every attempt of this session that took one, and keeps every other hold;
+`swg_reacquire` and `swg_write_cas`, of any path, drop every hold, and so does
+the server's normal exit. It answers `{ok: true, path, released}`:
+
+- `released: true`: this session gave a grant back. It does not mean the path
+  is free, since another agent may hold it, and on a path the coordinator does
+  not track the grant was never held there. The session keeps a read at the
+  version it held, so its next `swg_write` of the path needs no
+  `swg_reacquire` unless the file changed since. A path an earlier attempt of
+  this session holds (`held_by: earlier_attempt`) is released the same way, on
+  both coordinators.
+- `released: false`: this session had no write grant recorded on the path, and
+  nothing was sent, as on a repeat. A path this session handed off answers it
+  too, and its handoff record is unchanged.
+
+A release the coordinator did not confirm (no answer, an HTTP `5xx` or `4xx`,
+the failure envelope, a degraded answer, the grant reported still held, or a
+redirect the client refuses to follow)
+answers `reason: release_unconfirmed`, `recover: release_again`,
+`retryable: true`: sending it again is safe, at most twice more. If it still
+is not confirmed, the agent reports that this session's write grant on the
+path may still stand; `swg_reacquire` drops every hold, that one included. The
+answer never names a restart. A server whose volume never attached answers
+`coordinator_unavailable` with `recover: retry_later`, as every tool does.
+
+**Who holds a path.** Each `swg_status` `per_path` entry that someone holds
+for writing carries `holder_agent_id`, the holder's attempt id in the 32-hex
+spelling an `other_holder` refusal names it by, on both coordinators, and
+`held_by`: `this_attempt`, `earlier_attempt` (an earlier attempt of this
+session whose grant still stands, which this session releases) or
+`another_agent`. An entry nobody holds carries neither key. Holder ids are per
+attempt, so they never equal `session_agent_id`: tell your own holds by
+`held_by`, never by comparing ids. Every caller of one server process is one
+agent to the coordinator, so `this_attempt` can be another caller sharing this
+server. `held` lists, sorted, the paths this session holds, either attempt. It
+is `null`, never `[]`, when the coordinator cannot say who holds each path (an
+answer with no sessions list or a row the server cannot read, a degraded
+answer, or an unreachable coordinator), and `null` never means nothing is
+held. For clients that show only text, the text result's second line gives
+`on_held` and `held` (or `held=unavailable`), and one line follows for each
+path another agent or an earlier attempt holds, with its `held_by` and
+`holder_agent_id`.
 
 **A refused commit carries the generation pair.** When `swg_write`'s commit is
 refused after its bytes reached disk (`reason: commit_preempted`,
@@ -5213,7 +5406,19 @@ usable answer from its coordinator, the tool call answers `reason:
 coordinator_unavailable` with `recover: stop_and_report` and
 `retryable: false`, and a `next_step` that tells the agent to stop, not to
 write the managed files by any other route, and to report that the server must
-be restarted. While that coordinator stays down, every later tool call answers
+be restarted. `swg_write`'s step adds that a write whose bytes are on disk is
+written again once the server is back, and that a write grant this server
+holds stays until the coordinator takes it back: `swg_release` cannot reach a
+coordinator that is gone, and a restarted server cannot release this one's
+grants. On a refuse-mode server it also says that the restarted server's writes
+to paths this one held can be refused `other_holder` until then: for about 10
+minutes on this package's coordinator, which sweeps a grant whose holder went
+quiet, and up to 30 minutes on the Claude Code plugin's, which takes back a
+30-minute-old grant when an opted-in write asks for it. A refuse-mode
+`swg_write` whose grant request the coordinator answered with neither an admit
+nor a refusal answers the same `reason` and `recover` with another step: the
+coordinator is running, so it names one more try and no restart.
+While that coordinator stays down, every later tool call answers
 the same way, and the server never reaches a coordinator started after the old
 one went away: the volume keeps the endpoint it attached to. A coordinator that
 is only too slow to answer within the client's timeout gets the same answer,
@@ -5223,8 +5428,11 @@ attaches it again; if it will not start, stop the workspace's coordinator
 process first. The same `reason` with `recover: retry_later` comes only from a
 server whose volume never attached, so branch on `recover`, not on `reason`. A
 commit that was sent and got no answer, or that the coordinator answered with
-an HTTP `5xx`, answers `commit_unconfirmed` with `recover: read_then_retry`,
-where `swg_write` and `swg_write_cas` answered `internal_error` before. During
+an HTTP `5xx`, answers `commit_unconfirmed`, where `swg_write` and
+`swg_write_cas` answered `internal_error` before: `swg_write` with
+`recover: write_again`, because its bytes are on disk and writing the path again
+records them, and `swg_write_cas`, whose bytes never reached disk, with
+`recover: read_then_retry`. During
 a graceful stop the coordinator answers `503` for a moment before it stops
 listening: a call whose commit meets it answers `commit_unconfirmed`, and every
 other call in that moment answers `coordinator_failed`. While the coordinator
@@ -5261,15 +5469,29 @@ write grant an earlier `swg_write` left held, which `swg_write_cas` and
 another agent held the file, and `swg_reacquire` returned the content as if the
 release had gone through. The same answer comes when any of these calls is
 answered with an HTTP `5xx`, and when the release is answered with the grant
-still held, so that grant refuses the commit of `swg_write_cas`. A write whose
-commit gets that answer may
-have landed, so `swg_write` and `swg_write_cas` answer `commit_unconfirmed`
-with `recover: read_then_retry`, where `swg_write` answered `commit_preempted`
-and `swg_write_cas` answered `internal_error`.
+still held, so that grant refuses the commit of `swg_write_cas`. `swg_write`
+answers a `5xx` to its grant request with the same row, and its step adds that
+an agent that stops there should `swg_release` the path first. A refuse-mode
+`swg_write` refused because an earlier attempt of this session still holds the
+path answers `coordinator_failed` with `recover: reacquire` instead: the same
+call gets the same answer, and `swg_reacquire` sends that attempt's release
+again and returns the bytes to rebuild from. A write whose commit gets that answer may
+have landed, so `swg_write` answers `commit_unconfirmed` with
+`recover: write_again` and `swg_write_cas` with `recover: read_then_retry`,
+where `swg_write` answered `commit_preempted` and `swg_write_cas` answered
+`internal_error`.
 
 **Multiple sessions, one workspace.** Multiple `stale-write-guard-fs` instances
 pointed at the same `SWG_ROOT` attach to one coordinator, so a stale write is
 denied across sessions; if the coordinator's session exits, peers fail closed.
+The first server started on a workspace where no coordinator runs hosts the
+coordinator in its own process, so when that server exits, even normally, the
+coordinator stops for its peers, whose next calls answer
+`coordinator_unavailable` until they are restarted; stop that server last. In
+refuse mode, the restarted peers can then be refused by the grants they held
+before, for the window **A coordinator that stops answering** gives. An agent
+that finishes writing a path gives it back with `swg_release`, so other
+sessions need not wait for this server to end.
 When the host ends a server normally, the server closes its volume before it
 stops a coordinator it started, so the files its `swg_write` calls took are
 given back to the other sessions at once, not after the sweep, and the

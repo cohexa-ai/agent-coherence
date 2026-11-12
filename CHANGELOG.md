@@ -8,6 +8,92 @@ Alpha — APIs may change before `v1.0`.
 
 ### Added
 
+- **The `stale-write-guard-fs` server refuses a write to a file another
+  agent holds when it is started with `SWG_ON_HELD=refuse` (#504).**
+  The server built its volume in the default displace mode, so `swg_write`
+  took a file from whoever held it. With `SWG_ON_HELD=refuse` its volume is
+  built with `on_held="refuse"`: a `swg_write` of a managed path another agent
+  holds answers `reason: other_holder`, `recover: wait_then_reacquire`,
+  `retryable: false`, with the holder in `holder_agent_id`, nothing written and
+  the holder untouched, and its `next_step` gives the wait: release your own
+  holds, poll `swg_status`, then `swg_reacquire`, rebuild and write once. A
+  successful `swg_write` on such a server carries `opted_in`, which is `false`
+  for a path outside `SWG_MANAGED`, a path it still takes. The value is matched
+  exactly. Unset, empty or `displace` keeps the default, and such a server
+  sends exactly the requests it sent before; any other value stops the server
+  before anything starts, on one stderr line naming the accepted values, with
+  exit `2`. A refuse-mode start against a coordinator that cannot be relied on
+  to refuse (it does not advertise `pre_edit_if_unheld`, or the volume cannot
+  rely on the fold profile it advertises) never falls back to displace mode:
+  after any `INFO` lines its start-up logged, it prints one escaped stderr line
+  naming `SWG_ON_HELD` and the fix and exits `2`, with no traceback and nothing
+  on stdout. A hold is honoured only among opted-in writers; the Claude Code
+  hooks, displace-mode servers and older volumes still take the file. A
+  restarted refuse-mode server can be refused by grants its previous run left
+  standing, after a kill or a coordinator that went away, for about 10 minutes
+  on this package's coordinator and up to 30 minutes on the Claude Code
+  plugin's. The guide's "`stale-write-guard-fs` MCP server" section has the
+  details.
+
+- **`swg_release(path)` gives back this session's write grant on one path
+  (#504).** `swg_write` keeps its write grant after the write, and the server
+  had no way to give one back short of `swg_reacquire`, which drops every
+  hold, so a refuse-mode peer waited for the grant to be reclaimed.
+  `swg_release` gives back the grant on one path, under every attempt of the
+  session that took one, and keeps every other hold, in either mode. It
+  answers `{ok, path, released}`: `released` is `true` when a grant went back
+  and `false` when the session had none recorded there, in which case nothing
+  is sent. Neither says the path is free, and the session keeps a read at the
+  version it held. A release of a path the session handed off answers
+  `released: false` and leaves the handoff record as it was. A release the
+  coordinator did not confirm (no answer, an HTTP 5xx or 4xx, the failure
+  envelope, a degraded or still-held answer, or a refused redirect) answers
+  `reason: release_unconfirmed`, `recover: release_again`, `retryable: true`,
+  with a next step that allows two more tries and never names a restart.
+
+- **`swg_status` names each tracked path's write holder, the server's mode
+  and the paths the session holds (#504).** A `per_path` entry someone holds
+  for writing carries `holder_agent_id`, in the 32-hex spelling an
+  `other_holder` refusal names the holder by, on both coordinators (this
+  package's `/status` writes it hyphenated, so it is normalised), and
+  `held_by`: `this_attempt`, `earlier_attempt` or `another_agent`, because
+  holder ids are per attempt and never equal `session_agent_id`. Holders are
+  matched to paths by fold key, so another spelling of a held file still shows
+  its holder, and an entry nobody holds keeps exactly the shape it had.
+  Top-level `on_held` reports the mode, `refuse` or `displace`, and `held` lists
+  the paths the session holds, either attempt, sorted. `held` is `null`, never
+  `[]`, when the holders cannot be told: no sessions list, a row that cannot be
+  read, a degraded answer, or an unreachable coordinator. For clients that show
+  only text, the text result adds the mode, `held` or `held=unavailable`, and a
+  line for each path another agent or an earlier attempt holds.
+
+- **`CoherentVolume.release()` answers whether it gave a grant back, and the
+  volume says what a write of a path would do and whose an attempt is
+  (#504).** `release(path)` returns `True` when the volume recorded a grant on
+  the path and the coordinator confirmed every release it sent for it, or
+  accounted for the grant as handed off; it returns `False` when no write
+  recorded a grant there, with nothing sent, and in degrade mode for a release
+  that was not confirmed. `True` does not say the file is free. Three reads
+  send nothing: `asks_if_unheld(path)` says whether `write()` of the path would
+  ask for it only if nobody holds it, `is_managed(path)` whether the path
+  reaches a file under `managed`, each judged as `write()` judges the path,
+  links and folded spellings included, and `attempt_of(agent_id)` names an id,
+  hyphenated or 32 hex, as the volume's `"current"` attempt, an `"earlier"`
+  one, or neither (`None`).
+
+- **A refuse-mode volume's refusals are typed by cause (#504).**
+  `RefuseModeUnsupported`, a `CoherenceError` in `ccs.core.exceptions`, is what
+  a volume built with `on_held="refuse"` raises when it cannot attach because
+  the coordinator cannot be relied on to refuse: it does not advertise
+  `pre_edit_if_unheld`, or the volume cannot rely on the fold profile it read.
+  No retry clears it. `CoordinatorFailed.needs_reacquire` is `True` only when a
+  refuse-mode `write()` is refused by the volume's own earlier attempt, whose
+  recovery is `reacquire()`, and `CoordinatorUnreachable.answered` is `True`
+  only when an opted-in grant request is answered with neither an admit nor a
+  refusal, so the coordinator is running. Both are keyword arguments that
+  default to `False`, messages are unchanged, and both exceptions still pickle
+  whole across a process boundary.
+
 - **`CoherentVolume.release(path)` gives back the volume's write grant on one
   file, and `close()` gives back all of them and ends the volume (#505).** A
   successful `write()` keeps the file's write grant after it returns, and
@@ -206,22 +292,77 @@ Alpha — APIs may change before `v1.0`.
   holds. The other answers to the
   grant request are typed too, and none writes bytes: `unavailable` raises
   `CoordinatorFailed`, a refusal by this volume's own unreleased grant raises
-  `CoordinatorFailed` pointing at `reacquire()`, and a body without `ok: true`
-  raises `CoordinatorUnreachable`. The `stale-write-guard-fs` deny table maps
-  `OtherHolder` to `other_holder` / `wait_and_retry` with the holder, though its
-  tools do not opt in yet. `OtherHolder`'s message now says to read the file again
-  before writing, because a write built without reading lands over what the holder
-  committed. It covers managed paths only, and the Claude Code hooks do not opt in.
+  `CoordinatorFailed` pointing at `reacquire()` (with `needs_reacquire` set),
+  and a body without `ok: true` raises `CoordinatorUnreachable` (with
+  `answered` set). The `stale-write-guard-fs` server opts in when it is started
+  with `SWG_ON_HELD=refuse` (#504, above). `OtherHolder`'s message now says to
+  read the file again before writing, because a write built without reading
+  lands over what the holder committed. It covers managed paths only, and the
+  Claude Code hooks do not opt in.
 
 - **`/status` advertises the refusal as `pre_edit_if_unheld: true`, at every tier
   and in the degraded answer.** A coordinator that ignores `if_unheld` displaces
   the holder, and versions cannot separate the two, so a client reads this first.
-  A refuse-mode volume reads it at attach and raises `CoherenceError` before it
-  sends anything when the key is not JSON `true`. It cannot see a different
-  coordinator started later on the same port and secret; the guide says what that
-  leaves open.
+  A refuse-mode volume reads it at attach and raises `RefuseModeUnsupported`, a
+  `CoherenceError`, before it sends anything when the key is not JSON `true`.
+  It cannot see a different coordinator started later on the same port and
+  secret; the guide says what that leaves open.
 
 ### Changed
+
+- **Every `swg_write` answer names a recovery that keeps the other agent's
+  work and gives back what the write may still hold, on every server (#504).**
+  Each `detail` stays the volume's or coordinator's text byte for byte; the
+  words go in `next_step`, which names the tool for each library call a detail
+  names (`swg_release` for `release()`, `swg_reacquire` for `reacquire()`), and
+  every answer after which the write may have left a grant standing tells the
+  agent to `swg_release` the path if it stops there. On every server, displace
+  mode included:
+  - `commit_unconfirmed` answers `recover: write_again` on `swg_write`, because
+    its bytes are on disk and writing the path again records them while
+    re-reading does not; `retryable` stays `false`, and the step names one more
+    write, then a report. `swg_write_cas`, whose bytes never reached disk, keeps
+    `read_then_retry`.
+  - `stale_view` keeps `recover: reacquire` and `retryable: true`, and gains a
+    `next_step`: rebuild from `swg_reacquire`'s bytes, never send the old
+    content again, and never re-read with your own file tools instead.
+  - `coordinator_failed` keeps its one retry, and its step now ends by telling
+    the agent to `swg_release` the path if it stops.
+  - `coordinator_unavailable` for a coordinator that is gone keeps its stop and
+    restart, and adds that a write whose bytes are on disk is written again
+    once the server is back and that this server's grants stand until the
+    coordinator takes them back; on a refuse-mode server, that the restarted
+    server can be refused by them for about 10 minutes on this package's
+    coordinator and up to 30 minutes on the Claude Code plugin's.
+  - `internal_error` gains a `next_step`: stop, `swg_release` the path (or
+    `swg_reacquire` it if the release answers `release_unconfirmed` twice), and
+    report.
+
+  On a server started with `SWG_ON_HELD=refuse` (under Added):
+  - another agent's hold answers `other_holder` with
+    `recover: wait_then_reacquire` and `retryable: false`, because the same
+    write sent again lands over the holder's commit once the path comes free;
+  - a refusal caused by the session's own earlier attempt, whose release was
+    not confirmed, answers `coordinator_failed` with `recover: reacquire`,
+    because the same call only fails the same way;
+  - a grant request answered with neither an admit nor a refusal answers
+    `coordinator_unavailable` with `recover: stop_and_report` and a step that
+    names one more try and no restart, since the coordinator is running;
+  - a write through a link whose name is managed to a file outside the managed
+    globs answers `link_out_of_managed` with `recover: stop_and_report`, and its
+    step forbids writing that file by any other route;
+  - a success carries `opted_in`.
+
+  The other tools keep their rows. The server's instructions and tool
+  descriptions now give the hold lifecycle (`swg_write` takes and keeps a write
+  grant; `swg_release` gives back one path; `swg_reacquire`, `swg_write_cas`
+  and the server's normal exit drop every hold), the holder's duty to release a
+  path it has finished writing, refuse mode and which writers honour a hold,
+  what `retryable` means (the identical call is safe to send again; it is not
+  the next step) and every `recover` verb a tool answers; `swg_reacquire`'s and
+  `swg_write_cas`'s descriptions say they drop every hold. The new
+  `swg_release` tool and the `swg_status` keys `on_held`, `held`,
+  `holder_agent_id` and `held_by` reach every server too (under Added).
 
 - **A `CoherentVolume` with `managed` globs attaches to the Claude Code
   plugin's Node coordinator, in refuse mode too (#518).** The Node coordinator
@@ -366,9 +507,10 @@ Alpha — APIs may change before `v1.0`.
     fields, `cannot_tell`, a value the volume does not know and a fold table of
     another Unicode version all key names exactly;
   - in refuse mode, an attach that cannot read `/status` raises
-    `CoordinatorUnreachable` (no answer) or `CoherenceError` (an unusable
-    answer), and one that finds a fold table of another Unicode version raises
-    `CoherenceError`, each before it sends anything;
+    `CoordinatorUnreachable` (no answer) or `RefuseModeUnsupported`, a
+    `CoherenceError` (an unusable answer), and one that finds a fold table of
+    another Unicode version raises `RefuseModeUnsupported`, each before it
+    sends anything;
   - in refuse mode, a `write()` through a link whose name is under `managed` to
     a file outside it raises the new `LinkOutOfManaged` (in
     `ccs.core.exceptions`; `reason` is `"link_out_of_managed"`, and it carries
@@ -382,8 +524,11 @@ Alpha — APIs may change before `v1.0`.
   - the MCP server compares names by the profile `/status` advertises: after a
     denied read, `swg_read` finds the path's handoff record under any spelling
     of the file, and `swg_write_cas` counts consecutive conflicts on every
-    spelling of one file toward one limit. Its tools accept `.//data/x` as
-    `data/x`, where they refused it;
+    spelling of one file toward one limit. `swg_status` judges each listed
+    path `enforced` by the volume's own rule, so a managed file stored as
+    `DATA/x.md` reads `enforced` under `SWG_MANAGED=data/**` on a disk that
+    folds case (#504). Its tools accept `.//data/x` as `data/x`, where they
+    refused it;
   - the Claude Code hook client still follows links and keeps the case a path
     was typed in. It now skips a Read, Edit or Write through a link that does
     not resolve (dangling or looping), which it sent before, and reaches the
@@ -779,8 +924,9 @@ Alpha — APIs may change before `v1.0`.
   plain `CoherenceError`, which `swg_write_cas` reported as `internal_error`,
   `recover: none`; the post-edit of a plain `write()` raised `CommitPreempted`;
   and `atomic_publish` said the batch was not published. All four raise
-  `CommitUnconfirmed` now, in both modes, so `swg_write` and `swg_write_cas`
-  answer `commit_unconfirmed` with `recover: read_then_retry`. A plain
+  `CommitUnconfirmed` now, in both modes, so `swg_write` answers
+  `commit_unconfirmed` with `recover: write_again` (#504) and `swg_write_cas`
+  with `recover: read_then_retry`. A plain
   `write()` says its bytes are on disk and first releases its write grant. A
   strict read, on a `CoherentVolume` or a `CoordinatedSubstrate`, raised a
   plain `CoherenceError`; it raises `CoordinatorFailed`, a `CoherenceError`
@@ -810,9 +956,10 @@ Alpha — APIs may change before `v1.0`.
   `atomic_publish` before any work runs, so nothing lands and a re-read shows
   the file as it was, but a retry meets the same `503` until the drain ends and
   the coordinator stops: do not retry in a tight loop. `swg_write` and
-  `swg_write_cas` answer `commit_unconfirmed` with `recover: read_then_retry`
-  where they answered `internal_error`. A 4xx or a redirect, degrade mode,
-  reads, and the handoff verbs, which already treated a 5xx as an unknown
+  `swg_write_cas` answer `commit_unconfirmed` where they answered
+  `internal_error`, `swg_write` with `recover: write_again` (#504) and
+  `swg_write_cas` with `recover: read_then_retry`. A 4xx or a redirect,
+  degrade mode, reads, and the handoff verbs, which already treated a 5xx as an unknown
   outcome, are unchanged. The guide's "When the coordinator does not answer"
   section has the details.
 

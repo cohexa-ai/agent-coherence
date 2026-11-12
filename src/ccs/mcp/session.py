@@ -8,9 +8,17 @@ owns exactly ONE :class:`~ccs.adapters.coherent_volume.CoherentVolume` for that
 session's workspace. Constructing the volume self-spawns/attaches the loopback
 coordinator (strict-only, fail-closed); on a normal exit the server lifespan
 closes the volume, giving back its write grants, then calls
-``stop_coordinator``. The server NEVER constructs a degrade-mode volume —
-a degrade write skips the version check and silently re-opens the lost update, so
-strict-only is the honesty floor.
+``stop_coordinator``, which stops the coordinator only when this process
+started it, and then for every peer attached to it. The server NEVER constructs
+a degrade-mode volume — a degrade write skips the version check and silently
+re-opens the lost update, so strict-only is the honesty floor.
+
+``SWG_ON_HELD`` picks what a write does to a managed file another agent holds:
+``displace`` (unset or empty too, the default) takes it, as the server always
+did; ``refuse`` builds the volume with ``on_held="refuse"``, so the write is
+refused while another agent holds the file. It is matched exactly,
+because a near-miss read as the default would leave an operator believing holds
+are honoured.
 """
 
 from __future__ import annotations

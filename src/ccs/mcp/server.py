@@ -443,13 +443,18 @@ class ServerContext:
 async def lifespan(server: FastMCP) -> AsyncIterator[ServerContext]:
     """Own the coordinator for the server's lifetime.
 
-    Enter → construct the strict-only volume (self-spawns/attaches; raises
-    fail-closed if it can't). Exit → close the volume, which gives back its
-    write grants (a failed close is logged), then ``stop_coordinator``: an
-    in-process coordinator must still answer the close. The coordinator is
-    stopped whatever the close does. Only a normal end runs this; nothing
-    handles a signal. Does NOT call ``connect_or_spawn`` — construction
-    already did, so calling it again would double-spawn.
+    Enter → construct the strict-only volume in the mode ``SWG_ON_HELD``
+    names (self-spawns/attaches; raises fail-closed if it can't). A
+    refuse-mode volume the coordinator cannot be relied on to honour raises
+    ``RefuseModeUnsupported`` here, before anything is served, and ``main()``
+    turns it into one stderr line and exit 2. Exit → close the volume, which
+    gives back its write grants (a failed close is logged), then
+    ``stop_coordinator``: an in-process coordinator must still answer the
+    close. The coordinator is stopped whatever the close does; one this
+    process started stops for every peer attached to it too. Only a normal
+    end runs this; nothing handles a signal. Does NOT call
+    ``connect_or_spawn`` — construction already did, so calling it again
+    would double-spawn.
     """
     config = SessionConfig.from_env()
     volume = build_volume(config)  # blocking, fail-closed
