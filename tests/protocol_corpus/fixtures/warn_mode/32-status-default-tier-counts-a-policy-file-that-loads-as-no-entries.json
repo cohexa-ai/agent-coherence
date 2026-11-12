@@ -15,7 +15,9 @@
     "sessions",
     "default_pattern_count",
     "endpoint_counters",
-    "coordinator_version"
+    "coordinator_version",
+    "fold_profile",
+    "fold_table_unicode"
   ],
   "expected": {
     "status": 200,
@@ -33,6 +35,8 @@
       "detail": "minimal",
       "effect_fence_holds_total": 0,
       "endpoint_counters": "<IGNORED>",
+      "fold_profile": "<IGNORED>",
+      "fold_table_unicode": "<IGNORED>",
       "fresh_shared_hash_mismatch_total": 0,
       "handler_concurrency_overflows_total": 0,
       "handoff_giver_denials_total": 0,
@@ -68,6 +72,6 @@
       "watchdog_timeouts_total": 0
     }
   },
-  "_comment": "Copies fixture 08's envelope, so a counter that joins the Python /status body joins both rows. Only policy_summary differs from 08: rejected_pattern_count is 1 and user_added_pattern_count stays 0, because the broken file contributes one rejected entry and none of the patterns it was meant to hold.",
+  "_comment": "Copies fixture 08's envelope, so a counter that joins the Python /status body joins both rows. Only policy_summary differs from 08: rejected_pattern_count is 1 and user_added_pattern_count stays 0, because the broken file contributes one rejected entry and none of the patterns it was meant to hold. fold_profile and fold_table_unicode are ignored but kept in the body, so both keys stay required in this tier: the profile is whatever the disk under the run's tmp dir folds (caseless on a Mac, none on Linux CI), and the fold rows assert both fields per profile.",
   "backends": ["python"]
 }

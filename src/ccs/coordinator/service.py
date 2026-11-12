@@ -91,6 +91,7 @@ from ccs.core.types import (
     WorkspaceRestoreWrite,
 )
 
+from .fold_merge import FOLD_MERGE_PREEMPTER_ID, FOLD_MERGE_TRIGGER, index_key_of
 from .registry_protocol import (
     RELEASE_TRIGGER,
     CheckpointMember,
@@ -2227,8 +2228,9 @@ class CoordinatorService:
         artifact = self._require_artifact(artifact_id)
         identity = caller if caller is not None else agent_id
         # Before the acquire: a giver's re-acquire must never invalidate
-        # the successor's read and then meet it as another holder.
-        self._refuse_handed_off_giver(artifact_id, identity)
+        # the successor's read and then meet it as another holder. Every row
+        # of the fold bucket, since the acquire demotes the writers of all.
+        self._refuse_bucket_giver(artifact_id, identity)
         admitted = self._live_transfer_record(artifact_id)
         if if_unheld:
             # Before the first state write, so a refusal changes nothing,
@@ -2240,7 +2242,11 @@ class CoordinatorService:
             TransientState.IED,
             entered_tick=issued_at_tick,
         )
-        signals: list[InvalidationSignal] = []
+        # Other rows of the file's fold bucket: spellings of one file a merge
+        # left apart, which the coordinator serves as one file.
+        signals = self._demote_bucket_writers(
+            self._fold_bucket_peers(artifact_id), agent_id, issued_at_tick
+        )
         for peer_id, state in self.registry.get_state_map(artifact_id).items():
             if peer_id == agent_id or state == MESIState.INVALID:
                 continue
@@ -3135,7 +3141,8 @@ class CoordinatorService:
             CheckpointRegistrationRefused: one of the four typed reasons above
                 (``reason`` matched by identity); nothing resolved or minted.
             ValueError: blank/duplicate member paths or a blank fingerprint
-                (caller bugs, refused before any resolution).
+                (caller bugs, refused before any resolution). Two spellings
+                that resolve to one row are duplicates.
         """
         record = self.registry.get_checkpoint(checkpoint_id)
         if record is None:
@@ -3150,12 +3157,13 @@ class CoordinatorService:
                     f"register_workspace_restore: member {write.member_path!r} "
                     "carries no fingerprint (a written member always has one)"
                 )
-            if write.member_path in seen:
+            member_key = self._member_resolution_key(write.member_path)
+            if member_key in seen:
                 raise ValueError(
                     f"register_workspace_restore: duplicate member_path "
                     f"{write.member_path!r} in the write-set"
                 )
-            seen.add(write.member_path)
+            seen.add(member_key)
         retry_of_own = self._claim_workspace_registration(
             record, controller, entries, abort=abort
         )
@@ -3327,6 +3335,15 @@ class CoordinatorService:
             raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
         record.require_registrable_by(controller)
 
+    def _member_resolution_key(self, member_path: str) -> str:
+        """The key :meth:`_resolve_workspace_member_artifact` finds
+        ``member_path``'s row by: its fold key where the registry keys file
+        names by a fold, else the name exactly. Two writes with one key would
+        land on one row, the second silently replacing the first."""
+        # Only a SQLite registry its coordinator indexed folds; others keep names exact.
+        profile = getattr(self.registry, "fold_index_profile", None)
+        return member_path if profile is None else index_key_of(member_path, profile)
+
     def _resolve_workspace_member_artifact(
         self, member_path: str, fingerprint: str
     ) -> UUID:
@@ -3369,11 +3386,16 @@ class CoordinatorService:
         5: a refused-terminal registration must never re-read as
         ``None``-means-fine on a re-restore). Never resolves, never mints,
         never mutates: an unknown path answers ``False`` (nothing registered).
-        A plain name scan on BOTH registry backends — sqlite's
-        ``resolve_or_register`` is mint-on-miss and therefore unusable for a
-        read — matching the first-match semantics of
-        :meth:`_resolve_workspace_member_artifact`'s in-memory scan.
+        The durable registry looks the path up as
+        :meth:`_resolve_workspace_member_artifact` resolves it, through the
+        fold index when the coordinator built one, so a merge of the path's
+        spellings into one row leaves the answer as it was. The in-memory
+        registry scans names, matching that method's first-match scan.
         """
+        if isinstance(self.registry, SqliteExtended):
+            found = self.registry.lookup_artifact_id_by_name(member_path)
+            artifact = None if found is None else self.registry.get_artifact(found)
+            return artifact is not None and artifact.content_hash == fingerprint
         for artifact_id in self.registry.artifact_ids():
             artifact = self.registry.get_artifact(artifact_id)
             if artifact is not None and artifact.name == member_path:
@@ -3487,17 +3509,63 @@ class CoordinatorService:
         if record is not None:
             raise GiverFenced(artifact_id, record.successor, record.version_at_transfer)
 
+    def _refuse_bucket_giver(self, artifact_id: UUID, identity: UUID) -> None:
+        """:meth:`_refuse_handed_off_giver` over ``artifact_id`` and every
+        other row of its fold bucket, naming ``artifact_id`` as the head row
+        would. An acquire demotes the writers of the whole bucket, so a giver
+        reaching the file through another spelling's row would otherwise take
+        the grant it handed off. Caller holds the abort guard."""
+        for row_id in (artifact_id, *self._fold_bucket_peers(artifact_id)):
+            record = self.live_handoff_given_by(row_id, identity)
+            if record is not None:
+                raise GiverFenced(artifact_id, record.successor, record.version_at_transfer)
+
     def _refuse_other_holder(self, artifact_id: UUID, agent_id: UUID) -> None:
         """Raise :class:`OtherHolder` when an agent other than ``agent_id``
-        holds ``artifact_id`` EXCLUSIVE or MODIFIED, naming that agent from the
-        same read. Caller holds the abort guard.
+        holds ``artifact_id``, or another row of its fold bucket, EXCLUSIVE or
+        MODIFIED, naming that agent from the same read. Caller holds the
+        abort guard.
 
         "Other" is any composite agent id but the writer's own, so a subagent
         and its parent refuse each other. Only opted-in writers are refused:
         an ordinary write still displaces an opted-in holder."""
-        for peer_id, state in self.registry.get_state_map(artifact_id).items():
-            if peer_id != agent_id and state in _M_OR_E_STATES:
-                raise OtherHolder(artifact_id, peer_id)
+        for row_id in (artifact_id, *self._fold_bucket_peers(artifact_id)):
+            for peer_id, state in self.registry.get_state_map(row_id).items():
+                if peer_id != agent_id and state in _M_OR_E_STATES:
+                    raise OtherHolder(artifact_id, peer_id)
+
+    def _fold_bucket_peers(self, artifact_id: UUID) -> list[UUID]:
+        """The artifact's fold-bucket siblings; none on a registry that keeps
+        names exact (the in-memory one keeps no index)."""
+        if isinstance(self.registry, SqliteExtended):
+            return self.registry.fold_bucket_peers(artifact_id)
+        return []
+
+    def _demote_bucket_writers(
+        self, bucket_rows: list[UUID], agent_id: UUID, tick: int
+    ) -> list[InvalidationSignal]:
+        """A bucket is one file, so an acquire on one of its rows takes the
+        write grant from other agents' holders of its other rows as the
+        start-time merge would: INVALID and present, ``fold_merge`` as the
+        reclaim, and a signal from the merge preempter, whose notice tells
+        the holder that no session's commit took its grant. The agent's own
+        grant on another row is left as it is. Caller holds the abort guard."""
+        signals: list[InvalidationSignal] = []
+        for row_id in bucket_rows:
+            row = self.registry.get_artifact(row_id)
+            for peer_id, state in self.registry.get_state_map(row_id).items():
+                if row is None or peer_id == agent_id or state not in _M_OR_E_STATES:
+                    continue
+                self.registry.set_agent_state(
+                    row_id, peer_id, MESIState.INVALID, trigger=FOLD_MERGE_TRIGGER, tick=tick
+                )
+                self.registry.record_last_reclamation(peer_id, row_id, FOLD_MERGE_TRIGGER, tick)
+                signals.append(InvalidationSignal(
+                    artifact_id=row_id, new_version=row.version, issued_at_tick=tick,
+                    issuer_agent_id=FOLD_MERGE_PREEMPTER_ID, victim_agent_id=peer_id,
+                    victim_state=state,
+                ))
+        return signals
 
     def _live_transfer_record(self, artifact_id: UUID) -> TransferRecord | None:
         """The path's record if it is live now. Read inside the write path's

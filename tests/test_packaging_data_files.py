@@ -262,6 +262,15 @@ def test_the_html_templates_are_declared() -> None:
         assert SRC_ROOT / relative in declared, f"{relative} is not declared package data"
 
 
+def test_the_fold_table_and_its_license_notice_are_declared() -> None:
+    """The fold table ``ccs.core.path_fold`` reads at import, and the Unicode
+    License notice that must ship with the data it covers."""
+    declared = _declared_data_files()
+
+    for relative in ("ccs/core/fold_data/fold_table.json", "ccs/core/fold_data/LICENSE-UNICODE"):
+        assert SRC_ROOT / relative in declared, f"{relative} is not declared package data"
+
+
 def test_replayed_data_files_match_setuptools(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin the replay above to what the real build backend resolves.
 

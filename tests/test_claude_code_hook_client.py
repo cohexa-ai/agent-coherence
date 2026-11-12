@@ -1398,3 +1398,272 @@ def test_load_secret_never_reads_through_a_link(tmp_path: Path, linked: str) -> 
         (tmp_path / ".coherence").symlink_to(elsewhere)
 
     assert load_secret(tmp_path) is None
+
+
+# ----------------------------------------------------------------------
+# Links and workspace-root spellings
+#
+# The hook client keys a file the way the plugin's Node client does: it
+# follows links to the file they name and keeps the case each name was typed
+# in, and it falls back to the disk's own spelling only for a path that would
+# otherwise lie outside the root (a root typed in another case, or /var for
+# /private/var). One file then reaches the coordinator under one path, whatever
+# link or root spelling the tool call used. The expected paths are literal and
+# match the Node client's on the same layout.
+# ----------------------------------------------------------------------
+
+from functools import partial  # noqa: E402
+
+from ccs.core.disk_spelling import native_spelling  # noqa: E402
+
+_LINK_SID = "55555555-5555-4555-8555-555555555555"
+
+
+@pytest.fixture
+def linked_workspace(tmp_path: Path) -> Path:
+    """``<tmp>/ws`` is the root: plan.md, documentation/guide.md,
+    docs -> documentation, data/plan-link.md -> ../plan.md,
+    data/outside-link.md -> <tmp>/outside/secret.md, and
+    data/dangle.md -> nope.md (missing)."""
+    root = tmp_path / "ws"
+    (root / "data").mkdir(parents=True)
+    (root / "documentation").mkdir()
+    (tmp_path / "outside").mkdir()
+    (root / "plan.md").write_text("plan")
+    (root / "documentation" / "guide.md").write_text("guide")
+    (tmp_path / "outside" / "secret.md").write_text("secret")
+    (root / "docs").symlink_to("documentation")
+    (root / "data" / "plan-link.md").symlink_to(Path("..") / "plan.md")
+    (root / "data" / "outside-link.md").symlink_to(tmp_path / "outside" / "secret.md")
+    (root / "data" / "dangle.md").symlink_to("nope.md")
+    return root
+
+
+def _file_cc(file_path: Path | str) -> dict[str, Any]:
+    return {"session_id": _LINK_SID, "tool_input": {"file_path": str(file_path)}}
+
+
+def _read_path(file_path: Path | str, root: Path) -> str:
+    """The path a pre-read of ``file_path`` sends for workspace ``root``."""
+    return coherence_hook_client._build_pre_read(_file_cc(file_path), root)["path"]
+
+
+def test_a_link_to_a_file_is_sent_as_the_file_it_names(linked_workspace: Path) -> None:
+    root = linked_workspace
+    link = root / "data" / "plan-link.md"
+
+    assert _read_path(link, root) == "plan.md"
+    edit = coherence_hook_client._build_pre_edit(_file_cc(link), root)
+    assert edit == {"session_id": _LINK_SID, "path": "plan.md"}
+
+
+def test_a_path_through_a_linked_directory_is_sent_under_the_targets_path(
+    linked_workspace: Path,
+) -> None:
+    root = linked_workspace
+
+    assert _read_path(root / "docs" / "guide.md", root) == "documentation/guide.md"
+    grep = coherence_hook_client._build_pre_grep(
+        {"session_id": _LINK_SID, "tool_input": {"path": str(root / "docs")}}, root
+    )
+    assert grep == {"session_id": _LINK_SID, "search_root": "documentation"}
+
+
+def test_a_link_whose_target_leaves_the_root_skips_the_hook(linked_workspace: Path) -> None:
+    root = linked_workspace
+    with pytest.raises(coherence_hook_client._SkipHook):
+        _read_path(root / "data" / "outside-link.md", root)
+
+
+@pytest.mark.parametrize("name", ["dangle.md", "loop-a.md"])
+def test_a_link_that_does_not_resolve_skips_the_hook_with_the_skip_signal(
+    linked_workspace: Path, name: str
+) -> None:
+    """A dangling or looping link is skipped, not sent under the missing
+    target's path (or the link's own): either would give its file a second
+    identity once the target exists. The skip signal, not a filesystem
+    error, so the hook prints ``{}`` without contacting the coordinator."""
+    root = linked_workspace
+    (root / "data" / "loop-a.md").symlink_to("loop-b.md")
+    (root / "data" / "loop-b.md").symlink_to("loop-a.md")
+    builders = (
+        coherence_hook_client._build_pre_read,
+        coherence_hook_client._build_pre_edit,
+        coherence_hook_client._build_post_edit,
+    )
+    for build in builders:
+        with pytest.raises(coherence_hook_client._SkipHook):
+            build(_file_cc(root / "data" / name), root)
+
+
+def test_a_new_file_under_an_existing_directory_keeps_the_leaf_as_typed(
+    linked_workspace: Path,
+) -> None:
+    root = linked_workspace
+
+    edit = coherence_hook_client._build_pre_edit(_file_cc(root / "docs" / "New-Plan.MD"), root)
+    assert edit == {"session_id": _LINK_SID, "path": "documentation/New-Plan.MD"}
+    assert _read_path(root / "data" / "new" / "deep.md", root) == "data/new/deep.md"
+
+
+def test_a_name_typed_in_another_case_under_a_correctly_spelled_root_is_sent_as_typed(
+    linked_workspace: Path,
+) -> None:
+    """A Bash token is keyed as typed, so a Read of README.MD is sent as
+    typed too: sending the disk's README.md would keep the two tools'
+    records of one file apart on a coordinator that folds nothing."""
+    root = linked_workspace
+    (root / "README.md").write_text("readme")
+    if not (root / "README.MD").exists():
+        pytest.skip("the temporary disk keeps two spellings apart, so README.MD is another file")
+
+    assert _read_path(root / "README.MD", root) == "README.MD"
+    edit = coherence_hook_client._build_pre_edit(_file_cc(root / "README.MD"), root)
+    assert edit == {"session_id": _LINK_SID, "path": "README.MD"}
+    # The link is followed; the names typed around it keep their case.
+    assert _read_path(root / "docs" / "GUIDE.MD", root) == "documentation/GUIDE.MD"
+
+
+def test_a_tool_path_spelled_with_a_differently_cased_root_is_sent_relative_to_it(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Repo"
+    (root / "data").mkdir(parents=True)
+    (root / "data" / "x.txt").write_text("x")
+    other_case = tmp_path / "REPO"
+    if not other_case.exists():
+        pytest.skip("the temporary disk keeps two spellings apart, so no other spelling reaches the root")
+
+    assert _read_path(other_case / "data" / "x.txt", root) == "data/x.txt"
+    assert _read_path(root / "data" / "x.txt", other_case) == "data/x.txt"
+    edit = coherence_hook_client._build_pre_edit(_file_cc(other_case / "data" / "New.TXT"), root)
+    assert edit == {"session_id": _LINK_SID, "path": "data/New.TXT"}
+
+
+def test_a_hook_whose_path_spells_the_root_in_another_case_reaches_the_coordinator(
+    live_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Claude Code sends ``<base>/REPO/data/x.txt`` for a workspace whose disk
+    spelling is ``<base>/Repo``: the coordinator sees the read of
+    ``data/x.txt`` instead of the hook skipping it as outside the root."""
+    workspace, _ = live_coordinator
+    other_case = workspace.parent / workspace.name.swapcase()
+    if not other_case.exists():
+        pytest.skip("the temporary disk keeps two spellings apart, so no other spelling reaches the root")
+    from ccs.cli import coherence_status, coherence_track
+
+    (workspace / "data").mkdir()
+    (workspace / "data" / "x.txt").write_text("x")
+    coherence_track.main(["--root", str(workspace), "data/x.txt"])
+    capsys.readouterr()
+
+    rc, out = _drive(
+        "pre-read", _file_cc(other_case / "data" / "x.txt"), workspace, monkeypatch, capsys
+    )
+    assert rc == 0
+    assert json.loads(out) != {}, "the hook skipped the read as outside the workspace root"
+    coherence_status.main(["--root", str(workspace), "--json"])
+    status = json.loads(capsys.readouterr().out)
+    assert "data/x.txt" in [a["path"] for a in status.get("tracked_artifacts", [])]
+
+
+def test_a_root_reached_through_a_link_and_a_path_spelled_through_its_target_agree(
+    linked_workspace: Path, tmp_path: Path
+) -> None:
+    root = linked_workspace
+    alias = tmp_path / "alias"
+    alias.symlink_to(root)
+
+    assert _read_path(root / "plan.md", alias) == "plan.md"
+    assert _read_path(alias / "plan.md", root) == "plan.md"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS reaches /var through /private/var")
+def test_macos_var_and_private_var_spellings_of_the_root_and_the_path_agree(
+    linked_workspace: Path,
+) -> None:
+    private_spelling = native_spelling(linked_workspace)
+    assert private_spelling.startswith("/private/"), private_spelling
+    private_root = Path(private_spelling)
+    link_root = Path(private_spelling[len("/private"):])
+
+    assert _read_path(private_root / "plan.md", link_root) == "plan.md"
+    assert _read_path(link_root / "plan.md", private_root) == "plan.md"
+
+
+@pytest.mark.parametrize(
+    "typed, expected",
+    [
+        ("plan.md", "plan.md"),
+        ("documentation/guide.md", "documentation/guide.md"),
+        ("data/new/deep.md", "data/new/deep.md"),
+        ("data/", "data"),
+        ("", "."),
+    ],
+)
+def test_todays_paths_are_sent_as_before(
+    linked_workspace: Path, typed: str, expected: str
+) -> None:
+    """A path with no link and the root's own spelling is sent exactly as
+    before links were followed through the disk resolvers."""
+    root = linked_workspace
+    file_path = os.path.join(str(root), typed)
+
+    assert coherence_hook_client._to_workspace_relative(file_path, root) == expected
+
+
+@pytest.mark.parametrize(
+    "typed, key",
+    [
+        ("sub/link/../plan.md", "sub/plan.md"),
+        ("sub/link/../new.md", "sub/new.md"),
+        ("missing/../w2.md", "w2.md"),
+    ],
+)
+def test_a_parent_step_is_folded_by_text_before_links_are_followed(
+    tmp_path: Path, typed: str, key: str
+) -> None:
+    """A ``..`` in a tool path is folded by text before any link is followed,
+    so the key names the file Claude Code's tools open, not the one the shell
+    opens. Measured on this layout (sub/link -> other/dir): a Read of
+    sub/link/../plan.md returned sub/plan.md, an Edit of it changed
+    sub/plan.md, a Write of sub/link/../new.md created sub/new.md and a Write
+    of missing/../w2.md created w2.md; only the shell opened other/plan.md.
+    Claude Code normalizes an absolute tool path before opening it; the
+    shell's ``..`` is coordinated by the Bash routes. Following the link
+    first would key other/plan.md for a Read that opened sub/plan.md."""
+    root = tmp_path / "ws"
+    (root / "sub").mkdir(parents=True)
+    (root / "other" / "dir").mkdir(parents=True)
+    (root / "sub" / "plan.md").write_text("lexical")
+    (root / "other" / "plan.md").write_text("physical")
+    (root / "sub" / "link").symlink_to(root / "other" / "dir")
+    file_path = os.path.join(str(root), typed)
+
+    assert coherence_hook_client._to_workspace_relative(file_path, root) == key
+    assert _coherence_client.normalize_workspace_path(file_path, root) == (key, None)
+
+
+def test_no_payload_carries_a_name_kind_field(linked_workspace: Path) -> None:
+    """Each coordinator works out a name's kind itself; the hook client
+    never sends one."""
+    root = linked_workspace
+    cc = {
+        "session_id": _LINK_SID,
+        "agent_id": "sub-1",
+        "source": "compact",
+        "tool_input": {
+            "file_path": str(root / "data" / "plan-link.md"),
+            "command": "cat plan.md",
+            "path": str(root / "docs"),
+        },
+    }
+    hc = coherence_hook_client
+    with_root = (hc._build_pre_read, hc._build_pre_edit, hc._build_post_edit, hc._build_pre_grep)
+    without_root = (
+        hc._build_session_stop, hc._build_subagent_stop, hc._build_session_start, hc._build_pre_bash,
+    )
+    builds = [partial(b, cc, root) for b in with_root] + [partial(b, cc) for b in without_root]
+    for build in builds:
+        assert "name_kind" not in build(), build

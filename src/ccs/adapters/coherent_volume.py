@@ -59,7 +59,7 @@ from ccs.adapters.claude_code.lifecycle import (
     connect_or_spawn,
     running_coordinator_port,
 )
-from ccs.adapters.claude_code.policy import matches_any
+from ccs.adapters.claude_code.policy import PolicyMatchContext, TrackedArtifactPolicy
 from ccs.adapters.claude_code.state_dir import check_coherence_dir
 from ccs.cli._coherence_client import (
     NODE_BACKEND,
@@ -85,7 +85,9 @@ from ccs.cli._coherence_client import (
 from ccs.cli._coherence_client import (
     post as _coordinator_post,
 )
+from ccs.coordinator.fold_merge import index_key_of
 from ccs.coordinator.sqlite_registry import StoreHeldError
+from ccs.core.disk_spelling import native_spelling
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_CLAIMED_REASON,
     COMMIT_UNCONFIRMED_REASON,
@@ -111,6 +113,7 @@ from ccs.core.exceptions import (
     GiverFenced,
     HandoffPathsInvalid,
     InternalConcurrencyError,
+    LinkOutOfManaged,
     OtherHolder,
     PublishMaterializationError,
     RedirectRefused,
@@ -120,6 +123,7 @@ from ccs.core.exceptions import (
     _is_handler_failure_reason,
 )
 from ccs.core.fence import confirmed_generation
+from ccs.core.path_fold import FOLD_TABLE_UNICODE_VERSION, FoldProfile
 
 logger = logging.getLogger(__name__)
 
@@ -600,6 +604,51 @@ def _check_refuse_mode(
         raise ValueError("on_held='refuse' opts in on managed paths, so it needs managed globs")
     if remote_endpoint is not None:
         raise ValueError("on_held='refuse' is not supported with remote_endpoint")
+
+
+#: The ``/status`` ``fold_profile`` values a volume keys by. ``cannot_tell`` and
+#: any value it does not know key as ``none``, as the coordinator keys
+#: ``cannot_tell``: folding a name the coordinator keeps apart would be a guess.
+_FOLD_PROFILES: dict[str, FoldProfile] = {"caseless": "caseless", "nfd": "nfd", "none": "none"}
+
+
+class _FoldView(NamedTuple):
+    """What an attach read of how the coordinator keys file names: the profile
+    the volume keys its records by, and ``doubt``, why the volume cannot rely
+    on it, which a refuse-mode attach refuses on. ``unanswered``: the read got
+    no usable answer at all."""
+
+    profile: FoldProfile
+    doubt: str | None = None
+    unanswered: bool = False
+
+
+def _fold_view_of(status: object) -> _FoldView:
+    """Read the fold fields of a default-tier ``/status`` answer. No
+    ``fold_profile`` is an older coordinator, which keys names exactly. A
+    fold table of another Unicode version may key a name another way, so the
+    volume keys exactly and says why."""
+    if not isinstance(status, dict):
+        return _FoldView("none", "the /status answer is not a JSON object")
+    if "fold_profile" not in status:
+        return _FoldView("none")
+    table = status.get("fold_table_unicode")
+    if table != FOLD_TABLE_UNICODE_VERSION:
+        return _FoldView(
+            "none",
+            f"the coordinator folds names by the Unicode {table!r} table and this "
+            f"library by Unicode {FOLD_TABLE_UNICODE_VERSION}",
+        )
+    profile = status.get("fold_profile")
+    return _FoldView(_FOLD_PROFILES.get(profile, "none") if isinstance(profile, str) else "none")
+
+
+def _fold_profile_refusal_message(doubt: str) -> str:
+    return (
+        "on_held='refuse' keys each file as the coordinator does, by the fold profile "
+        f"it advertises, and cannot rely on it: {doubt}. Nothing was sent. Run this "
+        "library and the coordinator from the same release, or use on_held='displace'."
+    )
 
 
 def _own_grant_message(rel: str, *, held: bool) -> str:
@@ -1172,10 +1221,28 @@ class CoherentVolume:
       file, leaving it with its holder. Strict-only, needs ``managed`` globs,
       not available with ``remote_endpoint``. At attach the coordinator must
       advertise ``pre_edit_if_unheld``; otherwise the attach raises
-      :class:`~ccs.core.exceptions.CoherenceError` before it sends anything. A
-      write outside ``managed`` sends no flag and still displaces. The check
-      reads the resolved path, so a link under ``managed`` to a file outside
-      it is such a write.
+      :class:`~ccs.core.exceptions.CoherenceError` before it sends anything,
+      and so does an attach that cannot read the coordinator's fold profile or
+      finds it folding by another Unicode table (see below). A
+      write outside ``managed`` sends no flag and still displaces. A write
+      through a link whose name is under ``managed`` to a file outside it
+      raises :class:`~ccs.core.exceptions.LinkOutOfManaged` before it sends
+      anything, decided against the links as they stand when :meth:`write` is
+      called.
+
+    **One identity per file (#506).** At every local attach the volume reads
+    the coordinator's ``fold_profile`` and ``fold_table_unicode`` from the
+    default ``/status`` tier, and keys everything it records per file (grants,
+    reads, hashes, read handoffs, held paths) by that profile's fold key, as
+    the coordinator keys file names: on a case-insensitive disk ``DATA/x.txt``
+    and ``data/x.txt`` are one file to both, and :meth:`release` of either
+    releases it. Its managed checks read a name as the coordinator's policy
+    does, so ``DATA/x.txt`` is under ``data/**`` there. An older coordinator
+    without the fields, an unreadable ``/status``, ``cannot_tell``, a profile
+    it does not know, or a table of another Unicode version all key names
+    exactly (``none``). A ``remote_endpoint`` volume keys exactly too, and
+    marks each path it sends a key (``name_kind``): the remote disk is not
+    its own.
 
     **Letting go (#505).** A successful :meth:`write` keeps the file's write
     grant after it returns. :meth:`release` gives back one file's grant and
@@ -1257,6 +1324,21 @@ class CoherentVolume:
         # same grammar as tracked.yaml). They must be tracked AND strict for the
         # INVALID-deny to fire (is_strict_mode ⊂ is_tracked).
         self._managed: tuple[str, ...] = tuple(managed)
+        # The managed globs as the coordinator's own policy reads them, built
+        # once: a name is managed when any of its readings matches (as typed,
+        # as the disk spells it, folded by the profile), so every spelling the
+        # coordinator treats as a managed file counts here too. The volume puts
+        # these globs in both the tracked and the strict set, so "strict" under
+        # this policy is "managed".
+        self._managed_policy = TrackedArtifactPolicy(
+            coordinator_root=self._root,
+            tracked_patterns=self._managed,
+            strict_mode_paths=self._managed,
+        )
+        # How the attached coordinator keys file names, read at every local
+        # attach (_attach): every per-file record below is keyed by this
+        # profile's fold key, so each spelling of one file reaches one record.
+        self._fold_profile: FoldProfile = "none"
         self._on_held = on_held
         # What the latest operator view said about the opted-in refusal. Only
         # refuse mode reads it, right after the view that set it.
@@ -1609,7 +1691,11 @@ class CoherentVolume:
     def _attach(self) -> None:
         """Dispatch attach: local spawn-with-strict, or remote connect-only.
 
-        Remote mode (the cross-host demo) NEVER spawns a local coordinator."""
+        Remote mode (the cross-host demo) NEVER spawns a local coordinator.
+
+        A remote coordinator's disk is not this volume's, so its records stay
+        keyed exactly and its paths are sent as keys; a local attach keys them
+        by the profile the coordinator advertises."""
         if self._remote_endpoint is not None:
             self._attach_remote()
         else:
@@ -1759,7 +1845,35 @@ class CoherentVolume:
                 # receives nothing.
                 self._endpoint = None
                 raise CoherenceError(_IF_UNHELD_NOT_ADVERTISED_MESSAGE)
+        self._adopt_fold_profile()
         self._claim_principal()
+
+    def _adopt_fold_profile(self) -> None:
+        """Key this volume's records as the attached coordinator keys file
+        names. Refuse mode, which promises a holder its file under every
+        spelling, cannot rely on a profile it could not read or one folded by
+        another table, so it fails closed, detached, before the claim, as the
+        capability check above does."""
+        view = self._read_fold_view()
+        self._fold_profile = view.profile
+        if self._on_held != "refuse" or view.doubt is None:
+            return
+        self._endpoint = None
+        refusal = CoordinatorUnreachable if view.unanswered else CoherenceError
+        raise refusal(_fold_profile_refusal_message(view.doubt))
+
+    def _read_fold_view(self) -> _FoldView:
+        """The fold fields of the default ``/status`` tier, which every
+        coordinator serves; the operator tier the glob check reads is not
+        served by the Node coordinator. Only the failure's type is named,
+        never its text."""
+        try:
+            status = _coordinator_get(self._endpoint, "/status")
+        except CoordinatorUnavailable as exc:
+            return _FoldView("none", f"{type(exc).__name__} reading /status", unanswered=True)
+        except Exception as exc:  # any other failure to read it is "cannot tell"
+            return _FoldView("none", f"{type(exc).__name__} reading /status")
+        return _fold_view_of(status)
 
     def _enforcement_failure(self, enforcement: ManagedGlobEnforcement) -> str:
         """The message for an attach the per-glob check did not confirm: which
@@ -2083,15 +2197,16 @@ class CoherentVolume:
             raise FileNotFoundError(f"no such file in workspace: {rel}")
         data = self._read_file_bytes(abs_path)  # empty file -> b"" -> sha256(b"")
         content_hash = self._sha256_bytes(data)
+        key = self._key_of(rel)
         # SB-23: a path this volume has no baseline for takes these bytes as its
         # first one even if the read is refused below. Without it a refused first
         # read leaves a later write unchecked, and a peer commit that reached disk
         # after the refusal is overwritten. setdefault never replaces an earlier
         # observation, so the refused bytes cannot absolve an edit made after one.
-        self._last_observed_hash.setdefault(rel, content_hash)
+        self._last_observed_hash.setdefault(key, content_hash)
         # This read's answer replaces both: its handoff key and whether it was
         # a strict deny. An unanswered or failed read leaves neither set.
-        self._read_handoffs.pop(rel, None)
+        self._read_handoffs.pop(key, None)
         self._last_read_denied = False
         self._last_read_split = False
         if self._endpoint is not None:
@@ -2133,7 +2248,7 @@ class CoherentVolume:
                     raise _split_pair_refusal()
                 raise StaleView(self._deny_reason(resp))
             if self._read_registered(resp):
-                self._read_incarnations[rel] = reader
+                self._read_incarnations[key] = reader
         # SB-23: advance the foreign-edit baseline only HERE, where the bytes
         # reach the caller. Every raise above leaves the caller without them: a
         # request refused for its caller principal (raised out of _post in both
@@ -2142,7 +2257,7 @@ class CoherentVolume:
         # the caller never saw, and its next write() would clobber it instead of
         # being denied. (A path with no baseline yet was already given one by the
         # setdefault above.)
-        self._last_observed_hash[rel] = content_hash
+        self._last_observed_hash[key] = content_hash
         return data
 
     def write(self, path: str | os.PathLike[str], data: bytes | bytearray) -> WriteResult:
@@ -2222,6 +2337,10 @@ class CoherentVolume:
         data = bytes(data)
         self._ensure_attached()
         abs_path, rel = self._to_relative(path)
+        if self._on_held == "refuse":
+            # Decided now, against the links as they stand, before any request.
+            self._refuse_link_out_of_managed(path, rel)
+        key = self._key_of(rel)
 
         if self._endpoint is None:
             # Unattached / degraded coordinator (strict already raised at
@@ -2249,13 +2368,13 @@ class CoherentVolume:
         # bare ok:true as an acquire, so the volume cannot tell that no grant was
         # taken.
         written = self._grant_incarnations.setdefault(self._incarnation, set())
-        recorded_before = rel in written
-        written.add(rel)
+        recorded_before = key in written
+        written.add(key)
 
         def withdraw_record() -> None:
             if recorded_before:
                 return
-            written.discard(rel)
+            written.discard(key)
             if not written:
                 self._grant_incarnations.pop(self._incarnation, None)
 
@@ -2301,7 +2420,7 @@ class CoherentVolume:
             # ALREADY holds these bytes. _last_committed_hash is a cheap fast-path
             # gate; the CURRENT on-disk hash is the authority (see _disk_hash).
             already_on_disk = (
-                self._last_committed_hash.get(rel) == new_hash
+                self._last_committed_hash.get(key) == new_hash
                 and disk_hash == new_hash
             )
             if not already_on_disk:
@@ -2312,7 +2431,7 @@ class CoherentVolume:
             # is DELIBERATELY split from the _last_committed_hash advance below (after
             # the post-edit POST); the other own-write sites advance both caches
             # together, so do not "fix" this into a pair — the ordering is load-bearing.
-            self._last_observed_hash[rel] = new_hash
+            self._last_observed_hash[key] = new_hash
         except Exception:
             # Release the grant so it is not orphaned until the sweep, then
             # re-raise the original error. Best-effort release — a release failure
@@ -2387,7 +2506,7 @@ class CoherentVolume:
             # write (a concurrent-writer case v1 does not claim to serialize);
             # fail closed so the caller knows the commit did not register.
             self._check_grant(post_resp, rel, phase="post-edit")
-        self._last_committed_hash[rel] = new_hash
+        self._last_committed_hash[key] = new_hash
         # Relayed, never acted on: the coordinator's note does not move the
         # observed baseline the foreign-edit check compares against.
         return WriteResult(path=rel, disk_differs=isinstance(resp, dict) and resp.get("disk_differs") is True)
@@ -2398,7 +2517,7 @@ class CoherentVolume:
         send it through the untracked exit, around the check. A session with no
         caller principal raises, with nothing sent, because the coordinator would
         refuse the request."""
-        if self._on_held != "refuse" or not matches_any(rel, self._managed):
+        if self._on_held != "refuse" or not self._matches_managed(rel):
             return False
         if self._principal is None:
             raise CoherenceError(_no_principal_message(rel, self.principal_claim_outcome))
@@ -2413,12 +2532,14 @@ class CoherentVolume:
             return _coordinator_post(
                 self._endpoint,
                 "/hooks/post-edit",
-                {
-                    "session_id": self._session_id,
-                    "agent_id": self._incarnation,
-                    "path": rel,
-                    "success": False,
-                },
+                self._named(
+                    {
+                        "session_id": self._session_id,
+                        "agent_id": self._incarnation,
+                        "path": rel,
+                        "success": False,
+                    }
+                ),
                 extra_headers=caller_principal_headers(self._principal),
                 **post_kwargs,
             )
@@ -2447,7 +2568,7 @@ class CoherentVolume:
         # write() calls took on other paths, which this release did not touch.
         written = self._grant_incarnations.get(incarnation)
         if written is not None:
-            written.discard(rel)
+            written.discard(self._key_of(rel))
             if not written:
                 del self._grant_incarnations[incarnation]
         return True
@@ -2732,11 +2853,11 @@ class CoherentVolume:
             path = entry.get("path")
             if not isinstance(path, str):
                 continue
-            held = entry.get("held")
+            key, held = self._key_of(path), entry.get("held")
             if held is False:
-                written.discard(path)
-            elif held is True and path in written:
-                self._release_held_paths.add(path)
+                written.discard(key)
+            elif held is True and key in written:
+                self._release_held_paths.add(key)
         if not written:
             del self._grant_incarnations[incarnation]
 
@@ -2755,8 +2876,9 @@ class CoherentVolume:
         coordinator answers a release the same way whether it released a grant
         or held nothing: one release per attempt whose :meth:`write` took a
         grant on ``path``, and none for a path no write of this volume recorded.
-        That includes another spelling of a recorded path, such as a different
-        case or Unicode form, which releases nothing (#506).
+        A spelling the attached coordinator keys as a recorded file, such as
+        another case on a case-insensitive disk, is that file (#506); on a disk
+        that keeps spellings apart it is another file, and releases nothing.
 
         A release the coordinator does not confirm keeps the path recorded and
         goes through ``on_error``: strict raises (``CoordinatorUnreachable``
@@ -2783,6 +2905,7 @@ class CoherentVolume:
         displaced by it, so a later transfer presents a claim that holds."""
         if self._endpoint is None:
             return None  # detached: no write of this volume recorded a grant
+        key = self._key_of(rel)
         held: _ReleaseFailure | None = None
         released_first = False
         for incarnation in self._writer_incarnations(rel):
@@ -2793,19 +2916,20 @@ class CoherentVolume:
             if isinstance(answer, _ReleaseFailure):
                 return answer
             if self._settle_path_release(incarnation, rel, answer) and not released_first:
-                self._read_incarnations[rel] = incarnation
+                self._read_incarnations[key] = incarnation
                 released_first = True
-            if rel in self._grant_incarnations.get(incarnation, ()):
+            if key in self._grant_incarnations.get(incarnation, ()):
                 held = _ReleaseFailure(CoherenceError, held=True)
         if not self._records_write_grant(rel):
-            self._release_held_paths.discard(rel)
+            self._release_held_paths.discard(key)
         return held
 
     def _writer_incarnations(self, rel: str) -> list[str]:
         """The incarnations whose write() recorded a grant on ``rel``: the
         current one first, then the latest. The first holds the grant, since
         each later acquire took it from the earlier ones."""
-        writers = [inc for inc, written in self._grant_incarnations.items() if rel in written]
+        key = self._key_of(rel)
+        writers = [inc for inc, written in self._grant_incarnations.items() if key in written]
         ordered = list(reversed(writers))
         if self._incarnation in ordered:
             ordered.remove(self._incarnation)
@@ -2861,7 +2985,7 @@ class CoherentVolume:
             return False
         written = self._grant_incarnations.get(incarnation)
         if written is not None:
-            written.discard(rel)
+            written.discard(self._key_of(rel))
             if not written:
                 del self._grant_incarnations[incarnation]
         return True
@@ -3223,7 +3347,7 @@ class CoherentVolume:
             # make_content, so they become the foreign-edit baseline — and only
             # here: a denied read (above) was never handed to it, and seeding
             # from one would absolve the out-of-band edit that got it denied.
-            self._last_observed_hash[rel] = self._sha256_bytes(current_bytes)
+            self._last_observed_hash[self._key_of(rel)] = self._sha256_bytes(current_bytes)
             data = bytes(make_content(current_bytes))
             new_hash = self._sha256_bytes(data)
 
@@ -3470,7 +3594,8 @@ class CoherentVolume:
         answered reaches the text."""
         if reason != "other_holder" or not self._records_write_grant(rel):
             return None
-        return CoordinatorFailed(_own_grant_message(rel, held=rel in self._release_held_paths))
+        held = self._key_of(rel) in self._release_held_paths
+        return CoordinatorFailed(_own_grant_message(rel, held=held))
 
     def _raise_if_refused_by_own_grant(self, rel: str, reason: object) -> None:
         """Raise :meth:`_own_grant_refusal`'s error, when there is one."""
@@ -3493,7 +3618,8 @@ class CoherentVolume:
     def _records_write_grant(self, rel: str) -> bool:
         """Whether this volume's record holds a write grant on ``rel`` that no
         confirmed release has cleared, under any incarnation."""
-        return any(rel in written for written in self._grant_incarnations.values())
+        key = self._key_of(rel)
+        return any(key in written for written in self._grant_incarnations.values())
 
     def atomic_publish(
         self,
@@ -3633,9 +3759,10 @@ class CoherentVolume:
                     f"got {type(content).__name__}"
                 )
             abs_path, rel = self._to_relative(path)
-            if rel in seen:
+            key = self._key_of(rel)
+            if key in seen:
                 raise ValueError(f"atomic_publish write-set has a duplicate path: {rel}")
-            seen.add(rel)
+            seen.add(key)
             resolved.append((abs_path, rel, int(expected_version), disk_bytes))
         return resolved
 
@@ -3915,9 +4042,10 @@ class CoherentVolume:
                 raise HandoffPathsInvalid("transfer requires at least one path")
             seen: set[str] = set()
             for rel in rels:
-                if rel in seen:
+                key = self._key_of(rel)
+                if key in seen:
                     raise HandoffPathsInvalid(f"transfer names a path more than once: {rel}")
-                seen.add(rel)
+                seen.add(key)
             self._require_attached_for("transfer", rels)
             resp = self._post(
                 "/handoff/transfer",
@@ -3977,7 +4105,7 @@ class CoherentVolume:
         strict deny's bytes never carry the key."""
         self._require_open()
         _abs_path, rel = self._to_relative(path)
-        handoff = self._read_handoffs.get(rel)
+        handoff = self._read_handoffs.get(self._key_of(rel))
         return dict(handoff) if handoff is not None else None
 
     @property
@@ -4003,7 +4131,7 @@ class CoherentVolume:
         before sending, so an answer without a key leaves none."""
         handoff = resp.get("handoff") if isinstance(resp, dict) else None
         if isinstance(handoff, dict):
-            self._read_handoffs[rel] = handoff
+            self._read_handoffs[self._key_of(rel)] = handoff
 
     def _settle_handoff(
         self, verb: Literal["accept", "decline", "withdraw"], path: str | os.PathLike[str]
@@ -4073,17 +4201,18 @@ class CoherentVolume:
         writers = self._writer_incarnations(rel)
         if writers:
             return writers[0]
-        return self._read_incarnations.get(rel, self._incarnation)
+        return self._read_incarnations.get(self._key_of(rel), self._incarnation)
 
     def _forget_claim(self, rel: str) -> None:
         """Drop ``rel`` from what this volume records holding, once a transfer
         handed its claim on: the coordinator moved that claim to INVALID. An
         incarnation stays in the write record while it records another path,
         which a re-mint must still release."""
-        self._read_incarnations.pop(rel, None)
+        key = self._key_of(rel)
+        self._read_incarnations.pop(key, None)
         for incarnation in list(self._grant_incarnations):
             written = self._grant_incarnations[incarnation]
-            written.discard(rel)
+            written.discard(key)
             if not written:
                 del self._grant_incarnations[incarnation]
 
@@ -4189,6 +4318,69 @@ class CoherentVolume:
             ) from exc
         return abs_path, rel.as_posix()
 
+    def _key_of(self, rel: str) -> str:
+        """The key this volume records ``rel`` under: the one the attached
+        coordinator looks the file up by, so every spelling it treats as this
+        file reaches the same record, and no other file's."""
+        return index_key_of(rel, self._fold_profile)
+
+    def _matches_managed(self, rel: str) -> bool:
+        """Whether ``rel``, a path :meth:`_to_relative` resolved, is managed.
+        It crosses no link, so the disk's spelling of it is the same file."""
+        if not self._managed:
+            return False
+        return self._matches_globs(rel, self._disk_spelling_of(rel))
+
+    def _matches_globs(self, name: str, disk_spelling: str | None) -> bool:
+        """Whether ``name`` matches ``managed`` by the coordinator's own readings
+        of a file name under the attached profile: ``DATA/x.md`` is under
+        ``data/**`` on a disk that folds case, as the coordinator holds it
+        strict there."""
+        context = PolicyMatchContext(self._fold_profile, "file", disk_spelling)
+        return self._managed_policy.is_strict_mode(name, context)
+
+    def _disk_spelling_of(self, rel: str) -> str | None:
+        """The disk's own spelling of ``rel``, relative to the root, which only
+        a folding profile reads, so the resolver is skipped otherwise. One it
+        cannot find leaves the other readings, as on the coordinator: the
+        shim's managed check must never raise."""
+        if self._fold_profile == "none":
+            return None
+        try:
+            return os.path.relpath(native_spelling(self._root / rel), native_spelling(self._root))
+        except (OSError, ValueError):
+            return None
+
+    def _refuse_link_out_of_managed(self, path: str | os.PathLike[str], rel: str) -> None:
+        """Refuse mode: raise :class:`~ccs.core.exceptions.LinkOutOfManaged`
+        when ``path`` reaches ``rel``, a file outside ``managed``, through a link
+        whose name, as ``path`` writes through it, is managed. The refusal of a
+        held file applies to managed files only, so such a write would take
+        ``rel`` from its holder under a name that promised otherwise."""
+        if self._matches_managed(rel):
+            return
+        for link, written in self._links_on(path):
+            # A name through a link has no disk spelling: the disk's is the target's.
+            if self._matches_globs(written, None):
+                raise LinkOutOfManaged(os.fspath(path), link, rel)
+
+    def _links_on(self, path: str | os.PathLike[str]) -> Iterator[tuple[str, str]]:
+        """Each link on ``path`` inside the root, from the root down: where it
+        lies, relative to the root with the links above it followed, and the
+        name ``path`` writes through it. A ``..`` step is never read as text
+        before a link: each link's place comes from its resolved parent."""
+        typed = Path(path)
+        parts = (typed if typed.is_absolute() else self._root / typed).parts
+        for depth in range(1, len(parts) + 1):
+            entry = Path(*parts[:depth])
+            if not entry.is_symlink():
+                continue
+            try:
+                link = (entry.parent.resolve() / entry.name).relative_to(self._root).as_posix()
+            except ValueError:
+                continue  # above or outside the root: not under managed
+            yield link, "/".join((link, *parts[depth:]))
+
     @staticmethod
     def _sha256_bytes(data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()
@@ -4247,12 +4439,12 @@ class CoherentVolume:
         peer write, so a disk mismatch could be that coordinated change — not foreign
         — and must NOT be denied (the no-op-skip handles it). The caller fetches
         ``disk_hash`` once via :meth:`_disk_hash` and reuses it for the no-op-skip."""
-        baseline = self._last_observed_hash.get(rel)
+        baseline = self._last_observed_hash.get(self._key_of(rel))
         diverged = (
             baseline is not None and disk_hash is not None and disk_hash != baseline
         )
-        # matches_any (the glob scan) is evaluated last — the cheap checks short-circuit.
-        if diverged and self._on_stale_write == "raise" and matches_any(rel, self._managed):
+        # The managed check (the glob scan) is evaluated last — the cheap checks short-circuit.
+        if diverged and self._on_stale_write == "raise" and self._matches_managed(rel):
             raise StaleView(_STALE_WRITE_DENY_REASON)
 
     def _record_own_write(self, rel: str, content_hash: str) -> None:
@@ -4262,8 +4454,9 @@ class CoherentVolume:
         Use at the own-write sites where the two advance in lockstep. The main
         :meth:`write` path advances them SEPARATELY (observed before the post-edit
         POST, committed after — see :meth:`_write_impl`), so it does NOT use this."""
-        self._last_committed_hash[rel] = content_hash
-        self._last_observed_hash[rel] = content_hash
+        key = self._key_of(rel)
+        self._last_committed_hash[key] = content_hash
+        self._last_observed_hash[key] = content_hash
 
     def _stage_tmp(self, abs_path: Path, data: bytes) -> Path:
         """Durably write ``data`` to a unique ``.tmp`` beside ``abs_path`` (mkdir +
@@ -4356,7 +4549,7 @@ class CoherentVolume:
         failure, so degrade mode does not soften it into a ``None`` that the
         caller would read as an unanswered request (a degraded read, a
         ``CommitUnconfirmed``, bytes written to disk unrecorded)."""
-        payload = {"agent_id": self._incarnation, **payload}
+        payload = self._named({"agent_id": self._incarnation, **payload})
         self._unended_incarnations.add(payload["agent_id"])
         commit_leg = _is_commit_leg(endpoint_path, payload)
         self._settle_unconfirmed_claim()
@@ -4398,6 +4591,15 @@ class CoherentVolume:
         raise CallerPrincipalRefused(
             reason, principal_refusal_message(reason, detail), settled=recovery.settled
         )
+
+    def _named(self, body: dict) -> dict:
+        """``body``, its ``path`` marked a key (``name_kind``) for a remote
+        coordinator: its disk is not this volume's, so the volume's paths are
+        names to it, never folded, tidied or merged as its own files. Only
+        the hook routes read the field; the others ignore it."""
+        if self._remote_endpoint is None or "path" not in body:
+            return body
+        return {**body, "name_kind": "key"}
 
     def _recover_principal(self) -> PrincipalRecovery:
         """Claim again with the session's SAME nonce after a principal refusal
@@ -4688,6 +4890,7 @@ class CoherentVolume:
             raise FileNotFoundError(f"no such file in workspace: {_rel}")
         data = self._read_file_bytes(abs_path)
         content_hash = self._sha256_bytes(data)
+        key = self._key_of(_rel)
         # A path's FIRST observing read records what the disk held, before the
         # response can refuse or fail it (a strict deny, a request refused for
         # its caller principal, a strict transport or watchdog failure). It
@@ -4697,7 +4900,7 @@ class CoherentVolume:
         # refused or failed — from having no baseline at all, which would let a
         # later write() land over a peer commit or an out-of-band edit unchecked.
         if observe:
-            self._last_observed_hash.setdefault(_rel, content_hash)
+            self._last_observed_hash.setdefault(key, content_hash)
         version = 0
         stale_denied = False
         stale_status = False
@@ -4705,7 +4908,7 @@ class CoherentVolume:
         owner_generation: int | None = None
         # This read's answer replaces both: its handoff key and whether it was
         # a strict deny. An unanswered or failed read leaves neither set.
-        self._read_handoffs.pop(_rel, None)
+        self._read_handoffs.pop(key, None)
         self._last_read_denied = False
         self._last_read_split = False
         if self._endpoint is not None:
@@ -4766,7 +4969,7 @@ class CoherentVolume:
                 # winning incarnation. A verification read asked the
                 # coordinator not to register one, so it records nothing.
                 if observe and self._read_registered(resp):
-                    self._read_incarnations[_rel] = reader
+                    self._read_incarnations[key] = reader
         result = _ReadResult(
             data, version, stale_denied, owner_generation, stale_status, content_differs
         )
@@ -4790,7 +4993,7 @@ class CoherentVolume:
         # effect. The first-read seed above still applies to every observing
         # read.
         if observe and advance_baseline and not result.split_pair:
-            self._last_observed_hash[_rel] = content_hash
+            self._last_observed_hash[key] = content_hash
         return result
 
     @staticmethod
@@ -5260,13 +5463,16 @@ def _managed_rel(volume: CoherentVolume, file: object) -> str | None:
         return None
     try:
         # Resolve like builtins.open (relative → against CWD), then require it be
-        # under the volume root.
-        rel = Path(raw).resolve().relative_to(volume._root).as_posix()
+        # under the volume root. realpath, not Path.resolve(): on Python 3.11
+        # and 3.12 a non-strict resolve() raises RuntimeError on a link that
+        # loops, where realpath, like 3.13's resolve(), keeps the loop's name.
+        rel = Path(os.path.realpath(raw)).relative_to(volume._root).as_posix()
     except (ValueError, OSError):
         return None
-    # Use the coordinator's own glob matcher so the shim's notion of "managed" is
-    # exactly the coordinator's tracked set (handles ``**`` segment globs).
-    return rel if matches_any(rel, volume._managed) else None
+    # The coordinator's own readings of a name, so the shim's notion of "managed"
+    # is exactly the coordinator's (``**`` segment globs, and every spelling the
+    # attached profile folds onto a managed file).
+    return rel if volume._matches_managed(rel) else None
 
 
 def _make_open_wrapper(state: _ShimState) -> Callable:

@@ -1,0 +1,118 @@
+{
+  "name": "fold-stale-edit-of-a-lower-case-name-is-denied-through-an-upper-case-class-where-the-disk-folds-case",
+  "description": "tracked.yaml lists docs/*.md and strict_mode.yaml docs/[A-Z]*.md; the disk holds docs/plan.md. Session A reads docs/plan.md, session B reads it, edits it and commits, so A's read is stale; A then pre-edits docs/plan.md, the disk's own spelling. As written, the class [A-Z] does not accept p. On a case-insensitive disk (caseless) docs/plan.md also opens as docs/Plan.md, which the class does accept, so the folded name meets the class folded with it (it accepts p as it accepts P) and A is denied exactly as strict_mode 05 denies a stale edit, with the reason and summary.path echoing docs/plan.md as A sent it. Where the disk keeps case apart (nfd, none) no spelling of docs/plan.md is strict: the pre-edit falls through to warn mode and is allowed with the collision warning against B's grant and the disk-differs notice of warn_mode 36, both naming docs/plan.md. Fold 14 is the control: docs/Plan.md is denied on every disk. The two summary timestamps are ignored; every other summary field is compared. Both backends.",
+  "setup": {
+    "tracked": [
+      "docs/*.md"
+    ],
+    "strict_mode": [
+      "docs/[A-Z]*.md"
+    ],
+    "files": {
+      "docs/plan.md": "# Plan\nv1\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "docs/plan.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "docs/plan.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "docs/plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "docs/plan.md",
+          "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f",
+          "success": true
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "docs/plan.md"
+    }
+  },
+  "expected_by_fold_profile": {
+    "caseless": {
+      "status": 200,
+      "body": {
+        "ok": false,
+        "hookSpecificOutput": {
+          "hookEventName": "PreToolUse",
+          "permissionDecision": "deny",
+          "permissionDecisionReason": "Stale read denied: docs/plan.md was updated by agent 814dac78 at <TS>. Re-read docs/plan.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+        },
+        "status": "stale",
+        "summary": {
+          "current_version": 2,
+          "hash_differs": false,
+          "last_writer_at_unix_ts": "<IGNORED>",
+          "last_writer_session_id": "814dac789b8f560d9236b12165a0b50d",
+          "path": "docs/plan.md",
+          "prior_version_seen_by_session": 1,
+          "warning_generated_at_unix_ts": "<IGNORED>"
+        }
+      }
+    },
+    "nfd": {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "collision": true,
+        "disk_differs": true,
+        "hookSpecificOutput": {
+          "hookEventName": "PreToolUse",
+          "permissionDecision": "allow",
+          "additionalContext": "\u26a0 Concurrent edit detected at <TS> (UTC): another agent (814dac78) has been editing docs/plan.md since <TS>. Your edit will land in your own worktree, but only one session's commit will be accepted by the coordinator. Consider waiting for the other session to finish or coordinating which one should proceed.\n\n\u26a0 docs/plan.md on disk differs from v2, the last content committed through the coordinator, and no session committed the change: it was made outside the coordinator. Read docs/plan.md before relying on it, and do not write it from an earlier read; that write would replace the change."
+        }
+      }
+    },
+    "none": {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "collision": true,
+        "disk_differs": true,
+        "hookSpecificOutput": {
+          "hookEventName": "PreToolUse",
+          "permissionDecision": "allow",
+          "additionalContext": "\u26a0 Concurrent edit detected at <TS> (UTC): another agent (814dac78) has been editing docs/plan.md since <TS>. Your edit will land in your own worktree, but only one session's commit will be accepted by the coordinator. Consider waiting for the other session to finish or coordinating which one should proceed.\n\n\u26a0 docs/plan.md on disk differs from v2, the last content committed through the coordinator, and no session committed the change: it was made outside the coordinator. Read docs/plan.md before relying on it, and do not write it from an earlier read; that write would replace the change."
+        }
+      }
+    }
+  },
+  "ignore_keys": [
+    "last_writer_at_unix_ts",
+    "warning_generated_at_unix_ts"
+  ],
+  "backends": [
+    "python",
+    "node"
+  ]
+}

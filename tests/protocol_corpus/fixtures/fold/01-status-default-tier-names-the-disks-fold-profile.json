@@ -1,0 +1,79 @@
+{
+  "name": "fold-status-default-tier-names-the-disks-fold-profile",
+  "description": "GET /status, the default tier, names how the coordinator keys file names on this workspace disk (#506): fold_profile is caseless on a case-insensitive APFS volume, nfd on a case-sensitive one and none on a disk that folds nothing (Linux CI). The profile is the disk's, not the OS's: the harness classifies this run's own tmp workspace with the coordinators' probe and asserts the matching entry, and fails the row on a profile the map does not name. fold_table_unicode is the fold table's Unicode version, the same on every disk. The two backends' default envelopes differ (see warn_mode 08 and 09), so every other top-level key of either is dropped on both sides and only the two fold fields are compared; a key either backend adds fails this row until it is listed. Both backends.",
+  "setup": {},
+  "request": {
+    "method": "GET",
+    "path": "/status"
+  },
+  "expected_by_fold_profile": {
+    "caseless": {
+      "status": 200,
+      "body": {
+        "fold_profile": "caseless",
+        "fold_table_unicode": "17.0.0"
+      }
+    },
+    "nfd": {
+      "status": 200,
+      "body": {
+        "fold_profile": "nfd",
+        "fold_table_unicode": "17.0.0"
+      }
+    },
+    "none": {
+      "status": 200,
+      "body": {
+        "fold_profile": "none",
+        "fold_table_unicode": "17.0.0"
+      }
+    }
+  },
+  "optional_keys": [
+    "audit_log_mode_drift_total",
+    "auth_401_total",
+    "backend",
+    "caller_principal_absent_total",
+    "caller_principal_refused_total",
+    "cold_start_duration_ms",
+    "coordinator_backend",
+    "coordinator_pid",
+    "coordinator_root",
+    "coordinator_uptime_s",
+    "coordinator_uptime_seconds",
+    "coordinator_version",
+    "counts",
+    "detail",
+    "effect_fence_holds_total",
+    "endpoint_counters",
+    "fresh_shared_hash_mismatch_total",
+    "handler_concurrency_overflows_total",
+    "handoff_giver_denials_total",
+    "in_flight_drain_timed_out",
+    "intra_task_acquire_release_total",
+    "policy_summary",
+    "pre_edit_if_unheld",
+    "pre_edit_other_holder_denials_total",
+    "registry_schema_version",
+    "schema_version",
+    "sessions",
+    "shared_foreign_lag_suppressed_total",
+    "stale_warning_emitted_total",
+    "stale_warning_reread_total",
+    "status",
+    "strict_mode_denials_total",
+    "strict_mode_routed_around_via_bash_total",
+    "sweep_reclaims_by_trigger",
+    "sweep_reclaims_total",
+    "tracked_artifacts",
+    "version",
+    "watchdog_late_aborts_total",
+    "watchdog_late_completion_total",
+    "watchdog_queue_overflows_total",
+    "watchdog_timeouts_total"
+  ],
+  "backends": [
+    "python",
+    "node"
+  ]
+}

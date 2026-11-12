@@ -69,12 +69,24 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Literal, Protocol, TypeVar, runtime_checkable
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    Literal,
+    Mapping,
+    Protocol,
+    Sequence,
+    TypeVar,
+    runtime_checkable,
+)
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import yaml
 
 from ccs.adapters.claude_code import audit_log as _audit_log
+from ccs.adapters.claude_code import fs_profile as _fs_profile
 from ccs.adapters.claude_code import hook_payloads as _payloads
 from ccs.adapters.claude_code import session_audit_log as _session_audit
 from ccs.adapters.claude_code.auth import (
@@ -88,9 +100,22 @@ from ccs.adapters.claude_code.auth import (
 from ccs.adapters.claude_code.bash_path_detector import detect_tracked_paths
 from ccs.adapters.claude_code.bash_write_detector import detect_tracked_writes
 from ccs.adapters.claude_code.disk_content import hash_regular_file
+from ccs.adapters.claude_code.door import (
+    RequestName,
+    file_key,
+    file_request,
+    file_requests,
+    find_requested,
+    is_strict_request,
+    is_tracked_request,
+    request_name,
+    resolve_requested,
+    stored_file_policy,
+)
 from ccs.adapters.claude_code.policy import (
     POLICY_LOAD_ERRORS,
     UNTRACK_STRICT_PATH_REASON,
+    PolicyMatchContext,
     TrackedArtifactPolicy,
     policy_file_name,
 )
@@ -102,6 +127,14 @@ from ccs.adapters.claude_code.regular_file import (
     read_regular_file,
 )
 from ccs.adapters.claude_code.state_dir import check_coherence_dir, lock_link_refusal, policy_link_refusal
+from ccs.coordinator.fold_merge import (
+    FoldGroup,
+    FoldRow,
+    ResolvedFile,
+    colliding_rows,
+    is_inside_root,
+    same_file_groups,
+)
 from ccs.coordinator.registry_protocol import (
     RECLAIM_TRIGGERS,
     CheckpointMember,
@@ -117,6 +150,7 @@ from ccs.coordinator.service import (
 )
 from ccs.coordinator.sqlite_registry import SCHEMA_USER_VERSION, SqliteArtifactRegistry
 from ccs.core.clock import monotonic_seconds
+from ccs.core.disk_spelling import native_spelling
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_ABSENT_REASON,
     CALLER_PRINCIPAL_FOREIGN_REASON,
@@ -161,6 +195,7 @@ from ccs.core.fence import (
     confirmed_generation,
     coordinator_holds_content_claim,
 )
+from ccs.core.path_fold import FOLD_TABLE_UNICODE_VERSION, FoldProfile
 from ccs.core.states import MESIState
 from ccs.core.substrate import ArbitrationTier, RestoreTier
 from ccs.core.types import (
@@ -992,6 +1027,20 @@ def validate_path(path: Any) -> str | None:
     return None
 
 
+def _read_request_name(body: dict, coordinator: CoordinatorHTTPServer) -> RequestName | str:
+    """The name a hook request's ``path`` and ``name_kind`` carry, through the
+    request door, or the route's 400 path error: :func:`validate_path`'s
+    reason, a missing or non-string path answered as ``missing or empty
+    path``, which a ``name_kind`` other than ``"file"`` or ``"key"`` gets too.
+    Keys pass the same validation, the length limit included."""
+    path = body.get("path", "")
+    path_err = validate_path(path)
+    if path_err:
+        return "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
+    name = request_name(coordinator, path, body.get("name_kind", "file"))
+    return "missing or empty path" if name is None else name
+
+
 def validate_content_hash(content_hash: Any, *, required: bool) -> str | None:
     """Return reason if invalid, None if valid. content_hash is OPTIONAL on
     pre-read (the caller may not have it yet) but REQUIRED on post-edit
@@ -1027,6 +1076,101 @@ _SHARED_FOREIGN_DENY_LAG_WINDOW_SEC = 5.0
 
 
 # ----------------------------------------------------------------------
+# One identity per file: the start-time merge and the fold index
+# ----------------------------------------------------------------------
+
+
+def _resolve_row_file(canonical_root: str, name: str) -> ResolvedFile | None:
+    """The file ``name`` reaches under the canonical root, through the
+    platform's own resolver, so the spelling is the one the disk stores. None
+    when the name reaches nothing, or something outside the root."""
+    try:
+        real_path = native_spelling(os.path.join(canonical_root, name))
+        spelling = os.path.relpath(real_path, canonical_root)
+        if not is_inside_root(spelling):
+            return None
+        info = os.stat(real_path)
+    except (OSError, ValueError):
+        # A name that reaches nothing (or holds a NUL a path cannot carry)
+        # confirms nothing: it stays out of every group.
+        return None
+    return ResolvedFile(
+        dev=info.st_dev, ino=info.st_ino, real_path=real_path, disk_spelling=spelling
+    )
+
+
+def find_fold_groups(
+    rows: Sequence[FoldRow], profile: FoldProfile, root: Path
+) -> list[FoldGroup]:
+    """Read-only: the groups of file rows the disk confirms as one file, each
+    with the disk's spelling of the file and the hash of its bytes in the
+    format the hook clients and the volume record."""
+    try:
+        canonical_root = native_spelling(root)
+    except OSError:
+        return []
+    groups: list[FoldGroup] = []
+    for key, keyed in colliding_rows(rows, profile).items():
+        resolved = [_resolve_row_file(canonical_root, row.name) for row in keyed]
+        for grouped, file in same_file_groups(keyed, resolved):
+            groups.append(FoldGroup(
+                profile=profile, key=key, ids=tuple(row.id for row in grouped),
+                disk_spelling=file.disk_spelling,
+                disk_hash=hash_regular_file(Path(file.real_path)),
+            ))
+    return groups
+
+
+def _merge_one_group(
+    registry: SqliteArtifactRegistry, group: FoldGroup, now_unix: float
+) -> None:
+    rows = ", ".join(row_id.hex for row_id in group.ids)
+    try:
+        outcome = registry.merge_fold_group(group, now_unix)
+    except Exception as exc:  # noqa: BLE001 — any failure, a state-log callback's included
+        # The rows stay apart and the index serves them as one file; the next start retries.
+        logger.warning("fold merge of rows %s failed and was rolled back: %s", rows, exc)
+        return
+    if not outcome.merged:
+        logger.warning("fold merge of rows %s skipped: %s", rows, outcome.reason)
+        return
+    survivor = outcome.survivor_id.hex if outcome.survivor_id is not None else "?"
+    keeper = outcome.keeper_agent_id.hex if outcome.keeper_agent_id is not None else "nobody"
+    demoted = ", ".join(agent_id.hex for agent_id in outcome.demoted_writers) or "none"
+    logger.info(
+        "fold merge: rows %s merged into %s; write grant kept by %s; demoted writers: %s",
+        rows, survivor, keeper, demoted,
+    )
+
+
+def prepare_fold_index(
+    registry: SqliteArtifactRegistry, root: Path, fold_profile: _fs_profile.FoldProfileResult
+) -> None:
+    """Once per start, after the store opened and the probe ran and before the
+    service exists: merge the groups the disk confirms, then build the fold
+    index and log each key several rows still share. Without the
+    single-writer lock another coordinator may hold the same store, so names
+    stay exact: nothing merges and no index is built."""
+    if not registry.holds_writer_lock:
+        logger.warning(
+            "fold index: not built; without the single-writer lock names match exactly as given"
+        )
+        return
+    profile = fold_profile.profile
+    now_unix = time.time()
+    for group in find_fold_groups(registry.file_rows_for_fold(), profile, root):
+        _merge_one_group(registry, group, now_unix)
+    for bucket in registry.build_fold_index(profile):
+        # JSON keeps a newline in a name from splitting the log line.
+        logger.warning(
+            "fold bucket %s: rows %s resolve to %s",
+            json.dumps(bucket.key, ensure_ascii=False),
+            ", ".join(row_id.hex for row_id in bucket.ids),
+            bucket.ids[0].hex,
+        )
+
+
+# ----------------------------------------------------------------------
 # Server shell
 # ----------------------------------------------------------------------
 
@@ -1036,7 +1180,9 @@ class CoordinatorHTTPServer:
 
     Caller (Unit 5 ``lifecycle.ensure_coordinator``) instantiates this then
     calls :meth:`serve_in_thread` to start a daemon-thread serving loop. The
-    ``port`` attribute is populated once the OS picks one (port=0 binding)."""
+    ``port`` attribute is populated once the OS picks one (port=0 binding).
+    ``fold_profile`` is the workspace disk's fold profile, found once at
+    construction (:mod:`ccs.adapters.claude_code.fs_profile`)."""
 
     def __init__(
         self,
@@ -1367,6 +1513,21 @@ class CoordinatorHTTPServer:
 
     def _finish_construction(self, port: int) -> None:
         """The steps of the constructor past the store open."""
+        # After the store open, whose writer lock lets the probe sweep what a
+        # crashed start left, and before the port exists, so every request is
+        # answered with the profile known.
+        self.fold_profile = self._probe_fold_profile()
+        # The root as the disk spells it, which a request's disk spelling is
+        # relative to: ``coordinator_root`` follows links but keeps the case it
+        # was given in.
+        self.canonical_root = native_spelling(self.coordinator_root)
+        # Before the service, the sweeps and the watchdog pool exist, so no
+        # request, reclaim or sweep can touch a row the merge is rewriting.
+        prepare_fold_index(self.registry, self.coordinator_root, self.fold_profile)
+        # Read once: the index is built once per start, and the request door
+        # reads the profile before the untracked fast path, which must not
+        # wait on the registry lock a long registry call may hold.
+        self.fold_index_profile: FoldProfile | None = self.registry.fold_index_profile
         self.service = CoordinatorService(self.registry)
         self.policy = TrackedArtifactPolicy.load(self.coordinator_root)
 
@@ -1394,6 +1555,21 @@ class CoordinatorHTTPServer:
         self.port = self._server.server_port
         self._serve_thread: threading.Thread | None = None
         self._serve_loop_committed = False
+
+    def _probe_fold_profile(self) -> _fs_profile.FoldProfileResult:
+        """Classify the workspace disk once, logging one line that names the
+        profile, or why the disk could not be classified."""
+        result = _fs_profile.probe_fold_profile(
+            _fs_profile.FoldProbeInput(
+                root=self.coordinator_root,
+                coherence_dir=self.coordinator_root / ".coherence",
+                lock_state="held" if self.registry.holds_writer_lock else "unlocked",
+                log=lambda line: logger.warning("fold probe: %s", line),
+            )
+        )
+        log = logger.info if result.status == "classified" else logger.warning
+        log("%s", _fs_profile.fold_profile_log_line(result))
+        return result
 
     def serve_in_thread(self) -> None:
         """Start the serving loop in a daemon thread."""
@@ -1839,9 +2015,12 @@ class CoordinatorHTTPServer:
         pair with monotonic timestamp so a subsequent pre-bash deny on
         the same pair within STRICT_DENY_ROUTE_AROUND_WINDOW_SEC can be
         recognized as a route-around. #185: the giver's pre-edit deny is
-        recorded here too, so a shell read routing around it is counted."""
+        recorded here too, so a shell read routing around it is counted.
+        Keyed by the file's fold key, so a deny under one spelling and a shell
+        read under another the disk treats as the same file are one pair."""
+        key = file_key(self, path)
         with self._recent_strict_denies_lock:
-            self._recent_strict_denies[(session_id, path)] = time.monotonic()
+            self._recent_strict_denies[(session_id, key)] = time.monotonic()
 
     def check_strict_deny_route_around(self, session_id: str, path: str) -> bool:
         """v0.2 Unit 4: return True iff a prior strict-deny on (session,
@@ -1851,6 +2030,7 @@ class CoordinatorHTTPServer:
         (session × path) cardinality within the window."""
         now = time.monotonic()
         cutoff = now - STRICT_DENY_ROUTE_AROUND_WINDOW_SEC
+        key = file_key(self, path)
         with self._recent_strict_denies_lock:
             # Lazy GC.
             stale_keys = [
@@ -1858,7 +2038,7 @@ class CoordinatorHTTPServer:
             ]
             for k in stale_keys:
                 del self._recent_strict_denies[k]
-            return (session_id, path) in self._recent_strict_denies
+            return (session_id, key) in self._recent_strict_denies
 
     def increment_watchdog_late_completion(self) -> None:
         """P1 #5: a watchdog-timed-out future eventually completed
@@ -2493,7 +2673,6 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     if body is None:
         return
     session_id = body.get("session_id")
-    path = body.get("path", "")
     content_hash = body.get("content_hash") or None
     # Effect-gate opt-in: a truthy ``want_owner_generation`` asks the fresh and
     # warn-stale responses to carry the pair-consistent
@@ -2513,13 +2692,11 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     if sid_err:
         req._json(400, {"error": sid_err[1]})
         return
-    path_err = validate_path(path)
-    if path_err:
-        # Mirror the prior "missing or empty path" message shape for empty/missing
-        # to keep client-side error-handling stable.
-        msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
-        req._json(400, {"error": msg})
+    name = _read_request_name(body, coordinator)
+    if isinstance(name, str):
+        req._json(400, {"error": name})
         return
+    path = name.requested
     err = validate_content_hash(content_hash, required=False)
     if err:
         req._json(400, {"error": err})
@@ -2534,7 +2711,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # pending re-grounding payload still reaches an untracked admit; with
     # no flag pending, response bytes and the no-registry behavior are
     # exactly today's.
-    if not coordinator.policy.is_tracked(path):
+    if not is_tracked_request(coordinator, name):
         _fast_path_json(req, coordinator, session_id, body, {"status": "fresh"})
         return
 
@@ -2548,15 +2725,13 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
 
     def work() -> dict:
         coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
-        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        artifact_id = find_requested(coordinator, name)
 
         if artifact_id is None:
             # First observation per KTD-9 — seed v1 with the on-disk hash if
             # the caller supplied one, else use a sentinel.
             seed_hash = content_hash or ""
-            artifact_id = coordinator.registry.resolve_or_register(
-                path, content_hash=seed_hash
-            )
+            artifact_id = resolve_requested(coordinator, name, seed_hash)
             # Grant SHARED to the first reader so subsequent reads see
             # themselves as known-fresh.
             coordinator.registry.set_agent_state(
@@ -2641,6 +2816,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             agent_state=agent_state,
             caller_content_hash=content_hash,
             now_unix=_now,
+            policy_context=name.policy,
         )
 
         if decision.holds_valid_grant:
@@ -3110,7 +3286,7 @@ def _effect_fence_no_record(
 def _effect_fence_comparands(
     coordinator: CoordinatorHTTPServer,
     *,
-    path: str,
+    name: RequestName,
     agent_id: UUID,
     expected_version: int,
     expected_generation: int | None,
@@ -3129,9 +3305,9 @@ def _effect_fence_comparands(
     # ``{"status": "fresh"}`` with no version here; copying that would turn
     # "the coordinator knows nothing about this file" into "the coordinator
     # agrees nothing moved".
-    if not coordinator.policy.is_tracked(path):
+    if not is_tracked_request(coordinator, name):
         return _effect_fence_no_record(expected_version, expected_generation)
-    artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    artifact_id = find_requested(coordinator, name)
     if artifact_id is None:
         return _effect_fence_no_record(expected_version, expected_generation)
     # ONE pair-atomic read backs the version, the canonical content hash and
@@ -3145,7 +3321,7 @@ def _effect_fence_comparands(
 
     decision = decide_tracked_read(
         coordinator,
-        path=path,
+        path=name.requested,
         artifact_id=artifact_id,
         agent_id=agent_id,
         artifact=artifact,
@@ -3155,6 +3331,7 @@ def _effect_fence_comparands(
         # ONE instant for the whole request: the lag gate inside the verdict
         # and anything else stamped from it must share a clock read (KTD-P).
         now_unix=now_unix,
+        policy_context=name.policy,
     )
 
     # The mismatch the coordinator WOULD HAVE REPORTED on the wire for this
@@ -3204,7 +3381,7 @@ def _effect_fence_comparands(
 def _effect_fence_verdict(
     coordinator: CoordinatorHTTPServer,
     *,
-    path: str,
+    name: RequestName,
     agent_id: UUID,
     expected_version: int,
     expected_generation: int | None,
@@ -3225,7 +3402,7 @@ def _effect_fence_verdict(
     """
     comparands = _effect_fence_comparands(
         coordinator,
-        path=path,
+        name=name,
         agent_id=agent_id,
         expected_version=expected_version,
         expected_generation=expected_generation,
@@ -3283,7 +3460,6 @@ def _handle_effect_fence(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         return
 
     session_id = body.get("session_id")
-    path = body.get("path", "")
 
     # Validated in the order the sibling hook routes use, through the SAME
     # server-side gates: identity, then path, then the comparands, then the
@@ -3295,11 +3471,9 @@ def _handle_effect_fence(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     if sid_err:
         req._json(400, {"error": sid_err[1]})
         return
-    path_err = validate_path(path)
-    if path_err:
-        # Mirror the sibling routes' message shape for empty/missing.
-        msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
-        req._json(400, {"error": msg})
+    name = _read_request_name(body, coordinator)
+    if isinstance(name, str):
+        req._json(400, {"error": name})
         return
 
     expected_version, version_err = _read_expected_version(body)
@@ -3350,7 +3524,7 @@ def _handle_effect_fence(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
         try:
             verdict = _effect_fence_verdict(
                 coordinator,
-                path=path,
+                name=name,
                 agent_id=agent_id,
                 expected_version=expected_version,
                 expected_generation=expected_generation,
@@ -3389,16 +3563,15 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     if body is None:
         return
     session_id = body.get("session_id")
-    path = body.get("path", "")
     sid_err = validate_session_id(session_id)
     if sid_err:
         req._json(400, {"error": sid_err[1]})
         return
-    path_err = validate_path(path)
-    if path_err:
-        msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
-        req._json(400, {"error": msg})
+    name = _read_request_name(body, coordinator)
+    if isinstance(name, str):
+        req._json(400, {"error": name})
         return
+    path = name.requested
     # Read once, so the timeout answer, at the gate or in the work body, and
     # the write's holder check all follow the same opt-in.
     opted_in = _opted_in_acquire_or_fail(body)
@@ -3418,7 +3591,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         return
     # SB-10 U4 (KTD6): advisory peek hoisted above the untracked exit —
     # see the pre-read twin for the no-flag byte/behavior guarantee.
-    if not coordinator.policy.is_tracked(path):
+    if not is_tracked_request(coordinator, name):
         _fast_path_json(req, coordinator, session_id, body, {"ok": True})
         return
 
@@ -3438,9 +3611,9 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         nonlocal observed_before_acquire, out_of_band_version
         coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
         # Seed the artifact row if this is the first Edit on a fresh path.
-        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        artifact_id = find_requested(coordinator, name)
         if artifact_id is None:
-            artifact_id = coordinator.registry.resolve_or_register(path, content_hash="")
+            artifact_id = resolve_requested(coordinator, name, "")
 
         # #185: the giver of a live handoff is denied AHEAD of the
         # strict-mode stale branch, and in warn mode too. The transfer left
@@ -3474,7 +3647,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         #
         # This is the Edit/Write surface of KTD-Q (the hooks.json matcher
         # routes both tools through /hooks/pre-edit).
-        if coordinator.policy.is_strict_mode(path):
+        if is_strict_request(coordinator, name):
             artifact = coordinator.registry.get_artifact(artifact_id)
             editor_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
             # Reverted to INVALID-only 2026-05-24 per the launch-gate
@@ -3726,18 +3899,17 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
     if body is None:
         return
     session_id = body.get("session_id")
-    path = body.get("path", "")
     content_hash = body.get("content_hash")  # required when success=true
     success = bool(body.get("success", True))
     sid_err = validate_session_id(session_id)
     if sid_err:
         req._json(400, {"error": sid_err[1]})
         return
-    path_err = validate_path(path)
-    if path_err:
-        msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
-        req._json(400, {"error": msg})
+    name = _read_request_name(body, coordinator)
+    if isinstance(name, str):
+        req._json(400, {"error": name})
         return
+    path = name.requested
     # content_hash is required only on success — if the tool succeeded, the
     # hook script computed it from the worktree's post-write state.
     err = validate_content_hash(content_hash, required=bool(success))
@@ -3752,7 +3924,7 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
     )
     if agent_id is None:
         return
-    if not coordinator.policy.is_tracked(path):
+    if not is_tracked_request(coordinator, name):
         req._json(200, {"ok": True})
         return
 
@@ -3763,7 +3935,7 @@ def _handle_post_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer)
 
     def work() -> dict:
         coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
-        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        artifact_id = find_requested(coordinator, name)
         if artifact_id is None:
             # No prior pre-edit / pre-read; nothing to commit against.
             return {"ok": True, "note": "untracked-at-commit"}
@@ -3933,18 +4105,17 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
     if body is None:
         return
     session_id = body.get("session_id")
-    path = body.get("path", "")
     content_hash = body.get("content_hash")  # always required on the OCC commit
     expected_version = body.get("expected_version")
     sid_err = validate_session_id(session_id)
     if sid_err:
         req._json(400, {"error": sid_err[1]})
         return
-    path_err = validate_path(path)
-    if path_err:
-        msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
-        req._json(400, {"error": msg})
+    name = _read_request_name(body, coordinator)
+    if isinstance(name, str):
+        req._json(400, {"error": name})
         return
+    path = name.requested
     # The OCC commit always carries the bytes it just wrote — there is no
     # "release on failure" sub-mode here (that lives on the pessimistic
     # post-edit), so content_hash is unconditionally required.
@@ -3966,7 +4137,7 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
     )
     if agent_id is None:
         return
-    if not coordinator.policy.is_tracked(path):
+    if not is_tracked_request(coordinator, name):
         req._json(200, {"ok": True})
         return
 
@@ -3977,7 +4148,7 @@ def _handle_post_edit_cas(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
 
     def work() -> dict:
         coordinator.service.record_heartbeat(agent_id=agent_id, now_tick=now)
-        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        artifact_id = find_requested(coordinator, name)
         if artifact_id is None:
             # No prior pre-read seeded the artifact; nothing to CAS against.
             # Mirror post-edit's untracked-at-commit fast path.
@@ -4473,8 +4644,12 @@ def _handle_policy_untrack(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     # strict_mode.yaml inside that window can be lost; strict-wins still holds
     # for every pattern that survives. A change that lets a reload drop a
     # spawn-time strict pattern must make this check-then-append atomic with it.
+    # The entries are patterns: validated, never tidied or folded here. On a
+    # disk that folds names the coverage search folds both sides itself, so
+    # an entry covers a strict path it reaches under any spelling the disk
+    # treats as the same.
     policy = coordinator.policy
-    coverage = policy.strict_patterns_covering_each(safe_paths)
+    coverage = policy.strict_patterns_covering_each(safe_paths, coordinator.fold_profile.profile)
     refused = [
         {"path": p, "strict_patterns": list(covering)}
         for p, covering in zip(safe_paths, coverage)
@@ -4717,7 +4892,14 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # policy gate — handler never touches SQLite for an untracked workspace.
     # SB-10 U4 (KTD6): advisory peek hoisted above the zero-tracked-reads
     # exit — see the pre-read twin for the no-flag byte/behavior guarantee.
-    tracked_paths = detect_tracked_paths(command, coordinator.policy.is_tracked)
+    # The policy gate and the collapse of spellings by key both read each
+    # token's name, so each token passes the door once.
+    name_of = file_requests(coordinator)
+    tracked_paths = detect_tracked_paths(
+        command,
+        lambda token: is_tracked_request(coordinator, name_of(token)),
+        lambda token: name_of(token).key,
+    )
     if not tracked_paths:
         base: dict = {"status": "fresh"}
         if giver_unverified:
@@ -4742,15 +4924,14 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         regrants: list[tuple[UUID, str]] = []
         held: list[tuple[UUID, str]] = []
         for path in tracked_paths:
-            artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+            name = name_of(path)
+            artifact_id = find_requested(coordinator, name)
             if artifact_id is None:
                 # First observation per KTD-9 — seed v1 + grant SHARED so
                 # subsequent reads see fresh. ``detect_tracked_paths``
-                # deduplicates, so deferring the grant cannot make a later
-                # iteration read this path as stale.
-                artifact_id = coordinator.registry.resolve_or_register(
-                    path, content_hash=""
-                )
+                # deduplicates by key, so deferring the grant cannot make a
+                # later iteration read this file as stale.
+                artifact_id = resolve_requested(coordinator, name, "")
                 regrants.append((artifact_id, "first_bash_read"))
                 continue
             agent_state = coordinator.registry.get_agent_state(artifact_id, agent_id)
@@ -4764,10 +4945,7 @@ def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "path": path,
                 "current_version": artifact.version,
             })
-            if (
-                strict_stale_first is None
-                and coordinator.policy.is_strict_mode(path)
-            ):
+            if strict_stale_first is None and is_strict_request(coordinator, name):
                 last_writer_id = _last_writer_for(coordinator, artifact_id)
                 last_writer_ts = (
                     _last_writer_unix_ts(coordinator, artifact_id) or _payloads.now_unix()
@@ -4988,9 +5166,15 @@ def _tracked_writes(coordinator: CoordinatorHTTPServer, command: str) -> list[st
     """The tracked paths ``command`` writes, or none when the detector raises:
     a bug in the giver check must never take the read checks after it -- the
     strict-mode shell-read deny among them -- down with it."""
+    name_of = file_requests(coordinator)
     try:
+        # Both spellings of the root: the one the coordinator was given, and
+        # the disk's, which a command may spell an absolute path with.
         return detect_tracked_writes(
-            command, coordinator.policy.is_tracked, root=str(coordinator.coordinator_root)
+            command,
+            lambda path: is_tracked_request(coordinator, name_of(path)),
+            root=(str(coordinator.coordinator_root), coordinator.canonical_root),
+            key_of=lambda path: name_of(path).key,
         )
     except Exception:
         logger.warning("pre-bash write detection raised; answering without the giver check", exc_info=True)
@@ -5005,7 +5189,7 @@ def _first_write_handed_off_by(
     registry does not know is looked up, never registered (a shell write must
     not seed an artifact the edit hooks would then treat as observed)."""
     for path in written:
-        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        artifact_id = find_requested(coordinator, file_request(coordinator, path))
         if artifact_id is None:
             continue
         record = coordinator.service.live_handoff_given_by(artifact_id, caller)
@@ -5099,9 +5283,10 @@ def _handle_pre_grep(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 "path": path,
                 "current_version": artifact.version,
             })
+            # A listed name is a stored row's own: no request spelled it.
             if (
                 strict_stale_first is None
-                and coordinator.policy.is_strict_mode(path)
+                and coordinator.policy.is_strict_mode(path, stored_file_policy(coordinator))
             ):
                 last_writer_id = _last_writer_for(coordinator, artifact_id)
                 last_writer_ts = (
@@ -5260,21 +5445,33 @@ def _session_owner_from_request(
 
 
 def _resolve_read_set(
-    coordinator: CoordinatorHTTPServer, paths: list[str]
+    coordinator: CoordinatorHTTPServer, names: list[RequestName]
 ) -> list[UUID]:
-    """Resolve repo-relative read-set paths to artifact UUIDs, seeding a v1
-    row (KTD-9 first-observation, mirroring ``/hooks/pre-read``) for any path
+    """Resolve the read set's names to artifact UUIDs, seeding a v1
+    row (first observation, mirroring ``/hooks/pre-read``) for any name
     not yet known. Non-mutating w.r.t. coherence STATE for already-known
     artifacts (it only looks them up); a first-observation seed registers the
     artifact row exactly as pre-read does. The returned id order matches the
-    input path order so the begin handler can render a path-keyed cut."""
+    input order so the begin handler can render a path-keyed cut; two
+    spellings of one file resolve to one id, as a name sent twice does."""
     ids: list[UUID] = []
-    for path in paths:
-        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    for name in names:
+        artifact_id = find_requested(coordinator, name)
         if artifact_id is None:
-            artifact_id = coordinator.registry.resolve_or_register(path, content_hash="")
+            artifact_id = resolve_requested(coordinator, name, "")
         ids.append(artifact_id)
     return ids
+
+
+def _cut_by_requested_name(
+    names: list[RequestName], ids: list[UUID], cut: Mapping[UUID, int]
+) -> dict[str, int]:
+    """The pinned cut keyed by the names the request sent (the client speaks
+    paths; artifact UUIDs stay server-internal). Every spelling is a key of
+    its own, even two spellings of one file pinned once, because the client
+    looks each name up in the cut by the bytes it sent. A cut holds every id
+    of the read set: a capture missing one is rejected whole."""
+    return {name.requested: cut[aid] for name, aid in zip(names, ids)}
 
 
 def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -5320,6 +5517,7 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
         if path_err:
             req._json(400, {"error": path_err})
             return
+    names = [file_request(coordinator, path) for path in read_set]
 
     # OWNER derived from the caller-asserted session_id, never an owner field (R9/R13).
     if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
@@ -5328,10 +5526,7 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
     now = monotonic_seconds()
 
     def work() -> dict:
-        read_set_ids = _resolve_read_set(coordinator, read_set)
-        # Keep a path↔id map so the response renders the cut path-keyed (the
-        # client speaks paths; artifact UUIDs stay server-internal).
-        id_to_path = {aid: path for aid, path in zip(read_set_ids, read_set)}
+        read_set_ids = _resolve_read_set(coordinator, names)
         result = coordinator.service.begin_session(
             read_set=read_set_ids, owner=owner, created_at_tick=now, abort=abort,
         )
@@ -5345,14 +5540,10 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
             session_token=result.session_token,
             cut=result.cut,
         )
-        cut_by_path = {
-            id_to_path.get(aid, str(aid)): version
-            for aid, version in result.cut.items()
-        }
         return {
             "ok": True,
             "session_token": result.session_token,
-            "cut": cut_by_path,
+            "cut": _cut_by_requested_name(names, read_set_ids, result.cut),
             "coordinator_epoch": result.coordinator_epoch,
             "retain_versions": result.retain_versions,
         }
@@ -5425,13 +5616,14 @@ def _handle_session_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     if path_err:
         req._json(400, {"error": path_err})
         return
+    name = file_request(coordinator, path)
 
     if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
         return
     caller = _session_owner_from_request(coordinator, session_id)
 
     def work() -> dict:
-        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        artifact_id = find_requested(coordinator, name)
         if artifact_id is None:
             # Unknown path → cannot be in any cut. Mirror the service's
             # not-in-cut signal rather than seeding a row a read can't serve.
@@ -5522,6 +5714,7 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     if not isinstance(content, str):
         req._json(400, {"error": "content must be a string"})
         return
+    name = file_request(coordinator, path)
 
     if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
         return
@@ -5529,7 +5722,7 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     now = monotonic_seconds()
 
     def work() -> dict:
-        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        artifact_id = find_requested(coordinator, name)
         if artifact_id is None:
             return {"ok": False, "reason": "artifact_not_in_cut"}
         # Read the pinned base BEFORE the commit so the content-free audit can
@@ -5596,6 +5789,12 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     _run_or_degrade(req, coordinator, work, degraded_response=_OCC_DEGRADED_RESPONSE, abort=abort)
 
 
+def _names_repeat(names: list[RequestName]) -> bool:
+    """Whether two of a request's names reach one row: the same bytes twice,
+    or two spellings of one file, which share its key."""
+    return len({name.key for name in names}) != len(names)
+
+
 def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /session/commit_all — atomic multi-artifact publish against the cut.
 
@@ -5638,7 +5837,7 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
     if len(writes) > MAX_SESSION_READ_SET_PATHS:
         req._json(400, {"error": f"writes exceeds {MAX_SESSION_READ_SET_PATHS} paths"})
         return
-    paths: list[str] = []
+    names: list[RequestName] = []
     contents: list[str] = []
     for item in writes:
         if not isinstance(item, dict):
@@ -5653,11 +5852,12 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
         if not isinstance(content, str):
             req._json(400, {"error": "content must be a string"})
             return
-        paths.append(path)
+        names.append(file_request(coordinator, path))
         contents.append(content)
     # A duplicate path would collapse in the id-keyed map — reject it up front so
     # a silently-dropped member can't turn an all-or-nothing batch into a partial.
-    if len(set(paths)) != len(paths):
+    # Two spellings of one file reach one row, so they repeat by key.
+    if _names_repeat(names):
         req._json(400, {"error": "writes contains duplicate paths"})
         return
 
@@ -5672,11 +5872,11 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
         # not-in-cut signal rather than seeding a row a commit can't source.
         path_by_id: dict[UUID, str] = {}
         writes_map: dict[UUID, tuple[str, int | None]] = {}
-        for path, content in zip(paths, contents):
-            artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        for name, content in zip(names, contents):
+            artifact_id = find_requested(coordinator, name)
             if artifact_id is None:
                 return {"ok": False, "reason": "artifact_not_in_cut"}
-            path_by_id[artifact_id] = path
+            path_by_id[artifact_id] = name.requested
             writes_map[artifact_id] = (content, None)
         # Pinned bases read BEFORE the commit for the content-free WIN audit.
         cut = coordinator.registry.get_session_cut(session_token)
@@ -6266,8 +6466,10 @@ def _transfer_answer(entries: list[dict]) -> dict:
     return {"ok": all(entry["transferred"] for entry in entries), "grants": entries}
 
 
-def _parse_transfer_grants(grants: Any) -> "list[tuple[str, str | None]] | str":
-    """The transfer's ``grants`` as ``(path, subagent id or None)`` pairs, or
+def _parse_transfer_grants(
+    coordinator: CoordinatorHTTPServer, grants: Any
+) -> "list[tuple[RequestName, str | None]] | str":
+    """The transfer's ``grants`` as ``(name, subagent id or None)`` pairs, or
     the 400 ``error`` naming what is wrong.
 
     A grant's ``agent_id`` names the incarnation (a subagent component) that
@@ -6279,7 +6481,7 @@ def _parse_transfer_grants(grants: Any) -> "list[tuple[str, str | None]] | str":
         return "grants must be a non-empty list of {path, agent_id}"
     if len(grants) > MAX_TRANSFER_GRANTS:
         return f"grants exceeds {MAX_TRANSFER_GRANTS} paths"
-    parsed: list[tuple[str, str | None]] = []
+    parsed: list[tuple[RequestName, str | None]] = []
     for item in grants:
         if not isinstance(item, dict):
             return "each grant must be a {path, agent_id} object"
@@ -6290,9 +6492,10 @@ def _parse_transfer_grants(grants: Any) -> "list[tuple[str, str | None]] | str":
         subagent = read_subagent_id(item)
         if subagent is None and has_subagent_id_field(item):
             return _MALFORMED_SUBAGENT_ERROR
-        parsed.append((path, subagent))
-    # A duplicate path would collapse in the artifact-keyed request.
-    if len({path for path, _ in parsed}) != len(parsed):
+        parsed.append((file_request(coordinator, path), subagent))
+    # A duplicate path would collapse in the artifact-keyed request, and so
+    # would two spellings of one file.
+    if _names_repeat([name for name, _ in parsed]):
         return "grants contains duplicate paths"
     return parsed
 
@@ -6348,7 +6551,7 @@ def _handle_handoff_transfer(req: _RequestProtocol, coordinator: CoordinatorHTTP
     if sid_err:
         req._json(400, {"error": sid_err[1]})
         return
-    grants = _parse_transfer_grants(body.get("grants"))
+    grants = _parse_transfer_grants(coordinator, body.get("grants"))
     if isinstance(grants, str):
         req._json(400, {"error": grants})
         return
@@ -6369,8 +6572,8 @@ def _handle_handoff_transfer(req: _RequestProtocol, coordinator: CoordinatorHTTP
         # and never a plain release -- the stated exception to the
         # malformed-optional rule.
         req._json(200, _transfer_answer([
-            _refused_transfer_grant(path, HANDOFF_SUCCESSOR_MALFORMED_REASON)
-            for path, _ in grants
+            _refused_transfer_grant(name.requested, HANDOFF_SUCCESSOR_MALFORMED_REASON)
+            for name, _ in grants
         ]))
         return
     giver = caller_principal_identity(session_id)
@@ -6383,14 +6586,15 @@ def _handle_handoff_transfer(req: _RequestProtocol, coordinator: CoordinatorHTTP
             resolved = successor
         if resolved is None:
             return _transfer_answer([
-                _refused_transfer_grant(path, HANDOFF_SUCCESSOR_UNKNOWN_REASON)
-                for path, _ in grants
+                _refused_transfer_grant(name.requested, HANDOFF_SUCCESSOR_UNKNOWN_REASON)
+                for name, _ in grants
             ])
         entries: dict[str, dict] = {}
         holders: dict[UUID, UUID] = {}
         path_by_id: dict[UUID, str] = {}
-        for path, subagent in grants:
-            artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        for name, subagent in grants:
+            path = name.requested
+            artifact_id = find_requested(coordinator, name)
             if artifact_id is None:
                 entries[path] = _refused_transfer_grant(path, HANDOFF_NOT_HELD_REASON)
                 continue
@@ -6410,7 +6614,7 @@ def _handle_handoff_transfer(req: _RequestProtocol, coordinator: CoordinatorHTTP
             ):
                 path = path_by_id[outcome.artifact_id]
                 entries[path] = _transfer_grant_entry(path, outcome)
-        return _transfer_answer([entries[path] for path, _ in grants])
+        return _transfer_answer([entries[name.requested] for name, _ in grants])
 
     abort = WatchdogAbort()
     _run_or_degrade(
@@ -6461,13 +6665,14 @@ def _settle_handoff(
         msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
         req._json(400, {"error": msg})
         return
+    name = file_request(coordinator, path)
     if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
         return
     coordinator.register_session(session_id, read_subagent_id(body))
     caller = caller_principal_identity(session_id)
 
     def work() -> dict:
-        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        artifact_id = find_requested(coordinator, name)
         if artifact_id is None:
             return {"ok": False, "reason": HANDOFF_NOT_LIVE_REASON}
         return _verb_body(settle(artifact_id=artifact_id, caller=caller, abort=abort))
@@ -6641,6 +6846,28 @@ def _parse_checkpoint_member(item: object) -> "CheckpointMember | str":
     )
 
 
+def _is_file_member(member: CheckpointMember) -> bool:
+    """Whether a checkpoint member names a workspace file. The member wire
+    carries no name kind, so its tiers say: only a file has no arbiter and
+    state a restore can bring back. Any other member (an object, or one the
+    checkpoint only enumerates) is a key, stored and matched exactly as
+    sent."""
+    return (
+        member.arbitration_tier == ArbitrationTier.NO_ARBITER.value
+        and member.restore_tier != RestoreTier.FORWARD_ONLY.value
+    )
+
+
+def _members_repeat(
+    coordinator: CoordinatorHTTPServer, members: list[CheckpointMember]
+) -> bool:
+    """Whether a manifest names one member twice: the same bytes, or two
+    spellings of one file, which a restore would register as one row."""
+    paths = [member.member_path for member in members]
+    file_keys = [file_key(coordinator, member.member_path) for member in members if _is_file_member(member)]
+    return len(set(paths)) != len(paths) or len(set(file_keys)) != len(file_keys)
+
+
 def _handle_workspace_checkpoint(
     req: _RequestProtocol, coordinator: CoordinatorHTTPServer
 ) -> None:
@@ -6725,8 +6952,7 @@ def _handle_workspace_checkpoint(
         member_rows.append(parsed)
     # A duplicate member path would reject registry-side mid-transaction;
     # reject it loud at the boundary instead (mirror the commit_all guard).
-    paths = [m.member_path for m in member_rows]
-    if len(set(paths)) != len(paths):
+    if _members_repeat(coordinator, member_rows):
         req._json(400, {"error": "members contains duplicate member_path values"})
         return
 
@@ -7143,7 +7369,7 @@ def _handle_workspace_restore_register(
         req._json(400, {"error": f"writes exceeds {MAX_CHECKPOINT_MEMBERS} rows"})
         return
     entries: list[WorkspaceRestoreWrite] = []
-    seen_paths: set[str] = set()
+    seen_keys: set[str] = set()
     for item in writes:
         if not isinstance(item, dict):
             req._json(400, {"error": "each write must be a JSON object"})
@@ -7157,10 +7383,13 @@ def _handle_workspace_restore_register(
         if not isinstance(fingerprint, str) or not _CONTENT_HASH_RE.match(fingerprint):
             req._json(400, {"error": "fingerprint must be a 64-hex sha-256 digest"})
             return
-        if member_path in seen_paths:
+        # The service registers each write as a file, so two spellings of one
+        # file would land on one row.
+        member_key = file_key(coordinator, member_path)
+        if member_key in seen_keys:
             req._json(400, {"error": "writes contains duplicate member_path values"})
             return
-        seen_paths.add(member_path)
+        seen_keys.add(member_key)
         entries.append(
             WorkspaceRestoreWrite(member_path=member_path, fingerprint=fingerprint)
         )
@@ -7336,7 +7565,16 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
       ``in_flight_drain_timed_out``, ``cold_start_duration_ms``,
       ``endpoint_counters``, ``intra_task_acquire_release_total``,
       ``stale_warning_emitted_total``, ``stale_warning_reread_total``,
-      ``sweep_reclaims_total``, ``sweep_reclaims_by_trigger`` (#195).
+      ``sweep_reclaims_total``, ``sweep_reclaims_by_trigger`` (#195),
+      ``fold_profile``, ``fold_table_unicode``.
+
+      ``fold_profile`` is how this coordinator keys file names: ``caseless``,
+      ``nfd`` or ``none``, the profile the start found for the workspace
+      disk, or ``cannot_tell`` for a disk it could not classify (or a start
+      without the single-writer lock), which keys names as ``none``.
+      ``fold_table_unicode`` is the Unicode version of the fold table. Both
+      are facts about this start, so every tier and the degraded answer
+      carry them.
 
       ``registry_schema_version`` is an int, the registry's
       ``SCHEMA_USER_VERSION``: the store format this coordinator writes. Its
@@ -7629,8 +7867,20 @@ def _status_counters(coordinator: CoordinatorHTTPServer) -> dict[str, Any]:
         # this first. A fact about this build: it makes no registry read, so the
         # metrics tier and the degraded answer carry it too.
         "pre_edit_if_unheld": True,
+        # How this coordinator keys file names, so a client keys its own
+        # records alike: facts about this start, not registry reads, so the
+        # metrics tier and the degraded answer carry them too.
+        "fold_profile": _advertised_fold_profile(coordinator.fold_profile),
+        "fold_table_unicode": FOLD_TABLE_UNICODE_VERSION,
         **coordinator.counters_snapshot(),
     }
+
+
+def _advertised_fold_profile(result: _fs_profile.FoldProfileResult) -> str:
+    """``/status``'s ``fold_profile``: the profile names are keyed by, or
+    ``cannot_tell`` for a disk the start could not classify (keyed as
+    ``none``), so it is not mistaken for one that folds nothing."""
+    return "cannot_tell" if result.status == "cannot_tell" else result.profile
 
 
 def _status_wait_deadline(req: _RequestProtocol) -> float:
@@ -8414,15 +8664,24 @@ def _exclusive_holder(
     *,
     exclude_agent: UUID,
 ) -> tuple[UUID | None, int | None]:
-    """Return a current M/E holder and its acquisition-time hint for pre-edit."""
-    state_map = coordinator.registry.get_state_map(artifact_id)
-    for other_id, state in state_map.items():
-        if other_id == exclude_agent:
-            continue
-        if state in (MESIState.EXCLUSIVE, MESIState.MODIFIED):
-            granted_at = coordinator.registry.granted_at_tick(other_id, artifact_id)
-            return other_id, granted_at
+    """Return a current M/E holder and its acquisition-time hint for pre-edit.
+    A holder of another row of the artifact's fold bucket counts: the
+    acquire that follows takes that grant too."""
+    for row_id in _file_rows(coordinator.registry, artifact_id):
+        for other_id, state in coordinator.registry.get_state_map(row_id).items():
+            if other_id == exclude_agent:
+                continue
+            if state in (MESIState.EXCLUSIVE, MESIState.MODIFIED):
+                granted_at = coordinator.registry.granted_at_tick(other_id, row_id)
+                return other_id, granted_at
     return None, None
+
+
+def _file_rows(registry: SqliteArtifactRegistry, artifact_id: UUID) -> tuple[UUID, ...]:
+    """The artifact and the other rows of its fold bucket (spellings of one
+    file a start-time merge left apart), which the coordinator serves as one
+    file."""
+    return (artifact_id, *registry.fold_bucket_peers(artifact_id))
 
 
 def _iso_utc(unix_ts: float) -> str:
@@ -9144,13 +9403,15 @@ def _a_write_is_in_flight(
     died before its commit -- explains nothing on disk, and its row stands until
     the sweep reclaims it. A holder with no heartbeat on record is given the
     benefit of the doubt, as every holder was before: only a recorded silence
-    longer than the window ends it."""
-    for agent_id, state in registry.get_state_map(artifact_id).items():
-        if state != _WRITE_IN_FLIGHT_STATE or agent_id == exclude_agent:
-            continue
-        last_heartbeat = registry.last_heartbeat_tick(agent_id)
-        if last_heartbeat is None or (now_unix - last_heartbeat) <= window_sec:
-            return True
+    longer than the window ends it. A holder of another row of the artifact's
+    fold bucket counts, since its bytes land on the same file."""
+    for row_id in _file_rows(registry, artifact_id):
+        for agent_id, state in registry.get_state_map(row_id).items():
+            if state != _WRITE_IN_FLIGHT_STATE or agent_id == exclude_agent:
+                continue
+            last_heartbeat = registry.last_heartbeat_tick(agent_id)
+            if last_heartbeat is None or (now_unix - last_heartbeat) <= window_sec:
+                return True
     return False
 
 
@@ -9263,6 +9524,7 @@ def decide_tracked_read(
     agent_state: MESIState | None,
     caller_content_hash: str | None,
     now_unix: float,
+    policy_context: PolicyMatchContext | None = None,
 ) -> TrackedReadDecision:
     """Classify a pre-read of an already-tracked artifact. PURE QUERY.
 
@@ -9295,7 +9557,11 @@ def decide_tracked_read(
             take, and both callers take it before calling: the fence holds
             with ``input_vanished`` and pre-read admits with no version
             (#224).
+        policy_context: how the policy reads ``path`` -- the request door's
+            context, which carries the disk's fold and spelling. Without one,
+            ``path`` is read as a stored file name under the disk's fold.
     """
+    strict_context = policy_context or stored_file_policy(coordinator)
     # A grant that is present and not INVALID is the fresh arm's admission
     # ticket: the holder was granted on the current version, and a peer commit
     # would have invalidated it.
@@ -9327,7 +9593,7 @@ def decide_tracked_read(
         # out-of-band edit (deny). Warn mode never denies here.
         commit_lag_suppressed = False
         outcome: Literal["fresh", "stale", "denied"] = "fresh"
-        if fresh_hash_differs and coordinator.policy.is_strict_mode(path):
+        if fresh_hash_differs and coordinator.policy.is_strict_mode(path, strict_context):
             if _is_recent_self_commit_lag(
                 coordinator, artifact_id, agent_id, now_unix=now_unix,
             ):
@@ -9359,7 +9625,7 @@ def decide_tracked_read(
     # prior grant at all while the bytes it just hashed differ from the
     # canonical. Matching hashes mean the session is observing what the
     # registry recorded, so there is nothing stale to act on: warn-mode allow.
-    denied = coordinator.policy.is_strict_mode(path) and (
+    denied = coordinator.policy.is_strict_mode(path, strict_context) and (
         agent_state == MESIState.INVALID
         or (agent_state is None and stale_hash_differs)
     )

@@ -54,6 +54,7 @@ from ccs.adapters.claude_code.coordinator_server import (
 )
 from ccs.adapters.claude_code.regular_file import ReadStatus, read_state_file
 from ccs.adapters.claude_code.state_dir import dir_link_refusal, state_file_link_refusal
+from ccs.core.disk_spelling import native_spelling, resolve_links
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_CLAIMED_REASON,
     CALLER_PRINCIPAL_REASONS,
@@ -149,6 +150,37 @@ def validate_relative_path(p: str) -> str | None:
     return None
 
 
+def _relative_inside(root: str, path: str) -> str | None:
+    try:
+        return str(Path(path).relative_to(root))
+    except ValueError:
+        return None
+
+
+def workspace_relative(path: str, root: Path) -> str | None:
+    """``path`` relative to the workspace ``root``, or ``None`` when it lies
+    outside. Both are made absolute as Node's ``path.resolve`` does, then
+    resolved by :func:`~ccs.core.disk_spelling.resolve_links`: links are
+    followed and every name keeps the case it was typed in. Only a path that
+    would otherwise lie outside is tried again with
+    :func:`~ccs.core.disk_spelling.native_spelling`, which is how a root typed
+    in another case (``REPO`` for ``Repo``) still meets the path.
+
+    The typed case comes first because a Bash token is keyed as typed: sending
+    the disk's spelling for a Read would keep the two tools' records of one
+    file apart on a coordinator that folds nothing. Raises
+    :class:`~ccs.core.disk_spelling.LinkDoesNotResolve` for a dangling or
+    looping link, and ``OSError`` for a path the resolvers cannot walk."""
+    # abspath folds '..' by text BEFORE links are followed: Claude Code opens the
+    # normalized tool path, so this keys that file; the Bash routes cover the shell's '..'.
+    absolute, absolute_root = os.path.abspath(path), os.path.abspath(root)
+    for resolver in (resolve_links, native_spelling):
+        relative = _relative_inside(resolver(absolute_root), resolver(absolute))
+        if relative is not None:
+            return relative
+    return None
+
+
 def normalize_workspace_path(p: str, root: Path) -> tuple[str, str | None]:
     """Normalize a CLI path argument to workspace-relative form.
 
@@ -165,6 +197,11 @@ def normalize_workspace_path(p: str, root: Path) -> tuple[str, str | None]:
       for ``..`` traversal defense.
     - **Absolute and outside workspace root** (e.g., ``"/etc/passwd"``)
       → rejected with ``"path outside workspace root"``.
+    - **Absolute through a dangling or looping link** → rejected with
+      ``"link does not resolve"``.
+
+    An absolute path is relativized by :func:`workspace_relative`: links are
+    followed, and a root typed in another case than the disk's still matches.
 
     This helper exists because the Claude Code plugin's
     ``/agent-coherence:track`` skill template substitutes ``$ARGUMENTS``
@@ -189,8 +226,15 @@ def normalize_workspace_path(p: str, root: Path) -> tuple[str, str | None]:
         return p, "empty"
     if Path(p).is_absolute():
         try:
-            normalized = str(Path(p).resolve().relative_to(root.resolve()))
-        except ValueError:
+            # '..' is folded by text as for a tool path, so a tracked name is
+            # the key the hook client sends when a tool opens that path.
+            normalized = workspace_relative(p, root)
+        except OSError as exc:
+            # A dangling or looping link (or a path the resolvers cannot walk)
+            # is refused like any invalid path: tracking the missing target
+            # would give its file a second name once the target exists.
+            return p, str(exc.strerror)
+        if normalized is None:
             return p, "path outside workspace root"
         # Re-validate the normalized form against the pure-string rules
         # (catches e.g. a resolved path that still contains '..' — defensive)

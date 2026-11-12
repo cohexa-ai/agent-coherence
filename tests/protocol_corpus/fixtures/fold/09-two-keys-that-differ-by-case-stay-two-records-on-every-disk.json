@@ -1,0 +1,103 @@
+{
+  "name": "fold-two-keys-that-differ-by-case-stay-two-records-on-every-disk",
+  "description": "Session A pre-edits ws-42 and session B pre-edits WS-42, each sent with \"name_kind\": \"key\": a name that is not a workspace file is never folded, so the two stay two records on every disk, caseless included, and GET /status lists each under the name its client sent. One expectation for every profile. The two backends' /status envelopes differ (see warn_mode 08 and 09), so every top-level key but sessions is dropped on both sides and sessions is compared in full; agent_id is scrubbed by name. The session ids are those of the ended_attempt rows, chosen so both backends list the two agents in the same order. Both backends.",
+  "setup": {
+    "tracked": [
+      "ws-42",
+      "WS-42"
+    ],
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "99999999-9999-4999-8999-999999999999",
+          "path": "ws-42",
+          "name_kind": "key"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "66666666-6666-4666-8666-666666666666",
+          "path": "WS-42",
+          "name_kind": "key"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "GET",
+    "path": "/status"
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "sessions": [
+        {
+          "agent_id": "<UUID>",
+          "agent_name": null,
+          "states": {
+            "ws-42": "EXCLUSIVE"
+          }
+        },
+        {
+          "agent_id": "<UUID>",
+          "agent_name": null,
+          "states": {
+            "WS-42": "EXCLUSIVE"
+          }
+        }
+      ]
+    }
+  },
+  "optional_keys": [
+    "audit_log_mode_drift_total",
+    "auth_401_total",
+    "backend",
+    "caller_principal_absent_total",
+    "caller_principal_refused_total",
+    "cold_start_duration_ms",
+    "coordinator_backend",
+    "coordinator_pid",
+    "coordinator_root",
+    "coordinator_uptime_s",
+    "coordinator_uptime_seconds",
+    "coordinator_version",
+    "counts",
+    "detail",
+    "effect_fence_holds_total",
+    "endpoint_counters",
+    "fold_profile",
+    "fold_table_unicode",
+    "fresh_shared_hash_mismatch_total",
+    "handler_concurrency_overflows_total",
+    "handoff_giver_denials_total",
+    "in_flight_drain_timed_out",
+    "intra_task_acquire_release_total",
+    "policy_summary",
+    "pre_edit_if_unheld",
+    "pre_edit_other_holder_denials_total",
+    "registry_schema_version",
+    "schema_version",
+    "shared_foreign_lag_suppressed_total",
+    "stale_warning_emitted_total",
+    "stale_warning_reread_total",
+    "status",
+    "strict_mode_denials_total",
+    "strict_mode_routed_around_via_bash_total",
+    "sweep_reclaims_by_trigger",
+    "sweep_reclaims_total",
+    "tracked_artifacts",
+    "version",
+    "watchdog_late_aborts_total",
+    "watchdog_late_completion_total",
+    "watchdog_queue_overflows_total",
+    "watchdog_timeouts_total"
+  ],
+  "backends": [
+    "python",
+    "node"
+  ]
+}

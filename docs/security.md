@@ -281,9 +281,9 @@ view reports `agent_name` as `null`, the workspace root as `.` (both
 counts without the patterns. It still lists each tracked path relative to the
 root, each session's agent id with the states it holds, and the Python
 coordinator's process id (`coordinator_pid`), which the operator view carries
-too. The `metrics` view carries counters only: no paths, no process id and no
-sessions. When the Python coordinator's registry is busy, its default and
-operator views answer with their usual keys, `"degraded": true` and `null`
+too. The `metrics` view carries no paths, no process id and no sessions.
+When the Python coordinator's registry is busy, its default and operator views
+answer with their usual keys, `"degraded": true` and `null`
 path and session lists (see [When the registry is busy](guide.md#when-the-registry-is-busy)),
 so a degraded answer discloses nothing its view does not. A tracked artifact that
 has a handoff record
@@ -352,6 +352,81 @@ What it does not cover:
   link.
 - A link at the workspace root or above it, or inside a subdirectory of
   `.coherence`.
+
+## Other spellings of one file
+
+A session whose copy of a strict file is stale is denied a Read, Edit or Write
+of it. Through 0.15.0 the coordinator matched strict patterns, and keyed
+grants, by the path exactly as a request sent it, so that session could reach
+the file under another spelling and be admitted: `PLAN.MD` for a strict
+`plan.md` on a macOS disk that folds case, a composed or a decomposed accent,
+or `.//plan.md` on any disk
+([#506](https://github.com/Cohexa-ai/agent-coherence/issues/506)). A
+coordinator newer than 0.15.0 tidies `./` and `//` in every route that takes a
+file name, and keys the name by the fold the workspace disk applies, before
+strict mode and the records see it (`src/ccs/adapters/claude_code/door.py`).
+So every spelling the disk opens as that file is denied alike, and a
+refuse-mode `CoherentVolume`, which needs such a coordinator, is refused a
+file another agent holds under any of its spellings. On a disk that folds
+nothing, only `./` and `//` are tidied. The Claude Code
+plugin's Node coordinator does the same in plugin releases after 0.6.0.
+
+The coordinator learns the disk's fold once per start
+(`src/ccs/adapters/claude_code/fs_profile.py`):
+
+- it probes only while it holds the store's single-writer lock, and creates
+  nothing outside `.coherence`;
+- it compares `.COHERENCE` with `.coherence` by `lstat`, so a committed
+  `.COHERENCE` link to `.coherence` reads as a link, not as case folding;
+- it creates each probe file with `O_CREAT | O_EXCL` and mode `0600` in a
+  fresh `0700` directory under `.coherence` named `fold-probe-<pid>-<random>`,
+  and compares two spellings by the device and inode `lstat` reports, never
+  following a link;
+- from a `fold-probe-` directory a crashed start left, it removes the regular
+  files directly inside, then the directory once it is empty; it leaves
+  anything else under that prefix in place, a link included, without
+  following it.
+
+A planted entry under the probe prefix, a `.coherence` on another device than
+the workspace, or a probe step that fails at worst makes the start
+cannot-tell, and the coordinator logs why:
+a disk the start probe cannot classify folds nothing, as before this change.
+`/status` names the result as `fold_profile`, beside `fold_table_unicode`, in
+every view, the `metrics` view included: it says how the workspace disk folds
+names, and nothing about any file.
+
+Names that are not files stay exact. A request that marks its name a key
+(`"name_kind": "key"`), as `CoherentRow` and `CoherentObject` do, is never
+tidied, folded or merged, so a row or object key is never taken for a workspace
+file. A client that marks a real file as a key gains nothing the model above
+does not already grant: any process running as your OS user can skip the
+coordinator.
+
+A `CoherentVolume` built with `on_held="refuse"` promises a holder its managed
+files. A write through a link whose name is under the volume's `managed` globs
+to a file outside them would take that file from its holder under a name that
+promised the refusal, so the volume
+raises `LinkOutOfManaged` and sends nothing
+(`src/ccs/adapters/coherent_volume.py`). It decides this from the links as they
+stand when `write()` is called.
+
+Not covered:
+
+- A hook Read, Edit or Write through a link inside the workspace that points
+  outside it, or through a link that does not resolve. The hook client stays
+  out of such a call, as for any path outside the workspace, so no grant,
+  warning or strict-mode deny applies to it; a repository can commit such a
+  link. The coordinator logs each tracked or strict pattern that passes
+  through a link when it loads or reloads its policy.
+- A Bash command's file arguments, which are matched as typed: through a
+  link, a Bash read reaches the link's own path, not the file it names.
+- A hard link, which is a second name with a record of its own.
+- A link put in place while a refuse-mode `write()` runs, after its check.
+  Making one takes a process running as your OS user, which the model above
+  already trusts.
+- A disk the coordinator cannot classify, or a coordinator running without
+  its lock: there another spelling of a strict file is still a different file,
+  except for `./` and `//`.
 
 ## Env-var kill switches
 

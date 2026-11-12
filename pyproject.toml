@@ -176,6 +176,9 @@ where = ["src"]
 # subdirectory has to be named. tests/test_packaging_data_files.py fails if any
 # future non-.py asset under src/ccs/ is left undeclared here.
 [tool.setuptools.package-data]
+# The fold table ccs/core/path_fold.py loads at import, and the Unicode License
+# notice that covers it.
+"ccs.core" = ["fold_data/*.json", "fold_data/LICENSE-UNICODE"]
 "ccs.diagnose" = ["templates/*.html"]
 "ccs.output" = ["templates/*.html"]
 

@@ -81,6 +81,7 @@ from ccs.core.types import (
     VersionedReadRejection,
 )
 
+from .fold_merge import NameKind
 from .retention import RetentionPolicy
 
 # Contract return types — DEFINED here in the contract module and re-exported by
@@ -1343,8 +1344,9 @@ class SqliteExtended(RegistryBase, Protocol):
 
     These cover the durable-store-only concerns: connection ``close``, durable
     name/prefix lookups, the preemption-notice surface (record/peek/pop/evict),
-    ``resolve_or_register`` first-observation seeding, and the ``status_snapshot``
-    batch. Extracted as a pure refactor (no behavior change).
+    ``resolve_or_register`` first-observation seeding, the ``status_snapshot``
+    batch, and ``fold_bucket_peers``, the other rows of a file's fold bucket
+    that the write path treats as the same file.
     """
 
     def artifact_names_under_prefix(self, prefix: str) -> list[str]:
@@ -1363,13 +1365,23 @@ class SqliteExtended(RegistryBase, Protocol):
     ) -> int:
         ...
 
+    def fold_bucket_peers(self, artifact_id: UUID) -> list[UUID]:
+        ...
+
     def get_artifact_updated_at(self, artifact_id: UUID) -> Optional[float]:
         ...
 
     def last_writer_for(self, artifact_id: UUID) -> Optional[UUID]:
         ...
 
-    def lookup_artifact_id_by_name(self, parent_rel_path: str) -> UUID | None:
+    def lookup_artifact_id_by_name(
+        self,
+        parent_rel_path: str,
+        *,
+        key: str | None = None,
+        disk_spelling: str | None = None,
+        name_kind: NameKind = "file",
+    ) -> UUID | None:
         ...
 
     def peek_preemption_notice(
@@ -1403,6 +1415,9 @@ class SqliteExtended(RegistryBase, Protocol):
         content_hash: str,
         *,
         initial_owner: Optional[UUID] = None,
+        key: str | None = None,
+        disk_spelling: str | None = None,
+        name_kind: NameKind = "file",
     ) -> UUID:
         ...
 

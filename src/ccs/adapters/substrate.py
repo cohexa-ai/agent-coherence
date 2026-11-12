@@ -309,6 +309,13 @@ class CoherenceSubstrate(Protocol):
 # admit-on-absent path by design, the same posture as ``CoherentVolume.write_cas``.
 # ---------------------------------------------------------------------------
 
+# Every request names its artifact as a key: a row or an object, never a
+# workspace file. A coordinator keeps a key exactly as sent, so ``ws-42`` and
+# ``WS-42`` stay two artifacts even where the workspace disk folds case; sent
+# as file names, they would share one row and conflict with each other.
+# Coordinators older than the field ignore it.
+_NAME_KIND = "key"
+
 
 @runtime_checkable
 class ReconcilingSubstrate(CoherenceSubstrate, Protocol):
@@ -667,7 +674,11 @@ class SubstrateCoordinatorSession:
         coordinator's failure envelope (#259) or an HTTP 5xx (#433) raises
         ``CoordinatorFailed``, as the volume's strict reads do.
         """
-        payload: dict[str, object] = {"session_id": self._session_id, "path": artifact_ref}
+        payload: dict[str, object] = {
+            "session_id": self._session_id,
+            "path": artifact_ref,
+            "name_kind": _NAME_KIND,
+        }
         if content_hash is not None:
             payload["content_hash"] = content_hash
         resp = self._post("/hooks/pre-read", payload, unknown=unknown)
@@ -706,6 +717,7 @@ class SubstrateCoordinatorSession:
         payload = {
             "session_id": self._session_id,
             "path": artifact_ref,
+            "name_kind": _NAME_KIND,
             "success": True,
             "content_hash": content_hash,
             "expected_version": expected_version,
