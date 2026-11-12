@@ -24,6 +24,7 @@ from ccs.mcp.status import (
     build_status,
     fold_profile_of,
     handoff_from_status,
+    status_text,
 )
 from tests.coordinator_helpers import serve_in_process
 
@@ -45,6 +46,10 @@ class _StubVolume:
 
     def coordinator_status(self) -> dict | None:
         return self._doc
+
+    def is_managed(self, path: str) -> bool:
+        """The stub's managed rule: every path under ``data/``."""
+        return path.startswith("data/")
 
 
 #: A frozen copy of the text ``swg_status`` adds when ``per_path`` is null,
@@ -141,15 +146,17 @@ def test_build_status_never_invents_a_registry_schema_version(doc) -> None:
 
 
 def test_status_text_does_not_carry_the_registry_schema_version() -> None:
-    """Pin: the schema version is structured content only; the text result is
-    the coordinator state, as before."""
+    """Pin: the schema version is structured content only; the text result
+    opens with the coordinator state, as before, and never names it."""
     config = SessionConfig(root=Path("/x"), managed=("data/**",))
     doc = {**_doc(1), "tracked_artifacts": [], "registry_schema_version": 10}
 
     result = _do_status(_StubVolume(True, doc=doc), config)
 
     assert result.structuredContent["registry_schema_version"] == 10
-    assert _texts(result) == ["coordinator=on"]
+    [text] = _texts(result)
+    assert text.splitlines()[0] == "coordinator=on"
+    assert "registry_schema_version" not in text
 
 
 def test_state_on_when_reachable_with_strict_patterns() -> None:
@@ -180,14 +187,13 @@ def test_per_path_enforced_vs_not_registered() -> None:
             {"path": "other/b.txt", "version": 1},
         ]
     }
-    config = SessionConfig(root=Path("/x"), managed=("data/**",))
-    per_path = _per_path(config, doc)
+    per_path = _per_path(_StubVolume(True), doc)
     assert per_path["data/a.txt"] == {"version": 3, "status": "enforced"}
     assert per_path["other/b.txt"] == {"version": 1, "status": "not_registered"}
 
 
 def test_per_path_empty_when_no_status() -> None:
-    assert _per_path(SessionConfig(root=Path("/x"), managed=("data/**",)), None) == {}
+    assert _per_path(_StubVolume(True), None) == {}
 
 
 def _degraded_doc() -> dict:
@@ -239,19 +245,24 @@ def test_status_text_says_per_path_unavailable_when_status_is_degraded() -> None
 @pytest.mark.parametrize(
     ("doc", "expected"),
     [
-        ({**_doc(1), "tracked_artifacts": []}, ["coordinator=on"]),
-        ({**_doc(1), "tracked_artifacts": [{"path": "data/a.txt", "version": 2}]}, ["coordinator=on"]),
-        ({**_doc(0), "tracked_artifacts": []}, ["coordinator=off"]),
-        (None, ["coordinator=unknown"]),
+        ({**_doc(1), "tracked_artifacts": []}, "coordinator=on"),
+        ({**_doc(1), "tracked_artifacts": [{"path": "data/a.txt", "version": 2}]}, "coordinator=on"),
+        ({**_doc(0), "tracked_artifacts": []}, "coordinator=off"),
+        (None, "coordinator=unknown"),
     ],
     ids=["on-empty", "on-tracked", "off", "unreachable"],
 )
 def test_status_text_is_unchanged_when_per_path_is_reported(doc, expected) -> None:
-    """Pin: an answer whose per-path state was reported keeps its text byte
-    for byte; only a null ``per_path`` adds the marker."""
+    """Pin: an answer whose per-path state was reported keeps its first text
+    line byte for byte; only a null ``per_path`` adds the marker there. The
+    lines after it name the mode and the holds."""
     config = SessionConfig(root=Path("/x"), managed=("data/**",))
 
-    assert _texts(_do_status(_StubVolume(True, doc=doc), config)) == expected
+    result = _do_status(_StubVolume(True, doc=doc), config)
+    [text] = _texts(result)
+    assert text.splitlines()[0] == expected
+    # The tool sends the whole text the status builds, mode and holds included.
+    assert text == status_text(result.structuredContent)
 
 
 @pytest.mark.parametrize(

@@ -58,10 +58,10 @@ from ccs.mcp.deny import (
 )
 from ccs.mcp.session import SessionConfig, build_volume
 from ccs.mcp.status import (
-    PER_PATH_UNAVAILABLE_TEXT,
     build_status,
     fold_profile_of,
     handoff_from_status,
+    status_text,
 )
 from ccs.mcp.uri import UriValidationError, validate_uri
 
@@ -560,12 +560,9 @@ def _do_reacquire(volume: CoherentVolume, config: SessionConfig, path: str) -> C
 
 def _do_status(volume: CoherentVolume, config: SessionConfig) -> CallToolResult:
     status = build_status(volume, config)
-    text = f"coordinator={status['coordinator']}"
-    if status["per_path"] is None:
-        # A client that shows only the text channel must still see that the
-        # tracked paths could not be told: coordinator=on alone reads healthy.
-        text = f"{text} {PER_PATH_UNAVAILABLE_TEXT}"
-    return _ok_result(status, text)
+    # A client that shows only the text channel must still see what an agent
+    # acts on: the mode, its own holds, and who else holds a path.
+    return _ok_result(status, status_text(status))
 
 
 def _do_write_cas(
