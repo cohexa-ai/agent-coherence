@@ -5141,11 +5141,12 @@ class SqliteArtifactRegistry:
         - a file name, with the fold index built: by ``key`` (the request's
           fold key, computed from ``parent_rel_path`` when not given), so every
           spelling of one file reaches one row: a key with several rows (a
-          bucket) reaches its lowest-rowid row and never mints another. A new
-          row takes ``disk_spelling`` when the caller found one, else the
-          tidied request. The lookup, the insert and the index update all run
-          under the registry lock, so two threads registering two spellings
-          get one row.
+          bucket) reaches its lowest-rowid row and never mints another. A key
+          with no bucket is looked up exactly, so a key row of the same exact
+          name is shared. A new row takes ``disk_spelling`` when the caller
+          found one, else the tidied request. The lookup, the insert and the
+          index update all run under the registry lock, so two threads
+          registering two spellings get one row.
         - a file name without the index (a coordinator without its writer
           lock, any other handle): exactly as given, as before.
 
@@ -5180,8 +5181,8 @@ class SqliteArtifactRegistry:
             self._conn.execute("COMMIT")
             return new_id, True
         except sqlite3.IntegrityError as exc:
-            # A row of exactly this name that the lookup does not reach: a key
-            # row met by a file request under the index, or a racing insert.
+            # A racing insert of exactly this name: the lookup above reaches
+            # every row of that name, key rows included.
             return self._winner_of_lost_insert(request.stored_name, exc), False
         except BaseException:
             # BaseException catches KeyboardInterrupt/SystemExit mid-transaction
@@ -6307,9 +6308,15 @@ class SqliteArtifactRegistry:
         return _NameRequest(tidy_path(name), fold, is_key=False)
 
     def _find_row_id(self, request: _NameRequest) -> str | None:
-        """The request's row id, or None. Caller holds the lock."""
+        """The request's row id, or None. Caller holds the lock.
+
+        A file request the index has no bucket for is then looked up exactly:
+        a key row of the same exact name is not indexed, yet the insert would
+        collide with it and register would return it, so lookup must too."""
         if request.index_key is not None:
-            return self._indexed_row_id(request.index_key)
+            row_id = self._indexed_row_id(request.index_key)
+            if row_id is not None:
+                return row_id
         row = self._conn.execute(
             "SELECT id FROM artifacts WHERE name = ?", (request.stored_name,)
         ).fetchone()

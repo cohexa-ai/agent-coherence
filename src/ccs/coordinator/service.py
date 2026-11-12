@@ -2228,8 +2228,9 @@ class CoordinatorService:
         artifact = self._require_artifact(artifact_id)
         identity = caller if caller is not None else agent_id
         # Before the acquire: a giver's re-acquire must never invalidate
-        # the successor's read and then meet it as another holder.
-        self._refuse_handed_off_giver(artifact_id, identity)
+        # the successor's read and then meet it as another holder. Every row
+        # of the fold bucket, since the acquire demotes the writers of all.
+        self._refuse_bucket_giver(artifact_id, identity)
         admitted = self._live_transfer_record(artifact_id)
         if if_unheld:
             # Before the first state write, so a refusal changes nothing,
@@ -3496,6 +3497,17 @@ class CoordinatorService:
         record = self.live_handoff_given_by(artifact_id, identity)
         if record is not None:
             raise GiverFenced(artifact_id, record.successor, record.version_at_transfer)
+
+    def _refuse_bucket_giver(self, artifact_id: UUID, identity: UUID) -> None:
+        """:meth:`_refuse_handed_off_giver` over ``artifact_id`` and every
+        other row of its fold bucket, naming ``artifact_id`` as the head row
+        would. An acquire demotes the writers of the whole bucket, so a giver
+        reaching the file through another spelling's row would otherwise take
+        the grant it handed off. Caller holds the abort guard."""
+        for row_id in (artifact_id, *self._fold_bucket_peers(artifact_id)):
+            record = self.live_handoff_given_by(row_id, identity)
+            if record is not None:
+                raise GiverFenced(artifact_id, record.successor, record.version_at_transfer)
 
     def _refuse_other_holder(self, artifact_id: UUID, agent_id: UUID) -> None:
         """Raise :class:`OtherHolder` when an agent other than ``agent_id``

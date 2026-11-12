@@ -49,6 +49,7 @@ from ccs.coordinator.service import CoordinatorService
 from ccs.coordinator.sqlite_registry import SCHEMA_USER_VERSION, SqliteArtifactRegistry
 from ccs.core.exceptions import (
     CommitNotAllowed,
+    GiverFenced,
     InvariantViolationError,
     OtherHolder,
     StaleReadGeneration,
@@ -437,14 +438,14 @@ def test_a_key_keeps_its_exact_name_is_listed_and_stays_out_of_the_index(raw, op
     assert upper != lower
     assert registry.resolve_or_register("WS-42", "", name_kind="key") == upper
     assert registry.lookup_artifact_id_by_name("ws-42", name_kind="key") == lower
-    assert registry.lookup_artifact_id_by_name("ws-42") is None
+    assert registry.lookup_artifact_id_by_name("Ws-42") is None
     listed = raw.execute("SELECT artifact_id, kind FROM artifact_name_kinds").fetchall()
     assert sorted(listed) == sorted([(upper.hex, "key"), (lower.hex, "key")])
 
     registry.close()
     reopened = opened()
     assert reopened.build_fold_index("caseless") == []
-    assert reopened.lookup_artifact_id_by_name("ws-42") is None
+    assert reopened.lookup_artifact_id_by_name("Ws-42") is None
 
 
 def test_a_key_request_meeting_a_file_row_of_the_same_exact_name_shares_it(raw, opened) -> None:
@@ -454,6 +455,26 @@ def test_a_key_request_meeting_a_file_row_of_the_same_exact_name_shares_it(raw, 
     assert registry.resolve_or_register("data/x.txt", "", name_kind="key") == file_id
     assert registry.lookup_artifact_id_by_name("data/x.txt", name_kind="key") == file_id
     assert raw.execute("SELECT * FROM artifact_name_kinds").fetchall() == []
+
+
+def test_a_file_request_of_a_key_rows_exact_name_reaches_it_by_lookup_and_by_register(
+    raw, opened
+) -> None:
+    registry = opened()
+    registry.build_fold_index("caseless")
+    key_id = registry.resolve_or_register("docs/plan.md", "", name_kind="key")
+
+    assert registry.lookup_artifact_id_by_name("docs/plan.md") == key_id
+    registered = registry.resolve_or_register("docs/plan.md", "")
+    assert registered == key_id
+    registry.set_agent_state(registered, AGENT_A, MESIState.EXCLUSIVE)
+    looked_up = registry.lookup_artifact_id_by_name("docs/plan.md")
+    assert registry.get_agent_state(looked_up, AGENT_A) == MESIState.EXCLUSIVE
+    assert registry.lookup_artifact_id_by_name("DOCS/PLAN.MD") is None
+    assert registry.lookup_artifact_id_by_name("docs/plan.md", name_kind="key") == key_id
+    assert raw.execute("SELECT artifact_id FROM artifact_name_kinds").fetchall() == [
+        (key_id.hex,)
+    ]
 
 
 def test_the_side_table_is_created_at_open_with_no_user_version_change(store: Store) -> None:
@@ -537,6 +558,24 @@ def test_an_acquire_leaves_the_agents_own_grant_on_another_row_of_its_bucket(raw
     )
     assert signals == []
     assert registry.get_agent_state(second, AGENT_A) == MESIState.EXCLUSIVE
+
+
+def test_the_giver_of_a_live_handoff_on_another_row_of_the_bucket_is_refused_its_acquire(
+    raw, opened
+) -> None:
+    first = seed_artifact(raw, "./plan.md")
+    second = seed_artifact(raw, "plan.md")
+    seed_state(raw, (second, AGENT_C), MESIState.EXCLUSIVE, granted_at=TICK - 10, observed=1,
+               read_generation=0)
+    seed_transfer(raw, second, AGENT_A)
+    registry = opened()
+    registry.build_fold_index("none")
+    before = tables(raw)
+    with pytest.raises(GiverFenced) as refused:
+        CoordinatorService(registry).write(agent_id=AGENT_A, artifact_id=first, issued_at_tick=TICK)
+    assert (refused.value.successor, refused.value.version_at_transfer) == (AGENT_C, 1)
+    assert registry.get_agent_state(second, AGENT_C) == MESIState.EXCLUSIVE
+    assert tables(raw) == before
 
 
 def test_the_pre_edit_holder_checks_count_a_holder_of_another_row_of_the_bucket(
