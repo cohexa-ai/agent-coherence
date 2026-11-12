@@ -891,6 +891,51 @@ Alpha — APIs may change before `v1.0`.
 
 ### Fixed
 
+- **`ccs-diagnose` writes its report when the graph handles a broken pipe of
+  its own (#470).** On POSIX the console entry point keeps Python's default
+  SIGPIPE handling for its own output, so a graph whose socket closed was
+  killed by the signal before it could catch `BrokenPipeError`: the command
+  exited 141 and wrote no report. While it loads, builds and invokes the graph,
+  the console entry point now ignores SIGPIPE, so graph code can catch the
+  error, and it restores the previous handler when the invocation returns. The
+  window is process-wide. Inside it, a write to a closed stdout, as with
+  `ccs-diagnose ... | head`, still ends the process quietly with status 141,
+  including from a graph worker thread, and writes no false `insufficient`
+  report; `subprocess` sees `141` rather than `-13`. An embedded caller of
+  `main()` keeps its own signal handling and stdout. Stderr, raw descriptor
+  writes, `sys.stdout.buffer`, and graph code that runs after the invocation
+  returns are outside the window (#497). The guide's "Broken pipes in console
+  and embedded runs" section has the details.
+
+- **A session displaced by another session's pre-edit gets its preemption
+  notice, and one that let go first is no longer named (#450).** Pre-edit
+  looked up the file's other write holders before its acquire, outside the
+  registry lock, and built the preemption notices and the collision warning
+  from that lookup. A session that took the write grant between the lookup and
+  the acquire was displaced with no notice, and one that released it in that
+  gap was reported as a holder it no longer was. Pre-edit now builds both from
+  the acquire's own invalidations: only a session that held the file
+  `MODIFIED` or `EXCLUSIVE` when the acquire displaced it gets a notice or is
+  named in the warning. A holder that had already let go no longer suppresses
+  the warning that the file on disk differs from the content the coordinator
+  recorded (#278). `InvalidationSignal` gains two optional fields,
+  `victim_agent_id` and `victim_state`: the invalidated session and its state
+  just before the invalidation. The coordinator and the simulation engine fill
+  them; a signal built by hand defaults both to `None`, and so does
+  `victim_state` for a peer that another registry writer adds during a
+  `commit_cas` or `commit_all`. The plugin's Node coordinator looks up and
+  acquires with nothing in between and is unchanged.
+
+- **Six coherence exceptions survive a pickle round trip (#452).**
+  `GiverFenced`, `CallerPrincipalRefused`, `CasRetriesExhausted`,
+  `CasVersionConflict`, `PublishMaterializationError` and
+  `ConditionalPutRetriesExhausted` take required constructor arguments, and
+  the default reduction passed back only the message, so unpickling one, as a
+  process pool does to return it to the parent, raised `TypeError`. Each now
+  reduces to its constructor fields and comes back with its type, `args`,
+  attributes and notes, including the generation pair of `CasRetriesExhausted`
+  and `CasVersionConflict` (#361).
+
 - **`agent-coherence-status` names the Node coordinator and its version
   (#518).** Against the Claude Code plugin's Node coordinator it printed
   `backend=python` and an empty version, because that coordinator sends
