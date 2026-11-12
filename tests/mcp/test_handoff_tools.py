@@ -28,6 +28,7 @@ from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.cli._coherence_client import CoordinatorUnavailable, resolve_endpoint
 from ccs.cli._coherence_client import post as _cc_post
+from ccs.core.path_fold import FOLD_TABLE_UNICODE_VERSION
 from ccs.mcp.server import (
     _do_accept,
     _do_decline,
@@ -881,6 +882,111 @@ def test_a_status_lookup_tells_no_record_from_cannot_tell() -> None:
         False,
         None,
     )
+
+
+#: A record naming this session as the successor, so a found record is
+#: projected with the role ``successor``.
+_RECORD_FOR_ME = {
+    "giver": _OTHER_AGENT,
+    "successor": _FIXED_AGENT,
+    "version_at_transfer": 3,
+    "hold_shape": "MODIFIED",
+    "status": "pending",
+    "live": True,
+}
+#: Not the Unicode version of this library's fold table.
+_OTHER_TABLE = "16.0.0"
+
+
+def _listing(name: str, profile: object, table: object = FOLD_TABLE_UNICODE_VERSION) -> dict:
+    """A ``/status`` document whose coordinator advertises ``profile`` and
+    ``table`` and lists the record under ``name``, the spelling it stores;
+    ``None`` leaves the field out, as a coordinator older than the fold
+    fields does."""
+    doc: dict = {
+        "tracked_artifacts": [
+            {"path": OTHER, "version": 1},
+            {"path": name, "version": 3, "handoff": _RECORD_FOR_ME},
+        ]
+    }
+    if profile is not None:
+        doc["fold_profile"] = profile
+    if table is not None:
+        doc["fold_table_unicode"] = table
+    return doc
+
+
+@pytest.mark.parametrize(
+    ("profile", "listed", "asked"),
+    [
+        ("caseless", "data/Plan.md", "DATA/PLAN.MD"),
+        ("caseless", "data/café.md", "data/CAFÉ.md"),
+        ("nfd", "data/café.md", "data/café.md"),
+    ],
+    ids=["case", "case-and-accent-form", "accent-form"],
+)
+def test_a_status_lookup_finds_a_record_listed_under_the_disk_spelling_when_asked_by_an_alias(
+    profile: str, listed: str, asked: str
+) -> None:
+    """``/status`` lists a file under the spelling its coordinator stores,
+    the one on disk, while an agent may ask by any spelling the disk opens as
+    that file. Compared as typed, the alias found no entry and a live
+    handoff read as "no record"."""
+    volume = _StatusDocVolume(_FIXED_SESSION, _listing(listed, profile))
+
+    assert handoff_from_status(volume, asked) == (True, {"role": "successor", **_RECORD_FOR_ME})
+
+
+@pytest.mark.parametrize(
+    ("profile", "table"),
+    [
+        (None, None),
+        ("none", FOLD_TABLE_UNICODE_VERSION),
+        ("cannot_tell", FOLD_TABLE_UNICODE_VERSION),
+        ("folds-everything", FOLD_TABLE_UNICODE_VERSION),
+        (["caseless"], FOLD_TABLE_UNICODE_VERSION),
+        ("caseless", _OTHER_TABLE),
+        ("caseless", None),
+    ],
+    ids=[
+        "older-coordinator",
+        "none",
+        "cannot-tell",
+        "unknown-profile",
+        "not-a-string",
+        "another-table",
+        "no-table",
+    ],
+)
+def test_a_status_lookup_compares_names_as_typed_where_it_cannot_fold_as_the_coordinator_does(
+    profile: object, table: object
+) -> None:
+    """A coordinator that folds nothing, cannot tell what its disk folds, names
+    a profile this build does not know, or folds by a table of another
+    Unicode version keys names as typed (tidied), so the lookup does too: an
+    alias finds nothing, the stored spelling still finds its record."""
+    volume = _StatusDocVolume(_FIXED_SESSION, _listing("data/Plan.md", profile, table))
+
+    assert handoff_from_status(volume, "DATA/PLAN.MD") == (True, None)
+    assert handoff_from_status(volume, "data/Plan.md") == (True, {"role": "successor", **_RECORD_FOR_ME})
+
+
+def test_a_status_lookup_takes_the_record_from_whichever_listed_spelling_carries_it() -> None:
+    """Rows a start could not merge stay listed under each of their
+    spellings, and the coordinator treats them as one file. The record is
+    found whichever of them carries it, never hidden by a sibling listed
+    first without one."""
+    doc = {
+        "fold_profile": "caseless",
+        "fold_table_unicode": FOLD_TABLE_UNICODE_VERSION,
+        "tracked_artifacts": [
+            {"path": "DATA/plan.md", "version": 1},
+            {"path": "data/Plan.md", "version": 3, "handoff": _RECORD_FOR_ME},
+        ],
+    }
+    volume = _StatusDocVolume(_FIXED_SESSION, doc)
+
+    assert handoff_from_status(volume, "data/plan.md") == (True, {"role": "successor", **_RECORD_FOR_ME})
 
 
 #: Stands for a request whose connect is refused, so it is never sent.

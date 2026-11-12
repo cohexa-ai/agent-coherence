@@ -33,6 +33,8 @@ from pathlib import Path
 import pytest
 
 import ccs.adapters.substrate as substrate_module
+from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
+from ccs.adapters.claude_code.fs_profile import FoldProfileResult
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.substrate import (
     CasConflict,
@@ -63,6 +65,7 @@ from ccs.core.substrate import CapabilityDescriptor, Tier
 from tests.coherence_link_helpers import plant_link
 from tests.coordinator_helpers import serve_in_process
 from tests.loopback_helpers import refused_endpoint, refusing_port
+from tests.pid_lock_helpers import write_coordinator_pid_file
 from tests.test_coherence_client_tls import (
     _make_handler_class,
     _mint_bundle,
@@ -664,6 +667,99 @@ def test_commit_wire_payload_carries_hash_not_content(
             assert "content" not in payload  # bytes are NEVER sent
     finally:
         stop_coordinator(tmp_path)
+
+
+# --- a substrate's names are keys, not workspace files ----------------------
+
+#: A workspace disk that folds case, forced whatever disk the test runs on:
+#: what is under test is how the substrate's names are keyed, not the disk.
+_CASELESS = FoldProfileResult(profile="caseless", status="classified")
+#: Two names a case-folding disk would take for one file.
+_CASE_PAIR = ("ws-42", "WS-42")
+
+
+def test_a_sessions_read_and_commit_send_their_name_as_a_key(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A substrate names a row or an object, never a workspace file, so both of
+    its requests say so: the coordinator then keeps the name exactly as sent,
+    neither tidied nor folded by what its workspace disk folds."""
+    store = _FakeStore()
+    store.seed(REF, b"v1")
+    sent: list[tuple[str, object]] = []
+    real_post = substrate_module._coordinator_post
+
+    def spy(endpoint, path, payload, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        if path in ("/hooks/pre-read", "/hooks/post-edit-cas"):
+            sent.append((path, payload.get("name_kind")))
+        return real_post(endpoint, path, payload, **kwargs)
+
+    monkeypatch.setattr(substrate_module, "_coordinator_post", spy)
+    sa = _session(tmp_path, fast_cfg)
+    try:
+        a, _fa = _agent(store, sa)
+        _bytes, token = a.read(REF)
+        a.commit(REF, expected_token=token, new_bytes=b"v2")
+
+        assert {route for route, _kind in sent} == {"/hooks/pre-read", "/hooks/post-edit-cas"}
+        assert all(kind == "key" for _route, kind in sent), sent
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def _commit_each_of_the_pair(store: _FakeStore, root: Path, cfg: LifecycleConfig) -> None:
+    """Session A reads and commits ``ws-42`` while session B holds a read of
+    ``WS-42``, then B commits ``WS-42``. Were the two one row, A's commit
+    would invalidate B's read and B's commit would be refused as stale. Each
+    commit changes the bytes it read, so none is a no-op."""
+    a, _fa = _agent(store, _session(root, cfg))
+    b, _fb = _agent(store, _session(root, cfg))
+    a_bytes, a_token = a.read("ws-42")
+    b_bytes, b_token = b.read("WS-42")
+    a.commit("ws-42", expected_token=a_token, new_bytes=a_bytes + b"+lower")
+    b.commit("WS-42", expected_token=b_token, new_bytes=b_bytes + b"+upper")
+
+
+def _rows_of_the_pair(server: CoordinatorHTTPServer) -> dict[str, tuple[object, int]]:
+    """Each name's own row, as ``(id, version)``, looked up as a key."""
+    rows = {}
+    for name in _CASE_PAIR:
+        artifact_id = server.registry.lookup_artifact_id_by_name(name, name_kind="key")
+        assert artifact_id is not None, f"{name} has no row of its own"
+        rows[name] = (artifact_id, server.registry.get_artifact(artifact_id).version)
+    return rows
+
+
+def test_keys_that_differ_only_by_case_stay_two_rows_on_a_caseless_coordinator_across_a_restart(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ws-42`` and ``WS-42`` are two rows of a table (or two objects), so a
+    coordinator whose disk folds case still keeps them apart,
+    and its next start, which merges rows that spell one file, leaves them
+    apart too. Keyed as files, they shared one row: one session's commit
+    refused the other's as a stale view."""
+    monkeypatch.setattr(CoordinatorHTTPServer, "_probe_fold_profile", lambda _self: _CASELESS)
+    store = _FakeStore()
+    for name in _CASE_PAIR:
+        store.seed(name, b"v1")
+    server = serve_in_process(tmp_path, "substrate-keys-before", tracked='"**"')
+    try:
+        assert server.registry.fold_index_profile == "caseless", "control: the coordinator folds case"
+        _commit_each_of_the_pair(store, tmp_path, fast_cfg)
+        before = _rows_of_the_pair(server)
+    finally:
+        server.shutdown()
+    server = CoordinatorHTTPServer(tmp_path, port=0, instance_id="substrate-keys-after")
+    server.serve_in_thread()
+    write_coordinator_pid_file(tmp_path / ".coherence", server.port, pid=os.getpid())
+    try:
+        _commit_each_of_the_pair(store, tmp_path, fast_cfg)
+        after = _rows_of_the_pair(server)
+    finally:
+        server.shutdown()
+
+    assert before["ws-42"][0] != before["WS-42"][0]
+    assert after == {name: (row, version + 1) for name, (row, version) in before.items()}
 
 
 # --- forbidden: coordinator-bump-first --------------------------------------

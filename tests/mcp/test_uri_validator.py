@@ -25,6 +25,11 @@ from ccs.mcp.uri import UriValidationError, validate_uri
         ("./data/x", "data/x"),  # leading './' stripped
         ("data//notes.md", "data/notes.md"),  # repeated slash canonicalised
         ("data/sub/", "data/sub"),  # trailing slash canonicalised
+        # The kernel opens these as the name with its '.' segments and extra
+        # slashes dropped, so they key that same file.
+        (".//data/x", "data/x"),
+        ("././data/x", "data/x"),
+        ("data/./x", "data/x"),
     ],
 )
 def test_valid_uri_normalises_to_key(tmp_path: Path, uri: str, expected: str) -> None:
@@ -86,6 +91,7 @@ def test_overlong_uri_rejected(tmp_path: Path) -> None:
         ".coherence/strict_mode.yaml",
         ".coherence/audit.log",
         "./.coherence/state.db",
+        ".//.coherence/state.db",
         ".COHERENCE/state.db",  # case-variant maps to the same dir on case-insensitive FS
     ],
 )

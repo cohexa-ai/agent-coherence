@@ -38,6 +38,7 @@ from ccs.adapters.coherent_volume import (
 )
 from ccs.adapters.effect_gate import check_fence
 from ccs.cli._coherence_client import err, escape_nonprintable
+from ccs.coordinator.fold_merge import index_key_of
 from ccs.core.exceptions import (
     HOLD_INPUT_VANISHED,
     CasVersionConflict,
@@ -55,7 +56,12 @@ from ccs.mcp.deny import (
     handoff_verb_refusal_result,
 )
 from ccs.mcp.session import SessionConfig, build_volume
-from ccs.mcp.status import PER_PATH_UNAVAILABLE_TEXT, build_status, handoff_from_status
+from ccs.mcp.status import (
+    PER_PATH_UNAVAILABLE_TEXT,
+    build_status,
+    fold_profile_of,
+    handoff_from_status,
+)
 from ccs.mcp.uri import UriValidationError, validate_uri
 
 logger = logging.getLogger(__name__)
@@ -311,8 +317,9 @@ class ServerContext:
     volume: CoherentVolume
     config: SessionConfig
     lock: asyncio.Lock
-    # path → consecutive CAS-conflict count, the cooperating-agent livelock bound
-    # for swg_write_cas (reset on a win; survives only within one stdio session).
+    # file's fold key → consecutive CAS-conflict count, the cooperating-agent
+    # livelock bound for swg_write_cas (reset on a win; survives only within one
+    # stdio session).
     cas_conflicts: dict[str, int] = field(default_factory=dict)
 
 
@@ -578,15 +585,17 @@ def _do_write_cas(
         won = volume.write_cas_at(key, expected_version, new_content.encode("utf-8"))
     except CasVersionConflict as exc:
         # Bound a COOPERATING agent's retry loop: too many consecutive conflicts
-        # on one path in this session → tell it to stop (retryable=false).
-        count = conflicts.get(key, 0) + 1
+        # on one file in this session, under any of its spellings → tell it to
+        # stop (retryable=false).
+        streak = _conflict_streak_key(volume, key)
+        count = conflicts.get(streak, 0) + 1
         if count > MAX_CAS_CONFLICTS:
-            conflicts.pop(key, None)
+            conflicts.pop(streak, None)
             return cas_exhausted_result(
                 f"{key}: {count} consecutive CAS conflicts in this session — stop "
                 "(the cooperating-agent livelock bound; coordinator-side fencing is v1.1)"
             )
-        conflicts[key] = count
+        conflicts[streak] = count
         return deny_result(exc)
     except FileNotFoundError as exc:
         return _client_error_result("file_not_found", "check_path", str(exc))
@@ -594,13 +603,24 @@ def _do_write_cas(
         return deny_result(exc)
     except OSError as exc:  # disk/permission failure → fail closed, never escape to FastMCP
         return _client_error_result("io_error", "none", str(exc))
-    conflicts.pop(key, None)  # a win resets the cooperating-agent conflict streak
+    if conflicts:  # a win resets the file's conflict streak; with none open, no /status read
+        conflicts.pop(_conflict_streak_key(volume, key), None)
     structured: dict = {"ok": True, "path": key}
     if won.handoff is not None:
         # What the win did to a live handoff of the path (#185): completed it
         # (this session is the successor) or overtook it (a bystander).
         structured["handoff"] = _present(asdict(won.handoff))
     return _ok_result(structured, f"committed {key}")
+
+
+def _conflict_streak_key(volume: CoherentVolume, key: str) -> str:
+    """The name ``key``'s consecutive CAS conflicts are counted under: its
+    fold key by the profile the coordinator's default ``/status`` tier
+    advertises, read each time it is needed, so two spellings the
+    coordinator keys as one file share one streak. A coordinator restarted
+    on a disk it classifies differently is then followed, not the profile
+    of an earlier start."""
+    return index_key_of(key, fold_profile_of(volume.coordinator_status()))
 
 
 def _present(fields: dict) -> dict:
