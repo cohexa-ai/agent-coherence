@@ -593,9 +593,12 @@ def handoff_deny_result(exc: BaseException, verb: str) -> CallToolResult:
 # answers. Its rows keep every detail verbatim, and their words name the tool
 # for each library method a detail names, never the method.
 
-# Every swg_write answer after which a write grant may still stand closes with
-# this. It is safe on each: a release of a path with no recorded grant sends
-# nothing (measured).
+# Each swg_write row here after which a write grant may still stand closes with
+# this, except the row for a coordinator that is gone, which no release can
+# reach: that row says the grant stands until the coordinator takes it back.
+# The caller-principal refusals and io_error keep the answers every tool gives.
+# It is safe on each row that carries it: a release of a path with no recorded
+# grant sends nothing (measured).
 WRITE_RELEASE_SENTENCE = (
     "If you stop here instead, call swg_release on the path first: it gives back any "
     "write grant this write may have left standing, which could otherwise keep another "

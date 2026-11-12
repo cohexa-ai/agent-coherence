@@ -310,14 +310,16 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
-- **Every `swg_write` answer names a recovery that keeps the other agent's
-  work and gives back what the write may still hold, on every server (#504).**
-  Each `detail` stays the volume's or coordinator's text byte for byte; the
-  words go in `next_step`, which names the tool for each library call a detail
-  names (`swg_release` for `release()`, `swg_reacquire` for `reacquire()`), and
-  every answer after which the write may have left a grant standing tells the
-  agent to `swg_release` the path if it stops there. On every server, displace
-  mode included:
+- **`swg_write`'s refusals name a recovery that keeps the other agent's work
+  and say what to do about a grant the write may still hold, on every server
+  (#504).** Each `detail` stays the volume's or coordinator's text byte for
+  byte; the words go in `next_step`, which names the tool for each library
+  call a detail names (`swg_release` for `release()`, `swg_reacquire` for
+  `reacquire()`). Each row after which the write may have left a grant
+  standing tells the agent to `swg_release` the path if it stops there, except
+  the row for a coordinator that is gone, which says the grant stands until the
+  coordinator takes it back. The caller-principal refusals and `io_error`
+  answer as they do for every tool. On every server, displace mode included:
   - `commit_unconfirmed` answers `recover: write_again` on `swg_write`, because
     its bytes are on disk and writing the path again records them while
     re-reading does not; `retryable` stays `false`, and the step names one more
