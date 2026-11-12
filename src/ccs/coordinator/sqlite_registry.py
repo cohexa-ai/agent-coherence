@@ -696,6 +696,16 @@ class _NameRequest:
     is_key: bool
 
 
+def _stored_as(request: _NameRequest, disk_spelling: str | None) -> _NameRequest:
+    """``request`` storing a new row under the disk's spelling of the file,
+    when the caller found one and the name is keyed by the fold index.
+    Register and lookup both apply it, so the name a new row would take is
+    the name a lookup falls back to."""
+    if disk_spelling is None or request.index_key is None:
+        return request
+    return _NameRequest(disk_spelling, request.index_key, is_key=False)
+
+
 # registry_meta keys persisting the retention policy on writer open (plan item
 # N v1, Unit 3). ``retention_enabled`` is the explicit marker set even in the
 # unbounded mode (retain_versions=True + policy=None → enabled with NULL axes):
@@ -5158,9 +5168,7 @@ class SqliteArtifactRegistry:
         del initial_owner  # parameter symmetry only; plugin handler sets state explicitly
         self._guard_writable()
         with self._lock:
-            request = self._name_request(parent_rel_path, key, name_kind)
-            if disk_spelling is not None and request.index_key is not None:
-                request = _NameRequest(disk_spelling, request.index_key, is_key=False)
+            request = _stored_as(self._name_request(parent_rel_path, key, name_kind), disk_spelling)
             row_id, inserted = self._resolve_or_insert(request, content_hash)
             if inserted and not request.is_key:
                 self._index_add(row_id, request.stored_name)
@@ -6177,14 +6185,21 @@ class SqliteArtifactRegistry:
         parent_rel_path: str,
         *,
         key: str | None = None,
+        disk_spelling: str | None = None,
         name_kind: NameKind = "file",
     ) -> UUID | None:
         """Read-only lookup of the row a name reaches, by the rules
         :meth:`resolve_or_register` uses: a key exactly, a file name through
         the fold index when it is built (``key``, or the key of
-        ``parent_rel_path``), otherwise exactly as given."""
+        ``parent_rel_path``), otherwise exactly as given.
+
+        ``disk_spelling`` is the one register takes: a key the index has no
+        bucket for is then looked up under the name a new row would take, so a
+        key row named exactly like the disk spelling, which register's insert
+        would collide with and return, is found here too."""
         with self._lock:
-            row_id = self._find_row_id(self._name_request(parent_rel_path, key, name_kind))
+            request = _stored_as(self._name_request(parent_rel_path, key, name_kind), disk_spelling)
+            row_id = self._find_row_id(request)
         return None if row_id is None else UUID(hex=row_id)
 
     def artifact_names_under_prefix(self, prefix: str) -> list[str]:

@@ -1380,6 +1380,7 @@ class SqliteExtended(RegistryBase, Protocol):
         parent_rel_path: str,
         *,
         key: str | None = None,
+        disk_spelling: str | None = None,
         name_kind: NameKind = "file",
     ) -> UUID | None:
         ...

@@ -934,27 +934,42 @@ def _under_root(path: str, roots: tuple[str, ...]) -> str | None:
     return None
 
 
-def _root_aliases(root: str | None) -> tuple[str, ...]:
-    """The spellings of the workspace root an absolute path may start with.
-    On macOS ``/tmp`` and ``/var`` are links into ``/private``, and a command
-    may use either spelling while the coordinator holds the resolved one."""
-    if not root:
-        return ()
-    root = root.rstrip("/")
-    aliases = {root}
-    if root.startswith("/private/"):
-        aliases.add(root.removeprefix("/private"))
-    elif root.startswith(("/tmp/", "/var/")):
-        aliases.add("/private" + root)
+def _root_aliases(root: str | Sequence[str] | None) -> tuple[str, ...]:
+    """The spellings of the workspace root an absolute path may start with:
+    each spelling given, and on macOS its ``/private`` twin, since ``/tmp``
+    and ``/var`` are links into ``/private`` and a command may use either
+    spelling while the coordinator holds the resolved one."""
+    roots = (root,) if isinstance(root, str) else root or ()
+    aliases: set[str] = set()
+    for spelling in (given.rstrip("/") for given in roots if given):
+        aliases.add(spelling)
+        if spelling.startswith("/private/"):
+            aliases.add(spelling.removeprefix("/private"))
+        elif spelling.startswith(("/tmp/", "/var/")):
+            aliases.add("/private" + spelling)
     return tuple(sorted(aliases))
+
+
+def _first_of_each_key(
+    paths: Iterable[str], is_tracked: Callable[[str], bool], key_of: Callable[[str], str]
+) -> list[str]:
+    """The first tracked spelling of each key, in first-occurrence order.
+    Only tracked paths claim a key, so an untracked first spelling of a file
+    hides no later one."""
+    kept: dict[str, str] = {}
+    for path in dict.fromkeys(paths):
+        if is_tracked(path):
+            kept.setdefault(key_of(path), path)
+    return list(kept.values())
 
 
 def detect_tracked_writes(
     command: str,
     is_tracked: Callable[[str], bool],
     *,
-    root: str | None = None,
+    root: str | Sequence[str] | None = None,
     cwd: str = "",
+    key_of: Callable[[str], str] | None = None,
 ) -> list[str]:
     """Return the tracked-artifact paths the command would write.
 
@@ -962,20 +977,22 @@ def detect_tracked_writes(
         command: Raw Bash command string from CC's ``tool_input.command``.
         is_tracked: Returns True for a workspace-relative path the policy
             tracks (e.g. ``coordinator.policy.is_tracked``).
-        root: The workspace root, to resolve absolute paths; without it an
-            absolute path is never resolved.
+        root: The workspace root, or every spelling of it, to resolve
+            absolute paths; without it an absolute path is never resolved.
         cwd: The shell's directory relative to ``root`` (``""`` for the root).
             A ``cd`` inside the command moves it. The coordinator is not told
             the session's directory and passes the root.
+        key_of: The key of the file a path names, under which two spellings
+            of one file collapse; the path itself when not given.
 
     Returns:
-        Workspace-relative tracked paths, deduplicated, in first-occurrence
+        Workspace-relative tracked paths, one per key, in first-occurrence
         order. Empty if none is detected; false negatives are expected for the
         forms the module docstring lists as out of scope.
     """
     start = posixpath.normpath(cwd) if cwd else ""
     found = _scan(command, "" if start == "." else start, _root_aliases(root), 0)
-    return [path for path in dict.fromkeys(found) if is_tracked(path)]
+    return _first_of_each_key(found, is_tracked, key_of or (lambda path: path))
 
 
 __all__ = ["detect_tracked_writes"]
