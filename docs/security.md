@@ -267,8 +267,15 @@ embed the raw session id — and the policy's pattern lists (the tracked, user-a
 ignored and strict globs, which are the operator's directory layout) only in the
 operator view (`?detail=full` plus the `Coherence-Local-Operator: true` header). A
 `CoherentVolume` reads that view once, at attach, to check that the coordinator
-enforces the globs it declared. Which paths each session lost to the
-coordinator's grant sweep, and why (`sessions[].reclaimed`), is likewise in the
+enforces the globs it declared. The header is an opt-in that keeps the view out
+of output fetched and pasted by accident, not a second factor: its value is a
+well-known string, and the bearer secret is the only gate on both
+coordinators. The Claude Code plugin's Node coordinator serves the operator
+view from plugin releases after 0.6.0, behind the same header and `403`
+without it, as its default view plus the four pattern lists and nothing else:
+its session names stay `null`, its root stays `.`, it carries no process id,
+and a pattern it rejected shows only in a count. Which paths each session lost
+to the coordinator's grant sweep, and why (`sessions[].reclaimed`), is likewise in the
 operator view only; the other views carry just the reclaim counts
 (`sweep_reclaims_total`, `sweep_reclaims_by_trigger`). The inputs to a
 reclaim are in the operator view only too: each tracked artifact's
@@ -408,7 +415,11 @@ to a file outside them would take that file from its holder under a name that
 promised the refusal, so the volume
 raises `LinkOutOfManaged` and sends nothing
 (`src/ccs/adapters/coherent_volume.py`). It decides this from the links as they
-stand when `write()` is called.
+stand when `write()` is called. On the Claude Code plugin's Node coordinator,
+which issues no caller principals, a refuse-mode volume's requests carry none,
+so the refusal there separates callers only by the session ids they send: a
+caller that sends the holder's own session id is admitted as the holder (see
+[A volume on the Node coordinator](guide.md#a-volume-on-the-node-coordinator)).
 
 Not covered:
 

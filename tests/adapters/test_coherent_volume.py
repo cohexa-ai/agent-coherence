@@ -1028,7 +1028,8 @@ def test_a_sibling_with_different_managed_globs_is_refused_not_silently_unenforc
 ) -> None:
     """A volume that attaches to a coordinator a sibling spawned with DIFFERENT
     managed globs is refused: strict raises, degrade warns and runs detached.
-    The message names the globs the coordinator does not enforce.
+    The message names the globs the coordinator does not enforce, and, the
+    coordinator being one a volume starts, says to stop it.
 
     Prevents the silent lost update in #190: the sibling passed the attach
     check because the coordinator's /status reported only a COUNT of strict
@@ -1056,6 +1057,7 @@ def test_a_sibling_with_different_managed_globs_is_refused_not_silently_unenforc
             message = str(warned[0].message)
         assert "b/**" in message, message
         assert "does not enforce strict mode for" in message, message
+        assert "Stop it, or use a dedicated workspace root." in message, message
         # Control: the spawner's own glob is enforced by the same coordinator.
         assert spawner.is_attached and spawner.strict_mode_active()
         _data, version = spawner.read_with_version("a/plan.md")
@@ -1627,25 +1629,28 @@ def test_untracking_an_unmanaged_path_on_a_strict_coordinator_still_works(
 # How the operator view fails to answer, and the reason the volume must name.
 _UNCONFIRMABLE_VIEWS = {
     "absent": "publishes no glob sets",
-    "refused": "the operator view was refused (HTTP 501)",
-    "refused-node": "the Node coordinator does not serve the operator view (HTTP 501)",
+    "refused": "the operator view was refused (HTTP 403)",
+    "predates": "the coordinator predates the operator view (HTTP 501)",
     "transport": "CoordinatorUnavailable reading the operator view",
 }
+#: The status each answered refusal of the operator view carries.
+_VIEW_REFUSAL_STATUS = {"refused": 403, "predates": 501}
 
 
 @pytest.mark.parametrize("sets", list(_UNCONFIRMABLE_VIEWS))
 def test_a_coordinator_that_does_not_publish_its_glob_sets_cannot_confirm_enforcement(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, sets: str
 ) -> None:
-    """When the operator view cannot be read — an older Python coordinator
-    whose summary carries only counts, a coordinator that refuses the view,
-    the Node coordinator (which answers 501, and is named from the pid file's
-    backend line), or a transport failure during that one GET (a refused
-    connect, through the real client) — the volume cannot tell whether its
-    globs are enforced. It fails closed, detached, and says which: "cannot
-    tell" is never reported as "not enforced", nor as enforced. Only the GET
-    that got no answer at all raises ``CoordinatorUnreachable`` (AE5); the
-    answered ones keep the plain error.
+    """When the operator view cannot be read -- an older Python coordinator
+    whose summary carries only counts, a coordinator that refuses the view
+    (403), one that predates it (501, the Node coordinator of plugin 0.6.0 and
+    earlier), or a transport failure during that one GET (a refused connect,
+    through the real client) -- the volume cannot tell whether its globs are
+    enforced. It fails closed, detached, and says which: "cannot tell" is
+    never reported as "not enforced", nor as enforced, and a 501 tells the
+    caller to upgrade the plugin rather than that the view is not served.
+    Only the GET that got no answer at all raises ``CoordinatorUnreachable``;
+    the answered ones keep the plain error.
 
     Prevents a count, nothing at all, or a raised transport error being read
     as confirmation, and a coordinator dying mid-attach escaping the
@@ -1654,17 +1659,12 @@ def test_a_coordinator_that_does_not_publish_its_glob_sets_cannot_confirm_enforc
 
     _seed(tmp_path, content=b"v1")
     real_get = coherent_volume_module._coordinator_get
-    if sets == "refused-node":
-        monkeypatch.setattr(
-            coherent_volume_module, "coordinator_backend",
-            lambda root: coherent_volume_module.NODE_BACKEND,
-        )
 
     def operator_view_unavailable(endpoint, path, **kwargs):  # noqa: ANN001, ANN003, ANN202
         if "detail=full" not in path:
             return real_get(endpoint, path, **kwargs)
-        if sets in ("refused", "refused-node"):
-            raise urllib.error.HTTPError(path, 501, "Not Implemented", {}, None)  # type: ignore[arg-type]
+        if sets in _VIEW_REFUSAL_STATUS:
+            raise urllib.error.HTTPError(path, _VIEW_REFUSAL_STATUS[sets], "refused", {}, None)  # type: ignore[arg-type]
         if sets == "transport":
             return real_get(refused_endpoint(endpoint), path, **kwargs)
         doc = real_get(endpoint, path, **kwargs)
@@ -1683,6 +1683,8 @@ def test_a_coordinator_that_does_not_publish_its_glob_sets_cannot_confirm_enforc
         assert "cannot be confirmed" in message, message
         assert _UNCONFIRMABLE_VIEWS[sets] in message, message
         assert "does not enforce strict mode for" not in message, message
+        assert "does not serve" not in message, message
+        assert ("upgrade the agent-coherence plugin" in message) is (sets == "predates"), message
         assert "data/**" in message, message
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_get", real_get)

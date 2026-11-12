@@ -32,9 +32,11 @@ claims again with the same nonce by itself before it runs. The two
 them. ``registry_schema_version``, the schema version of the coordinator's
 store (#294), is forwarded the same way: ``None`` when the coordinator is
 unreachable or its answer carries no such field. The strict volume this server
-runs never attaches to the Node coordinator or to a release up to v0.14.1, and
-the Node coordinator's own ``schema_version`` counts a different ledger and is
-never read in its place.
+runs never attaches to a release up to v0.14.1, or to a Node coordinator of
+plugin 0.6.0 or earlier, which does not serve the operator view. It attaches to
+a later Node coordinator, whose answer carries no such field: that
+coordinator's own ``schema_version`` counts a different ledger and is never
+read in its place.
 
 ``session_agent_id`` is this session's session-level agent id: the value
 another session names as the successor when it hands this session a path

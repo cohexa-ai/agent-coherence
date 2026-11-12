@@ -223,6 +223,63 @@ Alpha — APIs may change before `v1.0`.
 
 ### Changed
 
+- **A `CoherentVolume` with `managed` globs attaches to the Claude Code
+  plugin's Node coordinator, in refuse mode too (#518).** The Node coordinator
+  answered the operator view of `/status` with `501`, so such a volume could
+  not confirm its globs there: under `on_error="strict"` construction raised,
+  and under `"degrade"` the volume ran detached with coherence enforcement off.
+  Plugin releases after 0.6.0 serve that view behind the same
+  `Coherence-Local-Operator: true` header and advertise `pre_edit_if_unheld`,
+  so a volume attaches by the same glob check, in strict, degrade and refuse
+  mode, with no option to set, and so does the `stale-write-guard-fs` MCP
+  server. The volume needs that coordinator already running, with its globs in
+  `.coherence/tracked.yaml` and `.coherence/strict_mode.yaml`: a volume never
+  starts the Node coordinator, and one built while no coordinator runs writes
+  its globs and starts this package's coordinator, which refuses a store the
+  Node coordinator created. What differs there:
+  - it issues no caller principals and answers the claim `404`, so an opted-in
+    write now goes without one when the claim was answered `404`; every other
+    volume without a principal still raises `CoherenceError` before it sends
+    an opted-in write;
+  - it has no snapshot sessions or handoffs, so a multi-file `atomic_publish`
+    and the handoff methods raise `CoherenceError` naming the route (see the
+    next entry);
+  - `gate()` always holds, because it reports no ownership generation;
+  - it has no sweep: an opted-in request takes back a grant held 30 minutes
+    or more, so a refuse-mode volume that exits without `close()` refuses other
+    refuse-mode writers on its files for up to 30 minutes, and a reclaimed
+    holder's commit raises `CommitPreempted`;
+  - Claude Code sessions never opt in, so they displace a volume's hold, as on
+    this package's coordinator.
+
+  The attach messages name the cause on that coordinator: a `501` on the
+  operator view says the coordinator predates the view and to upgrade the
+  agent-coherence plugin (0.6.0 and earlier); any other refusal says the view
+  was refused. When the Node coordinator does not enforce the volume's globs,
+  the remedy says to add them to its two policy files and reload its policy or
+  restart it, and never to stop it. The refusal for a coordinator that does not
+  advertise `pre_edit_if_unheld` is unchanged. A 0.15.0 volume or MCP server
+  with `managed` globs attaches to such a Node coordinator too, with nothing
+  changed on its side. Upgrade it: 0.15.0 keeps sending the workspace secret to
+  a coordinator that has exited (#503), and keys each file by its exact
+  spelling while the Node coordinator keys every spelling the disk opens as one
+  file to that file (#506). The guide's "A volume on the Node coordinator"
+  section has the details.
+
+- **A snapshot-session or handoff route the coordinator does not serve raises
+  `CoherenceError` naming the route (#518).** The Node coordinator answers
+  `/session/begin`, `/session/commit_all` and the four `/handoff/*` routes with
+  `404`. A degrade-mode multi-file `atomic_publish` then raised
+  `CommitUnconfirmed`, saying the transport failed and to retry, and a
+  degrade-mode handoff method raised `CommitUnconfirmed`, saying whether the
+  verb landed was unknown; every retry got the same `404`. Now a `404` on one of these
+  routes raises `CoherenceError` naming the route, under either `on_error`: a
+  coordinator answers `404` only for a route it does not serve, so nothing ran.
+  The volume stays attached and is not counted degraded. A degrade-mode caller
+  that caught `CommitUnconfirmed` for this case now gets `CoherenceError`;
+  `except CoherenceError` catches both, since `CommitUnconfirmed` is a
+  `CoherenceError`. Every other failure on these routes keeps its handling.
+
 - **Every spelling the workspace disk opens as one file reaches that one file,
   for every client (#506).** The coordinator identified a file by the exact path a client sent, but a
   macOS disk opens `PLAN.MD` and `plan.md`, or a composed and a decomposed `é`,
@@ -833,6 +890,18 @@ Alpha — APIs may change before `v1.0`.
   so nothing changes there. The guide's "Hold reasons" table has the details.
 
 ### Fixed
+
+- **`agent-coherence-status` names the Node coordinator and its version
+  (#518).** Against the Claude Code plugin's Node coordinator it printed
+  `backend=python` and an empty version, because that coordinator sends
+  `version` and `schema_version` and no `coordinator_*` key. The backend now
+  comes from the `.coherence/server.pid` that gave the command its port, which
+  the Node coordinator writes with a `backend=node` line, and the header line
+  prints Node's own `version` and `schema_version` (the `--detail metrics`
+  line its `version`) when the body has no `coordinator_version` or
+  `registry_schema_version`. The two backends count different migration steps,
+  so their schema numbers are not comparable. Output against this package's
+  coordinator, and `--json`, are unchanged.
 
 - **A `write()` whose commit was not recorded says how to record it, instead of
   telling the caller to re-read (#526).** When a strict `write()`'s commit got no

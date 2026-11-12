@@ -1,6 +1,6 @@
 {
   "name": "status-default-tier-counts-a-policy-file-that-loads-as-no-entries-node-backend",
-  "description": "Plugin #192: the Node half of fixture 32. tracked.yaml holds the unquoted `- *.md` (a YAML alias), so it loads as no entries; the Node coordinator's GET /status counts it as one rejected pattern, as the Python coordinator does. Before #192 the Node coordinator reported rejected_pattern_count 0 here.",
+  "description": "Plugin #192: the Node half of fixture 32. tracked.yaml holds the unquoted `- *.md` (a YAML alias), so it loads as no entries; the Node coordinator's GET /status counts it as one rejected pattern, as the Python coordinator does. Before #192 the Node coordinator reported rejected_pattern_count 0 here. Like fixture 09 it carries pre_edit_if_unheld: true.",
   "setup": {
     "files": {
       ".coherence/tracked.yaml": "- data/**\n- *.md\n"
@@ -35,6 +35,7 @@
         "strict_mode_pattern_count": 0,
         "user_added_pattern_count": 0
       },
+      "pre_edit_if_unheld": true,
       "schema_version": 5,
       "sessions": "<IGNORED>",
       "status": "ok",

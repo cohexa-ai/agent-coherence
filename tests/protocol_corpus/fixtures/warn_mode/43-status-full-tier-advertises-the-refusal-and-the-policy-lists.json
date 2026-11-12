@@ -1,0 +1,102 @@
+{
+  "name": "status-full-tier-advertises-the-refusal-and-the-policy-lists",
+  "description": "GET /status?detail=full with the operator opt-in header, on both backends, after the same tracked.yaml, ignored.yaml and strict_mode.yaml: the operator view carries pre_edit_if_unheld: true, so a client that relies on the refusal of an opted-in pre-edit of a held file can attach, and the same user-added, ignored and strict pattern lists and counts, each as written, which a client checks its own globs against. Each backend's own defaults (tracked_patterns, default_pattern_count) and its coordinator_root are ignored, and every other top-level key of either backend's view is dropped: the two views differ there, and fixtures 27 and 42 pin each. Both backends.",
+  "setup": {
+    "tracked": [
+      "data/**",
+      "notes/*.md"
+    ],
+    "ignored": [
+      "data/tmp/**"
+    ],
+    "strict_mode": [
+      "data/**"
+    ]
+  },
+  "request": {
+    "method": "GET",
+    "path": "/status?detail=full",
+    "headers": {
+      "Coherence-Local-Operator": "true"
+    }
+  },
+  "ignore_keys": [
+    "coordinator_root",
+    "default_pattern_count",
+    "tracked_patterns"
+  ],
+  "optional_keys": [
+    "audit_log_mode_drift_total",
+    "auth_401_total",
+    "backend",
+    "caller_principal_absent_total",
+    "caller_principal_refused_total",
+    "cold_start_duration_ms",
+    "coordinator_backend",
+    "coordinator_pid",
+    "coordinator_root",
+    "coordinator_uptime_s",
+    "coordinator_uptime_seconds",
+    "coordinator_version",
+    "counts",
+    "detail",
+    "effect_fence_holds_total",
+    "endpoint_counters",
+    "fold_profile",
+    "fold_table_unicode",
+    "fresh_shared_hash_mismatch_total",
+    "grant_heartbeat_timeout_sec",
+    "grant_max_hold_sec",
+    "handler_concurrency_overflows_total",
+    "handoff_giver_denials_total",
+    "in_flight_drain_timed_out",
+    "intra_task_acquire_release_total",
+    "pre_edit_other_holder_denials_total",
+    "registry_schema_version",
+    "schema_version",
+    "sessions",
+    "shared_foreign_lag_suppressed_total",
+    "stale_warning_emitted_total",
+    "stale_warning_reread_total",
+    "status",
+    "strict_mode_denials_total",
+    "strict_mode_routed_around_via_bash_total",
+    "sweep_reclaims_by_trigger",
+    "sweep_reclaims_total",
+    "tracked_artifacts",
+    "version",
+    "watchdog_late_aborts_total",
+    "watchdog_late_completion_total",
+    "watchdog_queue_overflows_total",
+    "watchdog_timeouts_total"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "policy_summary": {
+        "coordinator_root": "<IGNORED>",
+        "default_pattern_count": "<IGNORED>",
+        "ignored_pattern_count": 1,
+        "ignored_patterns": [
+          "data/tmp/**"
+        ],
+        "rejected_pattern_count": 0,
+        "strict_mode_pattern_count": 1,
+        "strict_mode_patterns": [
+          "data/**"
+        ],
+        "tracked_patterns": "<IGNORED>",
+        "user_added_pattern_count": 2,
+        "user_added_patterns": [
+          "data/**",
+          "notes/*.md"
+        ]
+      },
+      "pre_edit_if_unheld": true
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

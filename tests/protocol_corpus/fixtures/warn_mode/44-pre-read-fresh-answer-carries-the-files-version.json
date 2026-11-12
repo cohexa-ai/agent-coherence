@@ -1,0 +1,53 @@
+{
+  "name": "pre-read-fresh-answer-carries-the-files-version",
+  "description": "Session A reads notes/plan.md (version 1) and commits it by compare-and-swap at expected_version 1, so the file is at version 2. A's next read is fresh, and the fresh answer carries version 2, the file's version when the read was classified, on both backends. A client that reads and then writes with that version compares against the file's real version; an answer without it, as a Node coordinator of plugin 0.6.0 or earlier sends, fails the row, and so does any version but 2. The file on disk holds the bytes A commits, and every hash in this row is theirs. Both backends.",
+  "setup": {
+    "tracked": [
+      "notes/*.md"
+    ],
+    "files": {
+      "notes/plan.md": "# Plan\nv2 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-0000000000a1",
+          "path": "notes/plan.md",
+          "content_hash": "4c29b29b8461c488ec2b05dd6174aa5cefbaa6541faa28cb66f137d9269127b8"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit-cas",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-0000000000a1",
+          "path": "notes/plan.md",
+          "content_hash": "4c29b29b8461c488ec2b05dd6174aa5cefbaa6541faa28cb66f137d9269127b8",
+          "expected_version": 1
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-0000000000a1",
+      "path": "notes/plan.md",
+      "content_hash": "4c29b29b8461c488ec2b05dd6174aa5cefbaa6541faa28cb66f137d9269127b8"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "status": "fresh",
+      "version": 2
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

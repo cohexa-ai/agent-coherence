@@ -7477,11 +7477,12 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
     all and is unaffected by R6. ``full`` is the legacy
     everything-block plus the absolute top-level ``coordinator_root``
     (``coordinator_pid`` is at the minimal tier too, P1 #7),
-    gated by the explicit ``Coherence-Local-Operator: true`` header so a
-    same-user adversary (Adversary 1 in auth.py) cannot trivially grab
-    the operator's home-directory path. Bearer auth is enforced by the
-    dispatcher; the header is a SECOND factor specifically for the
-    elevated tier.
+    gated by the explicit ``Coherence-Local-Operator: true`` header, an
+    opt-in that keeps the operator's home-directory path and session names
+    out of output fetched and pasted by accident. It is not a second factor:
+    its value is a well-known string, so a same-user process that can read
+    the bearer secret (Adversary 1 in auth.py) can send it too. Bearer auth,
+    which the dispatcher enforces, is the only gate.
 
     #185: while a tracked artifact has a transfer record, its
     ``tracked_artifacts`` entry carries a ``handoff`` key at the minimal and
@@ -7589,7 +7590,8 @@ def _handle_status(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) ->
       that sends ``if_unheld: true`` while another agent holds the path. An
       older build of this coordinator has no such key and ignores the flag,
       and the version does not tell the two apart. The Node coordinator
-      honours the flag and does not advertise it.
+      sends the key at every tier from plugin releases after 0.6.0; plugin
+      0.6.0 and earlier ignore the flag and send no key.
 
       Fields may be ADDED in minor versions (additive change is
       non-breaking for dashboards using selective key access).

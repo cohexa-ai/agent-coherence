@@ -1837,8 +1837,8 @@ def test_status_metrics_line_shows_the_registry_schema_version_after_the_version
 def test_status_header_and_metrics_line_are_unchanged_without_a_schema_version(
     schema_field: dict, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """An older coordinator, or the Node one, sends no
-    ``registry_schema_version``: the table and the metrics line are byte for
+    """An older coordinator sends no ``registry_schema_version``, nor the
+    Node coordinator's ``schema_version``: the table and the metrics line are byte for
     byte what they were, with no ``schema=`` placeholder. Prevents a guessed or
     empty schema number standing in for one the coordinator never sent."""
     monkeypatch.setenv("COLUMNS", "80")
@@ -1870,6 +1870,91 @@ def test_status_header_shows_the_schema_version_a_live_coordinator_sends(
 
     assert coherence_status.main(["--root", str(workspace), "--detail", "metrics"]) == 0
     assert capsys.readouterr().out.splitlines()[0].endswith(f" schema={schema}")
+
+
+# ----------------------------------------------------------------------
+# coherence_status -- the backend and version of a Node coordinator (#518)
+# ----------------------------------------------------------------------
+
+#: The Node coordinator's default-tier ``/status`` body as a 0.6.0 build
+#: answers it: it names its version and schema in ``version`` and
+#: ``schema_version``, and sends no ``coordinator_*`` key.
+_NODE_STATUS_BODY = {
+    "backend": "node",
+    "coordinator_uptime_seconds": 27,
+    "counts": {"sessions": 0, "tracked_artifacts": 0},
+    "fold_profile": "caseless",
+    "fold_table_unicode": "17.0.0",
+    "policy_summary": {
+        "coordinator_root": ".", "default_pattern_count": 9, "ignored_pattern_count": 0,
+        "rejected_pattern_count": 0, "strict_mode_pattern_count": 1, "user_added_pattern_count": 1,
+    },
+    "schema_version": 5,
+    "sessions": [],
+    "status": "ok",
+    "tracked_artifacts": [],
+    "version": "0.6.0",
+}
+
+#: The same build's ``/status?detail=metrics`` body.
+_NODE_METRICS_BODY = {
+    "backend": "node", "counters": {}, "fold_profile": "caseless",
+    "fold_table_unicode": "17.0.0", "version": "0.6.0",
+}
+
+
+def _status_against(workspace: Path, body: dict, detail: str | None = None) -> int:
+    """``agent-coherence-status``'s exit code for ``workspace`` at ``detail``
+    while the stub coordinator answers ``/status`` with ``body``."""
+    _StubCoordinator.answers = {"/status": (200, body)}
+    detail_args = [] if detail is None else ["--detail", detail]
+    return coherence_status.main(["--root", str(workspace), *detail_args])
+
+
+def test_status_names_the_node_coordinator_and_its_version(
+    stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Against a coordinator whose pid file says ``backend=node`` and whose
+    body carries Node's ``version`` and ``schema_version`` but no
+    ``coordinator_*`` key, the table header says ``backend=node`` with that
+    version and schema, and the metrics line says ``backend=node`` with that
+    version. Prevents the command calling the Node coordinator ``python`` with
+    an empty version, when a refusal sends the operator here to see the
+    coordinator's version."""
+    workspace, port = stub_coordinator
+    (workspace / ".coherence" / "server.pid").write_text(f"999\n{port}\nbackend=node\n")
+
+    assert _status_against(workspace, _NODE_STATUS_BODY) == 0
+    table = capsys.readouterr().out.splitlines()
+    assert _status_against(workspace, _NODE_METRICS_BODY, "metrics") == 0
+    metrics = capsys.readouterr().out.splitlines()
+
+    assert table[0] == "Coordinator: uptime=27s backend=node version=0.6.0 schema=5"
+    assert metrics[0] == "Coordinator metrics: backend=node version=0.6.0"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [_status_payload(), {k: v for k, v in _status_payload().items() if k != "coordinator_backend"}],
+    ids=["names-its-backend", "names-no-backend"],
+)
+def test_status_output_against_the_python_coordinator_is_unchanged(
+    body: dict, stub_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With the Python coordinator's pid file, which has no backend line, and
+    a body that names its version in ``coordinator_version``, the table and
+    the metrics line are byte for byte what they were, ``backend=python``
+    included whether or not the body names its backend. Prevents reading
+    Node's keys, or the backend from the pid file, changing what an operator
+    of the Python coordinator sees."""
+    workspace, _ = stub_coordinator
+    monkeypatch.setenv("COLUMNS", "80")
+
+    assert _status_against(workspace, body) == 0
+    assert capsys.readouterr().out == _STATUS_TEXT_WITHOUT_HANDOFF
+    assert _status_against(workspace, body, "metrics") == 0
+    assert capsys.readouterr().out.splitlines()[0] == "Coordinator metrics: backend=python version=9.9.9"
 
 
 # ----------------------------------------------------------------------
