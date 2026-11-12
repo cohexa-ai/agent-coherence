@@ -51,6 +51,8 @@ _ALIAS_ROWS = frozenset({
     "fold-stale-edit-of-another-case-of-a-strict-file-is-denied-where-the-disk-folds-case",
     "fold-two-keys-that-differ-by-case-stay-two-records-on-every-disk",
     "fold-pre-edit-of-a-dot-slash-spelling-meets-the-holder-on-every-disk",
+    "fold-stale-edit-of-a-lower-case-name-is-denied-through-an-upper-case-class-where-the-disk-folds-case",
+    "fold-stale-edit-of-a-lower-case-name-is-denied-through-a-negated-class-where-the-disk-folds-case",
 })
 
 
