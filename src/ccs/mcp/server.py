@@ -45,6 +45,7 @@ from ccs.core.exceptions import (
     CoherenceDirRefused,
     CoherenceError,
     HandoffPathsInvalid,
+    RefuseModeUnsupported,
 )
 from ccs.mcp.deny import (
     HANDOFF_LANDED_TRANSFER,
@@ -882,11 +883,44 @@ def _exit_if_coherence_dir_refused(root: Path) -> None:
         raise SystemExit(2) from None
 
 
+def _config_or_exit() -> SessionConfig:
+    """The spawn environment's config, or exit 2 on one stderr line, before
+    anything starts, when it names a value the server cannot honour (an
+    ``SWG_ON_HELD`` other than ``refuse`` or ``displace``). The message shows
+    the value as ``repr`` writes it, so it stays one line."""
+    try:
+        return SessionConfig.from_env()
+    except ValueError as exc:
+        err(f"{SERVER_NAME}: {exc}")
+        raise SystemExit(2) from None
+
+
+#: How an operator gets a refuse-mode server to start, after the volume's own
+#: reason it could not.
+_REFUSE_MODE_FIX = (
+    "Run a coordinator that can refuse (agent-coherence after 0.15.0, or the Claude Code "
+    "plugin after 0.6.0), or unset SWG_ON_HELD to serve in displace mode."
+)
+
+
+def _serve_or_exit(server: FastMCP) -> None:
+    """Serve over stdio. A refuse-mode start the coordinator cannot honour,
+    raised by the lifespan's attach before anything is served, ends on one
+    stderr line and exit 2, as a refused ``.coherence`` does."""
+    try:
+        server.run(transport="stdio")
+    except* RefuseModeUnsupported as refused:
+        # The volume's reason can quote what the coordinator answered.
+        reason = escape_nonprintable(str(refused.exceptions[0]))
+        err(f"{SERVER_NAME}: refusing to start with SWG_ON_HELD=refuse: {reason} {_REFUSE_MODE_FIX}")
+        raise SystemExit(2) from None
+
+
 def main() -> None:
     """Console-script entrypoint: run the server over stdio."""
     _configure_stderr_logging()
-    _exit_if_coherence_dir_refused(SessionConfig.from_env().root)
-    build_server().run(transport="stdio")
+    _exit_if_coherence_dir_refused(_config_or_exit().root)
+    _serve_or_exit(build_server())
 
 
 if __name__ == "__main__":

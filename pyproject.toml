@@ -81,7 +81,7 @@ agent-coherence-replay = "ccs.cli.coherence_replay:main"
 agent-coherence-workspace = "ccs.cli.workspace:main"
 # The stale-write-guard-fs stdio MCP server (requires the `mcp` extra).
 # Single-host coherence guard over CoherentVolume; configured via SWG_ROOT /
-# SWG_MANAGED. See src/ccs/mcp/.
+# SWG_MANAGED / SWG_ON_HELD. See src/ccs/mcp/.
 stale-write-guard-fs = "ccs.mcp.server:main"
 # Note: ccs-check-release is intentionally NOT exposed as a public console
 # script. It's a maintainer-only pre-tag-push verifier that queries this
