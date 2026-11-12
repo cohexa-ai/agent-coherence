@@ -114,7 +114,7 @@ def file_request(host: DoorHost, requested: str) -> RequestName:
     validated, so it may be absolute, climb out with ``..`` or run past the
     fold limit)."""
     tidied = tidy_path(requested)
-    key = file_key(host, requested)
+    key = file_key(host, tidied)
     disk_spelling = _disk_spelling_of(host, tidied, key)
     policy = PolicyMatchContext(policy_profile_of(host), "file", disk_spelling)
     return RequestName(requested, "file", tidied, key, disk_spelling, policy)

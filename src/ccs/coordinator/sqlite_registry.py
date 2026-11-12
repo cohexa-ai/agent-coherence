@@ -6235,7 +6235,7 @@ class SqliteArtifactRegistry:
         escaped = normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = escaped + "%"
         exact_match = prefix.rstrip("/")
-        # REL-08: the LIKE-prefix query and the exact-match query are one
+        # The LIKE-prefix query and the exact-match query are one
         # UNION under one lock hold, so a concurrent delete cannot tear the
         # result set between them.
         rows = self._conn.execute(

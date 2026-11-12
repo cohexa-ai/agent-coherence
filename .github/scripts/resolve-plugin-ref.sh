@@ -35,9 +35,9 @@
 
 # GitHub runs a `run:` that names no `shell:` as `bash -e {0}`: -e, and no
 # pipefail. The step starts this file in a bash of its own, which does not
-# inherit that -e, so it sets -e itself and, like the inline step it
-# replaces, leaves pipefail off: a failed lookup inside the SHA's pipe
-# below leaves the SHA empty and the parity job running, as it always has.
+# inherit that -e, so it sets -e itself and leaves pipefail off: a failed
+# lookup inside the SHA's pipe below leaves the SHA empty and the parity
+# job running.
 set -e
 
 # The summary's em dash, spelled in octal so this file stays ASCII.

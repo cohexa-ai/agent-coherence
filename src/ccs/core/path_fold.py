@@ -156,7 +156,7 @@ def _canonical_composition(code_points: Sequence[int]) -> list[int]:
     return composed
 
 
-def _segment_key(segment: str, profile: str) -> list[int]:
+def _segment_key(segment: str, profile: FoldingProfile) -> list[int]:
     decomposed = _canonical_decomposition(map(ord, segment))
     if profile == "nfd":
         return decomposed

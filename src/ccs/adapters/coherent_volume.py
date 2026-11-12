@@ -3759,9 +3759,10 @@ class CoherentVolume:
                     f"got {type(content).__name__}"
                 )
             abs_path, rel = self._to_relative(path)
-            if self._key_of(rel) in seen:
+            key = self._key_of(rel)
+            if key in seen:
                 raise ValueError(f"atomic_publish write-set has a duplicate path: {rel}")
-            seen.add(self._key_of(rel))
+            seen.add(key)
             resolved.append((abs_path, rel, int(expected_version), disk_bytes))
         return resolved
 
@@ -4041,9 +4042,10 @@ class CoherentVolume:
                 raise HandoffPathsInvalid("transfer requires at least one path")
             seen: set[str] = set()
             for rel in rels:
-                if self._key_of(rel) in seen:
+                key = self._key_of(rel)
+                if key in seen:
                     raise HandoffPathsInvalid(f"transfer names a path more than once: {rel}")
-                seen.add(self._key_of(rel))
+                seen.add(key)
             self._require_attached_for("transfer", rels)
             resp = self._post(
                 "/handoff/transfer",
