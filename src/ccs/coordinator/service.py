@@ -91,7 +91,7 @@ from ccs.core.types import (
     WorkspaceRestoreWrite,
 )
 
-from .fold_merge import FOLD_MERGE_PREEMPTER_ID, FOLD_MERGE_TRIGGER
+from .fold_merge import FOLD_MERGE_PREEMPTER_ID, FOLD_MERGE_TRIGGER, index_key_of
 from .registry_protocol import (
     RELEASE_TRIGGER,
     CheckpointMember,
@@ -3141,7 +3141,8 @@ class CoordinatorService:
             CheckpointRegistrationRefused: one of the four typed reasons above
                 (``reason`` matched by identity); nothing resolved or minted.
             ValueError: blank/duplicate member paths or a blank fingerprint
-                (caller bugs, refused before any resolution).
+                (caller bugs, refused before any resolution). Two spellings
+                that resolve to one row are duplicates.
         """
         record = self.registry.get_checkpoint(checkpoint_id)
         if record is None:
@@ -3156,12 +3157,13 @@ class CoordinatorService:
                     f"register_workspace_restore: member {write.member_path!r} "
                     "carries no fingerprint (a written member always has one)"
                 )
-            if write.member_path in seen:
+            member_key = self._member_resolution_key(write.member_path)
+            if member_key in seen:
                 raise ValueError(
                     f"register_workspace_restore: duplicate member_path "
                     f"{write.member_path!r} in the write-set"
                 )
-            seen.add(write.member_path)
+            seen.add(member_key)
         retry_of_own = self._claim_workspace_registration(
             record, controller, entries, abort=abort
         )
@@ -3332,6 +3334,15 @@ class CoordinatorService:
         if record is None:
             raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
         record.require_registrable_by(controller)
+
+    def _member_resolution_key(self, member_path: str) -> str:
+        """The key :meth:`_resolve_workspace_member_artifact` finds
+        ``member_path``'s row by: its fold key where the registry keys file
+        names by a fold, else the name exactly. Two writes with one key would
+        land on one row, the second silently replacing the first."""
+        # Only a SQLite registry its coordinator indexed folds; others keep names exact.
+        profile = getattr(self.registry, "fold_index_profile", None)
+        return member_path if profile is None else index_key_of(member_path, profile)
 
     def _resolve_workspace_member_artifact(
         self, member_path: str, fingerprint: str

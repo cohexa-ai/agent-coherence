@@ -75,6 +75,7 @@ from typing import (
     Iterable,
     Iterator,
     Literal,
+    Mapping,
     Protocol,
     Sequence,
     TypeVar,
@@ -5444,21 +5445,33 @@ def _session_owner_from_request(
 
 
 def _resolve_read_set(
-    coordinator: CoordinatorHTTPServer, paths: list[str]
+    coordinator: CoordinatorHTTPServer, names: list[RequestName]
 ) -> list[UUID]:
-    """Resolve repo-relative read-set paths to artifact UUIDs, seeding a v1
-    row (KTD-9 first-observation, mirroring ``/hooks/pre-read``) for any path
+    """Resolve the read set's names to artifact UUIDs, seeding a v1
+    row (first observation, mirroring ``/hooks/pre-read``) for any name
     not yet known. Non-mutating w.r.t. coherence STATE for already-known
     artifacts (it only looks them up); a first-observation seed registers the
     artifact row exactly as pre-read does. The returned id order matches the
-    input path order so the begin handler can render a path-keyed cut."""
+    input order so the begin handler can render a path-keyed cut; two
+    spellings of one file resolve to one id, as a name sent twice does."""
     ids: list[UUID] = []
-    for path in paths:
-        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+    for name in names:
+        artifact_id = find_requested(coordinator, name)
         if artifact_id is None:
-            artifact_id = coordinator.registry.resolve_or_register(path, content_hash="")
+            artifact_id = resolve_requested(coordinator, name, "")
         ids.append(artifact_id)
     return ids
+
+
+def _cut_by_requested_name(
+    names: list[RequestName], ids: list[UUID], cut: Mapping[UUID, int]
+) -> dict[str, int]:
+    """The pinned cut keyed by the names the request sent (the client speaks
+    paths; artifact UUIDs stay server-internal). Every spelling is a key of
+    its own, even two spellings of one file pinned once, because the client
+    looks each name up in the cut by the bytes it sent. A cut holds every id
+    of the read set: a capture missing one is rejected whole."""
+    return {name.requested: cut[aid] for name, aid in zip(names, ids)}
 
 
 def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -5504,6 +5517,7 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
         if path_err:
             req._json(400, {"error": path_err})
             return
+    names = [file_request(coordinator, path) for path in read_set]
 
     # OWNER derived from the caller-asserted session_id, never an owner field (R9/R13).
     if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
@@ -5512,10 +5526,7 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
     now = monotonic_seconds()
 
     def work() -> dict:
-        read_set_ids = _resolve_read_set(coordinator, read_set)
-        # Keep a path↔id map so the response renders the cut path-keyed (the
-        # client speaks paths; artifact UUIDs stay server-internal).
-        id_to_path = {aid: path for aid, path in zip(read_set_ids, read_set)}
+        read_set_ids = _resolve_read_set(coordinator, names)
         result = coordinator.service.begin_session(
             read_set=read_set_ids, owner=owner, created_at_tick=now, abort=abort,
         )
@@ -5529,14 +5540,10 @@ def _handle_session_begin(req: _RequestProtocol, coordinator: CoordinatorHTTPSer
             session_token=result.session_token,
             cut=result.cut,
         )
-        cut_by_path = {
-            id_to_path.get(aid, str(aid)): version
-            for aid, version in result.cut.items()
-        }
         return {
             "ok": True,
             "session_token": result.session_token,
-            "cut": cut_by_path,
+            "cut": _cut_by_requested_name(names, read_set_ids, result.cut),
             "coordinator_epoch": result.coordinator_epoch,
             "retain_versions": result.retain_versions,
         }
@@ -5609,13 +5616,14 @@ def _handle_session_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServ
     if path_err:
         req._json(400, {"error": path_err})
         return
+    name = file_request(coordinator, path)
 
     if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
         return
     caller = _session_owner_from_request(coordinator, session_id)
 
     def work() -> dict:
-        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        artifact_id = find_requested(coordinator, name)
         if artifact_id is None:
             # Unknown path → cannot be in any cut. Mirror the service's
             # not-in-cut signal rather than seeding a row a read can't serve.
@@ -5706,6 +5714,7 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     if not isinstance(content, str):
         req._json(400, {"error": "content must be a string"})
         return
+    name = file_request(coordinator, path)
 
     if _admit_caller(req, coordinator, _presented_caller(req, session_id)) is None:
         return
@@ -5713,7 +5722,7 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     now = monotonic_seconds()
 
     def work() -> dict:
-        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        artifact_id = find_requested(coordinator, name)
         if artifact_id is None:
             return {"ok": False, "reason": "artifact_not_in_cut"}
         # Read the pinned base BEFORE the commit so the content-free audit can
@@ -5780,6 +5789,12 @@ def _handle_session_commit(req: _RequestProtocol, coordinator: CoordinatorHTTPSe
     _run_or_degrade(req, coordinator, work, degraded_response=_OCC_DEGRADED_RESPONSE, abort=abort)
 
 
+def _names_repeat(names: list[RequestName]) -> bool:
+    """Whether two of a request's names reach one row: the same bytes twice,
+    or two spellings of one file, which share its key."""
+    return len({name.key for name in names}) != len(names)
+
+
 def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
     """POST /session/commit_all — atomic multi-artifact publish against the cut.
 
@@ -5822,7 +5837,7 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
     if len(writes) > MAX_SESSION_READ_SET_PATHS:
         req._json(400, {"error": f"writes exceeds {MAX_SESSION_READ_SET_PATHS} paths"})
         return
-    paths: list[str] = []
+    names: list[RequestName] = []
     contents: list[str] = []
     for item in writes:
         if not isinstance(item, dict):
@@ -5837,11 +5852,12 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
         if not isinstance(content, str):
             req._json(400, {"error": "content must be a string"})
             return
-        paths.append(path)
+        names.append(file_request(coordinator, path))
         contents.append(content)
     # A duplicate path would collapse in the id-keyed map — reject it up front so
     # a silently-dropped member can't turn an all-or-nothing batch into a partial.
-    if len(set(paths)) != len(paths):
+    # Two spellings of one file reach one row, so they repeat by key.
+    if _names_repeat(names):
         req._json(400, {"error": "writes contains duplicate paths"})
         return
 
@@ -5856,11 +5872,11 @@ def _handle_session_commit_all(req: _RequestProtocol, coordinator: CoordinatorHT
         # not-in-cut signal rather than seeding a row a commit can't source.
         path_by_id: dict[UUID, str] = {}
         writes_map: dict[UUID, tuple[str, int | None]] = {}
-        for path, content in zip(paths, contents):
-            artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        for name, content in zip(names, contents):
+            artifact_id = find_requested(coordinator, name)
             if artifact_id is None:
                 return {"ok": False, "reason": "artifact_not_in_cut"}
-            path_by_id[artifact_id] = path
+            path_by_id[artifact_id] = name.requested
             writes_map[artifact_id] = (content, None)
         # Pinned bases read BEFORE the commit for the content-free WIN audit.
         cut = coordinator.registry.get_session_cut(session_token)
@@ -6450,8 +6466,10 @@ def _transfer_answer(entries: list[dict]) -> dict:
     return {"ok": all(entry["transferred"] for entry in entries), "grants": entries}
 
 
-def _parse_transfer_grants(grants: Any) -> "list[tuple[str, str | None]] | str":
-    """The transfer's ``grants`` as ``(path, subagent id or None)`` pairs, or
+def _parse_transfer_grants(
+    coordinator: CoordinatorHTTPServer, grants: Any
+) -> "list[tuple[RequestName, str | None]] | str":
+    """The transfer's ``grants`` as ``(name, subagent id or None)`` pairs, or
     the 400 ``error`` naming what is wrong.
 
     A grant's ``agent_id`` names the incarnation (a subagent component) that
@@ -6463,7 +6481,7 @@ def _parse_transfer_grants(grants: Any) -> "list[tuple[str, str | None]] | str":
         return "grants must be a non-empty list of {path, agent_id}"
     if len(grants) > MAX_TRANSFER_GRANTS:
         return f"grants exceeds {MAX_TRANSFER_GRANTS} paths"
-    parsed: list[tuple[str, str | None]] = []
+    parsed: list[tuple[RequestName, str | None]] = []
     for item in grants:
         if not isinstance(item, dict):
             return "each grant must be a {path, agent_id} object"
@@ -6474,9 +6492,10 @@ def _parse_transfer_grants(grants: Any) -> "list[tuple[str, str | None]] | str":
         subagent = read_subagent_id(item)
         if subagent is None and has_subagent_id_field(item):
             return _MALFORMED_SUBAGENT_ERROR
-        parsed.append((path, subagent))
-    # A duplicate path would collapse in the artifact-keyed request.
-    if len({path for path, _ in parsed}) != len(parsed):
+        parsed.append((file_request(coordinator, path), subagent))
+    # A duplicate path would collapse in the artifact-keyed request, and so
+    # would two spellings of one file.
+    if _names_repeat([name for name, _ in parsed]):
         return "grants contains duplicate paths"
     return parsed
 
@@ -6532,7 +6551,7 @@ def _handle_handoff_transfer(req: _RequestProtocol, coordinator: CoordinatorHTTP
     if sid_err:
         req._json(400, {"error": sid_err[1]})
         return
-    grants = _parse_transfer_grants(body.get("grants"))
+    grants = _parse_transfer_grants(coordinator, body.get("grants"))
     if isinstance(grants, str):
         req._json(400, {"error": grants})
         return
@@ -6553,8 +6572,8 @@ def _handle_handoff_transfer(req: _RequestProtocol, coordinator: CoordinatorHTTP
         # and never a plain release -- the stated exception to the
         # malformed-optional rule.
         req._json(200, _transfer_answer([
-            _refused_transfer_grant(path, HANDOFF_SUCCESSOR_MALFORMED_REASON)
-            for path, _ in grants
+            _refused_transfer_grant(name.requested, HANDOFF_SUCCESSOR_MALFORMED_REASON)
+            for name, _ in grants
         ]))
         return
     giver = caller_principal_identity(session_id)
@@ -6567,14 +6586,15 @@ def _handle_handoff_transfer(req: _RequestProtocol, coordinator: CoordinatorHTTP
             resolved = successor
         if resolved is None:
             return _transfer_answer([
-                _refused_transfer_grant(path, HANDOFF_SUCCESSOR_UNKNOWN_REASON)
-                for path, _ in grants
+                _refused_transfer_grant(name.requested, HANDOFF_SUCCESSOR_UNKNOWN_REASON)
+                for name, _ in grants
             ])
         entries: dict[str, dict] = {}
         holders: dict[UUID, UUID] = {}
         path_by_id: dict[UUID, str] = {}
-        for path, subagent in grants:
-            artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        for name, subagent in grants:
+            path = name.requested
+            artifact_id = find_requested(coordinator, name)
             if artifact_id is None:
                 entries[path] = _refused_transfer_grant(path, HANDOFF_NOT_HELD_REASON)
                 continue
@@ -6594,7 +6614,7 @@ def _handle_handoff_transfer(req: _RequestProtocol, coordinator: CoordinatorHTTP
             ):
                 path = path_by_id[outcome.artifact_id]
                 entries[path] = _transfer_grant_entry(path, outcome)
-        return _transfer_answer([entries[path] for path, _ in grants])
+        return _transfer_answer([entries[name.requested] for name, _ in grants])
 
     abort = WatchdogAbort()
     _run_or_degrade(
@@ -6645,13 +6665,14 @@ def _settle_handoff(
         msg = "missing or empty path" if path_err in ("path is empty", "path must be a string") else path_err
         req._json(400, {"error": msg})
         return
+    name = file_request(coordinator, path)
     if _admit_caller(req, coordinator, _presented_caller(req, session_id, read_subagent_id(body))) is None:
         return
     coordinator.register_session(session_id, read_subagent_id(body))
     caller = caller_principal_identity(session_id)
 
     def work() -> dict:
-        artifact_id = coordinator.registry.lookup_artifact_id_by_name(path)
+        artifact_id = find_requested(coordinator, name)
         if artifact_id is None:
             return {"ok": False, "reason": HANDOFF_NOT_LIVE_REASON}
         return _verb_body(settle(artifact_id=artifact_id, caller=caller, abort=abort))
@@ -6825,6 +6846,28 @@ def _parse_checkpoint_member(item: object) -> "CheckpointMember | str":
     )
 
 
+def _is_file_member(member: CheckpointMember) -> bool:
+    """Whether a checkpoint member names a workspace file. The member wire
+    carries no name kind, so its tiers say: only a file has no arbiter and
+    state a restore can bring back. Any other member (an object, or one the
+    checkpoint only enumerates) is a key, stored and matched exactly as
+    sent."""
+    return (
+        member.arbitration_tier == ArbitrationTier.NO_ARBITER.value
+        and member.restore_tier != RestoreTier.FORWARD_ONLY.value
+    )
+
+
+def _members_repeat(
+    coordinator: CoordinatorHTTPServer, members: list[CheckpointMember]
+) -> bool:
+    """Whether a manifest names one member twice: the same bytes, or two
+    spellings of one file, which a restore would register as one row."""
+    paths = [member.member_path for member in members]
+    file_keys = [file_key(coordinator, member.member_path) for member in members if _is_file_member(member)]
+    return len(set(paths)) != len(paths) or len(set(file_keys)) != len(file_keys)
+
+
 def _handle_workspace_checkpoint(
     req: _RequestProtocol, coordinator: CoordinatorHTTPServer
 ) -> None:
@@ -6909,8 +6952,7 @@ def _handle_workspace_checkpoint(
         member_rows.append(parsed)
     # A duplicate member path would reject registry-side mid-transaction;
     # reject it loud at the boundary instead (mirror the commit_all guard).
-    paths = [m.member_path for m in member_rows]
-    if len(set(paths)) != len(paths):
+    if _members_repeat(coordinator, member_rows):
         req._json(400, {"error": "members contains duplicate member_path values"})
         return
 
@@ -7327,7 +7369,7 @@ def _handle_workspace_restore_register(
         req._json(400, {"error": f"writes exceeds {MAX_CHECKPOINT_MEMBERS} rows"})
         return
     entries: list[WorkspaceRestoreWrite] = []
-    seen_paths: set[str] = set()
+    seen_keys: set[str] = set()
     for item in writes:
         if not isinstance(item, dict):
             req._json(400, {"error": "each write must be a JSON object"})
@@ -7341,10 +7383,13 @@ def _handle_workspace_restore_register(
         if not isinstance(fingerprint, str) or not _CONTENT_HASH_RE.match(fingerprint):
             req._json(400, {"error": "fingerprint must be a 64-hex sha-256 digest"})
             return
-        if member_path in seen_paths:
+        # The service registers each write as a file, so two spellings of one
+        # file would land on one row.
+        member_key = file_key(coordinator, member_path)
+        if member_key in seen_keys:
             req._json(400, {"error": "writes contains duplicate member_path values"})
             return
-        seen_paths.add(member_path)
+        seen_keys.add(member_key)
         entries.append(
             WorkspaceRestoreWrite(member_path=member_path, fingerprint=fingerprint)
         )
