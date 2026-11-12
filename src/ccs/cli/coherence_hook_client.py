@@ -104,7 +104,9 @@ from ccs.cli._coherence_client import (
     post,
     post_with_stored_principal,
     resolve_endpoint,
+    workspace_relative,
 )
+from ccs.core.disk_spelling import LinkDoesNotResolve
 from ccs.core.exceptions import CallerPrincipalRefused
 
 
@@ -506,13 +508,19 @@ def _with_agent_id(cc: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
 
 def _to_workspace_relative(file_path: str, root: Path) -> str:
     """Convert CC's absolute file_path → workspace-relative path the
-    coordinator expects. If the path is outside the workspace (shouldn't
-    happen but defensive), skip the hook rather than send garbage."""
+    coordinator expects, as the plugin's Node client does (see
+    :func:`~ccs.cli._coherence_client.workspace_relative`). A path outside
+    the workspace, through a link or not, skips the hook rather than send
+    garbage."""
     try:
-        rel = Path(file_path).resolve().relative_to(root)
-    except ValueError:
+        rel = workspace_relative(file_path, root)
+    except LinkDoesNotResolve:
+        # Keying the missing target, or the link's own path, would give its
+        # file a second identity once the target exists.
+        raise _SkipHook(f"link does not resolve: {file_path}") from None
+    if rel is None:
         raise _SkipHook(f"path outside workspace root: {file_path}")
-    return str(rel)
+    return rel
 
 
 def _hash_file(path: Path) -> Optional[str]:

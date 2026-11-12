@@ -1185,6 +1185,46 @@ def test_untrack_accepts_absolute_path_inside_workspace(
     assert str(target) not in content
 
 
+def test_track_accepts_a_root_spelled_in_another_case(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An absolute path whose workspace root is typed in another case than the
+    disk's (``REPO`` for ``Repo``) is tracked relative to the root, as the hook
+    client sends it, whichever of the two spellings carries the other case."""
+    workspace, _ = live_coordinator
+    other_case = workspace.parent / workspace.name.swapcase()
+    if not other_case.exists():
+        pytest.skip("the temporary disk keeps two spellings apart, so no other spelling reaches the root")
+    (workspace / "docs").mkdir()
+    (workspace / "docs" / "plan.md").write_text("plan")
+    (workspace / "docs" / "notes.md").write_text("notes")
+
+    rc = coherence_track.main(["--root", str(workspace), str(other_case / "docs" / "plan.md")])
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "tracked docs/plan.md" in captured.out
+
+    rc = coherence_track.main(["--root", str(other_case), str(workspace / "docs" / "notes.md")])
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "tracked docs/notes.md" in captured.out
+
+
+def test_track_refuses_a_link_that_does_not_resolve_without_network(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A dangling link is refused before any request, not tracked under the
+    missing target's path: once the target exists, that would be a second
+    name for the file the link names."""
+    (git_workspace / "data").mkdir()
+    (git_workspace / "data" / "dangle.md").symlink_to("nope.md")
+
+    rc = coherence_track.main(["--root", str(git_workspace), str(git_workspace / "data" / "dangle.md")])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "link does not resolve" in captured.err
+
+
 def test_track_no_coordinator_running_exits_2(
     git_workspace: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
