@@ -196,9 +196,10 @@ def test_a_write_whose_commit_the_coordinator_answers_with_a_failure_is_unconfir
 ) -> None:
     """``swg_write`` and ``swg_write_cas`` whose commit the coordinator answers
     with its failure envelope after recording it both answer
-    ``commit_unconfirmed`` with ``read_then_retry`` (#259): the two write
-    tools agree, and the coordinator holds the commit the agent is told may
-    have landed.
+    ``commit_unconfirmed`` (#259), and the coordinator holds the commit the
+    agent is told may have landed. ``swg_write``, whose bytes are on disk,
+    recovers by writing again (``write_again``); ``swg_write_cas``, whose
+    bytes never reached disk, by ``read_then_retry``.
 
     Prevents ``internal_error`` / ``recover: none`` on ``swg_write_cas`` and
     ``commit_preempted`` on ``swg_write``: each tells the agent its write did
@@ -228,9 +229,8 @@ def test_a_write_whose_commit_the_coordinator_answers_with_a_failure_is_unconfir
 
         assert result.isError is True, result.structuredContent
         sc = result.structuredContent
-        assert (sc["reason"], sc["recover"], sc["retryable"]) == (
-            _COMMIT_UNCONFIRMED, _READ_THEN_RETRY, False
-        ), sc
+        recover = "write_again" if tool == "swg_write" else _READ_THEN_RETRY
+        assert (sc["reason"], sc["recover"], sc["retryable"]) == (_COMMIT_UNCONFIRMED, recover, False), sc
         artifact_id = server.registry.lookup_artifact_id_by_name(rel)
         assert server.registry.get_artifact(artifact_id).version == version + 1, (
             "control: the coordinator recorded the commit"

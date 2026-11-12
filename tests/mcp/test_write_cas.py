@@ -608,10 +608,14 @@ def test_swg_read_then_write_cas_through_a_peer_commit_window_loses_no_update(
 # the client cannot tell that 5xx from the others, and the agent recovers by
 # the same steps.
 
-#: FROZEN duplicates of the unconfirmed-commit terminal, of the terminal a
-#: failure the deny mapper recognises nothing in gets, and of the stale-read
-#: terminal (never imported from the code under test).
-_COMMIT_UNCONFIRMED = ("commit_unconfirmed", "read_then_retry", False)
+#: FROZEN duplicates of the unconfirmed-commit terminal per tool, of the
+#: terminal a failure the deny mapper recognises nothing in gets, and of the
+#: stale-read terminal (never imported from the code under test). swg_write's
+#: bytes are on disk, so it writes again; swg_write_cas's never reached disk.
+_COMMIT_UNCONFIRMED = {
+    "swg_write_cas": ("commit_unconfirmed", "read_then_retry", False),
+    "swg_write": ("commit_unconfirmed", "write_again", False),
+}
 _UNRECOGNIZED = ("internal_error", "none", False)
 _STALE_VIEW = ("stale_view", "reacquire", True)
 
@@ -643,11 +647,12 @@ def test_a_write_tool_whose_commit_is_answered_with_a_5xx_after_it_landed_answer
 ) -> None:
     """swg_write_cas and swg_write reach the coordinator, which records the
     commit, and the answer is an HTTP 5xx. The write may already be recorded,
-    so the tool answers the unconfirmed-commit deny: ``commit_unconfirmed``,
-    ``read_then_retry``, not retryable as is. Before, it answered
-    ``internal_error`` with recover ``none``: the shape of a bug in the
-    server, telling the agent to stop, with no hint that its write may have
-    landed."""
+    so the tool answers the unconfirmed-commit deny, not retryable as is:
+    ``read_then_retry`` for swg_write_cas, whose bytes never reached disk,
+    and ``write_again`` for swg_write, whose bytes are on disk and recorded
+    only by another write. Before, it answered ``internal_error`` with
+    recover ``none``: the shape of a bug in the server, telling the agent to
+    stop, with no hint that its write may have landed."""
     _seed(tmp_path, b"v1")
     config = _config(tmp_path)
     server = serve_in_process(tmp_path, f"swg-5xx-{tool}-{status}")
@@ -659,7 +664,7 @@ def test_a_write_tool_whose_commit_is_answered_with_a_5xx_after_it_landed_answer
         deny = _write_with(tool, vol, config, version)
 
         assert recorded_version(server, _PATH) == version + 1, "control: the coordinator recorded the commit"
-        assert deny == _COMMIT_UNCONFIRMED
+        assert deny == _COMMIT_UNCONFIRMED[tool]
     finally:
         server.shutdown()
 
@@ -687,15 +692,15 @@ def test_a_write_tool_whose_commit_is_refused_with_a_4xx_answers_as_before(
         server.shutdown()
 
 
-def test_a_write_whose_commit_is_answered_with_a_5xx_before_it_ran_recovers_by_read_then_retry(
+def test_a_write_whose_commit_is_answered_with_a_5xx_before_it_ran_recovers_by_writing_again(
     tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """swg_write's bytes reach disk and its commit is answered with a 503
     before the coordinator ran it, so nothing is recorded. The agent follows
-    each answer: ``commit_unconfirmed`` / ``read_then_retry``; ``swg_read``
+    each answer: ``commit_unconfirmed`` / ``write_again``; ``swg_read``
     refuses the unrecorded bytes as ``stale_view`` / ``reacquire`` with no
-    version; ``swg_reacquire`` answers the bytes on disk; the rewrite from
-    them lands, and the coordinator records it one version on.
+    version, as the next step says a read first does; the same swg_write once
+    more lands, and the coordinator records it one version on.
 
     Prevents a read that answers the unrecorded bytes with the old version,
     so the agent takes a write the coordinator never recorded for one it
@@ -711,7 +716,7 @@ def test_a_write_whose_commit_is_answered_with_a_5xx_before_it_ran_recovers_by_r
             answer_with_status(answered, _commit_on("/hooks/post-edit"), 503, forwarded=False)
             deny = _write_with("swg_write", vol, config, version)
 
-        assert deny == _COMMIT_UNCONFIRMED
+        assert deny == _COMMIT_UNCONFIRMED["swg_write"]
         assert target.read_bytes() == b"v2", "control: the write's bytes reached disk"
         assert recorded_version(server, _PATH) == version, "control: the coordinator recorded nothing"
 
@@ -721,11 +726,7 @@ def test_a_write_whose_commit_is_answered_with_a_5xx_before_it_ran_recovers_by_r
         assert (sc["reason"], sc["recover"], sc["retryable"]) == _STALE_VIEW, sc
         assert "version" not in sc and "content" not in sc
 
-        reacquired = _do_reacquire(vol, config, _PATH)
-        assert reacquired.isError is False, reacquired.structuredContent
-        assert reacquired.structuredContent["content"] == "v2"
-
-        rewrite = _do_write(vol, config, _PATH, reacquired.structuredContent["content"])
+        rewrite = _do_write(vol, config, _PATH, "v2")
         assert rewrite.isError is False, rewrite.structuredContent
         assert recorded_version(server, _PATH) == version + 1, "the rewrite was not recorded"
         settled = _do_read(vol, config, _PATH)

@@ -55,6 +55,7 @@ from ccs.mcp.deny import (
     handoff_deny_result,
     handoff_transfer_refusal_result,
     handoff_verb_refusal_result,
+    write_deny_result,
 )
 from ccs.mcp.session import SessionConfig, build_volume
 from ccs.mcp.status import (
@@ -529,12 +530,22 @@ def _do_write(volume: CoherentVolume, config: SessionConfig, path: str, content:
     if not volume.is_attached:
         return coordinator_unavailable_result(f"coordinator unattached; refusing write of {key}")
     try:
+        # Judged before the write, by the volume's own rule for the path, so a
+        # refuse-mode answer says whether this write asked only if nobody held
+        # the file. A displace-mode server asks nothing and answers as before.
+        opted_in = volume.asks_if_unheld(key) if config.on_held == "refuse" else None
         volume.write(key, content.encode("utf-8"))
     except CoherenceError as exc:
-        return deny_result(exc)
+        return write_deny_result(exc, config.on_held)
     except OSError as exc:  # disk/permission failure → fail closed, never escape to FastMCP
         return _client_error_result("io_error", "none", str(exc))
-    return _ok_result({"ok": True, "path": key}, f"wrote {key}")
+    if opted_in is None:
+        return _ok_result({"ok": True, "path": key}, f"wrote {key}")
+    text = f"wrote {key}" if opted_in else (
+        f"wrote {key} without asking first: it is not among the managed files, so this "
+        "write takes the file from any agent that holds it"
+    )
+    return _ok_result({"ok": True, "path": key, "opted_in": opted_in}, text)
 
 
 def _do_reacquire(volume: CoherentVolume, config: SessionConfig, path: str) -> CallToolResult:
