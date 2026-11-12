@@ -145,19 +145,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.self_test:
         return _run_self_test(Path(root), json_mode=args.json)
 
-    payload = _fetch_status(Path(root), args.detail)
-    if isinstance(payload, int):
-        return payload
+    fetched = _fetch_status(Path(root), args.detail)
+    if isinstance(fetched, int):
+        return fetched
+    payload, backend = fetched
     # The metrics tier carries no lists and never reads the registry.
     if args.detail != "metrics" and _lists_unavailable(payload):
         return _print_lists_unavailable(payload, json_mode=args.json)
-    return _print_status(payload, args)
+    return _print_status(payload, args, backend)
 
 
-def _fetch_status(root: Path, detail: str | None) -> dict[str, Any] | int:
+def _fetch_status(root: Path, detail: str | None) -> tuple[dict[str, Any], str] | int:
     """The ``/status`` body at ``detail`` (the coordinator's default tier when
-    ``None``), or the exit code of a failure
-    already reported in one line: 0 when no coordinator runs; 2 for an HTTP
+    ``None``) with the backend :func:`_pinned_backend` names, or the exit code
+    of a failure already reported in one line: 0 when no coordinator runs; 2 for an HTTP
     error, a refused redirect, a TLS failure or a body that is not a JSON
     object (#245)."""
     try:
@@ -189,7 +190,21 @@ def _fetch_status(root: Path, detail: str | None) -> dict[str, Any] | int:
     if not isinstance(payload, dict):
         err(f"agent-coherence-status: {NOT_A_JSON_OBJECT_LINE}")
         return 2
-    return payload
+    return payload, _pinned_backend(endpoint)
+
+
+#: The backend a pid file with no backend line belongs to.
+_PYTHON_BACKEND = "python"
+
+
+def _pinned_backend(endpoint: CoordinatorEndpoint) -> str:
+    """The backend the pid file that gave ``endpoint`` its port names: the
+    Node coordinator writes ``backend=node`` there, which its ``/status`` body
+    does not carry as ``coordinator_backend``. ``python`` when the file has no
+    backend line, as the Python coordinator writes it, or the endpoint has no
+    pid file."""
+    pinned = endpoint.pin.resolved.backend if endpoint.pin is not None else None
+    return pinned or _PYTHON_BACKEND
 
 
 _SHAPE_LINE = "agent-coherence-status: unexpected /status shape"
@@ -224,15 +239,16 @@ def _print_lists_unavailable(payload: dict[str, Any], *, json_mode: bool) -> int
     return 2
 
 
-def _print_status(payload: dict[str, Any], args: argparse.Namespace) -> int:
+def _print_status(payload: dict[str, Any], args: argparse.Namespace, backend: str) -> int:
     """Print ``payload`` as ``--json``, the metrics block or the table: 0, or
     2 when a field has the wrong type or a number out of range (#245).
+    ``backend`` labels a body that names none.
     Rendered into a buffer first, so a body that fails part-way prints one
     line, not half a table."""
     rendered = io.StringIO()
     try:
         with contextlib.redirect_stdout(rendered):
-            _render_payload(payload, args)
+            _render_payload(payload, args, backend)
     except (TypeError, ValueError, AttributeError, KeyError, OverflowError):
         err(_SHAPE_LINE)
         return 2
@@ -240,7 +256,7 @@ def _print_status(payload: dict[str, Any], args: argparse.Namespace) -> int:
     return 0
 
 
-def _render_payload(payload: dict[str, Any], args: argparse.Namespace) -> None:
+def _render_payload(payload: dict[str, Any], args: argparse.Namespace, backend: str) -> None:
     if args.json:
         import json as _json
         if args.show_policy:
@@ -251,9 +267,9 @@ def _render_payload(payload: dict[str, Any], args: argparse.Namespace) -> None:
             ]
         print(_json.dumps(payload, indent=2))
     elif args.detail == "metrics":
-        _render_metrics(payload)
+        _render_metrics(payload, backend)
     else:
-        _render_table(payload, show_policy=args.show_policy)
+        _render_table(payload, show_policy=args.show_policy, backend=backend)
 
 
 def _run_self_test(root: Path, *, json_mode: bool = False) -> int:
@@ -527,10 +543,26 @@ def _elide_middle(text: str, max_len: int) -> str:
 _STATE_NAME_W = max(len(state.name) for state in MESIState)
 
 
-def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None:
+def _coordinator_identity(payload: dict[str, Any], backend: str) -> tuple[Any, Any, Any]:
+    """``(backend, version, schema)`` for the header line. The Python
+    coordinator names all three in ``coordinator_backend``,
+    ``coordinator_version`` and ``registry_schema_version``; the Node
+    coordinator sends ``version`` and ``schema_version`` and no backend key,
+    so ``backend`` labels it."""
+    return (
+        payload.get("coordinator_backend", backend),
+        payload.get("coordinator_version", payload.get("version", "")),
+        payload.get("registry_schema_version", payload.get("schema_version")),
+    )
+
+
+def _render_table(
+    payload: dict[str, Any], *, show_policy: bool = False, backend: str = _PYTHON_BACKEND
+) -> None:
     """Manual column alignment — stdlib only, no rich/tabulate. Every value
     taken from the coordinator prints through :func:`escape_nonprintable`
-    (#245), and widths and elision work on that escaped text."""
+    (#245), and widths and elision work on that escaped text. ``backend``
+    labels a body that names none."""
     tracked = payload.get("tracked_artifacts", [])
     sessions = payload.get("sessions", [])
     policy = payload.get("policy_summary", {})
@@ -541,9 +573,7 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
     uptime = payload.get("coordinator_uptime_seconds",
                          payload.get("coordinator_uptime_s", 0.0))
     pid = payload.get("coordinator_pid", 0)
-    backend = payload.get("coordinator_backend", "python")
-    version = payload.get("coordinator_version", "")
-    schema = payload.get("registry_schema_version")
+    backend, version, schema = _coordinator_identity(payload, backend)
 
     header_bits: list[str] = []
     if pid:
@@ -552,8 +582,8 @@ def _render_table(payload: dict[str, Any], *, show_policy: bool = False) -> None
     header_bits.append(f"backend={escape_nonprintable(backend)}")
     if version:
         header_bits.append(f"version={escape_nonprintable(version)}")
-    # An older or Node coordinator sends no schema number; print nothing
-    # rather than a placeholder an operator could mistake for one.
+    # An older coordinator sends no schema number; print nothing rather than
+    # a placeholder an operator could mistake for one.
     if schema is not None:
         header_bits.append(f"schema={escape_nonprintable(schema)}")
     print("Coordinator: " + " ".join(header_bits))
@@ -809,15 +839,17 @@ def _render_counter_block(payload: dict[str, Any]) -> None:
         print(f"  {name:<40}  {value_str}")
 
 
-def _render_metrics(payload: dict[str, Any]) -> None:
+def _render_metrics(payload: dict[str, Any], backend: str = _PYTHON_BACKEND) -> None:
     """KTD-J `--detail metrics` rendering — counter block only, no
     artifact/session detail. Used by dashboard scrapers that want a
-    consistent counter format without parsing JSON."""
-    backend = escape_nonprintable(payload.get("coordinator_backend", "python"))
-    version = escape_nonprintable(payload.get("coordinator_version", ""))
-    schema = payload.get("registry_schema_version")
+    consistent counter format without parsing JSON. ``backend`` labels a
+    body that names none."""
+    backend, version, schema = _coordinator_identity(payload, backend)
     schema_bit = "" if schema is None else f" schema={escape_nonprintable(schema)}"
-    print(f"Coordinator metrics: backend={backend} version={version}{schema_bit}")
+    print(
+        f"Coordinator metrics: backend={escape_nonprintable(backend)} "
+        f"version={escape_nonprintable(version)}{schema_bit}"
+    )
     _render_counter_block(payload)
 
 
