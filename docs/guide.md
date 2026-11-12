@@ -587,8 +587,9 @@ Each entry is a flat `dict` with exactly these eight keys:
 | `"timeout"` | Transient state timeout; agent force-invalidated (→ INVALID) |
 | `"reclaim_heartbeat"` | Crash recovery: agent's heartbeat older than `heartbeat_timeout_ticks` |
 | `"reclaim_max_hold"` | Crash recovery: grant held for at least `max_hold_ticks` |
+| `"fold_merge"` | A coordinator start merged records an older build kept for one file under several spellings (see [One file, many spellings](#one-file-many-spellings)): every agent on them moves to the record kept, and every one but the write holder kept, if any (the single one whose record matches the file on disk), goes INVALID (stale), readers included. It also fires when a write grant on one of several records still kept for one file takes that file from a write holder on another |
 
-The last five triggers move the artifact's **ownership epoch** when they take a
+The five triggers from `"invalidate"` to `"reclaim_max_hold"` move the artifact's **ownership epoch** when they take a
 holder out of EXCLUSIVE/MODIFIED, because each of them ends a write claim
 *without the version moving* — the one case a version check cannot see. A later
 commit from that ex-holder is then rejected with `stale_read_generation` rather
@@ -604,6 +605,12 @@ giver that hands off a write grant moves the epoch exactly as a release does; a
 giver that hands off a standing SHARED read takes no one out of
 EXCLUSIVE/MODIFIED and moves no epoch, so sessions that read the path are not
 fenced as though a writer had been reclaimed.
+
+`"fold_merge"` sets both numbers itself: the record a merge keeps takes a
+version and an ownership epoch one past the highest of the records it merged.
+The write holder that keeps its grant moves to both, so its next commit is
+admitted; every other agent's recorded version and captured generation stay
+below them, so its next commit is refused until it reads the file again.
 
 An explicit invalidation is also **pinned**: one issued by a peer is dropped as
 obsolete if the agent it names has since observed a version at least as new as
@@ -867,7 +874,11 @@ holder tell a reclaim from a path taken by another session's edit:
   [which requests record one](#reading-when-the-sweep-will-reclaim-a-grant))
   or `reclaim_max_hold` (held past
   `grant_max_hold_sec`), and `reclaimed_at_unix_ts` is when the reclaim
-  happened, in unix seconds.
+  happened, in unix seconds. A third trigger, `fold_merge`, is not the sweep's:
+  a start merged records an older build kept for one file under several
+  spellings, and this holder lost its write grant there, or another agent's
+  write grant on another record still kept for the same file took it (see
+  [One file, many spellings](#one-file-many-spellings)).
 - **The counters.** Every view, the default one and `?detail=metrics`
   included, carries `sweep_reclaims_total` and `sweep_reclaims_by_trigger`.
   They name no session or path: a count that rose tells you the sweep pulled
@@ -911,7 +922,8 @@ Limits:
   row is dropped.
 - A zero count does not prove the sweep is running: it reads the same when
   there was nothing to reclaim.
-- Only the grant sweep's two triggers are recorded. A holder the coordinator
+- Only the grant sweep's two triggers and `fold_merge` are recorded, and only
+  the sweep's two are counted. A holder the coordinator
   invalidates because it sat mid-transition past `transient_timeout_sec` gets
   no `reclaimed` entry and no count.
 - The Python console script, run as `agent-coherence-status --detail full`,
@@ -1659,11 +1671,12 @@ even for a volume that only read (see
 The volume decides what to release from its own record of the grants its
 `write()` calls took, because the coordinator answers a release the same way
 whether it released a grant or held nothing. So `release()` sends nothing for a
-path this volume never wrote. It sends nothing either for another spelling of a
-path it wrote, such as `data/X.TXT` for `data/x.txt` or another Unicode form of
-the same name, even where the filesystem treats the two as one file, so the
-grant stands (#506). `./data/x.txt` and a symbolic link to the file resolve to
-the same path and are released.
+path this volume never wrote. Another spelling of a path it wrote is that path
+when the attached coordinator keys the two as one file: on a disk that folds
+case, `release("data/X.TXT")` gives back the grant a write of `data/x.txt`
+took. On a disk that keeps them apart it is another path, and sends nothing
+(see [One file, many spellings](#one-file-many-spellings)). `./data/x.txt` and a
+symbolic link to the file resolve to the same path and are released.
 
 **When the release is not confirmed.** A release the coordinator does not
 confirm keeps the grant on the volume's record. Under `on_error="strict"` it
@@ -1836,7 +1849,14 @@ attach the volume reads `pre_edit_if_unheld` from the operator view of `/status`
 and attaches only when it is JSON `true`. Otherwise it raises `CoherenceError`
 before it sends anything, because a coordinator that ignores the flag would take
 the file from its holder. That rules out this package's coordinator through
-0.15.0. A forked child checks again on its first read or write. A volume with
+0.15.0. The volume also reads `fold_profile` and `fold_table_unicode` from the
+default view, so it keys each file as the coordinator does (see
+[One file, many spellings](#one-file-many-spellings)). When it cannot read them
+it raises `CoordinatorUnreachable` for no answer and `CoherenceError` for an
+unusable one, and it raises `CoherenceError` for a fold table of another
+Unicode version, both before it sends anything: a refusal it promises under
+every spelling of a file needs the coordinator's own fold. A forked child
+checks again on its first read or write. A volume with
 `managed` globs cannot attach to the Claude Code plugin's Node coordinator in
 either mode, because it does not serve the operator view, so refuse mode does
 not reach it.
@@ -1855,6 +1875,7 @@ not reach it.
 | `collision: true`, which only a coordinator that ignores the flag sends | `CoherenceError` | build a new volume: the coordinator changed after this one attached, and the holder may have lost the file. If the message says the release was not confirmed, call `reacquire()` first, or that grant refuses the new volume |
 | `degraded: true` beside `ok: true`, which only a coordinator that ignores the flag sends | `CoherenceError` | call `reacquire()`, because the abandoned request may still take the grant, then build a new volume |
 | none: the session holds no [caller principal](#caller-principal), so nothing is sent | `CoherenceError` | build a new volume |
+| none: the path goes through a link whose name is under `managed` to a file outside it, so nothing is sent | `LinkOutOfManaged` | write the file by its own path from a volume that may displace its holder, or point the link inside `managed` |
 
 **Polling.**
 
@@ -1917,8 +1938,16 @@ a holder refuses until it releases. A reclaimed holder's next write raises
   default-tracked file such as `plan.md` loses it, and so does a holder of a file
   a peer's narrower `managed` does not cover. The flag stays off those paths
   because an untrack could send them around the check.
-  The check reads the resolved path, so a link under `managed` to a file outside
-  it is a write outside `managed`, whatever its name matches.
+- A write through
+  a link whose name is under `managed` to a file outside it
+  raises `LinkOutOfManaged` (from `ccs.core.exceptions`, `reason`
+  `link_out_of_managed`, with `path`, `link` and `target`) and sends nothing,
+  where it used to take that file from its holder. The check
+  reads the links as they stand when `write()` is called, so a link put in
+  place while the write runs is not seen; only a process running as your OS
+  user can do that, which the [trust model](security.md#who-the-coordinator-can-tell-apart)
+  already trusts. A link under `managed` to a file under `managed` writes as
+  before, refused while another agent holds the file.
 - `install()`, `coherent_workspace()` and the `stale-write-guard-fs` tools take
   no `on_held`, so they displace.
 - A forked child is another agent: it is refused while its parent holds the file,
@@ -2433,6 +2462,188 @@ above the worktrees, the Python coordinator's
 [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)
 does not watch the files inside them yet ([#241](https://github.com/Cohexa-ai/agent-coherence/issues/241)).
 
+### One file, many spellings
+
+A macOS disk opens `PLAN.MD` and `plan.md`, or a composed and a decomposed `é`,
+as one file. This package's coordinator newer than 0.15.0 treats every spelling
+the workspace disk opens as one file, plus its `./` and `//` variants, as that
+one file ([#506](https://github.com/Cohexa-ai/agent-coherence/issues/506)): the
+same holder, the same refusal, the same strict-mode rule and the same version,
+for Claude Code hook sessions, `CoherentVolume`, snapshot sessions, handoffs,
+workspace checkpoints and the effect fence. A `tracked.yaml`, `ignored.yaml` or
+`strict_mode.yaml` pattern, and so a volume's `managed` glob, matches every
+spelling of the files it names. On a disk that folds nothing, such as a typical
+Linux disk, names that differ only by case or accent form stay separate files:
+only `./` segments and repeated `/` are tidied, and a pattern that matched a
+name before still matches it. There is no flag. The Claude Code plugin's Node
+coordinator does the same in plugin releases after 0.6.0.
+
+**How the coordinator learns the disk.** Once per start, while it holds the
+store's single-writer lock and before it answers any request, the coordinator
+creates a few probe files under `.coherence`, looks each one up under another
+spelling, and removes them. It creates nothing anywhere else, and no hook
+creates a file to find out. The answers give the profile it keys file names by,
+which `/status` reports as `fold_profile` in every view and in a degraded
+answer:
+
+| `fold_profile` | The disk | One file is |
+|---|---|---|
+| `caseless` | case-insensitive APFS, the macOS default | every spelling that differs by case or accent form |
+| `nfd` | case-sensitive APFS | every spelling that differs by accent form |
+| `none` | a disk that folds nothing, such as a typical Linux disk | one spelling, tidied |
+| `cannot_tell` | a disk the probe could not classify | one spelling, tidied, as for `none` |
+
+Beside it, `fold_table_unicode` is the Unicode version of the fold table that
+both coordinators and this package's clients fold by, `17.0.0`. The start logs
+one line naming the profile, or why it could not tell.
+A disk the start probe cannot classify folds nothing: HFS+, exFAT and FAT
+answer with no profile the probe knows, and so does a `.coherence` on another
+device than the workspace, or a probe step that fails. A coordinator that runs
+without its single-writer lock folds nothing and merges nothing, and reports
+`cannot_tell`: that is a start where `flock` does not exist or does not work
+(see **One writer per store** under [Durability](#durability)).
+
+**What a request gets.** A new record takes the disk's own spelling when the
+file exists: where `data/x.txt` exists on a `caseless` disk, a first edit of
+`DATA/X.TXT` is listed in `/status` as `data/x.txt`. Every answer repeats the
+path exactly as the request sent it. On such a disk a Grep of `DATA/` also
+reaches the tracked files under `data/`. Two spellings of one file in one request are handled as
+one name sent twice: `/session/begin` pins the file once, a Bash command reads
+it as one file, and `/session/commit_all`, `/handoff/transfer`, a checkpoint's
+file members and a restore registration refuse the pair with their existing
+duplicate error. On a folding disk the untrack command also refuses an entry
+that covers a strict path under another spelling.
+
+**Names that are not files.** A hook request that sends `"name_kind": "key"`
+names an object or row key: it is kept and matched exactly, never tidied,
+folded or merged, and a record it creates stays a key across restarts.
+`CoherentRow` and `CoherentObject` send it with every key, so `ws-42` and
+`WS-42` stay two artifacts on any disk. A `CoherentVolume` built with
+`remote_endpoint` sends it with each path it sends to a hook route, because the
+remote coordinator's disk is not the volume's. A checkpoint member is a file
+only when its `arbitration_tier` is `no-arbiter` and its `restore_tier` is not
+`forward_only`; every other member, such as an S3 object, stays exact. Any
+other `name_kind` value gets the route's HTTP `400` path error. The Claude Code
+hooks never send the field.
+
+**Clients.**
+
+- `CoherentVolume` reads `fold_profile` and `fold_table_unicode` from the
+  default view of `/status` at every local attach, and keys everything it
+  records per file by that profile, as the coordinator does: grants, reads,
+  content hashes, read handoffs and held paths. On a `caseless` disk,
+  `release("data/x.txt")` gives back the grant a write of `DATA/x.txt` took,
+  `DATA/x.txt` is under `managed=("data/**",)`, and `transfer()` and
+  `atomic_publish()` refuse `a.txt` beside `A.txt` as one path named twice. A
+  coordinator without the fields, `cannot_tell`, a value the volume does not
+  know and a fold table of another Unicode version all key names exactly. A
+  refuse-mode volume does not attach in the last case, or when it cannot read
+  `/status` (see
+  [Refusing a file another agent holds](#refusing-a-file-another-agent-holds)).
+- The MCP server compares names by the profile `/status` advertises: after a
+  denied read, `swg_read` finds the path's handoff record under any spelling of
+  the file, and `swg_write_cas` counts consecutive conflicts on every spelling
+  of one file toward one limit.
+- The Claude Code hook client, and the console scripts that take a workspace
+  path (`agent-coherence-track`, `agent-coherence-untrack`, the handoff commands
+  and `agent-coherence-workspace checkpoint`), follow links and keep the case a
+  path was typed in, as before. A tool path that spells the workspace root in
+  another case than the disk (`REPO` for `Repo`) now reaches the coordinator,
+  where the hook skipped it, and the console scripts accept a root typed in
+  another case. A `/var` path for a root under `/private/var` on macOS already
+  reached it, since the client resolves both the root and the path. A Read, Edit or Write
+  through a link that does not resolve is no longer sent, and the console
+  scripts refuse such a path with `link does not resolve`.
+- [Foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back),
+  on a disk that folds names, reads git's index first and checks each file
+  under git's own spelling of it, so an outside edit of a file whose record is
+  spelled otherwise than in git's index (`PLAN.MD` for `plan.md`, or another
+  Unicode form) is counted.
+
+**Links.** A Read, Edit or Write through a link reaches the coordinator under
+the path of the file the link names: from this package's hook client as
+before, and from the plugin's Node hook client in plugin releases after 0.6.0.
+A file reached through a linked directory therefore matches patterns written
+against its target's path, not the link's. When it loads or reloads the
+policy, the coordinator logs each tracked or strict pattern whose directories
+pass through a link inside the workspace, or that names a link to a file, and
+says when the link's target is outside the workspace, where
+a Read, Edit or Write through such a link is not coordinated and no pattern
+can cover it. A Bash command's file arguments are matched as typed, and so is
+a Grep's search directory given relative to the workspace: they are folded by
+spelling but not resolved, so a Bash read through a link reaches the link's own
+path, not the file it names.
+
+**Records an older build split.** A coordinator through 0.15.0 could keep one
+file as several records, one per spelling, each with its own write grant. At
+the first start of a newer coordinator they are merged into one record when
+their names still reach the same file on disk, `./` and `//` splits included:
+
+- At most one write grant survives: the single write holder of the record
+  whose content matches the file on disk keeps it, and when no single holder
+  fits, nobody does.
+- Every other agent on the file stays on it as stale. A holder that lost its
+  write grant gets a notice, and its next commit is refused until it reads the
+  file again. The operator view of `/status` lists it under `reclaimed` with
+  the trigger `fold_merge`, and the [state log](#trigger-vocabulary) records
+  every agent the merge moves under that trigger.
+- A snapshot session that pinned one of the records is ended, every handoff
+  record on them ends withdrawn, and their conflict and foreign-write counts
+  are added together.
+- Records whose file is missing at the start are not merged, and neither are
+  records other than the one kept that hold retained versions. Such records act
+  as one file for grants and refusals.
+
+The coordinator logs each merge, each group it left apart, and each name that
+still has several records.
+
+**What it does not cover.**
+
+- **A mount that folds names otherwise.** The coordinator
+  classifies only the disk that holds the workspace and its `.coherence`.
+  Under a folding mount inside a workspace whose disk folds nothing, spellings
+  of one file stay separate records, so they do not meet each other's grants.
+  Under a mount that folds nothing inside a folding workspace, two files that
+  differ only by case or accent form share one record: spurious conflicts,
+  never a lost write.
+- **Linux disks that fold names.** Linux ext4's per-directory case folding
+  (the casefold attribute, `chattr +F`) is not detected, so spellings of one
+  file in such a directory can get separate records. The probe knows only the
+  answers measured on case-insensitive APFS, case-sensitive APFS and a disk
+  that folds nothing; a whole Linux disk that folds names is expected to match
+  none of them and fold nothing, but
+  no CI job runs on a Linux disk that folds names.
+- **A disk the probe cannot classify, or a coordinator without its lock.**
+  Each spelling keeps a record of its own there, as on a coordinator through
+  0.15.0, except for `./` and `//` variants. Read `fold_profile` from `/status`
+  to see which applies.
+- **Characters newer than Unicode 17.0.0** are left as sent, even where the
+  disk folds them.
+- **A `?` or a `[...]` class stands for one character.** Where one character
+  folds to several, a pattern can miss a spelling: a strict `stra?e.md` does
+  not match a request spelled `STRASSE.MD` unless the file on disk is spelled
+  `straße.md`. Add the spelled-out form (`strasse.md`) as its own entry.
+- **A hard link** is a second name, with a record of its own.
+- **A key record an older build created** carries no kind, so a key spelled
+  like an existing workspace file is treated as that file.
+- **A checkpoint an older build recorded** with two spellings of one file
+  refuses restore with the duplicate error.
+- **A `remote_endpoint` volume's handoffs and `atomic_publish` members** are
+  sent as files, not keys, so the remote coordinator folds them by its own
+  disk: spurious conflicts at worst.
+
+**Versions.** One identity per file needs this package's coordinator newer than
+0.15.0, or the Claude Code plugin's Node coordinator in plugin releases after
+0.6.0. Use `CoherentVolume`, the MCP server, `CoherentRow` and `CoherentObject`
+from a release newer than 0.15.0 with such a coordinator. Older ones compare
+paths exactly as they spelled them, so they can miss a file the coordinator
+records under the disk's spelling; an older `CoherentRow` or `CoherentObject`
+sends its keys as file names, so two keys that differ only by `./` or a
+repeated `/`, or by case or Unicode form on a disk that folds names, share one
+record there: spurious conflicts, never a lost write. Against a
+coordinator through 0.15.0, which sends no `fold_profile`, a newer client keys
+names exactly.
+
 ### When you don't need this
 
 Coherence is worth adding only when agents actually share mutable state through a
@@ -2543,6 +2754,7 @@ A declarative manifest binds each artifact to a substrate + connection + tier, a
 - **`native-CAS`, with the timeout asterisk.** The substrate CAS prevents the concurrent single-host lost update on the token axis; an unconfirmed substrate write is reconverged inside `commit()` by a token-identity re-read, but a coordinator timeout *after* a durable substrate write is not, and registry↔substrate agreement is a *detectable signal*, not a held guarantee (see the coordinator-behind bullet below).
 - **Single-host, subtractive.** When the substrate is itself distributed (S3, managed Postgres), the no-lost-update guarantee is the *substrate's* and is identical with or without this layer; the adapter's contribution (invalidation, uniformity) is single-host. Never run the S3 CAS loop through a Multi-Region Access Point / cross-Region replica, and never place agents on two hosts against one distributed substrate.
 - **Coordinator-behind-substrate wedges the artifact.** If a writer's substrate write lands but the coordinator never records its version bump (the process dies between the two legs, or the bump is lost or refused), or a foreign write moves the substrate, every agent's next binding-mediated read of that artifact raises `ViewWedged`, and so does every read or commit after `reacquire()`, across coordinator restarts. It fails closed — no commit through the binding lands on stale bytes — but no binding call clears it yet ([#240](https://github.com/Cohexa-ai/agent-coherence/issues/240)).
+- **Keys are matched exactly, from releases newer than 0.15.0.** A session sends each key with `"name_kind": "key"`, so a coordinator newer than 0.15.0 (or the Claude Code plugin's Node coordinator after plugin 0.6.0) keeps it exactly as sent: `ws-42` and `WS-42` stay two artifacts even where the workspace disk folds case. A session from 0.15.0 or earlier sends no such field, so such a coordinator keys its keys as file names: two keys that differ only by `./` or a repeated `/`, or, on a disk that folds names, by case or Unicode form, share one record there, which gives spurious conflicts, never a lost write. A record an older coordinator created carries no kind, so a key spelled like an existing workspace file is treated as that file (see [One file, many spellings](#one-file-many-spellings)).
 - **More backends are demand-gated, not shipped.** A Letta vendor-memory sidecar is a post-v1 candidate: Letta exposes no atomic conditional-write token, so a binding could only *detect* a sequential stale write via a client-held content shadow, not prevent a concurrent one — it would be a `detect-only` tier and lands only when a concrete need pulls it in.
 
 ### Try it, then harden
@@ -4747,10 +4959,17 @@ coordinator in these ways:
   set answers `{"ok": true}` and the write lands over the holder. A remote
   coordinator on a fixed port has no such check, which is why refuse mode is not
   available with `remote_endpoint`.
-- **Spelling aliases.** The coordinator tracks a path by its spelling. On a
-  case-insensitive filesystem, `data/X.TXT` and `DATA/x.txt` reach the file a
-  holder has as `data/x.txt`, get no refusal, and overwrite it. On APFS the two
-  Unicode forms of a name, NFC and NFD, do the same.
+- **Spellings the coordinator does not fold together.** A coordinator newer
+  than 0.15.0, and the Node coordinator in plugin releases after 0.6.0, key a
+  path by the fold the workspace disk applies: on case-insensitive APFS,
+  `data/X.TXT` and `DATA/x.txt` meet a holder of `data/x.txt` and are refused
+  as a request for `data/x.txt` would be, and so are the composed and
+  decomposed forms of a name on any APFS disk. Where the coordinator folds nothing (`fold_profile` `none` or
+  `cannot_tell`), and in the other cases
+  [One file, many spellings](#one-file-many-spellings) lists, another
+  spelling is another file: on a disk that still opens it as the holder's
+  file, it gets no refusal and overwrites that file. An older coordinator
+  tracks a path by its spelling, `./` and `//` included.
 - **A reclaimed holder's pending write can still land.** On both coordinators
   a reclaim does not stop a write the holder had already been admitted for:
   that write can reach the file after the reclaim. Its `post-edit` is refused,
@@ -5528,6 +5747,16 @@ plainly:**
   Under a subdirectory root that holds a directory of its own name, such as
   `repo/sub/sub/`, a write to one file can be checked against another and read
   as no foreign write.
+- **On a disk that folds names, a file is checked under git's spelling.** Git
+  reports a file only under the name in its index: asked about `PLAN.MD` when
+  the index has `plan.md`, it reports nothing. So on a coordinator
+  newer than 0.15.0 whose disk folds names (see
+  [One file, many spellings](#one-file-many-spellings)), each check reads
+  git's index first and asks about each file under the index's own spelling
+  of it: an outside edit of a file the coordinator records as `PLAN.MD`, or in
+  another Unicode form, while git's index has `plan.md` is counted. A file no
+  index name folds to is checked under its own name and counts only when git
+  reports that exact name, such as a staged deletion or a rename's old side.
 - **A suppression expires.** A mismatch excused as a write still landing is
   re-examined once the window passes. If no write ever landed, it becomes a
   foreign write and is counted as one. The benefit of the doubt is temporary.
@@ -5749,7 +5978,7 @@ inside it.
 
 | Command | What it does |
 |---|---|
-| `agent-coherence-status [--detail LEVEL] [--json] [--show-policy]` | prints `/status` as a table, or with `--json` as the body itself. `LEVEL` picks the view: `minimal`, which names no session; `full`, the operator view, asked for with the `Coherence-Local-Operator: true` header; or `metrics`, the counters only. With no `--detail` it asks for the coordinator's default view, which is `minimal`, and sends no operator header. `--show-policy` adds the user-added tracked paths no hook has seen yet; it needs `--detail full`, because only the operator view carries them |
+| `agent-coherence-status [--detail LEVEL] [--json] [--show-policy]` | prints `/status` as a table, or with `--json` as the body itself. `LEVEL` picks the view: `minimal`, which names no session; `full`, the operator view, asked for with the `Coherence-Local-Operator: true` header; or `metrics`, the counters and facts about the coordinator, with no path or session. With no `--detail` it asks for the coordinator's default view, which is `minimal`, and sends no operator header. `--show-policy` adds the user-added tracked paths no hook has seen yet; it needs `--detail full`, because only the operator view carries them |
 | `agent-coherence-track path [path ...]` | adds the paths to the coordinator's tracked set (`POST /policy/track`) |
 | `agent-coherence-untrack path [path ...]` | adds the paths to the coordinator's ignored set (`POST /policy/untrack`); a path enforced in strict mode is refused, and then nothing is untracked |
 
@@ -5898,14 +6127,16 @@ serves the default and `metrics` views in a shape of its own and answers
 
 | View | Ask with | Carries |
 |---|---|---|
-| `metrics` | `?detail=metrics` | counters only |
+| `metrics` | `?detail=metrics` | the counters and facts about the coordinator, with no path or session |
 | `minimal`, the default | no `detail`, or `?detail=minimal` | the tracked paths and who holds them, without session names or absolute paths |
 | `full`, the operator view | `?detail=full` with the `Coherence-Local-Operator: true` header; without the header the answer is `403` | session names, the absolute root, the pattern lists and the grant detail |
 
 **`metrics`** carries `coordinator_version`, `coordinator_backend`,
 `coordinator_uptime_seconds`, `registry_schema_version`, `pre_edit_if_unheld`
 (JSON `true`: this coordinator refuses an opted-in `pre-edit`; see
-[Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)) and the counters:
+[Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)), `fold_profile`
+and `fold_table_unicode` (how this coordinator keys file names; see
+[One file, many spellings](#one-file-many-spellings)) and the counters:
 `endpoint_counters`, request counts by route, and the rest, such as
 `watchdog_timeouts_total`, `sweep_reclaims_total` and
 `caller_principal_absent_total`. It names no path, no process id and no
@@ -5916,7 +6147,10 @@ session. It does not read the registry, so it is never degraded.
 - `tracked_artifacts`: one entry per path the coordinator has a record for,
   with the `path` relative to the workspace root, its `version` and its
   artifact `id`, and a [`handoff` key](#the-handoff-key) while the path has a
-  transfer record. Untracking a path does not remove its entry;
+  transfer record. Untracking a path does not remove its entry. On a disk
+  that folds names, a coordinator newer than 0.15.0 lists a record it made
+  for an existing file under the disk's spelling of that file, whatever
+  spelling first reached it;
 - `sessions`: one row per agent that this coordinator process has seen or
   that holds a path, except an agent that has ended: a `CoherentVolume`
   attempt the volume has ended (see

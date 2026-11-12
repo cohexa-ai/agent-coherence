@@ -18,8 +18,10 @@ Alpha — APIs may change before `v1.0`.
   hold; the volume keeps a read of the version it held, so it reads and writes
   the file again with no `reacquire()` until a peer writes it, and a refuse-mode
   peer is admitted at once. The volume decides what to release from its own
-  record, so `release()` of a path it never wrote, or of another spelling of a
-  path it wrote (a different case or Unicode form, #506), sends nothing.
+  record, so `release()` of a path it never wrote sends nothing. Another
+  spelling of a path it wrote is that path where the coordinator keys the two
+  as one file (a different case or Unicode form on a disk that folds it, #506),
+  and another path, which sends nothing, on a disk that keeps them apart.
   `close()` releases every grant; from then on every operation but `close()`
   raises `CoherenceError` and sends nothing, and the new `closed` property says
   so. `with CoherentVolume(...) as vol:` closes on exit, and when the body
@@ -220,6 +222,165 @@ Alpha — APIs may change before `v1.0`.
   leaves open.
 
 ### Changed
+
+- **Every spelling the workspace disk opens as one file reaches that one file,
+  for every client (#506).** The coordinator identified a file by the exact path a client sent, but a
+  macOS disk opens `PLAN.MD` and `plan.md`, or a composed and a decomposed `é`,
+  as one file. One file could then get several records, each with its own write
+  grant: an edit of `DATA/X.TXT` did not meet another agent's grant on
+  `data/x.txt`, a refuse-mode volume's write of it was not refused, and a stale
+  session's edit of `PLAN.MD` was admitted where a strict `plan.md` is denied.
+  On every disk, `./data/x.txt`, `data//x.txt` and `data/./x.txt` each got a
+  record of their own, and `.//data/x.txt` slipped past strict mode. Now, with
+  no flag, for Claude Code hook sessions, `CoherentVolume`, snapshot sessions,
+  handoffs, workspace checkpoints and the effect fence:
+  - every spelling the workspace disk treats as one file, plus its `./` and
+    `//` variants, reaches the same holder, the same refusal and the same
+    strict-mode rule, and a `tracked.yaml`, `ignored.yaml` or
+    `strict_mode.yaml` pattern, a volume's `managed` glob included, matches
+    all of them;
+  - on a disk that folds nothing, names that differ only by case or accent
+    form stay separate files, as before: only `./` segments and repeated `/`
+    are tidied;
+  - a new record takes the disk's own spelling when the file exists, and every
+    answer repeats the path exactly as the request sent it;
+  - two spellings of one file in one request count as one name sent twice:
+    `/session/begin` pins the file once and a Bash command reads it once, and
+    `/session/commit_all`, `/handoff/transfer`, a checkpoint's file members and
+    a restore registration refuse the pair with their existing duplicate
+    error;
+  - on a disk that folds names, a Grep's search directory reaches the tracked
+    files under every spelling the disk treats as that directory, and the
+    untrack command refuses an entry that covers a strict path under another
+    spelling.
+
+  How the coordinator learns the disk:
+  - once per start, while it holds the store's single-writer lock and before
+    it answers any request, it creates and removes a few probe files inside
+    `.coherence`, and nowhere else; no hook creates a file to find out;
+  - `/status` shows the result in every view and in the degraded answer:
+    `fold_profile` is `caseless` (case and accent forms fold, as on the macOS
+    default, case-insensitive APFS), `nfd` (accent forms only, as on
+    case-sensitive APFS), `none` or `cannot_tell`, and `fold_table_unicode` is
+    the Unicode version of the fold table, `17.0.0`;
+  - a disk it cannot classify (`cannot_tell`: HFS+, exFAT, FAT, a `.coherence`
+    on another device than the workspace, a probe step that fails) folds
+    nothing, and the coordinator logs why, once;
+  - a coordinator that runs without its single-writer lock folds nothing and
+    merges nothing.
+
+  Records an older build split for one file:
+  - at the first start they are merged into one record when their names still
+    reach the same file on disk, `./` and `//` splits included;
+  - at most one write grant survives: the single write holder of the record
+    whose content matches the file on disk keeps it, and when no single holder
+    fits, nobody does;
+  - every other agent on the file stays on it as stale: a holder that lost its
+    write grant gets a notice, and its next commit is refused
+    (`commit_not_allowed`) until it reads the file again. The state log
+    records each move under the new trigger `fold_merge`, which the operator
+    view of `/status` also shows as a demoted holder's reclaim trigger;
+  - a snapshot session that pinned one of the records is ended, every handoff
+    record on them ends withdrawn, and their conflict and foreign-write counts
+    are added together;
+  - records whose file is missing at start, and records holding retained
+    versions other than the one kept, are not merged but act as one file; the
+    coordinator logs each merge and each group it left apart.
+
+  Names that are not files: a hook request that sends `"name_kind": "key"`
+  names an object or row key, which is kept and matched exactly, never tidied,
+  folded or merged, and stays a key across restarts. `CoherentRow` and
+  `CoherentObject` sessions send it with every key, and a `CoherentVolume`
+  built with `remote_endpoint` with each path it sends to a hook route,
+  because the remote coordinator's disk is not its own. A checkpoint member is
+  a file only when its `arbitration_tier` is `no-arbiter` and its
+  `restore_tier` is not `forward_only`; every other member stays exact. Any
+  other `name_kind` value is refused with HTTP `400`, as an invalid path is.
+  The Claude Code hooks never send the field.
+
+  `CoherentVolume`:
+  - at every local attach it reads `fold_profile` and `fold_table_unicode`
+    from the default view of `/status`, and keys every per-file record by that
+    profile, as the coordinator does: grants, reads, content hashes, read
+    handoffs and held paths. On a disk that folds case, `release("data/x.txt")`
+    gives back the grant a write of `DATA/x.txt` took, `DATA/x.txt` is under
+    `managed=("data/**",)`, and `transfer()` and `atomic_publish()` refuse two
+    spellings of one file as a path named twice. A coordinator without the
+    fields, `cannot_tell`, a value the volume does not know and a fold table of
+    another Unicode version all key names exactly;
+  - in refuse mode, an attach that cannot read `/status` raises
+    `CoordinatorUnreachable` (no answer) or `CoherenceError` (an unusable
+    answer), and one that finds a fold table of another Unicode version raises
+    `CoherenceError`, each before it sends anything;
+  - in refuse mode, a `write()` through a link whose name is under `managed` to
+    a file outside it raises the new `LinkOutOfManaged` (in
+    `ccs.core.exceptions`; `reason` is `"link_out_of_managed"`, and it carries
+    `path`, `link` and `target`) before it sends anything, and nothing is
+    written. Such a write used to send no flag and take the file from its
+    holder under a name that promised the refusal. The volume decides from the
+    links as they stand when `write()` is called. A link under `managed` to a
+    file under `managed` writes as before.
+
+  Also:
+  - the MCP server compares names by the profile `/status` advertises: after a
+    denied read, `swg_read` finds the path's handoff record under any spelling
+    of the file, and `swg_write_cas` counts consecutive conflicts on every
+    spelling of one file toward one limit. Its tools accept `.//data/x` as
+    `data/x`, where they refused it;
+  - the Claude Code hook client still follows links and keeps the case a path
+    was typed in. It now skips a Read, Edit or Write through a link that does
+    not resolve (dangling or looping), which it sent before, and reaches the
+    coordinator when a tool path spells the workspace root in another case
+    than the disk (`REPO` for `Repo`), where it skipped the hook. A `/var`
+    path for a root under `/private/var` on macOS already reached it, since
+    the client resolves both the root and the path. `agent-coherence-track`,
+    `-untrack`, the handoff commands and `agent-coherence-workspace
+    checkpoint` accept a root typed in another case, and refuse a path
+    through a link that does not resolve with `link does not resolve`;
+  - a file reached through a linked directory matches patterns written against
+    its target's path, as before with this package's hook client and now with
+    the plugin's Node hook client too. When it loads or reloads the policy, the
+    coordinator logs each tracked or strict pattern whose directories pass
+    through a link inside the workspace, or that names a link to a file, and
+    says when the link's target is outside the workspace, where a Read, Edit or
+    Write through it is not coordinated;
+  - the git foreign-write check, on a disk that folds names, reads git's index
+    first and checks each file under git's own spelling of it, so an outside
+    edit of a file recorded as `PLAN.MD` while git's index has `plan.md`, or in
+    another Unicode form, is counted. A record no index name folds to is
+    checked under its own name and counts only when git reports that exact
+    name.
+
+  New modules: `ccs.core.path_fold` (the fold, from one table generated from
+  the Unicode Character Database 17.0.0 and shared byte for byte with the
+  Claude Code plugin), `ccs.core.disk_spelling` (the link and disk-spelling
+  resolvers) and `ccs.adapters.claude_code.fs_profile` (the start probe). The
+  wheel ships the table as `ccs/core/fold_data/fold_table.json`, with the
+  Unicode License v3 notice that covers it beside it. `ccs.mcp.status` gains
+  `fold_profile_of`.
+
+  Compatibility: upgrade `CoherentVolume`, the MCP server, `CoherentRow` and
+  `CoherentObject` together with the coordinator. Older ones compare paths
+  exactly as they spelled them, so against this coordinator, which records a
+  file under the disk's spelling, they can miss a file they wrote or a record
+  `/status` lists; an older `CoherentRow` or `CoherentObject` sends no
+  `name_kind`, so its keys are keyed as file names and two keys that differ
+  only by case or Unicode form share one record on a folding disk, which gives
+  spurious conflicts, never a lost write. A record an older build created
+  carries no kind, so a key spelled like an existing workspace file is treated
+  as that file. Code that reads state-log or `/status` reclaim triggers must
+  accept `fold_merge`. The Claude Code plugin's Node coordinator and hook
+  client make the same change in plugin releases after 0.6.0; use this release
+  with one of those, so both coordinators and both hook clients fold names
+  alike. What this does not cover, stated in the guide's "One file, many
+  spellings" section: a mount inside the workspace that folds names otherwise
+  than the workspace's disk, ext4's per-directory case folding, a disk the
+  start cannot classify (no CI job runs on a Linux disk that folds names),
+  characters newer than Unicode 17.0.0, a `?` or `[...]` class facing a
+  character that folds to several, hard links, Bash arguments and Grep
+  directories matched as typed, key records an older build created, and a
+  checkpoint an older build recorded with two spellings of one file, which
+  refuses restore with the duplicate error.
 
 - **A local client sends nothing to a coordinator that has exited (#503).** A
   client finds the coordinator through the port in `.coherence/server.pid` and
