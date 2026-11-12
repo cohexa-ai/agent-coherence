@@ -2623,6 +2623,11 @@ still has several records.
   folds to several, a pattern can miss a spelling: a strict `stra?e.md` does
   not match a request spelled `STRASSE.MD` unless the file on disk is spelled
   `straße.md`. Add the spelled-out form (`strasse.md`) as its own entry.
+- **A `[...]` class that names more than 64 characters, or with a range
+  written high to low** (`[z-a]`), meets the folded name as written, so it can
+  miss a spelling in another case. A narrower class, a negated one included,
+  is folded with the name: on a disk that folds case, a strict
+  `docs/[A-Z]*.md` holds `docs/plan.md` and `docs/[!a-z]*.md` does too.
 - **A hard link** is a second name, with a record of its own.
 - **A key record an older build created** carries no kind, so a key spelled
   like an existing workspace file is treated as that file.

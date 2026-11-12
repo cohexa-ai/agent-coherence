@@ -377,7 +377,8 @@ Alpha — APIs may change before `v1.0`.
   than the workspace's disk, ext4's per-directory case folding, a disk the
   start cannot classify (no CI job runs on a Linux disk that folds names),
   characters newer than Unicode 17.0.0, a `?` or `[...]` class facing a
-  character that folds to several, hard links, Bash arguments and Grep
+  character that folds to several, a `[...]` class that names more than 64
+  characters or holds a range written high to low, hard links, Bash arguments and Grep
   directories matched as typed, key records an older build created, and a
   checkpoint an older build recorded with two spellings of one file, which
   refuses restore with the duplicate error.

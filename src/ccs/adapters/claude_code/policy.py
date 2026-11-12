@@ -34,10 +34,10 @@ Design constraints:
   readings does: the pattern as written against the name as requested, tidied
   (:func:`ccs.core.path_fold.tidy_path`), and as typed; the pattern as written
   against the spelling the disk stores, when the coordinator has one; and the
-  pattern with its literal characters folded against the folded name. A disk
-  that folds nothing uses the first two readings alone, so folding only ever
-  adds matches. A key, a name that is not a workspace file, is matched as
-  requested only (:class:`PolicyMatchContext`).
+  pattern with its literal characters and classes folded against the folded
+  name. A disk that folds nothing uses the first two readings alone, so
+  folding only ever adds matches. A key, a name that is not a workspace file,
+  is matched as requested only (:class:`PolicyMatchContext`).
 """
 
 from __future__ import annotations
@@ -60,7 +60,9 @@ from ccs.core.disk_spelling import native_spelling, resolve_links
 from ccs.core.path_fold import (
     FoldingProfile,
     FoldProfile,
+    code_points_folding_to,
     exceeds_fold_limit,
+    fold_code_point,
     policy_fold,
     policy_fold_text,
     tidy_path,
@@ -367,7 +369,7 @@ class TrackedArtifactPolicy:
         patterns.
 
         On a folding ``profile`` the search runs as written first, then again
-        with the literal characters of both sides folded for each strict
+        with both sides folded (:func:`_fold_glob_literals`) for each strict
         pattern not yet covered, under the same budgets: a name still matches
         a pattern as written, so the search as written keeps every refusal it
         makes, and the folded search only adds refusals."""
@@ -407,9 +409,9 @@ class TrackedArtifactPolicy:
 
     def _build_coverage(self, profile: FoldProfile) -> "_CoverageView":
         """The strict and tracked patterns the coverage search reads under
-        ``profile``: as written for ``none``, with their literal characters
-        folded for a folding profile. Each glob reports the pattern as
-        written."""
+        ``profile``: as written for ``none``, folded
+        (:func:`_fold_glob_literals`) for a folding profile. Each glob reports
+        the pattern as written."""
         text_of = None if profile == "none" else self._folded_patterns_for(profile).text_of
         return _CoverageView(
             # A literal strict path no tracked pattern reaches puts nothing in
@@ -606,6 +608,12 @@ _CLASS_MEMBER_LIMIT = 64
 character. Every member joins the search alphabet, and every explored state
 walks the whole alphabet, so an unbounded class made one untrack entry cost
 minutes."""
+_FOLDED_CLASS_MEMBER_LIMIT = 2 * _CLASS_MEMBER_LIMIT
+"""Characters a class of a folded pattern (:func:`_fold_glob_literals`) may
+enumerate. The fold adds at most one member per member to a class of at most
+:data:`_CLASS_MEMBER_LIMIT`, so the search still reads a class the fold grew
+member by member, as it reads the class as written: read as any one
+character, it covered names no spelling of the class holds."""
 
 
 def _class_close(pattern: str, start: int) -> int:
@@ -623,27 +631,35 @@ def _class_close(pattern: str, start: int) -> int:
     return pattern.find("]", j)
 
 
-def _glob_tokens(pattern: str) -> list[tuple]:
+def _glob_tokens(pattern: str, member_limit: int = _CLASS_MEMBER_LIMIT) -> list[tuple]:
+    return _double_star_tokens(pattern) if "**" in pattern else _fnmatch_tokens(pattern, member_limit)
+
+
+def _double_star_tokens(pattern: str) -> list[tuple]:
     tokens: list[tuple] = []
     i = 0
-    if "**" in pattern:
-        while i < len(pattern):
-            c = pattern[i]
-            if c == "*" and i + 1 < len(pattern) and pattern[i + 1] == "*":
-                tokens.append((_ANY_RUN,))
-                i += 2
-                if i < len(pattern) and pattern[i] == "/":
-                    i += 1
-            elif c == "*":
-                tokens.append((_SEG_RUN,))
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "*" and i + 1 < len(pattern) and pattern[i + 1] == "*":
+            tokens.append((_ANY_RUN,))
+            i += 2
+            if i < len(pattern) and pattern[i] == "/":
                 i += 1
-            elif c == "?":
-                tokens.append((_SEG_ONE,))
-                i += 1
-            else:
-                tokens.append((_LIT, c))
-                i += 1
-        return tokens
+        elif c == "*":
+            tokens.append((_SEG_RUN,))
+            i += 1
+        elif c == "?":
+            tokens.append((_SEG_ONE,))
+            i += 1
+        else:
+            tokens.append((_LIT, c))
+            i += 1
+    return tokens
+
+
+def _fnmatch_tokens(pattern: str, member_limit: int) -> list[tuple]:
+    tokens: list[tuple] = []
+    i = 0
     while i < len(pattern):
         c = pattern[i]
         i += 1
@@ -652,42 +668,63 @@ def _glob_tokens(pattern: str) -> list[tuple]:
         elif c == "?":
             tokens.append((_ANY_ONE,))
         elif c == "[":
-            # fnmatch.translate: '!' negates, a leading ']' is literal, and an
-            # unterminated '[' is a literal '['.
+            # fnmatch.translate: an unterminated '[' is a literal '['.
             j = _class_close(pattern, i)
             if j < 0:
                 tokens.append((_LIT, "["))
                 continue
-            body = pattern[i:j]
+            negated, members, _ = _read_class(pattern[i:j], member_limit)
             i = j + 1
-            negated = body.startswith("!")
-            if negated:
-                body = body[1:]
-            members: set[str] = set()
-            too_wide = False
-            k = 0
-            while k < len(body) and not too_wide:
-                if k + 2 < len(body) and body[k + 1] == "-":
-                    lo, hi = body[k], body[k + 2]
-                    if ord(hi) - ord(lo) < _CLASS_MEMBER_LIMIT:
-                        members.update(chr(o) for o in range(ord(lo), ord(hi) + 1))
-                    else:
-                        too_wide = True
-                    k += 3
-                else:
-                    members.add(body[k])
-                    k += 1
-                too_wide = too_wide or len(members) > _CLASS_MEMBER_LIMIT
-            if too_wide:
-                # Any one character accepts more than the class does, never
-                # less, in either polarity (a negated class accepts '/' too):
-                # approximate toward "intersects".
-                tokens.append((_ANY_ONE,))
-            else:
-                tokens.append((_CLASS, negated, frozenset(members)))
+            # For a class too wide to enumerate, any one character accepts
+            # more than the class does, never less, in either polarity (a
+            # negated class accepts '/' too): approximate toward "intersects".
+            tokens.append((_ANY_ONE,) if members is None else (_CLASS, negated, members))
         else:
             tokens.append((_LIT, c))
     return tokens
+
+
+class _ClassReading(NamedTuple):
+    """A class body as :func:`_read_class` reads it."""
+
+    negated: bool
+    members: frozenset[str] | None
+    """The characters it names, or None when that is more than the limit."""
+    has_reversed_range: bool
+    """Whether it holds a range from a higher character to a lower one, which
+    names none here. fnmatch drops such a range together with both its ends,
+    so a ``!`` right after it can lead what is left and negate it: fnmatch
+    reads ``[z-a!X]`` as ``[^X]``, not as the members ``!`` and ``X``."""
+
+
+def _read_class(body: str, member_limit: int = _CLASS_MEMBER_LIMIT) -> _ClassReading:
+    """A class body, the text between ``[`` and the ``]`` :func:`_class_close`
+    finds, read as fnmatch.translate reads it, but for a reversed range
+    (:attr:`_ClassReading.has_reversed_range`): whether a leading ``!``
+    negates it, and the characters it names, up to ``member_limit``. A
+    leading ``]`` is a member, ``lo-hi`` names every character from lo to hi,
+    and a ``-`` that ends the body is a member. The tokens and the class fold
+    both read a class here, so the coverage search and the folded pattern
+    agree on it."""
+    negated = body.startswith("!")
+    chars = body[1:] if negated else body
+    members: set[str] = set()
+    has_reversed_range = False
+    k = 0
+    while k < len(chars):
+        if k + 2 < len(chars) and chars[k + 1] == "-":
+            lo, hi = chars[k], chars[k + 2]
+            if ord(hi) - ord(lo) >= member_limit:
+                return _ClassReading(negated, None, has_reversed_range)
+            has_reversed_range = has_reversed_range or hi < lo
+            members.update(chr(o) for o in range(ord(lo), ord(hi) + 1))
+            k += 3
+        else:
+            members.add(chars[k])
+            k += 1
+        if len(members) > member_limit:
+            return _ClassReading(negated, None, has_reversed_range)
+    return _ClassReading(negated, frozenset(members), has_reversed_range)
 
 
 def _token_accepts(token: tuple, ch: str | None) -> bool:
@@ -809,7 +846,16 @@ class _Glob(NamedTuple):
 
     @classmethod
     def of(cls, pattern: str, source: str | None = None) -> "_Glob":
-        tokens = _glob_tokens(pattern)
+        return cls._of(pattern, _glob_tokens(pattern), source)
+
+    @classmethod
+    def folded(cls, text: str, source: str) -> "_Glob":
+        """The folded ``text`` of the pattern or entry ``source``, tokenized
+        under :data:`_FOLDED_CLASS_MEMBER_LIMIT`."""
+        return cls._of(text, _glob_tokens(text, _FOLDED_CLASS_MEMBER_LIMIT), source)
+
+    @classmethod
+    def _of(cls, pattern: str, tokens: list[tuple], source: str | None) -> "_Glob":
         return cls(pattern, tokens, _literal_affixes(tokens), pattern if source is None else source)
 
 
@@ -829,17 +875,18 @@ class _CoverageSearch(NamedTuple):
 def _coverage_glob(pattern: str, text_of: dict[str, str] | None) -> _Glob:
     """``pattern`` as the coverage search reads it: as written, or by its
     folded text when ``text_of`` maps it."""
-    return _Glob.of(pattern) if text_of is None else _Glob.of(text_of[pattern], source=pattern)
+    return _Glob.of(pattern) if text_of is None else _Glob.folded(text_of[pattern], pattern)
 
 
 def _entry_glob(pattern: str, profile: FoldProfile = "none") -> _Glob:
     """An untrack entry as a glob. Paths are matched with a leading "./"
     stripped, so an entry spelled that way names the same paths; the entry is
     not tidied, so the search reads it as written. On a folding ``profile``
-    its literal characters are folded, as the strict and tracked patterns it
-    is searched against are, and uncached, so a client cannot grow a cache."""
+    it is folded (:func:`_fold_glob_literals`), as the strict and tracked
+    patterns it is searched against are, and uncached, so a client cannot
+    grow a cache."""
     entry = _strip_leading_dot_slash(pattern) or pattern
-    return _Glob.of(entry) if profile == "none" else _Glob.of(_fold_glob_literals(entry, profile), source=entry)
+    return _Glob.of(entry) if profile == "none" else _Glob.folded(_fold_glob_literals(entry, profile), entry)
 
 
 def _iter_covered(view: _CoverageView, entry: _Glob, budget: _SearchBudget) -> Iterator[str]:
@@ -933,10 +980,11 @@ def _globs_intersect(token_lists: Sequence[list[tuple]], budget: _SearchBudget) 
     A product of the patterns' automata searched over an alphabet of every
     character the patterns name, ``/``, and one stand-in for every other
     character. Exact for ``*``, ``**`` and ``?``; a class wider than
-    :data:`_CLASS_MEMBER_LIMIT` characters is approximated so it accepts more,
-    never less. Each transition is charged to ``budget`` at the size of the
-    state it leaves; running out raises :class:`_BudgetExhausted`, which every
-    caller counts as "intersects"."""
+    :data:`_CLASS_MEMBER_LIMIT` characters (:data:`_FOLDED_CLASS_MEMBER_LIMIT`
+    in a folded pattern) is approximated so it accepts more, never less. Each
+    transition is charged to ``budget`` at the size of the state it leaves;
+    running out raises :class:`_BudgetExhausted`, which every caller counts as
+    "intersects"."""
     # Most pairs an untrack check meets (``.log`` against ``.json``, ``svc3/``
     # against ``svc7/``) fail on their literal ends: settled without a search.
     if not _affixes_nest([_literal_affixes(t) for t in token_lists]):
@@ -1081,12 +1129,13 @@ def _fold_patterns(patterns: Iterable[str], profile: FoldingProfile) -> _FoldedP
 
 
 def _fold_glob_literals(pattern: str, profile: FoldingProfile) -> str:
-    """``pattern`` with each run of literal characters folded where it stands:
-    ``*``, ``?`` and, in a pattern without ``**``, each ``[...]`` class stay
-    as written (with ``**``, ``[`` is a literal). No fold produces
-    ``* ? [ ] ! /``, so the folded pattern parses into the same wildcards and
-    classes, and the same matcher reads it. Not tidied: tidying the lone
-    ``.`` in ``*.*`` would change what the pattern matches."""
+    """``pattern`` with each run of literal characters folded where it stands
+    and, in a pattern without ``**``, each ``[...]`` class folded
+    (:func:`_fold_class`); ``*`` and ``?`` stay as written (with ``**``,
+    ``[`` is a literal). No fold produces ``* ? [ ] ! / -``, so the folded
+    pattern parses into the same wildcards and classes, but for a class that
+    becomes ``?``, and the same matcher reads it. Not tidied: tidying the
+    lone ``.`` in ``*.*`` would change what the pattern matches."""
     has_classes = "**" not in pattern
     parts: list[str] = []
     literal_start = i = 0
@@ -1095,10 +1144,62 @@ def _fold_glob_literals(pattern: str, profile: FoldingProfile) -> str:
         if end is None:
             i += 1
             continue
-        parts += [policy_fold_text(pattern[literal_start:i], profile), pattern[i:end]]
+        wildcard = pattern[i:end]
+        folded = _fold_class(wildcard, profile) if wildcard.startswith("[") else wildcard
+        parts += [policy_fold_text(pattern[literal_start:i], profile), folded]
         literal_start = i = end
     parts.append(policy_fold_text(pattern[literal_start:], profile))
     return "".join(parts)
+
+
+def _fold_class(text: str, profile: FoldingProfile) -> str:
+    """The class ``text`` (``[...]``) as the folded name meets it: it accepts
+    a folded character exactly when the class as written accepts a spelling
+    that folds to it, so every spelling of a file gets the answer one of them
+    gets. Copied as written when that already holds, and, as a stated limit,
+    when the class is too wide to enumerate or holds a reversed range, which
+    fnmatch can read otherwise than its members say. A member that folds to
+    several code points adds nothing: a class meets one character."""
+    negated, members, has_reversed_range = _read_class(text[1:-1])
+    if members is None or has_reversed_range:
+        return text
+    folded = _members_only_they_spell(members, profile) if negated else _members_and_folds(members, profile)
+    if folded == members:
+        return text
+    if not folded:
+        # Only a negated class shrinks. One that refuses no folded character
+        # is fnmatch's '?', which accepts any one, '/' included, as it does.
+        return "?"
+    return _class_text(folded, negated)
+
+
+def _members_and_folds(members: frozenset[str], profile: FoldingProfile) -> frozenset[str]:
+    """A positive class's members with the one-code-point fold of each."""
+    folds = (fold_code_point(member, profile) for member in members)
+    return members | {fold for fold in folds if fold is not None}
+
+
+def _members_only_they_spell(members: frozenset[str], profile: FoldingProfile) -> frozenset[str]:
+    """The members of a negated class the folded name must still not carry:
+    those no code point outside the class folds to. A folded name holds only
+    folded characters, so a member some outside spelling folds to stands for
+    a file the class as written accepts under that spelling."""
+    return frozenset(member for member in members if code_points_folding_to(member, profile) <= members)
+
+
+def _class_text(members: frozenset[str], negated: bool) -> str:
+    """The one spelling both coordinators write for a class of ``members``:
+    no ranges, ``]`` first and ``-`` last, where neither closes the class nor
+    makes a range, and every other member once, in code point order. In a
+    positive class a leading ``!`` would negate it, so ``!`` moves after every
+    other member, before any ``-``; no fold makes ``!``, so a class the fold
+    changed always has another member to lead with."""
+    middle = sorted(members - {"]", "-"})
+    if not negated and "]" not in members and middle[:1] == ["!"]:
+        middle = [*middle[1:], "!"]
+    head = "]" if "]" in members else ""
+    tail = "-" if "-" in members else ""
+    return f"[{'!' if negated else ''}{head}{''.join(middle)}{tail}]"
 
 
 def _wildcard_end(pattern: str, at: int, has_classes: bool) -> int | None:

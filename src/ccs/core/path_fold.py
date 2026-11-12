@@ -28,6 +28,7 @@ folded. The folds themselves stay O(n log n) at any length.
 
 from __future__ import annotations
 
+import functools
 import json
 from collections.abc import Callable, Iterable, Sequence
 from importlib import resources
@@ -208,6 +209,47 @@ def policy_fold_text(text: str, profile: FoldingProfile) -> str:
     return _map_segments(
         text, lambda segment: _from_code_points(_canonical_composition(_segment_key(segment, profile)))
     )
+
+
+def fold_code_point(char: str, profile: FoldingProfile) -> str | None:
+    """:func:`policy_fold_text` of the one code point ``char`` when that is
+    one code point too, else None (U+00DF folds to ``ss`` caselessly). Looked
+    up, not worked out: a class fold asks this of every member of every
+    class, and an untrack request's entries can hold thousands of them."""
+    return _single_folds(profile).get(char, char)
+
+
+def code_points_folding_to(char: str, profile: FoldingProfile) -> frozenset[str]:
+    """Every code point whose :func:`fold_code_point` is ``char``: caselessly,
+    ``k``, ``K`` and the Kelvin sign for ``k``, and none for ``K``."""
+    spellings = _fold_inverse(profile).get(char, frozenset())
+    return spellings | {char} if fold_code_point(char, profile) == char else spellings
+
+
+@functools.cache
+def _single_folds(profile: FoldingProfile) -> dict[str, str | None]:
+    """:func:`fold_code_point` over the table's domain, built on first use.
+    Only a code point with a case-folding or a decomposition entry can fold
+    to anything but itself (a Hangul syllable decomposes and recomposes to
+    itself), so every code point outside the domain folds to itself, and the
+    other runtime, reading the same table, builds the same map."""
+    folds: dict[str, str | None] = {}
+    for code_point in _DECOMPOSITION.keys() | _CASE_FOLDING.keys():
+        char = chr(code_point)
+        folded = policy_fold_text(char, profile)
+        folds[char] = folded if len(folded) == 1 else None
+    return folds
+
+
+@functools.cache
+def _fold_inverse(profile: FoldingProfile) -> dict[str, frozenset[str]]:
+    """:func:`fold_code_point` inverted over the table's domain, built on
+    first use from :func:`_single_folds`."""
+    inverse: dict[str, set[str]] = {}
+    for char, folded in _single_folds(profile).items():
+        if folded is not None:
+            inverse.setdefault(folded, set()).add(char)
+    return {folded: frozenset(chars) for folded, chars in inverse.items()}
 
 
 def exceeds_fold_limit(text: str) -> bool:

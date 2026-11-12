@@ -14,11 +14,12 @@ Node coordinator runs the same scenarios against its own policy.
 
 from __future__ import annotations
 
+import fnmatch
 import itertools
 import json
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,7 +29,8 @@ from ccs.adapters.claude_code import policy as policy_module
 from ccs.adapters.claude_code.coordinator_server import _handle_policy_untrack
 from ccs.adapters.claude_code.fs_profile import FoldProfileResult
 from ccs.adapters.claude_code.policy import PolicyMatchContext, TrackedArtifactPolicy, matches_any
-from ccs.core.path_fold import FoldProfile
+from ccs.core import path_fold
+from ccs.core.path_fold import FoldingProfile, FoldProfile, policy_fold_text
 
 PROFILES: tuple[FoldProfile, ...] = ("none", "nfd", "caseless")
 
@@ -148,16 +150,332 @@ def test_with_strasse_on_disk_a_question_mark_glob_matches_an_upper_case_request
     assert not policy.is_tracked("STRASSE.MD", file("caseless"))
 
 
-def test_with_a_capital_file_on_disk_a_class_matches_a_lower_case_request_by_the_disk_spelling(
+def test_with_a_capital_file_on_disk_a_class_matches_a_lower_case_request_on_a_caseless_disk(
     policy_with: LoadPolicy, tmp_path: Path
 ) -> None:
     disk = _stored_spelling(tmp_path / "disk", "A.md")
     policy = policy_with({"tracked": ["[A-Z]*.md"]})
     assert policy.is_tracked("a.md", file("caseless", disk))
-    # A class stays as written in the folded pattern, so the folded reading alone does not match.
-    assert not policy.is_tracked("a.md", file("caseless"))
+    # The folded class holds the fold of each member, so the folded reading matches without the disk spelling too.
+    assert policy.is_tracked("a.md", file("caseless"))
     # A disk that folds nothing matches by the request spelling alone.
     assert not policy.is_tracked("a.md", file("none", disk))
+
+
+# ------------------------------------------------------------------ class fold
+
+_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+
+@pytest.mark.parametrize(
+    ("pattern", "folded"),
+    [
+        # A positive class gains the fold of each member...
+        ("docs/[A-Z]*.md", f"docs/[{_LETTERS}]*.md"),
+        ("[P]", "[Pp]"),
+        ("DOCS/[P]LAN.MD", "docs/[Pp]lan.md"),
+        ("[\u212b]", "[\u00e5\u212b]"),
+        # ...and is copied as written when it holds them all already.
+        ("[a-z]", "[a-z]"),
+        ("[Pp]", "[Pp]"),
+        # A member that folds to several code points adds nothing.
+        ("[\u00df]", "[\u00df]"),
+        # A spelling outside the class (A to Z, the Kelvin sign, the long s)
+        # folds to each of a to z, so the folded name meets no member.
+        ("[!a-z]", "?"),
+        # No code point folds to P or to any capital: copied as written.
+        ("[!P]", "[!P]"),
+        ("[!A-Z]", "[!A-Z]"),
+        # The Kelvin sign, outside the class, folds to k: only K stays refused.
+        ("[!kK]", "[!K]"),
+        ("[!]a]", "[!]]"),
+        ("[!-a]", "[!-]"),
+        # After the negating '!', a member '!' leads as it sorts.
+        ("[!!Ka]", "[!!K]"),
+        # One spelling per member set: ']' first, '-' last, a '!' that would
+        # lead a positive class moved after every other member...
+        ("[]A]", "[]Aa]"),
+        ("[A!]", "[Aa!]"),
+        ("[-A!]", "[Aa!-]"),
+        ("[]!A]", "[]!Aa]"),
+        # ...and the rest in code point order, so U+FF41 comes before U+10400.
+        ("[\uff21\U00010400]", "[\uff21\uff41\U00010400\U00010428]"),
+        # An unterminated '[' is a literal.
+        ("DOCS/[PLAN", "docs/[plan"),
+    ],
+)
+def test_a_class_folds_to_the_folds_its_members_spell_on_a_caseless_disk(pattern: str, folded: str) -> None:
+    assert policy_module._fold_glob_literals(pattern, "caseless") == folded
+
+
+@pytest.mark.parametrize(
+    ("pattern", "folded"),
+    [
+        ("DOCS/[A-Z]*.md", "DOCS/[A-Z]*.md"),
+        ("[a-z]", "[a-z]"),
+        ("[!a-z]", "[!a-z]"),
+        ("[!0-9_]", "[!0-9_]"),
+        ("[!P]", "[!P]"),
+        # Case stays apart, but the Kelvin sign decomposes to K, outside the class.
+        ("[!A-Z]", "[!ABCDEFGHIJLMNOPQRSTUVWXYZ]"),
+        # The angstrom sign decomposes to the letter A with ring above.
+        ("[\u212b]", "[\u00c5\u212b]"),
+        ("[!\u00c5]", "?"),
+    ],
+)
+def test_on_a_disk_that_folds_accents_only_a_canonical_decomposition_changes_a_class(
+    pattern: str, folded: str
+) -> None:
+    assert policy_module._fold_glob_literals(pattern, "nfd") == folded
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        pytest.param("[A-Z\u0391-\u03a9\u0410-\u042f]", id="more-members-than-the-limit"),
+        pytest.param("[\u0100-\u017f]", id="a-range-wider-than-the-limit"),
+    ],
+)
+def test_a_class_too_wide_to_enumerate_is_copied_as_written(pattern: str) -> None:
+    assert policy_module._fold_glob_literals(pattern, "caseless") == pattern
+
+
+def test_a_class_of_as_many_members_as_the_limit_is_folded_and_one_of_more_is_copied_as_written() -> None:
+    # 64 code points from U+0100; caselessly the last, U+013F, folds to U+0140.
+    at_limit = f"[{chr(0x100)}-{chr(0x13F)}]"
+    past_limit = f"[{chr(0x100)}-{chr(0x140)}]"
+    assert policy_module._fold_glob_literals(at_limit, "caseless") == f"[{''.join(map(chr, range(0x100, 0x141)))}]"
+    assert policy_module._fold_glob_literals(past_limit, "caseless") == past_limit
+
+
+def test_in_a_double_star_pattern_a_bracket_is_literal_text_folded_where_it_stands() -> None:
+    assert policy_module._fold_glob_literals("DOCS/**/[A-Z]*.md", "caseless") == "docs/**/[a-z]*.md"
+    assert policy_module._fold_glob_literals("data/**/[!P]", "caseless") == "data/**/[!p]"
+    assert policy_module._fold_glob_literals("DOCS/**/[A-Z]*.md", "nfd") == "DOCS/**/[A-Z]*.md"
+
+
+def test_every_pattern_folds_to_the_text_the_vectors_shared_with_the_node_coordinator_name() -> None:
+    """The plugin's Node coordinator runs a byte-identical copy of this file
+    against its own fold, so a pattern folds to the same text in both, and the
+    two coordinators give every spelling of a file the same answer."""
+    vectors = json.loads((Path(__file__).parent / "fixtures" / "policy_class_fold_vectors.json").read_text("ascii"))
+    # Both profiles present, so an emptied or one-sided file cannot pass.
+    assert {vector["profile"] for vector in vectors} == {"caseless", "nfd"}
+    mismatches = [
+        (vector["profile"], vector["pattern"], folded, vector["folded"])
+        for vector in vectors
+        if (folded := policy_module._fold_glob_literals(vector["pattern"], vector["profile"])) != vector["folded"]
+    ]
+    assert mismatches == []
+
+
+#: Code points the class tests name, with their folds and spellings: ASCII,
+#: Latin-1 and a few signs and letters that fold across blocks or planes.
+_CLASS_ALPHABET = "".join(
+    [*map(chr, range(0x20, 0x7F)), *map(chr, range(0xA0, 0x100))]
+) + "\u017f\u0391\u03b1\u03bc\u212a\u212b\uff21\uff41\U00010400\U00010428"
+
+_FOLDED_CLASSES = [
+    "[A-Z]", "[a-z]", "[!a-z]", "[!A-Z]", "[P]", "[!P]", "[!kK]", "[]a]", "[!]a]", "[!-a]", "[A!]",
+    "[-A!]", "[0-9_]", "[\u212b]", "[!\u00c5]", "[\u00df]", "[!\u00e9]", "[\u00c0-\u00de]",
+    "[!\u00e0-\u00fe]", "[\uff21\U00010400]", "[!\U00010428]",
+    # 39 members as written and 65 folded, past the 64 a class as written may list.
+    "[A-Z0-9_.-]",
+]
+
+
+@pytest.fixture(scope="module")
+def spellings_by_fold() -> dict[str, dict[str, set[str]]]:
+    """Every code point of the basic plane and the Deseret block, grouped by
+    the one code point it folds to under each folding profile: found by
+    folding each of them, not from the policy's own inverse."""
+    scanned = itertools.chain(range(0xD800), range(0xE000, 0x10000), range(0x10400, 0x10450))
+    chars = [chr(code_point) for code_point in scanned]
+    by_profile: dict[str, dict[str, set[str]]] = {}
+    for profile in ("caseless", "nfd"):
+        groups: dict[str, set[str]] = {}
+        for char in chars:
+            folded = policy_fold_text(char, profile)
+            if len(folded) == 1:
+                groups.setdefault(folded, set()).add(char)
+        by_profile[profile] = groups
+    return by_profile
+
+
+@pytest.mark.parametrize("profile", ["caseless", "nfd"])
+@pytest.mark.parametrize("pattern", _FOLDED_CLASSES)
+def test_a_folded_class_meets_a_folded_character_exactly_when_the_class_meets_one_of_its_spellings(
+    spellings_by_fold: dict[str, dict[str, set[str]]], pattern: str, profile: FoldingProfile
+) -> None:
+    """So every spelling of one file gets one answer from a class. Both
+    readers of the folded class agree: fnmatch, which matches it, and the
+    tokens the coverage search reads a folded pattern by."""
+    folded_class = policy_module._fold_glob_literals(pattern, profile)
+    [token] = policy_module._glob_tokens(folded_class, policy_module._FOLDED_CLASS_MEMBER_LIMIT)
+    for folded_char, expected in _answers_by_folded_char(pattern, profile, spellings_by_fold):
+        where = f"{folded_char!r} against {folded_class!r}"
+        assert fnmatch.fnmatchcase(folded_char, folded_class) is expected, where
+        assert policy_module._token_accepts(token, folded_char) is expected, where
+
+
+@pytest.mark.parametrize("profile", ["caseless", "nfd"])
+def test_a_class_fnmatch_negates_after_a_reversed_range_meets_every_spelling_alike_folded(
+    spellings_by_fold: dict[str, dict[str, set[str]]], profile: FoldingProfile
+) -> None:
+    """fnmatch drops the reversed range z-a together with both its ends, so
+    the '!' after them leads and negates the class: it reads [^X]. Folded by
+    its members, a '!' and X, the class would turn away p, which fnmatch
+    accepts. The search's tokens read it by its members too, a stated limit,
+    so only fnmatch is checked."""
+    pattern = "[z-a!X]"
+    folded_class = policy_module._fold_glob_literals(pattern, profile)
+    for folded_char, expected in _answers_by_folded_char(pattern, profile, spellings_by_fold):
+        assert fnmatch.fnmatchcase(folded_char, folded_class) is expected, f"{folded_char!r} against {folded_class!r}"
+
+
+def _answers_by_folded_char(
+    pattern: str, profile: FoldingProfile, spellings_by_fold: dict[str, dict[str, set[str]]]
+) -> Iterator[tuple[str, bool]]:
+    """Each folded character of :data:`_CLASS_ALPHABET`, with the answer the
+    folded class owes it: whether ``pattern`` as written meets one of its
+    spellings."""
+    for char in _CLASS_ALPHABET:
+        folded_char = policy_fold_text(char, profile)
+        if len(folded_char) == 1:
+            spellings = spellings_by_fold[profile][folded_char]
+            yield folded_char, any(fnmatch.fnmatchcase(spelling, pattern) for spelling in spellings)
+
+
+@pytest.mark.parametrize("profile", ["caseless", "nfd"])
+def test_the_fold_of_one_code_point_is_the_fold_of_its_text_for_every_code_point_scanned(
+    spellings_by_fold: dict[str, dict[str, set[str]]], profile: FoldingProfile
+) -> None:
+    """The fold of one code point is looked up in a map of the table's
+    domain, and every code point outside it is taken to fold to itself:
+    checked against folding the text of each code point the scan reads."""
+    folds = {spelling: folded for folded, spellings in spellings_by_fold[profile].items() for spelling in spellings}
+    scanned = itertools.chain(range(0xD800), range(0xE000, 0x10000), range(0x10400, 0x10450))
+    mismatches = [
+        char for char in map(chr, scanned) if path_fold.fold_code_point(char, profile) != folds.get(char)
+    ]
+    assert mismatches == []
+
+
+def test_a_class_is_folded_by_looking_its_members_up_not_by_folding_the_text_of_each(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An untrack request may carry 20 entries of 1,024 characters, each a
+    run of 64-member classes: folding the text of every member took seconds
+    of the request, where a lookup takes milliseconds."""
+    path_fold.code_points_folding_to("a", "caseless")
+    folded_texts: list[str] = []
+    fold_text = path_fold.policy_fold_text
+
+    def counting_fold_text(text: str, profile: FoldingProfile) -> str:
+        folded_texts.append(text)
+        return fold_text(text, profile)
+
+    monkeypatch.setattr(path_fold, "policy_fold_text", counting_fold_text)
+    assert policy_module._fold_glob_literals("[\u0100-\u013f][!\u0100-\u013f]", "caseless") != ""
+    assert folded_texts == []
+
+
+@pytest.mark.parametrize("profile", ["caseless", "nfd"])
+def test_the_code_points_folding_to_a_character_are_those_a_scan_of_every_code_point_finds(
+    spellings_by_fold: dict[str, dict[str, set[str]]], profile: FoldingProfile
+) -> None:
+    groups = spellings_by_fold[profile]
+    scanned = set().union(*groups.values())
+    for folded, spellings in groups.items():
+        found = path_fold.code_points_folding_to(folded, profile)
+        assert found & scanned == spellings, folded
+    for char in _CLASS_ALPHABET:
+        if char not in groups:
+            assert not path_fold.code_points_folding_to(char, profile) & scanned, char
+    # A compatibility ideograph outside the scan decomposes to one in it.
+    assert "\U0002f800" in path_fold.code_points_folding_to("\u4e3d", profile)
+
+
+def test_a_strict_class_holds_every_spelling_of_a_file_the_disk_stores_in_lower_case(
+    policy_with: LoadPolicy,
+) -> None:
+    policy = policy_with({"tracked": ["docs/**"], "strict": ["docs/[A-Z]*.md"]})
+    on_disk = file("caseless", "docs/plan.md")
+    for spelling in ("docs/plan.md", "docs/Plan.md", "docs/PLAN.md"):
+        assert policy.is_strict_mode(spelling, on_disk), spelling
+        assert policy.is_strict_mode(spelling, file("caseless")), spelling
+    # A disk that folds nothing keeps the spellings apart.
+    assert not policy.is_strict_mode("docs/plan.md", file("none", "docs/plan.md"))
+
+
+def test_a_strict_negated_class_holds_every_spelling_of_a_file_one_spelling_of_which_it_accepts(
+    policy_with: LoadPolicy,
+) -> None:
+    policy = policy_with({"tracked": ["docs/**"], "strict": ["docs/[!a-z]*.md"]})
+    on_disk = file("caseless", "docs/plan.md")
+    for spelling in ("docs/plan.md", "docs/Plan.md", "docs/PLAN.md"):
+        assert policy.is_strict_mode(spelling, on_disk), spelling
+    assert not policy.is_strict_mode("docs/plan.md", file("none", "docs/plan.md"))
+
+
+def test_a_negated_ignored_class_holding_every_spelling_of_its_members_ignores_no_spelling_of_them(
+    policy_with: LoadPolicy,
+) -> None:
+    """No code point folds to P, and only P and p fold to p, so the class
+    as written refuses every spelling of plan.md: folded, it must refuse the
+    folded name too, not widen to any one character."""
+    policy = policy_with({"tracked": ["docs/**"], "ignored": ["docs/[!Pp]*.md"]})
+    for spelling in ("docs/plan.md", "docs/Plan.md", "docs/PLAN.md"):
+        assert policy.is_tracked(spelling, file("caseless", "docs/plan.md")), spelling
+    for spelling in ("docs/notes.md", "docs/NOTES.md"):
+        assert not policy.is_tracked(spelling, file("caseless", "docs/notes.md")), spelling
+
+
+def test_untracking_a_lower_case_spelling_a_strict_class_holds_is_refused_on_a_caseless_disk(
+    policy_with: LoadPolicy,
+) -> None:
+    policy = policy_with({"tracked": ["docs/**"], "strict": ["docs/[A-Z]*.md"]})
+    assert policy.strict_patterns_covering("docs/plan.md", "caseless") == ("docs/[A-Z]*.md",)
+    assert policy.strict_patterns_covering("docs/plan.md", "none") == ()
+
+
+def test_a_strict_class_fnmatch_negates_after_a_reversed_range_holds_every_spelling_of_a_file(
+    policy_with: LoadPolicy,
+) -> None:
+    """fnmatch reads [z-a!X] as [^X]: it drops z-a with both its ends, and
+    the '!' left first negates. As written it holds PLAN.md, so folded it
+    must hold plan.md, the disk's own spelling, too."""
+    policy = policy_with({"tracked": ["**"], "strict": ["[z-a!X]LAN.md"]})
+    for spelling in ("plan.md", "Plan.md", "PLAN.md"):
+        assert policy.is_strict_mode(spelling, file("caseless", "plan.md")), spelling
+
+
+def test_untracking_a_name_a_strict_class_folded_past_64_members_does_not_spell_is_allowed(
+    policy_with: LoadPolicy,
+) -> None:
+    """[A-Z0-9_.-] lists 39 members, 65 folded: past the 64 a class as
+    written may list before the search reads it as any one character. The
+    folded search still lists it, so an entry naming # or ~ there covers
+    nothing, as on a disk that folds nothing."""
+    policy = policy_with({"tracked": ["src/**"], "strict": ["src/[A-Z0-9_.-]*.py"]})
+    for entry in ("src/#foo.py", "src/~x.py"):
+        assert not policy.is_strict_mode(entry, file("caseless")), entry
+        assert policy.strict_patterns_covering(entry, "caseless") == (), entry
+        assert policy.strict_patterns_covering(entry, "none") == (), entry
+    assert policy.strict_patterns_covering("src/foo.py", "caseless") == ("src/[A-Z0-9_.-]*.py",)
+    # So does an entry's class, folded as the strict and tracked patterns are.
+    hash_names = policy_with({"tracked": ["src/**"], "strict": ["src/#*.py"]})
+    assert hash_names.strict_patterns_covering("src/[A-Z0-9_.-]*.py", "caseless") == ()
+    assert hash_names.strict_patterns_covering("src/[#A-Z]*.py", "caseless") == ("src/#*.py",)
+
+
+def test_the_folded_search_lists_a_range_of_up_to_twice_64_characters(policy_with: LoadPolicy) -> None:
+    """A range of 100 is too wide to fold and is copied as written, but the
+    folded search lists it, as it lists a class the fold grew: SRC/ meets
+    src/ only folded, and # is not in the range, so nothing is covered."""
+    policy = policy_with({"tracked": ["**"], "strict": ["SRC/[\u0100-\u0163]*.py"]})
+    assert policy.strict_patterns_covering("src/#x.py", "caseless") == ()
+    assert policy.strict_patterns_covering("src/\u0101x.py", "caseless") == ("SRC/[\u0100-\u0163]*.py",)
 
 
 # ------------------------------------------------------------------------ keys
@@ -251,6 +569,20 @@ def test_the_folded_pass_draws_on_the_request_budget_the_search_as_written_drew_
     monkeypatch.setattr(policy_module, "GLOB_INTERSECT_REQUEST_BUDGET", 700)
     assert policy.strict_patterns_covering_each(["data/[0-9]"], "none") == ((),)
     assert policy.strict_patterns_covering_each(["data/[0-9]"], "caseless") == (("data/*.json",),)
+
+
+def test_the_folded_pass_does_not_search_again_a_strict_pattern_the_search_as_written_covered(
+    policy_with: LoadPolicy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A strict pattern the search as written covered stays reported; the
+    folded pass spends the request's budget only on the ones left open."""
+    policy = policy_with({"tracked": ["data/**"], "strict": ["data/*.json", "data/[a-z]"]})
+    # As written the entry covers data/*.json in 2,356 steps and rules out
+    # data/[a-z] in 702; folded, data/[a-z] takes 702 more, 3,760 in all.
+    # Searching data/*.json again would run past 4,000, and an entry out of
+    # budget covers every strict pattern its literal ends allow: data/[a-z] too.
+    monkeypatch.setattr(policy_module, "GLOB_INTERSECT_REQUEST_BUDGET", 4_000)
+    assert policy.strict_patterns_covering_each(["data/[0-9]*.json"], "caseless") == (("data/*.json",),)
 
 
 class _StepCount:

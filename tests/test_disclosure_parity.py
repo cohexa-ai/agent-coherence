@@ -169,6 +169,13 @@ PINS: tuple[Pin, ...] = (
         doc_phrase="no CI job runs on a Linux disk that folds names",
     ),
     Pin(
+        name="spellings: a class too wide to enumerate, or with a reversed range, is not folded",
+        source="src/ccs/adapters/claude_code/policy.py",
+        source_marker="when the class is too wide to enumerate or holds a reversed range",
+        doc="docs/guide.md",
+        doc_phrase="written high to low** (`[z-a]`), meets the folded name as written",
+    ),
+    Pin(
         name="spellings: records whose file is missing at the start are not merged",
         source="src/ccs/coordinator/fold_merge.py",
         source_marker="a file that is absent right now confirms nothing",
