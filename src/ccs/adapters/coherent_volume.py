@@ -643,6 +643,39 @@ def _fold_view_of(status: object) -> _FoldView:
     return _FoldView(_FOLD_PROFILES.get(profile, "none") if isinstance(profile, str) else "none")
 
 
+#: How to make a coordinator a volume starts enforce the volume's globs.
+_SPAWNED_COORDINATOR_REMEDY = (
+    "Every volume on a workspace must declare the globs the coordinator was "
+    "started with; an attaching volume adds none to a running coordinator's "
+    "policy. Stop it, or use a dedicated workspace root."
+)
+#: The same for the Node coordinator, which no volume starts. A successful track
+#: or untrack request reloads its policy, and a reload takes up what was added on
+#: disk.
+_NODE_COORDINATOR_REMEDY = (
+    "The Node coordinator enforces the globs in its own policy files, and an "
+    "attaching volume adds none to them: add these globs to .coherence/tracked.yaml "
+    "and .coherence/strict_mode.yaml, then reload its policy (a successful track or "
+    "untrack request does) or restart it, or use a dedicated workspace root."
+)
+_ENFORCEMENT_OFF_IN_DEGRADE = (
+    "In degrade mode the volume operates best-effort with coherence enforcement off."
+)
+
+
+def _operator_view_refusal(status: int) -> str:
+    """Why the operator view could not be read, from the status of the answer
+    that refused it. A 501 comes from a Node coordinator of agent-coherence
+    plugin 0.6.0 or earlier, which predates the view; later ones serve it."""
+    if status == 501:
+        return (
+            "the coordinator predates the operator view (HTTP 501), as the Node "
+            "coordinator of agent-coherence plugin 0.6.0 and earlier does, so "
+            "upgrade the agent-coherence plugin"
+        )
+    return f"the operator view was refused (HTTP {status})"
+
+
 def _fold_profile_refusal_message(doubt: str) -> str:
     return (
         "on_held='refuse' keys each file as the coordinator does, by the fold profile "
@@ -1111,9 +1144,10 @@ class ManagedGlobEnforcement:
     untracks a strict path — strict wins — so an ignore covering a managed glob
     under another spelling is harmless there; a literal ignore of the glob is
     still reported as not enforced, which is conservative for an older one.)
-    ``unavailable`` is set when the sets could not be read at all — an older
-    coordinator whose summary publishes only counts, the Node coordinator, which
-    does not serve the operator view, or a ``/status`` that failed — and then
+    ``unavailable`` is set when the sets could not be read at all -- an older
+    coordinator whose summary publishes only counts, a Node coordinator of
+    plugin 0.6.0 or earlier, which predates the operator view, a coordinator
+    that refuses the view, or a ``/status`` that failed -- and then
     both lists are empty and say nothing: "cannot tell" is not "not enforced",
     and it is never "enforced".
     """
@@ -1814,8 +1848,9 @@ class CoherentVolume:
         #     strict wins over ignore, /policy/untrack refuses a strict path,
         #     a reload never drops a strict pattern).
         #   * the sets cannot be read (an older coordinator publishing counts
-        #     only, the Node coordinator, a failed /status) -> cannot tell ->
-        #     fail closed, saying so; never read as enforced.
+        #     only, a Node coordinator of plugin 0.6.0 or earlier, a failed
+        #     /status) -> cannot tell -> fail closed, saying so; never read as
+        #     enforced.
         # A pattern COUNT is not a check: the spawner's one pattern satisfied
         # every later attacher, whose untracked paths then answered every hook
         # as if enforced, so its stale writes landed with no signal (#190).
@@ -1877,13 +1912,9 @@ class CoherentVolume:
 
     def _enforcement_failure(self, enforcement: ManagedGlobEnforcement) -> str:
         """The message for an attach the per-glob check did not confirm: which
-        globs are not enforced, or why enforcement could not be told."""
-        tail = (
-            " Every volume on a workspace must declare the globs the coordinator was "
-            "started with; an attaching volume adds none to a running coordinator's "
-            "policy. Stop it, or use a dedicated workspace root. In degrade mode the "
-            "volume operates best-effort with coherence enforcement off."
-        )
+        globs are not enforced, or why enforcement could not be told, and how
+        to make the coordinator enforce them."""
+        tail = f" {self._enforcement_remedy()} {_ENFORCEMENT_OFF_IN_DEGRADE}"
         if enforcement.unavailable is not None:
             globs = ", ".join(self._managed)
             return (
@@ -1897,6 +1928,15 @@ class CoherentVolume:
             "or ignored."
             + tail
         )
+
+    def _enforcement_remedy(self) -> str:
+        """How to make the attached coordinator enforce this volume's globs, by
+        the backend its pid file names. The Node coordinator, which no volume
+        starts, is never told to stop: the next volume would then start the
+        Python coordinator on the store Node created, which refuses it."""
+        if coordinator_backend(self._root) == NODE_BACKEND:
+            return _NODE_COORDINATOR_REMEDY
+        return _SPAWNED_COORDINATOR_REMEDY
 
     def _claim_principal(self) -> None:
         """Obtain this session's caller principal: once per session, at attach.
@@ -2066,15 +2106,8 @@ class CoherentVolume:
         except CoordinatorUnavailable:
             raise
         except urllib.error.HTTPError as exc:
-            # The Node coordinator answers 501 to the operator view and
-            # publishes no strict patterns at any tier; name it when the pid
-            # file says so. Only the status code is relayed, never the body.
-            who = (
-                "the Node coordinator does not serve the operator view"
-                if coordinator_backend(self._root) == NODE_BACKEND
-                else "the operator view was refused"
-            )
-            return ManagedGlobEnforcement((), (), f"{who} (HTTP {exc.code})")
+            # Only the status code is relayed, never the body.
+            return ManagedGlobEnforcement((), (), _operator_view_refusal(exc.code))
         except Exception as exc:  # any other failure to read the view is "cannot tell"
             return self._unreadable_view(exc)
         self._advertises_if_unheld = (
@@ -2515,11 +2548,13 @@ class CoherentVolume:
         """Whether this write asks for ``rel`` only if nobody holds it: refuse mode,
         on a managed path. Any other path takes no flag, because an untrack could
         send it through the untracked exit, around the check. A session with no
-        caller principal raises, with nothing sent, because the coordinator would
-        refuse the request."""
+        caller principal raises, with nothing sent, because a coordinator that
+        issues principals refuses the request without one. Only a claim answered
+        404 (``unsupported``) shows that the coordinator issues none, as the Node
+        coordinator does; that one decides the request without a principal."""
         if self._on_held != "refuse" or not self._matches_managed(rel):
             return False
-        if self._principal is None:
+        if self._principal is None and self._claim_outcome != "unsupported":
             raise CoherenceError(_no_principal_message(rel, self.principal_claim_outcome))
         return True
 
