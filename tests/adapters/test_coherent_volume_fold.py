@@ -37,6 +37,7 @@ from ccs.cli._coherence_client import (
 )
 from ccs.core.exceptions import (
     CoherenceError,
+    CommitUnconfirmed,
     CoordinatorUnreachable,
     HandoffPathsInvalid,
     LinkOutOfManaged,
@@ -51,7 +52,7 @@ from tests.adapters.test_coherent_volume_other_holder import (
     _PRE_EDIT,
     _Wire,
 )
-from tests.coordinator_helpers import serve_in_process, write_holders
+from tests.coordinator_helpers import answer_with_status, serve_in_process, write_holders
 
 _X = "data/x.txt"
 _FOLD_FIELDS = ("fold_profile", "fold_table_unicode")
@@ -396,6 +397,50 @@ def test_two_spellings_of_one_file_in_one_request_are_a_duplicate(
         volume.atomic_publish([(_X, 1, b"one"), ("DATA/X.TXT", 1, b"two")])
 
     assert wire.sent == []
+
+
+@pytest.fixture
+def caseless_keyed_server(
+    server: CoordinatorHTTPServer, monkeypatch: pytest.MonkeyPatch
+) -> CoordinatorHTTPServer:
+    """The ``server``, read by every volume as keyed by ``caseless``, whatever the disk."""
+    _status_changed_to(monkeypatch, lambda doc: {**doc, "fold_profile": "caseless"})
+    return server
+
+
+def _is_write_commit(path: str, payload: dict) -> bool:
+    """write()'s commit, not the release it sends on the same route."""
+    return path == _POST_EDIT and payload.get("success") is True
+
+
+def test_a_confirmed_release_after_an_unanswered_commit_clears_the_fold_keys_record(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    caseless_keyed_server: CoordinatorHTTPServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """write() records its grant under the fold key, so when its commit is
+    answered with HTTP 503 and the release it sends first is confirmed, the
+    record is cleared under that key, not under the spelling written.
+
+    Prevents a confirmed release that leaves the grant in the volume's
+    record, so a later release() or re-mint sends it again."""
+    volume = _holder(tmp_path, fast_cfg)
+    holder = volume._incarnation
+    calls: list[tuple[str, dict, dict]] = []
+    answer_with_status(monkeypatch, _is_write_commit, 503, calls=calls)
+
+    with pytest.raises(CommitUnconfirmed):
+        volume.write("data/X.txt", b"from the holder")
+
+    assert volume._fold_profile == "caseless", "premise: the volume keys by caseless"
+    released = [
+        body["path"] for route, body, _ in calls
+        if route == _POST_EDIT and body.get("success") is False
+    ]
+    assert released == ["data/X.txt"], "control: one release, sent under the spelling written"
+    assert not volume._records_write_grant(_X)
+    assert holder not in volume._grant_incarnations
 
 
 def test_the_open_shim_mediates_another_spelling_of_a_managed_file(
