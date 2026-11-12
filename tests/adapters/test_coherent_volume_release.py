@@ -276,20 +276,28 @@ def test_a_path_the_volume_did_not_write_sends_nothing(
     assert wire.sent == []
 
 
-def test_another_spelling_of_a_held_path_releases_nothing(
+def test_another_spelling_of_a_held_path_releases_it_where_the_disk_folds_it(
     tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
 ) -> None:
-    """The volume records a path by the spelling it was written under, so a
-    release of another spelling (case here) finds nothing and sends nothing,
-    and a refuse-mode peer is still refused on the file.
+    """The volume records a path by the key its coordinator's profile gives it
+    (#506). Where that profile folds case, a release of another case of the
+    path releases it and a refuse-mode peer is admitted; where it keeps case
+    apart, the other spelling is another file, the release finds nothing and
+    sends nothing, and the peer is still refused.
 
-    Pins the limit the docs state until other spellings are handled (#506)."""
+    Prevents a release that misses the file the coordinator holds for a
+    spelling, and one that releases a file the spelling does not name."""
     holder, peer = _holder(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
     holder.write(_X, b"from the holder")
     wire.sent.clear()
 
     holder.release("data/X.TXT")
 
+    if (server.fold_index_profile or "none") == "caseless":
+        assert len(_releases(wire)) == 1
+        peer.write(_X, b"from the peer")
+        assert write_holders(server, _X) == {peer.agent_id}
+        return
     assert _releases(wire) == []
     with pytest.raises(OtherHolder):
         peer.write(_X, b"from the peer")

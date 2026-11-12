@@ -991,6 +991,46 @@ class OtherHolder(CoherenceError):
         return (type(self), (self.artifact_id, self.holder_agent_id))
 
 
+#: Why a refuse-mode volume refused a write through a link out of its managed set.
+LINK_OUT_OF_MANAGED_REASON = "link_out_of_managed"
+
+
+class LinkOutOfManaged(CoherenceError):
+    """A volume built with ``on_held="refuse"`` was asked to write a path whose
+    name lies under its managed globs but which reaches, through a link on the
+    path, a file outside them. Nothing was sent and nothing was written.
+
+    The refusal of a held file applies on managed paths only, so the write would
+    take the file from whichever agent holds it, outside the guarantee the
+    volume was built for. Write the target by its own path from a volume that
+    may displace its holder, or point the link inside the managed set.
+
+    Carries :data:`LINK_OUT_OF_MANAGED_REASON` on the class, so a consumer
+    classifies it by type or ``.reason``, never by the message, plus ``path``
+    (as the caller wrote it), ``link`` (the link on it, relative to the
+    workspace root) and ``target`` (the file the write reaches, relative to the
+    root). It rebuilds from those three, so it pickles whole across a process
+    boundary.
+    """
+
+    reason = LINK_OUT_OF_MANAGED_REASON
+
+    def __init__(self, path: str, link: str, target: str) -> None:
+        super().__init__(
+            f"{LINK_OUT_OF_MANAGED_REASON} path={path} link={link} target={target} "
+            "(nothing was sent or written: the link lies under managed and leads to a "
+            "file outside it, where refuse mode cannot keep the file from its holder. "
+            "Write the target by its own path from a volume that may displace its "
+            "holder, or point the link inside managed)"
+        )
+        self.path = path
+        self.link = link
+        self.target = target
+
+    def __reduce__(self) -> tuple[type[LinkOutOfManaged], tuple[str, str, str]]:
+        return (type(self), (self.path, self.link, self.target))
+
+
 class CoherenceDegradedWarning(UserWarning):
     """Emitted once per adapter instance when a coherence error degrades to fallback.
 

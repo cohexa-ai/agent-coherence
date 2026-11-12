@@ -99,13 +99,6 @@ PINS: tuple[Pin, ...] = (
         doc_phrase="A write outside `managed` sends no flag and displaces",
     ),
     Pin(
-        name="refuse mode: a link under managed to a file outside it still displaces",
-        source="src/ccs/adapters/coherent_volume.py",
-        source_marker="reads the resolved path, so a link under ``managed``",
-        doc="docs/guide.md",
-        doc_phrase="The check reads the resolved path, so a link under `managed`",
-    ),
-    Pin(
         name="refuse mode: the release gives up every path",
         source="src/ccs/adapters/coherent_volume.py",
         source_marker="path this attempt holds, not only ``path``",

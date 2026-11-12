@@ -45,9 +45,11 @@ from ccs.core.exceptions import (
     CoordinatorFailed,
     CoordinatorUnreachable,
     GiverFenced,
+    LinkOutOfManaged,
     OtherHolder,
     StaleView,
 )
+from ccs.core.path_fold import fold_key
 from ccs.testing.silent_listener import SilentListener
 from tests.coordinator_helpers import serve_in_process, write_holders
 
@@ -975,24 +977,26 @@ def test_a_write_outside_managed_sends_no_flag_and_displaces(
     assert write_holders(server, "plan.md") == {writer.agent_id}
 
 
-def test_a_link_under_managed_to_a_file_outside_it_sends_no_flag(
+def test_a_link_under_managed_to_a_file_outside_it_raises_and_sends_nothing(
     tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
 ) -> None:
-    """The managed check reads the resolved path, so a link whose name matches
-    ``managed`` is a write outside it and displaces the file's holder.
+    """A link whose name matches ``managed`` leads to a file outside it, where
+    the opted-in refusal does not apply, so the write raises before any request
+    and the file's holder keeps it, on every disk.
 
-    Pins the limit the docs state, so a change to it is seen."""
+    Prevents a refuse-mode write that takes a file from its holder."""
     (tmp_path / "plan.md").write_bytes(b"seed")
     (tmp_path / "data" / "plan-link.md").symlink_to(tmp_path / "plan.md")
     holder, writer = _displacer(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
     holder.write("plan.md", b"from-the-holder")
     wire.sent.clear()
 
-    writer.write("data/plan-link.md", b"through-the-link")
+    with pytest.raises(LinkOutOfManaged):
+        writer.write("data/plan-link.md", b"through-the-link")
 
-    assert "if_unheld" not in wire.bodies(_PRE_EDIT)[0]
-    assert (tmp_path / "plan.md").read_bytes() == b"through-the-link"
-    assert write_holders(server, "plan.md") == {writer.agent_id}
+    assert wire.sent == []
+    assert (tmp_path / "plan.md").read_bytes() == b"from-the-holder"
+    assert write_holders(server, "plan.md") == {holder.agent_id}
 
 
 @pytest.mark.parametrize(
@@ -1000,25 +1004,31 @@ def test_a_link_under_managed_to_a_file_outside_it_sends_no_flag(
     [("data/shared.txt", "data/SHARED.txt"), ("data/café.txt", "data/café.txt")],
     ids=["case", "unicode-form"],
 )
-def test_another_spelling_of_a_held_path_gets_no_refusal(
+def test_another_spelling_of_a_held_path_is_refused_where_the_disk_folds_it(
     tmp_path: Path,
     fast_cfg: LifecycleConfig,
     server: CoordinatorHTTPServer,
     spelling: str,
     alias: str,
 ) -> None:
-    """The coordinator tracks a path by its spelling, so each spelling has its own
-    holder. Where the filesystem folds the two, as a default Mac volume does, the
-    second write lands on the first holder's file.
+    """Where the coordinator's profile folds the two spellings into one file,
+    as on a default Mac volume, they share one holder and the second write is
+    refused. Where it keeps them apart, they are two files with a holder each.
 
-    Pins the limit the docs state, so a change to it is seen."""
+    Prevents a second spelling that takes a file from its holder."""
+    profile = server.fold_index_profile or "none"
     holder, writer = _refuser(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
     holder.write(spelling, b"from-the-holder")
 
-    writer.write(alias, b"from-the-writer")
-
+    if fold_key(spelling, profile) == fold_key(alias, profile):
+        with pytest.raises(OtherHolder):
+            writer.write(alias, b"from-the-writer")
+        assert write_holders(server, alias) == {holder.agent_id}
+        assert (tmp_path / spelling).read_bytes() == b"from-the-holder"
+    else:
+        writer.write(alias, b"from-the-writer")
+        assert write_holders(server, alias) == {writer.agent_id}
     assert write_holders(server, spelling) == {holder.agent_id}
-    assert write_holders(server, alias) == {writer.agent_id}
 
 
 # --- this volume's own abandoned grant ------------------------------------
