@@ -27,10 +27,9 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig
-from ccs.adapters.coherent_volume import CoherentVolume
+from ccs.adapters.coherent_volume import CoherentVolume, OnHeld
 
 # Env keys the MCP client sets when spawning the server subprocess.
 ROOT_ENV = "SWG_ROOT"
@@ -39,8 +38,6 @@ ON_HELD_ENV = "SWG_ON_HELD"
 # Guard the whole workspace unless the client narrows it. A non-empty managed set
 # is REQUIRED for the INVALID-deny to fire (is_strict_mode ⊂ is_tracked).
 _DEFAULT_MANAGED: tuple[str, ...] = ("**",)
-
-OnHeld = Literal["displace", "refuse"]
 
 
 def _on_held_from(environ: Mapping[str, str]) -> OnHeld:

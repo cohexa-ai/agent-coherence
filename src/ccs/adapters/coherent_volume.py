@@ -331,6 +331,8 @@ coordinator, and in a forked child until it re-attaches. The fifth arm beside
 the four a claim itself can settle (``PrincipalClaim.outcome``)."""
 
 PrincipalClaimOutcome = Literal["bound", "unsupported", "refused", "unconfirmed", "not_attempted"]
+#: What :meth:`CoherentVolume.write` does to a managed file another agent holds.
+OnHeld = Literal["displace", "refuse"]
 
 
 def denied_read_backoff_sec(refusals: int) -> float:
@@ -1339,7 +1341,7 @@ class CoherentVolume:
         config: LifecycleConfig | None = None,
         bind_host: str = "127.0.0.1",
         remote_endpoint: CoordinatorEndpoint | None = None,
-        on_held: Literal["displace", "refuse"] = "displace",
+        on_held: OnHeld = "displace",
     ) -> None:
         if on_error not in ("strict", "degrade"):
             raise ValueError(f"on_error must be 'strict' or 'degrade', got {on_error!r}")
@@ -1469,11 +1471,9 @@ class CoherentVolume:
         # confirmed the coordinator has forgotten it, so nothing is sent under
         # it again: a strict pre-edit would admit what it denied before.
         self._unended_incarnations: set[str] = set()
-        # Every incarnation this volume's session minted, the current one
-        # included, so attempt_of() names an id as this volume's own after the
-        # record of its grant is gone: a grant can outlive its record. A forked
-        # child, a new session, starts it again.
-        self._minted_incarnations: set[str] = set()
+        # The agent id of every attempt this session minted, kept apart from the
+        # grant records because a grant can outlive its record.
+        self._minted_agent_ids: set[uuid.UUID] = set()
         # close() has run: every operation but close() raises from here on, and
         # a close the coordinator did not confirm sends what is still recorded
         # when called again. A forked child inherits it.
@@ -1534,7 +1534,7 @@ class CoherentVolume:
         """Mint the incarnation every request names from now on, and keep it
         among the attempts :meth:`attempt_of` names as this volume's."""
         self._incarnation = self._new_incarnation()
-        self._minted_incarnations.add(self._incarnation)
+        self._minted_agent_ids.add(session_to_agent_id(self._session_id, self._incarnation))
 
     def _after_fork(self) -> None:
         # Runs in the child after fork, where the forking thread is the only
@@ -1554,7 +1554,7 @@ class CoherentVolume:
         # parent's identity, which is still live in the parent. It ends none
         # of the parent's incarnations either: the parent still owns them.
         self._session_id = str(uuid.uuid4())
-        self._minted_incarnations.clear()
+        self._minted_agent_ids.clear()
         self._start_attempt()
         # The parent's principal is bound to the parent's session: discard it
         # (and its nonce); the child claims for its own session when it
@@ -1688,8 +1688,7 @@ class CoherentVolume:
         named = parse_agent_id(agent_id)  # None for an id that does not parse, which matches none
         if named == session_to_agent_id(self._session_id, self._incarnation):
             return "current"
-        minted = (session_to_agent_id(self._session_id, inc) for inc in self._minted_incarnations)
-        return "earlier" if named in minted else None
+        return "earlier" if named in self._minted_agent_ids else None
 
     @property
     def root(self) -> Path:
@@ -5340,7 +5339,6 @@ class CoherentVolume:
         what lets :meth:`reacquire` send it again."""
         holder = _wire_str(resp, "holder_agent_id")
         if self._names_a_recorded_incarnation(holder):
-            # write() never re-mints, so only reacquire() sends that release again.
             return CoordinatorFailed(_own_abandoned_grant_message(rel), needs_reacquire=True)
         return OtherHolder(rel, holder)
 
@@ -5364,7 +5362,6 @@ class CoherentVolume:
         shows the coordinator ignored the flag, so the volume releases what it
         took, keeping the record unless that release is confirmed."""
         if not (isinstance(resp, dict) and resp.get("ok") is True):
-            # A coordinator answered: a consumer names no restart for this one.
             raise CoordinatorUnreachable(_no_usable_admit_message(rel), answered=True)
         if resp.get("collision"):
             released = self._release_unconfirmed_grant(rel)

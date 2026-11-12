@@ -49,6 +49,7 @@ typed-signal-not-substring house rule).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from mcp.types import CallToolResult, TextContent
 
@@ -89,6 +90,9 @@ from ccs.core.exceptions import (
     ViewWedged,
     _generation_pair_fields,
 )
+
+if TYPE_CHECKING:
+    from ccs.adapters.coherent_volume import OnHeld
 
 
 @dataclass(frozen=True)
@@ -712,7 +716,7 @@ _WRITE_UNRECOGNIZED = _Terminal(
 )
 
 
-def write_deny_result(exc: BaseException, on_held: str) -> CallToolResult:
+def write_deny_result(exc: BaseException, on_held: OnHeld) -> CallToolResult:
     """:func:`deny_result` for ``swg_write``: its own row where one differs,
     else the shared row, with a next step added to the generic
     ``internal_error``. ``on_held`` is the server's mode, ``"refuse"`` or
@@ -727,7 +731,7 @@ def write_deny_result(exc: BaseException, on_held: str) -> CallToolResult:
     return result
 
 
-def _write_terminal(exc: BaseException, on_held: str) -> _Terminal | None:
+def _write_terminal(exc: BaseException, on_held: OnHeld) -> _Terminal | None:
     """swg_write's own row for ``exc``, or ``None`` where the shared row
     answers. Exact type, like ``_TERMINALS``; between two rows of one type the
     attribute that only write() sets decides, never the message."""

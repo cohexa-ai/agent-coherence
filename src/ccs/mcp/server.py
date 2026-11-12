@@ -717,8 +717,6 @@ def _release_text(key: str, released: bool) -> str:
 
 def _do_status(volume: CoherentVolume, config: SessionConfig) -> CallToolResult:
     status = build_status(volume, config)
-    # A client that shows only the text channel must still see what an agent
-    # acts on: the mode, its own holds, and who else holds a path.
     return _ok_result(status, status_text(status))
 
 
@@ -1062,8 +1060,6 @@ def _config_or_exit() -> SessionConfig:
         raise SystemExit(2) from None
 
 
-#: How an operator gets a refuse-mode server to start, after the volume's own
-#: reason it could not.
 _REFUSE_MODE_FIX = (
     "Run a coordinator that can refuse (agent-coherence after 0.15.0, or the Claude Code "
     "plugin after 0.6.0), or unset SWG_ON_HELD to serve in displace mode."

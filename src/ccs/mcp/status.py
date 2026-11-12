@@ -102,12 +102,8 @@ HELD_UNAVAILABLE_TEXT = (
     "path; retry shortly and do not treat this as no path being held"
 )
 
-# Each file's write holder keys, ``holder_agent_id`` and ``held_by``, by the
-# file's fold key.
 _Holders = dict[str, dict[str, str]]
-# The states a session row holds a path in for writing.
 _WRITE_STATES = ("EXCLUSIVE", "MODIFIED")
-# ``held_by`` for each answer of ``CoherentVolume.attempt_of``.
 _HELD_BY = {"current": "this_attempt", "earlier": "earlier_attempt", None: "another_agent"}
 # The holds that are this session's, either attempt: the ``held`` list.
 _OWN_HOLDS = ("this_attempt", "earlier_attempt")
@@ -125,8 +121,9 @@ def build_status(volume: CoherentVolume, config: SessionConfig) -> dict:
     """Compose the ``swg_status`` payload from the coordinator ``/status`` + the
     volume's local view + this server's managed scope."""
     status_doc = volume.coordinator_status()  # None if unattached / unreachable
-    holders = _holders_by_key(volume, status_doc)
-    per_path = _with_holders(_per_path(volume, status_doc), holders, fold_profile_of(status_doc))
+    profile = fold_profile_of(status_doc)
+    holders = _holders_by_key(volume, status_doc, profile)
+    per_path = _with_holders(_per_path(volume, status_doc), holders, profile)
     return {
         "coordinator": _coordinator_state(volume, status_doc),
         "is_attached": volume.is_attached,
@@ -252,7 +249,7 @@ def _is_managed(volume: CoherentVolume, path: str) -> bool:
         return False
 
 
-def _holders_by_key(volume: CoherentVolume, status_doc: dict | None) -> _Holders | None:
+def _holders_by_key(volume: CoherentVolume, status_doc: dict | None, profile: FoldProfile) -> _Holders | None:
     """Each file's write holder keyed by the file's fold key under the
     profile ``/status`` advertises, or ``None`` when the answer carries no
     sessions list (unreachable, degraded, or malformed) or a row it cannot
@@ -260,7 +257,6 @@ def _holders_by_key(volume: CoherentVolume, status_doc: dict | None) -> _Holders
     sessions = status_doc.get("sessions") if isinstance(status_doc, dict) else None
     if not isinstance(sessions, list):
         return None
-    profile = fold_profile_of(status_doc)
     holders: _Holders = {}
     for session in sessions:
         holds = _write_holds(session)
