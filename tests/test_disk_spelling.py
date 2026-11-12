@@ -101,6 +101,23 @@ def test_a_link_is_followed_to_its_target(scratch: str) -> None:
 
 
 @pytest.mark.parametrize("resolver", [resolve_links, native_spelling], ids=["resolve_links", "native_spelling"])
+def test_a_parent_step_after_a_link_leaves_the_links_target(scratch: str, resolver) -> None:
+    """``..`` after a link steps up from the link's target, as the kernel
+    does, and a ``..`` in a tail that does not exist yet is kept as typed:
+    folding either by text would name another file than the kernel opens."""
+    os.makedirs(os.path.join(scratch, "other", "dir"))
+    os.symlink(os.path.join(scratch, "other", "dir"), os.path.join(scratch, "Repo", "link"))
+    root = canonical(scratch)
+
+    assert resolver(os.path.join(scratch, "Repo", "link", "..", "plan.md")) == os.path.join(root, "other", "plan.md")
+    assert resolver(os.path.join(scratch, "Repo", "link", "..", "New", "x.md")) == os.path.join(
+        root, "other", "New", "x.md"
+    )
+    missing_tail = os.path.join("missing", "..", "plan.md")
+    assert resolver(os.path.join(scratch, "Repo", missing_tail)) == os.path.join(root, "Repo", missing_tail)
+
+
+@pytest.mark.parametrize("resolver", [resolve_links, native_spelling], ids=["resolve_links", "native_spelling"])
 def test_a_dangling_link_is_reported_not_resolved(scratch: str, resolver) -> None:
     dangling = os.path.join(scratch, "dangling")
     os.symlink(os.path.join(scratch, "missing"), dangling)
