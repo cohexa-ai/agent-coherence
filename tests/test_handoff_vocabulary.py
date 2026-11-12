@@ -11,7 +11,10 @@ another's recovery.
 
 from __future__ import annotations
 
+import multiprocessing
 import pickle
+from collections.abc import Iterator
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import FrozenInstanceError
 from uuid import UUID, uuid4
 
@@ -312,7 +315,8 @@ def test_coordinator_unreachable_carries_its_reason_and_crosses_a_process_bounda
     rest and a consumer classifies it by type or ``.reason``, never by the
     message. Its class-level reason is the existing wire value the MCP
     unattached refusal already answers, not a new one. It carries the message
-    only, so a child process can raise it and the parent unpickle it whole."""
+    and a keyword mark, so a child process can raise it and the parent
+    unpickle it whole."""
     err = CoordinatorUnreachable("coordinator gone")
     assert CoordinatorUnreachable.reason == "coordinator_unavailable"
     assert err.reason == COORDINATOR_UNAVAILABLE_REASON
@@ -328,8 +332,8 @@ def test_coordinator_failed_carries_its_reason_and_crosses_a_process_boundary() 
     """The read error for the coordinator's failure envelope (#259) is a typed
     terminal in the coherence family, never a stale view (a caller reads a
     ``StaleView`` from a versioned read as the split pair), with its own wire
-    value. It carries the message only, so a child process can raise it and the
-    parent unpickle it whole."""
+    value. It carries the message and a keyword mark, so a child process can
+    raise it and the parent unpickle it whole."""
     err = CoordinatorFailed("coordinator answered the read with a failure")
     assert CoordinatorFailed.reason == "coordinator_failed"
     assert err.reason == COORDINATOR_FAILED_REASON
@@ -340,6 +344,62 @@ def test_coordinator_failed_carries_its_reason_and_crosses_a_process_boundary() 
     assert type(restored) is CoordinatorFailed
     assert restored.args == ("coordinator answered the read with a failure",)
     assert SPLIT_PAIR_REASON == "split_pair"
+
+
+@pytest.fixture(scope="module")
+def spawned_worker() -> Iterator[ProcessPoolExecutor]:
+    """One worker in a spawned process, so an error crosses a real process
+    boundary both ways: pickled to the worker, raised there, pickled back."""
+    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as worker:
+        yield worker
+
+
+def _raise(error: BaseException) -> None:
+    raise error
+
+
+def _raised_in_a_spawned_process(worker: ProcessPoolExecutor, error: BaseException) -> BaseException | None:
+    return worker.submit(_raise, error).exception(timeout=120)
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["needs-reacquire", "unmarked"])
+def test_coordinator_failed_keeps_its_reacquire_mark_across_a_spawned_process(
+    spawned_worker: ProcessPoolExecutor, marked: bool
+) -> None:
+    """A write refused by this volume's own earlier attempt is marked so a
+    consumer sends the caller to ``reacquire()`` by the mark, never by the
+    message. A worker process that raises it hands the parent the mark and
+    the message whole; one raised without the mark reads unmarked."""
+    message = "data/x.md is held by this volume's own earlier write grant"
+    sent = CoordinatorFailed(message, needs_reacquire=True) if marked else CoordinatorFailed(message)
+    assert CoordinatorFailed.needs_reacquire is False
+
+    restored = _raised_in_a_spawned_process(spawned_worker, sent)
+
+    assert type(restored) is CoordinatorFailed and restored is not sent
+    assert restored.args == (message,)
+    assert restored.needs_reacquire is marked
+    assert restored.reason == COORDINATOR_FAILED_REASON
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["answered", "unmarked"])
+def test_coordinator_unreachable_keeps_its_answered_mark_across_a_spawned_process(
+    spawned_worker: ProcessPoolExecutor, marked: bool
+) -> None:
+    """A grant request the coordinator answered with neither an admit nor a
+    refusal is marked, so a consumer tells a live coordinator from a gone one
+    by the mark, never by the message. The mark and the message cross a
+    process boundary whole; one raised without the mark reads unmarked."""
+    message = "the coordinator answered the grant request for data/x.md with neither an admit nor a refusal"
+    sent = CoordinatorUnreachable(message, answered=True) if marked else CoordinatorUnreachable(message)
+    assert CoordinatorUnreachable.answered is False
+
+    restored = _raised_in_a_spawned_process(spawned_worker, sent)
+
+    assert type(restored) is CoordinatorUnreachable and restored is not sent
+    assert restored.args == (message,)
+    assert restored.answered is marked
+    assert restored.reason == COORDINATOR_UNAVAILABLE_REASON
 
 
 def test_unavailable_reason_is_its_own_wire_value() -> None:
