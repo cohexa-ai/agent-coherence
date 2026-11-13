@@ -21,6 +21,12 @@ updates:
   # No labels are set, so Dependabot keeps its defaults: `dependencies` plus
   # the ecosystem's own label.
   #
+  # What merges without a person: dependabot-gate.yml judges each PR and
+  # dependabot-merge.yml merges a qualifying one once its checks pass. Only a
+  # patch or minor update of the Python lock or the TypeScript fixture
+  # qualifies, and a lock update that lowers or removes any package does not.
+  # GitHub Actions bumps, majors and grouped updates wait for a person.
+  #
   # This file is read from the default branch, so a change takes effect once it
   # reaches `dev`.
   - package-ecosystem: "uv"

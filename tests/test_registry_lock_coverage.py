@@ -273,7 +273,7 @@ INMEM_SURFACE = frozenset({
     "artifacts_with_detection_edge", "clear_detection_edges",
     "close_detection_run", "create_checkpoint", "detection_runs",
     "detection_uncoverable", "evict_transfer_records", "foreign_write_totals",
-    "get_agent_state", "get_agent_transient", "get_artifact",
+    "forget_agent", "get_agent_state", "get_agent_transient", "get_artifact",
     "get_artifact_and_generation", "get_caller_principal", "get_checkpoint",
     "get_checkpoint_members",
     "get_content", "get_content_at_version", "get_last_reclamation",
@@ -292,8 +292,9 @@ INMEM_SURFACE = frozenset({
     "valid_holders",
 })
 SQLITE_SURFACE = INMEM_SURFACE | frozenset({
-    "artifact_names_under_prefix", "artifacts_held_by_agent", "close",
-    "evict_stale_notices", "get_artifact_updated_at", "last_writer_for",
+    "artifact_names_under_prefix", "artifacts_held_by_agent", "build_fold_index", "close",
+    "evict_stale_notices", "file_rows_for_fold", "fold_bucket_peers", "fold_index_profile",
+    "get_artifact_updated_at", "holds_writer_lock", "last_writer_for", "merge_fold_group",
     "lookup_artifact_id_by_name", "peek_preemption_notice",
     "pop_pending_notices", "pop_preemption_notice", "record_preemption_notice",
     "resolve_or_register", "status_snapshot",

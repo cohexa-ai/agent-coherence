@@ -1,0 +1,9 @@
+{
+  "ok": false,
+  "reason": "unavailable",
+  "degraded": true,
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "additionalContext": "<IGNORED>"
+  }
+}

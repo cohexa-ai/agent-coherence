@@ -50,8 +50,11 @@ from ccs.core.exceptions import (
     CheckpointRegistrationRefused,
     CheckpointUnknown,
     CoherenceError,
+    CommitNotAllowed,
+    ForgetRefused,
     GiverFenced,
     OccCallerTransientError,
+    OtherHolder,
     SessionInvalidated,
     StaleReadGeneration,
 )
@@ -88,7 +91,9 @@ from ccs.core.types import (
     WorkspaceRestoreWrite,
 )
 
+from .fold_merge import FOLD_MERGE_PREEMPTER_ID, FOLD_MERGE_TRIGGER, index_key_of
 from .registry_protocol import (
+    RELEASE_TRIGGER,
     CheckpointMember,
     CheckpointRecord,
     RegistryBase,
@@ -381,6 +386,16 @@ def _same_secret(expected: str, presented: str) -> bool:
     return hmac.compare_digest(expected.encode("utf-8"), presented.encode("utf-8"))
 
 
+@dataclass(frozen=True)
+class ReleaseRequest:
+    """An identity giving back its own write grant on one artifact: a failed
+    edit's report or the end of a turn (see :meth:`CoordinatorService.release_to_reader`)."""
+
+    agent_id: UUID
+    artifact_id: UUID
+    issued_at_tick: int
+
+
 class CallerPrincipalUncached(Exception):
     """A ``cached_only`` caller-principal lookup that the service's in-process
     cache cannot answer.
@@ -491,7 +506,8 @@ class CoordinatorService:
         # via ``_drop_session_state``). Lock ORDER is always service-lock →
         # registry-lock (the registry never calls back into the service), so the
         # ``with self._session_lock:`` blocks that wrap ``registry`` calls
-        # (capture / release / get_session_meta) cannot deadlock.
+        # (capture / release / get_session_meta / the atomic effect gate's check
+        # and commit) cannot deadlock.
         self._session_lock = threading.RLock()
         self._session_owners: dict[str, UUID] = {}
         # Snapshot session CREATION tick (SB-17 / TX-1, Unit 7 / R14):
@@ -544,7 +560,8 @@ class CoordinatorService:
         # goes stale, and an UNBOUND one goes stale only when this service binds
         # the identity — which replaces it (see :meth:`_record_bind_attempt`).
         # A second writer of bindings into the same store would not be seen
-        # here; there is none. ``_caller_principal_binds`` counts finished bind
+        # here; a second read-write open of a SQLite store is refused (#453).
+        # ``_caller_principal_binds`` counts finished bind
         # attempts, so a lookup whose durable read raced one never caches the
         # UNBOUND answer it read before that bind. Deliberately separate from
         # every session map above and from ``_session_lock``: a principal's
@@ -833,6 +850,7 @@ class CoordinatorService:
         read_set: Iterable[UUID],
         owner: UUID,
         created_at_tick: int = 0,
+        abort: threading.Event | None = None,
     ) -> SnapshotSession | VersionedReadRejection:
         """Open a consistent multi-artifact snapshot session (SB-17 / TX-1,
         Unit 2 / R1, R13). Pins a coherent CUT of ``read_set`` at one
@@ -866,6 +884,12 @@ class CoordinatorService:
             read_set: The artifact ids to pin into the consistent cut.
             owner: The creating caller's identity (the MESI agent/process label),
                 bound to the minted token for R13 owner-binding.
+            abort: Optional handler-watchdog abort Event (A6, #340). Checked by
+                ``registry.abort_guard`` once the session and registry locks
+                are won, before any token is minted or cut pinned: a begin whose
+                request was already answered degraded (with no token) raises
+                ``WatchdogAbandoned`` instead of opening a session its caller
+                could neither use nor release.
 
         Returns:
             A :class:`SnapshotSession` on success, else a
@@ -900,7 +924,9 @@ class CoordinatorService:
         # across the capture also serializes begin against the sweep — both
         # acquire ``_session_lock`` first, then the registry lock, so there is no
         # deadlock and a begin never races a reap of the same maps.
-        with self._session_lock:
+        # ``abort_guard`` is taken INSIDE ``_session_lock`` for the same order
+        # (#340): a guard taken around this call by the handler would invert it.
+        with self._session_lock, self.registry.abort_guard(abort):
             # The many-sessions GC-starvation bound (threat-model #2). Count ALL
             # live sessions via the durable session_meta (one row per open session
             # — in-memory OR a durable-only restart survivor), NOT just the
@@ -1612,16 +1638,21 @@ class CoordinatorService:
         or neither, is caller misuse → ``ValueError``):
 
         - **ATOMIC** (``commit=(artifact_id, content)``) — the effect IS an
-          artifact write, routed through :meth:`session_commit` so the shipped
-          ``commit_cas`` arbitrates AT the pinned base in the SAME step. There is
-          NO re-validate→fire window: "unchanged" and "commit" are one atomic
-          arbitration. The pre-fire re-validate still runs as a fast HELD short
-          circuit (it spares the CAS when a peer already moved the target), but
-          the AUTHORITATIVE guard is ``commit_cas`` — even if a peer commits in
-          the instant between the re-validate and the CAS, the CAS at the pinned
-          ``expected_version`` loses cleanly and returns :class:`ConflictDetail`
-          (surfaced as :class:`EffectHeld` with ``conflict`` set). This is the
-          STRONG guarantee.
+          artifact write. The gate re-validates the WHOLE read-set and routes the
+          write through :meth:`session_commit` (the shipped ``commit_cas`` at the
+          pinned base) under ONE hold of the service and registry locks. Every
+          in-process registry write takes that registry lock, so no writer using
+          this registry instance can move any read-set member between the
+          re-validate and the commit: "unchanged" and "commit" are one step, and
+          a moved non-target member holds the commit just as a moved target does.
+          The target is also CAS-guarded inside the registry's own transaction,
+          so a writer on another store handle that moves it loses cleanly
+          (:class:`ConflictDetail`, surfaced as :class:`EffectHeld` with
+          ``conflict`` set). This is the STRONG guarantee. A writer on another
+          handle to the same store could move a NON-target member between the
+          re-validate and the CAS; a second read-write handle on a SQLite store
+          is refused at open where ``flock`` exists (#453), so that residual
+          remains only without ``flock``.
         - **ESCAPING** (``effect=callable``) — the effect is a non-commit side
           effect (deploy / charge / click). The gate re-validates, then fires the
           callable. **The guarantee is "the read-set was unchanged AS OF the
@@ -1770,7 +1801,8 @@ class CoordinatorService:
         # callable runs. The gate gates PRE-FIRE and never rolls back (EO-7), so
         # the guarantee is "unchanged as of re-validate", NOT "as of fire". This
         # is intrinsic to a non-commit side effect (deploy/charge/click cannot be
-        # version-CAS'd); ATOMIC mode closes it by riding ``commit_cas``.
+        # version-CAS'd); ATOMIC mode closes it by re-validating and committing
+        # under one lock hold (see ``_effect_gate_atomic``).
         result = effect(decision)
         return EffectFired(
             revalidated_cut=dict(session.cut),
@@ -1786,61 +1818,77 @@ class CoordinatorService:
         commit: tuple[UUID, bytes | str],
         issued_at_tick: int,
     ) -> EffectFired | EffectHeld:
-        """ATOMIC mode — route the write through ``session_commit`` so the shipped
-        ``commit_cas`` arbitrates at the pinned base in the SAME step. NO
-        re-validate→fire window: the CAS at ``expected_version=pin`` is the
-        authoritative guard. A pre-CAS re-validate runs as a fast HELD short
-        circuit (sparing the CAS when the target already moved), but even without
-        it the CAS would lose cleanly on a raced peer commit."""
-        artifact_id, content = commit
-        # Fast pre-CAS re-validate: if the COMMIT TARGET already moved, hold
-        # before attempting the CAS. (The CAS itself is still authoritative for
-        # the no-window guarantee; this only short-circuits the common case and
-        # surfaces a uniform drift map with the escaping mode.)
-        moved = self._revalidate_cut(session.cut)
-        if artifact_id in moved:
-            return EffectHeld(
-                moved=moved,
-                coordinator_epoch=session.coordinator_epoch,
-            )
+        """ATOMIC mode — re-validate the WHOLE cut, then route the write through
+        ``session_commit`` so the shipped ``commit_cas`` arbitrates the target at
+        the pinned base, both under ONE hold of ``_session_lock`` and the registry
+        lock (``abort_guard``). Every in-process registry write takes that
+        registry lock, so no writer using this registry instance can move ANY
+        read-set member between the re-validate and the commit (#456). The
+        target is also CAS-guarded inside the registry's own transaction, against
+        every writer.
 
-        # Atomic arbitration at the pinned base. ``session_commit`` reuses the
-        # shipped ``commit_cas`` verbatim (admit-on-absent → version-CAS), maps
-        # the CasCorruption sentinel to a raised CoherenceError, and returns the
-        # ConflictDetail unchanged on a lost race. A SessionCommitRejection here
-        # means the cut died mid-gate (token/pin gone) → fail closed.
-        outcome = self.session_commit(
-            session.session_token,
-            artifact_id,
-            content,
-            caller=owner,
-            issued_at_tick=issued_at_tick,
-        )
-        if isinstance(outcome, SessionCommitRejection):
-            # Fail-closed: the session is gone (reaped / restart-wiped / released)
-            # — never a silent non-fire. Raise the typed dead-session error.
-            raise SessionInvalidated(
-                f"effect_gate atomic commit failed closed: {outcome.reason} "
-                f"(artifact={outcome.artifact_id})"
+        Residual, only where ``flock`` does not exist: a writer on another
+        handle to the same store is outside the hold and can move a NON-target
+        member between the re-validate and the CAS. Elsewhere a second
+        read-write handle on a SQLite store is refused at open (#453); checking
+        the read-set inside the registry's commit transaction would close it
+        everywhere. ``decide`` has already
+        run, so no caller code runs under the hold."""
+        artifact_id, content = commit
+        # Service lock first, then the registry lock: the documented order (see
+        # ``_session_lock`` and ``begin_session``). ``session_commit`` re-takes
+        # both (re-entrant); taking the registry lock first would invert the
+        # order against a concurrent ``begin_session``.
+        with self._session_lock, self.registry.abort_guard():
+            # The whole cut, not just the target: the commit is derived from the
+            # pinned cut, so ANY moved (or vanished) member holds it, as escaping
+            # mode does.
+            moved = self._revalidate_cut(session.cut)
+            if moved:
+                return EffectHeld(
+                    moved=moved,
+                    coordinator_epoch=session.coordinator_epoch,
+                )
+
+            # Atomic arbitration at the pinned base. ``session_commit`` reuses the
+            # shipped ``commit_cas`` verbatim (admit-on-absent → version-CAS), maps
+            # the CasCorruption sentinel to a raised CoherenceError, and returns the
+            # ConflictDetail unchanged on a lost race. A SessionCommitRejection here
+            # means the cut died mid-gate (token/pin gone) → fail closed.
+            outcome = self.session_commit(
+                session.session_token,
+                artifact_id,
+                content,
+                caller=owner,
+                issued_at_tick=issued_at_tick,
             )
-        if isinstance(outcome, ConflictDetail):
-            # Lost the OCC race AT the pinned base — HELD, nothing mutated. Carry
-            # the shipped ConflictDetail through verbatim (the same taxonomy a
-            # bare session_commit surfaces). Re-read the post-conflict drift so
-            # ``moved`` reflects what actually changed under the commit target.
-            post = self._revalidate_cut(session.cut)
-            return EffectHeld(
-                moved=post,
+            if isinstance(outcome, SessionCommitRejection):
+                # Fail-closed: the session is gone (reaped / restart-wiped / released)
+                # — never a silent non-fire. Raise the typed dead-session error.
+                raise SessionInvalidated(
+                    f"effect_gate atomic commit failed closed: {outcome.reason} "
+                    f"(artifact={outcome.artifact_id})"
+                )
+            if isinstance(outcome, ConflictDetail):
+                # Lost the OCC race AT the pinned base — HELD, nothing mutated. Carry
+                # the shipped ConflictDetail through verbatim (the same taxonomy a
+                # bare session_commit surfaces). Re-read the whole cut so ``moved``
+                # shows what changed; it is empty for ``other_holder`` (a peer holds
+                # the target, so nothing moved).
+                post = self._revalidate_cut(session.cut)
+                return EffectHeld(
+                    moved=post,
+                    coordinator_epoch=session.coordinator_epoch,
+                    conflict=outcome,
+                )
+            # WIN — (updated_artifact, signals); the whole cut was unchanged at the
+            # re-validate and the target committed at its pin, with no writer on
+            # this registry instance in between.
+            return EffectFired(
+                revalidated_cut=dict(session.cut),
                 coordinator_epoch=session.coordinator_epoch,
-                conflict=outcome,
+                commit=outcome,
             )
-        # WIN — (updated_artifact, signals); the commit landed atomically at the
-        # pinned base with NO window.
-        return EffectFired(
-            revalidated_cut=dict(session.cut),
-            coordinator_epoch=session.coordinator_epoch,
-            commit=outcome,
-        )
 
     # ------------------------------------------------------------------
     # Session pin lifetime — heartbeat lease + liveness sweep (Unit 5 / R4)
@@ -1973,7 +2021,8 @@ class CoordinatorService:
         Reaping a session: :meth:`registry.release_session` drops its pins AND its
         durable owner-binding (so its pinned versions become collectible again and
         no orphaned owner remains), then its in-memory owner binding, heartbeat
-        lease, and creation tick are cleared and the token is recorded in the
+        lease, and creation tick are cleared, its committer identity's rows are
+        forgotten (it can never commit again), and the token is recorded in the
         bounded reaped tombstone. After reaping, a ``session_read`` /
         ``session_commit`` on that token fails closed with ``session_invalidated``
         (the cut is gone).
@@ -2052,12 +2101,31 @@ class CoordinatorService:
         registry is the authoritative pin store, idempotent on an unknown token, so
         a crash mid-teardown leaves no live-pin-without-owner leak on sqlite), then
         drop the in-memory maps. Holds ``_session_lock`` (re-entrant — the sweep
-        already holds it) so the in-memory drops never race a concurrent handler."""
+        already holds it) so the in-memory drops never race a concurrent handler.
+
+        Last, still under ``_session_lock`` so the lock order stays service →
+        registry, it forgets the session's committer identity (#525): a commit
+        on a dropped token fails closed and no hook route names a raw agent
+        id, so the committer can never act again, and its rows would otherwise
+        stay for good. A coordinator restart drops no session, so it forgets
+        nothing on its own."""
         self.registry.release_session(session_token)
         with self._session_lock:
             self._session_heartbeats.pop(session_token, None)
             self._session_owners.pop(session_token, None)
             self._session_created.pop(session_token, None)
+            self._forget_session_committer(session_token)
+
+    def _forget_session_committer(self, session_token: str) -> None:
+        """Forget the committer of a dropped snapshot session. Its commits
+        end SHARED, so a refusal (a write grant it holds) means a ledger
+        something else wrote: logged, its rows kept, and the teardown of the
+        session, and of any sweep running it, goes on."""
+        committer = self._session_committer_id(session_token)
+        try:
+            self.forget_agent(committer)
+        except ForgetRefused as exc:
+            logger.warning("a dropped snapshot session kept its committer's records: %s", exc)
 
     def _reap_session(self, session_token: str) -> None:
         """Drop a session's pins + lease + owner binding and tombstone the token
@@ -2118,6 +2186,7 @@ class CoordinatorService:
         issued_at_tick: int = 0,
         abort: threading.Event | None = None,
         caller: UUID | None = None,
+        if_unheld: bool = False,
     ) -> list[InvalidationSignal]:
         """Request write ownership by invalidating peers and granting EXCLUSIVE.
 
@@ -2130,10 +2199,21 @@ class CoordinatorService:
         compares ``agent_id`` itself, so a library agent is unchanged. The giver
         of a live handoff of the path is refused with :class:`GiverFenced`
         before anyone is invalidated; any other acquire on a live record labels
-        it completed (the successor) or overtaken (anyone else)."""
+        it completed (the successor) or overtaken (anyone else).
+
+        ``if_unheld`` asks to take the artifact only if no other agent holds it:
+        another composite holding it EXCLUSIVE or MODIFIED refuses the write
+        with :class:`OtherHolder`, and nothing changes. The check runs inside
+        the same hold as the grant, so two such writers never both win, among
+        the writers of this one service: a second read-write registry on the
+        same store is outside that hold."""
         with self.registry.abort_guard(abort):
             return self._write_impl(
-                agent_id=agent_id, artifact_id=artifact_id, issued_at_tick=issued_at_tick, caller=caller
+                agent_id=agent_id,
+                artifact_id=artifact_id,
+                issued_at_tick=issued_at_tick,
+                caller=caller,
+                if_unheld=if_unheld,
             )
 
     def _write_impl(
@@ -2143,20 +2223,30 @@ class CoordinatorService:
         artifact_id: UUID,
         issued_at_tick: int = 0,
         caller: UUID | None = None,
+        if_unheld: bool = False,
     ) -> list[InvalidationSignal]:
         artifact = self._require_artifact(artifact_id)
         identity = caller if caller is not None else agent_id
         # Before the acquire: a giver's re-acquire must never invalidate
-        # the successor's read and then meet it as another holder.
-        self._refuse_handed_off_giver(artifact_id, identity)
+        # the successor's read and then meet it as another holder. Every row
+        # of the fold bucket, since the acquire demotes the writers of all.
+        self._refuse_bucket_giver(artifact_id, identity)
         admitted = self._live_transfer_record(artifact_id)
+        if if_unheld:
+            # Before the first state write, so a refusal changes nothing,
+            # transfer labels included.
+            self._refuse_other_holder(artifact_id, agent_id)
         self.registry.set_agent_transient(
             artifact_id,
             agent_id,
             TransientState.IED,
             entered_tick=issued_at_tick,
         )
-        signals: list[InvalidationSignal] = []
+        # Other rows of the file's fold bucket: spellings of one file a merge
+        # left apart, which the coordinator serves as one file.
+        signals = self._demote_bucket_writers(
+            self._fold_bucket_peers(artifact_id), agent_id, issued_at_tick
+        )
         for peer_id, state in self.registry.get_state_map(artifact_id).items():
             if peer_id == agent_id or state == MESIState.INVALID:
                 continue
@@ -2175,6 +2265,8 @@ class CoordinatorService:
                     new_version=artifact.version,
                     issued_at_tick=issued_at_tick,
                     issuer_agent_id=agent_id,
+                    victim_agent_id=peer_id,
+                    victim_state=state,
                 )
             )
 
@@ -2239,8 +2331,10 @@ class CoordinatorService:
                 still live -- checked first, so a giver whose grant was
                 handed off is never answered commit_not_allowed, nor shown a
                 reclaim it did not suffer.
-            CoherenceError: the committer does not hold M/E (e.g. its grant was
-                already reclaimed — the error names the reclaim trigger/tick).
+            CommitNotAllowed: the committer does not hold M/E (e.g. its grant
+                was already reclaimed — the error names the reclaim
+                trigger/tick), carrying the generation pair read in this
+                decision.
             StaleReadGeneration: the read-generation fence fired — a sweep
                 reclaimed this committer in the race window between the state
                 check above and the version persist (``ccs.core.exceptions``).
@@ -2252,15 +2346,27 @@ class CoordinatorService:
         self._refuse_handed_off_giver(artifact_id, caller if caller is not None else agent_id)
         agent_state = self.registry.get_agent_state(artifact_id, agent_id)
         if agent_state not in {MESIState.EXCLUSIVE, MESIState.MODIFIED}:
+            # Read under commit()'s abort_guard hold, the one this refusal is
+            # decided in, so no reclaim or release can land between the state
+            # check and the pair the refusal reports: the store has no other
+            # writer, since a second read-write open is refused (#453, #364).
+            pair = {
+                "captured_generation": self.registry.get_read_generation(
+                    artifact_id, agent_id
+                ),
+                "owner_generation": self.registry.get_owner_generation(artifact_id),
+            }
             reclamation = self.registry.get_last_reclamation(agent_id, artifact_id)
             if reclamation is not None:
                 trigger, reclaimed_at_tick = reclamation
-                raise CoherenceError(
+                raise CommitNotAllowed(
                     f"commit_not_allowed agent={agent_id} artifact={artifact_id} "
-                    f"state={agent_state} reclaimed_by={trigger} at_tick={reclaimed_at_tick}"
+                    f"state={agent_state} reclaimed_by={trigger} at_tick={reclaimed_at_tick}",
+                    **pair,
                 )
-            raise CoherenceError(
-                f"commit_not_allowed agent={agent_id} artifact={artifact_id} state={agent_state}"
+            raise CommitNotAllowed(
+                f"commit_not_allowed agent={agent_id} artifact={artifact_id} state={agent_state}",
+                **pair,
             )
 
         self.registry.set_agent_transient(
@@ -2320,6 +2426,8 @@ class CoordinatorService:
                     new_version=next_version,
                     issued_at_tick=issued_at_tick,
                     issuer_agent_id=agent_id,
+                    victim_agent_id=peer_id,
+                    victim_state=state,
                 )
             )
         commit_hash = content_hash if content_hash is not None else compute_content_hash(content)
@@ -2459,6 +2567,9 @@ class CoordinatorService:
         self._refuse_handed_off_giver(artifact_id, identity)
         admitted = self._live_transfer_record(artifact_id)
 
+        # The abort guard keeps this snapshot consistent with the result for
+        # registry writes made through this process.
+        victim_states = self.registry.get_state_map(artifact_id)
         result = self.registry.commit_cas(
             artifact_id,
             agent_id,
@@ -2491,8 +2602,15 @@ class CoordinatorService:
                 new_version=updated.version,
                 issued_at_tick=issued_at_tick,
                 issuer_agent_id=agent_id,
+                victim_agent_id=invalidated_id,
+                # A second registry writer (only where no single-writer lock
+                # holds, #453) may add a peer after the snapshot and before the
+                # commit result is returned.  The commit has
+                # still landed; preserve that success and report the state as
+                # unknown instead of turning it into a KeyError.
+                victim_state=victim_states.get(invalidated_id),
             )
-            for _ in invalidated_ids
+            for invalidated_id in invalidated_ids
         ]
         self._validate_single_writer(artifact_id)
         self._label_live_transfer(admitted, identity)
@@ -2559,6 +2677,12 @@ class CoordinatorService:
             self._refuse_handed_off_giver(artifact_id, identity)
             admitted[artifact_id] = self._live_transfer_record(artifact_id)
 
+        # The abort guard serializes this snapshot and the batch against other
+        # registry writes made through this process.
+        victim_states = {
+            artifact_id: self.registry.get_state_map(artifact_id)
+            for artifact_id in writes
+        }
         result = self.registry.commit_all(agent_id, writes, tick=issued_at_tick)
 
         if isinstance(result, CasCorruption):
@@ -2582,6 +2706,8 @@ class CoordinatorService:
                         new_version=new_version,
                         issued_at_tick=issued_at_tick,
                         issuer_agent_id=agent_id,
+                        victim_agent_id=_peer,
+                        victim_state=victim_states[art_id].get(_peer),
                     )
                 )
             self._validate_single_writer(art_id)
@@ -3015,7 +3141,8 @@ class CoordinatorService:
             CheckpointRegistrationRefused: one of the four typed reasons above
                 (``reason`` matched by identity); nothing resolved or minted.
             ValueError: blank/duplicate member paths or a blank fingerprint
-                (caller bugs, refused before any resolution).
+                (caller bugs, refused before any resolution). Two spellings
+                that resolve to one row are duplicates.
         """
         record = self.registry.get_checkpoint(checkpoint_id)
         if record is None:
@@ -3030,12 +3157,13 @@ class CoordinatorService:
                     f"register_workspace_restore: member {write.member_path!r} "
                     "carries no fingerprint (a written member always has one)"
                 )
-            if write.member_path in seen:
+            member_key = self._member_resolution_key(write.member_path)
+            if member_key in seen:
                 raise ValueError(
                     f"register_workspace_restore: duplicate member_path "
                     f"{write.member_path!r} in the write-set"
                 )
-            seen.add(write.member_path)
+            seen.add(member_key)
         retry_of_own = self._claim_workspace_registration(
             record, controller, entries, abort=abort
         )
@@ -3207,6 +3335,15 @@ class CoordinatorService:
             raise KeyError(f"checkpoint {checkpoint_id!r} not in registry")
         record.require_registrable_by(controller)
 
+    def _member_resolution_key(self, member_path: str) -> str:
+        """The key :meth:`_resolve_workspace_member_artifact` finds
+        ``member_path``'s row by: its fold key where the registry keys file
+        names by a fold, else the name exactly. Two writes with one key would
+        land on one row, the second silently replacing the first."""
+        # Only a SQLite registry its coordinator indexed folds; others keep names exact.
+        profile = getattr(self.registry, "fold_index_profile", None)
+        return member_path if profile is None else index_key_of(member_path, profile)
+
     def _resolve_workspace_member_artifact(
         self, member_path: str, fingerprint: str
     ) -> UUID:
@@ -3249,11 +3386,16 @@ class CoordinatorService:
         5: a refused-terminal registration must never re-read as
         ``None``-means-fine on a re-restore). Never resolves, never mints,
         never mutates: an unknown path answers ``False`` (nothing registered).
-        A plain name scan on BOTH registry backends — sqlite's
-        ``resolve_or_register`` is mint-on-miss and therefore unusable for a
-        read — matching the first-match semantics of
-        :meth:`_resolve_workspace_member_artifact`'s in-memory scan.
+        The durable registry looks the path up as
+        :meth:`_resolve_workspace_member_artifact` resolves it, through the
+        fold index when the coordinator built one, so a merge of the path's
+        spellings into one row leaves the answer as it was. The in-memory
+        registry scans names, matching that method's first-match scan.
         """
+        if isinstance(self.registry, SqliteExtended):
+            found = self.registry.lookup_artifact_id_by_name(member_path)
+            artifact = None if found is None else self.registry.get_artifact(found)
+            return artifact is not None and artifact.content_hash == fingerprint
         for artifact_id in self.registry.artifact_ids():
             artifact = self.registry.get_artifact(artifact_id)
             if artifact is not None and artifact.name == member_path:
@@ -3367,6 +3509,64 @@ class CoordinatorService:
         if record is not None:
             raise GiverFenced(artifact_id, record.successor, record.version_at_transfer)
 
+    def _refuse_bucket_giver(self, artifact_id: UUID, identity: UUID) -> None:
+        """:meth:`_refuse_handed_off_giver` over ``artifact_id`` and every
+        other row of its fold bucket, naming ``artifact_id`` as the head row
+        would. An acquire demotes the writers of the whole bucket, so a giver
+        reaching the file through another spelling's row would otherwise take
+        the grant it handed off. Caller holds the abort guard."""
+        for row_id in (artifact_id, *self._fold_bucket_peers(artifact_id)):
+            record = self.live_handoff_given_by(row_id, identity)
+            if record is not None:
+                raise GiverFenced(artifact_id, record.successor, record.version_at_transfer)
+
+    def _refuse_other_holder(self, artifact_id: UUID, agent_id: UUID) -> None:
+        """Raise :class:`OtherHolder` when an agent other than ``agent_id``
+        holds ``artifact_id``, or another row of its fold bucket, EXCLUSIVE or
+        MODIFIED, naming that agent from the same read. Caller holds the
+        abort guard.
+
+        "Other" is any composite agent id but the writer's own, so a subagent
+        and its parent refuse each other. Only opted-in writers are refused:
+        an ordinary write still displaces an opted-in holder."""
+        for row_id in (artifact_id, *self._fold_bucket_peers(artifact_id)):
+            for peer_id, state in self.registry.get_state_map(row_id).items():
+                if peer_id != agent_id and state in _M_OR_E_STATES:
+                    raise OtherHolder(artifact_id, peer_id)
+
+    def _fold_bucket_peers(self, artifact_id: UUID) -> list[UUID]:
+        """The artifact's fold-bucket siblings; none on a registry that keeps
+        names exact (the in-memory one keeps no index)."""
+        if isinstance(self.registry, SqliteExtended):
+            return self.registry.fold_bucket_peers(artifact_id)
+        return []
+
+    def _demote_bucket_writers(
+        self, bucket_rows: list[UUID], agent_id: UUID, tick: int
+    ) -> list[InvalidationSignal]:
+        """A bucket is one file, so an acquire on one of its rows takes the
+        write grant from other agents' holders of its other rows as the
+        start-time merge would: INVALID and present, ``fold_merge`` as the
+        reclaim, and a signal from the merge preempter, whose notice tells
+        the holder that no session's commit took its grant. The agent's own
+        grant on another row is left as it is. Caller holds the abort guard."""
+        signals: list[InvalidationSignal] = []
+        for row_id in bucket_rows:
+            row = self.registry.get_artifact(row_id)
+            for peer_id, state in self.registry.get_state_map(row_id).items():
+                if row is None or peer_id == agent_id or state not in _M_OR_E_STATES:
+                    continue
+                self.registry.set_agent_state(
+                    row_id, peer_id, MESIState.INVALID, trigger=FOLD_MERGE_TRIGGER, tick=tick
+                )
+                self.registry.record_last_reclamation(peer_id, row_id, FOLD_MERGE_TRIGGER, tick)
+                signals.append(InvalidationSignal(
+                    artifact_id=row_id, new_version=row.version, issued_at_tick=tick,
+                    issuer_agent_id=FOLD_MERGE_PREEMPTER_ID, victim_agent_id=peer_id,
+                    victim_state=state,
+                ))
+        return signals
+
     def _live_transfer_record(self, artifact_id: UUID) -> TransferRecord | None:
         """The path's record if it is live now. Read inside the write path's
         hold before its acquire or win, so it is the record that was live when
@@ -3445,7 +3645,7 @@ class CoordinatorService:
         NoZombieRevoke pin.
 
         Wrapped in :meth:`registry.abort_guard` (finding A6): a late
-        session-stop release whose handler already timed out aborts here rather
+        release whose handler already timed out aborts here rather
         than revoking a grant the registry has since handed to another session.
         That guard is a *time* predicate on the local watchdog, so it covers
         only the callers that thread an ``abort`` Event; a PEER-issued
@@ -3466,6 +3666,63 @@ class CoordinatorService:
                 issued_at_tick=issued_at_tick,
             )
 
+    def release_to_reader(self, request: ReleaseRequest, *, abort: threading.Event | None = None) -> bool:
+        """Give back the caller's own write grant and keep a read of the
+        version it held (#513). Returns whether a write grant was released.
+
+        Read, decide and apply run in one :meth:`registry.abort_guard` hold,
+        under the request's watchdog abort, deciding from the state read there:
+        a peer's acquire or commit lands wholly before the release, which then
+        finds the row stale and leaves it, or wholly after, and makes the read
+        stale as it would any reader's.
+
+        - EXCLUSIVE or MODIFIED: SHARED, under ``RELEASE_TRIGGER``,
+          so leaving the write claim still moves the ownership epoch
+          (``EPOCH_BUMP_TRIGGERS``) and a commit on the claim captured before
+          the release is refused. ``observed=False``: the release reads
+          nothing, and the version the grant recorded is the one held.
+        - INVALID: unchanged; the self-issued invalidation still runs, which
+          clears the acknowledgement a peer's write left pending.
+        - SHARED, no row, or no artifact: nothing changes and no row is made.
+
+        The operator drain keeps :meth:`invalidate`: the bytes on disk behind
+        an orphaned grant may never have been committed."""
+        with self.registry.abort_guard(abort):
+            artifact = self.registry.get_artifact(request.artifact_id)
+            if artifact is None:
+                return False
+            state = self.registry.get_agent_state(request.artifact_id, request.agent_id)
+            if state in _M_OR_E_STATES:
+                self.registry.clear_agent_transient(request.artifact_id, request.agent_id)
+                self.registry.set_agent_state(
+                    request.artifact_id, request.agent_id, MESIState.SHARED,
+                    trigger=RELEASE_TRIGGER, tick=request.issued_at_tick, observed=False,
+                )
+                return True
+            if state == MESIState.INVALID:
+                self._invalidate_impl(
+                    agent_id=request.agent_id,
+                    artifact_id=request.artifact_id,
+                    new_version=artifact.version,
+                    issuer_agent_id=request.agent_id,
+                    issued_at_tick=request.issued_at_tick,
+                )
+            return False
+
+    def forget_agent(self, agent_id: UUID, *, abort: threading.Event | None = None) -> int:
+        """Forget an identity that has ended (#525): the registry's
+        :meth:`~ccs.coordinator.registry_protocol.RegistryBase.forget_agent`
+        in one :meth:`registry.abort_guard` hold under the caller's watchdog
+        abort, so a request the watchdog already answered deletes nothing.
+        Returns how many per-file state rows went, and raises the registry's
+        :class:`~ccs.core.exceptions.ForgetRefused`, having deleted nothing,
+        while the identity holds a write grant.
+
+        Only for an identity that can never act again: a deleted row reads as
+        never seen, so the fence admits its commit on the version alone."""
+        with self.registry.abort_guard(abort):
+            return self.registry.forget_agent(agent_id)
+
     def _invalidate_impl(
         self,
         *,
@@ -3484,8 +3741,9 @@ class CoordinatorService:
             issuer_agent_id=issuer_agent_id,
         ):
             return None
+        victim_state = self.registry.get_agent_state(artifact_id, agent_id)
         self.registry.set_agent_state(
-            artifact_id, agent_id, MESIState.INVALID, trigger="invalidate", tick=issued_at_tick
+            artifact_id, agent_id, MESIState.INVALID, trigger=RELEASE_TRIGGER, tick=issued_at_tick
         )
         self.registry.clear_agent_transient(artifact_id, agent_id)
         return InvalidationSignal(
@@ -3493,6 +3751,8 @@ class CoordinatorService:
             new_version=new_version,
             issued_at_tick=issued_at_tick,
             issuer_agent_id=issuer_agent_id,
+            victim_agent_id=agent_id,
+            victim_state=victim_state,
         )
 
     def _revoke_is_superseded(
@@ -3526,9 +3786,10 @@ class CoordinatorService:
         layer exists to close):
 
         1. **Self-issued releases are always honoured.** ``issuer_agent_id ==
-           agent_id`` is an agent giving back its OWN claim (a post-edit
-           failure, a session-stop release, an operator drain), never a
-           cross-agent revoke. It is not pinned.
+           agent_id`` is an agent giving back its OWN claim (an operator
+           drain, or a post-edit failure or session-stop release whose row a
+           peer already made INVALID), never a cross-agent revoke. It is not
+           pinned.
         2. **Only a target currently holding a claim is pinned.** An already-
            INVALID target is pinned by nothing: applying is a state no-op, and
            the call still has to run — ``_write_impl`` / ``_commit_impl``
@@ -3576,6 +3837,8 @@ class CoordinatorService:
                     new_version=artifact.version,
                     issued_at_tick=issued_at_tick,
                     issuer_agent_id=agent_id,
+                    victim_agent_id=holder_id,
+                    victim_state=state,
                 )
                 for holder_id, state in self.registry.get_state_map(artifact_id).items()
                 if state != MESIState.INVALID

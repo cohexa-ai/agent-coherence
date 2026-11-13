@@ -14,12 +14,14 @@ Covers:
 
 from __future__ import annotations
 
+import gc
 import itertools
 import logging
 import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -47,6 +49,29 @@ from ccs.adapters.claude_code.policy import (
 def root(tmp_path: Path) -> Path:
     (tmp_path / ".coherence").mkdir()
     return tmp_path
+
+
+class _StepCount:
+    """Automaton steps (``_advance`` calls) taken so far."""
+
+    def __init__(self) -> None:
+        self.taken = 0
+
+
+@pytest.fixture
+def automaton_steps(monkeypatch: pytest.MonkeyPatch) -> _StepCount:
+    """Counts every automaton step the search and the linear matcher take:
+    their cost in steps is the same on an idle machine and a loaded one,
+    where a wall-clock budget failed with the code unchanged."""
+    count = _StepCount()
+    advance = policy_module._advance
+
+    def counted_advance(states: frozenset[int], tokens: list[tuple], ch: str | None) -> frozenset[int]:
+        count.taken += 1
+        return advance(states, tokens, ch)
+
+    monkeypatch.setattr(policy_module, "_advance", counted_advance)
+    return count
 
 
 def _quoted_yaml(patterns: list[str]) -> str:
@@ -469,8 +494,13 @@ def test_literal_ends_rule_a_search_out_at_no_cost() -> None:
     assert budget.remaining == 0
 
 
+#: FROZEN: automaton steps the star-heavy entry may take. Healthy code takes
+#: 3,745; with the search no longer skipping states it has seen, 57,176.
+_STAR_HEAVY_STEP_BOUND = 15_000
+
+
 def test_a_star_heavy_untrack_entry_is_decided_within_the_budget(
-    root: Path, monkeypatch: pytest.MonkeyPatch
+    root: Path, monkeypatch: pytest.MonkeyPatch, automaton_steps: _StepCount
 ) -> None:
     """A star-heavy entry is decided well inside the /policy/untrack handler
     (unbounded, this case explored the whole state space against every
@@ -478,20 +508,26 @@ def test_a_star_heavy_untrack_entry_is_decided_within_the_budget(
     runs out of its budget counts as covered, unless no tracked pattern's
     literal ends can meet it: ``docs/**/*.txt`` reaches no tracked path (the
     default ``docs/`` patterns end in ``.md``), so nothing under it is
-    strict, and it is exactly not covered."""
+    strict, and it is exactly not covered.
+
+    The search is counted in automaton steps, not timed."""
     (root / ".coherence" / "tracked.yaml").write_text("- src/**/*.py\n")
     (root / ".coherence" / "strict_mode.yaml").write_text(
         "- 'docs/**/*.txt'\n- 'src/**/*.py'\n"
     )
     policy = TrackedArtifactPolicy.load(root)
 
-    started = time.monotonic()
     covering = policy.strict_patterns_covering(_STAR_HEAVY)
-    assert time.monotonic() - started < 2.0
+    # Zero would mean the count no longer sees the search, not that it is fast.
+    assert 0 < automaton_steps.taken < _STAR_HEAVY_STEP_BOUND, f"{automaton_steps.taken} automaton steps"
     assert "src/**/*.py" in covering
 
     monkeypatch.setattr(policy_module, "GLOB_INTERSECT_PATTERN_BUDGET", 1)
+    searched = automaton_steps.taken
     assert policy.strict_patterns_covering(_STAR_HEAVY) == ("src/**/*.py",)
+    # Out of budget before its first step. Unbounded, the search above finds a
+    # shared path in its 3,745 steps, so only this count tells the two apart.
+    assert automaton_steps.taken == searched
 
 
 _STAR_HEAVY_LOG = _STAR_HEAVY + ".log"
@@ -559,12 +595,20 @@ def test_an_untrack_request_is_decided_under_one_budget(
     ) == ((), ("data/*.json",), ())
 
 
+#: FROZEN: automaton steps loading the 21 ignored entries below may take (the
+#: spawn-time diagnostic). Healthy code takes 7,182; with the search no
+#: longer skipping states it has seen, 35,910.
+_SPAWN_DIAGNOSTIC_STEP_BOUND = 15_000
+
+
 def test_the_spawn_override_diagnostic_is_bounded_in_total(
-    root: Path, monkeypatch: pytest.MonkeyPatch
+    root: Path, monkeypatch: pytest.MonkeyPatch, automaton_steps: _StepCount
 ) -> None:
     """The spawn-time diagnostic decides every ignored entry under one total
     budget, so a large or pathological ignored.yaml cannot hold the spawn up;
-    once the budget runs out it errs toward reporting the entry overridden."""
+    once the budget runs out it errs toward reporting the entry overridden.
+
+    The spawn is counted in automaton steps, not timed."""
     # Each entry ends like the strict glob but needs a letter that src/<digit>.py
     # never holds: disjoint, which only a search shows.
     entries = [f"**/*{c}*.py" for c in "abdefghijklmnoqtuvwxz"]
@@ -572,9 +616,10 @@ def test_the_spawn_override_diagnostic_is_bounded_in_total(
     (root / ".coherence" / "strict_mode.yaml").write_text("- 'src/[0-9].py'\n")
     (root / ".coherence" / "ignored.yaml").write_text(_quoted_yaml(entries))
 
-    started = time.monotonic()
     policy = TrackedArtifactPolicy.load(root)
-    assert time.monotonic() - started < 5.0
+    spawn_steps = automaton_steps.taken
+    # Zero would mean the count no longer sees the search, not that it is fast.
+    assert 0 < spawn_steps < _SPAWN_DIAGNOSTIC_STEP_BOUND, f"{spawn_steps} automaton steps"
     assert policy.ignored_patterns_overridden_by_strict() == ()
 
     # Each entry takes about 855 steps, all 21 about 18,000: a budget per
@@ -595,20 +640,30 @@ def _wide_class_entry(ranges: int) -> str:
     return "*[" + body + "]*"
 
 
-def test_a_wide_class_range_untrack_entry_is_decided_quickly(root: Path) -> None:
+#: FROZEN: automaton steps the 60-range entry may take. Healthy code takes 480;
+#: with every class enumerated however wide, the search walked over 30,000
+#: characters per state and ran out of its budget at 100,000.
+_WIDE_CLASS_STEP_BOUND = 5_000
+
+
+def test_a_wide_class_range_untrack_entry_is_decided_quickly(
+    root: Path, automaton_steps: _StepCount
+) -> None:
     """A /policy/untrack entry of 60 wide class ranges used to hold the
     handler for over 20 s and was then accepted (and replayed at every spawn
     from ignored.yaml). A class too wide to enumerate cheaply now counts as
     any one character, so the search is bounded and the answer errs toward
-    "covers": the entry is refused, never accepted unchecked."""
+    "covers": the entry is refused, never accepted unchecked.
+
+    The search is counted in automaton steps, not timed."""
     (root / ".coherence" / "tracked.yaml").write_text("- data/**\n")
     (root / ".coherence" / "strict_mode.yaml").write_text("- 'data/*.json'\n")
     policy = TrackedArtifactPolicy.load(root)
 
-    started = time.monotonic()
     covering = policy.strict_patterns_covering(_wide_class_entry(60))
 
-    assert time.monotonic() - started < 1.0
+    # Zero would mean the count no longer sees the search, not that it is fast.
+    assert 0 < automaton_steps.taken < _WIDE_CLASS_STEP_BOUND, f"{automaton_steps.taken} automaton steps"
     assert covering == ("data/*.json",)
 
 
@@ -621,47 +676,100 @@ def test_a_class_too_wide_to_enumerate_is_any_one_character() -> None:
     assert _glob_tokens("[a-c]") == [(_CLASS, False, frozenset("abc"))]
 
 
+#: FROZEN: CPU time tokenizing 5,000 unterminated ``[`` may take, as a multiple
+#: of tokenizing 5,000 literal characters in the same process. Healthy code
+#: took 1.7-2.6x at load averages of 70-375 on 8 CPUs; scanning for the ``]``
+#: one character at a time, 670-1,400x (over 1 s).
+_UNTERMINATED_BRACKETS_CPU_RATIO_BOUND = 10.0
+
+
+def _cpu_seconds(call: Callable[[], object]) -> float:
+    started = time.process_time()
+    call()
+    return time.process_time() - started
+
+
+@pytest.mark.serial
 def test_an_entry_of_many_unterminated_brackets_is_tokenized_quickly() -> None:
     """An unterminated ``[`` is a literal ``[``. Finding that out used to scan
     the rest of the pattern one character at a time, once per ``[``: 5,000 of
-    them took over a second, outside every search budget."""
-    started = time.monotonic()
-    tokens = _glob_tokens("[" * 5_000)
+    them took over a second, outside every search budget.
 
-    assert time.monotonic() - started < 0.25
-    assert tokens == [(_LIT, "[")] * 5_000
+    No search budget or automaton step sees the tokenizer, so it is timed,
+    but against a reference in the same process rather than a wall-clock
+    budget a loaded machine overruns: CPU time, as the best of up to three
+    interleaved pairs, with garbage collection paused."""
+    brackets, literals = "[" * 5_000, "a" * 5_000
+
+    assert _glob_tokens(brackets) == [(_LIT, "[")] * 5_000
+
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        best_case = best_reference = float("inf")
+        for _ in range(3):
+            best_case = min(best_case, _cpu_seconds(lambda: _glob_tokens(brackets)))
+            best_reference = min(best_reference, _cpu_seconds(lambda: _glob_tokens(literals)))
+            if best_case / best_reference < _UNTERMINATED_BRACKETS_CPU_RATIO_BOUND:
+                break
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+    ratio = best_case / best_reference
+    assert ratio < _UNTERMINATED_BRACKETS_CPU_RATIO_BOUND, f"{ratio:.1f}x the reference"
+
+
+#: FROZEN: automaton steps (``_advance`` calls) the 400-character entry below
+#: may take. Healthy code takes 68,170, where the strict glob's budget runs
+#: out; charged per new state only, the search took 1,656,430 (over 3 s).
+_DISTINCT_CHARACTERS_STEP_BOUND = 200_000
 
 
 def test_an_untrack_entry_of_many_distinct_characters_is_decided_quickly(
-    root: Path,
+    root: Path, automaton_steps: _StepCount
 ) -> None:
     """Literal characters join the search alphabet too, and each explored
     state is charged for every character it tries. Charged per new state
-    only, an entry of 400 distinct characters took over 3 s."""
+    only, an entry of 400 distinct characters took over 3 s.
+
+    The search is counted in automaton steps, not timed: a 1 s wall-clock
+    budget failed at 2.9 s on a loaded machine with the search unchanged."""
     (root / ".coherence" / "tracked.yaml").write_text("- data/**\n")
     (root / ".coherence" / "strict_mode.yaml").write_text("- 'data/*.json'\n")
     policy = TrackedArtifactPolicy.load(root)
     entry = "*" + "".join(chr(0x4E00 + i) for i in range(400)) + "*"
 
-    started = time.monotonic()
-    policy.strict_patterns_covering(entry)
+    covering = policy.strict_patterns_covering(entry)
 
-    assert time.monotonic() - started < 1.0
+    assert covering == ("data/*.json",)
+    # Zero would mean the count no longer sees the search, not that it is fast.
+    assert 0 < automaton_steps.taken < _DISTINCT_CHARACTERS_STEP_BOUND, f"{automaton_steps.taken} automaton steps"
 
 
-def test_the_search_is_charged_at_the_size_of_each_state(root: Path) -> None:
+#: FROZEN: automaton steps the ``*ab*ab*...`` entry may take. Healthy code
+#: takes 3,788 before its budget runs out; charged one step per transition,
+#: the search ran on to 33,585 (several seconds: its states hold hundreds).
+_STATE_SIZE_CHARGE_STEP_BOUND = 10_000
+
+
+def test_the_search_is_charged_at_the_size_of_each_state(
+    root: Path, automaton_steps: _StepCount
+) -> None:
     """Each transition is charged at the size of the state it leaves: an entry
     whose states grow with every run (``*ab*ab*...``) runs out of its budget
     in about 0.1 s. Charged one step per transition, the same budget lets it
-    run for seconds."""
+    run for seconds.
+
+    The search is counted in automaton steps, not timed."""
     (root / ".coherence" / "tracked.yaml").write_text("- data/**\n")
     (root / ".coherence" / "strict_mode.yaml").write_text("- 'data/*.json'\n")
     policy = TrackedArtifactPolicy.load(root)
 
-    started = time.monotonic()
-    policy.strict_patterns_covering("*" + "ab*" * 300)
+    covering = policy.strict_patterns_covering("*" + "ab*" * 300)
 
-    assert time.monotonic() - started < 1.0
+    # Zero would mean the count no longer sees the search, not that it is fast.
+    assert 0 < automaton_steps.taken < _STATE_SIZE_CHARGE_STEP_BOUND, f"{automaton_steps.taken} automaton steps"
+    assert covering == ("data/*.json",)
 
 
 def test_an_ordinary_multi_segment_untrack_is_not_refused(root: Path) -> None:
@@ -685,35 +793,56 @@ def test_an_ordinary_multi_segment_untrack_is_not_refused(root: Path) -> None:
 _BACKTRACKING = "**" * 12 + "Z"
 
 
-def test_a_double_star_heavy_ignore_entry_does_not_stall_the_matcher(root: Path) -> None:
+#: FROZEN: automaton steps matching the 23-character path below against the
+#: ignored entry may take. Healthy code takes 23, one per character; matched by
+#: the entry's regex, it takes none, and 8.9 s.
+_DOUBLE_STAR_IGNORE_STEP_BOUND = 100
+
+
+def test_a_double_star_heavy_ignore_entry_does_not_stall_the_matcher(
+    root: Path, automaton_steps: _StepCount
+) -> None:
     """The ``**`` matcher's regex backtracks into every run: with an accepted
     ``'**' * 12 + 'Z'`` in ignored.yaml, every ``is_tracked`` call, on every
     hook, took several seconds. A pattern of that many runs is matched in
-    time linear in the path."""
+    time linear in the path.
+
+    The match is counted in automaton steps, not timed."""
     (root / ".coherence" / "ignored.yaml").write_text(_quoted_yaml([_BACKTRACKING]))
 
-    started = time.monotonic()
     policy = TrackedArtifactPolicy.load(root)
     assert policy.is_tracked("docs/plans/feature-y.md")
 
-    assert time.monotonic() - started < 1.0
+    # Zero would mean the linear automaton never ran: the regex matched the entry.
+    assert 0 < automaton_steps.taken < _DOUBLE_STAR_IGNORE_STEP_BOUND, f"{automaton_steps.taken} automaton steps"
 
 
-def test_a_literal_strict_path_is_matched_in_linear_time(root: Path) -> None:
+#: FROZEN: automaton steps loading, checking and diagnosing the entry below
+#: against the 23-character strict path may take. Healthy code takes 69, one
+#: per character for each of the three matches; matched by the entry's regex,
+#: it takes none, and about 8 s per match.
+_LITERAL_STRICT_PATH_STEP_BOUND = 300
+
+
+def test_a_literal_strict_path_is_matched_in_linear_time(
+    root: Path, automaton_steps: _StepCount
+) -> None:
     """A literal strict path is decided by matching the entry against it. With
     the entry's backtracking regex, a 30-character untrack entry held the
     handler for several seconds, and the same entry in ignored.yaml held the
-    spawn before the port was bound."""
+    spawn before the port was bound.
+
+    The matches are counted in automaton steps, not timed."""
     entry = "**" * 12 + "Z**.md"  # its literal ends nest with the strict path's
     (root / ".coherence" / "strict_mode.yaml").write_text("- docs/plans/feature-x.md\n")
     (root / ".coherence" / "ignored.yaml").write_text(_quoted_yaml([entry]))
 
-    started = time.monotonic()
     policy = TrackedArtifactPolicy.load(root)
     assert policy.strict_patterns_covering(entry) == ()
     assert policy.ignored_patterns_overridden_by_strict() == ()
 
-    assert time.monotonic() - started < 1.0
+    # Zero would mean the linear automaton never ran: the regex matched the entry.
+    assert 0 < automaton_steps.taken < _LITERAL_STRICT_PATH_STEP_BOUND, f"{automaton_steps.taken} automaton steps"
 
 
 _SEARCH_STEPS_SCRIPT = """

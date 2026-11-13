@@ -99,7 +99,7 @@ def test_counting_leaves_the_deny_and_arbitration_state_byte_stable(registry) ->
     _seed(registry, art, agent)
     before_gen = registry.get_owner_generation(art.id)
     result = registry.commit_cas(art.id, agent, expected_version=0, content_hash="h")
-    assert result == ConflictDetail("version_mismatch", 1)
+    assert result == ConflictDetail("version_mismatch", 1, captured_generation=0, owner_generation=0)
     assert registry.get_artifact(art.id).version == 1
     assert registry.get_owner_generation(art.id) == before_gen
 

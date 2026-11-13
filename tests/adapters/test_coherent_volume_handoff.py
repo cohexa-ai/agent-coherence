@@ -50,6 +50,7 @@ from ccs.core.exceptions import (
     GiverFenced,
     HandoffPathsInvalid,
 )
+from tests.loopback_helpers import refused_endpoint
 
 _MANAGED = ("data/**",)
 _PLAN = "data/plan.md"
@@ -234,8 +235,11 @@ def test_the_givers_pre_edit_raises_the_same_terminal_without_a_reacquire(
 
         sent.clear()
         giver.reacquire(_PLAN)
-        assert "/hooks/session-stop" not in [route for route, _b in sent], (
-            "the refused pre-edit took no grant, yet the re-mint released one")
+        # The re-mint ends the incarnation the transfer left unreferenced
+        # (#525), and releases nothing.
+        assert [body for route, body in sent if route == "/hooks/session-stop"] == [
+            {"session_id": giver.session_id, "agent_id": incarnation, "ended": True},
+        ], "the refused pre-edit took no grant, yet the re-mint released one"
     finally:
         stop_coordinator(tmp_path)
 
@@ -422,7 +426,10 @@ def test_a_write_of_a_path_never_read_presents_the_writing_incarnation(
         assert _presented(sent) == [{"path": _PLAN, "agent_id": writer}]
         sent.clear()
         giver.reacquire(_OTHER)
-        assert "/hooks/session-stop" not in [route for route, _b in sent]
+        # The re-mint ends the writing incarnation (#525), and releases nothing.
+        assert [body for route, body in sent if route == "/hooks/session-stop"] == [
+            {"session_id": giver.session_id, "agent_id": writer, "ended": True},
+        ]
     finally:
         stop_coordinator(tmp_path)
 
@@ -433,7 +440,7 @@ def test_a_transferred_path_leaves_the_write_record_and_the_rest_stays(
     """One incarnation wrote two paths and hands one of them on. The record
     keeps that incarnation for the other path, which it still holds: the next
     re-mint releases it, one stop naming the writing incarnation, and the
-    grant is gone afterwards."""
+    write grant is gone afterwards (the release keeps a read, #513)."""
     _seed(tmp_path, _PLAN, b"plan v1")
     _seed(tmp_path, _OTHER, b"other v1")
     spare = "data/spare.md"
@@ -451,9 +458,20 @@ def test_a_transferred_path_leaves_the_write_record_and_the_rest_stays(
 
         stops = [body for route, body in sent if route == "/hooks/session-stop"]
         assert [body["agent_id"] for body in stops] == [writer]
-        assert _held(giver, str(session_to_agent_id(giver.session_id, writer))) == {}
+        held = _held(giver, str(session_to_agent_id(giver.session_id, writer)))
+        assert not [state for state in held.values() if state in ("EXCLUSIVE", "MODIFIED")], held
     finally:
         stop_coordinator(tmp_path)
+
+
+#: What a stop that left the plan's grant held answers (#185): the release is
+#: not confirmed, so the volume keeps the grant recorded, and a strict volume
+#: goes on past it.
+_PLAN_HELD_RELEASE = {
+    "ok": False,
+    "released_artifacts": [],
+    "grants": [{"path": _PLAN, "held": True, "reason": "internal: RuntimeError"}],
+}
 
 
 def test_a_stranded_write_grant_is_presented_ahead_of_the_current_incarnation(
@@ -477,7 +495,7 @@ def test_a_stranded_write_grant_is_presented_ahead_of_the_current_incarnation(
         def refuse_one_release(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
             if path == "/hooks/session-stop" and unconfirmed[0]:
                 unconfirmed[0] -= 1
-                return {"ok": False, "reason": "internal: RuntimeError"}  # not released
+                return _PLAN_HELD_RELEASE
             return real_post(endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", refuse_one_release)
@@ -495,7 +513,10 @@ def test_a_stranded_write_grant_is_presented_ahead_of_the_current_incarnation(
         assert _presented(sent) == [{"path": _PLAN, "agent_id": writer}]
         sent.clear()
         giver.reacquire(_OTHER)
-        assert "/hooks/session-stop" not in [route for route, _b in sent]
+        # The re-mint ends the handed-on incarnation (#525), and releases nothing.
+        assert [body for route, body in sent if route == "/hooks/session-stop"] == [
+            {"session_id": giver.session_id, "agent_id": writer, "ended": True},
+        ]
     finally:
         stop_coordinator(tmp_path)
 
@@ -764,10 +785,15 @@ def _http_error(code: int, body: dict) -> urllib.error.HTTPError:
     )
 
 
+#: The failures after which the verb cannot have landed.
+_NEVER_FORWARDED = ("http_503_before_forwarding", "refused_before_sending")
+
+
 def _fail_on(route: str, kind: str) -> object:
     """``_coordinator_post`` that fails ``route`` the way ``kind`` names: the
-    answer lost after the request was forwarded (a reset, an HTTP 500), or an
-    HTTP 503 before it was."""
+    answer lost after the request was forwarded (a reset, an HTTP 500), an
+    HTTP 503 before it was, or a connect refused, through the real client, so
+    the request was never sent."""
     real_post = coherent_volume_module._coordinator_post
 
     def post(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
@@ -775,6 +801,8 @@ def _fail_on(route: str, kind: str) -> object:
             return real_post(endpoint, path, payload, **kwargs)
         if kind == "http_503_before_forwarding":
             raise _http_error(503, {"error": "handler concurrency exceeded"})
+        if kind == "refused_before_sending":
+            return real_post(refused_endpoint(endpoint), path, payload, **kwargs)
         real_post(endpoint, path, payload, **kwargs)
         if kind == "reset_after_forwarding":
             raise CoordinatorUnavailable("simulated: the answer was lost")
@@ -805,7 +833,10 @@ def _volume_pair(tmp_path: Path, cfg: LifecycleConfig, on_error: str, verb: str)
     return giver, successor
 
 
-@pytest.mark.parametrize("kind", ["reset_after_forwarding", "http_500_after_forwarding", "http_503_before_forwarding"])
+@pytest.mark.parametrize(
+    "kind",
+    ["reset_after_forwarding", "http_500_after_forwarding", "http_503_before_forwarding", "refused_before_sending"],
+)
 @pytest.mark.parametrize("on_error", ["strict", "degrade"])
 @pytest.mark.parametrize("verb", ["transfer", "accept", "decline", "withdraw"])
 def test_a_handoff_verb_whose_answer_is_lost_raises_unconfirmed_in_both_modes(
@@ -815,7 +846,9 @@ def test_a_handoff_verb_whose_answer_is_lost_raises_unconfirmed_in_both_modes(
     modes (#276). Under strict it used to raise a plain ``CoherenceError``,
     which reads as "nothing happened" although the verb may have landed; the
     caller would then repeat it. The record shows the verb did land whenever
-    the request was forwarded."""
+    the request was forwarded. A connect refused before the request was sent
+    raises ``CommitUnconfirmed`` too, never ``CoordinatorUnreachable``: a
+    handoff verb keeps one answer for every transport failure."""
     try:
         giver, successor = _volume_pair(tmp_path, fast_cfg, on_error, verb)
         before = (_status_handoff(giver, _PLAN) or {}).get("status")
@@ -828,7 +861,7 @@ def test_a_handoff_verb_whose_answer_is_lost_raises_unconfirmed_in_both_modes(
         assert "whether it landed is unknown" in str(raised.value)
         monkeypatch.undo()
         after = (_status_handoff(giver, _PLAN) or {}).get("status")
-        assert after == (before if kind == "http_503_before_forwarding" else _LANDED_STATUS[verb])
+        assert after == (before if kind in _NEVER_FORWARDED else _LANDED_STATUS[verb])
         sender = successor if verb in ("accept", "decline") else giver
         assert sender.degradation_count == (1 if on_error == "degrade" else 0)
     finally:
@@ -1026,7 +1059,7 @@ def test_the_latest_of_two_stranded_write_grants_is_the_one_presented(
 
         def refuse_releases(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
             if path == "/hooks/session-stop":
-                return {"ok": False, "reason": "internal: RuntimeError"}  # not released
+                return _PLAN_HELD_RELEASE
             return real_post(endpoint, path, payload, **kwargs)
 
         monkeypatch.setattr(coherent_volume_module, "_coordinator_post", refuse_releases)

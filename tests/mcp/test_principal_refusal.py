@@ -26,12 +26,15 @@ from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.mcp.server import _do_gate, _do_read, _do_status, _do_write
 from ccs.mcp.session import SessionConfig
 
-#: FROZEN duplicates of the wire reason and the recover verbs (never imported
+#: FROZEN duplicates of the wire reasons and the recover verbs (never imported
 #: from the code under test): the verb for a refusal that is settled for the
-#: session, and the one for a refusal whose recovery claim's answer was lost.
+#: session, the one for a refusal whose recovery claim was answered without
+#: binding, and the stop for a recovery claim that got no answer at all.
 _FOREIGN = "caller_principal_foreign"
 _RECOVER = "restart_session"
 _UNSETTLED_RECOVER = "wait_and_retry"
+_UNAVAILABLE = "coordinator_unavailable"
+_STOP = "stop_and_report"
 #: In principal / nonce shape, minted by nobody: a principal that is not the
 #: session's, and a nonce that is not the one its binding was made under.
 _OTHER_PRINCIPAL = "X" * 43
@@ -121,8 +124,10 @@ def test_a_refusal_whose_recovery_claim_is_unconfirmed_is_retryable_and_the_next
 ) -> None:
     """The session is bound and the volume presents a principal that is not
     the bound one while holding the binding's own nonce; the coordinator
-    refuses the write, and the recovery claim's answer is lost (a transport
-    blip). The tool call answers the typed reason with ``recover:
+    refuses the write, and the recovery claim is answered without binding
+    (faked here as an ``unconfirmed`` claim with no transport failure, the
+    shape a redirect, an HTTP status or an unconfirmed body produces). The
+    tool call answers the typed reason with ``recover:
     wait_and_retry`` and ``retryable: true`` — not ``restart_session`` — and
     ``swg_status`` reads ``principal_claim: unconfirmed``; the next tool call
     claims again with the same nonce by itself, succeeds, and status reads
@@ -171,6 +176,55 @@ def test_a_refusal_whose_recovery_claim_is_unconfirmed_is_retryable_and_the_next
         assert nonces == [nonce, nonce], "the next call claimed again by itself, same nonce"
         assert vol._principal == bound
         assert _do_status(vol, config).structuredContent["principal_claim"] == "bound"
+        for secret in (bound, nonce, _OTHER_PRINCIPAL):
+            assert secret not in _rendered(denied), "a principal or nonce was rendered"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_a_refusal_whose_recovery_claim_gets_no_answer_stops_the_agent(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The coordinator refuses the write for its principal, and the recovery
+    claim then gets no answer at all (``transport_failed``, the shape the
+    client gives a claim whose connection failed). On the strict MCP volume
+    that is a coordinator that cannot be reached to settle the principal, so
+    the tool call answers ``reason: coordinator_unavailable``, ``recover:
+    stop_and_report``, ``retryable: false`` with a ``next_step`` saying stop,
+    not the principal reason with ``wait_and_retry``. Nothing is written, the
+    claim stays ``unconfirmed``, and nothing rendered carries a principal or
+    the nonce. The lost answer is faked in-process over a live loopback
+    coordinator: one machine; it does not prove what a real dropped
+    connection does to the claim."""
+    import ccs.adapters.coherent_volume as coherent_volume_module
+    from ccs.cli._coherence_client import PrincipalClaim
+
+    target = _seed(tmp_path)
+    config = SessionConfig(root=tmp_path.resolve(), managed=("data/**",))
+    vol = CoherentVolume(tmp_path, managed=("data/**",), on_error="strict", config=fast_cfg)
+    try:
+        bound, nonce = vol._principal, vol._mint_nonce
+        assert bound and nonce, "control: the session claimed a principal at attach"
+        assert _do_read(vol, config, "data/shared.txt").isError is False
+        nonces: list[str] = []
+
+        def unanswered(endpoint, session_id, presented_nonce):  # noqa: ANN001, ANN202
+            nonces.append(presented_nonce)
+            return PrincipalClaim("unconfirmed", detail="connection refused", transport_failed=True)
+
+        monkeypatch.setattr(coherent_volume_module, "claim_caller_principal", unanswered)
+        vol._principal = _OTHER_PRINCIPAL
+
+        denied = _do_write(vol, config, "data/shared.txt", "v2")
+        sc = denied.structuredContent
+        assert denied.isError is True
+        assert sc["reason"] == _UNAVAILABLE and sc["reason"] != _FOREIGN
+        assert sc["recover"] == _STOP and sc["recover"] != _UNSETTLED_RECOVER
+        assert sc["retryable"] is False
+        assert "stop" in sc["next_step"].lower()
+        assert target.read_bytes() == b"v1", "the refused write landed"
+        assert nonces == [nonce], "the recovery claim presented the binding's own nonce"
+        assert _do_status(vol, config).structuredContent["principal_claim"] == "unconfirmed"
         for secret in (bound, nonce, _OTHER_PRINCIPAL):
             assert secret not in _rendered(denied), "a principal or nonce was rendered"
     finally:

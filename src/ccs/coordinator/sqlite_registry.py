@@ -75,10 +75,20 @@ Thread safety: process-level RLock guards all mutating methods. SQLite
 connection opened with ``check_same_thread=False`` so handler threads share
 one connection (mutation-then-log invariant preserved by RLock + BEGIN
 IMMEDIATE transactions).
+
+One writer per store (#453): the RLock serializes only the callers of one
+handle, so every read-write open takes an exclusive ``flock`` on
+``<store>.writer-lock`` (:func:`writer_lock_path`) before it touches the store,
+and a second one, in this or another process, raises :class:`StoreHeldError`.
+``read_only=True`` takes no lock. A lock file that cannot be opened, or is not a
+regular file, refuses the open. Only where ``flock`` does not exist (no
+``fcntl``, or a file system whose flock does not work) does the open proceed
+unlocked.
 """
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import sqlite3
@@ -86,7 +96,8 @@ import stat
 import threading
 import time
 import warnings
-from contextlib import contextmanager
+import weakref
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -99,12 +110,24 @@ from typing import (
     NoReturn,
     Optional,
     Sequence,
+    TypeVar,
 )
+from urllib.parse import quote
 from uuid import UUID, uuid4
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no flock
+    fcntl = None  # type: ignore[assignment]
 
 from ccs.core.exceptions import (
     CROSS_RUNTIME_SCHEMA_REASON,
+    REGISTRY_META_INCOMPLETE_REASON,
+    SCHEMA_NEWER_REASON,
+    SCHEMA_OLDER_REASON,
+    SCHEMA_UNRECOGNIZED_REASON,
     STALE_READ_GENERATION_REASON,
+    STORE_HELD_REASON,
     STORE_SIGNAL_BUSY,
     STORE_SIGNAL_UNREADABLE,
     STORE_SIGNAL_WAL_RECOVERY,
@@ -112,8 +135,11 @@ from ccs.core.exceptions import (
     StaleReadGeneration,
     WatchdogAbandoned,
 )
+from ccs.core.invariants import check_monotonic_version, check_single_writer
+from ccs.core.path_fold import FoldProfile, tidy_path
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import (
+    TRANSFER_STATUS_WITHDRAWN,
     Artifact,
     CasCorruption,
     CommitAllEntry,
@@ -122,6 +148,23 @@ from ccs.core.types import (
     MultiCommitResult,
     TransferGrantOutcome,
     VersionedReadRejection,
+)
+
+from .fold_merge import (
+    FOLD_MERGE_TRIGGER,
+    FoldBucket,
+    FoldGroup,
+    FoldMergeOutcome,
+    FoldRow,
+    MergeArtifactRow,
+    MergeFacts,
+    MergeNoticeRow,
+    MergePlan,
+    MergeSnapshot,
+    MergeStateRow,
+    NameKind,
+    index_key_of,
+    plan_fold_merge,
 )
 
 # Contract return types (ReclamationSlot / CasResult / CaptureResult) live in the
@@ -148,6 +191,9 @@ from .registry_protocol import (
     UncoverableRun,
     acquire_by_deadline,
     decide_transfer_grant,
+    forget_refusal,
+    note_guard_won,
+    refusal_with_generation_pair,
     require_storable_transfer_status,
     transfer_record_live,
 )
@@ -579,6 +625,90 @@ _WORKSPACE_CHECKPOINTS_NAME_INDEX_DDL = (
     "CREATE INDEX idx_workspace_checkpoints_name ON workspace_checkpoints(name)"
 )
 
+# The rows a request for a name that is not a file (a key: a substrate row or
+# object, a remote-endpoint volume's name) created. Listed rows keep their
+# exact name: they stay out of the fold index and the start-time merge. The
+# same shape as the Node coordinator's, so whichever opens the store first
+# creates the table the other reads.
+_ARTIFACT_NAME_KINDS_DDL = """
+CREATE TABLE IF NOT EXISTS artifact_name_kinds (
+    artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL
+)
+"""
+
+_GROUPED_STATE_COLUMNS = (
+    "artifact_id", "agent_id", "state", "transient_state", "transient_tick",
+    "granted_at_tick", "last_reclaim_trigger", "last_reclaim_tick",
+    "read_generation", "last_observed_version",
+)
+
+# Row ids bound by one name read; under the 999 variables older SQLite builds allow.
+_NAMES_PER_QUERY = 500
+
+
+def _in_clause(values: Sequence[object]) -> str:
+    """``IN (?, ?, ...)`` placeholders for ``values``."""
+    return f"IN ({', '.join('?' for _ in values)})"
+
+
+@dataclass
+class _FoldIndex:
+    """Fold key -> file-row ids (hex), lowest rowid first, each file row
+    listed once under the key of its stored name by ``profile``. Built once
+    per start after the merge; changed only after a commit that inserts or
+    deletes a row, always under the registry lock."""
+
+    profile: FoldProfile
+    by_key: dict[str, list[str]]
+    key_by_id: dict[str, str]
+
+    def add(self, row_id: str, stored_name: str) -> None:
+        key = index_key_of(stored_name, self.profile)
+        self.by_key.setdefault(key, []).append(row_id)
+        self.key_by_id[row_id] = key
+
+    def forget(self, row_id: str) -> None:
+        key = self.key_by_id.pop(row_id, None)
+        if key is None:
+            return
+        remaining = [other for other in self.by_key.get(key, []) if other != row_id]
+        if remaining:
+            self.by_key[key] = remaining
+        else:
+            self.by_key.pop(key, None)
+
+
+def _state_row_values(row: MergeStateRow) -> tuple[object, ...]:
+    """``row`` in ``_GROUPED_STATE_COLUMNS`` order, the state stored by name."""
+    return (
+        row.artifact_id, row.agent_id, row.state.name, row.transient_state, row.transient_tick,
+        row.granted_at_tick, row.last_reclaim_trigger, row.last_reclaim_tick,
+        row.read_generation, row.last_observed_version,
+    )
+
+
+@dataclass(frozen=True)
+class _NameRequest:
+    """How one request names its row. ``stored_name`` is looked up exactly
+    when ``index_key`` is None, is the name a new row takes, and is the name
+    re-read after a lost insert race."""
+
+    stored_name: str
+    index_key: str | None
+    is_key: bool
+
+
+def _stored_as(request: _NameRequest, disk_spelling: str | None) -> _NameRequest:
+    """``request`` storing a new row under the disk's spelling of the file,
+    when the caller found one and the name is keyed by the fold index.
+    Register and lookup both apply it, so the name a new row would take is
+    the name a lookup falls back to."""
+    if disk_spelling is None or request.index_key is None:
+        return request
+    return _NameRequest(disk_spelling, request.index_key, is_key=False)
+
+
 # registry_meta keys persisting the retention policy on writer open (plan item
 # N v1, Unit 3). ``retention_enabled`` is the explicit marker set even in the
 # unbounded mode (retain_versions=True + policy=None → enabled with NULL axes):
@@ -612,7 +742,41 @@ class SchemaVersionError(RuntimeError):
     state, so a delete is destructive (it drops retained history AND the fence
     epoch). The forward path is upgrading the embedder binary to one that
     understands the schema, never ``rm state.db``.
+
+    Typed fields (#345), so a host branches on attributes, never on the
+    message (the typed-signal-not-substring house rule):
+
+    - ``reason`` — one of :data:`ccs.core.exceptions.SCHEMA_VERSION_REASONS`
+      on every raise in this module; ``None`` only for an embedder's own
+      message-only construction.
+    - ``found_version`` — the store's raw ``user_version`` under
+      ``schema_older``, ``schema_newer`` and ``schema_unrecognized``. It is
+      negative under ``schema_unrecognized``, and under ``schema_newer`` it may
+      be a sibling runtime's ledger number this build does not recognize, so
+      read it with ``reason``, never alone. ``None`` under
+      ``registry_meta_incomplete`` (the check runs after every migration step,
+      so the version is not what is wrong), under ``cross_runtime_schema`` (a
+      Node ledger number means a different schema, #294), and for an
+      embedder's own message-only construction.
+    - ``expected_version`` — the schema this build serves.
+
+    All three are keyword-only with defaults, so ``SchemaVersionError("m")``
+    keeps working. Pickling keeps them: ``BaseException.__reduce__`` carries
+    the instance ``__dict__`` and re-applies it after ``cls(message)``.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str | None = None,
+        found_version: int | None = None,
+        expected_version: int = SCHEMA_USER_VERSION,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.found_version = found_version
+        self.expected_version = expected_version
 
 
 class CrossRuntimeSchemaError(SchemaVersionError):
@@ -633,19 +797,60 @@ class CrossRuntimeSchemaError(SchemaVersionError):
     ``exc.reason == CONSTANT``, never a substring of the message (the
     typed-signal-not-substring house rule). Same anti-delete wording rule as
     the parent: the message must never advise removing the db — it holds the
-    sibling runtime's live coordination state.
+    sibling runtime's live coordination state. ``found_version`` stays
+    ``None``: a Node ledger number names a different schema than the same
+    Python number (#294), so it is never comparable to ``expected_version``.
     """
 
     def __init__(self, message: str) -> None:
-        super().__init__(message)
-        self.reason = CROSS_RUNTIME_SCHEMA_REASON
+        super().__init__(message, reason=CROSS_RUNTIME_SCHEMA_REASON)
+
+
+def _unrecognized_schema_error(header: str, current: int) -> SchemaVersionError:
+    """The refusal of a negative ``user_version``, which no coordinator build
+    stamps (#345). Its remedy is a backup restore on the writer and the
+    read-only open alike: no build understands the store, so "upgrade" would
+    send the user after a build that does not exist, and "re-open read-write
+    to migrate" would loop, because the writer open refuses it too."""
+    return SchemaVersionError(
+        f"{header} No coordinator build stamps a negative user_version, so "
+        f"the store was damaged or changed outside a coordinator. Restore it "
+        f"from a backup rather than removing it — it may hold durable retained "
+        f"content and read-generation fence state that a delete would destroy.",
+        reason=SCHEMA_UNRECOGNIZED_REASON,
+        found_version=current,
+    )
+
+
+def _read_only_uri(db_path: Path) -> str:
+    """The ``mode=ro`` SQLite URI that opens exactly ``db_path`` (#418)."""
+    # Quoted so SQLite reads the path as filename bytes, never URI syntax:
+    # unquoted, a '#' or '?' cut it short and took mode=ro with it, so SQLite
+    # opened (or created) the shorter path read-write, and a '%xx' decoded to
+    # another name. safe="" so a leading '//' is not an authority; absolute() so
+    # a bare ':memory:' is not the in-memory store; surrogateescape so an
+    # undecodable filename byte still reaches the open. The same encoding as
+    # ccs.diagnose._state_db (#183), which this layer may not import.
+    encoded = quote(str(db_path.absolute()), safe="", errors="surrogateescape")
+    return f"file:{encoded}?mode=ro"
+
+
+#: ``os.stat`` errors for a path where no store can stand: the ones
+#: ``Path.exists()`` reads as False, plus a name too long for the file system.
+_PATH_NOT_THERE_ERRNOS = frozenset(
+    {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EBADF, errno.ENAMETOOLONG}
+)
 
 
 class ReadOnlyRegistryError(RuntimeError):
     """Base for read-only-open failures (the resolver / SB-17 inherit this).
 
-    A read-only :class:`SqliteArtifactRegistry` (``mode=ro`` URI) never creates,
-    migrates, or mutates the store. The subclasses below give the CLI a typed,
+    A read-only :class:`SqliteArtifactRegistry` (``mode=ro`` URI) never creates
+    the store, never migrates it, and never changes ``state.db`` or its WAL.
+    SQLite itself creates an empty ``-wal`` and a ``-shm`` beside a WAL store
+    when they are missing, and rewrites ``-shm`` (#419): resolve a copy of
+    ``state.db`` and ``-wal`` to leave an original untouched. The subclasses
+    below give the CLI a typed,
     prose-free way to distinguish *why* a read-only open or call failed; they
     are exceptions (not the ``ConflictDetail`` typed-return discipline) because
     an open that cannot proceed has no value to return.
@@ -666,14 +871,15 @@ class ReadOnlyMutationError(ReadOnlyRegistryError):
 
 
 class StoreNeedsRecoveryError(ReadOnlyRegistryError):
-    """The read-only connection could not read the store (recovery/busy/other).
+    """The read-only connection could not read the store as it is.
 
-    After an embedder crash SQLite leaves a hot WAL whose recovery requires a
-    *write* lock; a ``mode=ro`` connection raises ``SQLITE_READONLY_RECOVERY``.
-    This is distinct from missing / corrupt — the remedy is to re-open
-    the store once with the embedder (read-write) so it checkpoints the WAL,
-    then retry the read-only resolve. The forensic population over-represents
-    crashed writers, so this is the resolver's most on-brand failure mode.
+    A writer holds its lock (``busy``); another process holds a WAL index a
+    read-only reader cannot rebuild (``wal_recovery``); or the store cannot be
+    read as it is (``unreadable``): no access, a read-only directory SQLite
+    cannot create a sidecar in, a hot rollback journal. A crashed writer's WAL
+    is not among them: a ``mode=ro`` connection reads it in place, committed
+    transactions visible and the unfinished one not (#419). The message names
+    SQLite's error code and a step that works for it.
 
     ``reason`` is the machine-readable classification signal (one of
     ``ccs.core.exceptions.STORE_OPEN_SIGNALS``: ``wal_recovery`` / ``busy`` /
@@ -683,32 +889,380 @@ class StoreNeedsRecoveryError(ReadOnlyRegistryError):
     message — per the typed-signal house rule.
     """
 
-    def __init__(self, message: str, *, reason: str = STORE_SIGNAL_WAL_RECOVERY) -> None:
+    def __init__(self, message: str, *, reason: str = STORE_SIGNAL_UNREADABLE) -> None:
         super().__init__(message)
         self.reason = reason
+
+
+_BUSY_SQLITE_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+
+#: How SQLite's own lock messages start. Only for an error that carries no
+#: code: Python raises some OperationalErrors itself, and a decode error's text
+#: quotes the stored bytes, so a substring anywhere would let data pick the label.
+_BUSY_TEXT_PREFIXES = ("database is locked", "database table is locked")
+
+# The operator step each read-only refusal names. A read-write open is named
+# only where it works: in a read-only directory it fails the same way.
+_COPY_STEP = (
+    "or copy state.db and state.db-wal (never state.db-shm) to a writable "
+    "directory and resolve the copy"
+)
+#: For a user who cannot read the store: a copy of retained content stays 0600.
+_CROSS_USER_COPY_STEP = (
+    "or have that user copy state.db and state.db-wal (never state.db-shm) into a "
+    "directory only this user can reach, keeping the copy at mode 0600, and resolve the copy"
+)
+_BUSY_STEP = "A writer holds the store's lock and the open timed out waiting for it. Retry shortly."
+_WAL_INDEX_STEP = (
+    "Another process has the store open, and SQLite cannot rebuild its write-ahead "
+    "log index for a read-only reader. Retry once that process exits; a copy of "
+    "state.db and state.db-wal (never state.db-shm) taken after it exits resolves too."
+)
+_STEP_BY_SQLITE_CODE = {
+    sqlite3.SQLITE_READONLY_ROLLBACK: (
+        "A writer stopped mid-transaction and left state.db-journal, which a "
+        "read-only open cannot roll back. One read-write SQLite open rolls it back, "
+        "in a writable directory; to leave this store as it is, copy state.db and "
+        "state.db-journal, open the copy read-write once (for example "
+        "sqlite3.connect(path).execute('PRAGMA user_version')), and resolve the copy."
+    ),
+    sqlite3.SQLITE_READONLY_DIRECTORY: (
+        "SQLite must create state.db-wal and state.db-shm beside the store and "
+        "cannot: the directory is read-only, and a read-write open fails the same "
+        "way. Make the directory writable for the resolve, or copy state.db to a "
+        "writable directory and resolve the copy."
+    ),
+}
+_UNREADABLE_FILE_STEP = (
+    "This user cannot read state.db. Run the resolve as a user that can read it "
+    f"(the user the coordinator runs as), {_CROSS_USER_COPY_STEP}."
+)
+_MISSING_SHM_STEP = (
+    "SQLite must create state.db-shm beside the store's write-ahead log and "
+    "cannot: this user cannot write the directory, and a read-write open fails "
+    f"the same way. Make the directory writable for the resolve, {_COPY_STEP}."
+)
+_GENERIC_STEP = (
+    f"Check that this user can read the store and write its directory, {_COPY_STEP}. "
+    "If it can, retry once (a process out of file descriptors gets the same code); "
+    "if it fails again, the store may be damaged: inspect a copy, not the original."
+)
+
+
+def _unreachable_store_step(exc: OSError) -> str:
+    """The step for an ``os.stat`` failure on the store path that is not a
+    missing file: an access error names a user, anything else a retry."""
+    if exc.errno in (errno.EACCES, errno.EPERM):
+        return (
+            "A directory above it cannot be searched by this user. Run the resolve "
+            f"as a user that can reach the store, {_CROSS_USER_COPY_STEP}."
+        )
+    return "Retry; if it fails again, check the file system the store is on."
 
 
 def classify_sqlite_operational_signal(exc: sqlite3.OperationalError) -> str:
     """Classify an ``OperationalError`` from a read-only connection into one of
     the ``STORE_OPEN_SIGNALS`` (``busy`` / ``wal_recovery`` / ``unreadable``).
 
-    The ONE place sqlite's rendered error text is substring-matched: Python's
-    ``sqlite3`` exposes no stable error code on every path/version, so the
-    classification is unavoidably text-based and therefore FRAGILE against
-    sqlite message rewording — which is exactly why it must not be duplicated
-    (the typed-signal-not-substring house rule,
-    ``docs/solutions/best-practices/typed-signal-not-substring-...``). Every
-    downstream consumer matches the returned constant with ``==``, never the
-    message. Order matters: a locked store is checked FIRST because a busy
-    signal has a different remedy (retry) than a recovery one (re-open with
-    the embedder).
+    By SQLite's extended error code (``sqlite_errorcode``, on every error
+    SQLite raises since Python 3.11), never its message: SQLite renders every
+    ``SQLITE_READONLY_*`` code as the same "attempt to write a readonly
+    database" (#420). This is the ONE classification point (the
+    typed-signal-not-substring house rule,
+    ``docs/solutions/best-practices/typed-signal-not-substring-...``); every
+    consumer matches the returned constant with ``==``, never the message.
     """
-    text = str(exc).lower()
-    if "busy" in text or "locked" in text:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is None:
+        text = str(exc).lower()
+        return STORE_SIGNAL_BUSY if text.startswith(_BUSY_TEXT_PREFIXES) else STORE_SIGNAL_UNREADABLE
+    if (code & 0xFF) in _BUSY_SQLITE_CODES:
         return STORE_SIGNAL_BUSY
-    if "readonly" in text or "recovery" in text or "wal" in text:
+    if code == sqlite3.SQLITE_READONLY_RECOVERY:
         return STORE_SIGNAL_WAL_RECOVERY
     return STORE_SIGNAL_UNREADABLE
+
+
+# ---------------------------------------------------------------------------
+# Trial opens of a store COPY (the #345 store check)
+# ---------------------------------------------------------------------------
+#
+# The store check (``ccs.adapters.claude_code.store_check``) predicts a
+# coordinator start by running the start's own writer open on a private copy
+# of the store. Every SQLite call it needs lives HERE, beside the registry
+# that opens the coordinator store for writing: adapters, cli and mcp modules
+# never import ``sqlite3`` (tests/coordinator/test_caller_principal.py::
+# test_no_interface_module_owns_a_table sweeps those three), so SQLite
+# failures cross into the adapter typed, as :class:`StoreSqliteError`.
+
+#: Primary SQLite result codes that describe the side OPENING a store — its
+#: disk, memory, file handles and locks — never the store's content.
+_OPENER_SIDE_SQLITE_CODES = frozenset(
+    {
+        sqlite3.SQLITE_FULL,
+        sqlite3.SQLITE_IOERR,
+        sqlite3.SQLITE_CANTOPEN,
+        sqlite3.SQLITE_PERM,
+        sqlite3.SQLITE_NOMEM,
+        sqlite3.SQLITE_READONLY,
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+    }
+)
+
+
+class StoreSqliteError(RuntimeError):
+    """A ``sqlite3.Error`` from a trial open of a store copy, typed (#345).
+
+    ``reason`` is ``sqlite_<code name>`` lower-cased (``sqlite_notadb``,
+    ``sqlite_corrupt``; ``sqlite_error`` when SQLite attached no code).
+    ``opener_side`` is True when the PRIMARY result code is one of
+    :data:`_OPENER_SIDE_SQLITE_CODES`: the failure is the opener's
+    environment (a full or failing disk, memory, a lock), which says nothing
+    about the store. Matched by attribute, never by message (the
+    typed-signal-not-substring house rule).
+    """
+
+    def __init__(self, message: str, *, reason: str, opener_side: bool) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.opener_side = opener_side
+
+    @classmethod
+    def from_sqlite(cls, exc: sqlite3.Error) -> "StoreSqliteError":
+        # sqlite_errorcode/-name (Python >= 3.11) carry the EXTENDED code;
+        # the low byte is the primary one. Absent on an error SQLite did not
+        # raise itself, which then reads as the store's.
+        code = getattr(exc, "sqlite_errorcode", None)
+        name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
+        return cls(
+            " ".join(str(exc).split()),
+            reason=name.lower(),
+            opener_side=code is not None and (code & 0xFF) in _OPENER_SIDE_SQLITE_CODES,
+        )
+
+
+class StoreHeldError(RuntimeError):
+    """A read-write open found another live read-write handle on the store.
+
+    A store has one writer: a coordinator, or one registry in this or another
+    process. The refused open touched nothing in the store. A
+    ``read_only=True`` open takes no lock and stays allowed.
+
+    - ``reason`` — always :data:`ccs.core.exceptions.STORE_HELD_REASON`.
+    - ``lock_path`` — the lock file beside the store that the holder has
+      locked.
+    """
+
+    reason = STORE_HELD_REASON
+
+    def __init__(self, message: str, lock_path: str) -> None:
+        super().__init__(message)
+        self.lock_path = lock_path
+
+    def __reduce__(self) -> tuple[type["StoreHeldError"], tuple[str, str]]:
+        return type(self), (str(self), self.lock_path)
+
+
+_WRITER_LOCK_SUFFIX = ".writer-lock"
+_OpenedT = TypeVar("_OpenedT")
+
+#: flock's "someone else holds a conflicting lock" errnos. EACCES: some systems
+#: answer a conflicting non-blocking flock with it.
+LOCK_CONTENDED_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
+#: flock's "this file system has no working flock" errnos: the only failures
+#: that let a writer open go ahead without the lock.
+_NO_FLOCK_ERRNOS = frozenset({errno.ENOLCK, errno.ENOTSUP, errno.EOPNOTSUPP})
+#: The store check probes the lock with a shared lock it drops at once; a writer
+#: open retries a contended lock this long before it reads it as a holder.
+_CONTENDED_RETRY_SEC = 0.1
+_CONTENDED_POLL_SEC = 0.01
+
+
+class _WriterLock:
+    """The open file description that holds ``flock`` on a store's lock file."""
+
+    __slots__ = ("fd",)
+
+    def __init__(self, fd: int) -> None:
+        self.fd: int | None = fd
+        _HELD_WRITER_LOCKS.add(self)
+
+    def release(self) -> None:
+        """Unlock and close. Idempotent, so a second close of a registry never
+        frees a lock a later handle took."""
+        fd, self.fd = self.fd, None
+        _HELD_WRITER_LOCKS.discard(self)
+        if fd is None:
+            return
+        if fcntl is not None:
+            with suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+#: Every writer lock this process holds, so a forked child can drop its copies.
+_HELD_WRITER_LOCKS: "set[_WriterLock]" = set()
+
+
+def _drop_writer_locks_in_child() -> None:
+    """Close a forked child's copies of its parent's writer locks.
+
+    A flock belongs to the open file description, which a forked child shares:
+    its copy would keep the store locked after the parent exits, and an unlock
+    from it would free the live parent's lock. So close, never unlock.
+    """
+    for lock in tuple(_HELD_WRITER_LOCKS):
+        fd, lock.fd = lock.fd, None
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
+    _HELD_WRITER_LOCKS.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_drop_writer_locks_in_child)
+
+
+def _warn_unlocked(path: str | Path, exc: OSError) -> None:
+    logger.warning(
+        "opening %s without the single-writer lock (%s): a second read-write "
+        "open of this store will not be refused",
+        path,
+        exc,
+    )
+
+
+def _open_lock_file(lock_path: Path) -> int:
+    """The lock file's descriptor, made private (0600). Raises ``OSError`` when
+    the path cannot be opened or is not a regular file: a store whose lock
+    cannot be taken is never opened unlocked. ``O_NOFOLLOW``: a link planted at
+    the path is refused (ELOOP), never followed. ``O_NONBLOCK``: a FIFO there
+    cannot hang the open."""
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open(lock_path, flags, _DB_FILE_MODE)
+    try:
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            code = errno.EISDIR if stat.S_ISDIR(mode) else errno.EINVAL
+            raise OSError(code, "not a regular file, so it cannot hold the store's lock", str(lock_path))
+        # A lock file that already existed keeps its mode through O_CREAT.
+        with suppress(OSError):
+            os.fchmod(fd, _DB_FILE_MODE)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _flock_exclusive(fd: int) -> None:
+    """``flock(LOCK_EX)``, retried for :data:`_CONTENDED_RETRY_SEC` while it is
+    contended, so a shared probe held for an instant is not read as a holder."""
+    deadline = time.monotonic() + _CONTENDED_RETRY_SEC
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            if exc.errno not in LOCK_CONTENDED_ERRNOS or time.monotonic() >= deadline:
+                raise
+            time.sleep(_CONTENDED_POLL_SEC)
+
+
+def writer_lock_path(db_path: str | Path) -> Path:
+    """The single-writer lock file of the store at ``db_path``: beside the
+    store with every symlink resolved, so each path to one store names the
+    same lock."""
+    return Path(os.path.realpath(db_path) + _WRITER_LOCK_SUFFIX)
+
+
+def _take_writer_lock(db_path: Path) -> _WriterLock | None:
+    """Take the store's single-writer lock, or raise :class:`StoreHeldError`.
+
+    The lock is ``flock`` on a lock file beside the store, never on the store:
+    on Darwin a flock on the database file conflicts with SQLite's own locks.
+    It is keyed on the resolved path, so a symlink to the store meets the same
+    lock. None where there is no flock: no ``fcntl``, or a file system whose
+    flock does not work (one WARNING), and for a bare ``:memory:`` path, which
+    is a private store for each connection. Any other failure raises.
+    """
+    if fcntl is None or str(db_path) == ":memory:":
+        return None
+    lock_path = writer_lock_path(db_path)
+    # Tracked from the open, so a fork or an interrupt mid-take frees it.
+    lock = _WriterLock(_open_lock_file(lock_path))
+    try:
+        _flock_exclusive(lock.fd)
+    except BaseException as exc:
+        lock.release()
+        if not isinstance(exc, OSError) or exc.errno not in (LOCK_CONTENDED_ERRNOS | _NO_FLOCK_ERRNOS):
+            raise
+        if exc.errno in LOCK_CONTENDED_ERRNOS:
+            raise StoreHeldError(_store_held_message(db_path), str(lock_path)) from None
+        _warn_unlocked(db_path, exc)
+        return None
+    return lock
+
+
+def open_waiting_out_a_holder(
+    open_store: Callable[[], _OpenedT], wait_sec: float, poll_sec: float
+) -> _OpenedT:
+    """``open_store()``, tried again every ``poll_sec`` while it raises
+    :class:`StoreHeldError`, for up to ``wait_sec``; past that the error
+    propagates."""
+    deadline = time.monotonic() + wait_sec
+    while True:
+        try:
+            return open_store()
+        except StoreHeldError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(poll_sec)
+
+
+def _store_held_message(db_path: Path) -> str:
+    return (
+        f"{db_path} is open for writing by another handle: a coordinator, or a "
+        "registry in this or another process. A store has one writer: go "
+        "through that handle, open with read_only=True to read, or retry once "
+        "it closes."
+    )
+
+
+def read_copy_user_version(copy_path: str | Path) -> int:
+    """``PRAGMA user_version`` of a store COPY as a writer open would read it:
+    committed WAL frames applied, a hot journal rolled back (#345).
+
+    A read-write connection, so it may write — replay the journal, build a
+    ``-shm`` — which is why it is for a disposable copy only, never a live
+    store. A plain path, never a ``file:`` URI, so a ``#`` or ``?`` in the
+    path is never parsed as URI syntax. Raises :class:`StoreSqliteError`.
+    """
+    try:
+        conn = sqlite3.connect(str(copy_path))
+        try:
+            return conn.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise StoreSqliteError.from_sqlite(exc) from exc
+
+
+def trial_writer_open(copy_path: str | Path) -> None:
+    """Run the writer open a coordinator start reaches
+    (``CoordinatorHTTPServer`` → :class:`SqliteArtifactRegistry`) on a store
+    COPY, then close it (#345).
+
+    It MIGRATES, creates the schema, or replays a hot WAL/journal exactly as
+    the start would — on ``copy_path``, which must be a disposable copy.
+    Raises what that open raises (:class:`SchemaVersionError` and its
+    cross-runtime subclass, ``OSError``), with any ``sqlite3.Error`` typed as
+    :class:`StoreSqliteError`.
+    """
+    try:
+        SqliteArtifactRegistry(copy_path).close()
+    except sqlite3.Error as exc:
+        raise StoreSqliteError.from_sqlite(exc) from exc
 
 
 # The one place the outcome vocabulary is bound to the columns that store it.
@@ -741,6 +1295,18 @@ def _foreign_write_column(outcome: str) -> str:
         ) from None
 
 
+# The version, size and owner generation of one artifact plus one agent's
+# recorded claim on it, in ONE statement: the commit decision and the pair its
+# refusal reports come from the same read. A missing agent row and a NULL
+# claim both read as an absent claim.
+_DECISION_SNAPSHOT_SQL = (
+    "SELECT a.version, a.size_tokens, a.owner_generation, "
+    "(SELECT s.read_generation FROM agent_states s "
+    "WHERE s.artifact_id = a.id AND s.agent_id = ?) "
+    "FROM artifacts a WHERE a.id = ?"
+)
+
+
 @dataclass(frozen=True)
 class _ArtifactRow:
     """Internal row decoded from the artifacts table."""
@@ -769,6 +1335,7 @@ class SqliteArtifactRegistry:
         retain_versions: bool = False,
         retention_policy: RetentionPolicy | None = None,
         read_only: bool = False,
+        on_migrated: Callable[[int], None] | None = None,
     ) -> None:
         if state_log is not None and instance_id is None:
             raise ValueError(
@@ -805,12 +1372,52 @@ class SqliteArtifactRegistry:
         # store but never ran the detector leaves no observation row at all —
         # which is exactly the not-instrumented signal ``detection_runs`` reads.
         self._detection_run_id: str = uuid4().hex
+        # The registry schema version THIS open migrated the store from, or
+        # None when it migrated nothing (a fresh create, a current store, a
+        # read-only open, or a concurrent loser whose every step found the
+        # racing winner's stamp) (#345). Set by the first migration step that
+        # actually runs its body — each step marks itself only AFTER its
+        # concurrent-loser early return — so the spawn can log an exact
+        # "migrated from N" line; the dispatch's pre-lock read cannot, since a
+        # loser dispatches on a version it then never migrates.
+        self.migrated_from_version: int | None = None
+        self._writer_lock: _WriterLock | None = None
+        # One identity per file: None until the coordinator's start builds it
+        # (build_fold_index); until then, and on every other handle, file
+        # names are looked up exactly as given.
+        self._fold_index: _FoldIndex | None = None
 
         if read_only:
             self._open_read_only(instance_id)
             return
 
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Before the first descriptor on the store opens: closing any descriptor
+        # on a file drops this process's POSIX locks on it, so an open that
+        # touched the store and then refused would free a holder's SQLite locks.
+        try:
+            self._writer_lock = _take_writer_lock(self._db_path)
+            if self._writer_lock is not None:
+                # A registry dropped without close() frees its lock when collected.
+                weakref.finalize(self, self._writer_lock.release)
+            self._conn = self._precreate_and_connect()
+        except BaseException:
+            self._release_writer_lock()
+            raise
+        # Every step past the connect can raise, and the caller then never gets
+        # a registry to .close(): a kept exception's traceback would hold the
+        # store open (#426), and its lock with it. The BaseException breadth
+        # mirrors _open_read_only.
+        try:
+            self._finish_writer_open(instance_id, on_migrated)
+        except BaseException:
+            self._conn.close()
+            self._release_writer_lock()
+            raise
+
+    def _precreate_and_connect(self) -> sqlite3.Connection:
+        """The writer's connection, with the store and its sidecars created at
+        0600 first."""
         # Race-free 0600: pre-create state.db at 0o600 via os.open BEFORE
         # sqlite3.connect, so the file never exists at a broader umask mode in
         # the window between creation and an explicit chmod (the audit_log
@@ -828,15 +1435,23 @@ class SqliteArtifactRegistry:
         # below stays as belt-and-suspenders.
         self._precreate_file_0600(self._wal_path())
         self._precreate_file_0600(self._shm_path())
-
         # check_same_thread=False because ThreadingHTTPServer handler threads
         # all share one registry instance. Coupled with the RLock on every
         # mutating method, this preserves the mutation-then-log invariant.
-        self._conn = sqlite3.connect(
+        return sqlite3.connect(
             str(self._db_path),
             check_same_thread=False,
             isolation_level=None,  # autocommit; we manage transactions explicitly
         )
+
+    def _release_writer_lock(self) -> None:
+        if self._writer_lock is not None:
+            self._writer_lock.release()
+
+    def _finish_writer_open(
+        self, instance_id: str | None, on_migrated: Callable[[int], None] | None
+    ) -> None:
+        """The steps of a writer open past the connect."""
         # WAL for concurrent readers + bounded busy_timeout for write contention.
         # synchronous=NORMAL is durable enough for non-financial use.
         #
@@ -865,6 +1480,13 @@ class SqliteArtifactRegistry:
         self._chmod_if_exists(self._shm_path())
 
         self._initialize_schema(instance_id)
+        # Reported here, not at the end: the chain has committed, and the store
+        # stays moved even if a later step of this open raises (#417).
+        if on_migrated is not None and self.migrated_from_version is not None:
+            try:
+                on_migrated(self.migrated_from_version)
+            except Exception:  # noqa: BLE001 — observer isolation by design
+                logger.exception("on_migrated callback raised; store open unaffected")
         # Conflict-counter table (guarantee-ladder U5 / KTD-9): an idempotent
         # writer-open ensure, deliberately OUTSIDE the versioned migration
         # chain — the counters are observability exhaust, not coordination
@@ -882,6 +1504,10 @@ class SqliteArtifactRegistry:
         # mean "the detector ran". Only an observation ROW can, which is what
         # ``detection_runs`` reads.
         self._ensure_foreign_write_tables()
+        # The rows created for names that are not files (keys). Same posture
+        # as the two ensures above: a new user_version would make an older
+        # build refuse or re-stamp the store, an extra table does neither.
+        self._conn.execute(_ARTIFACT_NAME_KINDS_DDL)
         # Persist the retention policy on writer open (incl. the explicit
         # unbounded marker) so a read-only resolver can derive T-expiry + the
         # retention_off reason from the store, not a process-local object.
@@ -1067,7 +1693,7 @@ class SqliteArtifactRegistry:
                 # Existing v10 database — rehydrate; NO writes on this path (the
                 # prerequisite for read-only open mode).
                 self._rehydrate_meta(instance_id)
-            else:
+            elif current > SCHEMA_USER_VERSION:
                 raise SchemaVersionError(
                     f"unexpected schema version {current}; this build expects "
                     f"{SCHEMA_USER_VERSION}. The database at {self._db_path} was "
@@ -1077,7 +1703,16 @@ class SqliteArtifactRegistry:
                     f"to a build that understands schema v{current} rather than "
                     f"removing the store — as of v2 it holds durable retained "
                     f"content and read-generation fence state that a delete would "
-                    f"destroy."
+                    f"destroy.",
+                    reason=SCHEMA_NEWER_REASON,
+                    found_version=current,
+                )
+            else:
+                # Only a negative value is left, and no build stamps one (#345).
+                raise _unrecognized_schema_error(
+                    f"unexpected schema version {current}; this build expects "
+                    f"{SCHEMA_USER_VERSION}. The database is at {self._db_path}.",
+                    current,
                 )
 
     # ------------------------------------------------------------------
@@ -1105,9 +1740,11 @@ class SqliteArtifactRegistry:
 
         Residual (documented, finding A6): a ``BEGIN IMMEDIATE`` that starts
         AFTER this check and then blocks on CROSS-PROCESS SQLite write
-        contention is not covered. That window is narrow — the coordinator is
-        single-process, so the RLock already serializes in-process writers — and
-        remains observed by ``watchdog_late_completion_total``.
+        contention is not covered. That window is narrow — the RLock serializes
+        this handle's writers, and the store has no other read-write handle: a
+        second read-write open is refused while this one is open (#453), except
+        where ``flock`` does not exist — and remains observed by
+        ``watchdog_late_completion_total``.
 
         ``deadline`` (keyword-only, #238) bounds the wait for the lock: a
         :func:`time.monotonic` instant past which the guard stops waiting and
@@ -1127,6 +1764,7 @@ class SqliteArtifactRegistry:
                     "handler watchdog timed out while this mutation was blocked "
                     "on the registry write lock; aborting before it lands (A6)."
                 )
+            note_guard_won(abort)
             yield
         finally:
             self._lock.release()
@@ -1495,6 +2133,11 @@ class SqliteArtifactRegistry:
         same code be reused read-only. Earlier versions ran the
         ``pending_notices`` IF-NOT-EXISTS and the fence-column ALTERs here on
         EVERY open; those moved into ``_migrate_v1_to_v2`` and run once.
+
+        Every refusal carries ``found_version=None`` (#345): this runs after EVERY
+        migration step as well as on a current store, so ``user_version`` here
+        can be anything from 2 to the current schema — and the version is not
+        what is wrong.
         """
         rows = dict(
             self._conn.execute(
@@ -1506,11 +2149,21 @@ class SqliteArtifactRegistry:
                 f"registry_meta is missing required keys at {self._db_path}; "
                 f"the database may be corrupted (a v2 store always carries these). "
                 f"Restore from a backup rather than deleting — the store may hold "
-                f"durable retained content."
+                f"durable retained content.",
+                reason=REGISTRY_META_INCOMPLETE_REASON,
             )
         # Caller's explicit instance_id wins (rare; typically used in tests).
         self._instance_id = instance_id_override or rows["instance_id"]
-        self._seq = int(rows["sequence_number"])
+        try:
+            self._seq = int(rows["sequence_number"])
+        except (TypeError, ValueError) as exc:
+            raise SchemaVersionError(
+                f"registry_meta holds a sequence_number that is not an integer "
+                f"({rows['sequence_number']!r}) at {self._db_path}; the database may "
+                f"be corrupted. Restore from a backup rather than deleting — the "
+                f"store may hold durable retained content.",
+                reason=REGISTRY_META_INCOMPLETE_REASON,
+            ) from exc
         epoch_row = self._conn.execute(
             "SELECT value FROM registry_meta WHERE key = 'coordinator_epoch'"
         ).fetchone()
@@ -1519,9 +2172,23 @@ class SqliteArtifactRegistry:
                 f"coordinator_epoch missing from registry_meta at {self._db_path}; "
                 f"the database may be corrupted (a v2 store always seeds the epoch). "
                 f"Restore from a backup rather than deleting — the store may hold "
-                f"durable retained content and fence state."
+                f"durable retained content and fence state.",
+                reason=REGISTRY_META_INCOMPLETE_REASON,
             )
         self._coordinator_epoch = epoch_row[0]
+
+    def _mark_migrated_from(self, version: int) -> None:
+        """Record ``version`` as the schema this open migrated from, unless an
+        earlier step of the same chain already did (#345). Each migration step
+        calls it as its first statement AFTER its concurrent-loser early
+        return, so a loser that migrates nothing records nothing.
+
+        ``getattr``, not the attribute: the migration-step crash tests assemble
+        a handle without ``__init__``. A plain attribute set in ``__init__``,
+        not a class default, keeps it off the class's public surface, which
+        the registry-lock coverage test enumerates."""
+        if getattr(self, "migrated_from_version", None) is None:
+            self.migrated_from_version = version
 
     def _migrate_v1_to_v2(self, instance_id: str | None) -> None:
         """Migrate any wild v1 db to v2 in ONE atomic transaction. Caller holds lock.
@@ -1566,6 +2233,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(1)
             art_cols = {
                 row[1] for row in c.execute("PRAGMA table_info(artifacts)").fetchall()
             }
@@ -1665,6 +2333,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(2)
             # IF NOT EXISTS guards the half-migrated-db case (table created by a
             # prior crashed migration whose user_version stamp never committed).
             c.execute(
@@ -1720,6 +2389,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(3)
             c.execute(
                 _SESSION_META_DDL.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1)
             )
@@ -1798,6 +2468,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(4)
             c.execute(
                 _WORKSPACE_CHECKPOINTS_DDL.replace(
                     "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
@@ -1876,6 +2547,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(5)
             if not self._has_column("agent_states", "last_observed_version"):
                 c.execute(
                     "ALTER TABLE agent_states ADD COLUMN last_observed_version INTEGER"
@@ -1935,6 +2607,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(6)
             c.execute(
                 "CREATE INDEX IF NOT EXISTS idx_agent_states_agent "
                 "ON agent_states(agent_id)"
@@ -1988,6 +2661,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(7)
             c.execute(
                 _CALLER_PRINCIPALS_DDL.replace(
                     "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
@@ -2043,6 +2717,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(8)
             c.execute(
                 _TRANSFER_RECORDS_DDL.replace(
                     "CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1
@@ -2096,6 +2771,7 @@ class SqliteArtifactRegistry:
                 c.execute("COMMIT")
                 self._rehydrate_meta(instance_id)
                 return
+            self._mark_migrated_from(9)
             if not self._has_column("workspace_checkpoints", "receiver"):
                 c.execute("ALTER TABLE workspace_checkpoints ADD COLUMN receiver TEXT")
             if not self._has_column("workspace_checkpoints", "registered_by"):
@@ -2135,33 +2811,37 @@ class SqliteArtifactRegistry:
         self._chmod_if_exists(self._shm_path())
 
     def _open_read_only(self, instance_id: str | None) -> None:
-        """Open the store read-only: never creates, migrates, ALTERs, or mutates.
+        """Open the store read-only: never creates the store, migrates, ALTERs,
+        or changes ``state.db`` or its WAL.
 
         Used by the replay resolver (Unit 6) and SB-17 later. The
         ``file:...?mode=ro`` URI requires ``uri=True`` to be passed EXPLICITLY —
         without it sqlite3 treats the whole string as a literal filename and can
-        silently fall back to read-write (and create the file). A missing path is
-        a typed :class:`MissingDatabaseError` (a read-write open would create it;
-        read-only must not materialize a fresh empty store). A v1 (un-migrated)
-        db is a typed :class:`SchemaVersionError` with NO migration attempted. A
-        post-crash hot WAL that needs replay raises
-        :class:`StoreNeedsRecoveryError` (a read-only connection cannot run WAL
-        recovery — SQLITE_READONLY_RECOVERY).
+        silently fall back to read-write (and create the file). The path rides in
+        that URI percent-encoded, so SQLite opens exactly the named file (#418).
+        A missing path is a typed :class:`MissingDatabaseError` (a read-write
+        open would create it; read-only must not materialize a fresh empty
+        store), and so is one deleted between that check and the connect; any
+        other failure of the connect is typed like a failed read on it. A v1
+        (un-migrated) db is a typed :class:`SchemaVersionError` with NO
+        migration attempted. A crashed writer's WAL is read in place: its
+        committed transactions are visible, the unfinished one is not. SQLite
+        creates ``-wal`` and ``-shm`` when they are missing and rewrites
+        ``-shm`` (#419); where it cannot, the open raises
+        :class:`StoreNeedsRecoveryError` naming the step that works.
         """
-        if not self._db_path.exists():
-            raise MissingDatabaseError(
-                f"read-only open: no database at {self._db_path}. A read-only "
-                f"registry never creates the file (that would materialize a fresh "
-                f"empty store); point it at an existing coordinator state.db."
-            )
+        self._check_read_only_store_path()
         # mode=ro + uri=True (explicit) — see docstring on the silent-rw hazard.
-        uri = f"file:{self._db_path}?mode=ro"
-        self._conn = sqlite3.connect(
-            uri,
-            uri=True,
-            check_same_thread=False,
-            isolation_level=None,
-        )
+        try:
+            self._conn = sqlite3.connect(
+                _read_only_uri(self._db_path),
+                uri=True,
+                check_same_thread=False,
+                isolation_level=None,
+            )
+        except sqlite3.OperationalError as exc:
+            self._check_read_only_store_path(cause=exc)
+            raise self._classify_readonly_operational_error(exc) from exc
         # Everything past the connect is validation that can raise a TYPED
         # error; without the close-on-raise the construction failure would leak
         # the open handle (the caller never gets a registry to .close()). The
@@ -2176,8 +2856,9 @@ class SqliteArtifactRegistry:
             try:
                 current = self._conn.execute("PRAGMA user_version").fetchone()[0]
                 # Cross-runtime fail-closed guard (same classification as the
-                # writer path): the probes are plain reads, so a busy/hot-WAL
-                # store surfaces the SAME typed signal as the version read.
+                # writer path): the probes are plain reads, so a locked or
+                # unreadable store surfaces the SAME typed signal as the version
+                # read.
                 self._reject_foreign_ledger_db(current)
             except sqlite3.OperationalError as exc:
                 raise self._classify_readonly_operational_error(exc) from exc
@@ -2192,24 +2873,84 @@ class SqliteArtifactRegistry:
                     f"a newer Python coordinator or a sibling-runtime coordinator "
                     f"whose ledger this build does not recognize may have written "
                     f"it. Read-only mode performs NO migration — use a build that "
-                    f"understands schema v{current}, then retry."
+                    f"understands schema v{current}, then retry.",
+                    reason=SCHEMA_NEWER_REASON,
+                    found_version=current,
+                )
+            if current < 0:
+                raise _unrecognized_schema_error(
+                    f"read-only open: database at {self._db_path} is schema "
+                    f"v{current}, this build serves v{SCHEMA_USER_VERSION}.",
+                    current,
                 )
             if current != SCHEMA_USER_VERSION:
+                # Below the current schema, 0 included: read-only never creates
+                # the schema a writer open would.
                 raise SchemaVersionError(
                     f"read-only open: database at {self._db_path} is schema "
                     f"v{current}, this build serves v{SCHEMA_USER_VERSION}. Read-only "
                     f"mode performs NO migration — re-open the store once with the "
-                    f"embedder (read-write) to migrate it, then retry."
+                    f"embedder (read-write) to migrate it, then retry.",
+                    reason=SCHEMA_OLDER_REASON,
+                    found_version=current,
                 )
             try:
                 self._rehydrate_meta(instance_id)
+                # Policy is immutable per handle (see retention_meta) — cache once.
+                self._retention_meta_cache = self._load_retention_meta()
             except sqlite3.OperationalError as exc:
                 raise self._classify_readonly_operational_error(exc) from exc
-            # Policy is immutable per handle (see retention_meta) — cache once.
-            self._retention_meta_cache = self._load_retention_meta()
         except BaseException:
             self._conn.close()
             raise
+
+    def _check_read_only_store_path(self, *, cause: BaseException | None = None) -> None:
+        """Raise unless a file the open could read stands at the store path,
+        and refuse an empty store file with a write-ahead log beside it.
+
+        ``os.stat``, not ``Path.exists()``, which raises ``PermissionError`` for
+        a path under a directory this user cannot search, and ``OSError`` for a
+        name too long for the file system (#437). A NUL stops here too
+        (``ValueError``): encoded as ``%00`` it would cut the path short in
+        SQLite and open the store before it. ``cause`` is the failed connect
+        this check explains, when there is one.
+        """
+        try:
+            found = os.stat(self._db_path)
+        except ValueError as exc:
+            raise self._missing_read_only_store_error() from (cause or exc)
+        except OSError as exc:
+            if exc.errno in _PATH_NOT_THERE_ERRNOS:
+                raise self._missing_read_only_store_error() from (cause or exc)
+            raise StoreNeedsRecoveryError(
+                f"read-only open: this user cannot reach the store at "
+                f"{self._db_path} ({exc.strerror}). {_unreachable_store_step(exc)}",
+                reason=STORE_SIGNAL_UNREADABLE,
+            ) from exc
+        if stat.S_ISDIR(found.st_mode):
+            raise StoreNeedsRecoveryError(
+                f"read-only open: {self._db_path} is a directory, not a store "
+                f"file; point the open at the state.db file inside it.",
+                reason=STORE_SIGNAL_UNREADABLE,
+            ) from cause
+        # SQLite discards the WAL of an empty database file on its first read,
+        # even read-only, and that log may hold every committed version.
+        if found.st_size == 0 and os.path.lexists(self._sidecar_sqlite_opens("-wal")):
+            raise StoreNeedsRecoveryError(
+                f"read-only open: {self._db_path} is empty, and the write-ahead "
+                f"log beside it holds the store's committed data, which a SQLite "
+                f"open of the empty file would discard; nothing was opened. Copy "
+                f"state.db and state.db-wal, keeping mode 0600, before anything "
+                f"opens them, and restore the store from a backup.",
+                reason=STORE_SIGNAL_UNREADABLE,
+            ) from cause
+
+    def _missing_read_only_store_error(self) -> MissingDatabaseError:
+        return MissingDatabaseError(
+            f"read-only open: no database at {self._db_path}. A read-only "
+            f"registry never creates the file (that would materialize a fresh "
+            f"empty store); point it at an existing coordinator state.db."
+        )
 
     def _classify_readonly_operational_error(
         self, exc: sqlite3.OperationalError
@@ -2220,32 +2961,47 @@ class SqliteArtifactRegistry:
         :func:`classify_sqlite_operational_signal` seam; the signal rides on
         ``StoreNeedsRecoveryError.reason`` so consumers (the replay resolver)
         branch on the attribute, never re-parse the message. All three signals
-        stay ONE exception type — a locked store and a hot WAL are both
-        "cannot read right now" from the registry's perspective; the reason
-        carries the operator remedy.
+        stay ONE exception type — "cannot read the store as it is" from the
+        registry's perspective; the message names SQLite's code and the step
+        that works for it.
         """
         signal = classify_sqlite_operational_signal(exc)
-        if signal == STORE_SIGNAL_BUSY:
-            return StoreNeedsRecoveryError(
-                f"the store at {self._db_path} is locked by a concurrent writer "
-                f"(SQLITE_BUSY) and the read-only open timed out waiting for the "
-                f"lock. Retry shortly. Underlying: {exc}",
-                reason=signal,
-            )
-        if signal == STORE_SIGNAL_WAL_RECOVERY:
-            return StoreNeedsRecoveryError(
-                f"the store at {self._db_path} has an unclean write-ahead log that "
-                f"a read-only connection cannot replay (SQLITE_READONLY_RECOVERY). "
-                f"Re-open it once with the embedder (read-write) so it checkpoints "
-                f"the WAL, then retry the read-only resolve. Underlying: {exc}",
-                reason=signal,
-            )
+        code = getattr(exc, "sqlite_errorcode", None)
+        code_name = getattr(exc, "sqlite_errorname", None) or "no SQLite code"
         return StoreNeedsRecoveryError(
-            f"the read-only store at {self._db_path} could not be read "
-            f"({exc}); it may need recovery (re-open once with the embedder) or "
-            f"be corrupt.",
+            f"read-only open of the store at {self._db_path} failed "
+            f"({code_name}: {exc}). {self._read_only_step(signal, code)}",
             reason=signal,
         )
+
+    def _read_only_step(self, signal: str, code: int | None) -> str:
+        """The step that works for this refusal (the ``_*_STEP`` texts)."""
+        if signal == STORE_SIGNAL_BUSY:
+            return _BUSY_STEP
+        if signal == STORE_SIGNAL_WAL_RECOVERY:
+            return _WAL_INDEX_STEP
+        if code in _STEP_BY_SQLITE_CODE:
+            return _STEP_BY_SQLITE_CODE[code]
+        if code is not None and (code & 0xFF) == sqlite3.SQLITE_CANTOPEN:
+            return self._cantopen_step()
+        return _GENERIC_STEP
+
+    def _cantopen_step(self) -> str:
+        """SQLITE_CANTOPEN names no file: tell a store file this user cannot
+        read apart from a ``-shm`` SQLite must create and cannot. ``os.path``
+        checks, which answer False rather than raise: choosing a message must
+        not replace the refusal (a ``-wal`` name past the file system's limit)."""
+        if not os.access(self._db_path, os.R_OK):
+            return _UNREADABLE_FILE_STEP
+        wal, shm = self._sidecar_sqlite_opens("-wal"), self._sidecar_sqlite_opens("-shm")
+        if os.path.exists(wal) and not os.path.exists(shm):
+            return _MISSING_SHM_STEP
+        return _GENERIC_STEP
+
+    def _sidecar_sqlite_opens(self, suffix: str) -> str:
+        """The sidecar SQLite uses for this store: beside the symlink's target,
+        not beside the link, since SQLite resolves the path it opens."""
+        return os.path.realpath(self._db_path) + suffix
 
     def _persist_retention_policy(self) -> None:
         """Persist the constructor retention policy to registry_meta (writer open).
@@ -2515,6 +3271,14 @@ class SqliteArtifactRegistry:
         field. Seeded at first create, stable across reopens."""
         return self._instance_id
 
+    @property
+    def holds_writer_lock(self) -> bool:
+        """Whether this handle holds the store's single-writer lock: False for
+        a read-only open, after close, and for a read-write open that
+        proceeded unlocked where ``flock`` does not exist."""
+        with self._lock:
+            return self._writer_lock is not None and self._writer_lock.fd is not None
+
     def get_owner_generation(self, artifact_id: UUID) -> int:
         """Return the artifact's ownership epoch (read-generation fence)."""
         with self._lock:
@@ -2582,12 +3346,14 @@ class SqliteArtifactRegistry:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Close the underlying SQLite connection. Idempotent."""
+        """Close the underlying SQLite connection, then free the single-writer
+        lock. Idempotent."""
         with self._lock:
             try:
                 self._conn.close()
             except sqlite3.ProgrammingError:
                 pass
+            self._release_writer_lock()
 
     def __enter__(self) -> "SqliteArtifactRegistry":
         return self
@@ -2605,7 +3371,10 @@ class SqliteArtifactRegistry:
         retention is active (``retain_versions=True``) — otherwise discarded.
 
         Threat-model note: with retention on, ``register_artifact`` puts the v1
-        body of a merely-OBSERVED artifact on disk (per plan R2 + docs/security)."""
+        body of a merely-OBSERVED artifact on disk (per plan R2 + docs/security).
+
+        With the fold index built, the new row is listed under the key of its
+        name once the insert commits."""
         self._guard_writable()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -2635,6 +3404,7 @@ class SqliteArtifactRegistry:
                 # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
+            self._index_add(artifact.id.hex, artifact.name)
 
     def has_artifact(self, artifact_id: UUID) -> bool:
         """Return whether an artifact exists in registry."""
@@ -2709,7 +3479,9 @@ class SqliteArtifactRegistry:
                             raise StaleReadGeneration(
                                 f"{STALE_READ_GENERATION_REASON} agent={fence_agent_id} "
                                 f"artifact={artifact_id} read_gen={rg_row[0]} "
-                                f"owner_gen={owner_gen}"
+                                f"owner_gen={owner_gen}",
+                                captured_generation=rg_row[0],
+                                owner_generation=owner_gen,
                             )
                 self._conn.execute(
                     """
@@ -2813,6 +3585,8 @@ class SqliteArtifactRegistry:
                 # uncommitted transaction that the next BEGIN IMMEDIATE sees.
                 self._conn.execute("ROLLBACK")
                 raise
+            # After the commit: a delete that rolled back keeps its row listed.
+            self._index_forget(artifact_id.hex)
 
     # ------------------------------------------------------------------
     # Snapshot consistent-cut capture + pin store (SB-17 / TX-1, Unit 2)
@@ -3938,9 +4712,10 @@ class SqliteArtifactRegistry:
                     raise KeyError(f"artifact {artifact_id} not in registry")
                 version = version_row[0]
 
-                # Read-generation fence: when an M/E -> INVALID transition
-                # revokes the write claim WITHOUT moving the version (a sweep
-                # reclaim, the voluntary "invalidate" release, or a handoff
+                # Read-generation fence: when a transition out of M/E (to
+                # INVALID, or to SHARED when the holder releases its own grant
+                # and keeps a read) revokes the write claim WITHOUT moving the
+                # version (a sweep reclaim, the voluntary "invalidate" release, or a handoff
                 # under HANDOFF_TRIGGER — see EPOCH_BUMP_TRIGGERS), bump the
                 # artifact's ownership epoch atomically with the state
                 # transition in this BEGIN IMMEDIATE, so a commit by the
@@ -4307,6 +5082,46 @@ class SqliteArtifactRegistry:
             ).fetchall()
         return [UUID(hex=r[0]) for r in rows]
 
+    def forget_agent(self, agent_id: UUID) -> int:
+        """Forget an identity that has ended; see
+        :meth:`RegistryBase.forget_agent`. One ``BEGIN IMMEDIATE``: the
+        write-grant check and every delete commit together, and a refusal
+        rolls back having deleted nothing. The ``agent_id`` index serves the
+        deletes; no schema change."""
+        self._guard_writable()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                removed = self._forget_agent_in_txn(agent_id)
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        return removed
+
+    def _forget_agent_in_txn(self, agent_id: UUID) -> int:
+        """The forget's statements, inside the caller's open transaction."""
+        held = self._conn.execute(
+            "SELECT artifact_id FROM agent_states "
+            "WHERE agent_id = ? AND state IN (?, ?) LIMIT 1",
+            (agent_id.hex, MESIState.EXCLUSIVE.name, MESIState.MODIFIED.name),
+        ).fetchone()
+        if held is not None:
+            raise forget_refusal(agent_id, UUID(hex=held[0]))
+        removed = self._conn.execute(
+            "DELETE FROM agent_states WHERE agent_id = ? AND last_reclaim_trigger IS NULL",
+            (agent_id.hex,),
+        ).rowcount
+        # The rows left record a reclaim. One the identity read again is
+        # SHARED; an ended identity reads nothing, so it stays as the record only.
+        self._conn.execute(
+            "UPDATE agent_states SET state = ? WHERE agent_id = ? AND state != ?",
+            (MESIState.INVALID.name, agent_id.hex, MESIState.INVALID.name),
+        )
+        self._conn.execute("DELETE FROM heartbeats WHERE agent_id = ?", (agent_id.hex,))
+        self._conn.execute("DELETE FROM pending_notices WHERE agent_id = ?", (agent_id.hex,))
+        return removed
+
     # ------------------------------------------------------------------
     # Plugin-only extensions (KTD-9 + KTD-11)
     # ------------------------------------------------------------------
@@ -4317,15 +5132,36 @@ class SqliteArtifactRegistry:
         content_hash: str,
         *,
         initial_owner: Optional[UUID] = None,
+        key: str | None = None,
+        disk_spelling: str | None = None,
+        name_kind: NameKind = "file",
     ) -> UUID:
         """KTD-9 first-observation seeding for the plugin's pre-read handler.
 
-        Atomically: SELECT artifact by name → if found, return its id;
+        Atomically: look the artifact up → if found, return its id;
         otherwise INSERT a new artifact at version 1 with the given content_hash
         and return the new id. Concurrent first-Reads from two sessions on
         the same fresh path converge to one row (BEGIN IMMEDIATE + UNIQUE
         constraint on artifacts.name absorbs the race; the second caller's
         INSERT raises IntegrityError, which we catch and re-fetch).
+
+        How the name is looked up (one identity per file):
+
+        - ``name_kind="key"``, a name that is not a file: exactly as given,
+          and a new row is listed in ``artifact_name_kinds`` so it stays out
+          of the fold index and the start-time merge. A file row of the same
+          exact name is shared.
+        - a file name, with the fold index built: by ``key`` (the request's
+          fold key, computed from ``parent_rel_path`` when not given), so every
+          spelling of one file reaches one row: a key with several rows (a
+          bucket) reaches its lowest-rowid row and never mints another. A key
+          with no bucket is looked up exactly, so a key row of the same exact
+          name is shared. A new row takes ``disk_spelling`` when the caller
+          found one, else the tidied request. The lookup, the insert and the
+          index update all run under the registry lock, so two threads
+          registering two spellings get one row.
+        - a file name without the index (a coordinator without its writer
+          lock, any other handle): exactly as given, as before.
 
         The ``initial_owner`` parameter is accepted for API symmetry with
         ``CoordinatorService.register_artifact`` but does NOT set a MESI grant
@@ -4335,57 +5171,75 @@ class SqliteArtifactRegistry:
         del initial_owner  # parameter symmetry only; plugin handler sets state explicitly
         self._guard_writable()
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                row = self._conn.execute(
-                    "SELECT id FROM artifacts WHERE name = ?", (parent_rel_path,)
-                ).fetchone()
-                if row is not None:
-                    self._conn.execute("COMMIT")
-                    return UUID(hex=row[0])
-                # First observation — insert.
-                new_id = uuid4()
-                self._conn.execute(
-                    """
-                    INSERT INTO artifacts (id, name, version, content_hash, size_tokens,
-                                           last_writer_id, updated_at)
-                    VALUES (?, ?, ?, ?, NULL, NULL, ?)
-                    """,
-                    (new_id.hex, parent_rel_path, 1, content_hash, time.time()),
-                )
+            request = _stored_as(self._name_request(parent_rel_path, key, name_kind), disk_spelling)
+            row_id, inserted = self._resolve_or_insert(request, content_hash)
+            if inserted and not request.is_key:
+                self._index_add(row_id, request.stored_name)
+            return UUID(hex=row_id)
+
+    def _resolve_or_insert(self, request: _NameRequest, content_hash: str) -> tuple[str, bool]:
+        """The request's row id, inserting it at version 1 on a miss, and
+        whether this call inserted it. Caller holds the lock."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row_id = self._find_row_id(request)
+            if row_id is not None:
                 self._conn.execute("COMMIT")
-                return new_id
-            except sqlite3.IntegrityError as exc:
-                # Lost the UNIQUE-on-name race; another caller inserted between
-                # our SELECT and INSERT. ROLLBACK and re-fetch.
-                #
-                # COR-04: a concurrent remove_artifact between ROLLBACK and
-                # re-fetch can leave the row absent. Old behaviour: re-raise
-                # the original IntegrityError with no context — operator sees
-                # a confusing "UNIQUE constraint failed" trace for what's
-                # really a delete race. New behaviour: raise an explicit
-                # informative RuntimeError so the operator knows exactly
-                # what happened.
-                self._conn.execute("ROLLBACK")
-                row = self._conn.execute(
-                    "SELECT id FROM artifacts WHERE name = ?", (parent_rel_path,)
-                ).fetchone()
-                if row is None:
-                    raise RuntimeError(
-                        f"resolve_or_register: lost INSERT race on {parent_rel_path!r} "
-                        "but the winning row was deleted before re-fetch. This "
-                        "indicates a concurrent remove_artifact running against the "
-                        "same name — caller should retry or treat the artifact as "
-                        f"absent. Original IntegrityError: {exc}"
-                    ) from exc
-                return UUID(hex=row[0])
-            except BaseException:
-                # P2 ce-review fix #14 (kieran-python): BaseException catches
-                # KeyboardInterrupt/SystemExit mid-transaction so ROLLBACK fires
-                # before propagation — otherwise the connection is left with an
-                # uncommitted transaction that the next BEGIN IMMEDIATE sees.
-                self._conn.execute("ROLLBACK")
-                raise
+                return row_id, False
+            # First observation — insert.
+            new_id = uuid4().hex
+            self._insert_first_observation(new_id, request, content_hash)
+            self._conn.execute("COMMIT")
+            return new_id, True
+        except sqlite3.IntegrityError as exc:
+            # A racing insert of exactly this name: the lookup above reaches
+            # every row of that name, key rows included.
+            return self._winner_of_lost_insert(request.stored_name, exc), False
+        except BaseException:
+            # BaseException catches KeyboardInterrupt/SystemExit mid-transaction
+            # so ROLLBACK fires before propagation.
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def _insert_first_observation(
+        self, row_id: str, request: _NameRequest, content_hash: str
+    ) -> None:
+        """The new row at version 1, listed as a key when it is one. Caller
+        holds the lock inside its transaction."""
+        self._conn.execute(
+            """
+            INSERT INTO artifacts (id, name, version, content_hash, size_tokens,
+                                   last_writer_id, updated_at)
+            VALUES (?, ?, ?, ?, NULL, NULL, ?)
+            """,
+            (row_id, request.stored_name, 1, content_hash, time.time()),
+        )
+        if request.is_key:
+            self._conn.execute(
+                "INSERT INTO artifact_name_kinds (artifact_id, kind) VALUES (?, 'key')",
+                (row_id,),
+            )
+
+    def _winner_of_lost_insert(self, parent_rel_path: str, exc: sqlite3.IntegrityError) -> str:
+        """The row whose name the insert collided with, re-read after the
+        rollback. Caller holds the lock inside the failed transaction.
+
+        COR-04: a concurrent remove_artifact between ROLLBACK and re-fetch can
+        leave the row absent; an explicit RuntimeError then says what happened
+        instead of a bare "UNIQUE constraint failed" trace."""
+        self._conn.execute("ROLLBACK")
+        row = self._conn.execute(
+            "SELECT id FROM artifacts WHERE name = ?", (parent_rel_path,)
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"resolve_or_register: lost INSERT race on {parent_rel_path!r} "
+                "but the winning row was deleted before re-fetch. This "
+                "indicates a concurrent remove_artifact running against the "
+                "same name — caller should retry or treat the artifact as "
+                f"absent. Original IntegrityError: {exc}"
+            ) from exc
+        return row[0]
 
     def _ensure_conflict_counters_table(self) -> None:
         """Create the conflict-counter table if absent (writer open only).
@@ -4772,14 +5626,16 @@ class SqliteArtifactRegistry:
             }
 
     def _deny(
-        self, artifact_id: UUID, agent_id: UUID, reason: str, current: int
+        self, artifact_id: UUID, agent_id: UUID, detail: ConflictDetail
     ) -> ConflictDetail:
         """One typed deny: count it inside the open txn, COMMIT so the count
         lands atomically with the decision, fire observers only after the txn
-        closes, and hand back the ConflictDetail. The count -> COMMIT -> fire
-        -> return ordering is a correctness invariant; single-sourced here so
-        the three commit_cas branches cannot drift apart."""
-        detail = ConflictDetail(reason, current)
+        closes, and hand back the ConflictDetail. The caller builds ``detail``,
+        pair included, from the decision's own read before this runs, so the
+        read pair -> build -> count -> COMMIT -> fire -> return ordering holds
+        and an observer re-entering after COMMIT cannot tear the pair. That
+        ordering is a correctness invariant; single-sourced here so the three
+        commit_cas branches cannot drift apart."""
         self._count_conflict_in_txn(artifact_id, agent_id, detail.reason)
         self._conn.execute("COMMIT")
         self._fire_conflict_callbacks(artifact_id, agent_id, detail.reason)
@@ -4860,13 +5716,12 @@ class SqliteArtifactRegistry:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 version_row = self._conn.execute(
-                    "SELECT version, size_tokens FROM artifacts WHERE id = ?",
-                    (artifact_id.hex,),
+                    _DECISION_SNAPSHOT_SQL, (agent_id.hex, artifact_id.hex)
                 ).fetchone()
                 if version_row is None:
                     raise KeyError(f"artifact {artifact_id} not in registry")
-                current = version_row[0]
-                current_size_tokens = version_row[1]
+                current, current_size_tokens, owner_gen, read_gen = version_row
+                generation_pair = (read_gen, owner_gen)
 
                 # 3-outcome discrimination. Each ConflictDetail branch resolves
                 # via _deny (U5 instrumentation; see its docstring for the
@@ -4877,7 +5732,11 @@ class SqliteArtifactRegistry:
                     self._conn.execute("COMMIT")
                     return CasCorruption(current_version=current)
                 if expected_version < current:
-                    return self._deny(artifact_id, agent_id, "version_mismatch", current)
+                    return self._deny(
+                        artifact_id,
+                        agent_id,
+                        refusal_with_generation_pair("version_mismatch", current, generation_pair),
+                    )
                 # Version matches. Holder check is the OCC-vs-pessimistic guard;
                 # exclude the committer itself (it is S/I, but be defensive).
                 other_holder = self._conn.execute(
@@ -4894,7 +5753,9 @@ class SqliteArtifactRegistry:
                     ),
                 ).fetchone()
                 if other_holder is not None:
-                    return self._deny(artifact_id, agent_id, "other_holder", current)
+                    return self._deny(
+                        artifact_id, agent_id, refusal_with_generation_pair("other_holder", current, generation_pair)
+                    )
 
                 # Read-generation fence: reject a committer whose CAPTURED
                 # read-claim was superseded by a sweep reclamation (a reclaimed
@@ -4904,22 +5765,12 @@ class SqliteArtifactRegistry:
                 # that never established a fence claim -- version-CAS protects it,
                 # so admit. Strict->; equality admits. Server-side, no signature
                 # change.
-                rg_row = self._conn.execute(
-                    "SELECT read_generation FROM agent_states "
-                    "WHERE artifact_id = ? AND agent_id = ?",
-                    (artifact_id.hex, agent_id.hex),
-                ).fetchone()
-                if rg_row is not None and rg_row[0] is not None:
-                    og_row = self._conn.execute(
-                        "SELECT owner_generation FROM artifacts WHERE id = ?",
-                        (artifact_id.hex,),
-                    ).fetchone()
-                    if og_row is None:
-                        raise KeyError(f"artifact {artifact_id} not in registry")
-                    if rg_row[0] < og_row[0]:
-                        return self._deny(
-                            artifact_id, agent_id, "stale_read_generation", current
-                        )
+                if read_gen is not None and read_gen < owner_gen:
+                    return self._deny(
+                        artifact_id,
+                        agent_id,
+                        refusal_with_generation_pair("stale_read_generation", current, generation_pair),
+                    )
 
                 # ---- WIN: mutate atomically ----
                 next_version = current + 1
@@ -5125,18 +5976,18 @@ class SqliteArtifactRegistry:
                 current_by: dict[UUID, tuple[int, Any]] = {}
                 for art_id, entry in writes.items():
                     row = self._conn.execute(
-                        "SELECT version, size_tokens FROM artifacts WHERE id = ?",
-                        (art_id.hex,),
+                        _DECISION_SNAPSHOT_SQL, (agent_id.hex, art_id.hex)
                     ).fetchone()
                     if row is None:
                         raise KeyError(f"artifact {art_id} not in registry")
-                    current = row[0]
-                    current_by[art_id] = (current, row[1])
+                    current, size_tokens, owner_gen, read_gen = row
+                    generation_pair = (read_gen, owner_gen)
+                    current_by[art_id] = (current, size_tokens)
                     if entry.expected_version > current:
                         self._conn.execute("COMMIT")  # nothing mutated
                         return CasCorruption(current_version=current)
                     if entry.expected_version < current:
-                        conflicts[art_id] = ConflictDetail("version_mismatch", current)
+                        conflicts[art_id] = refusal_with_generation_pair("version_mismatch", current, generation_pair)
                         continue
                     other_holder = self._conn.execute(
                         "SELECT 1 FROM agent_states WHERE artifact_id = ? AND agent_id != ? "
@@ -5144,20 +5995,13 @@ class SqliteArtifactRegistry:
                         (art_id.hex, agent_id.hex, MESIState.MODIFIED.name, MESIState.EXCLUSIVE.name),
                     ).fetchone()
                     if other_holder is not None:
-                        conflicts[art_id] = ConflictDetail("other_holder", current)
+                        conflicts[art_id] = refusal_with_generation_pair("other_holder", current, generation_pair)
                         continue
-                    rg_row = self._conn.execute(
-                        "SELECT read_generation FROM agent_states WHERE artifact_id = ? AND agent_id = ?",
-                        (art_id.hex, agent_id.hex),
-                    ).fetchone()
-                    if rg_row is not None and rg_row[0] is not None:
-                        og_row = self._conn.execute(
-                            "SELECT owner_generation FROM artifacts WHERE id = ?",
-                            (art_id.hex,),
-                        ).fetchone()
-                        if og_row is not None and rg_row[0] < og_row[0]:
-                            conflicts[art_id] = ConflictDetail("stale_read_generation", current)
-                            continue
+                    if read_gen is not None and read_gen < owner_gen:
+                        conflicts[art_id] = refusal_with_generation_pair(
+                            "stale_read_generation", current, generation_pair
+                        )
+                        continue
 
                 if conflicts:
                     # Count each failing member atomically with the aggregate
@@ -5324,7 +6168,7 @@ class SqliteArtifactRegistry:
         """KTD-11 session-stop release iteration: return artifacts where the
         given agent holds any of the listed MESI states. Used by Unit 4's
         ``/hooks/session-stop`` handler to enumerate uncommitted grants for
-        release via :class:`CoordinatorService.invalidate`."""
+        release via :meth:`CoordinatorService.release_to_reader`."""
         state_names = [s.name for s in states]
         if not state_names:
             return []
@@ -5339,13 +6183,27 @@ class SqliteArtifactRegistry:
             ).fetchall()
         return [UUID(hex=r[0]) for r in rows]
 
-    def lookup_artifact_id_by_name(self, parent_rel_path: str) -> UUID | None:
-        """Read-only path lookup; used by status endpoint and tests."""
+    def lookup_artifact_id_by_name(
+        self,
+        parent_rel_path: str,
+        *,
+        key: str | None = None,
+        disk_spelling: str | None = None,
+        name_kind: NameKind = "file",
+    ) -> UUID | None:
+        """Read-only lookup of the row a name reaches, by the rules
+        :meth:`resolve_or_register` uses: a key exactly, a file name through
+        the fold index when it is built (``key``, or the key of
+        ``parent_rel_path``), otherwise exactly as given.
+
+        ``disk_spelling`` is the one register takes: a key the index has no
+        bucket for is then looked up under the name a new row would take, so a
+        key row named exactly like the disk spelling, which register's insert
+        would collide with and return, is found here too."""
         with self._lock:
-            row = self._conn.execute(
-                "SELECT id FROM artifacts WHERE name = ?", (parent_rel_path,)
-            ).fetchone()
-        return UUID(hex=row[0]) if row else None
+            request = _stored_as(self._name_request(parent_rel_path, key, name_kind), disk_spelling)
+            row_id = self._find_row_id(request)
+        return None if row_id is None else UUID(hex=row_id)
 
     def artifact_names_under_prefix(self, prefix: str) -> list[str]:
         """Return tracked-artifact paths registered under a directory prefix.
@@ -5355,11 +6213,23 @@ class SqliteArtifactRegistry:
         ``escape`` to defang any ``%``/``_`` wildcards in the operator-
         supplied search root. Empty/``.``/``./`` prefix returns all
         registered artifacts (Grep over workspace root).
+
+        On a disk that folds names (the fold index built under ``caseless``
+        or ``nfd``), instead every file row whose fold key is the prefix's or
+        lies under it, once per key: the key's lowest-rowid row, the one every
+        other lookup reaches, sorted by UTF-8 bytes. Key rows are not listed.
         """
+        with self._lock:
+            index = self._fold_index
+            if index is not None and index.profile != "none":
+                return self._indexed_names_under(prefix, index)
+            return self._names_like_prefix(prefix)
+
+    def _names_like_prefix(self, prefix: str) -> list[str]:
+        """The SQL prefix match. Caller holds the lock."""
         # Normalize prefix. Treat empty / "." / "./" as "all artifacts".
         if prefix in ("", ".", "./"):
-            with self._lock:
-                rows = self._conn.execute("SELECT name FROM artifacts").fetchall()
+            rows = self._conn.execute("SELECT name FROM artifacts").fetchall()
             return [r[0] for r in rows]
         # Strip trailing slash; ensure we don't accidentally claim
         # "docs/specs-internal/" as a child of "docs/specs/".
@@ -5368,22 +6238,395 @@ class SqliteArtifactRegistry:
         escaped = normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = escaped + "%"
         exact_match = prefix.rstrip("/")
-        # REL-08: combine the LIKE-prefix query and the exact-match query
-        # into a single UNION under one lock acquisition. The prior
-        # two-step pattern released the lock between queries — a
-        # concurrent delete or rename could remove an artifact between
-        # them, producing a torn result set (LIKE row gone but exact-
-        # match row appears, or vice versa). Single query closes the gap.
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT name FROM artifacts WHERE name LIKE ? ESCAPE '\\'
-                UNION
-                SELECT name FROM artifacts WHERE name = ?
-                """,
-                (pattern, exact_match),
-            ).fetchall()
+        # The LIKE-prefix query and the exact-match query are one
+        # UNION under one lock hold, so a concurrent delete cannot tear the
+        # result set between them.
+        rows = self._conn.execute(
+            """
+            SELECT name FROM artifacts WHERE name LIKE ? ESCAPE '\\'
+            UNION
+            SELECT name FROM artifacts WHERE name = ?
+            """,
+            (pattern, exact_match),
+        ).fetchall()
         return [r[0] for r in rows]
+
+    def _indexed_names_under(self, prefix: str, index: _FoldIndex) -> list[str]:
+        """Each bucket's head under ``prefix``. Caller holds the lock."""
+        # Folding is per segment, so a key under the root's key starts with it and "/".
+        root_key = index_key_of(tidy_path(prefix).rstrip("/"), index.profile)
+        buckets = [
+            ids for key, ids in index.by_key.items()
+            if not root_key or key == root_key or key.startswith(f"{root_key}/")
+        ]
+        wanted = [row_id for ids in buckets for row_id in ids]
+        # Past about half the indexed rows, one scan of the store costs less
+        # than a lookup per row (measured at 50k rows).
+        scan = 2 * len(wanted) > len(index.key_by_id)
+        names_by_id = self._names_by_id(None if scan else wanted)
+        heads: list[str] = []
+        for ids in buckets:
+            # A head gone from the store gives way to the bucket's next row.
+            head = next((row_id for row_id in ids if row_id in names_by_id), None)
+            if head is not None:
+                heads.append(names_by_id[head])
+        return sorted(heads, key=lambda name: name.encode("utf-8"))
+
+    def _names_by_id(self, row_ids: list[str] | None) -> dict[str, str]:
+        """Stored names by row id: of ``row_ids``, or of every row given None.
+        Caller holds the lock."""
+        if row_ids is None:
+            return dict(self._conn.execute("SELECT id, name FROM artifacts").fetchall())
+        names: dict[str, str] = {}
+        for start in range(0, len(row_ids), _NAMES_PER_QUERY):
+            batch = row_ids[start : start + _NAMES_PER_QUERY]
+            names.update(
+                self._conn.execute(
+                    f"SELECT id, name FROM artifacts WHERE id {_in_clause(batch)}", batch
+                ).fetchall()
+            )
+        return names
+
+    # ------------------------------------------------------------------
+    # One identity per file: the fold index, key rows, the start merge
+    # ------------------------------------------------------------------
+
+    def build_fold_index(self, profile: FoldProfile) -> list[FoldBucket]:
+        """Key file rows by ``profile``: every row not listed as a key, in
+        rowid order, once, under the fold of its stored name. Called once per
+        start, after the merge, by a coordinator that holds the single-writer
+        lock; until then names stay exact. Returns each key several file rows
+        share (a bucket)."""
+        with self._lock:
+            index = _FoldIndex(profile=profile, by_key={}, key_by_id={})
+            for row in self._file_rows_for_fold():
+                index.add(row.id.hex, row.name)
+            self._fold_index = index
+            return [
+                FoldBucket(key=key, ids=tuple(UUID(hex=row_id) for row_id in ids))
+                for key, ids in index.by_key.items()
+                if len(ids) > 1
+            ]
+
+    @property
+    def fold_index_profile(self) -> FoldProfile | None:
+        """The profile the fold index keys by, or None while names are exact."""
+        with self._lock:
+            return None if self._fold_index is None else self._fold_index.profile
+
+    def file_rows_for_fold(self) -> list[FoldRow]:
+        """Every row not listed as a key, lowest rowid first. Rowid order is
+        insertion order: no AUTOINCREMENT, no VACUUM."""
+        with self._lock:
+            return self._file_rows_for_fold()
+
+    def _file_rows_for_fold(self) -> list[FoldRow]:
+        rows = self._conn.execute(
+            "SELECT rowid, id, name FROM artifacts "
+            "WHERE id NOT IN (SELECT artifact_id FROM artifact_name_kinds) ORDER BY rowid"
+        ).fetchall()
+        return [FoldRow(rowid=row[0], id=UUID(hex=row[1]), name=row[2]) for row in rows]
+
+    def fold_bucket_peers(self, artifact_id: UUID) -> list[UUID]:
+        """The other rows of the artifact's fold bucket (spellings of one file
+        a merge left apart), lowest rowid first; empty without the index or
+        when the artifact's key has one row."""
+        with self._lock:
+            index = self._fold_index
+            key = None if index is None else index.key_by_id.get(artifact_id.hex)
+            if index is None or key is None:
+                return []
+            return [UUID(hex=row_id) for row_id in index.by_key[key] if row_id != artifact_id.hex]
+
+    def _name_request(self, name: str, key: str | None, name_kind: NameKind) -> _NameRequest:
+        """How ``name`` is looked up and stored. Caller holds the lock."""
+        index = self._fold_index
+        if name_kind == "key" or index is None:
+            return _NameRequest(name, None, is_key=name_kind == "key")
+        fold = key if key is not None else index_key_of(name, index.profile)
+        return _NameRequest(tidy_path(name), fold, is_key=False)
+
+    def _find_row_id(self, request: _NameRequest) -> str | None:
+        """The request's row id, or None. Caller holds the lock.
+
+        A file request the index has no bucket for is then looked up exactly:
+        a key row of the same exact name is not indexed, yet the insert would
+        collide with it and register would return it, so lookup must too."""
+        if request.index_key is not None:
+            row_id = self._indexed_row_id(request.index_key)
+            if row_id is not None:
+                return row_id
+        row = self._conn.execute(
+            "SELECT id FROM artifacts WHERE name = ?", (request.stored_name,)
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def _indexed_row_id(self, key: str) -> str | None:
+        """The lowest-rowid row of ``key``'s bucket. Each hit is re-read by id,
+        inside the caller's transaction when it has one, and a row no longer in
+        the store leaves the index, so the lookup moves on to the bucket's next
+        row or misses. Caller holds the lock."""
+        index = self._fold_index
+        for row_id in list(index.by_key.get(key, ())) if index is not None else ():
+            if self._conn.execute("SELECT 1 FROM artifacts WHERE id = ?", (row_id,)).fetchone():
+                return row_id
+            index.forget(row_id)
+        return None
+
+    def _index_add(self, row_id: str, stored_name: str) -> None:
+        """List a committed file row. Caller holds the lock."""
+        if self._fold_index is not None:
+            self._fold_index.add(row_id, stored_name)
+
+    def _index_forget(self, row_id: str) -> None:
+        """Drop a committed delete from the index. Caller holds the lock."""
+        if self._fold_index is not None:
+            self._fold_index.forget(row_id)
+
+    def merge_fold_group(self, group: FoldGroup, now_unix: float) -> FoldMergeOutcome:
+        """Merge one group the start found, in one BEGIN IMMEDIATE that
+        re-reads it: a group whose rows are gone, are listed as keys or no
+        longer share the key, or whose rows to merge away hold retained
+        history, is skipped and changes nothing. Every referencing table is
+        rewritten before any row is deleted, the single-writer check runs
+        before COMMIT, and one state-log entry per moved or demoted agent is
+        written under ``fold_merge``; any failure rolls all of it back."""
+        with self._lock:
+            self._guard_writable()
+            seq_before = self._seq
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                outcome = self._merge_group_in_txn(group, now_unix)
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                self._seq = seq_before
+                raise
+            for removed_id in outcome.removed_ids:
+                self._index_forget(removed_id.hex)
+            return outcome
+
+    def _merge_group_in_txn(self, group: FoldGroup, now_unix: float) -> FoldMergeOutcome:
+        artifacts = self._group_artifacts(group.ids)
+        stale = self._stale_group_reason(group, artifacts)
+        if stale is not None:
+            return FoldMergeOutcome(merged=False, reason=stale)
+        facts = MergeFacts(group.disk_spelling, group.disk_hash, now_unix)
+        plan = plan_fold_merge(self._group_snapshot(artifacts), facts)
+        if self._holds_retained_history(plan.removed_ids):
+            return FoldMergeOutcome(merged=False, reason="a row to merge away holds retained history")
+        self._apply_merge_plan(plan, tuple(row.id for row in artifacts), now_unix)
+        return FoldMergeOutcome(
+            merged=True,
+            survivor_id=UUID(hex=plan.survivor_id),
+            removed_ids=tuple(UUID(hex=row_id) for row_id in plan.removed_ids),
+            keeper_agent_id=None if plan.keeper_agent_id is None else UUID(hex=plan.keeper_agent_id),
+            demoted_writers=tuple(UUID(hex=agent_id) for agent_id in plan.demoted_writers),
+        )
+
+    def _group_artifacts(self, ids: Sequence[UUID]) -> list[MergeArtifactRow]:
+        hexes = [artifact_id.hex for artifact_id in ids]
+        rows = self._conn.execute(
+            "SELECT rowid, id, name, version, owner_generation, content_hash, size_tokens, "
+            f"last_writer_id, updated_at FROM artifacts WHERE id {_in_clause(hexes)} "
+            "ORDER BY rowid",
+            hexes,
+        ).fetchall()
+        return [MergeArtifactRow(*row) for row in rows]
+
+    def _stale_group_reason(
+        self, group: FoldGroup, artifacts: Sequence[MergeArtifactRow]
+    ) -> str | None:
+        """Why the group the start found no longer holds, or None."""
+        if len(group.ids) < 2 or len(artifacts) != len(set(group.ids)):
+            return "a row is gone"
+        hexes = [row.id for row in artifacts]
+        listed = self._conn.execute(
+            f"SELECT 1 FROM artifact_name_kinds WHERE artifact_id {_in_clause(hexes)}", hexes
+        ).fetchone()
+        if listed is not None:
+            return "a row is listed as a key"
+        if any(index_key_of(row.name, group.profile) != group.key for row in artifacts):
+            return "a row no longer shares the key"
+        return None
+
+    def _group_snapshot(self, artifacts: Sequence[MergeArtifactRow]) -> MergeSnapshot:
+        hexes = [row.id for row in artifacts]
+        states = self._conn.execute(
+            f"SELECT {', '.join(_GROUPED_STATE_COLUMNS)} FROM agent_states "
+            f"WHERE artifact_id {_in_clause(hexes)}",
+            hexes,
+        ).fetchall()
+        # The planner keeps the last of an agent's equal-time notices, so the
+        # order is explicit, and the plugin's coordinator reads the same one.
+        notices = self._conn.execute(
+            "SELECT agent_id, artifact_id, preempter_agent_id, preempted_at_unix_ts "
+            f"FROM pending_notices WHERE artifact_id {_in_clause(hexes)} "
+            "ORDER BY agent_id, artifact_id",
+            hexes,
+        ).fetchall()
+        return MergeSnapshot(
+            artifacts=tuple(artifacts),
+            states=tuple(
+                MergeStateRow(row[0], row[1], MESIState[row[2]], *row[3:]) for row in states
+            ),
+            notices=tuple(MergeNoticeRow(*row) for row in notices),
+        )
+
+    def _holds_retained_history(self, row_ids: Sequence[str]) -> bool:
+        """Whether a row to merge away holds retained versions: their numbers
+        are that row's own, so they can neither move to the survivor nor be
+        deleted with it without losing a committed write."""
+        if not row_ids:
+            return False
+        return self._conn.execute(
+            f"SELECT 1 FROM artifact_versions WHERE artifact_id {_in_clause(row_ids)} LIMIT 1",
+            list(row_ids),
+        ).fetchone() is not None
+
+    def _apply_merge_plan(
+        self, plan: MergePlan, group_ids: Sequence[str], now_unix: float
+    ) -> None:
+        """Write ``plan`` inside the merge's transaction: every referencing
+        table first, the single-writer check, then the delete of the rows
+        merged away, then the state log."""
+        self._write_survivor_values(plan)
+        self._replace_group_states(plan, group_ids)
+        self._conn.execute(
+            f"UPDATE transfer_records SET status = ?, updated_at = ? "
+            f"WHERE artifact_id {_in_clause(group_ids)}",
+            [TRANSFER_STATUS_WITHDRAWN, now_unix, *group_ids],
+        )
+        self._end_sessions_pinning(group_ids)
+        if plan.removed_ids:
+            self._conn.execute(
+                "UPDATE workspace_checkpoint_members SET artifact_id = ? "
+                f"WHERE artifact_id {_in_clause(plan.removed_ids)}",
+                [plan.survivor_id, *plan.removed_ids],
+            )
+        self._sum_conflict_counters(plan.survivor_id, group_ids)
+        self._sum_foreign_write_counters(plan, group_ids)
+        check_single_writer(self._state_map_in_txn(plan.survivor_id))
+        if plan.removed_ids:
+            self._conn.execute(
+                f"DELETE FROM artifacts WHERE id {_in_clause(plan.removed_ids)}",
+                list(plan.removed_ids),
+            )
+        self._log_merge_transitions(plan, int(now_unix))
+
+    def _write_survivor_values(self, plan: MergePlan) -> None:
+        current = self._conn.execute(
+            "SELECT version FROM artifacts WHERE id = ?", (plan.survivor_id,)
+        ).fetchone()
+        values = plan.values
+        check_monotonic_version(current[0], values.version)
+        self._conn.execute(
+            "UPDATE artifacts SET version = ?, owner_generation = ?, content_hash = ?, "
+            "size_tokens = ?, last_writer_id = ?, updated_at = ? WHERE id = ?",
+            (
+                values.version, values.owner_generation, values.content_hash,
+                values.size_tokens, values.last_writer_id, values.updated_at, plan.survivor_id,
+            ),
+        )
+
+    def _replace_group_states(self, plan: MergePlan, group_ids: Sequence[str]) -> None:
+        """One state row and at most one notice per agent, on the survivor:
+        an agent with rows on two spellings would otherwise collide on both
+        tables' primary keys."""
+        for table in ("pending_notices", "agent_states"):
+            self._conn.execute(
+                f"DELETE FROM {table} WHERE artifact_id {_in_clause(group_ids)}", list(group_ids)
+            )
+        columns = ", ".join(_GROUPED_STATE_COLUMNS)
+        self._conn.executemany(
+            f"INSERT INTO agent_states ({columns}) "
+            f"VALUES ({', '.join('?' for _ in _GROUPED_STATE_COLUMNS)})",
+            [_state_row_values(row) for row in plan.states],
+        )
+        self._conn.executemany(
+            "INSERT INTO pending_notices (agent_id, artifact_id, preempter_agent_id, "
+            "preempted_at_unix_ts) VALUES (?, ?, ?, ?)",
+            [
+                (row.agent_id, row.artifact_id, row.preempter_agent_id, row.preempted_at_unix_ts)
+                for row in plan.notices
+            ],
+        )
+
+    def _end_sessions_pinning(self, group_ids: Sequence[str]) -> None:
+        """End every snapshot session whose cut pins a grouped row: a pinned
+        version is a number in that row's own numbering, so it is never
+        re-pointed. Its next call finds no session."""
+        tokens = [
+            row[0]
+            for row in self._conn.execute(
+                f"SELECT DISTINCT session_token FROM session_pins "
+                f"WHERE artifact_id {_in_clause(group_ids)}",
+                list(group_ids),
+            ).fetchall()
+        ]
+        if not tokens:
+            return
+        for table in ("session_pins", "session_meta"):
+            self._conn.execute(
+                f"DELETE FROM {table} WHERE session_token {_in_clause(tokens)}", tokens
+            )
+
+    def _sum_conflict_counters(self, survivor_id: str, group_ids: Sequence[str]) -> None:
+        in_group = _in_clause(group_ids)
+        sums = self._conn.execute(
+            f"SELECT agent_id, reason, SUM(count) FROM conflict_counters "
+            f"WHERE artifact_id {in_group} GROUP BY agent_id, reason",
+            list(group_ids),
+        ).fetchall()
+        self._conn.execute(
+            f"DELETE FROM conflict_counters WHERE artifact_id {in_group}", list(group_ids)
+        )
+        self._conn.executemany(
+            "INSERT INTO conflict_counters (artifact_id, agent_id, reason, count) "
+            "VALUES (?, ?, ?, ?)",
+            [(survivor_id, *row) for row in sums],
+        )
+
+    def _sum_foreign_write_counters(self, plan: MergePlan, group_ids: Sequence[str]) -> None:
+        """Summed onto the survivor. The edge value takes the survivor's hash
+        with no outcome, so a disk that differs from it is counted once
+        more rather than suppressed by another spelling's gate."""
+        in_group = _in_clause(group_ids)
+        rows, *sums = self._conn.execute(
+            "SELECT COUNT(*), SUM(foreign_count), SUM(mediated_count), SUM(lag_suppressed_count) "
+            f"FROM foreign_write_counters WHERE artifact_id {in_group}",
+            list(group_ids),
+        ).fetchone()
+        if rows == 0:
+            return
+        self._conn.execute(
+            f"DELETE FROM foreign_write_counters WHERE artifact_id {in_group}", list(group_ids)
+        )
+        self._conn.execute(
+            "INSERT INTO foreign_write_counters (artifact_id, foreign_count, mediated_count, "
+            "lag_suppressed_count, last_counted_hash, last_counted_outcome) "
+            "VALUES (?, ?, ?, ?, ?, '')",
+            (plan.survivor_id, *sums, plan.values.content_hash),
+        )
+
+    def _state_map_in_txn(self, artifact_id: str) -> dict[str, MESIState]:
+        rows = self._conn.execute(
+            "SELECT agent_id, state FROM agent_states WHERE artifact_id = ?", (artifact_id,)
+        ).fetchall()
+        return {row[0]: MESIState[row[1]] for row in rows}
+
+    def _log_merge_transitions(self, plan: MergePlan, tick: int) -> None:
+        for transition in plan.transitions:
+            self._emit_state_log(
+                artifact_id=UUID(hex=plan.survivor_id),
+                agent_id=UUID(hex=transition.agent_id),
+                from_state=transition.from_state,
+                to_state=transition.to_state,
+                trigger=FOLD_MERGE_TRIGGER,
+                tick=tick,
+                version=plan.values.version,
+                content_hash=None,
+            )
 
     # ------------------------------------------------------------------
     # A1 — Preemption notices (silent-grant-revocation surfacing)

@@ -37,6 +37,15 @@ Fixture schema (see ``fixtures/warn_mode/*.json``)::
       "preserve_identity": ["<key>", ...] # opt out of UUID scrubbing (R15)
     }
 
+A fixture whose answer depends on how the workspace disk folds file names
+carries ``"expected_by_fold_profile": {"caseless": {...}, "nfd": {...},
+"none": {...}}`` in place of ``expected``: one ``{status, body}`` per profile a
+disk classifies as, plus ``cannot_tell`` when the fixture pins that answer too.
+The harness classifies each scenario's own tmp workspace with the
+coordinators' probe and asserts the matching entry; a profile the map does not
+name fails the row (see ``workspace_fold_profile`` and
+``expected_for_fold_profile``).
+
 Two things a fixture can express since the identity unit (R15), both of which
 the harness could not carry before and which are described in full at
 ``normalize_response`` and ``apply_preflight_requests``:
@@ -86,6 +95,7 @@ raises instead of falling back. If it is unset and neither fallback exists, the 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import socket
@@ -107,6 +117,17 @@ NODE_SPAWN_TIMEOUT_SEC = 8.0
 NODE_SHUTDOWN_TIMEOUT_SEC = 5.0
 #: Names the Node coordinator entry point to run; see :func:`resolve_node_dist_path`.
 NODE_DIST_PATH_ENV = "AGENT_COHERENCE_PLUGIN_DIST_PATH"
+#: Every ``fold_profile`` a coordinator advertises on ``/status``: the three
+#: profiles a disk classifies as, and ``cannot_tell`` for one it could not
+#: classify (keyed as ``none``, but advertised under its own name).
+FOLD_PROFILES: tuple[str, ...] = ("caseless", "nfd", "none", "cannot_tell")
+#: The profiles every per-profile map names. A developer Mac classifies as
+#: ``caseless`` and Linux CI as ``none``, so a map missing one of them would
+#: fail only on the machine that has the other disk; refused at load, the gap
+#: shows on every machine.
+_REQUIRED_FOLD_PROFILES: tuple[str, ...] = ("caseless", "nfd", "none")
+
+_logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------
@@ -282,6 +303,15 @@ class FixtureSubstitutionError(FixtureContractError):
     substitution having happened."""
 
 
+class FoldProfileNotExpected(FixtureContractError):
+    """The run's workspace disk classified as a profile the fixture's
+    per-profile map does not name.
+
+    Raised, never skipped: a row that passed against an answer written for
+    another disk would claim parity on a disk the fixture never reasoned
+    about."""
+
+
 def normalize_response(
     value: Any,
     *,
@@ -301,8 +331,8 @@ def normalize_response(
     ``optional_keys`` — per-fixture opt-in set of key names DROPPED entirely
     from the normalized dict (on both actual and expected), for backend-specific
     optional extension fields whose shared baseline both backends must still
-    match (e.g. a Python-only OCC ``version`` field on a pre-read response that
-    the Node coordinator does not emit). **Scoped to the TOP-LEVEL response body
+    match (e.g. the OCC ``version`` field on a fresh pre-read answer, which a
+    Node coordinator of plugin 0.6.0 or earlier does not emit). **Scoped to the TOP-LEVEL response body
     only** (AC3) — a nested key that happens to share a name with an optional_key
     is still compared, so a real nested divergence is never masked.
 
@@ -423,7 +453,9 @@ class Fixture:
     path: Path
     setup: dict[str, Any]
     request: dict[str, Any]
-    expected: dict[str, Any]
+    #: The one ``{status, body}`` asserted on every disk; None when the fixture
+    #: carries ``expected_by_fold_profile`` instead.
+    expected: Optional[dict[str, Any]]
     backends: tuple[str, ...]
     ignore_keys: frozenset[str]
     optional_keys: frozenset[str]
@@ -431,6 +463,9 @@ class Fixture:
     #: fixture that predates the identity capability, which is the portability
     #: default (see ``normalize_response``).
     preserve_identity: frozenset[str] = frozenset()
+    #: One ``{status, body}`` per fold profile, in place of ``expected``; read
+    #: through ``expected_for_fold_profile``.
+    expected_by_fold_profile: Optional[dict[str, dict[str, Any]]] = None
 
 
 def _iter_keyed(value: Any) -> Iterator[tuple[str, Any]]:
@@ -666,13 +701,16 @@ def build_fixture(data: dict[str, Any], path: Path) -> Fixture:
         )
     setup = data.get("setup", {})
     request = data["request"]
-    expected = data["expected"]
+    expected, expected_by_fold_profile = _read_expectations(name, data)
+    bodies = _expected_bodies(expected, expected_by_fold_profile)
     ignore_keys = frozenset(data.get("ignore_keys", []))
     preserve_identity = frozenset(data.get("preserve_identity", []))
 
-    _validate_expected_body(name, expected.get("body"))
+    for body in bodies:
+        _validate_expected_body(name, body)
     _validate_capture_references(name, setup, request)
-    _validate_preserve_identity(name, preserve_identity, ignore_keys, expected.get("body"))
+    for body in bodies:
+        _validate_preserve_identity(name, preserve_identity, ignore_keys, body)
 
     return Fixture(
         name=name,
@@ -685,7 +723,123 @@ def build_fixture(data: dict[str, Any], path: Path) -> Fixture:
         ignore_keys=ignore_keys,
         optional_keys=frozenset(data.get("optional_keys", [])),
         preserve_identity=preserve_identity,
+        expected_by_fold_profile=expected_by_fold_profile,
     )
+
+
+def _read_expectations(
+    name: str, data: dict[str, Any]
+) -> tuple[Optional[dict[str, Any]], Optional[dict[str, dict[str, Any]]]]:
+    """A fixture's one ``expected``, or its per-profile map: exactly one.
+
+    Both at once is refused rather than read as "the map, else the default":
+    a default would let a profile the map forgot pass against an answer
+    written for another disk, which is the silent pass the map exists to rule
+    out."""
+    has_one = "expected" in data
+    has_map = "expected_by_fold_profile" in data
+    if has_one == has_map:
+        raise FixtureContractError(
+            f"{name}: carries {'both' if has_one else 'neither'} of 'expected' and "
+            f"'expected_by_fold_profile'. A fixture asserts one answer on every "
+            f"disk, or one answer per fold profile."
+        )
+    if has_one:
+        return data["expected"], None
+    return None, _read_fold_expectations(name, data["expected_by_fold_profile"])
+
+
+def _read_fold_expectations(name: str, by_profile: Any) -> dict[str, dict[str, Any]]:
+    """Validate an ``expected_by_fold_profile`` map: only advertised profile
+    names (a misspelled key would never be selected), each disk profile named,
+    and a ``{status, body}`` entry under each."""
+    if not isinstance(by_profile, dict):
+        raise FixtureContractError(
+            f"{name}: expected_by_fold_profile must be an object keyed by fold profile."
+        )
+    unknown = sorted(set(by_profile) - set(FOLD_PROFILES))
+    missing = [profile for profile in _REQUIRED_FOLD_PROFILES if profile not in by_profile]
+    if unknown or missing:
+        raise FixtureContractError(
+            f"{name}: expected_by_fold_profile names {sorted(by_profile)}: unknown "
+            f"{unknown}, missing {missing}. It names each of "
+            f"{list(_REQUIRED_FOLD_PROFILES)} and may add 'cannot_tell'."
+        )
+    malformed = sorted(p for p, entry in by_profile.items() if not _is_expectation(entry))
+    if malformed:
+        raise FixtureContractError(
+            f"{name}: expected_by_fold_profile entries {malformed} are not "
+            f"{{status: <int>, body: ...}}."
+        )
+    return dict(by_profile)
+
+
+def _is_expectation(entry: Any) -> bool:
+    return isinstance(entry, dict) and isinstance(entry.get("status"), int) and "body" in entry
+
+
+def _expected_bodies(
+    expected: Optional[dict[str, Any]],
+    by_profile: Optional[dict[str, dict[str, Any]]],
+) -> list[Any]:
+    """Every body the fixture may assert, so each load rule checks all of them."""
+    entries = [expected] if by_profile is None else list(by_profile.values())
+    return [entry.get("body") for entry in entries]
+
+
+def expected_for_fold_profile(fixture: Fixture, profile: str) -> dict[str, Any]:
+    """The ``{status, body}`` a run whose workspace disk is ``profile`` asserts.
+
+    A fixture without a per-profile map asserts its one ``expected`` on every
+    disk. With a map it is the entry for ``profile``, with no fallback: a
+    profile the map does not name raises ``FoldProfileNotExpected``, so the
+    row fails instead of passing against an answer written for another disk."""
+    if fixture.expected_by_fold_profile is None:
+        assert fixture.expected is not None, f"{fixture.name}: build_fixture admits one of the two"
+        return fixture.expected
+    entry = fixture.expected_by_fold_profile.get(profile)
+    if entry is None:
+        raise FoldProfileNotExpected(
+            f"{fixture.name}: this run's workspace disk classified as {profile!r}, "
+            f"and expected_by_fold_profile names only "
+            f"{sorted(fixture.expected_by_fold_profile)}. Add the {profile!r} "
+            f"answer, reasoned from what that disk folds."
+        )
+    return entry
+
+
+def workspace_fold_profile(workspace: Path) -> str:
+    """The ``fold_profile`` a coordinator started on ``workspace`` advertises.
+
+    Classified once per scenario, on the scenario's own tmp workspace, with the
+    library's own probe (the Node coordinator runs the same vectors and answer
+    table), before any coordinator starts there. So the disk under the tmp dir
+    picks a fixture's answer -- ``caseless`` on a Mac's default APFS, ``nfd``
+    on a case-sensitive APFS volume, ``none`` on Linux CI -- never the OS name.
+    A disk the probe cannot classify answers ``cannot_tell``, as ``/status``
+    does, not ``none``: a fixture's ``none`` answer is asserted only on a disk
+    the probe showed folds nothing."""
+    from ccs.adapters.claude_code import fs_profile
+
+    coherence_dir = workspace / ".coherence"
+    coherence_dir.mkdir(exist_ok=True, mode=0o700)
+    result = fs_profile.probe_fold_profile(
+        fs_profile.FoldProbeInput(
+            root=workspace,
+            coherence_dir=coherence_dir,
+            # No coordinator has opened this workspace yet, so no other start
+            # can be probing it: the sweep the writer lock guards races nothing.
+            lock_state="held",
+            log=lambda line: _logger.warning("fold probe: %s", line),
+        )
+    )
+    return "cannot_tell" if result.status == "cannot_tell" else result.profile
+
+
+def expected_for_workspace(fixture: Fixture, workspace: Path) -> dict[str, Any]:
+    """``expected_for_fold_profile`` for the disk under ``workspace``; call it
+    before ``run_scenario`` starts a coordinator there."""
+    return expected_for_fold_profile(fixture, workspace_fold_profile(workspace))
 
 
 def load_fixtures(mode: str = "warn_mode") -> list[Fixture]:
@@ -713,9 +867,7 @@ def apply_setup(workspace: Path, setup: dict[str, Any]) -> None:
     - ``tracked``: writes ``.coherence/tracked.yaml`` with one path per line.
     - ``ignored``: writes ``.coherence/ignored.yaml`` with one path per line.
     - ``strict_mode``: writes ``.coherence/strict_mode.yaml`` with one path
-      per line (Unit 7b — strict-mode-fixture support; the Node coordinator
-      doesn't ship strict_mode.yaml loading in v0.2 so strict fixtures are
-      python-only).
+      per line (both coordinators load it).
     - ``preflight_requests``: list of request dicts fired BEFORE the main
       test request; responses ignored. Used to drive multi-step setup like
       "session A reads → session B preempts → A re-reads (the test request)".

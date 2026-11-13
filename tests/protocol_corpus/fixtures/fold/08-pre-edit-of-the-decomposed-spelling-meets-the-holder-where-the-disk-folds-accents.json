@@ -1,0 +1,67 @@
+{
+  "name": "fold-pre-edit-of-the-decomposed-spelling-meets-the-holder-where-the-disk-folds-accents",
+  "description": "Session A takes EXCLUSIVE on data/caf\u00e9.txt (composed e-acute); session B then pre-edits data/cafe\u0301.txt (e plus a combining acute). APFS folds the two forms whether or not it folds case, so on caseless and nfd B meets A's hold with the collision warning, which echoes B's decomposed spelling. A disk that folds nothing (none) keeps them apart and B gets the plain {ok: true}: no collision. Both spellings are listed in tracked.yaml, so the decomposed one is tracked on every disk by its own literal pattern; on none this row cannot tell that admission from an untracked one, which answers the same {ok: true}. Both backends.",
+  "setup": {
+    "tracked": [
+      "data/caf\u00e9.txt",
+      "data/cafe\u0301.txt"
+    ],
+    "files": {
+      "data/caf\u00e9.txt": "x\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "path": "data/caf\u00e9.txt"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+      "path": "data/cafe\u0301.txt"
+    }
+  },
+  "expected_by_fold_profile": {
+    "caseless": {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "collision": true,
+        "hookSpecificOutput": {
+          "hookEventName": "PreToolUse",
+          "permissionDecision": "allow",
+          "additionalContext": "\u26a0 Concurrent edit detected at <TS> (UTC): another agent (80cbc93d) has been editing data/cafe\u0301.txt since <TS>. Your edit will land in your own worktree, but only one session's commit will be accepted by the coordinator. Consider waiting for the other session to finish or coordinating which one should proceed."
+        }
+      }
+    },
+    "nfd": {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "collision": true,
+        "hookSpecificOutput": {
+          "hookEventName": "PreToolUse",
+          "permissionDecision": "allow",
+          "additionalContext": "\u26a0 Concurrent edit detected at <TS> (UTC): another agent (80cbc93d) has been editing data/cafe\u0301.txt since <TS>. Your edit will land in your own worktree, but only one session's commit will be accepted by the coordinator. Consider waiting for the other session to finish or coordinating which one should proceed."
+        }
+      }
+    },
+    "none": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

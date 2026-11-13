@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 
+from ccs.adapters.claude_code import lifecycle
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, ensure_coordinator, stop_coordinator
 from ccs.cli import (
     coherence_coordinator,
@@ -37,12 +38,16 @@ from ccs.cli._coherence_client import (
     PrincipalClaim,
     caller_principal_headers,
     claim_caller_principal,
+    escape_nonprintable,
     get,
     post,
     post_with_stored_principal,
     resolve_endpoint,
 )
+from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import TlsConfigError, TlsVerificationFailed
+from tests.coherence_link_helpers import plant_link, target_snapshot
+from tests.pid_lock_helpers import hold_coordinator_lock, write_coordinator_pid_file
 
 
 @pytest.fixture
@@ -223,7 +228,8 @@ def test_coordinator_second_invocation_reuses_existing(
 
 
 def _capture_probe(seen: dict, *, reachable: bool):
-    """Stub for coherence_coordinator._tcp_probe that records bind_host."""
+    """Stub for a port probe (``lifecycle.tcp_probe``, or the CLI's own
+    ``_tcp_probe`` on the migration path) that records bind_host."""
     def probe(port: int, cfg: LifecycleConfig, *, bind_host: str = "127.0.0.1") -> bool:
         seen["bind_host"] = bind_host
         return reachable
@@ -234,6 +240,7 @@ def _write_port_file(workspace: Path, port: int) -> Path:
     pid_file = workspace / ".coherence" / "server.pid"
     pid_file.parent.mkdir(exist_ok=True)
     pid_file.write_text(f"999\n{port}\n", encoding="utf-8")
+    hold_coordinator_lock(pid_file)
     return pid_file
 
 
@@ -254,9 +261,8 @@ def test_coordinator_reuse_probe_targets_routed_bind_host(
     monkeypatch.setenv("CCS_REMOTE_COORDINATOR", "1")
     _write_port_file(git_workspace, 54321)
     seen: dict = {}
-    monkeypatch.setattr(
-        coherence_coordinator, "_tcp_probe", _capture_probe(seen, reachable=True)
-    )
+    monkeypatch.setattr(lifecycle, "tcp_probe", _capture_probe(seen, reachable=True))
+    monkeypatch.setattr(coherence_coordinator.subprocess, "Popen", _fail_on_call("a spawn"))
 
     rc = coherence_coordinator.main([
         "--root", str(git_workspace), "--bind-host", "10.0.0.5", "--quiet",
@@ -275,9 +281,7 @@ def test_spawn_detached_probe_targets_routed_bind_host(
     daemon orphaned behind the port file."""
     _write_port_file(git_workspace, 54321)
     seen: dict = {}
-    monkeypatch.setattr(
-        coherence_coordinator, "_tcp_probe", _capture_probe(seen, reachable=True)
-    )
+    monkeypatch.setattr(lifecycle, "tcp_probe", _capture_probe(seen, reachable=True))
     monkeypatch.setattr(
         coherence_coordinator.subprocess, "Popen",
         lambda *a, **kw: None,  # the pre-written port file stands in for the child
@@ -306,7 +310,7 @@ def test_spawn_detached_routed_bind_reports_loopback_conflict(
     def split_probe(port, cfg, *, bind_host="127.0.0.1"):
         return bind_host == "127.0.0.1"  # loopback answers, routed host doesn't
 
-    monkeypatch.setattr(coherence_coordinator, "_tcp_probe", split_probe)
+    monkeypatch.setattr(lifecycle, "tcp_probe", split_probe)
     monkeypatch.setattr(
         coherence_coordinator.subprocess, "Popen", lambda *a, **kw: None,
     )
@@ -340,7 +344,7 @@ def test_spawn_detached_wait_is_wall_clock_bounded(
         time.sleep(0.2)  # stand-in for the probe's own retry budget
         return False
 
-    monkeypatch.setattr(coherence_coordinator, "_tcp_probe", slow_dead_probe)
+    monkeypatch.setattr(lifecycle, "tcp_probe", slow_dead_probe)
     monkeypatch.setattr(
         coherence_coordinator.subprocess, "Popen", lambda *a, **kw: None,
     )
@@ -358,6 +362,268 @@ def test_spawn_detached_wait_is_wall_clock_bounded(
     )
 
 
+@pytest.mark.parametrize("target_exists", [True, False], ids=["existing_target", "dangling"])
+def test_coordinator_names_a_symlinked_pid_file_without_spawning(
+    git_workspace: Path, tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], target_exists: bool,
+) -> None:
+    """#464: the detached worker refuses the link too, but its stderr is /dev/null,
+    so the user would wait out the window and read only "did not become reachable".
+    Prevents that: the parent names the link, exits 2 and spawns nothing."""
+    target = tmp_path_factory.mktemp("outside") / "target"
+    if target_exists:
+        target.write_bytes(b"keep\n")
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir(mode=0o700)
+    (coherence / "server.pid").symlink_to(target)
+
+    def spawn(*args: object, **kwargs: object) -> None:
+        pytest.fail("spawned a detached worker")
+
+    monkeypatch.setattr(coherence_coordinator.subprocess, "Popen", spawn)
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace)])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert ".coherence/server.pid: it is a symlink" in err
+    assert "mount a directory" in err
+    assert (coherence / "server.pid").is_symlink()
+    assert (target.read_bytes() == b"keep\n") if target_exists else not target.exists()
+
+
+def _fail_on_call(what: str):
+    def fail(*args: object, **kwargs: object) -> None:
+        pytest.fail(f"{what} ran before the .coherence check refused")
+    return fail
+
+
+def test_coordinator_refuses_a_symlinked_pid_file_that_names_a_live_coordinator(
+    git_workspace: Path, tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#498: a committed ``server.pid`` link that names a live coordinator used to
+    be joined, because the reuse probe ran before the link refusal. Prevents a
+    clone joining another workspace's coordinator through it: the CLI refuses
+    before it probes a port or spawns, and names the way out."""
+    target = tmp_path_factory.mktemp("outside") / "server.pid"
+    target.write_text("999\n54321\n", encoding="utf-8")
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir(mode=0o700)
+    (coherence / "server.pid").symlink_to(target)
+    monkeypatch.setattr(coherence_coordinator, "_tcp_probe", _fail_on_call("a port probe"))
+    monkeypatch.setattr(lifecycle, "tcp_probe", _fail_on_call("a port probe"))
+    monkeypatch.setattr(coherence_coordinator.subprocess, "Popen", _fail_on_call("a spawn"))
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace)])
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert ".coherence/server.pid: it is a symlink" in captured.err
+    assert "mount a directory" in captured.err
+    assert "port=" not in captured.out
+
+
+def _plant_cli_link(root: Path, name: str, factory: pytest.TempPathFactory) -> tuple[Path, Path]:
+    """The link and its target: ``.coherence`` itself linked to a directory
+    outside the workspace, or a file link of that name inside it."""
+    coherence = root / ".coherence"
+    if name == ".coherence":
+        target = factory.mktemp("outside")
+        coherence.symlink_to(target, target_is_directory=True)
+        return coherence, target
+    return coherence / name, plant_link(coherence, name, "existing")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [".coherence", "hook.secret", "state.db", "tracked.yaml", "notes.txt", "evil\x1b[2Jname"],
+    ids=[".coherence", "hook.secret", "state.db", "tracked.yaml", "notes.txt", "escape_sequence"],
+)
+def test_coordinator_refuses_a_link_in_coherence_before_any_probe_or_spawn(
+    git_workspace: Path, tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], name: str,
+) -> None:
+    """#498: any link in ``.coherence``, or ``.coherence`` itself as a link, is
+    refused on one stderr line that names it with its control characters escaped,
+    before the CLI reads the pid file, probes a port or spawns a worker. Prevents
+    the refusal reaching the user only after a probe, or as a worker's silence."""
+    link, target = _plant_cli_link(git_workspace, name, tmp_path_factory)
+    before = (target_snapshot(target), sorted(os.listdir(link.parent)))
+    for step, owner in (("_read_port_from_file", coherence_coordinator),
+                        ("_tcp_probe", coherence_coordinator),
+                        ("Popen", coherence_coordinator.subprocess)):
+        monkeypatch.setattr(owner, step, _fail_on_call(step))
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace)])
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    assert len(captured.err.splitlines()) == 1, captured.err
+    shown = escape_nonprintable(str(git_workspace.resolve() / link.relative_to(git_workspace)))
+    assert f"refusing {shown}: it is a symlink" in captured.err
+    assert "\x1b" not in captured.err
+    assert (target_snapshot(target), sorted(os.listdir(link.parent))) == before
+
+
+@pytest.mark.parametrize("name", ["tracked.yaml", "hook.secret"])
+def test_the_detached_worker_refuses_a_link_the_parent_did_not_see(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch, name: str,
+) -> None:
+    """#498 through ``--_daemonized``, the entry the CLI spawns, for links at
+    names other than the pid file. Prevents a worker starting over a link made
+    after the parent's check, which would read or write the file it names."""
+    coherence = git_workspace / ".coherence"
+    target = plant_link(coherence, name, "existing")
+    before = target_snapshot(target)
+
+    def started(root: Path) -> None:
+        stop_coordinator(root)
+        pytest.fail("the worker started a coordinator over a link in .coherence")
+
+    # A worker that binds then waits forever: fail a regression instead of hanging.
+    monkeypatch.setattr("ccs.adapters.claude_code.lifecycle.wait_for_shutdown", started)
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace), "--_daemonized"])
+
+    assert rc == 2
+    assert target_snapshot(target) == before
+    assert sorted(os.listdir(coherence)) == [name]
+
+
+def test_no_detach_names_the_link_it_refuses(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#498: ``--no-detach`` used to report only that the coordinator "could not
+    be spawned". Prevents that: it names the link and the way out."""
+    coherence = git_workspace / ".coherence"
+    plant_link(coherence, "hook.secret", "existing")
+
+    try:
+        rc = coherence_coordinator.main(["--root", str(git_workspace), "--no-detach"])
+    finally:
+        stop_coordinator(git_workspace)
+
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert ".coherence/hook.secret: it is a symlink" in err
+    assert "mount a directory" in err
+    assert "could not be spawned" not in err
+
+
+@pytest.mark.parametrize("mode", ["--no-detach", "--_daemonized"])
+def test_a_link_made_after_the_cli_checked_is_still_refused_and_named(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], mode: str,
+) -> None:
+    """#498: a link made after the CLI's own check reaches the start, which raises
+    the refusal. Prevents that refusal escaping as a traceback and exit 1, which
+    reads as "not in a git repository": it is printed, with exit 2."""
+    coherence = git_workspace / ".coherence"
+    plant_link(coherence, "hook.secret", "existing")
+    cli_checks: list[Path] = []
+
+    def checked_before_the_link(root: Path) -> None:
+        # Stands in for a link made after the CLI's check ran.
+        cli_checks.append(root)
+
+    monkeypatch.setattr(coherence_coordinator, "check_coherence_dir", checked_before_the_link)
+
+    def started(root: Path) -> None:
+        stop_coordinator(root)
+        pytest.fail("the worker started a coordinator over a link in .coherence")
+
+    monkeypatch.setattr("ccs.adapters.claude_code.lifecycle.wait_for_shutdown", started)
+
+    try:
+        rc = coherence_coordinator.main(["--root", str(git_workspace), mode])
+    finally:
+        stop_coordinator(git_workspace)
+
+    # The stand-in ran, so the refusal is the start's, not the CLI's own check.
+    assert len(cli_checks) == 1
+    assert rc == 2
+    assert ".coherence/hook.secret: it is a symlink" in capsys.readouterr().err
+
+
+def test_prepare_for_migration_refuses_a_linked_pid_file_and_posts_nothing(
+    git_workspace: Path, tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#498: ``--prepare-for-migration`` resolves the coordinator from the pid
+    file and POSTs a drain, so a linked pid file aims it at another workspace's
+    coordinator. Prevents draining that coordinator's grants: the CLI refuses
+    before it resolves or posts anything."""
+    target = tmp_path_factory.mktemp("outside") / "server.pid"
+    target.write_text("999\n54321\n", encoding="utf-8")
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir(mode=0o700)
+    (coherence / "server.pid").symlink_to(target)
+    for step in ("resolve_endpoint", "post"):
+        monkeypatch.setattr(f"ccs.cli._coherence_client.{step}", _fail_on_call(step))
+    monkeypatch.setattr("urllib.request.urlopen", _fail_on_call("an HTTP request"))
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace), "--prepare-for-migration"])
+
+    assert rc == 2
+    assert ".coherence/server.pid: it is a symlink" in capsys.readouterr().err
+    assert target.read_text(encoding="utf-8") == "999\n54321\n"
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root searches a mode-000 directory"
+)
+def test_coordinator_still_spawns_when_it_cannot_search_coherence(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``.coherence`` the user cannot search (another user's, or one that lost its
+    x bit) makes ``Path.is_symlink`` raise. Prevents the link check crashing the CLI
+    with a traceback and exit 1, which means "not in a git repository": the worker
+    repairs a mode the user owns, and reports any other failure as exit 2."""
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir(mode=0o700)
+    spawned: list[Path] = []
+    monkeypatch.setattr(
+        coherence_coordinator, "_spawn_detached", lambda root, **kwargs: spawned.append(root) or 0,
+    )
+
+    coherence.chmod(0)
+    try:
+        rc = coherence_coordinator.main(["--root", str(git_workspace)])
+    finally:
+        coherence.chmod(0o700)
+
+    assert rc == 0
+    assert len(spawned) == 1
+
+
+def test_the_detached_worker_refuses_a_symlinked_pid_file(
+    git_workspace: Path, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#464 through the entry the CLI spawns, ``--_daemonized``. Prevents a worker
+    writing through a link the parent's check did not see, such as one made after
+    that check ran."""
+    target = tmp_path_factory.mktemp("outside") / "target"
+    target.write_bytes(b"keep\n")
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir(mode=0o700)
+    (coherence / "server.pid").symlink_to(target)
+
+    def started(root: Path) -> None:
+        stop_coordinator(root)
+        pytest.fail("the worker started a coordinator over a symlinked pid file")
+
+    # A worker that binds then waits forever: fail a regression instead of hanging.
+    monkeypatch.setattr("ccs.adapters.claude_code.lifecycle.wait_for_shutdown", started)
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace), "--_daemonized"])
+
+    assert rc == 2
+    assert target.read_bytes() == b"keep\n"
+    assert (coherence / "server.pid").is_symlink()
+
+
 def test_wildcard_bind_host_rejected_before_any_dial(
     git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -373,6 +639,7 @@ def test_wildcard_bind_host_rejected_before_any_dial(
         pytest.fail(f"probe dialed {bind_host!r} before bind-host validation")
 
     monkeypatch.setattr(coherence_coordinator, "_tcp_probe", must_not_dial)
+    monkeypatch.setattr(lifecycle, "tcp_probe", must_not_dial)
 
     rc = coherence_coordinator.main([
         "--root", str(git_workspace), "--bind-host", "0.0.0.0",
@@ -918,6 +1185,46 @@ def test_untrack_accepts_absolute_path_inside_workspace(
     assert str(target) not in content
 
 
+def test_track_accepts_a_root_spelled_in_another_case(
+    live_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An absolute path whose workspace root is typed in another case than the
+    disk's (``REPO`` for ``Repo``) is tracked relative to the root, as the hook
+    client sends it, whichever of the two spellings carries the other case."""
+    workspace, _ = live_coordinator
+    other_case = workspace.parent / workspace.name.swapcase()
+    if not other_case.exists():
+        pytest.skip("the temporary disk keeps two spellings apart, so no other spelling reaches the root")
+    (workspace / "docs").mkdir()
+    (workspace / "docs" / "plan.md").write_text("plan")
+    (workspace / "docs" / "notes.md").write_text("notes")
+
+    rc = coherence_track.main(["--root", str(workspace), str(other_case / "docs" / "plan.md")])
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "tracked docs/plan.md" in captured.out
+
+    rc = coherence_track.main(["--root", str(other_case), str(workspace / "docs" / "notes.md")])
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "tracked docs/notes.md" in captured.out
+
+
+def test_track_refuses_a_link_that_does_not_resolve_without_network(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A dangling link is refused before any request, not tracked under the
+    missing target's path: once the target exists, that would be a second
+    name for the file the link names."""
+    (git_workspace / "data").mkdir()
+    (git_workspace / "data" / "dangle.md").symlink_to("nope.md")
+
+    rc = coherence_track.main(["--root", str(git_workspace), str(git_workspace / "data" / "dangle.md")])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "link does not resolve" in captured.err
+
+
 def test_track_no_coordinator_running_exits_2(
     git_workspace: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1123,7 +1430,7 @@ def test_resolve_endpoint_missing_pid_file(git_workspace: Path) -> None:
 def test_resolve_endpoint_missing_secret_file(git_workspace: Path) -> None:
     """Port file present but hook.secret missing → CoordinatorUnavailable."""
     (git_workspace / ".coherence").mkdir(parents=True, exist_ok=True, mode=0o700)
-    (git_workspace / ".coherence" / "server.pid").write_text("12345\n50000\n")
+    write_coordinator_pid_file(git_workspace / ".coherence", 50000)
     with pytest.raises(CoordinatorUnavailable) as excinfo:
         resolve_endpoint(git_workspace)
     assert "authentication unavailable" in str(excinfo.value)
@@ -1133,7 +1440,7 @@ def test_resolve_endpoint_empty_secret(git_workspace: Path) -> None:
     """hook.secret exists but is empty → CoordinatorUnavailable."""
     coh = git_workspace / ".coherence"
     coh.mkdir(parents=True, exist_ok=True, mode=0o700)
-    (coh / "server.pid").write_text("12345\n50000\n")
+    write_coordinator_pid_file(coh, 50000)
     (coh / "hook.secret").write_text("")
     with pytest.raises(CoordinatorUnavailable) as excinfo:
         resolve_endpoint(git_workspace)
@@ -1407,6 +1714,45 @@ def test_status_text_lists_a_handoff_after_the_artifacts_table(
     assert capsys.readouterr().out == expected
 
 
+def test_status_text_lists_changes_made_outside_the_coordinator_after_the_artifacts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#278: an entry carrying ``foreign_writes`` (the operator tier) gets one
+    line in a block after the artifacts table: the changes the detector found
+    on disk with no commit behind them, and the ones it excused as a write
+    still landing. A mediated count alone is no news and prints nothing.
+    Prevents a detected out-of-band change being visible only in --json."""
+    monkeypatch.setenv("COLUMNS", "80")
+    payload = _status_payload(foreign_writes={"foreign": 2, "lag_suppressed": 1, "mediated": 3})
+    payload["tracked_artifacts"][1]["foreign_writes"] = {"mediated": 4}
+
+    coherence_status._render_table(payload)
+
+    block = (
+        "Changes made outside the coordinator (counted by the foreign-write detector):\n"
+        "  plan.md: 2 foreign, 1 excused as a write still landing\n"
+        "\n"
+    )
+    expected = _STATUS_TEXT_WITHOUT_HANDOFF.replace("\nSessions:\n", "\n" + block + "Sessions:\n")
+    assert capsys.readouterr().out == expected
+
+
+def test_status_counters_print_the_hash_mismatch_counts(
+    capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#278: the two counters that move when a reader's bytes differ from the
+    recorded content print in the counter block, which shows them in the
+    table and in --detail metrics alike; they used to reach only --json."""
+    coherence_status._render_counter_block({
+        "fresh_shared_hash_mismatch_total": 3,
+        "shared_foreign_lag_suppressed_total": 1,
+    })
+
+    lines = capsys.readouterr().out.splitlines()
+    assert f"  {'fresh_shared_hash_mismatch_total':<40}  3" in lines
+    assert f"  {'shared_foreign_lag_suppressed_total':<40}  1" in lines
+
+
 def test_status_text_is_byte_identical_to_today_when_no_entry_carries_a_handoff(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1491,8 +1837,8 @@ def test_status_metrics_line_shows_the_registry_schema_version_after_the_version
 def test_status_header_and_metrics_line_are_unchanged_without_a_schema_version(
     schema_field: dict, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """An older coordinator, or the Node one, sends no
-    ``registry_schema_version``: the table and the metrics line are byte for
+    """An older coordinator sends no ``registry_schema_version``, nor the
+    Node coordinator's ``schema_version``: the table and the metrics line are byte for
     byte what they were, with no ``schema=`` placeholder. Prevents a guessed or
     empty schema number standing in for one the coordinator never sent."""
     monkeypatch.setenv("COLUMNS", "80")
@@ -1527,6 +1873,91 @@ def test_status_header_shows_the_schema_version_a_live_coordinator_sends(
 
 
 # ----------------------------------------------------------------------
+# coherence_status -- the backend and version of a Node coordinator (#518)
+# ----------------------------------------------------------------------
+
+#: The Node coordinator's default-tier ``/status`` body as a 0.6.0 build
+#: answers it: it names its version and schema in ``version`` and
+#: ``schema_version``, and sends no ``coordinator_*`` key.
+_NODE_STATUS_BODY = {
+    "backend": "node",
+    "coordinator_uptime_seconds": 27,
+    "counts": {"sessions": 0, "tracked_artifacts": 0},
+    "fold_profile": "caseless",
+    "fold_table_unicode": "17.0.0",
+    "policy_summary": {
+        "coordinator_root": ".", "default_pattern_count": 9, "ignored_pattern_count": 0,
+        "rejected_pattern_count": 0, "strict_mode_pattern_count": 1, "user_added_pattern_count": 1,
+    },
+    "schema_version": 5,
+    "sessions": [],
+    "status": "ok",
+    "tracked_artifacts": [],
+    "version": "0.6.0",
+}
+
+#: The same build's ``/status?detail=metrics`` body.
+_NODE_METRICS_BODY = {
+    "backend": "node", "counters": {}, "fold_profile": "caseless",
+    "fold_table_unicode": "17.0.0", "version": "0.6.0",
+}
+
+
+def _status_against(workspace: Path, body: dict, detail: str | None = None) -> int:
+    """``agent-coherence-status``'s exit code for ``workspace`` at ``detail``
+    while the stub coordinator answers ``/status`` with ``body``."""
+    _StubCoordinator.answers = {"/status": (200, body)}
+    detail_args = [] if detail is None else ["--detail", detail]
+    return coherence_status.main(["--root", str(workspace), *detail_args])
+
+
+def test_status_names_the_node_coordinator_and_its_version(
+    stub_coordinator, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Against a coordinator whose pid file says ``backend=node`` and whose
+    body carries Node's ``version`` and ``schema_version`` but no
+    ``coordinator_*`` key, the table header says ``backend=node`` with that
+    version and schema, and the metrics line says ``backend=node`` with that
+    version. Prevents the command calling the Node coordinator ``python`` with
+    an empty version, when a refusal sends the operator here to see the
+    coordinator's version."""
+    workspace, port = stub_coordinator
+    (workspace / ".coherence" / "server.pid").write_text(f"999\n{port}\nbackend=node\n")
+
+    assert _status_against(workspace, _NODE_STATUS_BODY) == 0
+    table = capsys.readouterr().out.splitlines()
+    assert _status_against(workspace, _NODE_METRICS_BODY, "metrics") == 0
+    metrics = capsys.readouterr().out.splitlines()
+
+    assert table[0] == "Coordinator: uptime=27s backend=node version=0.6.0 schema=5"
+    assert metrics[0] == "Coordinator metrics: backend=node version=0.6.0"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [_status_payload(), {k: v for k, v in _status_payload().items() if k != "coordinator_backend"}],
+    ids=["names-its-backend", "names-no-backend"],
+)
+def test_status_output_against_the_python_coordinator_is_unchanged(
+    body: dict, stub_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With the Python coordinator's pid file, which has no backend line, and
+    a body that names its version in ``coordinator_version``, the table and
+    the metrics line are byte for byte what they were, ``backend=python``
+    included whether or not the body names its backend. Prevents reading
+    Node's keys, or the backend from the pid file, changing what an operator
+    of the Python coordinator sees."""
+    workspace, _ = stub_coordinator
+    monkeypatch.setenv("COLUMNS", "80")
+
+    assert _status_against(workspace, body) == 0
+    assert capsys.readouterr().out == _STATUS_TEXT_WITHOUT_HANDOFF
+    assert _status_against(workspace, body, "metrics") == 0
+    assert capsys.readouterr().out.splitlines()[0] == "Coordinator metrics: backend=python version=9.9.9"
+
+
+# ----------------------------------------------------------------------
 # coherence_handoff — the four handoff verbs (#185)
 # ----------------------------------------------------------------------
 
@@ -1536,14 +1967,16 @@ _SESSION_VAR = "CLAUDE_CODE_SESSION_ID"
 _EXIT_DONE, _EXIT_USAGE, _EXIT_FAILED, _EXIT_NOT_SERVED = 0, 1, 2, 4
 
 _NOT_HELD_HINT = (
-    "hint: a Claude Code session's write grant ends when its turn ends. If an "
-    "earlier transfer of plan.md may have landed, check the path's handoff in "
-    "agent-coherence-status output first: a handoff from this session to that "
-    "successor made at the version it held, live or ended, means it landed, so "
-    "do not transfer again, and if it shows another session's handoff, ask "
-    "before transferring; otherwise have the giver session read plan.md, then "
-    "transfer it again (on a strict-mode path that read is denied: hand the "
-    "path on in the same turn as its edit)"
+    "hint: this session holds no claim on plan.md: an earlier transfer of it "
+    "may have landed, another session may have taken or changed it since this "
+    "session read it, or this session may never have read it. Check the path's "
+    "handoff in agent-coherence-status output first: a handoff from this "
+    "session to that successor made at the version it held, live or ended, "
+    "means it landed, so do not transfer again, and if it shows another "
+    "session's handoff, ask before transferring; otherwise have the giver "
+    "session read plan.md, then transfer it again (on a strict-mode path that "
+    "read is denied, and grants nothing, when another session took or changed "
+    "plan.md after this session read it)"
 )
 
 _VERB_RUNS = {
@@ -1641,7 +2074,7 @@ def stub_coordinator(git_workspace: Path):
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _StubCoordinator)
     threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     port = httpd.server_address[1]
-    (coherence / "server.pid").write_text(f"999\n{port}\n")
+    write_coordinator_pid_file(coherence, port, pid=999)
     (coherence / "hook.secret").write_text("test-secret")
     _StubCoordinator.answers, _StubCoordinator.seen = {}, []
     try:
@@ -1863,23 +2296,26 @@ def test_a_verb_for_a_session_bound_under_another_nonce_is_refused_and_never_re_
     assert (record["status"], record["live"]) == ("pending", True)
 
 
-def test_a_transfer_after_the_givers_turn_ended_is_not_held_with_a_hint_and_a_pre_read_makes_it_transferable(
+def test_a_transfer_of_a_read_a_peer_made_stale_is_not_held_with_a_hint_and_a_pre_read_makes_it_transferable(
     live_coordinator, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A hook session's write grant ends at its turn end (its session-stop), so
-    a transfer run afterwards answers not held: the verb prints the wire
+    """A hook session's turn end (its session-stop) leaves it a read of its
+    file (#513), and a peer's pre-edit then makes that read stale, so a
+    transfer run afterwards answers not held: the verb prints the wire
     reason unchanged, adds the client-side hint (have the giver session read
     the path, then transfer) and exits 2. After the giver session's pre-read
     the same transfer goes through, giving up a SHARED claim. Prevents an
     operator meeting a bare refusal with no way forward."""
     workspace, _ = live_coordinator
-    giver = str(uuid.uuid4())
+    giver, peer = str(uuid.uuid4()), str(uuid.uuid4())
     successor_agent = _known_successor(workspace)
     _hook(workspace, "/hooks/pre-edit", {"session_id": giver, "path": "plan.md"})
     _hook(workspace, "/hooks/post-edit", {
         "session_id": giver, "path": "plan.md", "content_hash": "b" * 64, "success": True,
     })
     _hook(workspace, "/hooks/session-stop", {"session_id": giver})
+    _hook(workspace, "/hooks/pre-edit", {"session_id": peer, "path": "plan.md"})
+    _hook(workspace, "/hooks/session-stop", {"session_id": peer})
     argv = ["--root", str(workspace), "--session", giver, "--successor", successor_agent, "plan.md"]
 
     rc = coherence_handoff.transfer_main(argv)
@@ -2890,3 +3326,461 @@ def test_status_table_on_an_answer_with_one_list_null_exits_2(
         _DEGRADED_STATUS_LINE if degraded else "agent-coherence-status: unexpected /status shape\n"
     )
     assert captured.out == ""
+
+
+# ----------------------------------------------------------------------
+# #345 -- agent-coherence-coordinator --check-store
+# ----------------------------------------------------------------------
+
+#: FROZEN duplicate of the --check-store exit-code contract a host hard-codes:
+#: 0 for a store a start opens unchanged, 10-17 for the rest, clear of 1 (not
+#: a git repo) and 2 (usage) and of 3-9, which spawn mode may still claim.
+_CHECK_STORE_EXIT_CODES = {
+    "current": 0,
+    "fresh": 10,
+    "will_migrate": 11,
+    "newer": 12,
+    "foreign": 13,
+    "unusable": 14,
+    "live": 15,
+    "cannot_tell": 16,
+    "coherence_dir_refused": 17,
+}
+
+#: FROZEN duplicate of the --check-store --json object's key set. No bare
+#: ``schema_version``: the store's and this build's registry schema versions
+#: are named apart, so neither can be read as the other.
+_CHECK_STORE_JSON_KEYS = {
+    "kind", "outcome", "exit_code", "db_path", "coordinator_backend",
+    "registry_schema_version", "store_registry_schema_version", "reason", "message",
+}
+
+
+def _lay_store(shape: str, workspace: Path) -> None:
+    """One store shape under ``workspace`` (the store-check test's builders,
+    plus an orphan WAL with no store beside it and a ``state.db`` linked to a
+    v7 store outside ``.coherence``)."""
+    from tests.test_claude_code_store_check import _build
+
+    if shape == "orphan_wal":
+        coherence_dir = workspace / ".coherence"
+        coherence_dir.mkdir(mode=0o700)
+        (coherence_dir / "state.db-wal").write_bytes(b"\x00" * 4096)
+        return
+    if shape == "linked_store":
+        elsewhere = workspace / "elsewhere"
+        _build("v7", elsewhere)
+        coherence_dir = workspace / ".coherence"
+        coherence_dir.mkdir(mode=0o700)
+        (coherence_dir / "state.db").symlink_to(elsewhere / ".coherence" / "state.db")
+        return
+    _build(shape, workspace)
+
+
+@pytest.mark.parametrize(
+    ("shape", "outcome", "found"),
+    [
+        ("v10", "current", 10),
+        ("absent", "fresh", None),
+        ("v7", "will_migrate", 7),
+        ("v11", "newer", 11),
+        ("node_stamp", "foreign", None),
+        ("text", "unusable", None),
+        ("orphan_wal", "cannot_tell", None),
+        ("linked_store", "coherence_dir_refused", None),
+    ],
+)
+def test_check_store_json_prints_one_object_and_exits_with_the_outcomes_code(
+    shape: str, outcome: str, found: int | None,
+    git_workspace: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--check-store --json`` prints exactly one JSON object — the outcome,
+    its exit code, the store path, the backend it speaks for, this build's
+    and the store's registry schema versions under distinct keys, the reason
+    and a message — and exits with that outcome's code. Prevents a host that
+    pins the binary (or a TS host that can only run it) parsing prose, or
+    reading the store's schema version as the build's."""
+    _lay_store(shape, git_workspace)
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace), "--check-store", "--json"])
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    [line] = captured.out.splitlines()
+    body = json.loads(line)
+    assert set(body) == _CHECK_STORE_JSON_KEYS
+    assert "schema_version" not in body
+    assert (body["kind"], body["outcome"], body["coordinator_backend"]) == (
+        "store_check", outcome, "python",
+    )
+    assert rc == body["exit_code"] == _CHECK_STORE_EXIT_CODES[outcome]
+    assert body["registry_schema_version"] == 10
+    assert body["store_registry_schema_version"] == found
+    assert body["db_path"] == str(git_workspace.resolve() / ".coherence" / "state.db")
+    assert body["message"]
+
+
+def test_check_store_against_a_running_coordinator_exits_live(
+    git_workspace: Path, fast_cfg: LifecycleConfig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With a coordinator running for the workspace, the check exits with the
+    ``live`` code and names the running coordinator as the reason. Prevents a
+    host asking consent for a migration a start would never run (it joins
+    the running coordinator)."""
+    assert ensure_coordinator(git_workspace, config=fast_cfg) > 0
+    try:
+        rc = coherence_coordinator.main(
+            ["--root", str(git_workspace), "--check-store", "--json"]
+        )
+    finally:
+        stop_coordinator(git_workspace)
+
+    body = json.loads(capsys.readouterr().out)
+    assert rc == body["exit_code"] == _CHECK_STORE_EXIT_CODES["live"]
+    assert (body["outcome"], body["reason"]) == ("live", "coordinator_running")
+
+
+@pytest.mark.parametrize(
+    ("shape", "outcome"), [("v10", "current"), ("v7", "will_migrate"), ("text", "unusable")]
+)
+def test_check_store_without_json_prints_one_line_that_quiet_suppresses(
+    shape: str, outcome: str, git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without ``--json`` the check prints one plain line naming the outcome;
+    ``--quiet`` prints nothing and keeps the exit code. Prevents a shell
+    script needing the JSON to read the answer, or ``--quiet`` changing it."""
+    _lay_store(shape, git_workspace)
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace), "--check-store"])
+    loud = capsys.readouterr()
+    quiet_rc = coherence_coordinator.main(
+        ["--root", str(git_workspace), "--check-store", "--quiet"]
+    )
+    quiet = capsys.readouterr()
+
+    assert rc == quiet_rc == _CHECK_STORE_EXIT_CODES[outcome]
+    [line] = loud.out.splitlines()
+    assert outcome in line
+    assert (quiet.out, quiet.err) == ("", "")
+
+
+def test_check_store_json_still_prints_under_quiet(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--quiet`` silences only the plain line; ``--json`` still prints its
+    one object and keeps the exit code. Prevents a host that adds ``--quiet``
+    getting an empty stdout (a JSON parse failure) and losing the store's
+    schema version and the reason."""
+    _lay_store("v7", git_workspace)
+    args = ["--root", str(git_workspace), "--check-store", "--json"]
+
+    rc = coherence_coordinator.main(args)
+    loud = capsys.readouterr()
+    quiet_rc = coherence_coordinator.main([*args, "--quiet"])
+    quiet = capsys.readouterr()
+
+    assert rc == quiet_rc == _CHECK_STORE_EXIT_CODES["will_migrate"]
+    assert (quiet.out, quiet.err) == (loud.out, "")
+    assert json.loads(quiet.out)["store_registry_schema_version"] == 7
+
+
+#: An object name that sets the terminal title, then turns the text red.
+_TERMINAL_CONTROL_NAME = "\x1b]0;title\x07\x1b[31mred"
+
+
+def _lay_store_naming_an_object(workspace: Path, name: str) -> None:
+    """A store whose schema holds a malformed table named ``name``, so a
+    writer open fails with SQLite's ``malformed database schema (<name>)``."""
+    import sqlite3
+
+    coherence_dir = workspace / ".coherence"
+    coherence_dir.mkdir(mode=0o700)
+    conn = sqlite3.connect(str(coherence_dir / "state.db"))
+    try:
+        conn.execute("CREATE TABLE t (x)")
+        conn.execute("PRAGMA writable_schema = ON")
+        conn.execute(
+            "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) "
+            "VALUES ('table', ?, ?, 0, 'not sql')",
+            (name, name),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_check_store_plain_line_escapes_control_characters_from_the_store(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The plain line prints a store's own text (here an object name SQLite
+    quotes in its error) with each control character escaped, while
+    ``--json`` keeps the message as it is (JSON escapes it). Prevents a
+    crafted store, the kind the check exists to inspect before a start,
+    retitling or recoloring the terminal of whoever checks it."""
+    _lay_store_naming_an_object(git_workspace, _TERMINAL_CONTROL_NAME)
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace), "--check-store"])
+    plain = capsys.readouterr()
+    json_rc = coherence_coordinator.main(
+        ["--root", str(git_workspace), "--check-store", "--json"]
+    )
+    body = json.loads(capsys.readouterr().out)
+
+    assert rc == json_rc == _CHECK_STORE_EXIT_CODES["unusable"]
+    assert "\x1b" not in plain.out
+    assert "\x07" not in plain.out
+    assert r"\x1b]0;title\x07\x1b[31mred" in plain.out
+    assert _TERMINAL_CONTROL_NAME in body["message"]
+
+
+def test_check_store_on_a_sequence_number_that_is_not_an_integer_exits_unusable(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A store whose ``registry_meta`` sequence number is not an integer
+    reads ``unusable`` (``registry_meta_incomplete``) with exit 14 and one
+    JSON object. Prevents the check crashing with exit 1 and an empty stdout,
+    which a host cannot parse, on a store a start refuses."""
+    _lay_store("seq_text", git_workspace)
+
+    rc = coherence_coordinator.main(
+        ["--root", str(git_workspace), "--check-store", "--json"]
+    )
+
+    body = json.loads(capsys.readouterr().out)
+    assert rc == body["exit_code"] == _CHECK_STORE_EXIT_CODES["unusable"]
+    assert (body["outcome"], body["reason"]) == ("unusable", "registry_meta_incomplete")
+
+
+def test_check_store_on_an_absent_store_creates_no_coherence_dir(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Checking a workspace with no store reads ``fresh`` and leaves it with
+    no ``.coherence/`` — the check never runs the spawn's directory setup.
+    Prevents a check leaving the workspace looking initialized."""
+    rc = coherence_coordinator.main(["--root", str(git_workspace), "--check-store", "--json"])
+
+    assert rc == _CHECK_STORE_EXIT_CODES["fresh"]
+    assert json.loads(capsys.readouterr().out)["store_registry_schema_version"] is None
+    assert not (git_workspace / ".coherence").exists()
+
+
+@pytest.mark.parametrize("name", [".coherence", "state.db", "hook.secret"])
+def test_check_store_and_a_start_agree_on_a_link(
+    git_workspace: Path, tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], name: str,
+) -> None:
+    """#511's contract: for a workspace a start refuses (#498), ``--check-store
+    --json`` answers ``coherence_dir_refused`` with exit 17, and the start
+    exits 2 printing the same refusal, which names the same path. Prevents a
+    host reading ``fresh``, ``current`` or ``unusable`` from the check and
+    then watching the start refuse."""
+    link, _target = _plant_cli_link(git_workspace, name, tmp_path_factory)
+    monkeypatch.setattr(coherence_coordinator.subprocess, "Popen", _fail_on_call("a spawn"))
+
+    check_rc = coherence_coordinator.main(["--root", str(git_workspace), "--check-store", "--json"])
+    body = json.loads(capsys.readouterr().out)
+    start_rc = coherence_coordinator.main(["--root", str(git_workspace)])
+    start = capsys.readouterr()
+
+    assert check_rc == body["exit_code"] == _CHECK_STORE_EXIT_CODES["coherence_dir_refused"]
+    assert (body["outcome"], body["reason"]) == ("coherence_dir_refused", "coherence_link")
+    assert body["store_registry_schema_version"] is None
+    shown = git_workspace.resolve() / link.relative_to(git_workspace)
+    assert body["message"].startswith(f"refusing {shown}: it is a symlink")
+    assert start_rc == 2
+    assert start.err == f"agent-coherence-coordinator: {escape_nonprintable(body['message'])}\n"
+
+
+def test_check_store_on_a_linked_coherence_changes_nothing_in_its_target(
+    git_workspace: Path, tmp_path_factory: pytest.TempPathFactory,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#511: a ``.coherence`` linked to an outside 0755 directory that holds a
+    store answers ``coherence_dir_refused``, and the check leaves that
+    directory's mode, its listing and the store as they were. Prevents the
+    check running a start's directory setup through the link, which would
+    tighten the target to 0700 or create files in it."""
+    outside = tmp_path_factory.mktemp("outside")
+    _lay_store("v10", outside)
+    target = outside / ".coherence"
+    target.chmod(0o755)
+    (git_workspace / ".coherence").symlink_to(target, target_is_directory=True)
+    before = (target_snapshot(target), target_snapshot(target / "state.db"))
+
+    rc = coherence_coordinator.main(["--root", str(git_workspace), "--check-store", "--json"])
+
+    assert rc == _CHECK_STORE_EXIT_CODES["coherence_dir_refused"]
+    assert json.loads(capsys.readouterr().out)["outcome"] == "coherence_dir_refused"
+    assert (target_snapshot(target), target_snapshot(target / "state.db")) == before
+    assert (git_workspace / ".coherence").is_symlink()
+
+
+def test_check_store_ignores_the_bind_host_it_never_binds(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The check runs before the bind-host validation: it binds nothing and
+    dials nothing, so a bind host spawn mode would refuse does not turn the
+    answer into a usage error. Prevents a host's routed-bind configuration
+    breaking its pre-start check."""
+    monkeypatch.delenv("CCS_REMOTE_COORDINATOR", raising=False)
+
+    rc = coherence_coordinator.main(
+        ["--root", str(git_workspace), "--check-store", "--bind-host", "0.0.0.0"]
+    )
+
+    assert rc == _CHECK_STORE_EXIT_CODES["fresh"]
+    assert capsys.readouterr().err == ""
+
+
+def test_json_without_check_store_is_a_usage_error(
+    git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--json`` only shapes the check's answer, so alone it is a usage
+    error (exit 2) naming ``--check-store``, and nothing is spawned.
+    Prevents a host's ``--json`` spawn call silently starting a coordinator
+    and printing prose."""
+    with pytest.raises(SystemExit) as excinfo:
+        coherence_coordinator.main(["--root", str(git_workspace), "--json"])
+
+    assert excinfo.value.code == 2
+    assert "--json requires --check-store" in capsys.readouterr().err
+    assert not (git_workspace / ".coherence").exists()
+
+
+@pytest.mark.parametrize("mode_flag", ["--prepare-for-migration", "--no-detach", "--_daemonized"])
+def test_check_store_with_a_spawn_or_shutdown_mode_is_a_usage_error(
+    mode_flag: str, git_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--check-store`` never starts or stops a coordinator, so combining it
+    with a mode that does is a usage error (exit 2) and nothing runs.
+    Prevents a check that drains grants, or one that spawns."""
+    with pytest.raises(SystemExit) as excinfo:
+        coherence_coordinator.main(["--root", str(git_workspace), "--check-store", mode_flag])
+
+    assert excinfo.value.code == 2
+    assert f"--check-store cannot be combined with {mode_flag}" in capsys.readouterr().err
+    assert not (git_workspace / ".coherence").exists()
+
+
+def test_the_check_store_exit_map_covers_every_outcome_and_avoids_1_and_2() -> None:
+    """The exit map is the frozen contract: one code per outcome, every
+    outcome mapped, no code shared, and none equal to 1 (not a git repo) or
+    2 (usage). Prevents a new outcome exiting with a code a host reads as
+    another, or as a usage error."""
+    from ccs.adapters.claude_code.store_check import StoreCheckOutcome
+
+    codes = {
+        outcome.value: code
+        for outcome, code in coherence_coordinator._CHECK_STORE_EXIT_CODES.items()
+    }
+    assert codes == _CHECK_STORE_EXIT_CODES
+    assert set(codes) == {outcome.value for outcome in StoreCheckOutcome}
+    assert len(set(codes.values())) == len(codes)
+    assert not set(codes.values()) & {1, 2}
+
+
+# --- one writer per store (#453) ------------------------------------------------
+
+
+def test_coordinator_no_detach_names_a_store_another_writer_holds(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A start that still finds another read-write handle on state.db after its
+    wait exits 2 with one line naming it, never a traceback."""
+    monkeypatch.setattr(
+        lifecycle, "_DEFAULT_CONFIG", LifecycleConfig(store_holder_wait_sec=0.1)
+    )
+    try:
+        with SqliteArtifactRegistry(git_workspace / ".coherence" / "state.db"):
+            rc = coherence_coordinator.main(["--root", str(git_workspace), "--no-detach"])
+    finally:
+        stop_coordinator(git_workspace)
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "open for writing by another handle" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_spawn_detached_names_a_held_store_when_its_wait_ends(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The detached worker's stderr is /dev/null, so when the wait ends the
+    parent probes the store's lock itself and names a holder, instead of the
+    bare 'did not become reachable'."""
+    monkeypatch.setattr(coherence_coordinator, "_DETACH_PORT_WAIT_TIMEOUT_SEC", 0.3)
+    monkeypatch.setattr(coherence_coordinator.subprocess, "Popen", lambda *a, **kw: None)
+    with SqliteArtifactRegistry(git_workspace / ".coherence" / "state.db"):
+        rc = coherence_coordinator._spawn_detached(git_workspace, quiet=True)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "open for writing by another handle" in err
+    assert "did not become reachable" not in err
+
+
+def test_the_coordinator_command_starts_one_rather_than_report_an_exited_ones_port(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#503: a stranger listening on a dead coordinator's port is not a running
+    coordinator, so the command starts one instead of printing that port."""
+    import socket
+    import subprocess
+    import sys
+
+    stranger = socket.socket()
+    stranger.bind(("127.0.0.1", 0))
+    stranger.listen()
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(60)
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir(mode=0o700, exist_ok=True)
+    (coherence / "server.pid").write_text(f"{child.pid}\n{stranger.getsockname()[1]}\n")
+    stranger_port = stranger.getsockname()[1]
+    spawned: list[Path] = []
+    monkeypatch.setattr(
+        coherence_coordinator, "_spawn_detached", lambda root, **_kw: spawned.append(root) or 0
+    )
+    try:
+        assert coherence_coordinator.main(["--root", str(git_workspace)]) == 0
+    finally:
+        stranger.close()
+    assert [path.resolve() for path in spawned] == [git_workspace.resolve()]
+    assert f"port={stranger_port}" not in capsys.readouterr().out
+
+
+def test_the_detached_start_waits_for_its_own_coordinator_not_an_exited_ones_port(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#503: while the detached worker starts, ``server.pid`` still names the
+    exited coordinator and a stranger listens on its port. The command waits
+    for the worker's own lines and prints the worker's port, never the
+    stranger's."""
+    import socket
+    import subprocess
+    import sys
+    import threading
+
+    from tests.pid_lock_helpers import write_coordinator_pid_file
+
+    stranger, worker = socket.socket(), socket.socket()
+    for listener in (stranger, worker):
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+    stranger_port, worker_port = stranger.getsockname()[1], worker.getsockname()[1]
+    exited = subprocess.Popen([sys.executable, "-c", "pass"])
+    exited.wait(60)
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir(mode=0o700, exist_ok=True)
+    (coherence / "server.pid").write_text(f"{exited.pid}\n{stranger_port}\n")
+
+    def start_worker(*_args: object, **_kwargs: object) -> None:
+        threading.Timer(
+            0.3, write_coordinator_pid_file, (coherence, worker_port, os.getpid())
+        ).start()
+
+    monkeypatch.setattr(coherence_coordinator.subprocess, "Popen", start_worker)
+    try:
+        assert coherence_coordinator._spawn_detached(git_workspace, quiet=False) == 0
+    finally:
+        stranger.close()
+        worker.close()
+    assert capsys.readouterr().out.strip() == f"port={worker_port}"

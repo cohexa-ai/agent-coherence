@@ -31,8 +31,10 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -40,6 +42,7 @@ import pytest
 
 import ccs
 from ccs.adapters.workspace import MemberRestoreOutcome, RestoreObservation
+from ccs.cli import workspace as workspace_cli
 from ccs.cli.workspace import (
     CLAIMED_NOT_BACKED_LABEL,
     FILE_RETENTION_CAVEAT,
@@ -69,6 +72,7 @@ from ccs.core.exceptions import (
 )
 from ccs.core.substrate import ArbitrationTier, RestoreTier, sha256_hex
 from ccs.core.types import ConflictDetail, WorkspaceRegistrationResult
+from tests.coherence_link_helpers import plant_link, target_snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE = REPO_ROOT / "examples" / "workspace_versioning" / "main.py"
@@ -865,6 +869,91 @@ def test_preexisting_0755_coherence_dir_is_retightened_to_0700(
     )
     assert rc == 0, err
     assert (coherence.stat().st_mode & 0o777) == 0o700
+
+
+# --- a link in .coherence (#498) ------------------------------------------------
+
+
+def _make_sqlite(path: Path) -> None:
+    """A small SQLite store at ``path``, closed, with no sidecar left beside it."""
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("CREATE TABLE kept (x)")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("shape", ["existing", "dangling"])
+def test_a_verb_refuses_a_linked_workspace_db_and_changes_nothing_at_its_target(
+    tmp_path: Path, capsys, shape: str
+) -> None:
+    """A ``workspace.db`` linked out of ``.coherence`` exits 2 with the typed
+    refusal, which names the link and the way out, and the store the link names
+    is never opened: no ``-wal`` or ``-shm`` beside it, and a dangling link's
+    target is not created. Prevents the generic exit 1, which reads as a
+    contention error, and an open through the link, which SQLite follows."""
+    coherence_dir = tmp_path / ".coherence"
+    target = plant_link(coherence_dir, "workspace.db", "dangling")
+    if shape == "existing":
+        _make_sqlite(target)
+    before = target_snapshot(target)
+
+    rc, out, err = _run(capsys, "list", "--json", "--root", str(tmp_path))
+
+    assert rc == 2
+    envelope = json.loads(out)
+    assert (envelope["exit_code"], envelope["reason"], envelope["exception"]) == (
+        2, "coherence_dir_refused", "CoherenceDirRefused",
+    )
+    link = tmp_path.resolve() / ".coherence" / "workspace.db"
+    assert envelope["message"].startswith(f"refusing {link}: it is a symlink")
+    assert err == f"agent-coherence-workspace: refused (coherence_dir_refused): {envelope['message']}\n"
+    assert "mount a directory" in err
+    assert target_snapshot(target) == before
+    assert sorted(os.listdir(target.parent)) == (["workspace.db"] if shape == "existing" else [])
+    assert sorted(os.listdir(coherence_dir)) == ["workspace.db"]
+
+
+def test_a_verb_refuses_a_linked_coherence_before_tightening_its_target(
+    tmp_path: Path, capsys
+) -> None:
+    """A ``.coherence`` that is itself a link exits 2, and the directory it names
+    keeps its 0755 and stays empty. Prevents a verb tightening that directory and
+    writing its ``.gitignore`` and ``workspace.db`` there."""
+    target = tmp_path / "link-targets" / "state"
+    target.mkdir(parents=True)
+    target.chmod(0o755)
+    (tmp_path / ".coherence").symlink_to(target, target_is_directory=True)
+    _seed_file(tmp_path)
+
+    rc, out, err = _run(
+        capsys, "checkpoint", "cp1", "--file", "docs/plan.md", "--json", "--root", str(tmp_path)
+    )
+
+    assert rc == 2
+    assert json.loads(out)["reason"] == "coherence_dir_refused"
+    assert f"refusing {tmp_path.resolve() / '.coherence'}: it is a symlink" in err
+    assert (target.stat().st_mode & 0o777) == 0o755
+    assert os.listdir(target) == []
+    assert (tmp_path / ".coherence").is_symlink()
+
+
+def test_a_refused_link_is_printed_with_its_control_characters_escaped(
+    tmp_path: Path, capsys
+) -> None:
+    """The refused name reaches stderr escaped and the ``--json`` envelope raw
+    (JSON escapes it there). Prevents a cloned link's name driving the
+    operator's terminal."""
+    name = "notes\x1b[2J.txt"
+    plant_link(tmp_path / ".coherence", name, "existing")
+
+    rc, out, err = _run(capsys, "list", "--json", "--root", str(tmp_path))
+
+    assert rc == 2
+    assert "\x1b" not in err
+    assert "notes\\x1b[2J.txt: it is a symlink" in err
+    assert name in json.loads(out)["message"]
 
 
 # --- --json error envelope ------------------------------------------------------
@@ -1714,3 +1803,64 @@ def test_restore_of_a_checkpoint_bound_to_another_receiver_is_refused(
     rc, out, _ = _run(capsys, "status", ckpt, "--json", "--root", str(tmp_path))
     assert rc == 0
     assert json.loads(out)["checkpoint"]["restore_status"] == "none"
+
+
+# --- one writer per store (#453) ------------------------------------------------
+
+
+def _hold_workspace_store(root: Path) -> SqliteArtifactRegistry:
+    """Another verb's open: the read-write handle a running verb holds."""
+    return SqliteArtifactRegistry(root / ".coherence" / "workspace.db", retain_versions=True)
+
+
+def test_a_verb_waits_for_another_verb_holding_the_store(tmp_path: Path, capsys) -> None:
+    _seed_file(tmp_path)
+    _run(capsys, "list", "--root", str(tmp_path))
+    holder = _hold_workspace_store(tmp_path)
+    release = threading.Timer(0.5, holder.close)
+    release.start()
+    try:
+        rc, _, err = _run(capsys, "checkpoint", "cp1", "--file", "docs/plan.md", "--root", str(tmp_path))
+    finally:
+        release.join()
+    assert (rc, err) == (0, "")
+    assert _checkpoint_id(capsys, tmp_path)
+
+
+def test_a_verb_still_held_after_its_wait_exits_2_store_held(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workspace_cli, "_PEER_VERB_WAIT_SEC", 0.1)
+    _seed_file(tmp_path)
+    _run(capsys, "list", "--root", str(tmp_path))
+    with _hold_workspace_store(tmp_path):
+        rc, out, err = _run(
+            capsys, "checkpoint", "cp1", "--file", "docs/plan.md", "--json", "--root", str(tmp_path)
+        )
+    assert rc == 2
+    envelope = json.loads(out)
+    assert (envelope["reason"], envelope["exception"]) == ("store_held", "StoreHeldError")
+    assert "refused (store_held)" in err
+
+
+def test_read_verbs_answer_while_another_verb_holds_the_store(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workspace_cli, "_PEER_VERB_WAIT_SEC", 0.1)
+    _seed_file(tmp_path)
+    _run(capsys, "checkpoint", "cp1", "--file", "docs/plan.md", "--root", str(tmp_path))
+    ckpt = _checkpoint_id(capsys, tmp_path)
+    with _hold_workspace_store(tmp_path):
+        rc_list, out_list, _ = _run(capsys, "list", "--json", "--root", str(tmp_path))
+        rc_status, out_status, _ = _run(capsys, "status", ckpt, "--json", "--root", str(tmp_path))
+    assert (rc_list, rc_status) == (0, 0)
+    assert json.loads(out_list)["checkpoints"][0]["checkpoint_id"] == ckpt
+    assert json.loads(out_status)["checkpoint"]["name"] == "cp1"
+
+
+def test_a_read_verb_on_a_store_needing_a_writer_opens_one(tmp_path: Path, capsys) -> None:
+    """A read verb opens read-only, and a store it cannot read that way (none
+    yet, here) gets the writer open every verb used before."""
+    rc, out, _ = _run(capsys, "list", "--root", str(tmp_path))
+    assert (rc, "no checkpoints persisted" in out) == (0, True)
+    assert (tmp_path / ".coherence" / "workspace.db").exists()

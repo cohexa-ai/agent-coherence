@@ -58,6 +58,7 @@ PATH_TOKEN_RE: re.Pattern[str] = re.compile(
 def detect_tracked_paths(
     command: str,
     is_tracked: Callable[[str], bool],
+    key_of: Callable[[str], str] | None = None,
 ) -> list[str]:
     """Return tracked-artifact paths the command would read.
 
@@ -71,13 +72,19 @@ def detect_tracked_paths(
     4. Across the full command, scan eval patterns (``python -c "..."``)
        for substring file-path-shaped tokens; filter via ``is_tracked``.
 
-    Returns a deduplicated list preserving first-occurrence order.
+    Returns a list preserving first-occurrence order, with one path per
+    file: the first tracked spelling of each key ``key_of`` gives.
 
     Args:
         command: Raw Bash command string from CC's ``tool_input.command``.
         is_tracked: Callable that returns True if a parent-repo-relative
             path is tracked by the policy (e.g.,
             ``coordinator.policy.is_tracked``).
+        key_of: The key of the file a tracked path names, under which two
+            spellings of one file collapse; the path itself when not given.
+            The route registers a token's file and grants it only after
+            reading every token, so a second spelling of a file the first
+            just registered would otherwise read as stale.
 
     Returns:
         List of tracked-artifact paths the command would read. Empty if
@@ -87,9 +94,12 @@ def detect_tracked_paths(
     paths: list[str] = []
 
     def _add(path: str) -> None:
-        if path in seen:
+        # Called with tracked paths only, so an untracked first spelling of a
+        # file hides no later one.
+        key = path if key_of is None else key_of(path)
+        if key in seen:
             return
-        seen.add(path)
+        seen.add(key)
         paths.append(path)
 
     # Step 1+2+3: pipeline segments.

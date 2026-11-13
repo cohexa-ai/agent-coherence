@@ -1111,19 +1111,19 @@ def test_classify_mismatch_is_a_pure_function_of_its_inputs() -> None:
     """Only the mismatch branch reaches here; a hash match is settled by the
     caller without touching the store at all."""
     assert _classify_mismatch(
-        updated_at=1.0, has_mediated_writer=True, has_write_grant=False,
+        updated_at=1.0, has_mediated_writer=True, has_write_in_flight=False,
         now_unix=2.0, window_sec=5.0,
     ) == "lag_suppressed"
     assert _classify_mismatch(
-        updated_at=1.0, has_mediated_writer=False, has_write_grant=False,
+        updated_at=1.0, has_mediated_writer=False, has_write_in_flight=False,
         now_unix=2.0, window_sec=5.0,
     ) == "foreign"
     assert _classify_mismatch(
-        updated_at=None, has_mediated_writer=True, has_write_grant=False,
+        updated_at=None, has_mediated_writer=True, has_write_in_flight=False,
         now_unix=2.0, window_sec=5.0,
     ) == "foreign"
     assert _classify_mismatch(
-        updated_at=1.0, has_mediated_writer=True, has_write_grant=False,
+        updated_at=1.0, has_mediated_writer=True, has_write_in_flight=False,
         now_unix=99.0, window_sec=5.0,
     ) == "foreign"
 
@@ -1136,22 +1136,22 @@ def test_an_outstanding_write_grant_suppresses_on_its_own() -> None:
     hour the timestamp leg says foreign about a perfectly ordinary mediated
     write. An outstanding grant is the registry's own evidence."""
     assert _classify_mismatch(
-        updated_at=0.0, has_mediated_writer=True, has_write_grant=True,
+        updated_at=0.0, has_mediated_writer=True, has_write_in_flight=True,
         now_unix=100_000.0, window_sec=5.0,
     ) == "lag_suppressed"
     assert _classify_mismatch(
-        updated_at=None, has_mediated_writer=False, has_write_grant=True,
+        updated_at=None, has_mediated_writer=False, has_write_in_flight=True,
         now_unix=100_000.0, window_sec=5.0,
     ) == "lag_suppressed"
 
 
 def test_the_lag_window_boundary_is_inclusive() -> None:
     assert _classify_mismatch(
-        updated_at=0.0, has_mediated_writer=True, has_write_grant=False,
+        updated_at=0.0, has_mediated_writer=True, has_write_in_flight=False,
         now_unix=5.0, window_sec=5.0,
     ) == "lag_suppressed"
     assert _classify_mismatch(
-        updated_at=0.0, has_mediated_writer=True, has_write_grant=False,
+        updated_at=0.0, has_mediated_writer=True, has_write_in_flight=False,
         now_unix=5.001, window_sec=5.0,
     ) == "foreign"
 
@@ -1218,14 +1218,96 @@ def test_a_write_landing_on_a_long_idle_artifact_is_not_called_foreign(
 
     art = _register(coordinator, "notes.md", "v1\n")
     holder = __import__("uuid").uuid4()
+    # A write in flight: the holder's pre-edit acquire set EXCLUSIVE and its
+    # commit, which would turn the row MODIFIED, has not landed. The holder
+    # is active -- its acquire recorded a heartbeat moments ago.
     coordinator.registry.set_agent_state(
-        art, holder, MESIState.MODIFIED, trigger="write", tick=0
+        art, holder, MESIState.EXCLUSIVE, trigger="write", tick=0
+    )
+    (repo / "notes.md").write_text("bytes on disk, commit not yet landed\n")
+    updated_at = coordinator.registry.get_artifact_updated_at(art)
+    now = updated_at + 100_000.0
+    coordinator.registry.record_heartbeat(holder, int(now) - 1)
+
+    _tick(coordinator, now_unix=now)
+
+    assert _totals(coordinator, art) == {"lag_suppressed": 1}
+
+
+def test_a_committed_write_grant_does_not_excuse_a_later_out_of_band_change(
+    coordinator, repo: Path
+) -> None:
+    """#278: a commit leaves its writer MODIFIED, and the row stands until the
+    writer releases it or the sweep reclaims it -- up to half an hour. A
+    MODIFIED row says the write already landed; any later write by the same
+    session re-acquires EXCLUSIVE first. So once the window after the commit
+    has passed, a mismatch is foreign even while the committer's session is
+    still active. Fails if a standing MODIFIED row keeps excusing it."""
+    from ccs.core.states import MESIState
+
+    art = _register(coordinator, "notes.md", "v1\n")
+    committer = __import__("uuid").uuid4()
+    coordinator.registry.set_agent_state(
+        art, committer, MESIState.MODIFIED, trigger="commit", tick=0
+    )
+    (repo / "notes.md").write_text("written by a script the coordinator never saw\n")
+    updated_at = coordinator.registry.get_artifact_updated_at(art)
+    now = updated_at + 600.0
+    coordinator.registry.record_heartbeat(committer, int(now) - 1)
+
+    _tick(coordinator, now_unix=now)
+
+    assert _totals(coordinator, art) == {"foreign": 1}
+
+
+def test_an_uncommitted_write_claim_whose_holder_went_quiet_stops_excusing(
+    coordinator, repo: Path
+) -> None:
+    """#278: an EXCLUSIVE row excuses a mismatch only while its holder is
+    active. A session that acquired a write and then went quiet for longer
+    than the window -- a handoff successor that ran pre-edit and stopped, a
+    client that died before its commit -- no longer explains the bytes, and
+    the mismatch is foreign. Fails if a quiet holder's claim excuses it
+    until the sweep reclaims the grant."""
+    from ccs.core.states import MESIState
+
+    art = _register(coordinator, "notes.md", "v1\n")
+    holder = __import__("uuid").uuid4()
+    coordinator.registry.set_agent_state(
+        art, holder, MESIState.EXCLUSIVE, trigger="write", tick=0
+    )
+    (repo / "notes.md").write_text("bytes nobody committed\n")
+    updated_at = coordinator.registry.get_artifact_updated_at(art)
+    now = updated_at + 600.0
+    coordinator.registry.record_heartbeat(holder, int(now - WINDOW) - 5)
+
+    _tick(coordinator, now_unix=now)
+
+    assert _totals(coordinator, art) == {"foreign": 1}
+
+
+def test_an_uncommitted_write_claim_with_no_heartbeat_on_record_still_excuses(
+    coordinator, repo: Path
+) -> None:
+    """#278: only a RECORDED silence longer than the window ends the excuse.
+    A holder with no heartbeat on record keeps the benefit of the doubt every
+    holder had before -- the hook path records one at every pre-edit, so only
+    a claim made off that path lands here. Pins the rule so changing it is a
+    decision rather than an accident. Fails if a heartbeat-less EXCLUSIVE row
+    stops excusing the mismatch."""
+    from ccs.core.states import MESIState
+
+    art = _register(coordinator, "notes.md", "v1\n")
+    holder = __import__("uuid").uuid4()
+    coordinator.registry.set_agent_state(
+        art, holder, MESIState.EXCLUSIVE, trigger="write", tick=0
     )
     (repo / "notes.md").write_text("bytes on disk, commit not yet landed\n")
     updated_at = coordinator.registry.get_artifact_updated_at(art)
 
-    _tick(coordinator, now_unix=updated_at + 100_000.0)
+    _tick(coordinator, now_unix=updated_at + 600.0)
 
+    assert coordinator.registry.last_heartbeat_tick(holder) is None
     assert _totals(coordinator, art) == {"lag_suppressed": 1}
 
 

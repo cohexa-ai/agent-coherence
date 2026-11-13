@@ -13,8 +13,10 @@ deliberately does not preserve (KTD-13 contract divergence).
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import stat
+import sys
 import threading
 import time
 import warnings
@@ -37,10 +39,29 @@ from ccs.coordinator.sqlite_registry import (
     SchemaVersionError,
     SqliteArtifactRegistry,
     StoreNeedsRecoveryError,
+    _read_only_uri,
+    classify_sqlite_operational_signal,
 )
-from ccs.core.exceptions import CROSS_RUNTIME_SCHEMA_REASON
+from ccs.core.exceptions import (
+    CROSS_RUNTIME_SCHEMA_REASON,
+    SCHEMA_VERSION_REASONS,
+    STORE_SIGNAL_BUSY,
+    STORE_SIGNAL_UNREADABLE,
+    STORE_SIGNAL_WAL_RECOVERY,
+)
 from ccs.core.states import MESIState, TransientState
 from ccs.core.types import Artifact, CasCorruption, ConflictDetail, FetchRequest
+from tests.coordinator_helpers import no_sqlite_connection_left_open
+from tests.store_images import (
+    COMMITTED_V1,
+    COMMITTED_V2,
+    UNCOMMITTED_TABLE,
+    crashed_wal_image,
+    hot_journal_image,
+    kill_writer_mid_flight,
+    sidecar_path,
+    sqlite_error,
+)
 
 
 @pytest.fixture
@@ -1786,8 +1807,29 @@ class TestRetentionCrashAtomicity:
             assert reg.get_content_at_version(art.id, 2) is None
 
 
+# Characters the URI layer reads as syntax: '#' starts a fragment, '?' the
+# query, '%' an escape; a space and non-ASCII names are the ordinary cases that
+# must keep working once every path is encoded. tmp_path never emits them, so
+# without these names no test here could see a read-only open land on a file
+# other than the one it was given (#418).
+_URI_HOSTILE_DIRS = ["ws#hash", "ws?q", "p%41q", "proj dir", "café", "日本語"]
+
+
+def _writer_store(db: Path) -> str:
+    """Create a current store at ``db`` with a writer open; return its instance_id."""
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with SqliteArtifactRegistry(db) as reg:
+        return reg.instance_id
+
+
+def _assert_refuses_writes(reg: SqliteArtifactRegistry) -> None:
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        reg._conn.execute("CREATE TABLE proof_of_write (x)")
+
+
 class TestReadOnlyMode:
-    """R2: read-only open never creates / migrates / mutates; typed failures."""
+    """R2: read-only open never creates the store, migrates it, or changes
+    state.db or its WAL; typed failures."""
 
     def test_missing_path_raises_and_creates_no_file(self, tmp_path: Path) -> None:
         missing = tmp_path / "absent.db"
@@ -1834,9 +1876,10 @@ class TestReadOnlyMode:
     def test_read_only_needs_recovery_fault_injected(
         self, db_path: Path, monkeypatch
     ) -> None:
-        # A real post-crash hot-WAL state cannot be deterministically created in
-        # pytest, so inject SQLITE_READONLY_RECOVERY on the ro connection's first
-        # user_version read (the point a hot-WAL ro open fails).
+        # SQLite raises SQLITE_READONLY_RECOVERY only while another process
+        # holds the store's WAL index in a state a read-only reader cannot
+        # rebuild; a crashed writer's WAL is read in place instead. Inject the
+        # code on the first user_version read.
         with SqliteArtifactRegistry(db_path) as reg:
             _retain_artifact(reg, content="x")
 
@@ -1848,9 +1891,8 @@ class TestReadOnlyMode:
 
             def execute(self, sql, *a, **k):
                 if "user_version" in sql:
-                    raise sqlite3.OperationalError(
-                        "attempt to write a readonly database "
-                        "(SQLITE_READONLY_RECOVERY)"
+                    raise sqlite_error(
+                        "attempt to write a readonly database", "SQLITE_READONLY_RECOVERY"
                     )
                 return self._real.execute(sql, *a, **k)
 
@@ -1866,26 +1908,30 @@ class TestReadOnlyMode:
             return conn
 
         monkeypatch.setattr(sr.sqlite3, "connect", fake_connect)
-        with pytest.raises(StoreNeedsRecoveryError):
+        with pytest.raises(StoreNeedsRecoveryError) as excinfo:
             SqliteArtifactRegistry(db_path, read_only=True)
+        assert excinfo.value.reason == STORE_SIGNAL_WAL_RECOVERY
+        assert "SQLITE_READONLY_RECOVERY" in str(excinfo.value)
+        assert "Retry once that process exits" in str(excinfo.value)
 
     @pytest.mark.parametrize(
-        ("build_store", "fault_message", "expected_error"),
+        ("build_store", "fault", "expected_error"),
         [
             pytest.param("v1", None, SchemaVersionError, id="schema-version-mismatch"),
             pytest.param(
                 "v2",
-                "attempt to write a readonly database (SQLITE_READONLY_RECOVERY)",
+                ("attempt to write a readonly database", "SQLITE_READONLY_RECOVERY"),
                 StoreNeedsRecoveryError,
                 id="needs-recovery",
             ),
             pytest.param(
-                "v2", "database is locked", StoreNeedsRecoveryError, id="busy"
+                "v2", ("database is locked", "SQLITE_BUSY"), StoreNeedsRecoveryError,
+                id="busy",
             ),
         ],
     )
     def test_read_only_open_failure_closes_connection(
-        self, db_path: Path, monkeypatch, build_store, fault_message, expected_error
+        self, db_path: Path, monkeypatch, build_store, fault, expected_error
     ) -> None:
         # A typed failure AFTER sqlite3.connect succeeded must close the
         # connection before raising — the caller never receives a registry
@@ -1910,8 +1956,8 @@ class TestReadOnlyMode:
                 return self._real.close()
 
             def execute(self, sql, *a, **k):
-                if fault_message is not None and "user_version" in sql:
-                    raise sqlite3.OperationalError(fault_message)
+                if fault is not None and "user_version" in sql:
+                    raise sqlite_error(*fault)
                 return self._real.execute(sql, *a, **k)
 
             def __getattr__(self, n):
@@ -1967,6 +2013,463 @@ class TestReadOnlyMode:
         with pytest.raises(StoreNeedsRecoveryError) as excinfo:
             SqliteArtifactRegistry(db_path, read_only=True)
         assert excinfo.value.reason == STORE_SIGNAL_BUSY
+        assert "Retry shortly" in str(excinfo.value)
+        assert "no SQLite code" in str(excinfo.value)
+
+    @pytest.mark.parametrize("dirname", _URI_HOSTILE_DIRS)
+    def test_a_uri_reserved_character_in_the_path_opens_the_named_store(
+        self, tmp_path: Path, dirname: str
+    ) -> None:
+        """Unencoded, '#' and '?' cut the path short and took ``mode=ro`` with
+        them, so SQLite created an empty file at the shorter name and the open
+        reported a current store as schema v0; '%41' decoded to a path that was
+        not there. Asserted on tmp_path, where the stray file appeared."""
+        db = tmp_path / dirname / "state.db"
+        instance_id = _writer_store(db)
+        before = sorted(p.name for p in tmp_path.iterdir())
+
+        with SqliteArtifactRegistry(db, read_only=True) as ro:
+            assert ro.instance_id == instance_id
+            _assert_refuses_writes(ro)
+
+        assert sorted(p.name for p in tmp_path.iterdir()) == before
+
+    def test_a_copy_beside_a_live_store_opens_the_copy(self, tmp_path: Path) -> None:
+        """'state.db#before-upgrade' was cut to 'state.db', so the open answered
+        from the live store beside the copy, over a writable connection."""
+        live = tmp_path / "sib" / "state.db"
+        _writer_store(live)
+        other = tmp_path / "other" / "state.db"
+        copy_instance_id = _writer_store(other)
+        copy = live.with_name("state.db#before-upgrade")
+        shutil.copyfile(other, copy)
+        live_bytes = live.read_bytes()
+
+        with SqliteArtifactRegistry(copy, read_only=True) as ro:
+            assert ro.instance_id == copy_instance_id
+            _assert_refuses_writes(ro)
+
+        assert live.read_bytes() == live_bytes
+
+    def test_a_reserved_character_cut_to_an_existing_directory_opens_the_named_store(
+        self, tmp_path: Path
+    ) -> None:
+        """'dirB#x' was cut to 'dirB', a directory, so the open failed with a
+        raw sqlite3.OperationalError instead of reading the store it was given."""
+        (tmp_path / "dirB").mkdir()
+        db = tmp_path / "dirB#x" / "state.db"
+        instance_id = _writer_store(db)
+
+        with SqliteArtifactRegistry(db, read_only=True) as ro:
+            assert ro.instance_id == instance_id
+
+    def test_a_relative_path_with_a_reserved_character_opens_the_named_store(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guide documents the relative '.coherence/state.db' form, so the
+        encoding must hold for a relative path, not only an absolute one."""
+        instance_id = _writer_store(tmp_path / "rel#1" / "state.db")
+        monkeypatch.chdir(tmp_path)
+
+        with SqliteArtifactRegistry(Path("rel#1/state.db"), read_only=True) as ro:
+            assert ro.instance_id == instance_id
+
+        assert not (tmp_path / "rel").exists()
+
+    def test_a_leading_double_slash_is_not_read_as_a_uri_authority(
+        self, db_path: Path
+    ) -> None:
+        """'//tmp/...' names the same file to the OS, but unescaped the URI
+        parser read its first component as a host and refused the open."""
+        instance_id = _writer_store(db_path)
+
+        with SqliteArtifactRegistry(Path(f"/{db_path}"), read_only=True) as ro:
+            assert ro.instance_id == instance_id
+
+    def test_a_relative_memory_name_opens_that_file_not_an_in_memory_store(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bare ':memory:' that reached the URI intact opened SQLite's
+        in-memory store, which then read as an un-migrated schema v0."""
+        instance_id = _writer_store(tmp_path / ":memory:")
+        monkeypatch.chdir(tmp_path)
+
+        with SqliteArtifactRegistry(Path(":memory:"), read_only=True) as ro:
+            assert ro.instance_id == instance_id
+
+    @pytest.mark.skipif(
+        sys.platform == "darwin", reason="APFS refuses a filename that is not UTF-8"
+    )
+    def test_an_undecodable_filename_byte_still_opens_the_named_store(
+        self, tmp_path: Path
+    ) -> None:
+        """POSIX filenames are bytes, and Python surfaces an undecodable one as a
+        surrogate. Encoded strictly, it raised UnicodeEncodeError past every
+        typed error before the open was tried."""
+        db = tmp_path / "\udcff" / "state.db"
+        instance_id = _writer_store(db)
+
+        with SqliteArtifactRegistry(db, read_only=True) as ro:
+            assert ro.instance_id == instance_id
+
+    def test_an_undecodable_filename_byte_can_be_encoded_on_every_platform(
+        self,
+    ) -> None:
+        """The open above runs only on Linux, and the existence check stops a
+        missing undecodable path before it is encoded; this keeps the encoding
+        itself checked on a host that cannot create such a file."""
+        _read_only_uri(Path("/store/\udcff/state.db"))
+
+    def test_a_nul_byte_in_the_path_is_a_missing_store_not_a_truncated_one(
+        self, db_path: Path
+    ) -> None:
+        """Encoded, a NUL becomes %00 and SQLite cuts the path there, opening
+        the real store under a name nobody gave. The existence check refuses it
+        first; this pins that it stays ahead of the connect."""
+        _writer_store(db_path)
+
+        with pytest.raises(MissingDatabaseError):
+            SqliteArtifactRegistry(Path(f"{db_path}\x00.evil"), read_only=True)
+
+    def test_a_store_deleted_before_the_connect_is_missing_not_a_raw_error(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The existence check and the connect are two calls; a store deleted
+        between them failed the connect with a raw sqlite3.OperationalError."""
+        _writer_store(db_path)
+        from ccs.coordinator import sqlite_registry as sr
+
+        real_connect = sqlite3.connect
+
+        def connect_after_delete(*a, **k):
+            if a and "mode=ro" in str(a[0]):
+                for path in db_path.parent.glob("state.db*"):
+                    path.unlink()
+            return real_connect(*a, **k)
+
+        monkeypatch.setattr(sr.sqlite3, "connect", connect_after_delete)
+        with pytest.raises(MissingDatabaseError):
+            SqliteArtifactRegistry(db_path, read_only=True)
+
+    def test_a_directory_at_the_store_path_raises_a_typed_unreadable_error(
+        self, db_path: Path
+    ) -> None:
+        """No reserved character needed: the connect sat outside every
+        classifying try, so a directory leaked a raw sqlite3.OperationalError
+        past the typed ReadOnlyRegistryError contract."""
+        db_path.mkdir()
+
+        with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+            SqliteArtifactRegistry(db_path, read_only=True)
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert "is a directory" in str(excinfo.value)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+    def test_an_unreadable_store_file_raises_a_typed_unreadable_error(
+        self, db_path: Path
+    ) -> None:
+        _writer_store(db_path)
+        db_path.chmod(0)
+        try:
+            with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+                SqliteArtifactRegistry(db_path, read_only=True)
+        finally:
+            db_path.chmod(_DB_FILE_MODE)
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert "cannot read state.db" in str(excinfo.value)
+        assert "state.db-wal" in str(excinfo.value)
+        assert "mode 0600" in str(excinfo.value)
+
+    @pytest.mark.parametrize("shm", ["as-left", "missing"])
+    def test_a_crashed_writers_wal_is_read_in_place(
+        self, tmp_path: Path, shm: str
+    ) -> None:
+        """The docs said a crashed writer's WAL makes a read-only open fail
+        (#419). SQLite reads it in place: the committed versions, whose only
+        copy is in the WAL, are visible, and the unfinished transaction is not."""
+        db, art_id = crashed_wal_image(tmp_path)
+        if shm == "missing":
+            sidecar_path(db, "-shm").unlink()
+        db_bytes, wal_bytes = db.read_bytes(), sidecar_path(db, "-wal").read_bytes()
+
+        with SqliteArtifactRegistry(db, read_only=True) as ro:
+            assert ro.get_content_at_version(art_id, 1) == COMMITTED_V1
+            assert ro.get_content_at_version(art_id, 2) == COMMITTED_V2
+            tables = {row[0] for row in ro._conn.execute("SELECT name FROM sqlite_master")}
+        assert UNCOMMITTED_TABLE not in tables
+
+        assert db.read_bytes() == db_bytes
+        assert sidecar_path(db, "-wal").read_bytes() == wal_bytes
+        # The next writer open, a coordinator restart, finds the same history.
+        with SqliteArtifactRegistry(db) as writer:
+            assert writer.get_content_at_version(art_id, 2) == COMMITTED_V2
+            tables = {row[0] for row in writer._conn.execute("SELECT name FROM sqlite_master")}
+        assert UNCOMMITTED_TABLE not in tables
+
+    @pytest.mark.serial
+    def test_a_crashed_writers_wal_reads_the_same_as_a_sigkilled_writers(
+        self, tmp_path: Path
+    ) -> None:
+        """tests/store_images.py builds a crashed writer's files in-process; this
+        checks that image against a writer that really is SIGKILLed."""
+        db = tmp_path / "state.db"
+        SqliteArtifactRegistry(db).close()
+        kill_writer_mid_flight(_CRASHING_WRITER, str(db))
+
+        with SqliteArtifactRegistry(db, read_only=True) as ro:
+            art_id = ro.lookup_artifact_id_by_name("plan.md")
+            assert ro.get_content_at_version(art_id, 1) == COMMITTED_V1
+            assert ro.get_content_at_version(art_id, 2) == COMMITTED_V2
+            tables = {row[0] for row in ro._conn.execute("SELECT name FROM sqlite_master")}
+        assert UNCOMMITTED_TABLE not in tables
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_a_missing_shm_in_a_directory_this_user_cannot_write_names_the_copy(
+        self, tmp_path: Path
+    ) -> None:
+        """SQLite must create state.db-shm beside a WAL and cannot. The message
+        said to re-open the store read-write, which fails the same way."""
+        db, _ = crashed_wal_image(tmp_path)
+        sidecar_path(db, "-shm").unlink()
+        db.parent.chmod(0o555)
+        try:
+            with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+                SqliteArtifactRegistry(db, read_only=True)
+        finally:
+            db.parent.chmod(0o700)
+
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert excinfo.value.__cause__.sqlite_errorcode == sqlite3.SQLITE_CANTOPEN
+        assert "must create state.db-shm" in str(excinfo.value)
+        assert "resolve the copy" in str(excinfo.value)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_a_closed_store_in_a_read_only_directory_is_not_an_unclean_wal(
+        self, db_path: Path
+    ) -> None:
+        """A cleanly closed store has no WAL, but SQLite must create one and
+        cannot (SQLITE_READONLY_DIRECTORY). The text rule called it an unclean
+        write-ahead log that a read-write open would checkpoint."""
+        _writer_store(db_path)
+        db_path.parent.chmod(0o555)
+        try:
+            with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+                SqliteArtifactRegistry(db_path, read_only=True)
+        finally:
+            db_path.parent.chmod(0o700)
+
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert (
+            excinfo.value.__cause__.sqlite_errorcode == sqlite3.SQLITE_READONLY_DIRECTORY
+        )
+        assert "the directory is read-only" in str(excinfo.value)
+        assert "write-ahead log" not in str(excinfo.value)
+
+    def test_a_hot_rollback_journal_is_not_an_unclean_wal(self, tmp_path: Path) -> None:
+        """#420: the store has no WAL; SQLite reports SQLITE_READONLY_ROLLBACK,
+        and the text rule labelled it a WAL in need of recovery."""
+        db, _ = hot_journal_image(tmp_path)
+
+        with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+            SqliteArtifactRegistry(db, read_only=True)
+
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert excinfo.value.__cause__.sqlite_errorcode == sqlite3.SQLITE_READONLY_ROLLBACK
+        assert "state.db-journal" in str(excinfo.value)
+        assert "write-ahead log" not in str(excinfo.value)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
+    def test_a_store_under_a_directory_this_user_cannot_search_is_unreadable(
+        self, tmp_path: Path
+    ) -> None:
+        """#437: the existence check raised a raw PermissionError."""
+        db = tmp_path / "locked" / "state.db"
+        _writer_store(db)
+        db.parent.chmod(0)
+        try:
+            with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+                SqliteArtifactRegistry(db, read_only=True)
+        finally:
+            db.parent.chmod(0o700)
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert "cannot be searched" in str(excinfo.value)
+        assert "mode 0600" in str(excinfo.value)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
+    def test_a_directory_that_becomes_unsearchable_before_the_connect_is_unreadable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The check after a failed connect raised the raw PermissionError too."""
+        db = tmp_path / "locked" / "state.db"
+        _writer_store(db)
+        from ccs.coordinator import sqlite_registry as sr
+
+        real_connect = sqlite3.connect
+
+        def connect_after_lock(*a, **k):
+            if a and "mode=ro" in str(a[0]):
+                db.parent.chmod(0)
+            return real_connect(*a, **k)
+
+        monkeypatch.setattr(sr.sqlite3, "connect", connect_after_lock)
+        try:
+            with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+                SqliteArtifactRegistry(db, read_only=True)
+        finally:
+            db.parent.chmod(0o700)
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+
+    def test_a_path_too_long_for_the_file_system_is_a_missing_store(
+        self, tmp_path: Path
+    ) -> None:
+        """The existence check raised a raw OSError (ENAMETOOLONG)."""
+        with pytest.raises(MissingDatabaseError):
+            SqliteArtifactRegistry(tmp_path / ("x" * 300) / "state.db", read_only=True)
+
+    def test_a_path_under_a_file_or_a_symlink_loop_is_a_missing_store(
+        self, tmp_path: Path
+    ) -> None:
+        """Path.exists() answers False for these (ENOTDIR, ELOOP), so they stay
+        db_missing rather than becoming a store this user cannot read."""
+        (tmp_path / "a-file").write_text("x")
+        (tmp_path / "loop-a").symlink_to(tmp_path / "loop-b")
+        (tmp_path / "loop-b").symlink_to(tmp_path / "loop-a")
+
+        for path in (tmp_path / "a-file" / "state.db", tmp_path / "loop-a" / "state.db"):
+            with pytest.raises(MissingDatabaseError):
+                SqliteArtifactRegistry(path, read_only=True)
+
+    def test_a_store_name_too_long_for_its_wal_is_unreadable_not_a_raw_error(
+        self, tmp_path: Path
+    ) -> None:
+        """At 252 bytes the -wal name passes the file system's limit, so SQLite
+        cannot open the store, and choosing the message stat'ed that name."""
+        db = tmp_path / "state.db"
+        _writer_store(db)
+        long_name = db.rename(tmp_path / ("s" * 252))
+
+        with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+            SqliteArtifactRegistry(long_name, read_only=True)
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert "may be damaged" in str(excinfo.value)
+
+    @pytest.mark.parametrize("opened_as", ["the file", "a symlink to it"])
+    def test_an_empty_store_beside_a_wal_is_refused_before_sqlite_discards_the_wal(
+        self, tmp_path: Path, opened_as: str
+    ) -> None:
+        """SQLite discards the WAL of an empty database file on its first read,
+        even read-only, and here that log is the only copy of the history.
+        Through a symlink, SQLite uses the WAL beside the target, not the link."""
+        db, _ = crashed_wal_image(tmp_path)
+        db.write_bytes(b"")
+        wal_bytes = sidecar_path(db, "-wal").read_bytes()
+        opened = db
+        if opened_as == "a symlink to it":
+            opened = tmp_path / "link" / "state.db"
+            opened.parent.mkdir()
+            opened.symlink_to(db)
+
+        with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+            SqliteArtifactRegistry(opened, read_only=True)
+
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert "is empty" in str(excinfo.value)
+        assert sidecar_path(db, "-wal").read_bytes() == wal_bytes
+
+    def test_a_busy_store_while_the_retention_policy_loads_is_busy(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The open's last read sat outside its classifying try, so a lock there
+        escaped raw, and the resolver reported it as a corrupt store."""
+        _writer_store(db_path)
+
+        def locked(self):
+            raise sqlite_error("database is locked", "SQLITE_BUSY")
+
+        monkeypatch.setattr(SqliteArtifactRegistry, "_load_retention_meta", locked)
+        with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+            SqliteArtifactRegistry(db_path, read_only=True)
+        assert excinfo.value.reason == STORE_SIGNAL_BUSY
+        assert "SQLITE_BUSY" in str(excinfo.value)
+        assert "Retry shortly" in str(excinfo.value)
+
+    def test_an_unclassified_refusal_names_its_code_and_the_generic_step(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _writer_store(db_path)
+
+        def failing(self):
+            raise sqlite_error("disk I/O error", "SQLITE_IOERR_READ")
+
+        monkeypatch.setattr(SqliteArtifactRegistry, "_load_retention_meta", failing)
+        with pytest.raises(StoreNeedsRecoveryError) as excinfo:
+            SqliteArtifactRegistry(db_path, read_only=True)
+        assert excinfo.value.reason == STORE_SIGNAL_UNREADABLE
+        assert "SQLITE_IOERR_READ" in str(excinfo.value)
+        assert "may be damaged" in str(excinfo.value)
+
+    def test_a_read_only_open_creates_the_wal_sidecars_at_the_store_files_mode(
+        self, db_path: Path
+    ) -> None:
+        """The docs say so: SQLite creates a missing -wal and -shm beside a WAL
+        store even on a read-only open, with the store file's mode."""
+        _writer_store(db_path)
+        assert not sidecar_path(db_path, "-wal").exists()
+
+        SqliteArtifactRegistry(db_path, read_only=True).close()
+
+        for suffix in ("-wal", "-shm"):
+            mode = stat.S_IMODE(sidecar_path(db_path, suffix).stat().st_mode)
+            assert mode == stat.S_IMODE(db_path.stat().st_mode)
+
+
+#: The writer tests/store_images.py copies mid-transaction, run in a child
+#: process the test SIGKILLs once it says READY.
+_CRASHING_WRITER = """
+import sys, time
+from tests.store_images import open_crashing_writer
+
+writer, _ = open_crashing_writer(sys.argv[1])
+print("READY", flush=True)
+time.sleep(600)
+"""
+
+
+@pytest.mark.parametrize(
+    ("name", "message", "signal_name"),
+    [
+        ("SQLITE_BUSY", "database is locked", "busy"),
+        ("SQLITE_LOCKED", "database table is locked", "busy"),
+        ("SQLITE_BUSY_RECOVERY", "database is locked", "busy"),
+        ("SQLITE_BUSY_SNAPSHOT", "database is locked", "busy"),
+        ("SQLITE_LOCKED_SHAREDCACHE", "database table is locked: t", "busy"),
+        ("SQLITE_READONLY_RECOVERY", "attempt to write a readonly database", "wal_recovery"),
+        ("SQLITE_READONLY_ROLLBACK", "attempt to write a readonly database", "unreadable"),
+        ("SQLITE_READONLY_DIRECTORY", "attempt to write a readonly database", "unreadable"),
+        ("SQLITE_READONLY_CANTLOCK", "attempt to write a readonly database", "unreadable"),
+        ("SQLITE_CANTOPEN", "unable to open database file", "unreadable"),
+        ("SQLITE_IOERR_READ", "disk I/O error", "unreadable"),
+        # The code decides, whatever the message says.
+        ("SQLITE_IOERR_READ", "database is locked", "unreadable"),
+        ("SQLITE_BUSY", "x", "busy"),
+        (None, "database is locked", "busy"),
+        (None, "database table is locked: t", "busy"),
+        (None, "attempt to write a readonly database", "unreadable"),
+        # Python raises this one itself, quoting the stored bytes.
+        (None, "Could not decode to UTF-8 column 'value' with text 'busy�'", "unreadable"),
+        (None, "Could not decode to UTF-8 column 'value' with text 'wal�'", "unreadable"),
+        (None, "Could not decode to UTF-8 column 'value' with text 'database is locked'", "unreadable"),
+        (None, "Could not decode to UTF-8 column 'value' with text 'database table is locked'", "unreadable"),
+    ],
+)
+def test_a_read_only_refusal_is_classified_by_its_sqlite_code(
+    name: str | None, message: str, signal_name: str
+) -> None:
+    """#420: the classifier read SQLite's message, which is the same for every
+    SQLITE_READONLY_* code, and called each of them a WAL in need of recovery.
+    An error SQLite did not raise has no code; only the start of SQLite's own
+    lock messages counts then, since Python's own errors can quote store data."""
+    assert classify_sqlite_operational_signal(sqlite_error(message, name)) == signal_name
 
 
 class TestRetentionRemoveAndEpoch:
@@ -2700,3 +3203,515 @@ def test_status_snapshot_scoped_query_is_index_backed(db_path: Path) -> None:
         )
     assert "idx_agent_states_agent" in plan, plan
     assert "SCAN agent_states" not in plan, plan
+
+
+# ----------------------------------------------------------------------
+# Typed SchemaVersionError (#345)
+# ----------------------------------------------------------------------
+
+#: FROZEN duplicates of the wire-stable schema refusal reasons (#345). A host
+#: branches on ``exc.reason == CONSTANT`` to tell "upgrade this build" from
+#: "this store is broken"; renaming a value is a wire break, so each one is
+#: pinned to a hand-written literal here, never to the constant.
+_FROZEN_SCHEMA_OLDER = "schema_older"
+_FROZEN_SCHEMA_NEWER = "schema_newer"
+_FROZEN_SCHEMA_UNRECOGNIZED = "schema_unrecognized"
+_FROZEN_REGISTRY_META_INCOMPLETE = "registry_meta_incomplete"
+_FROZEN_CROSS_RUNTIME = "cross_runtime_schema"
+
+
+def _set_user_version(db_path: Path, value: int) -> Path:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(f"PRAGMA user_version = {int(value)}")
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def _delete_meta_key(db_path: Path, key: str) -> Path:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("DELETE FROM registry_meta WHERE key = ?", (key,))
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def _current_store(db_path: Path) -> Path:
+    SqliteArtifactRegistry(db_path).close()
+    return db_path
+
+
+def _execute_statements(db_path: Path, *statements: str) -> Path:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        for statement in statements:
+            conn.execute(statement)
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def _v11_store(db_path: Path) -> Path:
+    return _set_user_version(_current_store(db_path), 11)
+
+
+def _negative_store(db_path: Path) -> Path:
+    return _set_user_version(_current_store(db_path), -1)
+
+
+def _v9_store(db_path: Path) -> Path:
+    from tests.coordinator.test_checkpoint_registration_schema import _revert_to_v9_shape
+
+    _revert_to_v9_shape(_current_store(db_path))
+    return db_path
+
+
+def _v8_store(db_path: Path) -> Path:
+    from tests.coordinator.test_checkpoint_registration_schema import _revert_to_v8_shape
+
+    _revert_to_v8_shape(_current_store(db_path))
+    return db_path
+
+
+def _v7_store(db_path: Path) -> Path:
+    from tests.coordinator.test_checkpoint_registration_schema import _revert_to_v7_shape
+
+    _revert_to_v7_shape(_current_store(db_path))
+    return db_path
+
+
+def _v6_store(db_path: Path) -> Path:
+    from tests.coordinator.test_last_observed_version import _revert_to_v6_shape
+
+    _revert_to_v6_shape(_v7_store(db_path))
+    return db_path
+
+
+def _v5_store(db_path: Path) -> Path:
+    from tests.coordinator.test_last_observed_version import _revert_to_v5_shape
+
+    _revert_to_v5_shape(_v7_store(db_path))
+    return db_path
+
+
+def _v4_store(db_path: Path) -> Path:
+    from tests.coordinator.test_last_observed_version import _revert_to_v4_shape
+
+    _revert_to_v4_shape(_v7_store(db_path))
+    return db_path
+
+
+def _v3_store(db_path: Path) -> Path:
+    # Rewound from v4 by hand: the workspace-checkpoint suite's v3 helper
+    # drops last_observed_version itself, which the v4 rewind already dropped.
+    _execute_statements(
+        _v4_store(db_path),
+        "DROP TABLE IF EXISTS session_meta",
+        "DROP INDEX IF EXISTS idx_session_pins_artifact",
+    )
+    return _set_user_version(db_path, 3)
+
+
+def _v2_store(db_path: Path) -> Path:
+    _execute_statements(_v3_store(db_path), "DROP TABLE IF EXISTS session_pins")
+    return _set_user_version(db_path, 2)
+
+
+def _raw_v1_store(db_path: Path) -> Path:
+    _build_raw_v1_db(db_path, fence=True, notices=True)
+    return db_path
+
+
+#: A store at every schema a writer open migrates FROM, keyed by that schema:
+#: each migration step marks its own origin, so each needs its own case.
+_STORES_BY_ORIGIN = {
+    1: _raw_v1_store,
+    2: _v2_store,
+    3: _v3_store,
+    4: _v4_store,
+    5: _v5_store,
+    6: _v6_store,
+    7: _v7_store,
+    8: _v8_store,
+    9: _v9_store,
+}
+
+
+def _zero_byte_store(db_path: Path) -> Path:
+    db_path.write_bytes(b"")
+    return db_path
+
+
+def _schema_error(db_path: Path, *, read_only: bool = False) -> SchemaVersionError:
+    with pytest.raises(SchemaVersionError) as ei:
+        SqliteArtifactRegistry(db_path, read_only=read_only)
+    return ei.value
+
+
+class TestSchemaVersionErrorTyped:
+    """#345: a store-open refusal says WHICH refusal it is, as fields.
+
+    ``reason`` is one of the wire-stable schema reasons, ``found_version`` the
+    store's raw ``user_version`` under the three version reasons (negative for
+    an unrecognized store; ``None`` under the meta-incomplete and cross-runtime
+    reasons), and ``expected_version`` the schema this build serves. Before
+    these fields a host could only substring-match the message to tell
+    "upgrade the coordinator" from "the store is corrupt"."""
+
+    def test_writer_open_of_a_newer_store_reports_newer_and_both_versions(
+        self, db_path: Path
+    ) -> None:
+        """A writer open of a store stamped past this build names it newer,
+        with the store's version and this build's. Prevents a host telling a
+        user to "migrate" a store only a newer build can open."""
+        _v11_store(db_path)
+
+        exc = _schema_error(db_path)
+
+        assert exc.reason == _FROZEN_SCHEMA_NEWER
+        assert exc.found_version == 11
+        assert exc.expected_version == SCHEMA_USER_VERSION
+        assert "unexpected schema version 11" in str(exc)  # message unchanged
+
+    @pytest.mark.parametrize("read_only", [False, True], ids=["writer", "read-only"])
+    def test_a_negative_user_version_is_unrecognized_and_advises_a_backup_restore(
+        self, db_path: Path, read_only: bool
+    ) -> None:
+        """A negative user_version is no build's schema: both opens report it
+        as unrecognized, never as newer or older, and their message advises a
+        backup restore. Prevents "upgrade the coordinator" or "re-open
+        read-write to migrate" advice for a store no coordinator wrote, which
+        a writer open refuses too."""
+        _negative_store(db_path)
+
+        exc = _schema_error(db_path, read_only=read_only)
+
+        assert exc.reason == _FROZEN_SCHEMA_UNRECOGNIZED
+        assert exc.found_version == -1
+        assert exc.expected_version == SCHEMA_USER_VERSION
+        # The path is masked so a temp directory's name cannot satisfy or
+        # trip a phrase check.
+        message = str(exc).replace(str(db_path), "<db>").lower()
+        assert "backup" in message, str(exc)
+        for wrong_advice in ("newer", "upgrade", "migrate", "read-write"):
+            assert wrong_advice not in message, str(exc)
+
+    @pytest.mark.parametrize(
+        ("build", "reason", "found"),
+        [
+            (_v9_store, _FROZEN_SCHEMA_OLDER, 9),
+            (_v11_store, _FROZEN_SCHEMA_NEWER, 11),
+            (_zero_byte_store, _FROZEN_SCHEMA_OLDER, 0),
+        ],
+        ids=["v9", "v11", "zero-byte"],
+    )
+    def test_read_only_open_reports_older_or_newer_with_the_found_version(
+        self, db_path: Path, build, reason: str, found: int
+    ) -> None:
+        """The read-only open (which never migrates) names the direction of
+        the mismatch and the store's version. Prevents a resolver reading an
+        older store and a newer one as the same failure."""
+        build(db_path)
+
+        exc = _schema_error(db_path, read_only=True)
+
+        assert exc.reason == reason
+        assert exc.found_version == found
+        assert exc.expected_version == SCHEMA_USER_VERSION
+
+    @pytest.mark.parametrize("read_only", [False, True], ids=["writer", "read-only"])
+    @pytest.mark.parametrize("key", ["instance_id", "coordinator_epoch"])
+    def test_a_current_store_missing_a_meta_key_reports_meta_incomplete_without_a_version(
+        self, db_path: Path, key: str, read_only: bool
+    ) -> None:
+        """A store whose ``registry_meta`` lost a required key is refused as
+        incomplete, and claims no schema version: the check runs after every
+        migration step, so the version is not what is wrong. Prevents a
+        corrupt store reading as a version mismatch."""
+        _delete_meta_key(_current_store(db_path), key)
+
+        exc = _schema_error(db_path, read_only=read_only)
+
+        assert exc.reason == _FROZEN_REGISTRY_META_INCOMPLETE
+        assert exc.found_version is None
+        assert exc.expected_version == SCHEMA_USER_VERSION
+
+    @pytest.mark.parametrize("read_only", [False, True], ids=["writer", "read-only"])
+    @pytest.mark.parametrize("value", ["'abc'", "NULL"], ids=["text", "null"])
+    def test_a_sequence_number_that_is_not_an_integer_reports_meta_incomplete(
+        self, db_path: Path, value: str, read_only: bool
+    ) -> None:
+        """A current store whose ``sequence_number`` holds a value that is not
+        an integer is refused as incomplete, with no found version, and the
+        message names the store. Prevents a bare ValueError or TypeError
+        escaping the open, which the store check and the CLI cannot type."""
+        _execute_statements(
+            _current_store(db_path),
+            f"UPDATE registry_meta SET value = {value} WHERE key = 'sequence_number'",
+        )
+
+        exc = _schema_error(db_path, read_only=read_only)
+
+        assert exc.reason == _FROZEN_REGISTRY_META_INCOMPLETE
+        assert exc.found_version is None
+        assert exc.expected_version == SCHEMA_USER_VERSION
+        assert str(db_path) in str(exc)
+
+    def test_a_v7_store_missing_its_epoch_is_meta_incomplete_after_one_migration_step(
+        self, db_path: Path
+    ) -> None:
+        """A v7 store with no ``coordinator_epoch`` is migrated to 8 and then
+        refused as incomplete mid-ladder, with no found version: 10 would be
+        wrong (the store is at 8), and so would 7. Prevents the error
+        reporting a version the store is not at."""
+        _delete_meta_key(_v7_store(db_path), "coordinator_epoch")
+
+        exc = _schema_error(db_path)
+
+        assert exc.reason == _FROZEN_REGISTRY_META_INCOMPLETE
+        assert exc.found_version is None
+        assert _user_version(db_path) == 8
+
+    @pytest.mark.parametrize("read_only", [False, True], ids=["writer", "read-only"])
+    def test_a_node_store_keeps_its_cross_runtime_reason_and_claims_no_version(
+        self, db_path: Path, read_only: bool
+    ) -> None:
+        """The cross-runtime refusal keeps its reason, is still a
+        :class:`SchemaVersionError`, and carries no found version: a Node
+        ledger number means a different schema (#294). Prevents a host
+        comparing a Node version against this build's."""
+        _forge_node_v3_db(db_path)
+
+        with pytest.raises(CrossRuntimeSchemaError) as ei:
+            SqliteArtifactRegistry(db_path, read_only=read_only)
+
+        assert isinstance(ei.value, SchemaVersionError)
+        assert ei.value.reason == _FROZEN_CROSS_RUNTIME
+        assert ei.value.found_version is None
+        assert ei.value.expected_version == SCHEMA_USER_VERSION
+
+    def test_a_legacy_message_only_construction_still_works_with_empty_fields(self) -> None:
+        """``SchemaVersionError("m")`` keeps working: the new fields are
+        optional keywords. Prevents breaking an embedder that raises or
+        subclasses it with a message only."""
+        exc = SchemaVersionError("m")
+
+        assert str(exc) == "m"
+        assert exc.reason is None
+        assert exc.found_version is None
+        assert exc.expected_version == SCHEMA_USER_VERSION
+
+    def test_pickle_round_trip_keeps_every_field_on_both_classes(self, db_path: Path) -> None:
+        """Both classes survive pickling with message, reason, found and
+        expected version intact, built by hand and raised by a real open.
+        Prevents a multiprocessing or executor boundary dropping the typed
+        fields a host branches on."""
+        import pickle
+
+        raised = _schema_error(_v11_store(db_path))
+        cases = [
+            SchemaVersionError(
+                "m", reason=_FROZEN_SCHEMA_OLDER, found_version=3, expected_version=7
+            ),
+            CrossRuntimeSchemaError("foreign"),
+            raised,
+        ]
+
+        for original in cases:
+            # Round-trips only objects this test just built; no untrusted input.
+            copy = pickle.loads(pickle.dumps(original))
+            assert type(copy) is type(original)
+            assert str(copy) == str(original)
+            assert (copy.reason, copy.found_version, copy.expected_version) == (
+                original.reason, original.found_version, original.expected_version,
+            )
+
+    def test_the_schema_reason_set_is_exactly_the_five_wire_reasons(self) -> None:
+        """``SCHEMA_VERSION_REASONS``, the closed set a host enumerates, is
+        exactly the five frozen literals; each raise site's reason is pinned
+        by its own test above. Prevents the set silently gaining, losing or
+        renaming a value a host branches on."""
+        assert SCHEMA_VERSION_REASONS == frozenset({
+            _FROZEN_SCHEMA_OLDER, _FROZEN_SCHEMA_NEWER, _FROZEN_SCHEMA_UNRECOGNIZED,
+            _FROZEN_REGISTRY_META_INCOMPLETE, _FROZEN_CROSS_RUNTIME,
+        })
+
+    @pytest.mark.parametrize("origin", sorted(_STORES_BY_ORIGIN), ids=lambda n: f"v{n}")
+    def test_migrated_from_version_names_the_schema_a_writer_open_migrated_from(
+        self, db_path: Path, origin: int
+    ) -> None:
+        """A writer open that migrates records the version it started from,
+        from every origin: each step marks its own. Prevents a host losing,
+        or misnumbering, the one fact it needs to say "a coordinator
+        expecting schema N refuses this store from now on" (a 0.13.x store
+        is at schema 4)."""
+        _STORES_BY_ORIGIN[origin](db_path)
+
+        with SqliteArtifactRegistry(db_path) as reg:
+            assert reg.migrated_from_version == origin
+        assert _user_version(db_path) == SCHEMA_USER_VERSION
+
+    def test_the_origin_cases_cover_every_migration_step(self) -> None:
+        """Every schema below this build's has an origin case above.
+        Prevents a new migration step shipping with a mark nothing checks."""
+        assert sorted(_STORES_BY_ORIGIN) == list(range(1, SCHEMA_USER_VERSION))
+
+    def test_migrated_from_version_is_none_when_no_migration_ran(self, db_path: Path) -> None:
+        """A fresh create, a reopen of a current store and a read-only open
+        migrate nothing, so they record nothing. Prevents a migration notice
+        on every start."""
+        with SqliteArtifactRegistry(db_path) as fresh:
+            assert fresh.migrated_from_version is None
+        with SqliteArtifactRegistry(db_path) as reopened:
+            assert reopened.migrated_from_version is None
+        with SqliteArtifactRegistry(db_path, read_only=True) as read_only:
+            assert read_only.migrated_from_version is None
+
+    def test_a_concurrent_loser_that_migrates_nothing_records_no_origin(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A writer whose pre-lock read saw v1 while a racing winner already
+        migrated the store runs every step's loser guard and migrates nothing,
+        so it records no origin. Prevents two coordinators racing one start
+        both announcing the migration: in every step, the marker sits after
+        the step's concurrent-loser early return, not before it."""
+        _raw_v1_store(db_path)
+        with SqliteArtifactRegistry(db_path) as winner:
+            assert winner.migrated_from_version == 1
+
+        def stale_v1_dispatch(self, instance_id):
+            # The loser's dispatch decision, made from a stale pre-lock read of
+            # the oldest origin, so the whole chain runs: every step's guard.
+            for step in range(1, SCHEMA_USER_VERSION):
+                getattr(self, f"_migrate_v{step}_to_v{step + 1}")(instance_id)
+
+        monkeypatch.setattr(SqliteArtifactRegistry, "_initialize_schema", stale_v1_dispatch)
+        heard: list[int] = []
+        with SqliteArtifactRegistry(db_path, on_migrated=heard.append) as loser:
+            assert loser.migrated_from_version is None
+        assert heard == []
+
+    def test_on_migrated_reports_the_origin_once_the_store_is_current(self, db_path: Path) -> None:
+        """A writer open tells ``on_migrated`` the schema it migrated from, once,
+        when the whole chain has committed (#417). Prevents a host that reports
+        the migration from depending on the rest of its start, or saying the
+        store reached the current schema before it did."""
+        _STORES_BY_ORIGIN[7](db_path)
+        heard: list[tuple[int, int]] = []
+
+        def hear(origin: int) -> None:
+            heard.append((origin, _user_version(db_path)))
+
+        SqliteArtifactRegistry(db_path, on_migrated=hear).close()
+
+        assert heard == [(7, SCHEMA_USER_VERSION)]
+
+    def test_on_migrated_stays_silent_when_no_migration_ran(self, db_path: Path) -> None:
+        """A fresh create, a current store and a read-only open migrate nothing
+        and report nothing, so a report means a store really moved (#417)."""
+        heard: list[int] = []
+        SqliteArtifactRegistry(db_path, on_migrated=heard.append).close()
+        SqliteArtifactRegistry(db_path, on_migrated=heard.append).close()
+        SqliteArtifactRegistry(db_path, read_only=True, on_migrated=heard.append).close()
+        assert heard == []
+
+    def test_on_migrated_stays_silent_when_the_chain_fails_part_way(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A chain that fails after an earlier step committed reports nothing,
+        since the report means the store reached the current schema, and the
+        next open reports from where the store stopped. Prevents the known
+        limit moving unnoticed: this is the state a host's log cannot show."""
+        _STORES_BY_ORIGIN[7](db_path)
+        heard: list[int] = []
+
+        def failing_last_step(self: SqliteArtifactRegistry, instance_id: str | None) -> None:
+            raise sqlite3.OperationalError("database or disk is full")
+
+        with monkeypatch.context() as last_step_patch:
+            last_step_patch.setattr(SqliteArtifactRegistry, "_migrate_v9_to_v10", failing_last_step)
+            with pytest.raises(sqlite3.OperationalError, match="disk is full"):
+                SqliteArtifactRegistry(db_path, on_migrated=heard.append)
+
+        assert heard == []
+        assert _user_version(db_path) == 9
+        SqliteArtifactRegistry(db_path, on_migrated=heard.append).close()
+        assert heard == [9]
+
+    def test_a_raising_on_migrated_does_not_fail_the_open(self, db_path: Path) -> None:
+        """An observer's raise leaves the open as it was, as it does for
+        ``conflict_callbacks``: the store has already moved, and a report
+        must not refuse it."""
+        _STORES_BY_ORIGIN[7](db_path)
+
+        def raising_observer(origin: int) -> None:
+            raise ValueError("observer failed")
+
+        with SqliteArtifactRegistry(db_path, on_migrated=raising_observer) as reg:
+            assert reg.migrated_from_version == 7
+
+
+def _store_at_user_version(db_path: Path, version: int) -> None:
+    SqliteArtifactRegistry(db_path).close()
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(f"PRAGMA user_version={version}")
+    finally:
+        conn.close()
+
+
+class TestRefusedOpenClosesItsConnection:
+    """#426: an open that raises closes the connection it made. The caller never
+    gets a registry to ``.close()``, and a kept exception's traceback holds the
+    connection, so until then nothing closes it and the store stays open."""
+
+    @pytest.mark.parametrize("version", [99, -3], ids=["newer", "negative"])
+    def test_a_writer_open_refusing_the_schema_closes_its_connection(self, db_path: Path, version: int) -> None:
+        _store_at_user_version(db_path, version)
+        with no_sqlite_connection_left_open():
+            with pytest.raises(SchemaVersionError) as refused:
+                SqliteArtifactRegistry(db_path)
+        assert refused.value.found_version == version
+
+    def test_a_writer_open_of_a_file_that_is_no_database_closes_its_connection(self, db_path: Path) -> None:
+        db_path.write_bytes(b"this is not a sqlite database" * 100)
+        with no_sqlite_connection_left_open():
+            with pytest.raises(sqlite3.DatabaseError) as refused:
+                SqliteArtifactRegistry(db_path)
+        assert "not a database" in str(refused.value)
+
+    def test_a_writer_open_failing_at_its_last_step_closes_its_connection(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def failing_last_step(self: SqliteArtifactRegistry) -> None:
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(SqliteArtifactRegistry, "_load_retention_meta", failing_last_step)
+        with no_sqlite_connection_left_open():
+            with pytest.raises(sqlite3.OperationalError) as failed:
+                SqliteArtifactRegistry(db_path)
+        assert "disk I/O error" in str(failed.value)
+
+    def test_a_writer_open_interrupted_closes_its_connection(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Ctrl-C mid-open must not orphan the connection either."""
+        def interrupted_schema_step(self: SqliteArtifactRegistry, instance_id: str | None) -> None:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(SqliteArtifactRegistry, "_initialize_schema", interrupted_schema_step)
+        with no_sqlite_connection_left_open():
+            with pytest.raises(KeyboardInterrupt) as _interrupted:
+                SqliteArtifactRegistry(db_path)
+
+    def test_a_refused_read_only_open_closes_its_connection(self, db_path: Path) -> None:
+        _store_at_user_version(db_path, 99)
+        with no_sqlite_connection_left_open():
+            with pytest.raises(SchemaVersionError) as refused:
+                SqliteArtifactRegistry(db_path, read_only=True)
+        assert refused.value.found_version == 99

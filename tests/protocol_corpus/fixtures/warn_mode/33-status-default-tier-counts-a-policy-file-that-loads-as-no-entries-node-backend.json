@@ -1,0 +1,48 @@
+{
+  "name": "status-default-tier-counts-a-policy-file-that-loads-as-no-entries-node-backend",
+  "description": "Plugin #192: the Node half of fixture 32. tracked.yaml holds the unquoted `- *.md` (a YAML alias), so it loads as no entries; the Node coordinator's GET /status counts it as one rejected pattern, as the Python coordinator does. Before #192 the Node coordinator reported rejected_pattern_count 0 here. Like fixture 09 it carries pre_edit_if_unheld: true.",
+  "setup": {
+    "files": {
+      ".coherence/tracked.yaml": "- data/**\n- *.md\n"
+    }
+  },
+  "request": {
+    "method": "GET",
+    "path": "/status"
+  },
+  "ignore_keys": [
+    "tracked_artifacts",
+    "sessions",
+    "default_pattern_count",
+    "counts",
+    "version",
+    "fold_profile",
+    "fold_table_unicode"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "backend": "node",
+      "counts": "<IGNORED>",
+      "coordinator_uptime_seconds": "<UPTIME>",
+      "fold_profile": "<IGNORED>",
+      "fold_table_unicode": "<IGNORED>",
+      "policy_summary": {
+        "coordinator_root": ".",
+        "default_pattern_count": "<IGNORED>",
+        "ignored_pattern_count": 0,
+        "rejected_pattern_count": 1,
+        "strict_mode_pattern_count": 0,
+        "user_added_pattern_count": 0
+      },
+      "pre_edit_if_unheld": true,
+      "schema_version": 5,
+      "sessions": "<IGNORED>",
+      "status": "ok",
+      "tracked_artifacts": "<IGNORED>",
+      "version": "<IGNORED>"
+    }
+  },
+  "_comment": "Copies fixture 09's envelope. Only policy_summary differs from 09: rejected_pattern_count is 1 and user_added_pattern_count stays 0. The rejected entry's reason never reaches the wire on either backend, so the corpus pins the count; the plugin's unit tests pin the reason text. fold_profile and fold_table_unicode are ignored but kept in the body, so both keys stay required in this tier: the profile is whatever the disk under the run's tmp dir folds (caseless on a Mac, none on Linux CI), and the fold rows assert both fields per profile.",
+  "backends": ["node"]
+}

@@ -64,8 +64,9 @@ JSON ``reason`` slug) without parsing prose:
 - ``11`` — resolver CONFIG error: the ``--db`` path is missing (no store
   materialized), OR an ``--instance-id`` cross-check disagreed with the store's
   persisted identity. (Both are caller/config misuse.)
-- ``12`` — resolver STORE error: the store needs recovery (hot WAL a read-only
-  conn cannot replay), is locked (SQLITE_BUSY), is corrupt (non-sqlite), or is a
+- ``12`` — resolver STORE error: the store cannot be read as it is (no access,
+  a read-only directory, a hot rollback journal; the message names the step),
+  is locked (SQLITE_BUSY), is corrupt (non-sqlite), or is a
   v1/wrong-schema db (read-only mode performs no migration). The JSON ``reason``
   slug distinguishes ``needs_recovery`` / ``db_busy`` / ``db_corrupt`` /
   ``schema_version_mismatch`` so scripts stay precise within this class.
@@ -374,7 +375,10 @@ def build_resolve_parser() -> argparse.ArgumentParser:
         description=(
             "Resolve 'bytes at version k' against a (restarted) coordinator "
             "store. Opens .coherence/state.db READ-ONLY (never migrates, never "
-            "creates) and calls read_at_version. Output is content-safe by "
+            "creates) and calls read_at_version; SQLite may still create an "
+            "empty state.db-wal and a state.db-shm beside it, so resolve a copy "
+            "of state.db and state.db-wal to leave an original untouched. "
+            "Output is content-safe by "
             "default (metadata only); retained bytes leave the process ONLY via "
             "--include-content or --output-file. Note: a rejection can become "
             "servable history the moment a peer commits a newer version, and "

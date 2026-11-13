@@ -33,6 +33,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import sqlite3
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -61,6 +62,12 @@ from ccs.replay import (
     ResolverSchemaVersionError,
     ResolverUnknownArtifactPathError,
     resolve_version,
+)
+from tests.store_images import (
+    COMMITTED_V1,
+    crashed_wal_image,
+    hot_journal_image,
+    sqlite_error,
 )
 
 _K8 = RetentionPolicy(max_versions=8)
@@ -413,9 +420,8 @@ class TestErrorPaths:
             conn.close()
 
     def test_needs_recovery_exit_12_fault_injected(self, tmp_path: Path, monkeypatch) -> None:
-        # A real post-crash hot-WAL state cannot be created deterministically in
-        # pytest; inject SQLITE_READONLY_RECOVERY on the ro connection's first
-        # user_version read (the Unit 3 fault-injection approach).
+        # SQLITE_READONLY_RECOVERY needs another process holding the store's WAL
+        # index; inject the code on the ro connection's first user_version read.
         db = tmp_path / "state.db"
         _write_store(db, ("c1", "c2", "c3"))
 
@@ -427,8 +433,8 @@ class TestErrorPaths:
 
             def execute(self, sql, *a, **k):
                 if "user_version" in sql:
-                    raise sqlite3.OperationalError(
-                        "attempt to write a readonly database (SQLITE_READONLY_RECOVERY)"
+                    raise sqlite_error(
+                        "attempt to write a readonly database", "SQLITE_READONLY_RECOVERY"
                     )
                 return self._real.execute(sql, *a, **k)
 
@@ -557,8 +563,8 @@ class TestErrorPaths:
 
             def execute(self, sql, *a, **k):
                 if "artifact_versions" in sql:
-                    raise sqlite3.OperationalError(
-                        "attempt to write a readonly database (SQLITE_READONLY_RECOVERY)"
+                    raise sqlite_error(
+                        "attempt to write a readonly database", "SQLITE_READONLY_RECOVERY"
                     )
                 return self._real.execute(sql, *a, **k)
 
@@ -585,7 +591,7 @@ class TestErrorPaths:
     ) -> None:
         # The catch-all "unreadable" signal (an OperationalError that is
         # neither busy nor a recognized recovery state) keeps today's wire
-        # outcome: needs_recovery, exit 12 (same operator remedy).
+        # outcome: needs_recovery, exit 12.
         db = tmp_path / "state.db"
         _write_store(db, ("c1", "c2", "c3"))
 
@@ -630,6 +636,153 @@ class TestErrorPaths:
         )
         assert rc == 5  # current_version rejection
         assert not out.exists()
+
+
+# ===========================================================================
+# --db NAMES A FILE — never URI syntax (#418)
+# ===========================================================================
+
+
+class TestDbPathIsFilenameBytes:
+    """tmp_path never emits '#', '?' or '%', so these names are the only way a
+    test here can see the resolver answer from a file other than the one named."""
+
+    @pytest.mark.parametrize("dirname", ["proj#2", "proj?x", "p%41q"])
+    def test_a_reserved_character_in_the_db_path_resolves_the_named_store(
+        self, tmp_path: Path, dirname: str
+    ) -> None:
+        # Unencoded, '#' and '?' reported a current store as schema v0 and left
+        # a stray file at the cut-short name; '%41' reported it as db_corrupt.
+        db = tmp_path / dirname / ".coherence" / "state.db"
+        _write_store(db, ("c1", "c2", "c3"))
+        before = sorted(p.name for p in tmp_path.iterdir())
+
+        rc, obj = _resolve_json(
+            ["--db", str(db), "--artifact", "plan.md", "--version", "2",
+             "--include-content", "--json"]
+        )
+
+        assert rc == 0
+        assert obj["content"] == "c2"
+        assert sorted(p.name for p in tmp_path.iterdir()) == before
+
+    def test_a_copy_beside_the_live_store_answers_for_the_copy(
+        self, tmp_path: Path
+    ) -> None:
+        # A forensic resolve against a saved copy returned the live store's
+        # bytes: 'state.db#before-upgrade' was cut to the 'state.db' beside it.
+        live = tmp_path / ".coherence" / "state.db"
+        _write_store(live, ("live-v1", "live-v2", "live-v3"))
+        other = tmp_path / "other" / "state.db"
+        _write_store(other, ("copy-v1", "copy-v2", "copy-v3"))
+        copy = live.with_name("state.db#before-upgrade")
+        shutil.copyfile(other, copy)
+
+        rc, obj = _resolve_json(
+            ["--db", str(copy), "--artifact", "plan.md", "--version", "2",
+             "--include-content", "--json"]
+        )
+
+        assert rc == 0
+        assert obj["content"] == "copy-v2"
+
+    def test_a_directory_at_db_is_needs_recovery_not_db_corrupt(
+        self, tmp_path: Path
+    ) -> None:
+        # A failed connect now takes the registry's read-only classification,
+        # like every later read: a store the open cannot read is needs_recovery.
+        db = tmp_path / "state.db"
+        db.mkdir()
+
+        rc, obj = _resolve_json(
+            ["--db", str(db), "--artifact", "plan.md", "--version", "1", "--json"]
+        )
+
+        assert rc == 12
+        assert obj["reason"] == "needs_recovery"
+
+    def test_a_store_deleted_after_the_existence_check_is_db_missing(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # The resolver and the registry each check that the store exists, then
+        # connect; a store deleted in between failed the connect with a raw
+        # error the resolver reported as db_corrupt (exit 12).
+        db = tmp_path / "state.db"
+        _write_store(db, ("c1", "c2", "c3"))
+
+        from ccs.coordinator import sqlite_registry as sr
+
+        real_connect = sqlite3.connect
+
+        def connect_after_delete(*a, **k):
+            if a and "mode=ro" in str(a[0]):
+                for path in tmp_path.glob("state.db*"):
+                    path.unlink()
+            return real_connect(*a, **k)
+
+        monkeypatch.setattr(sr.sqlite3, "connect", connect_after_delete)
+        rc, obj = _resolve_json(
+            ["--db", str(db), "--artifact", "plan.md", "--version", "2", "--json"]
+        )
+
+        assert rc == 11
+        assert obj["reason"] == "db_missing"
+
+
+# ===========================================================================
+# STORES A CRASHED WRITER LEFT, AND STORES THIS USER CANNOT REACH (#419, #420, #437)
+# ===========================================================================
+
+
+class TestCrashedAndUnreachableStores:
+    def test_a_version_only_in_a_crashed_writers_wal_resolves(
+        self, tmp_path: Path
+    ) -> None:
+        # The docs called a crashed writer's WAL the resolver's likeliest
+        # failure; the read-only open reads its committed versions in place.
+        db, _ = crashed_wal_image(tmp_path)
+
+        rc, obj = _resolve_json(
+            ["--db", str(db), "--artifact", "plan.md", "--version", "1",
+             "--include-content", "--json"]
+        )
+
+        assert rc == 0
+        assert obj["content"] == COMMITTED_V1
+
+    def test_a_hot_rollback_journal_names_the_journal_not_a_wal(
+        self, tmp_path: Path
+    ) -> None:
+        db, _ = hot_journal_image(tmp_path)
+
+        rc, obj = _resolve_json(
+            ["--db", str(db), "--artifact", "plan.md", "--version", "1", "--json"]
+        )
+
+        assert rc == 12
+        assert obj["reason"] == "needs_recovery"
+        assert "state.db-journal" in obj["message"]
+        assert "write-ahead log" not in obj["message"]
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
+    def test_a_store_under_a_directory_this_user_cannot_search_is_needs_recovery(
+        self, tmp_path: Path
+    ) -> None:
+        # The resolver's own existence check raised a raw PermissionError, which
+        # the CLI reported as internal_error (exit 4).
+        db = tmp_path / "locked" / ".coherence" / "state.db"
+        _write_store(db, ("c1", "c2"))
+        locked = tmp_path / "locked"
+        locked.chmod(0)
+        try:
+            rc, obj = _resolve_json(
+                ["--db", str(db), "--artifact", "plan.md", "--version", "1", "--json"]
+            )
+        finally:
+            locked.chmod(0o700)
+
+        assert rc == 12
+        assert obj["reason"] == "needs_recovery"
 
 
 # ===========================================================================
@@ -791,7 +944,7 @@ class _ConnectionCloseTracker:
     """Wrap ``sqlite3.connect`` for ``mode=ro`` URIs and track close() calls."""
 
     def __init__(self, monkeypatch, *, fault_sql: str | None = None,
-                 fault_message: str | None = None) -> None:
+                 fault: sqlite3.OperationalError | None = None) -> None:
         self.opened: list[object] = []
         self.closed: list[object] = []
         tracker = self
@@ -806,7 +959,7 @@ class _ConnectionCloseTracker:
 
             def execute(self, sql, *a, **k):
                 if fault_sql is not None and fault_sql in sql:
-                    raise sqlite3.OperationalError(fault_message)
+                    raise fault
                 return self._real.execute(sql, *a, **k)
 
             def __getattr__(self, n):
@@ -856,8 +1009,8 @@ class TestNoLeakedConnectionOnTypedRaise:
         tracker = _ConnectionCloseTracker(
             monkeypatch,
             fault_sql="user_version",
-            fault_message=(
-                "attempt to write a readonly database (SQLITE_READONLY_RECOVERY)"
+            fault=sqlite_error(
+                "attempt to write a readonly database", "SQLITE_READONLY_RECOVERY"
             ),
         )
         with pytest.raises(ResolverNeedsRecoveryError):

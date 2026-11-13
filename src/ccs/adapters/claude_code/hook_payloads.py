@@ -116,6 +116,41 @@ report. That makes this arm byte-stable for the same reason the other one
 is — every substitution is per-artifact."""
 
 
+OUT_OF_BAND_DENY_REASON_TEMPLATE: str = (
+    "Stale read denied: {path} on disk no longer matches v{current_version}, "
+    "the version you last read, and no session committed the change, so it "
+    "was made outside the coordinator. Do not restore or overwrite {path}: "
+    "the change may be your user's work. Tell your user that {path} changed "
+    "outside the coordinator; the read stays denied until the change is "
+    "committed through the coordinator. This denial is structural (v0.2 "
+    "strict mode); retrying the same operation will produce the same denial."
+)
+"""The deny text for a change made outside the coordinator (#278).
+
+The reader still holds a valid grant on the current version, yet the bytes it
+just hashed differ from the recorded content: no commit explains them. The
+write template named the last committer at the time of its commit -- a write
+that did not make this change, at a time it was not made, or
+``agent <unknown>`` when nothing was ever committed. Only the SHARED-holder
+arm picks this text (``out_of_band`` on :func:`emit_strict_deny`); a reader a
+peer's acquire revoked keeps the grant-change text, since that writer went
+through the coordinator. Re-reading does not clear the deny, and the one move
+left to the model -- putting the old bytes back -- would discard a change that
+may be the user's own edit, so the text says to leave the file alone and
+report it. Per-artifact placeholders only, so it is byte-stable."""
+
+OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE: str = (
+    "⚠ {path} on disk differs from v{version}, the last content committed "
+    "through the coordinator, and no session committed the change: it was "
+    "made outside the coordinator. Read {path} before relying on it, and do "
+    "not write it from an earlier read; that write would replace the change."
+)
+"""The warn-mode counterpart, attached to an admitted read as context only
+(#278). The fresh answer's ``hash_differs`` flag is a top-level key the model
+never sees, so without this sentence a reader holding a valid grant was told
+nothing when its file changed underneath it."""
+
+
 def emit_allow(
     *,
     source: str,
@@ -208,21 +243,53 @@ def summary_reports_a_write(summary: "StaleSummary") -> bool:
     return summary["current_version"] > prior
 
 
+def summary_reports_an_out_of_band_change(summary: "StaleSummary") -> bool:
+    """Were the bytes changed with no commit behind them? (#278)
+
+    The session observed a version that is still the current one, and the
+    bytes it just hashed differ from the recorded content. A commit would have
+    moved the version; a grant changing hands would not have moved the bytes.
+    What is left is a change made outside the coordinator. A session that never
+    observed the artifact has no version of its own to compare, so this never
+    holds for it."""
+    prior = summary.get("prior_version_seen_by_session")
+    return (
+        prior is not None
+        and summary["hash_differs"]
+        and summary["current_version"] == prior
+    )
+
+
 def emit_strict_deny(
     *,
     source: str,
     summary: "StaleSummary",
+    out_of_band: bool = False,
 ) -> dict[str, Any]:
     """Build the ``hookSpecificOutput`` envelope for a v0.2 strict-mode
     deny response.
 
     The ``permissionDecisionReason`` is rendered via
-    :data:`STRICT_MODE_DENY_REASON_TEMPLATE` or, when the summary cannot
-    support a write claim, :data:`GRANT_CHANGE_DENY_REASON_TEMPLATE` (R8).
-    Both are static and byte-stable across retries per KTD-P. The ``source``
+    :data:`OUT_OF_BAND_DENY_REASON_TEMPLATE` when the caller denies a reader
+    that holds a valid grant (``out_of_band``) and the bytes changed with no
+    commit behind them (#278), else :data:`GRANT_CHANGE_DENY_REASON_TEMPLATE`
+    when the summary cannot support a write claim (R8), else
+    :data:`STRICT_MODE_DENY_REASON_TEMPLATE`. The summary alone cannot pick the
+    first: a reader a peer's acquire revoked can show the same version and a
+    differing hash, and that change went through the coordinator. All three
+    are static and byte-stable across retries per KTD-P. The ``source``
     argument is preserved for telemetry (Unit 4 audit-log append) and
     parameter-list parity with :func:`emit_allow`.
     """
+    if out_of_band and summary_reports_an_out_of_band_change(summary):
+        return {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": OUT_OF_BAND_DENY_REASON_TEMPLATE.format(
+                path=summary["path"],
+                current_version=summary["current_version"],
+            ),
+        }
     if not summary_reports_a_write(summary):
         reason = GRANT_CHANGE_DENY_REASON_TEMPLATE.format(
             path=summary["path"],

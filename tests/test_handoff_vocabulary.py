@@ -11,16 +11,27 @@ another's recovery.
 
 from __future__ import annotations
 
+import multiprocessing
+import pickle
+from collections.abc import Iterator
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import FrozenInstanceError
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
+from ccs.adapters.coherent_object import ConditionalPutRetriesExhausted
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_REASONS,
     CAS_EXHAUSTED_REASON,
+    COHERENCE_DIR_REFUSAL_KINDS,
+    COHERENCE_DIR_REFUSED_REASON,
+    COHERENCE_LINK_KIND,
+    COHERENCE_NOT_A_DIRECTORY_KIND,
+    COHERENCE_SPECIAL_ENTRY_KIND,
     COMMIT_PREEMPTED_REASON,
     COMMIT_UNCONFIRMED_REASON,
+    COORDINATOR_FAILED_REASON,
     COORDINATOR_UNAVAILABLE_REASON,
     GIVER_FENCED_REASON,
     HANDOFF_ACCEPT_UNCONFIRMED_REASON,
@@ -44,12 +55,24 @@ from ccs.core.exceptions import (
     HOLD_REASONS,
     INTERNAL_CONCURRENCY_REASON,
     OCC_CALLER_TRANSIENT_REASON,
+    OTHER_HOLDER_REASON,
+    SPLIT_PAIR_REASON,
     STALE_READ_GENERATION_REASON,
     STALE_VIEW_REASON,
+    UNAVAILABLE_REASON,
     VERSION_MISMATCH_REASON,
     VIEW_WEDGED_REASON,
+    CallerPrincipalRefused,
+    CasRetriesExhausted,
+    CasVersionConflict,
+    CoherenceDirRefused,
     CoherenceError,
+    CoordinatorFailed,
+    CoordinatorUnreachable,
     GiverFenced,
+    OtherHolder,
+    PublishMaterializationError,
+    StaleView,
 )
 from ccs.core.states import MESIState
 from ccs.core.types import (
@@ -137,7 +160,7 @@ def test_handoff_reasons_collide_with_no_existing_reason_or_status() -> None:
         | CALLER_PRINCIPAL_REASONS
         | {
             VERSION_MISMATCH_REASON,
-            "other_holder",
+            OTHER_HOLDER_REASON,
             STALE_READ_GENERATION_REASON,
             OCC_CALLER_TRANSIENT_REASON,
             STALE_VIEW_REASON,
@@ -147,6 +170,10 @@ def test_handoff_reasons_collide_with_no_existing_reason_or_status() -> None:
             CAS_EXHAUSTED_REASON,
             INTERNAL_CONCURRENCY_REASON,
             COORDINATOR_UNAVAILABLE_REASON,
+            COORDINATOR_FAILED_REASON,
+            SPLIT_PAIR_REASON,
+            UNAVAILABLE_REASON,
+            COHERENCE_DIR_REFUSED_REASON,
         }
     )
     assert HANDOFF_REASONS.isdisjoint(existing)
@@ -170,6 +197,268 @@ def test_giver_fenced_carries_its_reason_successor_and_version() -> None:
     assert isinstance(err, CoherenceError)
     assert str(successor) in str(err)
     assert "version_at_transfer=7" in str(err)
+
+
+@pytest.mark.parametrize("successor", [uuid4(), "successor-session"], ids=["uuid", "string"])
+def test_giver_fenced_crosses_a_process_boundary(successor: UUID | str) -> None:
+    """Pickling retains the terminal type and the fields callers inspect."""
+    err = GiverFenced("notes/plan.md", successor, 7)
+    err.add_note("context")
+
+    restored = pickle.loads(pickle.dumps(err))
+
+    assert type(restored) is GiverFenced
+    assert restored.args == err.args
+    assert restored.reason == err.reason == GIVER_FENCED_REASON
+    assert restored.artifact_id == err.artifact_id
+    assert restored.successor == successor
+    assert restored.version_at_transfer == err.version_at_transfer == 7
+    assert restored.__dict__ == err.__dict__
+    assert restored.__notes__ == ["context"]
+
+
+@pytest.mark.parametrize(
+    "err",
+    [
+        CallerPrincipalRefused(
+            sorted(CALLER_PRINCIPAL_REASONS)[0], "caller refused", settled=False
+        ),
+        CasRetriesExhausted(
+            "notes/plan.md",
+            3,
+            7,
+            last_conflict_reason=VERSION_MISMATCH_REASON,
+            captured_generation=4,
+            owner_generation=5,
+        ),
+        CasVersionConflict(
+            "notes/plan.md",
+            6,
+            7,
+            reason=VERSION_MISMATCH_REASON,
+            captured_generation=4,
+            owner_generation=5,
+        ),
+        ConditionalPutRetriesExhausted("s3://bucket/key", 3),
+        PublishMaterializationError(
+            ("notes/plan.md",), ("notes/other.md",), cause=OSError("disk write failed")
+        ),
+    ],
+    ids=[
+        "caller-principal-refused",
+        "cas-retries-exhausted",
+        "cas-version-conflict",
+        "conditional-put-retries-exhausted",
+        "publish-materialization-error",
+    ],
+)
+def test_client_exceptions_with_constructor_fields_cross_a_process_boundary(
+    err: CoherenceError,
+) -> None:
+    """The message and per-instance recovery details survive process transfer."""
+    err.add_note("context")
+
+    restored = pickle.loads(pickle.dumps(err))
+
+    assert type(restored) is type(err)
+    assert restored.args == err.args
+    assert restored.__dict__ == err.__dict__
+    assert restored.__notes__ == ["context"]
+
+
+def test_coherence_dir_refused_carries_its_reason_kind_and_path_and_crosses_a_process_boundary() -> None:
+    """A start's refusal of a linked or non-directory ``.coherence`` (#498) is
+    a typed terminal in the coherence family with one class-level reason, and
+    ``kind`` says which rule refused it. It is not a
+    :class:`CoordinatorUnreachable`, so no ``except CoordinatorUnreachable``
+    retry loop catches it: no retry clears a link a person must replace. A
+    worker process that raises it hands the parent the same refusal."""
+    assert COHERENCE_DIR_REFUSED_REASON == "coherence_dir_refused"
+    for constant, literal in [
+        (COHERENCE_LINK_KIND, "coherence_link"),
+        (COHERENCE_NOT_A_DIRECTORY_KIND, "coherence_not_a_directory"),
+        (COHERENCE_SPECIAL_ENTRY_KIND, "coherence_special_entry"),
+    ]:
+        assert constant == literal
+    assert COHERENCE_DIR_REFUSAL_KINDS == {
+        "coherence_link", "coherence_not_a_directory", "coherence_special_entry",
+    }
+    assert COHERENCE_DIR_REFUSED_REASON not in COHERENCE_DIR_REFUSAL_KINDS
+
+    err = CoherenceDirRefused(
+        COHERENCE_LINK_KIND, "/w/.coherence/hook.secret", "refusing /w/.coherence/hook.secret"
+    )
+    err.add_note("context")
+    assert CoherenceDirRefused.reason == COHERENCE_DIR_REFUSED_REASON
+    assert err.reason == COHERENCE_DIR_REFUSED_REASON
+    assert err.kind == COHERENCE_LINK_KIND
+    assert err.path == "/w/.coherence/hook.secret"
+    assert str(err) == "refusing /w/.coherence/hook.secret"
+    assert isinstance(err, CoherenceError)
+    assert not isinstance(err, CoordinatorUnreachable)
+
+    restored = pickle.loads(pickle.dumps(err))
+
+    assert type(restored) is CoherenceDirRefused
+    assert restored.args == err.args
+    assert restored.reason == COHERENCE_DIR_REFUSED_REASON
+    assert restored.kind == COHERENCE_LINK_KIND
+    assert restored.path == "/w/.coherence/hook.secret"
+    assert str(restored) == str(err)
+    assert restored.__dict__ == err.__dict__
+    assert restored.__notes__ == ["context"]
+
+
+def test_coordinator_unreachable_carries_its_reason_and_crosses_a_process_boundary() -> None:
+    """The refusal for no usable answer from the coordinator is a typed
+    terminal in the coherence family, so a strict caller catches it with the
+    rest and a consumer classifies it by type or ``.reason``, never by the
+    message. Its class-level reason is the existing wire value the MCP
+    unattached refusal already answers, not a new one. It carries the message
+    and a keyword mark, so a child process can raise it and the parent
+    unpickle it whole."""
+    err = CoordinatorUnreachable("coordinator gone")
+    assert CoordinatorUnreachable.reason == "coordinator_unavailable"
+    assert err.reason == COORDINATOR_UNAVAILABLE_REASON
+    assert isinstance(err, CoherenceError)
+
+    restored = pickle.loads(pickle.dumps(err))
+    assert type(restored) is CoordinatorUnreachable
+    assert restored.args == ("coordinator gone",)
+    assert restored.reason == "coordinator_unavailable"
+
+
+def test_coordinator_failed_carries_its_reason_and_crosses_a_process_boundary() -> None:
+    """The read error for the coordinator's failure envelope (#259) is a typed
+    terminal in the coherence family, never a stale view (a caller reads a
+    ``StaleView`` from a versioned read as the split pair), with its own wire
+    value. It carries the message and a keyword mark, so a child process can
+    raise it and the parent unpickle it whole."""
+    err = CoordinatorFailed("coordinator answered the read with a failure")
+    assert CoordinatorFailed.reason == "coordinator_failed"
+    assert err.reason == COORDINATOR_FAILED_REASON
+    assert isinstance(err, CoherenceError)
+    assert not isinstance(err, StaleView)
+
+    restored = pickle.loads(pickle.dumps(err))
+    assert type(restored) is CoordinatorFailed
+    assert restored.args == ("coordinator answered the read with a failure",)
+    assert SPLIT_PAIR_REASON == "split_pair"
+
+
+@pytest.fixture(scope="module")
+def spawned_worker() -> Iterator[ProcessPoolExecutor]:
+    """One worker in a spawned process, so an error crosses a real process
+    boundary both ways: pickled to the worker, raised there, pickled back."""
+    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as worker:
+        yield worker
+
+
+def _raise(error: BaseException) -> None:
+    raise error
+
+
+def _raised_in_a_spawned_process(worker: ProcessPoolExecutor, error: BaseException) -> BaseException | None:
+    return worker.submit(_raise, error).exception(timeout=120)
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["needs-reacquire", "unmarked"])
+def test_coordinator_failed_keeps_its_reacquire_mark_across_a_spawned_process(
+    spawned_worker: ProcessPoolExecutor, marked: bool
+) -> None:
+    """A write refused by this volume's own earlier attempt is marked so a
+    consumer sends the caller to ``reacquire()`` by the mark, never by the
+    message. A worker process that raises it hands the parent the mark and
+    the message whole; one raised without the mark reads unmarked."""
+    message = "data/x.md is held by this volume's own earlier write grant"
+    sent = CoordinatorFailed(message, needs_reacquire=True) if marked else CoordinatorFailed(message)
+    assert CoordinatorFailed.needs_reacquire is False
+
+    restored = _raised_in_a_spawned_process(spawned_worker, sent)
+
+    assert type(restored) is CoordinatorFailed and restored is not sent
+    assert restored.args == (message,)
+    assert restored.needs_reacquire is marked
+    assert restored.reason == COORDINATOR_FAILED_REASON
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["answered", "unmarked"])
+def test_coordinator_unreachable_keeps_its_answered_mark_across_a_spawned_process(
+    spawned_worker: ProcessPoolExecutor, marked: bool
+) -> None:
+    """A grant request the coordinator answered with neither an admit nor a
+    refusal is marked, so a consumer tells a live coordinator from a gone one
+    by the mark, never by the message. The mark and the message cross a
+    process boundary whole; one raised without the mark reads unmarked."""
+    message = "the coordinator answered the grant request for data/x.md with neither an admit nor a refusal"
+    sent = CoordinatorUnreachable(message, answered=True) if marked else CoordinatorUnreachable(message)
+    assert CoordinatorUnreachable.answered is False
+
+    restored = _raised_in_a_spawned_process(spawned_worker, sent)
+
+    assert type(restored) is CoordinatorUnreachable and restored is not sent
+    assert restored.args == (message,)
+    assert restored.answered is marked
+    assert restored.reason == COORDINATOR_UNAVAILABLE_REASON
+
+
+def test_unavailable_reason_is_its_own_wire_value() -> None:
+    """An opted-in pre-edit the coordinator could not decide in time is refused
+    with this reason, and a client keys its refusal on the value. It stays apart
+    from ``coordinator_unavailable``, which means the coordinator gave no usable
+    answer at all: this answer comes from a coordinator that is alive and busy."""
+    assert UNAVAILABLE_REASON == "unavailable"
+    assert UNAVAILABLE_REASON != COORDINATOR_UNAVAILABLE_REASON
+
+
+def test_other_holder_reason_is_its_own_wire_value() -> None:
+    """An opted-in pre-edit refused because another agent holds the file
+    answers this reason, the value ``post-edit-cas`` already returns when a
+    commit meets a holder. It is not the handoff route's
+    ``handoff_other_holder``, which refuses a transfer, and not an effect-gate
+    hold cause, which an effect check answers and a client matches by
+    membership in ``HOLD_REASONS``."""
+    assert OTHER_HOLDER_REASON == "other_holder"
+    assert OTHER_HOLDER_REASON != HANDOFF_OTHER_HOLDER_REASON
+    assert OTHER_HOLDER_REASON not in HOLD_REASONS
+
+
+def test_other_holder_carries_its_reason_artifact_and_holder() -> None:
+    """The refusal is one typed error whose class-level reason equals the wire
+    constant, so a consumer classifies it by type or ``.reason`` and never by
+    the message, and it carries the holder the caller backs off from."""
+    holder = uuid4()
+    with pytest.raises(OtherHolder) as caught:
+        raise OtherHolder("notes/plan.md", holder)
+    err = caught.value
+    assert OtherHolder.reason == "other_holder"
+    assert err.reason == OTHER_HOLDER_REASON
+    assert err.artifact_id == "notes/plan.md"
+    assert err.holder_agent_id == holder
+    assert isinstance(err, CoherenceError)
+    assert str(holder) in str(err)
+
+
+@pytest.mark.parametrize(
+    ("artifact_id", "holder"),
+    [
+        (uuid4(), uuid4()),
+        ("notes/plan.md", "0123456789abcdef0123456789abcdef"),
+        (None, None),
+    ],
+    ids=["uuid-holder", "wire-string-holder", "no-holder"],
+)
+def test_other_holder_crosses_a_process_boundary(artifact_id: object, holder: object) -> None:
+    """The service raises it in process, and a client raises the same class
+    from the wire answer, so a worker process that raises it must hand the
+    parent the typed refusal, not a ``TypeError`` from unpickling."""
+    err = OtherHolder(artifact_id, holder)
+    restored = pickle.loads(pickle.dumps(err))
+    assert type(restored) is OtherHolder
+    assert restored.reason == OTHER_HOLDER_REASON
+    assert restored.artifact_id == artifact_id
+    assert restored.holder_agent_id == holder
+    assert str(restored) == str(err)
 
 
 def test_transfer_statuses_are_the_six_closed_values() -> None:

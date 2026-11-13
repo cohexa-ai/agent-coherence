@@ -1,6 +1,6 @@
 {
   "name": "effect-fence-hold-grant-reclaimed-generation-differs",
-  "description": "HOLD reason `grant_reclaimed`. Both generations are CONFIRMED and they differ: the coordinator's first observation records ownership generation 0, the caller captured 1. The version never moved (1 on both sides) and the content claim matches, so every earlier leg passes and leg 7 answers -- a sweep reclaimed the grant the decision was read under. Pins that a generation disagreement is NOT reported as version_moved or as the residual bucket: an agent reading `grant_reclaimed` knows the bytes are current and the AUTHORITY is not, which is a different recovery from re-reading.",
+  "description": "HOLD reason `grant_reclaimed`. Both generations are CONFIRMED and they differ: the coordinator's first observation records ownership generation 0, the caller captured 1. The version never moved (1 on both sides) and the content claim matches, so every earlier leg passes and leg 8 answers -- a sweep reclaimed the grant the decision was read under. Pins that a generation disagreement is NOT reported as version_moved or as the residual bucket: an agent reading `grant_reclaimed` knows the bytes are current and the AUTHORITY is not, which is a different recovery from re-reading.",
   "setup": {
     "tracked": ["docs/**"],
     "files": {

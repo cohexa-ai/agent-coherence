@@ -1,0 +1,30 @@
+{
+  "name": "caller-principal-node-opted-in-pre-edit-admits-an-absent-principal",
+  "description": "The Node side of fixture 19, with the identical setup and request. Node keeps no caller principal, so an opted-in pre-edit needs none: nobody holds the path and Node admits it.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    }
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+      "path": "CLAUDE.md",
+      "if_unheld": true
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "ok": true
+    }
+  },
+  "backends": [
+    "node"
+  ]
+}

@@ -44,7 +44,9 @@ Exit codes:
      persist failure, member-path containment refusal — symlink component,
      hardlinked regular file (external co-owner), non-regular leaf
      (FIFO/socket/device), ``.coherence`` self-target, workspace escape, or an
-     unreadable non-file member)
+     unreadable non-file member), or a ``.coherence`` that is a symlink or not
+     a directory, or holds a symlink, FIFO, socket or device (#498), refused
+     before anything under it is opened
 - 3: restore CONCLUDED but at least one member ended in an absorbing/hold
      outcome (``conflict`` / ``target_lost`` / ``held_unconfirmed``) or the
      registration was refused — the report on stdout carries the per-member truth
@@ -74,6 +76,7 @@ import errno
 import json
 import os
 import stat
+from functools import partial
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -89,10 +92,16 @@ from ccs.adapters.workspace import (
     WorkspaceRestoreReport,
     WorkspaceVersioner,
 )
-from ccs.cli._coherence_client import err, normalize_workspace_path
+from ccs.cli._coherence_client import err, escape_nonprintable, normalize_workspace_path
 from ccs.coordinator.registry_protocol import CheckpointMember, CheckpointRecord
 from ccs.coordinator.service import CoordinatorService
-from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
+from ccs.coordinator.sqlite_registry import (
+    ReadOnlyRegistryError,
+    SchemaVersionError,
+    SqliteArtifactRegistry,
+    StoreHeldError,
+    open_waiting_out_a_holder,
+)
 from ccs.core.exceptions import (
     PIN_STATE_UNPINNED,
     RESTORE_OBSERVATION_DIFFERS,
@@ -106,6 +115,7 @@ from ccs.core.exceptions import (
     CasVersionConflict,
     CheckpointRegistrationRefused,
     CheckpointUnknown,
+    CoherenceDirRefused,
     CoherenceError,
     CommitUnconfirmed,
 )
@@ -505,9 +515,10 @@ class WorkingTreeSource:
     ledger has not observed). A win writes the disk FIRST, then commits the
     ledger — a crash between the two leaves the disk restored and the ledger
     behind, which the next read re-observes (self-healing in the safe
-    direction). Documented v1 residuals: a delete landing between the read and
-    the CAS is recreated undetected, and two concurrent CLI processes could
-    both pass detection (single-writer CLI assumption).
+    direction). Documented v1 residual: a delete landing between the read and
+    the CAS is recreated undetected. Two CLI processes never run this leg at
+    once: a verb holds the store's single-writer lock for its whole run, and
+    another verb that writes waits for it (#453).
 
     Non-UTF-8 disk bytes are returned with version 0 (pointer UNCONFIRMED) and
     are never minted into the ledger — the versioner's typed
@@ -973,10 +984,41 @@ def _live_coordinator_warning(pid: int) -> str:
 # --- the in-process stack --------------------------------------------------------
 
 
+#: Verbs of one workspace take turns on workspace.db (#453): a verb that finds
+#: another verb's writer lock held waits up to this long for it.
+_PEER_VERB_WAIT_SEC = 30.0
+_PEER_VERB_POLL_SEC = 0.05
+
+#: Verbs that only read the store: they open it read-only and wait for no one.
+_READ_VERBS = frozenset({"list", "status"})
+
+
+def _open_writer_waiting_for_a_peer_verb(db_path: Path) -> SqliteArtifactRegistry:
+    """The store's one read-write handle, once no other verb holds it; past
+    :data:`_PEER_VERB_WAIT_SEC` the :class:`StoreHeldError` propagates."""
+    # Retention ON: the file-member resolver reads captured bytes back through
+    # get_content_at_version — without it every file restore would honestly
+    # (and uselessly) report target_lost.
+    open_writer = partial(SqliteArtifactRegistry, db_path, retain_versions=True)
+    return open_waiting_out_a_holder(open_writer, _PEER_VERB_WAIT_SEC, _PEER_VERB_POLL_SEC)
+
+
+def _open_registry(db_path: Path, read_only: bool) -> SqliteArtifactRegistry:
+    """A read verb opens the store read-only, so it never waits on a verb that
+    writes. A store it cannot read that way (none yet, an older schema, one a
+    crashed writer left needing recovery) gets the writer open instead."""
+    if read_only:
+        try:
+            return SqliteArtifactRegistry(db_path, read_only=True)
+        except (ReadOnlyRegistryError, SchemaVersionError):
+            pass
+    return _open_writer_waiting_for_a_peer_verb(db_path)
+
+
 class _Stack:
     """One verb invocation's in-process service stack (context-managed)."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, read_only: bool = False) -> None:
         self.root = root
         # KTD-13: create .coherence/ via the documented single implementation
         # (0700 perms + the '*' gitignore). A bare mkdir here would race ahead
@@ -991,11 +1033,7 @@ class _Stack:
                 "registry needs a writable .coherence directory (read-only "
                 "workspace?)"
             )
-        db_path = root / _WORKSPACE_DB_RELPATH
-        # Retention ON: the file-member resolver reads captured bytes back
-        # through get_content_at_version — without it every file restore
-        # would honestly (and uselessly) report target_lost.
-        self.registry = SqliteArtifactRegistry(db_path, retain_versions=True)
+        self.registry = _open_registry(root / _WORKSPACE_DB_RELPATH, read_only)
         self.service = CoordinatorService(self.registry)
         self.owner = uuid5(_IDENTITY_NAMESPACE, f"owner:{root}")
         self.source = WorkingTreeSource(
@@ -1264,7 +1302,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     stack: _Stack | None = None
     try:
-        stack = _Stack(root)
+        stack = _Stack(root, read_only=args.verb in _READ_VERBS)
         if args.verb == "checkpoint":
             return _cmd_checkpoint(stack, args)
         if args.verb == "list":
@@ -1304,6 +1342,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     except CheckpointPersistFailed as exc:
         err(f"{_PROG}: failed ({exc.reason}): {exc}")
+        _emit_error_envelope(
+            args, exit_code=2, reason=exc.reason, message=str(exc), exc=exc
+        )
+        return 2
+    except CoherenceDirRefused as exc:
+        # A refusal a person must fix (#498), not contention: before the
+        # generic arm, which answers 1. The path came from the workspace, so
+        # it is printed escaped.
+        err(f"{_PROG}: refused ({exc.reason}): {escape_nonprintable(str(exc))}")
+        _emit_error_envelope(
+            args, exit_code=2, reason=exc.reason, message=str(exc), exc=exc
+        )
+        return 2
+    except StoreHeldError as exc:
+        # Another verb, or a script, kept the workspace's store past the wait:
+        # a typed refusal a later run clears, never a traceback. The path came
+        # from the workspace, so it is printed escaped.
+        err(f"{_PROG}: refused ({exc.reason}): {escape_nonprintable(str(exc))}")
         _emit_error_envelope(
             args, exit_code=2, reason=exc.reason, message=str(exc), exc=exc
         )

@@ -32,20 +32,52 @@ teeth: it delegates everything, but a requester's ``"fetch"`` set re-lists every
 OTHER non-INVALID holder under the capture trigger — the effect the service's
 fetch loop used to have when it rewrote peers that were already SHARED, moved
 inside the backend. The kit's peer-fetch scenario MUST FAIL it.
+
+The refusal-pair stubs give each of the kit's three refusal-pair scenarios its
+teeth. Each delegates everything to a real in-memory registry and drops the
+generation pair at ONE entry point (``commit_cas``, ``commit_all``, or the
+fenced persist's raise), keeping the reason and version, as a binding would
+that kept its pre-pair refusal constructor. A fourth fills the pair only on
+``stale_read_generation``, and the other reasons' checks MUST catch it.
+
+The INVALID-only bump stub (:class:`_InvalidOnlyBumpRegistry`) gives the
+voluntary-release scenario's release-to-reader leg its teeth. It moves the
+ownership epoch when a holder leaves EXCLUSIVE or MODIFIED only if the holder
+lands INVALID, as a backend would that keyed the bump on the target state. It
+passes the release to INVALID and MUST FAIL the release to SHARED.
+
+The follow-up-read stub (:class:`_FollowUpReadRegistry`) gives the two
+refusal-pair races their teeth. It decides every refusal on the right snapshot,
+then re-reads the owner leg alone, or both legs, after a 0.5 ms window at one
+entry point. The sequential scenarios cannot see that; the race for its entry
+point MUST FAIL it as a snapshot violation. A starving stub
+(:class:`_StarvedMutatorRegistry`) keeps a race's mutator from running beside
+its actor, and the race MUST FAIL it as starved, not as a snapshot violation.
+
+The forget stub (:class:`_ForgetDroppingRegistry`) gives the forget scenario
+its teeth, once per obligation: it forgets past a held write grant, deletes
+the row that records a reclaim, leaves that row as a reader, deletes before
+it refuses, refuses with a plain ``ValueError``, keeps the heartbeat, keeps a
+transient state, miscounts the rows it removed, deletes a peer's row, or
+refuses on a peer's write grant. The scenario MUST FAIL each, naming the
+obligation dropped.
 """
 
 from __future__ import annotations
 
+import threading
 import time
+from functools import partial
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 
 from ccs.coordinator.registry import ArtifactRegistry
-from ccs.coordinator.registry_protocol import CLAIM_CAPTURE_TRIGGERS, CasResult
+from ccs.coordinator.registry_protocol import CLAIM_CAPTURE_TRIGGERS, CasResult, forget_refusal
+from ccs.core.exceptions import STALE_READ_GENERATION_REASON, ForgetRefused, StaleReadGeneration
 from ccs.core.states import MESIState
-from ccs.core.types import CasCorruption, ConflictDetail
+from ccs.core.types import CasCorruption, ConflictDetail, MultiCommitConflict
 from tests.backend_conformance import kit
 from tests.backend_conformance.kit import RegistryFactory
 
@@ -335,6 +367,545 @@ def test_torn_pair_stub_fails_pair_atomicity_scenario() -> None:
         "the teeth failure must name the obligation a backend author skipped; "
         f"got: {message}"
     )
+
+
+def _without_pair(detail: ConflictDetail) -> ConflictDetail:
+    return ConflictDetail(detail.reason, detail.current_version)
+
+
+def _strip_batch(result: object, *, keep: frozenset[str] = frozenset()) -> object:
+    """``result`` with the pair dropped from every refused member whose reason
+    is not in ``keep``."""
+    if not isinstance(result, MultiCommitConflict):
+        return result
+    return MultiCommitConflict(
+        per_artifact={
+            art: detail if detail.reason in keep else _without_pair(detail)
+            for art, detail in result.per_artifact.items()
+        }
+    )
+
+
+class _PairlessCasRegistry:
+    """A degraded backend whose ``commit_cas`` refusals carry the reason and
+    version but no generation pair. Everything else is the real in-memory
+    registry."""
+
+    def __init__(self) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def commit_cas(self, *args: object, **kwargs: object) -> CasResult:
+        result = self._inner.commit_cas(*args, **kwargs)  # type: ignore[arg-type]
+        return _without_pair(result) if isinstance(result, ConflictDetail) else result
+
+
+class _PairlessBatchRegistry:
+    """A degraded backend whose ``commit_all`` names every refused member with
+    its reason and version but no generation pair."""
+
+    def __init__(self) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def commit_all(self, *args: object, **kwargs: object) -> object:
+        return _strip_batch(self._inner.commit_all(*args, **kwargs))  # type: ignore[arg-type]
+
+
+class _PairlessFenceRaiseRegistry:
+    """A degraded backend whose fenced persist still raises
+    :class:`StaleReadGeneration`, with the same message, but without the pair."""
+
+    def __init__(self) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def set_artifact_and_content(self, *args: object, **kwargs: object) -> None:
+        try:
+            self._inner.set_artifact_and_content(*args, **kwargs)  # type: ignore[arg-type]
+        except StaleReadGeneration as exc:
+            raise StaleReadGeneration(*exc.args) from None
+
+
+class _FenceOnlyPairRegistry:
+    """A degraded backend that reports the pair on ``stale_read_generation``
+    only, at both commit entry points: the reading under which the pair is a
+    fence detail rather than part of every refusal."""
+
+    _KEEP = frozenset({STALE_READ_GENERATION_REASON})
+
+    def __init__(self) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def commit_cas(self, *args: object, **kwargs: object) -> CasResult:
+        result = self._inner.commit_cas(*args, **kwargs)  # type: ignore[arg-type]
+        if isinstance(result, ConflictDetail) and result.reason not in self._KEEP:
+            return _without_pair(result)
+        return result
+
+    def commit_all(self, *args: object, **kwargs: object) -> object:
+        return _strip_batch(self._inner.commit_all(*args, **kwargs), keep=self._KEEP)  # type: ignore[arg-type]
+
+
+class _OneStoreFactory:
+    """A :class:`RegistryFactory` minting one process-scoped instance of
+    ``stub`` (the shape of :class:`_DegradedFactory`, for any stub class)."""
+
+    def __init__(self, stub: type) -> None:
+        self._stub = stub
+        self._reg: object | None = None
+
+    def __call__(self) -> object:
+        if self._reg is None:
+            self._reg = self._stub()
+        return self._reg
+
+    def close_all(self) -> None:
+        return None
+
+    @property
+    def db_path(self) -> Path | None:
+        return None
+
+
+def test_pairless_cas_stub_fails_commit_cas_pair_scenario() -> None:
+    """THE TEETH for the ``commit_cas`` refusal-pair scenario. A binding that
+    refuses the right commit with the right reason but drops the pair MUST FAIL
+    the kit; the failure names the entry point, the reason and both fields."""
+    with pytest.raises(AssertionError) as excinfo:
+        kit.assert_commit_cas_refusals_carry_the_generation_pair(_OneStoreFactory(_PairlessCasRegistry))
+    message = str(excinfo.value)
+    assert "commit_cas's stale_read_generation refusal DROPPED the generation pair" in message
+    assert "captured_generation=2, owner_generation=3" in message
+    assert "captured_generation=None, owner_generation=None" in message
+
+
+def test_pairless_batch_stub_fails_commit_all_pair_scenario() -> None:
+    """THE TEETH for the ``commit_all`` refusal-pair scenario: a batch that names
+    its refused members without their pairs MUST FAIL the kit."""
+    with pytest.raises(AssertionError) as excinfo:
+        kit.assert_commit_all_refusals_carry_each_members_generation_pair(
+            _OneStoreFactory(_PairlessBatchRegistry)
+        )
+    message = str(excinfo.value)
+    assert (
+        "commit_all's stale_read_generation refusal for the fenced member DROPPED the "
+        "generation pair" in message
+    )
+    assert "captured_generation=2, owner_generation=3" in message
+
+
+def test_pairless_fence_raise_stub_fails_fenced_persist_pair_scenario() -> None:
+    """THE TEETH for the fenced-persist refusal-pair scenario: a raise that keeps
+    its type and message but drops the pair MUST FAIL the kit."""
+    with pytest.raises(AssertionError) as excinfo:
+        kit.assert_fenced_persist_raise_carries_the_generation_pair(
+            _OneStoreFactory(_PairlessFenceRaiseRegistry)
+        )
+    message = str(excinfo.value)
+    assert (
+        "set_artifact_and_content's StaleReadGeneration raise DROPPED the generation pair"
+        in message
+    )
+    assert "captured_generation=2, owner_generation=3" in message
+
+
+def test_fence_only_pair_stub_fails_the_other_reasons() -> None:
+    """A binding that fills the pair only on the fence reason MUST FAIL both the
+    ``other_holder`` check (``commit_cas``) and the claim-holding
+    ``version_mismatch`` check (``commit_all``). Each scenario checks its fence
+    refusal first, so these failures also show the stub's fence leg passed:
+    the kit fails it for the reasons it drops, not for the one it keeps."""
+    factory: RegistryFactory = _OneStoreFactory(_FenceOnlyPairRegistry)
+    with pytest.raises(AssertionError) as excinfo:
+        kit.assert_commit_cas_refusals_carry_the_generation_pair(factory)
+    assert "commit_cas's other_holder refusal DROPPED the generation pair" in str(excinfo.value)
+
+    with pytest.raises(AssertionError) as excinfo:
+        kit.assert_commit_all_refusals_carry_each_members_generation_pair(
+            _OneStoreFactory(_FenceOnlyPairRegistry)
+        )
+    assert (
+        "commit_all's version_mismatch refusal for the overtaken member DROPPED the "
+        "generation pair" in str(excinfo.value)
+    )
+
+
+class _InvalidOnlyBumpRegistry:
+    """A degraded backend that moves ``owner_generation`` on leaving EXCLUSIVE
+    or MODIFIED under a bump trigger only when the holder lands INVALID. A
+    holder that gives back its own write grant and keeps a read lands SHARED,
+    so its claim is revoked with the epoch left behind. Everything else is the
+    real in-memory registry."""
+
+    def __init__(self) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def set_agent_state(self, artifact_id: UUID, agent_id: UUID, state: MESIState, **kwargs: object) -> None:
+        record = self._inner._records[artifact_id]  # noqa: SLF001 - test stub reaches in
+        epoch = record.owner_generation
+        self._inner.set_agent_state(artifact_id, agent_id, state, **kwargs)  # type: ignore[arg-type]
+        # THE INJECTED BUG: the real registry bumped on leaving M/E whatever the
+        # target; this stub takes the bump back unless the holder landed INVALID.
+        if state != MESIState.INVALID:
+            record.owner_generation = epoch
+
+
+def test_invalid_only_bump_stub_fails_the_release_to_reader_leg() -> None:
+    """THE TEETH for the release-to-reader leg. A backend that moves the epoch
+    only when a released holder lands INVALID MUST FAIL the voluntary-release
+    scenario: a holder that gives back its write grant and keeps a read would
+    have its commit on that claim admitted at a version that never moved. The
+    scenario checks the release to INVALID first, so a failure naming a
+    release-to-reader route also shows the stub's INVALID leg passed: the kit
+    fails it for the SHARED landing it skips, not for the one it bumps on."""
+    with pytest.raises(AssertionError) as excinfo:
+        kit.assert_epoch_moves_on_voluntary_release(_OneStoreFactory(_InvalidOnlyBumpRegistry))
+    message = str(excinfo.value)
+    assert "set_agent_state from EXCLUSIVE" in message, message
+    assert "landing SHARED instead of INVALID does not exempt it" in message, message
+
+
+# The gap a binding leaves when it decides a refusal, then reads the pair in a
+# second step. A real (GIL-releasing) sleep, so the race's mutator runs inside
+# it, as in _TornPairRegistry.
+_FOLLOW_UP_WINDOW_SECONDS = 0.0005
+
+_OWNER_LEG, _BOTH_LEGS = "owner", "both"
+_CAS, _BATCH, _FENCE = "commit_cas", "commit_all", "fence"
+
+
+class _FollowUpReadRegistry:
+    """A degraded backend that decides every refusal on the right snapshot but
+    fills the pair from a second read after it, at ONE entry point:
+    ``commit_cas``, ``commit_all`` per member, or the fenced persist's raise.
+    With ``legs="owner"`` only ``owner_generation`` is re-read, and the decided
+    ``captured_generation`` is kept; with ``legs="both"`` both are re-read.
+    Reason, version and message stay the decision's. Everything else is the
+    real in-memory registry, so the sequential refusal-pair scenarios pass it:
+    only a race can see the re-read."""
+
+    def __init__(self, entry: str, legs: str) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+        self._entry, self._legs = entry, legs
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def _reread(self, artifact_id: UUID, agent_id: UUID, decided: int | None) -> tuple[int | None, int | None]:
+        owner = self._inner.get_owner_generation(artifact_id)
+        captured = self._inner.get_read_generation(artifact_id, agent_id) if self._legs == _BOTH_LEGS else decided
+        # The no-claim rule still holds on the re-read: no claim, no pair.
+        return (None, None) if captured is None else (captured, owner)
+
+    def _refill(self, detail: ConflictDetail, artifact_id: UUID, agent_id: UUID) -> ConflictDetail:
+        captured, owner = self._reread(artifact_id, agent_id, detail.captured_generation)
+        return ConflictDetail(
+            detail.reason, detail.current_version, captured_generation=captured, owner_generation=owner
+        )
+
+    def commit_cas(self, artifact_id: UUID, agent_id: UUID, **kwargs: object) -> CasResult:
+        result = self._inner.commit_cas(artifact_id, agent_id, **kwargs)  # type: ignore[arg-type]
+        if self._entry != _CAS or not isinstance(result, ConflictDetail):
+            return result
+        time.sleep(_FOLLOW_UP_WINDOW_SECONDS)
+        return self._refill(result, artifact_id, agent_id)
+
+    def commit_all(self, agent_id: UUID, writes: object, **kwargs: object) -> object:
+        result = self._inner.commit_all(agent_id, writes, **kwargs)  # type: ignore[arg-type]
+        if self._entry != _BATCH or not isinstance(result, MultiCommitConflict):
+            return result
+        time.sleep(_FOLLOW_UP_WINDOW_SECONDS)
+        return MultiCommitConflict(
+            per_artifact={
+                art: self._refill(detail, art, agent_id) for art, detail in result.per_artifact.items()
+            }
+        )
+
+    def set_artifact_and_content(self, artifact_id: UUID, *args: object, **kwargs: object) -> None:
+        try:
+            self._inner.set_artifact_and_content(artifact_id, *args, **kwargs)  # type: ignore[arg-type]
+        except StaleReadGeneration as exc:
+            if self._entry != _FENCE:
+                raise
+            time.sleep(_FOLLOW_UP_WINDOW_SECONDS)
+            fenced = kwargs["fence_agent_id"]
+            captured, owner = self._reread(artifact_id, fenced, exc.captured_generation)  # type: ignore[arg-type]
+            raise StaleReadGeneration(
+                *exc.args, captured_generation=captured, owner_generation=owner
+            ) from None
+
+
+_RACES = {
+    _CAS: kit.assert_commit_refusal_pairs_come_from_the_decision_snapshot,
+    _BATCH: kit.assert_commit_refusal_pairs_come_from_the_decision_snapshot,
+    _FENCE: kit.assert_fenced_persist_raise_pair_comes_from_the_decision_snapshot,
+}
+_ENTRY_IN_MESSAGE = {
+    _CAS: "commit_cas's",
+    _BATCH: "commit_all's",
+    _FENCE: "set_artifact_and_content's StaleReadGeneration raise",
+}
+
+
+@pytest.mark.parametrize("legs", [_OWNER_LEG, _BOTH_LEGS])
+@pytest.mark.parametrize("entry", [_CAS, _BATCH, _FENCE])
+def test_follow_up_read_stub_fails_its_race(entry: str, legs: str) -> None:
+    """THE TEETH for the snapshot rule. A binding that refuses correctly but reads the pair
+    after the decision MUST FAIL the race for its entry point (the commit race for the
+    two commit routes, the fence race for the fenced persist), as a snapshot violation naming
+    that entry point, never as a starved run."""
+    factory: RegistryFactory = _OneStoreFactory(partial(_FollowUpReadRegistry, entry, legs))  # type: ignore[arg-type]
+    with pytest.raises(AssertionError) as excinfo:
+        _RACES[entry](factory)
+    message = str(excinfo.value)
+    assert kit.SNAPSHOT_VIOLATION in message, message
+    assert _ENTRY_IN_MESSAGE[entry] in message, message
+    assert kit.STARVED_RACE not in message
+
+
+def test_follow_up_read_stub_passes_the_sequential_pair_scenarios() -> None:
+    """The re-read is invisible without concurrency: each follow-up-read stub
+    passes its entry point's sequential refusal-pair scenario, so the races
+    above are what catch it."""
+    sequential = {
+        _CAS: kit.assert_commit_cas_refusals_carry_the_generation_pair,
+        _BATCH: kit.assert_commit_all_refusals_carry_each_members_generation_pair,
+        _FENCE: kit.assert_fenced_persist_raise_carries_the_generation_pair,
+    }
+    for entry, scenario in sequential.items():
+        for legs in (_OWNER_LEG, _BOTH_LEGS):
+            scenario(_OneStoreFactory(partial(_FollowUpReadRegistry, entry, legs)))  # type: ignore[arg-type]
+
+
+# The thread each race's actor runs in, by the name of its mutator's thread.
+_ACTOR_OF_MUTATOR = {
+    kit.COMMIT_RACE_MUTATOR_THREAD: kit.COMMIT_RACE_COMMITTER_THREAD,
+    kit.FENCE_RACE_MUTATOR_THREAD: kit.FENCE_RACE_ZOMBIE_THREAD,
+}
+
+
+class _StarvedMutatorRegistry:
+    """A correct backend on a runner that never schedules a race's mutator
+    while the actor runs: the mutator's first move waits for the actor's
+    thread to finish, so every refusal lands on the race's starting state."""
+
+    def __init__(self) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def set_agent_state(self, *args: object, **kwargs: object) -> None:
+        actor = _ACTOR_OF_MUTATOR.get(threading.current_thread().name)
+        for thread in threading.enumerate():
+            if thread.name == actor:
+                thread.join()
+        self._inner.set_agent_state(*args, **kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("race", [_CAS, _FENCE], ids=["commit_race", "fence_race"])
+def test_starved_race_fails_as_starved_not_as_a_snapshot_violation(race: str) -> None:
+    """A run whose mutator never ran beside the actor proves nothing, so it
+    must FAIL rather than pass, and with its own message: a correct backend
+    reported as a snapshot violation would send its author after a bug it does not
+    have."""
+    with pytest.raises(AssertionError) as excinfo:
+        _RACES[race](_OneStoreFactory(_StarvedMutatorRegistry))
+    message = str(excinfo.value)
+    assert kit.STARVED_RACE in message, message
+    assert kit.SNAPSHOT_VIOLATION not in message
+
+
+# Every per-identity map an in-memory record keeps: one row's worth of state.
+_PER_AGENT_MAPS = (
+    "state_by_agent", "transient_by_agent", "transient_tick_by_agent", "granted_at_tick_by_agent",
+    "last_reclamation_by_agent", "read_generation_by_agent", "last_observed_version_by_agent",
+)
+
+
+def _drop_row(record: object, agent_id: UUID) -> None:
+    for name in _PER_AGENT_MAPS:
+        getattr(record, name).pop(agent_id, None)
+
+
+def _reclaim_rows(inner: ArtifactRegistry, agent_id: UUID) -> list:
+    records = inner._records.values()  # noqa: SLF001 - test stub reaches in
+    return [record for record in records if agent_id in record.last_reclamation_by_agent]
+
+
+def _forget_unchecked(inner: ArtifactRegistry, agent_id: UUID) -> int:
+    """The delete with no checks: every row but a writer's, and the heartbeat."""
+    doomed = [
+        record for record in inner._records.values()  # noqa: SLF001 - test stub reaches in
+        if agent_id in record.state_by_agent and record.state_by_agent[agent_id] not in _M_OR_E
+    ]
+    for record in doomed:
+        _drop_row(record, agent_id)
+    inner._heartbeat_by_agent.pop(agent_id, None)  # noqa: SLF001 - test stub reaches in
+    return len(doomed)
+
+
+def _forget_dropping_reclaim_rows(inner: ArtifactRegistry, agent_id: UUID) -> int:
+    """Forgets correctly, then deletes the rows that record a reclaim as well."""
+    reclaim_rows = _reclaim_rows(inner, agent_id)
+    removed = inner.forget_agent(agent_id)
+    for record in reclaim_rows:
+        _drop_row(record, agent_id)
+    return removed
+
+
+def _forget_keeping_a_reader(inner: ArtifactRegistry, agent_id: UUID) -> int:
+    """Forgets correctly, then puts back the state each kept reclaim row had,
+    so an identity that read the file again stays a reader."""
+    prior = [(record, record.state_by_agent.get(agent_id)) for record in _reclaim_rows(inner, agent_id)]
+    removed = inner.forget_agent(agent_id)
+    for record, state in prior:
+        if state is not None:
+            record.state_by_agent[agent_id] = state
+    return removed
+
+
+def _forget_after_a_partial_delete(inner: ArtifactRegistry, agent_id: UUID) -> int:
+    """Refuses a writer, but only after deleting its other rows and its heartbeat."""
+    try:
+        return inner.forget_agent(agent_id)
+    except ValueError:
+        _forget_unchecked(inner, agent_id)
+        raise
+
+
+def _forget_refusing_untyped(inner: ArtifactRegistry, agent_id: UUID) -> int:
+    """Refuses a writer in the same words, but as a plain ``ValueError``."""
+    try:
+        return inner.forget_agent(agent_id)
+    except ForgetRefused as exc:
+        raise ValueError(str(exc)) from None
+
+
+def _forget_keeping_the_transient(inner: ArtifactRegistry, agent_id: UUID) -> int:
+    """Forgets correctly, then puts back each transient state and its tick."""
+    kept = [
+        (record, record.transient_by_agent[agent_id], record.transient_tick_by_agent[agent_id])
+        for record in inner._records.values()  # noqa: SLF001 - test stub reaches in
+        if agent_id in record.transient_by_agent
+    ]
+    removed = inner.forget_agent(agent_id)
+    for record, transient, tick in kept:
+        record.transient_by_agent[agent_id] = transient
+        record.transient_tick_by_agent[agent_id] = tick
+    return removed
+
+
+def _forget_keeping_the_heartbeat(inner: ArtifactRegistry, agent_id: UUID) -> int:
+    """Forgets correctly, then puts the heartbeat back."""
+    heartbeats = inner._heartbeat_by_agent  # noqa: SLF001 - test stub reaches in
+    tick = heartbeats.get(agent_id)
+    removed = inner.forget_agent(agent_id)
+    if tick is not None:
+        heartbeats[agent_id] = tick
+    return removed
+
+
+def _forget_counting_kept_rows(inner: ArtifactRegistry, agent_id: UUID) -> int:
+    """Forgets correctly, but counts the reclaim rows it keeps as removed too."""
+    kept = len(_reclaim_rows(inner, agent_id))
+    return inner.forget_agent(agent_id) + kept
+
+
+def _forget_by_file(inner: ArtifactRegistry, agent_id: UUID) -> int:
+    """Forgets correctly, then deletes every other row on the files whose row
+    it deleted: a delete keyed by file instead of by identity."""
+    files = [
+        record for record in inner._records.values()  # noqa: SLF001 - test stub reaches in
+        if agent_id in record.state_by_agent and agent_id not in record.last_reclamation_by_agent
+    ]
+    removed = inner.forget_agent(agent_id)
+    for record in files:
+        for other in list(record.state_by_agent):
+            _drop_row(record, other)
+    return removed
+
+
+def _forget_refusing_beside_a_writer(inner: ArtifactRegistry, agent_id: UUID) -> int:
+    """Refuses while ANY identity holds a write grant on a file this one has a
+    row on, so a peer's grant blocks the forget."""
+    for artifact_id, record in inner._records.items():  # noqa: SLF001 - test stub reaches in
+        if agent_id in record.state_by_agent and _M_OR_E.intersection(record.state_by_agent.values()):
+            raise forget_refusal(agent_id, artifact_id)
+    return inner.forget_agent(agent_id)
+
+
+# Each forget variant by the obligation it drops.
+_FORGET_VARIANTS = {
+    "no_refusal": _forget_unchecked,
+    "no_reclaim_row": _forget_dropping_reclaim_rows,
+    "reader_kept": _forget_keeping_a_reader,
+    "partial_refusal": _forget_after_a_partial_delete,
+    "untyped_refusal": _forget_refusing_untyped,
+    "heartbeat_kept": _forget_keeping_the_heartbeat,
+    "transient_kept": _forget_keeping_the_transient,
+    "miscounted": _forget_counting_kept_rows,
+    "peer_touched": _forget_by_file,
+    "peer_refused": _forget_refusing_beside_a_writer,
+}
+
+
+class _ForgetDroppingRegistry:
+    """A degraded backend whose ``forget_agent`` drops ONE of its obligations:
+    it runs the :data:`_FORGET_VARIANTS` entry named ``dropped``, whose
+    docstring says which. Everything else is the real in-memory registry."""
+
+    def __init__(self, dropped: str) -> None:
+        self._inner = ArtifactRegistry(retain_versions=True)
+        self._forget = _FORGET_VARIANTS[dropped]
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    def forget_agent(self, agent_id: UUID) -> int:
+        return self._forget(self._inner, agent_id)
+
+
+@pytest.mark.parametrize(
+    ("dropped", "named"),
+    [
+        ("no_refusal", kit.FORGET_REFUSED_WHILE_WRITING),
+        ("no_reclaim_row", kit.FORGET_DROPPED_RECLAIM_ROW),
+        ("reader_kept", kit.FORGET_KEPT_A_READER),
+        ("partial_refusal", kit.FORGET_CHANGED_WHILE_REFUSING),
+        ("untyped_refusal", kit.FORGET_REFUSED_UNTYPED),
+        ("heartbeat_kept", kit.FORGET_KEPT_THE_HEARTBEAT),
+        ("transient_kept", kit.FORGET_KEPT_THE_TRANSIENT),
+        ("miscounted", kit.FORGET_MISCOUNTED),
+        ("peer_touched", kit.FORGET_TOUCHED_A_PEER),
+        ("peer_refused", kit.FORGET_REFUSED_FOR_A_PEER),
+    ],
+)
+def test_forget_dropping_stub_fails_the_forget_scenario(dropped: str, named: str) -> None:
+    """THE TEETH for the forget scenario. A backend that drops any one of the
+    forget's obligations MUST FAIL the kit, and the failure names the one it
+    dropped: forgetting past a held write grant, deleting the row that records
+    a reclaim, leaving that row as a reader, deleting before a refusal,
+    refusing with a plain ``ValueError``, keeping the heartbeat, keeping a
+    transient state, miscounting, touching a peer's row, or refusing on a
+    peer's write grant."""
+    factory: RegistryFactory = _OneStoreFactory(partial(_ForgetDroppingRegistry, dropped))  # type: ignore[arg-type]
+    with pytest.raises(AssertionError) as excinfo:
+        kit.assert_forget_agent_forgets_only_an_ended_identity(factory)
+    assert named in str(excinfo.value), str(excinfo.value)
 
 
 def test_degraded_stub_fails_single_writer_scenario() -> None:

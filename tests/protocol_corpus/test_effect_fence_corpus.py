@@ -85,12 +85,13 @@ _EXPECTED_HOLD_REASONS: frozenset[str] = frozenset({
     "grant_preempted",
     "input_vanished",
     "version_unconfirmed",
+    "split_pair",
     "read_denied",
     "content_claim_absent",
     "generation_unconfirmed",
 })
-_EXPECTED_HOLD_REASON_COUNT = 8
-_EXPECTED_FIXTURE_COUNT = 13
+_EXPECTED_HOLD_REASON_COUNT = 9
+_EXPECTED_FIXTURE_COUNT = 14
 
 # The complete verdict/error envelope. Every key any fixture may assert.
 # ``degraded``/``held_by`` belong to the two degraded arms, which a fixture

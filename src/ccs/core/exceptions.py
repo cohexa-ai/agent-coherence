@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from typing import Protocol, TypeGuard
 from uuid import UUID
 
 # Wire-stable reason string for the retry-eligible OCC precondition where a peer
@@ -29,7 +30,9 @@ STALE_READ_GENERATION_REASON = "stale_read_generation"
 #
 # Honest limits of the discriminator: VERSION_MOVED, GRANT_RECLAIMED,
 # GRANT_PREEMPTED, INPUT_VANISHED, READ_DENIED and CONTENT_CLAIM_ABSENT are
-# recoverable — reacquire, re-decide, re-gate. GENERATION_UNCONFIRMED is the
+# recoverable — reacquire, re-decide, re-gate. SPLIT_PAIR is recoverable too,
+# but not by a reacquire: the bytes on disk stay unrecorded until a write
+# records them. GENERATION_UNCONFIRMED is the
 # residual bucket and is NOT a clean
 # permanent/transient signal: a degraded read, an unconfirmable foreign edit,
 # and a coordinator that predates generation reporting all land there. Treat it
@@ -48,6 +51,15 @@ HOLD_GRANT_RECLAIMED = "grant_reclaimed"
 HOLD_GRANT_PREEMPTED = "grant_preempted"
 HOLD_INPUT_VANISHED = "input_vanished"
 HOLD_VERSION_UNCONFIRMED = "version_unconfirmed"
+# The coordinator refused the re-validate read because the bytes are not the
+# content it records at the version, which has not moved: a peer's write()
+# whose bytes landed before its commit, a change made outside the coordinator,
+# a commit's disk write failed (#405), or a write whose commit never reached the
+# coordinator (#526). The same answer a version-checked read refuses as the
+# split pair (#264), hence the same value as SPLIT_PAIR_REASON. Split out of READ_DENIED because its recovery differs: a
+# reacquire returns the bytes on disk but does not record them, so the hold
+# repeats until the peer's commit lands or a write() records them.
+HOLD_SPLIT_PAIR = "split_pair"
 HOLD_READ_DENIED = "read_denied"
 # The coordinator records NO content claim for this artifact at all — the
 # recorded hash is absent, empty, or the all-``f`` launch-gate sentinel — so it
@@ -75,6 +87,7 @@ HOLD_REASONS: frozenset[str] = frozenset(
         HOLD_GRANT_PREEMPTED,
         HOLD_INPUT_VANISHED,
         HOLD_VERSION_UNCONFIRMED,
+        HOLD_SPLIT_PAIR,
         HOLD_READ_DENIED,
         HOLD_CONTENT_CLAIM_ABSENT,
         HOLD_GENERATION_UNCONFIRMED,
@@ -290,24 +303,28 @@ SESSION_BEGIN_CAP_REASONS: frozenset[str] = frozenset(
 # Machine-readable signals carried by ``StoreNeedsRecoveryError.reason``
 # (``ccs.coordinator.sqlite_registry``). INTERNAL routing values, not the wire
 # contract: the CLI's JSON ``reason`` slugs (``needs_recovery`` / ``db_busy`` /
-# ``db_corrupt``) stay owned by the resolver error classes. sqlite renders its
-# operational errors as prose, so SOME substring matching is unavoidable — it
-# happens in exactly ONE place (``classify_sqlite_operational_signal``), and
-# every consumer branches on ``exc.reason == CONSTANT`` from here, never on a
-# substring of the human message (the typed-signal-not-substring house rule,
+# ``db_corrupt``) stay owned by the resolver error classes. They are chosen by
+# SQLite's error code in exactly ONE place
+# (``classify_sqlite_operational_signal``), and every consumer branches on
+# ``exc.reason == CONSTANT`` from here, never on a substring of the human
+# message (the typed-signal-not-substring house rule,
 # ``docs/solutions/best-practices/typed-signal-not-substring-...``).
 STORE_SIGNAL_WAL_RECOVERY = "wal_recovery"
-"""A hot WAL a read-only connection cannot replay (SQLITE_READONLY_RECOVERY).
-Remedy: re-open once with the embedder (read-write) to checkpoint the WAL."""
+"""Another process holds the store's WAL index in a state a read-only reader
+cannot rebuild (SQLITE_READONLY_RECOVERY). A crashed writer's WAL does not
+produce this: a read-only open reads it in place. Remedy: retry once that
+process exits, or resolve a copy of ``state.db`` and ``-wal``."""
 
 STORE_SIGNAL_BUSY = "busy"
-"""The store is locked by a concurrent writer (SQLITE_BUSY); retry shortly."""
+"""The store is locked by a concurrent writer (SQLITE_BUSY / SQLITE_LOCKED);
+retry shortly."""
 
 STORE_SIGNAL_UNREADABLE = "unreadable"
-"""The catch-all: the read-only connection could not read the store for a
-reason that is neither a recognized recovery state nor a lock. The operator
-remedy matches ``wal_recovery`` (re-open with the embedder), so consumers may
-fold this into their needs-recovery surface."""
+"""The store cannot be read as it is: this user cannot reach or read it,
+SQLite must create a sidecar in a directory it cannot write, a writer left a
+hot rollback journal, or another SQLite error. The message names the code
+and the step that works; consumers fold this into their needs-recovery
+surface."""
 
 STORE_OPEN_SIGNALS: frozenset[str] = frozenset(
     {STORE_SIGNAL_WAL_RECOVERY, STORE_SIGNAL_BUSY, STORE_SIGNAL_UNREADABLE}
@@ -341,6 +358,63 @@ STORE_OPEN_SIGNALS: frozenset[str] = frozenset(
 CROSS_RUNTIME_SCHEMA_REASON = "cross_runtime_schema"
 
 # ---------------------------------------------------------------------------
+# schema-version refusal reasons (#345)
+# ---------------------------------------------------------------------------
+#
+# ``SchemaVersionError.reason`` (defined in ``ccs.coordinator.sqlite_registry``
+# for the same layering reason as the cross-runtime class above) says WHICH
+# refusal a store open raised, so a host can tell "upgrade this build" from
+# "this store is broken" without substring-matching the message (the
+# typed-signal-not-substring house rule). The error's ``found_version`` is
+# the store's raw ``user_version`` under the three version reasons (negative
+# under ``schema_unrecognized``) and ``None`` under the other two, so a host
+# branches on ``reason``, not on a version comparison. Wire-stable and
+# ADDITIVE: renaming a value is a wire break; add, do not mutate.
+SCHEMA_OLDER_REASON = "schema_older"
+"""The store is at an older Python registry schema that a read-only open
+will not migrate. Remedy: re-open it once with a writer (a coordinator start
+migrates it)."""
+
+SCHEMA_NEWER_REASON = "schema_newer"
+"""The store is stamped past this build's schema: a newer Python coordinator,
+or a sibling-runtime ledger this build does not recognize, wrote it. Remedy:
+use a build that understands that schema; no build migrates down."""
+
+SCHEMA_UNRECOGNIZED_REASON = "schema_unrecognized"
+"""The store's ``user_version`` is negative: no coordinator build stamps it.
+Remedy: restore the store from a backup."""
+
+REGISTRY_META_INCOMPLETE_REASON = "registry_meta_incomplete"
+"""``registry_meta`` lacks, or holds an unreadable value for, a key every store
+carries (``instance_id``, ``sequence_number`` or ``coordinator_epoch``).
+Raised after a migration step as well as on a current store, so the error
+carries no found version. Remedy: restore the store from a backup."""
+
+SCHEMA_VERSION_REASONS: frozenset[str] = frozenset(
+    {
+        SCHEMA_OLDER_REASON,
+        SCHEMA_NEWER_REASON,
+        SCHEMA_UNRECOGNIZED_REASON,
+        REGISTRY_META_INCOMPLETE_REASON,
+        CROSS_RUNTIME_SCHEMA_REASON,
+    }
+)
+
+# ---------------------------------------------------------------------------
+# one read-write handle per store (#453)
+# ---------------------------------------------------------------------------
+#
+# ``StoreHeldError.reason`` (defined in ``ccs.coordinator.sqlite_registry`` for
+# the same layering reason as the schema classes above). The workspace CLI's
+# JSON envelope and the store check carry it, so it is wire-stable: add, do
+# not mutate.
+STORE_HELD_REASON = "store_held"
+"""Another read-write handle has the store open: a coordinator, or a registry
+in this or another process. A store has one writer. Remedy: go through that
+handle (a coordinator's routes), open with ``read_only=True`` to read, or
+retry once it closes."""
+
+# ---------------------------------------------------------------------------
 # caller-principal refusal reasons (coordinator caller principal, U4)
 # ---------------------------------------------------------------------------
 #
@@ -359,9 +433,10 @@ CROSS_RUNTIME_SCHEMA_REASON = "cross_runtime_schema"
 # hold invites a retry, and no retry supplies a principal the caller never had.
 CALLER_PRINCIPAL_ABSENT_REASON = "caller_principal_absent"
 """The request names an identity but presents no caller principal. On the wire
-a route sends it only for an identity that is BOUND: a request presenting none
-for an identity nobody has claimed is a client predating the principal, and is
-admitted (KTD15)."""
+a route sends it for an identity that is BOUND, and ``POST /hooks/pre-edit``
+also for a request that opts in with ``if_unheld: true``, whatever identity it
+names. Any other request presenting none for an identity nobody has claimed is
+a client predating the principal, and is admitted."""
 
 CALLER_PRINCIPAL_FOREIGN_REASON = "caller_principal_foreign"
 """The request presents a caller principal that is not the one bound to the
@@ -532,8 +607,18 @@ protocol corpus's coverage check, matches against."""
 # byte-stable coordinator ``permissionDecisionReason`` prose (the model's retry
 # loop depends on that stability, auto-memory
 # ``project_cc_strict_mode_retry_hazard``; the typed-signal-not-substring house
-# rule). Renaming a value is a wire break; add, do not mutate.
+# rule). Renaming a value is a wire break; add, do not mutate. One exception
+# carries a second value per instance: the split-pair read refusal (#264) is a
+# :class:`StaleView` whose instance ``.reason`` is :data:`SPLIT_PAIR_REASON`,
+# while the mapper keeps answering the class's :data:`STALE_VIEW_REASON`.
 STALE_VIEW_REASON = "stale_view"
+#: The instance reason of the :class:`StaleView` a read raises when the bytes
+#: on disk are not the content the coordinator records at its current version
+#: (#264; ``read()`` too since #405): a peer's commit whose bytes have not
+#: landed yet, or an out-of-band edit. It names the split, not its cause. The
+#: effect fence's hold for the same answer carries it as well, beside
+#: ``hold_cause`` :data:`HOLD_SPLIT_PAIR`.
+SPLIT_PAIR_REASON = "split_pair"
 COMMIT_PREEMPTED_REASON = "commit_preempted"
 VIEW_WEDGED_REASON = "view_wedged"
 COMMIT_UNCONFIRMED_REASON = "commit_unconfirmed"
@@ -550,16 +635,104 @@ INTERNAL_CONCURRENCY_REASON = "internal_concurrency_error"
 # longer matches the coordinator's current version. Typed-conflict, NOT
 # auto-merge — the agent re-reads at current_version, re-merges, and retries.
 VERSION_MISMATCH_REASON = "version_mismatch"
-# Type B — synthesized by the mapper (no adapter raise-site) when the volume is
-# unattached / coordinator transport failed; the write is NOT version-committed.
+# No usable answer from the coordinator; the write is NOT version-committed.
+# Two producers share it: the MCP mapper synthesizes it for a volume that is
+# not attached (Type B), and it is the class reason of
+# :class:`CoordinatorUnreachable`, which the strict surfaces raise.
 COORDINATOR_UNAVAILABLE_REASON = "coordinator_unavailable"
+#: The class reason of :class:`CoordinatorFailed`: the coordinator answered a
+#: read, or a volume's release of an earlier attempt's write grant (#401), with
+#: its failure envelope (#259), or could not decide a refuse-mode grant request
+#: in time.
+COORDINATOR_FAILED_REASON = "coordinator_failed"
+#: The coordinator's refusal of a ``pre-edit`` that opted in with
+#: ``if_unheld: true`` and that it could not decide in time. A live, busy
+#: coordinator answers it, so it is not :data:`COORDINATOR_UNAVAILABLE_REASON`.
+#: A request that did not opt in still gets the degraded admit.
+UNAVAILABLE_REASON = "unavailable"
+#: The class reason of :class:`OtherHolder`: another agent holds the artifact
+#: EXCLUSIVE or MODIFIED. A ``pre-edit`` that opted in with ``if_unheld: true``
+#: is refused with it, and ``post-edit-cas`` returns the same value when a
+#: commit meets a holder. The two routes ask different things of a client (back
+#: off, against re-read and retry), so a client reads it by route. Not
+#: :data:`HANDOFF_OTHER_HOLDER_REASON`, which refuses a transfer.
+OTHER_HOLDER_REASON = "other_holder"
 
 
 class CoherenceError(Exception):
     """Base error for coherence domain failures."""
 
 
-class StaleReadGeneration(CoherenceError):
+def _is_handler_failure_reason(reason: object) -> bool:
+    """Whether ``reason`` is the coordinator's failure envelope's: a string
+    with :data:`HANDLER_FAILURE_REASON_PREFIX`, matched exactly, so a reason
+    worded any other way stays an ordinary refusal (#259)."""
+    return isinstance(reason, str) and reason.startswith(HANDLER_FAILURE_REASON_PREFIX)
+
+
+def _is_generation(value: object) -> TypeGuard[int]:
+    # bool is an int subclass, and True is no generation.
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _generation_pair(captured: object, owner: object) -> tuple[int, int] | None:
+    """A commit refusal's ``(captured_generation, owner_generation)``, or
+    ``None`` when the pair is absent or malformed.
+
+    Generations start at 0 and only grow, so a negative, a bool, a non-int or
+    a lone value is no generation, and half a pair names no lost token: the
+    pair is kept or dropped whole. The one rule for every place that parses or
+    emits the pair, so they cannot disagree. Never raises, because exception
+    constructors call it with whatever a response body held."""
+    if _is_generation(captured) and _is_generation(owner):
+        return captured, owner
+    return None
+
+
+class _PairCarrier(Protocol):
+    @property
+    def captured_generation(self) -> int | None: ...
+
+    @property
+    def owner_generation(self) -> int | None: ...
+
+
+def _generation_pair_fields(refusal: _PairCarrier) -> dict[str, int]:
+    """A refusal's pair as two body or result keys, both or neither, so a
+    response never carries a null or half a pair."""
+    pair = _generation_pair(refusal.captured_generation, refusal.owner_generation)
+    if pair is None:
+        return {}
+    captured, owner = pair
+    return {"captured_generation": captured, "owner_generation": owner}
+
+
+class _CarriesGenerationPair:
+    """The keyword-only ``captured_generation`` / ``owner_generation`` a commit
+    refusal carries, kept or dropped whole by :func:`_generation_pair` and
+    never part of the message. Not an exception base, so it changes no
+    ``except`` clause; the class defaults keep both attributes on a subclass
+    that bypasses ``__init__``."""
+
+    captured_generation: int | None = None
+    owner_generation: int | None = None
+
+    def __init__(
+        self,
+        *args: object,
+        captured_generation: object = None,
+        owner_generation: object = None,
+    ) -> None:
+        super().__init__(*args)
+        self._adopt_generation_pair(captured_generation, owner_generation)
+
+    def _adopt_generation_pair(self, captured: object, owner: object) -> None:
+        pair = _generation_pair(captured, owner)
+        if pair is not None:
+            self.captured_generation, self.owner_generation = pair
+
+
+class StaleReadGeneration(_CarriesGenerationPair, CoherenceError):
     """The read-generation fence rejected a commit: the committer's
     read_generation is older than the artifact's current owner_generation --
     its captured ownership/read-claim was superseded by a sweep reclamation.
@@ -568,7 +741,32 @@ class StaleReadGeneration(CoherenceError):
     ``commit_cas`` path returns a :class:`ConflictDetail` with the same reason
     instead. Retry-eligible: ``reacquire()`` + fresh read + re-commit. Carries
     ``STALE_READ_GENERATION_REASON`` so the client classifier matches it
-    exactly (never on the human message)."""
+    exactly (never on the human message).
+
+    :attr:`captured_generation` and :attr:`owner_generation` are the two values
+    the fence compared, as on :class:`ConflictDetail`. They are keyword-only
+    and never enter the message, which stays whatever the raise site wrote;
+    both are ``None`` (the class default) when no valid pair was passed."""
+
+
+class CommitNotAllowed(_CarriesGenerationPair, CoherenceError):
+    """The coordinator refused a pessimistic commit because the committer does
+    not hold the artifact's write grant (M or E): a sweep reclaimed it, a peer
+    preempted it, or it never held one. Nothing landed.
+
+    Raised by ``CoordinatorService.commit``. The message is the refusal's
+    prose, ``commit_not_allowed ...`` (naming the reclaim trigger and tick
+    when a sweep reclaimed the grant).
+
+    :attr:`captured_generation` is the read_generation the coordinator
+    recorded at the committer's last claim; :attr:`owner_generation` is the
+    artifact's ownership generation. Both are read in the same decision as
+    the refusal. ``captured < owner`` means some write claim on the artifact
+    ended without a version move after the committer's claim was recorded (a
+    release, a reclaim or a handoff); it does not say why this committer
+    lost, and the two are not ordered otherwise. Both are ``None`` (the class
+    default) when the committer has no recorded claim. Keyword-only, never in
+    the message; recovery follows the refusal, never the pair."""
 
 
 class OccCallerTransientError(CoherenceError):
@@ -645,6 +843,65 @@ class CallerPrincipalRefused(CoherenceError):
         self.reason = reason
         self.settled = settled
 
+    def __reduce__(
+        self,
+    ) -> tuple[type[CallerPrincipalRefused], tuple[str, str], dict[str, object]]:
+        return type(self), (self.reason, str(self)), {**self.__dict__, "args": self.args}
+
+
+# A start's refusal of this workspace's ``.coherence`` (#498). One class-level
+# reason, so every surface (the exception, ``--check-store``, the workspace
+# envelope) answers one token; ``kind`` says which rule refused it. Wire-stable
+# and ADDITIVE, matched by ``reason == CONSTANT`` / ``kind in KINDS``, never by
+# a substring of the message.
+COHERENCE_DIR_REFUSED_REASON = "coherence_dir_refused"
+COHERENCE_LINK_KIND = "coherence_link"
+"""``.coherence`` is a symlink, or an entry directly inside it is one."""
+
+COHERENCE_NOT_A_DIRECTORY_KIND = "coherence_not_a_directory"
+"""``.coherence`` exists and is not a directory: a regular file, FIFO, socket or
+device."""
+
+COHERENCE_SPECIAL_ENTRY_KIND = "coherence_special_entry"
+"""An entry directly inside ``.coherence`` is a FIFO, socket or device, which no
+coordinator creates and whose open can block a start."""
+
+COHERENCE_DIR_REFUSAL_KINDS: frozenset[str] = frozenset(
+    {
+        COHERENCE_LINK_KIND,
+        COHERENCE_NOT_A_DIRECTORY_KIND,
+        COHERENCE_SPECIAL_ENTRY_KIND,
+    }
+)
+
+
+class CoherenceDirRefused(CoherenceError):
+    """A coordinator start refused this workspace's ``.coherence`` (#498): it is
+    a symlink or not a directory, or it holds a symlink, FIFO, socket or device
+    directly inside it. Nothing was written, joined or probed.
+
+    Not a :class:`CoordinatorUnreachable`: no retry, and no coordinator started
+    later, clears it. A person replaces the link or mounts a directory at
+    ``.coherence``, then builds a new volume or session. Carries
+    :data:`COHERENCE_DIR_REFUSED_REASON` on the class; ``kind`` (one of
+    :data:`COHERENCE_DIR_REFUSAL_KINDS`) says which rule refused it, and
+    ``path`` is the refused path, raw: a CLI escapes it before printing. It
+    rebuilds from its three fields, so it pickles whole across a process
+    boundary.
+    """
+
+    reason = COHERENCE_DIR_REFUSED_REASON
+
+    def __init__(self, kind: str, path: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.path = path
+
+    def __reduce__(
+        self,
+    ) -> tuple[type[CoherenceDirRefused], tuple[str, str, str], dict[str, object]]:
+        return type(self), (self.kind, self.path, str(self)), {**self.__dict__, "args": self.args}
+
 
 class GiverFenced(CoherenceError):
     """The committer handed this path off, and the handoff is still live: its
@@ -683,6 +940,97 @@ class GiverFenced(CoherenceError):
         self.successor = successor
         self.version_at_transfer = version_at_transfer
 
+    def __reduce__(
+        self,
+    ) -> tuple[
+        type[GiverFenced],
+        tuple[object, UUID | str, int],
+        dict[str, object],
+    ]:
+        return (
+            type(self),
+            (self.artifact_id, self.successor, self.version_at_transfer),
+            {**self.__dict__, "args": self.args},
+        )
+
+
+class OtherHolder(CoherenceError):
+    """Another agent holds the artifact EXCLUSIVE or MODIFIED, so a write that
+    asked to take it only if nobody holds it is refused, and nothing changed
+    hands: the holder keeps its grant and the caller gains none.
+
+    The caller backs off, then reads the artifact again before it writes: a write
+    built without reading overwrites whatever the holder committed once the
+    artifact comes free. The holder lets go when it releases the artifact, hands
+    it on, or is reclaimed: by the Python coordinator's sweep, or, on the Node
+    coordinator, by an opted-in request once the grant is 30 minutes old.
+
+    Carries :data:`OTHER_HOLDER_REASON` on the class, so a consumer classifies
+    it by type or ``.reason``, never by the message, plus ``holder_agent_id``,
+    the agent the decision found holding. ``artifact_id`` names what was
+    refused: the artifact id in process, a path on a client. The holder is a
+    ``UUID`` in process and the wire string on a client, and the constructor
+    never parses either, because an exception constructor must not raise. It
+    rebuilds from its two fields, so it pickles whole across a process
+    boundary.
+    """
+
+    reason = OTHER_HOLDER_REASON
+
+    def __init__(self, artifact_id: object, holder_agent_id: UUID | str | None) -> None:
+        super().__init__(
+            f"{OTHER_HOLDER_REASON} artifact={artifact_id} holder={holder_agent_id} "
+            "(nothing changed hands: another agent holds this for writing. Back off, "
+            "then read the file again before you write: a write built without reading "
+            "overwrites what the holder committed. It is free once the holder releases "
+            "it, hands it on, or is reclaimed)"
+        )
+        self.artifact_id = artifact_id
+        self.holder_agent_id = holder_agent_id
+
+    def __reduce__(self) -> tuple[type[OtherHolder], tuple[object, UUID | str | None]]:
+        return (type(self), (self.artifact_id, self.holder_agent_id))
+
+
+#: Why a refuse-mode volume refused a write through a link out of its managed set.
+LINK_OUT_OF_MANAGED_REASON = "link_out_of_managed"
+
+
+class LinkOutOfManaged(CoherenceError):
+    """A volume built with ``on_held="refuse"`` was asked to write a path whose
+    name lies under its managed globs but which reaches, through a link on the
+    path, a file outside them. Nothing was sent and nothing was written.
+
+    The refusal of a held file applies on managed paths only, so the write would
+    take the file from whichever agent holds it, outside the guarantee the
+    volume was built for. Write the target by its own path from a volume that
+    may displace its holder, or point the link inside the managed set.
+
+    Carries :data:`LINK_OUT_OF_MANAGED_REASON` on the class, so a consumer
+    classifies it by type or ``.reason``, never by the message, plus ``path``
+    (as the caller wrote it), ``link`` (the link on it, relative to the
+    workspace root) and ``target`` (the file the write reaches, relative to the
+    root). It rebuilds from those three, so it pickles whole across a process
+    boundary.
+    """
+
+    reason = LINK_OUT_OF_MANAGED_REASON
+
+    def __init__(self, path: str, link: str, target: str) -> None:
+        super().__init__(
+            f"{LINK_OUT_OF_MANAGED_REASON} path={path} link={link} target={target} "
+            "(nothing was sent or written: the link lies under managed and leads to a "
+            "file outside it, where refuse mode cannot keep the file from its holder. "
+            "Write the target by its own path from a volume that may displace its "
+            "holder, or point the link inside managed)"
+        )
+        self.path = path
+        self.link = link
+        self.target = target
+
+    def __reduce__(self) -> tuple[type[LinkOutOfManaged], tuple[str, str, str]]:
+        return (type(self), (self.path, self.link, self.target))
+
 
 class CoherenceDegradedWarning(UserWarning):
     """Emitted once per adapter instance when a coherence error degrades to fallback.
@@ -711,6 +1059,13 @@ class HandoffPathsInvalid(ValueError):
     the request went out, which must read as an unknown outcome instead."""
 
 
+class ForgetRefused(ValueError):
+    """A registry's ``forget_agent`` refused, deleting nothing, because the
+    identity still holds a write grant (EXCLUSIVE or MODIFIED). A
+    ``ValueError``, and its own type so the coordinator logs and passes over
+    exactly this refusal: any other error inside a forget is a fault."""
+
+
 class InvalidTransitionError(CoherenceError):
     """Raised when the MESI transition table rejects a state transition."""
 
@@ -725,7 +1080,7 @@ class InvariantViolationError(CoherenceError):
     """Raised when a runtime invariant check fails."""
 
 
-class CasRetriesExhausted(CoherenceError):
+class CasRetriesExhausted(_CarriesGenerationPair, CoherenceError):
     """Raised when an optimistic-concurrency commit-CAS retry loop is exhausted.
 
     The typed terminal failure for the OCC write path (plan Unit 5, R6 /
@@ -742,10 +1097,11 @@ class CasRetriesExhausted(CoherenceError):
     not: another agent holds the grant at an unchanged version. Against the
     cross-process coordinator (``CoherentVolume``) nothing the caller does
     releases it. The holder does: a Claude Code session at its turn end, a
-    ``CoherentVolume`` at its own next ``write_cas`` of that file or any
-    ``write_cas`` retry, ``write_cas_at``, ``atomic_publish`` or
-    ``reacquire()`` (a ``session-stop`` naming only that volume's
-    ``session_id`` releases nothing). Otherwise the coordinator's reclaim
+    ``CoherentVolume`` when it calls ``release()`` on the file or ``close()``,
+    or at its own next ``write_cas`` of that file or any ``write_cas`` retry,
+    ``write_cas_at``, ``atomic_publish`` or ``reacquire()`` (a
+    ``session-stop`` naming only that volume's ``session_id`` releases
+    nothing). Otherwise the coordinator's reclaim
     does. In process (``AgentRuntime``) the loop's own re-fetch
     downgrades the holder, so ``other_holder`` there clears on the next attempt
     unless the holder re-acquires.
@@ -756,11 +1112,18 @@ class CasRetriesExhausted(CoherenceError):
     Carries :data:`CAS_EXHAUSTED_REASON` (MCP-C Unit 1) so the deny mapper
     classifies it by type; the wire reason ``cas_exhausted`` is deliberately
     distinct from the ``cas_retries_exhausted`` prose token in the message.
+
+    :attr:`captured_generation` and :attr:`owner_generation` are the LAST
+    refusal's pair, as on :class:`ConflictDetail`: the committer's recorded
+    claim and the artifact's ownership generation, read in that refusal's
+    decision. Both are ``None`` when that refusal carried none (no recorded
+    claim, or a coordinator that does not report them). Keyword-only and never
+    in the message; recovery follows the reason, never the pair.
     """
 
     reason = CAS_EXHAUSTED_REASON
-    #: Class default, so a subclass that bypasses ``__init__``
-    #: (``ConditionalPutRetriesExhausted``) still has the attribute.
+    #: Class defaults, so a subclass that bypasses ``__init__``
+    #: (``ConditionalPutRetriesExhausted``) still has the attributes.
     last_conflict_reason: str | None = None
 
     def __init__(
@@ -770,11 +1133,14 @@ class CasRetriesExhausted(CoherenceError):
         last_current_version: int,
         *,
         last_conflict_reason: str | None = None,
+        captured_generation: object = None,
+        owner_generation: object = None,
     ) -> None:
         # isinstance, not truthiness alone: the reason arrives from a JSON body,
         # and an exception constructor must never raise (see CasVersionConflict).
         if isinstance(last_conflict_reason, str) and last_conflict_reason:
             self.last_conflict_reason = last_conflict_reason
+        self._adopt_generation_pair(captured_generation, owner_generation)
         if self.last_conflict_reason is None:
             # No reason known (a raise site that does not pass one): the text
             # this message has always had.
@@ -794,6 +1160,19 @@ class CasRetriesExhausted(CoherenceError):
         self.attempts = attempts
         self.last_current_version = last_current_version
 
+    def __reduce__(
+        self,
+    ) -> tuple[
+        type[CasRetriesExhausted],
+        tuple[object, int, int],
+        dict[str, object],
+    ]:
+        return (
+            type(self),
+            (self.artifact_id, self.attempts, self.last_current_version),
+            {**self.__dict__, "args": self.args},
+        )
+
 
 class StaleView(CoherenceError):
     """Pre-edit deny (MCP-C Unit 1): this instance's view is INVALID — a peer
@@ -808,7 +1187,14 @@ class StaleView(CoherenceError):
     move", the generation pair answers "was the grant it was read under
     reclaimed" (a sweep reclamation advances the generation WITHOUT a version
     move). On every other raise path (the coordinator deny sites) all four stay
-    ``None``, so a generic ``except StaleView`` handler reads them uniformly."""
+    ``None``, so a generic ``except StaleView`` handler reads them uniformly.
+
+    ``reason`` is :data:`STALE_VIEW_REASON` except on a split pair, whose
+    instance carries :data:`SPLIT_PAIR_REASON` so a caller can tell it from
+    every other stale view by value: the refusal an observing read raises for
+    one (#264, #405), and the effect fence's ``split_pair`` hold. The MCP answer
+    stays ``stale_view`` for all of them: the mapper reads the class
+    constant."""
 
     reason = STALE_VIEW_REASON
     #: Version drift set by gate()'s HOLD; ``None`` on coordinator-raised instances.
@@ -830,14 +1216,21 @@ class StaleView(CoherenceError):
     current_generation: int | None = None
 
 
-class CommitPreempted(CoherenceError):
+class CommitPreempted(_CarriesGenerationPair, CoherenceError):
     """Post-edit deny (MCP-C Unit 1): the EXCLUSIVE grant was preempted /
     sweep-reclaimed AFTER the atomic disk write but BEFORE the commit landed, so
     the bytes may already be on disk *un-versioned* (disk ahead of the
     coordinator version). NOT only a concurrent edge — a lone sequential writer's
     grant can age out mid-write (crash-recovery sweep, default-on). Recover by
     re-reading fresh bytes and reconciling the pending buffer (agent-driven; v1
-    has no server reconcile primitive). Carries :data:`COMMIT_PREEMPTED_REASON`."""
+    has no server reconcile primitive). Carries :data:`COMMIT_PREEMPTED_REASON`.
+
+    :attr:`captured_generation` and :attr:`owner_generation` are the commit
+    refusal's pair, as on :class:`CommitNotAllowed`: ``captured < owner`` means
+    some write claim on the artifact ended without a version move after this
+    writer's claim was recorded (a sweep reclaim, for one). Both are ``None``
+    when the refusal carried none. Keyword-only and never in the message; the
+    recovery above holds whatever they say."""
 
     reason = COMMIT_PREEMPTED_REASON
 
@@ -957,12 +1350,130 @@ class RedirectRefused(CoherenceError):
 
 
 class CommitUnconfirmed(CoherenceError):
-    """OCC commit unconfirmed (MCP-C Unit 1): the coordinator transport failed
-    mid-commit, a false-negative ack — NOT a confirmed loss. The write may or may
-    not have landed; reconcile by re-reading, then retry only if absent. Carries
-    :data:`COMMIT_UNCONFIRMED_REASON`."""
+    """A commit's outcome is unknown (MCP-C Unit 1): a false-negative ack, NOT a
+    confirmed loss. Raised when a commit request got no usable answer after it
+    may have reached the coordinator, or an answer that decides nothing (the
+    coordinator's failure envelope, #259, or, on a strict volume, an HTTP 5xx,
+    which says nothing of whether the commit ran, #398): an OCC commit
+    (``write_cas``, ``write_cas_at``, ``atomic_publish``), a pessimistic
+    ``write()``'s post-edit, or any other commit request delivered and left
+    unanswered. It does not by itself mean the request was delivered: the
+    handoff verbs and the substrate's legs after its write landed raise it even
+    when the request was never sent, because the outcome they must reconcile is
+    the same. The write
+    may or may not have landed; reconcile by re-reading, then retry only if
+    absent. A pessimistic ``write()`` is the exception: its bytes are already
+    on disk, a read that refuses stale bytes refuses them until a write of the
+    path is recorded, so write the path again, which records it either way.
+    Carries :data:`COMMIT_UNCONFIRMED_REASON`."""
 
     reason = COMMIT_UNCONFIRMED_REASON
+
+
+class CoordinatorUnreachable(CoherenceError):
+    """No usable answer came from the coordinator. Either the request never
+    reached it (no coordinator to spawn or attach, a refused connect), on any
+    leg; or it reached it and got no usable answer (a silent listener, a reset,
+    an empty, unparseable or non-object reply) on a leg that commits nothing. A
+    commit request that reached it and went unanswered raises
+    :class:`CommitUnconfirmed` instead, because it may have landed.
+
+    No write was version-committed. A pessimistic ``write()`` that raises it
+    from its commit has already put its bytes on disk, unrecorded, and its
+    message says so: writing the path again records them, and re-reading does
+    not. One that raises it from its grant request has written nothing, though
+    the request may have taken the grant, which ``release()`` or
+    ``reacquire()`` releases. An attached
+    volume or substrate session keeps the endpoint it attached to, so recovery
+    depends on what happened to that coordinator. If it only stalled (for
+    example, a stopped process that resumes) and comes back on the same port,
+    the next call on the same volume or session goes through (#389). If it
+    went away, the volume or session never finds a coordinator started after
+    it: build a new one (for the MCP server, restart it) once a coordinator is
+    running again; see ``docs/guide.md``. Carries
+    :data:`COORDINATOR_UNAVAILABLE_REASON`.
+
+    ``answered`` is ``True`` only for an opted-in ``write()`` whose grant
+    request the coordinator answered with a body that neither admits nor
+    refuses: a coordinator answered, so no restart is called for, nothing was
+    written, and the request may have taken the grant. Every other cause
+    leaves it ``False``, the class default; a consumer reads it, never the
+    message. It is a keyword with a default and the message comes in already
+    built, so the exception pickles whole across a process boundary."""
+
+    reason = COORDINATOR_UNAVAILABLE_REASON
+    answered: bool = False
+
+    def __init__(self, *args: object, answered: bool = False) -> None:
+        super().__init__(*args)
+        self.answered = answered
+
+
+class CoordinatorFailed(CoherenceError):
+    """The coordinator answered a read with its failure envelope, HTTP 200
+    ``{"ok": false, "reason": "internal: <Type>"}`` (#259): the route's work,
+    or the caller-principal gate's store read, raised inside it. The read is
+    not confirmed as registered, so a strict volume or substrate session
+    raises rather than hand out bytes no peer's commit would invalidate.
+
+    A strict volume raises it too when the envelope answers the release its
+    re-mint sends for an earlier attempt's write grant (#401), before
+    ``write_cas``, ``write_cas_at``, ``atomic_publish`` or ``reacquire()``
+    goes on. The grant may still stand (the envelope can follow a release that
+    ran, and the client cannot tell), and a standing grant would refuse the
+    volume's own commit as another agent's, so the operation stops there, with
+    nothing committed; the grant stays recorded, and the next re-mint sends the
+    release again.
+
+    The same coordinator failure answered as an HTTP 5xx raises it too, for
+    every strict volume request that commits nothing (a read, write()'s
+    claim, that release, a publish's snapshot session) and for the
+    substrate's read leg (#433). And a commit refused ``other_holder`` while
+    the volume's own earlier write grant on the file is still unreleased
+    raises it, in either ``on_error`` mode, naming that grant (#434): a retry
+    sends the release again, where waiting for the holder waits on a peer
+    that does not exist.
+
+    A refuse-mode ``write()`` raises it as well, with nothing written, for two
+    answers to its grant request. ``unavailable``: the coordinator could not
+    decide in time and the abandoned work may still take the grant, so retry, or
+    call ``release()`` on the path if giving up. And a refusal naming this volume's own
+    earlier incarnation, whose release did not land: a plain retry never sends
+    that release again, so call ``reacquire()``.
+
+    The envelope names only the exception's type, so nothing here tells a
+    busy store, which clears by itself, from a fault that repeats on every
+    call. One retry after a short wait is the recovery; a second failure is
+    for the operator. A commit answered with the envelope raises
+    :class:`CommitUnconfirmed` instead, because it may have landed. Carries
+    :data:`COORDINATOR_FAILED_REASON`.
+
+    ``needs_reacquire`` is ``True`` only for that refuse-mode ``write()``
+    refused by this volume's own earlier incarnation: ``reacquire()`` is the
+    recovery, because a retry never sends the release again. Every other
+    cause leaves it ``False``, the class default, the commit refused by the
+    volume's own grant included, whose retry does send it. A consumer reads it,
+    never the message. It is a keyword with a default and the message comes in
+    already built, so the exception pickles whole across a process boundary."""
+
+    reason = COORDINATOR_FAILED_REASON
+    needs_reacquire: bool = False
+
+    def __init__(self, *args: object, needs_reacquire: bool = False) -> None:
+        super().__init__(*args)
+        self.needs_reacquire = needs_reacquire
+
+
+class RefuseModeUnsupported(CoherenceError):
+    """A volume built with ``on_held="refuse"`` refused to attach, before it
+    sent anything, because the coordinator cannot be relied on to refuse: it
+    does not advertise ``pre_edit_if_unheld``, or the volume cannot rely on the
+    fold profile it read from it. Only refuse mode raises it, and no retry
+    clears it: run a coordinator that can refuse, from the library's release,
+    or use ``on_held="displace"``. A
+    :class:`CoherenceError`, so every handler of that still catches it; a
+    ``/status`` read that got no answer raises :class:`CoordinatorUnreachable`
+    instead. Message only, so it pickles whole across a process boundary."""
 
 
 class PublishMaterializationError(CoherenceError):
@@ -996,6 +1507,19 @@ class PublishMaterializationError(CoherenceError):
         )
         self.landed = landed
         self.not_landed = not_landed
+
+    def __reduce__(
+        self,
+    ) -> tuple[
+        type[PublishMaterializationError],
+        tuple[tuple[str, ...], tuple[str, ...]],
+        dict[str, object],
+    ]:
+        return (
+            type(self),
+            (self.landed, self.not_landed),
+            {**self.__dict__, "args": self.args},
+        )
 
 
 class InternalConcurrencyError(CoherenceError):
@@ -1059,7 +1583,7 @@ _CAS_EXHAUSTED_ADVICE: dict[str, str] = {
 }
 
 
-class CasVersionConflict(CoherenceError):
+class CasVersionConflict(_CarriesGenerationPair, CoherenceError):
     """Option-A CAS rejected (MCP-C Unit 5). Typed-conflict, NOT auto-merge: NO
     write landed, and both versions are carried so the client can recover
     without another read.
@@ -1079,6 +1603,11 @@ class CasVersionConflict(CoherenceError):
     not re-read — it is best-effort (the version observed at pre-read time); a
     caller keys recovery on ``reacquire()`` (which re-reads fresh), not on the
     numeric.
+
+    :attr:`captured_generation` and :attr:`owner_generation` are the
+    coordinator refusal's pair, as on :class:`ConflictDetail`. Both are
+    ``None`` when the refusal carried none, and on a conflict the client
+    decided itself (no refusal body). Keyword-only and never in the message.
     """
 
     #: Class default, kept so ``except`` clauses and consumers that read the
@@ -1093,6 +1622,8 @@ class CasVersionConflict(CoherenceError):
         current_version: int,
         *,
         reason: str | None = None,
+        captured_generation: object = None,
+        owner_generation: object = None,
     ) -> None:
         """``reason`` is the coordinator's refusal reason when the raise site
         has one. The coordinator distinguishes four — ``version_mismatch``,
@@ -1119,6 +1650,20 @@ class CasVersionConflict(CoherenceError):
         self.artifact_id = artifact_id
         self.expected_version = expected_version
         self.current_version = current_version
+        self._adopt_generation_pair(captured_generation, owner_generation)
+
+    def __reduce__(
+        self,
+    ) -> tuple[
+        type[CasVersionConflict],
+        tuple[object, int, int],
+        dict[str, object],
+    ]:
+        return (
+            type(self),
+            (self.artifact_id, self.expected_version, self.current_version),
+            {**self.__dict__, "args": self.args},
+        )
 
 
 class ScenarioValidationError(CoherenceError):
@@ -1579,6 +2124,12 @@ class WatchdogAbandoned(RuntimeError):
     registry write lock — i.e. the handler timed out (and the client already got
     ``degraded: true``) while this work was blocked on that lock. Aborting there
     is what stops the late "phantom grant" / grant-revocation from landing.
+
+    The Claude Code coordinator's deny bodies raise it too, from
+    ``_AnswerEffects.defer``, when the watchdog answered before the deny was
+    decided (#236). There it means no deny was recorded, not that nothing
+    mutated: registry work the body did before deciding (a pre-bash or
+    pre-grep re-grant, for one) has already landed.
 
     Deliberately NOT a :class:`CoherenceError`: it never reaches a client. The
     only caller that ever sets the abort Event is the handler watchdog, which

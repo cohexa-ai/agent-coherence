@@ -1098,10 +1098,12 @@ class WorkspaceVersioner:
         claimed it in the gap. A failure to put it back is logged.
 
         Idempotent means REPEAT calls, not concurrent ones: this instance's
-        lock does not serialize a second versioner or process releasing the
-        same checkpoint, and two that both read the same ``held`` rows will
-        both decrement the pin refcount — the registry fails closed with
-        ``ValueError`` on whichever decrement would take the count below zero.
+        lock does not serialize a second versioner releasing the same
+        checkpoint (two processes cannot both open a SQLite store for writing
+        where ``flock`` exists, #453), and two that both read the same
+        ``held`` rows will both decrement the pin refcount — the registry
+        fails closed with ``ValueError`` on whichever decrement would take the
+        count below zero.
         That raise lands after the member's row is already ``released`` and
         after its substrate drop has been attempted, so the hold is already
         gone and what is left is refcount drift, not a stranded hold. The
@@ -1112,7 +1114,7 @@ class WorkspaceVersioner:
         error between the two strands a live hold on an already-terminal row.
         The recovery is
         :meth:`~ccs.adapters.coherent_object.CoherentObject.release_legal_hold`
-        on the binding, by version. The remaining residuals (two processes
+        on the binding, by version. The remaining residuals (two versioners
         releasing concurrently and both over-retaining; the refcount's
         separate registry write) are documented on
         :meth:`_release_checkpoint_pins`, the engine this delegates to.
@@ -2780,8 +2782,8 @@ class WorkspaceVersioner:
                 outcome=RESTORE_OUTCOME_HELD_UNCONFIRMED,
                 attempts=budget.attempts,
                 detail=(
-                    "the version-CAS commit could not be confirmed (transport "
-                    "failed mid-commit) — HELD, never best-effort"
+                    "the version-CAS commit could not be confirmed (no definite "
+                    "answer to the commit) — HELD, never best-effort"
                 ),
                 observation=OBSERVATION_NOT_RECORDED,
             )

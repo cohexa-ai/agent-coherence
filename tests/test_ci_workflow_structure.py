@@ -28,8 +28,42 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 RUNNER_IMAGE = "ubuntu-24.04"
+# The one job that needs a disk that folds file names, which no Ubuntu disk
+# does; it is pinned to a named image for the same reason as the others.
+FOLDING_JOB = "folding-macos"
+FOLDING_RUNNER_IMAGE = "macos-26"
+FOLDING_STEP = "Run the folding tests on the runner's disk"
+EXPECT_FOLD_PROFILE = "AGENT_COHERENCE_EXPECT_FOLD_PROFILE"
+# Every suite whose tests take another branch, or stop skipping, on a disk
+# that folds names. Frozen on purpose: a suite dropped from the macOS job
+# would be checked only on Ubuntu, where nothing folds, with every job green.
+FOLDING_SUITES = frozenset(
+    {
+        "tests/test_path_fold.py",
+        "tests/test_fs_profile.py",
+        "tests/test_disk_spelling.py",
+        "tests/test_registry_fold_merge.py",
+        "tests/test_coordinator_door_fold.py",
+        "tests/test_policy_fold.py",
+        "tests/test_foreign_write_detector_fold.py",
+        "tests/test_coordinator_session_fold.py",
+        "tests/adapters/test_coherent_volume_fold.py",
+        "tests/test_claude_code_hook_client.py",
+        "tests/test_claude_code_cli.py",
+        "tests/adapters/test_coherent_volume_other_holder.py",
+        "tests/adapters/test_coherent_volume_release.py",
+    }
+)
+FOLDING_SUITE_COUNT = 13
+# Everything the folding step's command holds besides the suites. A list of
+# what is allowed, not of what is not: `-kfold`, `-vk fold` and
+# `--deselect=<id>` each narrow a run without a bare `-k` or `--deselect`.
+FOLDING_PYTEST_ARGS = ("pytest", "-v", "-rs", "--tb=short")
 MAX_JOB_TIMEOUT_MINUTES = 60
 RESOLVE_STEP = "Resolve plugin ref"
+RESOLVE_RUN = "bash .github/scripts/resolve-plugin-ref.sh"
+PLUGIN_REF_JOBS = ("protocol-corpus", FOLDING_JOB)
+CORPUS_RUN_STEP = "Run protocol corpus"
 PLUGIN_REPOSITORY = "Cohexa-ai/agent-coherence-plugin"
 PLUGIN_LOCKFILE = "_plugin_checkout/package-lock.json"
 PINNED_ACTION = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
@@ -89,9 +123,11 @@ def _is_setup_node(step: dict[str, Any]) -> bool:
 
 
 def test_every_job_pins_the_runner_image_and_bounds_its_time() -> None:
-    """A moving ``ubuntu-latest`` or a job with the default 6-hour timeout fails here."""
+    """A moving ``ubuntu-latest`` or ``macos-latest``, or a job with the
+    default 6-hour timeout, fails here. Only the folding job runs on macOS."""
     for name, job in _jobs().items():
-        assert job.get("runs-on") == RUNNER_IMAGE, f"{name} runs on {job.get('runs-on')!r}"
+        image = FOLDING_RUNNER_IMAGE if name == FOLDING_JOB else RUNNER_IMAGE
+        assert job.get("runs-on") == image, f"{name} runs on {job.get('runs-on')!r}"
         timeout = job.get("timeout-minutes")
         assert isinstance(timeout, int) and 0 < timeout <= MAX_JOB_TIMEOUT_MINUTES, (
             f"{name} timeout-minutes is {timeout!r}"
@@ -133,10 +169,13 @@ def test_resolve_plugin_ref_keeps_its_contract() -> None:
     """The step that ``tests/test_parity_gate_ref_resolution.py`` executes stays where it is.
 
     Its name, id and environment are how that test finds and runs it, and the
-    plugin checkout reads its output.
+    plugin checkout reads its output. It runs in the corpus job and the
+    folding job only, as one shared script, so the two cannot pick plugin
+    branches by different rules. The fork's ``head_ref`` reaches the script
+    through the environment alone: no ``${{ }}`` is ever pasted into it.
     """
     jobs_with_step = [job_name for job_name, step in _all_steps() if step.get("name") == RESOLVE_STEP]
-    assert jobs_with_step == ["protocol-corpus"]
+    assert sorted(jobs_with_step) == sorted(PLUGIN_REF_JOBS)
 
     steps = _corpus_steps()
     resolve = _index_of(steps, lambda candidate: candidate.get("name") == RESOLVE_STEP)
@@ -148,14 +187,81 @@ def test_resolve_plugin_ref_keeps_its_contract() -> None:
         "EVENT_NAME": "${{ github.event_name }}",
         "REF_NAME": "${{ github.ref_name }}",
     }
+    assert step["run"] == RESOLVE_RUN
+    assert (REPO_ROOT / RESOLVE_RUN.split()[-1]).is_file()
 
     checkout = _index_of(steps, _is_plugin_checkout)
     assert resolve < checkout
     assert steps[checkout]["with"]["ref"] == "${{ steps.plugin_ref.outputs.ref }}"
-    corpus_run = _index_of(steps, lambda candidate: candidate.get("name") == "Run protocol corpus")
+    corpus_run = _index_of(steps, lambda candidate: candidate.get("name") == CORPUS_RUN_STEP)
     assert steps[corpus_run]["env"] == {
         "AGENT_COHERENCE_PLUGIN_DIST_PATH": ("${{ github.workspace }}/_plugin_checkout/dist/coordinator.js"),
     }
+
+
+def _folding_steps() -> list[dict[str, Any]]:
+    return _jobs()[FOLDING_JOB]["steps"]
+
+
+def test_the_folding_job_builds_and_runs_the_corpus_as_the_corpus_job_does() -> None:
+    """The macOS job is the corpus job plus one step that runs the folding
+    suites, so it picks and builds the plugin branch by the same rules and
+    runs the same corpus command. Its corpus run also goes on after a folding
+    failure, so one run shows both. A step edited in one job only fails here."""
+    steps = _folding_steps()
+    folding = _index_of(steps, lambda step: step.get("name") == FOLDING_STEP)
+    corpus_run = _index_of(steps, lambda step: step.get("name") == CORPUS_RUN_STEP)
+    assert folding == corpus_run - 1
+    assert steps[corpus_run].get("if") == "${{ !cancelled() }}"
+    shared = [dict(step) for index, step in enumerate(steps) if index != folding]
+    del shared[corpus_run - 1]["if"]
+    assert shared == _corpus_steps()
+
+
+def test_the_folding_job_fails_unless_the_runner_disk_folds_case() -> None:
+    """Named at job level, the expected profile makes the probe test in
+    tests/test_fs_profile.py fail, never skip, on a runner whose disk does
+    not classify as caseless; no step may name another."""
+    job = _jobs()[FOLDING_JOB]
+    assert job["env"] == {EXPECT_FOLD_PROFILE: "caseless"}
+    for step in job["steps"]:
+        assert EXPECT_FOLD_PROFILE not in (step.get("env") or {}), step.get("name")
+
+
+def test_the_folding_job_runs_every_folding_suite_and_nothing_narrows_it() -> None:
+    """Each frozen suite exists and is named once; every test file named for
+    the fold is among them, except the corpus's own, which the job's corpus
+    step runs; no option but the frozen few, and no environment of the
+    step's own (where a ``PYTEST_ADDOPTS`` would hide), drops tests."""
+    assert len(FOLDING_SUITES) == FOLDING_SUITE_COUNT
+    steps = _folding_steps()
+    folding = steps[_index_of(steps, lambda step: step.get("name") == FOLDING_STEP)]
+    tokens = folding["run"].split()
+    suites = [token for token in tokens if token.startswith("tests/")]
+    assert sorted(suites) == sorted(FOLDING_SUITES)
+    assert [token for token in tokens if not token.startswith("tests/")] == list(FOLDING_PYTEST_ARGS)
+    assert "env" not in folding
+    for suite in suites:
+        assert (REPO_ROOT / suite).is_file(), suite
+    named_for_the_fold = {
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in (REPO_ROOT / "tests").rglob("test_*fold*.py")
+        if "protocol_corpus" not in path.parts
+    }
+    assert named_for_the_fold <= FOLDING_SUITES, named_for_the_fold - FOLDING_SUITES
+
+
+def test_the_folding_job_cannot_pass_with_a_failure() -> None:
+    """``continue-on-error`` on the job or on any step turns a failing run
+    green, and an ``if:`` on the job or on a step can skip it. Only the
+    corpus step carries an ``if:``, the one that runs it after a folding
+    failure too."""
+    job = _jobs()[FOLDING_JOB]
+    assert "continue-on-error" not in job and "if" not in job
+    for step in job["steps"]:
+        assert "continue-on-error" not in step, f"{step.get('name')!r} can swallow a failure"
+        if step.get("name") != CORPUS_RUN_STEP:
+            assert "if" not in step, f"{step.get('name')!r} can be skipped"
 
 
 def test_every_action_is_pinned_to_a_commit_sha() -> None:
@@ -209,7 +315,13 @@ REQUIRED_CHECKS = frozenset(
 REQUIRED_CHECK_COUNT = 9
 TEST_GATES = {"tests-py311": "test-shards-py311", "tests-py312": "test-shards-py312"}
 TEST_GATE_PYTHON = {"tests-py311": "3.11", "tests-py312": "3.12"}
-OTHER_WORKFLOWS = ("publish-mcp.yml", "release.yml", "weekly-full-ci.yml")
+OTHER_WORKFLOWS = (
+    "dependabot-gate.yml",
+    "dependabot-merge.yml",
+    "publish-mcp.yml",
+    "release.yml",
+    "weekly-full-ci.yml",
+)
 COVERAGE_STEP = "Check that the shards ran every test exactly once"
 VERDICT_STEP = "Decide the verdict"
 TESTS_VERDICT_RUN = 'python3 tools/ci_gate_verdict.py tests --shards "$SHARDS" --coverage-exit "$COVERAGE_EXIT"'
@@ -241,10 +353,12 @@ def test_every_required_check_is_one_non_matrix_job() -> None:
 
 
 def test_the_corpus_needs_nothing_and_build_and_smoke_need_only_the_plan() -> None:
-    """A needed job that is skipped or failed cascades; the corpus must run
-    whatever else happens, and Build Package no longer waits on the long jobs."""
+    """A needed job that is skipped or failed cascades; the corpus and the
+    folding job must run whatever else happens, and Build Package no longer
+    waits on the long jobs."""
     jobs = _jobs()
     assert "needs" not in jobs["protocol-corpus"]
+    assert "needs" not in jobs[FOLDING_JOB]
     assert _needs(jobs["build"]) == ["plan"]
     assert _needs(jobs["benchmark-smoke"]) == ["plan"]
 
@@ -617,7 +731,8 @@ def _dispatched_title_format() -> str:
 FAKE_GH = """#!/usr/bin/env python3
 # Stands in for gh. Each call must have the exact shape the step uses, or
 # the fake exits 2. The dispatched run is in progress until a `run watch`
-# succeeds; a watch listed as failing in FAKE_WATCH_EXITS leaves it running.
+# succeeds; a watch listed as failing in FAKE_WATCH_EXITS leaves it running,
+# and with FAKE_RUN_NEVER_ENDS=1 every watch fails, however many fit the wait.
 import json, os, sys
 
 args = sys.argv[1:]
@@ -659,6 +774,8 @@ if args[:2] == ["run", "watch"]:
     exits = [int(code) for code in os.environ.get("FAKE_WATCH_EXITS", "").split(",") if code]
     call = bump("watch-calls")
     code = exits[call - 1] if call <= len(exits) else 0
+    if os.environ.get("FAKE_RUN_NEVER_ENDS") == "1":
+        code = 1
     if code == 0 and args[2] == "4242":
         with open(state_file, "w") as out:
             out.write("completed")
@@ -745,12 +862,14 @@ def test_the_weekly_run_keeps_waiting_when_a_watch_ends_early(tmp_path: Path) ->
 
 def test_the_weekly_run_says_so_when_its_run_is_still_going_at_the_deadline(tmp_path: Path) -> None:
     """A run that never completes inside the wait is not reported as failed:
-    the message says it was still running, and the weekly run still fails."""
+    the message says it was still running, and the weekly run still fails.
+    The run never ends, rather than ending after a fixed number of watches,
+    so a fast runner cannot finish them all inside the wait."""
     proc, _, _ = _run_weekly_step(
         tmp_path,
         FAKE_RUN_APPEARS="1",
         FAKE_CONCLUSION="success",
-        FAKE_WATCH_EXITS=",".join(["1"] * 50),
+        FAKE_RUN_NEVER_ENDS="1",
         WAIT_TIMEOUT_SECONDS="2",
     )
     assert proc.returncode != 0

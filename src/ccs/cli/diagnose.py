@@ -38,10 +38,12 @@ import importlib.util
 import inspect
 import json
 import math
+import os
 import signal
 import sys
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -83,7 +85,7 @@ from ccs.diagnose.telemetry import (
     resolve_consent,
 )
 
-__all__ = ["main", "build_parser"]
+__all__ = ["main", "console_main", "build_parser"]
 
 
 _DEFAULT_HTML_PATH = "diagnose_report.html"
@@ -391,15 +393,76 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """``ccs-diagnose`` entry point. Returns the process exit code."""
+def console_main(argv: Sequence[str] | None = None) -> int:
+    """Console-only entry point; embedded callers should use :func:`main`."""
     # Restore the default SIGPIPE behaviour so piping into ``head`` etc. exits
     # cleanly with status 141 instead of raising ``BrokenPipeError`` from the
     # interpreter. Windows lacks SIGPIPE; the ``hasattr`` guard keeps the
     # entrypoint portable.
     if hasattr(signal, "SIGPIPE"):
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    return main(argv, _graph_context=_graph_sigpipe_guard)
 
+
+class _ConsoleStdout:
+    """Keep a closed console pipe quiet, including writes from graph workers."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    def write(self, data: str) -> int:
+        try:
+            return self._stream.write(data)
+        except BrokenPipeError:
+            # signal.signal() cannot run in a worker thread. Exit immediately
+            # with the conventional shell status instead: graph exception
+            # handlers must not turn a closed stdout into a failure report.
+            os._exit(128 + signal.SIGPIPE)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except BrokenPipeError:
+            os._exit(128 + signal.SIGPIPE)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+@contextmanager
+def _graph_sigpipe_guard() -> Iterator[None]:
+    """Protect graph sockets while preserving quiet console stdout exits.
+
+    This process-wide window ends when graph load/build/invoke returns.
+    Embedded main() never enters it. Raw file descriptors, stdout.buffer,
+    captured stream aliases and graph work running after the window are not
+    covered by the stdout proxy.
+    """
+    if not hasattr(signal, "SIGPIPE"):
+        yield
+        return
+    previous = signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    original = sys.stdout
+    proxy = None if original is None else _ConsoleStdout(original)
+    if proxy is not None:
+        sys.stdout = proxy
+    try:
+        yield
+    finally:
+        # Restore only our proxy. A graph may replace stdout or detach and
+        # rewrap its buffer; restoring the old stream would close or invalidate
+        # the buffer the CLI needs. Absent stdout must keep print() a no-op.
+        if proxy is not None and sys.stdout is proxy:
+            sys.stdout = original
+        signal.signal(signal.SIGPIPE, previous)
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    _graph_context: Callable[[], AbstractContextManager[None]] = nullcontext,
+) -> int:
+    """Run diagnostics without changing SIGPIPE. Returns the exit code."""
     parser = build_parser()
     args = parser.parse_args(argv)
     args.ignore_keys = _parse_csv(args.ignore)
@@ -428,7 +491,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return EXIT_USAGE_ERROR
 
-    return _run_pipeline(args)
+    return _run_pipeline(args, graph_context=_graph_context)
 
 
 # -------------------------------------------------------------------- #
@@ -551,7 +614,11 @@ def _run_reset_token(args: argparse.Namespace) -> int:
 # -------------------------------------------------------------------- #
 
 
-def _run_pipeline(args: argparse.Namespace) -> int:
+def _run_pipeline(
+    args: argparse.Namespace,
+    *,
+    graph_context: Callable[[], AbstractContextManager[None]] = nullcontext,
+) -> int:
     """Orchestrate the diagnose CLI pipeline.
 
     The work is broken into four named phases (each ≤ 30 lines):
@@ -563,7 +630,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     """
     consent = _resolve_consent(args)
 
-    invoke = _load_graph_and_invoke(args)
+    with graph_context():
+        invoke = _load_graph_and_invoke(args)
     if isinstance(invoke, int):
         return invoke
     callback, initial_state, result = invoke
@@ -1226,7 +1294,7 @@ def _write_report_json(
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        raise SystemExit(console_main())
     except BrokenPipeError:
         # Mirror the conventional shell exit status for a SIGPIPE-killed
         # process. Without this, piping into ``head`` etc. surfaces a

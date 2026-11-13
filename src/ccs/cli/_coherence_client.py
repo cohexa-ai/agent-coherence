@@ -28,7 +28,7 @@ import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -40,11 +40,21 @@ from ccs.adapters.claude_code.auth import (
     load_mint_nonce,
     store_caller_principal,
 )
+from ccs.adapters.claude_code.coordinator_pin import (
+    NODE_BACKEND,
+    CoordinatorPin,
+    PidFileLines,
+    exit_evidence,
+    lines_of,
+    read_pid_file,
+)
 from ccs.adapters.claude_code.coordinator_server import (
     caller_principal_identity,
     validate_session_id,
 )
-from ccs.adapters.claude_code.lifecycle import read_port_from_file as _read_port_from_file
+from ccs.adapters.claude_code.regular_file import ReadStatus, read_state_file
+from ccs.adapters.claude_code.state_dir import dir_link_refusal, state_file_link_refusal
+from ccs.core.disk_spelling import native_spelling, resolve_links
 from ccs.core.exceptions import (
     CALLER_PRINCIPAL_CLAIMED_REASON,
     CALLER_PRINCIPAL_REASONS,
@@ -140,6 +150,37 @@ def validate_relative_path(p: str) -> str | None:
     return None
 
 
+def _relative_inside(root: str, path: str) -> str | None:
+    try:
+        return str(Path(path).relative_to(root))
+    except ValueError:
+        return None
+
+
+def workspace_relative(path: str, root: Path) -> str | None:
+    """``path`` relative to the workspace ``root``, or ``None`` when it lies
+    outside. Both are made absolute as Node's ``path.resolve`` does, then
+    resolved by :func:`~ccs.core.disk_spelling.resolve_links`: links are
+    followed and every name keeps the case it was typed in. Only a path that
+    would otherwise lie outside is tried again with
+    :func:`~ccs.core.disk_spelling.native_spelling`, which is how a root typed
+    in another case (``REPO`` for ``Repo``) still meets the path.
+
+    The typed case comes first because a Bash token is keyed as typed: sending
+    the disk's spelling for a Read would keep the two tools' records of one
+    file apart on a coordinator that folds nothing. Raises
+    :class:`~ccs.core.disk_spelling.LinkDoesNotResolve` for a dangling or
+    looping link, and ``OSError`` for a path the resolvers cannot walk."""
+    # abspath folds '..' by text BEFORE links are followed: Claude Code opens the
+    # normalized tool path, so this keys that file; the Bash routes cover the shell's '..'.
+    absolute, absolute_root = os.path.abspath(path), os.path.abspath(root)
+    for resolver in (resolve_links, native_spelling):
+        relative = _relative_inside(resolver(absolute_root), resolver(absolute))
+        if relative is not None:
+            return relative
+    return None
+
+
 def normalize_workspace_path(p: str, root: Path) -> tuple[str, str | None]:
     """Normalize a CLI path argument to workspace-relative form.
 
@@ -156,6 +197,11 @@ def normalize_workspace_path(p: str, root: Path) -> tuple[str, str | None]:
       for ``..`` traversal defense.
     - **Absolute and outside workspace root** (e.g., ``"/etc/passwd"``)
       → rejected with ``"path outside workspace root"``.
+    - **Absolute through a dangling or looping link** → rejected with
+      ``"link does not resolve"``.
+
+    An absolute path is relativized by :func:`workspace_relative`: links are
+    followed, and a root typed in another case than the disk's still matches.
 
     This helper exists because the Claude Code plugin's
     ``/agent-coherence:track`` skill template substitutes ``$ARGUMENTS``
@@ -180,8 +226,15 @@ def normalize_workspace_path(p: str, root: Path) -> tuple[str, str | None]:
         return p, "empty"
     if Path(p).is_absolute():
         try:
-            normalized = str(Path(p).resolve().relative_to(root.resolve()))
-        except ValueError:
+            # '..' is folded by text as for a tool path, so a tracked name is
+            # the key the hook client sends when a tool opens that path.
+            normalized = workspace_relative(p, root)
+        except OSError as exc:
+            # A dangling or looping link (or a path the resolvers cannot walk)
+            # is refused like any invalid path: tracking the missing target
+            # would give its file a second name once the target exists.
+            return p, str(exc.strerror)
+        if normalized is None:
             return p, "path outside workspace root"
         # Re-validate the normalized form against the pure-string rules
         # (catches e.g. a resolved path that still contains '..' — defensive)
@@ -212,6 +265,9 @@ class CoordinatorEndpoint:
     host: str = "127.0.0.1"
     scheme: str = "http"
     ca_file: str | None = None
+    #: The coordinator :func:`resolve_endpoint` found, checked before every
+    #: request (#503). ``None`` for a remote endpoint, which has no pid file.
+    pin: CoordinatorPin | None = field(default=None, compare=False, repr=False)
 
     @property
     def base_url(self) -> str:
@@ -232,7 +288,28 @@ class CoordinatorUnavailable(Exception):
     """Coordinator is not running or its auth surface is missing.
 
     Carries a human-readable message the console script prints verbatim.
+
+    ``never_sent`` is ``True`` only when the connection never carried the
+    request, so the coordinator cannot have acted on it. Every other failure
+    leaves it ``False`` — a timeout or reset after the request went out, a
+    malformed answer, a raise with no request at all — and a caller deciding
+    whether a commit may have landed must treat that as delivered: only
+    positive evidence counts as "not delivered".
     """
+
+    never_sent: bool = False
+
+    def __init__(self, *args: object, never_sent: bool = False) -> None:
+        super().__init__(*args)
+        self.never_sent = never_sent
+
+
+class CoordinatorDeparted(CoordinatorUnavailable):
+    """The coordinator a local endpoint was resolved from has exited or been
+    replaced, so the request was not sent (#503). Always ``never_sent``."""
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args, never_sent=True)
 
 
 class CoordinatorMalformedAnswer(CoordinatorUnavailable):
@@ -342,37 +419,90 @@ def build_tls_context(ca_file: str | None = None) -> ssl.SSLContext:
 
 def resolve_endpoint(coordinator_root: Path) -> CoordinatorEndpoint:
     """Read port + secret from ``<root>/.coherence/`` or raise
-    :class:`CoordinatorUnavailable` with an operator-friendly message."""
+    :class:`CoordinatorUnavailable` with an operator-friendly message.
+
+    A client reads these with no start before it (#498). A ``.coherence``
+    that is a symlink is refused before anything in it is read: it names
+    another directory, whose ``server.pid`` and ``hook.secret`` would join
+    this client to that coordinator with a valid bearer."""
     coherence_dir = coordinator_root / ".coherence"
-    pid_file = coherence_dir / "server.pid"
     secret_file = coherence_dir / "hook.secret"
 
-    port = _read_port_from_file(pid_file)
-    if port is None:
+    if os.path.islink(coherence_dir):
+        raise CoordinatorUnavailable(dir_link_refusal(coherence_dir))
+
+    lines = _running_coordinator_lines(coherence_dir)
+    return CoordinatorEndpoint(
+        port=lines.port,
+        bearer=_read_bearer(coherence_dir, secret_file),
+        pin=CoordinatorPin(coherence_dir, lines),
+    )
+
+
+def _running_coordinator_lines(coherence_dir: Path) -> PidFileLines:
+    """``server.pid``'s lines, read as a regular file only: a link there would
+    send the bearer to whatever port the file it names holds."""
+    read = read_pid_file(coherence_dir)
+    pid_file = read.path
+    if read.status is ReadStatus.LINK:
+        raise CoordinatorUnavailable(state_file_link_refusal(read.path, coherence_dir))
+    if read.status is ReadStatus.NOT_REGULAR:
+        raise CoordinatorUnavailable(
+            f"{pid_file} is not a regular file; restart with `agent-coherence-coordinator`"
+        )
+    lines = lines_of(read)
+    if lines.port is None:
         raise CoordinatorUnavailable(
             "no coordinator running for this workspace "
             f"(no port in {pid_file}); start one with `agent-coherence-coordinator`"
         )
+    evidence = exit_evidence(pid_file, lines)
+    if evidence is not None:
+        raise CoordinatorUnavailable(
+            f"no coordinator running for this workspace ({pid_file} names pid "
+            f"{lines.pid}, which {evidence}); start one with "
+            "`agent-coherence-coordinator`",
+            never_sent=True,
+        )
+    return lines
 
-    if not secret_file.is_file():
+
+def _refuse_if_coordinator_departed(endpoint: CoordinatorEndpoint) -> None:
+    """A process that took the resolved coordinator's port, with or without
+    the secret, never receives the bearer."""
+    if endpoint.pin is None:
+        return
+    departure = endpoint.pin.departure()
+    if departure is not None:
+        raise CoordinatorDeparted(f"{departure}; nothing was sent")
+
+
+def _read_bearer(coherence_dir: Path, secret_file: Path) -> str:
+    """``hook.secret``'s token, read as a regular file only, never through a
+    link: the bytes of the file a link names would go out as the bearer to
+    whatever port ``server.pid`` holds (#498). Raises
+    :class:`CoordinatorUnavailable` naming why there is none."""
+    result = read_state_file(coherence_dir, secret_file.name)
+    if result.status is ReadStatus.LINK:
+        raise CoordinatorUnavailable(state_file_link_refusal(result.path, coherence_dir))
+    if result.status is ReadStatus.ABSENT:
         raise CoordinatorUnavailable(
             "coordinator authentication unavailable "
             f"(missing {secret_file}); restart with `agent-coherence-coordinator`"
         )
-
-    try:
-        bearer = secret_file.read_text(encoding="utf-8").strip()
-    except OSError as exc:
+    if result.status is ReadStatus.NOT_REGULAR:
         raise CoordinatorUnavailable(
-            f"could not read {secret_file}: {exc}"
-        ) from exc
+            f"{secret_file} is not a regular file; restart with `agent-coherence-coordinator`"
+        )
+    if result.status is not ReadStatus.READ or result.data is None:
+        raise CoordinatorUnavailable(f"could not read {secret_file}: {result.error}") from result.error
 
+    bearer = result.data.decode("utf-8").strip()
     if not bearer:
         raise CoordinatorUnavailable(
             f"{secret_file} is empty; restart with `agent-coherence-coordinator`"
         )
-
-    return CoordinatorEndpoint(port=port, bearer=bearer)
+    return bearer
 
 
 #: Truthy env values that enable cross-host remote mode (mirrors the
@@ -576,6 +706,7 @@ def get(
     ``agent-coherence-status``) add ``Coherence-Local-Operator: true``
     for the elevated ``/status?detail=full`` tier without hard-coding
     that header here."""
+    _refuse_if_coordinator_departed(endpoint)
     headers: dict[str, str] = {
         "Authorization": f"Bearer {endpoint.bearer}",
         "Host": endpoint.host,
@@ -598,13 +729,19 @@ def post(
     body: dict[str, Any],
     *,
     extra_headers: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     """Authenticated POST with JSON body.
 
     M-04 / finding #28: ``extra_headers`` mirrors the pattern on ``get()``
     so callers can add e.g. ``Coherence-Local-Operator: true`` without
     reimplementing the urllib transport layer.
+
+    ``timeout`` bounds this one request, for a best-effort call that must not
+    cost a full timeout on top of the failure it follows; ``None`` means
+    :data:`CLI_HTTP_TIMEOUT_SEC` as it is when the request is made.
     """
+    _refuse_if_coordinator_departed(endpoint)
     payload = json.dumps(body).encode("utf-8")
     headers: dict[str, str] = {
         "Authorization": f"Bearer {endpoint.bearer}",
@@ -621,6 +758,9 @@ def post(
     )
     # Carry the CA bundle to _execute (only consulted for https requests).
     req._ccs_ca_file = endpoint.ca_file  # type: ignore[attr-defined]
+    # The timeout rides the request like the CA bundle, so _execute keeps its
+    # one-argument call shape (test seams replace it with one-argument fakes).
+    req._ccs_timeout = timeout  # type: ignore[attr-defined]
     return _execute(req)
 
 
@@ -677,11 +817,19 @@ class PrincipalClaim:
 
     ``detail`` is diagnostic prose built from constants, known reason tokens,
     an HTTP status code or this client's own transport message — never from
-    the coordinator's answer — so it carries no principal or nonce."""
+    the coordinator's answer — so it carries no principal or nonce.
+
+    ``transport_failed`` is ``True`` only on an ``unconfirmed`` claim that got
+    no answer at all (the client raised :class:`CoordinatorUnavailable`), so a
+    strict surface can type "coordinator unreachable" instead of reading
+    prose; a redirect, an error status or a 2xx that binds nothing is an
+    answer and leaves it ``False``. Keyword-only so positional construction is
+    unchanged; out of repr so a message that embeds one is unchanged."""
 
     outcome: Literal["bound", "unsupported", "refused", "unconfirmed"]
     principal: str | None = None
     detail: str = ""
+    transport_failed: bool = field(default=False, kw_only=True, repr=False)
 
 
 def claim_caller_principal(
@@ -721,7 +869,7 @@ def claim_caller_principal(
         reason = reportable_reason(error_body.get("reason") if isinstance(error_body, dict) else None)
         return PrincipalClaim("unconfirmed", detail=f"claim answered HTTP {exc.code}, reason={reason}")
     except CoordinatorUnavailable as exc:
-        return PrincipalClaim("unconfirmed", detail=str(exc))
+        return PrincipalClaim("unconfirmed", detail=str(exc), transport_failed=True)
     principal = body.get("principal") if isinstance(body, dict) else None
     if isinstance(body, dict) and body.get("ok") is True and isinstance(principal, str) and principal:
         return PrincipalClaim("bound", principal=principal)
@@ -731,9 +879,6 @@ def claim_caller_principal(
     return PrincipalClaim("unconfirmed", detail=f"claim not confirmed (reason={reason})")
 
 
-NODE_BACKEND = "node"
-
-
 def coordinator_backend(coordinator_root: Path) -> str | None:
     """The ``backend=<name>`` a coordinator recorded on the third line of
     ``.coherence/server.pid``, or ``None`` when there is none.
@@ -741,16 +886,9 @@ def coordinator_backend(coordinator_root: Path) -> str | None:
     The Node coordinator writes ``<pid>\\n<port>\\nbackend=node\\n``; the
     Python coordinator writes ``<pid>\\n<port>\\n`` with no backend line. Only
     the port line is load-bearing for reaching a coordinator — this is read
-    solely to skip work a Node coordinator could never answer."""
-    try:
-        lines = (coordinator_root / ".coherence" / "server.pid").read_text(
-            encoding="utf-8"
-        ).splitlines()
-    except (OSError, UnicodeDecodeError):
-        return None
-    if len(lines) < 3 or not lines[2].startswith("backend="):
-        return None
-    return lines[2][len("backend="):].strip() or None
+    solely to skip work a Node coordinator could never answer. Read as a
+    regular file only, never through a link (#503)."""
+    return lines_of(read_pid_file(coordinator_root / ".coherence")).backend
 
 
 def caller_principal_headers(principal: str | None) -> dict[str, str] | None:
@@ -1158,9 +1296,11 @@ def _execute(req: urllib.request.Request) -> dict[str, Any]:
             opener = _get_shared_opener(system_tls=True)
     else:
         opener = _get_shared_opener(system_tls=False)
+    # CLI_HTTP_TIMEOUT_SEC is read per request, not bound once, so a patched value is obeyed.
+    timeout = getattr(req, "_ccs_timeout", None)
     malformed: str | None = None
     try:
-        with opener.open(req, timeout=CLI_HTTP_TIMEOUT_SEC) as resp:
+        with opener.open(req, timeout=CLI_HTTP_TIMEOUT_SEC if timeout is None else timeout) as resp:
             raw = resp.read()
     except urllib.error.HTTPError:
         # Caller handles status-code-specific paths.
@@ -1178,8 +1318,12 @@ def _execute(req: urllib.request.Request) -> dict[str, Any]:
             raise TlsVerificationFailed(
                 _host_of(req), str(exc.reason)
             ) from exc
+        # urllib wraps an OSError in URLError only around the connect and the
+        # send; reading the answer raises unwrapped (the arms below). So here,
+        # and only here, the coordinator never received a whole request.
         raise CoordinatorUnavailable(
-            f"could not reach coordinator at {req.full_url}: {exc.reason}"
+            f"could not reach coordinator at {req.full_url}: {exc.reason}",
+            never_sent=True,
         ) from exc
     except (OSError, TimeoutError) as exc:
         raise CoordinatorUnavailable(

@@ -48,11 +48,16 @@ _ARMS = {
 
 
 @pytest.fixture(params=sorted(_ARMS))
-def factory(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[RegistryFactory]:
+def factory(
+    request: pytest.FixtureRequest, tmp_path: Path, two_writer_store: None
+) -> Iterator[RegistryFactory]:
     """A registry factory for one arm. The sqlite arm mints handles over an
     isolated ``tmp_path`` db and closes them all at teardown; the in-memory arm
     holds no OS resource. Every scenario runs against BOTH arms via this fixture's
-    parametrization — that is where the MUST-MATCH universality lives."""
+    parametrization — that is where the MUST-MATCH universality lives. The
+    sqlite arm's handles share one store, which the single-writer lock would
+    refuse, so they run without it: what they prove is what the store's own
+    transactions arbitrate."""
     arm: str = request.param
     fac: RegistryFactory = InMemoryFactory() if arm == "in_memory" else SqliteFactory(tmp_path)
     try:
@@ -112,8 +117,32 @@ def test_fence_admits_absent_read_generation(factory: RegistryFactory) -> None:
     kit.assert_fence_admits_absent_read_generation(factory)
 
 
+def test_commit_cas_refusals_carry_the_generation_pair(factory: RegistryFactory) -> None:
+    kit.assert_commit_cas_refusals_carry_the_generation_pair(factory)
+
+
+def test_commit_all_refusals_carry_each_members_generation_pair(factory: RegistryFactory) -> None:
+    kit.assert_commit_all_refusals_carry_each_members_generation_pair(factory)
+
+
+def test_fenced_persist_raise_carries_the_generation_pair(factory: RegistryFactory) -> None:
+    kit.assert_fenced_persist_raise_carries_the_generation_pair(factory)
+
+
+def test_commit_refusal_pairs_come_from_the_decision_snapshot(factory: RegistryFactory) -> None:
+    kit.assert_commit_refusal_pairs_come_from_the_decision_snapshot(factory)
+
+
+def test_fenced_persist_raise_pair_comes_from_the_decision_snapshot(factory: RegistryFactory) -> None:
+    kit.assert_fenced_persist_raise_pair_comes_from_the_decision_snapshot(factory)
+
+
 def test_session_fail_closed_on_foreign_and_reaped(factory: RegistryFactory) -> None:
     kit.assert_session_fail_closed_on_foreign_and_reaped(factory)
+
+
+def test_forget_agent_forgets_only_an_ended_identity(factory: RegistryFactory) -> None:
+    kit.assert_forget_agent_forgets_only_an_ended_identity(factory)
 
 
 # ---------------------------------------------------------------------------

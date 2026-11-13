@@ -457,8 +457,7 @@ def _fake_coherence_dir(workspace: Path, port: int) -> None:
     reachable without spawning a real coordinator."""
     coherence = workspace / ".coherence"
     coherence.mkdir(exist_ok=True)
-    # Port-file format per lifecycle.read_port_from_file: line 1 pid, line 2 port.
-    (coherence / "server.pid").write_text(f"12345\n{port}\n")
+    write_coordinator_pid_file(coherence, port)
     (coherence / "hook.secret").write_text("test-secret")
 
 
@@ -766,7 +765,7 @@ def inproc_coordinator(git_workspace: Path):
     server = CoordinatorHTTPServer(git_workspace, port=0, instance_id="hook-principal")
     server.serve_in_thread()
     assert load_secret(server.coordinator_root)
-    (git_workspace / ".coherence" / "server.pid").write_text(f"{os.getpid()}\n{server.port}\n")
+    write_coordinator_pid_file(git_workspace / ".coherence", server.port, pid=os.getpid())
     try:
         yield git_workspace, server
     finally:
@@ -1185,3 +1184,486 @@ def test_pre_grep_delivers_the_freshness_advisory_while_the_registry_lock_is_hel
     response = json.loads(out)
     assert response == json.loads(json.dumps(server_mod._DEFAULT_DEGRADED_RESPONSE))
     assert "could not verify" in response["hookSpecificOutput"]["additionalContext"]
+
+
+def test_pre_edit_delivers_the_freshness_advisory_when_the_coordinator_times_out(
+    inproc_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#236, end to end: an Edit whose pre-edit times out on registry
+    contention is admitted -- a hook does not block a tool call on coordinator
+    load -- and the model is told the coherence check did not run. The
+    advisory reaches stdout context-only: no ``permissionDecision``, so Claude
+    Code still asks the user about the Edit as it would have. It used to print
+    a bare ``{"ok": true, "degraded": true}``: an admit with no warning."""
+    import ccs.adapters.claude_code.coordinator_server as server_mod
+    from tests.test_claude_code_coordinator_server import _HeldRegistryLock
+
+    workspace, server = inproc_coordinator
+    (workspace / "plan.md").write_text("plan v1")
+    payload = _edit_payload(workspace, _sid())
+    # The first call claims the session's principal while the lock is free, so
+    # the held lock below blocks only pre-edit's work body.
+    rc, out = _drive("pre-edit", payload, workspace, monkeypatch, capsys)
+    assert rc == 0 and json.loads(out).get("ok") is True, out
+
+    monkeypatch.setattr(server_mod, "HANDLER_TIMEOUT_SEC", 0.25)
+    with _HeldRegistryLock(server):
+        rc, out = _drive("pre-edit", payload, workspace, monkeypatch, capsys)
+
+    assert rc == 0
+    response = json.loads(out)
+    assert response == json.loads(json.dumps(server_mod._PRE_EDIT_DEGRADED_RESPONSE))
+    hso = response["hookSpecificOutput"]
+    assert hso["hookEventName"] == "PreToolUse"
+    assert "permissionDecision" not in hso
+    assert "could not verify" in hso["additionalContext"]
+
+
+# ----------------------------------------------------------------------
+# #498 -- hook.secret and .coherence are read without following a link
+#
+# A client reads them with no start before it, so a link a repository
+# committed would send the file it names as the bearer to whatever port
+# server.pid holds. server.pid itself is a regular file in these tests:
+# how it is read is not changed here.
+# ----------------------------------------------------------------------
+
+from tests.coherence_link_helpers import TARGET_BYTES, plant_link, release_fifo  # noqa: E402
+from tests.pid_lock_helpers import write_coordinator_pid_file
+
+
+def _secret_link_refusal(coherence: Path) -> str:
+    """The refusal of a linked ``hook.secret``, written out: the Node client
+    prints the same text."""
+    return (
+        f"refusing {coherence / 'hook.secret'}: it is a symlink, and .coherence must be a real "
+        "directory with no link directly inside it. Replace the link with a copy of the file it "
+        f"names, or mount a directory at {coherence}."
+    )
+
+
+class _BearerRecorder(http.server.BaseHTTPRequestHandler):
+    """Records each request's path and ``Authorization``; answers 200 ``{}``."""
+
+    seen: list[tuple[str, str | None]] = []
+
+    def _answer(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.seen.append((self.path, self.headers.get("Authorization")))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def do_POST(self) -> None:  # noqa: N802 — stdlib name
+        self._answer()
+
+    def do_GET(self) -> None:  # noqa: N802 — stdlib name
+        self._answer()
+
+    def log_message(self, *_args: Any) -> None:
+        return
+
+
+def test_a_linked_hook_secret_is_never_sent_as_the_bearer(
+    git_workspace: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#498: a ``hook.secret`` that is a link is refused before any request: the
+    hook fails open with ``{}``, nothing reaches the port ``server.pid`` names,
+    and ``resolve_endpoint`` names the link and the way out.
+
+    Prevents the bytes of the file a link names going out as ``Authorization:
+    Bearer`` to that port."""
+    _BearerRecorder.seen = []
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _BearerRecorder)
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    coherence = git_workspace / ".coherence"
+    try:
+        coherence.mkdir()
+        write_coordinator_pid_file(coherence, httpd.server_address[1])
+        plant_link(coherence, "hook.secret", "existing")
+        (git_workspace / "plan.md").write_text("plan")
+        read = {
+            "session_id": _sid(), "tool_name": "Read",
+            "tool_input": {"file_path": str(git_workspace / "plan.md")},
+        }
+        rc, out = _drive("pre-read", read, git_workspace, monkeypatch, capsys)
+        with pytest.raises(_coherence_client.CoordinatorUnavailable) as refused:
+            _coherence_client.resolve_endpoint(git_workspace)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert (rc, json.loads(out)) == (0, {})
+    assert _BearerRecorder.seen == []
+    assert str(refused.value) == _secret_link_refusal(coherence)
+
+
+@pytest.mark.parametrize("dangling", [False, True], ids=["to_another_workspace", "dangling"])
+def test_resolve_endpoint_refuses_a_linked_coherence_before_reading_server_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangling: bool,
+) -> None:
+    """#498: a ``.coherence`` that is a link is refused before ``server.pid`` is
+    read, naming the link and the way out. ``O_NOFOLLOW`` on each file guards
+    only the last component, so a client would read the port and the secret of
+    the directory the link names.
+
+    Prevents a client in one workspace joining another workspace's coordinator
+    with that coordinator's own valid bearer."""
+    peer = tmp_path / "peer" / ".coherence"
+    if not dangling:
+        peer.mkdir(parents=True)
+        (peer / "server.pid").write_text("12345\n50000\n")
+        (peer / "hook.secret").write_text("peer-secret\n")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    coherence = workspace / ".coherence"
+    coherence.symlink_to(peer)
+
+    def no_pid_read(path: Path) -> None:
+        pytest.fail(f"read {path} through a linked .coherence")
+
+    monkeypatch.setattr(_coherence_client, "read_pid_file", no_pid_read)
+
+    with pytest.raises(_coherence_client.CoordinatorUnavailable) as refused:
+        _coherence_client.resolve_endpoint(workspace)
+
+    assert str(refused.value) == (
+        f"refusing {coherence}: it is a symlink, and .coherence must be a real directory. "
+        "Replace the link with a real directory and copy in the files you want to keep (move "
+        f"state.db together with its -wal and -shm), or mount a directory at {coherence}."
+    )
+
+
+@pytest.mark.parametrize("linked", [False, True], ids=["fifo", "link_to_fifo"])
+def test_resolve_endpoint_answers_at_once_for_a_fifo_hook_secret(git_workspace: Path, linked: bool) -> None:
+    """#498: a FIFO at ``hook.secret``, or a link to one, is refused at once and
+    named: "not a regular file" for the FIFO, the link refusal for the link. The
+    call runs on a thread and the FIFO is released whatever happens, so a
+    regression fails here instead of hanging the suite.
+
+    Prevents a hook blocking on a FIFO's open, and a FIFO with no writer reading
+    as an empty secret."""
+    coherence = git_workspace / ".coherence"
+    coherence.mkdir()
+    write_coordinator_pid_file(coherence, 50000)
+    secret = coherence / "hook.secret"
+    if linked:
+        fifo = plant_link(coherence, "hook.secret", "to_fifo")
+    else:
+        fifo = secret
+        os.mkfifo(fifo)
+    answers: list[str] = []
+
+    def resolve() -> None:
+        try:
+            _coherence_client.resolve_endpoint(git_workspace)
+        except _coherence_client.CoordinatorUnavailable as exc:
+            answers.append(str(exc))
+
+    worker = threading.Thread(target=resolve, daemon=True)
+    try:
+        worker.start()
+        worker.join(timeout=10)
+        blocked = worker.is_alive()
+    finally:
+        release_fifo(fifo)
+        worker.join(timeout=5)
+
+    assert not blocked, "resolve_endpoint blocked on a FIFO"
+    expected = (
+        _secret_link_refusal(coherence) if linked
+        else f"{secret} is not a regular file; restart with `agent-coherence-coordinator`"
+    )
+    assert answers == [expected]
+
+
+@pytest.mark.parametrize("linked", ["hook.secret", ".coherence"])
+def test_load_secret_never_reads_through_a_link(tmp_path: Path, linked: str) -> None:
+    """#498: ``load_secret`` answers None, as for a missing file, for a
+    ``hook.secret`` that is a link and for one in a ``.coherence`` that is a
+    link.
+
+    Prevents a hook client taking the bytes of the file a link names as the
+    workspace's secret."""
+    if linked == "hook.secret":
+        plant_link(tmp_path / ".coherence", "hook.secret", "existing")
+    else:
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "hook.secret").write_bytes(TARGET_BYTES)
+        (tmp_path / ".coherence").symlink_to(elsewhere)
+
+    assert load_secret(tmp_path) is None
+
+
+# ----------------------------------------------------------------------
+# Links and workspace-root spellings
+#
+# The hook client keys a file the way the plugin's Node client does: it
+# follows links to the file they name and keeps the case each name was typed
+# in, and it falls back to the disk's own spelling only for a path that would
+# otherwise lie outside the root (a root typed in another case, or /var for
+# /private/var). One file then reaches the coordinator under one path, whatever
+# link or root spelling the tool call used. The expected paths are literal and
+# match the Node client's on the same layout.
+# ----------------------------------------------------------------------
+
+from functools import partial  # noqa: E402
+
+from ccs.core.disk_spelling import native_spelling  # noqa: E402
+
+_LINK_SID = "55555555-5555-4555-8555-555555555555"
+
+
+@pytest.fixture
+def linked_workspace(tmp_path: Path) -> Path:
+    """``<tmp>/ws`` is the root: plan.md, documentation/guide.md,
+    docs -> documentation, data/plan-link.md -> ../plan.md,
+    data/outside-link.md -> <tmp>/outside/secret.md, and
+    data/dangle.md -> nope.md (missing)."""
+    root = tmp_path / "ws"
+    (root / "data").mkdir(parents=True)
+    (root / "documentation").mkdir()
+    (tmp_path / "outside").mkdir()
+    (root / "plan.md").write_text("plan")
+    (root / "documentation" / "guide.md").write_text("guide")
+    (tmp_path / "outside" / "secret.md").write_text("secret")
+    (root / "docs").symlink_to("documentation")
+    (root / "data" / "plan-link.md").symlink_to(Path("..") / "plan.md")
+    (root / "data" / "outside-link.md").symlink_to(tmp_path / "outside" / "secret.md")
+    (root / "data" / "dangle.md").symlink_to("nope.md")
+    return root
+
+
+def _file_cc(file_path: Path | str) -> dict[str, Any]:
+    return {"session_id": _LINK_SID, "tool_input": {"file_path": str(file_path)}}
+
+
+def _read_path(file_path: Path | str, root: Path) -> str:
+    """The path a pre-read of ``file_path`` sends for workspace ``root``."""
+    return coherence_hook_client._build_pre_read(_file_cc(file_path), root)["path"]
+
+
+def test_a_link_to_a_file_is_sent_as_the_file_it_names(linked_workspace: Path) -> None:
+    root = linked_workspace
+    link = root / "data" / "plan-link.md"
+
+    assert _read_path(link, root) == "plan.md"
+    edit = coherence_hook_client._build_pre_edit(_file_cc(link), root)
+    assert edit == {"session_id": _LINK_SID, "path": "plan.md"}
+
+
+def test_a_path_through_a_linked_directory_is_sent_under_the_targets_path(
+    linked_workspace: Path,
+) -> None:
+    root = linked_workspace
+
+    assert _read_path(root / "docs" / "guide.md", root) == "documentation/guide.md"
+    grep = coherence_hook_client._build_pre_grep(
+        {"session_id": _LINK_SID, "tool_input": {"path": str(root / "docs")}}, root
+    )
+    assert grep == {"session_id": _LINK_SID, "search_root": "documentation"}
+
+
+def test_a_link_whose_target_leaves_the_root_skips_the_hook(linked_workspace: Path) -> None:
+    root = linked_workspace
+    with pytest.raises(coherence_hook_client._SkipHook):
+        _read_path(root / "data" / "outside-link.md", root)
+
+
+@pytest.mark.parametrize("name", ["dangle.md", "loop-a.md"])
+def test_a_link_that_does_not_resolve_skips_the_hook_with_the_skip_signal(
+    linked_workspace: Path, name: str
+) -> None:
+    """A dangling or looping link is skipped, not sent under the missing
+    target's path (or the link's own): either would give its file a second
+    identity once the target exists. The skip signal, not a filesystem
+    error, so the hook prints ``{}`` without contacting the coordinator."""
+    root = linked_workspace
+    (root / "data" / "loop-a.md").symlink_to("loop-b.md")
+    (root / "data" / "loop-b.md").symlink_to("loop-a.md")
+    builders = (
+        coherence_hook_client._build_pre_read,
+        coherence_hook_client._build_pre_edit,
+        coherence_hook_client._build_post_edit,
+    )
+    for build in builders:
+        with pytest.raises(coherence_hook_client._SkipHook):
+            build(_file_cc(root / "data" / name), root)
+
+
+def test_a_new_file_under_an_existing_directory_keeps_the_leaf_as_typed(
+    linked_workspace: Path,
+) -> None:
+    root = linked_workspace
+
+    edit = coherence_hook_client._build_pre_edit(_file_cc(root / "docs" / "New-Plan.MD"), root)
+    assert edit == {"session_id": _LINK_SID, "path": "documentation/New-Plan.MD"}
+    assert _read_path(root / "data" / "new" / "deep.md", root) == "data/new/deep.md"
+
+
+def test_a_name_typed_in_another_case_under_a_correctly_spelled_root_is_sent_as_typed(
+    linked_workspace: Path,
+) -> None:
+    """A Bash token is keyed as typed, so a Read of README.MD is sent as
+    typed too: sending the disk's README.md would keep the two tools'
+    records of one file apart on a coordinator that folds nothing."""
+    root = linked_workspace
+    (root / "README.md").write_text("readme")
+    if not (root / "README.MD").exists():
+        pytest.skip("the temporary disk keeps two spellings apart, so README.MD is another file")
+
+    assert _read_path(root / "README.MD", root) == "README.MD"
+    edit = coherence_hook_client._build_pre_edit(_file_cc(root / "README.MD"), root)
+    assert edit == {"session_id": _LINK_SID, "path": "README.MD"}
+    # The link is followed; the names typed around it keep their case.
+    assert _read_path(root / "docs" / "GUIDE.MD", root) == "documentation/GUIDE.MD"
+
+
+def test_a_tool_path_spelled_with_a_differently_cased_root_is_sent_relative_to_it(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Repo"
+    (root / "data").mkdir(parents=True)
+    (root / "data" / "x.txt").write_text("x")
+    other_case = tmp_path / "REPO"
+    if not other_case.exists():
+        pytest.skip("the temporary disk keeps two spellings apart, so no other spelling reaches the root")
+
+    assert _read_path(other_case / "data" / "x.txt", root) == "data/x.txt"
+    assert _read_path(root / "data" / "x.txt", other_case) == "data/x.txt"
+    edit = coherence_hook_client._build_pre_edit(_file_cc(other_case / "data" / "New.TXT"), root)
+    assert edit == {"session_id": _LINK_SID, "path": "data/New.TXT"}
+
+
+def test_a_hook_whose_path_spells_the_root_in_another_case_reaches_the_coordinator(
+    live_coordinator, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Claude Code sends ``<base>/REPO/data/x.txt`` for a workspace whose disk
+    spelling is ``<base>/Repo``: the coordinator sees the read of
+    ``data/x.txt`` instead of the hook skipping it as outside the root."""
+    workspace, _ = live_coordinator
+    other_case = workspace.parent / workspace.name.swapcase()
+    if not other_case.exists():
+        pytest.skip("the temporary disk keeps two spellings apart, so no other spelling reaches the root")
+    from ccs.cli import coherence_status, coherence_track
+
+    (workspace / "data").mkdir()
+    (workspace / "data" / "x.txt").write_text("x")
+    coherence_track.main(["--root", str(workspace), "data/x.txt"])
+    capsys.readouterr()
+
+    rc, out = _drive(
+        "pre-read", _file_cc(other_case / "data" / "x.txt"), workspace, monkeypatch, capsys
+    )
+    assert rc == 0
+    assert json.loads(out) != {}, "the hook skipped the read as outside the workspace root"
+    coherence_status.main(["--root", str(workspace), "--json"])
+    status = json.loads(capsys.readouterr().out)
+    assert "data/x.txt" in [a["path"] for a in status.get("tracked_artifacts", [])]
+
+
+def test_a_root_reached_through_a_link_and_a_path_spelled_through_its_target_agree(
+    linked_workspace: Path, tmp_path: Path
+) -> None:
+    root = linked_workspace
+    alias = tmp_path / "alias"
+    alias.symlink_to(root)
+
+    assert _read_path(root / "plan.md", alias) == "plan.md"
+    assert _read_path(alias / "plan.md", root) == "plan.md"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS reaches /var through /private/var")
+def test_macos_var_and_private_var_spellings_of_the_root_and_the_path_agree(
+    linked_workspace: Path,
+) -> None:
+    private_spelling = native_spelling(linked_workspace)
+    assert private_spelling.startswith("/private/"), private_spelling
+    private_root = Path(private_spelling)
+    link_root = Path(private_spelling[len("/private"):])
+
+    assert _read_path(private_root / "plan.md", link_root) == "plan.md"
+    assert _read_path(link_root / "plan.md", private_root) == "plan.md"
+
+
+@pytest.mark.parametrize(
+    "typed, expected",
+    [
+        ("plan.md", "plan.md"),
+        ("documentation/guide.md", "documentation/guide.md"),
+        ("data/new/deep.md", "data/new/deep.md"),
+        ("data/", "data"),
+        ("", "."),
+    ],
+)
+def test_todays_paths_are_sent_as_before(
+    linked_workspace: Path, typed: str, expected: str
+) -> None:
+    """A path with no link and the root's own spelling is sent exactly as
+    before links were followed through the disk resolvers."""
+    root = linked_workspace
+    file_path = os.path.join(str(root), typed)
+
+    assert coherence_hook_client._to_workspace_relative(file_path, root) == expected
+
+
+@pytest.mark.parametrize(
+    "typed, key",
+    [
+        ("sub/link/../plan.md", "sub/plan.md"),
+        ("sub/link/../new.md", "sub/new.md"),
+        ("missing/../w2.md", "w2.md"),
+    ],
+)
+def test_a_parent_step_is_folded_by_text_before_links_are_followed(
+    tmp_path: Path, typed: str, key: str
+) -> None:
+    """A ``..`` in a tool path is folded by text before any link is followed,
+    so the key names the file Claude Code's tools open, not the one the shell
+    opens. Measured on this layout (sub/link -> other/dir): a Read of
+    sub/link/../plan.md returned sub/plan.md, an Edit of it changed
+    sub/plan.md, a Write of sub/link/../new.md created sub/new.md and a Write
+    of missing/../w2.md created w2.md; only the shell opened other/plan.md.
+    Claude Code normalizes an absolute tool path before opening it; the
+    shell's ``..`` is coordinated by the Bash routes. Following the link
+    first would key other/plan.md for a Read that opened sub/plan.md."""
+    root = tmp_path / "ws"
+    (root / "sub").mkdir(parents=True)
+    (root / "other" / "dir").mkdir(parents=True)
+    (root / "sub" / "plan.md").write_text("lexical")
+    (root / "other" / "plan.md").write_text("physical")
+    (root / "sub" / "link").symlink_to(root / "other" / "dir")
+    file_path = os.path.join(str(root), typed)
+
+    assert coherence_hook_client._to_workspace_relative(file_path, root) == key
+    assert _coherence_client.normalize_workspace_path(file_path, root) == (key, None)
+
+
+def test_no_payload_carries_a_name_kind_field(linked_workspace: Path) -> None:
+    """Each coordinator works out a name's kind itself; the hook client
+    never sends one."""
+    root = linked_workspace
+    cc = {
+        "session_id": _LINK_SID,
+        "agent_id": "sub-1",
+        "source": "compact",
+        "tool_input": {
+            "file_path": str(root / "data" / "plan-link.md"),
+            "command": "cat plan.md",
+            "path": str(root / "docs"),
+        },
+    }
+    hc = coherence_hook_client
+    with_root = (hc._build_pre_read, hc._build_pre_edit, hc._build_post_edit, hc._build_pre_grep)
+    without_root = (
+        hc._build_session_stop, hc._build_subagent_stop, hc._build_session_start, hc._build_pre_bash,
+    )
+    builds = [partial(b, cc, root) for b in with_root] + [partial(b, cc) for b in without_root]
+    for build in builds:
+        assert "name_kind" not in build(), build

@@ -9,6 +9,7 @@ per-session counter bounds a cooperating agent's retry loop.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ import pytest
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.core.exceptions import CasVersionConflict
+from ccs.core.path_fold import FOLD_TABLE_UNICODE_VERSION
 from ccs.mcp.server import (
     _READ_DESC,
     _WRITE_CAS_DESC,
@@ -27,6 +29,7 @@ from ccs.mcp.server import (
 )
 from ccs.mcp.session import SessionConfig
 from tests.adapters.test_coherent_volume_split_read import LaggingPeer
+from tests.coordinator_helpers import answer_with_status, recorded_version, serve_in_process
 
 
 @pytest.fixture
@@ -247,6 +250,114 @@ def test_write_cas_counter_resets_after_a_win(tmp_path: Path, fast_cfg: Lifecycl
         stop_coordinator(tmp_path)
 
 
+# --- one streak per file, whatever spelling the agent uses -------------------
+
+#: Two spellings a case-folding disk opens as one file.
+_SPELLINGS = ("data/shared.txt", "DATA/Shared.TXT")
+
+
+class _ScriptedCasVolume:
+    """Just what ``_do_write_cas`` touches of a volume: an attached session
+    whose compare-and-set loses every race until ``wins_next`` is set, against
+    a coordinator whose default ``/status`` tier answers ``status_doc``
+    (``None``: unreadable). Free of any disk, so the spellings below name one
+    file wherever the test runs."""
+
+    is_attached = True
+
+    def __init__(self, status_doc: dict | None) -> None:
+        self._status_doc = status_doc
+        self.wins_next = False
+        self.status_reads = 0
+
+    def coordinator_status(self) -> dict | None:
+        self.status_reads += 1
+        return self._status_doc
+
+    def write_cas_at(self, key: str, expected_version: int, data: bytes) -> object:
+        if self.wins_next:
+            return type("Won", (), {"handoff": None})()
+        raise CasVersionConflict(key, expected_version, expected_version + 1)
+
+
+def _advertising(profile: str, table: str = FOLD_TABLE_UNICODE_VERSION) -> dict:
+    return {"fold_profile": profile, "fold_table_unicode": table}
+
+
+def _reason(result: object) -> str:
+    return result.structuredContent["reason"]  # type: ignore[attr-defined]
+
+
+def test_conflicts_under_two_spellings_of_one_file_count_toward_one_limit(tmp_path: Path) -> None:
+    """An agent retrying one file under two spellings its coordinator folds
+    together is still one retry loop. Counted per spelling, it ran twice as
+    long as the bound before it was told to stop."""
+    volume = _ScriptedCasVolume(_advertising("caseless"))
+    config = _config(tmp_path)
+    conflicts: dict[str, int] = {}
+
+    for attempt in range(MAX_CAS_CONFLICTS):
+        result = _do_write_cas(volume, config, conflicts, _SPELLINGS[attempt % 2], 1, "x")  # type: ignore[arg-type]
+        assert _reason(result) == "version_mismatch"
+    exhausted = _do_write_cas(volume, config, conflicts, _SPELLINGS[MAX_CAS_CONFLICTS % 2], 1, "x")  # type: ignore[arg-type]
+
+    assert _reason(exhausted) == "cas_exhausted"
+
+
+@pytest.mark.parametrize(
+    "status_doc",
+    [
+        None,
+        {},
+        _advertising("none"),
+        _advertising("cannot_tell"),
+        _advertising("folds-everything"),
+        _advertising("caseless", table="16.0.0"),
+    ],
+    ids=["unreadable", "older-coordinator", "none", "cannot-tell", "unknown-profile", "another-table"],
+)
+def test_two_spellings_keep_two_limits_where_names_are_compared_as_typed(
+    tmp_path: Path, status_doc: dict | None
+) -> None:
+    """Where the coordinator keys names as typed (or this server cannot fold
+    as it does), two spellings are two files, each with its own streak."""
+    volume = _ScriptedCasVolume(status_doc)
+    config = _config(tmp_path)
+    conflicts: dict[str, int] = {}
+
+    for attempt in range(2 * MAX_CAS_CONFLICTS):
+        result = _do_write_cas(volume, config, conflicts, _SPELLINGS[attempt % 2], 1, "x")  # type: ignore[arg-type]
+        assert _reason(result) == "version_mismatch", attempt
+
+
+def test_a_win_under_one_spelling_ends_the_streak_counted_under_the_other(tmp_path: Path) -> None:
+    """A win resets the file's streak whichever spelling the conflicts and
+    the win came under, so the next conflict does not start near the bound."""
+    volume = _ScriptedCasVolume(_advertising("caseless"))
+    config = _config(tmp_path)
+    conflicts: dict[str, int] = {}
+    for _ in range(MAX_CAS_CONFLICTS):
+        _do_write_cas(volume, config, conflicts, _SPELLINGS[0], 1, "x")  # type: ignore[arg-type]
+
+    # The win comes under the spelling that differs from the file's fold key.
+    volume.wins_next = True
+    assert _do_write_cas(volume, config, conflicts, _SPELLINGS[1], 1, "won").isError is False  # type: ignore[arg-type]
+    volume.wins_next = False
+
+    assert _reason(_do_write_cas(volume, config, conflicts, _SPELLINGS[0], 1, "x")) == "version_mismatch"  # type: ignore[arg-type]
+
+
+def test_a_win_with_no_open_streak_reads_no_status(tmp_path: Path) -> None:
+    """Finding a file's streak costs a ``/status`` request, whose default tier
+    lists every tracked artifact. A win with no streak open has none to reset,
+    so the common case (a write that wins at once) sends no such request."""
+    volume = _ScriptedCasVolume(_advertising("caseless"))
+    volume.wins_next = True
+
+    assert _do_write_cas(volume, _config(tmp_path), {}, _SPELLINGS[0], 1, "won").isError is False  # type: ignore[arg-type]
+    assert volume.status_reads == 0
+
+
 # --- SB-23: foreign-edit-at-write via swg_write -------------------------------
 
 
@@ -354,6 +465,13 @@ def test_read_description_names_the_write_recovery_for_a_lasting_refusal() -> No
     # ...and only after retrying, since a peer's commit still reaching disk
     # clears on its own and a write made inside that window is overwritten.
     assert "few seconds" in _READ_DESC
+
+
+def test_read_description_names_a_write_whose_commit_did_not_reach_the_coordinator() -> None:
+    """A write whose bytes reached disk but whose commit did not reach the
+    coordinator is refused the same way, and the description lists it among
+    the causes, as the volume's own refusal does."""
+    assert "a write whose commit did not reach the coordinator" in _READ_DESC
 
 
 # --- the refusal reason reaches the caller -----------------------------------
@@ -472,3 +590,149 @@ def test_swg_read_then_write_cas_through_a_peer_commit_window_loses_no_update(
         assert target.read_bytes() == b"2"
     finally:
         stop_coordinator(tmp_path)
+
+
+# --- a commit answered with an HTTP 5xx after it reached the coordinator ------
+#
+# A 5xx says nothing of whether the work behind it ran: the coordinator's
+# dispatcher answers 500 when a handler raises after its work, and a gateway in
+# front of a remote coordinator answers 502, 503 or 504 after it forwarded the
+# request. Each commit here reaches a coordinator running in this process,
+# which records it, and only then is the status answered. Driven through the
+# sync ``_do_*`` helpers. What these do not prove: one machine and loopback
+# only; the status is raised at the client's HTTP boundary, not sent by a real
+# gateway.
+#
+# The journey test at the end answers the status before the commit reaches the
+# coordinator, as a coordinator shedding load does, so nothing is recorded:
+# the client cannot tell that 5xx from the others, and the agent recovers by
+# the same steps.
+
+#: FROZEN duplicates of the unconfirmed-commit terminal per tool, of the
+#: terminal a failure the deny mapper recognises nothing in gets, and of the
+#: stale-read terminal (never imported from the code under test). swg_write's
+#: bytes are on disk, so it writes again; swg_write_cas's never reached disk.
+_COMMIT_UNCONFIRMED = {
+    "swg_write_cas": ("commit_unconfirmed", "read_then_retry", False),
+    "swg_write": ("commit_unconfirmed", "write_again", False),
+}
+_UNRECOGNIZED = ("internal_error", "none", False)
+_STALE_VIEW = ("stale_view", "reacquire", True)
+
+#: The route each write tool commits on.
+_TOOL_COMMITS = {"swg_write_cas": "/hooks/post-edit-cas", "swg_write": "/hooks/post-edit"}
+
+
+def _commit_on(route: str) -> Callable[[str, dict], bool]:
+    """Picks the commit on ``route``, never swg_write's ``success:false``
+    release on the same route."""
+    return lambda path, payload: path == route and payload.get("success") is True
+
+
+def _write_with(tool: str, vol: CoherentVolume, config: SessionConfig, version: int) -> tuple[str, str, bool]:
+    """Run ``tool`` writing ``v2`` and return its deny's (reason, recover, retryable)."""
+    if tool == "swg_write_cas":
+        result = _do_write_cas(vol, config, {}, _PATH, version, "v2")
+    else:
+        result = _do_write(vol, config, _PATH, "v2")
+    assert result.isError is True, result.structuredContent
+    sc = result.structuredContent
+    return sc["reason"], sc["recover"], sc["retryable"]
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+@pytest.mark.parametrize("tool", list(_TOOL_COMMITS))
+def test_a_write_tool_whose_commit_is_answered_with_a_5xx_after_it_landed_answers_commit_unconfirmed(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, tool: str, status: int,
+) -> None:
+    """swg_write_cas and swg_write reach the coordinator, which records the
+    commit, and the answer is an HTTP 5xx. The write may already be recorded,
+    so the tool answers the unconfirmed-commit deny, not retryable as is:
+    ``read_then_retry`` for swg_write_cas, whose bytes never reached disk,
+    and ``write_again`` for swg_write, whose bytes are on disk and recorded
+    only by another write. Before, it answered ``internal_error`` with
+    recover ``none``: the shape of a bug in the server, telling the agent to
+    stop, with no hint that its write may have landed."""
+    _seed(tmp_path, b"v1")
+    config = _config(tmp_path)
+    server = serve_in_process(tmp_path, f"swg-5xx-{tool}-{status}")
+    try:
+        vol = _vol(tmp_path, fast_cfg)
+        version = _do_read(vol, config, _PATH).structuredContent["version"]
+        answer_with_status(monkeypatch, _commit_on(_TOOL_COMMITS[tool]), status)
+
+        deny = _write_with(tool, vol, config, version)
+
+        assert recorded_version(server, _PATH) == version + 1, "control: the coordinator recorded the commit"
+        assert deny == _COMMIT_UNCONFIRMED[tool]
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("tool", list(_TOOL_COMMITS))
+def test_a_write_tool_whose_commit_is_refused_with_a_4xx_answers_as_before(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch, tool: str,
+) -> None:
+    """Control: a 4xx is a definite refusal, never an unknown outcome. A
+    commit refused with one, before the coordinator ran it, answers the deny
+    it always has, and nothing is recorded."""
+    _seed(tmp_path, b"v1")
+    config = _config(tmp_path)
+    server = serve_in_process(tmp_path, f"swg-4xx-{tool}")
+    try:
+        vol = _vol(tmp_path, fast_cfg)
+        version = _do_read(vol, config, _PATH).structuredContent["version"]
+        answer_with_status(monkeypatch, _commit_on(_TOOL_COMMITS[tool]), 400, forwarded=False)
+
+        deny = _write_with(tool, vol, config, version)
+
+        assert recorded_version(server, _PATH) == version, "control: the refused commit was not recorded"
+        assert deny == _UNRECOGNIZED
+    finally:
+        server.shutdown()
+
+
+def test_a_write_whose_commit_is_answered_with_a_5xx_before_it_ran_recovers_by_writing_again(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """swg_write's bytes reach disk and its commit is answered with a 503
+    before the coordinator ran it, so nothing is recorded. The agent follows
+    each answer: ``commit_unconfirmed`` / ``write_again``; ``swg_read``
+    refuses the unrecorded bytes as ``stale_view`` / ``reacquire`` with no
+    version, as the next step says a read first does; the same swg_write once
+    more lands, and the coordinator records it one version on.
+
+    Prevents a read that answers the unrecorded bytes with the old version,
+    so the agent takes a write the coordinator never recorded for one it
+    did, and a recovery step that refuses, which leaves the bytes on disk
+    and never recorded."""
+    target = _seed(tmp_path, b"v1")
+    config = _config(tmp_path)
+    server = serve_in_process(tmp_path, "swg-5xx-before-it-ran")
+    try:
+        vol = _vol(tmp_path, fast_cfg)
+        version = _do_read(vol, config, _PATH).structuredContent["version"]
+        with monkeypatch.context() as answered:
+            answer_with_status(answered, _commit_on("/hooks/post-edit"), 503, forwarded=False)
+            deny = _write_with("swg_write", vol, config, version)
+
+        assert deny == _COMMIT_UNCONFIRMED["swg_write"]
+        assert target.read_bytes() == b"v2", "control: the write's bytes reached disk"
+        assert recorded_version(server, _PATH) == version, "control: the coordinator recorded nothing"
+
+        read = _do_read(vol, config, _PATH)
+        assert read.isError is True, read.structuredContent
+        sc = read.structuredContent
+        assert (sc["reason"], sc["recover"], sc["retryable"]) == _STALE_VIEW, sc
+        assert "version" not in sc and "content" not in sc
+
+        rewrite = _do_write(vol, config, _PATH, "v2")
+        assert rewrite.isError is False, rewrite.structuredContent
+        assert recorded_version(server, _PATH) == version + 1, "the rewrite was not recorded"
+        settled = _do_read(vol, config, _PATH)
+        assert settled.isError is False, settled.structuredContent
+        assert (settled.structuredContent["content"], settled.structuredContent["version"]) == (
+            "v2", version + 1
+        )
+    finally:
+        server.shutdown()

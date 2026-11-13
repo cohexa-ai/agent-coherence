@@ -1218,3 +1218,25 @@ def test_in_process_fence_still_admits_a_clean_pair_after_the_core_move() -> Non
     )
     assert result == "ok"
     assert fired == ["go"]
+
+
+def test_a_split_pair_hold_names_a_write_whose_commit_did_not_reach_the_coordinator() -> None:
+    """The gate's hold for a split pair lists the same causes as the volume's
+    read refusal, this volume's own unrecorded write among them, and names the
+    write that records the bytes.
+
+    Prevents the gate and the read giving one coordinator answer two causes."""
+    from ccs.adapters.effect_gate import _held
+    from ccs.core.exceptions import HOLD_SPLIT_PAIR
+    from ccs.core.types import FenceComparands
+
+    comparands = FenceComparands(
+        expected_version=3, current_version=3, expected_generation=1, current_generation=1,
+        read_refused=True, split_pair=True, grant_did_not_stand=False, content_claim_present=True,
+    )
+
+    held = _held("data/plan.md", comparands, HOLD_SPLIT_PAIR)
+
+    assert "a write whose commit did not reach the coordinator" in str(held), held
+    assert "write()" in str(held), held
+

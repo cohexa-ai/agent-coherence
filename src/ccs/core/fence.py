@@ -11,7 +11,7 @@ implementation of a safety rule is the failure this module exists to remove,
 not to add.
 
 Core is the right home: the classification takes only plain values (two version
-comparands, two generation comparands, three booleans) and the application
+comparands, two generation comparands, four booleans) and the application
 layer already answers a weaker version of this question, so an adapters home
 would bar that caller forever.
 
@@ -31,6 +31,7 @@ from .exceptions import (
     HOLD_GRANT_RECLAIMED,
     HOLD_INPUT_VANISHED,
     HOLD_READ_DENIED,
+    HOLD_SPLIT_PAIR,
     HOLD_VERSION_MOVED,
     HOLD_VERSION_UNCONFIRMED,
 )
@@ -104,8 +105,8 @@ def all_legs_confirmed(comparands: FenceComparands) -> bool:
     not cover — and adding a second caller with a wider input space is exactly
     what this module is for. Proceeding therefore requires saying YES to all of
     it: the input exists, both comparands are confirmed (no sentinels) and
-    unmoved, the read was not refused, the coordinator claims the content, and
-    the grant stood.
+    unmoved, the read was neither refused nor split, the coordinator claims the
+    content, and the grant stood.
     """
     return (
         comparands.current_version is not None
@@ -113,6 +114,7 @@ def all_legs_confirmed(comparands: FenceComparands) -> bool:
         and comparands.current_version != 0
         and comparands.current_version == comparands.expected_version
         and not comparands.read_refused
+        and not comparands.split_pair
         and comparands.content_claim_present
         and comparands.expected_generation is not None
         and comparands.current_generation is not None
@@ -132,14 +134,23 @@ def classify_hold(comparands: FenceComparands) -> str | None:
        resolve" sentinel; comparing sentinels as values is how "I do not know"
        becomes "I know it is unchanged".
     3. ``version_moved`` — the value the decision was derived from changed.
-    4. ``read_denied`` — the coordinator REFUSED the re-validate read. Fires on
+    4. ``split_pair`` — the coordinator refused the re-validate read because
+       the bytes are not the content it records at that version (#405).
+       Above ``read_denied``, which is the same refusal without that reason:
+       a reacquire clears a plain refusal, but not this one, which clears
+       when a peer's write lands or once a write records the bytes on disk.
+       Below ``version_moved``: a peer's compare-and-swap commit moves the
+       version before its bytes land, so it answers ``version_moved``, while a
+       peer's ``write()`` lands its bytes first, so its window answers
+       ``split_pair`` until its commit moves the version.
+    5. ``read_denied`` — the coordinator REFUSED the re-validate read. Fires on
        the refusal ALONE. It once required an unconfirmed generation as well,
        which held only because an in-process strict deny carries no generation;
        a caller that holds the registry's real generation (the coordinator
        route) would have fallen past this leg and either mislabelled its HOLD
        or, with matching comparands, proceeded on a view the coordinator had
        just refused to serve.
-    5. ``content_claim_absent`` — the coordinator records no content hash at
+    6. ``content_claim_absent`` — the coordinator records no content hash at
        all, so it cannot vouch that these bytes are the content at that
        version. Ordered ABOVE the residual bucket deliberately: both no-claim
        forms must land here, and the all-``f`` form arrives with its generation
@@ -147,13 +158,13 @@ def classify_hold(comparands: FenceComparands) -> str | None:
        ``generation_unconfirmed`` and become byte-identical on the wire to a
        genuinely degraded read — the same reason, hint and retryability for two
        cases whose recovery differs (re-read your bytes vs. call an operator).
-    6. ``generation_unconfirmed`` — the residual bucket: a degraded read, an
+    7. ``generation_unconfirmed`` — the residual bucket: a degraded read, an
        unconfirmable out-of-band edit, or a coordinator too old to report
        generations.
-    7. ``grant_reclaimed`` — both generations confirmed and they differ: a
+    8. ``grant_reclaimed`` — both generations confirmed and they differ: a
        sweep reclaimed the grant the decision was read under, while the version
        never moved.
-    8. ``grant_preempted`` — both comparands confirmed AND unchanged, yet the
+    9. ``grant_preempted`` — both comparands confirmed AND unchanged, yet the
        re-validate read was served without a standing grant.
 
     Raises:
@@ -168,6 +179,8 @@ def classify_hold(comparands: FenceComparands) -> str | None:
         return HOLD_VERSION_UNCONFIRMED
     if comparands.current_version != comparands.expected_version:
         return HOLD_VERSION_MOVED
+    if comparands.split_pair:
+        return HOLD_SPLIT_PAIR
     if comparands.read_refused:
         return HOLD_READ_DENIED
     if not comparands.content_claim_present:

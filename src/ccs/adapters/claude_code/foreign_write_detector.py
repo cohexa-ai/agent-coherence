@@ -83,24 +83,42 @@ offline report still shows the hole.
 **It asks git for literal paths.** A stored artifact name is data, and git reads
 pathspec magic in a path even after ``--``. A name beginning with a colon would
 otherwise re-scope or silently exclude the rest of the poll.
+
+**And, on a disk that folds names, by git's own spelling.** A row can be stored
+under a spelling the index does not use: a merge keeps the disk's spelling, and
+a case-only rename on a caseless disk leaves the index on the old one. Git drops
+a literal pathspec whose case differs from the index name before printing
+anything (measured with ``core.ignorecase=true``), so a poll that asks for the
+stored name sees nothing, on every tick. A folding pass therefore reads the
+index FIRST, maps each covered row to the index names sharing its fold key, and
+polls with those. A row no index name shares a key with is polled by its own
+name and counts only if git reports that exact name — a staged deletion, a
+rename's old side — as it does today. Because the index read now comes first,
+it is the call that meets a missing repository, so it classifies a failure by
+the same rule the poll does. On a disk that folds nothing the pass is unchanged.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import stat
 import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Protocol
+from typing import Iterable, Iterator, Protocol
 from uuid import UUID
 
-from ccs.adapters.claude_code.coordinator_server import _F_SENTINEL_CONTENT_HASH
-from ccs.core.states import MESIState
-from ccs.core.substrate import sha256_hex
+from ccs.adapters.claude_code.coordinator_server import (
+    _F_SENTINEL_CONTENT_HASH,
+    _a_write_is_in_flight,
+)
+from ccs.adapters.claude_code.disk_content import hash_regular_file
+from ccs.adapters.claude_code.policy import UNFOLDED_FILE, PolicyMatchContext
+from ccs.coordinator.fold_merge import index_key_of
+from ccs.core.path_fold import FoldingProfile, exceeds_fold_limit, tidy_path
 
 logger = logging.getLogger(__name__)
 
@@ -208,10 +226,6 @@ _WALK_BUDGET_SEC = 2.0
 # already "present", so a second one would buy nothing.
 _walk_lock = threading.Lock()
 _walk_in_flight: threading.Thread | None = None
-
-# An outstanding write grant is the registry's own evidence that a mediated
-# write is in flight, which the timestamp alone cannot supply — see _classify.
-_WRITE_GRANT_STATES = (MESIState.MODIFIED, MESIState.EXCLUSIVE)
 
 
 class DetectionTarget(Protocol):
@@ -350,28 +364,40 @@ def _git_dirty_paths(root: Path, names: list[str], *, deadline: float) -> set[st
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", "replace").strip()
             message = f"git status exited {result.returncode} in {root}: {stderr[:200]}"
-            # Two halves, and NEITHER is sufficient alone. 128 is git's generic
-            # fatal exit — a bad object, a corrupt index and a dubious-ownership
-            # refusal all land on it — so the sentence is what says this was a
-            # repository-discovery failure (`_poll_env` pins the language so the
-            # match holds under any locale). And the sentence is what git also
-            # says about a repository whose `.git` is present but gutted, so the
-            # filesystem is what says the repository is absent rather than
-            # broken. Quiet requires both; anything else keeps its traceback.
-            # The walk's own bound is a ceiling; what it actually gets is
-            # whatever is left of the budget that bounds this WHOLE poll, so a
-            # failed classification cannot push the tick past the sweep
-            # interval it shares with the coordinator's grant and session work.
-            walk_budget = min(_WALK_BUDGET_SEC, max(0.0, deadline - time.monotonic()))
-            if (
-                result.returncode == 128
-                and "not a git repository" in stderr.lower()
-                and _repository_is_absent(root, budget_sec=walk_budget)
-            ):
+            if _names_an_absent_repository(root, result, deadline=deadline):
                 raise NotAGitRepositoryError(message)
             raise GitPollError(message)
         dirty.update(_parse_porcelain_v2(result.stdout.decode("utf-8", "replace")))
     return dirty
+
+
+def _names_an_absent_repository(
+    root: Path, result: subprocess.CompletedProcess[bytes], *, deadline: float
+) -> bool:
+    """Whether a failed git call says no repository exists at or above ``root``.
+
+    One rule for whichever call meets the workspace first: the status poll on a
+    disk that folds nothing, the index read on one that folds names.
+    """
+    stderr = result.stderr.decode("utf-8", "replace")
+    # Two halves, and NEITHER is sufficient alone. 128 is git's generic
+    # fatal exit — a bad object, a corrupt index and a dubious-ownership
+    # refusal all land on it — so the sentence is what says this was a
+    # repository-discovery failure (`_poll_env` pins the language so the
+    # match holds under any locale). And the sentence is what git also
+    # says about a repository whose `.git` is present but gutted, so the
+    # filesystem is what says the repository is absent rather than
+    # broken. Quiet requires both; anything else keeps its traceback.
+    # The walk's own bound is a ceiling; what it actually gets is
+    # whatever is left of the budget that bounds this WHOLE poll, so a
+    # failed classification cannot push the tick past the sweep
+    # interval it shares with the coordinator's grant and session work.
+    walk_budget = min(_WALK_BUDGET_SEC, max(0.0, deadline - time.monotonic()))
+    return (
+        result.returncode == 128
+        and "not a git repository" in stderr.lower()
+        and _repository_is_absent(root, budget_sec=walk_budget)
+    )
 
 
 def _git_visible_names(root: Path, *, deadline: float) -> set[str]:
@@ -407,10 +433,53 @@ def _git_visible_names(root: Path, *, deadline: float) -> set[str]:
 
     It never classifies. The exit-128 ``NotAGitRepositoryError`` split, its
     bounded filesystem walk and its once-per-arrival latch belong to the status
-    poll, which runs FIRST. A second classifier here would make this call the
-    one that meets a non-repository, and put the entire no-work-tree story
-    behind a classifier nothing else has ever exercised.
+    poll, which runs FIRST on a disk that folds nothing. A second classifier
+    here would make this call the one that meets a non-repository, and put the
+    entire no-work-tree story behind a classifier nothing else has ever
+    exercised. (On a disk that folds names the index read runs first instead,
+    as :func:`_git_index`, through the same predicate the poll uses.)
     """
+    result = _run_ls_files(root, deadline=deadline)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", "replace").strip()
+        raise GitPollError(
+            f"git ls-files exited {result.returncode} in {root}: {stderr[:200]}"
+        )
+    return _parse_ls_files_v(result.stdout.decode("utf-8", "replace"))
+
+
+@dataclass(frozen=True)
+class _GitIndex:
+    """One index read: every name the index holds, whatever its tag, and the
+    subset the status poll can report on."""
+
+    names: frozenset[str]
+    visible: frozenset[str]
+
+
+def _git_index(root: Path, *, deadline: float) -> _GitIndex:
+    """The index read a folding pass makes BEFORE its poll.
+
+    Being first, it is the call that meets a workspace with no repository, so a
+    failure is classified exactly as the poll classifies one; otherwise every
+    tick in such a workspace would log a traceback and never record the note
+    the offline report reads.
+    """
+    result = _run_ls_files(root, deadline=deadline)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", "replace").strip()
+        message = f"git ls-files exited {result.returncode} in {root}: {stderr[:200]}"
+        if _names_an_absent_repository(root, result, deadline=deadline):
+            raise NotAGitRepositoryError(message)
+        raise GitPollError(message)
+    payload = result.stdout.decode("utf-8", "replace")
+    names = frozenset(path for _tag, path in _ls_files_records(payload))
+    return _GitIndex(names=names, visible=frozenset(_parse_ls_files_v(payload)))
+
+
+def _run_ls_files(root: Path, *, deadline: float) -> subprocess.CompletedProcess[bytes]:
+    """One ``git ls-files -z -v --full-name`` over the whole index, whatever its
+    exit; a spent budget, a timeout and a missing git raise ``GitPollError``."""
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         # Checked before the spawn, not after: a helper that started git anyway
@@ -418,7 +487,7 @@ def _git_visible_names(root: Path, *, deadline: float) -> set[str]:
         # budget that is already gone.
         raise GitPollError(f"git poll exceeded its budget before ls-files in {root}")
     try:
-        result = subprocess.run(
+        return subprocess.run(
             ["git", "-C", str(root), "ls-files", "-z", "-v", "--full-name"],
             check=False,
             capture_output=True,
@@ -429,12 +498,6 @@ def _git_visible_names(root: Path, *, deadline: float) -> set[str]:
         raise GitPollError(f"git ls-files timed out in {root}") from exc
     except FileNotFoundError as exc:
         raise GitPollError("git is not on PATH") from exc
-    if result.returncode != 0:
-        stderr = result.stderr.decode("utf-8", "replace").strip()
-        raise GitPollError(
-            f"git ls-files exited {result.returncode} in {root}: {stderr[:200]}"
-        )
-    return _parse_ls_files_v(result.stdout.decode("utf-8", "replace"))
 
 
 def _repository_is_absent(root: Path, *, budget_sec: float = _WALK_BUDGET_SEC) -> bool:
@@ -612,17 +675,101 @@ def _parse_ls_files_v(payload: str) -> set[str]:
     dropped; every other tag is kept, recognised or not. A record carrying no
     space carries no path either, so there is nothing to keep and it is skipped.
     """
-    names: set[str] = set()
+    return {
+        path
+        for tag, path in _ls_files_records(payload)
+        if tag not in _STATUS_BLIND_TAGS and not tag.islower()
+    }
+
+
+def _ls_files_records(payload: str) -> Iterator[tuple[str, str]]:
+    """Each ``(tag, path)`` record of ``git ls-files -z -v``, the path being
+    every byte after the first space; a record with no path is skipped."""
     for record in payload.split("\0"):
-        if not record:
-            continue
         tag, separator, path = record.partition(" ")
-        if not separator or not path:
-            continue
-        if tag in _STATUS_BLIND_TAGS or tag.islower():
-            continue
-        names.add(path)
-    return names
+        if separator and path:
+            yield tag, path
+
+
+def _fold_key_of(name: str, profile: FoldingProfile) -> str:
+    """The key the registry lists ``name`` under (:func:`index_key_of`).
+
+    Every index name is keyed on every tick, and the table fold costs about 50
+    microseconds a name: a repository of 100,000 files would spend the tick's
+    whole budget on it, on the thread that also reclaims grants. An ASCII name
+    has no decomposition and case-folds only A-Z, so its key is its tidied text,
+    lowercased when the profile folds case: the same key, far cheaper.
+    """
+    if not name.isascii() or exceeds_fold_limit(name):
+        return index_key_of(name, profile)
+    tidied = tidy_path(name)
+    return tidied.lower() if profile == "caseless" else tidied
+
+
+def _git_spellings(
+    rows: list[str], index_names: Iterable[str], profile: FoldingProfile
+) -> dict[str, tuple[str, ...]]:
+    """Each row's spellings to ask git about: the index names sharing its fold
+    key, else the row's own name.
+
+    Every index name counts, whatever its tag: a change staged before
+    ``--skip-worktree`` was set is still reported under the index's spelling.
+    A row no index name maps to keeps its own name because the poll still
+    reports a staged deletion or a rename's old side under it, and with no
+    index name sharing its key there is nothing for git to drop it against.
+    """
+    names_by_key: dict[str, list[str]] = {}
+    for name in index_names:
+        names_by_key.setdefault(_fold_key_of(name, profile), []).append(name)
+    return {row: tuple(names_by_key.get(_fold_key_of(row, profile), (row,))) for row in rows}
+
+
+def _rows_git_reports(
+    spellings: dict[str, tuple[str, ...]], dirty: set[str], index_visible: frozenset[str]
+) -> tuple[set[str], set[str]]:
+    """The rows the poll found dirty, and the rows it can report on at all,
+    each by whichever of its spellings git spoke of. A row whose spellings git
+    neither indexes visibly nor reported is not visible: counting it would
+    claim coverage of a name the poll cannot see."""
+    reportable = index_visible | dirty
+    dirty_rows = {row for row, names in spellings.items() if not dirty.isdisjoint(names)}
+    visible_rows = {row for row, names in spellings.items() if not reportable.isdisjoint(names)}
+    return dirty_rows, visible_rows
+
+
+@dataclass(frozen=True)
+class _FoldedScope:
+    """What a folding tick polls: the workspace, its covered rows, and the
+    profile the registry keys those rows by."""
+
+    root: Path
+    rows: list[str]
+    profile: FoldingProfile
+
+
+def _poll_by_git_spelling(
+    scope: _FoldedScope, *, index_deadline: float, poll_deadline: float
+) -> tuple[set[str], set[str]]:
+    """The folding tick's two git calls: the index read, then the poll with
+    git's spellings. Returns ``(dirty, visible)`` as covered row names, the
+    shape every later step of the tick reads."""
+    index = _git_index(scope.root, deadline=index_deadline)
+    spellings = _git_spellings(scope.rows, index.names, scope.profile)
+    pathspecs = sorted({name for names in spellings.values() for name in names})
+    dirty = _git_dirty_paths(scope.root, pathspecs, deadline=poll_deadline)
+    return _rows_git_reports(spellings, dirty, index.visible)
+
+
+def _folding_profile(registry) -> FoldingProfile | None:
+    """The profile the registry keys file rows by, when it folds anything.
+
+    Read off the registry rather than the server's probe result because it is
+    the key the covered names were listed under. The two agree whenever the
+    index is built; without the single-writer lock there is no index (None) and
+    the probe says ``none``. None and ``none`` run the pass as it always ran.
+    """
+    profile = registry.fold_index_profile
+    return None if profile is None or profile == "none" else profile
 
 
 def _argv_encodable(name: str) -> bool:
@@ -642,48 +789,11 @@ def _argv_encodable(name: str) -> bool:
 
 
 def _disk_hash(path: Path) -> str | None:
-    """Hash the file's raw bytes, or return None when it is not observable.
-
-    Raw bytes and the one canonical helper: no decode, no newline translation,
-    no git filter. A normalization here would be the first in the system and
-    would diverge this comparison from every writer that produced a stored hash.
-
-    One descriptor answers every question, which closes three gaps a
-    stat-then-open sequence leaves open. ``O_NOFOLLOW`` refuses a symlink leaf,
-    so a coordinated name cannot be pointed at a file outside the workspace.
-    ``O_NONBLOCK`` means a path replaced by a named pipe fails instead of
-    blocking this thread forever. And checking the size on the open descriptor,
-    then reading one byte past the cap, means a file that grows between the
-    check and the read is still refused rather than read unbounded.
-
-    None covers every way an artifact can stop being an observable regular file
-    — deleted, renamed away, replaced by a directory or a link, permission
-    revoked, or oversized. All of those are coverage gaps, not detections.
-    """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    try:
-        fd = os.open(path, flags)
-    except OSError:
-        return None
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            return None
-        if info.st_size > _MAX_HASH_BYTES:
-            logger.debug("detection: %s exceeds the per-tick hash cap; skipped", path)
-            return None
-        with os.fdopen(fd, "rb", closefd=True) as handle:
-            fd = -1  # ownership moved to the file object
-            data = handle.read(_MAX_HASH_BYTES + 1)
-        if len(data) > _MAX_HASH_BYTES:
-            logger.debug("detection: %s grew past the per-tick hash cap; skipped", path)
-            return None
-        return sha256_hex(data)
-    except OSError:
-        return None
-    finally:
-        if fd >= 0:
-            os.close(fd)
+    """Hash the file's raw bytes, or return None when it is not observable --
+    :func:`~ccs.adapters.claude_code.disk_content.hash_regular_file`, the read
+    pre-edit's out-of-band check shares (#278), under this pass's own cap. None
+    is a coverage gap, not a detection."""
+    return hash_regular_file(path, max_bytes=_MAX_HASH_BYTES)
 
 
 def _stat_signature(path: Path) -> tuple[int, int] | None:
@@ -714,7 +824,7 @@ def _classify_mismatch(
     *,
     updated_at: float | None,
     has_mediated_writer: bool,
-    has_write_grant: bool,
+    has_write_in_flight: bool,
     now_unix: float,
     window_sec: float,
 ) -> str:
@@ -729,9 +839,12 @@ def _classify_mismatch(
     lands, so a commit caught mid-flight looks like a divergence. The timestamp
     catches that only when a PREVIOUS commit happens to be recent — during the
     gap it still holds the previous commit's time, so a mediated write to an
-    artifact untouched for an hour would read as foreign. An outstanding write
-    grant is the registry's own evidence that a write is in flight right now,
-    and it covers exactly the case the timestamp misses.
+    artifact untouched for an hour would read as foreign. An acquired write
+    claim not yet committed, held by a session active within the window, is the
+    registry's own evidence that a write is in flight right now, and it covers
+    exactly the case the timestamp misses (``has_write_in_flight``; see
+    :func:`~ccs.adapters.claude_code.coordinator_server._a_write_is_in_flight`,
+    the rule pre-edit's out-of-band check shares).
 
     The timestamp leg additionally requires a witnessed writer: ``updated_at``
     is also stamped by first-observation registration, with no writer behind it,
@@ -741,7 +854,7 @@ def _classify_mismatch(
     What either leg admits is not hidden — a suppression is its own counted
     outcome, so an operator can size the exposure rather than trust it.
     """
-    if has_write_grant:
+    if has_write_in_flight:
         return "lag_suppressed"
     if (
         has_mediated_writer
@@ -910,6 +1023,13 @@ def _detect(
     registry = coordinator.registry
     policy = coordinator.policy
     root = Path(coordinator.coordinator_root)
+    folding_profile = _folding_profile(registry)
+    # On a disk that folds names the policy meets a stored name the way the
+    # coordinator meets a request there, so a pattern written in git's spelling
+    # still tracks a row the disk stores in another.
+    match_context = (
+        UNFOLDED_FILE if folding_profile is None else PolicyMatchContext(profile=folding_profile)
+    )
 
     # The registered names are NOT already policy-filtered: `/session/begin`
     # registers every client-supplied read-set path without consulting the
@@ -918,7 +1038,7 @@ def _detect(
     covered = [
         name
         for name in registry.artifact_names_under_prefix("")
-        if policy.is_tracked(name) and _argv_encodable(name)
+        if policy.is_tracked(name, match_context) and _argv_encodable(name)
     ]
     if not covered:
         # Deliberately no tick. A run that watched nothing must not read as a
@@ -949,52 +1069,64 @@ def _detect(
     # tick run for twice `poll_budget_sec` on the thread that also reclaims
     # grants and reaps dead sessions.
     deadline = time.monotonic() + poll_budget_sec
-    # The poll gets the budget minus the visibility read's reserve; the
-    # visibility read then gets whatever is genuinely left, up to the full
-    # deadline. Ordering is unchanged: the poll still runs first and still owns
-    # the not-a-repository classification.
+    # The first git call gets the budget minus a reserve for the second; the
+    # second then gets whatever is genuinely left, up to the full deadline. On
+    # a disk that folds nothing the poll runs first and owns the
+    # not-a-repository classification; on one that folds names the index read
+    # runs first and classifies by the same rule.
     reserve = min(_VISIBILITY_RESERVE_SEC, poll_budget_sec * _VISIBILITY_RESERVE_FRACTION)
-    dirty = _git_dirty_paths(root, covered, deadline=deadline - reserve)
-    # The poll completed, so whatever this workspace was when the latch was set,
-    # it is pollable now: re-arm, and a workspace that stops being a repository
-    # again is reported the second time too. Only a completed poll clears it —
-    # the early returns above observed nothing about the condition.
-    reported_faults.discard(_FAULT_NOT_A_REPOSITORY)
+    if folding_profile is not None:
+        # Git drops a stored spelling the index does not use, so the poll asks
+        # by git's spellings and both sets come back as covered row names.
+        dirty, visible = _poll_by_git_spelling(
+            _FoldedScope(root, covered, folding_profile),
+            index_deadline=deadline - reserve,
+            poll_deadline=deadline,
+        )
+        # Both calls completed, so the workspace is pollable: re-arm, as below.
+        reported_faults.discard(_FAULT_NOT_A_REPOSITORY)
+    else:
+        dirty = _git_dirty_paths(root, covered, deadline=deadline - reserve)
+        # The poll completed, so whatever this workspace was when the latch was set,
+        # it is pollable now: re-arm, and a workspace that stops being a repository
+        # again is reported the second time too. Only a completed poll clears it —
+        # the early returns above observed nothing about the condition.
+        reported_faults.discard(_FAULT_NOT_A_REPOSITORY)
 
-    # The claimed scope, narrowed to what the poll above can actually speak
-    # about. `--untracked-files=no` means a registered artifact git never
-    # tracked — or one an exclude rule, `--skip-worktree` or `--assume-unchanged`
-    # hides — is reported clean on every tick for the life of the workspace, so
-    # counting it as covered manufactures exactly the quiet month this module
-    # exists to refuse.
-    #
-    # The SAME deadline minted above, deliberately, and for the reason stated
-    # there: one budget bounds the whole tick.
-    #
-    # It raises like the poll does, and is not caught here. A visibility read
-    # that failed must never be read as a narrowed scope — that is the poll's
-    # "swallowed error reads as a clean tree" defect wearing a different hat,
-    # and an unrecorded tick is the honest answer to a scope nobody could read.
-    #
-    # `covered` stays bound, for exactly one reason: the check below has to be
-    # able to tell a scope that was non-empty and narrowed to nothing from one
-    # that started empty, and only the unnarrowed name still carries that. It is
-    # NOT what the eviction pass reads — that is keyed off the stat cache, so
-    # that a name which left the scope entirely by an untrack is reachable at
-    # all — nor what the edge release reads, which takes `visible`.
-    # The union is the whole point, and it is not belt-and-braces. The index
-    # read answers "is this name cached in the index", while the question that
-    # matters is "can the poll report on this name" — and those disagree in the
-    # narrowing direction, which is the direction that loses a foreign write.
-    # Measured on git 2.50.1: a path removed with `git rm --cached` but left on
-    # disk, the OLD side of a rename (porcelain emits a `2 R.` record carrying
-    # BOTH paths), and a change staged BEFORE `--skip-worktree` was set are all
-    # reported by the poll and all absent from, or blinded in, the index read.
-    # `dirty` is by construction what the poll just said it can see, so adding
-    # it back admits exactly those and nothing else: a name git never mentions
-    # is absent from `dirty` too, so the narrowing this pass exists for is
-    # untouched.
-    visible = set(covered) & (_git_visible_names(root, deadline=deadline) | dirty)
+        # The claimed scope, narrowed to what the poll above can actually speak
+        # about. `--untracked-files=no` means a registered artifact git never
+        # tracked — or one an exclude rule, `--skip-worktree` or `--assume-unchanged`
+        # hides — is reported clean on every tick for the life of the workspace, so
+        # counting it as covered manufactures exactly the quiet month this module
+        # exists to refuse.
+        #
+        # The SAME deadline minted above, deliberately, and for the reason stated
+        # there: one budget bounds the whole tick.
+        #
+        # It raises like the poll does, and is not caught here. A visibility read
+        # that failed must never be read as a narrowed scope — that is the poll's
+        # "swallowed error reads as a clean tree" defect wearing a different hat,
+        # and an unrecorded tick is the honest answer to a scope nobody could read.
+        #
+        # `covered` stays bound, for exactly one reason: the check below has to be
+        # able to tell a scope that was non-empty and narrowed to nothing from one
+        # that started empty, and only the unnarrowed name still carries that. It is
+        # NOT what the eviction pass reads — that is keyed off the stat cache, so
+        # that a name which left the scope entirely by an untrack is reachable at
+        # all — nor what the edge release reads, which takes `visible`.
+        # The union is the whole point, and it is not belt-and-braces. The index
+        # read answers "is this name cached in the index", while the question that
+        # matters is "can the poll report on this name" — and those disagree in the
+        # narrowing direction, which is the direction that loses a foreign write.
+        # Measured on git 2.50.1: a path removed with `git rm --cached` but left on
+        # disk, the OLD side of a rename (porcelain emits a `2 R.` record carrying
+        # BOTH paths), and a change staged BEFORE `--skip-worktree` was set are all
+        # reported by the poll and all absent from, or blinded in, the index read.
+        # `dirty` is by construction what the poll just said it can see, so adding
+        # it back admits exactly those and nothing else: a name git never mentions
+        # is absent from `dirty` too, so the narrowing this pass exists for is
+        # untouched.
+        visible = set(covered) & (_git_visible_names(root, deadline=deadline) | dirty)
 
     # FIRST, and before either the empty-scope return below or the clean-edge
     # pass at the bottom, because the all-invisible tick returns without
@@ -1202,11 +1334,12 @@ def _observe(
     if disk_hash == canonical:
         outcome = "mediated"
     else:
-        states = registry.get_state_map(artifact_id).values()
         outcome = _classify_mismatch(
             updated_at=registry.get_artifact_updated_at(artifact_id),
             has_mediated_writer=registry.last_writer_for(artifact_id) is not None,
-            has_write_grant=any(state in _WRITE_GRANT_STATES for state in states),
+            has_write_in_flight=_a_write_is_in_flight(
+                registry, artifact_id, now_unix=now_unix, window_sec=window_sec
+            ),
             now_unix=now_unix,
             window_sec=window_sec,
         )

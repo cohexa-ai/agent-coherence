@@ -47,5 +47,5 @@
     }
   },
   "_comment": "additionalContext text is per-invocation-varying (warn-mode template carries timestamps); corpus asserts only the wire shape (permissionDecision='allow', additionalContext present, status='stale').",
-  "backends": ["python"]
+  "backends": ["python", "node"]
 }

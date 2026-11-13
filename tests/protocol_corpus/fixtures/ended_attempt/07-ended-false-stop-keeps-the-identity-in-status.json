@@ -1,0 +1,109 @@
+{
+  "name": "ended-false-stop-keeps-the-identity-in-status",
+  "description": "\"ended\": false answers as a stop without the field (#525). The same requests as plain-subagent-stop-keeps-the-identity-in-status, with \"ended\": false on the stop: the stop releases the grant and keeps a read, so GET /status lists the identity with notes.md SHARED beside the peer's row, exactly as the control does. A backend that took any boolean as an end would drop that row. Both backends, with the same key projection as the ended row.",
+  "setup": {
+    "tracked": ["notes.md", "other.md"],
+    "files": {
+      "notes.md": "# Notes\n",
+      "other.md": "# Other\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "99999999-9999-4999-8999-999999999999",
+          "path": "other.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "66666666-6666-4666-8666-666666666666",
+          "agent_id": "a0826622451ec196f",
+          "path": "notes.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/session-stop",
+        "body": {
+          "session_id": "66666666-6666-4666-8666-666666666666",
+          "agent_id": "a0826622451ec196f",
+          "ended": false
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "GET",
+    "path": "/status"
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "sessions": [
+        {
+          "agent_id": "<UUID>",
+          "agent_name": null,
+          "states": {
+            "other.md": "SHARED"
+          }
+        },
+        {
+          "agent_id": "<UUID>",
+          "agent_name": null,
+          "states": {
+            "notes.md": "SHARED"
+          }
+        }
+      ]
+    }
+  },
+  "optional_keys": [
+    "audit_log_mode_drift_total",
+    "auth_401_total",
+    "backend",
+    "caller_principal_absent_total",
+    "caller_principal_refused_total",
+    "cold_start_duration_ms",
+    "coordinator_backend",
+    "coordinator_pid",
+    "coordinator_root",
+    "coordinator_uptime_s",
+    "coordinator_uptime_seconds",
+    "coordinator_version",
+    "counts",
+    "detail",
+    "effect_fence_holds_total",
+    "endpoint_counters",
+    "fold_profile",
+    "fold_table_unicode",
+    "fresh_shared_hash_mismatch_total",
+    "handler_concurrency_overflows_total",
+    "handoff_giver_denials_total",
+    "in_flight_drain_timed_out",
+    "intra_task_acquire_release_total",
+    "policy_summary",
+    "pre_edit_if_unheld",
+    "pre_edit_other_holder_denials_total",
+    "registry_schema_version",
+    "schema_version",
+    "shared_foreign_lag_suppressed_total",
+    "stale_warning_emitted_total",
+    "stale_warning_reread_total",
+    "status",
+    "strict_mode_denials_total",
+    "strict_mode_routed_around_via_bash_total",
+    "sweep_reclaims_by_trigger",
+    "sweep_reclaims_total",
+    "tracked_artifacts",
+    "version",
+    "watchdog_late_aborts_total",
+    "watchdog_late_completion_total",
+    "watchdog_queue_overflows_total",
+    "watchdog_timeouts_total"
+  ],
+  "backends": ["python", "node"]
+}

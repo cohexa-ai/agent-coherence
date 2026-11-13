@@ -398,6 +398,88 @@ def test_r12_retry_exhaustion_surfaces_typed_terminal_no_silent_drop() -> None:
     assert runtime.content(artifact.id) != last_writer_content
 
 
+def _reclaim_an_unrelated_holder(coordinator: CoordinatorService, artifact_id: UUID, *, tick: int) -> None:
+    """An agent that never heartbeats takes EXCLUSIVE and the shipped sweep
+    reclaims it: the ownership generation moves, the version does not. Set
+    on the registry directly, so the readers already on the path keep their
+    SHARED rows and their claims."""
+    coordinator.registry.set_agent_state(
+        artifact_id, uuid4(), MESIState.EXCLUSIVE, trigger="write", tick=tick
+    )
+    reclaimed = coordinator.enforce_stable_grant_timeouts(
+        current_tick=tick + 1, heartbeat_timeout_ticks=1, max_hold_ticks=1_000
+    )
+    assert reclaimed == 1
+
+
+def test_retry_exhaustion_carries_the_pair_of_the_last_refusal_it_saw() -> None:
+    """The terminal names the lost token of the LAST refusal, never the first.
+
+    Two reclaims before the run put the path at generation 2, so every claim
+    the writer records is 2. A peer wins before each of the first attempts,
+    which are refused ``version_mismatch`` at (2, 2). Before the last attempt
+    an unrelated holder is reclaimed, moving the generation to 3 and not the
+    version, so that attempt is refused ``stale_read_generation`` at (2, 3).
+    A terminal that kept the first refusal's pair, or none, fails."""
+    coordinator = CoordinatorService(ArtifactRegistry())
+    artifact = coordinator.register_artifact(name="plan.md", content="v1")
+    _reclaim_an_unrelated_holder(coordinator, artifact.id, tick=1)
+    _reclaim_an_unrelated_holder(coordinator, artifact.id, tick=3)
+
+    runtime = AgentRuntime(agent_id=uuid4(), coordinator=coordinator, strategy=LazyStrategy())
+    for reader in (runtime.agent_id, uuid4()):  # a co-reader keeps the writer SHARED
+        coordinator.fetch(
+            FetchRequest(artifact_id=artifact.id, requesting_agent_id=reader, requested_at_tick=5)
+        )
+    runtime.cache.put(
+        artifact.id,
+        runtime.strategy.on_fetch(
+            artifact_id=artifact.id, version=artifact.version, state=MESIState.SHARED, now_tick=5,
+        ),
+    )
+
+    max_attempts = LazyStrategy().max_cas_retries() + 1
+    real_commit_cas = coordinator.commit_cas
+    refusals: list[tuple[str, int | None, int | None]] = []
+
+    def _move_the_path_then_commit(**kwargs):  # type: ignore[no-untyped-def]
+        if len(refusals) < max_attempts - 1:
+            peer = uuid4()
+            for reader in (peer, uuid4()):
+                coordinator.fetch(
+                    FetchRequest(artifact_id=artifact.id, requesting_agent_id=reader, requested_at_tick=6)
+                )
+            peer_v = coordinator.registry.get_artifact(artifact.id).version
+            won = real_commit_cas(
+                agent_id=peer, artifact_id=artifact.id,
+                expected_version=peer_v, content_hash=compute_content_hash(f"peer-{peer_v}"),
+            )
+            assert isinstance(won, tuple)
+        else:
+            _reclaim_an_unrelated_holder(coordinator, artifact.id, tick=7)
+        result = real_commit_cas(**kwargs)
+        assert isinstance(result, ConflictDetail)
+        refusals.append((result.reason, result.captured_generation, result.owner_generation))
+        return result
+
+    coordinator.commit_cas = _move_the_path_then_commit  # type: ignore[assignment]
+    try:
+        with pytest.raises(CasRetriesExhausted) as excinfo:
+            runtime.write_cas(
+                artifact.id,
+                make_content=lambda entry: (f"prot-v{entry.local_version + 1}", None),
+                now_tick=6,
+            )
+    finally:
+        coordinator.commit_cas = real_commit_cas  # type: ignore[assignment]
+
+    assert refusals == [("version_mismatch", 2, 2)] * (max_attempts - 1) + [
+        ("stale_read_generation", 2, 3)
+    ]
+    assert excinfo.value.last_conflict_reason == "stale_read_generation"
+    assert (excinfo.value.captured_generation, excinfo.value.owner_generation) == (2, 3)
+
+
 # ----------------------------------------------------------------------
 # A handed-off giver racing its successor, through the service (#185)
 # ----------------------------------------------------------------------

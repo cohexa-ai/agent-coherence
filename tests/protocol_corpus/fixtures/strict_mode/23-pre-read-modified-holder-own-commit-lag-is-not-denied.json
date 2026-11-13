@@ -1,0 +1,68 @@
+{
+  "name": "pre-read-modified-holder-own-commit-lag-is-not-denied",
+  "description": "Session A seeds CLAUDE.md, pre-edits and commits v2, so it holds MODIFIED; its read seconds later offers other bytes. Its own commit explains them (the bytes may still be landing), so the read is admitted with hash_differs and no notice, and strict mode does not deny it. Both backends (cohexa-ai/agent-coherence-plugin#205).",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "strict_mode": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\nv1 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "CLAUDE.md",
+          "content_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "CLAUDE.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "CLAUDE.md",
+          "success": true,
+          "content_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "CLAUDE.md",
+      "content_hash": "4444444444444444444444444444444444444444444444444444444444444444"
+    }
+  },
+  "optional_keys": [
+    "version"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "status": "fresh",
+      "version": 2,
+      "hash_differs": true
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

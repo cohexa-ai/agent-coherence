@@ -1,0 +1,75 @@
+{
+  "name": "fold-opted-in-pre-edit-of-another-case-is-refused-where-the-disk-folds-case",
+  "description": "Session A takes EXCLUSIVE on data/x.txt; session B then pre-edits DATA/X.TXT with if_unheld: true. On a case-insensitive disk (caseless) B is refused other_holder naming A, as for data/x.txt; where the disk keeps case apart (nfd, none) DATA/X.TXT is another file and B is admitted: no refusal. Both spellings are listed in tracked.yaml, so DATA/X.TXT is tracked on every disk by its own literal pattern; this row cannot tell that admission from an untracked one, which answers the same {ok: true}. Fold 06 is the row that shows the second spelling is its own tracked record there. B presents its principal on Python, where an opted-in request needs one; the claim is scoped to Python and the header is omitted on Node. Both backends.",
+  "setup": {
+    "tracked": [
+      "data/x.txt",
+      "DATA/X.TXT"
+    ],
+    "files": {
+      "data/x.txt": "x\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "backends": [
+          "python"
+        ],
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+          "mint_nonce": "corpus-mint-nonce-b"
+        },
+        "capture": {
+          "principal_b": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "path": "data/x.txt"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000b",
+      "path": "DATA/X.TXT",
+      "if_unheld": true
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_b}"
+    }
+  },
+  "expected_by_fold_profile": {
+    "caseless": {
+      "status": 200,
+      "body": {
+        "ok": false,
+        "reason": "other_holder",
+        "holder_agent_id": "80cbc93dbdc35128a0f2b69566f01436"
+      }
+    },
+    "nfd": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    },
+    "none": {
+      "status": 200,
+      "body": {
+        "ok": true
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

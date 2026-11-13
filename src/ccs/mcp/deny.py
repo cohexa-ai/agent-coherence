@@ -16,18 +16,31 @@ Two input types (plan §"Deny reason-flow"):
   via the ``.reason`` constant carried on the exception class — or, for the two
   types that carry the coordinator's reason per INSTANCE (``CasVersionConflict``,
   ``CallerPrincipalRefused``), by that reason's exact membership in its
-  vocabulary. The exception
+  vocabulary. The split-pair read refusal also carries a reason per instance
+  (``split_pair``, #264), but it is the client's own name for one kind of
+  ``StaleView``, not a coordinator reason, so it is answered by the class
+  constant like every other ``StaleView``. The exception
   *message* stays the verbatim coordinator ``permissionDecisionReason`` (it is
   surfaced as ``detail``; the model's retry loop depends on that byte-stability,
   auto-memory ``project_cc_strict_mode_retry_hazard``). An unrecognized
   ``CoherenceError`` (a CAS corruption raise, a path escape) fails closed as
   ``internal_error`` — the mapper never lets an exception become a success.
-- **Type B** — synthesized here (NO adapter raise-site) when the volume is
-  unattached / the coordinator transport failed → ``coordinator_unavailable``.
+- **Type B** — synthesized here, with no exception, when the volume is
+  unattached → ``coordinator_unavailable`` with ``retry_later``. The same
+  reason also arrives as Type A: an attached strict volume raises
+  ``CoordinatorUnreachable`` when its coordinator gives no usable answer, and
+  that row stops and reports instead.
 - **Type C** — a handoff tool's typed refusal (#185), a value the volume
   returns rather than raises: mapped by exact reason through
   :data:`HANDOFF_REFUSALS`, each row not retryable and carrying a fixed
   ``next_step``; an unknown reason fails closed as ``internal_error``.
+
+Some tools map through their own function first. ``swg_write`` goes through
+:func:`write_deny_result`, whose rows differ where a write may leave a grant
+standing or its bytes on disk, or meets a refuse-mode answer; ``swg_release``
+through :func:`release_deny_result`, whose unconfirmed release is safe to
+send again; and the handoff tools through :func:`handoff_deny_result`.
+Anything else falls to :func:`deny_result`.
 
 The ``reason`` token is NEVER substring-matched off the message (the
 typed-signal-not-substring house rule).
@@ -36,6 +49,7 @@ typed-signal-not-substring house rule).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from mcp.types import CallToolResult, TextContent
 
@@ -61,13 +75,24 @@ from ccs.core.exceptions import (
     CallerPrincipalRefused,
     CasRetriesExhausted,
     CasVersionConflict,
+    CoherenceDirRefused,
+    CoherenceError,
     CommitPreempted,
     CommitUnconfirmed,
+    CoordinatorFailed,
+    CoordinatorUnreachable,
     GiverFenced,
     InternalConcurrencyError,
+    LinkOutOfManaged,
+    OtherHolder,
+    RedirectRefused,
     StaleView,
     ViewWedged,
+    _generation_pair_fields,
 )
+
+if TYPE_CHECKING:
+    from ccs.adapters.coherent_volume import OnHeld
 
 
 @dataclass(frozen=True)
@@ -97,6 +122,109 @@ GIVER_FENCED_NEXT_STEP = (
     "successor named here, at the version named here."
 )
 
+# An attached strict volume got no usable answer from its coordinator. The
+# volume keeps the endpoint it attached to and never reaches a coordinator
+# started after this one died, so no call in this server session gets through:
+# the verb is the house stop, not the unattached refusal's ``retry_later``.
+# Like the giver's words, these never name a retry, since a refusal that names
+# the act that lifts it invites the agent to take it. The restart is the user's
+# or host's to do, so the words say to report it.
+COORDINATOR_UNREACHABLE_RECOVER = GIVER_FENCED_RECOVER
+COORDINATOR_UNREACHABLE_NEXT_STEP = (
+    "Stop: this server got no usable answer from its coordinator, which is gone "
+    "or wedged, and the server cannot recover from that by itself. Do not write "
+    "the managed files by any other route. Report to your user or host that the "
+    "coordinator is gone and that they must restart this MCP server, stopping "
+    "the workspace's coordinator process first if the server will not start."
+)
+
+# The coordinator answered a read, or the volume's release of an earlier write
+# grant before a CAS or a reacquire (#401), with its failure envelope (#259) or
+# an HTTP 5xx (#433); or a commit was refused by the volume's own earlier
+# grant, which that release did not clear (#434). None of these says whether
+# its cause clears by itself (the envelope names only an exception's type, a
+# status names nothing), so a busy store looks the same as a fault that repeats
+# on every call. The verb is the house stop, with one retry named in the words:
+# an unbounded ``wait_and_retry`` would loop forever on the fault. ``retryable``
+# stays false so a client that retries on that flag alone does not loop either.
+# swg_write's own answers of this type have their own rows (below).
+COORDINATOR_FAILED_RECOVER = GIVER_FENCED_RECOVER
+COORDINATOR_FAILED_NEXT_STEP = (
+    "The coordinator failed while answering this call, so nothing was confirmed. "
+    "Make the same call once more after a few seconds: a busy coordinator store "
+    "clears by itself. If it fails the same way again, stop and report to your "
+    "user or host that the coordinator is failing; do not keep retrying."
+)
+
+# A person must replace the workspace's .coherence (#498), so the verb is the
+# house stop. The row maps the refusal for library callers of deny_result: the
+# server itself refuses to start before any tool runs, and its tools answer only
+# from an attached volume, so no tool call carries this refusal.
+COHERENCE_DIR_REFUSED_RECOVER = GIVER_FENCED_RECOVER
+COHERENCE_DIR_REFUSED_NEXT_STEP = (
+    "Stop: nothing was written. This workspace's .coherence is a symlink or not a "
+    "directory, or holds a symlink, FIFO, socket or device directly inside it. Do not "
+    "write the managed files by any other route. Report to your user or host that a "
+    "person must replace it with a real directory, or mount one at .coherence, and "
+    "then restart this MCP server."
+)
+
+
+# A refuse-mode write another agent holds, from a volume that opted in. Only
+# write() raises it. swg_write resends the same bytes, and once the path comes
+# free a bare retry lands them over whatever the holder committed (measured), so
+# the flag is false and the verb puts the wait before a reacquire that rebuilds
+# from the holder's bytes. The words give the wait in order. Holds go first:
+# two agents that keep theirs while each waits on the other wait out the
+# 30-minute ceiling, then overwrite each other blind (measured). The poll is
+# swg_status, which changes nothing, because a refused write refreshes the
+# waiter's other holds. The 30 minutes end the poll because the Node
+# coordinator takes back a grant that old only when a write asks for the path.
+# The server never waits itself, and the words give no total bound: the
+# agent's own bound ends the wait, and sizing one needs a real caller.
+OTHER_HOLDER_RECOVER = "wait_then_reacquire"
+OTHER_HOLDER_NEXT_STEP = (
+    "Nothing was written and nothing changed hands: another agent holds this path for "
+    "writing, and holder_agent_id names it. Do not send this write again as it is: once "
+    "the path comes free, these bytes would land over what the holder committed. Do this "
+    "in order. (1) Before you wait, call swg_release on every path swg_status lists in "
+    "held, including any an earlier attempt of yours holds; if a release answers "
+    "release_unconfirmed twice, or held is null because swg_status cannot tell who holds "
+    "each path, call swg_reacquire on this path instead, which drops every hold you "
+    "have. Two agents that "
+    "keep their holds while each waits for the other wait 30 minutes and then overwrite "
+    "each other's work. (2) Poll swg_status, which changes nothing, and not swg_write, "
+    "whose refusal keeps your other holds alive: wait at least 4 seconds before each "
+    "poll and double the wait each time up to 60 seconds, with jitter, until swg_status "
+    "lists this path, with held not null, and no longer shows it held_by another_agent, "
+    "or 30 minutes have passed (the "
+    "Claude Code plugin's coordinator takes back a "
+    "grant that old only when a write asks for the path). (3) Then call swg_reacquire on "
+    "the path, rebuild your content from the bytes it returns, and call swg_write once; "
+    "if it is refused other_holder again, go back to step 2. A live holder can keep a "
+    "path for up to 30 minutes, and the next holder starts a new clock. A holder that "
+    "stopped clears in about 10 minutes on this package's coordinator and in up to 30 "
+    "minutes on the Claude Code plugin's. The holder may be you: if you edited this file "
+    "with your own file tools this turn, it may be your own Claude Code hooks session, "
+    "which lets go when your turn ends, so waiting inside this turn does not clear it; "
+    "if this server restarted in the last 30 minutes, it may be this server's previous "
+    "run. If your own bound on the wait runs out, stop and report to your user or host "
+    "that another agent holds the path."
+)
+
+# A refuse-mode write through a link whose name is managed to a file that is
+# not, refused before anything was sent. Only write() raises it. The detail
+# names the routes around the refusal (the target's own path, a volume that
+# may displace), so the words forbid them and send the agent to report.
+LINK_OUT_OF_MANAGED_RECOVER = GIVER_FENCED_RECOVER
+LINK_OUT_OF_MANAGED_NEXT_STEP = (
+    "Stop: nothing was sent or written. This path goes through a link whose name is "
+    "among the managed files to a file outside them, where this server cannot keep the "
+    "file from an agent that holds it. Do not write that file by any other route: not "
+    "by its own path through this server, not through another server, and not with your "
+    "own file tools or a shell. Report to your user or host that this link leads out of "
+    "the managed files (the detail names the link and its target)."
+)
 
 # Type A — matched by EXACT exception type (so a future subclass cannot silently
 # inherit a mapping). ``reason`` mirrors the constant carried on the exception
@@ -111,6 +239,31 @@ _TERMINALS: dict[type, _Terminal] = {
     # Both write routes raise it (swg_write's pre-edit, swg_write_cas's commit).
     GiverFenced: _Terminal(
         GiverFenced.reason, GIVER_FENCED_RECOVER, False, GIVER_FENCED_NEXT_STEP
+    ),
+    OtherHolder: _Terminal(OtherHolder.reason, OTHER_HOLDER_RECOVER, False, OTHER_HOLDER_NEXT_STEP),
+    LinkOutOfManaged: _Terminal(
+        LinkOutOfManaged.reason,
+        LINK_OUT_OF_MANAGED_RECOVER,
+        False,
+        LINK_OUT_OF_MANAGED_NEXT_STEP,
+    ),
+    CoordinatorUnreachable: _Terminal(
+        CoordinatorUnreachable.reason,
+        COORDINATOR_UNREACHABLE_RECOVER,
+        False,
+        COORDINATOR_UNREACHABLE_NEXT_STEP,
+    ),
+    CoordinatorFailed: _Terminal(
+        CoordinatorFailed.reason,
+        COORDINATOR_FAILED_RECOVER,
+        False,
+        COORDINATOR_FAILED_NEXT_STEP,
+    ),
+    CoherenceDirRefused: _Terminal(
+        CoherenceDirRefused.reason,
+        COHERENCE_DIR_REFUSED_RECOVER,
+        False,
+        COHERENCE_DIR_REFUSED_NEXT_STEP,
     ),
 }
 
@@ -306,7 +459,10 @@ _CAS_TERMINALS: dict[str, _Terminal] = {
     VERSION_MISMATCH_REASON: _Terminal(
         VERSION_MISMATCH_REASON, "read_then_merge", False
     ),
-    # The holder will release; a bounded backoff is the recovery, not a merge.
+    # The holder will release; a bounded backoff is the recovery, not a merge,
+    # and a bare retry is safe because each CAS re-derives from the version it
+    # reads. A refuse-mode pre-edit's refusal has its own row, by exception
+    # type, whose resent bytes would not re-derive.
     "other_holder": _Terminal("other_holder", "wait_and_retry", True),
     STALE_READ_GENERATION_REASON: _Terminal(
         STALE_READ_GENERATION_REASON, "reacquire_and_reread", False
@@ -329,14 +485,17 @@ _CAS_TERMINALS: dict[str, _Terminal] = {
 # coordinator bug, for a state that is typed and the session's own.
 PRINCIPAL_REFUSED_RECOVER = "restart_session"
 
-# The refusal that is NOT settled: the request was refused, but the recovery
-# claim's answer was lost, so the volume adopted ``unconfirmed`` and its very
-# next request claims again with the same nonce by itself — the next tool call
-# may simply succeed, and ``swg_status`` reads ``principal_claim: unconfirmed``
+# The refusal that is NOT settled: the request was refused, and the recovery
+# claim was answered without binding (a redirect, an HTTP status, an
+# unconfirmed body), so the volume adopted ``unconfirmed`` and its very next
+# request claims again with the same nonce by itself — the next tool call may
+# simply succeed, and ``swg_status`` reads ``principal_claim: unconfirmed``
 # meanwhile. The verb is the existing one for "the state clears on its own,
-# call again" (``other_holder`` uses it), ``retryable`` true. Answering this arm
-# ``restart_session`` over-claimed durability: it sent the agent to a new
-# session for a state the next call cures.
+# call again" (a CAS commit's ``other_holder`` uses it), ``retryable`` true.
+# Answering this arm ``restart_session`` over-claimed durability: it sent the
+# agent to a new session for a state the next call cures. A recovery claim
+# that gets no answer at all raises ``CoordinatorUnreachable`` on the strict
+# volume and takes that row's stop instead.
 PRINCIPAL_UNSETTLED_RECOVER = "wait_and_retry"
 
 # Fallback for any unrecognized exception (an unexpected ``CoherenceError`` such
@@ -381,7 +540,11 @@ def deny_result(exc: BaseException) -> CallToolResult:
         return _result(
             terminal,
             str(exc),
-            {"expected_version": exc.expected_version, "current_version": exc.current_version},
+            {
+                "expected_version": exc.expected_version,
+                "current_version": exc.current_version,
+                **_generation_pair_fields(exc),
+            },
         )
     if type(exc) is CallerPrincipalRefused and exc.reason in CALLER_PRINCIPAL_REASONS:
         # Exact type, like ``_TERMINALS``; the reason by exact membership, so
@@ -396,11 +559,15 @@ def deny_result(exc: BaseException) -> CallToolResult:
     # The giver terminal also carries who the path went to and at which version
     # as values the agent can report (the detail says both in prose). Only
     # through its own row: without one it fails closed like any unknown type.
-    extra = (
-        _giver_fields(exc)
-        if isinstance(exc, GiverFenced) and terminal is not _UNRECOGNIZED
-        else None
-    )
+    extra: dict | None = None
+    if isinstance(exc, GiverFenced) and terminal is not _UNRECOGNIZED:
+        extra = _giver_fields(exc)
+    elif isinstance(exc, OtherHolder) and terminal is not _UNRECOGNIZED:
+        extra = _other_holder_fields(exc)
+    elif type(exc) in (CasRetriesExhausted, CommitPreempted):
+        # The two commit terminals add the refusal's lost token beside their
+        # unchanged recover verb. Diagnostic only: it changes no recovery.
+        extra = _generation_pair_fields(exc)
     return _result(terminal, str(exc), extra)
 
 
@@ -417,6 +584,219 @@ def handoff_deny_result(exc: BaseException, verb: str) -> CallToolResult:
         )
         return _result(terminal, str(exc))
     return deny_result(exc)
+
+
+# --- swg_write's own rows -----------------------------------------------------
+#
+# A write differs from the tools that share the table above: it may leave a
+# grant standing or its bytes on disk, and only it meets the refuse-mode
+# answers. Its rows keep every detail verbatim, and their words name the tool
+# for each library method a detail names, never the method.
+
+# Each swg_write row here after which a write grant may still stand closes with
+# this, except the row for a coordinator that is gone, which no release can
+# reach: that row says the grant stands until the coordinator takes it back.
+# The caller-principal refusals and io_error keep the answers every tool gives.
+# It is safe on each row that carries it: a release of a path with no recorded
+# grant sends nothing (measured).
+WRITE_RELEASE_SENTENCE = (
+    "If you stop here instead, call swg_release on the path first: it gives back any "
+    "write grant this write may have left standing, which could otherwise keep another "
+    "agent waiting."
+)
+
+# A refusal by this session's own earlier attempt, whose release did not land.
+# write() starts no new attempt, so the same call gets the same answer. A
+# reacquire, or a release of the path, sends that release again: each was
+# measured clearing it on both coordinators. The row names the reacquire,
+# which also returns the bytes to rebuild from; a stopping agent takes the
+# release, which keeps its other holds.
+WRITE_OWN_GRANT_RECOVER = "reacquire"
+WRITE_OWN_GRANT_NEXT_STEP = (
+    "Nothing was written: an earlier attempt of this server's own session still holds "
+    "this path, because its release was not confirmed, and the coordinator refused this "
+    "write because of it. No other agent holds the path, so do not wait for one, and do "
+    "not send the same write again, which gets the same answer: call swg_reacquire on the "
+    "path, which sends that release again, rebuild your content from the bytes it "
+    "returns, and call swg_write once. " + WRITE_RELEASE_SENTENCE
+)
+
+# The coordinator answered the opted-in grant request with neither an admit nor
+# a refusal. It is running, so no restart is named: the stop and its one retry
+# are coordinator_failed's, and the request may have taken the grant.
+WRITE_ANSWERED_UNUSABLE_NEXT_STEP = (
+    "Nothing was written: the coordinator answered this write's grant request with "
+    "neither an admit nor a refusal. It is running, so this server needs nothing done to "
+    "it, but the request may have taken the write grant. Make the same swg_write once "
+    "more after a few seconds. If it is answered the same way again, stop and report to "
+    "your user or host that the coordinator answers grant requests with neither an admit "
+    "nor a refusal; do not keep retrying. " + WRITE_RELEASE_SENTENCE
+)
+
+# The coordinator is gone. A commit that never left put its bytes on disk
+# unrecorded, and its detail names the write that records them; a grant this
+# run took stands until the coordinator takes it back.
+WRITE_GONE_NEXT_STEP = (
+    COORDINATOR_UNREACHABLE_NEXT_STEP + " If the detail says this write's bytes are on "
+    "disk, then once the server is back call swg_reacquire on the path first and compare "
+    "the bytes it returns with the ones this write sent. If they differ, another agent "
+    "has written the path since: rebuild your change from the returned bytes and "
+    "swg_write that. If they match, swg_write them, which records them. Never write "
+    "your bytes again without that check: a restarted server has no record of what you "
+    "read, so nothing else stops the write landing over another agent's commit. A "
+    "write grant this server holds stays until the coordinator takes it back: "
+    "swg_release cannot reach a coordinator that is gone, and a restarted server cannot "
+    "release this one's grants."
+)
+# A restarted refuse-mode server meets those grants as another agent's: the
+# Python coordinator sweeps a grant whose holder went quiet 10 minutes ago, and
+# the Node one takes back a 30-minute-old grant when a write asks for it.
+WRITE_GONE_REFUSE_NEXT_STEP = (
+    WRITE_GONE_NEXT_STEP + " Because this server refuses to take a file another agent "
+    "holds, the restarted server's writes to paths this one held can be refused "
+    "other_holder until then: for about 10 minutes on this package's coordinator, and up "
+    "to 30 minutes on the Claude Code plugin's."
+)
+
+# A commit that may have landed, its bytes on disk. A read refuses them until a
+# write of the path is recorded, so the verb is the detail's: write again.
+# ``retryable`` stays false, as on coordinator_failed, so a client that retries
+# on that flag alone does not loop on a coordinator that keeps failing.
+# swg_write_cas keeps read_then_retry: its unconfirmed bytes never reached disk.
+WRITE_AGAIN_RECOVER = "write_again"
+WRITE_AGAIN_NEXT_STEP = (
+    "The write's bytes are on disk, but the coordinator may not have recorded them, and "
+    "reading the path first does not help: a read refuses these bytes until a write of "
+    "them is recorded. So call swg_write on the path once more, with the same content or "
+    "a change built from it, which records it either way. If that write fails the same "
+    "way, stop and report to your user or host that the coordinator is not confirming "
+    "writes; do not keep retrying. " + WRITE_RELEASE_SENTENCE
+)
+
+# A stale write keeps the shared verb and flag: the same call is refused again,
+# so the flag keeps its meaning. The words stop the two moves that defeat it.
+WRITE_STALE_VIEW_NEXT_STEP = (
+    "Nothing was written: the file changed since this server last read or wrote it, "
+    "through another agent's commit or an edit made outside this server. To write it, "
+    "call swg_reacquire on the path, rebuild your content from the bytes it returns, and "
+    "swg_write that. Never send the content you just sent again: it was built on the old "
+    "file and would overwrite the change. Do not re-read the file with your own file tools "
+    "instead: only swg_reacquire's bytes are the version this server checks your next "
+    "write against. " + WRITE_RELEASE_SENTENCE
+)
+
+# A write failure no row recognises (a 4xx, a degraded answer, an admit with a
+# collision warning): nothing confirms what it did, and its grant may stand. A
+# collision's detail sends a library caller to a new volume; the words forbid
+# that route and name the tools that give the grant back.
+WRITE_UNRECOGNIZED_NEXT_STEP = (
+    "Stop: this write failed in a way this server has no recovery for, and nothing "
+    "confirms what it did. Do not send it again, and do not write the path by any other "
+    "route, through another server included. First call swg_release on the path, which "
+    "gives back any write grant this write may have left standing; if it answers "
+    "release_unconfirmed twice, call swg_reacquire on the path instead. Then report the "
+    "detail to your user or host."
+)
+
+_WRITE_OWN_GRANT = _Terminal(
+    CoordinatorFailed.reason, WRITE_OWN_GRANT_RECOVER, False, WRITE_OWN_GRANT_NEXT_STEP
+)
+_WRITE_COORDINATOR_FAILED = _Terminal(
+    CoordinatorFailed.reason,
+    COORDINATOR_FAILED_RECOVER,
+    False,
+    COORDINATOR_FAILED_NEXT_STEP + " " + WRITE_RELEASE_SENTENCE,
+)
+_WRITE_ANSWERED_UNUSABLE = _Terminal(
+    CoordinatorUnreachable.reason, COORDINATOR_UNREACHABLE_RECOVER, False, WRITE_ANSWERED_UNUSABLE_NEXT_STEP
+)
+_WRITE_GONE = _Terminal(
+    CoordinatorUnreachable.reason, COORDINATOR_UNREACHABLE_RECOVER, False, WRITE_GONE_NEXT_STEP
+)
+_WRITE_GONE_REFUSE = _Terminal(
+    CoordinatorUnreachable.reason, COORDINATOR_UNREACHABLE_RECOVER, False, WRITE_GONE_REFUSE_NEXT_STEP
+)
+# By exact type, like ``_TERMINALS``.
+_WRITE_TERMINALS: dict[type, _Terminal] = {
+    CommitUnconfirmed: _Terminal(CommitUnconfirmed.reason, WRITE_AGAIN_RECOVER, False, WRITE_AGAIN_NEXT_STEP),
+    StaleView: _Terminal(StaleView.reason, "reacquire", True, WRITE_STALE_VIEW_NEXT_STEP),
+}
+_WRITE_UNRECOGNIZED = _Terminal(
+    _UNRECOGNIZED.reason, _UNRECOGNIZED.recover, False, WRITE_UNRECOGNIZED_NEXT_STEP
+)
+
+
+def write_deny_result(exc: BaseException, on_held: OnHeld) -> CallToolResult:
+    """:func:`deny_result` for ``swg_write``: its own row where one differs,
+    else the shared row, with a next step added to the generic
+    ``internal_error``. ``on_held`` is the server's mode, ``"refuse"`` or
+    ``"displace"``; only the row for a coordinator that is gone reads it."""
+    terminal = _write_terminal(exc, on_held)
+    if terminal is not None:
+        return _result(terminal, str(exc))
+    result = deny_result(exc)
+    shared = result.structuredContent
+    if isinstance(shared, dict) and shared.get("reason") == _UNRECOGNIZED.reason:
+        return _result(_WRITE_UNRECOGNIZED, str(exc))
+    return result
+
+
+def _write_terminal(exc: BaseException, on_held: OnHeld) -> _Terminal | None:
+    """swg_write's own row for ``exc``, or ``None`` where the shared row
+    answers. Exact type, like ``_TERMINALS``; between two rows of one type the
+    attribute that only write() sets decides, never the message."""
+    if type(exc) is CoordinatorFailed:
+        return _WRITE_OWN_GRANT if exc.needs_reacquire is True else _WRITE_COORDINATOR_FAILED
+    if type(exc) is CoordinatorUnreachable:
+        if exc.answered is True:
+            return _WRITE_ANSWERED_UNUSABLE
+        return _WRITE_GONE_REFUSE if on_held == "refuse" else _WRITE_GONE
+    return _WRITE_TERMINALS.get(type(exc))
+
+
+# --- swg_release's own rows ---------------------------------------------------
+#
+# A release the coordinator did not confirm: no usable answer, its failure
+# envelope, an HTTP 5xx or 4xx, a watchdog-degraded answer, an answer that
+# reports the grant still held, or a redirect this client refuses to follow.
+# The volume keeps the path recorded in each case, so a repeat sends the
+# release again, and a release of a grant already given back changes nothing:
+# the flag is true and the verb is the repeat. A coordinator that keeps failing
+# answers every repeat the same, so the words bound the repeats and say what
+# to report, never a restart: the coordinator answered, or may answer the next.
+RELEASE_UNCONFIRMED_REASON = "release_unconfirmed"
+RELEASE_AGAIN_RECOVER = "release_again"
+RELEASE_UNCONFIRMED_NEXT_STEP = (
+    "The coordinator did not confirm this release, so this session's write grant on the "
+    "path may still stand; this session's other holds are as they were. Calling "
+    "swg_release on the path again is safe: it sends the release again, and a release of a "
+    "grant already given back changes nothing. Try it at most twice more. If it still is "
+    "not confirmed, stop and report to your user or host that this session's write grant "
+    "on the path may still stand, which can keep other agents that write the path waiting. "
+    "swg_reacquire on the path is the step that drops every hold this session has, this "
+    "one included."
+)
+_RELEASE_UNCONFIRMED = _Terminal(
+    RELEASE_UNCONFIRMED_REASON, RELEASE_AGAIN_RECOVER, True, RELEASE_UNCONFIRMED_NEXT_STEP
+)
+# By exact type, like ``_TERMINALS``: the plain ``CoherenceError`` is a 4xx, a
+# degraded answer or a grant reported still held, and a subclass with a meaning
+# of its own must not inherit the repeat.
+_RELEASE_UNCONFIRMED_TYPES: frozenset[type] = frozenset(
+    {CoordinatorUnreachable, CoordinatorFailed, CoherenceError, RedirectRefused}
+)
+
+
+def release_deny_result(exc: BaseException) -> CallToolResult:
+    """``swg_release``'s answer to a release that raised: the
+    ``release_unconfirmed`` row for each exact type a release the coordinator
+    did not confirm raises, the shared rows for a caller-principal refusal,
+    and ``internal_error`` for any other type."""
+    if type(exc) in _RELEASE_UNCONFIRMED_TYPES:
+        return _result(_RELEASE_UNCONFIRMED, str(exc))
+    if type(exc) is CallerPrincipalRefused:
+        return deny_result(exc)
+    return _result(_UNRECOGNIZED, str(exc))
 
 
 def handoff_verb_refusal_result(reason: object, detail: str, extra: dict) -> CallToolResult:
@@ -491,10 +871,18 @@ def _giver_fields(exc: GiverFenced) -> dict:
     return {"successor": successor, "version_at_transfer": version}
 
 
+def _other_holder_fields(exc: OtherHolder) -> dict:
+    """The holder as the wire string a client raises with, ``None`` otherwise: an
+    in-process refusal carries a ``UUID``, which ``json.dumps`` refuses."""
+    holder = exc.holder_agent_id
+    return {"holder_agent_id": holder if isinstance(holder, str) else None}
+
+
 def coordinator_unavailable_result(detail: str) -> CallToolResult:
-    """Type B (synthesized): no adapter raised, but the volume is unattached or
-    the coordinator transport failed. Fail closed — the write is NOT
-    version-committed."""
+    """Type B (synthesized): no adapter raised, because the volume is
+    unattached. Fail closed — the write is NOT version-committed. A coordinator
+    that fails an attached strict volume arrives typed instead, as
+    ``CoordinatorUnreachable`` through its own row."""
     return _result(
         _Terminal(COORDINATOR_UNAVAILABLE_REASON, "retry_later", False),
         detail,

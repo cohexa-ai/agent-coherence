@@ -46,7 +46,7 @@ import pytest
 
 from ccs.coordinator.registry import ArtifactRegistry
 from ccs.coordinator.registry_protocol import TransferRecord
-from ccs.coordinator.service import CoordinatorService
+from ccs.coordinator.service import CoordinatorService, ReleaseRequest
 from ccs.coordinator.sqlite_registry import SqliteArtifactRegistry
 from ccs.core.exceptions import CoherenceError, GiverFenced, WatchdogAbandoned
 from ccs.core.states import MESIState
@@ -503,8 +503,8 @@ def test_a_write_shape_giver_stays_stale_until_a_fresh_generation(service) -> No
     still_stale = _cas(service, handoff.path, handoff.giver_read, caller=handoff.giver)
     reminted = _cas(service, handoff.path, uuid4(), caller=handoff.giver)
 
-    assert stale == ConflictDetail("stale_read_generation", 1)
-    assert still_stale == ConflictDetail("stale_read_generation", 1)
+    assert stale == ConflictDetail("stale_read_generation", 1, captured_generation=0, owner_generation=1)
+    assert still_stale == ConflictDetail("stale_read_generation", 1, captured_generation=0, owner_generation=1)
     assert isinstance(reminted, tuple), reminted
 
 
@@ -1196,10 +1196,11 @@ def test_an_abort_set_after_the_hold_is_taken_lands_every_path(logged_service) -
 
 
 def test_a_session_stop_from_either_party_leaves_the_record(service) -> None:
-    """A session stop releases the session's EXCLUSIVE and
-    MODIFIED grants as today and never withdraws or declines. The successor's
-    stop after acquiring the handed path, and the giver's stop releasing its
-    write grant elsewhere, leave the record as it was."""
+    """A session stop releases the session's EXCLUSIVE and MODIFIED grants,
+    each through ``release_to_reader`` as the stop hook does, and never
+    withdraws or declines. The successor's stop after acquiring the handed
+    path, and the giver's stop releasing its write grant elsewhere, leave the
+    record as it was."""
     handoff = _hand_off(service, name="plan.md")
     elsewhere = _path(service, "notes.md")
     giver_inc, successor_inc = uuid4(), uuid4()
@@ -1208,13 +1209,10 @@ def test_a_session_stop_from_either_party_leaves_the_record(service) -> None:
     before = service.registry.get_transfer_record(handoff.path)
 
     for composite, path in ((successor_inc, handoff.path), (giver_inc, elsewhere)):
-        service.invalidate(
-            agent_id=composite,
-            artifact_id=path,
-            new_version=service.registry.get_artifact(path).version,
-            issuer_agent_id=composite,
-            issued_at_tick=5,
+        released = service.release_to_reader(
+            ReleaseRequest(agent_id=composite, artifact_id=path, issued_at_tick=5)
         )
+        assert released is True, f"no write grant of {composite} on {path} was released"
 
     assert service.registry.get_transfer_record(handoff.path) == before
     assert _label(service, handoff.path) == ("completed", None, True)

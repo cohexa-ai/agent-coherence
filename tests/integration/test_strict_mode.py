@@ -222,13 +222,21 @@ def test_pre_read_strict_shared_foreign_edit_denies(strict_client: _Client) -> N
     out = body["hookSpecificOutput"]
     assert out["permissionDecision"] == "deny"
     assert out["hookEventName"] == "PreToolUse"
-    assert "CLAUDE.md" in out["permissionDecisionReason"]
-    assert "Re-read" in out["permissionDecisionReason"]
+    # #278: named as a change made outside the coordinator. A re-read is
+    # denied again, so the text does not offer one; it says to tell the user.
+    from ccs.adapters.claude_code.hook_payloads import OUT_OF_BAND_DENY_REASON_TEMPLATE
+
+    assert out["permissionDecisionReason"] == OUT_OF_BAND_DENY_REASON_TEMPLATE.format(
+        path="CLAUDE.md", current_version=1)
 
 
 def test_pre_read_warn_shared_foreign_edit_still_allows(strict_client: _Client) -> None:
-    """Warn-mode unchanged: on a tracked-but-NOT-strict path the SHARED-holder
-    mismatch stays a fail-open allow + hash_differs (R1 warn preserved)."""
+    """Warn mode still admits: on a tracked-but-NOT-strict path the
+    SHARED-holder mismatch stays fail-open with hash_differs (R1 warn
+    preserved), and since #278 names the out-of-band change as context only --
+    never a permission decision."""
+    from ccs.adapters.claude_code.hook_payloads import OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE
+
     strict_client.post(
         "/hooks/pre-read",
         {"session_id": _sid("s1"), "path": "docs/plans/x.md", "content_hash": _hash("v1")},
@@ -238,7 +246,14 @@ def test_pre_read_warn_shared_foreign_edit_still_allows(strict_client: _Client) 
         {"session_id": _sid("s1"), "path": "docs/plans/x.md", "content_hash": _hash("foreign-v2")},
     )
     assert status == 200
-    assert body == {"status": "fresh", "version": 1, "hash_differs": True}
+    assert body == {
+        "status": "fresh", "version": 1, "hash_differs": True,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.format(
+                path="docs/plans/x.md", version=1),
+        },
+    }
 
 
 def test_pre_read_strict_shared_sentinel_never_denies(
@@ -646,7 +661,10 @@ ALLOW_EMISSION_SOURCES: list[str] = [
     "pre_edit_notice_only",          # coordinator_server._handle_pre_edit
     "pre_bash_stale_warn",           # coordinator_server._handle_pre_bash
     "pre_grep_stale_warn",           # coordinator_server._handle_pre_grep
-    "watchdog_degraded_read",        # coordinator_server._DEFAULT_DEGRADED_RESPONSE (A7)
+    # NOT listed: coordinator_server._DEFAULT_DEGRADED_RESPONSE. A timed-out
+    # read hook admits with a CONTEXT-ONLY advisory since #337, as a timed-out
+    # pre-edit has since #236: an allow would skip Claude Code's own permission
+    # prompt exactly when the check did not run.
     # NOT listed: coordinator_server._attach_pretooluse_context. The SB-10 deferred
     # re-grounding attach no longer emits an allow — a bare admit body now
     # gains a CONTEXT-ONLY PreToolUse envelope (hookEventName +
@@ -1565,9 +1583,10 @@ def test_emit_allow_refuses_the_handoff_giver_denial_class(source: str) -> None:
 def test_the_allow_emission_roster_is_unchanged_by_the_handoff_prose() -> None:
     """The handoff provenance, warning, advisory and outcome ride the
     context-only envelopes, never the allow emitter: the roster stays at the
-    seven sites it had before the handoff, so a new allow path for them would
-    have to change this count deliberately."""
-    assert len(ALLOW_EMISSION_SOURCES) == 7, ALLOW_EMISSION_SOURCES
+    six sites it has had since the timed-out read hooks stopped emitting allow
+    (#337), so a new allow path for them would have to change this count
+    deliberately."""
+    assert len(ALLOW_EMISSION_SOURCES) == 6, ALLOW_EMISSION_SOURCES
 
 
 @pytest.mark.parametrize("strict", [True, False], ids=["strict", "warn"])
@@ -2109,3 +2128,12 @@ def test_a_warn_path_re_armed_by_a_denied_command_still_edits(
         "/hooks/pre-edit", {"session_id": _sid("A"), "path": "docs/plans/x.md"},
     )
     assert _admitted(edit), edit
+
+
+def test_out_of_band_deny_reason_template_is_static() -> None:
+    """#278: the out-of-band arm of the strict deny is byte-stable like the
+    other two -- per-artifact placeholders only, no timestamp of any kind."""
+    from ccs.adapters.claude_code.hook_payloads import OUT_OF_BAND_DENY_REASON_TEMPLATE
+
+    actual = set(m.group(1) for m in re.finditer(r"\{([a-z_]+)\}", OUT_OF_BAND_DENY_REASON_TEMPLATE))
+    assert actual == {"path", "current_version"}

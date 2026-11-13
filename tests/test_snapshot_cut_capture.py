@@ -420,6 +420,57 @@ class TestUnknownIdRejection:
             sql.close()
 
 
+class TestWatchdogAbortOpensNoSession:
+    """#340: ``begin_session`` threads the handler watchdog's ``abort`` into
+    ``registry.abort_guard`` (A6), so a begin whose request already timed out
+    fails closed at the registry lock: no token minted, no owner bound, no cut
+    pinned, no session row for the cap to count. An unset abort opens the
+    session as before."""
+
+    @pytest.mark.parametrize("arm", ["in_memory", "sqlite"])
+    def test_preset_abort_opens_no_session(self, tmp_path: Path, arm: str) -> None:
+        from ccs.core.exceptions import WatchdogAbandoned
+
+        policy = RetentionPolicy(max_versions=1)  # so a leaked pin would hold v1
+        mem, sql = _make_registries(tmp_path, policy)
+        reg = mem if arm == "in_memory" else sql
+        try:
+            svc = CoordinatorService(reg)
+            a, writer = uuid4(), uuid4()
+            _register(reg, a, "plan.md", "v1")
+            abort = threading.Event()
+            abort.set()  # the handler watchdog already answered degraded
+
+            with pytest.raises(WatchdogAbandoned):
+                svc.begin_session(read_set=[a], owner=uuid4(), abort=abort)
+
+            assert svc._session_owners == {}
+            assert svc._session_heartbeats == {}
+            assert svc._session_created == {}
+            assert reg.session_count() == 0
+            assert reg.all_session_meta() == {}
+            _commit_cas(reg, a, writer, expected=1, body="v2")  # K=1 -> drop v1
+            assert reg.get_content_at_version(a, 1) is None, "the aborted begin pinned v1"
+        finally:
+            sql.close()
+
+    @pytest.mark.parametrize("arm", ["in_memory", "sqlite"])
+    def test_unset_abort_opens_the_session(self, tmp_path: Path, arm: str) -> None:
+        mem, sql = _make_registries(tmp_path)
+        reg = mem if arm == "in_memory" else sql
+        try:
+            svc = CoordinatorService(reg)
+            a, owner = uuid4(), uuid4()
+            _register(reg, a, "plan.md", "v1")
+            session = svc.begin_session(read_set=[a], owner=owner, abort=threading.Event())
+            assert isinstance(session, SnapshotSession)
+            assert session.cut == {a: 1}
+            assert svc._session_owners[session.session_token] == owner
+            assert reg.session_count() == 1
+        finally:
+            sql.close()
+
+
 # ===========================================================================
 # F — Owner-binding + non-mutating capture
 # ===========================================================================

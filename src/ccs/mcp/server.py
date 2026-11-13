@@ -24,22 +24,28 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 from ccs.adapters.claude_code.lifecycle import stop_coordinator
+from ccs.adapters.claude_code.state_dir import check_coherence_dir
 from ccs.adapters.coherent_volume import (
     CoherentVolume,
     HandoffTransferResult,
     HandoffVerbResult,
 )
 from ccs.adapters.effect_gate import check_fence
+from ccs.cli._coherence_client import err, escape_nonprintable
+from ccs.coordinator.fold_merge import index_key_of
 from ccs.core.exceptions import (
     HOLD_INPUT_VANISHED,
     CasVersionConflict,
+    CoherenceDirRefused,
     CoherenceError,
     HandoffPathsInvalid,
+    RefuseModeUnsupported,
 )
 from ccs.mcp.deny import (
     HANDOFF_LANDED_TRANSFER,
@@ -49,9 +55,16 @@ from ccs.mcp.deny import (
     handoff_deny_result,
     handoff_transfer_refusal_result,
     handoff_verb_refusal_result,
+    release_deny_result,
+    write_deny_result,
 )
 from ccs.mcp.session import SessionConfig, build_volume
-from ccs.mcp.status import PER_PATH_UNAVAILABLE_TEXT, build_status, handoff_from_status
+from ccs.mcp.status import (
+    build_status,
+    fold_profile_of,
+    handoff_from_status,
+    status_text,
+)
 from ccs.mcp.uri import UriValidationError, validate_uri
 
 logger = logging.getLogger(__name__)
@@ -86,6 +99,30 @@ Three guarantees, all single-host and fail-closed:
      re-decide.
      The verdict is true as of that call; the dispatch after it is still yours.
 
+WRITE HOLDS, in both modes: swg_write takes a write grant on the path it writes
+and keeps it after the write. swg_release(path) gives back that one path and
+keeps your other holds; swg_reacquire and swg_write_cas, of any path, drop every
+hold this session has, and so does this server's normal exit. When you finish
+writing a path, swg_release it: until you do, other opted-in agents that write
+it wait, for up to 30 minutes. swg_status lists your holds in held (null means
+it cannot tell, never that you hold nothing).
+
+REFUSE MODE is the operator's setting, SWG_ON_HELD=refuse; swg_status reports
+the mode as on_held. In it, a swg_write of a managed path that another agent
+holds is refused with reason=other_holder, recover=wait_then_reacquire,
+retryable=false: nothing was written, nothing changed hands, and its next_step
+gives the wait. Any writer's grant counts as a hold, but only opted-in writers
+honour a hold, such as a refuse-mode server writing one of its managed paths:
+the Claude Code plugin's hooks, displace-mode servers (the default) and older
+volumes take the file anyway, and the holder then sees stale_view on its next
+swg_write. A hold is not a lock.
+
+WHO HOLDS A PATH: holder ids are per attempt and never equal your
+session_agent_id, so tell your own holds by held_by in swg_status
+(this_attempt, earlier_attempt or another_agent), never by comparing ids.
+Every caller of one server process is one agent to the coordinator, so
+this_attempt can be another caller sharing this server.
+
 HANDOFF between sessions: swg_transfer(paths, successor) hands this session's
 claim on each path (the write grant from swg_write, or the standing read from
 swg_read) to another session, the successor, named by the session_agent_id the
@@ -102,6 +139,42 @@ any route. The successor sees the handoff in the handoff key of its
 swg_read and swg_status, and takes it with swg_accept or a write, or refuses it
 with swg_decline. swg_withdraw is taken only on the user's or host's explicit
 instruction, never as the recovery for a handed_off deny.
+
+REFUSALS are error results whose structuredContent carries reason, recover,
+retryable and detail, and often next_step: when next_step is present it is the
+procedure, so follow it. retryable=true means only that sending the identical
+call again is safe; it is not the next step. retryable=false means do not send
+it again unless next_step says to. The recover verbs:
+  reacquire: swg_reacquire the path, then write FROM the bytes it returns.
+  wait_then_reacquire: another agent holds the path; release your holds, poll
+    swg_status, then swg_reacquire and swg_write once (next_step has the steps).
+  write_again: the bytes swg_write put on disk may be unrecorded; swg_write the
+    path once more, which records them.
+  release_again: the release was not confirmed; swg_release the path again,
+    at most twice more.
+  reacquire_and_reconcile: the write lost its grant mid-write and its bytes may
+    be on disk unrecorded; swg_reacquire, reconcile your change with the bytes
+    it returns, and write that.
+  read_then_merge: swg_read the path, merge into what it returns, then
+    swg_write_cas at its version.
+  reacquire_and_reread: swg_reacquire the path, then swg_read it for a fresh
+    version.
+  read_then_retry: the commit may have landed; swg_read the path and retry only
+    if your change is not there.
+  wait_and_retry: wait a few seconds, then send the same call again.
+  wait_or_escalate: wait a while before trying again; if it persists, report it.
+  retry_later: this server has no coordinator attached; try later, and report
+    it if it persists.
+  check_handoff: look at the path's handoff in swg_status before you act.
+  fix_successor: name the successor by the session_agent_id its own swg_status
+    reports.
+  fix_path, check_path, use_text, reread: fix the path; check that the file
+    exists; the file is not UTF-8 text; swg_read again and pass both comparands
+    it returns.
+  restart_session: this server session lost coordination; report it, since
+    only a new server session regains it.
+  stop, stop_and_report, none: stop, do not write the path by any other route,
+    and report the detail to your user or host.
 
 OUT OF GUARANTEE (do not rely on this server for): writers on DIFFERENT hosts or
 across a synced/network mount; divergent-history reconciliation; semantic/content
@@ -144,10 +217,11 @@ _READ_DESC = (
     "swg_reacquire to recover before writing. If the bytes on disk are not the "
     "content at the current version, the read is DENIED with reason=stale_view "
     "and no version. A peer's commit still reaching disk clears on its own: "
-    "swg_reacquire, then swg_read again, retrying for a few seconds. Only if it "
-    "stays denied past that was the file changed outside the coordinator (an "
-    "out-of-band edit, or a commit whose disk write failed): swg_write the "
-    "content swg_reacquire returned (or your merge of it), then swg_read. A "
+    "swg_reacquire, then swg_read again, retrying for a few seconds. If it "
+    "stays denied past that, the bytes on disk were never recorded (an "
+    "out-of-band edit, a commit whose disk write failed, or a write whose commit "
+    "did not reach the coordinator); reading again does not clear it: swg_write "
+    "the content swg_reacquire returned (or your merge of it), then swg_read. A "
     "write made sooner can be overwritten by a peer commit still reaching "
     "disk." + _SCOPE_CLAUSE
 )
@@ -165,16 +239,54 @@ _GATE_DESC = (
     "take the action — swg_reacquire, re-read, re-decide." + _SCOPE_CLAUSE
 )
 _WRITE_DESC = (
-    "Write a workspace text file (acquire -> write -> commit). DENIED with "
-    "reason=stale_view if the file changed since you read it — a peer commit OR an "
-    "out-of-band edit (another tool/editor): recover with swg_reacquire, then write "
-    "FROM its bytes. A mid-write preempt returns reason=commit_preempted (disk may "
-    "hold un-versioned bytes; reacquire_and_reconcile)." + _SCOPE_CLAUSE
+    "Write a workspace text file (acquire -> write -> commit). In either mode the "
+    "write takes a write grant on the path and keeps it after the write. When you "
+    "finish writing a path, swg_release it: until you do, other opted-in agents that "
+    "write it wait, for up to 30 minutes. On a refuse-mode server (SWG_ON_HELD=refuse) "
+    "a success also carries opted_in: true when the write asked first, false when the "
+    "path is not among the managed files, so the write took the file from any agent "
+    "that held it. A refusal carries reason, recover and retryable; follow its "
+    "next_step when it has one. DENIED with reason=stale_view if the file changed "
+    "since you read it — a peer commit OR an out-of-band edit (another tool/editor): "
+    "recover with swg_reacquire, then write FROM its bytes, never the content you "
+    "just sent. The other reasons: other_holder (refuse mode only), another agent "
+    "holds the path and nothing was written (recover=wait_then_reacquire); "
+    "commit_preempted, a mid-write preempt (disk may hold un-versioned bytes; "
+    "reacquire_and_reconcile); commit_unconfirmed, the bytes are on disk but may be "
+    "unrecorded (recover=write_again); link_out_of_managed (refuse mode only), the "
+    "path goes through a link to a file outside the managed files; handed_off, this "
+    "session handed the path off; coordinator_failed, the coordinator failed while "
+    "answering (recover=reacquire when an earlier attempt of this session still "
+    "holds the path); coordinator_unavailable, it gave no usable answer or is not "
+    "attached; caller_principal_absent, caller_principal_foreign or "
+    "caller_principal_claimed, this session's caller principal was refused "
+    "(swg_status shows principal_claim); internal_error, a failure with no "
+    "recovery; invalid_path or io_error, a bad path or a disk failure." + _SCOPE_CLAUSE
 )
 _REACQUIRE_DESC = (
     "Recover from a stale_view deny: re-mint identity and return the CURRENT "
     "bytes. You MUST write FROM these exact bytes — the server enforces version "
-    "lineage, NOT that your content was derived from what you read." + _SCOPE_CLAUSE
+    "lineage, NOT that your content was derived from what you read. It is also the "
+    "step a swg_write refusal names with recover=reacquire or wait_then_reacquire. "
+    "The re-mint drops every hold this session has: the write grant on every path, "
+    "not only this one, so other agents can then write those paths. To give back "
+    "one path and keep the others, use swg_release." + _SCOPE_CLAUSE
+)
+_RELEASE_DESC = (
+    "Give back this session's write grant on one path and keep every other hold. "
+    "swg_write takes a write grant on the path it writes and keeps it after the "
+    "write. When you finish writing a path, swg_release it: until you do, other "
+    "opted-in agents that write it wait, for up to 30 minutes. Answers {ok, path, "
+    "released}. released=true means this session gave a grant back; it does not "
+    "mean the path is free (another agent may hold it), and this session keeps a "
+    "read at the version it held, so its next swg_write of the path needs no "
+    "swg_reacquire unless the file changed since. released=false means this "
+    "session had no write grant recorded on the path and nothing was sent, as on "
+    "a repeat. A release the coordinator did not confirm answers "
+    "reason=release_unconfirmed, recover=release_again, retryable=true: calling "
+    "swg_release again is safe, at most twice more; if it still is not confirmed, "
+    "report that this session's write grant on the path may still stand "
+    "(swg_reacquire drops every hold, this one included)." + _SCOPE_CLAUSE
 )
 _STATUS_DESC = (
     "Report coherence state: coordinator on|off|unknown (unknown is NOT off), "
@@ -186,6 +298,19 @@ _STATUS_DESC = (
     "tracked; the text result then says per_path=unavailable. With "
     "coordinator=unknown, per_path is {} and says nothing about what is "
     "tracked), "
+    "the write holder on each per_path entry someone holds for writing: "
+    "holder_agent_id (the holder's attempt id, in the 32-hex spelling an "
+    "other_holder refusal names; ids are per attempt, so it never equals "
+    "session_agent_id) and held_by (this_attempt; earlier_attempt, an earlier "
+    "attempt of this session whose grant still stands, which you release; or "
+    "another_agent), neither key on an entry nobody holds, and this_attempt "
+    "covering another caller sharing this server, since every caller of one "
+    "server process is one agent to the coordinator; "
+    "on_held (this server's mode: refuse when the operator set SWG_ON_HELD=refuse, "
+    "else displace), held (the sorted paths this session holds for writing, "
+    "either attempt; null when the coordinator cannot say who holds each path: "
+    "null means cannot tell, never that nothing is held; the text result gives "
+    "on_held, held, and a line per path held_by another_agent or earlier_attempt), "
     "is_attached/is_degraded/session_id, session_agent_id (this "
     "session's id as a handoff successor: the value another session passes to "
     "swg_transfer to hand this session a path; it does not change when this "
@@ -219,7 +344,9 @@ _WRITE_CAS_DESC = (
     "this session is its successor, overtaken (with counterparty) otherwise. The "
     "per-session conflict counter bounds only a COOPERATING agent (one session, "
     "stops on retryable=false); it is NOT livelock-proof against a fresh session "
-    "or one that ignores retryable=false." + _SCOPE_CLAUSE
+    "or one that ignores retryable=false. A call that reaches the coordinator drops "
+    "every hold this session has: it starts a new attempt, which gives back the write grant swg_write took "
+    "on every path, as swg_reacquire does." + _SCOPE_CLAUSE
 )
 
 # Appended to each of the four handoff tools' descriptions: what a transfer
@@ -306,8 +433,9 @@ class ServerContext:
     volume: CoherentVolume
     config: SessionConfig
     lock: asyncio.Lock
-    # path → consecutive CAS-conflict count, the cooperating-agent livelock bound
-    # for swg_write_cas (reset on a win; survives only within one stdio session).
+    # file's fold key → consecutive CAS-conflict count, the cooperating-agent
+    # livelock bound for swg_write_cas (reset on a win; survives only within one
+    # stdio session).
     cas_conflicts: dict[str, int] = field(default_factory=dict)
 
 
@@ -315,19 +443,35 @@ class ServerContext:
 async def lifespan(server: FastMCP) -> AsyncIterator[ServerContext]:
     """Own the coordinator for the server's lifetime.
 
-    Enter → construct the strict-only volume (self-spawns/attaches; raises
-    fail-closed if it can't). Exit → ``stop_coordinator``. Does NOT call
-    ``connect_or_spawn`` — construction already did, so calling it again would
-    double-spawn.
+    Enter → construct the strict-only volume in the mode ``SWG_ON_HELD``
+    names (self-spawns/attaches; raises fail-closed if it can't). A
+    refuse-mode volume the coordinator cannot be relied on to honour raises
+    ``RefuseModeUnsupported`` here, before anything is served, and ``main()``
+    turns it into one stderr line and exit 2. Exit → close the volume, which
+    gives back its write grants (a failed close is logged), then
+    ``stop_coordinator``: an in-process coordinator must still answer the
+    close. The coordinator is stopped whatever the close does; one this
+    process started stops for every peer attached to it too. Only a normal
+    end runs this; nothing handles a signal. Does NOT call
+    ``connect_or_spawn`` — construction already did, so calling it again
+    would double-spawn.
     """
     config = SessionConfig.from_env()
     volume = build_volume(config)  # blocking, fail-closed
     logger.info("stale-write-guard-fs attached: root=%s managed=%s", config.root, config.managed)
+    ctx = ServerContext(volume=volume, config=config, lock=asyncio.Lock())
     try:
-        yield ServerContext(volume=volume, config=config, lock=asyncio.Lock())
+        yield ctx
     finally:
-        stop_coordinator(config.root)
-        logger.info("stale-write-guard-fs coordinator stopped: root=%s", config.root)
+        try:
+            async with ctx.lock:
+                try:
+                    volume.close()
+                except CoherenceError as exc:
+                    logger.warning("stale-write-guard-fs could not close its volume: %s", exc)
+        finally:
+            stop_coordinator(config.root)
+            logger.info("stale-write-guard-fs coordinator stopped: root=%s", config.root)
 
 
 # --- result builders ---------------------------------------------------------
@@ -505,12 +649,22 @@ def _do_write(volume: CoherentVolume, config: SessionConfig, path: str, content:
     if not volume.is_attached:
         return coordinator_unavailable_result(f"coordinator unattached; refusing write of {key}")
     try:
+        # Judged before the write, by the volume's own rule for the path, so a
+        # refuse-mode answer says whether this write asked only if nobody held
+        # the file. A displace-mode server asks nothing and answers as before.
+        opted_in = volume.asks_if_unheld(key) if config.on_held == "refuse" else None
         volume.write(key, content.encode("utf-8"))
     except CoherenceError as exc:
-        return deny_result(exc)
+        return write_deny_result(exc, config.on_held)
     except OSError as exc:  # disk/permission failure → fail closed, never escape to FastMCP
         return _client_error_result("io_error", "none", str(exc))
-    return _ok_result({"ok": True, "path": key}, f"wrote {key}")
+    if opted_in is None:
+        return _ok_result({"ok": True, "path": key}, f"wrote {key}")
+    text = f"wrote {key}" if opted_in else (
+        f"wrote {key} without asking first: it is not among the managed files, so this "
+        "write takes the file from any agent that holds it"
+    )
+    return _ok_result({"ok": True, "path": key, "opted_in": opted_in}, text)
 
 
 def _do_reacquire(volume: CoherentVolume, config: SessionConfig, path: str) -> CallToolResult:
@@ -534,14 +688,36 @@ def _do_reacquire(volume: CoherentVolume, config: SessionConfig, path: str) -> C
     return _ok_result({"content": text, "encoding": "utf-8", "note": _REACQUIRE_NOTE}, text)
 
 
+def _do_release(volume: CoherentVolume, config: SessionConfig, path: str) -> CallToolResult:
+    try:
+        key = validate_uri(path, root=config.root)
+    except UriValidationError as exc:
+        return _client_error_result("invalid_path", "fix_path", str(exc))
+    # A volume with no endpoint sends nothing and still answers True for a
+    # grant it recorded, which would report a release no coordinator saw.
+    if not volume.is_attached:
+        return coordinator_unavailable_result(f"coordinator unattached; cannot release {key}")
+    try:
+        released = volume.release(key)
+    except CoherenceError as exc:
+        return release_deny_result(exc)
+    return _ok_result({"ok": True, "path": key, "released": released}, _release_text(key, released))
+
+
+def _release_text(key: str, released: bool) -> str:
+    """What a client that shows only the text channel learns of a release:
+    whether a grant went back, and never that the path is free."""
+    if not released:
+        return f"released nothing on {key}: this session has no write grant recorded there, so nothing was sent"
+    return (
+        f"released this session's write grant on {key}. The path is not necessarily free: "
+        "another agent may hold it. This session keeps a read of it at the version it held."
+    )
+
+
 def _do_status(volume: CoherentVolume, config: SessionConfig) -> CallToolResult:
     status = build_status(volume, config)
-    text = f"coordinator={status['coordinator']}"
-    if status["per_path"] is None:
-        # A client that shows only the text channel must still see that the
-        # tracked paths could not be told: coordinator=on alone reads healthy.
-        text = f"{text} {PER_PATH_UNAVAILABLE_TEXT}"
-    return _ok_result(status, text)
+    return _ok_result(status, status_text(status))
 
 
 def _do_write_cas(
@@ -562,15 +738,17 @@ def _do_write_cas(
         won = volume.write_cas_at(key, expected_version, new_content.encode("utf-8"))
     except CasVersionConflict as exc:
         # Bound a COOPERATING agent's retry loop: too many consecutive conflicts
-        # on one path in this session → tell it to stop (retryable=false).
-        count = conflicts.get(key, 0) + 1
+        # on one file in this session, under any of its spellings → tell it to
+        # stop (retryable=false).
+        streak = _conflict_streak_key(volume, key)
+        count = conflicts.get(streak, 0) + 1
         if count > MAX_CAS_CONFLICTS:
-            conflicts.pop(key, None)
+            conflicts.pop(streak, None)
             return cas_exhausted_result(
                 f"{key}: {count} consecutive CAS conflicts in this session — stop "
                 "(the cooperating-agent livelock bound; coordinator-side fencing is v1.1)"
             )
-        conflicts[key] = count
+        conflicts[streak] = count
         return deny_result(exc)
     except FileNotFoundError as exc:
         return _client_error_result("file_not_found", "check_path", str(exc))
@@ -578,13 +756,24 @@ def _do_write_cas(
         return deny_result(exc)
     except OSError as exc:  # disk/permission failure → fail closed, never escape to FastMCP
         return _client_error_result("io_error", "none", str(exc))
-    conflicts.pop(key, None)  # a win resets the cooperating-agent conflict streak
+    if conflicts:  # a win resets the file's conflict streak; with none open, no /status read
+        conflicts.pop(_conflict_streak_key(volume, key), None)
     structured: dict = {"ok": True, "path": key}
     if won.handoff is not None:
         # What the win did to a live handoff of the path (#185): completed it
         # (this session is the successor) or overtook it (a bystander).
         structured["handoff"] = _present(asdict(won.handoff))
     return _ok_result(structured, f"committed {key}")
+
+
+def _conflict_streak_key(volume: CoherentVolume, key: str) -> str:
+    """The name ``key``'s consecutive CAS conflicts are counted under: its
+    fold key by the profile the coordinator's default ``/status`` tier
+    advertises, read each time it is needed, so two spellings the
+    coordinator keys as one file share one streak. A coordinator restarted
+    on a disk it classifies differently is then followed, not the profile
+    of an earlier start."""
+    return index_key_of(key, fold_profile_of(volume.coordinator_status()))
 
 
 def _present(fields: dict) -> dict:
@@ -694,6 +883,8 @@ def register_tools(server: FastMCP) -> None:
 
     ``swg_write_cas`` is the concurrent regime; ``swg_gate`` is the
     pull-based effect fence agents call before an irreversible dispatch;
+    ``swg_release`` gives back this session's write grant on one path and
+    keeps every other hold (#504);
     ``swg_transfer``/``swg_accept``/``swg_decline``/``swg_withdraw`` hand this
     session's own claims to another session (#185).
     """
@@ -730,6 +921,17 @@ def register_tools(server: FastMCP) -> None:
         sctx = _server_context(ctx)
         async with sctx.lock:
             return _do_reacquire(sctx.volume, sctx.config, path)
+
+    @server.tool(
+        name="swg_release",
+        description=_RELEASE_DESC,
+        annotations=ToolAnnotations(readOnlyHint=False),
+        structured_output=False,
+    )
+    async def swg_release(path: str, ctx: Context) -> CallToolResult:
+        sctx = _server_context(ctx)
+        async with sctx.lock:
+            return _do_release(sctx.volume, sctx.config, path)
 
     @server.tool(
         name="swg_status",
@@ -832,10 +1034,56 @@ def _configure_stderr_logging() -> None:
     root.setLevel(logging.INFO)
 
 
+def _exit_if_coherence_dir_refused(root: Path) -> None:
+    """Exit 2 on one stderr line when a start would refuse ``root``'s
+    ``.coherence`` (#498), as the other console scripts do, before the server
+    serves. The lifespan's own refusal stays the backstop for a link made after
+    this check."""
+    try:
+        check_coherence_dir(root)
+    except CoherenceDirRefused as exc:
+        # A cloned repository chose the name in this text, and a host runs the
+        # server unattended: escaped, it cannot drive a terminal or split a log line.
+        err(f"{SERVER_NAME}: {escape_nonprintable(str(exc))}")
+        raise SystemExit(2) from None
+
+
+def _config_or_exit() -> SessionConfig:
+    """The spawn environment's config, or exit 2 on one stderr line, before
+    anything starts, when it names a value the server cannot honour (an
+    ``SWG_ON_HELD`` other than ``refuse`` or ``displace``). The message shows
+    the value as ``repr`` writes it, so it stays one line."""
+    try:
+        return SessionConfig.from_env()
+    except ValueError as exc:
+        err(f"{SERVER_NAME}: {exc}")
+        raise SystemExit(2) from None
+
+
+_REFUSE_MODE_FIX = (
+    "Run a coordinator that can refuse (agent-coherence after 0.15.0, or the Claude Code "
+    "plugin after 0.6.0), or unset SWG_ON_HELD to serve in displace mode."
+)
+
+
+def _serve_or_exit(server: FastMCP) -> None:
+    """Serve over stdio. A refuse-mode start the coordinator cannot honour,
+    raised by the lifespan's attach before anything is served, ends on one
+    stderr line and exit 2, as a refused ``.coherence`` does."""
+    try:
+        server.run(transport="stdio")
+    except* RefuseModeUnsupported as refused:
+        # The volume's reason can quote what the coordinator answered.
+        reason = escape_nonprintable(str(refused.exceptions[0]))
+        err(f"{SERVER_NAME}: refusing to start with SWG_ON_HELD=refuse: {reason} {_REFUSE_MODE_FIX}")
+        raise SystemExit(2) from None
+
+
 def main() -> None:
     """Console-script entrypoint: run the server over stdio."""
     _configure_stderr_logging()
-    build_server().run(transport="stdio")
+    _exit_if_coherence_dir_refused(_config_or_exit().root)
+    _serve_or_exit(build_server())
 
 
 if __name__ == "__main__":

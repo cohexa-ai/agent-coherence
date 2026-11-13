@@ -15,6 +15,9 @@ before any tool binding.
 
 from __future__ import annotations
 
+import json
+from uuid import UUID
+
 import pytest
 
 import ccs.mcp.deny as deny
@@ -25,11 +28,17 @@ from ccs.core.exceptions import (
     HANDOFF_UNCONFIRMED_REASONS,
     CallerPrincipalRefused,
     CasRetriesExhausted,
+    CasVersionConflict,
+    CoherenceDirRefused,
     CoherenceError,
     CommitPreempted,
     CommitUnconfirmed,
+    CoordinatorFailed,
+    CoordinatorUnreachable,
     GiverFenced,
     InternalConcurrencyError,
+    LinkOutOfManaged,
+    OtherHolder,
     StaleView,
     ViewWedged,
 )
@@ -38,6 +47,7 @@ from ccs.mcp.deny import (
     deny_result,
     handoff_transfer_refusal_result,
     handoff_verb_refusal_result,
+    write_deny_result,
 )
 
 #: FROZEN duplicates of the three typed principal-refusal reasons and the
@@ -56,6 +66,17 @@ _PRINCIPAL_UNSETTLED_RECOVER = "wait_and_retry"
 _GIVER_REASON = "handed_off"
 _GIVER_RECOVER = "stop_and_report"
 _SUCCESSOR = "6b0f3c1e-4a5d-5b7e-9c2f-1d3e5a7b9c0d"
+#: A holder in the refusal's wire spelling: 32 lowercase hex characters.
+_HOLDER = "5d0f3c9a8b7e4d21a6c3b2e1f0d9c8b7"
+#: FROZEN duplicates of the coordinator-unreachable terminal: the reason the
+#: synthesized unattached refusal already answers, and the same stop verb the
+#: giver terminal uses, never that refusal's ``retry_later``.
+_UNREACHABLE_REASON = "coordinator_unavailable"
+_UNREACHABLE_RECOVER = "stop_and_report"
+#: FROZEN duplicate of the reason a workspace's ``.coherence`` refusal carries
+#: (#498); it takes the same stop verb.
+_DIR_REFUSED_REASON = "coherence_dir_refused"
+_DIR_REFUSED_PATH = "/ws/.coherence/tracked.yaml"
 
 
 def _principal_refusal(reason: str) -> CallerPrincipalRefused:
@@ -113,6 +134,15 @@ _TERMINALS = [
     ),
     (CasRetriesExhausted("data/x", 8, 3), "cas_exhausted", "stop", False),
     (GiverFenced("data/x", _SUCCESSOR, 3), _GIVER_REASON, _GIVER_RECOVER, False),
+    (OtherHolder("data/x", _HOLDER), "other_holder", "wait_then_reacquire", False),
+    (LinkOutOfManaged("data/l/t.md", "data/l", "other/t.md"), "link_out_of_managed", "stop_and_report", False),
+    (CoordinatorUnreachable("coordinator gone"), _UNREACHABLE_REASON, _UNREACHABLE_RECOVER, False),
+    (
+        CoherenceDirRefused("coherence_link", _DIR_REFUSED_PATH, f"refusing {_DIR_REFUSED_PATH}: it is a symlink"),
+        _DIR_REFUSED_REASON,
+        _UNREACHABLE_RECOVER,
+        False,
+    ),
     (
         InternalConcurrencyError("concurrent use detected"),
         "internal_concurrency_error",
@@ -189,8 +219,11 @@ def test_unrecognized_coherence_error_fails_closed_generic():
 
 
 def test_type_b_coordinator_unavailable_is_synthesized_and_fails_closed():
-    """Type B: no adapter raise-site — when the volume is unattached/transport
-    failed, deny.py synthesizes a fail-closed coordinator_unavailable."""
+    """Type B: when the volume is unattached, the server answers before any
+    adapter call and deny.py synthesizes a fail-closed coordinator_unavailable
+    that keeps ``retry_later``. The same reason raised by an attached strict
+    volume, as ``CoordinatorUnreachable``, maps through its own row instead
+    (see the test below)."""
     result = coordinator_unavailable_result("coordinator unreachable at attach")
 
     assert result.isError is True
@@ -199,6 +232,113 @@ def test_type_b_coordinator_unavailable_is_synthesized_and_fails_closed():
     assert sc["recover"] == "retry_later"
     assert sc["retryable"] is False
     assert sc["detail"] == "coordinator unreachable at attach"
+
+
+def test_a_coordinator_unreachable_refusal_is_a_typed_stop_that_says_restart_and_never_retry():
+    """AE7. An attached strict volume whose coordinator gives no usable answer
+    raises ``CoordinatorUnreachable``. Without its own row it fell to
+    ``internal_error`` / ``none``, the shape of a bug inside the server. It
+    maps to ``coordinator_unavailable``, ``retryable: false``, and the stop
+    verb, not the unattached refusal's ``retry_later``: the attached volume
+    keeps its dead endpoint, so no retry inside this server session can reach
+    a coordinator again. The detail stays verbatim (first text item); the
+    fixed next step (second text item) says to restart the server, forbids
+    writing the managed files another way, and never names a retry, since a
+    refusal that names the act that lifts it invites the agent to take it.
+    A bare ``CoherenceError`` with the same text still answers
+    ``internal_error``: the row is keyed on the type, not the message."""
+    exc = CoordinatorUnreachable("coordinator gone")
+
+    result = deny_result(exc)
+
+    sc = result.structuredContent
+    assert result.isError is True
+    assert (sc["reason"], sc["recover"], sc["retryable"]) == (
+        _UNREACHABLE_REASON, _UNREACHABLE_RECOVER, False,
+    )
+    assert sc["detail"] == str(exc)
+    assert result.content[0].text == str(exc)
+    words = sc["next_step"]
+    assert [item.text for item in result.content[1:]] == [words]
+    for phrase in ("stop", "report", "restart", "other route", "will not start"):
+        assert phrase in words.lower(), phrase
+    assert "retry" not in words.lower()
+    assert "try again" not in words.lower()
+
+    assert deny_result(CoherenceError("coordinator gone")).structuredContent["reason"] == "internal_error"
+
+
+def test_a_coordinator_failed_read_is_a_stop_that_names_one_retry():
+    """#259. A strict read the coordinator answered with its failure envelope
+    raises ``CoordinatorFailed``. Without its own row it fell to
+    ``internal_error`` / ``none``. It maps to ``coordinator_failed`` with the
+    stop verb and ``retryable: false``, and its fixed next step names exactly
+    one retry before the report: the envelope names only an exception's type,
+    so a busy store and a fault that repeats on every call look the same, and
+    an unbounded ``wait_and_retry`` would loop forever on the fault. The
+    detail stays verbatim."""
+    exc = CoordinatorFailed(
+        "coordinator answered the read of data/x with a failure "
+        "(internal: OperationalError); the read is not confirmed as registered"
+    )
+
+    result = deny_result(exc)
+
+    sc = result.structuredContent
+    assert result.isError is True
+    assert (sc["reason"], sc["recover"], sc["retryable"]) == (
+        "coordinator_failed", "stop_and_report", False,
+    )
+    assert sc["detail"] == str(exc)
+    words = sc["next_step"]
+    assert [item.text for item in result.content[1:]] == [words]
+    for phrase in ("once more", "stop", "report", "do not keep retrying"):
+        assert phrase in words.lower(), phrase
+
+
+def test_a_coherence_dir_refusal_is_a_stop_that_says_a_person_must_fix_the_directory():
+    """#498. A strict volume whose workspace ``.coherence`` a start refuses raises
+    ``CoherenceDirRefused``. Without its own row it fell to ``internal_error`` /
+    ``none``. It maps to its own reason with the stop verb and ``retryable:
+    false``: no call in this server session clears it. The detail (the refusal,
+    naming the path) stays verbatim; the fixed next step says a person must put a
+    real directory there and restart the server, and never names a retry."""
+    exc = CoherenceDirRefused("coherence_link", _DIR_REFUSED_PATH, f"refusing {_DIR_REFUSED_PATH}: it is a symlink")
+
+    result = deny_result(exc)
+
+    sc = result.structuredContent
+    assert (sc["reason"], sc["recover"], sc["retryable"]) == (_DIR_REFUSED_REASON, "stop_and_report", False)
+    assert sc["detail"] == str(exc)
+    words = sc["next_step"]
+    assert [item.text for item in result.content[1:]] == [words]
+    for phrase in ("stop", "nothing was written", "report", "real directory", "mount", "restart", "other route"):
+        assert phrase in words.lower(), phrase
+    assert "retry" not in words.lower()
+
+
+def test_a_split_pair_refusal_keeps_the_stale_view_answer():
+    """#264. The split-pair read refusal carries ``split_pair`` on its
+    instance so a Python caller tells it from other stale views, but the MCP
+    answer is the documented ``swg_read`` one: ``stale_view`` / ``reacquire``
+    / retryable, read from the class, never the instance."""
+    refusal = StaleView("split prose")
+    refusal.reason = "split_pair"
+
+    sc = deny_result(refusal).structuredContent
+
+    assert (sc["reason"], sc["recover"], sc["retryable"]) == ("stale_view", "reacquire", True)
+
+
+def test_a_coordinator_unreachable_subclass_does_not_inherit_the_mapping():
+    """Type A is matched by EXACT type, so a future subclass cannot silently
+    inherit a recover verb that may be wrong for it."""
+
+    class _Narrower(CoordinatorUnreachable):
+        pass
+
+    sc = deny_result(_Narrower("coordinator gone")).structuredContent
+    assert sc["reason"] == "internal_error"
 
 
 def test_cas_exhausted_reason_constant_lives_on_the_type():
@@ -299,6 +439,112 @@ def test_cas_conflict_constructor_never_raises_on_a_malformed_wire_reason():
         exc = CasVersionConflict("data/f.txt", 1, 1, reason=bogus)
         assert exc.reason == "version_mismatch"
         assert deny_result(exc).structuredContent["reason"] == "version_mismatch"
+
+
+# ----------------------------------------------------------------------
+# The lost token on the library refusals and their MCP results
+#
+# The three commit refusals a library caller meets carry the refusal's
+# ``captured_generation`` and ``owner_generation`` as keyword-only values,
+# ``None`` when the refusal carried none. The MCP result adds both keys only
+# when both are valid generations; recovery never changes with them.
+# ----------------------------------------------------------------------
+
+_PAIR_KEYS = ("captured_generation", "owner_generation")
+
+#: Each refusal type, built with the arguments its raise sites pass.
+_PAIR_CARRIERS = {
+    "cas_version_conflict": lambda **pair: CasVersionConflict(
+        "data/f.txt", 1, 1, reason="stale_read_generation", **pair
+    ),
+    "cas_retries_exhausted": lambda **pair: CasRetriesExhausted(
+        "data/f.txt", 4, 1, last_conflict_reason="stale_read_generation", **pair
+    ),
+    "commit_preempted": lambda **pair: CommitPreempted("preempt prose", **pair),
+}
+
+
+def _pair_of(exc) -> tuple:
+    return exc.captured_generation, exc.owner_generation
+
+
+@pytest.mark.parametrize("build", _PAIR_CARRIERS.values(), ids=_PAIR_CARRIERS.keys())
+def test_a_refusals_pair_rides_its_exception_and_mcp_result_without_changing_recovery(build):
+    """Generation 2 against 3, so a swapped, zeroed or dropped value fails.
+    The result is the pairless one plus exactly the two keys."""
+    exc = build(captured_generation=2, owner_generation=3)
+    assert _pair_of(exc) == (2, 3)
+
+    with_pair = deny_result(exc).structuredContent
+    without_pair = deny_result(build()).structuredContent
+    assert with_pair == {**without_pair, "captured_generation": 2, "owner_generation": 3}
+
+
+_MALFORMED_PAIRS = {
+    "nothing": {},
+    "bool-captured": {"captured_generation": True, "owner_generation": 3},
+    "bool-owner": {"captured_generation": 2, "owner_generation": False},
+    "string": {"captured_generation": "1", "owner_generation": 3},
+    "negative": {"captured_generation": -1, "owner_generation": 3},
+    "dict": {"captured_generation": 2, "owner_generation": {}},
+    "lone-captured": {"captured_generation": 2},
+    "lone-owner": {"owner_generation": 3},
+    "null-captured": {"captured_generation": None, "owner_generation": 3},
+}
+
+
+@pytest.mark.parametrize("pair", _MALFORMED_PAIRS.values(), ids=_MALFORMED_PAIRS.keys())
+@pytest.mark.parametrize("build", _PAIR_CARRIERS.values(), ids=_PAIR_CARRIERS.keys())
+def test_a_malformed_pair_reads_as_absent_and_never_raises(build, pair):
+    """The pair comes off a JSON body, so a constructor given anything keeps
+    building the refusal: half a pair, or a value that is no generation, is
+    no pair at all, and the MCP result carries neither key."""
+    exc = build(**pair)
+    assert _pair_of(exc) == (None, None)
+    assert not set(_PAIR_KEYS) & set(deny_result(exc).structuredContent)
+
+
+@pytest.mark.parametrize("build", _PAIR_CARRIERS.values(), ids=_PAIR_CARRIERS.keys())
+def test_the_pair_leaves_message_repr_and_args_unchanged(build):
+    """The pair is never in the text a model or a log reads, and positional
+    construction is what it was."""
+    plain, paired = build(), build(captured_generation=2, owner_generation=3)
+    assert str(paired) == str(plain)
+    assert repr(paired) == repr(plain)
+    assert paired.args == plain.args
+
+
+def test_positional_construction_is_unchanged_and_names_no_pair():
+    preempted = CommitPreempted("preempt prose")
+    assert preempted.args == ("preempt prose",)
+    assert repr(preempted) == "CommitPreempted('preempt prose')"
+    conflict = CasVersionConflict("data/f.txt", 4, 7)
+    assert str(conflict).startswith("version_mismatch artifact=data/f.txt expected=4 current=7")
+    exhausted = CasRetriesExhausted("data/x", 9, 3)
+    assert str(exhausted) == (
+        "cas_retries_exhausted artifact=data/x attempts=9 last_current_version=3 "
+        "(no write landed — every commit_cas attempt lost the race)"
+    )
+    for exc in (preempted, conflict, exhausted):
+        assert _pair_of(exc) == (None, None)
+    for cls in (CommitPreempted, CasVersionConflict, CasRetriesExhausted):
+        assert (cls.captured_generation, cls.owner_generation) == (None, None)
+
+
+def test_a_subclass_that_skips_the_constructor_still_reads_no_pair():
+    """``ConditionalPutRetriesExhausted`` never calls its parent's
+    constructor, so only class defaults give it the two attributes."""
+    from ccs.adapters.coherent_object import ConditionalPutRetriesExhausted
+
+    assert _pair_of(ConditionalPutRetriesExhausted("bucket/key", 3)) == (None, None)
+
+
+def test_the_mcp_result_reapplies_the_pair_rule_to_the_exceptions_values():
+    """The result adds the keys only when both values are generations, read
+    off the instance as it is when mapped."""
+    exc = CommitPreempted("preempt prose", captured_generation=2, owner_generation=3)
+    exc.owner_generation = True
+    assert not set(_PAIR_KEYS) & set(deny_result(exc).structuredContent)
 
 
 def test_held_publish_member_reason_is_allowlisted_not_just_typed():
@@ -435,6 +681,247 @@ def test_the_giver_terminal_is_a_typed_stop_that_says_report_and_never_withdraw(
     assert "report" in words.lower()
     assert "stop" in words.lower()
     assert "withdraw" not in words.lower()
+
+
+def test_the_other_holder_terminal_names_the_holder_and_the_wait_in_order():
+    """A refuse-mode write another agent holds. A bare retry resends the same
+    bytes, which land over whatever the holder committed once the path comes
+    free, so the flag is false and the verb puts the wait before a reacquire.
+    The words give the wait in order: let go of this session's own holds, poll
+    swg_status, then reacquire, rebuild and write once; with the minimum wait,
+    the doubling, how long a live or a stopped holder keeps a path on either
+    coordinator, the two holders that can be the agent itself, and the report
+    when the agent's own bound runs out. No total bound is given in numbers.
+
+    Prevents a refusal that falls to ``internal_error``, the shape of a
+    coordinator bug, one that sends the agent straight back with the same
+    content, and two agents that each wait on the other's hold."""
+    exc = OtherHolder("data/plan.md", _HOLDER)
+
+    result = deny_result(exc)
+
+    sc = result.structuredContent
+    assert result.isError is True
+    assert (sc["reason"], sc["recover"], sc["retryable"]) == ("other_holder", "wait_then_reacquire", False)
+    assert sc["holder_agent_id"] == _HOLDER
+    assert sc["detail"] == str(exc)
+    assert result.content[0].text == str(exc)
+    words = sc["next_step"]
+    assert [item.text for item in result.content[1:]] == [words]
+    steps = ("(1)", "swg_release", "(2)", "Poll swg_status", "(3)", "swg_reacquire on the path",
+             "swg_write once")
+    assert all(step in words for step in steps), [step for step in steps if step not in words]
+    assert [words.index(step) for step in steps] == sorted(words.index(step) for step in steps)
+    for phrase in (
+        "Nothing was written", "holder_agent_id", "Do not send this write again",
+        "held", "earlier attempt", "release_unconfirmed twice",
+        "which changes nothing", "at least 4 seconds", "double the wait", "up to 60 seconds", "jitter",
+        "held is null", "with held not null",
+        "go back to step 2", "up to 30 minutes", "about 10 minutes on this package's coordinator",
+        "up to 30 minutes on the Claude Code plugin's", "Claude Code hooks session",
+        "restarted in the last 30 minutes", "previous run", "your own bound", "report",
+    ):
+        assert phrase in words, phrase
+    assert "bounded total" not in words
+
+
+@pytest.mark.parametrize(
+    "holder",
+    [None, UUID(_HOLDER), 7, {"a": 1}],
+    ids=["absent", "in-process-uuid", "number", "object"],
+)
+def test_the_other_holder_terminal_passes_only_a_string_holder(holder):
+    """The holder rides to the model as a value and into ``json.dumps``. An
+    in-process refusal carries a ``UUID``, which does not serialise, and anything
+    but a string is ``None``, as the giver terminal does.
+
+    Prevents a tool result that fails to serialise on the refusal it reports."""
+    sc = deny_result(OtherHolder("data/plan.md", holder)).structuredContent
+    assert sc["holder_agent_id"] is None
+    json.dumps(sc)
+
+
+def test_a_commits_other_holder_keeps_its_own_row():
+    """The same reason on the commit route is a lost race the tool re-derives from,
+    so it carries none of the pre-edit row's words or holder."""
+    sc = deny_result(CasVersionConflict("data/f.txt", 1, 1, reason="other_holder")).structuredContent
+    assert "next_step" not in sc
+    assert "holder_agent_id" not in sc
+
+
+def test_a_subclass_of_the_refusal_fails_closed():
+    """The table matches on the exact type, so a subclass does not inherit a
+    retryable recovery it was never reviewed for."""
+
+    class _Narrower(OtherHolder):
+        pass
+
+    sc = deny_result(_Narrower("data/plan.md", _HOLDER)).structuredContent
+    assert sc["reason"] == "internal_error"
+    assert "holder_agent_id" not in sc
+
+
+# --- swg_write's own rows -----------------------------------------------------
+#
+# ``swg_write`` maps through ``write_deny_result``: the rows below differ from
+# the shared table because a write took a grant, put bytes on disk, or was
+# refused by something only ``write()`` meets. These pin the pure mapping with
+# exceptions built by hand; ``tests/mcp/test_write_rows.py`` reaches each one
+# through the volume's own raise site.
+
+#: FROZEN: each swg_write row, as (exception, the server's mode, reason,
+#: recover, retryable, whether the release sentence closes its next step).
+_WRITE_ROWS = {
+    "other-holder": (OtherHolder("data/x", _HOLDER), "refuse", "other_holder", "wait_then_reacquire", False, False),
+    "own-grant": (
+        CoordinatorFailed("held by this volume's own earlier write grant", needs_reacquire=True),
+        "refuse", "coordinator_failed", "reacquire", False, True,
+    ),
+    "coordinator-failed": (
+        CoordinatorFailed("could not decide in time"), "refuse", "coordinator_failed", "stop_and_report", False, True,
+    ),
+    "answered-unusable": (
+        CoordinatorUnreachable("answered with neither", answered=True),
+        "refuse", "coordinator_unavailable", "stop_and_report", False, True,
+    ),
+    "gone-refuse": (
+        CoordinatorUnreachable("coordinator gone"), "refuse", "coordinator_unavailable", "stop_and_report", False, False,
+    ),
+    "gone-displace": (
+        CoordinatorUnreachable("coordinator gone"), "displace", "coordinator_unavailable", "stop_and_report",
+        False, False,
+    ),
+    "commit-unconfirmed": (
+        CommitUnconfirmed("bytes on disk"), "displace", "commit_unconfirmed", "write_again", False, True,
+    ),
+    "stale-view": (StaleView("stale prose"), "displace", "stale_view", "reacquire", True, True),
+    "link-out-of-managed": (
+        LinkOutOfManaged("data/l/t.md", "data/l", "other/t.md"), "refuse", "link_out_of_managed",
+        "stop_and_report", False, False,
+    ),
+    "unrecognized": (CoherenceError("plain prose"), "refuse", "internal_error", "none", False, False),
+    "giver": (GiverFenced("data/x", _SUCCESSOR, 3), "refuse", _GIVER_REASON, _GIVER_RECOVER, False, False),
+}
+#: FROZEN: the words that open the release sentence.
+_RELEASE_WORDS = "If you stop here instead, call swg_release on the path first"
+#: FROZEN: what no swg_write next step says: a library call the agent cannot
+#: make, or a route around the guard a detail may point to.
+_WRITE_FORBIDDEN = ("release()", "reacquire()", "write()", "close()", "on_held", "build a new volume")
+
+
+@pytest.mark.parametrize(
+    "exc, on_held, reason, recover, retryable, releases", _WRITE_ROWS.values(), ids=_WRITE_ROWS.keys()
+)
+def test_every_swg_write_row_names_tools_and_the_release_where_a_grant_may_stand(
+    exc, on_held, reason, recover, retryable, releases
+):
+    """Each swg_write answer is non-ignorable with its typed flags and the
+    verbatim detail, and carries a next step, as text too, that names tools
+    rather than the library calls a detail names and no route around the
+    guard. The rows after which a write grant may still stand close with the
+    release sentence; a stop that sent nothing, a refusal that took no grant,
+    and a gone coordinator that no release can reach do not."""
+    result = write_deny_result(exc, on_held)
+
+    sc = result.structuredContent
+    assert result.isError is True
+    assert (sc["reason"], sc["recover"], sc["retryable"]) == (reason, recover, retryable)
+    assert sc["detail"] == str(exc)
+    words = sc["next_step"]
+    assert [item.text for item in result.content] == [str(exc), words]
+    for forbidden in _WRITE_FORBIDDEN:
+        assert forbidden not in words.lower(), forbidden
+    assert (_RELEASE_WORDS in words) is releases
+
+
+def test_swg_write_rows_leave_the_shared_rows_as_they_were():
+    """The other tools keep the shared table: a commit that may have landed
+    stays ``read_then_retry`` with no next step for ``swg_write_cas``, a stale
+    view stays bare for ``swg_read``, and the coordinator-failed and
+    unreachable rows keep their words, whatever attribute the exception
+    carries, since only ``write()`` sets them."""
+    unconfirmed = deny_result(CommitUnconfirmed("p")).structuredContent
+    stale = deny_result(StaleView("p")).structuredContent
+    own = deny_result(CoordinatorFailed("p", needs_reacquire=True)).structuredContent
+    answered = deny_result(CoordinatorUnreachable("p", answered=True)).structuredContent
+
+    assert (unconfirmed["recover"], "next_step" in unconfirmed) == ("read_then_retry", False)
+    assert "next_step" not in stale
+    assert own["recover"] == "stop_and_report" and "once more" in own["next_step"]
+    assert "restart" in answered["next_step"]
+    for sc in (own, answered):
+        assert _RELEASE_WORDS not in sc["next_step"]
+
+
+def test_the_answered_row_names_one_retry_and_no_restart():
+    """The coordinator answered, so it is running: a restart is the wrong
+    report. Nothing was written, one more write is named, and the release
+    closes it, since the request may have taken the grant."""
+    words = write_deny_result(CoordinatorUnreachable("p", answered=True), "refuse").structuredContent["next_step"]
+
+    assert "restart" not in words.lower()
+    for phrase in ("Nothing was written", "neither an admit nor a refusal", "once more", "do not keep retrying"):
+        assert phrase in words, phrase
+
+
+def test_the_gone_row_adds_the_restart_window_only_on_a_refuse_mode_server():
+    """A restarted refuse-mode server can be refused by this run's grants,
+    which nothing gives back while the coordinator is gone, for about 10
+    minutes on the Python coordinator and up to 30 on the Node one. A
+    displace-mode server displaces them, so its row has no window. Both keep
+    the restart and name the swg_write that records bytes left on disk."""
+    exc = CoordinatorUnreachable("coordinator gone")
+    refuse = write_deny_result(exc, "refuse").structuredContent["next_step"]
+    displace = write_deny_result(exc, "displace").structuredContent["next_step"]
+
+    for words in (refuse, displace):
+        assert "restart this MCP server" in words
+        assert "call swg_reacquire on the path first" in words
+        assert "If they differ, another agent has written the path since" in words
+        assert "Never write your bytes again without that check" in words
+        assert "swg_release cannot reach" in words
+    for phrase in ("other_holder", "about 10 minutes on this package's coordinator",
+                   "up to 30 minutes on the Claude Code plugin's"):
+        assert phrase in refuse, phrase
+        assert phrase not in displace, phrase
+
+
+def test_the_own_grant_row_sends_the_agent_to_swg_reacquire_not_a_retry():
+    """No peer exists and a plain retry never sends the earlier attempt's
+    release again, so the words name swg_reacquire, then one write, and say
+    not to wait or resend; and swg_reacquire again if the agent stops there."""
+    words = write_deny_result(CoordinatorFailed("p", needs_reacquire=True), "refuse").structuredContent["next_step"]
+
+    for phrase in ("Nothing was written", "No other agent holds", "do not send the same write again",
+                   "call swg_reacquire on the path", "call swg_write once", "If you stop here instead"):
+        assert phrase in words, phrase
+    assert "once more" not in words
+
+
+def test_a_commit_that_may_have_landed_is_written_again_once():
+    """The detail says to write the path again: the next step names one more
+    swg_write with the same content or a change built from it, a stop if it
+    fails the same way, and no read first, which the bytes on disk refuse."""
+    words = write_deny_result(CommitUnconfirmed("p"), "refuse").structuredContent["next_step"]
+
+    for phrase in ("call swg_write on the path once more", "the same content or a change built from it",
+                   "fails the same way", "stop and report", "do not keep retrying", "reading the path first"):
+        assert phrase in words, phrase
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [CoordinatorFailed("p", needs_reacquire=True), CoordinatorUnreachable("p", answered=True), CommitUnconfirmed("p")],
+    ids=["coordinator-failed", "coordinator-unreachable", "commit-unconfirmed"],
+)
+def test_a_subclass_does_not_inherit_a_swg_write_row(exc):
+    """swg_write's rows match the exact type too, so a future subclass fails
+    closed instead of inheriting a recovery it was never reviewed for."""
+    narrower = type("Narrower", (type(exc),), {})(str(exc))
+
+    sc = write_deny_result(narrower, "refuse").structuredContent
+
+    assert (sc["reason"], sc["recover"]) == ("internal_error", "none")
 
 
 
