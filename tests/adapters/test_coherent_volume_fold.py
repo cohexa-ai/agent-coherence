@@ -42,6 +42,7 @@ from ccs.core.exceptions import (
     HandoffPathsInvalid,
     LinkOutOfManaged,
     OtherHolder,
+    RefuseModeUnsupported,
     StaleView,
 )
 from ccs.core.path_fold import FoldProfile
@@ -319,6 +320,122 @@ def test_a_glob_meets_the_disk_spelling_of_a_managed_file(
     assert pre_edit["if_unheld"] is True
 
 
+# --- whether a write would ask first, read without sending -----------------
+
+_PLANS = ("plans/**",)
+
+
+@pytest.fixture
+def plans_server(tmp_path: Path) -> Iterator[CoordinatorHTTPServer]:
+    """A strict coordinator for ``plans/**`` over a workspace where
+    ``notes/into.md`` links to ``plans/a.md`` and ``plans/link.md`` links to
+    ``notes/b.md``."""
+    for directory in ("plans", "notes"):
+        (tmp_path / directory).mkdir()
+    (tmp_path / "plans" / "a.md").write_bytes(b"seed")
+    (tmp_path / "notes" / "b.md").write_bytes(b"seed")
+    (tmp_path / "notes" / "into.md").symlink_to("../plans/a.md")
+    (tmp_path / "plans" / "link.md").symlink_to("../notes/b.md")
+    running = serve_in_process(tmp_path, "asks-first", tracked="plans/**")
+    yield running
+    running.shutdown()
+
+
+def _plan_paths(server: CoordinatorHTTPServer) -> dict[str, bool]:
+    """Each path, and whether the file it reaches is managed. ``PLANS/a.md``
+    is ``plans/a.md`` only on a disk that folds case."""
+    managed = {
+        "plans/a.md": True,
+        "./plans//a.md": True,
+        "notes/into.md": True,
+        "plans/link.md": False,
+        "notes/b.md": False,
+    }
+    if _keying_profile(server) == "caseless":
+        managed["PLANS/a.md"] = True
+    return managed
+
+
+def test_a_refuse_mode_volume_asks_first_exactly_where_its_write_does(
+    tmp_path: Path, fast_cfg: LifecycleConfig, plans_server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """Every spelling of a managed file asks first, a link into ``plans/``
+    too; a link in ``plans/`` to a file outside it does not, since its write
+    raises ``LinkOutOfManaged``, nor does a file outside. Asking sends nothing,
+    and each write then does what the answer said.
+
+    Prevents a server judging a path by a glob match of its own, which reads
+    a folded or linked spelling of a managed file as unmanaged."""
+    volume = CoherentVolume(tmp_path, managed=_PLANS, config=fast_cfg, on_held="refuse")
+    expected = _plan_paths(plans_server)
+    wire.sent.clear()
+
+    asks = {path: volume.asks_if_unheld(path) for path in expected}
+    managed = {path: volume.is_managed(path) for path in expected}
+
+    assert asks == expected
+    assert managed == expected
+    assert wire.sent == []
+    with pytest.raises(LinkOutOfManaged):
+        volume.write("plans/link.md", b"through the link")
+    assert wire.sent == []
+    for path in expected.keys() - {"plans/link.md"}:
+        wire.sent.clear()
+        volume.write(path, b"from the volume")
+        [pre_edit] = wire.bodies(_PRE_EDIT)
+        assert pre_edit.get("if_unheld", False) is asks[path], path
+
+
+def test_a_displacing_volume_asks_first_nowhere_and_still_names_its_managed_files(
+    tmp_path: Path, fast_cfg: LifecycleConfig, plans_server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """Only refuse mode asks first; which files are managed does not depend on
+    the mode.
+
+    Prevents a displacing server reporting a write that asked first, or
+    reading its managed files as unmanaged."""
+    volume = CoherentVolume(tmp_path, managed=_PLANS, config=fast_cfg)
+    expected = _plan_paths(plans_server)
+    wire.sent.clear()
+
+    assert {path: volume.asks_if_unheld(path) for path in expected} == dict.fromkeys(expected, False)
+    assert {path: volume.is_managed(path) for path in expected} == expected
+    assert wire.sent == []
+
+
+def test_a_path_python_cannot_resolve_asks_nothing_and_never_raises(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    plans_server: CoordinatorHTTPServer,
+    wire: _Wire,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Python 3.11 and 3.12 raise ``RuntimeError`` resolving a link that loops,
+    where 3.13 keeps its name, and the MCP server accepts such a path. There
+    ``write()`` raises before it sends anything, so it does not ask first, and
+    neither read raises. Reproduced on every Python by resolving that link as
+    3.11 does.
+
+    Prevents a status or write answer that fails on a looping link."""
+    (tmp_path / "plans" / "loop").symlink_to("loop")
+    volume = CoherentVolume(tmp_path, managed=_PLANS, config=fast_cfg, on_held="refuse")
+    real_resolve = Path.resolve
+
+    def resolve_as_python_3_11(self: Path, strict: bool = False) -> Path:
+        if self.name == "loop":
+            raise RuntimeError(f"Symlink loop from {str(self)!r}")
+        return real_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve_as_python_3_11)
+    wire.sent.clear()
+
+    assert volume.asks_if_unheld("plans/loop") is False
+    assert volume.is_managed("plans/loop") is False
+    with pytest.raises(RuntimeError):
+        volume.write("plans/loop", b"through the loop")
+    assert wire.sent == []
+
+
 # --- records keyed by the fold key -----------------------------------------
 
 
@@ -537,8 +654,8 @@ def test_an_older_coordinator_without_fold_fields_is_keyed_by_none(
     ("error", "raised_type"),
     [
         (CoordinatorUnavailable("scripted: no answer"), CoordinatorUnreachable),
-        (_http_error(503), CoherenceError),
-        (None, CoherenceError),
+        (_http_error(503), RefuseModeUnsupported),
+        (None, RefuseModeUnsupported),
     ],
     ids=["no-answer", "http-error", "not-an-object"],
 )
@@ -556,7 +673,8 @@ def test_an_unreadable_status_fails_a_refuse_mode_attach_closed(
     claim: the coordinator receives nothing.
 
     Prevents a refuse-mode volume that keys a file two ways on a coordinator
-    that keys it one way."""
+    that keys it one way. A status it read but cannot rely on is the typed
+    refusal a server stops on; one it got no answer to stays unreachable."""
     if error is None:
         _status_changed_to(monkeypatch, lambda doc: ["not", "an", "object"])
     else:
@@ -606,7 +724,7 @@ def test_a_fold_table_of_another_unicode_version_refuses_a_refuse_mode_attach(
 
     with pytest.raises(CoherenceError, match="16.0.0") as raised:
         _refuser(tmp_path, fast_cfg)
-    assert type(raised.value) is CoherenceError
+    assert type(raised.value) is RefuseModeUnsupported
     assert wire.sent == []
 
     holder = _holder(tmp_path, fast_cfg)

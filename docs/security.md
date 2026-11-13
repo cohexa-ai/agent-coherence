@@ -151,7 +151,7 @@ talks to it over stdin/stdout, and the server coordinates writes through an
 in-process `CoherentVolume` on the local filesystem. There is nothing to firewall
 and no endpoint to configure on this path. See the MCP sections of the
 [README](../README.md#mcp-server-stale-write-guard-fs) and the
-[guide](guide.md#stale-write-guard-fs-mcp-server) for setup and the ten `swg_*`
+[guide](guide.md#stale-write-guard-fs-mcp-server) for setup and the eleven `swg_*`
 tools.
 
 ## Who the coordinator can tell apart
@@ -306,9 +306,14 @@ as, never the session id. The MCP server's `swg_status` returns
 it is a one-way hash of the `session_id` the same tool already returns, and
 the id a `handoff` key names that session by, so it discloses nothing new. The
 MCP tools that carry a `handoff` key (`swg_read`, `swg_status`,
-`swg_write_cas`) relay the coordinator's, so they too carry session-level agent
-ids only. The `agent-coherence-status` command asks for the default view
-unless it is run with `--detail full`, because it often runs inside an agent's
+`swg_write_cas`) relay the coordinator's, so the ids in that key are
+session-level too. Write holders are named by per-attempt agent id instead:
+`swg_status` names the holder of each tracked path held for writing
+(`holder_agent_id`), and a `swg_write` refused `other_holder` names the agent
+that holds the path. The default view of `/status` already lists each
+session's agent id with the states it holds, so these reveal nothing a
+`/status` reader cannot already see. The `agent-coherence-status` command asks
+for the default view unless it is run with `--detail full`, because it often runs inside an agent's
 shell tool, where its output lands in the transcript; with `--detail full` its
 output carries session names and the absolute workspace root, so leave the flag
 off before pasting the output into a bug report, and point dashboards at
@@ -410,11 +415,14 @@ does not already grant: any process running as your OS user can skip the
 coordinator.
 
 A `CoherentVolume` built with `on_held="refuse"` promises a holder its managed
-files. A write through a link whose name is under the volume's `managed` globs
+files, and so does the `stale-write-guard-fs` server started with
+`SWG_ON_HELD=refuse`, whose volume is built that way. A write through a link
+whose name is under the volume's `managed` globs
 to a file outside them would take that file from its holder under a name that
 promised the refusal, so the volume
 raises `LinkOutOfManaged` and sends nothing
-(`src/ccs/adapters/coherent_volume.py`). It decides this from the links as they
+(`src/ccs/adapters/coherent_volume.py`), which the server's `swg_write` answers
+as `link_out_of_managed`. It decides this from the links as they
 stand when `write()` is called. On the Claude Code plugin's Node coordinator,
 which issues no caller principals, a refuse-mode volume's requests carry none,
 so the refusal there separates callers only by the session ids they send: a

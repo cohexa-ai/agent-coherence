@@ -50,6 +50,7 @@ from ccs.core.exceptions import (
     GiverFenced,
     LinkOutOfManaged,
     OtherHolder,
+    RefuseModeUnsupported,
     StaleView,
 )
 from ccs.core.path_fold import fold_key
@@ -350,11 +351,13 @@ def test_a_coordinator_that_does_not_advertise_the_refusal_is_refused_at_attach(
     a glob the coordinator does not enforce raises.
 
     Prevents a refuse-mode write landing over a holder on an older coordinator,
-    which a version number cannot predict."""
+    which a version number cannot predict. The refusal is typed, still a
+    ``CoherenceError``, so a server can stop on it by type and every existing
+    handler still catches it."""
     _operator_view_changed_to(monkeypatch, change)
     with pytest.raises(CoherenceError, match="pre_edit_if_unheld") as refused:
         _refuser(tmp_path, fast_cfg)
-    assert type(refused.value) is CoherenceError
+    assert type(refused.value) is RefuseModeUnsupported
     assert str(refused.value) == _NOT_ADVERTISED, "only a Python coordinator meets this, so it names no plugin"
     assert sent == [], "the check runs before the claim and before any pre-edit"
 
@@ -452,8 +455,8 @@ def test_a_forked_child_checks_the_coordinator_again(
         lambda: {**_write_and_report(volume, b"from-the-child"), "routes": _routes(sent)}
     )
 
-    assert report["raised"] == "CoherenceError", report
-    assert "pre_edit_if_unheld" in report["message"], report
+    assert report["raised"] == "RefuseModeUnsupported", report
+    assert report["message"] == _NOT_ADVERTISED, report
     assert "/hooks/pre-edit" not in report["routes"], report
     assert not (tmp_path / _PATH).exists()
 
@@ -829,9 +832,10 @@ def test_a_retry_after_unavailable_keeps_the_volumes_other_holds(
     wire.answers[_PRE_EDIT] = _UNAVAILABLE
     wire.sent.clear()
 
-    with pytest.raises(CoordinatorFailed):
+    with pytest.raises(CoordinatorFailed) as undecided:
         volume.write(_PATH, b"from-the-volume")
     assert wire.routes() == [_PRE_EDIT], "no release after an undecided grant request"
+    assert undecided.value.needs_reacquire is False, "a retry clears it, so it names no reacquire()"
 
     wire.answers.pop(_PRE_EDIT)
     volume.write(_PATH, b"from-the-volume")
@@ -1031,6 +1035,47 @@ def test_an_opted_in_write_is_admitted_only_on_ok_true(
     assert (tmp_path / _PATH).read_bytes() == b"seed"
 
 
+def _lose_the_answer(forward: Callable[..., object], payload: dict) -> object:
+    raise CoordinatorUnavailable("scripted: the answer was lost")
+
+
+@pytest.mark.parametrize(
+    ("answer", "answered"),
+    [({"ok": None}, True), (_lose_the_answer, False)],
+    ids=["answered-with-neither", "no-answer"],
+)
+def test_only_a_grant_request_answered_with_neither_is_marked_answered(
+    tmp_path: Path,
+    fast_cfg: LifecycleConfig,
+    server: CoordinatorHTTPServer,
+    wire: _Wire,
+    answer: object,
+    answered: bool,
+) -> None:
+    """Both raise ``CoordinatorUnreachable`` with nothing written. Only the
+    answer that neither admits nor refuses carries ``answered``: the coordinator
+    is up, so a consumer names no restart; a request that got no answer at all
+    may have met a coordinator that is gone. The message is today's.
+
+    Prevents a live coordinator's odd answer read as an outage, and an outage
+    read as a live coordinator."""
+    (tmp_path / _PATH).write_bytes(b"seed")
+    volume = _refuser(tmp_path, fast_cfg)
+    wire.answers[_PRE_EDIT] = answer
+
+    with pytest.raises(CoordinatorUnreachable) as unusable:
+        volume.write(_PATH, b"from-the-volume")
+
+    assert type(unusable.value) is CoordinatorUnreachable
+    assert unusable.value.answered is answered
+    if answered:
+        assert str(unusable.value) == (
+            f"the coordinator answered the grant request for {_PATH} with neither an admit "
+            "nor a refusal. Nothing was written."
+        )
+    assert (tmp_path / _PATH).read_bytes() == b"seed"
+
+
 def test_a_default_volume_still_writes_on_those_answers(
     tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
 ) -> None:
@@ -1220,6 +1265,55 @@ def test_a_refusal_by_this_volumes_own_old_grant_is_not_another_agent(
     assert (tmp_path / _PATH).read_bytes() == b"first + second"
 
 
+def test_a_write_refused_by_an_earlier_attempts_grant_is_marked_for_reacquire(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """``write()`` starts no new attempt, so a plain retry meets the same
+    refusal: the error carries ``needs_reacquire``, so a consumer names
+    ``reacquire()`` by the mark, never by the message, which is today's.
+
+    Prevents a caller told to retry a write that no retry can clear."""
+    volume = _refuser(tmp_path, fast_cfg)
+    _with_an_abandoned_grant(volume, wire)
+
+    with pytest.raises(CoordinatorFailed) as raised:
+        volume.write(_PATH, b"second")
+
+    assert raised.value.needs_reacquire is True
+    assert str(raised.value) == (
+        f"{_PATH} is held by this volume's own earlier write grant, whose release was not "
+        "confirmed, and the coordinator refused this write because of it. Nothing was "
+        "written. Call reacquire(), which sends the release again, and write from the "
+        "bytes it returns."
+    )
+
+
+def test_a_commit_refused_by_an_earlier_attempts_grant_is_not_marked_for_reacquire(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """An optimistic commit starts a new attempt, whose release of the earlier
+    one goes out again on a retry, so its refusal by that grant stays the
+    retry-once error it is today, without the mark.
+
+    Prevents a consumer sending a commit's caller to ``reacquire()``, which
+    would drop every other hold for a refusal one retry clears."""
+    volume = _refuser(tmp_path, fast_cfg)
+    volume.write(_PATH, b"first")
+    _data, version = volume.read_with_version(_PATH)
+    wire.answers[_SESSION_STOP] = {
+        "ok": False, "reason": "release_failed", "grants": [{"path": _PATH, "held": True}],
+    }
+
+    with pytest.raises(CoordinatorFailed) as raised:
+        volume.write_cas_at(_PATH, version, b"second")
+
+    assert raised.value.needs_reacquire is False
+    assert str(raised.value).startswith(
+        f"{_PATH} is held by this volume's own earlier write grant: the coordinator answered"
+    )
+    assert (tmp_path / _PATH).read_bytes() == b"first"
+
+
 @pytest.mark.parametrize(
     "holder",
     ["not-a-uuid", None, 7],
@@ -1262,6 +1356,60 @@ def test_a_peers_refusal_is_not_this_volumes_own(
     with pytest.raises(OtherHolder) as raised:
         volume.write(_PATH, b"second")
     assert raised.value.holder_agent_id == _SOME_HOLDER
+
+
+def _both_spellings(agent_id: str) -> tuple[str, str]:
+    """An agent id as ``/status`` lists it (hyphenated) and as a refusal names it (32 hex)."""
+    return str(UUID(agent_id)), UUID(agent_id).hex
+
+
+def test_the_volume_tells_its_own_attempts_from_any_other_agent(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """An id names the current attempt, an earlier attempt this volume started
+    (whether its grant is still recorded or its record already gone), or
+    neither, in either spelling the coordinator publishes. Asking sends nothing.
+
+    Prevents a grant that outlived its record read as another agent's, which
+    would have the caller wait on itself, and a peer read as this volume."""
+    volume, peer = _refuser(tmp_path, fast_cfg), _refuser(tmp_path, fast_cfg)
+    volume.write(_PATH, b"first")
+    released, released_incarnation = volume.agent_id, volume.incarnation
+    volume.reacquire(_PATH)
+    stranded, stranded_incarnation = volume.agent_id, volume.incarnation
+    _with_an_abandoned_grant(volume, wire)
+    assert released_incarnation not in volume._grant_incarnations, "control: its record is gone"
+    assert stranded_incarnation in volume._grant_incarnations, "control: its record stands"
+    wire.sent.clear()
+
+    for spelling in range(2):
+        assert volume.attempt_of(_both_spellings(volume.agent_id)[spelling]) == "current"
+        assert volume.attempt_of(_both_spellings(stranded)[spelling]) == "earlier"
+        assert volume.attempt_of(_both_spellings(released)[spelling]) == "earlier"
+        assert volume.attempt_of(_both_spellings(peer.agent_id)[spelling]) is None
+        assert volume.attempt_of(_both_spellings(_session_level_id(volume))[spelling]) is None
+    assert volume.attempt_of("not-an-agent-id") is None
+    assert wire.sent == []
+
+
+def test_a_forked_child_reads_its_parents_attempts_as_another_agents(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer
+) -> None:
+    """A forked child is a new session, so the attempts its parent started,
+    the one current at the fork included, are not its own.
+
+    Prevents a child told a grant its parent holds is its own to release."""
+    volume = _refuser(tmp_path, fast_cfg)
+    volume.write(_PATH, b"from the parent")
+    parent_earlier = volume.agent_id
+    volume.reacquire(_PATH)
+    parent_current = volume.agent_id
+
+    volume._after_fork()
+
+    assert volume.attempt_of(parent_earlier) is None
+    assert volume.attempt_of(parent_current) is None
+    assert volume.attempt_of(volume.agent_id) == "current"
 
 
 # --- an older coordinator at the write itself -----------------------------

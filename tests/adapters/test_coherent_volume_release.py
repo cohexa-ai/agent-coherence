@@ -208,7 +208,7 @@ def test_release_names_every_attempt_that_recorded_the_path(
     holder.write(_X, b"second")
     wire.sent.clear()
 
-    holder.release(_X)
+    assert holder.release(_X) is True
 
     assert [body["agent_id"] for body in _releases(wire)] == [holder.incarnation, earlier]
     assert write_holders(server, _X) == set()
@@ -274,6 +274,46 @@ def test_a_path_the_volume_did_not_write_sends_nothing(
     holder.release(_X)
 
     assert wire.sent == []
+
+
+def test_release_answers_whether_it_gave_a_grant_back(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """``True`` for a recorded grant whose release was confirmed, and the
+    coordinator then lists no holder; ``False`` when nothing is recorded, with
+    nothing sent: a repeat, and a path never written.
+
+    Prevents a caller told a grant went back when nothing was sent, or told
+    nothing went back when it did."""
+    holder = _holder(tmp_path, fast_cfg)
+    holder.write(_X, b"from the holder")
+
+    assert holder.release(_X) is True
+    assert write_holders(server, _X) == set()
+
+    wire.sent.clear()
+    assert holder.release(_X) is False
+    assert holder.release(_Z) is False
+    assert wire.sent == []
+
+
+def test_a_release_after_a_peer_displaced_the_grant_answers_true_and_the_peer_keeps_it(
+    tmp_path: Path, fast_cfg: LifecycleConfig, server: CoordinatorHTTPServer, wire: _Wire
+) -> None:
+    """The record stood when a displacing peer took the file, so the release
+    goes out and the coordinator confirms it as it confirms any. ``True`` says
+    this volume holds no grant there, not that the file is free.
+
+    Pins the answer a caller must not read as "the file is free"."""
+    holder, peer = _holder(tmp_path, fast_cfg), _holder(tmp_path, fast_cfg)
+    holder.write(_X, b"from the holder")
+    peer.write(_X, b"from the peer")
+    wire.sent.clear()
+
+    assert holder.release(_X) is True
+
+    assert len(_releases(wire)) == 1
+    assert write_holders(server, _X) == {peer.agent_id}
 
 
 def test_another_spelling_of_a_held_path_releases_it_where_the_disk_folds_it(
@@ -381,11 +421,11 @@ def test_an_unconfirmed_release_warns_in_degrade_mode_and_keeps_the_record(
     wire.answers[_POST_EDIT] = {"ok": True, "degraded": True}
 
     with pytest.warns(CoherenceDegradedWarning):
-        holder.release(_X)
+        assert holder.release(_X) is False, "a release the coordinator did not confirm gave nothing back"
 
     wire.answers.pop(_POST_EDIT)
     wire.sent.clear()
-    holder.release(_X)
+    assert holder.release(_X) is True
     assert len(_releases(wire)) == 1
 
 
@@ -425,11 +465,11 @@ def test_a_handed_off_grant_counts_as_released(
         "grants": [{"path": _X, "held": False, "cause": "handoff"}],
     }
 
-    holder.release(_X)
+    assert holder.release(_X) is True, "the coordinator's account settles the grant"
 
     wire.answers.pop(_POST_EDIT)
     wire.sent.clear()
-    holder.release(_X)
+    assert holder.release(_X) is False
     assert _releases(wire) == []
 
 

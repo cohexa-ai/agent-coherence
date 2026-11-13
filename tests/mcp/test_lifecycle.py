@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -20,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import ccs.adapters.coherent_volume as coherent_volume_module
+import ccs.cli._coherence_client as client_module
 import ccs.mcp.server as server_module
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
 from ccs.adapters.coherent_volume import CoherentVolume
@@ -27,10 +29,35 @@ from ccs.cli._coherence_client import CoordinatorUnavailable, escape_nonprintabl
 from ccs.core.exceptions import CoherenceDirRefused, CoherenceError, CoordinatorUnreachable
 from ccs.mcp.server import build_server, lifespan
 from ccs.mcp.session import SessionConfig, build_volume
+from tests.adapters.test_coherent_volume_other_holder import _NOT_ADVERTISED, _POST_EDIT, _PRE_EDIT, _Wire
 from tests.coherence_link_helpers import plant_link
 from tests.coordinator_helpers import serve_in_process, write_holders
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: The server's console script, run as an agent host runs it.
+_MAIN = "from ccs.mcp.server import main; main()"
+
+#: The console script against a real coordinator whose operator view loses
+#: ``pre_edit_if_unheld`` on the way in: every coordinator this package starts
+#: advertises it, so this is the one boundary stubbed.
+_MAIN_WITHOUT_THE_REFUSAL = textwrap.dedent(
+    """
+    import ccs.adapters.coherent_volume as coherent_volume
+    from ccs.mcp.server import main
+
+    real_get = coherent_volume._coordinator_get
+
+    def operator_view_without_the_refusal(endpoint, path, **kwargs):
+        answer = real_get(endpoint, path, **kwargs)
+        if "detail=full" in path:
+            answer.pop("pre_edit_if_unheld", None)
+        return answer
+
+    coherent_volume._coordinator_get = operator_view_without_the_refusal
+    main()
+    """
+)
 
 
 @pytest.fixture
@@ -61,6 +88,41 @@ def _subprocess_env(tmp_path: Path, managed: str = "data/**") -> dict[str, str]:
         "SWG_ROOT": str(tmp_path),
         "SWG_MANAGED": managed,
     }
+
+
+def _run_the_server(tmp_path: Path, on_held: str, script: str = _MAIN) -> subprocess.CompletedProcess[bytes]:
+    """Run the console script with ``SWG_ON_HELD=on_held`` and no client."""
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        env={**_subprocess_env(tmp_path), "SWG_ON_HELD": on_held},
+        timeout=60,
+    )
+
+
+@pytest.fixture
+def wire(monkeypatch) -> _Wire:
+    """Every request the server's volume sends: each POST under its route, each
+    GET as ``GET <path>``, so a request a write never sent before shows up. The
+    principal claim goes out through the client module, every other request
+    through the volume's aliases."""
+    recorded = _Wire()
+    real_post, real_get = client_module.post, client_module.get
+
+    def post(endpoint: object, path: str, payload: dict, **kwargs: object) -> object:
+        recorded.sent.append((path, dict(payload)))
+        return real_post(endpoint, path, payload, **kwargs)
+
+    def get(endpoint: object, path: str, **kwargs: object) -> object:
+        recorded.sent.append((f"GET {path}", {}))
+        return real_get(endpoint, path, **kwargs)
+
+    monkeypatch.setattr(client_module, "post", post)
+    monkeypatch.setattr(client_module, "get", get)
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_post", post)
+    monkeypatch.setattr(coherent_volume_module, "_coordinator_get", get)
+    return recorded
 
 
 # --- happy path: attach + strict + clean stop --------------------------------
@@ -168,6 +230,112 @@ def test_the_server_refuses_a_link_in_coherence_on_one_escaped_line_and_exits_2(
     assert not target.exists()
 
 
+# --- SWG_ON_HELD: the refuse-mode opt-in --------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("environ", "on_held"),
+    [
+        ({}, "displace"),
+        ({"SWG_ON_HELD": ""}, "displace"),
+        ({"SWG_ON_HELD": "displace"}, "displace"),
+        ({"SWG_ON_HELD": "refuse"}, "refuse"),
+    ],
+    ids=["unset", "empty", "displace", "refuse"],
+)
+def test_swg_on_held_turns_refuse_mode_on_and_displace_stays_the_default(
+    tmp_path: Path, environ: dict[str, str], on_held: str
+) -> None:
+    assert SessionConfig.from_env({"SWG_ROOT": str(tmp_path), **environ}).on_held == on_held
+
+
+@pytest.mark.parametrize("value", ["Refuse", "yes", " refuse", "refuse "])
+def test_swg_on_held_is_matched_exactly(tmp_path: Path, value: str) -> None:
+    """Prevents a near-miss spelling starting a server whose writes displace
+    holders while its operator believes they are refused."""
+    with pytest.raises(ValueError, match="SWG_ON_HELD must be 'refuse' or 'displace'"):
+        SessionConfig.from_env({"SWG_ROOT": str(tmp_path), "SWG_ON_HELD": value})
+
+
+@pytest.mark.parametrize(
+    ("value", "shown"),
+    [("sometimes", "'sometimes'"), ("Refuse\n\x1b[2J", "'Refuse\\n\\x1b[2J'")],
+    ids=["unknown", "control-characters"],
+)
+def test_the_server_refuses_another_swg_on_held_on_one_line_before_any_coordinator_starts(
+    tmp_path: Path, value: str, shown: str
+) -> None:
+    """An agent host runs the console script unattended, so a value it cannot
+    honour stops it before it serves, on one stderr line naming the accepted
+    values, and exit 2, as a refused ``.coherence`` does. Prevents a traceback,
+    and a coordinator started for a server that never serves."""
+    _seed(tmp_path)
+
+    result = _run_the_server(tmp_path, value)
+
+    assert result.returncode == 2, result.stderr
+    assert result.stdout == b""
+    assert result.stderr.decode("utf-8") == (
+        "stale-write-guard-fs: SWG_ON_HELD must be 'refuse' or 'displace' "
+        f"(unset or empty means 'displace'), got {shown}\n"
+    )
+    assert not (tmp_path / ".coherence").exists()
+
+
+def test_a_refuse_mode_start_a_coordinator_cannot_honour_ends_on_one_line_and_exit_2(tmp_path: Path) -> None:
+    """``SWG_ON_HELD=refuse`` against a coordinator that does not advertise
+    ``pre_edit_if_unheld`` stops the server before it serves: one stderr line
+    that carries the volume's refusal unchanged, names ``SWG_ON_HELD`` and the
+    fix, and exit 2. Prevents a server that silently displaces holders, and a
+    traceback in the host's log."""
+    _seed(tmp_path)
+
+    result = _run_the_server(tmp_path, "refuse", _MAIN_WITHOUT_THE_REFUSAL)
+
+    assert result.returncode == 2, result.stderr
+    assert result.stdout == b""
+    *logged, refusal = result.stderr.decode("utf-8").split("\n")[:-1]
+    assert refusal == (
+        f"stale-write-guard-fs: refusing to start with SWG_ON_HELD=refuse: {_NOT_ADVERTISED} "
+        "Run a coordinator that can refuse (agent-coherence after 0.15.0, or the Claude Code "
+        "plugin after 0.6.0), or unset SWG_ON_HELD to serve in displace mode."
+    )
+    # The attach spawned the coordinator before it read what the coordinator
+    # advertises, and the coordinator logs its start as it does on every start.
+    # Nothing else is printed: no traceback, and no error record.
+    assert all(re.match(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} INFO ccs\.adapters\.", line) for line in logged), logged
+
+
+@pytest.mark.parametrize("on_held", [None, "", "displace"], ids=["unset", "empty", "displace"])
+def test_a_displace_mode_write_sends_only_the_requests_it_always_sent(
+    tmp_path: Path, monkeypatch, wire: _Wire, on_held: str | None
+) -> None:
+    """Without refuse mode, ``swg_write`` asks the coordinator what it asked
+    before the option existed: a pre-edit with no ``if_unheld``, then the
+    post-edit, and nothing else. Prevents a server started without the option
+    opting its writes in, or paying an extra request for the option."""
+    monkeypatch.setenv("SWG_ROOT", str(tmp_path))
+    monkeypatch.setenv("SWG_MANAGED", "data/**")
+    if on_held is None:
+        monkeypatch.delenv("SWG_ON_HELD", raising=False)
+    else:
+        monkeypatch.setenv("SWG_ON_HELD", on_held)
+    _seed(tmp_path)
+
+    async def go() -> tuple[dict, list[str], dict]:
+        async with lifespan(build_server()) as ctx:
+            wire.sent.clear()
+            result = server_module._do_write(ctx.volume, ctx.config, "data/shared.txt", "v2")
+            return result.structuredContent, wire.routes(), wire.bodies(_PRE_EDIT)[0]
+
+    structured, routes, pre_edit = asyncio.run(go())
+
+    assert structured == {"ok": True, "path": "data/shared.txt"}
+    assert routes == [_PRE_EDIT, _POST_EDIT]
+    assert sorted(pre_edit) == ["agent_id", "path", "session_id"]
+    assert (tmp_path / "data/shared.txt").read_bytes() == b"v2"
+
+
 # --- strict-only construction (no degrade-mode volume) -----------------------
 
 
@@ -181,6 +349,20 @@ def test_build_volume_is_strict_only(tmp_path: Path) -> None:
         assert volume._on_error == "strict"
         assert volume.strict_mode_active() is True
         # The write-surface guard is armed too (foreign-edit clobber -> stale_view).
+        assert volume._on_stale_write == "raise"
+    finally:
+        stop_coordinator(tmp_path)
+
+
+def test_build_volume_on_a_refuse_config_builds_a_refuse_mode_volume(tmp_path: Path) -> None:
+    """Refuse mode adds to the strict-only volume and takes nothing from it."""
+    config = SessionConfig(root=tmp_path, managed=("data/**",), on_held="refuse")
+    _seed(tmp_path)
+    volume = build_volume(config)
+    try:
+        assert volume.asks_if_unheld("data/shared.txt") is True
+        assert volume.asks_if_unheld("outside.txt") is False
+        assert volume._on_error == "strict"
         assert volume._on_stale_write == "raise"
     finally:
         stop_coordinator(tmp_path)

@@ -1391,10 +1391,22 @@ class CoordinatorUnreachable(CoherenceError):
     went away, the volume or session never finds a coordinator started after
     it: build a new one (for the MCP server, restart it) once a coordinator is
     running again; see ``docs/guide.md``. Carries
-    :data:`COORDINATOR_UNAVAILABLE_REASON`. Message only, so it pickles whole
-    across a process boundary."""
+    :data:`COORDINATOR_UNAVAILABLE_REASON`.
+
+    ``answered`` is ``True`` only for an opted-in ``write()`` whose grant
+    request the coordinator answered with a body that neither admits nor
+    refuses: a coordinator answered, so no restart is called for, nothing was
+    written, and the request may have taken the grant. Every other cause
+    leaves it ``False``, the class default; a consumer reads it, never the
+    message. It is a keyword with a default and the message comes in already
+    built, so the exception pickles whole across a process boundary."""
 
     reason = COORDINATOR_UNAVAILABLE_REASON
+    answered: bool = False
+
+    def __init__(self, *args: object, answered: bool = False) -> None:
+        super().__init__(*args)
+        self.answered = answered
 
 
 class CoordinatorFailed(CoherenceError):
@@ -1434,10 +1446,34 @@ class CoordinatorFailed(CoherenceError):
     call. One retry after a short wait is the recovery; a second failure is
     for the operator. A commit answered with the envelope raises
     :class:`CommitUnconfirmed` instead, because it may have landed. Carries
-    :data:`COORDINATOR_FAILED_REASON`. Message only, so it pickles whole
-    across a process boundary."""
+    :data:`COORDINATOR_FAILED_REASON`.
+
+    ``needs_reacquire`` is ``True`` only for that refuse-mode ``write()``
+    refused by this volume's own earlier incarnation: ``reacquire()`` is the
+    recovery, because a retry never sends the release again. Every other
+    cause leaves it ``False``, the class default, the commit refused by the
+    volume's own grant included, whose retry does send it. A consumer reads it,
+    never the message. It is a keyword with a default and the message comes in
+    already built, so the exception pickles whole across a process boundary."""
 
     reason = COORDINATOR_FAILED_REASON
+    needs_reacquire: bool = False
+
+    def __init__(self, *args: object, needs_reacquire: bool = False) -> None:
+        super().__init__(*args)
+        self.needs_reacquire = needs_reacquire
+
+
+class RefuseModeUnsupported(CoherenceError):
+    """A volume built with ``on_held="refuse"`` refused to attach, before it
+    sent anything, because the coordinator cannot be relied on to refuse: it
+    does not advertise ``pre_edit_if_unheld``, or the volume cannot rely on the
+    fold profile it read from it. Only refuse mode raises it, and no retry
+    clears it: run a coordinator that can refuse, from the library's release,
+    or use ``on_held="displace"``. A
+    :class:`CoherenceError`, so every handler of that still catches it; a
+    ``/status`` read that got no answer raises :class:`CoordinatorUnreachable`
+    instead. Message only, so it pickles whole across a process boundary."""
 
 
 class PublishMaterializationError(CoherenceError):
