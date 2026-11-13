@@ -242,6 +242,19 @@ class TrackedArtifactPolicy:
         return policy
 
     @classmethod
+    def read_quietly(cls, coordinator_root: Path | str) -> "TrackedArtifactPolicy":
+        """The policy :meth:`load` reads, logging nothing. A hook client prints
+        only its answer, and with no logging configured a warning would reach
+        stderr on every hook; the coordinator reports these diagnostics when it
+        loads the same files."""
+        was_disabled = logger.disabled
+        logger.disabled = True
+        try:
+            return cls._read(coordinator_root)
+        finally:
+            logger.disabled = was_disabled
+
+    @classmethod
     def _read(
         cls, coordinator_root: Path | str, linked_prefixes_logged: set[str] | None = None
     ) -> "TrackedArtifactPolicy":
