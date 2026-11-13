@@ -9,6 +9,7 @@ per-invocation warning-template variation.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -1123,6 +1124,104 @@ def test_a_policy_route_refuses_a_fifo_lock_sidecar_made_after_the_start(
     })]
     assert target_snapshot(coherence_dir / file_name) == policy_before
     assert "ok.md" not in getattr(coordinator.policy, loaded_as)
+
+
+def _plant_directory_or_socket(
+    path: Path, shape: str, monkeypatch: pytest.MonkeyPatch, cleanup: contextlib.ExitStack,
+) -> None:
+    """Put an empty directory or a bound unix socket at ``path``. The socket
+    closes when ``cleanup`` does."""
+    if shape == "directory":
+        path.mkdir()
+        return
+    import socket
+
+    monkeypatch.chdir(path.parent)  # AF_UNIX paths are ~104 bytes; bind relatively
+    sock = cleanup.enter_context(socket.socket(socket.AF_UNIX))
+    sock.bind(path.name)
+
+
+@pytest.mark.parametrize("shape", ["directory", "socket"])
+@pytest.mark.parametrize(("endpoint", "file_name", "answer_key", "loaded_as"), _POLICY_FILES)
+def test_a_policy_route_refuses_a_directory_or_socket_at_its_lock_sidecar(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, endpoint: str,
+    file_name: str, answer_key: str, loaded_as: str, shape: str,
+) -> None:
+    """#534: a directory or socket put at the ``<name>.lock`` sidecar while the
+    coordinator runs fails the lock's open before its regular-file check (EISDIR
+    for a directory; EOPNOTSUPP or ENXIO for a socket). The route answers the 400
+    a FIFO there gets, naming the sidecar, and writes nothing.
+
+    Prevents a server error with nothing named. The request runs on a thread
+    with a deadline, so a regression fails here instead of hanging the run."""
+    coherence_dir = coordinator.coordinator_root / ".coherence"
+    policy_before = target_snapshot(coherence_dir / file_name)
+    lock = coherence_dir / f"{file_name}.lock"
+    lock.unlink(missing_ok=True)
+    answers: list[tuple[int, dict]] = []
+    with contextlib.ExitStack() as cleanup:
+        _plant_directory_or_socket(lock, shape, monkeypatch, cleanup)
+        lock_before = target_snapshot(lock)
+        worker = threading.Thread(
+            target=lambda: answers.append(client.post(endpoint, {"paths": ["ok.md"]})), daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=30)
+        assert not worker.is_alive(), "the route blocked on its lock sidecar"
+        assert target_snapshot(lock) == lock_before
+
+    assert answers == [(400, {
+        "error": f".coherence/{file_name}.lock could not be read (not a regular file); nothing was written.",
+    })]
+    assert target_snapshot(coherence_dir / file_name) == policy_before
+    assert "ok.md" not in getattr(coordinator.policy, loaded_as)
+
+
+@pytest.mark.parametrize(("endpoint", "file_name", "answer_key", "loaded_as"), _POLICY_FILES)
+def test_a_policy_route_without_fcntl_adds_its_entry_and_creates_no_lock_file(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, endpoint: str,
+    file_name: str, answer_key: str, loaded_as: str,
+) -> None:
+    """A platform with no ``fcntl`` writes the entry without a lock, as before.
+
+    Prevents the route failing there, or leaving a ``<name>.lock`` it never locked."""
+    lock = coordinator.coordinator_root / ".coherence" / f"{file_name}.lock"
+    lock.unlink(missing_ok=True)
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+
+    s, b = client.post(endpoint, {"paths": ["ok.md"]})
+
+    assert (s, b) == (200, {"ok": True, answer_key: ["ok.md"], "rejected": []})
+    assert "ok.md" in getattr(coordinator.policy, loaded_as)
+    assert not os.path.lexists(lock)
+
+
+@pytest.mark.parametrize(("content", "status"), [
+    ("- runbook.md\n", 200),
+    ("- runbook.md\n- *.md\n", 400),
+])
+@pytest.mark.parametrize(("endpoint", "file_name", "answer_key", "loaded_as"), _POLICY_FILES)
+def test_a_policy_route_frees_its_lock_before_it_answers(
+    coordinator, client: _Client, endpoint: str, file_name: str, answer_key: str,
+    loaded_as: str, content: str, status: int,
+) -> None:
+    """A route frees its ``<name>.lock`` before it answers, whether it wrote the
+    entry or refused the file under the lock.
+
+    Prevents a held lock blocking every later track, untrack and start merge."""
+    import fcntl
+
+    coherence_dir = coordinator.coordinator_root / ".coherence"
+    (coherence_dir / file_name).write_text(content)
+
+    s, b = client.post(endpoint, {"paths": ["ok.md"]})
+
+    assert s == status, b
+    fd = os.open(coherence_dir / f"{file_name}.lock", os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
 
 
 def test_a_policy_route_over_a_fifo_made_after_the_start_answers_at_once(

@@ -60,15 +60,17 @@ import os
 import re
 import secrets
 import socketserver
+import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
+from types import ModuleType
 from typing import (
     Any,
     Callable,
@@ -170,6 +172,7 @@ from ccs.core.exceptions import (
     HOLD_VERSION_UNCONFIRMED,
     OCC_CALLER_TRANSIENT_REASON,
     OTHER_HOLDER_REASON,
+    POLICY_LOCK_NOT_REGULAR_KIND,
     RESTORE_MEMBER_OUTCOMES,
     RESTORE_STATUSES,
     SESSION_INVALIDATED_REASON,
@@ -9847,21 +9850,101 @@ def merge_policy_globs(yaml_paths: Iterable[Path], globs: tuple[str, ...]) -> No
         _replace_policy_file(yaml_path, yaml.safe_dump(merged, default_flow_style=False))
 
 
+class _PolicyLockNotRegular(ValueError):
+    """A policy file's ``<name>.lock`` sidecar is a link or not a regular file,
+    so it was not locked and nothing was written (#498, #534). A ``ValueError``,
+    so the routes answer it as HTTP 400. ``path`` is the sidecar's path."""
+
+    kind = POLICY_LOCK_NOT_REGULAR_KIND
+
+    def __init__(self, lock_path: Path, message: str) -> None:
+        super().__init__(message)
+        self.path = str(lock_path)
+
+
+def _lock_not_regular_text(name: str) -> str:
+    return f"{name}.lock could not be read (not a regular file); nothing was written."
+
+
+def _is_present_but_not_regular(path: Path) -> bool:
+    try:
+        return not stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _open_policy_lock(yaml_path: Path) -> int:
+    """Open ``yaml_path``'s ``<name>.lock`` sidecar, creating it at mode 0o600,
+    and return the descriptor. Raises :class:`_PolicyLockNotRegular` with the
+    routes' text for a link or anything else that is not a regular file there,
+    and the open's own ``OSError`` otherwise."""
+    lock_path = yaml_path.with_suffix(yaml_path.suffix + ".lock")
+    name = policy_file_name(yaml_path)
+    try:
+        # No-follow (#498): O_CREAT through a dangling link creates the file it
+        # names, outside .coherence.
+        return open_regular(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except LinkRefused:
+        raise _PolicyLockNotRegular(lock_path, lock_link_refusal(name)) from None
+    except NotRegularFile:
+        # A FIFO or device put there while the coordinator runs (a start refuses
+        # one): the 400 a policy file that is not regular gets.
+        raise _PolicyLockNotRegular(lock_path, _lock_not_regular_text(name)) from None
+    except OSError:
+        # A directory or socket fails the open itself, before the regular-file
+        # check (#534): EISDIR, or EOPNOTSUPP on macOS and ENXIO on Linux. Told
+        # apart here rather than in the no-follow reader, so every other reader
+        # still reads a socket as unreadable.
+        if _is_present_but_not_regular(lock_path):
+            raise _PolicyLockNotRegular(lock_path, _lock_not_regular_text(name)) from None
+        raise
+
+
+def _release_policy_lock(fcntl_module: ModuleType, fd: int) -> None:
+    with suppress(OSError):
+        fcntl_module.flock(fd, fcntl_module.LOCK_UN)
+    with suppress(OSError):
+        os.close(fd)
+
+
+@contextmanager
+def _policy_locks(yaml_paths: Sequence[Path]) -> Iterator[None]:
+    """Hold an exclusive lock on each policy file's ``<name>.lock`` sidecar,
+    taken in the order given and released in reverse, ``LOCK_UN`` before
+    ``close``, with release errors suppressed. The wait has no bound. Raises
+    what :func:`_open_policy_lock` raises.
+
+    Two writers that each read a policy file and replace it cannot then
+    interleave and lose each other's entries. ``flock``, never ``lockf`` or
+    ``fcntl`` record locks: two holders in one process each open their own
+    descriptor, and only ``flock`` makes those exclude each other. A sidecar is
+    never removed: removing one lets two holders lock two different inodes.
+
+    Without ``fcntl`` (Windows, where lifecycle already disables the
+    coordinator) it takes no lock and creates no sidecar."""
+    try:
+        import fcntl as _fcntl
+    except ImportError:
+        yield
+        return
+    with ExitStack() as held:
+        for yaml_path in yaml_paths:
+            fd = _open_policy_lock(yaml_path)
+            held.callback(_release_policy_lock, _fcntl, fd)
+            _fcntl.flock(fd, _fcntl.LOCK_EX)
+        yield
+
+
 def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str], list[dict]]:
     """Append valid patterns to a YAML file. Returns (added, rejected).
     Raises ValueError, which the routes answer as HTTP 400, when the file
     would exceed MAX_POLICY_YAML_BYTES, an entry could not take effect in
     it (see :func:`_append_policy_entries`), or its lock sidecar is a link
-    or not a regular file (#498); nothing is written then.
+    or not a regular file (#498, #534); nothing is written then.
 
-    R14 (Unit 6): the read-modify-write is wrapped in an ``fcntl.flock``
-    exclusive lock on a sidecar ``<yaml_path>.lock`` file so two concurrent
-    /policy/track or /policy/untrack requests cannot interleave their
-    reads-and-writes and corrupt the YAML (e.g., both read the same
-    pre-state, both compute "previous + my_paths", second write loses the
-    first writer's additions). fcntl is POSIX-only; on the deferred
-    Windows path this is a no-op (lifecycle already disables the
-    coordinator on Windows per _FCNTL_AVAILABLE).
+    The read-modify-write runs under the file's lock (:func:`_policy_locks`),
+    so two concurrent /policy/track or /policy/untrack requests cannot both
+    read the same file and the second write drop the first's additions.
 
     COR-06: callers pre-validate via ``validate_path`` (or equivalent)
     and pass only safe paths. The local re-check below is a defensive
@@ -9894,35 +9977,5 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
 
     if not added:
         return added, rejected
-
-    try:
-        import fcntl as _fcntl
-    except ImportError:
-        # Windows fallback: no fcntl. Lifecycle already disables the
-        # coordinator on Windows, but degrade defensively if reached.
+    with _policy_locks([yaml_path]):
         return _append_policy_entries(yaml_path, added), rejected
-    lock_path = yaml_path.with_suffix(yaml_path.suffix + ".lock")
-    try:
-        # No-follow (#498): O_CREAT through a dangling link creates the file it
-        # names, outside .coherence.
-        lock_fd = open_regular(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-    except LinkRefused:
-        raise ValueError(lock_link_refusal(policy_file_name(yaml_path))) from None
-    except NotRegularFile:
-        # A FIFO, socket or device put there while the coordinator runs (a start
-        # refuses one): the 400 a policy file that is not regular gets.
-        raise ValueError(
-            f"{policy_file_name(yaml_path)}.lock could not be read (not a regular file); nothing was written."
-        ) from None
-    try:
-        _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
-        return _append_policy_entries(yaml_path, added), rejected
-    finally:
-        try:
-            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
-        except OSError:
-            pass
-        try:
-            os.close(lock_fd)
-        except OSError:
-            pass
