@@ -48,14 +48,17 @@ Outcomes (:class:`StoreCheckOutcome`):
   then on. The case a host asks consent for.
 - ``newer`` — the store is past this build's schema; a start refuses it.
 - ``foreign`` — the sibling Node coordinator's ledger wrote it; a start
-  refuses it. A LIVE Node coordinator also reads ``foreign``: it takes no
-  workspace lock, and a Python start refuses its store before it could join.
+  refuses it. A running Node coordinator that holds the workspace lock reads
+  ``live`` instead; one running without the lock (plugin 0.6.0 and earlier,
+  or a host where it cannot take one) also reads ``foreign``, and a Python
+  start refuses its store before it could join.
 - ``unusable`` — a start fails on the store itself (``reason`` names how).
-- ``live`` — a Python coordinator holds the workspace lock: a start joins it
-  and migrates nothing while it runs. The store is not read, so this says
-  nothing about its schema: an older build's coordinator left running after
-  an upgrade keeps the store at that build's schema, and the first start of
-  this build after it exits migrates it.
+- ``live`` — a coordinator holds the workspace lock: this package's, or the
+  Claude Code plugin's Node coordinator from 0.7.0, which takes the same lock
+  where it can. A start joins it and migrates nothing while it runs. The
+  store is not read, so this says nothing about its schema: an older build's
+  coordinator left running after an upgrade keeps the store at that build's
+  schema, and the first start of this build after it exits migrates it.
 - ``cannot_tell`` — the check could not observe the answer (``reason``).
 - ``coherence_dir_refused`` — ``.coherence`` is a symlink or not a
   directory, or holds a symlink, FIFO, socket or device directly inside it

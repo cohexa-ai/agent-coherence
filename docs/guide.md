@@ -19,38 +19,39 @@ full command-line toolset, and the API reference.
 ## Contents
 
 1. [Installation](#installation)
-2. [Upgrading from 0.14.1](#upgrading-from-0141)
-3. [Quick start](#quick-start)
-4. [Namespace convention](#namespace-convention)
-5. [Strategies](#strategies)
-6. [Observability](#observability)
-7. [State transitions log](#state-transitions-log)
-8. [Content audit log](#content-audit-log)
-9. [Crash recovery](#crash-recovery)
-10. [Version retention and read-at-version](#version-retention-and-read-at-version)
-11. [Coherent workspace (`CoherentVolume`)](#coherent-workspace-coherentvolume)
-12. [BYO substrate bindings (`CoherentRow`, `CoherentObject`)](#byo-substrate-bindings-coherentrow-coherentobject)
-13. [Workspace versioning & restore (`WorkspaceVersioner`)](#workspace-versioning--restore-workspaceversioner)
-14. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
-15. [Effect fence over HTTP](#effect-fence-over-http)
-16. [Caller principal](#caller-principal)
-17. [Targeted grant handoff](#targeted-grant-handoff)
-18. [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)
-19. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
-20. [Inline benchmark mode](#inline-benchmark-mode)
-21. [Telemetry](#telemetry)
-22. [Graceful degradation](#graceful-degradation)
-23. [Examples](#examples)
-24. [Real-workload benchmarks](#real-workload-benchmarks)
-25. [Benchmarking your own workload](#benchmarking-your-own-workload)
-26. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-27. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
-28. [Replay (v0.8.2+)](#replay-v082)
-29. [Command-line tools](#command-line-tools)
-30. [API reference](#api-reference)
-31. [Low-level adapter API](#low-level-adapter-api)
-32. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-33. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+2. [Upgrading from 0.15.0](#upgrading-from-0150)
+3. [Upgrading from 0.14.1](#upgrading-from-0141)
+4. [Quick start](#quick-start)
+5. [Namespace convention](#namespace-convention)
+6. [Strategies](#strategies)
+7. [Observability](#observability)
+8. [State transitions log](#state-transitions-log)
+9. [Content audit log](#content-audit-log)
+10. [Crash recovery](#crash-recovery)
+11. [Version retention and read-at-version](#version-retention-and-read-at-version)
+12. [Coherent workspace (`CoherentVolume`)](#coherent-workspace-coherentvolume)
+13. [BYO substrate bindings (`CoherentRow`, `CoherentObject`)](#byo-substrate-bindings-coherentrow-coherentobject)
+14. [Workspace versioning & restore (`WorkspaceVersioner`)](#workspace-versioning--restore-workspaceversioner)
+15. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
+16. [Effect fence over HTTP](#effect-fence-over-http)
+17. [Caller principal](#caller-principal)
+18. [Targeted grant handoff](#targeted-grant-handoff)
+19. [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)
+20. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
+21. [Inline benchmark mode](#inline-benchmark-mode)
+22. [Telemetry](#telemetry)
+23. [Graceful degradation](#graceful-degradation)
+24. [Examples](#examples)
+25. [Real-workload benchmarks](#real-workload-benchmarks)
+26. [Benchmarking your own workload](#benchmarking-your-own-workload)
+27. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+28. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
+29. [Replay (v0.8.2+)](#replay-v082)
+30. [Command-line tools](#command-line-tools)
+31. [API reference](#api-reference)
+32. [Low-level adapter API](#low-level-adapter-api)
+33. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+34. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -92,6 +93,192 @@ pip install "agent-coherence[all]"
 ```
 
 For security-sensitive installs with full transitive hash pinning, see [the security guide](security.md#hash-pinned-install-for-security-sensitive-users) and the bundled `requirements-diagnose.txt`.
+
+---
+
+## Upgrading from 0.15.0
+
+Upgrade every part of a workspace's setup together: the coordinator, every
+client that talks to it (the Claude Code hook client, the console scripts,
+`CoherentVolume` with the MCP server built on it, `CoherentRow` and
+`CoherentObject`), and the Claude Code plugin. Mixed releases lose protection
+or stop working:
+
+- a 0.15.0 `CoherentVolume`, MCP server, `CoherentRow` or `CoherentObject`
+  compares paths exactly as it spelled them, while this coordinator records a
+  file under the disk's spelling, so the older client can miss a file it wrote
+  or a record `/status` lists; an older `CoherentRow` or `CoherentObject` sends
+  no `name_kind`, so on a disk that folds names two keys that differ only by
+  case or Unicode form share one record, which gives spurious conflicts, never
+  a lost write (see [One file, many spellings](#one-file-many-spellings));
+- a 0.15.0 client keeps sending the workspace secret to a coordinator that has
+  exited (see
+  [A client sends nothing to a coordinator that exited](#a-client-sends-nothing-to-a-coordinator-that-exited));
+- a volume built with `on_held="refuse"`, or the MCP server started with
+  `SWG_ON_HELD=refuse`, will not attach to a 0.15.0 coordinator or to the
+  Claude Code plugin's Node coordinator through 0.6.0, since neither refuses an
+  opted-in pre-edit: the volume raises `RefuseModeUnsupported`, and the server
+  prints one line and exits `2`;
+- against a 0.15.0 coordinator, `release()` and `close()` leave the volume's
+  copy of each file `INVALID`, so call `reacquire()` before writing it again,
+  and the attempts a volume ends stay on the coordinator.
+
+Pair 0.16.0 with Claude Code plugin 0.7.0 or later. Its Node coordinator and
+Node hook client make the same changes: one record for every spelling of a
+file, the refusal of a linked `.coherence`, a read kept on a holder's own
+release, the attempts a volume ends forgotten, and no request sent to a
+coordinator that has exited. From 0.7.0 the Node coordinator also advertises
+`pre_edit_if_unheld` and serves the operator view of `/status` a volume with
+`managed` globs attaches by; through 0.6.0 it answers that view `501`, so a
+strict volume with `managed` globs raises at construction and a degrade one
+runs detached (see [A volume on the Node coordinator](#a-volume-on-the-node-coordinator)).
+
+### No store migration
+
+The registry schema stays at 10, the schema 0.15.0 writes, so nothing
+migrates, and 0.15.0 still opens a store this release has opened. A start of
+this release adds one table, `artifact_name_kinds`, which 0.15.0 ignores, and
+on its first start merges the records an older build split for one file (see
+[One file, many spellings](#one-file-many-spellings)); going back to 0.15.0
+keeps the merged record. Each read-write open of the store also locks a
+`state.db.writer-lock` file beside it.
+
+### What changes for a 0.15.0 user
+
+**The workspace and its store**
+
+- **A linked `.coherence`.** A coordinator start refuses a workspace whose
+  `.coherence` is a symbolic link or not a directory, or holds a link, FIFO,
+  socket or device directly inside it, before it writes anything. These links
+  worked before and stop working now: `.coherence` itself, and a link at
+  `state.db`, `hook.secret`, `audit.log` or any other file in it. To keep the
+  state on another disk, mount a directory at `.coherence`; otherwise, with no
+  coordinator running, put a copy of each file in place of its link, and move
+  `state.db` together with its `-wal` and `-shm`. See
+  [`.coherence` must be a real directory](#coherence-must-be-a-real-directory).
+- **One writer per store.** A second read-write `SqliteArtifactRegistry` on one
+  store, in this process or another, raises `StoreHeldError`. Open the others
+  with `read_only=True`, or go through a coordinator. A coordinator start waits
+  up to `LifecycleConfig.store_holder_wait_sec` (10 s) for another handle to
+  close the store, then raises it; `agent-coherence-workspace` verbs that write
+  wait up to 30 s for each other, then exit `2` with `reason` `store_held`.
+- **A coordinator that restarts.** A `CoherentVolume` or substrate session
+  attached to a coordinator that restarts, even on the same port and secret,
+  is refused from then on: build a new one. A `server.pid` written by hand for
+  a coordinator that does not hold its lock no longer counts as a running
+  coordinator.
+- **A policy file a volume cannot load.** A `CoherentVolume` or substrate
+  session that cannot read or parse `.coherence/tracked.yaml` or
+  `strict_mode.yaml` refuses it and starts nothing, where it used to replace the
+  file with its own globs. Fix the file, then build a new volume.
+
+**Coordinator answers**
+
+- **A holder's own release keeps a read.** A Stop, a SubagentStop and a failed
+  edit leave the holder `SHARED` at the version it held, not `INVALID`:
+  `/status` lists it as `SHARED`, and a commit refused after the caller's own
+  release names `SHARED` in its reason.
+- **`fold_merge`.** Code that reads state-log or `/status` reclaim triggers
+  must accept the new trigger `fold_merge`.
+- **Timed-out hooks.** A `pre-read`, `pre-bash` or `pre-grep` that times out no
+  longer carries `permissionDecision: "allow"`, so Claude Code applies its own
+  permission settings to the call; it and a timed-out `pre-edit` carry the
+  "could not verify" advisory as added context only. A timed-out `pre-edit`
+  that sends `"if_unheld": true` is refused as `unavailable`.
+- **New request fields.** A `session-stop` may carry `"ended": true` with an
+  `agent_id`, and a hook request may carry `"name_kind": "key"`. A non-boolean
+  `ended`, `ended` without `agent_id`, or any other `name_kind` gets HTTP `400`,
+  and so does a `pre-edit` that sends `"if_unheld": true` without a caller
+  principal. Requests without these fields answer as before.
+- **The effect fence.** The hold vocabulary has a ninth reason, `split_pair`,
+  checked after `version_moved` and before `read_denied`. Code that matches
+  reasons one by one must accept it. See
+  [Hold reasons](#hold-reasons--the-published-vocabulary).
+- **New keys.** Every `/status` view adds `pre_edit_if_unheld`, `fold_profile`,
+  `fold_table_unicode` and `pre_edit_other_holder_denials_total`, and
+  `?detail=full` adds `foreign_writes` per file; commit refusals add
+  `captured_generation` and `owner_generation`.
+
+**Python API**
+
+| What happened (strict mode unless noted) | 0.15.0 raised | 0.16.0 raises |
+|---|---|---|
+| no usable answer to a request that commits nothing, or no coordinator to start or attach | `CoherenceError` | `CoordinatorUnreachable` |
+| a commit sent and left unanswered, or answered with an HTTP 5xx or the coordinator's failure envelope (the envelope in either mode) | `CoherenceError`; `CommitPreempted` for a `write()` post-edit answered with the envelope | `CommitUnconfirmed` |
+| a request that commits nothing answered with the failure envelope or an HTTP 5xx | `CoherenceError`; a failed release of an earlier write grant was only logged | `CoordinatorFailed` |
+| a commit refused by the volume's own unreleased write grant (either mode) | `CasRetriesExhausted` or `CasVersionConflict` with `other_holder` | `CoordinatorFailed` |
+| a `read()` with `on_stale_read="raise"` refused as a split pair | `StaleView`, `reason` `stale_view` | `StaleView`, `reason` `split_pair` |
+| a `404` on `/session/begin`, `/session/commit_all` or a `/handoff/*` route, in degrade mode | `CommitUnconfirmed` | `CoherenceError` naming the route |
+| a start refused for its `.coherence` | — | `CoherenceDirRefused` |
+
+Each is a `CoherenceError`, so `except CoherenceError` still catches every one;
+narrower handlers need the new types. See
+[When the coordinator does not answer](#when-the-coordinator-does-not-answer)
+and [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure).
+
+- `write()` returns a `WriteResult` (`path`, `disk_differs`) instead of `None`.
+  When its commit was not recorded, its error says to write the path again, not
+  to re-read it.
+- `ConflictDetail` compares `captured_generation` and `owner_generation` too,
+  so an exact `==` against `ConflictDetail(reason, version)` no longer matches a
+  refusal for a committer with a recorded claim.
+- `CoordinatorService.commit` raises its not-held refusal as
+  `CommitNotAllowed`, a `CoherenceError` with the same message.
+- Leaving `coherent_workspace()`, or calling `uninstall()`, closes the volume
+  and gives back its write grants; close a managed file the shim opened for
+  writing inside the block. See
+  [Letting go: `release()` and `close()`](#letting-go-release-and-close).
+- `StoreNeedsRecoveryError.reason` defaults to `unreadable` (it was
+  `wal_recovery`), and is `wal_recovery` only for SQLite's
+  `SQLITE_READONLY_RECOVERY`.
+- `lifecycle.read_port_from_file` and `coordinator_backend` answer `None` for a
+  `server.pid` that is a link or over 4096 bytes.
+- A registry you implement against `RegistryBase` must implement
+  `forget_agent(agent_id) -> int`, refusing with `ForgetRefused` and deleting
+  nothing while the identity holds `EXCLUSIVE` or `MODIFIED`; report
+  `captured_generation` and `owner_generation` on commit refusals; and move the
+  ownership epoch whenever a trigger in `EPOCH_BUMP_TRIGGERS` takes an agent
+  out of `EXCLUSIVE` or `MODIFIED`, into `SHARED` as well as `INVALID`. The
+  backend conformance kit checks all three.
+
+**Console scripts**
+
+- `agent-coherence-coordinator` exits `2` for a refused `.coherence`,
+  `--prepare-for-migration` included, and for a store another handle holds.
+  The new `--check-store` exits `0` or `10` to `17` (see
+  [Checking a store before a coordinator starts](#checking-a-store-before-a-coordinator-starts)).
+- `agent-coherence-replay resolve` reports a store under a directory it cannot
+  search, or one it cannot stat, as `needs_recovery`, exit `12`, where it
+  exited `4` with `internal_error`; a directory or unreadable file at the
+  store's path is `needs_recovery` where it was `db_corrupt`, still exit `12`.
+- `agent-coherence-migrate-rules --apply` exits `2`, reading and writing
+  nothing, when it cannot take its lock, where it went on without one.
+- `agent-coherence-workspace` exits `2` with `reason` `coherence_dir_refused`
+  or `store_held`.
+- The `ccs-diagnose` launcher now calls `ccs.cli.diagnose:console_main`: for an
+  editable install, run `pip install -e .` again.
+
+**MCP server**
+
+- A new tool, `swg_release`, makes eleven. `swg_status` adds `on_held` and
+  `held`, and `holder_agent_id` and `held_by` on each path someone holds for
+  writing.
+- A host or agent that matches `reason` or `recover` must accept:
+  `commit_unconfirmed` where `swg_write` and `swg_write_cas` answered
+  `internal_error` for a commit that may have landed (`recover: write_again`
+  on `swg_write`, `read_then_retry` on `swg_write_cas`); `coordinator_unavailable`
+  with `recover: stop_and_report`, not retryable, once an attached server's
+  coordinator is gone; `coordinator_failed` with `recover: stop_and_report`
+  for a failed read or a failed release of an earlier grant;
+  `release_unconfirmed` with `recover: release_again` from `swg_release`; and,
+  on a refuse-mode server, `other_holder` with `recover: wait_then_reacquire`
+  and `link_out_of_managed`.
+- A `SWG_ON_HELD` other than unset, empty, `displace` or `refuse` stops the
+  server at start with exit `2`.
+- The server closes its volume when the host ends it normally, so the files it
+  wrote go back to other agents at once.
+- The MCP Registry lists the server as
+  `io.github.cohexa-ai/stale-write-guard-fs`.
 
 ---
 
@@ -190,9 +377,9 @@ migration: it is one-way.
 | `fresh` | 10 | create the schema (no store, an empty file, or a store with no schema yet) |
 | `will_migrate` | 11 | migrate the store forward; a coordinator that expects the old schema refuses it from then on |
 | `newer` | 12 | refuse it: a newer build wrote it |
-| `foreign` | 13 | refuse it: the Claude Code plugin's Node coordinator wrote it |
+| `foreign` | 13 | refuse it: the Claude Code plugin's Node coordinator wrote it; a running Node coordinator that holds the workspace lock reads `live` instead |
 | `unusable` | 14 | fail on the store itself; `reason` says how |
-| `live` | 15 | join the Python coordinator already serving the workspace, and migrate nothing while it runs; the check does not read the store (see below) |
+| `live` | 15 | join the coordinator already serving the workspace, and migrate nothing while it runs: a Python coordinator, or the Claude Code plugin's Node coordinator from 0.7.0, which holds the same lock where it can take one; the check does not read the store (see below) |
 | `cannot_tell` | 16 | unknown: the check could not observe the answer; `reason` says why |
 | `coherence_dir_refused` | 17 | refuse the workspace before it looks for a running coordinator or opens the store: `.coherence` is a symbolic link or not a directory, or holds a link, FIFO, socket or device directly inside it (see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory)); `message` is the text a start prints, naming the path |
 
@@ -6262,7 +6449,7 @@ seam via `ccs.replay.record_callbacks(...)`, but v1 only verifies the
 LangGraph path end-to-end. Direct callers must pass `accept_unverified=True`
 to acknowledge the v1 scope boundary — file an issue if the unverified path
 breaks for your stack. Ergonomic per-adapter wrappers (`record_to` mirrors)
-ship in the next release.
+are not shipped yet.
 
 ---
 
