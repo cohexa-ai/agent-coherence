@@ -951,8 +951,9 @@ def has_subagent_id_field(body: dict) -> bool:
 
 _MALFORMED_SUBAGENT_ERROR = "agent_id must be 1-64 chars of [A-Za-z0-9_-]"
 """The 400 ``error`` for a present-but-malformed subagent id on a route that
-refuses one rather than reading it as the parent (session-stop, the transfer)
--- the effect fence's wording, so a client sees one phrase for one fault."""
+refuses one rather than reading it as the parent (session-stop, the transfer,
+an opted-in pre-edit) -- the effect fence's wording, so a client sees one
+phrase for one fault."""
 
 _AGENT_ID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32}",
@@ -3577,6 +3578,16 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     opted_in = _opted_in_acquire_or_fail(body)
     degraded_answer = _pre_edit_degraded_answer(opted_in)
     req._degraded_response = degraded_answer
+    # An opted-in request with a present but malformed subagent id is
+    # refused, not read as the parent: the holder check admits the caller's
+    # own identity, so a subagent read as its parent would pass as that
+    # parent's repeat and edit over its hold. Checked ahead of the principal
+    # refusal and the untracked exit, as the effect fence checks it, so both
+    # coordinators answer one body for this fault whatever else the request
+    # carries. A request that did not opt in keeps reading it as the parent.
+    if opted_in and read_subagent_id(body) is None and has_subagent_id_field(body):
+        req._json(400, {"error": _MALFORMED_SUBAGENT_ERROR})
+        return
     presented = _presented_caller(req, session_id, read_subagent_id(body))
     if opted_in and presented.principal is None:
         # The holder check admits the caller's own identity, so an opted-in

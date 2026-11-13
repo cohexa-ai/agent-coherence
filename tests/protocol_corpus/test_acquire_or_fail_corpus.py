@@ -12,7 +12,9 @@ parent and its subagent either way) and the answers the opt-in must leave alone
 (the holder's own repeat, an unheld path, the field absent or not JSON
 ``true``, an untracked path, SHARED readers only, an ordinary pre-edit
 displacing an opted-in holder, and a stale strict-mode editor getting the
-strict deny before any holder check).
+strict deny before any holder check). One more row pins a client fault: an
+opted-in pre-edit whose subagent id is present but malformed is refused 400
+on both runtimes, ahead of the untracked exit, rather than read as the parent.
 
 The holder is pinned literally in each refusal row: the identity scrub matches
 only the dashed spelling, so the 32-hex agent id is compared as written. The
@@ -68,7 +70,7 @@ from tests.protocol_corpus.harness import (
 pytestmark = pytest.mark.protocol_corpus
 
 _FIXTURE_DIR = "acquire_or_fail"
-_EXPECTED_FIXTURE_COUNT = 13
+_EXPECTED_FIXTURE_COUNT = 14
 _HEADER = "Coherence-Caller-Principal"  # frozen duplicate of the wire name
 _CLAIM_PATH = "/principal/claim"
 _HELD_ROW = "acquire-or-fail-held-exclusive-refuses-an-opted-in-peer"

@@ -1,0 +1,71 @@
+{
+  "name": "acquire-or-fail-opted-in-malformed-subagent-id-is-refused",
+  "description": "Session A's main thread takes EXCLUSIVE on CLAUDE.md, then the path is untracked. A's opted-in pre-edit carrying the malformed subagent id 'bad id!' is refused 400 with the shared malformed-id error: it is not read as the parent's own repeat, and the check comes before the untracked exit, which would admit it unchecked.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/principal/claim",
+        "backends": [
+          "python"
+        ],
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "mint_nonce": "corpus-mint-nonce-a"
+        },
+        "capture": {
+          "principal_a": "principal"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+          "path": "CLAUDE.md"
+        },
+        "headers": {
+          "Coherence-Caller-Principal": "${principal_a}"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/policy/untrack",
+        "body": {
+          "paths": [
+            "CLAUDE.md"
+          ]
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-edit",
+    "body": {
+      "session_id": "c0c0c0c0-0000-4000-8000-00000000000a",
+      "agent_id": "bad id!",
+      "path": "CLAUDE.md",
+      "if_unheld": true
+    },
+    "headers": {
+      "Coherence-Caller-Principal": "${principal_a}"
+    }
+  },
+  "expected": {
+    "status": 400,
+    "body": {
+      "error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}
