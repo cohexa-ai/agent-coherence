@@ -59,9 +59,22 @@ HANDOFF_GIVER_DENIAL_CLASS: str = "permissions_deny_handoff_giver"
 mode alike (:func:`emit_handoff_giver_deny`). Terminal: no allow path may
 convert it."""
 
+HELD_PATH_DENIAL_CLASS: str = "permissions_deny_held_path"
+"""An opted-in edit refused because another agent holds the path, under the
+holder text and the parent text alike (:func:`emit_held_path_deny`,
+:func:`emit_held_by_parent_deny`). Terminal: no allow path may convert it."""
+
+ADMISSION_UNAVAILABLE_DENIAL_CLASS: str = "permissions_deny_admission_unavailable"
+"""An opted-in edit refused because the coordinator could not confirm that no
+other agent holds the path (:func:`emit_admission_unavailable_deny`).
+Terminal: admitting an edit nobody checked would let it displace the very
+holder the opt-in was sent to protect."""
+
 TERMINAL_DENIAL_CLASSES: frozenset[str] = frozenset({
     "permissions_deny_strict_mode",
     HANDOFF_GIVER_DENIAL_CLASS,
+    HELD_PATH_DENIAL_CLASS,
+    ADMISSION_UNAVAILABLE_DENIAL_CLASS,
 })
 """KTD-U security invariant: denial classes that MUST NEVER be converted to
 ``permissionDecision: "allow"``. Any code path emitting allow checks
@@ -315,6 +328,89 @@ def emit_strict_deny(
         "permissionDecision": "deny",
         "permissionDecisionReason": reason,
     }
+
+
+# ----------------------------------------------------------------------
+# Held-path denies: the hook client's answers to a strict edit it opted in
+# to acquire-or-fail
+# ----------------------------------------------------------------------
+#
+# Static like the strict templates, for the same measured reason, and pinned
+# by the fixtures in tests/fixtures/hook_on_held/ so another client can
+# reproduce them byte for byte, so ASCII only. Each reads as a sentence behind
+# Claude Code's "PreToolUse:Edit hook error: " prefix. None names a setting,
+# file, command or shell route: a refusal that hands the model its way around
+# is a self-bypass the retry loop would take. None says retrying gives the
+# same denial, because a held file does come free.
+
+HELD_PATH_DENY_REASON_TEMPLATE: str = (
+    "Edit denied: {path} is held by agent {holder}. It comes free when that "
+    "agent lets go of it, or after 10 to 30 minutes. Do not retry now: do "
+    "other work that does not need {path}, or stop and tell your user. If you "
+    "hold {path} yourself through another tool, such as an MCP server, "
+    "release it there first."
+)
+"""Another agent holds the path. ``holder`` is the holder's short agent id,
+never a session id. The text names both ways the file comes free and gives a
+window rather than a moment, and never a "turn", which one session cannot see
+in another. The last sentence is there because a hold this session took
+through another client is a different agent to the coordinator, so a session
+can be refused by its own hold."""
+
+HELD_BY_PARENT_DENY_REASON_TEMPLATE: str = (
+    "Edit denied: {path} is held by the session that started you. Do not wait "
+    "for it: finish without this change and report the change you wanted to "
+    "make back to that session."
+)
+"""A subagent refused by its own parent's hold. The parent is waiting on the
+subagent, so it does not let go of the path while the subagent runs and
+waiting would never end; the subagent hands the change back instead. It shares
+:data:`HELD_PATH_DENIAL_CLASS` with the holder text."""
+
+ADMISSION_UNAVAILABLE_DENY_REASON_TEMPLATE: str = (
+    "Edit denied: the coordinator could not confirm that no other agent holds "
+    "{path}. Try the edit once more; if it is denied again, stop and tell "
+    "your user."
+)
+"""Every other answer to an opted-in edit, and no answer at all: one text that
+stays true whatever the cause -- a timeout, a coordinator that went away, an
+answer in a shape the client does not know, or a request that could not be
+sent as it was. It never claims the edit left nothing behind, because a
+timed-out request was measured landing late on both coordinators. A strict
+edit refused because the coordinator cannot be reached should reuse this text
+and its class, so one state has one deny."""
+
+
+def _pretooluse_deny(reason: str) -> dict[str, Any]:
+    """The deny envelope the strict deny uses: the decision and its reason,
+    with no top-level ``reason`` or ``decision`` beside it."""
+    return {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
+    }
+
+
+def emit_held_path_deny(*, path: str, holder_agent_id: str) -> dict[str, Any]:
+    """The ``hookSpecificOutput`` deny for an edit of ``path`` refused because
+    another agent holds it, naming ``holder_agent_id`` (the refusal's 32-hex
+    holder) by its short form. Class :data:`HELD_PATH_DENIAL_CLASS`."""
+    return _pretooluse_deny(HELD_PATH_DENY_REASON_TEMPLATE.format(
+        path=path, holder=short_session_id(holder_agent_id),
+    ))
+
+
+def emit_held_by_parent_deny(*, path: str) -> dict[str, Any]:
+    """The ``hookSpecificOutput`` deny for a subagent's edit of ``path``
+    refused by its own parent's hold. Class :data:`HELD_PATH_DENIAL_CLASS`."""
+    return _pretooluse_deny(HELD_BY_PARENT_DENY_REASON_TEMPLATE.format(path=path))
+
+
+def emit_admission_unavailable_deny(*, path: str) -> dict[str, Any]:
+    """The ``hookSpecificOutput`` deny for an opted-in edit of ``path`` whose
+    answer was not an admit, a deny to relay or a holder refusal. Class
+    :data:`ADMISSION_UNAVAILABLE_DENIAL_CLASS`."""
+    return _pretooluse_deny(ADMISSION_UNAVAILABLE_DENY_REASON_TEMPLATE.format(path=path))
 
 
 # ----------------------------------------------------------------------
@@ -948,10 +1044,14 @@ def build_collision_response(
 ) -> dict:
     """Top-level hookSpecificOutput for an edit-collision PreToolUse response.
 
-    Edit collisions are distinct from stale-reads — the editor wants
-    EXCLUSIVE but another session holds it. v0.1.1 surfaces the collision
-    via warn-mode allow + additionalContext; v0.2 preserves this shape
-    (strict-mode flip applies to stale-reads, not contention)."""
+    Edit collisions are distinct from stale-reads: the editor wants
+    EXCLUSIVE but another session holds it. A pre-edit that does not opt in
+    gets this shape, an allow with additionalContext, in warn and strict mode
+    alike. Contention is not out of strict mode's reach, though: a pre-edit
+    that opts in with ``if_unheld: true``, as the hook client does for a
+    strict path when the workspace asks it to refuse held files, is refused
+    with ``other_holder`` instead, and a client that opted in reads a
+    ``collision`` key as a deny, since it means the opt-in was ignored."""
     return {
         "hookSpecificOutput": emit_allow(
             source="collision_response_builder",

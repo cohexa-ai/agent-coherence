@@ -1,0 +1,49 @@
+{
+  "description": "Value vectors for the workspace file .coherence/hook_on_held. Each row has: content, the file's exact text (null when the file is absent); and expected, on (an opted-in edit refuses a held strict file), off, or unknown (off, plus one stderr line). The grammar: drop at most one trailing \\n, then match exactly; refuse is on, empty or displace is off, anything else is unknown.",
+  "rows": [
+    {
+      "content": null,
+      "expected": "off"
+    },
+    {
+      "content": "",
+      "expected": "off"
+    },
+    {
+      "content": "\n",
+      "expected": "off"
+    },
+    {
+      "content": "displace",
+      "expected": "off"
+    },
+    {
+      "content": "displace\n",
+      "expected": "off"
+    },
+    {
+      "content": "refuse",
+      "expected": "on"
+    },
+    {
+      "content": "refuse\n",
+      "expected": "on"
+    },
+    {
+      "content": "Refuse",
+      "expected": "unknown"
+    },
+    {
+      "content": " refuse",
+      "expected": "unknown"
+    },
+    {
+      "content": "refuse\r\n",
+      "expected": "unknown"
+    },
+    {
+      "content": "refuse\n\n",
+      "expected": "unknown"
+    }
+  ]
+}
