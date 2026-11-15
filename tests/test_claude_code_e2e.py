@@ -466,6 +466,10 @@ VOLUME_CONFIG = LifecycleConfig(
 )
 #: The sources every hook process runs: this checkout's, not an installed copy.
 _SRC = Path(__file__).resolve().parents[1] / "src"
+#: The stderr lines both hook clients print, as the shared fixture pins them.
+_STDERR_LINES: dict[str, str] = json.loads(
+    (Path(__file__).parent / "fixtures" / "hook_on_held" / "stderr_lines.json").read_text(encoding="utf-8")
+)["lines"]
 _HOOK_MODULE = "ccs.cli.coherence_hook_client"
 #: Far above one hook process on a loaded machine; no row asserts a time bound.
 _HOOK_TIMEOUT_SEC = 300.0
@@ -766,6 +770,20 @@ def check_an_edit_of_a_held_file_takes_it_as_today(root: Path, client: HookClien
     assert write_holders(root, rel) == {editor.agent_id}
 
 
+def check_an_unknown_setting_takes_a_held_strict_file_as_today(root: Path, client: HookClient) -> None:
+    """A takes the strict file with the setting on; then the setting holds a
+    value that is neither refuse nor displace. B's edit is today's,
+    admitted with the concurrent-edit note naming A, its one stderr line the
+    one the shared fixture pins, and B takes the file from A."""
+    holder, editor = Caller.new(), Caller.new()
+    client.take(root, holder)
+    set_hold_refusal(root, "yes\n")
+    run = client.edit(root, editor)
+    assert run.stderr == _STDERR_LINES["setting_unknown"], run
+    assert normalize_response(json.loads(run.stdout)) == todays_collision(PLAN, holder.agent_id)
+    assert write_holders(root, PLAN) == {editor.agent_id}
+
+
 def check_a_subagent_refused_by_its_parents_hold_is_told_to_report_back(root: Path, client: HookClient) -> None:
     parent = Caller.new()
     client.take(root, parent)
@@ -937,12 +955,14 @@ def check_a_session_that_never_read_a_changed_file_stays_denied(root: Path, clie
         assert_denied(client.read(root, stranger), out_of_band_deny(PLAN, 1))
 
 
-def check_a_refused_reader_recovers_after_the_holder_commits(root: Path, later: HookClient) -> None:
+def check_a_refused_reader_recovers_after_the_holder_commits(
+    root: Path, first: HookClient, later: HookClient,
+) -> None:
     """#514 with the held-file refusal on: B read the file during A's hold and
-    the Python client refused B's edit; A commits and ends its session. B's
-    calls after that run through ``later``: one stale deny naming A, then an
+    ``first`` refused B's edit; A commits and ends its session. B's calls
+    after that run through ``later``: one stale deny naming A, then an
     admitted Read at v2 and an admitted Edit, and B holds the file."""
-    holder, editor = check_a_held_strict_file_is_refused_naming_its_holder(root, PYTHON_CLIENT, editor_read=True)
+    holder, editor = check_a_held_strict_file_is_refused_naming_its_holder(root, first, editor_read=True)
     (root / PLAN).write_text("docs/plan.md v2\n")
     _ends_ok(run_hook(root, "post-edit", holder.payload(root)))
     _ends_ok(run_hook(root, "session-stop", holder.payload(root)))
@@ -1089,10 +1109,22 @@ def test_an_edit_after_the_coordinator_is_killed_is_denied(workspace: Path, clie
 
 
 @pytest.mark.parametrize("later", HOOK_CLIENTS)
-def test_a_refused_reader_reads_again_and_edits_after_the_holder_commits(strict_workspace: Path, later: str) -> None:
-    """Prevents the #514 lockout after a held-file refusal: B's later calls
-    through either client recover after one deny."""
-    check_a_refused_reader_recovers_after_the_holder_commits(strict_workspace, hook_client(later))
+@pytest.mark.parametrize("first", HOOK_CLIENTS)
+def test_a_refused_reader_reads_again_and_edits_after_the_holder_commits(
+    strict_workspace: Path, first: str, later: str,
+) -> None:
+    """Prevents the #514 lockout after a held-file refusal: whichever client
+    refused B, B's later calls through either client recover after one deny."""
+    check_a_refused_reader_recovers_after_the_holder_commits(strict_workspace, hook_client(first), hook_client(later))
+
+
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+def test_with_an_unknown_setting_an_edit_of_a_held_strict_file_takes_it_as_today(
+    strict_workspace: Path, client: str,
+) -> None:
+    """Prevents an unknown setting value either refusing or passing unreported:
+    today's edit, and the one stderr line the shared fixture pins."""
+    check_an_unknown_setting_takes_a_held_strict_file_as_today(strict_workspace, hook_client(client))
 
 
 @pytest.mark.parametrize("client", HOOK_CLIENTS)

@@ -53,6 +53,7 @@ from tests.test_claude_code_e2e import (
     check_an_edit_after_the_coordinator_is_killed_is_denied,
     check_an_edit_of_a_free_strict_file_is_admitted,
     check_an_edit_of_a_held_file_takes_it_as_today,
+    check_an_unknown_setting_takes_a_held_strict_file_as_today,
     check_plain_volume_reads_after_a_peer_commit_stay_denied,
     coordinator_process,
     hook_client,
@@ -140,8 +141,18 @@ def test_an_edit_after_the_coordinator_is_killed_is_denied(tmp_path: Path, clien
 
 
 @pytest.mark.parametrize("later", _CLIENTS)
-def test_a_refused_reader_reads_again_and_edits_after_the_holder_commits(node_workspace: Path, later: str) -> None:
-    check_a_refused_reader_recovers_after_the_holder_commits(node_workspace, hook_client(later))
+@pytest.mark.parametrize("first", _CLIENTS)
+def test_a_refused_reader_reads_again_and_edits_after_the_holder_commits(
+    node_workspace: Path, first: str, later: str,
+) -> None:
+    check_a_refused_reader_recovers_after_the_holder_commits(node_workspace, hook_client(first), hook_client(later))
+
+
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_with_an_unknown_setting_an_edit_of_a_held_strict_file_takes_it_as_today(
+    node_workspace: Path, client: str,
+) -> None:
+    check_an_unknown_setting_takes_a_held_strict_file_as_today(node_workspace, hook_client(client))
 
 
 @pytest.mark.parametrize("client", _CLIENTS)
