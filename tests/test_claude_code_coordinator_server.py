@@ -4356,6 +4356,63 @@ def test_merge_policy_globs_waits_for_a_held_lock_and_keeps_the_entry_written_un
     assert waited_for_the_lock, "the merge wrote while a route held the lock"
 
 
+def test_merge_policy_globs_waits_for_a_held_strict_mode_lock_and_keeps_its_entry(
+    tmp_path: Path,
+) -> None:
+    """#499: another start holds ``strict_mode.yaml.lock`` and has read
+    ``strict_mode.yaml`` when this start's merge begins. No route writes that
+    file, so another start's merge is the only writer this lock excludes. The
+    merge waits for it, reads the file again under it, and the file afterwards
+    holds both starts' globs.
+
+    Prevents a merge that locks only ``tracked.yaml``: two starts would then
+    lose each other's strict globs, and the glob one of them lost would be
+    tracked but not enforced."""
+    tracked, strict = _two_policy_files(tmp_path)
+    held = _hold_policy_lock(strict)
+    try:
+        read_under_the_lock = strict.read_text()
+        worker, raised = _merge_on_a_thread((tracked, strict), ("data/**",))
+        worker.join(timeout=0.5)
+        waited_for_the_lock = worker.is_alive()
+        strict.write_text(read_under_the_lock + '- "other-start/**"\n')
+    finally:
+        os.close(held)
+    worker.join(timeout=30)
+
+    assert not worker.is_alive(), "the merge never took the lock"
+    assert raised == []
+    assert yaml.safe_load(strict.read_text()) == ["data/**", "docs/**", "other-start/**"]
+    assert yaml.safe_load(tracked.read_text()) == ["data/**", "docs/**"]
+    assert waited_for_the_lock, "the merge wrote while another start held the strict lock"
+
+
+def test_merge_policy_globs_writes_whole_files_when_each_write_takes_a_few_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#499: a write to a file may take fewer bytes than it was given. The
+    merge keeps writing each temp file until all of it is written, so both
+    policy files come out whole.
+
+    Prevents a single write that replaces a policy file with the first few
+    bytes of its new content, which loads as a different list or not at all."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+
+    tracked, strict = _two_policy_files(tmp_path)
+    real_write = os.write
+
+    def three_bytes_at_a_time(fd: int, data: bytes) -> int:
+        # Leave the test runner's own stdout and stderr whole.
+        return real_write(fd, data[:3] if fd > 2 else data)
+
+    monkeypatch.setattr(os, "write", three_bytes_at_a_time)
+    merge_policy_globs((tracked, strict), ("data/**",))
+    monkeypatch.undo()
+
+    assert yaml.safe_load(tracked.read_text()) == ["data/**", "docs/**"]
+    assert yaml.safe_load(strict.read_text()) == ["data/**", "docs/**"]
+
+
 def test_a_policy_track_waits_for_a_merge_that_holds_the_lock_and_both_entries_land(
     coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

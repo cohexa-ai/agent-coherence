@@ -20,9 +20,10 @@ Alpha — APIs may change before `v1.0`.
   escaped the constructor of a volume in degrade mode and reached a session
   raw. Both now run one shared writer. When both files already list the globs
   it locks and creates nothing. Otherwise it takes `tracked.yaml.lock`, the
-  lock the track route takes, then a new `strict_mode.yaml.lock`, waiting for
-  a track in progress; reads both files again under the locks; prepares both
-  before it replaces either; and replaces `tracked.yaml` first. A failure
+  lock the Python coordinator's track route takes, then a new
+  `strict_mode.yaml.lock`, waiting for a track in progress; reads both files
+  again under the locks; prepares both before it replaces either; and
+  replaces `tracked.yaml` first. A failure
   before the first replace changes neither file. A file that cannot be loaded,
   a lock file that is not a regular file, and a failed write, including
   creating `.coherence` or a lock file, now each raise `PolicyFileRefused`, a
