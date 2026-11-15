@@ -32,7 +32,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeAlias, runtime_checkable
 
-from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+from ccs.adapters.claude_code.coordinator_server import write_start_policy
 from ccs.adapters.claude_code.state_dir import check_coherence_dir
 from ccs.cli._coherence_client import (
     PRINCIPAL_REFUSED_AGAIN,
@@ -394,22 +394,6 @@ def _deny_is_peer_invalidation(version: int, prior_seen: int | None) -> bool:
     return prior_seen is not None and prior_seen < version
 
 
-def _write_strict_policy(coherence_dir: Path, managed: tuple[str, ...]) -> None:
-    """Enable strict mode on the managed artifact globs BEFORE the coordinator
-    spawns (policy is load-once-at-startup): a path must be tracked AND strict
-    for a peer commit to invalidate this reader's cached view. Raises ValueError
-    naming a policy file it cannot merge into (#305)."""
-    if not managed:
-        return
-    # Runs BEFORE the lifecycle creates the directory, so on a fresh workspace
-    # this is the creator: match the 0700 the lifecycle requires, or every new
-    # workspace spawns with a "tightened existing .coherence directory" warning
-    # about a directory this call made a moment earlier. An existing directory
-    # is left as-is (mkdir never chmods); re-tightening is the lifecycle's job.
-    coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    merge_policy_globs((coherence_dir / "tracked.yaml", coherence_dir / "strict_mode.yaml"), managed)
-
-
 @dataclass(frozen=True)
 class PreReadResult:
     """What a coordinator pre-read told this session about an artifact."""
@@ -543,8 +527,9 @@ class SubstrateCoordinatorSession:
     start or after, raises the typed
     :class:`~ccs.core.exceptions.CoordinatorUnreachable`, except after the
     substrate write landed, where it stays ``CommitUnconfirmed``. A policy file
-    it cannot merge its globs into before spawning raises the plain error,
-    naming the file and the workspace (#305). A ``.coherence`` that is a
+    it cannot load, lock or write before spawning raises the typed
+    :class:`~ccs.core.exceptions.PolicyFileRefused`, naming the workspace and
+    the file (#305, #499); no retry clears it. A ``.coherence`` that is a
     symlink or not a directory, or that holds a symlink, FIFO, socket or
     device, raises :class:`~ccs.core.exceptions.CoherenceDirRefused` before
     anything is probed or written (#498); no retry clears it. The
@@ -581,14 +566,11 @@ class SubstrateCoordinatorSession:
         check_coherence_dir(self._root)
         pid_file = coherence_dir / "server.pid"
         pre_existing = running_coordinator_port(pid_file, cfg, bind_host=bind_host) is not None
-        # Only the SPAWNER writes policy (load-once); a sibling must not clobber it.
+        # Only the SPAWNER writes policy (load-once); a sibling must not clobber
+        # it. Its refusals propagate: a session has no check after it attaches,
+        # so going on without the merge would run it unenforced with no signal.
         if not pre_existing:
-            try:
-                _write_strict_policy(coherence_dir, self._managed)
-            except ValueError as exc:
-                # Fail closed: a session has no check after it attaches, so going
-                # on without the merge would run it unenforced with no signal.
-                raise CoherenceError(f"{self._root}: {exc}") from exc
+            write_start_policy(self._root, self._managed)
         # No coordinator to spawn or attach, or none to name, is the same fact
         # to this caller as one that will not answer: nothing will.
         if connect_or_spawn(self._root, config=cfg, bind_host=bind_host) == -1:

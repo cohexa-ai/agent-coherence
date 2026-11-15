@@ -1669,7 +1669,7 @@ with CoherentVolume(workspace_root, managed=("plans/**",)) as vol:
 |---|---|---|
 | `workspace_root` | — | Directory the volume manages; the coordinator's state lives in `<root>/.coherence/` |
 | `managed` | `()` | Glob patterns for the files under coordination; unmanaged paths bypass the volume |
-| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A `.coherence` that a start refuses raises `CoherenceDirRefused` instead, which no retry clears; see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory). A read the coordinator answers with its failure envelope raises `CoordinatorFailed`, and so does the release of a write grant an earlier `write()` left held, every request that commits nothing answered with an HTTP 5xx, a commit refused by the volume's own unreleased write grant, and a refuse-mode grant request the coordinator could not decide in time; see [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
+| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A `.coherence` that a start refuses raises `CoherenceDirRefused` instead, which no retry clears; see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory). A policy file a start cannot load, lock or write raises `PolicyFileRefused`, which no retry clears either; see **Policy files** under [Status, track and untrack commands](#status-track-and-untrack-commands). A read the coordinator answers with its failure envelope raises `CoordinatorFailed`, and so does the release of a write grant an earlier `write()` left held, every request that commits nothing answered with an HTTP 5xx, a commit refused by the volume's own unreleased write grant, and a refuse-mode grant request the coordinator could not decide in time; see [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
 | `on_held` | `"displace"` | `"refuse"` — on a managed path, raise `OtherHolder` instead of taking a file another agent holds; see [Refusing a file another agent holds](#refusing-a-file-another-agent-holds) |
@@ -2293,6 +2293,12 @@ retry and no coordinator started later clears it. A volume in degrade mode
 warns once and stays detached. Fix `.coherence` first, then build a new
 `CoherentVolume`; see
 [`.coherence` must be a real directory](#coherence-must-be-a-real-directory).
+A policy file the start cannot load, lock or write is the same kind of answer:
+a strict volume raises `PolicyFileRefused` and starts no coordinator, no retry
+clears it, and a volume in degrade mode warns once and stays detached.
+Fix the named file, or free the disk, then build a new volume; see **Policy
+files** under
+[Status, track and untrack commands](#status-track-and-untrack-commands).
 
 A commit is different, because its request may have reached the coordinator
 before the answer was lost. When the CAS of `write_cas` or `write_cas_at`, the
@@ -5646,6 +5652,18 @@ and start the server again. No tool call carries this refusal: the server's
 tools answer only from an attached volume, so a detached one answers
 `coordinator_unavailable` as it does for any unattached volume.
 
+**A policy file the start cannot use.** When no coordinator runs, the server's
+volume merges its globs into `.coherence/tracked.yaml` and
+`.coherence/strict_mode.yaml` before it starts one (see **Policy files** under
+[Status, track and untrack commands](#status-track-and-untrack-commands)). When
+it cannot load one of those files, finds a lock file beside one that is not a
+regular file, or fails to write one, the server refuses to start before it
+serves. After any lines its start-up logged, stderr carries one line:
+`stale-write-guard-fs:`, the workspace root, and what failed, naming the file,
+with control characters escaped; a failed write also says which file, if any,
+was already written. The server exits `2`, with no traceback and nothing on
+stdout. Fix the named file, or free the disk, and start the server again.
+
 **A coordinator that fails while answering.** When the coordinator answers a
 read with its `internal:` failure envelope ([details](#when-the-coordinator-answers-with-a-failure)),
 the tool call answers `reason: coordinator_failed` with
@@ -6551,18 +6569,50 @@ file it names is not read. Both coordinators do this, the plugin's Node
 coordinator in plugin releases after 0.6.0. On the Python coordinator, a link
 at the lock file beside a policy file answers HTTP 400 with
 `.coherence/tracked.yaml.lock is a symlink; nothing was written. Remove the link.`
-A FIFO, socket or device there answers HTTP 400 with
+A directory, FIFO, socket or device there answers HTTP 400 with
 `.coherence/tracked.yaml.lock could not be read (not a regular file); nothing was written.`
 
 A `CoherentVolume` or substrate session about to start the coordinator merges
 its managed globs into `tracked.yaml` and `strict_mode.yaml`, and treats a file
-that cannot be read, is not valid YAML or is not a list the same way: it names
-the file, writes neither one, and starts no coordinator. A strict volume or a
-session raises `CoherenceError` with that text, after the workspace root. A
-volume in degrade mode warns and stays detached, so build a new one once the
-file is fixed. A policy file that is a link never reaches the merge: the
-volume or session runs a start's own check first and refuses it with
-`CoherenceDirRefused`.
+that cannot be read, is not valid YAML or is not a list the same way the routes
+do: it names the file, writes neither one, and starts no coordinator. It reads
+both files first, without a lock: when one cannot be loaded, or both already
+list the globs, it stops there, having locked and created nothing. Otherwise
+it locks `tracked.yaml.lock`, the lock the Python coordinator's track takes,
+then `strict_mode.yaml.lock`, which it creates beside `strict_mode.yaml` and
+leaves there, waiting with no time limit while a track or another start holds
+either.
+Under the locks it reads both files again, prepares the new content of each,
+and only then replaces `tracked.yaml`, then `strict_mode.yaml`. The read under
+the locks decides what is written, so a track that lands meanwhile keeps its
+entry, and a failure before the first replace leaves both files as they were.
+A policy file that is a link never reaches the merge: the volume or session
+runs a start's own check first and refuses it with `CoherenceDirRefused`.
+
+Every other problem the merge meets is one refusal, `PolicyFileRefused`, a
+`CoherenceError` from `ccs.core.exceptions` whose `reason` is
+`policy_file_refused`. Its `kind` says which step refused, collected in
+`POLICY_FILE_REFUSAL_KINDS`: `policy_file_unloadable` for a policy file it
+cannot load, with the routes' text; `policy_lock_not_regular` for a lock file
+that is not a regular file, such as a directory, with the routes' 400 text; and
+`policy_write_failed` when creating `.coherence` or a lock file, locking one, or
+writing a policy file fails, on a full or read-only disk, say. Its `path` is the
+absolute path of the file concerned. The text is the workspace root, a colon,
+and what failed. A failed write names the step and the error, and which policy
+file was already replaced, if any:
+
+```text
+/work/repo: .coherence/strict_mode.yaml could not be written (ENOSPC); .coherence/tracked.yaml was written and .coherence/strict_mode.yaml was not.
+```
+
+After that failure the globs are tracked but not strict; a volume or session
+that starts the coordinator after the fix merges `strict_mode.yaml` again.
+`PolicyFileRefused` is not a `CoordinatorUnreachable`: no retry clears it, so
+fix the named file, or free the disk, first. A strict volume or a session
+raises it and starts no coordinator. A volume in degrade mode warns once with
+the same text, its control characters escaped, and
+`This volume stays detached: build a new one once the file is fixed.`, and
+stays detached. Branch on `reason` and `kind`, not on the text.
 
 Releases up to 0.14.1 wrote entries without quotes. An entry starting with
 `*`, `[`, `{`, `!`, `&`, `%`, `@`, `|`, `>` or a quote, written by one of them,

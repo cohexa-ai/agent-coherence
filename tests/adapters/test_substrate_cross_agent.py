@@ -19,6 +19,7 @@ token-identity logic both real bindings use.
 from __future__ import annotations
 
 import dataclasses
+import errno
 import hashlib
 import http.server
 import logging
@@ -58,6 +59,7 @@ from ccs.core.exceptions import (
     CommitUnconfirmed,
     CoordinatorFailed,
     CoordinatorUnreachable,
+    PolicyFileRefused,
     StaleView,
     ViewWedged,
 )
@@ -247,6 +249,66 @@ def test_a_session_refuses_a_policy_file_it_cannot_load_and_keeps_it(
     assert broken.read_text() == "- docs/**\n- *.md\n"
     assert [path.name for path in coherence_dir.glob("*.yaml")] == [name]
     assert not (coherence_dir / "server.pid").exists()
+
+
+def _session_policy_refusal(root: Path, cfg: LifecycleConfig) -> PolicyFileRefused:
+    """What a session over ``root`` raises for its policy files; a session that
+    attaches instead stops the coordinator it started before the test fails."""
+    try:
+        with pytest.raises(PolicyFileRefused) as raised:
+            SubstrateCoordinatorSession(root, managed=("data/**",), config=cfg)
+    finally:
+        stop_coordinator(root)
+    return raised.value
+
+
+def test_a_session_raises_a_policy_file_it_cannot_load_as_the_typed_refusal(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#499: the #305 refusal is a ``PolicyFileRefused`` naming the file, so a
+    caller tells it apart by type. Prevents it reaching the caller as the plain
+    ``CoherenceError`` every other start failure raises, or as a
+    ``CoordinatorUnreachable`` a retry loop would wait on."""
+    tracked = tmp_path / ".coherence" / "tracked.yaml"
+    tracked.parent.mkdir(mode=0o700)
+    tracked.write_text("- docs/**\n- *.md\n")
+
+    refusal = _session_policy_refusal(tmp_path, fast_cfg)
+
+    assert (refusal.reason, refusal.kind, refusal.path) == (
+        "policy_file_refused", "policy_file_unloadable", str(tmp_path.resolve() / ".coherence" / "tracked.yaml"),
+    )
+    assert not isinstance(refusal, CoordinatorUnreachable)
+
+
+def test_a_session_whose_strict_policy_replace_fails_says_tracked_was_written(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#499: replacing ``strict_mode.yaml`` fails after ``tracked.yaml`` was
+    replaced. The session raises a ``PolicyFileRefused`` that says which file
+    was written and which was not, and starts no coordinator. Prevents a raw
+    ``OSError`` that ``except CoherenceError`` misses, and a split pair that
+    nothing reports."""
+    root = tmp_path.resolve()
+    real_replace = os.replace
+
+    def replace_fails_for_strict_mode(src: object, dst: object) -> None:
+        if Path(dst).name == "strict_mode.yaml":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real_replace(src, dst)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "replace", replace_fails_for_strict_mode)
+        refusal = _session_policy_refusal(tmp_path, fast_cfg)
+
+    assert (refusal.kind, refusal.path) == ("policy_write_failed", str(root / ".coherence" / "strict_mode.yaml"))
+    assert str(refusal) == (
+        f"{root}: .coherence/strict_mode.yaml could not be written (ENOSPC); "
+        ".coherence/tracked.yaml was written and .coherence/strict_mode.yaml was not."
+    )
+    assert (root / ".coherence" / "tracked.yaml").read_text() == "- data/**\n"
+    assert not (root / ".coherence" / "strict_mode.yaml").exists()
+    assert not (root / ".coherence" / "server.pid").exists()
 
 
 def test_a_session_joining_a_running_coordinator_is_not_refused_over_a_policy_file(
