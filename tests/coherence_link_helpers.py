@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 #: Names a link in ``.coherence`` may take: what a start writes, reads or
-#: creates beside the store, the policy files and their lock, the logs, a
+#: creates beside the store, the policy files and their locks, the logs, a
 #: caller-principal file, and a name no code reads (the check scans every
 #: entry, not a list of known names).
 LINK_NAMES = (
@@ -30,6 +30,7 @@ LINK_NAMES = (
     "ignored.yaml",
     "strict_mode.yaml",
     "tracked.yaml.lock",
+    "strict_mode.yaml.lock",
     "audit.log",
     "session-audit.log",
     "caller-principal-" + "0" * 32 + ".nonce",

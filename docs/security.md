@@ -186,6 +186,26 @@ What follows from that:
   session id can find a matching principal; there the principal exposes a client
   that never claimed or presents the wrong principal, but does not tell sessions
   apart.
+- The read hooks, `/hooks/pre-read`, `/hooks/pre-bash` and `/hooks/pre-grep`,
+  admit a request that names a session without its principal, even a session
+  that claimed one, and refuse one that presents another principal. A
+  pre-read drains the named session's pending notices into its own answer, and
+  in warn mode a stale pre-read re-grants the session a read of the file and
+  uses up its stale warning. In strict mode, from 0.16.1, a
+  Claude Code read of a stale copy is denied once and the next read whose
+  bytes are the recorded content is admitted (see
+  [After a strict-mode stale deny](guide.md#after-a-strict-mode-stale-deny)).
+  So a caller that names a bound session without its principal can heal that
+  session's stale copy with at most two pre-reads: the first, of any bytes,
+  starts the recovery unless the deny of that session's own stale Read or
+  Edit already did, and the second carries the hash of the recorded bytes, or
+  any bytes when the coordinator recorded no content for the file. A
+  strict-mode write route then admits that session's next edit, whatever copy
+  it was built from. A denied Bash or Grep command already
+  re-grants a stale copy
+  ([#242](https://github.com/Cohexa-ai/agent-coherence/issues/242)), so the
+  read hooks keep admitting a request without a principal. Under the trust
+  model above this grants nothing the secret does not.
 - The [handoff commands](guide.md#handoff-commands) (`agent-coherence-transfer`,
   `-accept`, `-decline`, `-withdraw`) act as the Claude Code session they name,
   through `--session` or the `CLAUDE_CODE_SESSION_ID` variable Claude Code sets
@@ -310,7 +330,11 @@ MCP tools that carry a `handoff` key (`swg_read`, `swg_status`,
 session-level too. Write holders are named by per-attempt agent id instead:
 `swg_status` names the holder of each tracked path held for writing
 (`holder_agent_id`), and a `swg_write` refused `other_holder` names the agent
-that holds the path. The default view of `/status` already lists each
+that holds the path. With the hook client's
+[refusal of held strict files](guide.md#refusing-a-held-strict-file-in-claude-code-sessions)
+on, a Claude Code edit denied because another agent holds the path names that
+agent by the first eight characters of the agent id the refusal carries, never
+by session id. The default view of `/status` already lists each
 session's agent id with the states it holds, so these reveal nothing a
 `/status` reader cannot already see. The `agent-coherence-status` command asks
 for the default view unless it is run with `--detail full`, because it often runs inside an agent's
@@ -324,6 +348,19 @@ so an answer cannot drive the terminal they print to. All of this is
 disclosure hygiene
 rather than a boundary: under the model above, knowing a session id grants
 nothing the secret does not already grant.
+
+**The hook's hold refusal is a workspace file.** `.coherence/hook_on_held`
+turns on the hook client's
+[refusal of held strict files](guide.md#refusing-a-held-strict-file-in-claude-code-sessions),
+and it is off by default. The coordinator never reads it. Like
+`.coherence/strict_mode.yaml`, it is a regular file that any process running as
+your OS user can write, a model's shell command included, so a model can turn
+the refusal off, or drop the path from `strict_mode.yaml`, and the next edit
+goes through as an ordinary one. The deny names neither file. The refusal
+separates agents that follow the protocol; it does not stop one set on getting
+around it. The client reads the setting without following a link: a
+`.coherence` that is a link, or a setting file that is a link or not a regular
+file, reads as off.
 
 ## A repository you clone
 

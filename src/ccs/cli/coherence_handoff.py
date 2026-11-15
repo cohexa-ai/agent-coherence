@@ -110,9 +110,11 @@ _NOT_HELD_HINT = (
     "session to that successor made at the version it held, live or ended, "
     "means it landed, so do not transfer again, and if it shows another "
     "session's handoff, ask before transferring; otherwise have the giver "
-    "session read {path}, then transfer it again (on a strict-mode path that "
-    "read is denied, and grants nothing, when another session took or changed "
-    "{path} after this session read it)"
+    "session read {path}, then transfer it again (on a strict-mode path, when "
+    "another session took or changed {path} after this session read it, the "
+    "first read is denied and grants nothing: a Claude Code session reads "
+    "{path} again with the Read tool, which grants it once the file holds the "
+    "last committed bytes, and a volume calls reacquire())"
 )
 """Printed after a ``handoff_not_held`` refusal, beside the wire reason, which
 is printed unchanged. Client-side only: the coordinator's answer is the same

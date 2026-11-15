@@ -1,0 +1,459 @@
+{
+  "description": "Rows for the hook client's pre-edit of a path with the workspace file .coherence/hook_on_held set to refuse (the two setting rows aside). Each row has: name, unique; stage, before_post for an exit of the decision before the opted-in POST /hooks/pre-edit is sent, or post for the answer to that POST; caller, the Claude Code payload's session_id and agent_id (null when absent); either http, the coordinator's {status, body} with body as parsed JSON, or outcome, a named outcome; and expected, the outcome class. Named outcomes before the POST, in the order the decision meets them: setting_off (absent, empty or displace); setting_unknown (any other value but refuse); not_strict (strict under no fold profile, or no strict entries); no_port (no .coherence directory, no server.pid, or a server.pid with no port line); died_at_resolve (any other failure to resolve the endpoint, such as a dead coordinator or a state file that cannot be read); timeout, refused and malformed_answer (GET /status?detail=metrics timed out, had its connection refused, or answered a body that is not a JSON object); status_non_2xx (that GET answered a non-2xx status); status_key_absent (that GET answered 2xx without pre_edit_if_unheld: true); not_strict_under_coordinator_profile (strict under some fold profile, not under the one the coordinator reports); malformed_agent_id (a present agent_id that is not a string of 1-64 chars of [A-Za-z0-9_-]). Named outcomes after the POST: timeout; refused; departed (the coordinator went away mid-request, so the connection was reset or closed with no answer); malformed_answer (a body that is not a JSON object). Outcome classes: today (the requests, stdout and stderr of a hook that never opted in); today_and_stderr_line (the same plus one stderr line); relay_admit and relay_deny (stdout is the coordinator's body as received); holder_deny, parent_deny and unavailable_deny (stdout is the deny of holder_deny.json, parent_deny.json or unavailable_deny.json, rendered for the edited path and, for holder_deny, the row's holder_agent_id).",
+  "rows": [
+    {
+      "name": "before_post_setting_off",
+      "stage": "before_post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "outcome": "setting_off",
+      "expected": "today"
+    },
+    {
+      "name": "before_post_setting_unknown",
+      "stage": "before_post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "outcome": "setting_unknown",
+      "expected": "today_and_stderr_line"
+    },
+    {
+      "name": "before_post_not_strict",
+      "stage": "before_post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "outcome": "not_strict",
+      "expected": "today"
+    },
+    {
+      "name": "before_post_no_port",
+      "stage": "before_post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "outcome": "no_port",
+      "expected": "today"
+    },
+    {
+      "name": "before_post_died_at_resolve",
+      "stage": "before_post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "outcome": "died_at_resolve",
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "before_post_timeout",
+      "stage": "before_post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "outcome": "timeout",
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "before_post_refused",
+      "stage": "before_post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "outcome": "refused",
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "before_post_malformed_answer",
+      "stage": "before_post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "outcome": "malformed_answer",
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "before_post_status_non_2xx",
+      "stage": "before_post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "outcome": "status_non_2xx",
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "before_post_status_key_absent",
+      "stage": "before_post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "outcome": "status_key_absent",
+      "expected": "today_and_stderr_line"
+    },
+    {
+      "name": "before_post_not_strict_under_coordinator_profile",
+      "stage": "before_post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "outcome": "not_strict_under_coordinator_profile",
+      "expected": "today"
+    },
+    {
+      "name": "before_post_malformed_agent_id",
+      "stage": "before_post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": "a3f9/c2e1"
+      },
+      "outcome": "malformed_agent_id",
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "admit",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "http": {
+        "status": 200,
+        "body": {
+          "ok": true
+        }
+      },
+      "expected": "relay_admit"
+    },
+    {
+      "name": "strict_stale_deny",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "http": {
+        "status": 200,
+        "body": {
+          "ok": false,
+          "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Stale read denied: docs/plan.md was updated by agent bc3013e1 at 2025-11-13T12:00:00+00:00. Read docs/plan.md again with the Read tool: the next Read returns the current version, and edits of docs/plan.md are denied until you have read it."
+          },
+          "status": "stale",
+          "summary": {
+            "path": "docs/plan.md",
+            "current_version": 2,
+            "prior_version_seen_by_session": 1,
+            "last_writer_session_id": "bc3013e123b458509bb8c8875e97ff53",
+            "last_writer_at_unix_ts": 1763035200.0,
+            "warning_generated_at_unix_ts": 1763035260.0,
+            "hash_differs": true
+          }
+        }
+      },
+      "expected": "relay_deny"
+    },
+    {
+      "name": "handoff_giver_deny",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "http": {
+        "status": 200,
+        "body": {
+          "ok": false,
+          "reason": "handed_off",
+          "successor": "bc3013e1-23b4-5850-9bb8-c8875e97ff53",
+          "version_at_transfer": 1,
+          "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Edit denied: you handed docs/plan.md to agent bc3013e1 at v1, so this session can no longer write it. The handoff ends when agent bc3013e1 writes docs/plan.md, when agent bc3013e1 declines it, or when you withdraw it on your user's or host's instruction. Stop and report to your user that docs/plan.md was handed off. This denial is structural; retrying the same operation will produce the same denial."
+          }
+        }
+      },
+      "expected": "relay_deny"
+    },
+    {
+      "name": "other_holder_is_the_callers_parent",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": "a3f9c2e1b7d4"
+      },
+      "http": {
+        "status": 200,
+        "body": {
+          "ok": false,
+          "reason": "other_holder",
+          "holder_agent_id": "bcac3323fcc3598c80dcdac488109608"
+        }
+      },
+      "expected": "parent_deny"
+    },
+    {
+      "name": "other_holder_is_another_session",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "http": {
+        "status": 200,
+        "body": {
+          "ok": false,
+          "reason": "other_holder",
+          "holder_agent_id": "bc3013e123b458509bb8c8875e97ff53"
+        }
+      },
+      "expected": "holder_deny"
+    },
+    {
+      "name": "other_holder_is_a_sibling_subagent",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": "b8e2d4f1c6a9"
+      },
+      "http": {
+        "status": 200,
+        "body": {
+          "ok": false,
+          "reason": "other_holder",
+          "holder_agent_id": "982f520ad1b95a1fbce2d21481cf0657"
+        }
+      },
+      "expected": "holder_deny"
+    },
+    {
+      "name": "other_holder_is_the_callers_own_subagent",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "http": {
+        "status": 200,
+        "body": {
+          "ok": false,
+          "reason": "other_holder",
+          "holder_agent_id": "982f520ad1b95a1fbce2d21481cf0657"
+        }
+      },
+      "expected": "holder_deny"
+    },
+    {
+      "name": "unavailable",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "http": {
+        "status": 200,
+        "body": {
+          "ok": false,
+          "reason": "unavailable",
+          "degraded": true,
+          "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": "\u26a0 Coherence could not verify this file's freshness \u2014 the coordinator staleness check timed out under load. Proceeding WITHOUT a stale-read guarantee: if this file is shared with other agents or sessions, re-read it before relying on its contents."
+          }
+        }
+      },
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "internal_error",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "http": {
+        "status": 200,
+        "body": {
+          "ok": false,
+          "reason": "internal: RuntimeError"
+        }
+      },
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "prose_reason",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "http": {
+        "status": 200,
+        "body": {
+          "ok": false,
+          "reason": "artifact docs/plan.md could not be acquired"
+        }
+      },
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "degraded_admit",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "http": {
+        "status": 200,
+        "body": {
+          "ok": true,
+          "degraded": true,
+          "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": "\u26a0 Coherence could not verify this file's freshness \u2014 the coordinator staleness check timed out under load. Proceeding WITHOUT a stale-read guarantee: if this file is shared with other agents or sessions, re-read it before relying on its contents."
+          }
+        }
+      },
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "collision",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "http": {
+        "status": 200,
+        "body": {
+          "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "additionalContext": "\u26a0 Concurrent edit detected at 2026-11-13T12:01:00+00:00 (UTC): another agent (bc3013e1) has been editing docs/plan.md since 2026-11-13T12:00:00+00:00. Your edit will land in your own worktree, but only one session's commit will be accepted by the coordinator. Consider waiting for the other session to finish or coordinating which one should proceed."
+          },
+          "ok": true,
+          "collision": true
+        }
+      },
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "other_holder_without_a_holder",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "http": {
+        "status": 200,
+        "body": {
+          "ok": false,
+          "reason": "other_holder"
+        }
+      },
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "other_holder_holder_not_32_hex",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "http": {
+        "status": 200,
+        "body": {
+          "ok": false,
+          "reason": "other_holder",
+          "holder_agent_id": "bc3013e1-23b4-5850-9bb8-c8875e97ff53"
+        }
+      },
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "caller_principal_absent_400",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "http": {
+        "status": 400,
+        "body": {
+          "error": "missing Coherence-Caller-Principal header: this route requires the caller principal that POST /principal/claim bound to the session_id it names (caller_principal_absent)",
+          "reason": "caller_principal_absent"
+        }
+      },
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "malformed_agent_id_400",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": "a3f9c2e1b7d4"
+      },
+      "http": {
+        "status": 400,
+        "body": {
+          "error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"
+        }
+      },
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "post_timeout",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "outcome": "timeout",
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "post_refused",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "outcome": "refused",
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "post_departed",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "outcome": "departed",
+      "expected": "unavailable_deny"
+    },
+    {
+      "name": "post_malformed_answer",
+      "stage": "post",
+      "caller": {
+        "session_id": "5f0c2a8e-3b1d-4c7a-9e2f-6a1b8d4c0e71",
+        "agent_id": null
+      },
+      "outcome": "malformed_answer",
+      "expected": "unavailable_deny"
+    }
+  ]
+}

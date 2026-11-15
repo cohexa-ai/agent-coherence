@@ -56,6 +56,11 @@ from ccs.core.exceptions import (
     INTERNAL_CONCURRENCY_REASON,
     OCC_CALLER_TRANSIENT_REASON,
     OTHER_HOLDER_REASON,
+    POLICY_FILE_REFUSAL_KINDS,
+    POLICY_FILE_REFUSED_REASON,
+    POLICY_FILE_UNLOADABLE_KIND,
+    POLICY_LOCK_NOT_REGULAR_KIND,
+    POLICY_WRITE_FAILED_KIND,
     SPLIT_PAIR_REASON,
     STALE_READ_GENERATION_REASON,
     STALE_VIEW_REASON,
@@ -71,6 +76,7 @@ from ccs.core.exceptions import (
     CoordinatorUnreachable,
     GiverFenced,
     OtherHolder,
+    PolicyFileRefused,
     PublishMaterializationError,
     StaleView,
 )
@@ -174,6 +180,7 @@ def test_handoff_reasons_collide_with_no_existing_reason_or_status() -> None:
             SPLIT_PAIR_REASON,
             UNAVAILABLE_REASON,
             COHERENCE_DIR_REFUSED_REASON,
+            POLICY_FILE_REFUSED_REASON,
         }
     )
     assert HANDOFF_REASONS.isdisjoint(existing)
@@ -304,6 +311,51 @@ def test_coherence_dir_refused_carries_its_reason_kind_and_path_and_crosses_a_pr
     assert restored.reason == COHERENCE_DIR_REFUSED_REASON
     assert restored.kind == COHERENCE_LINK_KIND
     assert restored.path == "/w/.coherence/hook.secret"
+    assert str(restored) == str(err)
+    assert restored.__dict__ == err.__dict__
+    assert restored.__notes__ == ["context"]
+
+
+def test_policy_file_refused_carries_its_reason_kind_and_path_and_crosses_a_process_boundary() -> None:
+    """A start's refusal of a policy file it could not load, lock or write
+    (#499) is a typed terminal in the coherence family with one class-level
+    reason, and ``kind`` says which step refused it. It is neither a
+    :class:`CoordinatorUnreachable`, so no retry loop catches it, nor a
+    :class:`CoherenceDirRefused`, so a consumer routing the two apart never
+    mixes them. Prevents a renamed wire token or a refusal that loses its kind
+    or path when a worker process hands it to the parent."""
+    assert POLICY_FILE_REFUSED_REASON == "policy_file_refused"
+    for constant, literal in [
+        (POLICY_FILE_UNLOADABLE_KIND, "policy_file_unloadable"),
+        (POLICY_LOCK_NOT_REGULAR_KIND, "policy_lock_not_regular"),
+        (POLICY_WRITE_FAILED_KIND, "policy_write_failed"),
+    ]:
+        assert constant == literal
+    assert POLICY_FILE_REFUSAL_KINDS == {
+        "policy_file_unloadable", "policy_lock_not_regular", "policy_write_failed",
+    }
+    assert POLICY_FILE_REFUSED_REASON not in POLICY_FILE_REFUSAL_KINDS
+
+    err = PolicyFileRefused(
+        POLICY_FILE_UNLOADABLE_KIND, "/w/.coherence/tracked.yaml", "/w: .coherence/tracked.yaml is not valid YAML"
+    )
+    err.add_note("context")
+    assert PolicyFileRefused.reason == POLICY_FILE_REFUSED_REASON
+    assert err.reason == POLICY_FILE_REFUSED_REASON
+    assert err.kind == POLICY_FILE_UNLOADABLE_KIND
+    assert err.path == "/w/.coherence/tracked.yaml"
+    assert str(err) == "/w: .coherence/tracked.yaml is not valid YAML"
+    assert isinstance(err, CoherenceError)
+    assert not isinstance(err, CoordinatorUnreachable)
+    assert not isinstance(err, CoherenceDirRefused)
+
+    restored = pickle.loads(pickle.dumps(err))
+
+    assert type(restored) is PolicyFileRefused
+    assert restored.args == err.args
+    assert restored.reason == POLICY_FILE_REFUSED_REASON
+    assert restored.kind == POLICY_FILE_UNLOADABLE_KIND
+    assert restored.path == "/w/.coherence/tracked.yaml"
     assert str(restored) == str(err)
     assert restored.__dict__ == err.__dict__
     assert restored.__notes__ == ["context"]

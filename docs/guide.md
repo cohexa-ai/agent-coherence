@@ -36,22 +36,24 @@ full command-line toolset, and the API reference.
 16. [Effect fence over HTTP](#effect-fence-over-http)
 17. [Caller principal](#caller-principal)
 18. [Targeted grant handoff](#targeted-grant-handoff)
-19. [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)
-20. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
-21. [Inline benchmark mode](#inline-benchmark-mode)
-22. [Telemetry](#telemetry)
-23. [Graceful degradation](#graceful-degradation)
-24. [Examples](#examples)
-25. [Real-workload benchmarks](#real-workload-benchmarks)
-26. [Benchmarking your own workload](#benchmarking-your-own-workload)
-27. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-28. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
-29. [Replay (v0.8.2+)](#replay-v082)
-30. [Command-line tools](#command-line-tools)
-31. [API reference](#api-reference)
-32. [Low-level adapter API](#low-level-adapter-api)
-33. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-34. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+19. [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)
+20. [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)
+    - [Refusing a held strict file in Claude Code sessions](#refusing-a-held-strict-file-in-claude-code-sessions)
+21. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
+22. [Inline benchmark mode](#inline-benchmark-mode)
+23. [Telemetry](#telemetry)
+24. [Graceful degradation](#graceful-degradation)
+25. [Examples](#examples)
+26. [Real-workload benchmarks](#real-workload-benchmarks)
+27. [Benchmarking your own workload](#benchmarking-your-own-workload)
+28. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+29. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
+30. [Replay (v0.8.2+)](#replay-v082)
+31. [Command-line tools](#command-line-tools)
+32. [API reference](#api-reference)
+33. [Low-level adapter API](#low-level-adapter-api)
+34. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+35. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -1669,7 +1671,7 @@ with CoherentVolume(workspace_root, managed=("plans/**",)) as vol:
 |---|---|---|
 | `workspace_root` | — | Directory the volume manages; the coordinator's state lives in `<root>/.coherence/` |
 | `managed` | `()` | Glob patterns for the files under coordination; unmanaged paths bypass the volume |
-| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A `.coherence` that a start refuses raises `CoherenceDirRefused` instead, which no retry clears; see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory). A read the coordinator answers with its failure envelope raises `CoordinatorFailed`, and so does the release of a write grant an earlier `write()` left held, every request that commits nothing answered with an HTTP 5xx, a commit refused by the volume's own unreleased write grant, and a refuse-mode grant request the coordinator could not decide in time; see [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
+| `on_error` | `"strict"` | `"degrade"` warns once and falls back to plain IO instead of raising on a coordination failure. In strict mode a coordinator that gives no usable answer raises `CoordinatorUnreachable`; see [When the coordinator does not answer](#when-the-coordinator-does-not-answer). A `.coherence` that a start refuses raises `CoherenceDirRefused` instead, which no retry clears; see [`.coherence` must be a real directory](#coherence-must-be-a-real-directory). A policy file a start cannot load, lock or write raises `PolicyFileRefused`, which no retry clears either; see **Policy files** under [Status, track and untrack commands](#status-track-and-untrack-commands). A read the coordinator answers with its failure envelope raises `CoordinatorFailed`, and so does the release of a write grant an earlier `write()` left held, every request that commits nothing answered with an HTTP 5xx, a commit refused by the volume's own unreleased write grant, and a refuse-mode grant request the coordinator could not decide in time; see [When the coordinator answers with a failure](#when-the-coordinator-answers-with-a-failure). A [caller principal](#caller-principal) refusal the volume cannot recover from is a definite answer, not a failure, and raises `CallerPrincipalRefused` in both modes |
 | `on_stale_read` | `"allow"` | `"raise"` — deny a re-read of a managed file whose on-disk bytes changed out-of-band |
 | `on_stale_write` | `"raise"` | `"allow"` — restore last-writer-wins over a foreign edit (not recommended) |
 | `on_held` | `"displace"` | `"refuse"` — on a managed path, raise `OtherHolder` instead of taking a file another agent holds; see [Refusing a file another agent holds](#refusing-a-file-another-agent-holds) |
@@ -2246,11 +2248,16 @@ coordinator on its store, which refuses it.
   answers its commit `commit_not_allowed`, without the `reclaimed` key this
   package's coordinator adds. Call `release(path)` and `close()` when you are
   done, so peers do not wait out the 30 minutes.
-- **Claude Code sessions displace.** The hook clients never opt in, so a
-  Claude Code session's edit takes a file a refuse-mode volume holds, as on
-  this package's coordinator. On a workspace the Node coordinator serves,
-  those sessions are usually the other writers, so there refuse mode protects
-  a volume's files only from other refuse-mode volumes.
+- **Claude Code sessions displace.** The plugin's Node hook client never opts
+  in, and this package's hook client opts in only where the workspace turned
+  on [its refusal of held strict files](#refusing-a-held-strict-file-in-claude-code-sessions),
+  which is off by default, so by default a Claude Code session's edit takes a
+  file a refuse-mode volume holds, as on this package's coordinator. The
+  plugin runs its Node hook client wherever `node` and a built Node client
+  exist, so on a workspace the Node coordinator serves, the sessions usually
+  run the Node client and displace whatever the setting says. Those sessions
+  are usually the other writers, so there refuse mode protects a volume's
+  files only from other refuse-mode volumes.
 - **Snapshot sessions and handoffs.**
   The Node coordinator has no snapshot sessions or handoffs, so a multi-file
   `atomic_publish` and the handoff methods (`transfer`, `accept`, `decline`,
@@ -2293,6 +2300,12 @@ retry and no coordinator started later clears it. A volume in degrade mode
 warns once and stays detached. Fix `.coherence` first, then build a new
 `CoherentVolume`; see
 [`.coherence` must be a real directory](#coherence-must-be-a-real-directory).
+A policy file the start cannot load, lock or write is the same kind of answer:
+a strict volume raises `PolicyFileRefused` and starts no coordinator, no retry
+clears it, and a volume in degrade mode warns once and stays detached.
+Fix the named file, or free the disk, then build a new volume; see **Policy
+files** under
+[Status, track and untrack commands](#status-track-and-untrack-commands).
 
 A commit is different, because its request may have reached the coordinator
 before the answer was lost. When the CAS of `write_cas` or `write_cas_at`, the
@@ -2600,6 +2613,17 @@ without the lock where it cannot take one (no flock helper, or a file system
 that refuses it); for that file the client checks that the pid still runs, also
 once the coordinator has removed the file at its stop. Where `fcntl` does not
 exist the lock cannot be probed, and the request goes.
+
+The hook client reads `server.pid` afresh for each hook event. In a workspace
+that turned on
+[its refusal of held strict files](#refusing-a-held-strict-file-in-claude-code-sessions),
+its `pre-edit` of a strict path reads the file this way before anything is
+sent: no file, or one with no port line, which a clean stop leaves, admits the
+edit as before, because no coordinator is known that could hold the file; a
+coordinator shown gone (the lock free, for a `backend=node` file only once its
+pid no longer runs), a file it cannot read, and a link or anything but a pid
+file deny the edit. Every other hook event, and that edit with the refusal
+off, sends nothing and prints `{}` in all of these cases, as before.
 
 A strict `CoherentVolume` raises the refusal as `CoordinatorUnreachable`, or as
 `CommitUnconfirmed` from a handoff verb; a degrade volume warns and counts a
@@ -3468,10 +3492,14 @@ snapshot, so the pair always describes the same state.
   that identity, so a fence call under another one answers about a grant you do
   not hold.
 - **After a strict-mode deny, capture again under a new `agent_id` with the
-  same `session_id`.** A deny never re-grants, so every later pre-read under the
-  denied identity is refused the same way. Re-read the file, hash it again, and
-  capture and fence under the new `agent_id`, as `CoherentVolume.reacquire()`
-  does. Keeping the `session_id` keeps a claimed caller principal valid.
+  same `session_id`.** A capture's pre-read sends `want_owner_generation`, so
+  its deny stays in place: the deny never re-grants, and every later pre-read
+  under the denied identity is refused the same way. Re-read the file, hash it
+  again, and capture and fence under the new `agent_id`, as
+  `CoherentVolume.reacquire()` does. Keeping the `session_id` keeps a claimed
+  caller principal valid. Only a Claude Code hook read, which sends none of
+  `want_owner_generation`, `verify_only` and `name_kind`, is admitted after one
+  deny; see [After a strict-mode stale deny](#after-a-strict-mode-stale-deny).
 - **Make a hashed pre-read the file's first touch.** The coordinator records a
   file's content claim from the hash on the pre-read that first registers the
   file. A file first registered some other way holds no claim: by a pre-read
@@ -3702,9 +3730,12 @@ grant, record workspace ownership, or hand a session's claims on or settle a
 [handoff](#targeted-grant-handoff) in its name — the things a caller naming the
 wrong session could do to someone else's work. `pre-edit` is among them because
 a grant taken without the principal could then be neither committed nor
-released. The accept-class reads change no grant or version, but they do
-deliver the named session's pending notices, so a read naming the wrong session
-can consume advisories meant for it. The snapshot-session routes are
+released. The accept-class reads move no version and take no write grant, but
+they do deliver the named session's pending notices, so a read naming the wrong
+session can consume advisories meant for it, and the read hooks can re-grant
+the named session a read of a file whose copy went stale, in strict mode too
+(see [security.md](security.md#who-the-coordinator-can-tell-apart)). The
+snapshot-session routes are
 accept-class because each is already gated by the server-issued session token.
 That token is issued to whichever session `/session/begin` names, and that
 route is accept-class too, so a request that presents no principal and names a
@@ -4315,9 +4346,12 @@ and answer as before apart from the giver's shell write, which is denied.
   Handoff: you handed {path} to agent {successor_short} at v{version_at_transfer}, so this session can no longer write it. The handoff ends when agent {successor_short} writes {path}, when agent {successor_short} declines it, or when you withdraw it on your user's or host's instruction. Until the handoff ends, do not change {path} by any route, a shell command included. Stop and report to your user that {path} was handed off.
   ```
 
-  On a strict-mode path this read is not admitted: the transfer left the
-  handed-off claim INVALID, so the Read of the identity that held it gets the
-  ordinary strict-mode stale-view deny, which carries no handoff text.
+  On a strict-mode path the first such read is not admitted: the transfer left
+  the handed-off claim INVALID, so the Read of the identity that held it gets
+  the ordinary strict-mode stale-view deny, which carries no handoff text. Its
+  next Read is admitted, as
+  [After a strict-mode stale deny](#after-a-strict-mode-stale-deny) describes,
+  and carries this text.
 - **The giver**, on a read or edit after the record ended, until the record is
   [evicted](#ended-records-and-eviction), one of:
 
@@ -4391,11 +4425,14 @@ grant ends with its turn, and the session keeps a read of the file:
   edit ends this session's read, and the transfer is refused as
   `handoff_not_held`. On a warn-mode path, have the session read the file
   again: the read gives it a standing read, and a transfer then hands that on
-  (`SHARED`). On a strict-mode path that `Read` is denied by the strict-mode
-  stale-view deny, and the denied read grants nothing. A shell read of the
-  file (`cat`, for example) is denied too, but its deny re-grants a standing
-  read without recording a read of the current version, and a transfer hands
-  that on as `SHARED`.
+  (`SHARED`). On a strict-mode path the first `Read` is denied by the
+  strict-mode stale-view deny, and the denied read grants nothing. The
+  session's next `Read` is admitted once the file holds the last committed
+  bytes, and gives it a standing read that a transfer hands on (`SHARED`); see
+  [After a strict-mode stale deny](#after-a-strict-mode-stale-deny). A shell
+  read of the file (`cat`, for example) is denied too, but its deny re-grants
+  a standing read without recording a read of the current version, and a
+  transfer hands that on as `SHARED`.
 
 ### Handoff commands
 
@@ -4492,14 +4529,17 @@ hint:
 
 ```text
 agent-coherence-transfer: notes.md not transferred (handoff_not_held)
-agent-coherence-transfer: hint: this session holds no claim on notes.md: an earlier transfer of it may have landed, another session may have taken or changed it since this session read it, or this session may never have read it. Check the path's handoff in agent-coherence-status output first: a handoff from this session to that successor made at the version it held, live or ended, means it landed, so do not transfer again, and if it shows another session's handoff, ask before transferring; otherwise have the giver session read notes.md, then transfer it again (on a strict-mode path that read is denied, and grants nothing, when another session took or changed notes.md after this session read it)
+agent-coherence-transfer: hint: this session holds no claim on notes.md: an earlier transfer of it may have landed, another session may have taken or changed it since this session read it, or this session may never have read it. Check the path's handoff in agent-coherence-status output first: a handoff from this session to that successor made at the version it held, live or ended, means it landed, so do not transfer again, and if it shows another session's handoff, ask before transferring; otherwise have the giver session read notes.md, then transfer it again (on a strict-mode path, when another session took or changed notes.md after this session read it, the first read is denied and grants nothing: a Claude Code session reads notes.md again with the Read tool, which grants it once the file holds the last committed bytes, and a volume calls reacquire())
 ```
 
 A session's own earlier edit is not a cause: the end of the turn leaves it a
 read of the file, which a transfer hands on. On a strict-mode path, when
 another session took or changed the file after this session read it, the
-hint's `Read` is denied and grants nothing, as the hint's last clause says;
-see [Claude Code sessions](#claude-code-sessions) for what a shell read does
+hint's first `Read` is denied and grants nothing, and the session's next
+`Read` is admitted once the file holds the last committed bytes, as the hint's
+last clause says; a volume's read stays denied until it calls `reacquire()`
+(see [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)). See
+[Claude Code sessions](#claude-code-sessions) for what a shell read does
 there.
 
 **Python coordinator only.** Against the Claude Code plugin's Node coordinator
@@ -4961,6 +5001,152 @@ route, but it reads the refusal differently on each:
   fence, so an older MCP giver can loop on reacquire and write until its
   client is upgraded.
 
+## After a strict-mode stale deny
+
+On a strict-mode path, a Claude Code session whose copy of a file is out of
+date is denied its next Read or Edit of that file. The copy goes out of date
+when another session commits the file, when another session takes the file for
+writing and lets go of it without committing, when the coordinator reclaims
+the session's grant, or when one of the session's own subagents commits the
+file. On this package's coordinator from 0.16.1, and on the Claude Code
+plugin's Node coordinator from plugin 0.7.1, the session gets one
+deny for a stale copy and can then read the file again
+([#514](https://github.com/Cohexa-ai/agent-coherence/issues/514)). Earlier
+coordinators deny every later Read of the file too.
+
+- The first stale Read or Edit of the file is denied, and the deny grants
+  nothing. The coordinator remembers, per agent and file, that it sent it.
+- The session's next Read of the file is admitted when the bytes it reads are
+  the content the coordinator recorded for the current version, or the
+  coordinator recorded no content for the file. The session is granted a read
+  at that version and answered `{"status": "fresh", "version": <n>}`, with any
+  queued notices and no stale warning, and its edits of the file are admitted
+  after it.
+- An Edit or Write sent before that Read is still denied, so a write built
+  from the old copy does not land.
+- A commit that lands between the deny and the Read costs no second deny: the
+  Read returns the newer version, as the deny says it will.
+- The session's next admitted Read or Edit of the file uses the recovery up,
+  one that follows a Bash or Grep read of the file included, so the next time
+  its copy goes out of date starts from a deny again. A Bash or Grep read that
+  re-grants the session a read of the file uses the recovery up as well, so
+  the session's next stale copy is denied again.
+
+**When reading again does not clear it.** A Read whose bytes are not the
+recorded content, or that carries no hash because the file is gone, is not
+admitted: admitting it would record a read of bytes the coordinator never
+recorded, and the session's next Edit would build on them. It is denied, and
+the deny names what clears it:
+
+- while another session holds a write of the file it has not committed, the
+  write-in-flight text below: once that write is committed, the session's next
+  Read is admitted. This package's coordinator picks this text only when that
+  session was active in the last 5 seconds; the Node coordinator picks it for
+  any such session.
+- otherwise, the out-of-band text below: the change was made outside the
+  coordinator, and the read stays denied until the change is committed through
+  the coordinator.
+
+A session that never read the file, and reads bytes that differ from the
+record, is denied with the same two texts, on every Read. It has no copy to
+recover, so its deny starts no recovery.
+
+**The texts.** Each depends only on the file, its version and its last commit,
+so a given file and event always produce the same bytes, on both coordinators.
+`{path}` is the workspace-relative path, `{current_version}` the current
+version, and `{last_writer_short}` and `{last_writer_ts_iso}` the first eight
+characters of the last writer's agent id and the time of its commit. Another
+session committed the file:
+
+```text
+Stale read denied: {path} was updated by agent {last_writer_short} at {last_writer_ts_iso}. Read {path} again with the Read tool: the next Read returns the current version, and edits of {path} are denied until you have read it.
+```
+
+The session's grant was revoked and nothing was committed:
+
+```text
+Stale read denied: your grant on {path} was revoked and no new version was committed — {path} is still at v{current_version}. Read {path} again with the Read tool: the next Read returns the current version, and edits of {path} are denied until you have read it.
+```
+
+The bytes on disk are not the recorded content, and no write is in flight:
+
+```text
+Stale read denied: {path} on disk does not match v{current_version}, the last version committed through the coordinator, and no session committed the change, so it was made outside the coordinator. Do not restore or overwrite {path}: the change may be your user's work. Tell your user that {path} changed outside the coordinator; the read stays denied until the change is committed through the coordinator. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial.
+```
+
+Another session's write is in flight:
+
+```text
+Stale read denied: another agent is writing {path} and has not committed it yet, so {path} on disk does not match v{current_version}, the last version committed through the coordinator. Wait for that write to be committed, then Read {path} again with the Read tool.
+```
+
+`pre-read`, `pre-edit`, `pre-bash` and `pre-grep` send the first two texts for
+a stale copy. They used to end by saying that retrying the same operation would
+produce the same denial. That was false after a strict Bash or Grep deny, which
+re-grants the session a read of the file
+([#242](https://github.com/Cohexa-ai/agent-coherence/issues/242)), and it is
+false after a Read deny now, so it is gone. The denies that stay in place keep
+that sentence: the out-of-band text above, the out-of-band deny of a session
+that still holds a valid grant (see
+[Foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)),
+and the handoff giver's deny (see [Claude Code sessions](#claude-code-sessions)).
+The last two are unchanged. A session that never read the file used to get the
+first text, which named the last committer, or `agent <unknown>` when nobody
+had committed, as the writer of bytes no session committed.
+
+**Which callers keep the deny.** Only Claude Code hook reads recover this way.
+The coordinator tells them apart by the request: a `pre-read` that carries any
+of `want_owner_generation`, `verify_only` and `name_kind`, whatever its value,
+is not a hook read. It keeps a strict deny in place across retries, as before,
+and neither starts nor uses up a session's recovery. Those callers recover
+their own way:
+
+- `CoherentVolume`, and the
+  [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server) built on
+  it: `reacquire()`, or `swg_reacquire`. From 0.16.1 the
+  volume's plain `read()` and its `open()` shim send
+  `"want_owner_generation": true`, as its versioned reads already did, so every
+  volume read keeps the deny. The answer gains an `owner_generation` that
+  `read()` does not use.
+- the [substrate session](#byo-substrate-bindings-coherentrow-coherentobject)
+  (`CoherentRow`, `CoherentObject`), which sends `name_kind`: `reacquire()`.
+- the effect fence's re-validate read, which sends `verify_only`: reacquire and
+  decide again.
+- the [raw HTTP capture](#capturing-the-comparands), which sends
+  `want_owner_generation`: capture again under a new `agent_id`.
+
+**Limits.**
+
+- The coordinator keeps its record of the deny in memory. After a coordinator
+  restart the session is denied once more, and the Read after that is
+  admitted. A coordinator that was running before the upgrade keeps the old
+  behaviour until it restarts.
+- A Read and a Write sent in one message, or a Read of part of the file, counts
+  as reading the current version, so a Write of the whole file built from the
+  old copy can then be admitted
+  ([#624](https://github.com/Cohexa-ai/agent-coherence/issues/624)). Have
+  sessions read a strict file whole, in a message of its own, before they
+  write it.
+- A `CoherentVolume` from 0.16.0 or earlier marks none of its plain reads.
+  Reading through a coordinator that has this recovery, such as the plugin's
+  Node coordinator from plugin 0.7.1, its second plain read of a
+  file whose copy went stale is admitted, and a later `write()` of a buffer
+  built before a peer's commit is admitted too
+  ([#629](https://github.com/Cohexa-ai/agent-coherence/issues/629)). Upgrade
+  the library together with the plugin.
+- The hook client's
+  [refusal of held strict files](#refusing-a-held-strict-file-in-claude-code-sessions)
+  (`.coherence/hook_on_held`) stays off by default. A session it refused,
+  which then sees the holder commit, recovers the same way: one deny, then a
+  Read.
+- `pre-read` admits a request that names a session without its
+  [caller principal](#caller-principal), so a caller that names a bound session
+  can heal that session's stale copy with at most two pre-reads: the first, of
+  any bytes, starts the recovery unless the deny of that session's own stale
+  Read or Edit already did, and the second carries the hash of the recorded
+  bytes, or any bytes when the coordinator recorded no content for the file;
+  see [security.md](security.md#who-the-coordinator-can-tell-apart).
+
 ## Acquire-or-fail on `pre-edit`
 
 An ordinary `POST /hooks/pre-edit` grants EXCLUSIVE to whoever asks, except the
@@ -4980,7 +5166,10 @@ two differ is listed under **On the Node coordinator** below.
 [Refusing a file another agent holds](#refusing-a-file-another-agent-holds)), and
 so does the `stale-write-guard-fs` server's `swg_write` when its operator sets
 `SWG_ON_HELD=refuse` (see [the MCP server](#stale-write-guard-fs-mcp-server)).
-The Claude Code hooks do not opt in.
+The Claude Code hooks do not opt in unless a workspace turns that on, which is
+off by default, and then only through this package's hook client, on edits of
+strict-mode paths (see
+[Refusing a held strict file in Claude Code sessions](#refusing-a-held-strict-file-in-claude-code-sessions)).
 
 A coordinator that ignores the flag (the Node coordinator in plugin 0.6.0 or
 earlier, or this package's coordinator through 0.15.0) admits an opted-in request
@@ -5030,8 +5219,15 @@ the client retries it (see [Concurrent writers](#concurrent-writers-write_cas)).
 Read `other_holder` by the route that sent it.
 
 **Who counts as another agent.** The check compares agent identities: the
-session, plus the subagent id when the request sends one. A malformed subagent
-id counts as none (see **What it does not close**).
+session, plus the subagent id when the request sends one. An empty or `null`
+subagent id is none: the request acts as the parent session. A coordinator
+from 0.16.1, and the Node coordinator from plugin 0.7.1,
+refuse an opted-in request whose subagent id is present but not 1 to 64
+characters of `[A-Za-z0-9_-]`, with HTTP `400` and
+`{"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"}`, ahead of the
+caller-principal check and the tracked-path check, and grant nothing. An older
+coordinator counts a malformed subagent id as none (see **What it does not
+close**).
 
 - A holder repeating its own opted-in `pre-edit` is admitted.
 - Two subagents of one session refuse each other.
@@ -5081,18 +5277,20 @@ keeps none of them. A refuse-mode `CoherentVolume` types each answer for you; se
 
 | When the request is decided | Answer | `/status` counter | What the client does |
 |---|---|---|---|
+| Python coordinator from 0.16.1, or Node coordinator from plugin 0.7.1: it carries a subagent id that is present but not 1 to 64 characters of `[A-Za-z0-9_-]` | HTTP `400`, `{"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"}`, decided ahead of the principal and tracked-path checks | none | send a well-formed subagent id, or none for the parent session: no retry clears it |
 | Python coordinator: it presents no principal header, or an empty or whitespace-only one | HTTP `400`, `"reason": "caller_principal_absent"` | `caller_principal_refused_total` | claim a principal, then send again; claiming binds the session (see the client rules below) |
 | Python coordinator: it presents a principal that is not the one bound to the session | HTTP `400`, `"reason": "caller_principal_foreign"` | `caller_principal_refused_total` | claim again with the same nonce, then send again |
 | Python coordinator: the caller-principal check or the pre-edit work runs past the 4-second handler budget | `unavailable` (see **Under load**) | `watchdog_timeouts_total` | back off, then release |
 | Node coordinator: the store is busy before the grant, or (rarely) fails after it | `{"ok": false, "reason": "internal: SqliteError"}`; nothing is granted unless the failure came after the grant | none | back off, then release |
 | the path is not tracked | `{"ok": true}`, unchecked; it may carry re-grounding context | none, or `watchdog_timeouts_total` when delivering that context times out, which still answers `{"ok": true}` | proceed; the path is outside this contract (see **What it does not close**) |
 | Python coordinator: the caller is the giver of a live handoff of the path | the `handed_off` deny | `handoff_giver_denials_total` | stop: no retry clears it |
-| the path is in strict mode and the caller's read is stale | the strict deny: `"status": "stale"`, a deny in `hookSpecificOutput`, and no top-level `reason` | `strict_mode_denials_total` and `stale_warning_emitted_total` | re-read under a new `agent_id` with the same `session_id`, then send again: a deny never re-grants the identity it denied |
+| the path is in strict mode and the caller's read is stale | the strict deny: `"status": "stale"`, a deny in `hookSpecificOutput`, and no top-level `reason` | `strict_mode_denials_total` and `stale_warning_emitted_total` | re-read, then send again: a Claude Code session's next Read of the file is admitted once it reads the recorded bytes (see [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)); a client whose `pre-read` sends `want_owner_generation`, `verify_only` or `name_kind` keeps the deny, which never re-grants its identity, so it re-reads under a new `agent_id` with the same `session_id` |
 | another agent holds the path EXCLUSIVE or MODIFIED; on the Node coordinator, one whose grant is less than 1800 s old or has no recorded grant time | `other_holder` | `pre_edit_other_holder_denials_total` | back off; once admitted, re-read the file before writing |
 | Node coordinator: another agent has held the path EXCLUSIVE or MODIFIED for 1800 s or more | the plain admit, with no collision warning: the coordinator reclaims that grant in the same decision (see **On the Node coordinator**) | none | proceed |
 | no other agent holds the path EXCLUSIVE or MODIFIED | the admit an ordinary `pre-edit` gets, but never with a collision warning: the decision displaced nobody, even when a holder let go just before it | as for an ordinary `pre-edit` | proceed |
 | Node coordinator: the grant is made, and only delivering the caller's queued notices finds the store busy | the admit, without the notices, which stay queued for the caller's next answer | none | proceed |
 | anything else: a `503` (the coordinator's queue or handler slots are full, or it is stopping or draining for a migration), an `internal:` failure ([details](#when-the-coordinator-answers-with-a-failure)), which a busy store can also cause on the Python coordinator (`internal: OperationalError`), an `ok: false` whose `reason` is prose, any other non-2xx status, no answer at all, or `{"ok": true, "degraded": true}`, which an older coordinator answers on a timeout because it never reads `if_unheld` | as for an ordinary `pre-edit` | as for an ordinary `pre-edit` | treat it as a refusal and back off; after no answer at all, then release (see the client rules) |
+| this package's Claude Code hook client sends it, in a workspace whose `.coherence/hook_on_held` holds `refuse` | any row above | as in that row | lets the edit go ahead on an admit; passes the strict deny and the `handed_off` deny to Claude Code unchanged; turns `other_holder` into a deny naming the holder; denies on every other answer and on no answer, and sends no release (see [Refusing a held strict file in Claude Code sessions](#refusing-a-held-strict-file-in-claude-code-sessions)) |
 
 **When the path comes free.** The refusal carries no retry hint because none
 exists. Committing does not end a grant: a holder that commits keeps the path
@@ -5138,16 +5336,30 @@ one. Poll with backoff rather than wait for a signal.
   keeps the state it had: a reader stays a reader, and a caller with no record
   on the path gets none. While no other agent has taken or written the path
   since, the caller's next `pre-edit` is not denied as stale. A caller another
-  agent's acquire or commit left INVALID stays INVALID, and on a strict-mode
-  path a deny never re-grants that identity, so its next `pre-edit`, and every
-  later read under it, gets the strict deny. Re-read under a new `agent_id`
-  with the same `session_id`, as the
+  agent's acquire or commit left INVALID stays INVALID, so on a strict-mode
+  path its next `pre-edit` gets the strict deny. After that deny, a `pre-read`
+  of the path that carries none of `want_owner_generation`, `verify_only` and
+  `name_kind`, as a Claude Code hook read does, is admitted once it reads the
+  recorded bytes (see
+  [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)). A
+  `pre-read` that carries one of them never re-grants that identity, and every
+  later read under it gets the strict deny, so such a client re-reads under a
+  new `agent_id` with the same `session_id`, as the
   [capture rule](#capturing-the-comparands) and `CoherentVolume.reacquire()`
   do. In warn mode a caller can still edit a path another agent changed since
   its last read, and that `pre-edit` takes the grant; if the edit then fails
   or the turn ends, the release leaves the caller a reader of the current
   version, so its next read is fresh and shows no stale warning. Strict mode
   denies that `pre-edit`, so this never happens there.
+  This package's Claude Code hook client does not follow this rule. With
+  [its refusal](#refusing-a-held-strict-file-in-claude-code-sessions) on, it
+  sends no release after it denies an edit because the coordinator could not
+  confirm the file is free: a release from the hook would cost another round
+  trip at the moment the coordinator is slow or gone, and could drop a grant
+  the session holds from an earlier edit of the file. A timed-out request was
+  measured landing late on both coordinators, so a session denied that way can
+  hold the file until its turn ends normally, when Claude Code's Stop hook
+  sends `session-stop`, or until the coordinator reclaims the grant.
 - **Send `session-stop` only when the work is done.** It releases every path
   the identity holds EXCLUSIVE or MODIFIED, not only the one in question, and
   leaves the identity a reader of each.
@@ -5258,7 +5470,10 @@ coordinator in these ways:
 
 - **Opted-in callers only.** The refusal protects a holder only from callers
   that also opt in: an ordinary pre-edit still displaces an opted-in holder,
-  and every Claude Code hook edit is an ordinary one.
+  and a Claude Code hook edit is an ordinary one unless it edits a strict-mode
+  path, its workspace turned on
+  [the hook client's refusal](#refusing-a-held-strict-file-in-claude-code-sessions),
+  and the session runs this package's hook client.
 - **Tracked paths only.** An opted-in request on an untracked path, presenting
   its principal on the Python coordinator, is admitted with `{"ok": true}` and
   no check, and so is one on a held path that was untracked afterwards; the
@@ -5317,11 +5532,15 @@ coordinator in these ways:
   writer is not refused and is outside that decision.
   On the Node coordinator they are one SQLite transaction, and the plugin runs
   one coordinator per workspace (see **On the Node coordinator**).
-- **A malformed subagent id is read as the parent.** An `agent_id` that is not
-  a string of 1 to 64 characters from `[A-Za-z0-9_-]` is read as no subagent
-  id, as on every hook route, so the request acts as the parent session. From
-  a session that holds the path, such a request is admitted as the holder's
-  own repeat.
+- **A malformed subagent id is read as the parent on an older coordinator.**
+  On this package's coordinator through 0.16.0, and the Node coordinator
+  through plugin 0.7.0, an `agent_id` that is not a string of 1 to 64
+  characters from `[A-Za-z0-9_-]` is read as no subagent id, as on every hook
+  route, so the request acts as the parent session. From a session that holds
+  the path, such a request is admitted as the holder's own repeat. A newer
+  coordinator refuses it with HTTP `400` instead (see **Who counts as another
+  agent**). A request that does not opt in still reads a malformed id as the
+  parent on every coordinator.
 - **The `handoff` key is read after the decision.** On a Python coordinator's
   refusal it is a best-effort read taken once the refusal is decided, so it
   can describe a later record than the one in force at the decision. Act on
@@ -5340,22 +5559,207 @@ coordinator in these ways:
   have left a grant behind, although the refusal landed nothing. When the
   deadline passes earlier, the work counts in `watchdog_late_aborts_total`
   instead.
-- A refused agent can still write the file with a shell command. On the
+- A refused agent can still write the file with a shell command
+  ([#516](https://github.com/Cohexa-ai/agent-coherence/issues/516)). On the
   Python coordinator the Bash hook refuses a shell write only from the giver of
   a live [handoff](#targeted-grant-handoff), so a write that goes around the
   Edit and Write tools is not refused here;
   [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)
   reports it afterwards. The Node coordinator has neither handoffs nor
   foreign-write detection, so neither applies there.
-- The Claude Code hooks do not opt in, so a Claude Code edit is never refused
-  this way. A new kind of deny on the edit path is shown to the model and
-  changes how it retries, so the change that adds one to the hooks needs its
-  own measurement of that before it ships.
+- The Claude Code hooks opt in only behind a workspace setting that is off by
+  default, and only in this package's hook client (see
+  [Refusing a held strict file in Claude Code sessions](#refusing-a-held-strict-file-in-claude-code-sessions)).
+  A new kind of deny on the edit path is shown to the model and changes how it
+  retries, and this one is not yet measured with real Claude Code sessions, so
+  it stays off by default until it is. A session that read the file and was
+  refused is denied once more after the holder commits, and its next Read of
+  the file is admitted
+  ([#514](https://github.com/Cohexa-ai/agent-coherence/issues/514); see
+  [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)).
 - On the Python coordinator's hook surface, any process that can read
   `.coherence/` can read another session's principal. The refusal separates
   writers that follow the protocol; it does not stop one that deliberately
   uses another's principal. The Node coordinator checks no principal at all
   (see **On the Node coordinator**).
+
+### Refusing a held strict file in Claude Code sessions
+
+By default a Claude Code edit sends an ordinary `pre-edit`: an edit of a file
+another agent holds is admitted with a "Concurrent edit detected" note, it
+lands, and the holder's grant goes INVALID. A workspace can have this package's
+hook client opt in to acquire-or-fail on edits of its strict-mode paths
+instead, so that such an edit is denied. This is off by default. With it off,
+and in a workspace with no strict-mode entries, every hook sends the same
+requests and prints the same output as before, apart from the one stderr line
+an unknown setting value prints (see **The setting** below). Turn it on from
+the workspace root:
+
+```bash
+echo refuse > .coherence/hook_on_held
+```
+
+Remove the file, or write `displace` to it, to turn it off again. How models
+respond to this deny is not yet measured with real Claude Code sessions, and it
+stays off by default until it is; read **What it does not cover** below before
+you turn it on.
+
+**The setting.** The client reads `.coherence/hook_on_held` on every
+`pre-edit`, so a change applies from the next edit, with nothing to restart.
+Its content, with at most one trailing newline removed, must be exactly
+`refuse` to turn the refusal on. No file, an empty file and `displace` leave it
+off. Any other value, `Refuse`, ` refuse` and `refuse` with a Windows line
+ending included, leaves it off too, and each `pre-edit` then prints one line on
+stderr:
+
+```text
+agent-coherence-hook-client: .coherence/hook_on_held holds neither refuse nor displace, so edits of held strict files are not refused
+```
+
+A setting file that is a symbolic link or not a regular file, and a
+`.coherence` that is a link, read as off. The hook exits `0` either way, and
+Claude Code does not show the model the stderr of a hook that exits `0`.
+
+**Which sessions it reaches.** Only this package's hook client,
+`agent-coherence-hook-client`, reads the setting. The Claude Code plugin's
+hooks run its `bin/hook-client`, which runs the plugin's Node hook client
+whenever `node` is on PATH and a built Node client exists, falls back to
+`agent-coherence-hook-client` when either is missing, and prints `{}` when
+neither client can run. The Node hook client does not read the setting, so
+most plugin installs keep today's behaviour with it on, until the Node client
+follows: a session that runs the Node client displaces a hold as before.
+
+**What a strict edit does with it on.** Only a `pre-edit`, from an Edit or a
+Write, opts in; every other hook event sends what it sent before. The client:
+
+1. checks the path against the workspace's strict-mode entries under each fold
+   profile, before it asks the coordinator anything. A path strict under none
+   of them goes on as before.
+2. finds the coordinator and reads `GET /status?detail=metrics`, one more
+   request for each strict edit. A coordinator whose answer lacks
+   `pre_edit_if_unheld: true` may ignore the flag, so the edit gets the
+   ordinary `pre-edit` it got before, and the client prints one line on
+   stderr:
+
+   ```text
+   agent-coherence-hook-client: the coordinator does not say it refuses edits of held files, so this edit of a strict file was not checked for another holder
+   ```
+
+3. checks the path again under the `fold_profile` in that answer, as the
+   coordinator keys it (see [One file, many spellings](#one-file-many-spellings)).
+   An absent `fold_profile`, or `cannot_tell`, is read as `none`, and a
+   profile the client does not know counts as strict. A path that is not
+   strict there goes on as before.
+4. checks the subagent id (see **Subagent ids** below), then sends the
+   `pre-edit` with `"if_unheld": true` and turns the answer into what Claude
+   Code gets:
+
+| The coordinator's answer | What Claude Code gets |
+|---|---|
+| HTTP 2xx with `ok: true` and no `degraded` or `collision` key | that answer, as before: the edit goes ahead |
+| a deny the coordinator wrote, with `permissionDecision: "deny"` in `hookSpecificOutput`: the strict-mode stale deny, or the giver's `handed_off` deny (see [The giver's fence](#the-givers-fence)) | that answer, unchanged |
+| `other_holder`, naming as the holder the session that started the subagent that sent the edit | the parent deny below |
+| `other_holder`, naming any other holder in its 32-hex spelling | the holder deny below |
+| anything else: `unavailable`, an `internal:` failure, any other `ok: false`, `degraded` or `collision` beside `ok: true`, `other_holder` without a 32-hex holder, a non-2xx status (the malformed-id `400` and a caller-principal refusal the client cannot recover included), a body that is not JSON, or no answer | the unavailable deny below |
+
+**The three denies.** Each reaches the model as the deny's reason, with
+`{path}` the workspace-relative path. When another agent holds the file, with
+`{holder}` the first eight characters of the holder's agent id, never a session
+id:
+
+```text
+Edit denied: {path} is held by agent {holder}. It comes free when that agent lets go of it, or after 10 to 30 minutes. Do not retry now: do other work that does not need {path}, or stop and tell your user. If you hold {path} yourself through another tool, such as an MCP server, release it there first.
+```
+
+The window is the reclaim's: by default this package's coordinator reclaims a
+holder that goes quiet after about 10 minutes, and either coordinator reclaims
+any holder after about 30, the Node coordinator when an opted-in request asks
+for the file (see **When the path comes free** above). The last
+sentence is there because a hold the session took through another client, such
+as the MCP server, is another agent to the coordinator, so a session can be
+refused by its own hold.
+
+When a subagent is refused by the hold of the session that started it, which
+is waiting on the subagent and so does not let go while the subagent runs:
+
+```text
+Edit denied: {path} is held by the session that started you. Do not wait for it: finish without this change and report the change you wanted to make back to that session.
+```
+
+Only a subagent refused by its own parent gets this one: a parent refused by
+its own subagent's hold, and a subagent refused by a sibling's, get the holder
+deny. For every other answer, and when the coordinator does not answer:
+
+```text
+Edit denied: the coordinator could not confirm that no other agent holds {path}. Try the edit once more; if it is denied again, stop and tell your user.
+```
+
+It never says the edit took nothing, because a timed-out request was measured
+landing late on both coordinators. None of the three names the setting, a
+command or a shell route: a refusal that hands the model a way around it
+invites the model to take it.
+
+**When the coordinator does not answer.** The client finds the coordinator
+through `.coherence/server.pid` and its secret in `.coherence/hook.secret`.
+When no port is known, because there is no `server.pid` or it has no port
+line, as a clean stop leaves it, the edit is admitted as before: no coordinator
+is known that could hold the file. A coordinator that is just starting can
+leave `server.pid` without a port line for a moment, so an edit in that moment
+is admitted too.
+Every other failure denies the edit with the unavailable deny: a port that does
+not answer, a coordinator that has died while its pid file still names it (see
+[A client sends nothing to a coordinator that exited](#a-client-sends-nothing-to-a-coordinator-that-exited)),
+a malformed answer, a non-2xx answer to the `/status` read, and any other
+failure to read `server.pid` or `hook.secret`. Once the client has opted in, no
+failure prints `{}`. Each unanswered request costs the client's 6-second
+timeout, and the client reads `/status` before it sends the edit, so a
+coordinator that does not answer costs it once.
+
+**Subagent ids.** Before it sends an opted-in edit, the client checks a
+present subagent id, `agent_id`, or `agentId` when `agent_id` is absent,
+against the coordinator's grammar: 1 to 64 characters of `[A-Za-z0-9_-]`. It
+denies a malformed one with the unavailable deny and sends nothing: a
+coordinator that reads such an id as the parent session would admit the
+subagent as the parent's own repeat, over the parent's hold. An empty or `null`
+id is the parent session, as on every route. A coordinator from 0.16.1,
+and the Node coordinator from plugin 0.7.1, refuse such a request
+with HTTP `400` themselves (see **Who counts as another agent**); against this
+package's 0.16.0 coordinator or the Node coordinator of plugin 0.7.0, the
+client's check is the only guard.
+
+**No release after the unavailable deny.** The client sends no release after
+it, so a request that landed late leaves the session holding the file until
+its turn ends normally or the coordinator reclaims the grant; **Client rules**
+above says why.
+
+**What it does not cover.** The limits under **What it does not close** above
+apply, and:
+
+- **A refused session that read the file is denied once more after the holder
+  commits ([#514](https://github.com/Cohexa-ai/agent-coherence/issues/514)).**
+  A session that read the file, was refused, and then saw the holder commit
+  has a stale copy, so its next Read or Edit of the file is denied. Its next
+  Read after that deny is admitted at the holder's version, and its edits are
+  admitted after it (see
+  [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)). This
+  package's coordinator from 0.16.1 and the Node coordinator from plugin 0.7.1 do this; on earlier coordinators the session stays
+  denied on Read and Edit of that file for the rest of the session.
+- **Shell writes still land
+  ([#516](https://github.com/Cohexa-ai/agent-coherence/issues/516)).** A
+  refused session can write the file with a shell command; the deny does not
+  stop that.
+- **A model can turn it off.** The setting is a file in the workspace, so a
+  session that can write files there can remove it, and as easily drop the
+  path from `.coherence/strict_mode.yaml`. The deny names neither (see
+  [Who the coordinator can tell apart](security.md#who-the-coordinator-can-tell-apart)).
+- **Claude Code sessions only.** An ordinary `pre-edit` from any other client,
+  a session that runs the plugin's Node hook client included, still displaces
+  a hold a refusing session took, and an agent in another host is refused only
+  through a client that opts in itself, such as a refuse-mode `CoherentVolume`
+  or MCP server.
+- **A subagent id outside the grammar denies every strict edit.** With the
+  setting on, a subagent whose id is not 1 to 64 characters of
+  `[A-Za-z0-9_-]` is denied each edit the client would opt in on.
 
 ## `stale-write-guard-fs` MCP server
 
@@ -5421,7 +5825,9 @@ other value, `Refuse` included, stops the server before anything starts, with
 one line on stderr naming the accepted values and exit code `2`. `swg_status`
 reports the mode as `on_held`. A hold is honoured only among opted-in writers,
 such as other refuse-mode servers and refuse-mode volumes: the Claude Code
-hooks, displace-mode servers and older volumes take the file anyway, and the
+hooks by default (see
+[Refusing a held strict file in Claude Code sessions](#refusing-a-held-strict-file-in-claude-code-sessions)),
+displace-mode servers and older volumes take the file anyway, and the
 holder then meets `stale_view` at its next `swg_write`. A hold is not a lock.
 A write of a path outside `SWG_MANAGED` asks nothing and takes the file; on a
 refuse-mode server every successful `swg_write` carries `opted_in`, `true` when
@@ -5645,6 +6051,18 @@ and exits `2`; nothing is written. Fix `.coherence` (see
 and start the server again. No tool call carries this refusal: the server's
 tools answer only from an attached volume, so a detached one answers
 `coordinator_unavailable` as it does for any unattached volume.
+
+**A policy file the start cannot use.** When no coordinator runs, the server's
+volume merges its globs into `.coherence/tracked.yaml` and
+`.coherence/strict_mode.yaml` before it starts one (see **Policy files** under
+[Status, track and untrack commands](#status-track-and-untrack-commands)). When
+it cannot load one of those files, finds a lock file beside one that is not a
+regular file, or fails to write one, the server refuses to start before it
+serves. After any lines its start-up logged, stderr carries one line:
+`stale-write-guard-fs:`, the workspace root, and what failed, naming the file,
+with control characters escaped; a failed write also says which file, if any,
+was already written. The server exits `2`, with no traceback and nothing on
+stdout. Fix the named file, or free the disk, and start the server again.
 
 **A coordinator that fails while answering.** When the coordinator answers a
 read with its `internal:` failure envelope ([details](#when-the-coordinator-answers-with-a-failure)),
@@ -6151,9 +6569,12 @@ no commit of its own to explain them, is told so:
   than the last session that committed. It tells the session not to restore or
   overwrite the file, since the change may be its user's work, and to tell its
   user: the read stays denied until the change is committed through the
-  coordinator. A session whose grant another session's `pre-edit` revoked is
-  not told this; that writer went through the coordinator, and the deny says
-  the grant was revoked, as before;
+  coordinator. A session whose grant another session's `pre-edit` revoked
+  holds no valid grant, so it gets the stale-copy denies instead: the deny
+  says the grant was revoked while the file still holds the recorded bytes,
+  and once that session's uncommitted bytes are on disk, it says that session
+  is writing the file and to read it again after the write is committed (see
+  [After a strict-mode stale deny](#after-a-strict-mode-stale-deny));
 - its `pre-edit` reads the file itself and, when it no longer holds the recorded
   content, adds `"disk_differs": true` and the same sentence. It skips the check
   while another session holds a write it has not committed and was active in
@@ -6551,18 +6972,50 @@ file it names is not read. Both coordinators do this, the plugin's Node
 coordinator in plugin releases after 0.6.0. On the Python coordinator, a link
 at the lock file beside a policy file answers HTTP 400 with
 `.coherence/tracked.yaml.lock is a symlink; nothing was written. Remove the link.`
-A FIFO, socket or device there answers HTTP 400 with
+A directory, FIFO, socket or device there answers HTTP 400 with
 `.coherence/tracked.yaml.lock could not be read (not a regular file); nothing was written.`
 
 A `CoherentVolume` or substrate session about to start the coordinator merges
 its managed globs into `tracked.yaml` and `strict_mode.yaml`, and treats a file
-that cannot be read, is not valid YAML or is not a list the same way: it names
-the file, writes neither one, and starts no coordinator. A strict volume or a
-session raises `CoherenceError` with that text, after the workspace root. A
-volume in degrade mode warns and stays detached, so build a new one once the
-file is fixed. A policy file that is a link never reaches the merge: the
-volume or session runs a start's own check first and refuses it with
-`CoherenceDirRefused`.
+that cannot be read, is not valid YAML or is not a list the same way the routes
+do: it names the file, writes neither one, and starts no coordinator. It reads
+both files first, without a lock: when one cannot be loaded, or both already
+list the globs, it stops there, having locked and created nothing. Otherwise
+it locks `tracked.yaml.lock`, the lock the Python coordinator's track takes,
+then `strict_mode.yaml.lock`, which it creates beside `strict_mode.yaml` and
+leaves there, waiting with no time limit while a track or another start holds
+either.
+Under the locks it reads both files again, prepares the new content of each,
+and only then replaces `tracked.yaml`, then `strict_mode.yaml`. The read under
+the locks decides what is written, so a track that lands meanwhile keeps its
+entry, and a failure before the first replace leaves both files as they were.
+A policy file that is a link never reaches the merge: the volume or session
+runs a start's own check first and refuses it with `CoherenceDirRefused`.
+
+Every other problem the merge meets is one refusal, `PolicyFileRefused`, a
+`CoherenceError` from `ccs.core.exceptions` whose `reason` is
+`policy_file_refused`. Its `kind` says which step refused, collected in
+`POLICY_FILE_REFUSAL_KINDS`: `policy_file_unloadable` for a policy file it
+cannot load, with the routes' text; `policy_lock_not_regular` for a lock file
+that is not a regular file, such as a directory, with the routes' 400 text; and
+`policy_write_failed` when creating `.coherence` or a lock file, locking one, or
+writing a policy file fails, on a full or read-only disk, say. Its `path` is the
+absolute path of the file concerned. The text is the workspace root, a colon,
+and what failed. A failed write names the step and the error, and which policy
+file was already replaced, if any:
+
+```text
+/work/repo: .coherence/strict_mode.yaml could not be written (ENOSPC); .coherence/tracked.yaml was written and .coherence/strict_mode.yaml was not.
+```
+
+After that failure the globs are tracked but not strict; a volume or session
+that starts the coordinator after the fix merges `strict_mode.yaml` again.
+`PolicyFileRefused` is not a `CoordinatorUnreachable`: no retry clears it, so
+fix the named file, or free the disk, first. A strict volume or a session
+raises it and starts no coordinator. A volume in degrade mode warns once with
+the same text, its control characters escaped, and
+`This volume stays detached: build a new one once the file is fixed.`, and
+stays detached. Branch on `reason` and `kind`, not on the text.
 
 Releases up to 0.14.1 wrote entries without quotes. An entry starting with
 `*`, `[`, `{`, `!`, `&`, `%`, `@`, `|`, `>` or a quote, written by one of them,

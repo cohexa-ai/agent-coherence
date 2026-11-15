@@ -45,6 +45,7 @@ from ccs.core.exceptions import (
     CoherenceDirRefused,
     CoherenceError,
     HandoffPathsInvalid,
+    PolicyFileRefused,
     RefuseModeUnsupported,
 )
 from ccs.mcp.deny import (
@@ -1067,15 +1068,23 @@ _REFUSE_MODE_FIX = (
 
 
 def _serve_or_exit(server: FastMCP) -> None:
-    """Serve over stdio. A refuse-mode start the coordinator cannot honour,
-    raised by the lifespan's attach before anything is served, ends on one
-    stderr line and exit 2, as a refused ``.coherence`` does."""
+    """Serve over stdio. Two refusals the lifespan's attach raises before
+    anything is served end on one stderr line and exit 2, as a refused
+    ``.coherence`` does: a refuse-mode start the coordinator cannot honour,
+    and a policy file the start cannot load, lock or write (#499), whose text
+    names the workspace and the file."""
     try:
         server.run(transport="stdio")
     except* RefuseModeUnsupported as refused:
         # The volume's reason can quote what the coordinator answered.
         reason = escape_nonprintable(str(refused.exceptions[0]))
         err(f"{SERVER_NAME}: refusing to start with SWG_ON_HELD=refuse: {reason} {_REFUSE_MODE_FIX}")
+        raise SystemExit(2) from None
+    except* PolicyFileRefused as refused:
+        # The workspace path in this text can hold any character, and a host
+        # runs the server unattended: escaped, it cannot drive a terminal or
+        # split a log line.
+        err(f"{SERVER_NAME}: {escape_nonprintable(str(refused.exceptions[0]))}")
         raise SystemExit(2) from None
 
 

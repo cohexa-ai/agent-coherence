@@ -1,0 +1,100 @@
+{
+  "name": "pre-read-with-verify-only-false-after-a-stale-deny-stays-denied",
+  "description": "#514: whether a pre-read is a Claude Code hook Read is decided by the presence of `want_owner_generation`, `verify_only` or `name_kind`, whatever the value. Sessions A and B read v1 and B commits v2, which makes A's copy INVALID; A's Read of the v2 bytes B committed is denied with the commit text (fixture 01). A's next read of the same bytes carries `\"verify_only\": false`: it is denied with the same commit text, as with `true` (fixture 40), because the field is present. A rule that read the value instead would take it for a hook Read and admit it.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "strict_mode": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\nv1 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "CLAUDE.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "CLAUDE.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "CLAUDE.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "CLAUDE.md",
+          "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f",
+          "success": true
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "CLAUDE.md",
+          "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "CLAUDE.md",
+      "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f",
+      "verify_only": false
+    }
+  },
+  "ignore_keys": [
+    "last_writer_at_unix_ts",
+    "warning_generated_at_unix_ts"
+  ],
+  "expected": {
+    "status": 200,
+    "body": {
+      "hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "Stale read denied: CLAUDE.md was updated by agent 814dac78 at <TS>. Read CLAUDE.md again with the Read tool: the next Read returns the current version, and edits of CLAUDE.md are denied until you have read it."
+      },
+      "status": "stale",
+      "summary": {
+        "path": "CLAUDE.md",
+        "current_version": 2,
+        "prior_version_seen_by_session": 1,
+        "last_writer_session_id": "814dac789b8f560d9236b12165a0b50d",
+        "last_writer_at_unix_ts": 0,
+        "warning_generated_at_unix_ts": 0,
+        "hash_differs": false
+      }
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

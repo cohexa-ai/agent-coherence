@@ -1,6 +1,6 @@
 {
   "name": "strict-deny-does-not-carry-reground",
-  "description": "SB-10 U4/U8 non-carriage on deny (AE3/KTD-P): with the compact-pending flag armed, a strict-mode stale-read deny must stay byte-identical to the flagless deny — no additionalContext key appears, and the flag is neither consumed nor attached. Setup mirrors strict_mode/01 exactly (A and B read v1, B commits v2 invalidating A), plus one extra preflight: A's session-start builds a non-empty payload (A is INVALID with recorded last-observed v1 behind current v2) and arms the flag. The test request is A's stale re-read on the strict artifact — the deny body below is byte-for-byte the strict_mode/01 expected body.",
+  "description": "SB-10 U4/U8 non-carriage on deny (AE3/KTD-P): with the compact-pending flag armed, a strict-mode stale-read deny must stay byte-identical to the flagless deny — no additionalContext key appears, and the flag is neither consumed nor attached. Setup mirrors strict_mode/01 exactly (A and B read v1, B commits v2 invalidating A), plus one extra preflight: A's session-start builds a non-empty payload (A is INVALID with recorded last-observed v1 behind current v2) and arms the flag. The test request is A's stale re-read of the v2 bytes on the strict artifact — the deny body below is byte-for-byte the strict_mode/01 expected body.",
   "setup": {
     "tracked": [
       "CLAUDE.md"
@@ -63,7 +63,7 @@
     "body": {
       "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
       "path": "CLAUDE.md",
-      "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+      "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f"
     }
   },
   "ignore_keys": [
@@ -75,7 +75,7 @@
       "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": "Stale read denied: CLAUDE.md was updated by agent 814dac78 at <TS>. Re-read CLAUDE.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+        "permissionDecisionReason": "Stale read denied: CLAUDE.md was updated by agent 814dac78 at <TS>. Read CLAUDE.md again with the Read tool: the next Read returns the current version, and edits of CLAUDE.md are denied until you have read it."
       },
       "status": "stale",
       "summary": "<IGNORED>"

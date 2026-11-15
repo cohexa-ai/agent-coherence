@@ -47,7 +47,11 @@ import pytest
 import ccs
 from ccs.adapters import coherent_volume
 from ccs.adapters.claude_code import lifecycle
-from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer, session_to_agent_id
+from ccs.adapters.claude_code.coordinator_server import (
+    CoordinatorHTTPServer,
+    session_to_agent_id,
+    write_start_policy,
+)
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
     ensure_coordinator,
@@ -57,7 +61,6 @@ from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.adapters.substrate import (
     CoordinatedSubstrate,
     SubstrateCoordinatorSession,
-    _write_strict_policy,
 )
 from ccs.cli._coherence_client import (
     CoordinatorEndpoint,
@@ -729,7 +732,7 @@ def launched_coordinator(tmp_path: Path) -> Iterator[_LaunchedCoordinator]:
     (root / ".git").mkdir()
     (root / _KILL_FILE).parent.mkdir(parents=True)
     (root / _KILL_FILE).write_text("seed\n")
-    _write_strict_policy(root / ".coherence", _KILL_MANAGED)
+    write_start_policy(root, _KILL_MANAGED)
     launched: _LaunchedCoordinator | None = None
     try:
         launched = _launch_coordinator(root)

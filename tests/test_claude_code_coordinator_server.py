@@ -9,11 +9,14 @@ per-invocation warning-template variation.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import errno
 import hashlib
 import json
 import logging
 import os
+import pickle
 import sqlite3
 import statistics
 import sys
@@ -39,17 +42,21 @@ from ccs.adapters.claude_code.coordinator_server import (
     _is_recent_self_commit_lag,
     caller_principal_identity,
     decide_tracked_read,
+    merge_policy_globs,
     session_to_agent_id,
+    write_start_policy,
 )
 from ccs.adapters.claude_code.fs_profile import FoldProfileResult
 from ccs.coordinator.service import ReleaseRequest
 from ccs.core.exceptions import (
     COHERENCE_LINK_KIND,
     HOLD_REASONS,
+    POLICY_FILE_REFUSED_REASON,
     UNAVAILABLE_REASON,
     CoherenceDirRefused,
     CoherenceError,
     InvariantViolationError,
+    PolicyFileRefused,
     StaleReadGeneration,
 )
 from ccs.core.states import MESIState
@@ -1123,6 +1130,104 @@ def test_a_policy_route_refuses_a_fifo_lock_sidecar_made_after_the_start(
     })]
     assert target_snapshot(coherence_dir / file_name) == policy_before
     assert "ok.md" not in getattr(coordinator.policy, loaded_as)
+
+
+def _plant_directory_or_socket(
+    path: Path, shape: str, monkeypatch: pytest.MonkeyPatch, cleanup: contextlib.ExitStack,
+) -> None:
+    """Put an empty directory or a bound unix socket at ``path``. The socket
+    closes when ``cleanup`` does."""
+    if shape == "directory":
+        path.mkdir()
+        return
+    import socket
+
+    monkeypatch.chdir(path.parent)  # AF_UNIX paths are ~104 bytes; bind relatively
+    sock = cleanup.enter_context(socket.socket(socket.AF_UNIX))
+    sock.bind(path.name)
+
+
+@pytest.mark.parametrize("shape", ["directory", "socket"])
+@pytest.mark.parametrize(("endpoint", "file_name", "answer_key", "loaded_as"), _POLICY_FILES)
+def test_a_policy_route_refuses_a_directory_or_socket_at_its_lock_sidecar(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, endpoint: str,
+    file_name: str, answer_key: str, loaded_as: str, shape: str,
+) -> None:
+    """#534: a directory or socket put at the ``<name>.lock`` sidecar while the
+    coordinator runs fails the lock's open before its regular-file check (EISDIR
+    for a directory; EOPNOTSUPP or ENXIO for a socket). The route answers the 400
+    a FIFO there gets, naming the sidecar, and writes nothing.
+
+    Prevents a server error with nothing named. The request runs on a thread
+    with a deadline, so a regression fails here instead of hanging the run."""
+    coherence_dir = coordinator.coordinator_root / ".coherence"
+    policy_before = target_snapshot(coherence_dir / file_name)
+    lock = coherence_dir / f"{file_name}.lock"
+    lock.unlink(missing_ok=True)
+    answers: list[tuple[int, dict]] = []
+    with contextlib.ExitStack() as cleanup:
+        _plant_directory_or_socket(lock, shape, monkeypatch, cleanup)
+        lock_before = target_snapshot(lock)
+        worker = threading.Thread(
+            target=lambda: answers.append(client.post(endpoint, {"paths": ["ok.md"]})), daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=30)
+        assert not worker.is_alive(), "the route blocked on its lock sidecar"
+        assert target_snapshot(lock) == lock_before
+
+    assert answers == [(400, {
+        "error": f".coherence/{file_name}.lock could not be read (not a regular file); nothing was written.",
+    })]
+    assert target_snapshot(coherence_dir / file_name) == policy_before
+    assert "ok.md" not in getattr(coordinator.policy, loaded_as)
+
+
+@pytest.mark.parametrize(("endpoint", "file_name", "answer_key", "loaded_as"), _POLICY_FILES)
+def test_a_policy_route_without_fcntl_adds_its_entry_and_creates_no_lock_file(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch, endpoint: str,
+    file_name: str, answer_key: str, loaded_as: str,
+) -> None:
+    """A platform with no ``fcntl`` writes the entry without a lock, as before.
+
+    Prevents the route failing there, or leaving a ``<name>.lock`` it never locked."""
+    lock = coordinator.coordinator_root / ".coherence" / f"{file_name}.lock"
+    lock.unlink(missing_ok=True)
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+
+    s, b = client.post(endpoint, {"paths": ["ok.md"]})
+
+    assert (s, b) == (200, {"ok": True, answer_key: ["ok.md"], "rejected": []})
+    assert "ok.md" in getattr(coordinator.policy, loaded_as)
+    assert not os.path.lexists(lock)
+
+
+@pytest.mark.parametrize(("content", "status"), [
+    ("- runbook.md\n", 200),
+    ("- runbook.md\n- *.md\n", 400),
+])
+@pytest.mark.parametrize(("endpoint", "file_name", "answer_key", "loaded_as"), _POLICY_FILES)
+def test_a_policy_route_frees_its_lock_before_it_answers(
+    coordinator, client: _Client, endpoint: str, file_name: str, answer_key: str,
+    loaded_as: str, content: str, status: int,
+) -> None:
+    """A route frees its ``<name>.lock`` before it answers, whether it wrote the
+    entry or refused the file under the lock.
+
+    Prevents a held lock blocking every later track, untrack and start merge."""
+    import fcntl
+
+    coherence_dir = coordinator.coordinator_root / ".coherence"
+    (coherence_dir / file_name).write_text(content)
+
+    s, b = client.post(endpoint, {"paths": ["ok.md"]})
+
+    assert s == status, b
+    fd = os.open(coherence_dir / f"{file_name}.lock", os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
 
 
 def test_a_policy_route_over_a_fifo_made_after_the_start_answers_at_once(
@@ -4094,7 +4199,7 @@ def test_merge_policy_globs_adds_to_a_file_that_loads(
     merge_policy_globs((tracked,), ("data/**",))
 
     assert yaml.safe_load(tracked.read_text()) == after
-    assert [path.name for path in tmp_path.iterdir()] == ["tracked.yaml"]
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["tracked.yaml", "tracked.yaml.lock"]
 
 
 def test_merge_policy_globs_leaves_a_file_that_already_holds_the_globs(tmp_path: Path) -> None:
@@ -4161,6 +4266,961 @@ def test_a_policy_write_that_fails_leaves_the_file_whole(
     assert sorted(p.name for p in policy_file.parent.iterdir()) == [
         "tracked.yaml", "tracked.yaml.lock",
     ]
+
+
+# ----------------------------------------------------------------------
+# The start's policy merge takes the routes' locks (#499)
+# ----------------------------------------------------------------------
+
+
+def _hold_policy_lock(yaml_path: Path) -> int:
+    """Hold ``<yaml_path>.lock`` the way a route does, through a descriptor of
+    this test's own. Closing the descriptor frees the lock."""
+    import fcntl
+
+    fd = os.open(f"{yaml_path}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+def _merge_on_a_thread(
+    yaml_paths: tuple[Path, ...], globs: tuple[str, ...],
+) -> tuple[threading.Thread, list[BaseException]]:
+    """Start the merge on a daemon thread; what it raises lands in the list."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+
+    raised: list[BaseException] = []
+
+    def merge() -> None:
+        try:
+            merge_policy_globs(yaml_paths, globs)
+        except BaseException as exc:
+            raised.append(exc)
+
+    worker = threading.Thread(target=merge, daemon=True)
+    worker.start()
+    return worker, raised
+
+
+def _assert_policy_locks_free(*yaml_paths: Path) -> None:
+    """Each ``<name>.lock`` takes a non-blocking exclusive lock now."""
+    import fcntl
+
+    for yaml_path in yaml_paths:
+        fd = os.open(f"{yaml_path}.lock", os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+
+
+def _two_policy_files(tmp_path: Path, content: str = '- "docs/**"\n') -> tuple[Path, Path]:
+    """``.coherence/tracked.yaml`` and ``.coherence/strict_mode.yaml``, each
+    holding ``content``."""
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked, strict = coherence / "tracked.yaml", coherence / "strict_mode.yaml"
+    tracked.write_text(content)
+    strict.write_text(content)
+    return tracked, strict
+
+
+def test_merge_policy_globs_waits_for_a_held_lock_and_keeps_the_entry_written_under_it(
+    tmp_path: Path,
+) -> None:
+    """#499: a ``/policy/track`` holds ``tracked.yaml.lock`` and has read the
+    file when a volume or session starts its merge. The merge waits for the
+    lock, reads the file again under it, and the file afterwards holds the
+    route's entry and the managed globs.
+
+    Prevents a lost update: a merge that does not wait, or that decides its
+    write from the read it took before the lock, replaces the file without one
+    of the two. Every wait is bounded, so a regression fails here instead of
+    hanging."""
+    tracked, strict = _two_policy_files(tmp_path)
+    held = _hold_policy_lock(tracked)
+    try:
+        read_under_the_lock = tracked.read_text()
+        worker, raised = _merge_on_a_thread((tracked, strict), ("data/**",))
+        worker.join(timeout=0.5)
+        waited_for_the_lock = worker.is_alive()
+        tracked.write_text(read_under_the_lock + '- "route.md"\n')
+    finally:
+        os.close(held)
+    worker.join(timeout=30)
+
+    assert not worker.is_alive(), "the merge never took the lock"
+    assert raised == []
+    assert yaml.safe_load(tracked.read_text()) == ["data/**", "docs/**", "route.md"]
+    assert yaml.safe_load(strict.read_text()) == ["data/**", "docs/**"]
+    assert waited_for_the_lock, "the merge wrote while a route held the lock"
+
+
+def test_merge_policy_globs_waits_for_a_held_strict_mode_lock_and_keeps_its_entry(
+    tmp_path: Path,
+) -> None:
+    """#499: another start holds ``strict_mode.yaml.lock`` and has read
+    ``strict_mode.yaml`` when this start's merge begins. No route writes that
+    file, so another start's merge is the only writer this lock excludes. The
+    merge waits for it, reads the file again under it, and the file afterwards
+    holds both starts' globs.
+
+    Prevents a merge that locks only ``tracked.yaml``: two starts would then
+    lose each other's strict globs, and the glob one of them lost would be
+    tracked but not enforced."""
+    tracked, strict = _two_policy_files(tmp_path)
+    held = _hold_policy_lock(strict)
+    try:
+        read_under_the_lock = strict.read_text()
+        worker, raised = _merge_on_a_thread((tracked, strict), ("data/**",))
+        worker.join(timeout=0.5)
+        waited_for_the_lock = worker.is_alive()
+        strict.write_text(read_under_the_lock + '- "other-start/**"\n')
+    finally:
+        os.close(held)
+    worker.join(timeout=30)
+
+    assert not worker.is_alive(), "the merge never took the lock"
+    assert raised == []
+    assert yaml.safe_load(strict.read_text()) == ["data/**", "docs/**", "other-start/**"]
+    assert yaml.safe_load(tracked.read_text()) == ["data/**", "docs/**"]
+    assert waited_for_the_lock, "the merge wrote while another start held the strict lock"
+
+
+def test_merge_policy_globs_writes_whole_files_when_each_write_takes_a_few_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#499: a write to a file may take fewer bytes than it was given. The
+    merge keeps writing each temp file until all of it is written, so both
+    policy files come out whole.
+
+    Prevents a single write that replaces a policy file with the first few
+    bytes of its new content, which loads as a different list or not at all."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+
+    tracked, strict = _two_policy_files(tmp_path)
+    real_write = os.write
+
+    def three_bytes_at_a_time(fd: int, data: bytes) -> int:
+        # Leave the test runner's own stdout and stderr whole.
+        return real_write(fd, data[:3] if fd > 2 else data)
+
+    monkeypatch.setattr(os, "write", three_bytes_at_a_time)
+    merge_policy_globs((tracked, strict), ("data/**",))
+    monkeypatch.undo()
+
+    assert yaml.safe_load(tracked.read_text()) == ["data/**", "docs/**"]
+    assert yaml.safe_load(strict.read_text()) == ["data/**", "docs/**"]
+
+
+def test_a_policy_track_waits_for_a_merge_that_holds_the_lock_and_both_entries_land(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#499: a volume's or session's merge holds ``tracked.yaml.lock`` while it
+    replaces the file, so a ``/policy/track`` arriving then waits for it, and
+    the file afterwards holds the merge's globs and the route's entry.
+
+    Prevents the route's read-modify-write interleaving with the merge's, which
+    lost whichever wrote first. The merge pauses inside its replace until the
+    test releases it; every wait is bounded."""
+    coherence = coordinator.coordinator_root / ".coherence"
+    tracked, strict = coherence / "tracked.yaml", coherence / "strict_mode.yaml"
+    committing, release = threading.Event(), threading.Event()
+    real_replace = os.replace
+
+    def paused_replace(src: Any, dst: Any) -> None:
+        if Path(dst) == tracked and not committing.is_set():
+            committing.set()
+            release.wait(timeout=30)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", paused_replace)
+    answers: list[tuple[int, dict]] = []
+    route = threading.Thread(
+        target=lambda: answers.append(client.post("/policy/track", {"paths": ["route.md"]})),
+        daemon=True,
+    )
+    merge, raised = _merge_on_a_thread((tracked, strict), ("data/**",))
+    try:
+        assert committing.wait(timeout=30), "the merge never replaced tracked.yaml"
+        route.start()
+        route.join(timeout=0.5)
+        route_waited = route.is_alive()
+    finally:
+        release.set()
+    merge.join(timeout=30)
+    route.join(timeout=30)
+
+    assert not merge.is_alive() and not route.is_alive(), "a writer never finished"
+    assert raised == []
+    assert answers == [(200, {"ok": True, "added": ["route.md"], "rejected": []})]
+    assert {"data/**", "route.md"} <= set(yaml.safe_load(tracked.read_text()))
+    assert route_waited, "the route wrote while the merge held the lock"
+
+
+def _fail_temp_writes(monkeypatch: pytest.MonkeyPatch, prefix: str, error: BaseException) -> None:
+    """Make every write to a ``<prefix>*.tmp`` file raise ``error`` once the
+    file was created, as a disk that fills up mid-write does."""
+    real_open, real_write = os.open, os.write
+    doomed: set[int] = set()
+
+    def tracking_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        fd = real_open(path, flags, *args, **kwargs)
+        name = os.path.basename(os.fspath(path))
+        if name.startswith(prefix) and name.endswith(".tmp"):
+            doomed.add(fd)
+        else:
+            doomed.discard(fd)
+        return fd
+
+    def failing_write(fd: int, data: Any) -> int:
+        if fd in doomed:
+            raise error
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "write", failing_write)
+
+
+def _temp_files(directory: Path) -> list[str]:
+    return sorted(path.name for path in directory.iterdir() if path.name.endswith(".tmp"))
+
+
+def test_merge_policy_globs_writes_neither_file_when_preparing_the_second_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#499: the merge prepares every file before it replaces any. Writing the
+    ``strict_mode.yaml`` temp fails (a full disk), so neither file changes, no
+    temp file is left, both locks are free, and the failure names
+    ``strict_mode.yaml`` and says nothing was written.
+
+    Prevents a failed second write leaving the globs tracked but not strict."""
+    tracked, strict = _two_policy_files(tmp_path)
+    _fail_temp_writes(monkeypatch, "strict_mode.yaml.", OSError(errno.ENOSPC, "No space left on device"))
+
+    with pytest.raises(OSError) as raised:
+        _two_file_merge(tracked, strict)
+
+    assert (raised.value.kind, raised.value.path, str(raised.value)) == (
+        "policy_write_failed", str(strict),
+        ".coherence/strict_mode.yaml could not be written (ENOSPC); nothing was written.",
+    )
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+    assert _temp_files(tracked.parent) == []
+    _assert_policy_locks_free(tracked, strict)
+
+
+def _two_file_merge(tracked: Path, strict: Path) -> None:
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+
+    merge_policy_globs((tracked, strict), ("data/**",))
+
+
+def test_merge_policy_globs_says_which_file_it_replaced_when_the_second_replace_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#499: replacing ``strict_mode.yaml`` fails after ``tracked.yaml`` was
+    replaced. The failure says ``tracked.yaml`` was written and
+    ``strict_mode.yaml`` was not, no temp file is left and both locks are free.
+
+    Prevents a split pair that nothing reports: the globs are tracked but not
+    strict until the next start merges again."""
+    tracked, strict = _two_policy_files(tmp_path)
+    real_replace = os.replace
+    replaced: list[Path] = []
+
+    def second_fails(src: Any, dst: Any) -> None:
+        if replaced:
+            raise OSError(errno.EIO, "Input/output error")
+        real_replace(src, dst)
+        replaced.append(Path(dst))
+
+    monkeypatch.setattr(os, "replace", second_fails)
+
+    with pytest.raises(OSError) as raised:
+        _two_file_merge(tracked, strict)
+
+    assert (raised.value.kind, raised.value.path, str(raised.value)) == (
+        "policy_write_failed", str(strict),
+        ".coherence/strict_mode.yaml could not be written (EIO); .coherence/tracked.yaml was "
+        "written and .coherence/strict_mode.yaml was not.",
+    )
+    assert yaml.safe_load(tracked.read_text()) == ["data/**", "docs/**"]
+    assert strict.read_text() == '- "docs/**"\n'
+    assert _temp_files(tracked.parent) == []
+    _assert_policy_locks_free(tracked, strict)
+
+
+@pytest.mark.parametrize("read_only", [False, True], ids=["writable", "read_only_coherence"])
+def test_merge_policy_globs_that_changes_nothing_takes_no_lock(tmp_path: Path, read_only: bool) -> None:
+    """#499: both files already hold the globs, so the merge creates no lock
+    file and both files keep their bytes, also in a ``.coherence`` at mode 0500
+    (which the lifecycle tightens to later).
+
+    Prevents every start leaving lock files behind, and a start over a
+    read-only ``.coherence`` failing on a lock it does not need."""
+    if read_only and os.geteuid() == 0:
+        pytest.skip("root ignores the directory's mode")
+    tracked, strict = _two_policy_files(tmp_path, '- "data/**"\n')
+    coherence = tracked.parent
+    if read_only:
+        os.chmod(coherence, 0o500)
+    try:
+        _two_file_merge(tracked, strict)
+    finally:
+        os.chmod(coherence, 0o700)
+
+    assert sorted(os.listdir(coherence)) == ["strict_mode.yaml", "tracked.yaml"]
+    assert tracked.read_text() == strict.read_text() == '- "data/**"\n'
+
+
+def test_merge_policy_globs_names_a_file_it_cannot_load_before_any_lock(tmp_path: Path) -> None:
+    """#499: a file the merge cannot load is refused from the read before any
+    lock, with the routes' text, its kind and the file it concerns, and no lock
+    file is created.
+
+    Prevents a refusal leaving files behind, or one the start cannot tell
+    apart from a failed write."""
+    tracked, strict = _two_policy_files(tmp_path)
+    strict.write_text("- *.md\n")
+
+    with pytest.raises(ValueError) as raised:
+        _two_file_merge(tracked, strict)
+
+    assert (raised.value.kind, raised.value.path) == ("policy_file_unloadable", str(strict))
+    assert str(raised.value).startswith(
+        ".coherence/strict_mode.yaml is not valid YAML, so it loads as no entries; nothing was written."
+    )
+    assert sorted(os.listdir(tracked.parent)) == ["strict_mode.yaml", "tracked.yaml"]
+
+
+def test_merge_policy_globs_refuses_a_file_that_goes_bad_while_it_waits_for_the_lock(
+    tmp_path: Path,
+) -> None:
+    """#499: ``tracked.yaml`` becomes invalid YAML while the merge waits for its
+    lock. The read under the lock refuses it and nothing is written.
+
+    Prevents the merge writing from the read it took before the lock, which
+    replaced a file someone had just changed. Every wait is bounded."""
+    tracked, strict = _two_policy_files(tmp_path)
+    held = _hold_policy_lock(tracked)
+    try:
+        worker, raised = _merge_on_a_thread((tracked, strict), ("data/**",))
+        worker.join(timeout=0.5)
+        waited_for_the_lock = worker.is_alive()
+        tracked.write_text("- *.md\n")
+    finally:
+        os.close(held)
+    worker.join(timeout=30)
+
+    assert not worker.is_alive(), "the merge never took the lock"
+    assert waited_for_the_lock, "the merge wrote while the lock was held"
+    assert len(raised) == 1 and isinstance(raised[0], ValueError), raised
+    assert (raised[0].kind, raised[0].path) == ("policy_file_unloadable", str(tracked))
+    assert str(raised[0]).startswith(".coherence/tracked.yaml is not valid YAML")
+    assert tracked.read_text() == "- *.md\n"
+    assert strict.read_text() == '- "docs/**"\n'
+    assert _temp_files(tracked.parent) == []
+    _assert_policy_locks_free(tracked, strict)
+
+
+def test_merge_policy_globs_refuses_a_directory_at_a_lock_file_and_writes_neither_file(
+    tmp_path: Path,
+) -> None:
+    """#499, #534: a directory at ``strict_mode.yaml.lock`` cannot be locked.
+    The merge refuses with the routes' text, naming the lock file, writes
+    neither file and frees the lock it already took.
+
+    Prevents ``tracked.yaml`` being written while ``strict_mode.yaml`` cannot
+    be, and a raw error with nothing named."""
+    tracked, strict = _two_policy_files(tmp_path)
+    lock = tracked.parent / "strict_mode.yaml.lock"
+    lock.mkdir()
+
+    with pytest.raises(ValueError) as raised:
+        _two_file_merge(tracked, strict)
+
+    assert (raised.value.kind, raised.value.path, str(raised.value)) == (
+        "policy_lock_not_regular", str(lock),
+        ".coherence/strict_mode.yaml.lock could not be read (not a regular file); nothing was written.",
+    )
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+    assert lock.is_dir()
+    _assert_policy_locks_free(tracked)
+
+
+@pytest.mark.parametrize(
+    ("step", "errno_name"), [("created", "EACCES"), ("locked", "ENOLCK")],
+)
+def test_merge_policy_globs_names_the_lock_file_it_could_not_create_or_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: str, errno_name: str,
+) -> None:
+    """#499: creating ``tracked.yaml.lock`` (a read-only ``.coherence``) or
+    locking it (a file system without ``flock``) fails. The failure names the
+    lock file and the step, and nothing is written.
+
+    Prevents a raw error that names neither, and a write without the lock."""
+    import fcntl
+
+    if step == "created" and os.geteuid() == 0:
+        pytest.skip("root ignores the directory's mode")
+    tracked, strict = _two_policy_files(tmp_path)
+    coherence = tracked.parent
+    real_flock = fcntl.flock
+
+    def no_locks(fd: int, operation: int) -> None:
+        if operation & fcntl.LOCK_EX:
+            raise OSError(errno.ENOLCK, "No locks available")
+        real_flock(fd, operation)
+
+    if step == "created":
+        os.chmod(coherence, 0o500)
+    else:
+        monkeypatch.setattr(fcntl, "flock", no_locks)
+    try:
+        with pytest.raises(OSError) as raised:
+            _two_file_merge(tracked, strict)
+    finally:
+        os.chmod(coherence, 0o700)
+
+    assert (raised.value.kind, raised.value.path, str(raised.value)) == (
+        "policy_write_failed", str(coherence / "tracked.yaml.lock"),
+        f".coherence/tracked.yaml.lock could not be {step} ({errno_name}); nothing was written.",
+    )
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+    assert not os.path.lexists(coherence / "strict_mode.yaml.lock")
+
+
+def test_merge_policy_globs_without_fcntl_writes_both_files_and_creates_no_lock_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A platform with no ``fcntl`` merges without a lock, as the routes do.
+
+    Prevents the merge failing there, or leaving lock files it never locked."""
+    tracked, strict = _two_policy_files(tmp_path)
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+
+    _two_file_merge(tracked, strict)
+
+    assert yaml.safe_load(tracked.read_text()) == yaml.safe_load(strict.read_text()) == [
+        "data/**", "docs/**",
+    ]
+    assert sorted(os.listdir(tracked.parent)) == ["strict_mode.yaml", "tracked.yaml"]
+
+
+def test_merge_policy_globs_lets_an_interrupt_through_after_it_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#499: a ``KeyboardInterrupt`` raised while the merge writes a temp file
+    propagates as itself, after the merge removed every temp file and freed
+    both locks.
+
+    Prevents an interrupt being reported as a failed write, and temp files or
+    held locks outliving it."""
+    tracked, strict = _two_policy_files(tmp_path)
+    _fail_temp_writes(monkeypatch, "strict_mode.yaml.", KeyboardInterrupt())
+
+    with pytest.raises(KeyboardInterrupt):
+        _two_file_merge(tracked, strict)
+
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+    assert _temp_files(tracked.parent) == []
+    _assert_policy_locks_free(tracked, strict)
+
+
+def test_merge_policy_globs_reports_a_failed_replace_when_removing_its_temp_files_fails_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#499: replacing ``tracked.yaml`` fails, and so does removing the temp
+    files after it. The failure that comes out is the failed replace, and both
+    locks are free.
+
+    Prevents a cleanup error hiding what failed, or skipping the unlock."""
+    tracked, strict = _two_policy_files(tmp_path)
+    real_unlink = os.unlink
+
+    def fail_replace(src: Any, dst: Any) -> None:
+        raise OSError(errno.EIO, "Input/output error")
+
+    def unlink_no_temp(path: Any, *args: Any, **kwargs: Any) -> None:
+        if os.fspath(path).endswith(".tmp"):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    monkeypatch.setattr(os, "unlink", unlink_no_temp)
+
+    with pytest.raises(OSError) as raised:
+        _two_file_merge(tracked, strict)
+
+    assert getattr(raised.value, "kind", None) == "policy_write_failed", repr(raised.value)
+    assert (raised.value.path, str(raised.value)) == (
+        str(tracked), ".coherence/tracked.yaml could not be written (EIO); nothing was written.",
+    )
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+    _assert_policy_locks_free(tracked, strict)
+
+
+# ----------------------------------------------------------------------
+# The policy writer a volume and a session run before a start (#535)
+# ----------------------------------------------------------------------
+
+
+_SKIP_AS_ROOT = pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root ignores a file's mode",
+)
+
+
+def _refusal_fields(refusal: PolicyFileRefused) -> tuple[str, str, str]:
+    return refusal.kind, refusal.path, str(refusal)
+
+
+def test_write_start_policy_with_no_managed_globs_checks_and_creates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#535: a start that manages no glob has no policy to write. The writer
+    returns at once: it runs no ``.coherence`` check and creates nothing.
+
+    Prevents a volume or session without managed globs creating
+    ``.coherence``, or refusing one, before the lifecycle looks at it."""
+    from ccs.adapters.claude_code import coordinator_server
+
+    def must_not_run(_root: Path) -> None:
+        raise AssertionError("the .coherence check ran with no managed globs")
+
+    monkeypatch.setattr(coordinator_server, "check_coherence_dir", must_not_run)
+
+    write_start_policy(tmp_path, ())
+
+    assert os.listdir(tmp_path) == []
+
+
+def test_write_start_policy_raises_a_refused_coherence_dir_as_itself(tmp_path: Path) -> None:
+    """#535: the writer runs the start's ``.coherence`` check before it reads
+    or writes anything. A link at ``.coherence/hook.secret`` is refused with
+    the check's own :class:`CoherenceDirRefused`, no policy file is written and
+    the file the link names keeps its bytes.
+
+    Prevents a writer that merges through a ``.coherence`` a start refuses,
+    and a refusal re-typed so a volume can no longer route it by type."""
+    coherence = tmp_path / ".coherence"
+    target = plant_link(coherence, "hook.secret", "existing")
+    listing = sorted(os.listdir(coherence))
+
+    with pytest.raises(CoherenceDirRefused) as raised:
+        write_start_policy(tmp_path, ("data/**",))
+
+    assert type(raised.value) is CoherenceDirRefused
+    assert (raised.value.kind, raised.value.path) == (COHERENCE_LINK_KIND, str(coherence / "hook.secret"))
+    assert sorted(os.listdir(coherence)) == listing
+    assert target.read_bytes() == TARGET_BYTES
+
+
+def test_write_start_policy_creates_coherence_at_0700_and_merges_both_files(tmp_path: Path) -> None:
+    """#535: on a fresh workspace the writer creates ``.coherence`` at mode
+    0o700, the mode the lifecycle requires, and both policy files hold the
+    globs, each with its lock file beside it.
+
+    Prevents a looser directory the lifecycle then warns about, and a glob
+    tracked but not strict."""
+    write_start_policy(tmp_path, ("data/**",))
+
+    coherence = tmp_path / ".coherence"
+    assert coherence.stat().st_mode & 0o777 == 0o700
+    assert sorted(os.listdir(coherence)) == [
+        "strict_mode.yaml", "strict_mode.yaml.lock", "tracked.yaml", "tracked.yaml.lock",
+    ]
+    assert yaml.safe_load((coherence / "tracked.yaml").read_text()) == ["data/**"]
+    assert yaml.safe_load((coherence / "strict_mode.yaml").read_text()) == ["data/**"]
+
+
+def test_write_start_policy_refuses_a_file_it_cannot_load_with_the_merge_text(tmp_path: Path) -> None:
+    """#305, #499: a ``tracked.yaml`` that is not valid YAML is refused as a
+    :class:`PolicyFileRefused` of kind ``policy_file_unloadable``, naming the
+    file, with the merge's own text after the root, byte for byte. Neither
+    file is written and no lock file is created.
+
+    Prevents a refusal a caller can tell apart only by its text, and a change
+    to the text the volume and session tests pin."""
+    tracked, strict = _two_policy_files(tmp_path)
+    tracked.write_text("- *.md\n")
+    with pytest.raises(ValueError) as merged:
+        merge_policy_globs((tracked, strict), ("data/**",))
+
+    with pytest.raises(PolicyFileRefused) as raised:
+        write_start_policy(tmp_path, ("data/**",))
+
+    assert _refusal_fields(raised.value) == (
+        "policy_file_unloadable", str(tracked), f"{tmp_path}: {merged.value}",
+    )
+    assert str(raised.value).startswith(f"{tmp_path}: .coherence/tracked.yaml is not valid YAML")
+    assert raised.value.reason == POLICY_FILE_REFUSED_REASON
+    assert tracked.read_text() == "- *.md\n"
+    assert strict.read_text() == '- "docs/**"\n'
+    assert sorted(os.listdir(tracked.parent)) == ["strict_mode.yaml", "tracked.yaml"]
+
+
+@pytest.mark.parametrize("planted", ["directory", "link_after_the_check"])
+def test_write_start_policy_refuses_a_lock_file_that_is_not_regular(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planted: str,
+) -> None:
+    """#534, #535: a directory at ``tracked.yaml.lock`` passes the start's
+    check but cannot be locked, and a link put there after the check is not
+    followed. Each is refused as kind ``policy_lock_not_regular``, naming the
+    lock file, with the routes' text after the root, and neither policy file
+    is written.
+
+    Prevents a raw ``OSError`` out of a start, and a lock taken through a link
+    on a file outside ``.coherence``."""
+    from ccs.adapters.claude_code import coordinator_server
+
+    tracked, strict = _two_policy_files(tmp_path)
+    lock = tracked.parent / "tracked.yaml.lock"
+    outside = tmp_path / "outside.lock"
+    if planted == "directory":
+        lock.mkdir()
+        text = ".coherence/tracked.yaml.lock could not be read (not a regular file); nothing was written."
+    else:
+        real_check = coordinator_server.check_coherence_dir
+
+        def check_then_plant(root: Path) -> None:
+            real_check(root)
+            lock.symlink_to(outside)
+
+        monkeypatch.setattr(coordinator_server, "check_coherence_dir", check_then_plant)
+        text = ".coherence/tracked.yaml.lock is a symlink; nothing was written. Remove the link."
+
+    with pytest.raises(PolicyFileRefused) as raised:
+        write_start_policy(tmp_path, ("data/**",))
+
+    assert _refusal_fields(raised.value) == ("policy_lock_not_regular", str(lock), f"{tmp_path}: {text}")
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+    assert not outside.exists()
+
+
+@_SKIP_AS_ROOT
+def test_write_start_policy_names_coherence_when_it_cannot_create_it(tmp_path: Path) -> None:
+    """#535: a workspace whose root this user cannot write, with no
+    ``.coherence``, is refused as kind ``policy_write_failed`` naming
+    ``.coherence`` and the error, and nothing is created.
+
+    Prevents a raw ``OSError`` out of a volume's constructor, where degrade
+    mode promises to warn."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    os.chmod(root, 0o500)
+    try:
+        with pytest.raises(PolicyFileRefused) as raised:
+            write_start_policy(root, ("data/**",))
+    finally:
+        os.chmod(root, 0o700)
+
+    assert _refusal_fields(raised.value) == (
+        "policy_write_failed", str(root / ".coherence"),
+        f"{root}: .coherence could not be created (EACCES); nothing was written.",
+    )
+    assert os.listdir(root) == []
+
+
+@pytest.mark.parametrize(
+    ("step", "errno_name"), [("created", "EACCES"), ("locked", "ENOLCK")],
+)
+def test_write_start_policy_names_the_lock_file_it_could_not_create_or_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: str, errno_name: str,
+) -> None:
+    """#499, #535: creating ``tracked.yaml.lock`` (a read-only ``.coherence``)
+    or locking it (a file system without ``flock``) fails. The refusal is kind
+    ``policy_write_failed``, names the lock file, the step and the error after
+    the root, and neither policy file is written.
+
+    Prevents a raw ``OSError`` out of a start, and a write without the lock."""
+    import fcntl
+
+    if step == "created" and os.geteuid() == 0:
+        pytest.skip("root ignores the directory's mode")
+    tracked, strict = _two_policy_files(tmp_path)
+    coherence = tracked.parent
+    real_flock = fcntl.flock
+
+    def no_locks(fd: int, operation: int) -> None:
+        if operation & fcntl.LOCK_EX:
+            raise OSError(errno.ENOLCK, "No locks available")
+        real_flock(fd, operation)
+
+    if step == "created":
+        os.chmod(coherence, 0o500)
+    else:
+        monkeypatch.setattr(fcntl, "flock", no_locks)
+    try:
+        with pytest.raises(PolicyFileRefused) as raised:
+            write_start_policy(tmp_path, ("data/**",))
+    finally:
+        os.chmod(coherence, 0o700)
+
+    assert _refusal_fields(raised.value) == (
+        "policy_write_failed", str(coherence / "tracked.yaml.lock"),
+        f"{tmp_path}: .coherence/tracked.yaml.lock could not be {step} ({errno_name}); nothing was written.",
+    )
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+
+
+def test_write_start_policy_writes_neither_file_when_preparing_strict_mode_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#499: writing the ``strict_mode.yaml`` temp fails on a full disk.
+    The refusal is kind ``policy_write_failed``, names ``strict_mode.yaml`` and
+    says nothing was written; neither file changes, no temp file is left and
+    both locks are free.
+
+    Prevents a failed second write leaving the globs tracked but not strict."""
+    tracked, strict = _two_policy_files(tmp_path)
+    _fail_temp_writes(monkeypatch, "strict_mode.yaml.", OSError(errno.ENOSPC, "No space left on device"))
+
+    with pytest.raises(PolicyFileRefused) as raised:
+        write_start_policy(tmp_path, ("data/**",))
+
+    assert _refusal_fields(raised.value) == (
+        "policy_write_failed", str(strict),
+        f"{tmp_path}: .coherence/strict_mode.yaml could not be written (ENOSPC); nothing was written.",
+    )
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+    assert _temp_files(tracked.parent) == []
+    _assert_policy_locks_free(tracked, strict)
+
+
+@pytest.mark.parametrize(
+    ("failing", "cleanup_fails", "outcome"),
+    [
+        ("tracked.yaml", False, "nothing was written."),
+        ("tracked.yaml", True, "nothing was written."),
+        (
+            "strict_mode.yaml", False,
+            ".coherence/tracked.yaml was written and .coherence/strict_mode.yaml was not.",
+        ),
+    ],
+    ids=["tracked", "tracked_and_its_cleanup", "strict_mode_after_tracked"],
+)
+def test_write_start_policy_names_the_file_whose_replace_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing: str, cleanup_fails: bool, outcome: str,
+) -> None:
+    """#499: replacing a policy file fails. The refusal is kind
+    ``policy_write_failed``, names that file and says which file, if any, was
+    already replaced; both locks are free. When removing the temp files fails
+    too, the refusal is still the failed replace.
+
+    Prevents a split pair that nothing reports, and a cleanup error hiding
+    what failed or skipping the unlock."""
+    tracked, strict = _two_policy_files(tmp_path)
+    real_replace, real_unlink = os.replace, os.unlink
+
+    def replace_fails_for_one(src: Any, dst: Any) -> None:
+        if Path(dst).name == failing:
+            raise OSError(errno.EIO, "Input/output error")
+        real_replace(src, dst)
+
+    def unlink_no_temp(path: Any, *args: Any, **kwargs: Any) -> None:
+        if os.fspath(path).endswith(".tmp"):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace_fails_for_one)
+    if cleanup_fails:
+        monkeypatch.setattr(os, "unlink", unlink_no_temp)
+
+    with pytest.raises(PolicyFileRefused) as raised:
+        write_start_policy(tmp_path, ("data/**",))
+
+    assert _refusal_fields(raised.value) == (
+        "policy_write_failed", str(tracked.parent / failing),
+        f"{tmp_path}: .coherence/{failing} could not be written (EIO); {outcome}",
+    )
+    tracked_now = '- "docs/**"\n' if failing == "tracked.yaml" else "- data/**\n- docs/**\n"
+    assert (tracked.read_text(), strict.read_text()) == (tracked_now, '- "docs/**"\n')
+    if not cleanup_fails:
+        assert _temp_files(tracked.parent) == []
+    _assert_policy_locks_free(tracked, strict)
+
+
+def test_write_start_policy_lets_an_error_that_is_not_a_policy_failure_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#535: only the merge's own failures become a refusal. A
+    ``RuntimeError`` from ``yaml.safe_dump`` while the locks are held (a bug,
+    not a policy problem) propagates as itself, after the locks are freed;
+    neither file changes and no temp file is left.
+
+    Prevents a broad catch that turns a bug into a quiet detach in degrade
+    mode."""
+    tracked, strict = _two_policy_files(tmp_path)
+    real_dump = yaml.safe_dump
+
+    def dump_fails_under_the_lock(*args: Any, **kwargs: Any) -> Any:
+        if (tracked.parent / "tracked.yaml.lock").exists():
+            raise RuntimeError("a bug in the writer")
+        return real_dump(*args, **kwargs)
+
+    monkeypatch.setattr(yaml, "safe_dump", dump_fails_under_the_lock)
+
+    with pytest.raises(RuntimeError, match="a bug in the writer") as raised:
+        write_start_policy(tmp_path, ("data/**",))
+
+    assert type(raised.value) is RuntimeError
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+    assert _temp_files(tracked.parent) == []
+    _assert_policy_locks_free(tracked, strict)
+
+
+def test_write_start_policy_refusal_pickles_whole(tmp_path: Path) -> None:
+    """#535: a refusal crosses a process boundary with its type, kind, path
+    and text, as a session started in a worker process raises it.
+
+    Prevents a refusal that arrives as a bare ``CoherenceError`` or loses the
+    file it names."""
+    tracked, _ = _two_policy_files(tmp_path)
+    tracked.write_text("plain: mapping\n")
+    with pytest.raises(PolicyFileRefused) as raised:
+        write_start_policy(tmp_path, ("data/**",))
+
+    copy = pickle.loads(pickle.dumps(raised.value))
+
+    assert type(copy) is PolicyFileRefused
+    assert _refusal_fields(copy) == _refusal_fields(raised.value)
+    assert copy.reason == POLICY_FILE_REFUSED_REASON
+
+
+# ----------------------------------------------------------------------
+# The start's merge refuses every policy file the loader rejects (#499)
+# ----------------------------------------------------------------------
+
+
+# Each shape a policy file can take: whether the coordinator's loader records
+# the file as rejected, and whether the start's merge refuses it. The merge
+# refuses a superset: the loader reads a directory or FIFO as no entries
+# without recording it, and the merge cannot replace either.
+_POLICY_FILE_SHAPES = [
+    pytest.param("link", True, True, id="link"),
+    pytest.param("unreadable", True, True, id="unreadable", marks=_SKIP_AS_ROOT),
+    pytest.param("socket", True, True, id="socket"),
+    pytest.param("invalid_yaml", True, True, id="invalid_yaml"),
+    pytest.param("tagged", True, True, id="tagged"),
+    pytest.param("mapping", True, True, id="mapping"),
+    pytest.param("scalar", True, True, id="scalar"),
+    pytest.param("directory", False, True, id="directory"),
+    pytest.param("fifo", False, True, id="fifo"),
+    pytest.param("valid_list", False, False, id="valid_list"),
+    pytest.param("empty", False, False, id="empty"),
+    pytest.param("absent", False, False, id="absent"),
+]
+
+_POLICY_FILE_BODIES = {
+    "unreadable": '- "docs/**"\n',
+    "invalid_yaml": "- *.md\n",
+    "tagged": "- !!bool x\n",
+    "mapping": "plain: mapping\n",
+    "scalar": "just a string\n",
+    "valid_list": '- "docs/**"\n',
+    "empty": "",
+}
+
+
+def _plant_policy_file_shape(
+    policy_file: Path, shape: str, monkeypatch: pytest.MonkeyPatch, cleanup: contextlib.ExitStack,
+) -> None:
+    """Put ``shape`` at ``policy_file``. A link names a valid list outside
+    ``.coherence``, so only the link is wrong; a FIFO is released and a socket
+    closed when ``cleanup`` closes."""
+    if shape in _POLICY_FILE_BODIES:
+        policy_file.write_text(_POLICY_FILE_BODIES[shape])
+    if shape == "unreadable":
+        os.chmod(policy_file, 0)
+    elif shape == "link":
+        named = policy_file.parent.parent / "named-by-the-link.yaml"
+        named.write_text('- "docs/**"\n')
+        policy_file.symlink_to(named)
+    elif shape in ("directory", "socket"):
+        _plant_directory_or_socket(policy_file, shape, monkeypatch, cleanup)
+    elif shape == "fifo":
+        os.mkfifo(policy_file)
+        cleanup.callback(release_fifo, policy_file)
+
+
+def _call_bounded(call: Callable[[], Any]) -> BaseException | None:
+    """Run ``call`` on a daemon thread and return what it raised, if anything.
+    A call still running after the deadline (blocked on a FIFO) fails the test;
+    the caller's cleanup then releases the FIFO so the thread can end."""
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            call()
+        except BaseException as exc:
+            raised.append(exc)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout=30)
+    if worker.is_alive():
+        pytest.fail("the call blocked")
+    return raised[0] if raised else None
+
+
+def _lstat_fingerprint(path: Path) -> tuple[int, int, int, int] | None:
+    """What is at ``path``, without opening it: a mode-000 file or a FIFO
+    cannot be read."""
+    try:
+        found = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return found.st_mode, found.st_ino, found.st_size, found.st_mtime_ns
+
+
+def _rejected_file_names(rejected: list[tuple[str, str]]) -> list[str]:
+    return [pattern for pattern, _ in rejected]
+
+
+@pytest.mark.parametrize(("shape", "loader_rejects", "merge_refuses"), _POLICY_FILE_SHAPES)
+def test_the_merge_refuses_every_policy_file_the_loader_rejects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str, loader_rejects: bool,
+    merge_refuses: bool,
+) -> None:
+    """#499: one table of file shapes runs through the coordinator's
+    loader and the start's merge. Every shape the loader records as rejected
+    makes the merge refuse it, unchanged; a directory or FIFO, which the loader
+    reads as no entries without recording it, makes the merge refuse too; a
+    valid list, an empty file and an absent file are merged into, and the
+    loader then reads the glob. Neither call blocks on a FIFO.
+
+    Prevents the two drifting apart unnoticed: a merge that writes into a file
+    the loader rejects replaces every entry in it with only the managed globs,
+    at the start that would otherwise report it. Item-level rejects, such as a
+    non-string entry or ``..``, are outside this seam."""
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked = coherence / "tracked.yaml"
+    name = policy_module.policy_file_name(tracked)
+    rejected: list[tuple[str, str]] = []
+    with contextlib.ExitStack() as cleanup:
+        _plant_policy_file_shape(tracked, shape, monkeypatch, cleanup)
+        before = _lstat_fingerprint(tracked)
+        loader_raised = _call_bounded(lambda: policy_module._load_yaml_patterns(tracked, rejected))
+        merge_raised = _call_bounded(lambda: merge_policy_globs((tracked,), ("data/**",)))
+        after = _lstat_fingerprint(tracked)
+
+    assert loader_raised is None, repr(loader_raised)
+    loader_rejected = name in _rejected_file_names(rejected)
+    merge_refused = merge_raised is not None
+    if merge_refused:
+        assert getattr(merge_raised, "kind", None) == "policy_file_unloadable", repr(merge_raised)
+    assert merge_refused or not loader_rejected, (
+        f"the loader rejects a {shape} policy file, but the merge wrote into it"
+    )
+    assert (loader_rejected, merge_refused) == (loader_rejects, merge_refuses)
+    if merge_refused:
+        assert after == before
+    else:
+        reread: list[tuple[str, str]] = []
+        assert "data/**" in policy_module._load_yaml_patterns(tracked, reread)
+        assert name not in _rejected_file_names(reread)
 
 
 # ----------------------------------------------------------------------
@@ -10061,11 +11121,13 @@ def test_deny_after_a_real_commit_still_names_the_writer_and_the_version() -> No
     reason = hp.emit_strict_deny(
         source="test", summary=_summary(),
     )["permissionDecisionReason"]
+    # #514: the next Read is admitted, so the text says so and no longer
+    # promises that a retry gets the same denial.
     assert reason == (
         "Stale read denied: docs/plan.md was updated by agent aaaaaaaa at "
-        "2023-11-14T22:13:20+00:00. Re-read docs/plan.md via the Read tool "
-        "before proceeding. This denial is structural (v0.2 strict mode); "
-        "retrying the same operation will produce the same denial."
+        "2023-11-14T22:13:20+00:00. Read docs/plan.md again with the Read tool: "
+        "the next Read returns the current version, and edits of docs/plan.md "
+        "are denied until you have read it."
     )
 
 
@@ -10078,12 +11140,60 @@ def test_deny_after_a_grant_handover_claims_no_write_and_names_the_version() -> 
     )["permissionDecisionReason"]
     assert reason == (
         "Stale read denied: your grant on docs/plan.md was revoked and no new "
-        "version was committed — docs/plan.md is still at v1. Re-read "
-        "docs/plan.md via the Read tool before proceeding. This denial is "
-        "structural (v0.2 strict mode); retrying the same operation will "
-        "produce the same denial."
+        "version was committed — docs/plan.md is still at v1. Read "
+        "docs/plan.md again with the Read tool: the next Read returns the "
+        "current version, and edits of docs/plan.md are denied until you have "
+        "read it."
     )
     assert "was updated by" not in reason
+
+
+@pytest.mark.parametrize("write_in_flight", [False, True])
+def test_a_stale_copy_whose_disk_differs_is_told_what_clears_its_deny(write_in_flight: bool) -> None:
+    """#514: a stale or never-read reader whose bytes are not the recorded
+    content stays denied after it reads again, so its text promises no Read:
+    it names the change made outside the coordinator, or the write still in
+    flight, as what clears the deny. Neither says "the version you last read",
+    which a never-read reader never had, nor names an unknown writer."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    out = hp.emit_disk_mismatch_deny(
+        path="docs/plan.md", current_version=3, write_in_flight=write_in_flight)
+    expected = (
+        "Stale read denied: another agent is writing docs/plan.md and has not "
+        "committed it yet, so docs/plan.md on disk does not match v3, the last "
+        "version committed through the coordinator. Wait for that write to be "
+        "committed, then Read docs/plan.md again with the Read tool."
+    ) if write_in_flight else (
+        "Stale read denied: docs/plan.md on disk does not match v3, the last "
+        "version committed through the coordinator, and no session committed the "
+        "change, so it was made outside the coordinator. Do not restore or "
+        "overwrite docs/plan.md: the change may be your user's work. Tell your "
+        "user that docs/plan.md changed outside the coordinator; the read stays "
+        "denied until the change is committed through the coordinator. This "
+        "denial is structural (v0.2 strict mode); retrying the same operation "
+        "will produce the same denial."
+    )
+    assert out == {
+        "hookEventName": "PreToolUse", "permissionDecision": "deny",
+        "permissionDecisionReason": expected,
+    }
+    assert "the version you last read" not in expected and "<unknown>" not in expected
+
+
+def test_only_the_denies_that_stay_in_place_promise_the_same_denial() -> None:
+    """#514: after a peer's commit or a grant change the next Read is
+    admitted, so those two texts drop "retrying the same operation will
+    produce the same denial". The out-of-band and handoff-giver denies stay in
+    place and keep it."""
+    from ccs.adapters.claude_code import hook_payloads as hp
+
+    same_denial = "retrying the same operation will produce the same denial"
+    assert same_denial not in hp.STRICT_MODE_DENY_REASON_TEMPLATE
+    assert same_denial not in hp.GRANT_CHANGE_DENY_REASON_TEMPLATE
+    assert same_denial in hp.OUT_OF_BAND_DENY_REASON_TEMPLATE
+    assert same_denial in hp.STALE_OUT_OF_BAND_DENY_REASON_TEMPLATE
+    assert same_denial in " ".join(hp.HANDOFF_GIVER_DENY_REASON_TEMPLATE.split())
 
 
 def test_stale_warning_after_a_grant_handover_claims_no_write() -> None:
@@ -11254,21 +12364,116 @@ def test_an_opted_in_admit_after_the_holder_released_carries_no_collision_or_not
     assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.EXCLUSIVE
 
 
-def test_a_malformed_subagent_id_is_read_as_the_holders_own_repeat(
-    coordinator, client: _Client
+#: Present subagent ids outside the accepted shape, one per kind a client
+#: could send: bad characters, too long, a number, a list.
+_MALFORMED_SUBAGENT_IDS = ["bad id!", "a" * 65, 7, ["x"]]
+_MALFORMED_SUBAGENT_IDS_IDS = ["bad-chars", "65-chars", "number", "list"]
+
+#: FROZEN duplicate of the 400 every route that refuses a malformed subagent
+#: id answers, so a reworded constant fails here instead of moving with it.
+_MALFORMED_SUBAGENT_REFUSAL = (400, {"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"})
+
+
+@pytest.mark.parametrize("agent_id", _MALFORMED_SUBAGENT_IDS, ids=_MALFORMED_SUBAGENT_IDS_IDS)
+def test_an_opted_in_malformed_subagent_id_is_refused_not_read_as_the_holders_own_repeat(
+    agent_id: object, coordinator, client: _Client
 ) -> None:
-    """A documented limit, pinned: a subagent id outside the accepted shape is
-    read as the parent, so a holder session sending one is admitted as its
-    own repeat. The same request with a well-formed subagent id is another
-    agent, refused naming the parent."""
+    """An opted-in pre-edit whose subagent id is present but outside the
+    accepted shape answers the malformed-id 400 and moves no grant row, while
+    its session holds the path. The same request with a well-formed subagent
+    id is another agent, refused naming the parent.
+
+    Prevents the opt-in admitting a malformed id as the parent: read as the
+    parent, a subagent the session holds a file against would be admitted as
+    the holder's own repeat and edit over its own parent's hold."""
     session = _claimed(client)
     _take(client, session)
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    rows_before = coordinator.registry.get_state_map(artifact_id)
 
-    status, admitted = _opted_in(client, session, agent_id="bad id!")
-    assert status == 200 and admitted.get("ok") is True, admitted
+    assert _opted_in(client, session, agent_id=agent_id) == _MALFORMED_SUBAGENT_REFUSAL
+    assert coordinator.registry.get_state_map(artifact_id) == rows_before
     assert _opted_in(client, session, agent_id="sub1") == _other_holder_refusal(
         session_to_agent_id(session.sid))
     assert _agent_state_on(coordinator, "plan.md", session.sid) == MESIState.EXCLUSIVE
+
+
+@pytest.mark.parametrize("agent_id", ["", None], ids=["empty", "null"])
+def test_an_opted_in_empty_or_null_subagent_id_is_the_parent(
+    agent_id: object, coordinator, client: _Client
+) -> None:
+    """An empty or null subagent id is absent, as on every other route: the
+    holder session's opted-in pre-edit carrying one is admitted as its own
+    repeat."""
+    session = _claimed(client)
+    _take(client, session)
+
+    assert _opted_in(client, session, agent_id=agent_id) == (200, {"ok": True})
+    assert _agent_state_on(coordinator, "plan.md", session.sid) == MESIState.EXCLUSIVE
+
+
+@pytest.mark.parametrize("agent_id", _MALFORMED_SUBAGENT_IDS, ids=_MALFORMED_SUBAGENT_IDS_IDS)
+def test_a_malformed_subagent_id_without_the_opt_in_is_still_read_as_the_parent(
+    agent_id: object, coordinator, client: _Client
+) -> None:
+    """Without the opt-in, a malformed subagent id keeps today's answer: the
+    pre-edit is admitted and the grant lands on the parent's row.
+
+    Prevents the refusal reaching requests that never opted in: every Claude
+    Code hook edit is an ordinary pre-edit, and its answers must not move."""
+    session = _claimed(client)
+
+    status, answer = client.post(
+        "/hooks/pre-edit", {"session_id": session.sid, "path": "plan.md", "agent_id": agent_id},
+        principal=session.principal)
+
+    assert status == 200 and answer.get("ok") is True, answer
+    assert _agent_state_on(coordinator, "plan.md", session.sid) == MESIState.EXCLUSIVE
+
+
+def test_an_opted_in_malformed_subagent_id_is_refused_on_an_untracked_path(
+    coordinator, client: _Client
+) -> None:
+    """The malformed-id 400 comes ahead of the untracked exit, which would
+    admit the request unchecked.
+
+    Prevents the same request being refused on a tracked path and admitted on
+    an untracked one."""
+    session = _claimed(client)
+    assert not coordinator.policy.is_tracked("notes.txt")
+
+    answer = _opted_in(client, session, agent_id="bad id!", path="notes.txt")
+
+    assert answer == _MALFORMED_SUBAGENT_REFUSAL, answer
+
+
+def test_an_opted_in_malformed_subagent_id_with_no_principal_gets_the_malformed_id_refusal(
+    coordinator, client: _Client
+) -> None:
+    """An opted-in pre-edit with a malformed subagent id and no principal
+    header answers the malformed-id 400, not the principal-absent one: the id
+    is checked first, as the effect fence checks it, so both coordinators
+    answer the same body whatever principal the request carried."""
+    never_claimed = str(uuid.uuid4())
+
+    answer = client.post("/hooks/pre-edit", {
+        "session_id": never_claimed, "path": "plan.md", "agent_id": "bad id!", "if_unheld": True,
+    })
+
+    assert answer == _MALFORMED_SUBAGENT_REFUSAL, answer
+
+
+def test_an_opted_in_volume_incarnation_id_is_admitted(coordinator, client: _Client) -> None:
+    """A 32-hex subagent id, the shape a volume incarnation sends, is well
+    formed: its opted-in pre-edit of an unheld path is granted on its own
+    composite row."""
+    session = _claimed(client)
+    incarnation = uuid.uuid4().hex
+
+    status, answer = _opted_in(client, session, agent_id=incarnation)
+
+    assert status == 200 and answer.get("ok") is True, answer
+    assert _state(coordinator, "plan.md", session.composite(incarnation)) == MESIState.EXCLUSIVE
 
 
 def test_a_holder_whose_heartbeat_stopped_refuses_until_the_sweep_reclaims_it(
@@ -13869,13 +15074,14 @@ def test_no_pre_edit_or_pre_read_deny_carries_the_pair(
 ) -> None:
     """A reclaimed session with a claim on a strict path is denied both hooks
     while a peer holds it. A deny is no commit refusal: neither key appears
-    anywhere in the body."""
+    anywhere in the body. The Read goes first: since #514 the Read after a
+    stale deny is admitted when its bytes match the record."""
     holder, peer, path = _sid("lost-token-deny-holder"), _sid("lost-token-deny-peer"), "data/a.json"
     assert strict_client.post("/hooks/pre-edit", {"session_id": holder, "path": path})[0] == 200
     assert _sweep(strict_coordinator, int(time.time()) + 999_999) == 1
     assert strict_client.post("/hooks/pre-edit", {"session_id": peer, "path": path})[0] == 200
 
-    for hook, extra in (("pre-edit", {}), ("pre-read", {"content_hash": _hash("x")})):
+    for hook, extra in (("pre-read", {"content_hash": _hash("x")}), ("pre-edit", {})):
         status, body = strict_client.post(f"/hooks/{hook}", {"session_id": holder, "path": path, **extra})
         assert status == 200, body
         assert body["hookSpecificOutput"]["permissionDecision"] == "deny", (hook, body)
@@ -18713,15 +19919,16 @@ def test_a_verify_only_fence_read_of_a_changed_file_carries_no_out_of_band_notic
     assert "outside the coordinator" not in json.dumps(body), body
 
 
-def test_a_strict_reader_a_peer_invalidated_without_a_commit_keeps_the_grant_change_deny(
+def test_a_strict_reader_a_peer_invalidated_without_a_commit_is_told_the_write_is_in_flight(
     strict_plan_coordinator, strict_plan_client: _Client,
 ) -> None:
-    """#278: the out-of-band wording belongs to a reader that still holds a
-    valid grant. A reader whose grant a peer's pre-edit revoked -- no commit,
-    so the version is unchanged -- and who then hashes the peer's bytes is
-    denied with the text its summary picked before #278: that writer went
-    through the coordinator. Fails if the out-of-band template answers this
-    arm."""
+    """#278, #514: a reader whose grant a peer's pre-edit revoked -- no commit,
+    so the version is unchanged -- hashes the peer's bytes, which are on disk
+    before the peer's commit. That writer goes through the coordinator, so the
+    deny does not call the change out-of-band: it names the write in flight,
+    and its commit, as what clears the deny. Fails if the out-of-band template
+    answers this arm, or a stale-copy text promises a Read the hash would
+    refuse."""
     from ccs.adapters.claude_code import hook_payloads as hp
 
     client = strict_plan_client
@@ -18739,9 +19946,7 @@ def test_a_strict_reader_a_peer_invalidated_without_a_commit_keeps_the_grant_cha
     summary = body["summary"]
     assert (summary["current_version"], summary["prior_version_seen_by_session"]) == (1, 1), summary
     reason = body["hookSpecificOutput"]["permissionDecisionReason"]
-    assert "outside the coordinator" not in reason, reason
-    assert reason == hp.emit_strict_deny(source="pre_read_strict_deny", summary=summary)[
-        "permissionDecisionReason"]
+    assert reason == hp.WRITE_IN_FLIGHT_DENY_REASON_TEMPLATE.format(path="plan.md", current_version=1)
 
 
 # ----------------------------------------------------------------------
@@ -19070,3 +20275,746 @@ def test_a_server_refused_its_port_closes_the_store(tmp_path: Path) -> None:
         with no_sqlite_connection_left_open():
             with pytest.raises(OSError) as _refused:
                 CoordinatorHTTPServer(tmp_path, port=holder.getsockname()[1])
+
+
+# ----------------------------------------------------------------------
+# #514 -- a strict reader recovers after one deny
+#
+# A session whose copy of a strict file went stale is denied its first stale
+# Read or Edit of the file, as before. Its next Read is admitted and granted at
+# the current version when the bytes it hashed are the bytes the coordinator
+# recorded, and an Edit sent before that Read is still refused. Every other
+# pre-read caller -- a CoherentVolume, the effect fence, the substrate, a raw
+# HTTP capture -- keeps the deny until it recovers its own way. These drive the
+# routes in the order a session meets them, and the disk holds what each commit
+# wrote, so a Read's hash is the hash of the bytes on disk.
+# ----------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class _PlanDesk:
+    """The strict ``plan.md`` workspace as sessions meet it. A Read hashes the
+    bytes on disk, and sends no hash when the file is missing; a commit writes
+    its bytes to disk before it records them. A session is a bare session id,
+    or a claimed :class:`_Session` whose principal rides every request."""
+
+    coordinator: CoordinatorHTTPServer
+    client: _Client
+
+    @property
+    def file(self) -> Path:
+        return self.coordinator.coordinator_root / "plan.md"
+
+    def post(self, route: str, who: "str | _Session", **fields: Any) -> dict:
+        sid, principal = (who, None) if isinstance(who, str) else (who.sid, who.principal)
+        status, answer = self.client.post(
+            route, {"session_id": sid, "path": "plan.md", **fields}, principal=principal)
+        assert status == 200, answer
+        return answer
+
+    def read(self, who: "str | _Session", **fields: Any) -> dict:
+        if self.file.is_file():
+            fields.setdefault("content_hash", _bytes_hash(self.file.read_bytes()))
+        return self.post("/hooks/pre-read", who, **fields)
+
+    def edit(self, who: "str | _Session", **fields: Any) -> dict:
+        return self.post("/hooks/pre-edit", who, **fields)
+
+    def commit(self, who: "str | _Session", data: bytes, **fields: Any) -> None:
+        assert self.edit(who, **fields).get("ok") is True
+        self.file.write_bytes(data)
+        committed = self.post(
+            "/hooks/post-edit", who, content_hash=_bytes_hash(data), success=True, **fields)
+        assert committed.get("ok") is True, committed
+
+    def stop(self, who: str, **fields: Any) -> None:
+        status, answer = self.client.post("/hooks/session-stop", {"session_id": who, **fields})
+        assert status == 200, answer
+
+
+@pytest.fixture
+def plan_desk(strict_plan_coordinator, strict_plan_client: _Client) -> _PlanDesk:
+    return _PlanDesk(strict_plan_coordinator, strict_plan_client)
+
+
+def _denied(answer: dict) -> bool:
+    return answer.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+
+
+def _stale_reader(desk: _PlanDesk) -> tuple[str, str]:
+    """A reader that read ``plan.md`` at v1, and the writer that then committed
+    v2 over it, leaving the reader's row INVALID."""
+    reader, writer = str(uuid.uuid4()), str(uuid.uuid4())
+    assert desk.read(reader)["status"] == "fresh"
+    desk.commit(writer, b"v2\n")
+    return reader, writer
+
+
+def _reason(answer: dict) -> str:
+    return answer["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+# The deny texts as literal bytes, so a reworded template fails here rather
+# than moving with the code under test. Path and version are the only
+# substitutions besides the commit text's writer and time.
+def _commit_deny(desk: _PlanDesk, writer: str) -> str:
+    from datetime import datetime, timezone
+
+    artifact_id = desk.coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    at = datetime.fromtimestamp(
+        desk.coordinator.registry.get_artifact_updated_at(artifact_id), tz=timezone.utc).isoformat()
+    return (
+        f"Stale read denied: plan.md was updated by agent {session_to_agent_id(writer).hex[:8]} "
+        f"at {at}. Read plan.md again with the Read tool: the next Read returns the current "
+        "version, and edits of plan.md are denied until you have read it."
+    )
+
+
+def _grant_change_deny(version: int) -> str:
+    return (
+        "Stale read denied: your grant on plan.md was revoked and no new version was "
+        f"committed — plan.md is still at v{version}. Read plan.md again with the Read "
+        "tool: the next Read returns the current version, and edits of plan.md are denied "
+        "until you have read it."
+    )
+
+
+def _changed_outside_deny(version: int) -> str:
+    return (
+        f"Stale read denied: plan.md on disk does not match v{version}, the last version "
+        "committed through the coordinator, and no session committed the change, so it was "
+        "made outside the coordinator. Do not restore or overwrite plan.md: the change may be "
+        "your user's work. Tell your user that plan.md changed outside the coordinator; the "
+        "read stays denied until the change is committed through the coordinator. This denial "
+        "is structural (v0.2 strict mode); retrying the same operation will produce the same "
+        "denial."
+    )
+
+
+def _write_in_flight_deny(version: int) -> str:
+    return (
+        "Stale read denied: another agent is writing plan.md and has not committed it yet, "
+        f"so plan.md on disk does not match v{version}, the last version committed through "
+        "the coordinator. Wait for that write to be committed, then Read plan.md again with "
+        "the Read tool."
+    )
+
+
+def test_a_stale_reader_is_denied_once_and_its_next_read_is_admitted(plan_desk: _PlanDesk) -> None:
+    """#514: the stale Read is denied, an Edit sent before reading again is
+    denied too, the next Read is admitted fresh at the current version with no
+    stale warning, and the Edit after it is admitted. Both denies say that the
+    next Read returns the current version. Fails if the reader stays locked
+    out, or if its Edit gets through before it reads again."""
+    reader, writer = _stale_reader(plan_desk)
+
+    denied = plan_desk.read(reader)
+    assert _denied(denied) and _reason(denied) == _commit_deny(plan_desk, writer), denied
+    refused = plan_desk.edit(reader)
+    assert refused["ok"] is False and _reason(refused) == _commit_deny(plan_desk, writer), refused
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 2}
+    assert plan_desk.edit(reader)["ok"] is True
+
+
+@pytest.mark.parametrize("route", ["pre-read", "pre-edit", "pre-bash", "pre-grep"])
+@pytest.mark.parametrize("event", ["commit", "grant-change"])
+def test_every_strict_surface_tells_a_stale_copy_that_the_next_read_returns_the_current_version(
+    plan_desk: _PlanDesk, route: str, event: str,
+) -> None:
+    """#514: the Read, Edit, Bash and Grep denies of a stale copy carry the
+    same bytes, after a peer's commit and after a grant a peer took without
+    committing. The sentence is true after a Bash or Grep deny too: their
+    re-grant (#242) admits the next Read on the fresh arm."""
+    reader, writer = str(uuid.uuid4()), str(uuid.uuid4())
+    assert plan_desk.read(reader)["status"] == "fresh"
+    if event == "commit":
+        plan_desk.commit(writer, b"v2\n")
+    else:
+        assert plan_desk.edit(writer)["ok"] is True
+
+    answer = {
+        "pre-read": lambda: plan_desk.read(reader),
+        "pre-edit": lambda: plan_desk.edit(reader),
+        "pre-bash": lambda: plan_desk.client.post(
+            "/hooks/pre-bash", {"session_id": reader, "command": "cat plan.md"})[1],
+        "pre-grep": lambda: plan_desk.client.post(
+            "/hooks/pre-grep", {"session_id": reader, "search_root": ""})[1],
+    }[route]()
+
+    expected = _commit_deny(plan_desk, writer) if event == "commit" else _grant_change_deny(1)
+    assert _denied(answer) and _reason(answer) == expected, answer
+
+
+def test_a_stale_session_whose_first_act_is_an_edit_reads_after_that_one_deny(
+    plan_desk: _PlanDesk,
+) -> None:
+    """#514: the Edit's deny is the session's one deny, so its next Read is
+    admitted. Fails if the strict pre-edit deny does not arm the recovery."""
+    reader, _writer = _stale_reader(plan_desk)
+
+    assert plan_desk.edit(reader)["ok"] is False
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 2}
+
+
+@pytest.mark.parametrize("change", ["reverted", "deleted"])
+def test_a_stale_reader_whose_disk_lost_the_recorded_bytes_stays_denied(
+    plan_desk: _PlanDesk, change: str,
+) -> None:
+    """#514: after the deny, the file on disk is put back to v1 with no commit,
+    or deleted, so the Read carries other bytes or no hash. It is denied and
+    so is the Edit: admitting it would let the next Edit build on bytes the
+    coordinator never recorded. The record stays armed, so once the recorded
+    bytes are back the Read is admitted. Fails if a Read is admitted on bytes
+    other than the recorded ones."""
+    reader, _writer = _stale_reader(plan_desk)
+    assert _denied(plan_desk.read(reader))
+    if change == "reverted":
+        plan_desk.file.write_bytes(b"v1\n")
+    else:
+        plan_desk.file.unlink()
+
+    again = plan_desk.read(reader)
+    assert _denied(again) and _reason(again) == _changed_outside_deny(2), again
+    assert plan_desk.edit(reader)["ok"] is False
+    plan_desk.file.write_bytes(b"v2\n")
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 2}
+
+
+def test_a_stale_reader_behind_an_uncommitted_write_stays_denied(plan_desk: _PlanDesk) -> None:
+    """#514: another session took the file and its bytes are on disk, not yet
+    committed. The stale reader's Read hashes those bytes and is denied.
+    Fails if a Read of uncommitted bytes is admitted."""
+    reader, _writer = _stale_reader(plan_desk)
+    assert _denied(plan_desk.read(reader))
+    peer = str(uuid.uuid4())
+    assert plan_desk.edit(peer)["ok"] is True
+    plan_desk.file.write_bytes(b"v2\nthe peer's uncommitted line\n")
+
+    again = plan_desk.read(reader)
+    assert _denied(again) and _reason(again) == _write_in_flight_deny(2), again
+
+
+def test_a_stale_readers_first_read_of_other_bytes_still_arms_its_recovery(
+    plan_desk: _PlanDesk,
+) -> None:
+    """#514: the stale reader's first Read already carries bytes that differ
+    from the record. It is denied, and that deny counts as the one deny: once
+    the recorded bytes are back, the next Read is admitted. Fails if only a
+    deny on matching bytes arms the recovery."""
+    reader, _writer = _stale_reader(plan_desk)
+    plan_desk.file.write_bytes(b"v2\nchanged outside the coordinator\n")
+    first = plan_desk.read(reader)
+    assert _denied(first) and _reason(first) == _changed_outside_deny(2), first
+
+    plan_desk.file.write_bytes(b"v2\n")
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 2}
+
+
+def test_the_admitted_read_uses_up_the_recovery(plan_desk: _PlanDesk) -> None:
+    """#514: the Read admitted after the deny uses the recovery up, so the
+    reader's first Read after the writer's next commit is denied again.
+    Fails if one deny buys more than one admitted Read."""
+    reader, writer = _stale_reader(plan_desk)
+    assert _denied(plan_desk.read(reader))
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 2}
+
+    plan_desk.commit(writer, b"v3\n")
+    assert _denied(plan_desk.read(reader))
+
+
+def test_a_commit_between_the_deny_and_the_read_costs_no_second_deny(plan_desk: _PlanDesk) -> None:
+    """#514: the writer commits again after the reader's deny. The reader's
+    Read is admitted at the newer version, which is what the deny said the
+    next Read returns. Fails if the recovery is tied to the denied version."""
+    reader, writer = _stale_reader(plan_desk)
+    assert _denied(plan_desk.read(reader))
+    plan_desk.commit(writer, b"v3\n")
+
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 3}
+
+
+def test_a_recovery_a_shell_read_left_unused_is_used_up_by_the_next_read(
+    plan_desk: _PlanDesk,
+) -> None:
+    """#514: after its Read is denied, the reader's ``cat`` is denied and
+    re-grants the row (#242), so its next Read is admitted on the fresh arm.
+    That Read uses up the recovery, so the reader's first Read after the next
+    commit is denied again. Fails if a leftover recovery skips the deny of a
+    later stale copy."""
+    reader, writer = _stale_reader(plan_desk)
+    assert _denied(plan_desk.read(reader))
+    status, shell = plan_desk.client.post(
+        "/hooks/pre-bash", {"session_id": reader, "command": "cat plan.md"})
+    assert status == 200 and shell["hookSpecificOutput"]["permissionDecision"] == "deny", shell
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 2}
+
+    plan_desk.commit(writer, b"v3\n")
+    assert _denied(plan_desk.read(reader))
+
+
+def test_a_recovery_an_admitted_edit_left_unused_is_used_up_by_that_edit(
+    plan_desk: _PlanDesk,
+) -> None:
+    """#514: a subagent's stale Read is denied, which arms its recovery, and
+    its stop reports it ended, which forgets its rows (#525) but not the
+    recovery. Its first act after that is an Edit, admitted because it has no
+    row to refuse, and it commits. That admitted Edit uses up the recovery:
+    after another session's commit the subagent's first Read is denied again.
+    Fails if an admitted edit leaves the recovery armed."""
+    parent, _writer = _ended_subagent_with_a_recovery(plan_desk)
+    plan_desk.commit(parent, b"v3\n", **_HELPER)
+
+    plan_desk.commit(str(uuid.uuid4()), b"v4\n")
+    assert _denied(plan_desk.read(parent, **_HELPER))
+
+
+_SHELL_READS: dict[str, tuple[str, dict]] = {
+    "pre-bash": ("/hooks/pre-bash", {"command": "cat plan.md"}),
+    "pre-grep": ("/hooks/pre-grep", {"search_root": ""}),
+}
+
+
+@pytest.mark.parametrize("route", sorted(_SHELL_READS))
+def test_a_shell_only_recovery_uses_up_the_recovery(plan_desk: _PlanDesk, route: str) -> None:
+    """#514: after its Read is denied, the reader recovers through the shell
+    alone: its ``cat`` (or Grep) is denied and re-grants the row (#242), and
+    the retry runs, with no Read between. That shell read uses up the
+    recovery, so after the writer's next commit the reader's first Read is
+    denied and only the Read after it is admitted. Fails if a recovery left
+    armed by a shell-only recovery admits the Read of a later stale copy with
+    no deny."""
+    reader, writer = _stale_reader(plan_desk)
+    assert _denied(plan_desk.read(reader))
+    route_path, fields = _SHELL_READS[route]
+    shell = [plan_desk.client.post(route_path, {"session_id": reader, **fields}) for _ in range(2)]
+    assert [status for status, _ in shell] == [200, 200], shell
+    assert _denied(shell[0][1]) and shell[1][1]["status"] == "fresh", shell
+
+    plan_desk.commit(writer, b"v3\n")
+    assert _denied(plan_desk.read(reader))
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 3}
+
+
+def test_a_shell_read_of_a_held_file_uses_up_the_recovery(plan_desk: _PlanDesk) -> None:
+    """#514: the reader's ``cat`` is denied and re-grants the row (#242) with
+    no observation, so its Edit is denied as stale and arms the recovery
+    while the row is held. The retried ``cat`` then runs on the held grant
+    and reads the current bytes, which uses the recovery up: after the
+    writer's next commit the reader's first Read is denied and only the Read
+    after it is admitted. Fails if a running shell read of a held file
+    leaves the recovery armed."""
+    reader, writer = _stale_reader(plan_desk)
+    cat = {"session_id": reader, "command": "cat plan.md"}
+    status, denied = plan_desk.client.post("/hooks/pre-bash", cat)
+    assert status == 200 and _denied(denied), denied
+    assert plan_desk.edit(reader)["ok"] is False
+    status, ran = plan_desk.client.post("/hooks/pre-bash", cat)
+    assert status == 200 and ran["status"] == "fresh", ran
+
+    plan_desk.commit(writer, b"v3\n")
+    assert _denied(plan_desk.read(reader))
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 3}
+
+
+def test_a_never_read_sessions_deny_arms_no_recovery(plan_desk: _PlanDesk) -> None:
+    """#514: a session that never read plan.md has no row to recover, so its
+    deny arms nothing. Once the recorded bytes are back on disk its Read is
+    admitted as a first read, and after a peer's next commit its first Read
+    is denied. Fails if the never-read deny leaves a recovery behind that
+    skips the deny of that later stale copy."""
+    seeded = plan_desk.read(str(uuid.uuid4()))
+    assert seeded["status"] == "fresh", seeded
+    newcomer = str(uuid.uuid4())
+    plan_desk.file.write_bytes(b"v1\nnot committed\n")
+    assert _denied(plan_desk.read(newcomer))
+    plan_desk.file.write_bytes(b"v1\n")
+    assert not _denied(plan_desk.read(newcomer))
+
+    plan_desk.commit(str(uuid.uuid4()), b"v2\n")
+    assert _denied(plan_desk.read(newcomer))
+
+
+def test_a_parent_whose_subagent_committed_reads_after_one_deny(plan_desk: _PlanDesk) -> None:
+    """#514: the parent read plan.md, then its own subagent edited, committed
+    and stopped. The parent's row is stale like any reader's: one deny, then
+    its next Read is admitted."""
+    parent = str(uuid.uuid4())
+    assert plan_desk.read(parent)["status"] == "fresh"
+    plan_desk.commit(parent, b"v2\n", agent_id="helper")
+    plan_desk.stop(parent, agent_id="helper")
+
+    assert _denied(plan_desk.read(parent))
+    assert plan_desk.read(parent) == {"status": "fresh", "version": 2}
+
+
+def test_a_reader_whose_grant_a_peer_took_and_let_go_reads_after_one_deny(
+    plan_desk: _PlanDesk,
+) -> None:
+    """#514: a peer took the file and stopped without committing, so the
+    version did not move. The reader is denied once and its next Read is
+    admitted at the same version."""
+    reader, peer = str(uuid.uuid4()), str(uuid.uuid4())
+    assert plan_desk.read(reader)["status"] == "fresh"
+    assert plan_desk.edit(peer)["ok"] is True
+    plan_desk.stop(peer)
+
+    denied = plan_desk.read(reader)
+    assert _denied(denied) and _reason(denied) == _grant_change_deny(1), denied
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 1}
+
+
+@pytest.mark.parametrize("write_in_flight", [False, True])
+def test_a_session_that_never_read_a_file_whose_disk_differs_names_no_writer(
+    plan_desk: _PlanDesk, write_in_flight: bool,
+) -> None:
+    """#514: a session that never read plan.md hashes bytes other than the
+    recorded ones. It has no row to recover, so its denies stay in place, and
+    its text no longer names "agent <unknown>" for a write nobody committed:
+    it names the change made outside the coordinator, or the write in flight
+    when another session holds an uncommitted write."""
+    seeded = plan_desk.read(str(uuid.uuid4()))
+    assert seeded["status"] == "fresh", seeded
+    if write_in_flight:
+        assert plan_desk.edit(str(uuid.uuid4()))["ok"] is True
+    plan_desk.file.write_bytes(b"v1\nnot committed\n")
+    newcomer = str(uuid.uuid4())
+
+    expected = _write_in_flight_deny(1) if write_in_flight else _changed_outside_deny(1)
+    for _ in range(2):
+        answer = plan_desk.read(newcomer)
+        assert _denied(answer) and _reason(answer) == expected, answer
+
+
+def test_a_never_read_deny_on_a_record_with_no_content_claim_promises_no_read(
+    plan_desk: _PlanDesk,
+) -> None:
+    """#514: the record of plan.md claims no content (the all-f placeholder a
+    legacy row or the strict-mode demo's seeding leaves), so a session that
+    never read the file is denied whatever bytes it reads. Its deny arms
+    nothing and its next Read is denied the same way, so the text names the
+    change made outside the coordinator instead of saying that the next Read
+    returns the current version, as the Node coordinator answers. Fails if a
+    never-read deny takes the commit text because the record claims no
+    content."""
+    seeded = plan_desk.read(str(uuid.uuid4()))
+    assert seeded["status"] == "fresh", seeded
+    registry = plan_desk.coordinator.registry
+    artifact_id = registry.lookup_artifact_id_by_name("plan.md")
+    # Written to the registry directly: no route records the placeholder here.
+    registry.set_artifact_and_content(
+        artifact_id,
+        dataclasses.replace(registry.get_artifact(artifact_id), content_hash="f" * 64),
+        "",
+    )
+    newcomer = str(uuid.uuid4())
+
+    for _ in range(2):
+        answer = plan_desk.read(newcomer)
+        assert _denied(answer) and _reason(answer) == _changed_outside_deny(1), answer
+
+
+def test_a_held_file_refusal_followed_by_the_holders_commit_costs_one_deny(
+    plan_desk: _PlanDesk,
+) -> None:
+    """#514, with the held-file refusal on: the reader read plan.md while the
+    holder held it, its opted-in edit was refused, and the holder committed
+    and stopped. The reader is denied once and its next Read is admitted."""
+    holder, reader = _claimed(plan_desk.client), _claimed(plan_desk.client)
+    assert plan_desk.edit(holder)["ok"] is True
+    assert plan_desk.read(reader)["status"] in ("fresh", "stale")
+    refused = plan_desk.edit(reader, if_unheld=True)
+    assert refused["reason"] == "other_holder", refused
+    plan_desk.file.write_bytes(b"v2\n")
+    committed = plan_desk.post(
+        "/hooks/post-edit", holder, content_hash=_bytes_hash(b"v2\n"), success=True)
+    assert committed["ok"] is True, committed
+    status, _ = plan_desk.client.post(
+        "/hooks/session-stop", {"session_id": holder.sid}, principal=holder.principal)
+    assert status == 200
+
+    assert _denied(plan_desk.read(reader))
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 2}
+
+
+_NOT_A_HOOK_READ: dict[str, dict] = {
+    "want_owner_generation": {"want_owner_generation": True},
+    "verify_only": {"verify_only": True},
+    "name_kind": {"name_kind": "file"},
+    "want_owner_generation-false": {"want_owner_generation": False},
+    "verify_only-false": {"verify_only": False},
+}
+
+
+@pytest.mark.parametrize("field", sorted(_NOT_A_HOOK_READ))
+def test_a_pre_read_that_is_not_a_hook_read_keeps_its_deny_and_leaves_the_recovery_alone(
+    plan_desk: _PlanDesk, field: str,
+) -> None:
+    """#514: a pre-read carrying any of these fields is a CoherentVolume read,
+    an effect-fence check, a raw capture or the substrate, whose recovery is a
+    new identity. Every such read of the stale file is denied: its denies arm
+    nothing, so the hook Read after them is still denied; and once a hook
+    Read's deny has armed the recovery, such a read neither takes it nor uses
+    it up, so the hook Read after it is admitted. Fails if any one of the
+    three fields is dropped from the rule, and, through the false-valued
+    cases, if the rule reads a field's value rather than its presence."""
+    marker = _NOT_A_HOOK_READ[field]
+    reader, _writer = _stale_reader(plan_desk)
+
+    assert _denied(plan_desk.read(reader, **marker))
+    assert _denied(plan_desk.read(reader, **marker))
+    assert _denied(plan_desk.read(reader))
+    assert _denied(plan_desk.read(reader, **marker))
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 2}
+
+
+def test_a_pre_read_with_a_false_name_kind_is_refused_and_leaves_the_recovery_alone(
+    plan_desk: _PlanDesk,
+) -> None:
+    """#514: ``name_kind`` takes only ``"file"`` or ``"key"``, so a false one
+    never reaches the hook-read rule: the pre-read is refused as a path error,
+    before and after a hook Read's deny arms the recovery, and the hook Read
+    after it is admitted, so the refusal neither took the recovery nor used it
+    up."""
+    reader, _writer = _stale_reader(plan_desk)
+    body = {
+        "session_id": reader, "path": "plan.md", "name_kind": False,
+        "content_hash": _bytes_hash(plan_desk.file.read_bytes()),
+    }
+    refused = (400, {"error": "missing or empty path"})
+
+    assert plan_desk.client.post("/hooks/pre-read", body) == refused
+    assert _denied(plan_desk.read(reader))
+    assert plan_desk.client.post("/hooks/pre-read", body) == refused
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 2}
+
+
+def test_a_fence_check_after_a_deny_holds_and_leaves_the_recovery_alone(
+    plan_desk: _PlanDesk,
+) -> None:
+    """#514: the effect fence's verification read, sent as CoherentVolume sends
+    it, after the reader's deny: denied, and the fence still holds the pair
+    the reader captured before the commit. The reader's next hook Read is
+    then admitted, so the fence read did not use the recovery up."""
+    reader, writer = str(uuid.uuid4()), str(uuid.uuid4())
+    held = _bytes_hash(plan_desk.file.read_bytes())
+    captured = plan_desk.read(reader, want_owner_generation=True)
+    plan_desk.commit(writer, b"v2\n")
+    assert _denied(plan_desk.read(reader))
+
+    assert _denied(plan_desk.read(reader, want_owner_generation=True, verify_only=True))
+    status, fence = plan_desk.client.post(_U4_ROUTE, _u4_body(
+        reader, "plan.md", version=captured["version"],
+        generation=captured["owner_generation"], content_hash=held))
+    assert status == 200 and fence["verdict"] == "hold", fence
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 2}
+
+
+def test_the_recovery_survives_the_end_of_a_turn(plan_desk: _PlanDesk) -> None:
+    """#514: the reader is denied, its turn ends, and its first Read in the
+    next turn is admitted. Fails if a Stop drops the recovery."""
+    reader, _writer = _stale_reader(plan_desk)
+    assert _denied(plan_desk.read(reader))
+    plan_desk.stop(reader)
+
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 2}
+
+
+_HELPER = {"agent_id": "helper"}
+
+
+def _ended_subagent_with_a_recovery(desk: _PlanDesk) -> tuple[str, str]:
+    """A subagent ``helper`` of the returned parent session whose stale Read
+    was denied, arming its recovery, and whose stop then reported it ended,
+    which forgets its rows (#525) but not the recovery; and the writer whose
+    v2 commit made its copy stale."""
+    parent, writer = str(uuid.uuid4()), str(uuid.uuid4())
+    assert desk.read(parent, **_HELPER)["status"] == "fresh"
+    desk.commit(writer, b"v2\n")
+    assert _denied(desk.read(parent, **_HELPER))
+    desk.stop(parent, ended=True, **_HELPER)
+    return parent, writer
+
+
+def test_a_read_admitted_on_the_stale_arm_uses_up_the_recovery(plan_desk: _PlanDesk) -> None:
+    """#514: an ended subagent's recovery is still armed, and its next Read,
+    of the recorded bytes, finds no row, so it is admitted with the
+    stale-read warning and re-granted. That Read uses up the recovery: after
+    the writer's next commit the subagent's first Read is denied and only
+    the Read after it is admitted. Fails if the stale arm's re-grant leaves
+    the recovery armed."""
+    parent, writer = _ended_subagent_with_a_recovery(plan_desk)
+
+    warned = plan_desk.read(parent, **_HELPER)
+    assert warned["status"] == "stale" and not _denied(warned), warned
+    plan_desk.commit(writer, b"v3\n")
+    assert _denied(plan_desk.read(parent, **_HELPER))
+    assert plan_desk.read(parent, **_HELPER) == {"status": "fresh", "version": 3}
+
+
+@pytest.mark.parametrize("field", ["name_kind", "want_owner_generation"])
+def test_a_stale_arm_read_that_is_not_a_hook_read_leaves_the_recovery_alone(
+    plan_desk: _PlanDesk, field: str,
+) -> None:
+    """#514: as on the deny arm, a pre-read that is not a hook read does not
+    use up a recovery when the stale arm admits it, as the Node coordinator
+    answers: the ended subagent's recovery is still armed after such a read
+    of the recorded bytes. Fails if the stale arm's take ignores whether the
+    read is a hook read."""
+    parent, _writer = _ended_subagent_with_a_recovery(plan_desk)
+
+    warned = plan_desk.read(parent, **_HELPER, **_NOT_A_HOOK_READ[field])
+    assert warned["status"] == "stale" and not _denied(warned), warned
+    coordinator = plan_desk.coordinator
+    agent_id = coordinator.register_session(parent, _HELPER["agent_id"])
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    assert coordinator.take_stale_read_recovery(agent_id, artifact_id) is True
+
+
+def test_a_recovery_left_armed_admits_no_read_with_no_row(plan_desk: _PlanDesk) -> None:
+    """#514: an ended subagent's recovery is still armed, and the record of
+    plan.md then claims no content (the all-f placeholder a legacy row or the
+    strict-mode demo's seeding leaves), so the subagent's Read, with no row,
+    is denied as a session that never read the file is. The recovery admits
+    only a Read of a stale row, so that Read is denied, on every retry, with
+    the text a never-read session gets, as the Node coordinator answers.
+    Fails if a recovery left armed admits a Read with no row."""
+    parent, _writer = _ended_subagent_with_a_recovery(plan_desk)
+    registry = plan_desk.coordinator.registry
+    artifact_id = registry.lookup_artifact_id_by_name("plan.md")
+    # Written to the registry directly: no route records the placeholder here.
+    registry.set_artifact_and_content(
+        artifact_id,
+        dataclasses.replace(registry.get_artifact(artifact_id), content_hash="f" * 64),
+        "",
+    )
+
+    for _ in range(2):
+        answer = plan_desk.read(parent, **_HELPER)
+        assert _denied(answer) and _reason(answer) == _changed_outside_deny(2), answer
+
+
+def test_warn_mode_still_admits_a_stale_read_with_its_warning(
+    coordinator, client: _Client,
+) -> None:
+    """#514 leaves warn mode alone: on a tracked file that is not strict, the
+    stale Read is admitted with the stale-read warning, as before."""
+    desk = _PlanDesk(coordinator, client)
+    desk.file.write_bytes(b"v1\n")
+    reader, _writer = _stale_reader(desk)
+
+    answer = desk.read(reader)
+    assert answer["status"] == "stale", answer
+    assert answer["hookSpecificOutput"]["permissionDecision"] == "allow", answer
+
+
+@pytest.mark.parametrize("trigger", ["reclaim_heartbeat", "reclaim_max_hold"])
+def test_a_holder_the_sweep_reclaimed_reads_after_one_deny(
+    plan_desk: _PlanDesk, trigger: str,
+) -> None:
+    """#514: the holder took plan.md and went quiet, or held it too long, and
+    the sweep reclaimed its grant with no peer waiting. Its next turn gets one
+    deny, its next Read is admitted, and its Edit after that too."""
+    from ccs.adapters.claude_code.lifecycle import LifecycleConfig, _sweep_stable_grants
+
+    holder = str(uuid.uuid4())
+    assert plan_desk.read(holder)["status"] == "fresh"
+    assert plan_desk.edit(holder)["ok"] is True
+    if trigger == "reclaim_heartbeat":
+        config = LifecycleConfig(grant_heartbeat_timeout_sec=1, grant_max_hold_sec=999_999_999)
+        now_tick = int(time.time()) + 999_999
+    else:
+        config = LifecycleConfig(grant_heartbeat_timeout_sec=999_999, grant_max_hold_sec=1)
+        now_tick = int(time.time()) + 10
+    assert _sweep_stable_grants(plan_desk.coordinator, config, now_tick) == 1
+
+    assert _denied(plan_desk.read(holder))
+    admitted = plan_desk.read(holder)
+    assert (admitted["status"], admitted["version"], _denied(admitted)) == ("fresh", 1, False), admitted
+    # The reclaim's notice rides the admitted Read, and tells the session to
+    # read the file before editing it rather than to re-fetch and retry.
+    notice = admitted["hookSpecificOutput"]["additionalContext"]
+    assert "plan.md \u2014 reclaimed by the coordinator sweep" in notice, notice
+    assert (
+        "is NOT reflected in the coordinator's version. "
+        "Read it again with the Read tool before you edit it." in notice
+    ), notice
+    assert "Re-fetch via pre-read" not in notice, notice
+    assert plan_desk.edit(holder)["ok"] is True
+
+
+def test_a_holder_reclaimed_after_its_own_commit_reads_after_one_deny(
+    plan_desk: _PlanDesk,
+) -> None:
+    """#514: the holder committed v2 and kept the grant past the hold limit,
+    so the sweep reclaimed it. One deny, then its Read is admitted at v2."""
+    from ccs.adapters.claude_code.lifecycle import LifecycleConfig, _sweep_stable_grants
+
+    holder = str(uuid.uuid4())
+    assert plan_desk.read(holder)["status"] == "fresh"
+    plan_desk.commit(holder, b"v2\n")
+    config = LifecycleConfig(grant_heartbeat_timeout_sec=999_999, grant_max_hold_sec=1)
+    assert _sweep_stable_grants(plan_desk.coordinator, config, int(time.time()) + 10) == 1
+
+    assert _denied(plan_desk.read(holder))
+    admitted = plan_desk.read(holder)
+    assert (admitted["status"], admitted["version"], _denied(admitted)) == ("fresh", 2, False), admitted
+
+
+def test_a_restart_after_the_deny_costs_one_more_deny(tmp_path: Path) -> None:
+    """#514: the recovery lives in the coordinator's memory. The reader is
+    denied, the coordinator stops and a new one starts on the same workspace:
+    the reader's next Read is denied once more, and the Read after it is
+    admitted. Fails if the restarted coordinator admits the first Read, or
+    never admits one."""
+    (tmp_path / ".coherence").mkdir()
+    (tmp_path / ".coherence" / "strict_mode.yaml").write_text("- plan.md\n")
+    (tmp_path / "plan.md").write_text("v1\n")
+
+    def desk_on(server: CoordinatorHTTPServer) -> _PlanDesk:
+        secret = load_secret(server.coordinator_root)
+        assert secret is not None
+        return _PlanDesk(server, _Client("127.0.0.1", server.port, secret))
+
+    first = _restart_on(tmp_path, "before-the-restart")
+    try:
+        reader, _writer = _stale_reader(desk_on(first))
+        assert _denied(desk_on(first).read(reader))
+    finally:
+        first.shutdown()
+    second = _restart_on(tmp_path, "after-the-restart")
+    try:
+        assert _denied(desk_on(second).read(reader))
+        assert desk_on(second).read(reader) == {"status": "fresh", "version": 2}
+    finally:
+        second.shutdown()
+
+
+def test_a_caller_naming_a_bound_peer_without_its_principal_can_heal_its_stale_view(
+    plan_desk: _PlanDesk,
+) -> None:
+    """Accepted behaviour since #514, pinned so the posture table cannot
+    understate it. Pre-read accepts a request without its caller principal,
+    so a caller naming a bound peer can send the peer's one deny, of any
+    bytes, and then the Read of the recorded bytes that heals the peer's
+    stale view, after which the peer's next edit is admitted whatever copy it
+    was built from. A denied Bash or Grep command already re-grants the same
+    way (#242). The table's harm text for the route says so, and no longer
+    claims strict mode never re-grants."""
+    from ccs.adapters.claude_code.coordinator_server import _CALLER_PRINCIPAL_POSTURE
+
+    peer = _claimed(plan_desk.client)
+    assert plan_desk.read(peer)["status"] == "fresh"
+    plan_desk.commit(str(uuid.uuid4()), b"v2\n")
+
+    assert _denied(plan_desk.read(peer.sid, content_hash=_bytes_hash(b"not the recorded bytes\n")))
+    assert plan_desk.read(peer.sid) == {"status": "fresh", "version": 2}
+    assert plan_desk.edit(peer)["ok"] is True
+
+    harm = _CALLER_PRINCIPAL_POSTURE[("POST", "/hooks/pre-read")].harm
+    assert "never re-grants" not in harm, harm
+    assert (
+        "heals the peer's stale view with at most two pre-reads: the first, of "
+        "any bytes, arms the recovery unless the peer's own stale deny already "
+        "did, and the second carries the hash of the recorded bytes, or any "
+        "bytes when the record holds no content claim"
+    ) in harm, harm

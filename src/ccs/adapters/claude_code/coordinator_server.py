@@ -60,15 +60,17 @@ import os
 import re
 import secrets
 import socketserver
+import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
+from types import ModuleType
 from typing import (
     Any,
     Callable,
@@ -170,6 +172,9 @@ from ccs.core.exceptions import (
     HOLD_VERSION_UNCONFIRMED,
     OCC_CALLER_TRANSIENT_REASON,
     OTHER_HOLDER_REASON,
+    POLICY_FILE_UNLOADABLE_KIND,
+    POLICY_LOCK_NOT_REGULAR_KIND,
+    POLICY_WRITE_FAILED_KIND,
     RESTORE_MEMBER_OUTCOMES,
     RESTORE_STATUSES,
     SESSION_INVALIDATED_REASON,
@@ -184,6 +189,7 @@ from ccs.core.exceptions import (
     GiverFenced,
     OccCallerTransientError,
     OtherHolder,
+    PolicyFileRefused,
     RegistryLockTimeout,
     SessionInvalidated,
     StaleReadGeneration,
@@ -577,14 +583,21 @@ _CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
     # -- the nine hook routes ------------------------------------------------
     ("POST", "/hooks/pre-read"): RoutePrincipalPosture(_ACCEPT, (
         "a read: registers or refreshes the named identity's SHARED view and "
-        "records no attribution; strict mode never re-grants on a stale read, "
-        "so a strict-mode write route still catches a stale writer. Accepted "
-        "behaviour for an absent principal, whether the identity is unbound or "
-        "bound: the read drains the named identity's pending notices into its "
-        "own response, and in warn mode a stale read re-grants the identity "
-        "SHARED and uses up its stale warning, so a caller naming a bound peer "
-        "without its principal takes the peer's notices and warning and the "
-        "peer never sees them")),
+        "records no attribution. Accepted behaviour for an absent principal, "
+        "whether the identity is unbound or bound: the read drains the named "
+        "identity's pending notices into its own response; in warn mode a "
+        "stale read re-grants the identity SHARED and uses up its stale "
+        "warning; and in strict mode, after a stale read is denied, the next "
+        "read whose bytes are the recorded content re-grants it SHARED at the "
+        "current version (#514), as a denied Bash or Grep command already "
+        "does (#242). So a caller naming a bound peer without its principal "
+        "takes the peer's notices and warning, which the peer never sees, and "
+        "heals the peer's stale view with at most two pre-reads: the first, "
+        "of any bytes, arms the recovery unless the peer's own stale deny "
+        "already did, and the second carries the hash of the recorded bytes, "
+        "or any bytes when the record holds no content claim. A strict-mode "
+        "write route then admits the peer's next edit whatever copy it was "
+        "built from")),
     ("POST", "/hooks/effect-fence"): RoutePrincipalPosture(_REQUIRE, (
         "gates an escaping effect on the named identity's grant standing: a "
         "caller naming a claimed peer without its principal would be answered "
@@ -949,10 +962,18 @@ def has_subagent_id_field(body: dict) -> bool:
     return raw is not None and raw != ""
 
 
+def has_malformed_subagent_id(body: dict) -> bool:
+    """True iff the body carries a subagent id that is present but does not
+    parse. An opted-in pre-edit refuses one rather than reading it as the
+    parent, and the hook client checks the same rule before it sends one."""
+    return has_subagent_id_field(body) and read_subagent_id(body) is None
+
+
 _MALFORMED_SUBAGENT_ERROR = "agent_id must be 1-64 chars of [A-Za-z0-9_-]"
 """The 400 ``error`` for a present-but-malformed subagent id on a route that
-refuses one rather than reading it as the parent (session-stop, the transfer)
--- the effect fence's wording, so a client sees one phrase for one fault."""
+refuses one rather than reading it as the parent (session-stop, the transfer,
+an opted-in pre-edit) -- the effect fence's wording, so a client sees one
+phrase for one fault."""
 
 _AGENT_ID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32}",
@@ -1481,6 +1502,21 @@ class CoordinatorHTTPServer:
         # records (:meth:`forget_stale_warnings`).
         self._stale_warned_pairs: set[tuple[UUID, UUID]] = set()
         self._stale_warned_pairs_lock = threading.Lock()
+
+        # #514: one entry per (agent, file) a strict stale-read deny was sent
+        # to -- a pre-read deny on an INVALID row, or the strict pre-edit stale
+        # deny. The agent's next Claude Code Read of the file is admitted when
+        # its bytes are the recorded content, and takes the entry; any admitted
+        # hook Read or pre-edit of the pair takes it too, and so does a Bash or
+        # Grep command that re-grants the row (#242). Every path that makes the
+        # row valid again must take it: an entry left behind lets a later stale
+        # Read through with no deny. No version in it: a
+        # commit after the deny is what that Read returns. Process-local, not
+        # Python's stale-warned set: that one is armed by every first warning
+        # and never by pre-edit. A restart loses the entries, which costs one
+        # more deny and never admits a write from a stale copy.
+        self._stale_read_recoveries: set[tuple[UUID, UUID]] = set()
+        self._stale_read_recoveries_lock = threading.Lock()
 
         # SB-10 (KTD5): compact-pending flags, keyed by session_id. Set by
         # /hooks/session-start when it emitted a non-empty re-grounding
@@ -2156,6 +2192,23 @@ class CoordinatorHTTPServer:
                 return True
             return False
 
+    def arm_stale_read_recovery(self, agent_id: UUID, artifact_id: UUID) -> None:
+        """#514: record that a strict stale-read deny was sent to this pair, so
+        its next Claude Code Read of the file can be admitted."""
+        with self._stale_read_recoveries_lock:
+            self._stale_read_recoveries.add((agent_id, artifact_id))
+
+    def take_stale_read_recovery(self, agent_id: UUID, artifact_id: UUID) -> bool:
+        """#514: clear the pair's entry and say whether there was one. One
+        test-and-clear under the lock, so two Reads racing after one deny
+        cannot both be admitted on it."""
+        with self._stale_read_recoveries_lock:
+            pair = (agent_id, artifact_id)
+            if pair in self._stale_read_recoveries:
+                self._stale_read_recoveries.remove(pair)
+                return True
+            return False
+
     def forget_stale_warnings(self, agent_id: UUID) -> None:
         """Drop every stale-warning marker of an identity that has ended
         (#525). Only the identity's own next pre-read on a file consumes its
@@ -2687,6 +2740,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # the victim's preemption notices or bump stale-warning telemetry the fence
     # throws away. Absent (every non-fence client), behavior is byte-unchanged.
     verify_only = bool(body.get("verify_only"))
+    hook_read = _is_hook_read(body)
 
     sid_err = validate_session_id(session_id)
     if sid_err:
@@ -2911,6 +2965,10 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 _record_held_read(
                     coordinator, artifact_id, agent_id, trigger="held_read", tick=now,
                 )
+            # #514: an admitted Read uses up a recovery a shell read left
+            # unused, so it cannot skip the deny of a later stale copy.
+            if hook_read:
+                coordinator.take_stale_read_recovery(agent_id, artifact_id)
             if want_generation and decision.owner_generation is not None:
                 fresh["owner_generation"] = decision.owner_generation
             return fresh
@@ -2983,14 +3041,39 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # != INVALID: continue` filter — same effective gate as the
         # original Unit 2 design, applied per-detected-path.
         #
-        # KTD-T: do NOT re-grant SHARED on deny. The MESI state stays
-        # INVALID (or None) across the model's retry loop so every
-        # retry produces the same byte-stable deny reason text. Per
-        # Phase 0 finding the model exits the retry loop after 2-5
-        # attempts and routes to alternative behavior; the deny IS the
-        # signal. Re-granting would let the second retry get fresh and
-        # silently downgrade the operator's hard guardrail.
+        # #514: deny once, then admit the next Read. The deny itself grants
+        # nothing, so an Edit sent before the session reads again is still
+        # refused (pre-edit refuses INVALID). The deny on an INVALID row arms
+        # the pair's recovery -- only that deny and pre-edit's stale deny arm
+        # it, and only such a row is admitted here: a recovery an ended
+        # identity left armed does not admit its Read with no row, as on the
+        # Node coordinator -- and the session's next
+        # Claude Code Read of the file is admitted through the stale-arm
+        # re-grant when the bytes it hashed are the recorded content, whatever
+        # version the deny reported: a commit since then is what that Read
+        # returns, as the deny text says. A Read of other bytes, or with no
+        # hash because the file is gone, stays denied and keeps the recovery:
+        # admitting it would record an observation of bytes the coordinator
+        # never recorded, and the next Edit would build on them. Every other
+        # pre-read caller (see ``_is_hook_read``) keeps the deny in place
+        # across retries, and so does a session that never read the file: it
+        # has no row to recover, so its deny arms nothing. That is also why
+        # its deny always takes the disk-mismatch text, even on a record that
+        # claims no content: its next Read is denied the same way, so the
+        # text must not promise one.
         if decision.outcome == "denied":
+            recorded_bytes = _reads_the_recorded_bytes(artifact, content_hash)
+            if (
+                hook_read
+                and agent_state == MESIState.INVALID
+                and recorded_bytes
+                and coordinator.take_stale_read_recovery(agent_id, artifact_id)
+            ):
+                _regrant_unless_overtaken(
+                    coordinator, artifact_id, agent_id,
+                    classified_version=decision.version, tick=now, content_hash=content_hash,
+                )
+                return {"status": "fresh", "version": decision.version}
             return _emit_pre_read_strict_deny(
                 coordinator,
                 agent_id=agent_id,
@@ -3000,6 +3083,8 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 summary=summary,
                 source="pre_read_strict_deny",
                 effects=effects,
+                disk_differs=(agent_state is None) or not recorded_bytes,
+                arm_recovery=hook_read and agent_state == MESIState.INVALID,
             )
 
         # Re-grant SHARED so this read doesn't re-fire stale on every call.
@@ -3008,13 +3093,21 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # ADMIT an effect whose grant a peer already revoked (the write-
         # preemption blind spot). Leaving it INVALID makes the HOLD
         # level-triggered — every bare re-check re-HOLDs until a real
-        # reacquire() re-mints a live grant — matching the strict leg (KTD-T
-        # never re-grants on a deny). The client discards this read's bytes.
+        # reacquire() re-mints a live grant. The strict leg stays
+        # level-triggered the same way for every caller that is not a hook
+        # Read (see ``_is_hook_read``), a verify_only read included: since
+        # #514 only a hook Read's strict deny is followed by an admitted
+        # re-read. The client discards this read's bytes.
         if not verify_only:
             _regrant_unless_overtaken(
                 coordinator, artifact_id, agent_id,
                 classified_version=decision.version, tick=now, content_hash=content_hash,
             )
+            # #514: an admitted Read uses up a recovery left armed -- by an
+            # identity whose rows an ended stop forgot -- so it cannot skip
+            # the deny of a later stale copy.
+            if hook_read:
+                coordinator.take_stale_read_recovery(agent_id, artifact_id)
         resp = _payloads.build_stale_response(summary)
         if want_generation and decision.owner_generation is not None:
             # The effect gate re-validates through THIS path after a sweep
@@ -3577,6 +3670,16 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     opted_in = _opted_in_acquire_or_fail(body)
     degraded_answer = _pre_edit_degraded_answer(opted_in)
     req._degraded_response = degraded_answer
+    # An opted-in request with a present but malformed subagent id is
+    # refused, not read as the parent: the holder check admits the caller's
+    # own identity, so a subagent read as its parent would pass as that
+    # parent's repeat and edit over its hold. Checked ahead of the principal
+    # refusal and the untracked exit, as the effect fence checks it, so both
+    # coordinators answer one body for this fault whatever else the request
+    # carries. A request that did not opt in keeps reading it as the parent.
+    if opted_in and has_malformed_subagent_id(body):
+        req._json(400, {"error": _MALFORMED_SUBAGENT_ERROR})
+        return
     presented = _presented_caller(req, session_id, read_subagent_id(body))
     if opted_in and presented.principal is None:
         # The holder check admits the caller's own identity, so an opted-in
@@ -3700,6 +3803,9 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                     "hash_differs": False,  # pre-edit doesn't carry content_hash
                 }
                 def record_deny() -> None:
+                    # #514: this deny is the session's one deny, so its next
+                    # Read of the file can be admitted.
+                    coordinator.arm_stale_read_recovery(agent_id, artifact_id)
                     coordinator.increment_stale_warning_emitted()
                     # v0.2 Unit 4 telemetry.
                     coordinator.increment_strict_mode_denial()
@@ -3766,6 +3872,10 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             return refusal
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
+        # #514: an admitted edit uses up a recovery left armed -- by an
+        # identity whose rows an ended stop forgot -- so it cannot skip the
+        # deny of a later stale copy.
+        coordinator.take_stale_read_recovery(agent_id, artifact_id)
 
         # #278: pre-edit carries no content hash, and post-edit records
         # whatever it is sent, so a write built from an earlier read replaced a
@@ -4682,6 +4792,35 @@ def _clear_acknowledged_marker(registry: RegistryBase, artifact_id: UUID, agent_
         registry.clear_agent_transient(artifact_id, agent_id)
 
 
+_NOT_A_HOOK_READ_FIELDS = ("want_owner_generation", "verify_only", "name_kind")
+"""Fields only a pre-read caller other than a Claude Code hook client sends:
+CoherentVolume and the documented raw capture send the generation opt-in, the
+effect fence sends ``verify_only``, the substrate sends ``name_kind``. The hook
+clients send ``{session_id, path, content_hash, agent_id}`` and nothing else."""
+
+
+def _is_hook_read(body: dict) -> bool:
+    """#514: whether a pre-read is a Claude Code hook Read, the one caller whose
+    strict stale-read deny is recovered by reading again. Every other caller
+    recovers with a new identity (``reacquire()`` or a new agent id), and the
+    substrate's commit gate relies on its deny staying in place, so a request
+    carrying any of :data:`_NOT_A_HOOK_READ_FIELDS` keeps today's deny. Decided
+    by the field being present, whatever its value, so an explicit ``false``
+    still marks a caller that is not a hook client."""
+    return not any(field in body for field in _NOT_A_HOOK_READ_FIELDS)
+
+
+def _reads_the_recorded_bytes(artifact: Artifact, content_hash: str | None) -> bool:
+    """Whether a read hashed the content the coordinator recorded, or the record
+    holds no content to compare with. A missing hash -- the file is gone -- is
+    not the recorded content. One rule for a stale-arm read acknowledging the
+    write that made it stale and for a strict reader being admitted (#514)."""
+    return (
+        not coordinator_holds_content_claim(artifact.content_hash)
+        or content_hash == artifact.content_hash
+    )
+
+
 def _regrant_unless_overtaken(
     coordinator: CoordinatorHTTPServer,
     artifact_id: UUID,
@@ -4718,9 +4857,8 @@ def _regrant_unless_overtaken(
     with registry.abort_guard():
         artifact = registry.get_artifact(artifact_id)
         overtaken = artifact is not None and artifact.version != classified_version
-        read_the_recorded_bytes = artifact is not None and (
-            not coordinator_holds_content_claim(artifact.content_hash)
-            or content_hash == artifact.content_hash
+        read_the_recorded_bytes = artifact is not None and _reads_the_recorded_bytes(
+            artifact, content_hash
         )
         if read_the_recorded_bytes and not overtaken:
             _clear_acknowledged_marker(registry, artifact_id, agent_id)
@@ -4808,6 +4946,11 @@ def _apply_bash_grep_regrants(
     Each grant clears the peer write's pending-invalidation marker in the same
     hold, as pre-read's re-grant does, so the transient sweep cannot expire the
     granted read to INVALID (#523).
+
+    Each grant, and each held path a running command reads, also uses up the
+    session's strict stale-read recovery on that path (#514): the session now
+    holds the file, so nothing is left to recover, and a recovery left armed
+    would admit its Read of a later stale copy with no deny.
     """
     registry = coordinator.registry
     for artifact_id, trigger in regrants:
@@ -4817,9 +4960,11 @@ def _apply_bash_grep_regrants(
                 artifact_id, agent_id, MESIState.SHARED,
                 trigger=trigger, tick=tick, observed=command_runs,
             )
+        coordinator.take_stale_read_recovery(agent_id, artifact_id)
     if command_runs:
         for artifact_id, trigger in held:
             _record_held_read(coordinator, artifact_id, agent_id, trigger=trigger, tick=tick)
+            coordinator.take_stale_read_recovery(agent_id, artifact_id)
 
 
 def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:
@@ -8761,7 +8906,9 @@ def _build_preemption_text(
                 f"(heartbeat timeout or max-hold ceiling) at {_iso_utc(ts)}. "
                 f"Any local edit you made to this file will land in your "
                 f"worktree but is NOT reflected in the coordinator's version. "
-                f"Re-fetch via pre-read and retry."
+                # #514: a strict file's first Read after the reclaim is denied
+                # and says to read again; the Read after it is admitted.
+                f"Read it again with the Read tool before you edit it."
             )
             continue
         # R7: the notice row already carries the preempter's agent id, which
@@ -9308,6 +9455,8 @@ def _emit_pre_read_strict_deny(
     source: str,
     effects: _AnswerEffects,
     out_of_band: bool = False,
+    disk_differs: bool = False,
+    arm_recovery: bool = False,
 ) -> dict:
     """Single source of truth for emitting a pre-read strict-mode deny, used by
     both deny arms: the INVALID/None-grant path and the Survivor #6
@@ -9320,8 +9469,31 @@ def _emit_pre_read_strict_deny(
     ``effects`` and recorded only when this deny is the answer sent (#236).
     ``out_of_band`` is the SHARED-holder arm's alone (#278): only a reader
     that still holds a valid grant is told its file changed outside the
-    coordinator."""
+    coordinator. ``disk_differs`` belongs to the arm for a reader with no
+    valid grant (#514): its bytes are not the recorded content, so reading
+    again does not clear the deny, and the text names what does instead of
+    promising a Read. ``arm_recovery`` is the INVALID-row arm's, for a Claude
+    Code Read (#514): it arms the recovery that admits the session's next
+    Read."""
+    if disk_differs:
+        hook_output = _payloads.emit_disk_mismatch_deny(
+            path=path,
+            current_version=summary["current_version"],
+            write_in_flight=_a_write_is_in_flight(
+                coordinator.registry, artifact_id,
+                now_unix=_payloads.now_unix(),
+                window_sec=_SHARED_FOREIGN_DENY_LAG_WINDOW_SEC,
+                exclude_agent=agent_id,
+            ),
+        )
+    else:
+        hook_output = _payloads.emit_strict_deny(
+            source=source, summary=summary, out_of_band=out_of_band,
+        )
+
     def record_deny() -> None:
+        if arm_recovery:
+            coordinator.arm_stale_read_recovery(agent_id, artifact_id)
         coordinator.increment_stale_warning_emitted()
         coordinator.mark_stale_warned(agent_id, artifact_id)
         coordinator.increment_strict_mode_denial()
@@ -9331,13 +9503,7 @@ def _emit_pre_read_strict_deny(
         ):
             coordinator.increment_audit_log_mode_drift()
     effects.defer(record_deny)
-    return {
-        "hookSpecificOutput": _payloads.emit_strict_deny(
-            source=source, summary=summary, out_of_band=out_of_band,
-        ),
-        "status": "stale",
-        "summary": summary,
-    }
+    return {"hookSpecificOutput": hook_output, "status": "stale", "summary": summary}
 
 
 def _is_recent_self_commit_lag(
@@ -9799,9 +9965,13 @@ def _read_policy_bytes(yaml_path: Path, name: str) -> bytes:
         result.status is ReadStatus.UNREADABLE
         or (result.status is ReadStatus.NOT_REGULAR and exc.errno == errno.EISDIR)
     ):
-        code = errno.errorcode.get(exc.errno, str(exc)) if exc.errno else str(exc)
-        raise ValueError(f"{name} could not be read ({code}); nothing was written.")
+        raise ValueError(f"{name} could not be read ({_errno_name(exc)}); nothing was written.")
     raise ValueError(f"{name} could not be read (not a regular file); nothing was written.")
+
+
+def _errno_name(exc: OSError) -> str:
+    """``exc``'s errno as its name (``ENOSPC``), or its text when it has none."""
+    return errno.errorcode.get(exc.errno, str(exc)) if exc.errno else str(exc)
 
 
 def _entries_or_none(text: str, name: str) -> list[str] | None:
@@ -9815,36 +9985,309 @@ def _entries_or_none(text: str, name: str) -> list[str] | None:
 def _replace_policy_file(yaml_path: Path, content: str) -> None:
     """Write ``content`` to a fresh temp file beside ``yaml_path`` and rename
     it over the file, so a failed write (an encoding error, a full disk)
-    leaves the old file whole where a truncating write left it empty. The
-    temp name is random and created exclusively, so a symlink planted at a
-    predictable name is never followed. Same pattern as the Node writer."""
-    tmp = yaml_path.with_name(f"{yaml_path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    leaves the old file whole where a truncating write left it empty. Same
+    pattern as the Node writer."""
+    tmp = _prepare_policy_file(yaml_path, content)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(content)
         os.replace(tmp, yaml_path)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _prepare_policy_file(yaml_path: Path, content: str) -> Path:
+    """Write ``content`` to a fresh temp file beside ``yaml_path`` and return
+    the temp's path, for :func:`os.replace` to put in place. The temp name is
+    random and created exclusively, so a symlink planted at a predictable name
+    is never followed. A temp that fails to be written is removed, and an
+    error removing it is suppressed so the write's own error comes through."""
+    data = content.encode("utf-8")
+    tmp = yaml_path.with_name(f"{yaml_path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    try:
+        _write_and_close(fd, data)
+    except BaseException:
+        with suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        raise
+    return tmp
+
+
+def _write_and_close(fd: int, data: bytes) -> None:
+    """Write ``data`` to ``fd`` whole, then close it. The descriptor is closed
+    whatever fails, and a failed close never hides the write's own error.
+    Plain ``os.write``, not ``os.fdopen``: a failed ``fdopen`` may or may not
+    have closed the descriptor already, and closing it again could close one
+    another thread just opened."""
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+    except BaseException:
+        with suppress(OSError):
+            os.close(fd)
+        raise
+    os.close(fd)
+
+
+class _PolicyFileUnloadable(ValueError):
+    """The start's policy merge cannot load a policy file: it is a link,
+    unreadable, not a regular file, not valid YAML or not a list. A
+    ``ValueError`` carrying the routes' own text; ``path`` is the file's."""
+
+    kind = POLICY_FILE_UNLOADABLE_KIND
+
+    def __init__(self, yaml_path: Path, message: str) -> None:
+        super().__init__(message)
+        self.path = str(yaml_path)
+
+
+class _PolicyWriteFailed(OSError):
+    """An ``OSError`` at one step of the start's policy merge: creating or
+    locking a lock file, or writing or replacing a policy file. ``path`` is the
+    file the step failed on, ``errno_name`` the error's name (``ENOSPC``) and
+    ``committed`` the policy files already replaced, in order. Still an
+    ``OSError``, as the failure was before it was named."""
+
+    kind = POLICY_WRITE_FAILED_KIND
+
+    def __init__(
+        self, path: Path, verb: str, error: OSError, committed: Sequence[Path] = (),
+    ) -> None:
+        self.path = str(path)
+        self.errno_name = _errno_name(error)
+        self.committed = tuple(str(written) for written in committed)
+        super().__init__(_write_failed_text(path, verb, self.errno_name, committed))
+
+
+def _write_failed_text(path: Path, verb: str, errno_name: str, committed: Sequence[Path]) -> str:
+    name = policy_file_name(path)
+    failed = f"{name} could not be {verb} ({errno_name});"
+    if not committed:
+        return f"{failed} nothing was written."
+    written = " and ".join(policy_file_name(each) for each in committed)
+    were = "was" if len(committed) == 1 else "were"
+    return f"{failed} {written} {were} written and {name} was not."
+
+
+@contextmanager
+def _write_step(path: Path, verb: str, committed: Sequence[Path] = ()) -> Iterator[None]:
+    """Raise an ``OSError`` from the block as :class:`_PolicyWriteFailed` for
+    ``path``. Anything else propagates as itself."""
+    try:
+        yield
+    except OSError as exc:
+        raise _PolicyWriteFailed(path, verb, exc, committed) from exc
 
 
 def merge_policy_globs(yaml_paths: Iterable[Path], globs: tuple[str, ...]) -> None:
     """Merge ``globs`` into each policy file. A file that already holds them is
     left as it is.
 
-    Raises ValueError, before writing any file, naming one that cannot be read, is
-    not valid YAML or is not a list, with the routes' own refusal (#305). Reading it
-    as empty would replace every entry in it with only these globs, at the restart
-    that would otherwise report it in ``rejected_pattern_count``."""
-    rewrites: list[tuple[Path, list[str]]] = []
+    Raises a ``ValueError`` (:class:`_PolicyFileUnloadable`), before writing
+    any file, naming one that cannot be read, is not valid YAML or is not a
+    list, with the routes' own refusal (#305). Reading it as empty would
+    replace every entry in it with only these globs, at the restart that would
+    otherwise report it in ``rejected_pattern_count``.
+
+    Two phases (#499). A read without a lock refuses, or returns when no file
+    needs a change, taking no lock and creating no file. Otherwise the merge
+    holds every file's ``<name>.lock`` (the locks the policy routes take), in
+    the order given, and reads again: that read decides the write, so a
+    ``/policy/track`` or ``/policy/untrack`` that lands meanwhile keeps its
+    entry. It prepares every changed file before it replaces any, then
+    replaces them in the order given, so a failure before the first replace
+    leaves every file as it was.
+
+    A lock file that is not a regular file raises
+    :class:`_PolicyLockNotRegular`. An ``OSError`` creating or locking a lock
+    file, or writing or replacing a policy file, raises
+    :class:`_PolicyWriteFailed`, naming the step, the file and the files
+    already replaced. Nothing else is translated: it propagates as itself once
+    the temp files are removed and the locks freed."""
+    paths = tuple(yaml_paths)
+    if not _policy_rewrites(paths, globs):
+        return
+    with _policy_locks(paths, typed_failures=True):
+        _write_policy_files(_policy_rewrites(paths, globs))
+
+
+def write_start_policy(root: Path, managed: tuple[str, ...]) -> None:
+    """The policy writer a volume and a session run before they start a
+    coordinator (#535): merge the ``managed`` globs into
+    ``.coherence/tracked.yaml`` and ``.coherence/strict_mode.yaml``, which the
+    coordinator loads once, at start. One writer keeps the ``.coherence``
+    check, the locks and the order in one place.
+
+    In order: return at once, checking and creating nothing, when no glob is
+    managed; run :func:`check_coherence_dir`, whose
+    :class:`~ccs.core.exceptions.CoherenceDirRefused` propagates as itself;
+    create ``.coherence`` at mode 0o700, which the lifecycle requires (an
+    existing one keeps its mode: tightening it is the lifecycle's job); then
+    :func:`merge_policy_globs`, ``tracked.yaml`` before ``strict_mode.yaml``.
+
+    Raises :class:`~ccs.core.exceptions.PolicyFileRefused`, its text
+    ``<root>: <what failed>``, for a policy file that cannot be loaded, a lock
+    file that is not a regular file, and an ``OSError`` creating
+    ``.coherence``, creating or locking a lock file, or writing a policy file.
+    Nothing else is translated: a bug or an interrupt propagates as itself, so
+    that degrade mode never turns it into a quiet detach."""
+    if not managed:
+        return
+    check_coherence_dir(root)
+    coherence_dir = root / ".coherence"
+    try:
+        coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise PolicyFileRefused(
+            POLICY_WRITE_FAILED_KIND, str(coherence_dir),
+            f"{root}: .coherence could not be created ({_errno_name(exc)}); nothing was written.",
+        ) from exc
+    try:
+        merge_policy_globs((coherence_dir / "tracked.yaml", coherence_dir / "strict_mode.yaml"), managed)
+    except (_PolicyFileUnloadable, _PolicyLockNotRegular, _PolicyWriteFailed) as signal:
+        raise PolicyFileRefused(signal.kind, signal.path, f"{root}: {signal}") from signal
+
+
+def _policy_rewrites(yaml_paths: Sequence[Path], globs: tuple[str, ...]) -> list[tuple[Path, str]]:
+    """The new content of each file in ``yaml_paths`` that lacks one of
+    ``globs``, in order. Reads every file before it returns, so one it cannot
+    load refuses the merge before any is written."""
+    rewrites: list[tuple[Path, str]] = []
     for yaml_path in yaml_paths:
-        name = policy_file_name(yaml_path)
-        existing = _read_policy_entries(_read_policy_bytes(yaml_path, name), name)
+        existing = _loadable_policy_entries(yaml_path)
         merged = sorted(set(existing) | set(globs))
         if merged != sorted(existing):
-            rewrites.append((yaml_path, merged))
-    for yaml_path, merged in rewrites:
-        _replace_policy_file(yaml_path, yaml.safe_dump(merged, default_flow_style=False))
+            rewrites.append((yaml_path, yaml.safe_dump(merged, default_flow_style=False)))
+    return rewrites
+
+
+def _loadable_policy_entries(yaml_path: Path) -> list[str]:
+    name = policy_file_name(yaml_path)
+    try:
+        return _read_policy_entries(_read_policy_bytes(yaml_path, name), name)
+    except ValueError as exc:
+        raise _PolicyFileUnloadable(yaml_path, str(exc)) from None
+
+
+def _write_policy_files(rewrites: Sequence[tuple[Path, str]]) -> None:
+    """Prepare a temp file for every one of ``rewrites``, then replace the
+    files in order. Every temp not put in place is removed whatever fails, an
+    error removing one suppressed so it never hides the failure."""
+    staged: list[tuple[Path, Path]] = []
+    committed: list[Path] = []
+    try:
+        for yaml_path, content in rewrites:
+            with _write_step(yaml_path, "written"):
+                staged.append((yaml_path, _prepare_policy_file(yaml_path, content)))
+        for yaml_path, tmp in staged:
+            with _write_step(yaml_path, "written", tuple(committed)):
+                os.replace(tmp, yaml_path)
+            committed.append(yaml_path)
+    finally:
+        for _, tmp in staged[len(committed):]:
+            with suppress(OSError):
+                tmp.unlink(missing_ok=True)
+
+
+class _PolicyLockNotRegular(ValueError):
+    """A policy file's ``<name>.lock`` sidecar is a link or not a regular file,
+    so it was not locked and nothing was written (#498, #534). A ``ValueError``,
+    so the routes answer it as HTTP 400. ``path`` is the sidecar's path."""
+
+    kind = POLICY_LOCK_NOT_REGULAR_KIND
+
+    def __init__(self, lock_path: Path, message: str) -> None:
+        super().__init__(message)
+        self.path = str(lock_path)
+
+
+def _lock_not_regular_text(name: str) -> str:
+    return f"{name}.lock could not be read (not a regular file); nothing was written."
+
+
+def _is_present_but_not_regular(path: Path) -> bool:
+    try:
+        return not stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _open_policy_lock(yaml_path: Path) -> int:
+    """Open ``yaml_path``'s ``<name>.lock`` sidecar, creating it at mode 0o600,
+    and return the descriptor. Raises :class:`_PolicyLockNotRegular` with the
+    routes' text for a link or anything else that is not a regular file there,
+    and the open's own ``OSError`` otherwise."""
+    lock_path = _policy_lock_path(yaml_path)
+    name = policy_file_name(yaml_path)
+    try:
+        # No-follow (#498): O_CREAT through a dangling link creates the file it
+        # names, outside .coherence.
+        return open_regular(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except LinkRefused:
+        raise _PolicyLockNotRegular(lock_path, lock_link_refusal(name)) from None
+    except NotRegularFile:
+        # A FIFO or device put there while the coordinator runs (a start refuses
+        # one): the 400 a policy file that is not regular gets.
+        raise _PolicyLockNotRegular(lock_path, _lock_not_regular_text(name)) from None
+    except OSError:
+        # A directory or socket fails the open itself, before the regular-file
+        # check (#534): EISDIR, or EOPNOTSUPP on macOS and ENXIO on Linux. Told
+        # apart here rather than in the no-follow reader, so every other reader
+        # still reads a socket as unreadable.
+        if _is_present_but_not_regular(lock_path):
+            raise _PolicyLockNotRegular(lock_path, _lock_not_regular_text(name)) from None
+        raise
+
+
+def _policy_lock_path(yaml_path: Path) -> Path:
+    return yaml_path.with_suffix(yaml_path.suffix + ".lock")
+
+
+def _release_policy_lock(fcntl_module: ModuleType, fd: int) -> None:
+    with suppress(OSError):
+        fcntl_module.flock(fd, fcntl_module.LOCK_UN)
+    with suppress(OSError):
+        os.close(fd)
+
+
+def _lock_step(yaml_path: Path, verb: str, typed_failures: bool) -> AbstractContextManager[None]:
+    return _write_step(_policy_lock_path(yaml_path), verb) if typed_failures else nullcontext()
+
+
+@contextmanager
+def _policy_locks(yaml_paths: Sequence[Path], *, typed_failures: bool = False) -> Iterator[None]:
+    """Hold an exclusive lock on each policy file's ``<name>.lock`` sidecar,
+    taken in the order given and released in reverse, ``LOCK_UN`` before
+    ``close``, with release errors suppressed. The wait has no bound. Raises
+    what :func:`_open_policy_lock` raises.
+
+    With ``typed_failures``, an ``OSError`` opening or locking a sidecar is
+    raised as :class:`_PolicyWriteFailed`, naming that step (``created`` or
+    ``locked``) and the sidecar; the start's policy merge asks for that. The
+    routes leave it off and get the ``OSError`` itself, which they answer as
+    before.
+
+    Two writers that each read a policy file and replace it cannot then
+    interleave and lose each other's entries. ``flock``, never ``lockf`` or
+    ``fcntl`` record locks: two holders in one process each open their own
+    descriptor, and only ``flock`` makes those exclude each other. A sidecar is
+    never removed: removing one lets two holders lock two different inodes.
+
+    Without ``fcntl`` (Windows, where lifecycle already disables the
+    coordinator) it takes no lock and creates no sidecar."""
+    try:
+        import fcntl as _fcntl
+    except ImportError:
+        yield
+        return
+    with ExitStack() as held:
+        for yaml_path in yaml_paths:
+            with _lock_step(yaml_path, "created", typed_failures):
+                fd = _open_policy_lock(yaml_path)
+            held.callback(_release_policy_lock, _fcntl, fd)
+            with _lock_step(yaml_path, "locked", typed_failures):
+                _fcntl.flock(fd, _fcntl.LOCK_EX)
+        yield
 
 
 def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str], list[dict]]:
@@ -9852,16 +10295,11 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
     Raises ValueError, which the routes answer as HTTP 400, when the file
     would exceed MAX_POLICY_YAML_BYTES, an entry could not take effect in
     it (see :func:`_append_policy_entries`), or its lock sidecar is a link
-    or not a regular file (#498); nothing is written then.
+    or not a regular file (#498, #534); nothing is written then.
 
-    R14 (Unit 6): the read-modify-write is wrapped in an ``fcntl.flock``
-    exclusive lock on a sidecar ``<yaml_path>.lock`` file so two concurrent
-    /policy/track or /policy/untrack requests cannot interleave their
-    reads-and-writes and corrupt the YAML (e.g., both read the same
-    pre-state, both compute "previous + my_paths", second write loses the
-    first writer's additions). fcntl is POSIX-only; on the deferred
-    Windows path this is a no-op (lifecycle already disables the
-    coordinator on Windows per _FCNTL_AVAILABLE).
+    The read-modify-write runs under the file's lock (:func:`_policy_locks`),
+    so two concurrent /policy/track or /policy/untrack requests cannot both
+    read the same file and the second write drop the first's additions.
 
     COR-06: callers pre-validate via ``validate_path`` (or equivalent)
     and pass only safe paths. The local re-check below is a defensive
@@ -9894,35 +10332,5 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
 
     if not added:
         return added, rejected
-
-    try:
-        import fcntl as _fcntl
-    except ImportError:
-        # Windows fallback: no fcntl. Lifecycle already disables the
-        # coordinator on Windows, but degrade defensively if reached.
+    with _policy_locks([yaml_path]):
         return _append_policy_entries(yaml_path, added), rejected
-    lock_path = yaml_path.with_suffix(yaml_path.suffix + ".lock")
-    try:
-        # No-follow (#498): O_CREAT through a dangling link creates the file it
-        # names, outside .coherence.
-        lock_fd = open_regular(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-    except LinkRefused:
-        raise ValueError(lock_link_refusal(policy_file_name(yaml_path))) from None
-    except NotRegularFile:
-        # A FIFO, socket or device put there while the coordinator runs (a start
-        # refuses one): the 400 a policy file that is not regular gets.
-        raise ValueError(
-            f"{policy_file_name(yaml_path)}.lock could not be read (not a regular file); nothing was written."
-        ) from None
-    try:
-        _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
-        return _append_policy_entries(yaml_path, added), rejected
-    finally:
-        try:
-            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
-        except OSError:
-            pass
-        try:
-            os.close(lock_fd)
-        except OSError:
-            pass
