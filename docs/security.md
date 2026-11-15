@@ -191,7 +191,7 @@ What follows from that:
   that claimed one, and refuse one that presents another principal. A
   pre-read drains the named session's pending notices into its own answer, and
   in warn mode a stale pre-read re-grants the session a read of the file and
-  uses up its stale warning. In strict mode, from the release after 0.16.0, a
+  uses up its stale warning. In strict mode, from 0.16.1, a
   Claude Code read of a stale copy is denied once and the next read whose
   bytes are the recorded content is admitted (see
   [After a strict-mode stale deny](guide.md#after-a-strict-mode-stale-deny)).

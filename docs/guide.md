@@ -5008,8 +5008,8 @@ date is denied its next Read or Edit of that file. The copy goes out of date
 when another session commits the file, when another session takes the file for
 writing and lets go of it without committing, when the coordinator reclaims
 the session's grant, or when one of the session's own subagents commits the
-file. On this package's coordinator newer than 0.16.0, and on the Claude Code
-plugin's Node coordinator in plugin releases after 0.7.0, the session gets one
+file. On this package's coordinator from 0.16.1, and on the Claude Code
+plugin's Node coordinator from plugin 0.7.1, the session gets one
 deny for a stale copy and can then read the file again
 ([#514](https://github.com/Cohexa-ai/agent-coherence/issues/514)). Earlier
 coordinators deny every later Read of the file too.
@@ -5103,7 +5103,7 @@ their own way:
 
 - `CoherentVolume`, and the
   [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server) built on
-  it: `reacquire()`, or `swg_reacquire`. From the release after 0.16.0 the
+  it: `reacquire()`, or `swg_reacquire`. From 0.16.1 the
   volume's plain `read()` and its `open()` shim send
   `"want_owner_generation": true`, as its versioned reads already did, so every
   volume read keeps the deny. The answer gains an `owner_generation` that
@@ -5129,7 +5129,7 @@ their own way:
   write it.
 - A `CoherentVolume` from 0.16.0 or earlier marks none of its plain reads.
   Reading through a coordinator that has this recovery, such as the plugin's
-  Node coordinator in plugin releases after 0.7.0, its second plain read of a
+  Node coordinator from plugin 0.7.1, its second plain read of a
   file whose copy went stale is admitted, and a later `write()` of a buffer
   built before a peer's commit is admitted too
   ([#629](https://github.com/Cohexa-ai/agent-coherence/issues/629)). Upgrade
@@ -5221,7 +5221,7 @@ Read `other_holder` by the route that sent it.
 **Who counts as another agent.** The check compares agent identities: the
 session, plus the subagent id when the request sends one. An empty or `null`
 subagent id is none: the request acts as the parent session. A coordinator
-newer than 0.16.0, and the Node coordinator in plugin releases after 0.7.0,
+from 0.16.1, and the Node coordinator from plugin 0.7.1,
 refuse an opted-in request whose subagent id is present but not 1 to 64
 characters of `[A-Za-z0-9_-]`, with HTTP `400` and
 `{"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"}`, ahead of the
@@ -5277,7 +5277,7 @@ keeps none of them. A refuse-mode `CoherentVolume` types each answer for you; se
 
 | When the request is decided | Answer | `/status` counter | What the client does |
 |---|---|---|---|
-| Python coordinator newer than 0.16.0, or Node coordinator in plugin releases after 0.7.0: it carries a subagent id that is present but not 1 to 64 characters of `[A-Za-z0-9_-]` | HTTP `400`, `{"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"}`, decided ahead of the principal and tracked-path checks | none | send a well-formed subagent id, or none for the parent session: no retry clears it |
+| Python coordinator from 0.16.1, or Node coordinator from plugin 0.7.1: it carries a subagent id that is present but not 1 to 64 characters of `[A-Za-z0-9_-]` | HTTP `400`, `{"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"}`, decided ahead of the principal and tracked-path checks | none | send a well-formed subagent id, or none for the parent session: no retry clears it |
 | Python coordinator: it presents no principal header, or an empty or whitespace-only one | HTTP `400`, `"reason": "caller_principal_absent"` | `caller_principal_refused_total` | claim a principal, then send again; claiming binds the session (see the client rules below) |
 | Python coordinator: it presents a principal that is not the one bound to the session | HTTP `400`, `"reason": "caller_principal_foreign"` | `caller_principal_refused_total` | claim again with the same nonce, then send again |
 | Python coordinator: the caller-principal check or the pre-edit work runs past the 4-second handler budget | `unavailable` (see **Under load**) | `watchdog_timeouts_total` | back off, then release |
@@ -5721,8 +5721,8 @@ against the coordinator's grammar: 1 to 64 characters of `[A-Za-z0-9_-]`. It
 denies a malformed one with the unavailable deny and sends nothing: a
 coordinator that reads such an id as the parent session would admit the
 subagent as the parent's own repeat, over the parent's hold. An empty or `null`
-id is the parent session, as on every route. A coordinator newer than 0.16.0,
-and the Node coordinator in plugin releases after 0.7.0, refuse such a request
+id is the parent session, as on every route. A coordinator from 0.16.1,
+and the Node coordinator from plugin 0.7.1, refuse such a request
 with HTTP `400` themselves (see **Who counts as another agent**); against this
 package's 0.16.0 coordinator or the Node coordinator of plugin 0.7.0, the
 client's check is the only guard.
@@ -5742,8 +5742,7 @@ apply, and:
   Read after that deny is admitted at the holder's version, and its edits are
   admitted after it (see
   [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)). This
-  package's coordinator newer than 0.16.0 and the Node coordinator in plugin
-  releases after 0.7.0 do this; on earlier coordinators the session stays
+  package's coordinator from 0.16.1 and the Node coordinator from plugin 0.7.1 do this; on earlier coordinators the session stays
   denied on Read and Edit of that file for the rest of the session.
 - **Shell writes still land
   ([#516](https://github.com/Cohexa-ai/agent-coherence/issues/516)).** A
