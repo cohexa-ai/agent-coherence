@@ -412,17 +412,24 @@ def emit_disk_mismatch_deny(
 
 HELD_PATH_DENY_REASON_TEMPLATE: str = (
     "Edit denied: {path} is held by agent {holder}. It comes free when that "
-    "agent lets go of it, or after 10 to 30 minutes. Do not retry now: do "
-    "other work that does not need {path}, or stop and tell your user. If you "
-    "hold {path} yourself through another tool, such as an MCP server, "
-    "release it there first."
+    "agent lets go of it, or at the latest once that agent has held it for 30 "
+    "minutes. Do not retry now: do other work that does not need {path}, or "
+    "stop and tell your user. If you hold {path} yourself through another "
+    "tool, such as an MCP server, release it there first."
 )
 """Another agent holds the path. ``holder`` is the holder's short agent id,
 never a session id. The text names both ways the file comes free and gives a
 window rather than a moment, and never a "turn", which one session cannot see
-in another. The last sentence is there because a hold this session took
-through another client is a different agent to the coordinator, so a session
-can be refused by its own hold."""
+in another. The window's end is the one both coordinators keep (#628): the
+Python coordinator's sweep frees a grant its holder has held for
+``grant_max_hold_sec`` (30 minutes by default), or sooner once the holder has
+been quiet for ``grant_heartbeat_timeout_sec`` (10 minutes); the Node
+coordinator runs no timer, and gives an opted-in edit a grant its holder has
+held for 30 minutes, so the refused session's next edit after that gets the
+file. The 10 minutes are left out because the Node coordinator does not keep
+them. The last sentence is there because a hold this session took through
+another client is a different agent to the coordinator, so a session can be
+refused by its own hold."""
 
 HELD_BY_PARENT_DENY_REASON_TEMPLATE: str = (
     "Edit denied: {path} is held by the session that started you. Do not wait "

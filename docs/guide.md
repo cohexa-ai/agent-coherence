@@ -5299,9 +5299,11 @@ MODIFIED, and the optimistic lane is no way around it — `post-edit-cas` answer
 releases it — `session-stop`, which a Claude Code session sends when a turn
 completes normally, or a failed `post-edit` — or hands it on with a
 [transfer](#targeted-grant-handoff) (Python coordinator only), or when the
-coordinator reclaims it: the Python coordinator's sweep from a silent holder
-(see **What it does not close**), the Node coordinator's opted-in acquire from
-a holder of 30 minutes or more (see **On the Node coordinator**). A release
+coordinator reclaims it. On the Python coordinator the sweep reclaims it, by
+default from a holder quiet for 10 minutes or one that has held the path for
+30 (see **What it does not close**). The Node coordinator runs no timer: only
+an opted-in acquire reclaims it, from a holder of 30 minutes or more (see
+**On the Node coordinator**). A release
 leaves the holder a reader of the path (`SHARED`), and a reader refuses no
 one. Poll with backoff rather than wait for a signal.
 
@@ -5668,13 +5670,16 @@ Write, opts in; every other hook event sends what it sent before. The client:
 id:
 
 ```text
-Edit denied: {path} is held by agent {holder}. It comes free when that agent lets go of it, or after 10 to 30 minutes. Do not retry now: do other work that does not need {path}, or stop and tell your user. If you hold {path} yourself through another tool, such as an MCP server, release it there first.
+Edit denied: {path} is held by agent {holder}. It comes free when that agent lets go of it, or at the latest once that agent has held it for 30 minutes. Do not retry now: do other work that does not need {path}, or stop and tell your user. If you hold {path} yourself through another tool, such as an MCP server, release it there first.
 ```
 
-The window is the reclaim's: by default this package's coordinator reclaims a
-holder that goes quiet after about 10 minutes, and either coordinator reclaims
-any holder after about 30, the Node coordinator when an opted-in request asks
-for the file (see **When the path comes free** above). The last
+The 30 minutes are the bound both coordinators keep. By default this package's
+coordinator reclaims a holder once it has held the file for 30 minutes, and
+sooner, after about 10, from a holder that goes quiet. The Node coordinator
+runs no timer: it gives the file to an opted-in edit once the holder has held
+it for 30 minutes, so the refused session's next edit after that gets it. The
+text leaves out the 10 minutes because the Node coordinator does not keep them
+(see **When the path comes free** above). The last
 sentence is there because a hold the session took through another client, such
 as the MCP server, is another agent to the coordinator, so a session can be
 refused by its own hold.

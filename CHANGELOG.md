@@ -4,6 +4,21 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
+## [Unreleased]
+
+### Fixed
+
+- **The held-file deny no longer says the file comes free after 10 to 30
+  minutes (#628).** The opt-in deny the hook client gives for an edit of a
+  strict-mode file another agent holds (`.coherence/hook_on_held`) said the
+  file comes free when that agent lets go of it "or after 10 to 30 minutes".
+  The Node coordinator runs no timer: it gives the file to an opted-in edit
+  once the holder has held it for 30 minutes, and never frees it after 10. The
+  deny now says the file comes free when that agent lets go of it, or at the
+  latest once that agent has held it for 30 minutes, which holds on both
+  coordinators. A script or prompt that matches this deny byte for byte must
+  accept the new wording.
+
 ## [0.16.1] - 2026-11-15
 
 **A strict-mode Claude Code session whose copy of a file went stale can read the file again after one deny and keep working, and the deny texts say so; a volume or substrate session merges its globs into the policy files under their locks and reports a policy problem as `PolicyFileRefused`; and the Claude Code hook client gains an opt-in deny for edits of a strict file another agent holds, off by default.**
