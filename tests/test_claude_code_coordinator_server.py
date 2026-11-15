@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import hashlib
 import json
 import logging
@@ -4193,7 +4194,7 @@ def test_merge_policy_globs_adds_to_a_file_that_loads(
     merge_policy_globs((tracked,), ("data/**",))
 
     assert yaml.safe_load(tracked.read_text()) == after
-    assert [path.name for path in tmp_path.iterdir()] == ["tracked.yaml"]
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["tracked.yaml", "tracked.yaml.lock"]
 
 
 def test_merge_policy_globs_leaves_a_file_that_already_holds_the_globs(tmp_path: Path) -> None:
@@ -4260,6 +4261,442 @@ def test_a_policy_write_that_fails_leaves_the_file_whole(
     assert sorted(p.name for p in policy_file.parent.iterdir()) == [
         "tracked.yaml", "tracked.yaml.lock",
     ]
+
+
+# ----------------------------------------------------------------------
+# The start's policy merge takes the routes' locks (#499)
+# ----------------------------------------------------------------------
+
+
+def _hold_policy_lock(yaml_path: Path) -> int:
+    """Hold ``<yaml_path>.lock`` the way a route does, through a descriptor of
+    this test's own. Closing the descriptor frees the lock."""
+    import fcntl
+
+    fd = os.open(f"{yaml_path}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+def _merge_on_a_thread(
+    yaml_paths: tuple[Path, ...], globs: tuple[str, ...],
+) -> tuple[threading.Thread, list[BaseException]]:
+    """Start the merge on a daemon thread; what it raises lands in the list."""
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+
+    raised: list[BaseException] = []
+
+    def merge() -> None:
+        try:
+            merge_policy_globs(yaml_paths, globs)
+        except BaseException as exc:
+            raised.append(exc)
+
+    worker = threading.Thread(target=merge, daemon=True)
+    worker.start()
+    return worker, raised
+
+
+def _assert_policy_locks_free(*yaml_paths: Path) -> None:
+    """Each ``<name>.lock`` takes a non-blocking exclusive lock now."""
+    import fcntl
+
+    for yaml_path in yaml_paths:
+        fd = os.open(f"{yaml_path}.lock", os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+
+
+def _two_policy_files(tmp_path: Path, content: str = '- "docs/**"\n') -> tuple[Path, Path]:
+    """``.coherence/tracked.yaml`` and ``.coherence/strict_mode.yaml``, each
+    holding ``content``."""
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked, strict = coherence / "tracked.yaml", coherence / "strict_mode.yaml"
+    tracked.write_text(content)
+    strict.write_text(content)
+    return tracked, strict
+
+
+def test_merge_policy_globs_waits_for_a_held_lock_and_keeps_the_entry_written_under_it(
+    tmp_path: Path,
+) -> None:
+    """#499: a ``/policy/track`` holds ``tracked.yaml.lock`` and has read the
+    file when a volume or session starts its merge. The merge waits for the
+    lock, reads the file again under it, and the file afterwards holds the
+    route's entry and the managed globs.
+
+    Prevents a lost update: a merge that does not wait, or that decides its
+    write from the read it took before the lock, replaces the file without one
+    of the two. Every wait is bounded, so a regression fails here instead of
+    hanging."""
+    tracked, strict = _two_policy_files(tmp_path)
+    held = _hold_policy_lock(tracked)
+    try:
+        read_under_the_lock = tracked.read_text()
+        worker, raised = _merge_on_a_thread((tracked, strict), ("data/**",))
+        worker.join(timeout=0.5)
+        waited_for_the_lock = worker.is_alive()
+        tracked.write_text(read_under_the_lock + '- "route.md"\n')
+    finally:
+        os.close(held)
+    worker.join(timeout=30)
+
+    assert not worker.is_alive(), "the merge never took the lock"
+    assert raised == []
+    assert yaml.safe_load(tracked.read_text()) == ["data/**", "docs/**", "route.md"]
+    assert yaml.safe_load(strict.read_text()) == ["data/**", "docs/**"]
+    assert waited_for_the_lock, "the merge wrote while a route held the lock"
+
+
+def test_a_policy_track_waits_for_a_merge_that_holds_the_lock_and_both_entries_land(
+    coordinator, client: _Client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#499: a volume's or session's merge holds ``tracked.yaml.lock`` while it
+    replaces the file, so a ``/policy/track`` arriving then waits for it, and
+    the file afterwards holds the merge's globs and the route's entry.
+
+    Prevents the route's read-modify-write interleaving with the merge's, which
+    lost whichever wrote first. The merge pauses inside its replace until the
+    test releases it; every wait is bounded."""
+    coherence = coordinator.coordinator_root / ".coherence"
+    tracked, strict = coherence / "tracked.yaml", coherence / "strict_mode.yaml"
+    committing, release = threading.Event(), threading.Event()
+    real_replace = os.replace
+
+    def paused_replace(src: Any, dst: Any) -> None:
+        if Path(dst) == tracked and not committing.is_set():
+            committing.set()
+            release.wait(timeout=30)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", paused_replace)
+    answers: list[tuple[int, dict]] = []
+    route = threading.Thread(
+        target=lambda: answers.append(client.post("/policy/track", {"paths": ["route.md"]})),
+        daemon=True,
+    )
+    merge, raised = _merge_on_a_thread((tracked, strict), ("data/**",))
+    try:
+        assert committing.wait(timeout=30), "the merge never replaced tracked.yaml"
+        route.start()
+        route.join(timeout=0.5)
+        route_waited = route.is_alive()
+    finally:
+        release.set()
+    merge.join(timeout=30)
+    route.join(timeout=30)
+
+    assert not merge.is_alive() and not route.is_alive(), "a writer never finished"
+    assert raised == []
+    assert answers == [(200, {"ok": True, "added": ["route.md"], "rejected": []})]
+    assert {"data/**", "route.md"} <= set(yaml.safe_load(tracked.read_text()))
+    assert route_waited, "the route wrote while the merge held the lock"
+
+
+def _fail_temp_writes(monkeypatch: pytest.MonkeyPatch, prefix: str, error: BaseException) -> None:
+    """Make every write to a ``<prefix>*.tmp`` file raise ``error`` once the
+    file was created, as a disk that fills up mid-write does."""
+    real_open, real_write = os.open, os.write
+    doomed: set[int] = set()
+
+    def tracking_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        fd = real_open(path, flags, *args, **kwargs)
+        name = os.path.basename(os.fspath(path))
+        if name.startswith(prefix) and name.endswith(".tmp"):
+            doomed.add(fd)
+        else:
+            doomed.discard(fd)
+        return fd
+
+    def failing_write(fd: int, data: Any) -> int:
+        if fd in doomed:
+            raise error
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "write", failing_write)
+
+
+def _temp_files(directory: Path) -> list[str]:
+    return sorted(path.name for path in directory.iterdir() if path.name.endswith(".tmp"))
+
+
+def test_merge_policy_globs_writes_neither_file_when_preparing_the_second_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#499: the merge prepares every file before it replaces any. Writing the
+    ``strict_mode.yaml`` temp fails (a full disk), so neither file changes, no
+    temp file is left, both locks are free, and the failure names
+    ``strict_mode.yaml`` and says nothing was written.
+
+    Prevents a failed second write leaving the globs tracked but not strict."""
+    tracked, strict = _two_policy_files(tmp_path)
+    _fail_temp_writes(monkeypatch, "strict_mode.yaml.", OSError(errno.ENOSPC, "No space left on device"))
+
+    with pytest.raises(OSError) as raised:
+        _two_file_merge(tracked, strict)
+
+    assert (raised.value.kind, raised.value.path, str(raised.value)) == (
+        "policy_write_failed", str(strict),
+        ".coherence/strict_mode.yaml could not be written (ENOSPC); nothing was written.",
+    )
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+    assert _temp_files(tracked.parent) == []
+    _assert_policy_locks_free(tracked, strict)
+
+
+def _two_file_merge(tracked: Path, strict: Path) -> None:
+    from ccs.adapters.claude_code.coordinator_server import merge_policy_globs
+
+    merge_policy_globs((tracked, strict), ("data/**",))
+
+
+def test_merge_policy_globs_says_which_file_it_replaced_when_the_second_replace_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#499: replacing ``strict_mode.yaml`` fails after ``tracked.yaml`` was
+    replaced. The failure says ``tracked.yaml`` was written and
+    ``strict_mode.yaml`` was not, no temp file is left and both locks are free.
+
+    Prevents a split pair that nothing reports: the globs are tracked but not
+    strict until the next start merges again."""
+    tracked, strict = _two_policy_files(tmp_path)
+    real_replace = os.replace
+    replaced: list[Path] = []
+
+    def second_fails(src: Any, dst: Any) -> None:
+        if replaced:
+            raise OSError(errno.EIO, "Input/output error")
+        real_replace(src, dst)
+        replaced.append(Path(dst))
+
+    monkeypatch.setattr(os, "replace", second_fails)
+
+    with pytest.raises(OSError) as raised:
+        _two_file_merge(tracked, strict)
+
+    assert (raised.value.kind, raised.value.path, str(raised.value)) == (
+        "policy_write_failed", str(strict),
+        ".coherence/strict_mode.yaml could not be written (EIO); .coherence/tracked.yaml was "
+        "written and .coherence/strict_mode.yaml was not.",
+    )
+    assert yaml.safe_load(tracked.read_text()) == ["data/**", "docs/**"]
+    assert strict.read_text() == '- "docs/**"\n'
+    assert _temp_files(tracked.parent) == []
+    _assert_policy_locks_free(tracked, strict)
+
+
+@pytest.mark.parametrize("read_only", [False, True], ids=["writable", "read_only_coherence"])
+def test_merge_policy_globs_that_changes_nothing_takes_no_lock(tmp_path: Path, read_only: bool) -> None:
+    """#499: both files already hold the globs, so the merge creates no lock
+    file and both files keep their bytes, also in a ``.coherence`` at mode 0500
+    (which the lifecycle tightens to later).
+
+    Prevents every start leaving lock files behind, and a start over a
+    read-only ``.coherence`` failing on a lock it does not need."""
+    if read_only and os.geteuid() == 0:
+        pytest.skip("root ignores the directory's mode")
+    tracked, strict = _two_policy_files(tmp_path, '- "data/**"\n')
+    coherence = tracked.parent
+    if read_only:
+        os.chmod(coherence, 0o500)
+    try:
+        _two_file_merge(tracked, strict)
+    finally:
+        os.chmod(coherence, 0o700)
+
+    assert sorted(os.listdir(coherence)) == ["strict_mode.yaml", "tracked.yaml"]
+    assert tracked.read_text() == strict.read_text() == '- "data/**"\n'
+
+
+def test_merge_policy_globs_names_a_file_it_cannot_load_before_any_lock(tmp_path: Path) -> None:
+    """#499: a file the merge cannot load is refused from the read before any
+    lock, with the routes' text, its kind and the file it concerns, and no lock
+    file is created.
+
+    Prevents a refusal leaving files behind, or one the start cannot tell
+    apart from a failed write."""
+    tracked, strict = _two_policy_files(tmp_path)
+    strict.write_text("- *.md\n")
+
+    with pytest.raises(ValueError) as raised:
+        _two_file_merge(tracked, strict)
+
+    assert (raised.value.kind, raised.value.path) == ("policy_file_unloadable", str(strict))
+    assert str(raised.value).startswith(
+        ".coherence/strict_mode.yaml is not valid YAML, so it loads as no entries; nothing was written."
+    )
+    assert sorted(os.listdir(tracked.parent)) == ["strict_mode.yaml", "tracked.yaml"]
+
+
+def test_merge_policy_globs_refuses_a_file_that_goes_bad_while_it_waits_for_the_lock(
+    tmp_path: Path,
+) -> None:
+    """#499: ``tracked.yaml`` becomes invalid YAML while the merge waits for its
+    lock. The read under the lock refuses it and nothing is written.
+
+    Prevents the merge writing from the read it took before the lock, which
+    replaced a file someone had just changed. Every wait is bounded."""
+    tracked, strict = _two_policy_files(tmp_path)
+    held = _hold_policy_lock(tracked)
+    try:
+        worker, raised = _merge_on_a_thread((tracked, strict), ("data/**",))
+        worker.join(timeout=0.5)
+        waited_for_the_lock = worker.is_alive()
+        tracked.write_text("- *.md\n")
+    finally:
+        os.close(held)
+    worker.join(timeout=30)
+
+    assert not worker.is_alive(), "the merge never took the lock"
+    assert waited_for_the_lock, "the merge wrote while the lock was held"
+    assert len(raised) == 1 and isinstance(raised[0], ValueError), raised
+    assert (raised[0].kind, raised[0].path) == ("policy_file_unloadable", str(tracked))
+    assert str(raised[0]).startswith(".coherence/tracked.yaml is not valid YAML")
+    assert tracked.read_text() == "- *.md\n"
+    assert strict.read_text() == '- "docs/**"\n'
+    assert _temp_files(tracked.parent) == []
+    _assert_policy_locks_free(tracked, strict)
+
+
+def test_merge_policy_globs_refuses_a_directory_at_a_lock_file_and_writes_neither_file(
+    tmp_path: Path,
+) -> None:
+    """#499, #534: a directory at ``strict_mode.yaml.lock`` cannot be locked.
+    The merge refuses with the routes' text, naming the lock file, writes
+    neither file and frees the lock it already took.
+
+    Prevents ``tracked.yaml`` being written while ``strict_mode.yaml`` cannot
+    be, and a raw error with nothing named."""
+    tracked, strict = _two_policy_files(tmp_path)
+    lock = tracked.parent / "strict_mode.yaml.lock"
+    lock.mkdir()
+
+    with pytest.raises(ValueError) as raised:
+        _two_file_merge(tracked, strict)
+
+    assert (raised.value.kind, raised.value.path, str(raised.value)) == (
+        "policy_lock_not_regular", str(lock),
+        ".coherence/strict_mode.yaml.lock could not be read (not a regular file); nothing was written.",
+    )
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+    assert lock.is_dir()
+    _assert_policy_locks_free(tracked)
+
+
+@pytest.mark.parametrize(
+    ("step", "errno_name"), [("created", "EACCES"), ("locked", "ENOLCK")],
+)
+def test_merge_policy_globs_names_the_lock_file_it_could_not_create_or_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: str, errno_name: str,
+) -> None:
+    """#499: creating ``tracked.yaml.lock`` (a read-only ``.coherence``) or
+    locking it (a file system without ``flock``) fails. The failure names the
+    lock file and the step, and nothing is written.
+
+    Prevents a raw error that names neither, and a write without the lock."""
+    import fcntl
+
+    if step == "created" and os.geteuid() == 0:
+        pytest.skip("root ignores the directory's mode")
+    tracked, strict = _two_policy_files(tmp_path)
+    coherence = tracked.parent
+    real_flock = fcntl.flock
+
+    def no_locks(fd: int, operation: int) -> None:
+        if operation & fcntl.LOCK_EX:
+            raise OSError(errno.ENOLCK, "No locks available")
+        real_flock(fd, operation)
+
+    if step == "created":
+        os.chmod(coherence, 0o500)
+    else:
+        monkeypatch.setattr(fcntl, "flock", no_locks)
+    try:
+        with pytest.raises(OSError) as raised:
+            _two_file_merge(tracked, strict)
+    finally:
+        os.chmod(coherence, 0o700)
+
+    assert (raised.value.kind, raised.value.path, str(raised.value)) == (
+        "policy_write_failed", str(coherence / "tracked.yaml.lock"),
+        f".coherence/tracked.yaml.lock could not be {step} ({errno_name}); nothing was written.",
+    )
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+    assert not os.path.lexists(coherence / "strict_mode.yaml.lock")
+
+
+def test_merge_policy_globs_without_fcntl_writes_both_files_and_creates_no_lock_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A platform with no ``fcntl`` merges without a lock, as the routes do.
+
+    Prevents the merge failing there, or leaving lock files it never locked."""
+    tracked, strict = _two_policy_files(tmp_path)
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+
+    _two_file_merge(tracked, strict)
+
+    assert yaml.safe_load(tracked.read_text()) == yaml.safe_load(strict.read_text()) == [
+        "data/**", "docs/**",
+    ]
+    assert sorted(os.listdir(tracked.parent)) == ["strict_mode.yaml", "tracked.yaml"]
+
+
+def test_merge_policy_globs_lets_an_interrupt_through_after_it_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#499: a ``KeyboardInterrupt`` raised while the merge writes a temp file
+    propagates as itself, after the merge removed every temp file and freed
+    both locks.
+
+    Prevents an interrupt being reported as a failed write, and temp files or
+    held locks outliving it."""
+    tracked, strict = _two_policy_files(tmp_path)
+    _fail_temp_writes(monkeypatch, "strict_mode.yaml.", KeyboardInterrupt())
+
+    with pytest.raises(KeyboardInterrupt):
+        _two_file_merge(tracked, strict)
+
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+    assert _temp_files(tracked.parent) == []
+    _assert_policy_locks_free(tracked, strict)
+
+
+def test_merge_policy_globs_reports_a_failed_replace_when_removing_its_temp_files_fails_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#499: replacing ``tracked.yaml`` fails, and so does removing the temp
+    files after it. The failure that comes out is the failed replace, and both
+    locks are free.
+
+    Prevents a cleanup error hiding what failed, or skipping the unlock."""
+    tracked, strict = _two_policy_files(tmp_path)
+    real_unlink = os.unlink
+
+    def fail_replace(src: Any, dst: Any) -> None:
+        raise OSError(errno.EIO, "Input/output error")
+
+    def unlink_no_temp(path: Any, *args: Any, **kwargs: Any) -> None:
+        if os.fspath(path).endswith(".tmp"):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    monkeypatch.setattr(os, "unlink", unlink_no_temp)
+
+    with pytest.raises(OSError) as raised:
+        _two_file_merge(tracked, strict)
+
+    assert getattr(raised.value, "kind", None) == "policy_write_failed", repr(raised.value)
+    assert (raised.value.path, str(raised.value)) == (
+        str(tracked), ".coherence/tracked.yaml could not be written (EIO); nothing was written.",
+    )
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+    _assert_policy_locks_free(tracked, strict)
 
 
 # ----------------------------------------------------------------------
