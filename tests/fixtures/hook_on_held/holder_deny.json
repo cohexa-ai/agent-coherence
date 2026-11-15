@@ -1,0 +1,14 @@
+{
+  "description": "The deny the hook client prints for an opted-in edit refused because another agent holds the path. inputs are the builder's arguments: the path and the refusal's 32-hex holder_agent_id, named in the text by its first 8 characters. stdout is the hook's stdout as parsed JSON; compare it parsed, and permissionDecisionReason as exact text.",
+  "inputs": {
+    "path": "docs/plan.md",
+    "holder_agent_id": "bc3013e123b458509bb8c8875e97ff53"
+  },
+  "stdout": {
+    "hookSpecificOutput": {
+      "hookEventName": "PreToolUse",
+      "permissionDecision": "deny",
+      "permissionDecisionReason": "Edit denied: docs/plan.md is held by agent bc3013e1. It comes free when that agent lets go of it, or after 10 to 30 minutes. Do not retry now: do other work that does not need docs/plan.md, or stop and tell your user. If you hold docs/plan.md yourself through another tool, such as an MCP server, release it there first."
+    }
+  }
+}

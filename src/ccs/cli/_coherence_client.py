@@ -52,7 +52,7 @@ from ccs.adapters.claude_code.coordinator_server import (
     caller_principal_identity,
     validate_session_id,
 )
-from ccs.adapters.claude_code.regular_file import ReadStatus, read_state_file
+from ccs.adapters.claude_code.regular_file import ReadStatus, RegularFileRead, read_state_file
 from ccs.adapters.claude_code.state_dir import dir_link_refusal, state_file_link_refusal
 from ccs.core.disk_spelling import native_spelling, resolve_links
 from ccs.core.exceptions import (
@@ -312,6 +312,22 @@ class CoordinatorDeparted(CoordinatorUnavailable):
         super().__init__(*args, never_sent=True)
 
 
+class CoordinatorPortUnknown(CoordinatorUnavailable):
+    """No coordinator port is known for this workspace: no ``server.pid``, or
+    one with no port line, as a clean stop leaves it.
+
+    A hook that denies when a coordinator it knows of does not answer still
+    admits when none is known, and ``never_sent`` cannot tell the two apart:
+    this case and a timeout both read ``False``. A file that cannot be read
+    may still name a port, so it raises the plain class. Always ``never_sent``
+    ``False``, as before this class existed, so every caller that catches
+    :class:`CoordinatorUnavailable` keeps its behaviour and output.
+    """
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+
+
 class CoordinatorMalformedAnswer(CoordinatorUnavailable):
     """A coordinator answered 2xx with a body that is empty or does not decode
     as JSON.
@@ -452,10 +468,7 @@ def _running_coordinator_lines(coherence_dir: Path) -> PidFileLines:
         )
     lines = lines_of(read)
     if lines.port is None:
-        raise CoordinatorUnavailable(
-            "no coordinator running for this workspace "
-            f"(no port in {pid_file}); start one with `agent-coherence-coordinator`"
-        )
+        raise _no_port_refusal(read)
     evidence = exit_evidence(pid_file, lines)
     if evidence is not None:
         raise CoordinatorUnavailable(
@@ -465,6 +478,20 @@ def _running_coordinator_lines(coherence_dir: Path) -> PidFileLines:
             never_sent=True,
         )
     return lines
+
+
+def _no_port_refusal(read: RegularFileRead) -> CoordinatorUnavailable:
+    """The error for a ``server.pid`` read that gave no port. Only an absent
+    file, or one read whole with no port line, shows that no port is known;
+    an oversized or unreadable file may still name one, so it keeps the plain
+    class. The message is the same either way."""
+    message = (
+        "no coordinator running for this workspace "
+        f"(no port in {read.path}); start one with `agent-coherence-coordinator`"
+    )
+    if read.status in (ReadStatus.ABSENT, ReadStatus.READ):
+        return CoordinatorPortUnknown(message)
+    return CoordinatorUnavailable(message)
 
 
 def _refuse_if_coordinator_departed(endpoint: CoordinatorEndpoint) -> None:

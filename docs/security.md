@@ -310,7 +310,11 @@ MCP tools that carry a `handoff` key (`swg_read`, `swg_status`,
 session-level too. Write holders are named by per-attempt agent id instead:
 `swg_status` names the holder of each tracked path held for writing
 (`holder_agent_id`), and a `swg_write` refused `other_holder` names the agent
-that holds the path. The default view of `/status` already lists each
+that holds the path. With the hook client's
+[refusal of held strict files](guide.md#refusing-a-held-strict-file-in-claude-code-sessions)
+on, a Claude Code edit denied because another agent holds the path names that
+agent by the first eight characters of the agent id the refusal carries, never
+by session id. The default view of `/status` already lists each
 session's agent id with the states it holds, so these reveal nothing a
 `/status` reader cannot already see. The `agent-coherence-status` command asks
 for the default view unless it is run with `--detail full`, because it often runs inside an agent's
@@ -324,6 +328,19 @@ so an answer cannot drive the terminal they print to. All of this is
 disclosure hygiene
 rather than a boundary: under the model above, knowing a session id grants
 nothing the secret does not already grant.
+
+**The hook's hold refusal is a workspace file.** `.coherence/hook_on_held`
+turns on the hook client's
+[refusal of held strict files](guide.md#refusing-a-held-strict-file-in-claude-code-sessions),
+and it is off by default. The coordinator never reads it. Like
+`.coherence/strict_mode.yaml`, it is a regular file that any process running as
+your OS user can write, a model's shell command included, so a model can turn
+the refusal off, or drop the path from `strict_mode.yaml`, and the next edit
+goes through as an ordinary one. The deny names neither file. The refusal
+separates agents that follow the protocol; it does not stop one set on getting
+around it. The client reads the setting without following a link: a
+`.coherence` that is a link, or a setting file that is a link or not a regular
+file, reads as off.
 
 ## A repository you clone
 

@@ -1667,3 +1667,602 @@ def test_no_payload_carries_a_name_kind_field(linked_workspace: Path) -> None:
     builds = [partial(b, cc, root) for b in with_root] + [partial(b, cc) for b in without_root]
     for build in builds:
         assert "name_kind" not in build(), build
+
+
+# ----------------------------------------------------------------------
+# Refusing an edit of a held strict file
+#
+# With .coherence/hook_on_held holding ``refuse``, a pre-edit of a strict path
+# reads the coordinator's capability from /status?detail=metrics, opts in with
+# ``if_unheld: true`` and prints a relay of the answer or one of three denies.
+# Once a coordinator is known and the path is strict, no failure prints ``{}``.
+# Every other case keeps today's requests and bytes. The rows are those of
+# tests/fixtures/hook_on_held/decision_table.json, driven through main().
+# ----------------------------------------------------------------------
+
+from collections.abc import Callable, Iterator  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
+
+from ccs.adapters.claude_code import hook_payloads  # noqa: E402
+from ccs.cli import _hook_on_held as on_held  # noqa: E402
+from tests.coordinator_helpers import write_holders  # noqa: E402
+
+_ON_HELD_FIXTURES = Path(__file__).parent / "fixtures" / "hook_on_held"
+_STATUS = "/status?detail=metrics"
+_ADMIT_BYTES = b'{"ok": true}'
+_ADMIT_LINE = _ADMIT_BYTES.decode() + "\n"
+_UNKNOWN_SETTING_LINE = f"agent-coherence-hook-client: {on_held.UNKNOWN_SETTING_MESSAGE}\n"
+_NO_REFUSAL_LINE = f"agent-coherence-hook-client: {on_held.NO_REFUSAL_MESSAGE}\n"
+_TODAYS_ROUTES = [("POST", "/principal/claim"), ("POST", "/hooks/pre-edit")]
+
+
+def _on_held_rows(stage: str) -> list[dict]:
+    rows = json.loads((_ON_HELD_FIXTURES / "decision_table.json").read_text())["rows"]
+    return [row for row in rows if row["stage"] == stage]
+
+
+def _strict_workspace(workspace: Path, setting: str | None = "refuse\n", strict: tuple[str, ...] = ("plan.md",)) -> None:
+    """``plan.md`` and ``notes.md`` tracked, ``strict`` strict, and the setting
+    file holding ``setting`` (absent for ``None``)."""
+    coherence = workspace / ".coherence"
+    coherence.mkdir(mode=0o700, exist_ok=True)
+    (coherence / "tracked.yaml").write_text('- "plan.md"\n- "notes.md"\n')
+    (coherence / "strict_mode.yaml").write_text("".join(f'- "{entry}"\n' for entry in strict))
+    if setting is not None:
+        (coherence / "hook_on_held").write_text(setting)
+    for name in ("plan.md", "notes.md"):
+        (workspace / name).write_text(f"{name} v1\n")
+
+
+@dataclass(frozen=True)
+class _Hook:
+    """One test's workspace and hook runner. ``run(cc, subcommand)`` feeds
+    ``cc`` to main() and returns (stdout, stderr); ``sends`` records each hook
+    request the client hands its transport as ``{"path", "payload",
+    "headers"}`` plus the ``answer`` it got or the exception it ``raised``."""
+
+    workspace: Path
+    run: Callable[..., tuple[str, str]]
+    sends: list[dict]
+    monkeypatch: pytest.MonkeyPatch
+
+
+def _record_sends(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    sends: list[dict] = []
+    real_post = coherence_hook_client.post
+
+    def spy(endpoint: Any, path: str, payload: dict, **kwargs: Any) -> Any:
+        record = {"path": path, "payload": dict(payload), "headers": kwargs.get("extra_headers")}
+        sends.append(record)
+        try:
+            record["answer"] = real_post(endpoint, path, payload, **kwargs)
+        except Exception as exc:
+            record["raised"] = exc
+            raise
+        return record["answer"]
+
+    monkeypatch.setattr(coherence_hook_client, "post", spy)
+    return sends
+
+
+@pytest.fixture
+def hook(git_workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> _Hook:
+    def run(cc: dict[str, Any], subcommand: str = "pre-edit") -> tuple[str, str]:
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(cc)))
+        assert coherence_hook_client.main([subcommand, "--root", str(git_workspace)]) == 0
+        captured = capsys.readouterr()
+        return captured.out, captured.err
+
+    return _Hook(git_workspace, run, _record_sends(monkeypatch), monkeypatch)
+
+
+@dataclass(frozen=True)
+class _Answer:
+    """How the scripted coordinator answers one route: ``status`` and raw
+    ``body`` after ``delay`` seconds and ``before`` has run; with ``hang_up``,
+    no answer at all; with ``refuse_after``, it stops listening first, so the
+    next connect is refused."""
+
+    status: int = 200
+    body: bytes = _ADMIT_BYTES
+    delay: float = 0.0
+    hang_up: bool = False
+    refuse_after: bool = False
+    before: Callable[[], None] | None = None
+
+
+def _json_answer(body: object, status: int = 200) -> _Answer:
+    return _Answer(status=status, body=json.dumps(body).encode())
+
+
+_REFUSES = _json_answer({"pre_edit_if_unheld": True, "fold_profile": "none"})
+
+
+class _SequentialServer(http.server.HTTPServer):
+    """Answers one request at a time, so an answer that stops listening does
+    so between requests; wakes every 50 ms to see a stop."""
+
+    timeout = 0.05
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # A client that gave up on a slow answer leaves a broken pipe here,
+        # which is the case under test, not a failure of it.
+        return
+
+
+def _serve(httpd: http.server.HTTPServer, stop: threading.Event) -> None:
+    while not stop.is_set() and httpd.socket.fileno() != -1:
+        httpd.handle_request()
+
+
+def _write_answer(handler: http.server.BaseHTTPRequestHandler, answer: _Answer, released: threading.Event) -> None:
+    released.wait(answer.delay)
+    if answer.before is not None:
+        answer.before()
+    if answer.refuse_after:
+        handler.server.socket.close()
+    if answer.hang_up:
+        handler.close_connection = True
+        return
+    handler.send_response(answer.status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(answer.body)))
+    handler.end_headers()
+    handler.wfile.write(answer.body)
+
+
+def _scripted_handler(answers: dict[str, _Answer], seen: list[dict], released: threading.Event) -> type:
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - the stdlib handler's name
+            seen.append({"method": "GET", "path": self.path, "body": None})
+            _write_answer(self, answers.get(self.path, _Answer(404, b"{}")), released)
+
+        def do_POST(self) -> None:  # noqa: N802 - the stdlib handler's name
+            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            seen.append({"method": "POST", "path": self.path, "body": json.loads(raw)})
+            claim = self.path == "/principal/claim"
+            _write_answer(self, answers.get(self.path, _Answer(404, b"{}") if claim else _Answer()), released)
+
+        def log_message(self, *_args: Any) -> None:
+            return
+
+    return Handler
+
+
+@contextmanager
+def _scripted_coordinator(workspace: Path, answers: dict[str, _Answer]) -> Iterator[list[dict]]:
+    """A coordinator that answers each route as ``answers`` scripts it (an
+    unscripted POST with ``{"ok": true}``) and 404 on the principal claim, as
+    one that issues no principals. Yields each request it got as
+    ``{"method", "path", "body"}``."""
+    seen: list[dict] = []
+    released, stop = threading.Event(), threading.Event()
+    httpd = _SequentialServer(("127.0.0.1", 0), _scripted_handler(answers, seen, released))
+    thread = threading.Thread(target=_serve, args=(httpd, stop), daemon=True)
+    thread.start()
+    try:
+        _fake_coherence_dir(workspace, port=httpd.server_address[1])
+        yield seen
+    finally:
+        released.set()
+        stop.set()
+        thread.join(timeout=10)
+        httpd.server_close()
+
+
+def _stub(answers: dict[str, _Answer] | None = None) -> Callable[[_Hook], Any]:
+    """Starts a scripted coordinator that refuses held files, answering as
+    ``answers`` adds."""
+    scripted = {_STATUS: _REFUSES, **(answers or {})}
+    return lambda hook: _scripted_coordinator(hook.workspace, scripted)
+
+
+def _slow(route: str) -> Callable[[_Hook], Any]:
+    """Starts a scripted coordinator that answers ``route`` only after the
+    client gave up on it."""
+
+    def start(hook: _Hook) -> Any:
+        hook.monkeypatch.setattr(_coherence_client, "CLI_HTTP_TIMEOUT_SEC", 0.5)
+        late = _Answer(body=_REFUSES.body if route == _STATUS else _ADMIT_BYTES, delay=10.0)
+        return _scripted_coordinator(hook.workspace, {_STATUS: _REFUSES, route: late})
+
+    return start
+
+
+@contextmanager
+def _no_coordinator(hook: _Hook) -> Iterator[list[dict]]:
+    """No server.pid: no coordinator port is known."""
+    yield []
+
+
+@contextmanager
+def _dead_coordinator(hook: _Hook) -> Iterator[list[dict]]:
+    """server.pid names a port, but no coordinator holds the workspace lock."""
+    (hook.workspace / ".coherence" / "server.pid").write_text("12345\n50000\n")
+    (hook.workspace / ".coherence" / "hook.secret").write_text("test-secret")
+    yield []
+
+
+@contextmanager
+def _refusing_port(hook: _Hook) -> Iterator[list[dict]]:
+    """server.pid names port 4, where nothing listens: below 1024, so no other
+    test's port-0 bind can take it."""
+    import errno
+    import socket
+
+    with socket.socket() as probe:
+        probe.settimeout(2)
+        assert probe.connect_ex(("127.0.0.1", 4)) == errno.ECONNREFUSED, "port 4 accepts connections here"
+    _fake_coherence_dir(hook.workspace, port=4)
+    yield []
+
+
+def _routes(seen: list[dict]) -> list[tuple[str, str]]:
+    return [(request["method"], request["path"]) for request in seen]
+
+
+def _sent_edits(seen: list[dict]) -> list[dict]:
+    return [request["body"] for request in seen if request["path"] == "/hooks/pre-edit"]
+
+
+def _edit_cc(workspace: Path, sid: str, name: str = "plan.md") -> dict[str, Any]:
+    return {"session_id": sid, "tool_name": "Edit", "tool_input": {"file_path": str(workspace / name)}}
+
+
+def _unavailable(path: str = "plan.md") -> str:
+    return json.dumps({"hookSpecificOutput": hook_payloads.emit_admission_unavailable_deny(path=path)}) + "\n"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        (None, ("plan.md",), "plan.md", "pre-edit", ""),
+        ("", ("plan.md",), "plan.md", "pre-edit", ""),
+        ("displace\n", ("plan.md",), "plan.md", "pre-edit", ""),
+        ("Refuse\n", ("plan.md",), "plan.md", "pre-edit", _UNKNOWN_SETTING_LINE),
+        ("refuse\n", ("plan.md",), "notes.md", "pre-edit", ""),
+        ("refuse\n", (), "plan.md", "pre-edit", ""),
+        ("refuse\n", ("plan.md",), "plan.md", "pre-read", ""),
+    ],
+    ids=["absent", "empty", "displace", "unknown", "not-strict", "no-strict-entries", "pre-read"],
+)
+def test_a_hook_that_does_not_opt_in_sends_and_prints_what_it_does_today(hook: _Hook, case: tuple) -> None:
+    """``case`` is the setting, the strict entries, the file, the subcommand
+    and the stderr today's hook adds."""
+    setting, strict, name, subcommand, stderr = case
+    _strict_workspace(hook.workspace, setting, strict)
+    with _stub()(hook) as seen:
+        out, err = hook.run(_edit_cc(hook.workspace, _sid(), name), subcommand)
+
+    assert (out, err) == (_ADMIT_LINE, stderr)
+    assert _routes(seen) == [("POST", "/principal/claim"), ("POST", f"/hooks/{subcommand}")]
+    assert "if_unheld" not in seen[-1]["body"] and seen[-1]["body"]["path"] == name
+
+
+@dataclass(frozen=True)
+class _Scenario:
+    """How one decision row is set up: the coordinator ``start`` gives, the
+    setting, the edited file, whether the capability read comes before the
+    exit, the stderr today's exit adds, and today's stdout."""
+
+    start: Callable[[_Hook], Any]
+    setting: str | None = "refuse\n"
+    name: str = "plan.md"
+    asks_status: bool = False
+    stderr: str = ""
+    today: str = _ADMIT_LINE
+
+
+_BEFORE_POST = {
+    "setting_off": _Scenario(_stub(), setting=None),
+    "setting_unknown": _Scenario(_stub(), setting="Refuse\n", stderr=_UNKNOWN_SETTING_LINE),
+    "not_strict": _Scenario(_stub(), name="notes.md"),
+    "no_port": _Scenario(_no_coordinator, today="{}\n"),
+    "died_at_resolve": _Scenario(_dead_coordinator),
+    "timeout": _Scenario(_slow(_STATUS)),
+    "refused": _Scenario(_refusing_port),
+    "malformed_answer": _Scenario(_stub({_STATUS: _Answer(body=b"not json")})),
+    "status_non_2xx": _Scenario(_stub({_STATUS: _Answer(503, _REFUSES.body)})),
+    "status_key_absent": _Scenario(
+        _stub({_STATUS: _json_answer({"fold_profile": "none"})}), asks_status=True, stderr=_NO_REFUSAL_LINE,
+    ),
+    "not_strict_under_coordinator_profile": _Scenario(_stub(), name="PLAN.MD", asks_status=True),
+    "malformed_agent_id": _Scenario(_stub()),
+}
+
+
+def _caller_cc(workspace: Path, row: dict, name: str = "plan.md") -> dict[str, Any]:
+    cc = _edit_cc(workspace, row["caller"]["session_id"], name)
+    if row["caller"]["agent_id"] is not None:
+        cc["agent_id"] = row["caller"]["agent_id"]
+    return cc
+
+
+def _assert_today(scenario: _Scenario, run: tuple[str, str], seen: list[dict]) -> None:
+    status_read = [("GET", _STATUS)] if scenario.asks_status else []
+    todays_routes = _TODAYS_ROUTES if scenario.start is not _no_coordinator else []
+    assert run == (scenario.today, scenario.stderr)
+    assert _routes(seen) == status_read + todays_routes
+    assert all("if_unheld" not in body for body in _sent_edits(seen))
+
+
+@pytest.mark.parametrize("row", _on_held_rows("before_post"), ids=lambda row: row["name"])
+def test_each_decision_row_before_the_post_ends_as_the_table_says(hook: _Hook, row: dict) -> None:
+    scenario = _BEFORE_POST[row["outcome"]]
+    _strict_workspace(hook.workspace, scenario.setting)
+    with scenario.start(hook) as seen:
+        out, err = hook.run(_caller_cc(hook.workspace, row, scenario.name))
+
+    if row["expected"] == "unavailable_deny":
+        assert (out, err) == (_unavailable(scenario.name), "")
+        assert _routes(seen) in ([], [("GET", _STATUS)]), "nothing is sent after the capability read"
+    else:
+        assert row["expected"] == ("today_and_stderr_line" if scenario.stderr else "today")
+        _assert_today(scenario, (out, err), seen)
+
+
+def test_a_server_pid_with_no_port_line_takes_todays_path(hook: _Hook) -> None:
+    """A clean stop leaves server.pid with no port line: no coordinator is
+    known, so none can hold the file, and the hook prints ``{}`` as today."""
+    _strict_workspace(hook.workspace)
+    (hook.workspace / ".coherence" / "server.pid").write_text("12345\n")
+
+    assert hook.run(_edit_cc(hook.workspace, _sid())) == ("{}\n", "")
+
+
+@pytest.mark.parametrize("body", [b"[]", b'"ok"', b"null", b"7"], ids=lambda body: body.decode())
+def test_a_capability_answer_that_is_not_a_json_object_denies(hook: _Hook, body: bytes) -> None:
+    _strict_workspace(hook.workspace)
+    with _stub({_STATUS: _Answer(body=body)})(hook) as seen:
+        out, err = hook.run(_edit_cc(hook.workspace, _sid()))
+
+    assert (out, err) == (_unavailable(), "")
+    assert _routes(seen) == [("GET", _STATUS)]
+
+
+def test_an_unexpected_failure_before_the_opt_in_decision_takes_todays_path(hook: _Hook) -> None:
+    """Nothing has been asked of the coordinator yet, so the hook does what it
+    does with the setting off rather than fail the event."""
+    _strict_workspace(hook.workspace)
+
+    def broken(*_args: Any) -> frozenset:
+        raise RuntimeError("strict decision regression")
+
+    hook.monkeypatch.setattr(on_held, "strict_profiles", broken)
+    with _stub()(hook) as seen:
+        out, err = hook.run(_edit_cc(hook.workspace, _sid()))
+
+    assert (out, err) == (_ADMIT_LINE, "")
+    assert _routes(seen) == _TODAYS_ROUTES
+
+
+def _post_start(row: dict) -> Callable[[_Hook], Any]:
+    if "http" in row:
+        return _stub({"/hooks/pre-edit": _json_answer(row["http"]["body"], row["http"]["status"])})
+    return {
+        "timeout": _slow("/hooks/pre-edit"),
+        "refused": _stub({_STATUS: _Answer(body=_REFUSES.body, refuse_after=True)}),
+        "departed": _stub({"/hooks/pre-edit": _Answer(hang_up=True)}),
+        "malformed_answer": _stub({"/hooks/pre-edit": _Answer(body=b"not json")}),
+    }[row["outcome"]]
+
+
+def _post_rows_without_a_2xx() -> list[dict]:
+    return [
+        row for row in _on_held_rows("post")
+        if "outcome" in row or not 200 <= row["http"]["status"] < 300
+    ]
+
+
+@pytest.mark.parametrize("row", _post_rows_without_a_2xx(), ids=lambda row: row["name"])
+def test_each_decision_row_after_the_post_without_a_2xx_answer_is_the_unavailable_deny(
+    hook: _Hook, row: dict,
+) -> None:
+    assert row["expected"] == "unavailable_deny"
+    _strict_workspace(hook.workspace)
+    with _post_start(row)(hook) as seen:
+        out, _err = hook.run(_caller_cc(hook.workspace, row))
+
+    assert out == _unavailable()
+    edits = [send for send in hook.sends if send["path"] == "/hooks/pre-edit"]
+    assert edits and all(send["payload"]["if_unheld"] is True for send in edits)
+    assert not any(request["path"] == "/hooks/session-stop" for request in seen), "no release follows"
+
+
+def _answered_rows() -> list[dict]:
+    return [row for row in _on_held_rows("post") if "http" in row and 200 <= row["http"]["status"] < 300]
+
+
+def _printed_for(row: dict) -> str:
+    """What the hook prints for an answered row, built from the deny builders
+    and the body alone."""
+    body, expected = row["http"]["body"], row["expected"]
+    if expected.startswith("relay_"):
+        return json.dumps(body) + "\n"
+    if expected == "holder_deny":
+        deny = hook_payloads.emit_held_path_deny(path="plan.md", holder_agent_id=body["holder_agent_id"])
+    elif expected == "parent_deny":
+        deny = hook_payloads.emit_held_by_parent_deny(path="plan.md")
+    else:
+        deny = hook_payloads.emit_admission_unavailable_deny(path="plan.md")
+    return json.dumps({"hookSpecificOutput": deny}) + "\n"
+
+
+@pytest.mark.parametrize("row", _answered_rows(), ids=lambda row: row["name"])
+def test_each_answered_decision_row_prints_its_class_through_the_hook_client(hook: _Hook, row: dict) -> None:
+    _strict_workspace(hook.workspace)
+    with _stub({"/hooks/pre-edit": _json_answer(row["http"]["body"])})(hook) as seen:
+        out, _err = hook.run(_caller_cc(hook.workspace, row))
+
+    assert out == _printed_for(row)
+    expected_edit = {"session_id": row["caller"]["session_id"], "path": "plan.md", "if_unheld": True}
+    if row["caller"]["agent_id"] is not None:
+        expected_edit = {**expected_edit, "agent_id": row["caller"]["agent_id"]}
+    assert _sent_edits(seen) == [expected_edit]
+    assert _routes(seen) == [("GET", _STATUS), *_TODAYS_ROUTES]
+
+
+def test_a_coordinator_replaced_between_the_capability_read_and_the_edit_denies(hook: _Hook) -> None:
+    """The coordinator that answered the capability read is gone by the
+    edit: the client refuses to send to whatever holds its port now."""
+    _strict_workspace(hook.workspace)
+    pid_file = hook.workspace / ".coherence" / "server.pid"
+    replaced = _Answer(body=_REFUSES.body, before=lambda: pid_file.write_text("54321\n50001\n"))
+    with _stub({_STATUS: replaced})(hook) as seen:
+        out, err = hook.run(_edit_cc(hook.workspace, _sid()))
+
+    assert (out, err) == (_unavailable(), "")
+    assert _routes(seen) == [("GET", _STATUS)]
+    assert isinstance(hook.sends[-1]["raised"], _coherence_client.CoordinatorDeparted)
+
+
+@pytest.mark.parametrize("agent_id", ["bad id!", 7], ids=repr)
+def test_a_malformed_subagent_id_is_denied_and_nothing_is_sent(hook: _Hook, agent_id: object) -> None:
+    _strict_workspace(hook.workspace)
+    with _stub()(hook) as seen:
+        out, err = hook.run({**_edit_cc(hook.workspace, _sid()), "agent_id": agent_id})
+
+    assert (out, err) == (_unavailable(), "")
+    assert _routes(seen) == [("GET", _STATUS)]
+
+
+@pytest.mark.parametrize("agent_id", ["", None], ids=repr)
+def test_an_empty_or_null_subagent_id_is_sent_as_the_parent(hook: _Hook, agent_id: object) -> None:
+    _strict_workspace(hook.workspace)
+    sid = _sid()
+    with _stub()(hook) as seen:
+        out, _err = hook.run({**_edit_cc(hook.workspace, sid), "agent_id": agent_id})
+
+    assert out == _ADMIT_LINE
+    assert _sent_edits(seen) == [{"session_id": sid, "path": "plan.md", "if_unheld": True}]
+
+
+# A coordinator in this process, with plan.md strict and the setting on.
+
+
+@pytest.fixture
+def strict_coordinator(git_workspace: Path):
+    _strict_workspace(git_workspace)
+    server = CoordinatorHTTPServer(git_workspace, port=0, instance_id="hook-on-held")
+    server.serve_in_thread()
+    write_coordinator_pid_file(git_workspace / ".coherence", server.port, pid=os.getpid())
+    try:
+        yield server
+    finally:
+        server.shutdown()
+
+
+def _holder_deny(holder: uuid.UUID) -> str:
+    deny = hook_payloads.emit_held_path_deny(path="plan.md", holder_agent_id=holder.hex)
+    return json.dumps({"hookSpecificOutput": deny}) + "\n"
+
+
+def test_an_edit_of_a_strict_file_another_session_holds_is_denied_naming_the_holder(
+    strict_coordinator: CoordinatorHTTPServer, hook: _Hook,
+) -> None:
+    holder, editor = _sid(), _sid()
+    out, _ = hook.run(_edit_cc(hook.workspace, holder))
+    assert json.loads(out).get("ok") is True, out
+
+    out, _ = hook.run(_edit_cc(hook.workspace, editor))
+
+    holder_id = session_to_agent_id(holder)
+    assert out == _holder_deny(holder_id)
+    assert f"held by agent {holder_id.hex[:8]}." in out
+    principal = _principal_files(hook.workspace, editor)[1].read_text().strip()
+    assert hook.sends[-1]["payload"]["if_unheld"] is True
+    assert hook.sends[-1]["headers"] == {_PRINCIPAL_HEADER: principal}
+    assert write_holders(strict_coordinator, "plan.md") == {str(holder_id)}
+
+
+@pytest.mark.parametrize(
+    "case",
+    [(None, "sub1", "parent"), ("sub2", None, "holder"), ("sub1", "sub2", "holder")],
+    ids=["subagent-of-the-holder", "parent-of-the-holding-subagent", "sibling-of-the-holder"],
+)
+def test_only_a_subagent_refused_by_its_own_parent_is_told_to_report_back(
+    strict_coordinator: CoordinatorHTTPServer, hook: _Hook, case: tuple,
+) -> None:
+    """``case`` is the holder's subagent id, the editor's, and the deny the
+    editor is told (None is the parent session itself)."""
+    holder_agent, editor_agent, told = case
+    sid = _sid()
+    holder_cc, editor_cc = _edit_cc(hook.workspace, sid), _edit_cc(hook.workspace, sid)
+    for cc, agent in ((holder_cc, holder_agent), (editor_cc, editor_agent)):
+        if agent is not None:
+            cc["agent_id"] = agent
+    out, _ = hook.run(holder_cc)
+    assert json.loads(out).get("ok") is True, out
+
+    out, _ = hook.run(editor_cc)
+
+    if told == "parent":
+        parent = hook_payloads.emit_held_by_parent_deny(path="plan.md")
+        assert out == json.dumps({"hookSpecificOutput": parent}) + "\n"
+    else:
+        assert out == _holder_deny(session_to_agent_id(sid, holder_agent))
+    assert write_holders(strict_coordinator, "plan.md") == {str(session_to_agent_id(sid, holder_agent))}
+
+
+def test_a_session_that_read_before_the_holder_committed_gets_the_strict_deny_as_sent(
+    strict_coordinator: CoordinatorHTTPServer, hook: _Hook,
+) -> None:
+    reader, writer = _sid(), _sid()
+    hook.run(_edit_cc(hook.workspace, reader), "pre-read")
+    out, _ = hook.run(_edit_cc(hook.workspace, writer))
+    assert json.loads(out).get("ok") is True, out
+    (hook.workspace / "plan.md").write_text("plan.md v2\n")
+    out, _ = hook.run(_edit_cc(hook.workspace, writer), "post-edit")
+    assert json.loads(out).get("ok") is True, out
+
+    out, _ = hook.run(_edit_cc(hook.workspace, reader))
+
+    sent = hook.sends[-1]
+    assert sent["payload"]["if_unheld"] is True
+    assert sent["answer"]["status"] == "stale"
+    assert sent["answer"]["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert out == json.dumps(sent["answer"]) + "\n"
+
+
+def test_an_opted_in_edit_the_coordinator_cannot_decide_in_time_is_denied(
+    strict_coordinator: CoordinatorHTTPServer, hook: _Hook,
+) -> None:
+    """The coordinator's watchdog answers ``unavailable`` with a note that the
+    edit proceeds without a guarantee; with the setting on that note never
+    reaches the model, and the edit is denied."""
+    import ccs.adapters.claude_code.coordinator_server as server_mod
+    from tests.test_claude_code_coordinator_server import _HeldRegistryLock
+
+    sid = _sid()
+    # The read claims the session's principal while the lock is free, so the
+    # held lock below blocks only the pre-edit's work body.
+    hook.run(_edit_cc(hook.workspace, sid), "pre-read")
+    hook.monkeypatch.setattr(server_mod, "HANDLER_TIMEOUT_SEC", 0.25)
+    with _HeldRegistryLock(strict_coordinator):
+        out, _ = hook.run(_edit_cc(hook.workspace, sid))
+
+    answer = hook.sends[-1]["answer"]
+    assert answer.get("reason") == "unavailable" and "Proceeding WITHOUT" in json.dumps(answer)
+    assert out == _unavailable()
+    assert "Proceeding WITHOUT" not in out
+
+
+def test_a_principal_recovery_cannot_cure_denies_where_today_admits_silently(
+    strict_coordinator: CoordinatorHTTPServer, hook: _Hook,
+) -> None:
+    """Another claimant bound this session first, so its opted-in edit is
+    refused for its principal even after recovery. Today's path prints ``{}``
+    for that; with the setting on it is the unavailable deny."""
+    sid = _sid()
+    strict_coordinator.service.claim_caller_principal(
+        identity=caller_principal_identity(sid), mint_nonce="someone-elses-nonce-0001"
+    )
+
+    out, err = hook.run(_edit_cc(hook.workspace, sid))
+    (hook.workspace / ".coherence" / "hook_on_held").unlink()
+    out_today, _ = hook.run(_edit_cc(hook.workspace, sid))
+
+    assert out == _unavailable()
+    assert "caller principal refused" in err
+    assert out_today == "{}\n"

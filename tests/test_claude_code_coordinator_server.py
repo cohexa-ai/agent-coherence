@@ -12314,21 +12314,116 @@ def test_an_opted_in_admit_after_the_holder_released_carries_no_collision_or_not
     assert _agent_state_on(coordinator, "plan.md", caller.sid) == MESIState.EXCLUSIVE
 
 
-def test_a_malformed_subagent_id_is_read_as_the_holders_own_repeat(
-    coordinator, client: _Client
+#: Present subagent ids outside the accepted shape, one per kind a client
+#: could send: bad characters, too long, a number, a list.
+_MALFORMED_SUBAGENT_IDS = ["bad id!", "a" * 65, 7, ["x"]]
+_MALFORMED_SUBAGENT_IDS_IDS = ["bad-chars", "65-chars", "number", "list"]
+
+#: FROZEN duplicate of the 400 every route that refuses a malformed subagent
+#: id answers, so a reworded constant fails here instead of moving with it.
+_MALFORMED_SUBAGENT_REFUSAL = (400, {"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"})
+
+
+@pytest.mark.parametrize("agent_id", _MALFORMED_SUBAGENT_IDS, ids=_MALFORMED_SUBAGENT_IDS_IDS)
+def test_an_opted_in_malformed_subagent_id_is_refused_not_read_as_the_holders_own_repeat(
+    agent_id: object, coordinator, client: _Client
 ) -> None:
-    """A documented limit, pinned: a subagent id outside the accepted shape is
-    read as the parent, so a holder session sending one is admitted as its
-    own repeat. The same request with a well-formed subagent id is another
-    agent, refused naming the parent."""
+    """An opted-in pre-edit whose subagent id is present but outside the
+    accepted shape answers the malformed-id 400 and moves no grant row, while
+    its session holds the path. The same request with a well-formed subagent
+    id is another agent, refused naming the parent.
+
+    Prevents the opt-in admitting a malformed id as the parent: read as the
+    parent, a subagent the session holds a file against would be admitted as
+    the holder's own repeat and edit over its own parent's hold."""
     session = _claimed(client)
     _take(client, session)
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    rows_before = coordinator.registry.get_state_map(artifact_id)
 
-    status, admitted = _opted_in(client, session, agent_id="bad id!")
-    assert status == 200 and admitted.get("ok") is True, admitted
+    assert _opted_in(client, session, agent_id=agent_id) == _MALFORMED_SUBAGENT_REFUSAL
+    assert coordinator.registry.get_state_map(artifact_id) == rows_before
     assert _opted_in(client, session, agent_id="sub1") == _other_holder_refusal(
         session_to_agent_id(session.sid))
     assert _agent_state_on(coordinator, "plan.md", session.sid) == MESIState.EXCLUSIVE
+
+
+@pytest.mark.parametrize("agent_id", ["", None], ids=["empty", "null"])
+def test_an_opted_in_empty_or_null_subagent_id_is_the_parent(
+    agent_id: object, coordinator, client: _Client
+) -> None:
+    """An empty or null subagent id is absent, as on every other route: the
+    holder session's opted-in pre-edit carrying one is admitted as its own
+    repeat."""
+    session = _claimed(client)
+    _take(client, session)
+
+    assert _opted_in(client, session, agent_id=agent_id) == (200, {"ok": True})
+    assert _agent_state_on(coordinator, "plan.md", session.sid) == MESIState.EXCLUSIVE
+
+
+@pytest.mark.parametrize("agent_id", _MALFORMED_SUBAGENT_IDS, ids=_MALFORMED_SUBAGENT_IDS_IDS)
+def test_a_malformed_subagent_id_without_the_opt_in_is_still_read_as_the_parent(
+    agent_id: object, coordinator, client: _Client
+) -> None:
+    """Without the opt-in, a malformed subagent id keeps today's answer: the
+    pre-edit is admitted and the grant lands on the parent's row.
+
+    Prevents the refusal reaching requests that never opted in: every Claude
+    Code hook edit is an ordinary pre-edit, and its answers must not move."""
+    session = _claimed(client)
+
+    status, answer = client.post(
+        "/hooks/pre-edit", {"session_id": session.sid, "path": "plan.md", "agent_id": agent_id},
+        principal=session.principal)
+
+    assert status == 200 and answer.get("ok") is True, answer
+    assert _agent_state_on(coordinator, "plan.md", session.sid) == MESIState.EXCLUSIVE
+
+
+def test_an_opted_in_malformed_subagent_id_is_refused_on_an_untracked_path(
+    coordinator, client: _Client
+) -> None:
+    """The malformed-id 400 comes ahead of the untracked exit, which would
+    admit the request unchecked.
+
+    Prevents the same request being refused on a tracked path and admitted on
+    an untracked one."""
+    session = _claimed(client)
+    assert not coordinator.policy.is_tracked("notes.txt")
+
+    answer = _opted_in(client, session, agent_id="bad id!", path="notes.txt")
+
+    assert answer == _MALFORMED_SUBAGENT_REFUSAL, answer
+
+
+def test_an_opted_in_malformed_subagent_id_with_no_principal_gets_the_malformed_id_refusal(
+    coordinator, client: _Client
+) -> None:
+    """An opted-in pre-edit with a malformed subagent id and no principal
+    header answers the malformed-id 400, not the principal-absent one: the id
+    is checked first, as the effect fence checks it, so both coordinators
+    answer the same body whatever principal the request carried."""
+    never_claimed = str(uuid.uuid4())
+
+    answer = client.post("/hooks/pre-edit", {
+        "session_id": never_claimed, "path": "plan.md", "agent_id": "bad id!", "if_unheld": True,
+    })
+
+    assert answer == _MALFORMED_SUBAGENT_REFUSAL, answer
+
+
+def test_an_opted_in_volume_incarnation_id_is_admitted(coordinator, client: _Client) -> None:
+    """A 32-hex subagent id, the shape a volume incarnation sends, is well
+    formed: its opted-in pre-edit of an unheld path is granted on its own
+    composite row."""
+    session = _claimed(client)
+    incarnation = uuid.uuid4().hex
+
+    status, answer = _opted_in(client, session, agent_id=incarnation)
+
+    assert status == 200 and answer.get("ok") is True, answer
+    assert _state(coordinator, "plan.md", session.composite(incarnation)) == MESIState.EXCLUSIVE
 
 
 def test_a_holder_whose_heartbeat_stopped_refuses_until_the_sweep_reclaims_it(

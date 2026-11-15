@@ -44,13 +44,19 @@ from ccs.adapters.claude_code.coordinator_server import (
     session_to_agent_id,
 )
 from ccs.adapters.claude_code.hook_payloads import (
+    ADMISSION_UNAVAILABLE_DENIAL_CLASS,
+    ADMISSION_UNAVAILABLE_DENY_REASON_TEMPLATE,
     HANDOFF_EDIT_ON_DISK_SENTENCE,
     HANDOFF_GIVER_COMMIT_REFUSED_TEMPLATE,
     HANDOFF_GIVER_DENY_REASON_TEMPLATE,
     HANDOFF_GIVER_READ_TEMPLATE,
+    HELD_BY_PARENT_DENY_REASON_TEMPLATE,
+    HELD_PATH_DENIAL_CLASS,
+    HELD_PATH_DENY_REASON_TEMPLATE,
     STRICT_MODE_DENY_REASON_TEMPLATE,
     TERMINAL_DENIAL_CLASSES,
     emit_allow,
+    emit_held_path_deny,
 )
 from ccs.core.states import MESIState
 
@@ -2137,3 +2143,85 @@ def test_out_of_band_deny_reason_template_is_static() -> None:
 
     actual = set(m.group(1) for m in re.finditer(r"\{([a-z_]+)\}", OUT_OF_BAND_DENY_REASON_TEMPLATE))
     assert actual == {"path", "current_version"}
+
+
+# ----------------------------------------------------------------------
+# The held-path denies: what the hook client answers an edit it opted in
+# to acquire-or-fail
+# ----------------------------------------------------------------------
+
+
+_HELD_PATH_DENY_TEMPLATES: dict[str, tuple[str, list[str]]] = {
+    "holder": (HELD_PATH_DENY_REASON_TEMPLATE, ["path", "holder", "path", "path"]),
+    "parent": (HELD_BY_PARENT_DENY_REASON_TEMPLATE, ["path"]),
+    "unavailable": (ADMISSION_UNAVAILABLE_DENY_REASON_TEMPLATE, ["path"]),
+}
+"""Each held-path deny template and its placeholders, in order."""
+
+#: What none of the three texts may say. A refused edit is not refused for
+#: good, so "the same denial" is false; the file comes free on its holder's
+#: release or a lease, never at a turn; and the setting, the policy file or
+#: a shell route would hand the model a way around its own refusal.
+_HELD_PATH_DENY_FORBIDDEN: tuple[str, ...] = (
+    "will produce the same denial",
+    "v0.2",
+    "turn",
+    "hook_on_held",
+    "strict_mode",
+    "Bash",
+    "shell",
+)
+
+
+@pytest.mark.parametrize("name", sorted(_HELD_PATH_DENY_TEMPLATES))
+def test_held_path_deny_templates_are_static(name: str) -> None:
+    """Placeholder lock, as for the strict template: the path, and for the
+    holder text the holder's short id, nothing else. A per-invocation field
+    would rotate the bytes across retries, which was measured to worsen the
+    retry loop, and the Node client could not reproduce them. Every brace
+    pair counts, so a positional ``{}`` cannot slip in either."""
+    template, placeholders = _HELD_PATH_DENY_TEMPLATES[name]
+    assert re.findall(r"\{([^{}]*)\}", template) == placeholders
+
+
+@pytest.mark.parametrize("name", sorted(_HELD_PATH_DENY_TEMPLATES))
+def test_held_path_deny_templates_are_ascii_and_name_no_way_around(name: str) -> None:
+    """The texts reach the model behind Claude Code's hook-error prefix and
+    are reproduced byte for byte by the Node client, so they are ASCII, and
+    they carry none of the forbidden phrases, in any case."""
+    template, _ = _HELD_PATH_DENY_TEMPLATES[name]
+    assert template.isascii()
+    present = [word for word in _HELD_PATH_DENY_FORBIDDEN if word.lower() in template.lower()]
+    assert present == [], f"forbidden phrases in the deny text: {present}"
+
+
+def test_the_holder_deny_names_a_32_hex_holder_by_its_first_8_characters() -> None:
+    """The holder is named by the short form every other deny uses, never
+    by its full id."""
+    holder = "bc3013e123b458509bb8c8875e97ff53"
+    reason = emit_held_path_deny(path="docs/plan.md", holder_agent_id=holder)[
+        "permissionDecisionReason"
+    ]
+    assert reason.startswith("Edit denied: docs/plan.md is held by agent bc3013e1. ")
+    assert holder not in reason
+
+
+@pytest.mark.parametrize(
+    "denial_class", [HELD_PATH_DENIAL_CLASS, ADMISSION_UNAVAILABLE_DENIAL_CLASS],
+)
+def test_the_held_path_denial_classes_are_terminal(denial_class: str) -> None:
+    """The holder and parent texts share one class and the unavailable text
+    has its own; both are terminal, beside the strict-mode one."""
+    assert denial_class in TERMINAL_DENIAL_CLASSES
+    assert HELD_PATH_DENIAL_CLASS != ADMISSION_UNAVAILABLE_DENIAL_CLASS
+
+
+@pytest.mark.parametrize(
+    "denial_class", [HELD_PATH_DENIAL_CLASS, ADMISSION_UNAVAILABLE_DENIAL_CLASS],
+)
+@pytest.mark.parametrize("source", ALLOW_EMISSION_SOURCES)
+def test_emit_allow_refuses_the_held_path_denial_classes(source: str, denial_class: str) -> None:
+    """No allow call site can convert a held-path deny. Goes red if either
+    class leaves the terminal set."""
+    with pytest.raises(AssertionError, match="TERMINAL_DENIAL_CLASSES"):
+        emit_allow(source=source, denial_class=denial_class)

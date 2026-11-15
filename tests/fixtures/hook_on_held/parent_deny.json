@@ -1,0 +1,13 @@
+{
+  "description": "The deny the hook client prints for a subagent's opted-in edit refused by its own parent's hold: the request carried a valid agent_id and the holder is the agent id of the caller's session. inputs are the builder's arguments. stdout is the hook's stdout as parsed JSON; compare it parsed, and permissionDecisionReason as exact text.",
+  "inputs": {
+    "path": "docs/plan.md"
+  },
+  "stdout": {
+    "hookSpecificOutput": {
+      "hookEventName": "PreToolUse",
+      "permissionDecision": "deny",
+      "permissionDecisionReason": "Edit denied: docs/plan.md is held by the session that started you. Do not wait for it: finish without this change and report the change you wanted to make back to that session."
+    }
+  }
+}

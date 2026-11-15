@@ -1,0 +1,13 @@
+{
+  "description": "The deny the hook client prints for an opted-in edit whose answer is not an admit, a deny to relay or a holder refusal, and for one that gets no answer. inputs are the builder's arguments. stdout is the hook's stdout as parsed JSON; compare it parsed, and permissionDecisionReason as exact text.",
+  "inputs": {
+    "path": "docs/plan.md"
+  },
+  "stdout": {
+    "hookSpecificOutput": {
+      "hookEventName": "PreToolUse",
+      "permissionDecision": "deny",
+      "permissionDecisionReason": "Edit denied: the coordinator could not confirm that no other agent holds docs/plan.md. Try the edit once more; if it is denied again, stop and tell your user."
+    }
+  }
+}

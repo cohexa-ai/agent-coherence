@@ -6,6 +6,76 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- **The Claude Code hook client can deny an edit of a strict-mode file another
+  agent holds, behind a workspace setting that is off by default (#519).** A
+  Claude Code edit was an ordinary `pre-edit`: an edit of a file another agent
+  held was admitted with a "Concurrent edit detected" note, landed, and left
+  the holder's grant INVALID. With `.coherence/hook_on_held` holding `refuse`
+  (`echo refuse > .coherence/hook_on_held`), the hook client's `pre-edit` of a
+  path that is strict under the coordinator's fold profile reads
+  `/status?detail=metrics` and, when the coordinator advertises
+  `pre_edit_if_unheld: true`, sends `"if_unheld": true`. A clean admit, and a
+  deny the coordinator wrote (the strict-mode stale deny, the handoff giver's
+  deny), reach Claude Code as before. An `other_holder` refusal becomes a deny
+  that names the holder by the first eight characters of its agent id and says
+  the file comes free when that agent lets go of it or after 10 to 30 minutes;
+  a subagent refused by the session that started it is told to report the
+  change back to that session instead. Every other answer, a coordinator whose
+  `server.pid` names a port but that does not answer or has died, a malformed
+  answer, any other failure to read the coordinator's state files, and a
+  present but malformed subagent id, which is not sent, become one deny saying
+  the coordinator could not confirm that no other agent holds the file. Where
+  no port is known (no `server.pid`, or one with no port line, as a clean stop
+  leaves it) the edit is admitted as before. The client sends no release after
+  that deny, so a request that landed late can leave the session holding the
+  file until its turn ends normally or the coordinator reclaims it.
+  - **Off by default.** The file's content, with at most one trailing newline
+    removed, must be exactly `refuse`. No file, an empty file or `displace` is
+    off, and every hook then sends and prints what it did before. Any other
+    value is off too, and prints one stderr line on each `pre-edit`. With it
+    on, a coordinator that does not advertise `pre_edit_if_unheld` gets the
+    ordinary request, plus one stderr line, and every other hook event and
+    every other path sends and prints what it did before.
+  - **Who gets it.** Only this package's hook client,
+    `agent-coherence-hook-client`, reads the setting. The Claude Code plugin's
+    `bin/hook-client` runs the plugin's Node hook client whenever `node` is on
+    PATH and a built Node client exists, and falls back to this client only
+    otherwise, so most plugin installs keep today's behaviour with the setting
+    on until the Node client follows.
+  - **Not yet usable on the read-then-edit path, and not yet measured.** A
+    session that read the file, was refused, and then saw the holder commit
+    stays denied on Read and Edit of that file for the rest of the session, on
+    both coordinators (#514); Claude Code's Edit needs a Read first, so this
+    is the ordinary path. A refused session can still write the file with a
+    shell command (#516). The setting is a workspace file, so a model can turn
+    it off or drop the path from `.coherence/strict_mode.yaml`. How models
+    respond to the deny is not yet measured with real Claude Code sessions,
+    and the setting stays off by default until it is.
+  - The deny texts, the setting's values and the table from coordinator answer
+    to outcome ship as fixtures in `tests/fixtures/hook_on_held/`, so another
+    hook client can reproduce them byte for byte. The guide's "Refusing a held
+    strict file in Claude Code sessions" section has the texts and the details.
+
+### Changed
+
+- **The Python coordinator answers `400` to an opted-in `pre-edit` whose
+  subagent id is malformed, where it read the id as the parent (#519).** A
+  `pre-edit` that sends `"if_unheld": true` asks whether the caller's own
+  agent identity may take the file. When its `agent_id` was present but not 1
+  to 64 characters of `[A-Za-z0-9_-]`, such as `"bad id!"`, a number or a
+  list, the coordinator read it as the parent session, so a subagent whose
+  parent held the path was admitted as the parent's own repeat. Such a request
+  now answers HTTP `400` with
+  `{"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"}`, the wording the
+  effect fence and `session-stop` use for this fault, ahead of the
+  caller-principal refusal and the untracked-path exit, and grants nothing. An
+  empty or `null` `agent_id` still means no subagent id, and a `pre-edit` that
+  does not opt in still reads a malformed id as the parent. The Claude Code
+  plugin's Node coordinator makes the same change in plugin releases after
+  0.7.0.
+
 ### Fixed
 
 - **A volume or substrate session merges its globs into the policy files under

@@ -82,6 +82,17 @@ cure is reported on stderr and never repaired by deleting and re-minting (see
 prints a principal or a nonce. Any process that can read ``.coherence/`` can
 read these files, so this is convention-enforcement and a detectable unbound
 caller, not separation between callers.
+
+## Refusing an edit of a held strict file
+
+With ``.coherence/hook_on_held`` holding ``refuse`` (off by default), a
+``pre-edit`` of a path that is strict under the coordinator's fold profile asks
+for the file only if no other agent holds it: it reads the capability from
+``/status?detail=metrics`` and sends ``if_unheld: true``. The answer becomes a
+relay of the coordinator's admit or deny, a deny naming the holder, or a deny
+saying the coordinator could not confirm the file is free. Once a coordinator
+port is known and the path is strict, no failure prints ``{}``. Every other
+case, and every other subcommand, keeps the requests and output above.
 """
 
 from __future__ import annotations
@@ -96,11 +107,15 @@ import urllib.error
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+from ccs.adapters.claude_code.policy import TrackedArtifactPolicy
 from ccs.adapters.claude_code.resolver import find_coordinator_root
+from ccs.cli import _hook_on_held as on_held
 from ccs.cli._coherence_client import (
     CoordinatorEndpoint,
+    CoordinatorPortUnknown,
     CoordinatorUnavailable,
     err,
+    get,
     post,
     post_with_stored_principal,
     resolve_endpoint,
@@ -108,6 +123,7 @@ from ccs.cli._coherence_client import (
 )
 from ccs.core.disk_spelling import LinkDoesNotResolve
 from ccs.core.exceptions import CallerPrincipalRefused
+from ccs.core.path_fold import FoldProfile
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -207,6 +223,12 @@ def _main_inner(argv: Sequence[str] | None = None) -> int:
         _emit_empty()
         return 0
     root_path = Path(root).resolve()
+
+    if args.subcommand == "pre-edit":
+        held_answer = _held_strict_answer(cc_payload, root_path)
+        if held_answer is not None:
+            print(json.dumps(held_answer), flush=True)
+            return 0
 
     try:
         endpoint = resolve_endpoint(root_path)
@@ -316,6 +338,82 @@ def _call(
         # Coordinator rejected the request (validation error). Degrade
         # silently — the hook should NEVER block the user's tool call.
         return None
+
+
+# A pre-edit payload and the fold profiles under which its path is strict.
+_HeldCandidate = tuple[dict[str, Any], frozenset[FoldProfile]]
+
+
+def _held_strict_answer(cc: Any, root: Path) -> Optional[Any]:
+    """With the hold-refusal setting on, what a ``pre-edit`` of a strict path
+    prints: the coordinator's admit or deny, or one of the held-file denies.
+    ``None`` takes today's path unchanged: the setting is off, the path is
+    strict under no profile, no coordinator port is known, or the coordinator
+    does not refuse held files or does not fold the path onto a strict entry."""
+    candidate = _held_strict_candidate(cc, root)
+    if candidate is None:
+        return None
+    try:
+        return _ask_coordinator(cc, root, candidate)
+    except Exception:
+        # A coordinator is known and the path is strict: admitting on a
+        # failure would let this edit take a file another agent may hold. This
+        # catches every transport, status and principal refusal alike.
+        return on_held.unavailable_deny(candidate[0]["path"])
+
+
+def _held_strict_candidate(
+    cc: Any, root: Path
+) -> Optional[_HeldCandidate]:
+    """The pre-edit payload and the fold profiles under which its path is
+    strict, when the setting is on and some profile makes it strict."""
+    try:
+        if not _hold_refusal_on(root):
+            return None
+        payload = _build_pre_edit(cc, root)
+        policy = TrackedArtifactPolicy.read_quietly(root)
+        profiles = on_held.strict_profiles(policy, root, payload["path"])
+    except Exception:
+        # Nothing has been asked yet, so today's path decides, as it would
+        # with the setting off.
+        return None
+    return (payload, profiles) if profiles else None
+
+
+def _hold_refusal_on(root: Path) -> bool:
+    setting = on_held.read_setting(root / ".coherence")
+    if setting == on_held.SETTING_UNKNOWN:
+        _report(on_held.UNKNOWN_SETTING_MESSAGE)
+    return setting == on_held.SETTING_ON
+
+
+def _ask_coordinator(
+    cc: Any, root: Path, candidate: _HeldCandidate
+) -> Optional[Any]:
+    """Read the capability, then send the opted-in pre-edit. Raises on any
+    failure to reach or read the coordinator, except that no known port takes
+    today's path."""
+    payload, profiles = candidate
+    try:
+        endpoint = resolve_endpoint(root)
+    except CoordinatorPortUnknown:
+        # No coordinator is known, so none can hold the file.
+        return None
+    status = get(endpoint, on_held.STATUS_ROUTE)
+    if not isinstance(status, dict):
+        return on_held.unavailable_deny(payload["path"])
+    if not on_held.advertises_refusal(status):
+        _report(on_held.NO_REFUSAL_MESSAGE)
+        return None
+    if not on_held.strict_for_coordinator(status, profiles):
+        return None
+    if on_held.malformed_subagent_id(cc):
+        return on_held.unavailable_deny(payload["path"])
+    request = {**payload, "if_unheld": True}
+    answer = post_with_stored_principal(
+        endpoint, root, "/hooks/pre-edit", request, report=_report, send=post
+    )
+    return on_held.answer_for(answer, request)
 
 
 def _report(message: str) -> None:
