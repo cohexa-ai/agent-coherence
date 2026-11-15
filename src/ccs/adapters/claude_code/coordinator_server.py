@@ -1507,7 +1507,10 @@ class CoordinatorHTTPServer:
         # to -- a pre-read deny on an INVALID row, or the strict pre-edit stale
         # deny. The agent's next Claude Code Read of the file is admitted when
         # its bytes are the recorded content, and takes the entry; any admitted
-        # hook Read or pre-edit of the pair takes it too. No version in it: a
+        # hook Read or pre-edit of the pair takes it too, and so does a Bash or
+        # Grep command that re-grants the row (#242). Every path that makes the
+        # row valid again must take it: an entry left behind lets a later stale
+        # Read through with no deny. No version in it: a
         # commit after the deny is what that Read returns. Process-local, not
         # Python's stale-warned set: that one is armed by every first warning
         # and never by pre-edit. A restart loses the entries, which costs one
