@@ -583,14 +583,18 @@ _CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
     # -- the nine hook routes ------------------------------------------------
     ("POST", "/hooks/pre-read"): RoutePrincipalPosture(_ACCEPT, (
         "a read: registers or refreshes the named identity's SHARED view and "
-        "records no attribution; strict mode never re-grants on a stale read, "
-        "so a strict-mode write route still catches a stale writer. Accepted "
-        "behaviour for an absent principal, whether the identity is unbound or "
-        "bound: the read drains the named identity's pending notices into its "
-        "own response, and in warn mode a stale read re-grants the identity "
-        "SHARED and uses up its stale warning, so a caller naming a bound peer "
-        "without its principal takes the peer's notices and warning and the "
-        "peer never sees them")),
+        "records no attribution. Accepted behaviour for an absent principal, "
+        "whether the identity is unbound or bound: the read drains the named "
+        "identity's pending notices into its own response; in warn mode a "
+        "stale read re-grants the identity SHARED and uses up its stale "
+        "warning; and in strict mode, after a stale read is denied, the next "
+        "read whose bytes are the recorded content re-grants it SHARED at the "
+        "current version (#514), as a denied Bash or Grep command already "
+        "does (#242). So a caller naming a bound peer without its principal "
+        "takes the peer's notices and warning, which the peer never sees, and "
+        "two reads carrying the hash of the current bytes heal the peer's "
+        "stale view, after which a strict-mode write route admits the peer's "
+        "next edit whatever copy it was built from")),
     ("POST", "/hooks/effect-fence"): RoutePrincipalPosture(_REQUIRE, (
         "gates an escaping effect on the named identity's grant standing: a "
         "caller naming a claimed peer without its principal would be answered "
@@ -1496,6 +1500,18 @@ class CoordinatorHTTPServer:
         self._stale_warned_pairs: set[tuple[UUID, UUID]] = set()
         self._stale_warned_pairs_lock = threading.Lock()
 
+        # #514: one entry per (agent, file) a strict stale-read deny was sent
+        # to -- a pre-read deny on an INVALID row, or the strict pre-edit stale
+        # deny. The agent's next Claude Code Read of the file is admitted when
+        # its bytes are the recorded content, and takes the entry; any admitted
+        # hook Read or pre-edit of the pair takes it too. No version in it: a
+        # commit after the deny is what that Read returns. Process-local, not
+        # Python's stale-warned set: that one is armed by every first warning
+        # and never by pre-edit. A restart loses the entries, which costs one
+        # more deny and never admits a write from a stale copy.
+        self._stale_read_recoveries: set[tuple[UUID, UUID]] = set()
+        self._stale_read_recoveries_lock = threading.Lock()
+
         # SB-10 (KTD5): compact-pending flags, keyed by session_id. Set by
         # /hooks/session-start when it emitted a non-empty re-grounding
         # payload; consumed by the next qualifying parent allow via
@@ -2170,6 +2186,23 @@ class CoordinatorHTTPServer:
                 return True
             return False
 
+    def arm_stale_read_recovery(self, agent_id: UUID, artifact_id: UUID) -> None:
+        """#514: record that a strict stale-read deny was sent to this pair, so
+        its next Claude Code Read of the file can be admitted."""
+        with self._stale_read_recoveries_lock:
+            self._stale_read_recoveries.add((agent_id, artifact_id))
+
+    def take_stale_read_recovery(self, agent_id: UUID, artifact_id: UUID) -> bool:
+        """#514: clear the pair's entry and say whether there was one. One
+        test-and-clear under the lock, so two Reads racing after one deny
+        cannot both be admitted on it."""
+        with self._stale_read_recoveries_lock:
+            pair = (agent_id, artifact_id)
+            if pair in self._stale_read_recoveries:
+                self._stale_read_recoveries.remove(pair)
+                return True
+            return False
+
     def forget_stale_warnings(self, agent_id: UUID) -> None:
         """Drop every stale-warning marker of an identity that has ended
         (#525). Only the identity's own next pre-read on a file consumes its
@@ -2701,6 +2734,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # the victim's preemption notices or bump stale-warning telemetry the fence
     # throws away. Absent (every non-fence client), behavior is byte-unchanged.
     verify_only = bool(body.get("verify_only"))
+    hook_read = _is_hook_read(body)
 
     sid_err = validate_session_id(session_id)
     if sid_err:
@@ -2925,6 +2959,10 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 _record_held_read(
                     coordinator, artifact_id, agent_id, trigger="held_read", tick=now,
                 )
+            # #514: an admitted Read uses up a recovery a shell read left
+            # unused, so it cannot skip the deny of a later stale copy.
+            if hook_read:
+                coordinator.take_stale_read_recovery(agent_id, artifact_id)
             if want_generation and decision.owner_generation is not None:
                 fresh["owner_generation"] = decision.owner_generation
             return fresh
@@ -2997,14 +3035,33 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # != INVALID: continue` filter — same effective gate as the
         # original Unit 2 design, applied per-detected-path.
         #
-        # KTD-T: do NOT re-grant SHARED on deny. The MESI state stays
-        # INVALID (or None) across the model's retry loop so every
-        # retry produces the same byte-stable deny reason text. Per
-        # Phase 0 finding the model exits the retry loop after 2-5
-        # attempts and routes to alternative behavior; the deny IS the
-        # signal. Re-granting would let the second retry get fresh and
-        # silently downgrade the operator's hard guardrail.
+        # #514: deny once, then admit the next Read. The deny itself grants
+        # nothing, so an Edit sent before the session reads again is still
+        # refused (pre-edit refuses INVALID). The deny on an INVALID row arms
+        # the pair's recovery -- only that deny and pre-edit's stale deny arm
+        # it, so only such a row is admitted here -- and the session's next
+        # Claude Code Read of the file is admitted through the stale-arm
+        # re-grant when the bytes it hashed are the recorded content, whatever
+        # version the deny reported: a commit since then is what that Read
+        # returns, as the deny text says. A Read of other bytes, or with no
+        # hash because the file is gone, stays denied and keeps the recovery:
+        # admitting it would record an observation of bytes the coordinator
+        # never recorded, and the next Edit would build on them. Every other
+        # pre-read caller (see ``_is_hook_read``) keeps the deny in place
+        # across retries, and so does a session that never read the file: it
+        # has no row to recover, so its deny arms nothing.
         if decision.outcome == "denied":
+            recorded_bytes = _reads_the_recorded_bytes(artifact, content_hash)
+            if (
+                hook_read
+                and recorded_bytes
+                and coordinator.take_stale_read_recovery(agent_id, artifact_id)
+            ):
+                _regrant_unless_overtaken(
+                    coordinator, artifact_id, agent_id,
+                    classified_version=decision.version, tick=now, content_hash=content_hash,
+                )
+                return {"status": "fresh", "version": decision.version}
             return _emit_pre_read_strict_deny(
                 coordinator,
                 agent_id=agent_id,
@@ -3014,6 +3071,8 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 summary=summary,
                 source="pre_read_strict_deny",
                 effects=effects,
+                disk_differs=not recorded_bytes,
+                arm_recovery=hook_read and agent_state == MESIState.INVALID,
             )
 
         # Re-grant SHARED so this read doesn't re-fire stale on every call.
@@ -3724,6 +3783,9 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                     "hash_differs": False,  # pre-edit doesn't carry content_hash
                 }
                 def record_deny() -> None:
+                    # #514: this deny is the session's one deny, so its next
+                    # Read of the file can be admitted.
+                    coordinator.arm_stale_read_recovery(agent_id, artifact_id)
                     coordinator.increment_stale_warning_emitted()
                     # v0.2 Unit 4 telemetry.
                     coordinator.increment_strict_mode_denial()
@@ -3790,6 +3852,9 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             return refusal
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
+        # #514: an admitted edit uses up a recovery left armed (a shell read
+        # recovered the row), so it cannot skip the deny of a later stale copy.
+        coordinator.take_stale_read_recovery(agent_id, artifact_id)
 
         # #278: pre-edit carries no content hash, and post-edit records
         # whatever it is sent, so a write built from an earlier read replaced a
@@ -4706,6 +4771,35 @@ def _clear_acknowledged_marker(registry: RegistryBase, artifact_id: UUID, agent_
         registry.clear_agent_transient(artifact_id, agent_id)
 
 
+_NOT_A_HOOK_READ_FIELDS = ("want_owner_generation", "verify_only", "name_kind")
+"""Fields only a pre-read caller other than a Claude Code hook client sends:
+CoherentVolume and the documented raw capture send the generation opt-in, the
+effect fence sends ``verify_only``, the substrate sends ``name_kind``. The hook
+clients send ``{session_id, path, content_hash, agent_id}`` and nothing else."""
+
+
+def _is_hook_read(body: dict) -> bool:
+    """#514: whether a pre-read is a Claude Code hook Read, the one caller whose
+    strict stale-read deny is recovered by reading again. Every other caller
+    recovers with a new identity (``reacquire()`` or a new agent id), and the
+    substrate's commit gate relies on its deny staying in place, so a request
+    carrying any of :data:`_NOT_A_HOOK_READ_FIELDS` keeps today's deny. Decided
+    by the field being present, whatever its value, so an explicit ``false``
+    still marks a caller that is not a hook client."""
+    return not any(field in body for field in _NOT_A_HOOK_READ_FIELDS)
+
+
+def _reads_the_recorded_bytes(artifact: Artifact, content_hash: str | None) -> bool:
+    """Whether a read hashed the content the coordinator recorded, or the record
+    holds no content to compare with. A missing hash -- the file is gone -- is
+    not the recorded content. One rule for a stale-arm read acknowledging the
+    write that made it stale and for a strict reader being admitted (#514)."""
+    return (
+        not coordinator_holds_content_claim(artifact.content_hash)
+        or content_hash == artifact.content_hash
+    )
+
+
 def _regrant_unless_overtaken(
     coordinator: CoordinatorHTTPServer,
     artifact_id: UUID,
@@ -4742,9 +4836,8 @@ def _regrant_unless_overtaken(
     with registry.abort_guard():
         artifact = registry.get_artifact(artifact_id)
         overtaken = artifact is not None and artifact.version != classified_version
-        read_the_recorded_bytes = artifact is not None and (
-            not coordinator_holds_content_claim(artifact.content_hash)
-            or content_hash == artifact.content_hash
+        read_the_recorded_bytes = artifact is not None and _reads_the_recorded_bytes(
+            artifact, content_hash
         )
         if read_the_recorded_bytes and not overtaken:
             _clear_acknowledged_marker(registry, artifact_id, agent_id)
@@ -8785,7 +8878,9 @@ def _build_preemption_text(
                 f"(heartbeat timeout or max-hold ceiling) at {_iso_utc(ts)}. "
                 f"Any local edit you made to this file will land in your "
                 f"worktree but is NOT reflected in the coordinator's version. "
-                f"Re-fetch via pre-read and retry."
+                # #514: a strict file's first Read after the reclaim is denied
+                # and says to read again; the Read after it is admitted.
+                f"Read it again with the Read tool before you edit it."
             )
             continue
         # R7: the notice row already carries the preempter's agent id, which
@@ -9332,6 +9427,8 @@ def _emit_pre_read_strict_deny(
     source: str,
     effects: _AnswerEffects,
     out_of_band: bool = False,
+    disk_differs: bool = False,
+    arm_recovery: bool = False,
 ) -> dict:
     """Single source of truth for emitting a pre-read strict-mode deny, used by
     both deny arms: the INVALID/None-grant path and the Survivor #6
@@ -9344,8 +9441,31 @@ def _emit_pre_read_strict_deny(
     ``effects`` and recorded only when this deny is the answer sent (#236).
     ``out_of_band`` is the SHARED-holder arm's alone (#278): only a reader
     that still holds a valid grant is told its file changed outside the
-    coordinator."""
+    coordinator. ``disk_differs`` belongs to the arm for a reader with no
+    valid grant (#514): its bytes are not the recorded content, so reading
+    again does not clear the deny, and the text names what does instead of
+    promising a Read. ``arm_recovery`` is the INVALID-row arm's, for a Claude
+    Code Read (#514): it arms the recovery that admits the session's next
+    Read."""
+    if disk_differs:
+        hook_output = _payloads.emit_disk_mismatch_deny(
+            path=path,
+            current_version=summary["current_version"],
+            write_in_flight=_a_write_is_in_flight(
+                coordinator.registry, artifact_id,
+                now_unix=_payloads.now_unix(),
+                window_sec=_SHARED_FOREIGN_DENY_LAG_WINDOW_SEC,
+                exclude_agent=agent_id,
+            ),
+        )
+    else:
+        hook_output = _payloads.emit_strict_deny(
+            source=source, summary=summary, out_of_band=out_of_band,
+        )
+
     def record_deny() -> None:
+        if arm_recovery:
+            coordinator.arm_stale_read_recovery(agent_id, artifact_id)
         coordinator.increment_stale_warning_emitted()
         coordinator.mark_stale_warned(agent_id, artifact_id)
         coordinator.increment_strict_mode_denial()
@@ -9355,13 +9475,7 @@ def _emit_pre_read_strict_deny(
         ):
             coordinator.increment_audit_log_mode_drift()
     effects.defer(record_deny)
-    return {
-        "hookSpecificOutput": _payloads.emit_strict_deny(
-            source=source, summary=summary, out_of_band=out_of_band,
-        ),
-        "status": "stale",
-        "summary": summary,
-    }
+    return {"hookSpecificOutput": hook_output, "status": "stale", "summary": summary}
 
 
 def _is_recent_self_commit_lag(

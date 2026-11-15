@@ -444,8 +444,9 @@ def _deny_stdout(artifact: str) -> str:
             "permissionDecision": "deny",
             "permissionDecisionReason": (
                 f"Stale read denied: {artifact} was updated by agent abcdef01 "
-                f"at 2026-05-23T12:00:00+00:00. Re-read {artifact} via the Read "
-                f"tool before proceeding."
+                f"at 2026-05-23T12:00:00+00:00. Read {artifact} again with the Read "
+                f"tool: the next Read returns the current version, and edits of "
+                f"{artifact} are denied until you have read it."
             ),
         },
         "status": "stale",

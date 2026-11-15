@@ -1,6 +1,6 @@
 {
-  "name": "pre-read-strict-unrecorded-writer-denies-with-the-write-wording",
-  "description": "The <unknown>-writer arm of the WRITE deny template, on BOTH backends. Fixture 09 used to carry it and no longer can: since R8 its scenario (a grant taken with no commit) takes the grant-change template instead, which names no writer at all. The arm is still reachable, and this is how: B pre-reads CLAUDE.md first, seeding v1 with B's hash and NO last_writer_id (a first observation is not a commit). A then pre-reads the same strict-tracked path for the FIRST time, offering different bytes. A has no prior grant, so nothing about a grant changed hands and the summary cannot call the version unchanged; the diverging hash says something WAS written, out of band. The deny therefore uses the write template -- and names 'agent <unknown>', preserved verbatim rather than [:8]-sliced to the malformed '<unknown'. Timestamps vary per run; the reason bytes and the summary shape are the contract.",
+  "name": "pre-read-never-read-session-with-other-bytes-is-denied-again",
+  "description": "#514, the control: a deny that the next Read does not clear. B pre-reads CLAUDE.md first, seeding v1 with B's hash. A, which never read the file, offers other bytes and is denied with the out-of-band text (fixture 10). That deny arms nothing, since A has no stale copy to recover, so A's second read of the same bytes is denied with the same text.",
   "setup": {
     "tracked": [
       "CLAUDE.md"
@@ -19,6 +19,15 @@
           "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
           "path": "CLAUDE.md",
           "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "CLAUDE.md",
+          "content_hash": "1111111111111111111111111111111111111111111111111111111111111111"
         }
       }
     ]
@@ -42,7 +51,7 @@
       "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": "Stale read denied: CLAUDE.md was updated by agent <unknown> at <TS>. Re-read CLAUDE.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+        "permissionDecisionReason": "Stale read denied: CLAUDE.md on disk does not match v1, the last version committed through the coordinator, and no session committed the change, so it was made outside the coordinator. Do not restore or overwrite CLAUDE.md: the change may be your user's work. Tell your user that CLAUDE.md changed outside the coordinator; the read stays denied until the change is committed through the coordinator. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
       },
       "status": "stale",
       "summary": {

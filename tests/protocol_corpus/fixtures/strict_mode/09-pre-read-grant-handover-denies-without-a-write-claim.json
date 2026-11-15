@@ -31,7 +31,7 @@
       "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": "Stale read denied: your grant on CLAUDE.md was revoked and no new version was committed \u2014 CLAUDE.md is still at v1. Re-read CLAUDE.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+        "permissionDecisionReason": "Stale read denied: your grant on CLAUDE.md was revoked and no new version was committed \u2014 CLAUDE.md is still at v1. Read CLAUDE.md again with the Read tool: the next Read returns the current version, and edits of CLAUDE.md are denied until you have read it."
       },
       "status": "stale",
       "summary": {

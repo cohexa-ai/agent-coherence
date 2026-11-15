@@ -1,0 +1,82 @@
+{
+  "name": "pre-read-after-a-stale-deny-is-admitted-at-the-current-version",
+  "description": "#514: a stale reader recovers in the same session. Sessions A and B read v1 and B commits v2, which makes A's copy INVALID; A's Read of the v2 bytes B committed is denied with the commit text (fixture 01). The deny says the next Read returns the current version, and it does: A reads the same bytes again and is admitted on the fresh arm at v2, with no stale warning and no summary. Before the fix every retry got the same deny, so the session could never edit the file again.",
+  "setup": {
+    "tracked": [
+      "CLAUDE.md"
+    ],
+    "strict_mode": [
+      "CLAUDE.md"
+    ],
+    "files": {
+      "CLAUDE.md": "# Project rules\nv1 content\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "CLAUDE.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "CLAUDE.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "CLAUDE.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "CLAUDE.md",
+          "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f",
+          "success": true
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "CLAUDE.md",
+          "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "CLAUDE.md",
+      "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "status": "fresh",
+      "version": 2
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

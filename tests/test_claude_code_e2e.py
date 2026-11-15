@@ -16,6 +16,17 @@ the scenarios from plan §Unit 8 that can be verified without a live
   binaries and a detached coordinator
 - Refusing an edit of a held strict file (#519) -- the real hook-client
   process, one per event, against a coordinator of the test's own
+- A stale strict reader reading the file again after one deny (#514) -- both
+  real hook clients, this checkout's Python one and the plugin's Node one
+
+Rows that run the plugin's Node hook client are marked ``protocol_corpus``:
+they need a built plugin, whose ``dist/coordinator.js`` the
+``AGENT_COHERENCE_PLUGIN_DIST_PATH`` variable names (the client is
+``hook_client.js`` beside it), so they run in the job that builds the paired
+plugin branch, or locally with
+``AGENT_COHERENCE_PLUGIN_DIST_PATH=<plugin>/dist/coordinator.js pytest -m
+protocol_corpus tests/test_claude_code_e2e.py``. Without a resolvable dist
+they xfail, as the Node rows of the parity corpora do.
 
 Scenarios that require a live ``claude`` CLI session (multi-process
 stale-read e2e, claude-agents probe) are exercised by the Phase E.0
@@ -57,8 +68,9 @@ from ccs.adapters.claude_code.lifecycle import (
 )
 from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.cli._coherence_client import get, post, resolve_endpoint
+from ccs.core.exceptions import StaleView
 from tests.pid_lock_helpers import write_coordinator_pid_file
-from tests.protocol_corpus.harness import apply_setup, normalize_response
+from tests.protocol_corpus.harness import apply_setup, normalize_response, resolve_node_dist_path
 
 # ----------------------------------------------------------------------
 # Fixtures
@@ -420,13 +432,16 @@ def test_e2e_subprocess_idempotent_second_spawn(workspace: Path) -> None:
 
 
 # ----------------------------------------------------------------------
-# Refusing an edit of a held strict file (#519), through the real
-# hook-client process. Each test starts its own coordinator in a fresh
-# workspace and runs ``python -m ccs.cli.coherence_hook_client`` as Claude
-# Code runs a command hook: one process per event, the payload on stdin.
-# The rows written once below as ``check_*`` functions run here against the
-# Python coordinator, and in tests/protocol_corpus/test_hook_client_on_held.py
-# against the Node coordinator, so both are held to the same deny bytes.
+# Refusing an edit of a held strict file (#519), and a stale strict reader
+# reading the file again after one deny (#514), through the real hook-client
+# process. Each test starts its own coordinator in a fresh workspace and runs
+# a hook client as Claude Code runs a command hook: one process per event,
+# the payload on stdin. The held-file rows run ``python -m
+# ccs.cli.coherence_hook_client``; the recovery rows run it and the plugin's
+# Node client. The rows written once below as ``check_*`` functions run here
+# against the Python coordinator, and in
+# tests/protocol_corpus/test_hook_client_on_held.py against the Node
+# coordinator, so both are held to the same deny bytes.
 # ----------------------------------------------------------------------
 
 PLAN = "docs/plan.md"
@@ -457,8 +472,21 @@ _COLLISION_CONTEXT = (
     "session to finish or coordinating which one should proceed."
 )
 _STALE_DENY_REASON = (
-    "Stale read denied: {path} was updated by agent {writer} at <TS>. Re-read {path} via "
-    "the Read tool before proceeding. This denial is structural (v0.2 strict mode); "
+    "Stale read denied: {path} was updated by agent {writer} at <TS>. Read {path} again with "
+    "the Read tool: the next Read returns the current version, and edits of {path} are denied "
+    "until you have read it."
+)
+_GRANT_CHANGE_DENY_REASON = (
+    "Stale read denied: your grant on {path} was revoked and no new version was committed "
+    "— {path} is still at v{version}. Read {path} again with the Read tool: the next Read "
+    "returns the current version, and edits of {path} are denied until you have read it."
+)
+_OUT_OF_BAND_DENY_REASON = (
+    "Stale read denied: {path} on disk does not match v{version}, the last version committed "
+    "through the coordinator, and no session committed the change, so it was made outside the "
+    "coordinator. Do not restore or overwrite {path}: the change may be your user's work. Tell "
+    "your user that {path} changed outside the coordinator; the read stays denied until the "
+    "change is committed through the coordinator. This denial is structural (v0.2 strict mode); "
     "retrying the same operation will produce the same denial."
 )
 
@@ -469,6 +497,51 @@ class HookRun:
 
     stdout: str
     stderr: str
+
+
+@dataclass(frozen=True)
+class HookClient:
+    """A real hook client, started as Claude Code starts a command hook: one
+    process per event, the payload on stdin."""
+
+    name: str
+    command: tuple[str, ...]
+
+    def run(self, root: Path, subcommand: str, cc: dict[str, Any]) -> HookRun:
+        """One hook process for ``subcommand`` with ``cc`` on its stdin."""
+        done = subprocess.run(
+            [*self.command, subcommand, "--root", str(root)],
+            input=json.dumps(cc), capture_output=True, text=True, cwd=root,
+            env={**os.environ, "PYTHONPATH": str(_SRC)}, timeout=_HOOK_TIMEOUT_SEC,
+        )
+        assert done.returncode == 0, done
+        return HookRun(done.stdout, done.stderr)
+
+    def read(self, root: Path, caller: Caller, rel: str = PLAN) -> HookRun:
+        return self.run(root, "pre-read", caller.payload(root, rel))
+
+    def edit(self, root: Path, caller: Caller, rel: str = PLAN) -> HookRun:
+        return self.run(root, "pre-edit", caller.payload(root, rel))
+
+
+#: This checkout's Python hook client.
+PYTHON_CLIENT = HookClient("python", (sys.executable, "-m", _HOOK_MODULE))
+
+
+def hook_client(name: str) -> HookClient:
+    """The ``python`` client, or the plugin's ``node`` client, which is built
+    beside the Node coordinator's dist."""
+    if name == "python":
+        return PYTHON_CLIENT
+    dist = resolve_node_dist_path()
+    if dist is None:
+        pytest.xfail(
+            "Node hook client not resolvable. Build the plugin checkout "
+            "(npm ci && npm run build) or set AGENT_COHERENCE_PLUGIN_DIST_PATH."
+        )
+    client = dist.parent / "hook_client.js"
+    assert client.is_file(), f"the Node hook client is not built at {client}"
+    return HookClient("node", ("node", str(client)))
 
 
 @dataclass(frozen=True)
@@ -527,18 +600,12 @@ def set_hold_refusal(root: Path, content: str | None) -> None:
 
 
 def run_hook(root: Path, subcommand: str, cc: dict[str, Any]) -> HookRun:
-    """One hook process for ``subcommand`` with ``cc`` on its stdin."""
-    done = subprocess.run(
-        [sys.executable, "-m", _HOOK_MODULE, subcommand, "--root", str(root)],
-        input=json.dumps(cc), capture_output=True, text=True, cwd=root,
-        env={**os.environ, "PYTHONPATH": str(_SRC)}, timeout=_HOOK_TIMEOUT_SEC,
-    )
-    assert done.returncode == 0, done
-    return HookRun(done.stdout, done.stderr)
+    """One Python hook-client process for ``subcommand`` with ``cc`` on its stdin."""
+    return PYTHON_CLIENT.run(root, subcommand, cc)
 
 
 def edit(root: Path, caller: Caller, rel: str = PLAN) -> HookRun:
-    return run_hook(root, "pre-edit", caller.payload(root, rel))
+    return PYTHON_CLIENT.edit(root, caller, rel)
 
 
 def take(root: Path, caller: Caller, rel: str = PLAN) -> None:
@@ -554,6 +621,13 @@ def write_holders(root: Path, rel: str) -> set[UUID]:
         UUID(row["agent_id"]) for row in status["sessions"]
         if row.get("states", {}).get(rel) in _WRITE_STATES
     }
+
+
+def grant_holders(root: Path, rel: str) -> set[UUID]:
+    """Who the coordinator's ``/status`` lists with any grant on ``rel``. It
+    lists no INVALID row, so a stale copy is absent."""
+    status = get(resolve_endpoint(root), "/status")
+    return {UUID(row["agent_id"]) for row in status["sessions"] if rel in row.get("states", {})}
 
 
 def _deny_line(deny: dict[str, Any]) -> str:
@@ -652,25 +726,177 @@ def check_a_sibling_subagent_is_refused_naming_the_holding_subagent(root: Path) 
     assert write_holders(root, PLAN) == {first.agent_id}
 
 
-def check_a_refused_reader_stays_denied_after_the_holder_commits(root: Path) -> None:
-    """#514 as it stands today: B read the file during A's hold and was
-    refused; A commits and ends its session. B's next read and its edit get
-    today's strict stale deny naming A, the edit's deny the one the setting-off
-    path prints, so B cannot re-read its way back to an edit."""
+def committed_deny(rel: str, writer: UUID) -> str:
+    """The stale deny naming ``writer``'s commit, as normalize_response leaves it."""
+    return _STALE_DENY_REASON.format(path=rel, writer=writer.hex[:8])
+
+
+def out_of_band_deny(rel: str, version: int) -> str:
+    """The deny of a read whose bytes are not ``rel``'s recorded v``version``."""
+    return _OUT_OF_BAND_DENY_REASON.format(path=rel, version=version)
+
+
+def assert_denied(run: HookRun, reason: str) -> None:
+    output = _comparable(run)["hookSpecificOutput"]
+    assert (output["permissionDecision"], output["permissionDecisionReason"], run.stderr) == ("deny", reason, ""), run
+
+
+def assert_read_admitted(run: HookRun, version: int) -> None:
+    """A fresh Read at ``version``, with no stale warning and no note."""
+    assert (json.loads(run.stdout), run.stderr) == ({"status": "fresh", "version": version}, ""), run
+
+
+def assert_edit_admitted(run: HookRun) -> None:
+    assert json.loads(run.stdout).get("ok") is True and _decision(run) != "deny" and run.stderr == "", run
+
+
+def commit(root: Path, client: HookClient, writer: Caller, content: str) -> None:
+    """``writer`` edits ``docs/plan.md`` and commits ``content``: the Edit's
+    pre-edit, the bytes it writes, its post-edit."""
+    assert_edit_admitted(client.edit(root, writer))
+    (root / PLAN).write_text(content)
+    _ends_ok(client.run(root, "post-edit", writer.payload(root)))
+
+
+def read_then_peer_commit(root: Path, client: HookClient) -> tuple[Caller, Caller]:
+    """B reads v1 and A commits v2, which makes B's copy stale. Returns B and A."""
+    set_hold_refusal(root, None)
+    reader, writer = Caller.new(), Caller.new()
+    assert_read_admitted(client.read(root, reader), 1)
+    commit(root, client, writer, "docs/plan.md v2\n")
+    return reader, writer
+
+
+def check_a_stale_reader_recovers_after_a_peer_commit(root: Path, client: HookClient) -> None:
+    """B read v1 and A committed v2. B's Read is denied naming A's commit, and
+    so is the Edit B sends before reading again; B's next Read is admitted at
+    v2, and its Edit after that."""
+    reader, writer = read_then_peer_commit(root, client)
+    reason = committed_deny(PLAN, writer.agent_id)
+    assert_denied(client.read(root, reader), reason)
+    assert_denied(client.edit(root, reader), reason)
+    assert_read_admitted(client.read(root, reader), 2)
+    assert_edit_admitted(client.edit(root, reader))
+
+
+def check_a_stale_editor_recovers_by_reading(root: Path, client: HookClient) -> None:
+    """The Edit-first order: B's first call after A's commit is an Edit, denied
+    naming A; B's next Read is admitted at v2, one deny and not two, and its
+    Edit after that."""
+    reader, writer = read_then_peer_commit(root, client)
+    assert_denied(client.edit(root, reader), committed_deny(PLAN, writer.agent_id))
+    assert_read_admitted(client.read(root, reader), 2)
+    assert_edit_admitted(client.edit(root, reader))
+
+
+def check_a_parent_recovers_after_its_subagent_commits(root: Path, client: HookClient) -> None:
+    """A session read v1, and its own subagent committed v2 and stopped. The
+    session's Read is denied naming the subagent; its next Read is admitted
+    at v2, and its Edit after that."""
+    set_hold_refusal(root, None)
+    parent = Caller.new()
+    subagent = parent.subagent_of("sub1")
+    assert_read_admitted(client.read(root, parent), 1)
+    commit(root, client, subagent, "docs/plan.md v2 by the subagent\n")
+    _ends_ok(client.run(root, "subagent-stop", subagent.payload(root)))
+
+    assert_denied(client.read(root, parent), committed_deny(PLAN, subagent.agent_id))
+    assert_read_admitted(client.read(root, parent), 2)
+    assert_edit_admitted(client.edit(root, parent))
+
+
+def check_a_reader_recovers_after_a_grant_taken_and_given_back_uncommitted(root: Path, client: HookClient) -> None:
+    """B read v1; A took the file and ended its session with no commit, which
+    revoked B's grant at an unchanged v1. B's Read is denied with the
+    grant-change text; its next Read is admitted at v1, and its Edit after
+    that."""
+    set_hold_refusal(root, None)
+    reader, taker = Caller.new(), Caller.new()
+    assert_read_admitted(client.read(root, reader), 1)
+    assert_edit_admitted(client.edit(root, taker))
+    _ends_ok(client.run(root, "session-stop", taker.payload(root)))
+
+    assert_denied(client.read(root, reader), _GRANT_CHANGE_DENY_REASON.format(path=PLAN, version=1))
+    assert_read_admitted(client.read(root, reader), 1)
+    assert_edit_admitted(client.edit(root, reader))
+
+
+def check_a_change_outside_the_coordinator_after_a_deny_stays_denied(root: Path, client: HookClient) -> None:
+    """B was denied after A's commit, and the file then changed with no
+    commit. B's Read of those bytes is denied with the out-of-band text, which
+    names a commit through the coordinator as what clears it, and B's Edit
+    stays denied."""
+    reader, writer = read_then_peer_commit(root, client)
+    assert_denied(client.read(root, reader), committed_deny(PLAN, writer.agent_id))
+    (root / PLAN).write_text("docs/plan.md changed outside the coordinator\n")
+
+    assert_denied(client.read(root, reader), out_of_band_deny(PLAN, 2))
+    assert_denied(client.edit(root, reader), committed_deny(PLAN, writer.agent_id))
+
+
+def check_a_missing_file_after_a_deny_stays_denied(root: Path, client: HookClient) -> None:
+    """B was denied after A's commit, and the file was then deleted. B's Read,
+    which carries no hash, is denied with the out-of-band text, and B's Edit
+    stays denied."""
+    reader, writer = read_then_peer_commit(root, client)
+    assert_denied(client.read(root, reader), committed_deny(PLAN, writer.agent_id))
+    (root / PLAN).unlink()
+
+    assert_denied(client.read(root, reader), out_of_band_deny(PLAN, 2))
+    assert_denied(client.edit(root, reader), committed_deny(PLAN, writer.agent_id))
+
+
+def check_a_session_that_never_read_a_changed_file_stays_denied(root: Path, client: HookClient) -> None:
+    """The control: A read v1 and the file then changed with no commit. C,
+    which never read it, is denied with the out-of-band text, and its second
+    Read is denied with it too: C has no stale copy to recover, so its deny
+    clears only with a commit through the coordinator."""
+    set_hold_refusal(root, None)
+    first, stranger = Caller.new(), Caller.new()
+    assert_read_admitted(client.read(root, first), 1)
+    (root / PLAN).write_text("docs/plan.md changed outside the coordinator\n")
+
+    for _ in range(2):
+        assert_denied(client.read(root, stranger), out_of_band_deny(PLAN, 1))
+
+
+def check_a_refused_reader_recovers_after_the_holder_commits(root: Path, later: HookClient) -> None:
+    """#514 with the held-file refusal on: B read the file during A's hold and
+    the Python client refused B's edit; A commits and ends its session. B's
+    calls after that run through ``later``: one stale deny naming A, then an
+    admitted Read at v2 and an admitted Edit, and B holds the file."""
     holder, editor = check_a_held_strict_file_is_refused_naming_its_holder(root, editor_read=True)
     (root / PLAN).write_text("docs/plan.md v2\n")
     _ends_ok(run_hook(root, "post-edit", holder.payload(root)))
     _ends_ok(run_hook(root, "session-stop", holder.payload(root)))
 
-    read, opted_in = run_hook(root, "pre-read", editor.payload(root)), edit(root, editor)
-    set_hold_refusal(root, None)
-    today = edit(root, editor)
+    assert_denied(later.read(root, editor), committed_deny(PLAN, holder.agent_id))
+    assert_read_admitted(later.read(root, editor), 2)
+    assert_edit_admitted(later.edit(root, editor))
+    assert write_holders(root, PLAN) == {editor.agent_id}
 
-    reason = _STALE_DENY_REASON.format(path=PLAN, writer=holder.agent_id.hex[:8])
-    for run in (read, opted_in, today):
-        output = _comparable(run)["hookSpecificOutput"]
-        assert (output["permissionDecision"], output["permissionDecisionReason"], run.stderr) == ("deny", reason, "")
-    assert _comparable(opted_in) == _comparable(today)
+
+def check_plain_volume_reads_after_a_peer_commit_stay_denied(root: Path) -> None:
+    """A ``CoherentVolume`` is not a hook client: the reader's view went stale
+    on the writer's commit, and two plain ``read()`` calls leave the reader
+    with no grant on the coordinator. A ``write()`` of a buffer the reader
+    built from v1 is then refused, and the writer's bytes stay. The volume's
+    recovery stays ``reacquire()``."""
+    writer = CoherentVolume(root, managed=(DATA_GLOB,), config=VOLUME_CONFIG)
+    reader = CoherentVolume(root, managed=(DATA_GLOB,), config=VOLUME_CONFIG)
+    try:
+        stale_buffer = reader.read(DATA_PLAN) + b"appended from v1\n"
+        writer.write(DATA_PLAN, b"v2 from the writer\n")
+
+        for _ in range(2):
+            assert reader.read(DATA_PLAN) == b"v2 from the writer\n"
+            assert UUID(reader.agent_id) not in grant_holders(root, DATA_PLAN), "a plain read healed the stale view"
+        with pytest.raises(StaleView):
+            reader.write(DATA_PLAN, stale_buffer)
+        assert (root / DATA_PLAN).read_bytes() == b"v2 from the writer\n"
+    finally:
+        reader.close()
+        writer.close()
 
 
 def check_a_refuse_mode_volume_holding_a_strict_file_is_named(root: Path) -> None:
@@ -749,9 +975,71 @@ def test_with_the_setting_off_an_edit_of_a_held_strict_file_takes_it_as_today(
     check_an_edit_of_a_held_file_takes_it_as_today(strict_workspace, PLAN)
 
 
-def test_a_refused_reader_stays_denied_after_the_holder_commits_as_today(strict_workspace: Path) -> None:
-    """Pins the #514 lockout as today's behaviour: a fix to it changes this row."""
-    check_a_refused_reader_stays_denied_after_the_holder_commits(strict_workspace)
+#: Both hook clients. The Node one needs the plugin's dist, so its rows run
+#: only where the corpus does (see the module docstring).
+HOOK_CLIENTS = [
+    pytest.param("python", id="python-client"),
+    pytest.param("node", id="node-client", marks=pytest.mark.protocol_corpus),
+]
+
+
+@pytest.mark.parametrize("later", HOOK_CLIENTS)
+def test_a_refused_reader_reads_again_and_edits_after_the_holder_commits(strict_workspace: Path, later: str) -> None:
+    """Prevents the #514 lockout after a held-file refusal: B's later calls
+    through either client recover after one deny."""
+    check_a_refused_reader_recovers_after_the_holder_commits(strict_workspace, hook_client(later))
+
+
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+def test_a_stale_reader_reads_again_and_edits_after_a_peer_commit(strict_workspace: Path, client: str) -> None:
+    """Prevents the #514 lockout: every retry of a stale Read denied, so the
+    session could never edit the file again."""
+    check_a_stale_reader_recovers_after_a_peer_commit(strict_workspace, hook_client(client))
+
+
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+def test_a_stale_editor_reads_again_and_edits(strict_workspace: Path, client: str) -> None:
+    """Prevents a second deny for a session whose first call was the Edit."""
+    check_a_stale_editor_recovers_by_reading(strict_workspace, hook_client(client))
+
+
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+def test_a_parent_reads_again_and_edits_after_its_subagent_commits(strict_workspace: Path, client: str) -> None:
+    """Prevents the lockout of a session whose own subagent committed."""
+    check_a_parent_recovers_after_its_subagent_commits(strict_workspace, hook_client(client))
+
+
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+def test_a_reader_reads_again_and_edits_after_a_grant_given_back_uncommitted(
+    strict_workspace: Path, client: str,
+) -> None:
+    """Prevents the lockout of a reader whose grant was revoked with no commit."""
+    check_a_reader_recovers_after_a_grant_taken_and_given_back_uncommitted(strict_workspace, hook_client(client))
+
+
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+def test_a_change_outside_the_coordinator_after_a_deny_stays_denied(strict_workspace: Path, client: str) -> None:
+    """Prevents a Read admitting bytes no version records, which the next Edit
+    would build on."""
+    check_a_change_outside_the_coordinator_after_a_deny_stays_denied(strict_workspace, hook_client(client))
+
+
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+def test_a_missing_file_after_a_deny_stays_denied(strict_workspace: Path, client: str) -> None:
+    """Prevents a Read with no hash counting as a read of the recorded version."""
+    check_a_missing_file_after_a_deny_stays_denied(strict_workspace, hook_client(client))
+
+
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+def test_a_session_that_never_read_a_changed_file_stays_denied(strict_workspace: Path, client: str) -> None:
+    """Prevents a deny with no stale copy behind it from clearing on a Read."""
+    check_a_session_that_never_read_a_changed_file_stays_denied(strict_workspace, hook_client(client))
+
+
+def test_plain_volume_reads_after_a_peer_commit_stay_denied(strict_workspace: Path) -> None:
+    """Prevents a plain volume read healing a stale view, so that a write of an
+    older buffer would be admitted."""
+    check_plain_volume_reads_after_a_peer_commit_stay_denied(strict_workspace)
 
 
 def test_an_edit_of_a_strict_file_a_refuse_mode_volume_holds_is_denied_naming_it(strict_workspace: Path) -> None:

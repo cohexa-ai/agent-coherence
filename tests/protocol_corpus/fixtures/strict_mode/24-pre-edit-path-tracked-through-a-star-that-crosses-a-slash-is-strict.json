@@ -68,7 +68,7 @@
       "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": "Stale read denied: docs/a/b.md was updated by agent 814dac78 at <TS>. Re-read docs/a/b.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+        "permissionDecisionReason": "Stale read denied: docs/a/b.md was updated by agent 814dac78 at <TS>. Read docs/a/b.md again with the Read tool: the next Read returns the current version, and edits of docs/a/b.md are denied until you have read it."
       },
       "status": "stale",
       "summary": "<IGNORED>"

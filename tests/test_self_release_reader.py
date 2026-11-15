@@ -311,8 +311,9 @@ def test_a_stop_releases_each_write_grant_to_a_read_and_leaves_a_read_alone(live
 @pytest.mark.parametrize("commits", [True, False], ids=["acquired-and-committed", "acquired-only"])
 def test_a_peer_write_after_the_release_leaves_the_holder_stale(live: _Live, commits: bool) -> None:
     """The read the release left is an ordinary read: a peer's acquire, with or
-    without its commit, makes it INVALID, and the holder's Read is denied with
-    the text that says which happened, and its Edit is denied."""
+    without its commit, makes it INVALID, and the holder's Read of the file as
+    it now is -- the peer's bytes, or its own when nothing was committed -- is
+    denied with the text that says which happened, and its Edit is denied."""
     holder = _Holder(_sid(f"peer-after-{commits}"), "stop")
     peer = _sid(f"peer-after-peer-{commits}")
     _take(live, holder, _STRICT)
@@ -325,7 +326,8 @@ def test_a_peer_write_after_the_release_leaves_the_holder_stale(live: _Live, com
         })
 
     assert _state(live, _STRICT, holder.agent_id) == MESIState.INVALID
-    assert (_UPDATED if commits else _REVOKED) in _denied_reason(_pre_read(live, holder, _STRICT))
+    read = _read_of_the_peer_version(live, holder, _STRICT) if commits else _pre_read(live, holder, _STRICT)
+    assert (_UPDATED if commits else _REVOKED) in _denied_reason(read)
     assert _pre_edit(live, holder, _STRICT).get("ok") is False
 
 
@@ -384,21 +386,23 @@ def test_a_released_warn_mode_edit_made_after_a_peer_commit_leaves_a_fresh_read(
 def test_a_strict_edit_after_a_peer_commit_is_denied_so_its_release_keeps_the_copy_stale(
     live: _Live, route: str,
 ) -> None:
-    """The strict twin of the row above: the Edit is denied before any grant is
-    taken, so the release finds the holder INVALID and leaves it so, and its
-    next Read is denied with the write wording."""
+    """The strict twin of the row above: the Edit is denied with the write
+    wording before any grant is taken, so the release finds the holder INVALID
+    and leaves it so. That deny was the holder's one stale deny (#514), so its
+    next Read, of the peer's version, is admitted at v2: the read the deny
+    asked for recovers the copy, the release does not."""
     holder = _Holder(_sid(f"strict-after-peer-{route}"), route)
     edit = _edit_after_a_peer_commit(live, holder, _STRICT)
     registry = live.server.registry
     artifact_id = _artifact_id(live, _STRICT)
 
-    assert edit.get("ok") is False, edit
+    assert edit.get("ok") is False and _UPDATED in _denied_reason(edit), edit
     assert registry.get_agent_state(artifact_id, holder.agent_id) == MESIState.INVALID
     assert registry.last_observed_version_for(artifact_id, holder.agent_id) == 1
     _release(live, holder, _STRICT)
 
     assert _state(live, _STRICT, holder.agent_id) == MESIState.INVALID
-    assert _UPDATED in _denied_reason(_read_of_the_peer_version(live, holder, _STRICT))
+    assert _read_of_the_peer_version(live, holder, _STRICT) == {"status": "fresh", "version": 2}
 
 
 class _Seam:

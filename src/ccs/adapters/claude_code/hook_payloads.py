@@ -87,11 +87,19 @@ trivially. Adding a new terminal class extends the boundary; never remove
 an entry without a security review."""
 
 
+_READ_AGAIN_SENTENCE: str = (
+    "Read {path} again with the Read tool: the next Read returns the current "
+    "version, and edits of {path} are denied until you have read it."
+)
+"""What follows the first sentence of both stale-copy denies (#514). The
+session's next Read of the file is admitted when its bytes are the recorded
+content, so the text says so; an Edit sent first is still denied. It also
+holds after a strict Bash or Grep deny, whose re-grant (#242) admits the next
+Read on the fresh arm. Both coordinators emit these bytes."""
+
 STRICT_MODE_DENY_REASON_TEMPLATE: str = (
     "Stale read denied: {path} was updated by agent {last_writer_short} "
-    "at {last_writer_ts_iso}. Re-read {path} via the Read tool before "
-    "proceeding. This denial is structural (v0.2 strict mode); retrying "
-    "the same operation will produce the same denial."
+    "at {last_writer_ts_iso}. " + _READ_AGAIN_SENTENCE
 )
 """KTD-P static deny text for the arm where a peer really did commit.
 Byte-stable across retries of the same (session, artifact) staleness event
@@ -102,6 +110,9 @@ The Phase 0 H1 falsification proved varied deny text WORSENS opus behavior
 re-introduction of per-invocation fields. The format-string placeholder set
 is locked by ``test_strict_mode_deny_reason_template_is_static``.
 
+It no longer says a retry gets the same denial (#514): the session's next
+Read is admitted, which is what the text now tells it.
+
 ``last_writer_short`` shortens an AGENT id (R7): the registry stores
 ``artifacts.last_writer_id`` as an agent id and the response now renders it
 as-is instead of mapping it back to the session id it was derived from."""
@@ -109,10 +120,8 @@ as-is instead of mapping it back to the session id it was derived from."""
 
 GRANT_CHANGE_DENY_REASON_TEMPLATE: str = (
     "Stale read denied: your grant on {path} was revoked and no new version "
-    "was committed — {path} is still at v{current_version}. Re-read "
-    "{path} via the Read tool before proceeding. This denial is structural "
-    "(v0.2 strict mode); retrying the same operation will produce the same "
-    "denial."
+    "was committed — {path} is still at v{current_version}. "
+    + _READ_AGAIN_SENTENCE
 )
 """The deny text for the arm where nothing was written (R8).
 
@@ -145,12 +154,46 @@ just hashed differ from the recorded content: no commit explains them. The
 write template named the last committer at the time of its commit -- a write
 that did not make this change, at a time it was not made, or
 ``agent <unknown>`` when nothing was ever committed. Only the SHARED-holder
-arm picks this text (``out_of_band`` on :func:`emit_strict_deny`); a reader a
-peer's acquire revoked keeps the grant-change text, since that writer went
-through the coordinator. Re-reading does not clear the deny, and the one move
-left to the model -- putting the old bytes back -- would discard a change that
-may be the user's own edit, so the text says to leave the file alone and
-report it. Per-artifact placeholders only, so it is byte-stable."""
+arm picks this text (``out_of_band`` on :func:`emit_strict_deny`); a reader
+with no valid grant whose bytes differ gets
+:data:`STALE_OUT_OF_BAND_DENY_REASON_TEMPLATE` or
+:data:`WRITE_IN_FLIGHT_DENY_REASON_TEMPLATE` instead. Re-reading does not
+clear the deny, and the one move left to the model -- putting the old bytes
+back -- would discard a change that may be the user's own edit, so the text
+says to leave the file alone and report it. Per-artifact placeholders only, so
+it is byte-stable."""
+
+STALE_OUT_OF_BAND_DENY_REASON_TEMPLATE: str = (
+    "Stale read denied: {path} on disk does not match v{current_version}, "
+    "the last version committed through the coordinator, and no session "
+    "committed the change, so it was made outside the coordinator. Do not "
+    "restore or overwrite {path}: the change may be your user's work. Tell "
+    "your user that {path} changed outside the coordinator; the read stays "
+    "denied until the change is committed through the coordinator. This "
+    "denial is structural (v0.2 strict mode); retrying the same operation "
+    "will produce the same denial."
+)
+"""The out-of-band text for a reader with no valid grant (#514): its copy is
+stale, or it never read the file, and the bytes it hashed are not the recorded
+content, or it sent no hash because the file is gone, while no other session
+holds an uncommitted write. A Read of those bytes is not admitted, so the text
+promises none and names what clears the deny: a commit through the
+coordinator. Unlike :data:`OUT_OF_BAND_DENY_REASON_TEMPLATE` it does not say
+"the version you last read", which a never-read session never had, and it
+names no writer, where the commit text named ``agent <unknown>`` for a write
+nobody committed. Per-artifact placeholders only, so it is byte-stable."""
+
+WRITE_IN_FLIGHT_DENY_REASON_TEMPLATE: str = (
+    "Stale read denied: another agent is writing {path} and has not "
+    "committed it yet, so {path} on disk does not match v{current_version}, "
+    "the last version committed through the coordinator. Wait for that write "
+    "to be committed, then Read {path} again with the Read tool."
+)
+"""The same reader's text when another session holds an uncommitted write on
+the file (#514): its bytes can reach the disk before its commit does, which
+is the coordinator's own write in flight, not a change made outside it. The
+commit is what clears the deny, so the text says to wait for it and then read
+again. Per-artifact placeholders only, so it is byte-stable."""
 
 OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE: str = (
     "⚠ {path} on disk differs from v{version}, the last content committed "
@@ -327,6 +370,30 @@ def emit_strict_deny(
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
         "permissionDecisionReason": reason,
+    }
+
+
+def emit_disk_mismatch_deny(
+    *, path: str, current_version: int, write_in_flight: bool
+) -> dict[str, Any]:
+    """The pre-read strict deny for a reader with no valid grant whose bytes
+    are not the recorded content (#514): its copy is stale, or it never read
+    the file. Reading again does not clear this deny, so the text names what
+    does: :data:`WRITE_IN_FLIGHT_DENY_REASON_TEMPLATE` when another session
+    holds an uncommitted write, else
+    :data:`STALE_OUT_OF_BAND_DENY_REASON_TEMPLATE`. The caller decides both
+    facts, since neither is in the summary."""
+    template = (
+        WRITE_IN_FLIGHT_DENY_REASON_TEMPLATE
+        if write_in_flight
+        else STALE_OUT_OF_BAND_DENY_REASON_TEMPLATE
+    )
+    return {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": template.format(
+            path=path, current_version=current_version,
+        ),
     }
 
 

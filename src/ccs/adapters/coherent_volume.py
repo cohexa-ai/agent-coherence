@@ -2283,6 +2283,15 @@ class CoherentVolume:
                     "session_id": self._session_id,
                     "path": rel,
                     "content_hash": content_hash,
+                    # Marks this read as not a Claude Code hook's (#514). The
+                    # coordinator admits a hook session's next Read after a
+                    # strict stale deny, and without a marker this request has
+                    # the hook's shape: two plain reads would heal an INVALID
+                    # view, and a write() of a buffer built before the peer's
+                    # commit would be admitted. The volume's recovery is
+                    # reacquire(), so its deny must stay in place. The answer
+                    # gains an owner_generation this method does not read.
+                    "want_owner_generation": True,
                 },
             )
             self._note_read_handoff(rel, resp)

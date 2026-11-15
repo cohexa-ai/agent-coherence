@@ -1,6 +1,6 @@
 {
   "name": "pre-read-strict-tracked-stale-denies",
-  "description": "Canonical strict-mode deny flow on /hooks/pre-read. Sessions A and B both pre-read v1, B pre-edits + post-edits v2 (invalidates A). A's next pre-read on the strict-tracked artifact returns permissionDecision:'deny' with the static reason template per KTD-P. This is the regression net for Unit 2's KTD-O/P/T decisions.",
+  "description": "Canonical strict-mode deny flow on /hooks/pre-read. Sessions A and B both pre-read v1, B pre-edits + post-edits v2 (invalidates A). A's next pre-read on the strict-tracked artifact, of the v2 bytes B committed, returns permissionDecision:'deny' with the static reason template per KTD-P. This is the regression net for Unit 2's KTD-O/P/T decisions. A read of other bytes is denied as an out-of-band change instead (fixture 37), and the read after this deny is admitted (fixture 35).",
   "setup": {
     "tracked": [
       "CLAUDE.md"
@@ -56,7 +56,7 @@
     "body": {
       "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
       "path": "CLAUDE.md",
-      "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+      "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f"
     }
   },
   "ignore_keys": [
@@ -68,7 +68,7 @@
       "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": "Stale read denied: CLAUDE.md was updated by agent 814dac78 at <TS>. Re-read CLAUDE.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+        "permissionDecisionReason": "Stale read denied: CLAUDE.md was updated by agent 814dac78 at <TS>. Read CLAUDE.md again with the Read tool: the next Read returns the current version, and edits of CLAUDE.md are denied until you have read it."
       },
       "status": "stale",
       "summary": "<IGNORED>"
