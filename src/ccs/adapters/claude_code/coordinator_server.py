@@ -3039,7 +3039,9 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # nothing, so an Edit sent before the session reads again is still
         # refused (pre-edit refuses INVALID). The deny on an INVALID row arms
         # the pair's recovery -- only that deny and pre-edit's stale deny arm
-        # it, so only such a row is admitted here -- and the session's next
+        # it, and only such a row is admitted here: a recovery an ended
+        # identity left armed does not admit its Read with no row, as on the
+        # Node coordinator -- and the session's next
         # Claude Code Read of the file is admitted through the stale-arm
         # re-grant when the bytes it hashed are the recorded content, whatever
         # version the deny reported: a commit since then is what that Read
@@ -3049,11 +3051,15 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # never recorded, and the next Edit would build on them. Every other
         # pre-read caller (see ``_is_hook_read``) keeps the deny in place
         # across retries, and so does a session that never read the file: it
-        # has no row to recover, so its deny arms nothing.
+        # has no row to recover, so its deny arms nothing. That is also why
+        # its deny always takes the disk-mismatch text, even on a record that
+        # claims no content: its next Read is denied the same way, so the
+        # text must not promise one.
         if decision.outcome == "denied":
             recorded_bytes = _reads_the_recorded_bytes(artifact, content_hash)
             if (
                 hook_read
+                and agent_state == MESIState.INVALID
                 and recorded_bytes
                 and coordinator.take_stale_read_recovery(agent_id, artifact_id)
             ):
@@ -3071,7 +3077,7 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 summary=summary,
                 source="pre_read_strict_deny",
                 effects=effects,
-                disk_differs=not recorded_bytes,
+                disk_differs=(agent_state is None) or not recorded_bytes,
                 arm_recovery=hook_read and agent_state == MESIState.INVALID,
             )
 
@@ -3088,6 +3094,11 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 coordinator, artifact_id, agent_id,
                 classified_version=decision.version, tick=now, content_hash=content_hash,
             )
+            # #514: an admitted Read uses up a recovery left armed -- by an
+            # identity whose rows an ended stop forgot -- so it cannot skip
+            # the deny of a later stale copy.
+            if hook_read:
+                coordinator.take_stale_read_recovery(agent_id, artifact_id)
         resp = _payloads.build_stale_response(summary)
         if want_generation and decision.owner_generation is not None:
             # The effect gate re-validates through THIS path after a sweep
@@ -3852,8 +3863,9 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             return refusal
         except CoherenceError as exc:
             return {"ok": False, "reason": str(exc)}
-        # #514: an admitted edit uses up a recovery left armed (a shell read
-        # recovered the row), so it cannot skip the deny of a later stale copy.
+        # #514: an admitted edit uses up a recovery left armed -- by an
+        # identity whose rows an ended stop forgot -- so it cannot skip the
+        # deny of a later stale copy.
         coordinator.take_stale_read_recovery(agent_id, artifact_id)
 
         # #278: pre-edit carries no content hash, and post-edit records
@@ -4925,6 +4937,11 @@ def _apply_bash_grep_regrants(
     Each grant clears the peer write's pending-invalidation marker in the same
     hold, as pre-read's re-grant does, so the transient sweep cannot expire the
     granted read to INVALID (#523).
+
+    Each grant, and each held path a running command reads, also uses up the
+    session's strict stale-read recovery on that path (#514): the session now
+    holds the file, so nothing is left to recover, and a recovery left armed
+    would admit its Read of a later stale copy with no deny.
     """
     registry = coordinator.registry
     for artifact_id, trigger in regrants:
@@ -4934,9 +4951,11 @@ def _apply_bash_grep_regrants(
                 artifact_id, agent_id, MESIState.SHARED,
                 trigger=trigger, tick=tick, observed=command_runs,
             )
+        coordinator.take_stale_read_recovery(agent_id, artifact_id)
     if command_runs:
         for artifact_id, trigger in held:
             _record_held_read(coordinator, artifact_id, agent_id, trigger=trigger, tick=tick)
+            coordinator.take_stale_read_recovery(agent_id, artifact_id)
 
 
 def _handle_pre_bash(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) -> None:

@@ -20555,20 +20555,65 @@ def test_a_recovery_a_shell_read_left_unused_is_used_up_by_the_next_read(
 def test_a_recovery_an_admitted_edit_left_unused_is_used_up_by_that_edit(
     plan_desk: _PlanDesk,
 ) -> None:
-    """#514: after its Read is denied, the reader's ``cat`` is denied and its
-    retry runs (#242), so the reader's Edit is admitted without a Read. That
-    Edit uses up the recovery: after another session's commit the reader's
-    first Read is denied again. Fails if an admitted edit leaves it armed."""
-    reader, _writer = _stale_reader(plan_desk)
-    assert _denied(plan_desk.read(reader))
-    for _ in range(2):
-        status, _shell = plan_desk.client.post(
-            "/hooks/pre-bash", {"session_id": reader, "command": "cat plan.md"})
-        assert status == 200
-    assert plan_desk.edit(reader)["ok"] is True
+    """#514: a subagent's stale Read is denied, which arms its recovery, and
+    its stop reports it ended, which forgets its rows (#525) but not the
+    recovery. Its first act after that is an Edit, admitted because it has no
+    row to refuse, and it commits. That admitted Edit uses up the recovery:
+    after another session's commit the subagent's first Read is denied again.
+    Fails if an admitted edit leaves the recovery armed."""
+    parent, _writer = _ended_subagent_with_a_recovery(plan_desk)
+    plan_desk.commit(parent, b"v3\n", **_HELPER)
 
-    plan_desk.commit(str(uuid.uuid4()), b"v3\n")
+    plan_desk.commit(str(uuid.uuid4()), b"v4\n")
+    assert _denied(plan_desk.read(parent, **_HELPER))
+
+
+_SHELL_READS: dict[str, tuple[str, dict]] = {
+    "pre-bash": ("/hooks/pre-bash", {"command": "cat plan.md"}),
+    "pre-grep": ("/hooks/pre-grep", {"search_root": ""}),
+}
+
+
+@pytest.mark.parametrize("route", sorted(_SHELL_READS))
+def test_a_shell_only_recovery_uses_up_the_recovery(plan_desk: _PlanDesk, route: str) -> None:
+    """#514: after its Read is denied, the reader recovers through the shell
+    alone: its ``cat`` (or Grep) is denied and re-grants the row (#242), and
+    the retry runs, with no Read between. That shell read uses up the
+    recovery, so after the writer's next commit the reader's first Read is
+    denied and only the Read after it is admitted. Fails if a recovery left
+    armed by a shell-only recovery admits the Read of a later stale copy with
+    no deny."""
+    reader, writer = _stale_reader(plan_desk)
     assert _denied(plan_desk.read(reader))
+    route_path, fields = _SHELL_READS[route]
+    shell = [plan_desk.client.post(route_path, {"session_id": reader, **fields}) for _ in range(2)]
+    assert [status for status, _ in shell] == [200, 200], shell
+    assert _denied(shell[0][1]) and shell[1][1]["status"] == "fresh", shell
+
+    plan_desk.commit(writer, b"v3\n")
+    assert _denied(plan_desk.read(reader))
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 3}
+
+
+def test_a_shell_read_of_a_held_file_uses_up_the_recovery(plan_desk: _PlanDesk) -> None:
+    """#514: the reader's ``cat`` is denied and re-grants the row (#242) with
+    no observation, so its Edit is denied as stale and arms the recovery
+    while the row is held. The retried ``cat`` then runs on the held grant
+    and reads the current bytes, which uses the recovery up: after the
+    writer's next commit the reader's first Read is denied and only the Read
+    after it is admitted. Fails if a running shell read of a held file
+    leaves the recovery armed."""
+    reader, writer = _stale_reader(plan_desk)
+    cat = {"session_id": reader, "command": "cat plan.md"}
+    status, denied = plan_desk.client.post("/hooks/pre-bash", cat)
+    assert status == 200 and _denied(denied), denied
+    assert plan_desk.edit(reader)["ok"] is False
+    status, ran = plan_desk.client.post("/hooks/pre-bash", cat)
+    assert status == 200 and ran["status"] == "fresh", ran
+
+    plan_desk.commit(writer, b"v3\n")
+    assert _denied(plan_desk.read(reader))
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 3}
 
 
 def test_a_never_read_sessions_deny_arms_no_recovery(plan_desk: _PlanDesk) -> None:
@@ -20638,6 +20683,34 @@ def test_a_session_that_never_read_a_file_whose_disk_differs_names_no_writer(
     for _ in range(2):
         answer = plan_desk.read(newcomer)
         assert _denied(answer) and _reason(answer) == expected, answer
+
+
+def test_a_never_read_deny_on_a_record_with_no_content_claim_promises_no_read(
+    plan_desk: _PlanDesk,
+) -> None:
+    """#514: the record of plan.md claims no content (the all-f placeholder a
+    legacy row or the strict-mode demo's seeding leaves), so a session that
+    never read the file is denied whatever bytes it reads. Its deny arms
+    nothing and its next Read is denied the same way, so the text names the
+    change made outside the coordinator instead of saying that the next Read
+    returns the current version, as the Node coordinator answers. Fails if a
+    never-read deny takes the commit text because the record claims no
+    content."""
+    seeded = plan_desk.read(str(uuid.uuid4()))
+    assert seeded["status"] == "fresh", seeded
+    registry = plan_desk.coordinator.registry
+    artifact_id = registry.lookup_artifact_id_by_name("plan.md")
+    # Written to the registry directly: no route records the placeholder here.
+    registry.set_artifact_and_content(
+        artifact_id,
+        dataclasses.replace(registry.get_artifact(artifact_id), content_hash="f" * 64),
+        "",
+    )
+    newcomer = str(uuid.uuid4())
+
+    for _ in range(2):
+        answer = plan_desk.read(newcomer)
+        assert _denied(answer) and _reason(answer) == _changed_outside_deny(1), answer
 
 
 def test_a_held_file_refusal_followed_by_the_holders_commit_costs_one_deny(
@@ -20720,6 +20793,80 @@ def test_the_recovery_survives_the_end_of_a_turn(plan_desk: _PlanDesk) -> None:
     plan_desk.stop(reader)
 
     assert plan_desk.read(reader) == {"status": "fresh", "version": 2}
+
+
+_HELPER = {"agent_id": "helper"}
+
+
+def _ended_subagent_with_a_recovery(desk: _PlanDesk) -> tuple[str, str]:
+    """A subagent ``helper`` of the returned parent session whose stale Read
+    was denied, arming its recovery, and whose stop then reported it ended,
+    which forgets its rows (#525) but not the recovery; and the writer whose
+    v2 commit made its copy stale."""
+    parent, writer = str(uuid.uuid4()), str(uuid.uuid4())
+    assert desk.read(parent, **_HELPER)["status"] == "fresh"
+    desk.commit(writer, b"v2\n")
+    assert _denied(desk.read(parent, **_HELPER))
+    desk.stop(parent, ended=True, **_HELPER)
+    return parent, writer
+
+
+def test_a_read_admitted_on_the_stale_arm_uses_up_the_recovery(plan_desk: _PlanDesk) -> None:
+    """#514: an ended subagent's recovery is still armed, and its next Read,
+    of the recorded bytes, finds no row, so it is admitted with the
+    stale-read warning and re-granted. That Read uses up the recovery: after
+    the writer's next commit the subagent's first Read is denied and only
+    the Read after it is admitted. Fails if the stale arm's re-grant leaves
+    the recovery armed."""
+    parent, writer = _ended_subagent_with_a_recovery(plan_desk)
+
+    warned = plan_desk.read(parent, **_HELPER)
+    assert warned["status"] == "stale" and not _denied(warned), warned
+    plan_desk.commit(writer, b"v3\n")
+    assert _denied(plan_desk.read(parent, **_HELPER))
+    assert plan_desk.read(parent, **_HELPER) == {"status": "fresh", "version": 3}
+
+
+@pytest.mark.parametrize("field", ["name_kind", "want_owner_generation"])
+def test_a_stale_arm_read_that_is_not_a_hook_read_leaves_the_recovery_alone(
+    plan_desk: _PlanDesk, field: str,
+) -> None:
+    """#514: as on the deny arm, a pre-read that is not a hook read does not
+    use up a recovery when the stale arm admits it, as the Node coordinator
+    answers: the ended subagent's recovery is still armed after such a read
+    of the recorded bytes. Fails if the stale arm's take ignores whether the
+    read is a hook read."""
+    parent, _writer = _ended_subagent_with_a_recovery(plan_desk)
+
+    warned = plan_desk.read(parent, **_HELPER, **_NOT_A_HOOK_READ[field])
+    assert warned["status"] == "stale" and not _denied(warned), warned
+    coordinator = plan_desk.coordinator
+    agent_id = coordinator.register_session(parent, _HELPER["agent_id"])
+    artifact_id = coordinator.registry.lookup_artifact_id_by_name("plan.md")
+    assert coordinator.take_stale_read_recovery(agent_id, artifact_id) is True
+
+
+def test_a_recovery_left_armed_admits_no_read_with_no_row(plan_desk: _PlanDesk) -> None:
+    """#514: an ended subagent's recovery is still armed, and the record of
+    plan.md then claims no content (the all-f placeholder a legacy row or the
+    strict-mode demo's seeding leaves), so the subagent's Read, with no row,
+    is denied as a session that never read the file is. The recovery admits
+    only a Read of a stale row, so that Read is denied, on every retry, with
+    the text a never-read session gets, as the Node coordinator answers.
+    Fails if a recovery left armed admits a Read with no row."""
+    parent, _writer = _ended_subagent_with_a_recovery(plan_desk)
+    registry = plan_desk.coordinator.registry
+    artifact_id = registry.lookup_artifact_id_by_name("plan.md")
+    # Written to the registry directly: no route records the placeholder here.
+    registry.set_artifact_and_content(
+        artifact_id,
+        dataclasses.replace(registry.get_artifact(artifact_id), content_hash="f" * 64),
+        "",
+    )
+
+    for _ in range(2):
+        answer = plan_desk.read(parent, **_HELPER)
+        assert _denied(answer) and _reason(answer) == _changed_outside_deny(2), answer
 
 
 def test_warn_mode_still_admits_a_stale_read_with_its_warning(

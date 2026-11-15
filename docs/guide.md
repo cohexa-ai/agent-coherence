@@ -5028,7 +5028,9 @@ coordinators deny every later Read of the file too.
   Read returns the newer version, as the deny says it will.
 - The session's next admitted Read or Edit of the file uses the recovery up,
   one that follows a Bash or Grep read of the file included, so the next time
-  its copy goes out of date starts from a deny again.
+  its copy goes out of date starts from a deny again. A Bash or Grep read that
+  re-grants the session a read of the file uses the recovery up as well, so
+  the session's next stale copy is denied again.
 
 **When reading again does not clear it.** A Read whose bytes are not the
 recorded content, or that carries no hash because the file is gone, is not

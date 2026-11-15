@@ -153,7 +153,9 @@ Alpha — APIs may change before `v1.0`.
   no hash because the file is gone, stays denied with a text that names what
   clears it (see **Changed**). The session's next admitted Read or Edit of the
   file uses the recovery up, one that follows a Bash or Grep read included, so
-  the next time the copy goes stale starts from a deny again. Neither hook
+  the next time the copy goes stale starts from a deny again. A Bash or Grep
+  read that re-grants the session a read of the file uses the recovery up as
+  well, so the session's next stale copy is denied again. Neither hook
   client changes. The Claude Code plugin's Node coordinator makes the same
   change in plugin releases after 0.7.0. A coordinator that was running before
   the upgrade keeps the old behaviour until it restarts. The guide's "After a
