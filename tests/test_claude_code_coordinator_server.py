@@ -20740,6 +20740,8 @@ _NOT_A_HOOK_READ: dict[str, dict] = {
     "want_owner_generation": {"want_owner_generation": True},
     "verify_only": {"verify_only": True},
     "name_kind": {"name_kind": "file"},
+    "want_owner_generation-false": {"want_owner_generation": False},
+    "verify_only-false": {"verify_only": False},
 }
 
 
@@ -20753,7 +20755,8 @@ def test_a_pre_read_that_is_not_a_hook_read_keeps_its_deny_and_leaves_the_recove
     nothing, so the hook Read after them is still denied; and once a hook
     Read's deny has armed the recovery, such a read neither takes it nor uses
     it up, so the hook Read after it is admitted. Fails if any one of the
-    three fields is dropped from the rule."""
+    three fields is dropped from the rule, and, through the false-valued
+    cases, if the rule reads a field's value rather than its presence."""
     marker = _NOT_A_HOOK_READ[field]
     reader, _writer = _stale_reader(plan_desk)
 
@@ -20761,6 +20764,27 @@ def test_a_pre_read_that_is_not_a_hook_read_keeps_its_deny_and_leaves_the_recove
     assert _denied(plan_desk.read(reader, **marker))
     assert _denied(plan_desk.read(reader))
     assert _denied(plan_desk.read(reader, **marker))
+    assert plan_desk.read(reader) == {"status": "fresh", "version": 2}
+
+
+def test_a_pre_read_with_a_false_name_kind_is_refused_and_leaves_the_recovery_alone(
+    plan_desk: _PlanDesk,
+) -> None:
+    """#514: ``name_kind`` takes only ``"file"`` or ``"key"``, so a false one
+    never reaches the hook-read rule: the pre-read is refused as a path error,
+    before and after a hook Read's deny arms the recovery, and the hook Read
+    after it is admitted, so the refusal neither took the recovery nor used it
+    up."""
+    reader, _writer = _stale_reader(plan_desk)
+    body = {
+        "session_id": reader, "path": "plan.md", "name_kind": False,
+        "content_hash": _bytes_hash(plan_desk.file.read_bytes()),
+    }
+    refused = (400, {"error": "missing or empty path"})
+
+    assert plan_desk.client.post("/hooks/pre-read", body) == refused
+    assert _denied(plan_desk.read(reader))
+    assert plan_desk.client.post("/hooks/pre-read", body) == refused
     assert plan_desk.read(reader) == {"status": "fresh", "version": 2}
 
 
@@ -20970,21 +20994,27 @@ def test_a_caller_naming_a_bound_peer_without_its_principal_can_heal_its_stale_v
 ) -> None:
     """Accepted behaviour since #514, pinned so the posture table cannot
     understate it. Pre-read accepts a request without its caller principal,
-    so a caller naming a bound peer can send the peer's one deny and then the
-    Read that heals the peer's stale view, after which the peer's next edit is
-    admitted whatever copy it was built from. A denied Bash or Grep command
-    already re-grants the same way (#242). The table's harm text for the
-    route says so, and no longer claims strict mode never re-grants."""
+    so a caller naming a bound peer can send the peer's one deny, of any
+    bytes, and then the Read of the recorded bytes that heals the peer's
+    stale view, after which the peer's next edit is admitted whatever copy it
+    was built from. A denied Bash or Grep command already re-grants the same
+    way (#242). The table's harm text for the route says so, and no longer
+    claims strict mode never re-grants."""
     from ccs.adapters.claude_code.coordinator_server import _CALLER_PRINCIPAL_POSTURE
 
     peer = _claimed(plan_desk.client)
     assert plan_desk.read(peer)["status"] == "fresh"
     plan_desk.commit(str(uuid.uuid4()), b"v2\n")
 
-    assert _denied(plan_desk.read(peer.sid))
+    assert _denied(plan_desk.read(peer.sid, content_hash=_bytes_hash(b"not the recorded bytes\n")))
     assert plan_desk.read(peer.sid) == {"status": "fresh", "version": 2}
     assert plan_desk.edit(peer)["ok"] is True
 
     harm = _CALLER_PRINCIPAL_POSTURE[("POST", "/hooks/pre-read")].harm
     assert "never re-grants" not in harm, harm
-    assert "two reads carrying the hash of the current bytes heal" in harm, harm
+    assert (
+        "heals the peer's stale view with at most two pre-reads: the first, of "
+        "any bytes, arms the recovery unless the peer's own stale deny already "
+        "did, and the second carries the hash of the recorded bytes, or any "
+        "bytes when the record holds no content claim"
+    ) in harm, harm

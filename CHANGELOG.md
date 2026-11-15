@@ -176,10 +176,12 @@ Alpha — APIs may change before `v1.0`.
     (`.coherence/hook_on_held`) stays off by default.
   - **Caller principal.** `/hooks/pre-read` still admits a request that names
     a session without its principal, so a caller that names a bound session
-    can now heal that session's stale copy with two pre-reads carrying the
-    hash of the current bytes, as a denied Bash or Grep command already could
-    (#242). `docs/security.md` says so under "Who the coordinator can tell
-    apart".
+    can now heal that session's stale copy with at most two pre-reads: the
+    first, of any bytes, starts the recovery unless the deny of that
+    session's own stale Read or Edit already did, and the second carries the
+    hash of the recorded bytes, or any bytes when the coordinator recorded no
+    content for the file. A denied Bash or Grep command already could (#242).
+    `docs/security.md` says so under "Who the coordinator can tell apart".
 
 - **A volume or substrate session merges its globs into the policy files under
   their locks, and reports every policy problem before a start as

@@ -196,9 +196,12 @@ What follows from that:
   bytes are the recorded content is admitted (see
   [After a strict-mode stale deny](guide.md#after-a-strict-mode-stale-deny)).
   So a caller that names a bound session without its principal can heal that
-  session's stale copy with two pre-reads carrying the hash of the current
-  bytes, after which a strict-mode write route admits that session's next
-  edit, whatever copy it was built from. A denied Bash or Grep command already
+  session's stale copy with at most two pre-reads: the first, of any bytes,
+  starts the recovery unless the deny of that session's own stale Read or
+  Edit already did, and the second carries the hash of the recorded bytes, or
+  any bytes when the coordinator recorded no content for the file. A
+  strict-mode write route then admits that session's next edit, whatever copy
+  it was built from. A denied Bash or Grep command already
   re-grants a stale copy
   ([#242](https://github.com/Cohexa-ai/agent-coherence/issues/242)), so the
   read hooks keep admitting a request without a principal. Under the trust

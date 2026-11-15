@@ -592,9 +592,12 @@ _CALLER_PRINCIPAL_POSTURE: dict[tuple[str, str], RoutePrincipalPosture] = {
         "current version (#514), as a denied Bash or Grep command already "
         "does (#242). So a caller naming a bound peer without its principal "
         "takes the peer's notices and warning, which the peer never sees, and "
-        "two reads carrying the hash of the current bytes heal the peer's "
-        "stale view, after which a strict-mode write route admits the peer's "
-        "next edit whatever copy it was built from")),
+        "heals the peer's stale view with at most two pre-reads: the first, "
+        "of any bytes, arms the recovery unless the peer's own stale deny "
+        "already did, and the second carries the hash of the recorded bytes, "
+        "or any bytes when the record holds no content claim. A strict-mode "
+        "write route then admits the peer's next edit whatever copy it was "
+        "built from")),
     ("POST", "/hooks/effect-fence"): RoutePrincipalPosture(_REQUIRE, (
         "gates an escaping effect on the named identity's grant standing: a "
         "caller naming a claimed peer without its principal would be answered "
@@ -3087,8 +3090,11 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
         # ADMIT an effect whose grant a peer already revoked (the write-
         # preemption blind spot). Leaving it INVALID makes the HOLD
         # level-triggered — every bare re-check re-HOLDs until a real
-        # reacquire() re-mints a live grant — matching the strict leg (KTD-T
-        # never re-grants on a deny). The client discards this read's bytes.
+        # reacquire() re-mints a live grant. The strict leg stays
+        # level-triggered the same way for every caller that is not a hook
+        # Read (see ``_is_hook_read``), a verify_only read included: since
+        # #514 only a hook Read's strict deny is followed by an admitted
+        # re-read. The client discards this read's bytes.
         if not verify_only:
             _regrant_unless_overtaken(
                 coordinator, artifact_id, agent_id,

@@ -5141,9 +5141,11 @@ their own way:
   Read.
 - `pre-read` admits a request that names a session without its
   [caller principal](#caller-principal), so a caller that names a bound session
-  can heal that session's stale copy with two pre-reads carrying the hash of
-  the current bytes; see
-  [security.md](security.md#who-the-coordinator-can-tell-apart).
+  can heal that session's stale copy with at most two pre-reads: the first, of
+  any bytes, starts the recovery unless the deny of that session's own stale
+  Read or Edit already did, and the second carries the hash of the recorded
+  bytes, or any bytes when the coordinator recorded no content for the file;
+  see [security.md](security.md#who-the-coordinator-can-tell-apart).
 
 ## Acquire-or-fail on `pre-edit`
 
