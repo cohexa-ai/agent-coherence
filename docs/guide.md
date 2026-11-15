@@ -5822,6 +5822,19 @@ apply, and:
 - **A subagent id outside the grammar denies every strict edit.** With the
   setting on, a subagent whose id is not 1 to 64 characters of
   `[A-Za-z0-9_-]` is denied each edit the client would opt in on.
+- **A policy the client cannot read turns it off.** The client decides which
+  files are strict from `.coherence/strict_mode.yaml` as it is on disk at each
+  edit. If that file does not load, for example because it is not valid YAML,
+  or the client cannot load its policy code, it counts no file as strict, so
+  it opts in for none and prints nothing; the edit goes ahead as with the
+  setting off. The Node hook client does the same, including while a session
+  start after a plugin upgrade reinstalls its packages.
+- **An edit the user rejects keeps the file.** The client takes the file for
+  the session before Claude Code asks whether to allow the edit. A rejected
+  edit or an interrupted turn sends no release, so the session keeps the file
+  until it next completes a turn normally, or at the latest once it has held
+  it for 30 minutes, and meanwhile other sessions' edits of the file are
+  denied naming it.
 
 ## `stale-write-guard-fs` MCP server
 
