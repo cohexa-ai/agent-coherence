@@ -1,0 +1,7 @@
+{
+  "description": "The stderr lines the hook client prints on a pre-edit, keyed by the decision_table.json outcome whose row expects today_and_stderr_line. Each value is the exact text written to stderr, the client's name prefix and the trailing \\n included; compare it as exact text. setting_unknown: .coherence/hook_on_held holds a value other than refuse, displace or empty. status_key_absent: GET /status?detail=metrics answered 2xx without pre_edit_if_unheld: true.",
+  "lines": {
+    "setting_unknown": "agent-coherence-hook-client: .coherence/hook_on_held holds neither refuse nor displace, so edits of held strict files are not refused\n",
+    "status_key_absent": "agent-coherence-hook-client: the coordinator does not say it refuses edits of held files, so this edit of a strict file was not checked for another holder\n"
+  }
+}

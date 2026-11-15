@@ -4,6 +4,40 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
+## [Unreleased]
+
+### Added
+
+- **The Claude Code plugin's Node hook client follows the same refusal of
+  edits of held strict files, and the shared fixtures carry the two stderr
+  lines and are checked against the plugin's copy.** In plugin releases after
+  0.7.1, the Node hook client reads `.coherence/hook_on_held` with the same
+  values as this package's hook client and gives the same decisions and deny
+  texts, so the setting also reaches sessions that run it, as most plugin
+  installs do. It bounds the whole decision by one 5-second deadline, where
+  this package's client gives each request its own 6-second timeout, and it
+  decides which files are strict with the plugin's policy, so it can also
+  refuse for `DECISIONS.md` and never refuses for a file whose name starts
+  with `subject:`; the guide's "Refusing a held strict file in Claude Code
+  sessions" section lists the differences. `tests/fixtures/hook_on_held/`
+  now holds the two stderr lines the hook client prints
+  (`stderr_lines.json`), and the cross-runtime tests fail when the plugin's
+  copy of the fixture files differs from this package's by a byte, lacks a
+  file, or has one this package does not. The setting stays off by default.
+
+### Fixed
+
+- **The held-file deny no longer says the file comes free after 10 to 30
+  minutes (#628).** The opt-in deny the hook client gives for an edit of a
+  strict-mode file another agent holds (`.coherence/hook_on_held`) said the
+  file comes free when that agent lets go of it "or after 10 to 30 minutes".
+  The Node coordinator runs no timer: it gives the file to an opted-in edit
+  once the holder has held it for 30 minutes, and never frees it after 10. The
+  deny now says the file comes free when that agent lets go of it, or at the
+  latest once that agent has held it for 30 minutes, which holds on both
+  coordinators. A script or prompt that matches this deny byte for byte must
+  accept the new wording.
+
 ## [0.16.1] - 2026-11-15
 
 **A strict-mode Claude Code session whose copy of a file went stale can read the file again after one deny and keep working, and the deny texts say so; a volume or substrate session merges its globs into the policy files under their locks and reports a policy problem as `PolicyFileRefused`; and the Claude Code hook client gains an opt-in deny for edits of a strict file another agent holds, off by default.**

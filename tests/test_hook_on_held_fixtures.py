@@ -5,7 +5,8 @@
 
 ``tests/fixtures/hook_on_held/`` is read by the hook client's tests and copied
 byte for byte by the Node hook client, so each rendered deny there must be what
-the builders render, and the decision table and the setting's value vectors
+the builders render, each stderr line what the client prints, and the decision
+table and the setting's value vectors
 must hold every row the two clients are checked against, with nothing in them
 that contradicts the rules they document.
 """
@@ -20,6 +21,8 @@ import pytest
 
 from ccs.adapters.claude_code import hook_payloads as hp
 from ccs.adapters.claude_code.coordinator_server import caller_principal_identity
+from ccs.cli import _hook_on_held as on_held
+from ccs.cli import coherence_hook_client
 
 _FIXTURES = Path(__file__).parent / "fixtures" / "hook_on_held"
 
@@ -27,6 +30,13 @@ _RENDERED_DENIES: dict[str, Callable[..., dict[str, Any]]] = {
     "holder_deny.json": hp.emit_held_path_deny,
     "parent_deny.json": hp.emit_held_by_parent_deny,
     "unavailable_deny.json": hp.emit_admission_unavailable_deny,
+}
+
+#: Each stderr line, by the decision-table outcome that prints it, and the
+#: message the hook client prints for it.
+_STDERR_MESSAGES: dict[str, str] = {
+    "setting_unknown": on_held.UNKNOWN_SETTING_MESSAGE,
+    "status_key_absent": on_held.NO_REFUSAL_MESSAGE,
 }
 
 #: The outcome classes a decision-table row may expect.
@@ -91,6 +101,22 @@ def test_each_rendered_deny_is_the_bare_deny_envelope(name: str) -> None:
         "permissionDecision": "deny",
         "permissionDecisionReason": stdout["hookSpecificOutput"]["permissionDecisionReason"],
     }
+
+
+def test_each_stderr_line_is_what_the_hook_client_prints(capsys: pytest.CaptureFixture[str]) -> None:
+    """Exact bytes, prefix and newline included, so the Node client can print
+    the same line; keyed by the outcomes the decision table gives a stderr
+    line, so a row cannot call for a line the file does not hold."""
+    fixture = _load("stderr_lines.json")
+    assert isinstance(fixture["description"], str) and fixture["description"]
+    table_outcomes = {
+        row["outcome"] for row in _rows("decision_table.json")
+        if row["expected"] == "today_and_stderr_line"
+    }
+    assert set(fixture["lines"]) == set(_STDERR_MESSAGES) == table_outcomes
+    for outcome, message in _STDERR_MESSAGES.items():
+        coherence_hook_client._report(message)
+        assert capsys.readouterr().err == fixture["lines"][outcome], outcome
 
 
 def test_every_decision_table_row_names_a_caller_one_cause_and_a_class() -> None:

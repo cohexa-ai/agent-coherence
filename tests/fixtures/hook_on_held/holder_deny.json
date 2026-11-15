@@ -8,7 +8,7 @@
     "hookSpecificOutput": {
       "hookEventName": "PreToolUse",
       "permissionDecision": "deny",
-      "permissionDecisionReason": "Edit denied: docs/plan.md is held by agent bc3013e1. It comes free when that agent lets go of it, or after 10 to 30 minutes. Do not retry now: do other work that does not need docs/plan.md, or stop and tell your user. If you hold docs/plan.md yourself through another tool, such as an MCP server, release it there first."
+      "permissionDecisionReason": "Edit denied: docs/plan.md is held by agent bc3013e1. It comes free when that agent lets go of it, or at the latest once that agent has held it for 30 minutes. Do not retry now: do other work that does not need docs/plan.md, or stop and tell your user. If you hold docs/plan.md yourself through another tool, such as an MCP server, release it there first."
     }
   }
 }
