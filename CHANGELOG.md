@@ -6,6 +6,25 @@ Alpha — APIs may change before `v1.0`.
 
 ## [Unreleased]
 
+### Added
+
+- **The Claude Code plugin's Node hook client follows the same refusal of
+  edits of held strict files, and the shared fixtures carry the two stderr
+  lines and are checked against the plugin's copy.** In plugin releases after
+  0.7.1, the Node hook client reads `.coherence/hook_on_held` with the same
+  values as this package's hook client and gives the same decisions and deny
+  texts, so the setting also reaches sessions that run it, as most plugin
+  installs do. It bounds the whole decision by one 5-second deadline, where
+  this package's client gives each request its own 6-second timeout, and it
+  decides which files are strict with the plugin's policy, so it can also
+  refuse for `DECISIONS.md` and never refuses for a file whose name starts
+  with `subject:`; the guide's "Refusing a held strict file in Claude Code
+  sessions" section lists the differences. `tests/fixtures/hook_on_held/`
+  now holds the two stderr lines the hook client prints
+  (`stderr_lines.json`), and the cross-runtime tests fail when the plugin's
+  copy of the fixture files differs from this package's by a byte, lacks a
+  file, or has one this package does not. The setting stays off by default.
+
 ### Fixed
 
 - **The held-file deny no longer says the file comes free after 10 to 30
