@@ -150,6 +150,8 @@ _MAY_HIDE_A_PORT: dict[str, Callable[[Path], ReadStatus]] = {
 @pytest.mark.parametrize("state", sorted(_MAY_HIDE_A_PORT))
 def test_a_pid_file_that_cannot_be_read_stays_the_plain_class(tmp_path: Path, state: str) -> None:
     expected_status = _MAY_HIDE_A_PORT[state](tmp_path)
+    if expected_status is ReadStatus.UNREADABLE and os.access(tmp_path / ".coherence" / "server.pid", os.R_OK):
+        pytest.skip("this process reads a mode-000 file, as root does")
     # The case under test must be the one the read reports, or a pass here
     # would prove nothing (a root user reads a mode-000 file, for one).
     assert read_pid_file(tmp_path / ".coherence").status is expected_status
