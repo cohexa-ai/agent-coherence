@@ -903,6 +903,58 @@ class CoherenceDirRefused(CoherenceError):
         return type(self), (self.kind, self.path, str(self)), {**self.__dict__, "args": self.args}
 
 
+# A start's refusal of this workspace's policy file or its lock (#499). One
+# class-level reason, so every surface answers one token; ``kind`` says which
+# step refused it. Wire-stable and ADDITIVE, matched by
+# ``reason == CONSTANT`` / ``kind in KINDS``, never by a substring of the message.
+POLICY_FILE_REFUSED_REASON = "policy_file_refused"
+POLICY_FILE_UNLOADABLE_KIND = "policy_file_unloadable"
+"""The policy file cannot be loaded: it is unreadable, a link, not a regular
+file, not valid YAML or not a list. It keeps the policy routes' own text."""
+
+POLICY_LOCK_NOT_REGULAR_KIND = "policy_lock_not_regular"
+"""The policy file's lock file is not a regular file: a link, directory, FIFO,
+socket or device."""
+
+POLICY_WRITE_FAILED_KIND = "policy_write_failed"
+"""Creating ``.coherence``, creating or locking a lock file, or preparing or
+replacing a policy file failed, for example on a full or read-only disk."""
+
+POLICY_FILE_REFUSAL_KINDS: frozenset[str] = frozenset(
+    {
+        POLICY_FILE_UNLOADABLE_KIND,
+        POLICY_LOCK_NOT_REGULAR_KIND,
+        POLICY_WRITE_FAILED_KIND,
+    }
+)
+
+
+class PolicyFileRefused(CoherenceError):
+    """A coordinator start could not load, lock or write this workspace's
+    policy file (#499). Nothing was started.
+
+    Not a :class:`CoordinatorUnreachable`: no retry, and no coordinator started
+    later, clears it. A person fixes the named file (or frees the disk), then
+    starts again. Carries :data:`POLICY_FILE_REFUSED_REASON` on the class;
+    ``kind`` (one of :data:`POLICY_FILE_REFUSAL_KINDS`) says which step
+    refused it, and ``path`` is the absolute path of the file it concerns, raw:
+    a CLI escapes it before printing. It rebuilds from its three fields, so it
+    pickles whole across a process boundary.
+    """
+
+    reason = POLICY_FILE_REFUSED_REASON
+
+    def __init__(self, kind: str, path: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.path = path
+
+    def __reduce__(
+        self,
+    ) -> tuple[type[PolicyFileRefused], tuple[str, str, str], dict[str, object]]:
+        return type(self), (self.kind, self.path, str(self)), {**self.__dict__, "args": self.args}
+
+
 class GiverFenced(CoherenceError):
     """The committer handed this path off, and the handoff is still live: its
     write is refused, on the pessimistic route and the compare-and-swap route

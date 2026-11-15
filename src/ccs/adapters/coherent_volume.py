@@ -50,9 +50,9 @@ from pathlib import Path
 from typing import Literal, NamedTuple
 
 from ccs.adapters.claude_code.coordinator_server import (
-    merge_policy_globs,
     parse_agent_id,
     session_to_agent_id,
+    write_start_policy,
 )
 from ccs.adapters.claude_code.lifecycle import (
     LifecycleConfig,
@@ -115,6 +115,7 @@ from ccs.core.exceptions import (
     InternalConcurrencyError,
     LinkOutOfManaged,
     OtherHolder,
+    PolicyFileRefused,
     PublishMaterializationError,
     RedirectRefused,
     RefuseModeUnsupported,
@@ -1213,7 +1214,7 @@ class CoherentVolume:
 
     - ``"strict"`` (default): any coherence failure — a coordinator that is
       unavailable, one already running that we cannot enable strict on, or a
-      policy file the volume cannot merge its globs into before spawning one —
+      policy file the volume cannot load, lock or write before spawning one —
       raises :class:`~ccs.core.exceptions.CoherenceError`. Fail-closed. A
       request that gets no usable answer from the coordinator raises its
       subclass :class:`~ccs.core.exceptions.CoordinatorUnreachable`, except
@@ -1234,7 +1235,10 @@ class CoherentVolume:
       ``.coherence`` that is a symlink or not a directory, or that holds a
       symlink, FIFO, socket or device, raises
       :class:`~ccs.core.exceptions.CoherenceDirRefused` before anything is
-      probed or written (#498); no retry clears it.
+      probed or written (#498); no retry clears it. A policy file the volume
+      cannot load, lock or write raises the subclass
+      :class:`~ccs.core.exceptions.PolicyFileRefused`, its text naming the
+      workspace and the file (#305, #499); no retry clears it either.
     - ``"degrade"``: the same conditions warn once
       (:class:`~ccs.core.exceptions.CoherenceDegradedWarning`) and the appliance
       operates best-effort (coherence may be off). Mirrors the other adapters.
@@ -1849,10 +1853,14 @@ class CoherentVolume:
         pre_existing = running_coordinator_port(pid_file, cfg, bind_host=self._bind_host) is not None
         if not pre_existing:
             try:
-                self._write_policy_yaml()
-            except ValueError as exc:
-                # A policy file it cannot merge into (#305). It is the user's to
-                # rewrite, so start nothing: the refusal names the file.
+                write_start_policy(self._root, self._managed)
+            except CoherenceDirRefused as exc:
+                # A link made after the check above; the writer checks again.
+                self._state_dir_refusal_or_degrade(exc)
+                return
+            except PolicyFileRefused as exc:
+                # A policy file it cannot load, lock or write (#305, #499). It
+                # is the user's to fix, so start nothing: the refusal names it.
                 self._policy_refusal_or_degrade(exc)
                 return
 
@@ -2065,29 +2073,6 @@ class CoherentVolume:
         if self._on_error == "strict":
             raise CallerPrincipalRefused(reason, message)
         self._record_degraded(message)
-
-    def _write_policy_yaml(self) -> None:
-        """Enable strict mode on the managed globs before the coordinator spawns.
-
-        Writes the managed globs to both ``tracked.yaml`` and ``strict_mode.yaml``
-        (a path must be tracked AND strict for the deny to fire). Idempotent —
-        merges with any existing entries. No-op when ``managed`` is empty. Raises
-        ValueError naming a policy file it cannot merge into (#305).
-        """
-        if not self._managed:
-            return
-        coherence_dir = self._root / ".coherence"
-        # This write runs BEFORE the lifecycle creates the directory, so on a
-        # fresh workspace it is the creator. The lifecycle requires 0700 here
-        # (state.db, hook.secret and the pidfile live inside) and re-tightens
-        # anything looser with a warning — a default-mode mkdir would earn every
-        # brand-new workspace that warning for a directory we made a moment
-        # earlier. An existing directory is left as-is (mkdir never chmods);
-        # re-tightening stays the lifecycle's job.
-        coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        merge_policy_globs(
-            (coherence_dir / "tracked.yaml", coherence_dir / "strict_mode.yaml"), self._managed
-        )
 
     # --- strict-mode verification (used by tests + callers) -----------------
 
@@ -5400,14 +5385,18 @@ class CoherentVolume:
             raise CoherenceError(message)
         self._record_degraded(message)
 
-    def _policy_refusal_or_degrade(self, refusal: ValueError) -> None:
-        """A policy file this volume cannot merge its globs into, through
-        ``on_error``. The text names the workspace, because a caller can hold
-        volumes over several roots."""
-        message = f"{self._root}: {refusal}"
+    def _policy_refusal_or_degrade(self, refusal: PolicyFileRefused) -> None:
+        """A policy file this volume cannot load, lock or write before it
+        starts a coordinator (#305, #499), through ``on_error``. Strict raises
+        the refusal itself, typed so that no retry loop catches it; degrade
+        warns once and stays detached. Its text already names the workspace,
+        because a caller can hold volumes over several roots."""
         if self._on_error == "strict":
-            raise CoherenceError(message)
-        self._record_degraded(f"{message} {_POLICY_REFUSAL_DEGRADED_NOTE}")
+            raise refusal
+        # The volume prints this text itself, and the workspace path in it can
+        # hold any character: escaped, it cannot drive the terminal or split
+        # the line.
+        self._record_degraded(f"{escape_nonprintable(str(refusal))} {_POLICY_REFUSAL_DEGRADED_NOTE}")
 
     def _state_dir_refusal_or_degrade(self, refusal: CoherenceDirRefused) -> None:
         """A ``.coherence`` a start refuses (#498), through ``on_error``. Strict

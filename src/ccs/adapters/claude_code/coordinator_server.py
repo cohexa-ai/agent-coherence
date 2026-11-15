@@ -60,15 +60,17 @@ import os
 import re
 import secrets
 import socketserver
+import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
+from types import ModuleType
 from typing import (
     Any,
     Callable,
@@ -170,6 +172,9 @@ from ccs.core.exceptions import (
     HOLD_VERSION_UNCONFIRMED,
     OCC_CALLER_TRANSIENT_REASON,
     OTHER_HOLDER_REASON,
+    POLICY_FILE_UNLOADABLE_KIND,
+    POLICY_LOCK_NOT_REGULAR_KIND,
+    POLICY_WRITE_FAILED_KIND,
     RESTORE_MEMBER_OUTCOMES,
     RESTORE_STATUSES,
     SESSION_INVALIDATED_REASON,
@@ -184,6 +189,7 @@ from ccs.core.exceptions import (
     GiverFenced,
     OccCallerTransientError,
     OtherHolder,
+    PolicyFileRefused,
     RegistryLockTimeout,
     SessionInvalidated,
     StaleReadGeneration,
@@ -9817,9 +9823,13 @@ def _read_policy_bytes(yaml_path: Path, name: str) -> bytes:
         result.status is ReadStatus.UNREADABLE
         or (result.status is ReadStatus.NOT_REGULAR and exc.errno == errno.EISDIR)
     ):
-        code = errno.errorcode.get(exc.errno, str(exc)) if exc.errno else str(exc)
-        raise ValueError(f"{name} could not be read ({code}); nothing was written.")
+        raise ValueError(f"{name} could not be read ({_errno_name(exc)}); nothing was written.")
     raise ValueError(f"{name} could not be read (not a regular file); nothing was written.")
+
+
+def _errno_name(exc: OSError) -> str:
+    """``exc``'s errno as its name (``ENOSPC``), or its text when it has none."""
+    return errno.errorcode.get(exc.errno, str(exc)) if exc.errno else str(exc)
 
 
 def _entries_or_none(text: str, name: str) -> list[str] | None:
@@ -9833,36 +9843,309 @@ def _entries_or_none(text: str, name: str) -> list[str] | None:
 def _replace_policy_file(yaml_path: Path, content: str) -> None:
     """Write ``content`` to a fresh temp file beside ``yaml_path`` and rename
     it over the file, so a failed write (an encoding error, a full disk)
-    leaves the old file whole where a truncating write left it empty. The
-    temp name is random and created exclusively, so a symlink planted at a
-    predictable name is never followed. Same pattern as the Node writer."""
-    tmp = yaml_path.with_name(f"{yaml_path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    leaves the old file whole where a truncating write left it empty. Same
+    pattern as the Node writer."""
+    tmp = _prepare_policy_file(yaml_path, content)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(content)
         os.replace(tmp, yaml_path)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _prepare_policy_file(yaml_path: Path, content: str) -> Path:
+    """Write ``content`` to a fresh temp file beside ``yaml_path`` and return
+    the temp's path, for :func:`os.replace` to put in place. The temp name is
+    random and created exclusively, so a symlink planted at a predictable name
+    is never followed. A temp that fails to be written is removed, and an
+    error removing it is suppressed so the write's own error comes through."""
+    data = content.encode("utf-8")
+    tmp = yaml_path.with_name(f"{yaml_path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    try:
+        _write_and_close(fd, data)
+    except BaseException:
+        with suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        raise
+    return tmp
+
+
+def _write_and_close(fd: int, data: bytes) -> None:
+    """Write ``data`` to ``fd`` whole, then close it. The descriptor is closed
+    whatever fails, and a failed close never hides the write's own error.
+    Plain ``os.write``, not ``os.fdopen``: a failed ``fdopen`` may or may not
+    have closed the descriptor already, and closing it again could close one
+    another thread just opened."""
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+    except BaseException:
+        with suppress(OSError):
+            os.close(fd)
+        raise
+    os.close(fd)
+
+
+class _PolicyFileUnloadable(ValueError):
+    """The start's policy merge cannot load a policy file: it is a link,
+    unreadable, not a regular file, not valid YAML or not a list. A
+    ``ValueError`` carrying the routes' own text; ``path`` is the file's."""
+
+    kind = POLICY_FILE_UNLOADABLE_KIND
+
+    def __init__(self, yaml_path: Path, message: str) -> None:
+        super().__init__(message)
+        self.path = str(yaml_path)
+
+
+class _PolicyWriteFailed(OSError):
+    """An ``OSError`` at one step of the start's policy merge: creating or
+    locking a lock file, or writing or replacing a policy file. ``path`` is the
+    file the step failed on, ``errno_name`` the error's name (``ENOSPC``) and
+    ``committed`` the policy files already replaced, in order. Still an
+    ``OSError``, as the failure was before it was named."""
+
+    kind = POLICY_WRITE_FAILED_KIND
+
+    def __init__(
+        self, path: Path, verb: str, error: OSError, committed: Sequence[Path] = (),
+    ) -> None:
+        self.path = str(path)
+        self.errno_name = _errno_name(error)
+        self.committed = tuple(str(written) for written in committed)
+        super().__init__(_write_failed_text(path, verb, self.errno_name, committed))
+
+
+def _write_failed_text(path: Path, verb: str, errno_name: str, committed: Sequence[Path]) -> str:
+    name = policy_file_name(path)
+    failed = f"{name} could not be {verb} ({errno_name});"
+    if not committed:
+        return f"{failed} nothing was written."
+    written = " and ".join(policy_file_name(each) for each in committed)
+    were = "was" if len(committed) == 1 else "were"
+    return f"{failed} {written} {were} written and {name} was not."
+
+
+@contextmanager
+def _write_step(path: Path, verb: str, committed: Sequence[Path] = ()) -> Iterator[None]:
+    """Raise an ``OSError`` from the block as :class:`_PolicyWriteFailed` for
+    ``path``. Anything else propagates as itself."""
+    try:
+        yield
+    except OSError as exc:
+        raise _PolicyWriteFailed(path, verb, exc, committed) from exc
 
 
 def merge_policy_globs(yaml_paths: Iterable[Path], globs: tuple[str, ...]) -> None:
     """Merge ``globs`` into each policy file. A file that already holds them is
     left as it is.
 
-    Raises ValueError, before writing any file, naming one that cannot be read, is
-    not valid YAML or is not a list, with the routes' own refusal (#305). Reading it
-    as empty would replace every entry in it with only these globs, at the restart
-    that would otherwise report it in ``rejected_pattern_count``."""
-    rewrites: list[tuple[Path, list[str]]] = []
+    Raises a ``ValueError`` (:class:`_PolicyFileUnloadable`), before writing
+    any file, naming one that cannot be read, is not valid YAML or is not a
+    list, with the routes' own refusal (#305). Reading it as empty would
+    replace every entry in it with only these globs, at the restart that would
+    otherwise report it in ``rejected_pattern_count``.
+
+    Two phases (#499). A read without a lock refuses, or returns when no file
+    needs a change, taking no lock and creating no file. Otherwise the merge
+    holds every file's ``<name>.lock`` (the locks the policy routes take), in
+    the order given, and reads again: that read decides the write, so a
+    ``/policy/track`` or ``/policy/untrack`` that lands meanwhile keeps its
+    entry. It prepares every changed file before it replaces any, then
+    replaces them in the order given, so a failure before the first replace
+    leaves every file as it was.
+
+    A lock file that is not a regular file raises
+    :class:`_PolicyLockNotRegular`. An ``OSError`` creating or locking a lock
+    file, or writing or replacing a policy file, raises
+    :class:`_PolicyWriteFailed`, naming the step, the file and the files
+    already replaced. Nothing else is translated: it propagates as itself once
+    the temp files are removed and the locks freed."""
+    paths = tuple(yaml_paths)
+    if not _policy_rewrites(paths, globs):
+        return
+    with _policy_locks(paths, typed_failures=True):
+        _write_policy_files(_policy_rewrites(paths, globs))
+
+
+def write_start_policy(root: Path, managed: tuple[str, ...]) -> None:
+    """The policy writer a volume and a session run before they start a
+    coordinator (#535): merge the ``managed`` globs into
+    ``.coherence/tracked.yaml`` and ``.coherence/strict_mode.yaml``, which the
+    coordinator loads once, at start. One writer keeps the ``.coherence``
+    check, the locks and the order in one place.
+
+    In order: return at once, checking and creating nothing, when no glob is
+    managed; run :func:`check_coherence_dir`, whose
+    :class:`~ccs.core.exceptions.CoherenceDirRefused` propagates as itself;
+    create ``.coherence`` at mode 0o700, which the lifecycle requires (an
+    existing one keeps its mode: tightening it is the lifecycle's job); then
+    :func:`merge_policy_globs`, ``tracked.yaml`` before ``strict_mode.yaml``.
+
+    Raises :class:`~ccs.core.exceptions.PolicyFileRefused`, its text
+    ``<root>: <what failed>``, for a policy file that cannot be loaded, a lock
+    file that is not a regular file, and an ``OSError`` creating
+    ``.coherence``, creating or locking a lock file, or writing a policy file.
+    Nothing else is translated: a bug or an interrupt propagates as itself, so
+    that degrade mode never turns it into a quiet detach."""
+    if not managed:
+        return
+    check_coherence_dir(root)
+    coherence_dir = root / ".coherence"
+    try:
+        coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise PolicyFileRefused(
+            POLICY_WRITE_FAILED_KIND, str(coherence_dir),
+            f"{root}: .coherence could not be created ({_errno_name(exc)}); nothing was written.",
+        ) from exc
+    try:
+        merge_policy_globs((coherence_dir / "tracked.yaml", coherence_dir / "strict_mode.yaml"), managed)
+    except (_PolicyFileUnloadable, _PolicyLockNotRegular, _PolicyWriteFailed) as signal:
+        raise PolicyFileRefused(signal.kind, signal.path, f"{root}: {signal}") from signal
+
+
+def _policy_rewrites(yaml_paths: Sequence[Path], globs: tuple[str, ...]) -> list[tuple[Path, str]]:
+    """The new content of each file in ``yaml_paths`` that lacks one of
+    ``globs``, in order. Reads every file before it returns, so one it cannot
+    load refuses the merge before any is written."""
+    rewrites: list[tuple[Path, str]] = []
     for yaml_path in yaml_paths:
-        name = policy_file_name(yaml_path)
-        existing = _read_policy_entries(_read_policy_bytes(yaml_path, name), name)
+        existing = _loadable_policy_entries(yaml_path)
         merged = sorted(set(existing) | set(globs))
         if merged != sorted(existing):
-            rewrites.append((yaml_path, merged))
-    for yaml_path, merged in rewrites:
-        _replace_policy_file(yaml_path, yaml.safe_dump(merged, default_flow_style=False))
+            rewrites.append((yaml_path, yaml.safe_dump(merged, default_flow_style=False)))
+    return rewrites
+
+
+def _loadable_policy_entries(yaml_path: Path) -> list[str]:
+    name = policy_file_name(yaml_path)
+    try:
+        return _read_policy_entries(_read_policy_bytes(yaml_path, name), name)
+    except ValueError as exc:
+        raise _PolicyFileUnloadable(yaml_path, str(exc)) from None
+
+
+def _write_policy_files(rewrites: Sequence[tuple[Path, str]]) -> None:
+    """Prepare a temp file for every one of ``rewrites``, then replace the
+    files in order. Every temp not put in place is removed whatever fails, an
+    error removing one suppressed so it never hides the failure."""
+    staged: list[tuple[Path, Path]] = []
+    committed: list[Path] = []
+    try:
+        for yaml_path, content in rewrites:
+            with _write_step(yaml_path, "written"):
+                staged.append((yaml_path, _prepare_policy_file(yaml_path, content)))
+        for yaml_path, tmp in staged:
+            with _write_step(yaml_path, "written", tuple(committed)):
+                os.replace(tmp, yaml_path)
+            committed.append(yaml_path)
+    finally:
+        for _, tmp in staged[len(committed):]:
+            with suppress(OSError):
+                tmp.unlink(missing_ok=True)
+
+
+class _PolicyLockNotRegular(ValueError):
+    """A policy file's ``<name>.lock`` sidecar is a link or not a regular file,
+    so it was not locked and nothing was written (#498, #534). A ``ValueError``,
+    so the routes answer it as HTTP 400. ``path`` is the sidecar's path."""
+
+    kind = POLICY_LOCK_NOT_REGULAR_KIND
+
+    def __init__(self, lock_path: Path, message: str) -> None:
+        super().__init__(message)
+        self.path = str(lock_path)
+
+
+def _lock_not_regular_text(name: str) -> str:
+    return f"{name}.lock could not be read (not a regular file); nothing was written."
+
+
+def _is_present_but_not_regular(path: Path) -> bool:
+    try:
+        return not stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _open_policy_lock(yaml_path: Path) -> int:
+    """Open ``yaml_path``'s ``<name>.lock`` sidecar, creating it at mode 0o600,
+    and return the descriptor. Raises :class:`_PolicyLockNotRegular` with the
+    routes' text for a link or anything else that is not a regular file there,
+    and the open's own ``OSError`` otherwise."""
+    lock_path = _policy_lock_path(yaml_path)
+    name = policy_file_name(yaml_path)
+    try:
+        # No-follow (#498): O_CREAT through a dangling link creates the file it
+        # names, outside .coherence.
+        return open_regular(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except LinkRefused:
+        raise _PolicyLockNotRegular(lock_path, lock_link_refusal(name)) from None
+    except NotRegularFile:
+        # A FIFO or device put there while the coordinator runs (a start refuses
+        # one): the 400 a policy file that is not regular gets.
+        raise _PolicyLockNotRegular(lock_path, _lock_not_regular_text(name)) from None
+    except OSError:
+        # A directory or socket fails the open itself, before the regular-file
+        # check (#534): EISDIR, or EOPNOTSUPP on macOS and ENXIO on Linux. Told
+        # apart here rather than in the no-follow reader, so every other reader
+        # still reads a socket as unreadable.
+        if _is_present_but_not_regular(lock_path):
+            raise _PolicyLockNotRegular(lock_path, _lock_not_regular_text(name)) from None
+        raise
+
+
+def _policy_lock_path(yaml_path: Path) -> Path:
+    return yaml_path.with_suffix(yaml_path.suffix + ".lock")
+
+
+def _release_policy_lock(fcntl_module: ModuleType, fd: int) -> None:
+    with suppress(OSError):
+        fcntl_module.flock(fd, fcntl_module.LOCK_UN)
+    with suppress(OSError):
+        os.close(fd)
+
+
+def _lock_step(yaml_path: Path, verb: str, typed_failures: bool) -> AbstractContextManager[None]:
+    return _write_step(_policy_lock_path(yaml_path), verb) if typed_failures else nullcontext()
+
+
+@contextmanager
+def _policy_locks(yaml_paths: Sequence[Path], *, typed_failures: bool = False) -> Iterator[None]:
+    """Hold an exclusive lock on each policy file's ``<name>.lock`` sidecar,
+    taken in the order given and released in reverse, ``LOCK_UN`` before
+    ``close``, with release errors suppressed. The wait has no bound. Raises
+    what :func:`_open_policy_lock` raises.
+
+    With ``typed_failures``, an ``OSError`` opening or locking a sidecar is
+    raised as :class:`_PolicyWriteFailed`, naming that step (``created`` or
+    ``locked``) and the sidecar; the start's policy merge asks for that. The
+    routes leave it off and get the ``OSError`` itself, which they answer as
+    before.
+
+    Two writers that each read a policy file and replace it cannot then
+    interleave and lose each other's entries. ``flock``, never ``lockf`` or
+    ``fcntl`` record locks: two holders in one process each open their own
+    descriptor, and only ``flock`` makes those exclude each other. A sidecar is
+    never removed: removing one lets two holders lock two different inodes.
+
+    Without ``fcntl`` (Windows, where lifecycle already disables the
+    coordinator) it takes no lock and creates no sidecar."""
+    try:
+        import fcntl as _fcntl
+    except ImportError:
+        yield
+        return
+    with ExitStack() as held:
+        for yaml_path in yaml_paths:
+            with _lock_step(yaml_path, "created", typed_failures):
+                fd = _open_policy_lock(yaml_path)
+            held.callback(_release_policy_lock, _fcntl, fd)
+            with _lock_step(yaml_path, "locked", typed_failures):
+                _fcntl.flock(fd, _fcntl.LOCK_EX)
+        yield
 
 
 def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str], list[dict]]:
@@ -9870,16 +10153,11 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
     Raises ValueError, which the routes answer as HTTP 400, when the file
     would exceed MAX_POLICY_YAML_BYTES, an entry could not take effect in
     it (see :func:`_append_policy_entries`), or its lock sidecar is a link
-    or not a regular file (#498); nothing is written then.
+    or not a regular file (#498, #534); nothing is written then.
 
-    R14 (Unit 6): the read-modify-write is wrapped in an ``fcntl.flock``
-    exclusive lock on a sidecar ``<yaml_path>.lock`` file so two concurrent
-    /policy/track or /policy/untrack requests cannot interleave their
-    reads-and-writes and corrupt the YAML (e.g., both read the same
-    pre-state, both compute "previous + my_paths", second write loses the
-    first writer's additions). fcntl is POSIX-only; on the deferred
-    Windows path this is a no-op (lifecycle already disables the
-    coordinator on Windows per _FCNTL_AVAILABLE).
+    The read-modify-write runs under the file's lock (:func:`_policy_locks`),
+    so two concurrent /policy/track or /policy/untrack requests cannot both
+    read the same file and the second write drop the first's additions.
 
     COR-06: callers pre-validate via ``validate_path`` (or equivalent)
     and pass only safe paths. The local re-check below is a defensive
@@ -9912,35 +10190,5 @@ def _append_policy_yaml(yaml_path: Path, new_paths: list[str]) -> tuple[list[str
 
     if not added:
         return added, rejected
-
-    try:
-        import fcntl as _fcntl
-    except ImportError:
-        # Windows fallback: no fcntl. Lifecycle already disables the
-        # coordinator on Windows, but degrade defensively if reached.
+    with _policy_locks([yaml_path]):
         return _append_policy_entries(yaml_path, added), rejected
-    lock_path = yaml_path.with_suffix(yaml_path.suffix + ".lock")
-    try:
-        # No-follow (#498): O_CREAT through a dangling link creates the file it
-        # names, outside .coherence.
-        lock_fd = open_regular(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-    except LinkRefused:
-        raise ValueError(lock_link_refusal(policy_file_name(yaml_path))) from None
-    except NotRegularFile:
-        # A FIFO, socket or device put there while the coordinator runs (a start
-        # refuses one): the 400 a policy file that is not regular gets.
-        raise ValueError(
-            f"{policy_file_name(yaml_path)}.lock could not be read (not a regular file); nothing was written."
-        ) from None
-    try:
-        _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
-        return _append_policy_entries(yaml_path, added), rejected
-    finally:
-        try:
-            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
-        except OSError:
-            pass
-        try:
-            os.close(lock_fd)
-        except OSError:
-            pass

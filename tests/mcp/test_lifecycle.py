@@ -230,6 +230,101 @@ def test_the_server_refuses_a_link_in_coherence_on_one_escaped_line_and_exits_2(
     assert not target.exists()
 
 
+#: The console script whose replace of ``strict_mode.yaml`` fails on a full
+#: disk, after ``tracked.yaml`` was replaced.
+_MAIN_WHOSE_STRICT_POLICY_REPLACE_FAILS = textwrap.dedent(
+    """
+    import errno
+    import os
+    from pathlib import Path
+
+    from ccs.mcp.server import main
+
+    real_replace = os.replace
+
+    def replace_fails_for_strict_mode(src, dst):
+        if Path(dst).name == "strict_mode.yaml":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real_replace(src, dst)
+
+    os.replace = replace_fails_for_strict_mode
+    main()
+    """
+)
+
+#: How the server and the volume log a record to stderr.
+_LOG_RECORD = re.compile(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} [A-Z]+ ccs\.")
+
+
+def _refusal_line(result: subprocess.CompletedProcess[bytes]) -> str:
+    """The last stderr line of a server that refused to start, once the
+    result shows exit 2, an empty stdout, no traceback and only log records
+    before that line."""
+    assert result.returncode == 2, result.stderr
+    assert result.stdout == b""
+    stderr = result.stderr.decode("utf-8")
+    assert "Traceback" not in stderr, stderr
+    *logged, refusal = stderr.split("\n")[:-1]
+    assert all(_LOG_RECORD.match(line) for line in logged), logged
+    return refusal
+
+
+@pytest.mark.parametrize("workspace", ["ws", "ws\n\x1b]0;PWNED\x07"], ids=["plain", "control-characters"])
+def test_the_server_refuses_a_policy_file_it_cannot_load_on_one_line_and_exits_2(
+    tmp_path: Path, workspace: str
+) -> None:
+    """#499 at the console script, which an agent host runs unattended: a
+    ``tracked.yaml`` that is not valid YAML stops the server before it serves,
+    on one stderr line that names the file after the workspace, with the
+    workspace's control characters escaped, and exit 2, as its other start
+    refusals answer. The file is kept. Prevents a traceback in the host's log,
+    with the path raw in its last line, and exit 1."""
+    root = tmp_path / workspace
+    _seed(root)
+    broken = root / ".coherence" / "tracked.yaml"
+    broken.parent.mkdir(mode=0o700)
+    broken.write_text("- docs/**\n- *.md\n")
+
+    try:
+        result = _run_the_server(root, "displace")
+    finally:
+        stop_coordinator(root)
+
+    # The parser's own words sit between these two parts; they are PyYAML's.
+    refusal = _refusal_line(result)
+    assert refusal.startswith(
+        f"stale-write-guard-fs: {escape_nonprintable(str(root.resolve()))}: .coherence/tracked.yaml is not "
+        "valid YAML, so it loads as no entries; nothing was written. The parser stopped near line 2"
+    ), refusal
+    assert refusal.endswith(
+        'Rewrite it with one entry per line, each a double-quoted string such as - "*.md", then retry.'
+    ), refusal
+    assert not any(byte < 0x20 or byte == 0x7F for byte in result.stderr.replace(b"\n", b"")), result.stderr
+    assert os.listdir(broken.parent) == ["tracked.yaml"]
+    assert broken.read_text() == "- docs/**\n- *.md\n"
+
+
+def test_the_server_whose_strict_policy_write_fails_says_tracked_was_written_and_exits_2(
+    tmp_path: Path,
+) -> None:
+    """#499: replacing ``strict_mode.yaml`` fails on a full disk after
+    ``tracked.yaml`` was replaced. The server stops before it serves, on one
+    stderr line that says which file was written and which was not, and exit
+    2. Prevents a raw ``OSError`` traceback in the host's log and exit 1, and
+    a split pair that nothing reports."""
+    _seed(tmp_path)
+
+    try:
+        result = _run_the_server(tmp_path, "displace", _MAIN_WHOSE_STRICT_POLICY_REPLACE_FAILS)
+    finally:
+        stop_coordinator(tmp_path)
+
+    assert _refusal_line(result) == (
+        f"stale-write-guard-fs: {tmp_path.resolve()}: .coherence/strict_mode.yaml could not be written "
+        "(ENOSPC); .coherence/tracked.yaml was written and .coherence/strict_mode.yaml was not."
+    )
+
+
 # --- SWG_ON_HELD: the refuse-mode opt-in --------------------------------------
 
 

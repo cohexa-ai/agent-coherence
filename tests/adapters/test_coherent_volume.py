@@ -68,6 +68,7 @@ from ccs.core.exceptions import (
     CommitPreempted,
     CoordinatorFailed,
     CoordinatorUnreachable,
+    PolicyFileRefused,
     StaleView,
     ViewWedged,
 )
@@ -1253,6 +1254,150 @@ def test_a_forked_child_refuses_a_policy_file_until_it_is_fixed(
     assert report == {"kept": True, "read": "v1", "attached": True}
 
 
+def _strict_policy_refusal(root: Path, cfg: LifecycleConfig) -> PolicyFileRefused:
+    """What a strict volume over ``root`` raises for its policy files; a volume
+    that attaches instead stops the coordinator it started before the test fails."""
+    try:
+        with pytest.raises(PolicyFileRefused) as raised:
+            CoherentVolume(root, managed=("data/**",), on_error="strict", config=cfg)
+    finally:
+        stop_coordinator(root)
+    return raised.value
+
+
+def _degraded_volume(root: Path, cfg: LifecycleConfig) -> tuple[CoherentVolume, list[str]]:
+    """A degrade volume over ``root`` and the degrade warnings its constructor gave."""
+    try:
+        with pytest.warns(CoherenceDegradedWarning) as caught:
+            vol = CoherentVolume(root, managed=("data/**",), on_error="degrade", config=cfg)
+    finally:
+        stop_coordinator(root)
+    return vol, [str(w.message) for w in caught if issubclass(w.category, CoherenceDegradedWarning)]
+
+
+def test_a_strict_volume_raises_a_policy_file_it_cannot_load_as_the_typed_refusal(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#499: the #305 refusal is a ``PolicyFileRefused`` naming the file, so a
+    caller tells it apart by type. Prevents it reaching the caller as the plain
+    ``CoherenceError`` every other attach failure raises, or as a
+    ``CoordinatorUnreachable`` a retry loop would wait on."""
+    _seed(tmp_path)
+    tracked = tmp_path / ".coherence" / "tracked.yaml"
+    tracked.parent.mkdir()
+    tracked.write_text("- docs/**\n- *.md\n")
+
+    refusal = _strict_policy_refusal(tmp_path, fast_cfg)
+
+    assert (refusal.reason, refusal.kind, refusal.path) == (
+        "policy_file_refused", "policy_file_unloadable", str(tmp_path.resolve() / ".coherence" / "tracked.yaml"),
+    )
+    assert not isinstance(refusal, CoordinatorUnreachable)
+
+
+def _read_only_empty_coherence(root: Path) -> Path:
+    """An empty ``.coherence`` this process owns, at mode 0500: a start can
+    create no lock file in it."""
+    coherence_dir = root / ".coherence"
+    coherence_dir.mkdir(mode=0o700)
+    coherence_dir.chmod(0o500)
+    return coherence_dir
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes into a mode-0500 directory")
+def test_a_degrade_volume_that_cannot_write_its_policy_warns_once_and_stays_detached(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#499, #535: an empty ``.coherence`` at mode 0500 refuses the policy
+    write's first step, creating ``tracked.yaml.lock``. A degrade volume warns
+    once naming that file and the retry, stays detached, and its constructor
+    raises nothing. Prevents the raw ``OSError`` escaping the constructor of a
+    volume that promises to warn."""
+    _seed(tmp_path)
+    coherence_dir = _read_only_empty_coherence(tmp_path)
+    try:
+        vol, messages = _degraded_volume(tmp_path, fast_cfg)
+    finally:
+        coherence_dir.chmod(0o700)
+
+    assert len(messages) == 1, messages
+    assert ".coherence/tracked.yaml.lock could not be created" in messages[0], messages[0]
+    assert messages[0].endswith("This volume stays detached: build a new one once the file is fixed.")
+    assert not vol.is_attached
+    assert vol.degradation_count == 1
+    assert os.listdir(coherence_dir) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes into a mode-0500 directory")
+def test_a_strict_volume_that_cannot_write_its_policy_raises_the_typed_refusal(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#499, #535: the same failed write in a strict volume raises a
+    ``PolicyFileRefused`` of kind ``policy_write_failed``, and no coordinator
+    starts. Prevents a raw ``OSError`` that ``except CoherenceError`` misses."""
+    _seed(tmp_path)
+    coherence_dir = _read_only_empty_coherence(tmp_path)
+    try:
+        refusal = _strict_policy_refusal(tmp_path, fast_cfg)
+    finally:
+        coherence_dir.chmod(0o700)
+
+    assert (refusal.kind, refusal.path) == (
+        "policy_write_failed", str(tmp_path.resolve() / ".coherence" / "tracked.yaml.lock"),
+    )
+    assert not (coherence_dir / "server.pid").exists()
+
+
+@pytest.mark.parametrize("on_error", ["strict", "degrade"])
+def test_a_volume_refuses_a_directory_at_a_policy_lock_file(
+    tmp_path: Path, fast_cfg: LifecycleConfig, on_error: str
+) -> None:
+    """#499, #534: a directory at ``strict_mode.yaml.lock`` cannot be locked.
+    A strict volume raises a ``PolicyFileRefused`` of kind
+    ``policy_lock_not_regular`` naming it; a degrade volume warns once and stays
+    detached. Neither writes a policy file. Prevents a merge without the lock
+    the policy routes take."""
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    (coherence_dir / "strict_mode.yaml.lock").mkdir(parents=True)
+
+    if on_error == "strict":
+        refusal = _strict_policy_refusal(tmp_path, fast_cfg)
+        assert (refusal.kind, refusal.path) == (
+            "policy_lock_not_regular", str(tmp_path.resolve() / ".coherence" / "strict_mode.yaml.lock"),
+        )
+    else:
+        vol, messages = _degraded_volume(tmp_path, fast_cfg)
+        assert len(messages) == 1, messages
+        assert ".coherence/strict_mode.yaml.lock could not be read (not a regular file)" in messages[0]
+        assert not vol.is_attached
+    assert sorted(coherence_dir.glob("*.yaml")) == []
+
+
+def test_a_degrade_volume_escapes_control_characters_in_a_policy_refusal(
+    tmp_path: Path, fast_cfg: LifecycleConfig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#499: a policy refusal's text starts with the workspace path, which can
+    hold any character. A degrade volume prints it itself, as a warning and a
+    log line, so it escapes it, as it escapes a refused ``.coherence``. Prevents
+    a path that drives the terminal or splits the line that says coherence is
+    off."""
+    root = tmp_path / "ws\n\x1b]0;PWNED\x07\x1b[2J"
+    _seed(root)
+    (root / ".coherence").mkdir()
+    (root / ".coherence" / "tracked.yaml").write_text("- docs/**\n- *.md\n")
+    caplog.set_level(logging.WARNING, logger="ccs.adapters.coherent_volume")
+
+    vol, messages = _degraded_volume(root, fast_cfg)
+
+    logged = [r.getMessage() for r in caplog.records if r.name == "ccs.adapters.coherent_volume"]
+    assert len(messages) == 1 and len(logged) == 1, (messages, logged)
+    for printed in (messages[0], logged[0]):
+        assert printed.isprintable(), printed
+        assert f"{escape_nonprintable(str(root.resolve()))}: .coherence/tracked.yaml is not valid YAML" in printed
+    assert not vol.is_attached
+
+
 def _stranger_on_an_exited_coordinators_port(root: Path) -> socket.socket:
     """A coordinator that died left its pid file, and another process listens
     on its port."""
@@ -1457,10 +1602,12 @@ def test_a_degrade_volume_warns_for_a_link_made_after_its_check(
 ) -> None:
     """#498: a link the volume's own check did not see (made after it) is refused
     by the start, and a degrade volume still warns and stays detached. Prevents
-    the start's refusal escaping raw from a volume that promises to warn."""
+    the start's refusal escaping raw from a volume that promises to warn. The
+    policy writer's check is skipped too, so the link reaches the start's own."""
     _seed(tmp_path)
     plant_link(tmp_path / ".coherence", "hook.secret", "existing")
     monkeypatch.setattr(coherent_volume_module, "check_coherence_dir", lambda root: None)
+    monkeypatch.setattr(coordinator_server_module, "check_coherence_dir", lambda root: None)
 
     try:
         with pytest.warns(CoherenceDegradedWarning) as caught:
@@ -1473,6 +1620,28 @@ def test_a_degrade_volume_warns_for_a_link_made_after_its_check(
     assert f"refusing {tmp_path.resolve() / '.coherence' / 'hook.secret'}: it is a symlink" in messages[0]
     assert messages[0].endswith("This volume stays detached: build a new one once .coherence is fixed.")
     assert not vol.is_attached
+
+
+def test_a_degrade_volume_warns_for_a_link_its_policy_writer_finds(
+    tmp_path: Path, fast_cfg: LifecycleConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#498, #535: a link the volume's own check did not see is refused by the
+    policy writer's check, before it writes a policy file. A degrade volume
+    warns once with the ``.coherence`` refusal and stays detached. Prevents the
+    merge writing policy files into a ``.coherence`` the start then refuses, and
+    the writer's refusal escaping raw from a volume that promises to warn."""
+    _seed(tmp_path)
+    coherence_dir = tmp_path / ".coherence"
+    plant_link(coherence_dir, "hook.secret", "existing")
+    monkeypatch.setattr(coherent_volume_module, "check_coherence_dir", lambda root: None)
+
+    vol, messages = _degraded_volume(tmp_path, fast_cfg)
+
+    assert len(messages) == 1, messages
+    assert f"refusing {tmp_path.resolve() / '.coherence' / 'hook.secret'}: it is a symlink" in messages[0]
+    assert messages[0].endswith("This volume stays detached: build a new one once .coherence is fixed.")
+    assert not vol.is_attached
+    assert sorted(os.listdir(coherence_dir)) == ["hook.secret"]
 
 
 def _link_to_peer_state(root: Path, peer: Path) -> None:

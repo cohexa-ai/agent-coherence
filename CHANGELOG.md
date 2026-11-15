@@ -76,6 +76,62 @@ Alpha — APIs may change before `v1.0`.
   plugin's Node coordinator makes the same change in plugin releases after
   0.7.0.
 
+### Fixed
+
+- **A volume or substrate session merges its globs into the policy files under
+  their locks, and reports every policy problem before a start as
+  `PolicyFileRefused` (#499, #535).** Before it starts the coordinator, a
+  volume or session merges its managed globs into `.coherence/tracked.yaml`
+  and `.coherence/strict_mode.yaml`. Each had its own copy of that code, which
+  read both files and then replaced each in turn with no lock: a
+  `/policy/track` that landed between the read and the replace lost its entry,
+  and a failed replace of `strict_mode.yaml` left the globs tracked but not
+  strict, with an error that did not say so. An `OSError` from the write
+  escaped the constructor of a volume in degrade mode and reached a session
+  raw. Both now run one shared writer. When both files already list the globs
+  it locks and creates nothing. Otherwise it takes `tracked.yaml.lock`, the
+  lock the Python coordinator's track route takes, then a new
+  `strict_mode.yaml.lock`, waiting for a track in progress; reads both files
+  again under the locks; prepares both before it replaces either; and
+  replaces `tracked.yaml` first. A failure
+  before the first replace changes neither file. A file that cannot be loaded,
+  a lock file that is not a regular file, and a failed write, including
+  creating `.coherence` or a lock file, now each raise `PolicyFileRefused`, a
+  `CoherenceError` and not a `CoordinatorUnreachable`, with `reason`
+  `policy_file_refused`, `kind` `policy_file_unloadable`,
+  `policy_lock_not_regular` or `policy_write_failed`, and the file in `path`.
+  Its text is `<root>: <what failed>`. A file that cannot be loaded keeps its
+  text, and a failed write says which file was already written, as in
+  `.coherence/strict_mode.yaml could not be written (ENOSPC);
+  .coherence/tracked.yaml was written and .coherence/strict_mode.yaml was
+  not.` A start after the fix merges again. A strict volume and a session
+  raise it; a volume in degrade mode warns once, with control characters
+  escaped, and stays detached. The guide's "Status, track and untrack
+  commands" section has the details.
+
+- **The policy routes answer 400, not 500, for a directory or socket at a
+  policy lock file (#534).** `/policy/track` and `/policy/untrack` open the
+  lock file beside the policy file they write without following a link, and
+  answered a link, FIFO or device there with HTTP 400. A directory or a socket
+  fails the open itself (`EISDIR`; `EOPNOTSUPP` on macOS, `ENXIO` on Linux)
+  before that check, so the route answered 500, although the guide already
+  listed a socket. Both now answer the same 400, naming the lock file, as in
+  `.coherence/tracked.yaml.lock could not be read (not a regular file);
+  nothing was written.`, and write nothing; `agent-coherence-track` and
+  `agent-coherence-untrack` exit `2` with that text. The routes' other texts
+  are unchanged. The guide's "Status, track and untrack commands" section has
+  the details.
+
+- **The `stale-write-guard-fs` server refuses a policy file its start cannot
+  load, lock or write on one line, with exit `2` (#499).** The server builds
+  its volume before it serves, and such a refusal reached it inside an
+  exception group: it printed a traceback of about a hundred lines and exited
+  `1`, while its other start refusals print one line and exit `2`. It now
+  prints `stale-write-guard-fs: <root>: <what failed>` on one stderr line,
+  after any lines its start-up logged, with control characters escaped, and
+  exits `2`, with nothing on stdout. The guide's "`stale-write-guard-fs` MCP
+  server" section has the details.
+
 ## [0.16.0] - 2026-11-13
 
 **`CoherentVolume` and the MCP server can refuse a file another agent holds instead of taking it, and give back a file they have finished writing; every spelling the workspace disk opens as one file reaches that file's one record; a managed volume attaches to the Claude Code plugin's Node coordinator; clients send nothing to a coordinator that has exited; a host can check a store before a start; and a run of fixes types every strict failure by outcome and closes ways a timed-out hook, a linked `.coherence`, a second store writer or a read that raced a commit let a write go unchecked or overwrite newer work.**
