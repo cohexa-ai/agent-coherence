@@ -4,7 +4,11 @@ All notable changes to `agent-coherence` are documented here. The format follows
 
 Alpha — APIs may change before `v1.0`.
 
-## [Unreleased]
+## [0.16.1] - 2026-11-15
+
+**A strict-mode Claude Code session whose copy of a file went stale can read the file again after one deny and keep working, and the deny texts say so; a volume or substrate session merges its globs into the policy files under their locks and reports a policy problem as `PolicyFileRefused`; and the Claude Code hook client gains an opt-in deny for edits of a strict file another agent holds, off by default.**
+
+**Upgrade note:** upgrade the coordinator, its clients (`CoherentVolume`, the MCP server, the hook client and the console scripts) and the Claude Code plugin together, and pair this release with plugin 0.7.1 or later: the stale-read recovery changes both coordinators, and a `CoherentVolume` from 0.16.0 or earlier that reads through a coordinator with the recovery can have a stale view healed by its second plain read (#629). A coordinator that was running before the upgrade keeps the old behaviour until it restarts. A script or prompt that matches the strict-mode deny texts byte for byte must accept the new wording. A volume or substrate session now raises `PolicyFileRefused`, a `CoherenceError` and not a `CoordinatorUnreachable`, for a policy file it cannot load, lock or write, and the `stale-write-guard-fs` server exits `2` for one where it exited `1`; an opted-in `pre-edit` with a malformed subagent id answers `400`. The registry schema stays at 10, so nothing migrates. The hook client's held-file deny (`.coherence/hook_on_held`) stays off by default.
 
 ### Added
 
@@ -91,7 +95,7 @@ Alpha — APIs may change before `v1.0`.
   - **Unchanged.** The out-of-band text for a reader that still holds a valid
     grant, and the handoff giver's deny, keep their bytes. Each text is the
     same bytes for a given file and event, and the Claude Code plugin's Node
-    coordinator sends the same bytes in plugin releases after 0.7.0.
+    coordinator sends the same bytes from plugin 0.7.1.
   - **Other texts that sent a session to read again.** The sweep's reclaim
     notice now ends `Read it again with the Read tool before you edit it.`,
     where it said `Re-fetch via pre-read and retry.`, and the
@@ -109,8 +113,7 @@ Alpha — APIs may change before `v1.0`.
     does not use.
   - **Version skew (#629).** A `CoherentVolume` from 0.16.0 or earlier marks
     none of its plain reads. Reading through a coordinator with the recovery,
-    such as the Claude Code plugin's Node coordinator in plugin releases after
-    0.7.0, its second plain read of a file whose copy went stale is admitted,
+    such as the Claude Code plugin's Node coordinator from plugin 0.7.1, its second plain read of a file whose copy went stale is admitted,
     and a later `write()` of a buffer built before a peer's commit is admitted
     too. Upgrade the library together with the plugin.
 
@@ -127,8 +130,7 @@ Alpha — APIs may change before `v1.0`.
   caller-principal refusal and the untracked-path exit, and grants nothing. An
   empty or `null` `agent_id` still means no subagent id, and a `pre-edit` that
   does not opt in still reads a malformed id as the parent. The Claude Code
-  plugin's Node coordinator makes the same change in plugin releases after
-  0.7.0.
+  plugin's Node coordinator makes the same change from plugin 0.7.1.
 
 ### Fixed
 
@@ -157,7 +159,7 @@ Alpha — APIs may change before `v1.0`.
   read that re-grants the session a read of the file uses the recovery up as
   well, so the session's next stale copy is denied again. Neither hook
   client changes. The Claude Code plugin's Node coordinator makes the same
-  change in plugin releases after 0.7.0. A coordinator that was running before
+  change from plugin 0.7.1. A coordinator that was running before
   the upgrade keeps the old behaviour until it restarts. The guide's "After a
   strict-mode stale deny" section has the details.
   - **Only the Claude Code hooks get it.** A `pre-read` that carries
