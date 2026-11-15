@@ -5032,6 +5032,141 @@ def test_write_start_policy_refusal_pickles_whole(tmp_path: Path) -> None:
 
 
 # ----------------------------------------------------------------------
+# The start's merge refuses every policy file the loader rejects (#499)
+# ----------------------------------------------------------------------
+
+
+# Each shape a policy file can take: whether the coordinator's loader records
+# the file as rejected, and whether the start's merge refuses it. The merge
+# refuses a superset: the loader reads a directory or FIFO as no entries
+# without recording it, and the merge cannot replace either.
+_POLICY_FILE_SHAPES = [
+    pytest.param("link", True, True, id="link"),
+    pytest.param("unreadable", True, True, id="unreadable", marks=_SKIP_AS_ROOT),
+    pytest.param("socket", True, True, id="socket"),
+    pytest.param("invalid_yaml", True, True, id="invalid_yaml"),
+    pytest.param("tagged", True, True, id="tagged"),
+    pytest.param("mapping", True, True, id="mapping"),
+    pytest.param("scalar", True, True, id="scalar"),
+    pytest.param("directory", False, True, id="directory"),
+    pytest.param("fifo", False, True, id="fifo"),
+    pytest.param("valid_list", False, False, id="valid_list"),
+    pytest.param("empty", False, False, id="empty"),
+    pytest.param("absent", False, False, id="absent"),
+]
+
+_POLICY_FILE_BODIES = {
+    "unreadable": '- "docs/**"\n',
+    "invalid_yaml": "- *.md\n",
+    "tagged": "- !!bool x\n",
+    "mapping": "plain: mapping\n",
+    "scalar": "just a string\n",
+    "valid_list": '- "docs/**"\n',
+    "empty": "",
+}
+
+
+def _plant_policy_file_shape(
+    policy_file: Path, shape: str, monkeypatch: pytest.MonkeyPatch, cleanup: contextlib.ExitStack,
+) -> None:
+    """Put ``shape`` at ``policy_file``. A link names a valid list outside
+    ``.coherence``, so only the link is wrong; a FIFO is released and a socket
+    closed when ``cleanup`` closes."""
+    if shape in _POLICY_FILE_BODIES:
+        policy_file.write_text(_POLICY_FILE_BODIES[shape])
+    if shape == "unreadable":
+        os.chmod(policy_file, 0)
+    elif shape == "link":
+        named = policy_file.parent.parent / "named-by-the-link.yaml"
+        named.write_text('- "docs/**"\n')
+        policy_file.symlink_to(named)
+    elif shape in ("directory", "socket"):
+        _plant_directory_or_socket(policy_file, shape, monkeypatch, cleanup)
+    elif shape == "fifo":
+        os.mkfifo(policy_file)
+        cleanup.callback(release_fifo, policy_file)
+
+
+def _call_bounded(call: Callable[[], Any]) -> BaseException | None:
+    """Run ``call`` on a daemon thread and return what it raised, if anything.
+    A call still running after the deadline (blocked on a FIFO) fails the test;
+    the caller's cleanup then releases the FIFO so the thread can end."""
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            call()
+        except BaseException as exc:
+            raised.append(exc)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout=30)
+    if worker.is_alive():
+        pytest.fail("the call blocked")
+    return raised[0] if raised else None
+
+
+def _lstat_fingerprint(path: Path) -> tuple[int, int, int, int] | None:
+    """What is at ``path``, without opening it: a mode-000 file or a FIFO
+    cannot be read."""
+    try:
+        found = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return found.st_mode, found.st_ino, found.st_size, found.st_mtime_ns
+
+
+def _rejected_file_names(rejected: list[tuple[str, str]]) -> list[str]:
+    return [pattern for pattern, _ in rejected]
+
+
+@pytest.mark.parametrize(("shape", "loader_rejects", "merge_refuses"), _POLICY_FILE_SHAPES)
+def test_the_merge_refuses_every_policy_file_the_loader_rejects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str, loader_rejects: bool,
+    merge_refuses: bool,
+) -> None:
+    """#499: one table of file shapes runs through the coordinator's
+    loader and the start's merge. Every shape the loader records as rejected
+    makes the merge refuse it, unchanged; a directory or FIFO, which the loader
+    reads as no entries without recording it, makes the merge refuse too; a
+    valid list, an empty file and an absent file are merged into, and the
+    loader then reads the glob. Neither call blocks on a FIFO.
+
+    Prevents the two drifting apart unnoticed: a merge that writes into a file
+    the loader rejects replaces every entry in it with only the managed globs,
+    at the start that would otherwise report it. Item-level rejects, such as a
+    non-string entry or ``..``, are outside this seam."""
+    coherence = tmp_path / ".coherence"
+    coherence.mkdir()
+    tracked = coherence / "tracked.yaml"
+    name = policy_module.policy_file_name(tracked)
+    rejected: list[tuple[str, str]] = []
+    with contextlib.ExitStack() as cleanup:
+        _plant_policy_file_shape(tracked, shape, monkeypatch, cleanup)
+        before = _lstat_fingerprint(tracked)
+        loader_raised = _call_bounded(lambda: policy_module._load_yaml_patterns(tracked, rejected))
+        merge_raised = _call_bounded(lambda: merge_policy_globs((tracked,), ("data/**",)))
+        after = _lstat_fingerprint(tracked)
+
+    assert loader_raised is None, repr(loader_raised)
+    loader_rejected = name in _rejected_file_names(rejected)
+    merge_refused = merge_raised is not None
+    if merge_refused:
+        assert getattr(merge_raised, "kind", None) == "policy_file_unloadable", repr(merge_raised)
+    assert merge_refused or not loader_rejected, (
+        f"the loader rejects a {shape} policy file, but the merge wrote into it"
+    )
+    assert (loader_rejected, merge_refused) == (loader_rejects, merge_refuses)
+    if merge_refused:
+        assert after == before
+    else:
+        reread: list[tuple[str, str]] = []
+        assert "data/**" in policy_module._load_yaml_patterns(tracked, reread)
+        assert name not in _rejected_file_names(reread)
+
+
+# ----------------------------------------------------------------------
 # R11 (Unit 6) — ensure_secret bounded O_EXCL retry, fail-closed
 # ----------------------------------------------------------------------
 
