@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import pickle
 import sqlite3
 import statistics
 import sys
@@ -41,17 +42,21 @@ from ccs.adapters.claude_code.coordinator_server import (
     _is_recent_self_commit_lag,
     caller_principal_identity,
     decide_tracked_read,
+    merge_policy_globs,
     session_to_agent_id,
+    write_start_policy,
 )
 from ccs.adapters.claude_code.fs_profile import FoldProfileResult
 from ccs.coordinator.service import ReleaseRequest
 from ccs.core.exceptions import (
     COHERENCE_LINK_KIND,
     HOLD_REASONS,
+    POLICY_FILE_REFUSED_REASON,
     UNAVAILABLE_REASON,
     CoherenceDirRefused,
     CoherenceError,
     InvariantViolationError,
+    PolicyFileRefused,
     StaleReadGeneration,
 )
 from ccs.core.states import MESIState
@@ -4697,6 +4702,333 @@ def test_merge_policy_globs_reports_a_failed_replace_when_removing_its_temp_file
     )
     assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
     _assert_policy_locks_free(tracked, strict)
+
+
+# ----------------------------------------------------------------------
+# The policy writer a volume and a session run before a start (#535)
+# ----------------------------------------------------------------------
+
+
+_SKIP_AS_ROOT = pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root ignores a file's mode",
+)
+
+
+def _refusal_fields(refusal: PolicyFileRefused) -> tuple[str, str, str]:
+    return refusal.kind, refusal.path, str(refusal)
+
+
+def test_write_start_policy_with_no_managed_globs_checks_and_creates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#535: a start that manages no glob has no policy to write. The writer
+    returns at once: it runs no ``.coherence`` check and creates nothing.
+
+    Prevents a volume or session without managed globs creating
+    ``.coherence``, or refusing one, before the lifecycle looks at it."""
+    from ccs.adapters.claude_code import coordinator_server
+
+    def must_not_run(_root: Path) -> None:
+        raise AssertionError("the .coherence check ran with no managed globs")
+
+    monkeypatch.setattr(coordinator_server, "check_coherence_dir", must_not_run)
+
+    write_start_policy(tmp_path, ())
+
+    assert os.listdir(tmp_path) == []
+
+
+def test_write_start_policy_raises_a_refused_coherence_dir_as_itself(tmp_path: Path) -> None:
+    """#535: the writer runs the start's ``.coherence`` check before it reads
+    or writes anything. A link at ``.coherence/hook.secret`` is refused with
+    the check's own :class:`CoherenceDirRefused`, no policy file is written and
+    the file the link names keeps its bytes.
+
+    Prevents a writer that merges through a ``.coherence`` a start refuses,
+    and a refusal re-typed so a volume can no longer route it by type."""
+    coherence = tmp_path / ".coherence"
+    target = plant_link(coherence, "hook.secret", "existing")
+    listing = sorted(os.listdir(coherence))
+
+    with pytest.raises(CoherenceDirRefused) as raised:
+        write_start_policy(tmp_path, ("data/**",))
+
+    assert type(raised.value) is CoherenceDirRefused
+    assert (raised.value.kind, raised.value.path) == (COHERENCE_LINK_KIND, str(coherence / "hook.secret"))
+    assert sorted(os.listdir(coherence)) == listing
+    assert target.read_bytes() == TARGET_BYTES
+
+
+def test_write_start_policy_creates_coherence_at_0700_and_merges_both_files(tmp_path: Path) -> None:
+    """#535: on a fresh workspace the writer creates ``.coherence`` at mode
+    0o700, the mode the lifecycle requires, and both policy files hold the
+    globs, each with its lock file beside it.
+
+    Prevents a looser directory the lifecycle then warns about, and a glob
+    tracked but not strict."""
+    write_start_policy(tmp_path, ("data/**",))
+
+    coherence = tmp_path / ".coherence"
+    assert coherence.stat().st_mode & 0o777 == 0o700
+    assert sorted(os.listdir(coherence)) == [
+        "strict_mode.yaml", "strict_mode.yaml.lock", "tracked.yaml", "tracked.yaml.lock",
+    ]
+    assert yaml.safe_load((coherence / "tracked.yaml").read_text()) == ["data/**"]
+    assert yaml.safe_load((coherence / "strict_mode.yaml").read_text()) == ["data/**"]
+
+
+def test_write_start_policy_refuses_a_file_it_cannot_load_with_the_merge_text(tmp_path: Path) -> None:
+    """#305, #499: a ``tracked.yaml`` that is not valid YAML is refused as a
+    :class:`PolicyFileRefused` of kind ``policy_file_unloadable``, naming the
+    file, with the merge's own text after the root, byte for byte. Neither
+    file is written and no lock file is created.
+
+    Prevents a refusal a caller can tell apart only by its text, and a change
+    to the text the volume and session tests pin."""
+    tracked, strict = _two_policy_files(tmp_path)
+    tracked.write_text("- *.md\n")
+    with pytest.raises(ValueError) as merged:
+        merge_policy_globs((tracked, strict), ("data/**",))
+
+    with pytest.raises(PolicyFileRefused) as raised:
+        write_start_policy(tmp_path, ("data/**",))
+
+    assert _refusal_fields(raised.value) == (
+        "policy_file_unloadable", str(tracked), f"{tmp_path}: {merged.value}",
+    )
+    assert str(raised.value).startswith(f"{tmp_path}: .coherence/tracked.yaml is not valid YAML")
+    assert raised.value.reason == POLICY_FILE_REFUSED_REASON
+    assert tracked.read_text() == "- *.md\n"
+    assert strict.read_text() == '- "docs/**"\n'
+    assert sorted(os.listdir(tracked.parent)) == ["strict_mode.yaml", "tracked.yaml"]
+
+
+@pytest.mark.parametrize("planted", ["directory", "link_after_the_check"])
+def test_write_start_policy_refuses_a_lock_file_that_is_not_regular(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planted: str,
+) -> None:
+    """#534, #535: a directory at ``tracked.yaml.lock`` passes the start's
+    check but cannot be locked, and a link put there after the check is not
+    followed. Each is refused as kind ``policy_lock_not_regular``, naming the
+    lock file, with the routes' text after the root, and neither policy file
+    is written.
+
+    Prevents a raw ``OSError`` out of a start, and a lock taken through a link
+    on a file outside ``.coherence``."""
+    from ccs.adapters.claude_code import coordinator_server
+
+    tracked, strict = _two_policy_files(tmp_path)
+    lock = tracked.parent / "tracked.yaml.lock"
+    outside = tmp_path / "outside.lock"
+    if planted == "directory":
+        lock.mkdir()
+        text = ".coherence/tracked.yaml.lock could not be read (not a regular file); nothing was written."
+    else:
+        real_check = coordinator_server.check_coherence_dir
+
+        def check_then_plant(root: Path) -> None:
+            real_check(root)
+            lock.symlink_to(outside)
+
+        monkeypatch.setattr(coordinator_server, "check_coherence_dir", check_then_plant)
+        text = ".coherence/tracked.yaml.lock is a symlink; nothing was written. Remove the link."
+
+    with pytest.raises(PolicyFileRefused) as raised:
+        write_start_policy(tmp_path, ("data/**",))
+
+    assert _refusal_fields(raised.value) == ("policy_lock_not_regular", str(lock), f"{tmp_path}: {text}")
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+    assert not outside.exists()
+
+
+@_SKIP_AS_ROOT
+def test_write_start_policy_names_coherence_when_it_cannot_create_it(tmp_path: Path) -> None:
+    """#535: a workspace whose root this user cannot write, with no
+    ``.coherence``, is refused as kind ``policy_write_failed`` naming
+    ``.coherence`` and the error, and nothing is created.
+
+    Prevents a raw ``OSError`` out of a volume's constructor, where degrade
+    mode promises to warn."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    os.chmod(root, 0o500)
+    try:
+        with pytest.raises(PolicyFileRefused) as raised:
+            write_start_policy(root, ("data/**",))
+    finally:
+        os.chmod(root, 0o700)
+
+    assert _refusal_fields(raised.value) == (
+        "policy_write_failed", str(root / ".coherence"),
+        f"{root}: .coherence could not be created (EACCES); nothing was written.",
+    )
+    assert os.listdir(root) == []
+
+
+@pytest.mark.parametrize(
+    ("step", "errno_name"), [("created", "EACCES"), ("locked", "ENOLCK")],
+)
+def test_write_start_policy_names_the_lock_file_it_could_not_create_or_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: str, errno_name: str,
+) -> None:
+    """#499, #535: creating ``tracked.yaml.lock`` (a read-only ``.coherence``)
+    or locking it (a file system without ``flock``) fails. The refusal is kind
+    ``policy_write_failed``, names the lock file, the step and the error after
+    the root, and neither policy file is written.
+
+    Prevents a raw ``OSError`` out of a start, and a write without the lock."""
+    import fcntl
+
+    if step == "created" and os.geteuid() == 0:
+        pytest.skip("root ignores the directory's mode")
+    tracked, strict = _two_policy_files(tmp_path)
+    coherence = tracked.parent
+    real_flock = fcntl.flock
+
+    def no_locks(fd: int, operation: int) -> None:
+        if operation & fcntl.LOCK_EX:
+            raise OSError(errno.ENOLCK, "No locks available")
+        real_flock(fd, operation)
+
+    if step == "created":
+        os.chmod(coherence, 0o500)
+    else:
+        monkeypatch.setattr(fcntl, "flock", no_locks)
+    try:
+        with pytest.raises(PolicyFileRefused) as raised:
+            write_start_policy(tmp_path, ("data/**",))
+    finally:
+        os.chmod(coherence, 0o700)
+
+    assert _refusal_fields(raised.value) == (
+        "policy_write_failed", str(coherence / "tracked.yaml.lock"),
+        f"{tmp_path}: .coherence/tracked.yaml.lock could not be {step} ({errno_name}); nothing was written.",
+    )
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+
+
+def test_write_start_policy_writes_neither_file_when_preparing_strict_mode_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#499: writing the ``strict_mode.yaml`` temp fails on a full disk.
+    The refusal is kind ``policy_write_failed``, names ``strict_mode.yaml`` and
+    says nothing was written; neither file changes, no temp file is left and
+    both locks are free.
+
+    Prevents a failed second write leaving the globs tracked but not strict."""
+    tracked, strict = _two_policy_files(tmp_path)
+    _fail_temp_writes(monkeypatch, "strict_mode.yaml.", OSError(errno.ENOSPC, "No space left on device"))
+
+    with pytest.raises(PolicyFileRefused) as raised:
+        write_start_policy(tmp_path, ("data/**",))
+
+    assert _refusal_fields(raised.value) == (
+        "policy_write_failed", str(strict),
+        f"{tmp_path}: .coherence/strict_mode.yaml could not be written (ENOSPC); nothing was written.",
+    )
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+    assert _temp_files(tracked.parent) == []
+    _assert_policy_locks_free(tracked, strict)
+
+
+@pytest.mark.parametrize(
+    ("failing", "cleanup_fails", "outcome"),
+    [
+        ("tracked.yaml", False, "nothing was written."),
+        ("tracked.yaml", True, "nothing was written."),
+        (
+            "strict_mode.yaml", False,
+            ".coherence/tracked.yaml was written and .coherence/strict_mode.yaml was not.",
+        ),
+    ],
+    ids=["tracked", "tracked_and_its_cleanup", "strict_mode_after_tracked"],
+)
+def test_write_start_policy_names_the_file_whose_replace_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing: str, cleanup_fails: bool, outcome: str,
+) -> None:
+    """#499: replacing a policy file fails. The refusal is kind
+    ``policy_write_failed``, names that file and says which file, if any, was
+    already replaced; both locks are free. When removing the temp files fails
+    too, the refusal is still the failed replace.
+
+    Prevents a split pair that nothing reports, and a cleanup error hiding
+    what failed or skipping the unlock."""
+    tracked, strict = _two_policy_files(tmp_path)
+    real_replace, real_unlink = os.replace, os.unlink
+
+    def replace_fails_for_one(src: Any, dst: Any) -> None:
+        if Path(dst).name == failing:
+            raise OSError(errno.EIO, "Input/output error")
+        real_replace(src, dst)
+
+    def unlink_no_temp(path: Any, *args: Any, **kwargs: Any) -> None:
+        if os.fspath(path).endswith(".tmp"):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace_fails_for_one)
+    if cleanup_fails:
+        monkeypatch.setattr(os, "unlink", unlink_no_temp)
+
+    with pytest.raises(PolicyFileRefused) as raised:
+        write_start_policy(tmp_path, ("data/**",))
+
+    assert _refusal_fields(raised.value) == (
+        "policy_write_failed", str(tracked.parent / failing),
+        f"{tmp_path}: .coherence/{failing} could not be written (EIO); {outcome}",
+    )
+    tracked_now = '- "docs/**"\n' if failing == "tracked.yaml" else "- data/**\n- docs/**\n"
+    assert (tracked.read_text(), strict.read_text()) == (tracked_now, '- "docs/**"\n')
+    if not cleanup_fails:
+        assert _temp_files(tracked.parent) == []
+    _assert_policy_locks_free(tracked, strict)
+
+
+def test_write_start_policy_lets_an_error_that_is_not_a_policy_failure_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#535: only the merge's own failures become a refusal. A
+    ``RuntimeError`` from ``yaml.safe_dump`` while the locks are held (a bug,
+    not a policy problem) propagates as itself, after the locks are freed;
+    neither file changes and no temp file is left.
+
+    Prevents a broad catch that turns a bug into a quiet detach in degrade
+    mode."""
+    tracked, strict = _two_policy_files(tmp_path)
+    real_dump = yaml.safe_dump
+
+    def dump_fails_under_the_lock(*args: Any, **kwargs: Any) -> Any:
+        if (tracked.parent / "tracked.yaml.lock").exists():
+            raise RuntimeError("a bug in the writer")
+        return real_dump(*args, **kwargs)
+
+    monkeypatch.setattr(yaml, "safe_dump", dump_fails_under_the_lock)
+
+    with pytest.raises(RuntimeError, match="a bug in the writer") as raised:
+        write_start_policy(tmp_path, ("data/**",))
+
+    assert type(raised.value) is RuntimeError
+    assert tracked.read_text() == strict.read_text() == '- "docs/**"\n'
+    assert _temp_files(tracked.parent) == []
+    _assert_policy_locks_free(tracked, strict)
+
+
+def test_write_start_policy_refusal_pickles_whole(tmp_path: Path) -> None:
+    """#535: a refusal crosses a process boundary with its type, kind, path
+    and text, as a session started in a worker process raises it.
+
+    Prevents a refusal that arrives as a bare ``CoherenceError`` or loses the
+    file it names."""
+    tracked, _ = _two_policy_files(tmp_path)
+    tracked.write_text("plain: mapping\n")
+    with pytest.raises(PolicyFileRefused) as raised:
+        write_start_policy(tmp_path, ("data/**",))
+
+    copy = pickle.loads(pickle.dumps(raised.value))
+
+    assert type(copy) is PolicyFileRefused
+    assert _refusal_fields(copy) == _refusal_fields(raised.value)
+    assert copy.reason == POLICY_FILE_REFUSED_REASON
 
 
 # ----------------------------------------------------------------------

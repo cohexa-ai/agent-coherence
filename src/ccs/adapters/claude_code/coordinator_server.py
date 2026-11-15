@@ -189,6 +189,7 @@ from ccs.core.exceptions import (
     GiverFenced,
     OccCallerTransientError,
     OtherHolder,
+    PolicyFileRefused,
     RegistryLockTimeout,
     SessionInvalidated,
     StaleReadGeneration,
@@ -9948,6 +9949,43 @@ def merge_policy_globs(yaml_paths: Iterable[Path], globs: tuple[str, ...]) -> No
         return
     with _policy_locks(paths, typed_failures=True):
         _write_policy_files(_policy_rewrites(paths, globs))
+
+
+def write_start_policy(root: Path, managed: tuple[str, ...]) -> None:
+    """The policy writer a volume and a session run before they start a
+    coordinator (#535): merge the ``managed`` globs into
+    ``.coherence/tracked.yaml`` and ``.coherence/strict_mode.yaml``, which the
+    coordinator loads once, at start. One writer keeps the ``.coherence``
+    check, the locks and the order in one place.
+
+    In order: return at once, checking and creating nothing, when no glob is
+    managed; run :func:`check_coherence_dir`, whose
+    :class:`~ccs.core.exceptions.CoherenceDirRefused` propagates as itself;
+    create ``.coherence`` at mode 0o700, which the lifecycle requires (an
+    existing one keeps its mode: tightening it is the lifecycle's job); then
+    :func:`merge_policy_globs`, ``tracked.yaml`` before ``strict_mode.yaml``.
+
+    Raises :class:`~ccs.core.exceptions.PolicyFileRefused`, its text
+    ``<root>: <what failed>``, for a policy file that cannot be loaded, a lock
+    file that is not a regular file, and an ``OSError`` creating
+    ``.coherence``, creating or locking a lock file, or writing a policy file.
+    Nothing else is translated: a bug or an interrupt propagates as itself, so
+    that degrade mode never turns it into a quiet detach."""
+    if not managed:
+        return
+    check_coherence_dir(root)
+    coherence_dir = root / ".coherence"
+    try:
+        coherence_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise PolicyFileRefused(
+            POLICY_WRITE_FAILED_KIND, str(coherence_dir),
+            f"{root}: .coherence could not be created ({_errno_name(exc)}); nothing was written.",
+        ) from exc
+    try:
+        merge_policy_globs((coherence_dir / "tracked.yaml", coherence_dir / "strict_mode.yaml"), managed)
+    except (_PolicyFileUnloadable, _PolicyLockNotRegular, _PolicyWriteFailed) as signal:
+        raise PolicyFileRefused(signal.kind, signal.path, f"{root}: {signal}") from signal
 
 
 def _policy_rewrites(yaml_paths: Sequence[Path], globs: tuple[str, ...]) -> list[tuple[Path, str]]:
