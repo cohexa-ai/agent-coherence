@@ -179,7 +179,9 @@ def _grant(registry: object, grant: str, ids: tuple[uuid.UUID, uuid.UUID]) -> No
     """Grant SHARED after a stale read, the way the ``grant`` route does. The
     read route reads the recorded bytes."""
     artifact_id, reader = ids
-    server = SimpleNamespace(registry=registry)  # the grant reads only the registry
+    # The grant reads the registry; a Bash or Grep grant also uses up the
+    # session's strict stale-read recovery, which this marker test does not need.
+    server = SimpleNamespace(registry=registry, take_stale_read_recovery=lambda *_: False)
     if grant == "read":
         _regrant_unless_overtaken(
             server, artifact_id, reader, classified_version=1, tick=2, content_hash=_hash("v1"),
