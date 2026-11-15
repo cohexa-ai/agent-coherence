@@ -44,21 +44,75 @@ Alpha — APIs may change before `v1.0`.
     PATH and a built Node client exists, and falls back to this client only
     otherwise, so most plugin installs keep today's behaviour with the setting
     on until the Node client follows.
-  - **Not yet usable on the read-then-edit path, and not yet measured.** A
-    session that read the file, was refused, and then saw the holder commit
-    stays denied on Read and Edit of that file for the rest of the session, on
-    both coordinators (#514); Claude Code's Edit needs a Read first, so this
-    is the ordinary path. A refused session can still write the file with a
-    shell command (#516). The setting is a workspace file, so a model can turn
-    it off or drop the path from `.coherence/strict_mode.yaml`. How models
-    respond to the deny is not yet measured with real Claude Code sessions,
-    and the setting stays off by default until it is.
+  - **Not yet measured.** A session that read the file, was refused, and then
+    saw the holder commit is denied once more, and its next Read of the file
+    is admitted (#514; see **Fixed**). A refused session can still write the
+    file with a shell command (#516). The setting is a workspace file, so a
+    model can turn it off or drop the path from `.coherence/strict_mode.yaml`.
+    How models respond to the deny is not yet measured with real Claude Code
+    sessions, and the setting stays off by default until it is.
   - The deny texts, the setting's values and the table from coordinator answer
     to outcome ship as fixtures in `tests/fixtures/hook_on_held/`, so another
     hook client can reproduce them byte for byte. The guide's "Refusing a held
     strict file in Claude Code sessions" section has the texts and the details.
 
 ### Changed
+
+- **The strict-mode deny texts for a stale copy say that reading the file
+  again returns the current version, and `CoherentVolume` marks its plain
+  reads (#514).** These go with the recovery under **Fixed**.
+  - **The commit and grant-change texts.** The text for a peer's commit and
+    the text for a revoked grant keep their first sentence, and the rest now
+    reads `Read <path> again with the Read tool: the next Read returns the
+    current version, and edits of <path> are denied until you have read it.`,
+    where it said to re-read the file via the Read tool and that retrying the
+    same operation would produce the same denial. `pre-read`, `pre-edit`,
+    `pre-bash` and `pre-grep` send these two texts, so the Bash and Grep
+    denies no longer say that a retry gets the same denial, which their
+    re-grant had already made false (#242).
+  - **Two texts for a Read that reading again does not clear.** A stale Read
+    whose bytes are not the recorded content, or that carries no hash because
+    the file is gone, gets `Stale read denied: <path> on disk does not match
+    v<n>, the last version committed through the coordinator, and no session
+    committed the change, so it was made outside the coordinator. ...`, which
+    keeps the same-denial sentence, or, while another session holds a write
+    of the file it has not committed, `Stale read denied: another agent is
+    writing <path> and has not committed it yet, so <path> on disk does not
+    match v<n>, the last version committed through the coordinator. Wait for
+    that write to be committed, then Read <path> again with the Read tool.`
+    This coordinator picks the second only when that session was active in
+    the last 5 seconds; the Node coordinator picks it for any such session.
+    The guide's "After a strict-mode stale deny" section quotes all four texts
+    in full.
+  - **The never-read arm.** A session that never read the file, and whose
+    bytes differ from the record, gets the same two texts, where it got the
+    commit text, which named the last committer, or `agent <unknown>` when
+    nobody had committed, as the writer of bytes no session committed.
+  - **Unchanged.** The out-of-band text for a reader that still holds a valid
+    grant, and the handoff giver's deny, keep their bytes. Each text is the
+    same bytes for a given file and event, and the Claude Code plugin's Node
+    coordinator sends the same bytes in plugin releases after 0.7.0.
+  - **Other texts that sent a session to read again.** The sweep's reclaim
+    notice now ends `Read it again with the Read tool before you edit it.`,
+    where it said `Re-fetch via pre-read and retry.`, and the
+    `agent-coherence-transfer` hint after `handoff_not_held` now says that on
+    a strict-mode path the first read is denied and grants nothing, a Claude
+    Code session reads the file again with the Read tool, which grants it once
+    the file holds the last committed bytes, and a volume calls `reacquire()`.
+  - **The volume's marker.** `CoherentVolume.read()` and the `open()` shim
+    send `"want_owner_generation": true`, as the volume's versioned reads
+    already did. Without it they sent what a Claude Code hook read sends, so
+    the recovery would have healed a volume's stale view on its second plain
+    read, and a later `write()` of a buffer built before a peer's commit would
+    have been admitted. With it every volume read keeps the deny that only
+    `reacquire()` clears. The answer gains an `owner_generation` that `read()`
+    does not use.
+  - **Version skew (#629).** A `CoherentVolume` from 0.16.0 or earlier marks
+    none of its plain reads. Reading through a coordinator with the recovery,
+    such as the Claude Code plugin's Node coordinator in plugin releases after
+    0.7.0, its second plain read of a file whose copy went stale is admitted,
+    and a later `write()` of a buffer built before a peer's commit is admitted
+    too. Upgrade the library together with the plugin.
 
 - **The Python coordinator answers `400` to an opted-in `pre-edit` whose
   subagent id is malformed, where it read the id as the parent (#519).** A
@@ -77,6 +131,53 @@ Alpha — APIs may change before `v1.0`.
   0.7.0.
 
 ### Fixed
+
+- **A strict-mode Claude Code session whose copy of a file went stale can read
+  the file again and keep working (#514).** The session's first stale Read or
+  Edit of the file was denied, and so was every Read after it, for the rest of
+  the session, whatever made the copy stale: another session's commit,
+  another session that took the file and let go of it without committing, a
+  grant the coordinator reclaimed, or a commit by one of the session's own
+  subagents. The deny told the session to re-read the file with the Read
+  tool, which could not clear it; only a Bash read run twice, a new session or
+  a new subagent got the file back. The first stale Read or Edit is still
+  denied, and the coordinator now remembers that deny, per agent and file, in
+  memory. The session's next Read of the file is admitted when the bytes it
+  reads are the content the coordinator recorded, or it recorded none: the
+  session is granted a read at the current version and answered
+  `{"status": "fresh", "version": <n>}`, with any queued notices and no stale
+  warning, and its edits of the file are admitted after it. A commit that
+  lands between the deny and that Read costs no second deny: the Read gets the
+  newer version. An Edit or Write sent before that Read is still denied, so a
+  write built from the old copy does not land. A Read of other bytes, or with
+  no hash because the file is gone, stays denied with a text that names what
+  clears it (see **Changed**). The session's next admitted Read or Edit of the
+  file uses the recovery up, one that follows a Bash or Grep read included, so
+  the next time the copy goes stale starts from a deny again. Neither hook
+  client changes. The Claude Code plugin's Node coordinator makes the same
+  change in plugin releases after 0.7.0. A coordinator that was running before
+  the upgrade keeps the old behaviour until it restarts. The guide's "After a
+  strict-mode stale deny" section has the details.
+  - **Only the Claude Code hooks get it.** A `pre-read` that carries
+    `want_owner_generation`, `verify_only` or `name_kind`, whatever its value,
+    keeps the deny across retries and neither starts nor uses up the
+    recovery: `CoherentVolume` and the MCP server built on it, the substrate
+    session, the effect fence's re-validate read and the guide's raw HTTP
+    capture. They recover as before, with `reacquire()` or a new `agent_id`.
+  - **Limits.** The coordinator keeps its record of the deny in memory, so
+    after a coordinator restart the session is denied once more before its
+    Read is admitted. A Read and a Write sent in one message, or a Read of
+    part of the file, counts as reading the current version, so a Write of
+    the whole file built from the old copy can then be admitted (#624). A
+    `CoherentVolume` from 0.16.0 or earlier needs an upgrade (see **Changed**,
+    #629). The hook client's refusal of held strict files
+    (`.coherence/hook_on_held`) stays off by default.
+  - **Caller principal.** `/hooks/pre-read` still admits a request that names
+    a session without its principal, so a caller that names a bound session
+    can now heal that session's stale copy with two pre-reads carrying the
+    hash of the current bytes, as a denied Bash or Grep command already could
+    (#242). `docs/security.md` says so under "Who the coordinator can tell
+    apart".
 
 - **A volume or substrate session merges its globs into the policy files under
   their locks, and reports every policy problem before a start as
