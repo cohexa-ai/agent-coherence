@@ -8,13 +8,14 @@ coordinator.
 The rows are the ones ``tests/test_claude_code_e2e.py`` runs against the
 Python coordinator, written once there: the real hook-client process, one per
 event, on a workspace whose Node coordinator this test starts, so the Node
-coordinator is held to the same deny bytes. The recovery rows run both hook
-clients, this checkout's Python one and the plugin's Node one; the held-file
-refusal runs through the Python client, which is the one that supports it.
-Three rows run there only: a caller principal refused beyond recovery (the
-Node coordinator issues none), an edit the coordinator cannot decide in time
-(its pre-edit has no watchdog), and an MCP server as the holder (the corpus
-jobs install the package without the mcp extra).
+coordinator is held to the same deny texts. Each row runs both hook clients,
+this checkout's Python one and the plugin's Node one, and compares what they
+print parsed. The killed-coordinator row starts its Node coordinator as its own
+process, so that it can kill it rather than stop it. Three rows run there
+only: a caller principal refused beyond recovery (the Node coordinator issues
+none), an edit the coordinator cannot decide in time (its pre-edit has no
+watchdog), and an MCP server as the holder (the corpus jobs install the
+package without the mcp extra).
 
 Marked ``protocol_corpus`` -- opt-in via ``pytest -m protocol_corpus``, in the
 job that builds the paired plugin branch. Without a resolvable plugin dist
@@ -49,8 +50,11 @@ from tests.test_claude_code_e2e import (
     check_a_stale_editor_recovers_by_reading,
     check_a_stale_reader_recovers_after_a_peer_commit,
     check_a_subagent_refused_by_its_parents_hold_is_told_to_report_back,
+    check_an_edit_after_the_coordinator_is_killed_is_denied,
+    check_an_edit_of_a_free_strict_file_is_admitted,
     check_an_edit_of_a_held_file_takes_it_as_today,
     check_plain_volume_reads_after_a_peer_commit_stay_denied,
+    coordinator_process,
     hook_client,
     set_hold_refusal,
     write_strict_workspace,
@@ -60,6 +64,10 @@ pytestmark = pytest.mark.protocol_corpus
 
 _NODE_DIST_PATH = resolve_node_dist_path()
 _CLIENTS = [pytest.param("python", id="python-client"), pytest.param("node", id="node-client")]
+_UNRESOLVABLE = (
+    "Node coordinator dist not resolvable. Build the plugin checkout "
+    "(npm ci && npm run build) or set AGENT_COHERENCE_PLUGIN_DIST_PATH."
+)
 
 
 @pytest.fixture
@@ -67,47 +75,68 @@ def node_workspace(tmp_path: Path) -> Iterator[Path]:
     """``tmp_path`` with the setting on and the strict policy, served by the
     Node coordinator."""
     if _NODE_DIST_PATH is None:
-        pytest.xfail(
-            "Node coordinator dist not resolvable. Build the plugin checkout "
-            "(npm ci && npm run build) or set AGENT_COHERENCE_PLUGIN_DIST_PATH."
-        )
+        pytest.xfail(_UNRESOLVABLE)
     write_strict_workspace(tmp_path)
     with coordinator_running(BACKEND_NODE, tmp_path, _NODE_DIST_PATH):
         assert get(resolve_endpoint(tmp_path), "/status")["backend"] == "node"
         yield tmp_path
 
 
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_an_edit_of_a_strict_file_nobody_holds_is_admitted(node_workspace: Path, client: str) -> None:
+    check_an_edit_of_a_free_strict_file_is_admitted(node_workspace, hook_client(client))
+
+
+@pytest.mark.parametrize("client", _CLIENTS)
 @pytest.mark.parametrize("editor_read", [False, True], ids=["editor-never-read", "editor-read-during-the-hold"])
 def test_an_edit_of_a_strict_file_another_session_holds_is_denied_naming_the_holder(
-    node_workspace: Path, editor_read: bool,
+    node_workspace: Path, editor_read: bool, client: str,
 ) -> None:
-    check_a_held_strict_file_is_refused_naming_its_holder(node_workspace, editor_read)
+    check_a_held_strict_file_is_refused_naming_its_holder(node_workspace, hook_client(client), editor_read)
 
 
+@pytest.mark.parametrize("client", _CLIENTS)
 def test_a_holder_that_stops_without_committing_frees_the_file_for_the_refused_editor(
-    node_workspace: Path,
+    node_workspace: Path, client: str,
 ) -> None:
-    check_a_holder_that_stops_without_committing_frees_the_file(node_workspace)
+    check_a_holder_that_stops_without_committing_frees_the_file(node_workspace, hook_client(client))
 
 
-def test_an_edit_of_a_held_file_that_is_not_strict_takes_it_as_today(node_workspace: Path) -> None:
-    check_an_edit_of_a_held_file_takes_it_as_today(node_workspace, NOTES)
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_an_edit_of_a_held_file_that_is_not_strict_takes_it_as_today(node_workspace: Path, client: str) -> None:
+    check_an_edit_of_a_held_file_takes_it_as_today(node_workspace, hook_client(client), NOTES)
 
 
-def test_a_subagent_refused_by_its_own_parents_hold_is_told_to_report_back(node_workspace: Path) -> None:
-    check_a_subagent_refused_by_its_parents_hold_is_told_to_report_back(node_workspace)
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_a_subagent_refused_by_its_own_parents_hold_is_told_to_report_back(node_workspace: Path, client: str) -> None:
+    check_a_subagent_refused_by_its_parents_hold_is_told_to_report_back(node_workspace, hook_client(client))
 
 
-def test_a_sibling_subagent_is_refused_naming_the_subagent_that_holds_the_file(node_workspace: Path) -> None:
-    check_a_sibling_subagent_is_refused_naming_the_holding_subagent(node_workspace)
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_a_sibling_subagent_is_refused_naming_the_subagent_that_holds_the_file(
+    node_workspace: Path, client: str,
+) -> None:
+    check_a_sibling_subagent_is_refused_naming_the_holding_subagent(node_workspace, hook_client(client))
 
 
+@pytest.mark.parametrize("client", _CLIENTS)
 @pytest.mark.parametrize("setting", [None, "displace\n"], ids=["setting-absent", "setting-displace"])
 def test_with_the_setting_off_an_edit_of_a_held_strict_file_takes_it_as_today(
-    node_workspace: Path, setting: str | None,
+    node_workspace: Path, setting: str | None, client: str,
 ) -> None:
     set_hold_refusal(node_workspace, setting)
-    check_an_edit_of_a_held_file_takes_it_as_today(node_workspace, PLAN)
+    check_an_edit_of_a_held_file_takes_it_as_today(node_workspace, hook_client(client), PLAN)
+
+
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_an_edit_after_the_coordinator_is_killed_is_denied(tmp_path: Path, client: str) -> None:
+    if _NODE_DIST_PATH is None:
+        pytest.xfail(_UNRESOLVABLE)
+    hook = hook_client(client)
+    write_strict_workspace(tmp_path)
+    with coordinator_process(tmp_path, ("node", str(_NODE_DIST_PATH))) as coordinator:
+        assert get(resolve_endpoint(tmp_path), "/status")["backend"] == "node"
+        check_an_edit_after_the_coordinator_is_killed_is_denied(tmp_path, hook, coordinator)
 
 
 @pytest.mark.parametrize("later", _CLIENTS)
@@ -156,5 +185,8 @@ def test_plain_volume_reads_after_a_peer_commit_stay_denied(node_workspace: Path
     check_plain_volume_reads_after_a_peer_commit_stay_denied(node_workspace)
 
 
-def test_an_edit_of_a_strict_file_a_refuse_mode_volume_holds_is_denied_naming_it(node_workspace: Path) -> None:
-    check_a_refuse_mode_volume_holding_a_strict_file_is_named(node_workspace)
+@pytest.mark.parametrize("client", _CLIENTS)
+def test_an_edit_of_a_strict_file_a_refuse_mode_volume_holds_is_denied_naming_it(
+    node_workspace: Path, client: str,
+) -> None:
+    check_a_refuse_mode_volume_holding_a_strict_file_is_named(node_workspace, hook_client(client))

@@ -14,10 +14,10 @@ the scenarios from plan §Unit 8 that can be verified without a live
 - Coordinator-down graceful degradation — kill the process, next hook no-ops
 - Subprocess-spawn integration — full pipeline via real ``agent-coherence-*``
   binaries and a detached coordinator
-- Refusing an edit of a held strict file (#519) -- the real hook-client
-  process, one per event, against a coordinator of the test's own
-- A stale strict reader reading the file again after one deny (#514) -- both
-  real hook clients, this checkout's Python one and the plugin's Node one
+- Refusing an edit of a held strict file (#519), and a stale strict reader
+  reading the file again after one deny (#514) -- both real hook clients,
+  this checkout's Python one and the plugin's Node one, one process per
+  event, against a coordinator of the test's own
 
 Rows that run the plugin's Node hook client are marked ``protocol_corpus``:
 they need a built plugin, whose ``dist/coordinator.js`` the
@@ -48,7 +48,8 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -70,7 +71,12 @@ from ccs.adapters.coherent_volume import CoherentVolume
 from ccs.cli._coherence_client import get, post, resolve_endpoint
 from ccs.core.exceptions import StaleView
 from tests.pid_lock_helpers import write_coordinator_pid_file
-from tests.protocol_corpus.harness import apply_setup, normalize_response, resolve_node_dist_path
+from tests.protocol_corpus.harness import (
+    _wait_for_coordinator,
+    apply_setup,
+    normalize_response,
+    resolve_node_dist_path,
+)
 
 # ----------------------------------------------------------------------
 # Fixtures
@@ -436,19 +442,20 @@ def test_e2e_subprocess_idempotent_second_spawn(workspace: Path) -> None:
 # reading the file again after one deny (#514), through the real hook-client
 # process. Each test starts its own coordinator in a fresh workspace and runs
 # a hook client as Claude Code runs a command hook: one process per event,
-# the payload on stdin. The held-file rows run ``python -m
-# ccs.cli.coherence_hook_client``; the recovery rows run it and the plugin's
-# Node client. The rows written once below as ``check_*`` functions run here
-# against the Python coordinator, and in
-# tests/protocol_corpus/test_hook_client_on_held.py against the Node
-# coordinator, so both are held to the same deny bytes.
+# the payload on stdin. Each row runs ``python -m
+# ccs.cli.coherence_hook_client`` and the plugin's Node client, and compares
+# what they print parsed, because the two space their JSON differently. The
+# rows written once below as ``check_*`` functions run here against the
+# Python coordinator, and in tests/protocol_corpus/test_hook_client_on_held.py
+# against the Node coordinator, so both are held to the same deny texts.
 # ----------------------------------------------------------------------
 
 PLAN = "docs/plan.md"
 NOTES = "docs/notes.md"
 DATA_GLOB = "data/**"
 DATA_PLAN = "data/plan.md"
-ADMIT_LINE = '{"ok": true}\n'
+#: What an admitted edit prints, parsed.
+ADMIT: dict[str, Any] = {"ok": True}
 #: How a volume holder attaches; it never starts a coordinator in these rows.
 VOLUME_CONFIG = LifecycleConfig(
     idle_shutdown_sec=0,
@@ -462,6 +469,8 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 _HOOK_MODULE = "ccs.cli.coherence_hook_client"
 #: Far above one hook process on a loaded machine; no row asserts a time bound.
 _HOOK_TIMEOUT_SEC = 300.0
+#: Far above one coordinator start on a loaded machine.
+_COORDINATOR_START_TIMEOUT_SEC = 60.0
 _WRITE_STATES = ("EXCLUSIVE", "MODIFIED")
 #: FROZEN copies of today's texts, never built by the code under test, with
 #: their timestamps as normalize_response scrubs them.
@@ -481,6 +490,22 @@ _GRANT_CHANGE_DENY_REASON = (
     "— {path} is still at v{version}. Read {path} again with the Read tool: the next Read "
     "returns the current version, and edits of {path} are denied until you have read it."
 )
+_CLAIM_REFUSED_LINE = (
+    "agent-coherence-hook-client: caller principal refused: this session is already bound under a "
+    "different mint nonce; proceeding without a principal and NOT re-minting (routes that require one "
+    "will refuse this session)\n"
+)
+#: What each client prints on stderr for an opted-in edit whose session
+#: another claimant bound first: the refused claim, and, from the Node client
+#: only, the recovery it gave up on.
+_PRINCIPAL_REFUSED_STDERR = {
+    "python": _CLAIM_REFUSED_LINE,
+    "node": _CLAIM_REFUSED_LINE + (
+        "agent-coherence-hook-client: coordinator refused this hook's caller principal "
+        "(caller_principal_absent); this session is bound under a different mint nonce, so nothing "
+        "was re-minted\n"
+    ),
+}
 _OUT_OF_BAND_DENY_REASON = (
     "Stale read denied: {path} on disk does not match v{version}, the last version committed "
     "through the coordinator, and no session committed the change, so it was made outside the "
@@ -522,6 +547,11 @@ class HookClient:
 
     def edit(self, root: Path, caller: Caller, rel: str = PLAN) -> HookRun:
         return self.run(root, "pre-edit", caller.payload(root, rel))
+
+    def take(self, root: Path, caller: Caller, rel: str = PLAN) -> None:
+        """``caller``'s edit of the free file ``rel`` is admitted with no
+        other word, so it holds the file."""
+        assert_hook_output(self.edit(root, caller, rel), ADMIT)
 
 
 #: This checkout's Python hook client.
@@ -604,14 +634,23 @@ def run_hook(root: Path, subcommand: str, cc: dict[str, Any]) -> HookRun:
     return PYTHON_CLIENT.run(root, subcommand, cc)
 
 
-def edit(root: Path, caller: Caller, rel: str = PLAN) -> HookRun:
-    return PYTHON_CLIENT.edit(root, caller, rel)
-
-
-def take(root: Path, caller: Caller, rel: str = PLAN) -> None:
-    """``caller``'s edit of the free file ``rel`` is admitted with no other
-    word, so it holds the file."""
-    assert edit(root, caller, rel) == HookRun(ADMIT_LINE, "")
+@contextmanager
+def coordinator_process(root: Path, command: Sequence[str]) -> Iterator[subprocess.Popen[bytes]]:
+    """A coordinator for ``root`` that this test starts as its own child
+    process, so that a row can SIGKILL it: a clean stop takes the port out of
+    ``server.pid``, and a kill leaves the file naming a port nothing serves.
+    Killed and reaped on the way out if it still runs."""
+    env = {**os.environ, "PYTHONPATH": str(_SRC), "AGENT_COHERENCE_WORKSPACE": str(root)}
+    with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+        try:
+            _wait_for_coordinator(
+                root, timeout_sec=_COORDINATOR_START_TIMEOUT_SEC, proc=process, backend_label=Path(command[0]).name,
+            )
+            yield process
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
 
 
 def write_holders(root: Path, rel: str) -> set[UUID]:
@@ -630,22 +669,30 @@ def grant_holders(root: Path, rel: str) -> set[UUID]:
     return {UUID(row["agent_id"]) for row in status["sessions"] if rel in row.get("states", {})}
 
 
-def _deny_line(deny: dict[str, Any]) -> str:
-    return json.dumps({"hookSpecificOutput": deny}) + "\n"
+def _deny(deny: dict[str, Any]) -> dict[str, Any]:
+    return {"hookSpecificOutput": deny}
 
 
-def held_deny(rel: str, holder: UUID) -> HookRun:
-    """What the hook prints for an edit of ``rel`` refused because ``holder``
-    holds it."""
-    return HookRun(_deny_line(hook_payloads.emit_held_path_deny(path=rel, holder_agent_id=holder.hex)), "")
+def held_deny(rel: str, holder: UUID) -> dict[str, Any]:
+    """What the hook prints, parsed, for an edit of ``rel`` refused because
+    ``holder`` holds it."""
+    return _deny(hook_payloads.emit_held_path_deny(path=rel, holder_agent_id=holder.hex))
 
 
-def parent_deny(rel: str) -> HookRun:
-    return HookRun(_deny_line(hook_payloads.emit_held_by_parent_deny(path=rel)), "")
+def parent_deny(rel: str) -> dict[str, Any]:
+    return _deny(hook_payloads.emit_held_by_parent_deny(path=rel))
 
 
-def unavailable_deny_line(rel: str) -> str:
-    return _deny_line(hook_payloads.emit_admission_unavailable_deny(path=rel))
+def unavailable_deny(rel: str) -> dict[str, Any]:
+    return _deny(hook_payloads.emit_admission_unavailable_deny(path=rel))
+
+
+def assert_hook_output(run: HookRun, expected: dict[str, Any], stderr: str = "") -> None:
+    """``run`` printed one line that parses to ``expected``, so a deny's
+    reason is compared as exact text, and ``stderr`` exactly. Parsed, not as
+    bytes: the Python client prints ``{"ok": true}`` and the Node one
+    ``{"ok":true}``."""
+    assert run.stdout.endswith("\n") and (json.loads(run.stdout), run.stderr) == (expected, stderr), run
 
 
 def todays_collision(rel: str, holder: UUID) -> dict[str, Any]:
@@ -675,55 +722,85 @@ def _ends_ok(run: HookRun) -> None:
     assert json.loads(run.stdout).get("ok") is True and run.stderr == "", run
 
 
-def check_a_held_strict_file_is_refused_naming_its_holder(root: Path, editor_read: bool) -> tuple[Caller, Caller]:
+def check_an_edit_of_a_free_strict_file_is_admitted(root: Path, client: HookClient) -> None:
+    """B's edit of the strict file nobody holds is admitted with no other
+    word, and B holds the file."""
+    editor = Caller.new()
+    client.take(root, editor)
+    assert write_holders(root, PLAN) == {editor.agent_id}
+
+
+def check_a_held_strict_file_is_refused_naming_its_holder(
+    root: Path, client: HookClient, editor_read: bool,
+) -> tuple[Caller, Caller]:
     """A takes the strict file. B, whether it read the file during the hold
     or never read it, is denied naming A, and A still holds the file.
     Returns A and B."""
     holder, editor = Caller.new(), Caller.new()
-    take(root, holder)
+    client.take(root, holder)
     if editor_read:
-        read = run_hook(root, "pre-read", editor.payload(root))
+        read = client.read(root, editor)
         assert _decision(read) != "deny", f"control: the read during the hold is admitted: {read}"
-    assert edit(root, editor) == held_deny(PLAN, holder.agent_id)
+    assert_hook_output(client.edit(root, editor), held_deny(PLAN, holder.agent_id))
     assert write_holders(root, PLAN) == {holder.agent_id}
     return holder, editor
 
 
-def check_a_holder_that_stops_without_committing_frees_the_file(root: Path) -> None:
+def check_a_holder_that_stops_without_committing_frees_the_file(root: Path, client: HookClient) -> None:
     """A lets go of the file by ending its session, with no commit; B's next
     edit is admitted and B holds the file."""
-    holder, editor = check_a_held_strict_file_is_refused_naming_its_holder(root, editor_read=False)
-    _ends_ok(run_hook(root, "session-stop", holder.payload(root)))
-    take(root, editor)
+    holder, editor = check_a_held_strict_file_is_refused_naming_its_holder(root, client, editor_read=False)
+    _ends_ok(client.run(root, "session-stop", holder.payload(root)))
+    client.take(root, editor)
     assert write_holders(root, PLAN) == {editor.agent_id}
 
 
-def check_an_edit_of_a_held_file_takes_it_as_today(root: Path, rel: str) -> None:
+def check_an_edit_of_a_held_file_takes_it_as_today(root: Path, client: HookClient, rel: str) -> None:
     """B's edit of ``rel`` while A holds it is admitted with today's
     concurrent-edit note naming A, and B takes the file from A, as today."""
     holder, editor = Caller.new(), Caller.new()
-    take(root, holder, rel)
-    run = edit(root, editor, rel)
+    client.take(root, holder, rel)
+    run = client.edit(root, editor, rel)
     assert run.stderr == ""
     assert normalize_response(json.loads(run.stdout)) == todays_collision(rel, holder.agent_id)
     assert write_holders(root, rel) == {editor.agent_id}
 
 
-def check_a_subagent_refused_by_its_parents_hold_is_told_to_report_back(root: Path) -> None:
+def check_a_subagent_refused_by_its_parents_hold_is_told_to_report_back(root: Path, client: HookClient) -> None:
     parent = Caller.new()
-    take(root, parent)
-    assert edit(root, parent.subagent_of("sub1")) == parent_deny(PLAN)
+    client.take(root, parent)
+    assert_hook_output(client.edit(root, parent.subagent_of("sub1")), parent_deny(PLAN))
     assert write_holders(root, PLAN) == {parent.agent_id}
 
 
-def check_a_sibling_subagent_is_refused_naming_the_holding_subagent(root: Path) -> None:
+def check_a_sibling_subagent_is_refused_naming_the_holding_subagent(root: Path, client: HookClient) -> None:
     """``sub1`` holds the file and its sibling ``sub2`` edits it: the holder
     deny naming ``sub1``'s own id, not the deny meant for its parent's hold."""
     session = Caller.new()
     first, sibling = session.subagent_of("sub1"), session.subagent_of("sub2")
-    take(root, first)
-    assert edit(root, sibling) == held_deny(PLAN, first.agent_id)
+    client.take(root, first)
+    assert_hook_output(client.edit(root, sibling), held_deny(PLAN, first.agent_id))
     assert write_holders(root, PLAN) == {first.agent_id}
+
+
+def check_an_edit_after_the_coordinator_is_killed_is_denied(
+    root: Path, client: HookClient, coordinator: subprocess.Popen[bytes],
+) -> None:
+    """``coordinator`` admits an edit, then is SIGKILLed, so ``server.pid``
+    still names its port. B's edit of the strict file is denied as one the
+    coordinator could not confirm free; with the setting off, the same edit
+    prints ``{}`` as today."""
+    pid_file = root / ".coherence" / "server.pid"
+    client.take(root, Caller.new())
+    named = pid_file.read_text()
+    coordinator.kill()
+    coordinator.wait()
+    assert pid_file.read_text() == named, "control: the kill left server.pid naming the coordinator's port"
+
+    editor = Caller.new()
+    assert_hook_output(client.edit(root, editor), unavailable_deny(PLAN))
+    set_hold_refusal(root, None)
+    assert_hook_output(client.edit(root, editor), {})
 
 
 def committed_deny(rel: str, writer: UUID) -> str:
@@ -865,7 +942,7 @@ def check_a_refused_reader_recovers_after_the_holder_commits(root: Path, later: 
     the Python client refused B's edit; A commits and ends its session. B's
     calls after that run through ``later``: one stale deny naming A, then an
     admitted Read at v2 and an admitted Edit, and B holds the file."""
-    holder, editor = check_a_held_strict_file_is_refused_naming_its_holder(root, editor_read=True)
+    holder, editor = check_a_held_strict_file_is_refused_naming_its_holder(root, PYTHON_CLIENT, editor_read=True)
     (root / PLAN).write_text("docs/plan.md v2\n")
     _ends_ok(run_hook(root, "post-edit", holder.payload(root)))
     _ends_ok(run_hook(root, "session-stop", holder.payload(root)))
@@ -899,7 +976,7 @@ def check_plain_volume_reads_after_a_peer_commit_stay_denied(root: Path) -> None
         writer.close()
 
 
-def check_a_refuse_mode_volume_holding_a_strict_file_is_named(root: Path) -> None:
+def check_a_refuse_mode_volume_holding_a_strict_file_is_named(root: Path, client: HookClient) -> None:
     """A ``CoherentVolume`` in refuse mode holds a strict file: the hook's
     edit of it is denied naming the volume, which keeps the file and its
     bytes."""
@@ -908,7 +985,7 @@ def check_a_refuse_mode_volume_holding_a_strict_file_is_named(root: Path) -> Non
         volume.write(DATA_PLAN, b"from the volume\n")
         holder = UUID(volume.agent_id)
         assert write_holders(root, DATA_PLAN) == {holder}, "control: the volume holds the file"
-        assert edit(root, Caller.new(), DATA_PLAN) == held_deny(DATA_PLAN, holder)
+        assert_hook_output(client.edit(root, Caller.new(), DATA_PLAN), held_deny(DATA_PLAN, holder))
         assert write_holders(root, DATA_PLAN) == {holder}
         assert (root / DATA_PLAN).read_bytes() == b"from the volume\n"
     finally:
@@ -935,52 +1012,80 @@ def strict_workspace(workspace: Path, strict_server: CoordinatorHTTPServer) -> P
     return workspace
 
 
-@pytest.mark.parametrize("editor_read", [False, True], ids=["editor-never-read", "editor-read-during-the-hold"])
-def test_an_edit_of_a_strict_file_another_session_holds_is_denied_naming_the_holder(
-    strict_workspace: Path, editor_read: bool,
-) -> None:
-    """Prevents a second session taking a strict file from its holder once
-    the workspace asks the hook to refuse held files."""
-    check_a_held_strict_file_is_refused_naming_its_holder(strict_workspace, editor_read)
-
-
-def test_a_holder_that_stops_without_committing_frees_the_file_for_the_refused_editor(
-    strict_workspace: Path,
-) -> None:
-    """Prevents a refusal that outlives the hold it refused for."""
-    check_a_holder_that_stops_without_committing_frees_the_file(strict_workspace)
-
-
-def test_an_edit_of_a_held_file_that_is_not_strict_takes_it_as_today(strict_workspace: Path) -> None:
-    """Prevents the setting reaching a tracked file that is not strict."""
-    check_an_edit_of_a_held_file_takes_it_as_today(strict_workspace, NOTES)
-
-
-def test_a_subagent_refused_by_its_own_parents_hold_is_told_to_report_back(strict_workspace: Path) -> None:
-    """Prevents a subagent told to wait on the session that started it."""
-    check_a_subagent_refused_by_its_parents_hold_is_told_to_report_back(strict_workspace)
-
-
-def test_a_sibling_subagent_is_refused_naming_the_subagent_that_holds_the_file(strict_workspace: Path) -> None:
-    """Prevents a sibling told the file is held by the session that started it."""
-    check_a_sibling_subagent_is_refused_naming_the_holding_subagent(strict_workspace)
-
-
-@pytest.mark.parametrize("setting", [None, "displace\n"], ids=["setting-absent", "setting-displace"])
-def test_with_the_setting_off_an_edit_of_a_held_strict_file_takes_it_as_today(
-    strict_workspace: Path, setting: str | None,
-) -> None:
-    """Prevents the deny reaching a workspace that did not turn it on."""
-    set_hold_refusal(strict_workspace, setting)
-    check_an_edit_of_a_held_file_takes_it_as_today(strict_workspace, PLAN)
-
-
 #: Both hook clients. The Node one needs the plugin's dist, so its rows run
 #: only where the corpus does (see the module docstring).
 HOOK_CLIENTS = [
     pytest.param("python", id="python-client"),
     pytest.param("node", id="node-client", marks=pytest.mark.protocol_corpus),
 ]
+
+
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+def test_an_edit_of_a_strict_file_nobody_holds_is_admitted(strict_workspace: Path, client: str) -> None:
+    """Prevents the refusal denying an edit no other agent stands in the way of."""
+    check_an_edit_of_a_free_strict_file_is_admitted(strict_workspace, hook_client(client))
+
+
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+@pytest.mark.parametrize("editor_read", [False, True], ids=["editor-never-read", "editor-read-during-the-hold"])
+def test_an_edit_of_a_strict_file_another_session_holds_is_denied_naming_the_holder(
+    strict_workspace: Path, editor_read: bool, client: str,
+) -> None:
+    """Prevents a second session taking a strict file from its holder once
+    the workspace asks the hook to refuse held files."""
+    check_a_held_strict_file_is_refused_naming_its_holder(strict_workspace, hook_client(client), editor_read)
+
+
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+def test_a_holder_that_stops_without_committing_frees_the_file_for_the_refused_editor(
+    strict_workspace: Path, client: str,
+) -> None:
+    """Prevents a refusal that outlives the hold it refused for."""
+    check_a_holder_that_stops_without_committing_frees_the_file(strict_workspace, hook_client(client))
+
+
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+def test_an_edit_of_a_held_file_that_is_not_strict_takes_it_as_today(strict_workspace: Path, client: str) -> None:
+    """Prevents the setting reaching a tracked file that is not strict."""
+    check_an_edit_of_a_held_file_takes_it_as_today(strict_workspace, hook_client(client), NOTES)
+
+
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+def test_a_subagent_refused_by_its_own_parents_hold_is_told_to_report_back(
+    strict_workspace: Path, client: str,
+) -> None:
+    """Prevents a subagent told to wait on the session that started it."""
+    check_a_subagent_refused_by_its_parents_hold_is_told_to_report_back(strict_workspace, hook_client(client))
+
+
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+def test_a_sibling_subagent_is_refused_naming_the_subagent_that_holds_the_file(
+    strict_workspace: Path, client: str,
+) -> None:
+    """Prevents a sibling told the file is held by the session that started it."""
+    check_a_sibling_subagent_is_refused_naming_the_holding_subagent(strict_workspace, hook_client(client))
+
+
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+@pytest.mark.parametrize("setting", [None, "displace\n"], ids=["setting-absent", "setting-displace"])
+def test_with_the_setting_off_an_edit_of_a_held_strict_file_takes_it_as_today(
+    strict_workspace: Path, setting: str | None, client: str,
+) -> None:
+    """Prevents the deny reaching a workspace that did not turn it on."""
+    set_hold_refusal(strict_workspace, setting)
+    check_an_edit_of_a_held_file_takes_it_as_today(strict_workspace, hook_client(client), PLAN)
+
+
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+def test_an_edit_after_the_coordinator_is_killed_is_denied(workspace: Path, client: str) -> None:
+    """Prevents an edit admitted unchecked because the coordinator died with
+    the file's holder unknown. The coordinator runs as this test's own
+    process, so that it can be killed rather than stopped."""
+    hook = hook_client(client)
+    write_strict_workspace(workspace)
+    command = (sys.executable, "-m", "ccs.cli.coherence_coordinator", "--_daemonized", "--root", str(workspace))
+    with coordinator_process(workspace, command) as coordinator:
+        check_an_edit_after_the_coordinator_is_killed_is_denied(workspace, hook, coordinator)
 
 
 @pytest.mark.parametrize("later", HOOK_CLIENTS)
@@ -1042,31 +1147,39 @@ def test_plain_volume_reads_after_a_peer_commit_stay_denied(strict_workspace: Pa
     check_plain_volume_reads_after_a_peer_commit_stay_denied(strict_workspace)
 
 
-def test_an_edit_of_a_strict_file_a_refuse_mode_volume_holds_is_denied_naming_it(strict_workspace: Path) -> None:
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+def test_an_edit_of_a_strict_file_a_refuse_mode_volume_holds_is_denied_naming_it(
+    strict_workspace: Path, client: str,
+) -> None:
     """Prevents the hook taking a file a refuse-mode volume holds."""
-    check_a_refuse_mode_volume_holding_a_strict_file_is_named(strict_workspace)
+    check_a_refuse_mode_volume_holding_a_strict_file_is_named(strict_workspace, hook_client(client))
 
 
-def test_an_edit_whose_caller_principal_is_refused_beyond_recovery_is_denied(strict_workspace: Path) -> None:
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
+def test_an_edit_whose_caller_principal_is_refused_beyond_recovery_is_denied(
+    strict_workspace: Path, client: str,
+) -> None:
     """Another claimant bound B's session first, so B's opted-in edit is
     refused for its principal even after the recovery: the unavailable deny,
-    where today's path prints ``{}``. Python coordinator only: the Node
-    coordinator issues no caller principal."""
+    where today's path prints ``{}``. Each client reports its own recovery on
+    stderr. Python coordinator only: the Node coordinator issues no caller
+    principal."""
+    hook = hook_client(client)
     editor = Caller.new()
     claim = {"session_id": editor.session_id, "mint_nonce": secrets.token_urlsafe(24)}
     assert post(resolve_endpoint(strict_workspace), "/principal/claim", claim).get("ok") is True
 
-    refused = edit(strict_workspace, editor)
+    refused = hook.edit(strict_workspace, editor)
     set_hold_refusal(strict_workspace, None)
-    today = edit(strict_workspace, editor)
+    today = hook.edit(strict_workspace, editor)
 
-    assert refused.stdout == unavailable_deny_line(PLAN)
-    assert "caller principal refused" in refused.stderr
-    assert today.stdout == "{}\n"
+    assert_hook_output(refused, unavailable_deny(PLAN), _PRINCIPAL_REFUSED_STDERR[client])
+    assert json.loads(today.stdout) == {}
 
 
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
 def test_an_edit_the_coordinator_cannot_decide_in_time_is_denied(
-    strict_workspace: Path, strict_server: CoordinatorHTTPServer, monkeypatch: pytest.MonkeyPatch,
+    strict_workspace: Path, strict_server: CoordinatorHTTPServer, monkeypatch: pytest.MonkeyPatch, client: str,
 ) -> None:
     """The coordinator's watchdog answers before the edit's check runs: the
     unavailable deny, where today's path admits with a note that the edit
@@ -1075,21 +1188,22 @@ def test_an_edit_the_coordinator_cannot_decide_in_time_is_denied(
     import ccs.adapters.claude_code.coordinator_server as server_mod
     from tests.test_claude_code_coordinator_server import _HeldRegistryLock
 
+    hook = hook_client(client)
     editor = Caller.new()
     # The read claims the session's principal while the registry is free, so
     # the held lock below blocks only the edits' own work.
-    run_hook(strict_workspace, "pre-read", editor.payload(strict_workspace))
+    hook.read(strict_workspace, editor)
     monkeypatch.setattr(server_mod, "HANDLER_TIMEOUT_SEC", 0.25)
     with _HeldRegistryLock(strict_server):
-        refused = edit(strict_workspace, editor)
+        refused = hook.edit(strict_workspace, editor)
         set_hold_refusal(strict_workspace, None)
-        today = edit(strict_workspace, editor)
+        today = hook.edit(strict_workspace, editor)
 
-    assert refused == HookRun(unavailable_deny_line(PLAN), "")
+    assert_hook_output(refused, unavailable_deny(PLAN))
     assert json.loads(today.stdout) == json.loads(json.dumps(server_mod._PRE_EDIT_DEGRADED_RESPONSE))
 
 
-async def _edit_beside_an_mcp_holder(root: Path, logs: Path) -> tuple[HookRun, set[UUID]]:
+async def _edit_beside_an_mcp_holder(root: Path, client: HookClient, logs: Path) -> tuple[HookRun, set[UUID]]:
     """A refuse-mode MCP server writes ``data/plan.md`` and so holds it; the
     hook edits it while the server still runs. Returns the hook's run and
     the holders listed before it."""
@@ -1100,20 +1214,23 @@ async def _edit_beside_an_mcp_holder(root: Path, logs: Path) -> tuple[HookRun, s
         answer = await server.call("swg_write", path=DATA_PLAN, content="from the server\n")
         assert answer.structured == {"ok": True, "path": DATA_PLAN, "opted_in": True}, answer
         holders = write_holders(root, DATA_PLAN)
-        run = await asyncio.to_thread(edit, root, Caller.new(), DATA_PLAN)
+        run = await asyncio.to_thread(client.edit, root, Caller.new(), DATA_PLAN)
         assert write_holders(root, DATA_PLAN) == holders
     return run, holders
 
 
+@pytest.mark.parametrize("client", HOOK_CLIENTS)
 def test_an_edit_of_a_strict_file_a_refuse_mode_mcp_server_holds_is_denied_naming_it(
-    strict_workspace: Path, tmp_path_factory: pytest.TempPathFactory,
+    strict_workspace: Path, tmp_path_factory: pytest.TempPathFactory, client: str,
 ) -> None:
     """Prevents the hook taking a file a refuse-mode MCP server holds. The
     server needs the mcp extra, which the protocol corpus jobs do not install,
-    so this row runs here only."""
+    so this row runs here only, and skips its Node-client case there."""
     pytest.importorskip("mcp.server.fastmcp", reason="the MCP server needs the mcp extra")
-    run, holders = asyncio.run(_edit_beside_an_mcp_holder(strict_workspace, tmp_path_factory.mktemp("mcp-logs")))
+    hook = hook_client(client)
+    logs = tmp_path_factory.mktemp("mcp-logs")
+    run, holders = asyncio.run(_edit_beside_an_mcp_holder(strict_workspace, hook, logs))
 
     (holder,) = holders
-    assert run == held_deny(DATA_PLAN, holder)
+    assert_hook_output(run, held_deny(DATA_PLAN, holder))
     assert (strict_workspace / DATA_PLAN).read_text() == "from the server\n"
