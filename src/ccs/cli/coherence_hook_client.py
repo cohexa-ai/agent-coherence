@@ -123,6 +123,7 @@ from ccs.cli._coherence_client import (
 )
 from ccs.core.disk_spelling import LinkDoesNotResolve
 from ccs.core.exceptions import CallerPrincipalRefused
+from ccs.core.path_fold import FoldProfile
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -339,6 +340,10 @@ def _call(
         return None
 
 
+# A pre-edit payload and the fold profiles under which its path is strict.
+_HeldCandidate = tuple[dict[str, Any], frozenset[FoldProfile]]
+
+
 def _held_strict_answer(cc: Any, root: Path) -> Optional[Any]:
     """With the hold-refusal setting on, what a ``pre-edit`` of a strict path
     prints: the coordinator's admit or deny, or one of the held-file denies.
@@ -359,7 +364,7 @@ def _held_strict_answer(cc: Any, root: Path) -> Optional[Any]:
 
 def _held_strict_candidate(
     cc: Any, root: Path
-) -> Optional[tuple[dict[str, Any], frozenset[str]]]:
+) -> Optional[_HeldCandidate]:
     """The pre-edit payload and the fold profiles under which its path is
     strict, when the setting is on and some profile makes it strict."""
     try:
@@ -383,7 +388,7 @@ def _hold_refusal_on(root: Path) -> bool:
 
 
 def _ask_coordinator(
-    cc: Any, root: Path, candidate: tuple[dict[str, Any], frozenset[str]]
+    cc: Any, root: Path, candidate: _HeldCandidate
 ) -> Optional[Any]:
     """Read the capability, then send the opted-in pre-edit. Raises on any
     failure to reach or read the coordinator, except that no known port takes

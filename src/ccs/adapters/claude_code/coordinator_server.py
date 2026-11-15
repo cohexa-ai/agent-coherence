@@ -949,6 +949,13 @@ def has_subagent_id_field(body: dict) -> bool:
     return raw is not None and raw != ""
 
 
+def has_malformed_subagent_id(body: dict) -> bool:
+    """True iff the body carries a subagent id that is present but does not
+    parse. An opted-in pre-edit refuses one rather than reading it as the
+    parent, and the hook client checks the same rule before it sends one."""
+    return has_subagent_id_field(body) and read_subagent_id(body) is None
+
+
 _MALFORMED_SUBAGENT_ERROR = "agent_id must be 1-64 chars of [A-Za-z0-9_-]"
 """The 400 ``error`` for a present-but-malformed subagent id on a route that
 refuses one rather than reading it as the parent (session-stop, the transfer,
@@ -3585,7 +3592,7 @@ def _handle_pre_edit(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # refusal and the untracked exit, as the effect fence checks it, so both
     # coordinators answer one body for this fault whatever else the request
     # carries. A request that did not opt in keeps reading it as the parent.
-    if opted_in and read_subagent_id(body) is None and has_subagent_id_field(body):
+    if opted_in and has_malformed_subagent_id(body):
         req._json(400, {"error": _MALFORMED_SUBAGENT_ERROR})
         return
     presented = _presented_caller(req, session_id, read_subagent_id(body))

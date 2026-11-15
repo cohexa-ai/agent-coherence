@@ -18,7 +18,7 @@ from typing import Any, get_args
 
 from ccs.adapters.claude_code.coordinator_server import (
     caller_principal_identity,
-    has_subagent_id_field,
+    has_malformed_subagent_id,
     read_subagent_id,
 )
 from ccs.adapters.claude_code.hook_payloads import (
@@ -104,22 +104,23 @@ def strict_profiles(policy: TrackedArtifactPolicy, root: Path, rel: str) -> froz
     candidate; once it knows, the profile's membership decides."""
     if not policy.strict_mode_paths:
         return frozenset()
+    spelling = _disk_spelling_of(root, rel)
     return frozenset(
         profile
         for profile in FOLD_PROFILES
-        if policy.is_strict_mode(rel, _match_context(root, rel, profile))
+        if policy.is_strict_mode(rel, _match_context(profile, spelling))
     )
 
 
-def _match_context(root: Path, rel: str, profile: FoldProfile) -> PolicyMatchContext:
-    return PolicyMatchContext(profile, "file", _disk_spelling_of(root, rel, profile))
+def _match_context(profile: FoldProfile, spelling: str | None) -> PolicyMatchContext:
+    """Only a folding profile reads the disk's spelling; the same spelling
+    serves every folding profile, so it is looked up once."""
+    return PolicyMatchContext(profile, "file", None if profile == "none" else spelling)
 
 
-def _disk_spelling_of(root: Path, rel: str, profile: FoldProfile) -> str | None:
-    """The disk's own spelling of ``rel``, which only a folding profile reads;
-    one it cannot find leaves the other readings, as on the coordinator."""
-    if profile == "none":
-        return None
+def _disk_spelling_of(root: Path, rel: str) -> str | None:
+    """The disk's own spelling of ``rel``; one it cannot find leaves the other
+    readings, as on the coordinator."""
     try:
         return os.path.relpath(native_spelling(root / rel), native_spelling(root))
     except (OSError, ValueError):
@@ -153,7 +154,7 @@ def malformed_subagent_id(cc: dict[str, Any]) -> bool:
     would refuse on an opted-in edit. Absent, null and empty are the parent,
     as on every route; sending a malformed one as the parent would let a
     subagent take its parent's place."""
-    return has_subagent_id_field(cc) and read_subagent_id(cc) is None
+    return has_malformed_subagent_id(cc)
 
 
 def classify_answer(body: object, request: dict[str, Any]) -> str:
