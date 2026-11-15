@@ -36,23 +36,24 @@ full command-line toolset, and the API reference.
 16. [Effect fence over HTTP](#effect-fence-over-http)
 17. [Caller principal](#caller-principal)
 18. [Targeted grant handoff](#targeted-grant-handoff)
-19. [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)
+19. [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)
+20. [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)
     - [Refusing a held strict file in Claude Code sessions](#refusing-a-held-strict-file-in-claude-code-sessions)
-20. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
-21. [Inline benchmark mode](#inline-benchmark-mode)
-22. [Telemetry](#telemetry)
-23. [Graceful degradation](#graceful-degradation)
-24. [Examples](#examples)
-25. [Real-workload benchmarks](#real-workload-benchmarks)
-26. [Benchmarking your own workload](#benchmarking-your-own-workload)
-27. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-28. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
-29. [Replay (v0.8.2+)](#replay-v082)
-30. [Command-line tools](#command-line-tools)
-31. [API reference](#api-reference)
-32. [Low-level adapter API](#low-level-adapter-api)
-33. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-34. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+21. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
+22. [Inline benchmark mode](#inline-benchmark-mode)
+23. [Telemetry](#telemetry)
+24. [Graceful degradation](#graceful-degradation)
+25. [Examples](#examples)
+26. [Real-workload benchmarks](#real-workload-benchmarks)
+27. [Benchmarking your own workload](#benchmarking-your-own-workload)
+28. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+29. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
+30. [Replay (v0.8.2+)](#replay-v082)
+31. [Command-line tools](#command-line-tools)
+32. [API reference](#api-reference)
+33. [Low-level adapter API](#low-level-adapter-api)
+34. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+35. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -3491,10 +3492,14 @@ snapshot, so the pair always describes the same state.
   that identity, so a fence call under another one answers about a grant you do
   not hold.
 - **After a strict-mode deny, capture again under a new `agent_id` with the
-  same `session_id`.** A deny never re-grants, so every later pre-read under the
-  denied identity is refused the same way. Re-read the file, hash it again, and
-  capture and fence under the new `agent_id`, as `CoherentVolume.reacquire()`
-  does. Keeping the `session_id` keeps a claimed caller principal valid.
+  same `session_id`.** A capture's pre-read sends `want_owner_generation`, so
+  its deny stays in place: the deny never re-grants, and every later pre-read
+  under the denied identity is refused the same way. Re-read the file, hash it
+  again, and capture and fence under the new `agent_id`, as
+  `CoherentVolume.reacquire()` does. Keeping the `session_id` keeps a claimed
+  caller principal valid. Only a Claude Code hook read, which sends none of
+  `want_owner_generation`, `verify_only` and `name_kind`, is admitted after one
+  deny; see [After a strict-mode stale deny](#after-a-strict-mode-stale-deny).
 - **Make a hashed pre-read the file's first touch.** The coordinator records a
   file's content claim from the hash on the pre-read that first registers the
   file. A file first registered some other way holds no claim: by a pre-read
@@ -3725,9 +3730,12 @@ grant, record workspace ownership, or hand a session's claims on or settle a
 [handoff](#targeted-grant-handoff) in its name — the things a caller naming the
 wrong session could do to someone else's work. `pre-edit` is among them because
 a grant taken without the principal could then be neither committed nor
-released. The accept-class reads change no grant or version, but they do
-deliver the named session's pending notices, so a read naming the wrong session
-can consume advisories meant for it. The snapshot-session routes are
+released. The accept-class reads move no version and take no write grant, but
+they do deliver the named session's pending notices, so a read naming the wrong
+session can consume advisories meant for it, and the read hooks can re-grant
+the named session a read of a file whose copy went stale, in strict mode too
+(see [security.md](security.md#who-the-coordinator-can-tell-apart)). The
+snapshot-session routes are
 accept-class because each is already gated by the server-issued session token.
 That token is issued to whichever session `/session/begin` names, and that
 route is accept-class too, so a request that presents no principal and names a
@@ -4338,9 +4346,12 @@ and answer as before apart from the giver's shell write, which is denied.
   Handoff: you handed {path} to agent {successor_short} at v{version_at_transfer}, so this session can no longer write it. The handoff ends when agent {successor_short} writes {path}, when agent {successor_short} declines it, or when you withdraw it on your user's or host's instruction. Until the handoff ends, do not change {path} by any route, a shell command included. Stop and report to your user that {path} was handed off.
   ```
 
-  On a strict-mode path this read is not admitted: the transfer left the
-  handed-off claim INVALID, so the Read of the identity that held it gets the
-  ordinary strict-mode stale-view deny, which carries no handoff text.
+  On a strict-mode path the first such read is not admitted: the transfer left
+  the handed-off claim INVALID, so the Read of the identity that held it gets
+  the ordinary strict-mode stale-view deny, which carries no handoff text. Its
+  next Read is admitted, as
+  [After a strict-mode stale deny](#after-a-strict-mode-stale-deny) describes,
+  and carries this text.
 - **The giver**, on a read or edit after the record ended, until the record is
   [evicted](#ended-records-and-eviction), one of:
 
@@ -4414,11 +4425,14 @@ grant ends with its turn, and the session keeps a read of the file:
   edit ends this session's read, and the transfer is refused as
   `handoff_not_held`. On a warn-mode path, have the session read the file
   again: the read gives it a standing read, and a transfer then hands that on
-  (`SHARED`). On a strict-mode path that `Read` is denied by the strict-mode
-  stale-view deny, and the denied read grants nothing. A shell read of the
-  file (`cat`, for example) is denied too, but its deny re-grants a standing
-  read without recording a read of the current version, and a transfer hands
-  that on as `SHARED`.
+  (`SHARED`). On a strict-mode path the first `Read` is denied by the
+  strict-mode stale-view deny, and the denied read grants nothing. The
+  session's next `Read` is admitted once the file holds the last committed
+  bytes, and gives it a standing read that a transfer hands on (`SHARED`); see
+  [After a strict-mode stale deny](#after-a-strict-mode-stale-deny). A shell
+  read of the file (`cat`, for example) is denied too, but its deny re-grants
+  a standing read without recording a read of the current version, and a
+  transfer hands that on as `SHARED`.
 
 ### Handoff commands
 
@@ -4515,14 +4529,17 @@ hint:
 
 ```text
 agent-coherence-transfer: notes.md not transferred (handoff_not_held)
-agent-coherence-transfer: hint: this session holds no claim on notes.md: an earlier transfer of it may have landed, another session may have taken or changed it since this session read it, or this session may never have read it. Check the path's handoff in agent-coherence-status output first: a handoff from this session to that successor made at the version it held, live or ended, means it landed, so do not transfer again, and if it shows another session's handoff, ask before transferring; otherwise have the giver session read notes.md, then transfer it again (on a strict-mode path that read is denied, and grants nothing, when another session took or changed notes.md after this session read it)
+agent-coherence-transfer: hint: this session holds no claim on notes.md: an earlier transfer of it may have landed, another session may have taken or changed it since this session read it, or this session may never have read it. Check the path's handoff in agent-coherence-status output first: a handoff from this session to that successor made at the version it held, live or ended, means it landed, so do not transfer again, and if it shows another session's handoff, ask before transferring; otherwise have the giver session read notes.md, then transfer it again (on a strict-mode path, when another session took or changed notes.md after this session read it, the first read is denied and grants nothing: a Claude Code session reads notes.md again with the Read tool, which grants it once the file holds the last committed bytes, and a volume calls reacquire())
 ```
 
 A session's own earlier edit is not a cause: the end of the turn leaves it a
 read of the file, which a transfer hands on. On a strict-mode path, when
 another session took or changed the file after this session read it, the
-hint's `Read` is denied and grants nothing, as the hint's last clause says;
-see [Claude Code sessions](#claude-code-sessions) for what a shell read does
+hint's first `Read` is denied and grants nothing, and the session's next
+`Read` is admitted once the file holds the last committed bytes, as the hint's
+last clause says; a volume's read stays denied until it calls `reacquire()`
+(see [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)). See
+[Claude Code sessions](#claude-code-sessions) for what a shell read does
 there.
 
 **Python coordinator only.** Against the Claude Code plugin's Node coordinator
@@ -4984,6 +5001,152 @@ route, but it reads the refusal differently on each:
   fence, so an older MCP giver can loop on reacquire and write until its
   client is upgraded.
 
+## After a strict-mode stale deny
+
+On a strict-mode path, a Claude Code session whose copy of a file is out of
+date is denied its next Read or Edit of that file. The copy goes out of date
+when another session commits the file, when another session takes the file for
+writing and lets go of it without committing, when the coordinator reclaims
+the session's grant, or when one of the session's own subagents commits the
+file. On this package's coordinator newer than 0.16.0, and on the Claude Code
+plugin's Node coordinator in plugin releases after 0.7.0, the session gets one
+deny for a stale copy and can then read the file again
+([#514](https://github.com/Cohexa-ai/agent-coherence/issues/514)). Earlier
+coordinators deny every later Read of the file too.
+
+- The first stale Read or Edit of the file is denied, and the deny grants
+  nothing. The coordinator remembers, per agent and file, that it sent it.
+- The session's next Read of the file is admitted when the bytes it reads are
+  the content the coordinator recorded for the current version, or the
+  coordinator recorded no content for the file. The session is granted a read
+  at that version and answered `{"status": "fresh", "version": <n>}`, with any
+  queued notices and no stale warning, and its edits of the file are admitted
+  after it.
+- An Edit or Write sent before that Read is still denied, so a write built
+  from the old copy does not land.
+- A commit that lands between the deny and the Read costs no second deny: the
+  Read returns the newer version, as the deny says it will.
+- The session's next admitted Read or Edit of the file uses the recovery up,
+  one that follows a Bash or Grep read of the file included, so the next time
+  its copy goes out of date starts from a deny again. A Bash or Grep read that
+  re-grants the session a read of the file uses the recovery up as well, so
+  the session's next stale copy is denied again.
+
+**When reading again does not clear it.** A Read whose bytes are not the
+recorded content, or that carries no hash because the file is gone, is not
+admitted: admitting it would record a read of bytes the coordinator never
+recorded, and the session's next Edit would build on them. It is denied, and
+the deny names what clears it:
+
+- while another session holds a write of the file it has not committed, the
+  write-in-flight text below: once that write is committed, the session's next
+  Read is admitted. This package's coordinator picks this text only when that
+  session was active in the last 5 seconds; the Node coordinator picks it for
+  any such session.
+- otherwise, the out-of-band text below: the change was made outside the
+  coordinator, and the read stays denied until the change is committed through
+  the coordinator.
+
+A session that never read the file, and reads bytes that differ from the
+record, is denied with the same two texts, on every Read. It has no copy to
+recover, so its deny starts no recovery.
+
+**The texts.** Each depends only on the file, its version and its last commit,
+so a given file and event always produce the same bytes, on both coordinators.
+`{path}` is the workspace-relative path, `{current_version}` the current
+version, and `{last_writer_short}` and `{last_writer_ts_iso}` the first eight
+characters of the last writer's agent id and the time of its commit. Another
+session committed the file:
+
+```text
+Stale read denied: {path} was updated by agent {last_writer_short} at {last_writer_ts_iso}. Read {path} again with the Read tool: the next Read returns the current version, and edits of {path} are denied until you have read it.
+```
+
+The session's grant was revoked and nothing was committed:
+
+```text
+Stale read denied: your grant on {path} was revoked and no new version was committed — {path} is still at v{current_version}. Read {path} again with the Read tool: the next Read returns the current version, and edits of {path} are denied until you have read it.
+```
+
+The bytes on disk are not the recorded content, and no write is in flight:
+
+```text
+Stale read denied: {path} on disk does not match v{current_version}, the last version committed through the coordinator, and no session committed the change, so it was made outside the coordinator. Do not restore or overwrite {path}: the change may be your user's work. Tell your user that {path} changed outside the coordinator; the read stays denied until the change is committed through the coordinator. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial.
+```
+
+Another session's write is in flight:
+
+```text
+Stale read denied: another agent is writing {path} and has not committed it yet, so {path} on disk does not match v{current_version}, the last version committed through the coordinator. Wait for that write to be committed, then Read {path} again with the Read tool.
+```
+
+`pre-read`, `pre-edit`, `pre-bash` and `pre-grep` send the first two texts for
+a stale copy. They used to end by saying that retrying the same operation would
+produce the same denial. That was false after a strict Bash or Grep deny, which
+re-grants the session a read of the file
+([#242](https://github.com/Cohexa-ai/agent-coherence/issues/242)), and it is
+false after a Read deny now, so it is gone. The denies that stay in place keep
+that sentence: the out-of-band text above, the out-of-band deny of a session
+that still holds a valid grant (see
+[Foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)),
+and the handoff giver's deny (see [Claude Code sessions](#claude-code-sessions)).
+The last two are unchanged. A session that never read the file used to get the
+first text, which named the last committer, or `agent <unknown>` when nobody
+had committed, as the writer of bytes no session committed.
+
+**Which callers keep the deny.** Only Claude Code hook reads recover this way.
+The coordinator tells them apart by the request: a `pre-read` that carries any
+of `want_owner_generation`, `verify_only` and `name_kind`, whatever its value,
+is not a hook read. It keeps a strict deny in place across retries, as before,
+and neither starts nor uses up a session's recovery. Those callers recover
+their own way:
+
+- `CoherentVolume`, and the
+  [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server) built on
+  it: `reacquire()`, or `swg_reacquire`. From the release after 0.16.0 the
+  volume's plain `read()` and its `open()` shim send
+  `"want_owner_generation": true`, as its versioned reads already did, so every
+  volume read keeps the deny. The answer gains an `owner_generation` that
+  `read()` does not use.
+- the [substrate session](#byo-substrate-bindings-coherentrow-coherentobject)
+  (`CoherentRow`, `CoherentObject`), which sends `name_kind`: `reacquire()`.
+- the effect fence's re-validate read, which sends `verify_only`: reacquire and
+  decide again.
+- the [raw HTTP capture](#capturing-the-comparands), which sends
+  `want_owner_generation`: capture again under a new `agent_id`.
+
+**Limits.**
+
+- The coordinator keeps its record of the deny in memory. After a coordinator
+  restart the session is denied once more, and the Read after that is
+  admitted. A coordinator that was running before the upgrade keeps the old
+  behaviour until it restarts.
+- A Read and a Write sent in one message, or a Read of part of the file, counts
+  as reading the current version, so a Write of the whole file built from the
+  old copy can then be admitted
+  ([#624](https://github.com/Cohexa-ai/agent-coherence/issues/624)). Have
+  sessions read a strict file whole, in a message of its own, before they
+  write it.
+- A `CoherentVolume` from 0.16.0 or earlier marks none of its plain reads.
+  Reading through a coordinator that has this recovery, such as the plugin's
+  Node coordinator in plugin releases after 0.7.0, its second plain read of a
+  file whose copy went stale is admitted, and a later `write()` of a buffer
+  built before a peer's commit is admitted too
+  ([#629](https://github.com/Cohexa-ai/agent-coherence/issues/629)). Upgrade
+  the library together with the plugin.
+- The hook client's
+  [refusal of held strict files](#refusing-a-held-strict-file-in-claude-code-sessions)
+  (`.coherence/hook_on_held`) stays off by default. A session it refused,
+  which then sees the holder commit, recovers the same way: one deny, then a
+  Read.
+- `pre-read` admits a request that names a session without its
+  [caller principal](#caller-principal), so a caller that names a bound session
+  can heal that session's stale copy with at most two pre-reads: the first, of
+  any bytes, starts the recovery unless the deny of that session's own stale
+  Read or Edit already did, and the second carries the hash of the recorded
+  bytes, or any bytes when the coordinator recorded no content for the file;
+  see [security.md](security.md#who-the-coordinator-can-tell-apart).
+
 ## Acquire-or-fail on `pre-edit`
 
 An ordinary `POST /hooks/pre-edit` grants EXCLUSIVE to whoever asks, except the
@@ -5121,7 +5284,7 @@ keeps none of them. A refuse-mode `CoherentVolume` types each answer for you; se
 | Node coordinator: the store is busy before the grant, or (rarely) fails after it | `{"ok": false, "reason": "internal: SqliteError"}`; nothing is granted unless the failure came after the grant | none | back off, then release |
 | the path is not tracked | `{"ok": true}`, unchecked; it may carry re-grounding context | none, or `watchdog_timeouts_total` when delivering that context times out, which still answers `{"ok": true}` | proceed; the path is outside this contract (see **What it does not close**) |
 | Python coordinator: the caller is the giver of a live handoff of the path | the `handed_off` deny | `handoff_giver_denials_total` | stop: no retry clears it |
-| the path is in strict mode and the caller's read is stale | the strict deny: `"status": "stale"`, a deny in `hookSpecificOutput`, and no top-level `reason` | `strict_mode_denials_total` and `stale_warning_emitted_total` | re-read under a new `agent_id` with the same `session_id`, then send again: a deny never re-grants the identity it denied |
+| the path is in strict mode and the caller's read is stale | the strict deny: `"status": "stale"`, a deny in `hookSpecificOutput`, and no top-level `reason` | `strict_mode_denials_total` and `stale_warning_emitted_total` | re-read, then send again: a Claude Code session's next Read of the file is admitted once it reads the recorded bytes (see [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)); a client whose `pre-read` sends `want_owner_generation`, `verify_only` or `name_kind` keeps the deny, which never re-grants its identity, so it re-reads under a new `agent_id` with the same `session_id` |
 | another agent holds the path EXCLUSIVE or MODIFIED; on the Node coordinator, one whose grant is less than 1800 s old or has no recorded grant time | `other_holder` | `pre_edit_other_holder_denials_total` | back off; once admitted, re-read the file before writing |
 | Node coordinator: another agent has held the path EXCLUSIVE or MODIFIED for 1800 s or more | the plain admit, with no collision warning: the coordinator reclaims that grant in the same decision (see **On the Node coordinator**) | none | proceed |
 | no other agent holds the path EXCLUSIVE or MODIFIED | the admit an ordinary `pre-edit` gets, but never with a collision warning: the decision displaced nobody, even when a holder let go just before it | as for an ordinary `pre-edit` | proceed |
@@ -5173,10 +5336,15 @@ one. Poll with backoff rather than wait for a signal.
   keeps the state it had: a reader stays a reader, and a caller with no record
   on the path gets none. While no other agent has taken or written the path
   since, the caller's next `pre-edit` is not denied as stale. A caller another
-  agent's acquire or commit left INVALID stays INVALID, and on a strict-mode
-  path a deny never re-grants that identity, so its next `pre-edit`, and every
-  later read under it, gets the strict deny. Re-read under a new `agent_id`
-  with the same `session_id`, as the
+  agent's acquire or commit left INVALID stays INVALID, so on a strict-mode
+  path its next `pre-edit` gets the strict deny. After that deny, a `pre-read`
+  of the path that carries none of `want_owner_generation`, `verify_only` and
+  `name_kind`, as a Claude Code hook read does, is admitted once it reads the
+  recorded bytes (see
+  [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)). A
+  `pre-read` that carries one of them never re-grants that identity, and every
+  later read under it gets the strict deny, so such a client re-reads under a
+  new `agent_id` with the same `session_id`, as the
   [capture rule](#capturing-the-comparands) and `CoherentVolume.reacquire()`
   do. In warn mode a caller can still edit a path another agent changed since
   its last read, and that `pre-edit` takes the grant; if the edit then fails
@@ -5405,8 +5573,10 @@ coordinator in these ways:
   A new kind of deny on the edit path is shown to the model and changes how it
   retries, and this one is not yet measured with real Claude Code sessions, so
   it stays off by default until it is. A session that read the file and was
-  refused is locked out of it once the holder commits
-  ([#514](https://github.com/Cohexa-ai/agent-coherence/issues/514)).
+  refused is denied once more after the holder commits, and its next Read of
+  the file is admitted
+  ([#514](https://github.com/Cohexa-ai/agent-coherence/issues/514); see
+  [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)).
 - On the Python coordinator's hook surface, any process that can read
   `.coherence/` can read another session's principal. The refusal separates
   writers that follow the protocol; it does not stop one that deliberately
@@ -5565,12 +5735,16 @@ above says why.
 **What it does not cover.** The limits under **What it does not close** above
 apply, and:
 
-- **A refused session that read the file is locked out once the holder
+- **A refused session that read the file is denied once more after the holder
   commits ([#514](https://github.com/Cohexa-ai/agent-coherence/issues/514)).**
   A session that read the file, was refused, and then saw the holder commit
-  stays denied on Read and Edit of that file for the rest of the session, on
-  both coordinators. Claude Code's Edit needs a Read of the file first, so
-  this is the ordinary path, and the setting is not yet usable there.
+  has a stale copy, so its next Read or Edit of the file is denied. Its next
+  Read after that deny is admitted at the holder's version, and its edits are
+  admitted after it (see
+  [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)). This
+  package's coordinator newer than 0.16.0 and the Node coordinator in plugin
+  releases after 0.7.0 do this; on earlier coordinators the session stays
+  denied on Read and Edit of that file for the rest of the session.
 - **Shell writes still land
   ([#516](https://github.com/Cohexa-ai/agent-coherence/issues/516)).** A
   refused session can write the file with a shell command; the deny does not
@@ -6396,9 +6570,12 @@ no commit of its own to explain them, is told so:
   than the last session that committed. It tells the session not to restore or
   overwrite the file, since the change may be its user's work, and to tell its
   user: the read stays denied until the change is committed through the
-  coordinator. A session whose grant another session's `pre-edit` revoked is
-  not told this; that writer went through the coordinator, and the deny says
-  the grant was revoked, as before;
+  coordinator. A session whose grant another session's `pre-edit` revoked
+  holds no valid grant, so it gets the stale-copy denies instead: the deny
+  says the grant was revoked while the file still holds the recorded bytes,
+  and once that session's uncommitted bytes are on disk, it says that session
+  is writing the file and to read it again after the write is committed (see
+  [After a strict-mode stale deny](#after-a-strict-mode-stale-deny));
 - its `pre-edit` reads the file itself and, when it no longer holds the recorded
   content, adds `"disk_differs": true` and the same sentence. It skips the check
   while another session holds a write it has not committed and was active in

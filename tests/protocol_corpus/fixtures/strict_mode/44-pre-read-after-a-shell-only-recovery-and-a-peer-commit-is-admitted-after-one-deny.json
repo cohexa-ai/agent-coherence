@@ -1,0 +1,125 @@
+{
+  "name": "pre-read-after-a-shell-only-recovery-and-a-peer-commit-is-admitted-after-one-deny",
+  "description": "#514: the same steps as fixture 43, whose Read of the v3 bytes is denied with the commit text. That deny arms A's recovery again, so A's next Read of the same bytes is admitted on the fresh arm at v3, with no stale warning and no summary: one deny per stale copy.",
+  "setup": {
+    "tracked": [
+      "plan.md"
+    ],
+    "strict_mode": [
+      "plan.md"
+    ],
+    "files": {
+      "plan.md": "# Plan\nv1\n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "plan.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md",
+          "content_hash": "fd34c2c2ce75b1f7c8df6ff05bd1ff8b9be3a25e8bb1d76b1d3a5a78f47db59c"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md",
+          "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f",
+          "success": true
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "plan.md",
+          "content_hash": "ad0f2f1b1e8d8c5a8c2e6f4b0d3a7b5e9c8f1e2d3a4b5c6d7e8f9a0b1c2d3e4f"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-bash",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "command": "cat plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-bash",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "command": "cat plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit",
+        "body": {
+          "session_id": "bbbbbbbb-0000-4000-8000-000000000002",
+          "path": "plan.md",
+          "content_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+          "success": true
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+          "path": "plan.md",
+          "content_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/hooks/pre-read",
+    "body": {
+      "session_id": "aaaaaaaa-0000-4000-8000-000000000001",
+      "path": "plan.md",
+      "content_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "status": "fresh",
+      "version": 3
+    }
+  },
+  "backends": [
+    "python",
+    "node"
+  ]
+}

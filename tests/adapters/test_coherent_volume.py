@@ -1983,6 +1983,31 @@ def test_strict_deny_is_sticky_bare_read_does_not_recover(
         stop_coordinator(tmp_path)
 
 
+def test_plain_reads_of_a_stale_strict_file_stay_denied_and_the_old_buffer_is_refused(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """#514: the coordinator admits a Claude Code session's second Read after a
+    stale deny, and a plain read() posts the same request shape, so the volume
+    marks its reads as not a hook's. B read v1 and A committed v2: B's plain
+    read() twice leaves B INVALID on the coordinator both times, and a write()
+    of a buffer B built from v1 is refused, so A's commit is not overwritten.
+    Recovery stays reacquire(). Fails if a plain read heals the INVALID row."""
+    target = _seed(tmp_path, content=b"v1")
+    vol_a, vol_b = _pair(tmp_path, fast_cfg)
+    try:
+        stale_buffer = vol_b.read("data/shared.txt") + b"\nappended-by-B"
+        vol_a.write("data/shared.txt", b"v2-from-A")  # B -> INVALID
+
+        for _ in range(2):
+            assert vol_b.read("data/shared.txt") == b"v2-from-A"
+            assert _held(vol_b, _agent_id(vol_b)) == {}, "a plain read healed the stale view"
+        with pytest.raises(StaleView):
+            vol_b.write("data/shared.txt", stale_buffer)
+        assert target.read_bytes() == b"v2-from-A"
+    finally:
+        stop_coordinator(tmp_path)
+
+
 def test_reacquire_recovers_then_write_succeeds(
     tmp_path: Path, fast_cfg: LifecycleConfig
 ) -> None:

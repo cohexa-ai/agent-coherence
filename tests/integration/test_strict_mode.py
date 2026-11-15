@@ -186,11 +186,13 @@ def _setup_stale(client: _Client, path: str) -> None:
 
 
 def test_pre_read_strict_tracked_stale_denies(strict_client: _Client) -> None:
-    """Read on a strict + tracked + stale artifact returns deny + static reason."""
+    """Read on a strict + tracked + stale artifact returns deny + static reason.
+    The Read hashes what B committed, which is what the disk holds after B's
+    commit, so the reason is the stale-copy text: read the file again."""
     _setup_stale(strict_client, "CLAUDE.md")
     status, body = strict_client.post(
         "/hooks/pre-read",
-        {"session_id": _sid("A"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+        {"session_id": _sid("A"), "path": "CLAUDE.md", "content_hash": _hash("v2")},
     )
     assert status == 200
     out = body["hookSpecificOutput"]
@@ -199,7 +201,7 @@ def test_pre_read_strict_tracked_stale_denies(strict_client: _Client) -> None:
     assert "permissionDecisionReason" in out
     reason = out["permissionDecisionReason"]
     assert "CLAUDE.md" in reason
-    assert "Re-read" in reason
+    assert "Read CLAUDE.md again with the Read tool" in reason
 
 
 # ----------------------------------------------------------------------
@@ -776,6 +778,23 @@ def test_strict_mode_deny_reason_template_is_static() -> None:
     )
 
 
+@pytest.mark.parametrize("name", [
+    "GRANT_CHANGE_DENY_REASON_TEMPLATE",
+    "OUT_OF_BAND_DENY_REASON_TEMPLATE",
+    "STALE_OUT_OF_BAND_DENY_REASON_TEMPLATE",
+    "WRITE_IN_FLIGHT_DENY_REASON_TEMPLATE",
+])
+def test_every_other_stale_read_deny_template_is_static(name: str) -> None:
+    """Static deny text for the other stale-read denies too (#278, #514): each
+    interpolates only the path and the current version, so its bytes are
+    stable per file and event. Fails if any of them gains a per-invocation
+    field."""
+    from ccs.adapters.claude_code import hook_payloads
+
+    template = getattr(hook_payloads, name)
+    assert set(re.findall(r"\{([a-z_]+)\}", template)) == {"path", "current_version"}, template
+
+
 def test_pre_read_strict_deny_ignores_want_owner_generation(
     strict_client: _Client,
 ) -> None:
@@ -856,7 +875,7 @@ def test_a_real_commit_still_denies_with_the_write_wording(
     _setup_stale(strict_client, "CLAUDE.md")
     status, body = strict_client.post(
         "/hooks/pre-read",
-        {"session_id": _sid("A"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+        {"session_id": _sid("A"), "path": "CLAUDE.md", "content_hash": _hash("v2")},
     )
     assert status == 200
     reason = body["hookSpecificOutput"]["permissionDecisionReason"]
@@ -869,19 +888,25 @@ def test_a_real_commit_still_denies_with_the_write_wording(
 def test_grant_handover_deny_is_byte_stable_across_retries(
     strict_client: _Client,
 ) -> None:
-    """KTD-T still holds on the new arm: retrying reproduces the same bytes.
+    """KTD-T still holds on the new arm: every deny of the same event carries
+    the same bytes -- the Read's, the Edit's sent before reading again, and
+    each retry of a caller whose deny stays in place (here a read carrying the
+    generation opt-in, as a CoherentVolume sends it). A hook Read's retry is
+    admitted since #514, so it is not one of them.
 
     The grant-change reason interpolates only the path and the current
     version, so unlike the write arm it carries no timestamp at all.
     """
     _setup_grant_handover(strict_client, "CLAUDE.md")
     reasons = set()
-    for _ in range(4):
+    for extra in ({}, {"want_owner_generation": True}, {"want_owner_generation": True}):
         _, body = strict_client.post(
             "/hooks/pre-read",
-            {"session_id": _sid("A"), "path": "CLAUDE.md", "content_hash": _hash("v1")},
+            {"session_id": _sid("A"), "path": "CLAUDE.md", "content_hash": _hash("v1"), **extra},
         )
         reasons.add(body["hookSpecificOutput"]["permissionDecisionReason"])
+    _, edit = strict_client.post("/hooks/pre-edit", {"session_id": _sid("A"), "path": "CLAUDE.md"})
+    reasons.add(edit["hookSpecificOutput"]["permissionDecisionReason"])
     assert len(reasons) == 1, reasons
 
 
@@ -990,7 +1015,8 @@ def test_denied_pre_bash_then_a_grant_handover_still_reports_the_write(
     _take_grant_without_committing(strict_coordinator, strict_client, "plan.md")
 
     status, body = strict_client.post(
-        "/hooks/pre-read", {"session_id": _sid("A"), "path": "plan.md"},
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "plan.md", "content_hash": _hash("v2")},
     )
     assert status == 200
     assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
@@ -1236,7 +1262,8 @@ def test_a_bash_retry_then_a_grant_handover_reports_no_write(
     _take_grant_without_committing(strict_coordinator, strict_client, "plan.md")
 
     status, body = strict_client.post(
-        "/hooks/pre-read", {"session_id": _sid("A"), "path": "plan.md"},
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "plan.md", "content_hash": _hash("v2")},
     )
     assert status == 200
     assert body["hookSpecificOutput"]["permissionDecision"] == "deny", body
@@ -1301,7 +1328,8 @@ def test_a_grep_after_a_denied_bash_does_not_count_as_reading_the_file(
 
     _take_grant_without_committing(strict_coordinator, strict_client, "plan.md")
     _, read = strict_client.post(
-        "/hooks/pre-read", {"session_id": _sid("A"), "path": "plan.md"},
+        "/hooks/pre-read",
+        {"session_id": _sid("A"), "path": "plan.md", "content_hash": _hash("v2")},
     )
     assert read["hookSpecificOutput"]["permissionDecision"] == "deny", read
     reason = read["hookSpecificOutput"]["permissionDecisionReason"]
@@ -1697,10 +1725,9 @@ def test_the_givers_strict_pre_read_deny_carries_no_handoff_prose(tmp_path: Path
         "permissionDecision": "deny",
         "permissionDecisionReason": (
             "Stale read denied: your grant on notes.md was revoked and no new "
-            "version was committed — notes.md is still at v1. Re-read notes.md "
-            "via the Read tool before proceeding. This denial is structural "
-            "(v0.2 strict mode); retrying the same operation will produce the "
-            "same denial."
+            "version was committed — notes.md is still at v1. Read notes.md "
+            "again with the Read tool: the next Read returns the current version, "
+            "and edits of notes.md are denied until you have read it."
         ),
     }
 
@@ -1745,10 +1772,9 @@ _GIVER_SHELL_READ: dict[bool, dict] = {
             "permissionDecision": "deny",
             "permissionDecisionReason": (
                 "Stale read denied: your grant on notes.md was revoked and no new "
-                "version was committed — notes.md is still at v1. Re-read notes.md "
-                "via the Read tool before proceeding. This denial is structural "
-                "(v0.2 strict mode); retrying the same operation will produce the "
-                "same denial."
+                "version was committed — notes.md is still at v1. Read notes.md "
+                "again with the Read tool: the next Read returns the current version, "
+                "and edits of notes.md are denied until you have read it."
             ),
         },
         "status": "stale",

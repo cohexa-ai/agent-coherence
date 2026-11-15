@@ -150,7 +150,7 @@
           "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
-            "permissionDecisionReason": "Stale read denied: docs/plan.md was updated by agent bc3013e1 at 2025-11-13T12:00:00+00:00. Re-read docs/plan.md via the Read tool before proceeding. This denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial."
+            "permissionDecisionReason": "Stale read denied: docs/plan.md was updated by agent bc3013e1 at 2025-11-13T12:00:00+00:00. Read docs/plan.md again with the Read tool: the next Read returns the current version, and edits of docs/plan.md are denied until you have read it."
           },
           "status": "stale",
           "summary": {

@@ -186,6 +186,26 @@ What follows from that:
   session id can find a matching principal; there the principal exposes a client
   that never claimed or presents the wrong principal, but does not tell sessions
   apart.
+- The read hooks, `/hooks/pre-read`, `/hooks/pre-bash` and `/hooks/pre-grep`,
+  admit a request that names a session without its principal, even a session
+  that claimed one, and refuse one that presents another principal. A
+  pre-read drains the named session's pending notices into its own answer, and
+  in warn mode a stale pre-read re-grants the session a read of the file and
+  uses up its stale warning. In strict mode, from the release after 0.16.0, a
+  Claude Code read of a stale copy is denied once and the next read whose
+  bytes are the recorded content is admitted (see
+  [After a strict-mode stale deny](guide.md#after-a-strict-mode-stale-deny)).
+  So a caller that names a bound session without its principal can heal that
+  session's stale copy with at most two pre-reads: the first, of any bytes,
+  starts the recovery unless the deny of that session's own stale Read or
+  Edit already did, and the second carries the hash of the recorded bytes, or
+  any bytes when the coordinator recorded no content for the file. A
+  strict-mode write route then admits that session's next edit, whatever copy
+  it was built from. A denied Bash or Grep command already
+  re-grants a stale copy
+  ([#242](https://github.com/Cohexa-ai/agent-coherence/issues/242)), so the
+  read hooks keep admitting a request without a principal. Under the trust
+  model above this grants nothing the secret does not.
 - The [handoff commands](guide.md#handoff-commands) (`agent-coherence-transfer`,
   `-accept`, `-decline`, `-withdraw`) act as the Claude Code session they name,
   through `--session` or the `CLAUDE_CODE_SESSION_ID` variable Claude Code sets

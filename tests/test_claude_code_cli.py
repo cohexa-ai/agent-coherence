@@ -1974,9 +1974,11 @@ _NOT_HELD_HINT = (
     "session to that successor made at the version it held, live or ended, "
     "means it landed, so do not transfer again, and if it shows another "
     "session's handoff, ask before transferring; otherwise have the giver "
-    "session read plan.md, then transfer it again (on a strict-mode path that "
-    "read is denied, and grants nothing, when another session took or changed "
-    "plan.md after this session read it)"
+    "session read plan.md, then transfer it again (on a strict-mode path, when "
+    "another session took or changed plan.md after this session read it, the "
+    "first read is denied and grants nothing: a Claude Code session reads "
+    "plan.md again with the Read tool, which grants it once the file holds the "
+    "last committed bytes, and a volume calls reacquire())"
 )
 
 _VERB_RUNS = {
