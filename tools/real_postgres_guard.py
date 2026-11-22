@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import xml.etree.ElementTree as ET
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 from types import MappingProxyType
@@ -69,7 +70,9 @@ ALLOWED_SKIP = MappingProxyType(
         (_TIERS, "test_real_s3_native_cas_conformance"): "CCS_REAL_S3_BUCKET",
     }
 )
-_SKIP_OUTCOMES = {"pytest.skip": "skipped", "pytest.xfail": "xfailed", "": "untyped skip"}
+PASSED = "passed"
+SKIPPED = "skipped"
+_SKIP_OUTCOMES = {"pytest.skip": SKIPPED, "pytest.xfail": "xfailed", "": "untyped skip"}
 
 
 class Report(NamedTuple):
@@ -93,7 +96,7 @@ def to_report(case: ET.Element) -> Report:
             return Report(key, outcome, child.get("message", ""))
     skipped = case.find("skipped")
     if skipped is None:
-        return Report(key, "passed", "")
+        return Report(key, PASSED, "")
     skip_type = skipped.get("type", "")
     return Report(key, _SKIP_OUTCOMES.get(skip_type, f"skip of type {skip_type}"), skipped.get("message", ""))
 
@@ -121,20 +124,18 @@ def judge_one(report: Report) -> str | None:
     node = node_name(report.key)
     seen = f"{report.outcome}: {report.message}" if report.message else report.outcome
     if report.key in MUST_PASS:
-        return None if report.outcome == "passed" else f"{node}: must pass, but {seen}"
+        return None if report.outcome == PASSED else f"{node}: must pass, but {seen}"
     reason = ALLOWED_SKIP.get(report.key)
     if reason is None:
         return f"{node}: unclassified ({seen}); add it to MUST_PASS or ALLOWED_SKIP in this tool"
-    if report.outcome == "skipped" and reason in report.message:
+    if report.outcome == SKIPPED and reason in report.message:
         return None
     return f"{node}: may skip only for {reason}, but {seen}"
 
 
 def judge(reports: Sequence[Report]) -> list[str]:
     """Every problem with the run, in report order; empty when the run proves what it must."""
-    counts: dict[tuple[str, str], int] = {}
-    for report in reports:
-        counts[report.key] = counts.get(report.key, 0) + 1
+    counts = Counter(report.key for report in reports)
     expected = MUST_PASS | ALLOWED_SKIP.keys()
     findings = [f"{node_name(key)}: reported {count} times" for key, count in counts.items() if count > 1]
     findings += [f"{node_name(key)}: missing from the report" for key in sorted(expected - counts.keys())]
