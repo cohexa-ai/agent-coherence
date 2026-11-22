@@ -627,16 +627,33 @@ def test_it_trigger_authority_ignores_client_new_version(real_pg) -> None:
 
 @pytest.mark.real_substrate
 def test_it_foreign_write_moves_version_agent_cas_fails(real_pg) -> None:
+    """A separate Postgres session moves the row from version 1 to 2 after the
+    agent read it: the agent's compare-and-set at 1 is refused and names 2, and
+    write() raises the conflict with both versions.
+
+    It does not prove the outside write is detected before the agent writes:
+    only that the refusal names the version that overtook it. The outsider is a
+    separate session in the same OS process, not another process or host, and
+    the test covers the binding alone, not the coordinated session, a write to a
+    different key, or a Postgres-backed registry."""
     dsn, table = real_pg
     import psycopg  # noqa: PLC0415
 
     agent = CoherentRow(table=table, dsn=dsn)
     _bytes, token = agent.read("row1")
+    assert token == "1"
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:  # a non-agent writer
         cur.execute(f'UPDATE "{table}" SET value = %s WHERE id = %s', (b"foreign", "row1"))
         conn.commit()
-    with pytest.raises(CasVersionConflict):
+
+    outcome = agent.cas_write("row1", expected_token=token, new_bytes=b"from-agent")
+    assert isinstance(outcome, CasConflict)
+    assert outcome.current_token == "2"
+
+    with pytest.raises(CasVersionConflict) as raised:
         agent.write("row1", expected_token=token, new_bytes=b"from-agent")
+    assert raised.value.expected_version == 1
+    assert raised.value.current_version == 2
 
 
 @pytest.mark.real_substrate

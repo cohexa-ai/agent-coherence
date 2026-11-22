@@ -891,3 +891,112 @@ def test_the_weekly_run_rides_out_a_failing_run_listing(tmp_path: Path) -> None:
     """A transient API error while looking for the run is retried until the deadline."""
     proc, _, _ = _run_weekly_step(tmp_path, FAKE_RUN_APPEARS="1", FAKE_CONCLUSION="success", FAKE_LIST_FAILS="2")
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+# The job that runs the gated real-substrate tests against a real Postgres.
+# It is advisory: not a required check, and nothing needs it.
+REAL_PG_JOB = "real-postgres"
+REAL_PG_NAME = "Real Postgres"
+REAL_PG_TIMEOUT_MINUTES = 15
+REAL_PG_PYTEST_TIMEOUT_MINUTES = 10
+# A tag can be moved to another build; a digest cannot. Dependabot does not
+# bump a service image, so a new Postgres is a deliberate edit here and in ci.yml.
+REAL_PG_IMAGE = "postgres:17.12-trixie@sha256:223efeb196329b55b3b9a13db144956411dbc18e727e59f681c3e0aede6475cf"
+DIGEST_PINNED_POSTGRES = re.compile(r"^postgres:[^@\s]+@sha256:[0-9a-f]{64}$")
+# Over TCP: a bare pg_isready can pass against the image's socket-only init
+# server before the server the tests connect to is up.
+REAL_PG_HEALTH_CMD = '--health-cmd "pg_isready -h 127.0.0.1 -p 5432 -U postgres"'
+REAL_PG_INSTALL = 'python -m pip install -e ".[dev,coherent-row]"'
+REAL_PG_DSN = "postgresql://postgres@127.0.0.1:5432/postgres"
+REAL_PG_RUN_STEP = "Run the gated tests against Postgres"
+REAL_PG_GUARD_STEP = "Check that the gated tests ran"
+REAL_PG_UPLOAD_STEP = "Upload the test report"
+REAL_PG_REPORT = "real-postgres/junit.xml"
+# Frozen on purpose, like FOLDING_SUITES: tests/test_real_postgres_guard.py runs
+# the same two files to check the guard's tables, and a file added here without
+# its tests classified there turns the job red as "unclassified".
+REAL_PG_FILES = frozenset({"tests/adapters/test_coherent_row.py", "tests/conformance/test_tier_honesty.py"})
+REAL_PG_PYTEST_ARGS = (
+    "pytest", "-v", "-rs", "--tb=short", "-m", "real_substrate", "-n", "0", f"--junitxml={REAL_PG_REPORT}",
+)
+# Each would turn an expected skip into a failure: the job has no limited role
+# and no real bucket.
+REAL_PG_UNSET_VARIABLES = ("CCS_TEST_PG_LIMITED_DSN", "CCS_REAL_S3_BUCKET")
+
+
+def _real_pg_steps() -> list[dict[str, Any]]:
+    return _jobs()[REAL_PG_JOB]["steps"]
+
+
+def _real_pg_step(name: str) -> dict[str, Any]:
+    steps = _real_pg_steps()
+    return steps[_index_of(steps, lambda step: step.get("name") == name)]
+
+
+def test_the_real_postgres_job_is_advisory_and_needs_nothing() -> None:
+    """Not a required check, so a red run never blocks a merge by itself; and
+    with no ``needs`` either way, it neither waits on nor holds up another job."""
+    jobs = _jobs()
+    job = jobs[REAL_PG_JOB]
+    assert job["name"] == REAL_PG_NAME
+    assert REAL_PG_NAME not in REQUIRED_CHECKS
+    assert len(REQUIRED_CHECKS) == REQUIRED_CHECK_COUNT
+    assert "needs" not in job
+    assert all(REAL_PG_JOB not in _needs(other) for other in jobs.values())
+    assert job["timeout-minutes"] == REAL_PG_TIMEOUT_MINUTES
+    assert _real_pg_step(REAL_PG_RUN_STEP)["timeout-minutes"] == REAL_PG_PYTEST_TIMEOUT_MINUTES
+
+
+def test_the_real_postgres_service_is_pinned_by_digest_and_waits_for_tcp() -> None:
+    """One Postgres service, its image pinned by digest, trusted local auth so no
+    password or secret exists, and a health check over TCP."""
+    assert DIGEST_PINNED_POSTGRES.match(REAL_PG_IMAGE)
+    job = _jobs()[REAL_PG_JOB]
+    assert list(job["services"]) == ["postgres"]
+    service = job["services"]["postgres"]
+    assert service["image"] == REAL_PG_IMAGE
+    assert service["env"] == {"POSTGRES_HOST_AUTH_METHOD": "trust"}
+    assert service["ports"] == ["5432:5432"]
+    assert REAL_PG_HEALTH_CMD in service["options"]
+    assert not any("secrets." in text for text in _strings(job))
+
+
+def test_the_real_postgres_job_runs_the_gated_files_and_nothing_narrows_it() -> None:
+    """The install brings psycopg; the pytest step runs both frozen files with
+    the fixed options only, and its environment holds exactly the DSN. Nothing
+    in the job names a variable that would make an expected skip run."""
+    assert REAL_PG_INSTALL in _real_pg_step("Install library + Postgres driver")["run"].splitlines()
+    step = _real_pg_step(REAL_PG_RUN_STEP)
+    tokens = step["run"].split()
+    paths = [token for token in tokens if token.startswith("tests/")]
+    assert sorted(paths) == sorted(REAL_PG_FILES)
+    assert [token for token in tokens if not token.startswith("tests/")] == list(REAL_PG_PYTEST_ARGS)
+    for path in paths:
+        assert (REPO_ROOT / path).is_file(), path
+    assert step["env"] == {"CCS_TEST_PG_DSN": REAL_PG_DSN}
+    job = _jobs()[REAL_PG_JOB]
+    assert "env" not in job
+    assert [s.get("name") for s in job["steps"] if "env" in s] == [REAL_PG_RUN_STEP]
+    for variable in REAL_PG_UNSET_VARIABLES:
+        assert not any(variable in text for text in _strings(job)), variable
+
+
+def test_the_real_postgres_guard_judges_every_run_and_nothing_swallows_a_failure() -> None:
+    """A pytest exit of 0 with every test skipped would pass, so the guard reads
+    the report after pytest, even a failed pytest; ``continue-on-error`` or a
+    job ``if:`` would turn a red run green or skip it. The report's artifact
+    name stays outside the shard gate's download pattern."""
+    job = _jobs()[REAL_PG_JOB]
+    assert "continue-on-error" not in job and "if" not in job
+    steps = _real_pg_steps()
+    for step in steps:
+        assert "continue-on-error" not in step, f"{step.get('name')!r} can swallow a failure"
+    conditions = {step.get("name"): step["if"] for step in steps if "if" in step}
+    assert conditions == {REAL_PG_GUARD_STEP: "${{ !cancelled() }}", REAL_PG_UPLOAD_STEP: "${{ always() }}"}
+    guard = _real_pg_step(REAL_PG_GUARD_STEP)
+    assert guard["run"] == f"python3 tools/real_postgres_guard.py --junit-xml {REAL_PG_REPORT}"
+    names = [step.get("name") for step in steps]
+    assert names.index(REAL_PG_RUN_STEP) < names.index(REAL_PG_GUARD_STEP) < names.index(REAL_PG_UPLOAD_STEP)
+    upload = _real_pg_step(REAL_PG_UPLOAD_STEP)["with"]
+    assert upload["path"] == REAL_PG_REPORT
+    assert not upload["name"].startswith("test-results-")

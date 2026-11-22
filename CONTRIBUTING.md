@@ -127,7 +127,7 @@ select opt-in suites that a default run leaves out:
 |---|---|
 | `protocol_corpus` | A built plugin checkout (see below) |
 | `live_api` | `OPENAI_API_KEY` and/or `MISTRAL_API_KEY`; calls paid APIs |
-| `real_substrate` | A real Postgres and S3, with credentials |
+| `real_substrate` | A real Postgres and S3, with credentials; CI runs the Postgres tests of two files (see "Real Postgres" below) |
 | `launch_gate`, `launch_gate_pilot`, `launch_gate_strict`, `launch_gate_pilot_matrix` | A live `claude` CLI; calls paid APIs |
 
 `pyproject.toml` describes each marker in full.
@@ -151,6 +151,40 @@ before it can merge:
 A pull request whose changes touch no TLA+ input skips the TLC run. The model
 check takes several minutes per bin, so run it when you change
 `formal/tla/` or the behaviour a specification models.
+
+### Real Postgres
+
+One more check, **Real Postgres**, runs on every pull request but is not
+required. It starts a Postgres server pinned by image digest and runs the
+`real_substrate` tests in `tests/adapters/test_coherent_row.py` and
+`tests/conformance/test_tier_honesty.py` with only `CCS_TEST_PG_DSN` set. Those
+tests skip themselves without their variables, so a guard,
+`tools/real_postgres_guard.py`, then reads the run's JUnit report: each test it
+lists as must-pass has to have passed, and each test it allows to skip has to
+have skipped for the reason it names. A red run does not block a merge by
+itself, but it fails the weekly full run and stops Dependabot updates from
+merging themselves.
+
+To run it locally, use a Postgres you can throw away and a separate virtual
+environment for psycopg, so the main `.venv` keeps matching what the default
+CI jobs install:
+
+```bash
+docker run -d --name ccs-pg-local -p 127.0.0.1:55432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:17.12-trixie
+until docker exec ccs-pg-local pg_isready -h 127.0.0.1 -U postgres; do sleep 1; done
+python3 -m venv /tmp/ccs-pg-venv && /tmp/ccs-pg-venv/bin/pip install -e ".[dev,coherent-row]"
+CCS_TEST_PG_DSN=postgresql://postgres@127.0.0.1:55432/postgres /tmp/ccs-pg-venv/bin/pytest -m real_substrate -n 0 --junitxml=/tmp/real-postgres.xml tests/adapters/test_coherent_row.py tests/conformance/test_tier_honesty.py
+python3 tools/real_postgres_guard.py --junit-xml /tmp/real-postgres.xml
+docker rm -f ccs-pg-local
+```
+
+To add a file to the job, name it in the job's pytest step and in the two
+lists that pin those files (`REAL_PG_FILES` in
+`tests/test_ci_workflow_structure.py`, `JOB_FILES` in
+`tests/test_real_postgres_guard.py`), then classify each of its gated tests in
+the guard's `MUST_PASS` or `ALLOWED_SKIP`. A test goes in `ALLOWED_SKIP` only
+when it cannot run in the job as written, with an explicit skip on a variable
+the job does not set.
 
 ### Protocol corpus
 

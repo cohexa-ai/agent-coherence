@@ -574,6 +574,74 @@ jobs:
           AGENT_COHERENCE_PLUGIN_DIST_PATH: ${{ github.workspace }}/_plugin_checkout/dist/coordinator.js
         run: pytest -m protocol_corpus -v --tb=short
 
+  # Every real-substrate test skips itself without its credentials, so the
+  # other jobs never run the Postgres binding against a real server. This one
+  # does. A pytest exit of 0 would also pass with every test skipped, so the
+  # guard then fails the job unless each test it names as must-pass passed
+  # and only the two it allows skipped, for their stated reasons
+  # (tools/real_postgres_guard.py). Not a required check; like the corpus
+  # job it needs nothing.
+  real-postgres:
+    name: Real Postgres
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        # Pinned by digest, since a tag can move to another build.
+        image: postgres:17.12-trixie@sha256:223efeb196329b55b3b9a13db144956411dbc18e727e59f681c3e0aede6475cf
+        env:
+          # No password, so no secret: the server lives only as long as the job.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        # Over TCP: a bare pg_isready can pass against the image's
+        # socket-only init server, before the real one accepts connections.
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -p 5432 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install library + Postgres driver
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,coherent-row]"
+
+      # Only the owner DSN is set: the limited-role test and the real S3 arm
+      # need a role and a bucket this job does not have, and skip.
+      - name: Run the gated tests against Postgres
+        timeout-minutes: 10
+        env:
+          CCS_TEST_PG_DSN: postgresql://postgres@127.0.0.1:5432/postgres
+        run: >-
+          pytest -v -rs --tb=short -m real_substrate -n 0
+          --junitxml=real-postgres/junit.xml
+          tests/adapters/test_coherent_row.py
+          tests/conformance/test_tier_honesty.py
+
+      # Runs after a pytest failure too, so the log names every test that
+      # did not do what the guard requires.
+      - name: Check that the gated tests ran
+        if: ${{ !cancelled() }}
+        run: python3 tools/real_postgres_guard.py --junit-xml real-postgres/junit.xml
+
+      - name: Upload the test report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: real-postgres-junit
+          path: real-postgres/junit.xml
+          retention-days: 14
+
   build:
     name: Build Package
     runs-on: ubuntu-24.04
