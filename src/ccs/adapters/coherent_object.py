@@ -355,8 +355,8 @@ class S3PutOutcome(Enum):
       have landed; reconcile by re-reading before doing anything else.
 
     ``CONFLICT`` / ``RETRYABLE`` / ``RACED_DELETE`` all map to the contract's
-    :class:`~ccs.adapters.substrate.CasConflict` (no write landed); ``UNKNOWN``
-    maps to :class:`~ccs.adapters.substrate.CasUnknown`.
+    :class:`~ccs.adapters.substrate.CasConflict` (no write landed, no token
+    reported); ``UNKNOWN`` maps to :class:`~ccs.adapters.substrate.CasUnknown`.
     """
 
     WON = "won"
@@ -393,6 +393,8 @@ def _cas_result_for_outcome(outcome: S3PutOutcome) -> CasWriteResult:
         # retryable/raced-delete distinction that a landed-nothing conflict carries
         # is preserved by classify_put_exception for callers that branch on it.
         return CasUnknown()
+    # No token to report: a 412, 409 or 404 response carries no current ETag,
+    # and fetching one would be a second read at a later time.
     return CasConflict()
 
 
@@ -519,7 +521,8 @@ class CoherentObject:
         write lands only if the object is absent). Returns a typed outcome: a win
         carries the ETag minted BY S3 for this write (from the response, never
         computed); a 412/409/404 is a :class:`~ccs.adapters.substrate.CasConflict`
-        (no write landed); a connect/timeout/ambiguous failure is a
+        (no write landed, and ``current_token`` is ``None``); a
+        connect/timeout/ambiguous failure is a
         :class:`~ccs.adapters.substrate.CasUnknown` — the write may or may not have
         landed, so reconcile via :meth:`reconcile_after_unknown` before anything else.
         """

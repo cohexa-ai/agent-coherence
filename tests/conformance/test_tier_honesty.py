@@ -20,16 +20,21 @@ import os
 import pytest
 
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig
+from ccs.adapters.substrate import CasConflict
 from tests.conformance.substrate_conformance import (
+    ConformanceSubstrate,
     CoordinatorHarness,
     InMemoryBinding,
     assert_abort_after_partial_visibility,
+    assert_comparand_echoing_binding_is_rejected,
+    assert_conflict_reports_a_read_back_token,
     assert_coordinator_retention_empty,
     assert_detect_only_silent_lost_update,
     assert_forward_only_honest,
     assert_read_pair_split_binding_is_rejected,
     assert_rejects_split_comparand,
     assert_split_view_is_rejected,
+    assert_successor_computing_binding_is_rejected,
     run_native_cas_conformance,
 )
 
@@ -99,6 +104,78 @@ def test_read_pair_atomicity_control_rejects_split_binding() -> None:
     native-CAS run) fails a split-read binding — a (bytes, token) pair fetched in
     two substrate reads, not one."""
     assert_read_pair_split_binding_is_rejected()
+
+
+def test_the_kit_substrate_reports_the_token_read_back_after_a_refusal() -> None:
+    """Two outside writes move the artifact past the agent's token; the refused
+    compare-and-set reports exactly what a read returns afterwards."""
+    binding = InMemoryBinding("row")
+    binding.seed("ref", b"seed")
+    view = binding.make_view()
+    _bytes, stale = view.read("ref")
+    binding.foreign_write("ref", b"outside-1")
+    binding.foreign_write("ref", b"outside-2")
+    _bytes, moved = binding.make_view().read("ref")
+    outcome = view.cas_write("ref", expected_token=stale, new_bytes=b"mine")
+    assert isinstance(outcome, CasConflict)
+    assert outcome.current_token == moved != stale
+
+
+class _NoTokenSubstrate(ConformanceSubstrate):
+    """A binding that never reports a token, as every binding did before the
+    field existed."""
+
+    def cas_write(self, artifact_ref: str, *, expected_token: str, new_bytes: bytes):  # noqa: ANN201
+        outcome = super().cas_write(artifact_ref, expected_token=expected_token, new_bytes=new_bytes)
+        return CasConflict() if isinstance(outcome, CasConflict) else outcome
+
+
+class _NoTokenBinding(InMemoryBinding):
+    def make_view(self) -> _NoTokenSubstrate:
+        return _NoTokenSubstrate(self._store, self._arm)
+
+
+def test_a_binding_that_reports_no_token_still_conforms() -> None:
+    assert_conflict_reports_a_read_back_token(_NoTokenBinding("object"), None)  # type: ignore[arg-type]
+
+
+class _EchoingSubstrate(ConformanceSubstrate):
+    """Reports the comparand it lost with as the current token."""
+
+    def cas_write(self, artifact_ref: str, *, expected_token: str, new_bytes: bytes):  # noqa: ANN201
+        outcome = super().cas_write(artifact_ref, expected_token=expected_token, new_bytes=new_bytes)
+        return CasConflict(current_token=expected_token) if isinstance(outcome, CasConflict) else outcome
+
+
+class _EchoingBinding(InMemoryBinding):
+    def make_view(self) -> _EchoingSubstrate:
+        return _EchoingSubstrate(self._store, self._arm)
+
+
+def test_every_native_cas_run_checks_the_refusal_token(harness: CoordinatorHarness) -> None:
+    """The refusal token check is part of the native-CAS run, so every arm (the
+    fakes, real Postgres, real S3, an outside binding) is held to it."""
+    with pytest.raises(AssertionError, match="expected None or the token read after the refusal"):
+        run_native_cas_conformance(_EchoingBinding("object"), harness)
+
+
+def test_the_kit_substrate_reports_no_token_for_a_missing_artifact() -> None:
+    view = InMemoryBinding("object").make_view()
+    outcome = view.cas_write("never-seeded", expected_token="tok-1", new_bytes=b"mine")
+    assert isinstance(outcome, CasConflict)
+    assert outcome.current_token is None
+
+
+def test_refusal_token_check_rejects_a_binding_that_echoes_the_comparand() -> None:
+    """MANDATORY teeth: a refusal that reports the token the caller lost with
+    invites re-driving the stale comparand, so the check must fail it."""
+    assert_comparand_echoing_binding_is_rejected()
+
+
+def test_refusal_token_check_rejects_a_binding_that_computes_the_token() -> None:
+    """MANDATORY teeth: a refusal that reports the token after the comparand,
+    without reading, is wrong once the artifact moved twice."""
+    assert_successor_computing_binding_is_rejected()
 
 
 def test_detect_only_forced_silent_lost_update() -> None:

@@ -27,7 +27,7 @@ import os
 import secrets
 import urllib.error
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeAlias, runtime_checkable
@@ -94,11 +94,22 @@ class CasWritten:
 
 @dataclass(frozen=True)
 class CasConflict:
-    """LOSS: the substrate rejected the compare-and-set — the token moved.
+    """LOSS: the substrate rejected the compare-and-set.
 
     No write landed. Recovery is a fresh read (bytes and token from ONE read),
     re-derive, retry; the stale comparand must never be re-driven.
+
+    ``current_token`` is a token the binding read AFTER the refusal, for logs and
+    diagnostics. A REPORT value only — nothing may seed a later comparand from
+    it: it arrives without the bytes it vouches for, and another write may land
+    after the read. It may be this caller's own earlier write. It is never the
+    ``expected_token`` the caller lost with. ``None`` means the binding could not
+    report one, never "unchanged": S3 refusals carry no current ETag, the row or
+    object may be gone, the read may fail, a read that returns the expected token
+    is not reported, and a binding may not read at all.
     """
+
+    current_token: SubstrateToken | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -282,8 +293,9 @@ class CoherenceSubstrate(Protocol):
 
         The comparison is the SUBSTRATE'S atomic conditional write, never a
         client-side check-then-write. Returns a typed outcome: a win carries
-        the newly minted token; a conflict means no write landed; an unknown
-        outcome means unconfirmed and must be reconciled by re-read.
+        the newly minted token; a conflict means no write landed, and may
+        report a token read after the refusal (never the ``expected_token``);
+        an unknown outcome means unconfirmed and must be reconciled by re-read.
         """
         ...
 

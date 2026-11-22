@@ -29,6 +29,7 @@ import subprocess
 import sys
 import threading
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,7 @@ import ccs.adapters.substrate as substrate_module
 from ccs.adapters.claude_code.coordinator_server import CoordinatorHTTPServer
 from ccs.adapters.claude_code.fs_profile import FoldProfileResult
 from ccs.adapters.claude_code.lifecycle import LifecycleConfig, stop_coordinator
+from ccs.adapters.coherent_row import CoherentRow
 from ccs.adapters.substrate import (
     CasConflict,
     CasUnknown,
@@ -64,6 +66,8 @@ from ccs.core.exceptions import (
     ViewWedged,
 )
 from ccs.core.substrate import CapabilityDescriptor, Tier
+from ccs.testing.substrate_conformance import ConformanceSubstrate, InMemoryBinding
+from tests.adapters.test_coherent_row import _FakeConnection
 from tests.coherence_link_helpers import plant_link
 from tests.coordinator_helpers import serve_in_process
 from tests.loopback_helpers import refused_endpoint, refusing_port
@@ -2640,4 +2644,83 @@ def test_a_2xx_that_is_not_an_object_is_unreachable_on_a_read_and_unconfirmed_on
     finally:
         httpd.shutdown()
         httpd.server_close()
+        stop_coordinator(tmp_path)
+
+
+# --- the refusal result: what a lost compare-and-set reports ------------------
+
+
+def test_a_refusal_reports_no_token_unless_the_binding_read_one() -> None:
+    assert CasConflict().current_token is None
+
+
+def test_a_refusal_takes_its_token_by_keyword_only() -> None:
+    """A positional token reads like the comparand the caller lost with, so the
+    field refuses one."""
+    with pytest.raises(TypeError):
+        CasConflict("5")  # type: ignore[misc]
+
+
+def test_a_refusal_with_a_token_is_not_equal_to_a_bare_refusal() -> None:
+    """Callers that compared a result with ``CasConflict()`` must use isinstance
+    once a binding reports the token; both stay hashable."""
+    reported = CasConflict(current_token="6")
+    assert reported != CasConflict()
+    assert reported == CasConflict(current_token="6")
+    assert len({reported, CasConflict()}) == 2
+
+
+def _kit_producer() -> tuple[ConformanceSubstrate, Callable[[bytes], None], Callable[[], str]]:
+    binding = InMemoryBinding("row")
+    binding.seed(REF, b"seed")
+    return binding.make_view(), lambda data: binding.foreign_write(REF, data), lambda: binding.make_view().read(REF)[1]
+
+
+def _row_producer() -> tuple[CoherentRow, Callable[[bytes], None], Callable[[], str]]:
+    conn = _FakeConnection({REF: (b"seed", 1)})
+    row = CoherentRow(table="workspace_rows", connection=conn)
+
+    def write_outside(data: bytes) -> None:  # an UPDATE that skips the binding; the trigger bumps the version
+        conn.rows[REF] = (data, conn.rows[REF][1] + 1)
+
+    return row, write_outside, lambda: row.read(REF)[1]
+
+
+@pytest.mark.parametrize("outside_writes", [1, 2])
+@pytest.mark.parametrize("make_producer", [_kit_producer, _row_producer], ids=["kit-substrate", "coherent-row"])
+def test_an_outside_write_reaches_the_agents_refused_cas_by_value(
+    make_producer: Callable[[], tuple[object, Callable[[bytes], None], Callable[[], str]]], outside_writes: int
+) -> None:
+    """A writer outside the binding moves the artifact past the agent's token;
+    the agent's compare-and-set at that token is refused and reports the token a
+    read returns afterwards, through a shipped binding."""
+    view, write_outside, read_back = make_producer()
+    _bytes, stale = view.read(REF)  # type: ignore[attr-defined]
+    for n in range(outside_writes):
+        write_outside(f"outside-{n}".encode())
+    moved = read_back()
+    outcome = view.cas_write(REF, expected_token=stale, new_bytes=b"mine")  # type: ignore[attr-defined]
+    assert isinstance(outcome, CasConflict)
+    assert outcome.current_token == moved != stale
+
+
+def test_the_coordinated_commit_keeps_the_token_out_of_its_conflict(
+    tmp_path: Path, fast_cfg: LifecycleConfig
+) -> None:
+    """A commit through the session raises a conflict in the coordinator's version
+    space; the substrate token, a row version or an ETag, never takes its place."""
+    binding = InMemoryBinding("row")
+    binding.seed(REF, b"v1")
+    session = _session(tmp_path, fast_cfg)
+    try:
+        agent = CoordinatedSubstrate(binding.make_view(), session)
+        _bytes, tok = agent.read(REF)
+        binding.foreign_write(REF, b"outside")
+        moved = binding.make_view().read(REF)[1]
+        with pytest.raises(CasVersionConflict) as raised:
+            agent.commit(REF, expected_token=tok, new_bytes=b"mine")
+        assert raised.value.current_version == raised.value.expected_version
+        bare = binding.make_view().cas_write(REF, expected_token=tok, new_bytes=b"mine")
+        assert isinstance(bare, CasConflict) and bare.current_token == moved
+    finally:
         stop_coordinator(tmp_path)
