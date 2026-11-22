@@ -91,6 +91,7 @@ RAG corpora and agent memory are **shared mutable state**, so the stale-read→w
 ---
 
 - 📖 [User guide](docs/guide.md) — installation, namespace convention, strategies, observability, telemetry, examples, full API reference
+- ⚠️ [Limits and boundaries](docs/guide.md#limits-and-boundaries): what the software does not do, when each guarded case holds, and when you do not need it
 - 🔎 [RAG & shared memory](https://agent-coherence.dev/rag/) — coherence for retrieval corpora and agent memory stores, with the runnable lost-update demo
 - 🗂️ [Coherent workspace](#coherent-workspace-the-data-plane-for-shared-files) — `CoherentVolume`, the data-plane appliance for plain files shared across processes
 - 🧱 [BYO substrate](#byo-substrate-coherence-over-the-store-you-already-run) — `CoherentRow` / `CoherentObject`, the same coherence over a Postgres row or an S3 object you already run

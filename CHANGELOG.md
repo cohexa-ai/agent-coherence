@@ -43,6 +43,17 @@ Alpha — APIs may change before `v1.0`.
   unchanged. A binding that sets the field needs a library release newer than
   0.16.1.
 
+### Changed
+
+- **The user guide has one "Limits and boundaries" section.** What the
+  software does not do was spread across the README and many "Scope,
+  honestly" notes in the guide. `docs/guide.md` now has a top-level section
+  after Quick start that lists the limits, gives a table of the conditions
+  each guarded case needs, and says when you do not need the library. Its
+  "When you do not need this" list replaces the guide's older one, which said
+  a database that settles concurrent writes is enough. The new list asks that
+  every writer carries the version it read. The README links to the section.
+
 ### Fixed
 
 - **The held-file deny no longer says the file comes free after 10 to 30

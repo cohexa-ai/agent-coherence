@@ -22,38 +22,39 @@ full command-line toolset, and the API reference.
 2. [Upgrading from 0.15.0](#upgrading-from-0150)
 3. [Upgrading from 0.14.1](#upgrading-from-0141)
 4. [Quick start](#quick-start)
-5. [Namespace convention](#namespace-convention)
-6. [Strategies](#strategies)
-7. [Observability](#observability)
-8. [State transitions log](#state-transitions-log)
-9. [Content audit log](#content-audit-log)
-10. [Crash recovery](#crash-recovery)
-11. [Version retention and read-at-version](#version-retention-and-read-at-version)
-12. [Coherent workspace (`CoherentVolume`)](#coherent-workspace-coherentvolume)
-13. [BYO substrate bindings (`CoherentRow`, `CoherentObject`)](#byo-substrate-bindings-coherentrow-coherentobject)
-14. [Workspace versioning & restore (`WorkspaceVersioner`)](#workspace-versioning--restore-workspaceversioner)
-15. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
-16. [Effect fence over HTTP](#effect-fence-over-http)
-17. [Caller principal](#caller-principal)
-18. [Targeted grant handoff](#targeted-grant-handoff)
-19. [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)
-20. [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)
+5. [Limits and boundaries](#limits-and-boundaries)
+6. [Namespace convention](#namespace-convention)
+7. [Strategies](#strategies)
+8. [Observability](#observability)
+9. [State transitions log](#state-transitions-log)
+10. [Content audit log](#content-audit-log)
+11. [Crash recovery](#crash-recovery)
+12. [Version retention and read-at-version](#version-retention-and-read-at-version)
+13. [Coherent workspace (`CoherentVolume`)](#coherent-workspace-coherentvolume)
+14. [BYO substrate bindings (`CoherentRow`, `CoherentObject`)](#byo-substrate-bindings-coherentrow-coherentobject)
+15. [Workspace versioning & restore (`WorkspaceVersioner`)](#workspace-versioning--restore-workspaceversioner)
+16. [Multi-artifact snapshot sessions](#multi-artifact-snapshot-sessions)
+17. [Effect fence over HTTP](#effect-fence-over-http)
+18. [Caller principal](#caller-principal)
+19. [Targeted grant handoff](#targeted-grant-handoff)
+20. [After a strict-mode stale deny](#after-a-strict-mode-stale-deny)
+21. [Acquire-or-fail on `pre-edit`](#acquire-or-fail-on-pre-edit)
     - [Refusing a held strict file in Claude Code sessions](#refusing-a-held-strict-file-in-claude-code-sessions)
-21. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
-22. [Inline benchmark mode](#inline-benchmark-mode)
-23. [Telemetry](#telemetry)
-24. [Graceful degradation](#graceful-degradation)
-25. [Examples](#examples)
-26. [Real-workload benchmarks](#real-workload-benchmarks)
-27. [Benchmarking your own workload](#benchmarking-your-own-workload)
-28. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
-29. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
-30. [Replay (v0.8.2+)](#replay-v082)
-31. [Command-line tools](#command-line-tools)
-32. [API reference](#api-reference)
-33. [Low-level adapter API](#low-level-adapter-api)
-34. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
-35. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
+22. [`stale-write-guard-fs` MCP server](#stale-write-guard-fs-mcp-server)
+23. [Inline benchmark mode](#inline-benchmark-mode)
+24. [Telemetry](#telemetry)
+25. [Graceful degradation](#graceful-degradation)
+26. [Examples](#examples)
+27. [Real-workload benchmarks](#real-workload-benchmarks)
+28. [Benchmarking your own workload](#benchmarking-your-own-workload)
+29. [`ccs-diagnose` — detect stale reads](#ccs-diagnose--detect-stale-reads)
+30. [Conflict-outcome counters — how often did it actually fire?](#conflict-outcome-counters--how-often-did-it-actually-fire)
+31. [Replay (v0.8.2+)](#replay-v082)
+32. [Command-line tools](#command-line-tools)
+33. [API reference](#api-reference)
+34. [Low-level adapter API](#low-level-adapter-api)
+35. [CrewAI and AutoGen adapters](#crewai-and-autogen-adapters)
+36. [OpenAI Agents SDK adapter (experimental)](#openai-agents-sdk-adapter-experimental)
 
 ---
 
@@ -643,6 +644,54 @@ process lifetime, not on disk — it is not a database. If you already run Mem0,
 Letta, LlamaIndex, or a LangGraph store, keep it: it stays your durability layer,
 and CCSStore adds coherence for the cached view above it (a peer write invalidates a
 stale read). It does not wrap or replace your backend's storage.
+
+---
+
+## Limits and boundaries
+
+What the software does not do, in one place: a list of limits, then [when each guarded case holds](#when-each-case-holds) and [when you do not need this](#when-you-do-not-need-this). The scope notes in the other sections of this guide and in the [README](../README.md) carry the detail, and each line of the list links to the one that explains it where there is one.
+
+### What it does not do
+
+- **One host.** One coordinator runs on one machine, and it is a single point of failure. No guarantee is claimed across hosts. Cross-host fencing is on the roadmap and is not shipped ([scope](../README.md#what-it-guarantees)).
+- **Small fleets.** Built for 2 to 10 long-lived agents writing the same files, with people in the loop. Not for swarms of hundreds. The Python coordinator has eight handler slots and answers `503` while all of them are busy.
+- **Cooperating writers only.** A writer that bypasses the coordinator is not stopped, and nothing blocks its edit as it happens. By default, `CoherentVolume.write()` and the MCP `swg_write` refuse the next write from an agent that read the file before that edit ([foreign-edit guards](../README.md#foreign-edit-guards-writes-that-bypass-the-coordinator)). The Claude Code hooks do not deny an edit over such a change: they admit it with a notice, in strict mode too ([details](#foreign-write-detection--who-wrote-this-behind-my-back)).
+- **Only managed or tracked files.** `CoherentVolume` refuses a stale write only on paths under its `managed` globs, and a stale write to any other path lands. The MCP server guards the whole workspace unless `SWG_MANAGED` narrows it. The Claude Code hooks check only tracked files. By default those are `CLAUDE.md` and `AGENTS.md` at the repository root, the Markdown under `docs/specs`, `docs/plans` and `docs/brainstorms`, and any file named `plan.md`, `task.md` or `spec.md`. The plugin's Node coordinator also tracks `DECISIONS.md` at the root. A read or an edit of any other file gets no check ([track and untrack](#status-track-and-untrack-commands)).
+- **Checks the read, not the payload.** At a write, the check is that the writer's last read of the file is current. A writer that never read the file has no read to check, and its write is admitted over whatever a peer committed. A volume built with `on_held="refuse"` refuses that write only while the peer still holds the file ([details](#refusing-a-file-another-agent-holds)). Once an agent has read the file again, nothing can tell that the bytes it writes were built from an older copy ([scope](../README.md#coherent-workspace-the-data-plane-for-shared-files)).
+- **Races need compare-and-swap.** A plain `write()` does not settle a race between two writers, and `write_cas` does ([scope](../README.md#coherent-workspace-the-data-plane-for-shared-files)). A known defect is open: a plain `write()` made after a peer's `write_cas_at` commits, and before the peer's bytes reach disk, can be lost while both calls report success ([#248](https://github.com/Cohexa-ai/agent-coherence/issues/248)).
+- **Read side only for the framework stores.** `CCSStore` and the CrewAI, AutoGen and OpenAI Agents SDK adapters keep readers current inside one process. They do not refuse a write built from an old read. For that, write through `CoherentVolume` or `write_cas` ([RAG and shared memory](../README.md#rag--shared-agent-memory)).
+- **No rollback.** `gate()` can hold an action before it fires. It checks just before the action, not while it runs, so it narrows that window and does not close it ([scope](#gatevolume-path--decide-effect)). It cannot undo an action, and [workspace restore](#workspace-versioning--restore-workspaceversioner) can put back a file or an object, not an action that already ran.
+- **No check of an earlier approval's inputs.** `gate()`, `swg_gate` and `POST /hooks/effect-fence` check one input per call, and a [snapshot session](#multi-artifact-snapshot-sessions) pins its inputs when it begins. No call takes the versions a review or approval read earlier, across several inputs, and checks them all at one instant without rewriting them. That check is proposed in [#653](https://github.com/Cohexa-ai/agent-coherence/issues/653) and is not shipped.
+- **Recovery is the agent's.** Over MCP a refusal carries a `recover` verb and often a `next_step`, and in Python it is a typed exception ([MCP server](#stale-write-guard-fs-mcp-server)). The agent then re-reads, rebuilds its change and retries, and nothing here merges content or rebuilds a change for it. `CoherentVolume.write_cas` does retry inside the call, but each retry only runs your `make_content` again on the current bytes, so the rebuild is still your code ([details](#concurrent-writers-write_cas)).
+- **No verdict on the work.** It checks that what an agent read is still current. It does not judge whether the result is right or the task is done.
+- **Claude Code warns by default.** The Claude Code hooks deny a session whose copy of a file went stale only in strict mode, on the files you opt in ([details](#after-a-strict-mode-stale-deny)). By default, if the coordinator is overloaded or does not answer, the hook lets the call through, in strict mode too ([#223](https://github.com/Cohexa-ai/agent-coherence/issues/223)). By default the hooks also do not settle two sessions editing one file at the same time: the later edit is admitted with a note ([details](#acquire-or-fail-on-pre-edit)).
+- **Python, or MCP.** The library is Python 3.11+. An agent in another language reaches it through the [MCP server](#stale-write-guard-fs-mcp-server), or the [HTTP effect fence](#effect-fence-over-http) on the same host, and there is no TypeScript or Go SDK. The Claude Code plugin ships its own Node coordinator, which has no caller principals, sweep, snapshot sessions or handoffs ([details](#a-volume-on-the-node-coordinator)).
+- **`ccs-diagnose` only reports.** It observes one run of one LangGraph graph in one process and reports reads that were handed different versions. It denies no read and no write, and it cannot see divergence across separate OS processes ([reference](ccs-diagnose.md)).
+- **No dashboard.** Nothing here shows a running fleet: there is no web UI and no live chart of coordinator state. You read typed results and what the `agent-coherence-status` command prints for either coordinator ([status](#status-track-and-untrack-commands)), and `CCSStore` can send per-operation metrics to OpenTelemetry or LangSmith ([telemetry](#telemetry)). The pages and charts that exist are static files: an HTML report from `ccs-diagnose`, `ccs-simulate` or `ccs-compare`, and the benchmark curve that `tools/plot_cost_sweep.py` draws. Counters exist on the Python coordinator only: in `/status`, and in its `state.db`, which you read offline ([conflict-outcome counters](#conflict-outcome-counters--how-often-did-it-actually-fire), [foreign-write detection](#foreign-write-detection--who-wrote-this-behind-my-back)).
+- **Not a security boundary.** It guards against accidents between your own agents, not against a hostile process. One bearer secret covers every process in the workspace, and a [caller principal](#caller-principal) is not authentication ([security notes](security.md)).
+- **What the model checking covers.** Nine TLA+ specs run under TLC in CI. They check safety properties of the protocol state machine on small bounded models, not bytes on disk and not liveness ([specs](../formal/tla/README.md)). `AtomicPublish.tla` is not in the CI run ([atomic publish](../README.md#atomic-multi-file-publish)). The foreign-edit guards, the gate's check that the grant still stands and the Claude Code hooks are covered by tests, not by a spec, and the claim ladder has no cross-host rung ([scope](../README.md#what-it-guarantees)).
+- **The token savings are estimates.** The 69%, 47% and 29% figures come from LangGraph graphs run with a fake chat model, with no live model call. Token counts are estimated from content length, and the baseline is computed as every store operation re-sending the whole artifact ([benchmarks](#real-workload-benchmarks)). They were measured on the `CCSStore` path only, not on `CoherentVolume`, the MCP server or the Claude Code hooks. The saving is on re-sent shared artifacts, not on a whole inference bill.
+- **Alpha.** APIs may change before 1.0 ([status](../README.md#status)). Open defects are in the [issue tracker](https://github.com/Cohexa-ai/agent-coherence/issues).
+
+### When each case holds
+
+Each row is a case the software guards, what happens on each surface, and the conditions it needs. A row holds only under the conditions in its last column.
+
+| The case | What happens | Holds when |
+|---|---|---|
+| A stalled worker is retried, the retry commits, then the first worker wakes up and writes. | `CoherentVolume.write()` raises `StaleView` and the MCP `swg_write` answers `stale_view`. Nothing is written. By default the Claude Code hooks admit the late edit. They deny it only in strict mode, on the files you opt in. | The file is a managed path. The stalled worker read it through the coordinator before it stalled, both workers write through the coordinator, and the retry runs under its own identity: its own `CoherentVolume` or its own MCP server process. `write()` and `swg_write` admit a write to a file the worker never read. |
+| An agent works out a fix against one version of a config, the config changes, and the agent applies the fix anyway. | `gate()` raises `StaleView` before the action runs, and its `hold_cause` names the reason. The MCP `swg_gate` answers the same hold. `POST /hooks/effect-fence` answers it for a change committed through the coordinator. | The decision and the action run inside one `gate()` call on one managed file, or the agent passes the version and ownership generation from its read to `swg_gate` just before the action. Over HTTP, on the Python coordinator, the agent also sends its session id and the hash of the bytes it read, and a request missing any of these gets HTTP 400, not a hold. That route never reads the file. It compares the hash with the coordinator's record, so a change made outside the coordinator gets `proceed` unless the caller hashes the file again just before the call ([details](#effect-fence-over-http)). The check runs just before the action. That narrows the window. It does not close it, and it does not undo an action. |
+| Someone edits a file by hand in the workspace while an agent is still working from the old copy, and the agent saves over the edit. | By default `CoherentVolume.write()` raises `StaleView` and `swg_write` answers `stale_view`. The hand edit stays on disk, and the refusal tells the agent to reacquire and rebuild its change from the fresh bytes. | The file is a managed path on the same machine. The agent read it through `CoherentVolume` or the MCP tools before the edit, and writes it the same way. The edit is caught at the agent's next write, not as it happens. The Claude Code hooks do not deny this save. They admit it with a notice. |
+| A background pass rewrites a memory file while a running agent still holds the earlier version. | One commit lands first, and the other is not applied over it. `write_cas_at` raises `CasVersionConflict` and the MCP `swg_write_cas` answers `version_mismatch`, and the agent re-reads and retries. `write_cas` reads the file itself, so the agent's `make_content` runs on the current bytes. | Both sides commit with compare-and-swap on a managed file, and each builds its content from the bytes that call or its read returned. On a path outside the managed globs a compare-and-swap checks no version and the later commit lands. |
+| Two agents race on one file. | One commit wins. `write_cas_at` and the MCP `swg_write_cas` refuse the other with a typed error: a version conflict, or `ViewWedged` while the winner's bytes are still reaching disk. `write_cas` retries the loser itself, running `make_content` again on the winner's bytes for at most nine commit attempts, then raises `CasRetriesExhausted`. | Both write with compare-and-swap on a managed file. A plain `write()` does not settle a race, and by default neither do the Claude Code hooks. |
+
+### When you do not need this
+
+Skip it when one of these is true:
+
+- No two writers meet on one file or record: a worktree per agent, a namespace per user or an append-only store. Once two writers meet, the race is back. A single writer whose readers act on what they read is still the second case in the table above.
+- Every writer already carries the version it read through your own write path, such as `UPDATE ... WHERE version = ?` or an S3 `If-Match`. That write path already rejects a stale write ([what the bindings add](#what-you-get-over-the-substrates-own-cas)).
+- You run a few agents on internal work where a bad write is annoying but easy to undo.
 
 ---
 
@@ -2999,20 +3048,12 @@ names exactly.
 
 ### When you don't need this
 
-Coherence is worth adding only when agents actually share mutable state through a
-back channel your framework doesn't already serialize. You can skip it when:
+The cases where you can skip this are listed in
+[When you do not need this](#when-you-do-not-need-this), under Limits and boundaries.
 
-- **Every agent owns an isolated workspace.** If sessions never write the same
-  artifact — separate worktrees, separate branches, separate keys with no shared
-  root — there is no lost update to prevent. (The moment they *do* converge on one
-  file or one shared root, the race is back.)
-- **A single database already arbitrates the writes.** If your shared state is rows
-  behind one transactional store, its own transactions and row locks already give
-  you last-committer-wins with no torn state. `CoherentVolume` targets *plain files*
-  and in-memory agent state, where nothing is arbitrating.
+### A crashed holder does not block the fleet
 
-The liveness tradeoff runs the other way: a crashed holder does not deadlock the
-fleet. A stalled `MODIFIED`/`EXCLUSIVE` grant is bounded and auto-reclaimed by the
+A crashed holder does not deadlock the fleet. A stalled `MODIFIED`/`EXCLUSIVE` grant is bounded and auto-reclaimed by the
 best-effort crash-recovery sweep (per artifact, never a global lock). The sweep
 reads only heartbeats and hold time, and only requests on tracked files record a
 heartbeat, so a live volume that goes quiet for `grant_heartbeat_timeout_sec`
