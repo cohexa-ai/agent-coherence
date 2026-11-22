@@ -20740,8 +20740,10 @@ _NOT_A_HOOK_READ: dict[str, dict] = {
     "want_owner_generation": {"want_owner_generation": True},
     "verify_only": {"verify_only": True},
     "name_kind": {"name_kind": "file"},
+    "want_registration": {"want_registration": True},
     "want_owner_generation-false": {"want_owner_generation": False},
     "verify_only-false": {"verify_only": False},
+    "want_registration-false": {"want_registration": False},
 }
 
 
@@ -20750,13 +20752,14 @@ def test_a_pre_read_that_is_not_a_hook_read_keeps_its_deny_and_leaves_the_recove
     plan_desk: _PlanDesk, field: str,
 ) -> None:
     """#514: a pre-read carrying any of these fields is a CoherentVolume read,
-    an effect-fence check, a raw capture or the substrate, whose recovery is a
-    new identity. Every such read of the stale file is denied: its denies arm
-    nothing, so the hook Read after them is still denied; and once a hook
-    Read's deny has armed the recovery, such a read neither takes it nor uses
-    it up, so the hook Read after it is admitted. Fails if any one of the
-    three fields is dropped from the rule, and, through the false-valued
-    cases, if the rule reads a field's value rather than its presence."""
+    an effect-fence check, a raw capture, a basis recording or the substrate,
+    whose recovery is a new identity. Every such read of the stale file is
+    denied: its denies arm nothing, so the hook Read after them is still
+    denied; and once a hook Read's deny has armed the recovery, such a read
+    neither takes it nor uses it up, so the hook Read after it is admitted.
+    Fails if any one of the four fields is dropped from the rule, and, through
+    the false-valued cases, if the rule reads a field's value rather than its
+    presence."""
     marker = _NOT_A_HOOK_READ[field]
     reader, _writer = _stale_reader(plan_desk)
 

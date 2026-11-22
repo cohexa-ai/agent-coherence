@@ -150,7 +150,11 @@ from ccs.coordinator.service import (
     ReleaseRequest,
     mint_nonce_problem,
 )
-from ccs.coordinator.sqlite_registry import SCHEMA_USER_VERSION, SqliteArtifactRegistry
+from ccs.coordinator.sqlite_registry import (
+    SCHEMA_USER_VERSION,
+    SqliteArtifactRegistry,
+    row_registration,
+)
 from ccs.core.clock import monotonic_seconds
 from ccs.core.disk_spelling import native_spelling
 from ccs.core.exceptions import (
@@ -2753,6 +2757,12 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
     # ``(version, owner_generation)``. Absent (every shipped client), the
     # response shapes below are byte-unchanged.
     want_generation = bool(body.get("want_owner_generation"))
+    # Basis opt-in: a truthy ``want_registration`` asks every admitted reply
+    # that reports a version to carry the registration of the row that version
+    # was read from (``null`` where it has none to report). Absent or false,
+    # every reply is byte-unchanged; replies that report no version never
+    # carry it.
+    want_registration = bool(body.get("want_registration"))
     # Effect-gate verification read: the fence re-reads only to COMPARE
     # comparands and discards the body. Such a read must not mutate coordinator
     # state -- above all it must not re-grant SHARED to a preempted holder,
@@ -2841,6 +2851,12 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 # overtake.
                 if want_generation and seeded_pair is not None:
                     first["owner_generation"] = seeded_pair[1]
+                # From the same snapshot; ``null`` when the row was gone before
+                # it, since the seeded version then has no row behind it.
+                if want_registration:
+                    first["registration"] = _reported_registration(
+                        seeded_pair[0] if seeded_pair is not None else None
+                    )
                 return first
 
         # KTD-J (Unit 8): if a prior pre-read on this exact (agent,
@@ -2992,6 +3008,8 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                 coordinator.take_stale_read_recovery(agent_id, artifact_id)
             if want_generation and decision.owner_generation is not None:
                 fresh["owner_generation"] = decision.owner_generation
+            if want_registration:
+                fresh["registration"] = _reported_registration(artifact)
             return fresh
 
         # Stale: either first time this session sees the artifact OR they
@@ -3094,6 +3112,8 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
                     coordinator, artifact_id, agent_id,
                     classified_version=decision.version, tick=now, content_hash=content_hash,
                 )
+                # No registration here: a request asking for one is not a hook
+                # read, so it never reaches this admit.
                 return {"status": "fresh", "version": decision.version}
             return _emit_pre_read_strict_deny(
                 coordinator,
@@ -3138,6 +3158,10 @@ def _handle_pre_read(req: _RequestProtocol, coordinator: CoordinatorHTTPServer) 
             # the verdict classified from, which is what produced
             # summary.current_version, so the pair cannot disagree.
             resp["owner_generation"] = decision.owner_generation
+        if want_registration:
+            # Top-level beside the generation, from the snapshot that produced
+            # summary.current_version.
+            resp["registration"] = _reported_registration(artifact)
         if not verify_only:
             # KTD-J (Unit 8): bump the stale-warning emission counter +
             # mark the pair so a follow-up pre-read counts as a re-read. A
@@ -4813,11 +4837,15 @@ def _clear_acknowledged_marker(registry: RegistryBase, artifact_id: UUID, agent_
         registry.clear_agent_transient(artifact_id, agent_id)
 
 
-_NOT_A_HOOK_READ_FIELDS = ("want_owner_generation", "verify_only", "name_kind")
+_NOT_A_HOOK_READ_FIELDS = (
+    "want_owner_generation", "verify_only", "name_kind", "want_registration",
+)
 """Fields only a pre-read caller other than a Claude Code hook client sends:
 CoherentVolume and the documented raw capture send the generation opt-in, the
-effect fence sends ``verify_only``, the substrate sends ``name_kind``. The hook
-clients send ``{session_id, path, content_hash, agent_id}`` and nothing else."""
+effect fence sends ``verify_only``, the substrate sends ``name_kind``, and a
+caller recording a basis sends the registration opt-in, which a raw client may
+send alone. The hook clients send ``{session_id, path, content_hash,
+agent_id}`` and nothing else."""
 
 
 def _is_hook_read(body: dict) -> bool:
@@ -4829,6 +4857,22 @@ def _is_hook_read(body: dict) -> bool:
     by the field being present, whatever its value, so an explicit ``false``
     still marks a caller that is not a hook client."""
     return not any(field in body for field in _NOT_A_HOOK_READ_FIELDS)
+
+
+def _reported_registration(snapshot: Artifact | None) -> str | None:
+    """The registration an opted-in pre-read reports beside its version: the
+    registration of the row the version was read from, so a basis recorded from
+    this read can later tell that row from one registered in its place.
+
+    The coordinator runs on the SQLite registry, where a row's registration is
+    its id: every row it registers gets a fresh one, so a path deleted and
+    registered again reports a new registration. ``None`` when no row snapshot
+    backs the version, or when the row records no content claim: the version
+    then vouches for no bytes, and only a commit of the file records some, so a
+    caller is told so rather than handed a token it would record."""
+    if snapshot is None or not coordinator_holds_content_claim(snapshot.content_hash):
+        return None
+    return row_registration(snapshot.id)
 
 
 def _reads_the_recorded_bytes(artifact: Artifact, content_hash: str | None) -> bool:
