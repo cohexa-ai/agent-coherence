@@ -256,7 +256,8 @@ reads the run's JUnit report and fails the job unless:
   native compare-and-set conformance run against Postgres;
 - **two tests skipped, each for its own reason:** the limited-role trigger test,
   which skips without a non-owner role in `CCS_TEST_PG_LIMITED_DSN` (and also
-  lacks the table fixture it would need to pass with one), and the real S3
+  lacks the table fixture it would need to pass with one:
+  [#660](https://github.com/Cohexa-ai/agent-coherence/issues/660)), and the real S3
   arm, which needs a bucket in `CCS_REAL_S3_BUCKET`. The job sets neither.
 
 Any other outcome fails the job and names the test: a failure or an error, a
