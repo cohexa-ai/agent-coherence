@@ -1,0 +1,73 @@
+{
+  "name": "basis-check-hold-byte-identical-re-save",
+  "description": "HOLD `version_moved`. A peer committed the same bytes the file already had, which still moves the version to 2. Only versions and registrations are compared, never content, so the check holds.",
+  "setup": {
+    "tracked": [
+      "docs/**"
+    ],
+    "files": {
+      "docs/plan.md": "# coherence corpus fixture  \n"
+    },
+    "preflight_requests": [
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "11111111-1111-4111-8111-111111111111",
+          "path": "docs/plan.md",
+          "content_hash": "f9b414ed170aade26e96b08b64710e279b57971274301dc1c4c22fb63de6eec6"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/pre-read",
+        "body": {
+          "session_id": "22222222-2222-4222-8222-222222222222",
+          "path": "docs/plan.md",
+          "content_hash": "f9b414ed170aade26e96b08b64710e279b57971274301dc1c4c22fb63de6eec6"
+        }
+      },
+      {
+        "method": "POST",
+        "path": "/hooks/post-edit-cas",
+        "body": {
+          "session_id": "22222222-2222-4222-8222-222222222222",
+          "path": "docs/plan.md",
+          "content_hash": "f9b414ed170aade26e96b08b64710e279b57971274301dc1c4c22fb63de6eec6",
+          "expected_version": 1
+        }
+      }
+    ]
+  },
+  "request": {
+    "method": "POST",
+    "path": "/basis/check",
+    "body": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "basis": [
+        {
+          "path": "docs/plan.md",
+          "version": 1
+        }
+      ]
+    }
+  },
+  "expected": {
+    "status": 200,
+    "body": {
+      "answer": "hold",
+      "moved": [
+        {
+          "path": "docs/plan.md",
+          "expected": 1,
+          "current": 2,
+          "reason": "version_moved"
+        }
+      ],
+      "recovery": "rederive"
+    }
+  },
+  "backends": [
+    "python"
+  ]
+}
