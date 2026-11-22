@@ -547,7 +547,9 @@ class CoherentRow:
         try:
             row = self._fetch_row(artifact_ref)
         except CoherenceError as exc:  # already scrubbed; an owned conn is dropped
-            logger.debug("CoherentRow could not read the row after a refused write: %s", type(exc).__name__)
+            # The scrubbed message names the driver error and the table, never the
+            # driver text; no exc_info, since its context still holds that text.
+            logger.debug("CoherentRow could not read the row after a refused write: %s", exc)
             return None
         if row is None:
             return None

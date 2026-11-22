@@ -250,6 +250,7 @@ def test_a_failed_read_after_a_refusal_keeps_the_refusal(
     assert outcome.current_token is None
     assert conn.rolled_back >= 1
     assert "hunter2" not in caplog.text
+    assert error_name in caplog.text  # the cause stays diagnosable without the driver text
 
 
 def test_a_failed_read_after_a_refusal_drops_an_owned_connection(
